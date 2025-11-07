@@ -1,8 +1,8 @@
 # Name of your application. Used to uniquely configure containers.
-service: llm_memories
+service: agent_hub
 
 # Name of the container image (use your-user/app-name on external registries).
-image: llm_memories
+image: agent_hub
 
 # Deploy to these servers.
 servers:
@@ -52,7 +52,7 @@ env:
     # WEB_CONCURRENCY: 2
 
     # Match this to any external database server to configure Active Record correctly
-    # Use llm_memories-db for a db accessory server on same machine via local kamal docker network.
+    # Use agent_hub-db for a db accessory server on same machine via local kamal docker network.
     # DB_HOST: 192.168.0.2
 
     # Log everything from Rails
@@ -69,13 +69,12 @@ aliases:
 # Use a persistent storage volume for sqlite database files and local Active Storage files.
 # Recommended to change this to a mounted volume path that is backed up off server.
 volumes:
-  - "llm_memories_storage:/rails/storage"
+  - "agent_hub_storage:/rails/storage"
 
 # Bridge fingerprinted assets, like JS and CSS, between versions to avoid
 # hitting 404 on in-flight requests. Combines all files from new and old
 # version inside the asset_path.
 asset_path: /rails/public/assets
-
 
 # Configure the image builder.
 builder:
@@ -90,7 +89,6 @@ builder:
   # secrets:
   #   - GITHUB_TOKEN
   #   - RAILS_MASTER_KEY
-
 # Use a different ssh user than root
 # ssh:
 #   user: app
