@@ -49,7 +49,7 @@ gem "omniauth"
 gem "omniauth-github"
 gem "omniauth-rails_csrf_protection"
 gem "jwt"
-gem "octokit", "~> 8.0"
+gem "octokit", "~> 10.0"
 
 # MCP
 gem "actionmcp"
