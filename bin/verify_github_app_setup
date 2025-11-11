@@ -1,0 +1,223 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Verification script for GitHub App setup
+# Run this after setting up your GitHub App to verify everything is configured correctly
+
+puts "🔍 GitHub App Setup Verification"
+puts "=" * 50
+puts ""
+
+errors = []
+warnings = []
+
+# Check 1: Environment Variables
+puts "✓ Checking environment variables..."
+required_vars = %w[GITHUB_APP_CLIENT_ID GITHUB_APP_CLIENT_SECRET APP_URL]
+
+required_vars.each do |var|
+  if ENV[var].present?
+    puts "  ✓ #{var} is set"
+  else
+    errors << "#{var} is not set"
+    puts "  ✗ #{var} is MISSING"
+  end
+end
+
+if ENV['GITHUB_APP_CLIENT_ID'] && !ENV['GITHUB_APP_CLIENT_ID'].start_with?('Iv1.')
+  warnings << "GITHUB_APP_CLIENT_ID should start with 'Iv1.'"
+  puts "  ⚠ GITHUB_APP_CLIENT_ID doesn't look like a GitHub App Client ID (should start with 'Iv1.')"
+end
+
+puts ""
+
+# Check 2: Database Migration
+puts "✓ Checking database schema..."
+require_relative "../config/environment"
+
+required_columns = {
+  'github_app_token' => 'string',
+  'github_app_refresh_token' => 'string',
+  'github_app_token_expires_at' => 'datetime',
+  'github_app_installation_id' => 'string',
+  'github_app_permissions' => 'jsonb'
+}
+
+required_columns.each do |column, type|
+  if User.column_names.include?(column)
+    puts "  ✓ users.#{column} exists"
+  else
+    errors << "Column users.#{column} is missing (run: bin/rails db:migrate)"
+    puts "  ✗ users.#{column} is MISSING"
+  end
+end
+
+puts ""
+
+# Check 3: User Model Methods
+puts "✓ Checking User model methods..."
+required_methods = %w[
+  github_app_authorized?
+  github_app_token_expired?
+  github_app_token_needs_refresh?
+  valid_github_app_token
+  refresh_github_app_token!
+  revoke_github_app_authorization!
+]
+
+required_methods.each do |method|
+  if User.instance_methods.include?(method.to_sym)
+    puts "  ✓ User##{method}"
+  else
+    errors << "User##{method} method is missing"
+    puts "  ✗ User##{method} is MISSING"
+  end
+end
+
+puts ""
+
+# Check 4: Service Class
+puts "✓ Checking GithubAppService..."
+if defined?(GithubAppService)
+  puts "  ✓ GithubAppService exists"
+
+  service_methods = %w[
+    authorization_url
+    exchange_code_for_token
+    refresh_token
+    get_user_info
+    get_user_repos
+    get_user_issues
+    get_user_pull_requests
+    create_issue_comment
+  ]
+
+  service_methods.each do |method|
+    if GithubAppService.respond_to?(method)
+      puts "  ✓ GithubAppService.#{method}"
+    else
+      errors << "GithubAppService.#{method} method is missing"
+      puts "  ✗ GithubAppService.#{method} is MISSING"
+    end
+  end
+else
+  errors << "GithubAppService class is missing"
+  puts "  ✗ GithubAppService class is MISSING"
+end
+
+puts ""
+
+# Check 5: Routes
+puts "✓ Checking routes..."
+routes = Rails.application.routes.routes.map { |r| r.name.to_s }
+
+required_routes = %w[
+  github_app_authorize
+  github_app_callback
+  github_app_revoke
+  github_app_status
+]
+
+required_routes.each do |route|
+  if routes.include?(route)
+    puts "  ✓ #{route}_path"
+  else
+    errors << "Route #{route}_path is missing"
+    puts "  ✗ #{route}_path is MISSING"
+  end
+end
+
+puts ""
+
+# Check 6: Controllers
+puts "✓ Checking controllers..."
+controllers = {
+  'GithubAppController' => %w[authorize callback revoke status],
+  'GithubExampleController' => %w[repos issues pull_requests create_comment status]
+}
+
+controllers.each do |controller_name, actions|
+  if defined?(controller_name.constantize)
+    puts "  ✓ #{controller_name} exists"
+    controller_class = controller_name.constantize
+    actions.each do |action|
+      if controller_class.instance_methods.include?(action.to_sym)
+        puts "    ✓ #{action}"
+      else
+        warnings << "#{controller_name}##{action} action is missing"
+        puts "    ⚠ #{action} is missing"
+      end
+    end
+  else
+    warnings << "#{controller_name} is missing (example controller, optional)"
+    puts "  ⚠ #{controller_name} is MISSING (optional)"
+  end
+end
+
+puts ""
+
+# Check 7: Dependencies
+puts "✓ Checking dependencies..."
+begin
+  require 'httparty'
+  puts "  ✓ httparty gem is installed"
+rescue LoadError
+  errors << "httparty gem is not installed (run: bundle install)"
+  puts "  ✗ httparty gem is MISSING"
+end
+
+puts ""
+
+# Check 8: Encryption
+puts "✓ Checking encryption..."
+if Rails.application.credentials.config[:active_record_encryption]
+  puts "  ✓ ActiveRecord encryption is configured"
+else
+  warnings << "ActiveRecord encryption may not be configured"
+  puts "  ⚠ ActiveRecord encryption configuration not found"
+end
+
+puts ""
+
+# Summary
+puts "=" * 50
+puts "📊 Summary"
+puts "=" * 50
+
+if errors.empty? && warnings.empty?
+  puts "✅ All checks passed! Your GitHub App setup is complete."
+  puts ""
+  puts "Next steps:"
+  puts "1. Register a GitHub App at https://github.com/settings/apps"
+  puts "2. Set the callback URL to: #{ENV['APP_URL']}/auth/github_app/callback"
+  puts "3. Configure permissions: Contents, Issues, Pull Requests (Read & Write)"
+  puts "4. Copy the Client ID and Client Secret to your .env file"
+  puts "5. Restart your Rails server"
+  puts "6. Visit your app and click 'Authorize GitHub App'"
+  exit 0
+elsif errors.empty?
+  puts "⚠️  Setup is mostly complete with #{warnings.count} warning(s):"
+  warnings.each do |warning|
+    puts "  - #{warning}"
+  end
+  puts ""
+  puts "These warnings are optional - your GitHub App should still work."
+  exit 0
+else
+  puts "❌ Setup has #{errors.count} error(s):"
+  errors.each do |error|
+    puts "  - #{error}"
+  end
+
+  if warnings.any?
+    puts ""
+    puts "And #{warnings.count} warning(s):"
+    warnings.each do |warning|
+      puts "  - #{warning}"
+    end
+  end
+
+  puts ""
+  puts "Please fix the errors above and run this script again."
+  exit 1
+end
