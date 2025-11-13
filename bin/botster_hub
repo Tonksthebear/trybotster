@@ -1,0 +1,672 @@
+#!/bin/bash
+# Botster Hub - Pure bash daemon for GitHub mention → local agent automation
+# ZERO dependencies - uses only macOS built-in tools (curl, grep, sed, osascript)
+
+set -euo pipefail
+
+VERSION="0.1.0"
+CONFIG_DIR="$HOME/.botster_hub"
+SESSIONS_DIR="$CONFIG_DIR/sessions"
+CONFIG_FILE="$CONFIG_DIR/config"
+LOG_FILE="$CONFIG_DIR/botster_hub.log"
+PID_FILE="$CONFIG_DIR/botster_hub.pid"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+#############################################################################
+# Config Management (Simple Key-Value)
+#############################################################################
+
+# Get config value
+get_config() {
+    local key="$1"
+    local default="${2:-}"
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "$default"
+        return
+    fi
+
+    # Read value from key=value format
+    local value=$(grep "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2-)
+    echo "${value:-$default}"
+}
+
+# Set config value
+set_config() {
+    local key="$1"
+    local value="$2"
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        touch "$CONFIG_FILE"
+    fi
+
+    # Remove existing key if present
+    if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+        # macOS sed requires backup extension
+        sed -i '' "/^${key}=/d" "$CONFIG_FILE"
+    fi
+
+    # Add new value
+    echo "${key}=${value}" >> "$CONFIG_FILE"
+
+    log "Config updated: $key = $value"
+}
+
+#############################################################################
+# Session Management (One File Per Session)
+#############################################################################
+
+# Get session file path
+session_file() {
+    local session_key="$1"
+    echo "$SESSIONS_DIR/$session_key"
+}
+
+# Check if session exists
+session_exists() {
+    local session_key="$1"
+    [[ -f "$(session_file "$session_key")" ]]
+}
+
+# Get session field
+get_session_field() {
+    local session_key="$1"
+    local field="$2"
+    local default="${3:-}"
+
+    local file=$(session_file "$session_key")
+
+    if [[ ! -f "$file" ]]; then
+        echo "$default"
+        return
+    fi
+
+    local value=$(grep "^${field}=" "$file" 2>/dev/null | cut -d'=' -f2-)
+    echo "${value:-$default}"
+}
+
+# Create session
+create_session() {
+    local session_key="$1"
+    local message_id="$2"
+    local repo="$3"
+    local issue_number="$4"
+    local worktree_path="$5"
+    local terminal_id="$6"
+
+    local file=$(session_file "$session_key")
+
+    cat > "$file" <<EOF
+message_id=$message_id
+repo=$repo
+issue_number=$issue_number
+worktree_path=$worktree_path
+terminal_id=$terminal_id
+started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+status=active
+EOF
+}
+
+# Remove session
+remove_session() {
+    local session_key="$1"
+    local file=$(session_file "$session_key")
+
+    if [[ -f "$file" ]]; then
+        rm -f "$file"
+    fi
+}
+
+# List all session keys
+list_sessions() {
+    if [[ ! -d "$SESSIONS_DIR" ]]; then
+        return
+    fi
+
+    for file in "$SESSIONS_DIR"/*; do
+        if [[ -f "$file" ]]; then
+            basename "$file"
+        fi
+    done
+}
+
+# Count sessions
+count_sessions() {
+    list_sessions | wc -l | tr -d ' '
+}
+
+#############################################################################
+# Logging
+#############################################################################
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+log_error() {
+    echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*${NC}" | tee -a "$LOG_FILE"
+}
+
+log_success() {
+    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')] $*${NC}" | tee -a "$LOG_FILE"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] WARN: $*${NC}" | tee -a "$LOG_FILE"
+}
+
+#############################################################################
+# Initialization
+#############################################################################
+
+init_dirs() {
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$SESSIONS_DIR"
+    mkdir -p "$HOME/botster-sessions"
+
+    # Create default config if it doesn't exist
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" <<EOF
+server_url=http://localhost:3000
+api_key=
+agent_command=claude
+completion_marker=.botster_status
+max_sessions=20
+poll_interval=5
+worktree_base=$HOME/botster-sessions
+EOF
+        log "Created default config at $CONFIG_FILE"
+    fi
+}
+
+#############################################################################
+# Daemon Control
+#############################################################################
+
+is_running() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid=$(cat "$PID_FILE")
+        if ps -p "$pid" > /dev/null 2>&1; then
+            return 0
+        else
+            rm -f "$PID_FILE"
+            return 1
+        fi
+    fi
+    return 1
+}
+
+#############################################################################
+# Simple JSON Extraction (for API responses only)
+#############################################################################
+
+# Extract string value from JSON response
+json_extract_string() {
+    local json="$1"
+    local key="$2"
+    echo "$json" | grep -o "\"$key\":\"[^\"]*\"" | head -1 | sed 's/.*:"\(.*\)".*/\1/'
+}
+
+# Extract number from JSON response
+json_extract_number() {
+    local json="$1"
+    local key="$2"
+    echo "$json" | grep -o "\"$key\":[0-9]*" | head -1 | sed 's/.*:\([0-9]*\).*/\1/'
+}
+
+# Extract messages array and process each
+process_json_messages() {
+    local json="$1"
+
+    # Split messages by },{
+    echo "$json" | sed -n 's/.*"messages":\[\(.*\)\].*/\1/p' | sed 's/},{/}|{/g' | tr '|' '\n'
+}
+
+# Extract payload object from message
+json_extract_payload() {
+    local message="$1"
+    echo "$message" | sed -n 's/.*"payload":\({[^}]*}\).*/\1/p'
+}
+
+#############################################################################
+# API Communication
+#############################################################################
+
+poll_messages() {
+    local server_url=$(get_config "server_url")
+    local api_key=$(get_config "api_key")
+
+    if [[ -z "$api_key" ]]; then
+        log_error "API key not configured. Run: botster_hub config api_key YOUR_KEY"
+        return 1
+    fi
+
+    curl -s -H "X-API-Key: $api_key" "$server_url/bots/messages" 2>/dev/null
+}
+
+ack_message() {
+    local message_id="$1"
+    local server_url=$(get_config "server_url")
+    local api_key=$(get_config "api_key")
+
+    curl -s -X PATCH \
+        -H "X-API-Key: $api_key" \
+        -H "Content-Type: application/json" \
+        "$server_url/bots/messages/$message_id" \
+        > /dev/null 2>&1
+
+    if [[ $? -eq 0 ]]; then
+        log "Acknowledged message: $message_id"
+    else
+        log_error "Failed to acknowledge message: $message_id"
+    fi
+}
+
+#############################################################################
+# Git Worktree Management
+#############################################################################
+
+create_worktree() {
+    local repo="$1"
+    local issue_number="$2"
+
+    # Sanitize repo name for filesystem
+    local repo_safe="${repo//\//-}"
+    local branch_name="botster-${repo_safe}-${issue_number}"
+    local worktree_base=$(get_config "worktree_base")
+    local worktree_path="$worktree_base/${repo_safe}-${issue_number}"
+
+    # Check if we're in a git repo
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        log_error "Not in a git repository. Cannot create worktree."
+        return 1
+    fi
+
+    # Create worktree
+    if git worktree add "$worktree_path" -b "$branch_name" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Created worktree: $worktree_path"
+        echo "$worktree_path"
+    else
+        log_error "Failed to create worktree: $worktree_path"
+        return 1
+    fi
+}
+
+#############################################################################
+# Terminal Session Management
+#############################################################################
+
+spawn_terminal() {
+    local worktree_path="$1"
+    local repo="$2"
+    local issue_number="$3"
+    local context="$4"
+
+    local agent_command=$(get_config "agent_command")
+    local completion_marker=$(get_config "completion_marker")
+    local server_url=$(get_config "server_url")
+    local api_key=$(get_config "api_key")
+
+    # Escape for AppleScript (replace single quotes)
+    local escaped_path="${worktree_path//\'/\\\'}"
+
+    # AppleScript to spawn Terminal tab
+    local script="tell application \"Terminal\"
+    activate
+    set newTab to do script \"cd '$escaped_path' && export BOTSTER_API_KEY='$api_key' && $agent_command || echo 'Agent failed'; echo 'DONE' > $completion_marker\"
+    set custom title of front window to \"Botster: ${repo}#${issue_number}\"
+    return id of front window
+end tell"
+
+    local terminal_id=$(osascript -e "$script" 2>&1)
+
+    if [[ $? -eq 0 ]]; then
+        log_success "Spawned terminal for ${repo}#${issue_number}"
+        echo "$terminal_id"
+    else
+        log_error "Failed to spawn terminal: $terminal_id"
+        return 1
+    fi
+}
+
+#############################################################################
+# Message Processing
+#############################################################################
+
+process_messages() {
+    local response=$(poll_messages)
+
+    if [[ -z "$response" ]]; then
+        return 0
+    fi
+
+    # Get count
+    local count=$(json_extract_number "$response" "count")
+
+    if [[ -z "$count" ]] || [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    log "Received $count new message(s)"
+
+    # Process each message
+    process_json_messages "$response" | while IFS= read -r message; do
+        if [[ -z "$message" ]]; then
+            continue
+        fi
+
+        local message_id=$(json_extract_number "$message" "id")
+        local event_type=$(json_extract_string "$message" "event_type")
+
+        if [[ "$event_type" != "github_mention" ]]; then
+            log_warn "Ignoring message type: $event_type"
+            ack_message "$message_id"
+            continue
+        fi
+
+        # Extract payload
+        local payload=$(json_extract_payload "$message")
+
+        local repo=$(json_extract_string "$payload" "repo")
+        local issue_number=$(json_extract_number "$payload" "issue_number")
+        local session_key="${repo}-${issue_number}"
+
+        # Check if session already exists
+        if session_exists "$session_key"; then
+            log_warn "Session already exists for ${session_key}, skipping"
+            ack_message "$message_id"
+            continue
+        fi
+
+        # Check max sessions
+        local max_sessions=$(get_config "max_sessions" "20")
+        local current_sessions=$(count_sessions)
+
+        if [[ "$current_sessions" -ge "$max_sessions" ]]; then
+            log_warn "Max sessions ($max_sessions) reached, skipping"
+            continue
+        fi
+
+        log "Processing GitHub mention in ${repo}#${issue_number}"
+
+        # Create worktree
+        local worktree_path=$(create_worktree "$repo" "$issue_number")
+
+        if [[ $? -ne 0 ]]; then
+            log_error "Failed to create worktree for ${session_key}"
+            continue
+        fi
+
+        # Get context
+        local context=$(json_extract_string "$payload" "context")
+
+        # Spawn terminal
+        local terminal_id=$(spawn_terminal "$worktree_path" "$repo" "$issue_number" "$context")
+
+        if [[ $? -ne 0 ]]; then
+            log_error "Failed to spawn terminal for ${session_key}"
+            git worktree remove "$worktree_path" --force 2>/dev/null || true
+            continue
+        fi
+
+        # Create session file
+        create_session "$session_key" "$message_id" "$repo" "$issue_number" "$worktree_path" "$terminal_id"
+
+        # Acknowledge message
+        ack_message "$message_id"
+
+        log_success "Session created: ${session_key}"
+    done
+}
+
+#############################################################################
+# Session Health Monitoring
+#############################################################################
+
+check_sessions() {
+    local completion_marker=$(get_config "completion_marker")
+
+    for session_key in $(list_sessions); do
+        local worktree_path=$(get_session_field "$session_key" "worktree_path")
+
+        # Check if worktree still exists
+        if [[ ! -d "$worktree_path" ]]; then
+            log_warn "Worktree missing for ${session_key}, cleaning up"
+            remove_session "$session_key"
+            continue
+        fi
+
+        # Check for completion marker
+        local marker_file="${worktree_path}/${completion_marker}"
+
+        if [[ -f "$marker_file" ]]; then
+            local content=$(cat "$marker_file")
+
+            if [[ "$content" == *"RESOLVED"* ]] || [[ "$content" == *"DONE"* ]]; then
+                log "Session completed: ${session_key}"
+
+                # Cleanup worktree
+                git worktree remove "$worktree_path" --force 2>&1 | tee -a "$LOG_FILE" || true
+
+                # Remove session file
+                remove_session "$session_key"
+
+                log_success "Cleaned up session: ${session_key}"
+            fi
+        fi
+    done
+}
+
+#############################################################################
+# Commands
+#############################################################################
+
+cmd_start() {
+    if is_running; then
+        echo "Botster Hub is already running (PID: $(cat $PID_FILE))"
+        exit 1
+    fi
+
+    log_success "Starting Botster Hub v${VERSION}"
+    log "Server: $(get_config server_url)"
+    log "Poll interval: $(get_config poll_interval)s"
+
+    # Write PID
+    echo $$ > "$PID_FILE"
+
+    # Setup signal handlers
+    trap 'log "Shutting down..."; rm -f "$PID_FILE"; exit 0' INT TERM
+
+    local poll_interval=$(get_config "poll_interval" "5")
+
+    # Main loop
+    while true; do
+        process_messages
+        check_sessions
+        sleep "$poll_interval"
+    done
+}
+
+cmd_status() {
+    if ! is_running; then
+        echo "Botster Hub is not running"
+        exit 1
+    fi
+
+    local session_count=$(count_sessions)
+
+    if [[ "$session_count" -eq 0 ]]; then
+        echo "No active sessions"
+        exit 0
+    fi
+
+    echo "Active Sessions ($session_count):"
+    printf '=%.0s' {1..80}
+    echo
+
+    for session_key in $(list_sessions); do
+        local repo=$(get_session_field "$session_key" "repo")
+        local issue_number=$(get_session_field "$session_key" "issue_number")
+        local worktree_path=$(get_session_field "$session_key" "worktree_path")
+        local started_at=$(get_session_field "$session_key" "started_at")
+        local status=$(get_session_field "$session_key" "status")
+
+        echo "✓ ${session_key}"
+        echo "  Repo: ${repo}"
+        echo "  Issue: #${issue_number}"
+        echo "  Path: ${worktree_path}"
+        echo "  Started: ${started_at}"
+        echo "  Status: ${status}"
+        echo
+    done
+}
+
+cmd_kill() {
+    local session_key="$1"
+
+    if [[ -z "$session_key" ]]; then
+        echo "Usage: botster_hub kill <session_key>"
+        exit 1
+    fi
+
+    if ! session_exists "$session_key"; then
+        echo "Session not found: $session_key"
+        exit 1
+    fi
+
+    local worktree_path=$(get_session_field "$session_key" "worktree_path")
+
+    log "Killing session: $session_key"
+
+    # Remove worktree
+    if [[ -d "$worktree_path" ]]; then
+        git worktree remove "$worktree_path" --force 2>&1 | tee -a "$LOG_FILE" || true
+    fi
+
+    # Remove session file
+    remove_session "$session_key"
+
+    log_success "Session killed: $session_key"
+}
+
+cmd_cleanup() {
+    log "Cleaning up stale sessions..."
+
+    local removed=0
+
+    for session_key in $(list_sessions); do
+        local worktree_path=$(get_session_field "$session_key" "worktree_path")
+
+        if [[ ! -d "$worktree_path" ]]; then
+            log "Removing stale session: $session_key"
+            remove_session "$session_key"
+            ((removed++))
+        fi
+    done
+
+    echo "Cleaned up $removed stale session(s)"
+}
+
+cmd_config() {
+    local key="$1"
+    local value="$2"
+
+    if [[ -z "$key" ]]; then
+        # Show all config
+        echo "Configuration ($CONFIG_FILE):"
+        cat "$CONFIG_FILE"
+        exit 0
+    fi
+
+    if [[ -z "$value" ]]; then
+        # Show specific key
+        echo "$(get_config "$key")"
+        exit 0
+    fi
+
+    # Set value
+    set_config "$key" "$value"
+}
+
+cmd_help() {
+    cat <<EOF
+Botster Hub v${VERSION} - GitHub mention → local agent automation
+
+Usage:
+  botster_hub start                  Start the daemon
+  botster_hub status                 Show active sessions
+  botster_hub kill <session_key>     Kill a specific session
+  botster_hub cleanup                Clean up stale worktrees
+  botster_hub config [key] [value]   Show or set configuration
+  botster_hub version                Show version
+
+Configuration ($CONFIG_FILE):
+  server_url       - Rails server URL (default: http://localhost:3000)
+  api_key          - API key for authentication
+  agent_command    - Command to run (default: claude)
+  completion_marker - File to watch for completion (default: .botster_status)
+  max_sessions     - Max concurrent sessions (default: 20)
+  poll_interval    - Seconds between polls (default: 5)
+  worktree_base    - Base directory for worktrees
+
+Session Files:
+  Each session stored in: $SESSIONS_DIR/<repo>-<issue>
+  Simple key=value format, one session per file
+
+Examples:
+  botster_hub config                          # Show all config
+  botster_hub config api_key                  # Show API key
+  botster_hub config api_key "your_key_here"  # Set API key
+  botster_hub config agent_command "aider"    # Change agent
+  botster_hub start                           # Start daemon
+
+ZERO DEPENDENCIES - Uses only macOS built-ins!
+No jq, no Python, no Ruby - just pure bash!
+EOF
+}
+
+#############################################################################
+# Main
+#############################################################################
+
+main() {
+    init_dirs
+
+    local command="${1:-}"
+
+    case "$command" in
+        start)
+            cmd_start
+            ;;
+        status)
+            cmd_status
+            ;;
+        kill)
+            cmd_kill "${2:-}"
+            ;;
+        cleanup)
+            cmd_cleanup
+            ;;
+        config)
+            cmd_config "${2:-}" "${3:-}"
+            ;;
+        version|--version|-v)
+            echo "Botster Hub v${VERSION}"
+            ;;
+        help|--help|-h|"")
+            cmd_help
+            ;;
+        *)
+            echo "Unknown command: $command"
+            echo "Run 'botster_hub help' for usage"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,6 +1,4 @@
 class Users::OmniauthCallbacksController < Devise::OmniauthCallbacksController
-  include JwtAuthenticatable::InstanceMethods
-
   def github
     @user = User.from_omniauth(request.env["omniauth.auth"])
 

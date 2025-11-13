@@ -1,0 +1,79 @@
+class Bot::Message < ApplicationRecord
+  belongs_to :user
+
+  # Validations
+  validates :event_type, presence: true, inclusion: {
+    in: %w[github_mention manual_trigger system_notification],
+    message: "%{value} is not a valid event type"
+  }
+  validates :payload, presence: true
+  validates :status, presence: true, inclusion: {
+    in: %w[pending sent acknowledged failed],
+    message: "%{value} is not a valid status"
+  }
+
+  # Scopes
+  scope :pending, -> { where(status: "pending") }
+  scope :sent, -> { where(status: "sent") }
+  scope :acknowledged, -> { where(status: "acknowledged") }
+  scope :failed, -> { where(status: "failed") }
+  scope :unacknowledged, -> { where(acknowledged_at: nil) }
+  scope :for_delivery, -> { pending.order(created_at: :asc) }
+  scope :stale, -> { sent.where("sent_at < ?", 5.minutes.ago).where(acknowledged_at: nil) }
+
+  # Callbacks
+  before_create :set_default_status
+
+  # Instance methods
+  def mark_as_sent!
+    update!(status: "sent", sent_at: Time.current)
+  end
+
+  def acknowledge!
+    update!(status: "acknowledged", acknowledged_at: Time.current)
+  end
+
+  def mark_as_failed!(error_message = nil)
+    payload_with_error = payload.merge(error: error_message) if error_message
+    update!(status: "failed", payload: payload_with_error || payload)
+  end
+
+  def pending?
+    status == "pending"
+  end
+
+  def sent?
+    status == "sent"
+  end
+
+  def acknowledged?
+    status == "acknowledged"
+  end
+
+  def failed?
+    status == "failed"
+  end
+
+  def github_mention?
+    event_type == "github_mention"
+  end
+
+  # Extract common payload fields
+  def repo
+    payload["repo"]
+  end
+
+  def issue_number
+    payload["issue_number"]
+  end
+
+  def comment_id
+    payload["comment_id"]
+  end
+
+  private
+
+  def set_default_status
+    self.status ||= "pending"
+  end
+end

@@ -1,24 +1,26 @@
 Rails.application.routes.draw do
   # Devise routes for session management (without OmniAuth callbacks)
-  devise_for :users, skip: [:sessions, :registrations, :omniauth_callbacks]
+  devise_for :users, skip: [ :sessions, :registrations, :omniauth_callbacks ]
 
   devise_scope :user do
-    delete 'logout', to: 'users/sessions#destroy', as: :destroy_user_session
+    delete "logout", to: "users/sessions#destroy", as: :destroy_user_session
   end
 
-  # GitHub App OAuth routes
-  get 'github_app/authorize', to: 'github_app#authorize', as: :github_app_authorize
-  get 'auth/github_app/callback', to: 'github_app#callback', as: :github_app_callback
-  delete 'github_app/revoke', to: 'github_app#revoke', as: :github_app_revoke
-  get 'github_app/status', to: 'github_app#status', as: :github_app_status
-
-  # GitHub API example routes (demonstrating API usage)
+  # GitHub namespace - all GitHub-related controllers
   namespace :github do
-    get 'repos', to: 'github_example#repos'
-    get 'issues', to: 'github_example#issues'
-    get 'pull_requests', to: 'github_example#pull_requests'
-    post 'comment', to: 'github_example#create_comment'
-    get 'status', to: 'github_example#status'
+    # OAuth - RESTful resource for authorization
+    resource :authorization, only: [ :new, :destroy ]
+
+    # OAuth callback - separate controller for handling GitHub redirects
+    resource :callback, only: [ :show ]  # GitHub OAuth callback (external constraint)
+
+    # Webhooks - Exception: External API naming constraints
+    post "webhooks", to: "webhooks#receive"  # GitHub webhook endpoint (external constraint)
+  end
+
+  # Botster Hub - RESTful resources
+  namespace :bots do
+    resources :messages, only: [ :index, :update ] # update for acknowledgment
   end
 
   root to: "home#index"

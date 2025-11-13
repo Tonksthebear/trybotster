@@ -29,7 +29,7 @@ class GithubListIssuesTool < ApplicationMCPTool
     render(text: "Fetching #{filter_param} issues (#{state_param}) via #{client_info}...")
 
     # Fetch issues using Octokit
-    result = GithubAppService.get_user_issues(token, filter: filter_param, state: state_param)
+    result = Github::App.get_user_issues(token, filter: filter_param, state: state_param)
 
     if result[:success]
       issues = result[:issues]
