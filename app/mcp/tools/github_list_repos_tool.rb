@@ -34,7 +34,7 @@ class GithubListReposTool < ApplicationMCPTool
     options[:direction] = direction if direction.present?
 
     # Fetch repositories using Octokit
-    result = GithubAppService.get_user_repos(token, **options)
+    result = Github::App.get_user_repos(token, **options)
 
     if result[:success]
       repos = result[:repos]

@@ -34,7 +34,7 @@ class GithubSearchReposTool < ApplicationMCPTool
     options[:per_page] = (per_page || 30).to_i.clamp(1, 100)
 
     # Search repositories using Octokit
-    result = GithubAppService.search_repos(token, query: query, **options)
+    result = Github::App.search_repos(token, query: query, **options)
 
     if result[:success]
       repos = result[:repos]

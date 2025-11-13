@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2025_11_06_182443) do
+ActiveRecord::Schema[8.1].define(version: 2025_11_12_231711) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "vector"
@@ -81,6 +81,24 @@ ActiveRecord::Schema[8.1].define(version: 2025_11_06_182443) do
     t.index ["created_at"], name: "index_action_mcp_sse_events_on_created_at"
     t.index ["session_id", "event_id"], name: "index_action_mcp_sse_events_on_session_id_and_event_id", unique: true
     t.index ["session_id"], name: "index_action_mcp_sse_events_on_session_id"
+  end
+
+  create_table "bot_messages", force: :cascade do |t|
+    t.datetime "acknowledged_at"
+    t.datetime "created_at", null: false
+    t.string "event_type", null: false
+    t.jsonb "payload", default: {}, null: false
+    t.datetime "sent_at"
+    t.string "status", default: "pending", null: false
+    t.datetime "updated_at", null: false
+    t.bigint "user_id", null: false
+    t.index ["acknowledged_at"], name: "index_bot_messages_on_acknowledged_at"
+    t.index ["event_type"], name: "index_bot_messages_on_event_type"
+    t.index ["sent_at"], name: "index_bot_messages_on_sent_at"
+    t.index ["status"], name: "index_bot_messages_on_status"
+    t.index ["user_id", "created_at"], name: "index_bot_messages_on_user_id_and_created_at"
+    t.index ["user_id", "status"], name: "index_bot_messages_on_user_id_and_status"
+    t.index ["user_id"], name: "index_bot_messages_on_user_id"
   end
 
   create_table "memories", force: :cascade do |t|
@@ -169,6 +187,7 @@ ActiveRecord::Schema[8.1].define(version: 2025_11_06_182443) do
   add_foreign_key "action_mcp_session_resources", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_session_subscriptions", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_sse_events", "action_mcp_sessions", column: "session_id"
+  add_foreign_key "bot_messages", "users"
   add_foreign_key "memories", "memories", column: "parent_id"
   add_foreign_key "memories", "teams"
   add_foreign_key "memories", "users"

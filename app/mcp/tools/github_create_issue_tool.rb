@@ -34,7 +34,7 @@ class GithubCreateIssueTool < ApplicationMCPTool
 
     # Get installation client (shows as [bot])
     begin
-      client = GithubAppService.installation_client(current_user.github_app_installation_id)
+      client = Github::App.installation_client(current_user.github_app_installation_id)
     rescue => e
       report_error("Failed to get bot credentials: #{e.message}")
       return

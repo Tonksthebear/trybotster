@@ -1,10 +1,15 @@
 class User < ApplicationRecord
   # Minimal modules: No :database_authenticatable, :registerable, :recoverable, :validatable
-  devise :trackable, :omniauthable, :rememberable
+  # Note: :omniauthable not used - we use custom GitHub App OAuth instead
+  devise :trackable, :rememberable
 
   encrypts :api_key, deterministic: true
   encrypts :github_app_token, deterministic: true
   encrypts :github_app_refresh_token, deterministic: true
+
+  # Associations
+  has_many :bot_messages, class_name: "Bot::Message", dependent: :destroy
+  belongs_to :team, optional: true
 
   # Skip email/password validations for OAuth users
   validates :email, presence: true, uniqueness: true, if: -> { provider.blank? }  # Only if not OAuth
@@ -12,6 +17,7 @@ class User < ApplicationRecord
 
   # Generate API token before create
   before_create :generate_api_key
+  after_create :ensure_api_key
 
   # Scope for active users
   scope :active, -> { where(active: true) }
@@ -42,6 +48,11 @@ class User < ApplicationRecord
     self.api_key = SecureRandom.urlsafe_base64(32)
   end
 
+  # Ensure API key exists (used in after_create callback)
+  def ensure_api_key
+    regenerate_api_key! unless api_key.present?
+  end
+
   # Regenerate API token (for security purposes)
   def regenerate_api_key!
     generate_api_key
@@ -64,7 +75,7 @@ class User < ApplicationRecord
   def fetch_installation_id!
     return unless github_app_token.present?
 
-    result = GithubAppService.get_user_installation(github_app_token)
+    result = Github::App.get_user_installation(github_app_token)
     if result[:success]
       update(github_app_installation_id: result[:installation_id].to_s)
       result[:installation_id]
@@ -109,7 +120,7 @@ class User < ApplicationRecord
   def refresh_github_app_token!
     return false unless github_app_refresh_token.present?
 
-    response = GithubAppService.refresh_token(github_app_refresh_token)
+    response = Github::App.refresh_token(github_app_refresh_token)
 
     if response[:success]
       update!(

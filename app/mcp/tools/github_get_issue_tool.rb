@@ -29,7 +29,7 @@ class GithubGetIssueTool < ApplicationMCPTool
     render(text: "Fetching details for #{repo}##{issue_number} (via #{client_info})...")
 
     # Get issue using Octokit
-    result = GithubAppService.get_issue(token, repo: repo, issue_number: issue_number.to_i)
+    result = Github::App.get_issue(token, repo: repo, issue_number: issue_number.to_i)
 
     if result[:success]
       issue = result[:issue]

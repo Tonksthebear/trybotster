@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 
-# Service for handling GitHub App authentication and API operations using Octokit
-class GithubAppService
+module Github
+  # Model for handling GitHub App authentication and API operations using Octokit
+  # This is project-specific logic for interacting with GitHub as a GitHub App
+  class App
   GITHUB_OAUTH_URL = "https://github.com/login/oauth"
 
   class << self
@@ -385,7 +387,7 @@ class GithubAppService
 
     # OAuth callback URL
     def callback_url
-      ENV["GITHUB_APP_CALLBACK_URL"] || "#{ENV['APP_URL']}/auth/github_app/callback"
+      ENV["GITHUB_APP_CALLBACK_URL"] || "https://#{ENV['HOST_URL']}/github/callback"
     end
 
     # Determine which client to use based on user preference
@@ -402,5 +404,6 @@ class GithubAppService
         client(token)
       end
     end
+  end
   end
 end
