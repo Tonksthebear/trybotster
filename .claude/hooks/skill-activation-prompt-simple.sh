@@ -1,10 +1,12 @@
 #!/bin/bash
 # Simple bash-only skill activation checker
-# No dependencies, no JSON parsing, just pattern matching
+# No dependencies, just pattern matching
 
 # Read the prompt from stdin (JSON input from Claude)
 input=$(cat)
-prompt=$(echo "$input" | grep -o '"prompt":"[^"]*"' | cut -d'"' -f4 | tr '[:upper:]' '[:lower:]')
+
+# Extract prompt field from JSON - handle both escaped and unescaped quotes
+prompt=$(echo "$input" | sed -n 's/.*"prompt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tr '[:upper:]' '[:lower:]')
 
 # If we can't extract prompt, exit silently
 if [ -z "$prompt" ]; then
