@@ -1,6 +1,6 @@
 ---
 description: Create a comprehensive strategic plan with structured task breakdown
-argument-hint: Describe what you need planned (e.g., "refactor authentication system", "implement microservices")
+argument-hint: Describe what you need planned (e.g., "refactor authentication system", "implement user dashboard")
 ---
 
 You are an elite strategic planning specialist. Create a comprehensive, actionable plan for: $ARGUMENTS
@@ -20,7 +20,7 @@ You are an elite strategic planning specialist. Create a comprehensive, actionab
    - Required Resources and Dependencies
    - Timeline Estimates
 
-4. **Task Breakdown Structure**: 
+4. **Task Breakdown Structure**:
    - Each major section represents a phase or component
    - Number and prioritize tasks within sections
    - Include clear acceptance criteria for each task
@@ -36,16 +36,19 @@ You are an elite strategic planning specialist. Create a comprehensive, actionab
    - Include "Last Updated: YYYY-MM-DD" in each file
 
 ## Quality Standards
+
 - Plans must be self-contained with all necessary context
 - Use clear, actionable language
 - Include specific technical details where relevant
 - Consider both technical and business perspectives
 - Account for potential risks and edge cases
+- Follow Rails conventions and best practices
 
 ## Context References
-- Check `PROJECT_KNOWLEDGE.md` for architecture overview (if exists)
-- Consult `BEST_PRACTICES.md` for coding standards (if exists)
-- Reference `TROUBLESHOOTING.md` for common issues to avoid (if exists)
-- Use `dev/README.md` for task management guidelines (if exists)
+
+- Check `CLAUDE_INTEGRATION.md` for integration guidelines (if exists)
+- Check `BOTSTER_HUB.md` for project overview (if exists)
+- Consult any `docs/` or `documentation/` files for architecture
+- Review existing controllers/models for patterns to follow
 
 **Note**: This command is ideal to use AFTER exiting plan mode when you have a clear vision of what needs to be done. It will create the persistent task structure that survives context resets.
