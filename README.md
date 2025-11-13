@@ -2,17 +2,23 @@
 
 **GitHub Mention → Local Agent Automation**
 
-Botster Hub automates GitHub issue/PR mentions (e.g., `@username fix this`) into local CLI agent sessions. When someone mentions you in a GitHub issue or PR, your local daemon automatically spawns a new terminal session with your chosen agent (Claude Code, Aider, Cursor, etc.) to handle the request.
+Botster Hub automates GitHub issue/PR mentions (e.g., `@trybotster fix this`) into local CLI agent sessions. When someone mentions `@trybotster` in a GitHub issue or PR, all authorized users' local daemons receive the notification and can spawn a terminal session with their chosen agent (Claude Code, Aider, Cursor, etc.) to handle the request.
 
 ## 🎯 What It Does
 
 ```
 GitHub Issue Comment
-  "@yourusername can you fix this bug?"
+  "@trybotster can you fix this bug?"
         ↓
-  Rails webhook receives mention
+  Rails webhook receives @trybotster mention
         ↓
-  Local daemon polls and detects new message
+  Creates pending messages for all active users
+        ↓
+  Local daemons poll and detect new message
+        ↓
+  Server verifies user has repo access (via GitHub API)
+        ↓
+  Authorized daemons receive the message
         ↓
   Daemon creates git worktree
         ↓
@@ -37,7 +43,7 @@ GitHub Issue Comment
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    GitHub (External)                          │
-│  Someone mentions @yourusername in issue/PR comment          │
+│  Someone mentions @trybotster in issue/PR comment            │
 └─────────────────────┬────────────────────────────────────────┘
                       │ Webhook
                       ↓
@@ -47,11 +53,16 @@ GitHub Issue Comment
 │  Models:                                                      │
 │  • Bot::Message - Message queue with lifecycle tracking      │
 │  • Github::App - GitHub API interactions                     │
-│  • User - Authentication & GitHub App tokens                 │
+│  • User - Authentication, GitHub App tokens, repo access     │
 │                                                               │
 │  Controllers:                                                 │
-│  • Github::WebhooksController - Receives GitHub webhooks     │
-│  • Bots::MessagesController - REST API for daemon polling    │
+│  • Github::WebhooksController - Receives @trybotster webhook │
+│  • Bots::MessagesController - REST API with repo auth check  │
+│                                                               │
+│  Authorization Flow:                                          │
+│  1. Webhook creates messages for all active users            │
+│  2. Daemon polls → controller checks repo access             │
+│  3. Only authorized users receive messages                   │
 │                                                               │
 │  MCP Tools (for agents):                                     │
 │  • github_get_issue                                          │
@@ -61,6 +72,7 @@ GitHub Issue Comment
 │  • + more...                                                 │
 └─────────────────────┬────────────────────────────────────────┘
                       │ HTTP Polling (GET /bots/messages)
+                      │ + Repo Access Check (via GitHub API)
                       ↓
 ┌──────────────────────────────────────────────────────────────┐
 │                  Local Machine (macOS)                        │
@@ -179,11 +191,11 @@ bin/botster_hub start
 
 ### Basic Workflow
 
-1. **Someone mentions you in GitHub:**
+1. **Someone mentions @trybotster in GitHub:**
 
    ```
    GitHub issue/PR comment:
-   "@yourusername can you investigate this memory leak?"
+   "@trybotster can you investigate this memory leak?"
    ```
 
 2. **Daemon automatically responds:**
@@ -459,7 +471,7 @@ t.string :github_app_installation_id       # For bot attribution
    ```
 
 3. **Trigger a mention:**
-   - Comment on a GitHub issue: `@yourusername test this`
+   - Comment on a GitHub issue: `@trybotster test this`
 
 4. **Verify flow:**
 
@@ -491,17 +503,18 @@ message = user.bot_messages.create!(
   payload: {
     repo: "test/repo",
     issue_number: 999,
-    comment_body: "@yourusername test this",
+    comment_body: "@trybotster test this",
     comment_author: "someone",
     issue_title: "Test Issue",
     issue_body: "Test description",
     issue_url: "https://github.com/test/repo/issues/999",
     is_pr: false,
-    context: "Test Issue\n\nTest description\n\nComment:\n@yourusername test this"
+    context: "Test Issue\n\nTest description\n\nComment:\n@trybotster test this"
   }
 )
 
-# Daemon should pick it up on next poll (within 5 seconds)
+# Note: The message will only be delivered to users who have access to "test/repo"
+# You can bypass the repo check by setting repo to nil or empty string for testing
 ```
 
 ## 🔧 Troubleshooting
