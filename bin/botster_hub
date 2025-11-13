@@ -287,8 +287,8 @@ create_worktree() {
         return 1
     fi
 
-    # Create worktree
-    if git worktree add "$worktree_path" -b "$branch_name" 2>&1 | tee -a "$LOG_FILE"; then
+    # Create worktree (redirect output to log file only, not stdout)
+    if git worktree add "$worktree_path" -b "$branch_name" >> "$LOG_FILE" 2>&1; then
         log_success "Created worktree: $worktree_path"
         echo "$worktree_path"
     else
@@ -374,7 +374,9 @@ process_messages() {
 
         local repo=$(json_extract_string "$payload" "repo")
         local issue_number=$(json_extract_number "$payload" "issue_number")
-        local session_key="${repo}-${issue_number}"
+        # Replace slash in repo name with dash for safe filesystem path
+        local repo_safe="${repo//\//-}"
+        local session_key="${repo_safe}-${issue_number}"
 
         # Check if session already exists
         if session_exists "$session_key"; then

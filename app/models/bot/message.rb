@@ -1,6 +1,4 @@
 class Bot::Message < ApplicationRecord
-  belongs_to :user
-
   # Validations
   validates :event_type, presence: true, inclusion: {
     in: %w[github_mention manual_trigger system_notification],
@@ -17,14 +15,24 @@ class Bot::Message < ApplicationRecord
   scope :sent, -> { where(status: "sent") }
   scope :acknowledged, -> { where(status: "acknowledged") }
   scope :failed, -> { where(status: "failed") }
-  scope :unacknowledged, -> { where(acknowledged_at: nil) }
-  scope :for_delivery, -> { pending.order(created_at: :asc) }
+  scope :unclaimed, -> { where(claimed_at: nil) }
+  scope :claimed, -> { where.not(claimed_at: nil) }
+  scope :for_delivery, -> { pending.unclaimed.order(created_at: :asc) }
   scope :stale, -> { sent.where("sent_at < ?", 5.minutes.ago).where(acknowledged_at: nil) }
 
   # Callbacks
   before_create :set_default_status
 
   # Instance methods
+  def claim!(user_id)
+    update!(
+      claimed_by_user_id: user_id,
+      claimed_at: Time.current,
+      status: "sent",
+      sent_at: Time.current
+    )
+  end
+
   def mark_as_sent!
     update!(status: "sent", sent_at: Time.current)
   end
@@ -36,6 +44,10 @@ class Bot::Message < ApplicationRecord
   def mark_as_failed!(error_message = nil)
     payload_with_error = payload.merge(error: error_message) if error_message
     update!(status: "failed", payload: payload_with_error || payload)
+  end
+
+  def claimed?
+    claimed_at.present?
   end
 
   def pending?

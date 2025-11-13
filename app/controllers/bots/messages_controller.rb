@@ -8,28 +8,57 @@ module Bots
     before_action :authenticate_with_api_key!
 
     # GET /bots/messages
-    # Returns pending messages for the authenticated user
+    # Returns pending, unclaimed messages for repos the authenticated user has access to
+    # First-come-first-served: daemon claims messages by polling
     def index
-      messages = current_api_user.bot_messages.for_delivery.limit(50)
+      # Get all pending, unclaimed messages
+      messages = Bot::Message.for_delivery.limit(50)
+
+      # Filter messages by repo access authorization
+      authorized_messages = []
+      unauthorized_messages = []
+
+      messages.each do |msg|
+        repo = msg.repo
+
+        if repo.blank?
+          # No repo in payload, allow it through
+          authorized_messages << msg
+        elsif current_api_user.has_github_repo_access?(repo)
+          # User has access to this repo
+          authorized_messages << msg
+        else
+          # User does not have access to this repo (skip, don't mark as failed yet)
+          # Another daemon with access might claim it
+          unauthorized_messages << msg
+        end
+      end
+
+      # Claim authorized messages for this user's daemon
+      authorized_messages.each do |msg|
+        msg.claim!(current_api_user.id)
+      end
 
       render json: {
-        messages: messages.map do |msg|
+        messages: authorized_messages.map do |msg|
           {
             id: msg.id,
             event_type: msg.event_type,
             payload: msg.payload,
             created_at: msg.created_at,
-            sent_at: msg.sent_at
+            sent_at: msg.sent_at,
+            claimed_at: msg.claimed_at
           }
         end,
-        count: messages.count
+        count: authorized_messages.count
       }
     end
 
     # PATCH/PUT /bots/messages/:id
     # Updates a message (typically to acknowledge it)
     def update
-      message = current_api_user.bot_messages.find(params[:id])
+      # Find message claimed by this user
+      message = Bot::Message.find_by!(id: params[:id], claimed_by_user_id: current_api_user.id)
 
       # Acknowledge the message (RESTful update)
       message.acknowledge!
@@ -40,7 +69,7 @@ module Bots
         acknowledged_at: message.acknowledged_at
       }
     rescue ActiveRecord::RecordNotFound
-      render json: { error: "Message not found" }, status: :not_found
+      render json: { error: "Message not found or not claimed by this user" }, status: :not_found
     end
   end
 end

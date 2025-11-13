@@ -8,7 +8,6 @@ class User < ApplicationRecord
   encrypts :github_app_refresh_token, deterministic: true
 
   # Associations
-  has_many :bot_messages, class_name: "Bot::Message", dependent: :destroy
   belongs_to :team, optional: true
 
   # Skip email/password validations for OAuth users
@@ -19,8 +18,8 @@ class User < ApplicationRecord
   before_create :generate_api_key
   after_create :ensure_api_key
 
-  # Scope for active users
-  scope :active, -> { where(active: true) }
+  # Note: No active/inactive status - all users receive @trybotster mentions
+  # Filtering happens at poll time based on repo access
 
   # Enhanced from_omniauth: Handle email fallback if GitHub doesn't provide it
   def self.from_omniauth(auth)
@@ -151,5 +150,36 @@ class User < ApplicationRecord
       github_app_installation_id: nil,
       github_app_permissions: {}
     )
+  end
+
+  # Check if user has access to a GitHub repository
+  # @param repo_full_name [String] Repository full name (e.g., "owner/repo")
+  # @return [Boolean] true if user has access, false otherwise
+  def has_github_repo_access?(repo_full_name)
+    return false unless github_app_authorized?
+
+    token = valid_github_app_token
+    return false if token.blank?
+
+    # Use GitHub API to check if user has access to the repository
+    client = Octokit::Client.new(access_token: token)
+
+    begin
+      # Try to fetch the repository - if user has access, this succeeds
+      client.repository(repo_full_name)
+      true
+    rescue Octokit::NotFound
+      # User doesn't have access or repo doesn't exist
+      Rails.logger.info "User #{id} (#{username}) does not have access to #{repo_full_name}"
+      false
+    rescue Octokit::Unauthorized, Octokit::Forbidden
+      # Token is invalid or doesn't have required permissions
+      Rails.logger.warn "User #{id} (#{username}) has invalid/expired token for #{repo_full_name}"
+      false
+    rescue => e
+      # Other errors (rate limit, network issues, etc.)
+      Rails.logger.error "Error checking repo access for user #{id}: #{e.message}"
+      false
+    end
   end
 end
