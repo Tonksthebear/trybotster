@@ -31,26 +31,26 @@ Listen for page changes in Stimulus:
 
 ```javascript
 // app/javascript/controllers/page_controller.js
-import { Controller } from "@hotwired/stimulus"
+import { Controller } from "@hotwired/stimulus";
 
 export default class extends Controller {
   connect() {
-    document.addEventListener("turbo:load", this.onPageLoad)
-    document.addEventListener("turbo:before-visit", this.beforeVisit)
+    document.addEventListener("turbo:load", this.onPageLoad);
+    document.addEventListener("turbo:before-visit", this.beforeVisit);
   }
 
   disconnect() {
-    document.removeEventListener("turbo:load", this.onPageLoad)
-    document.removeEventListener("turbo:before-visit", this.beforeVisit)
+    document.removeEventListener("turbo:load", this.onPageLoad);
+    document.removeEventListener("turbo:before-visit", this.beforeVisit);
   }
 
   onPageLoad = () => {
-    console.log("Page loaded via Turbo")
-  }
+    console.log("Page loaded via Turbo");
+  };
 
   beforeVisit = (event) => {
     // Can prevent navigation: event.preventDefault()
-  }
+  };
 }
 ```
 
@@ -67,7 +67,7 @@ export default class extends Controller {
 <turbo-frame id="post_<%= @post.id %>">
   <h1><%= @post.title %></h1>
   <p><%= @post.content %></p>
-  
+
   <%= link_to "Edit", edit_post_path(@post) %>
 </turbo-frame>
 
@@ -94,8 +94,8 @@ Load content on-demand:
 </turbo-frame>
 
 <%# Loads when scrolled into view %>
-<turbo-frame id="lazy_related" 
-             src="<%= related_posts_path(@post) %>" 
+<turbo-frame id="lazy_related"
+             src="<%= related_posts_path(@post) %>"
              loading="lazy">
   Loading related posts...
 </turbo-frame>
@@ -108,7 +108,7 @@ Navigate the full page from within a frame:
 ```erb
 <turbo-frame id="modal">
   <%= link_to "Full Page", some_path, data: { turbo_frame: "_top" } %>
-  
+
   <%# Or target a different frame %>
   <%= link_to "Other Frame", some_path, data: { turbo_frame: "other_frame" } %>
 </turbo-frame>
@@ -121,7 +121,7 @@ Frames can be nested:
 ```erb
 <turbo-frame id="post_<%= @post.id %>">
   <h1><%= @post.title %></h1>
-  
+
   <turbo-frame id="post_<%= @post.id %>_comments">
     <%= render @post.comments %>
   </turbo-frame>
@@ -151,7 +151,7 @@ Frames can be nested:
 class PostsController < ApplicationController
   def create
     @post = Post.new(post_params)
-    
+
     respond_to do |format|
       if @post.save
         format.turbo_stream do
@@ -167,7 +167,7 @@ class PostsController < ApplicationController
   def destroy
     @post = Post.find(params[:id])
     @post.destroy
-    
+
     respond_to do |format|
       format.turbo_stream do
         render turbo_stream: turbo_stream.remove(@post)
@@ -186,7 +186,7 @@ Create a `.turbo_stream.erb` file:
 <%# app/views/posts/create.turbo_stream.erb %>
 <%= turbo_stream.prepend "posts", partial: "posts/post", locals: { post: @post } %>
 <%= turbo_stream.update "post_form", partial: "posts/form", locals: { post: Post.new } %>
-<%= turbo_stream.update "flash", partial: "shared/flash", locals: { notice: "Post created!" } %>
+<%= turbo_stream.update "flash", partial: "shared/flash", locals: { notice: "Post created" } %>
 ```
 
 ### Multiple Stream Actions
@@ -232,14 +232,14 @@ You can create custom actions with Stimulus:
 
 ```javascript
 // app/javascript/controllers/turbo_streams_controller.js
-import { Controller } from "@hotwired/stimulus"
-import { StreamActions } from "@hotwired/turbo"
+import { Controller } from "@hotwired/stimulus";
+import { StreamActions } from "@hotwired/turbo";
 
 export default class extends Controller {
   connect() {
-    StreamActions.console_log = function() {
-      console.log(this.getAttribute("message"))
-    }
+    StreamActions.console_log = function () {
+      console.log(this.getAttribute("message"));
+    };
   }
 }
 ```
@@ -280,8 +280,8 @@ export default class extends Controller {
 <%= turbo_frame_tag "modal" %>
 
 <%# Link to open modal %>
-<%= link_to "New Post", 
-            new_post_path, 
+<%= link_to "New Post",
+            new_post_path,
             data: { turbo_frame: "modal" },
             class: "bg-blue-500 text-white px-4 py-2 rounded" %>
 
@@ -290,12 +290,12 @@ export default class extends Controller {
   <div class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center">
     <div class="bg-white p-6 rounded-lg shadow-xl max-w-2xl w-full">
       <h2 class="text-2xl font-bold mb-4">New Post</h2>
-      
+
       <%= form_with model: @post do |f| %>
         <%# Form fields %>
         <%= f.submit %>
       <% end %>
-      
+
       <%= link_to "Close", posts_path, class: "text-gray-500" %>
     </div>
   </div>
@@ -310,8 +310,8 @@ export default class extends Controller {
   <%= render @posts %>
 </div>
 
-<%= turbo_frame_tag "pagination", 
-                    src: posts_path(page: @next_page), 
+<%= turbo_frame_tag "pagination",
+                    src: posts_path(page: @next_page),
                     loading: "lazy" if @next_page %>
 
 <%# When this frame loads, it should return more posts + new pagination frame %>
@@ -334,15 +334,18 @@ export default class extends Controller {
 ## Troubleshooting
 
 ### Frame not updating?
+
 - Check frame IDs match exactly
 - Ensure both source and target have `<turbo-frame>` tags
 - Check server is returning HTML (not JSON)
 
 ### Form submits full page?
+
 - Make sure Turbo is not disabled
 - Check form is inside a Turbo Frame if you want frame-scoped updates
 
 ### Broadcasts not working?
+
 - Ensure Action Cable is configured
 - Check `turbo_stream_from` is in the view
 - Verify model callbacks are firing

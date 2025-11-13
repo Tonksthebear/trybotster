@@ -10,9 +10,7 @@ Stimulus has three main concepts:
 2. **Actions** - How events trigger controller methods
 3. **Targets** - Named DOM elements you can reference in your controller
 
-Plus two additional concepts:
-4. **Values** - Configuration data with automatic type conversion
-5. **Classes** - CSS class names you can reference
+Plus two additional concepts: 4. **Values** - Configuration data with automatic type conversion 5. **Classes** - CSS class names you can reference
 
 ---
 
@@ -22,11 +20,11 @@ Plus two additional concepts:
 
 ```javascript
 // app/javascript/controllers/hello_controller.js
-import { Controller } from "@hotwired/stimulus"
+import { Controller } from "@hotwired/stimulus";
 
 export default class extends Controller {
   connect() {
-    console.log("Hello, Stimulus!")
+    console.log("Hello, Stimulus");
   }
 }
 ```
@@ -53,19 +51,19 @@ Targets let you reference specific elements within your controller's scope.
 
 ```javascript
 // app/javascript/controllers/slideshow_controller.js
-import { Controller } from "@hotwired/stimulus"
+import { Controller } from "@hotwired/stimulus";
 
 export default class extends Controller {
-  static targets = ["slide", "caption"]
+  static targets = ["slide", "caption"];
 
   connect() {
-    console.log("Slides:", this.slideTargets.length)
-    console.log("Caption:", this.captionTarget.textContent)
+    console.log("Slides:", this.slideTargets.length);
+    console.log("Caption:", this.captionTarget.textContent);
   }
 
   // Check if target exists
   hasCaption() {
-    return this.hasCaptionTarget
+    return this.hasCaptionTarget;
   }
 }
 ```
@@ -77,7 +75,7 @@ export default class extends Controller {
   <div data-slideshow-target="slide">Slide 1</div>
   <div data-slideshow-target="slide">Slide 2</div>
   <div data-slideshow-target="slide">Slide 3</div>
-  
+
   <p data-slideshow-target="caption">Caption text</p>
 </div>
 ```
@@ -86,16 +84,16 @@ export default class extends Controller {
 
 ```javascript
 // Single target (throws if missing)
-this.slideTarget
+this.slideTarget;
 
 // Check existence
-this.hasSlideTarget  // boolean
+this.hasSlideTarget; // boolean
 
 // All targets
-this.slideTargets  // array
+this.slideTargets; // array
 
 // Find target
-this.slideTargets.find(el => el.dataset.active === "true")
+this.slideTargets.find((el) => el.dataset.active === "true");
 ```
 
 ---
@@ -115,17 +113,17 @@ Actions connect DOM events to controller methods.
 
 ```javascript
 // app/javascript/controllers/counter_controller.js
-import { Controller } from "@hotwired/stimulus"
+import { Controller } from "@hotwired/stimulus";
 
 export default class extends Controller {
-  static targets = ["count"]
+  static targets = ["count"];
 
   increment(event) {
-    const current = parseInt(this.countTarget.textContent)
-    this.countTarget.textContent = current + 1
-    
+    const current = parseInt(this.countTarget.textContent);
+    this.countTarget.textContent = current + 1;
+
     // Access the DOM event
-    console.log("Clicked element:", event.currentTarget)
+    console.log("Clicked element:", event.currentTarget);
   }
 }
 ```
@@ -186,29 +184,29 @@ Values provide a type-safe way to pass configuration to controllers.
 
 ```javascript
 // app/javascript/controllers/timer_controller.js
-import { Controller } from "@hotwired/stimulus"
+import { Controller } from "@hotwired/stimulus";
 
 export default class extends Controller {
   static values = {
-    duration: Number,          // Required type
-    autoStart: { type: Boolean, default: false },  // With default
+    duration: Number, // Required type
+    autoStart: { type: Boolean, default: false }, // With default
     message: String,
     data: Object,
-    items: Array
-  }
+    items: Array,
+  };
 
   connect() {
-    console.log(this.durationValue)      // Access value
-    console.log(this.hasMessageValue)    // Check existence
-    
+    console.log(this.durationValue); // Access value
+    console.log(this.hasMessageValue); // Check existence
+
     if (this.autoStartValue) {
-      this.start()
+      this.start();
     }
   }
 
   // Called when value changes
   durationValueChanged(value, previousValue) {
-    console.log(`Duration changed from ${previousValue} to ${value}`)
+    console.log(`Duration changed from ${previousValue} to ${value}`);
   }
 }
 ```
@@ -235,13 +233,13 @@ increment() {
 
 ### Value Types
 
-| Type | Example | Notes |
-|------|---------|-------|
-| `String` | `"hello"` | Default type if not specified |
-| `Number` | `42` | Parsed with `Number()` |
-| `Boolean` | `true`, `false`, `"true"`, `"1"`, `""` | Falsy values: false, 0, "" |
-| `Object` | `{"key": "value"}` | Parsed as JSON |
-| `Array` | `[1, 2, 3]` | Parsed as JSON |
+| Type      | Example                                | Notes                         |
+| --------- | -------------------------------------- | ----------------------------- |
+| `String`  | `"hello"`                              | Default type if not specified |
+| `Number`  | `42`                                   | Parsed with `Number()`        |
+| `Boolean` | `true`, `false`, `"true"`, `"1"`, `""` | Falsy values: false, 0, ""    |
+| `Object`  | `{"key": "value"}`                     | Parsed as JSON                |
+| `Array`   | `[1, 2, 3]`                            | Parsed as JSON                |
 
 ---
 
@@ -253,19 +251,19 @@ Classes let you reference CSS class names from your controller.
 
 ```javascript
 // app/javascript/controllers/dropdown_controller.js
-import { Controller } from "@hotwired/stimulus"
+import { Controller } from "@hotwired/stimulus";
 
 export default class extends Controller {
-  static classes = ["open", "closed"]
-  static targets = ["menu"]
+  static classes = ["open", "closed"];
+  static targets = ["menu"];
 
   toggle() {
     if (this.menuTarget.classList.contains(this.openClass)) {
-      this.menuTarget.classList.remove(this.openClass)
-      this.menuTarget.classList.add(this.closedClass)
+      this.menuTarget.classList.remove(this.openClass);
+      this.menuTarget.classList.add(this.closedClass);
     } else {
-      this.menuTarget.classList.remove(this.closedClass)
-      this.menuTarget.classList.add(this.openClass)
+      this.menuTarget.classList.remove(this.closedClass);
+      this.menuTarget.classList.add(this.openClass);
     }
   }
 }
@@ -277,10 +275,10 @@ export default class extends Controller {
 <div data-controller="dropdown"
      data-dropdown-open-class="block"
      data-dropdown-closed-class="hidden">
-  
+
   <button data-action="dropdown#toggle">Toggle</button>
-  
-  <div data-dropdown-target="menu" 
+
+  <div data-dropdown-target="menu"
        class="hidden">
     Menu content
   </div>
@@ -297,28 +295,29 @@ Stimulus controllers have lifecycle methods:
 export default class extends Controller {
   // Called when controller is connected to the DOM
   connect() {
-    console.log("Connected!")
-    this.setupEventListeners()
+    console.log("Connected!");
+    this.setupEventListeners();
   }
 
   // Called when controller is disconnected from the DOM
   disconnect() {
-    console.log("Disconnected!")
-    this.cleanupEventListeners()
+    console.log("Disconnected!");
+    this.cleanupEventListeners();
   }
 
   // Called when an element appears/disappears
   slideTargetConnected(element) {
-    console.log("Slide target connected:", element)
+    console.log("Slide target connected:", element);
   }
 
   slideTargetDisconnected(element) {
-    console.log("Slide target disconnected:", element)
+    console.log("Slide target disconnected:", element);
   }
 }
 ```
 
 **Important:** Always clean up in `disconnect()`:
+
 - Remove event listeners added in `connect()`
 - Clear timers/intervals
 - Cancel pending requests
@@ -329,64 +328,64 @@ export default class extends Controller {
 
 ```javascript
 // app/javascript/controllers/dropdown_controller.js
-import { Controller } from "@hotwired/stimulus"
+import { Controller } from "@hotwired/stimulus";
 
 export default class extends Controller {
-  static targets = ["menu"]
-  static classes = ["open"]
+  static targets = ["menu"];
+  static classes = ["open"];
   static values = {
-    closeOnClickOutside: { type: Boolean, default: true }
-  }
+    closeOnClickOutside: { type: Boolean, default: true },
+  };
 
   connect() {
     if (this.closeOnClickOutsideValue) {
-      this.boundHandleClickOutside = this.handleClickOutside.bind(this)
+      this.boundHandleClickOutside = this.handleClickOutside.bind(this);
     }
   }
 
   disconnect() {
-    this.removeClickOutsideListener()
+    this.removeClickOutsideListener();
   }
 
   toggle(event) {
-    event.preventDefault()
-    
+    event.preventDefault();
+
     if (this.isOpen) {
-      this.close()
+      this.close();
     } else {
-      this.open()
+      this.open();
     }
   }
 
   open() {
-    this.menuTarget.classList.add(this.openClass)
-    
+    this.menuTarget.classList.add(this.openClass);
+
     if (this.closeOnClickOutsideValue) {
       setTimeout(() => {
-        document.addEventListener("click", this.boundHandleClickOutside)
-      }, 0)
+        document.addEventListener("click", this.boundHandleClickOutside);
+      }, 0);
     }
   }
 
   close() {
-    this.menuTarget.classList.remove(this.openClass)
-    this.removeClickOutsideListener()
+    this.menuTarget.classList.remove(this.openClass);
+    this.removeClickOutsideListener();
   }
 
   handleClickOutside(event) {
     if (!this.element.contains(event.target)) {
-      this.close()
+      this.close();
     }
   }
 
   removeClickOutsideListener() {
     if (this.boundHandleClickOutside) {
-      document.removeEventListener("click", this.boundHandleClickOutside)
+      document.removeEventListener("click", this.boundHandleClickOutside);
     }
   }
 
   get isOpen() {
-    return this.menuTarget.classList.contains(this.openClass)
+    return this.menuTarget.classList.contains(this.openClass);
   }
 }
 ```
@@ -396,12 +395,12 @@ export default class extends Controller {
      data-dropdown-open-class="block"
      data-dropdown-close-on-click-outside-value="true"
      class="relative">
-  
+
   <button data-action="dropdown#toggle"
           class="bg-blue-500 text-white px-4 py-2 rounded">
     Dropdown
   </button>
-  
+
   <div data-dropdown-target="menu"
        class="hidden absolute mt-2 bg-white shadow-lg rounded">
     <a href="#" class="block px-4 py-2 hover:bg-gray-100">Item 1</a>
@@ -419,74 +418,74 @@ export default class extends Controller {
 
 ```javascript
 // app/javascript/controllers/autosave_controller.js
-import { Controller } from "@hotwired/stimulus"
+import { Controller } from "@hotwired/stimulus";
 
 export default class extends Controller {
-  static targets = ["status"]
+  static targets = ["status"];
   static values = {
     url: String,
-    delay: { type: Number, default: 1000 }
-  }
+    delay: { type: Number, default: 1000 },
+  };
 
   connect() {
-    this.timeout = null
+    this.timeout = null;
   }
 
   disconnect() {
-    clearTimeout(this.timeout)
+    clearTimeout(this.timeout);
   }
 
   save() {
-    clearTimeout(this.timeout)
-    
+    clearTimeout(this.timeout);
+
     this.timeout = setTimeout(() => {
-      this.performSave()
-    }, this.delayValue)
+      this.performSave();
+    }, this.delayValue);
   }
 
   async performSave() {
-    const formData = new FormData(this.element)
-    this.showStatus("Saving...")
-    
+    const formData = new FormData(this.element);
+    this.showStatus("Saving...");
+
     try {
       const response = await fetch(this.urlValue, {
         method: "PATCH",
         body: formData,
         headers: {
-          "X-CSRF-Token": document.querySelector("[name='csrf-token']").content
-        }
-      })
-      
+          "X-CSRF-Token": document.querySelector("[name='csrf-token']").content,
+        },
+      });
+
       if (response.ok) {
-        this.showStatus("Saved!", "success")
+        this.showStatus("Saved!", "success");
       } else {
-        this.showStatus("Error saving", "error")
+        this.showStatus("Error saving", "error");
       }
     } catch (error) {
-      this.showStatus("Error saving", "error")
+      this.showStatus("Error saving", "error");
     }
   }
 
   showStatus(message, type = "info") {
     if (this.hasStatusTarget) {
-      this.statusTarget.textContent = message
-      this.statusTarget.className = `status-${type}`
+      this.statusTarget.textContent = message;
+      this.statusTarget.className = `status-${type}`;
     }
   }
 }
 ```
 
 ```erb
-<%= form_with model: @post, 
-              data: { 
+<%= form_with model: @post,
+              data: {
                 controller: "autosave",
                 autosave_url_value: post_path(@post),
                 action: "input->autosave#save"
               } do |f| %>
-  
+
   <%= f.text_field :title %>
   <%= f.text_area :content %>
-  
+
   <span data-autosave-target="status"></span>
 <% end %>
 ```
@@ -495,28 +494,28 @@ export default class extends Controller {
 
 ```javascript
 // app/javascript/controllers/character_counter_controller.js
-import { Controller } from "@hotwired/stimulus"
+import { Controller } from "@hotwired/stimulus";
 
 export default class extends Controller {
-  static targets = ["input", "count"]
+  static targets = ["input", "count"];
   static values = {
-    max: { type: Number, default: 280 }
-  }
+    max: { type: Number, default: 280 },
+  };
 
   connect() {
-    this.updateCount()
+    this.updateCount();
   }
 
   updateCount() {
-    const length = this.inputTarget.value.length
-    const remaining = this.maxValue - length
-    
-    this.countTarget.textContent = remaining
-    
+    const length = this.inputTarget.value.length;
+    const remaining = this.maxValue - length;
+
+    this.countTarget.textContent = remaining;
+
     if (remaining < 0) {
-      this.countTarget.classList.add("text-red-500")
+      this.countTarget.classList.add("text-red-500");
     } else {
-      this.countTarget.classList.remove("text-red-500")
+      this.countTarget.classList.remove("text-red-500");
     }
   }
 }
@@ -525,14 +524,14 @@ export default class extends Controller {
 ```erb
 <div data-controller="character-counter"
      data-character-counter-max-value="280">
-  
+
   <%= text_area_tag :content, nil,
-                    data: { 
+                    data: {
                       character_counter_target: "input",
                       action: "input->character-counter#updateCount"
                     },
                     class: "border rounded p-2 w-full" %>
-  
+
   <div class="text-sm text-gray-600">
     <span data-character-counter-target="count">280</span> characters remaining
   </div>
@@ -569,15 +568,15 @@ Access from browser console:
 
 ```javascript
 // Get controller instance
-const element = document.querySelector("[data-controller='dropdown']")
+const element = document.querySelector("[data-controller='dropdown']");
 const controller = this.application.getControllerForElementAndIdentifier(
-  element, 
-  "dropdown"
-)
+  element,
+  "dropdown",
+);
 
 // Call methods
-controller.open()
-controller.close()
+controller.open();
+controller.close();
 ```
 
 ---

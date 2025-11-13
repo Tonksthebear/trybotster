@@ -490,6 +490,9 @@ spawn_terminal() {
     local completion_marker=$(get_config "completion_marker")
     local api_key=$(get_config "api_key")
 
+    # Get the main project directory (where the daemon is running from)
+    local main_project_dir="$(pwd)"
+
     # Create temporary files for script and context
     local script_file=$(mktemp)
     local context_file=$(mktemp)
@@ -503,7 +506,11 @@ spawn_terminal() {
     cat > "$script_file" <<SCRIPT_EOF
 #!/bin/bash
 cd '$worktree_path' || { echo "FATAL: Cannot cd to worktree: $worktree_path"; exit 1; }
-mkdir -p .claude && touch .claude/trusted
+
+# Create .claude directory and mark as trusted
+mkdir -p .claude
+touch .claude/trusted
+
 export BOTSTER_API_KEY='$api_key'
 
 # Register trybotster MCP server at local scope (highest precedence, no approval needed)
@@ -518,38 +525,64 @@ claude mcp add trybotster \\
 echo "Verifying MCP server..."
 claude mcp list
 
-# Create .claude directory structure
+# Copy .claude settings from main project (but disable hooks for bot sessions)
+echo "Setting up .claude permissions..."
 mkdir -p .claude/hooks
 
-# Create settings.local.json with pre-approved MCP tools
-echo "Creating .claude/settings.local.json with allowed tools..."
-cat > .claude/settings.local.json <<SETTINGS_EOF
-{
-  "permissions": {
-    "allow": [
-      "mcp__trybotster__github_get_issue",
-      "mcp__trybotster__github_list_issues",
-      "mcp__trybotster__github_comment_issue",
-      "mcp__trybotster__github_update_issue",
-      "mcp__trybotster__github_create_issue",
-      "mcp__trybotster__github_create_pull_request",
-      "mcp__trybotster__github_get_pull_request",
-      "mcp__trybotster__github_list_repos",
-      "mcp__trybotster__github_search_repos"
-    ],
-    "deny": [],
-    "ask": []
-  }
-}
-SETTINGS_EOF
+# Copy settings.local.json from main project if it exists
+if [ -f "$main_project_dir/.claude/settings.local.json" ]; then
+  cp "$main_project_dir/.claude/settings.local.json" .claude/settings.local.json
+  echo "✓ Copied settings.local.json from main project"
+else
+  echo "⚠ No settings.local.json found in main project at:"
+  echo "  $main_project_dir/.claude/settings.local.json"
+  echo "  Spawned Claude will use default permissions"
+fi
 
-echo "✓ Pre-approved trybotster MCP tools in .claude/settings.local.json"
+# Pre-accept trust dialog for this worktree in ~/.claude.json
+echo "Pre-accepting workspace trust..."
+node -e "
+const fs = require('fs');
+const path = require('path');
+const configPath = path.join(process.env.HOME, '.claude.json');
+try {
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const projectPath = '$worktree_path';
+  if (!config.projects) config.projects = {};
+  if (!config.projects[projectPath]) {
+    config.projects[projectPath] = {
+      allowedTools: [],
+      mcpContextUris: [],
+      mcpServers: {},
+      enabledMcpjsonServers: [],
+      disabledMcpjsonServers: [],
+      hasTrustDialogAccepted: true,
+      projectOnboardingSeenCount: 0,
+      hasClaudeMdExternalIncludesApproved: false,
+      hasClaudeMdExternalIncludesWarningShown: false
+    };
+  } else {
+    config.projects[projectPath].hasTrustDialogAccepted = true;
+  }
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  console.log('✓ Pre-accepted workspace trust for this worktree');
+} catch (e) {
+  console.error('Warning: Failed to pre-accept trust:', e.message);
+}
+"
 
 # Start Claude Code with context
+# Use --add-dir to pre-trust this worktree directory
 echo "Starting Claude Code..."
-$agent_command $agent_options -- "\$(cat '$context_file')" || echo 'Agent failed'
+$agent_command $agent_options --add-dir '$worktree_path' -- "\$(cat '$context_file')" || echo 'Agent failed'
 echo 'DONE' > $completion_marker
 rm -f '$context_file' '$script_file'
+
+# Wait a moment for cleanup, then close the terminal
+echo ""
+echo "Session complete. Terminal will close in 5 seconds..."
+sleep 5
+osascript -e 'tell application "Terminal" to close (every window whose name contains "Botster:")' 2>/dev/null || true
 SCRIPT_EOF
 
     chmod +x "$script_file"
@@ -749,8 +782,16 @@ check_sessions() {
             if [[ "$content" == *"RESOLVED"* ]] || [[ "$content" == *"DONE"* ]]; then
                 log "Session completed: ${session_key}"
 
-                # Cleanup worktree
-                git worktree remove "$worktree_path" --force 2>&1 | tee -a "$LOG_FILE" || true
+                # Cleanup worktree - check if it still exists first
+                if [[ -d "$worktree_path" ]]; then
+                    # Try to remove the worktree, but don't fail if it errors
+                    if git worktree remove "$worktree_path" --force >> "$LOG_FILE" 2>&1; then
+                        log "Removed worktree: $worktree_path"
+                    else
+                        log_warn "Could not remove worktree (may be in use): $worktree_path"
+                        # Still clean up the session - worktree will be cleaned up later
+                    fi
+                fi
 
                 # Remove session file
                 remove_session "$session_key"
