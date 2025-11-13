@@ -18,6 +18,10 @@ module Github
         handle_issue_comment(@webhook_payload)
       when "pull_request_review_comment"
         handle_pr_review_comment(@webhook_payload)
+      when "issues"
+        handle_issue(@webhook_payload)
+      when "pull_request"
+        handle_pull_request(@webhook_payload)
       else
         Rails.logger.info "Ignoring GitHub event type: #{event_type}"
       end
@@ -103,6 +107,78 @@ module Github
       )
     end
 
+    def handle_issue(payload)
+      # Handle both opened and edited issues
+      return unless %w[opened edited].include?(payload["action"])
+
+      issue_body = payload.dig("issue", "body")
+      return if issue_body.blank?
+
+      issue_author = payload.dig("issue", "user", "login")
+
+      # Ignore issues from the bot itself
+      return if issue_author == "trybotster" || issue_author&.downcase&.include?("bot")
+
+      # Check if @trybotster is mentioned in the issue body
+      return unless mentioned_trybotster?(issue_body)
+
+      repo_full_name = payload.dig("repository", "full_name")
+      issue_number = payload.dig("issue", "number")
+      issue_title = payload.dig("issue", "title")
+      issue_url = payload.dig("issue", "html_url")
+
+      Rails.logger.info "Processing @trybotster mention in issue body #{repo_full_name}##{issue_number}"
+
+      # Create a bot message
+      create_bot_message(
+        repo: repo_full_name,
+        issue_number: issue_number,
+        comment_id: nil, # No specific comment, it's in the issue body
+        comment_body: issue_body,
+        comment_author: issue_author,
+        issue_title: issue_title,
+        issue_body: issue_body,
+        issue_url: issue_url,
+        is_pr: false
+      )
+    end
+
+    def handle_pull_request(payload)
+      # Handle both opened and edited pull requests
+      return unless %w[opened edited].include?(payload["action"])
+
+      pr_body = payload.dig("pull_request", "body")
+      return if pr_body.blank?
+
+      pr_author = payload.dig("pull_request", "user", "login")
+
+      # Ignore PRs from the bot itself
+      return if pr_author == "trybotster" || pr_author&.downcase&.include?("bot")
+
+      # Check if @trybotster is mentioned in the PR body
+      return unless mentioned_trybotster?(pr_body)
+
+      repo_full_name = payload.dig("repository", "full_name")
+      pr_number = payload.dig("pull_request", "number")
+      pr_title = payload.dig("pull_request", "title")
+      pr_url = payload.dig("pull_request", "html_url")
+
+      Rails.logger.info "Processing @trybotster mention in PR body #{repo_full_name}##{pr_number}"
+
+      # Create a bot message
+      create_bot_message(
+        repo: repo_full_name,
+        issue_number: pr_number,
+        comment_id: nil, # No specific comment, it's in the PR body
+        comment_body: pr_body,
+        comment_author: pr_author,
+        issue_title: pr_title,
+        issue_body: pr_body,
+        issue_url: pr_url,
+        is_pr: true
+      )
+    end
+
     def mentioned_trybotster?(text)
       # Check if @trybotster is mentioned in the text
       text.match?(/@trybotster\b/i)
@@ -144,7 +220,19 @@ module Github
         "2. Review and understand the problem",
         "3. Investigate the codebase if needed",
         "4. Implement a solution if appropriate",
-        "5. Use ONLY the trybotster MCP tools to post your response (comment or PR)",
+        "5. Follow the code change workflow below",
+        "",
+        "CODE CHANGE WORKFLOW:",
+        "If you make ANY code changes:",
+        "- Check if there's already a PR associated with this #{type.downcase}",
+        "- If a PR exists: Commit and push your changes to the existing branch",
+        "- If no PR exists: Create a new branch, commit your changes, push, and open a PR",
+        "- Use descriptive commit messages explaining what you changed and why",
+        "- In the PR description, reference the original #{type.downcase} (##{issue_number})",
+        "- After creating/updating the PR, post a comment on the original #{type.downcase} with a link to the PR",
+        "",
+        "If you're only providing information/analysis without code changes:",
+        "- Post your response as a comment on the #{type.downcase}",
         "",
         "CRITICAL REQUIREMENTS:",
         "- You MUST use ONLY the trybotster MCP server tools for ALL GitHub interactions",
@@ -152,7 +240,8 @@ module Github
         "- DO NOT use the github MCP server - use ONLY trybotster MCP server",
         "- Available trybotster MCP tools include:",
         "  * github_get_issue - Fetch issue details",
-        "  * github_comment_issue - Post comments to issues",
+        "  * github_get_pull_request - Get PR details",
+        "  * github_comment_issue - Post comments to issues/PRs",
         "  * github_create_pull_request - Create pull requests",
         "  * github_list_repos - List repositories",
         "  * And other GitHub operations",
