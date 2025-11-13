@@ -1,14 +1,15 @@
 # Hooks
 
-Claude Code hooks that enable skill auto-activation, file tracking, and validation.
+Claude Code hooks that enable skill auto-activation, file tracking, and Rails validation.
 
 ---
 
 ## What Are Hooks?
 
 Hooks are scripts that run at specific points in Claude's workflow:
+
 - **UserPromptSubmit**: When user submits a prompt
-- **PreToolUse**: Before a tool executes  
+- **PreToolUse**: Before a tool executes
 - **PostToolUse**: After a tool completes
 - **Stop**: When user requests to stop
 
@@ -16,13 +17,14 @@ Hooks are scripts that run at specific points in Claude's workflow:
 
 ---
 
-## Essential Hooks (Start Here)
+## Active Hooks in This Project
 
 ### skill-activation-prompt (UserPromptSubmit)
 
 **Purpose:** Automatically suggests relevant skills based on user prompts and file context
 
 **How it works:**
+
 1. Reads `skill-rules.json`
 2. Matches user prompt against trigger patterns
 3. Checks which files user is working with
@@ -30,21 +32,10 @@ Hooks are scripts that run at specific points in Claude's workflow:
 
 **Why it's essential:** This is THE hook that makes skills auto-activate.
 
-**Integration:**
-```bash
-# Copy both files
-cp skill-activation-prompt.sh your-project/.claude/hooks/
-cp skill-activation-prompt.ts your-project/.claude/hooks/
+**Status:** ✅ Configured and executable
 
-# Make executable
-chmod +x your-project/.claude/hooks/skill-activation-prompt.sh
+**Configuration in settings.json:**
 
-# Install dependencies
-cd your-project/.claude/hooks
-npm install
-```
-
-**Add to settings.json:**
 ```json
 {
   "hooks": {
@@ -71,23 +62,18 @@ npm install
 **Purpose:** Tracks file changes to maintain context across sessions
 
 **How it works:**
+
 1. Monitors Edit/Write/MultiEdit tool calls
 2. Records which files were modified
 3. Creates cache for context management
-4. Auto-detects project structure (frontend, backend, packages, etc.)
+4. Auto-detects Rails project structure (controllers, models, views, etc.)
 
-**Why it's essential:** Helps Claude understand what parts of your codebase are active.
+**Why it's essential:** Helps Claude understand what parts of your Rails codebase are active.
 
-**Integration:**
-```bash
-# Copy file
-cp post-tool-use-tracker.sh your-project/.claude/hooks/
+**Status:** ✅ Configured and executable
 
-# Make executable
-chmod +x your-project/.claude/hooks/post-tool-use-tracker.sh
-```
+**Configuration in settings.json:**
 
-**Add to settings.json:**
 ```json
 {
   "hooks": {
@@ -106,58 +92,125 @@ chmod +x your-project/.claude/hooks/post-tool-use-tracker.sh
 }
 ```
 
-**Customization:** ✅ None needed - auto-detects structure
+**Customization:** ✅ None needed - auto-detects Rails structure
 
 ---
 
-## Optional Hooks (Require Customization)
+### rubocop-check (Stop)
 
-### tsc-check (Stop)
+**Purpose:** Runs RuboCop linting and auto-correction when user stops
 
-**Purpose:** TypeScript compilation check when user stops
+**How it works:**
 
-**⚠️ WARNING:** Configured for multi-service monorepo structure
+1. Runs when user stops Claude Code session
+2. Executes `rubocop --autocorrect-all --display-only-failed`
+3. Auto-fixes safe Ruby style violations
+4. Reports any remaining issues
 
-**Integration:**
+**Why it's useful:** Keeps your Ruby code clean and following Rails best practices automatically.
 
-**First, determine if this is right for you:**
-- ✅ Use if: Multi-service TypeScript monorepo
-- ❌ Skip if: Single-service project or different build setup
+**Status:** ✅ Configured and executable
 
-**If using:**
-1. Copy tsc-check.sh
-2. **EDIT the service detection (line ~28):**
-   ```bash
-   # Replace example services with YOUR services:
-   case "$repo" in
-       api|web|auth|payments|...)  # ← Your actual services
-   ```
-3. Test manually before adding to settings.json
+**Configuration in settings.json:**
 
-**Customization:** ⚠️⚠️⚠️ Heavy
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/rubocop-check.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Requirements:**
+
+- RuboCop must be installed (`gem install rubocop` or add to Gemfile)
+- Optional: `.rubocop.yml` for custom rules
+
+**Customization:** ✅ Configure via `.rubocop.yml` in project root
 
 ---
 
-### trigger-build-resolver (Stop)
+## File Permissions
 
-**Purpose:** Auto-launches build-error-resolver agent when compilation fails
+All hooks are executable:
 
-**Depends on:** tsc-check hook working correctly
+```bash
+-rwxr-xr-x  post-tool-use-tracker.sh
+-rwxr-xr-x  rubocop-check.sh
+-rwxr-xr-x  skill-activation-prompt.sh
+```
 
-**Customization:** ✅ None (but tsc-check must work first)
+To verify:
+
+```bash
+ls -la .claude/hooks/*.sh | grep rwx
+```
+
+---
+
+## Maintenance
+
+### Adding New Hooks
+
+1. Create script in `.claude/hooks/`
+2. Make executable: `chmod +x .claude/hooks/your-hook.sh`
+3. Register in `.claude/settings.json`
+4. Test by triggering the event
+
+### Removing Hooks
+
+1. Delete script from `.claude/hooks/`
+2. Remove from `.claude/settings.json`
+
+### Testing Hooks
+
+**UserPromptSubmit:**
+
+```bash
+# Submit any prompt to Claude
+```
+
+**PostToolUse:**
+
+```bash
+# Edit any file using Claude
+```
+
+**Stop:**
+
+```bash
+# Request Claude to stop
+```
+
+---
+
+## Rails-Specific Notes
+
+This hooks configuration is optimized for Rails projects:
+
+- **No TypeScript/Node.js dependencies** - Pure bash scripts
+- **RuboCop integration** - Automatic Ruby linting
+- **Rails structure detection** - Understands `app/`, `config/`, `db/` directories
+- **Compatible with Hotwire** - Works with Stimulus controllers and Turbo
 
 ---
 
 ## For Claude Code
 
-**When setting up hooks for a user:**
+**When working in this project:**
 
-1. **Read [CLAUDE_INTEGRATION_GUIDE.md](../../CLAUDE_INTEGRATION_GUIDE.md)** first
-2. **Always start with the two essential hooks**
-3. **Ask before adding Stop hooks** - they can block if misconfigured  
-4. **Verify after setup:**
-   ```bash
-   ls -la .claude/hooks/*.sh | grep rwx
-   ```
+1. ✅ All hooks are Rails-optimized
+2. ✅ No Node.js/npm dependencies required
+3. ✅ RuboCop runs automatically on Stop events
+4. ✅ Skills auto-activate for Rails files
 
-**Questions?** See [CLAUDE_INTEGRATION_GUIDE.md](../../CLAUDE_INTEGRATION_GUIDE.md)
+**Questions?** See [CLAUDE_INTEGRATION.md](../../CLAUDE_INTEGRATION.md)

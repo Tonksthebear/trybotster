@@ -1,12 +1,13 @@
 # Skills
 
-Production-tested skills for Claude Code that auto-activate based on context.
+Rails-focused skills for Claude Code that auto-activate based on context.
 
 ---
 
 ## What Are Skills?
 
 Skills are modular knowledge bases that Claude loads when needed. They provide:
+
 - Domain-specific guidelines
 - Best practices
 - Code examples
@@ -14,267 +15,191 @@ Skills are modular knowledge bases that Claude loads when needed. They provide:
 
 **Problem:** Skills don't activate automatically by default.
 
-**Solution:** This showcase includes the hooks + configuration to make them activate.
+**Solution:** This project includes the hooks + configuration to make them activate for Rails development.
 
 ---
 
-## Available Skills
+## Active Skills in This Project
 
 ### skill-developer (Meta-Skill)
+
 **Purpose:** Creating and managing Claude Code skills
 
 **Files:** 7 resource files (426 lines total)
 
 **Use when:**
+
 - Creating new skills
 - Understanding skill structure
 - Working with skill-rules.json
 - Debugging skill activation
 
-**Customization:** ✅ None - copy as-is
+**Customization:** ✅ None - works as-is
+
+**Status:** ✅ Installed and configured
 
 **[View Skill →](skill-developer/)**
 
 ---
 
-### backend-dev-guidelines
-**Purpose:** Node.js/Express/TypeScript development patterns
+### rails-backend-guidelines
 
-**Files:** 12 resource files (304 lines main + resources)
+**Purpose:** Rails backend development patterns and best practices
+
+**Files:** 11 resource files covering comprehensive Rails patterns
 
 **Covers:**
-- Layered architecture (Routes → Controllers → Services → Repositories)
-- BaseController pattern
-- Prisma database access
-- Sentry error tracking
-- Zod validation
-- UnifiedConfig pattern
-- Dependency injection
-- Testing strategies
+
+- Rails MVC architecture
+- Controllers and routing (RESTful conventions)
+- ActiveRecord models (associations, validations, scopes)
+- Service objects and business logic
+- Database patterns and migrations
+- Background jobs (Solid Queue)
+- Action Cable (WebSockets)
+- Error handling and Sentry integration
+- Testing with Minitest/RSpec
+- Rails conventions and best practices
 
 **Use when:**
-- Creating/modifying API routes
-- Building controllers or services
-- Database operations with Prisma
-- Setting up error tracking
 
-**Customization:** ⚠️ Update `pathPatterns` in skill-rules.json to match your backend directories
+- Creating/modifying controllers
+- Building models and migrations
+- Writing service objects
+- Database operations with ActiveRecord
+- Setting up background jobs
+- Implementing WebSocket features
 
-**Example pathPatterns:**
-```json
-{
-  "pathPatterns": [
-    "src/api/**/*.ts",       // Single app with src/api
-    "backend/**/*.ts",       // Backend directory
-    "services/*/src/**/*.ts" // Multi-service monorepo
-  ]
-}
-```
+**Auto-activates on:**
 
-**[View Skill →](backend-dev-guidelines/)**
+- Editing files in `app/controllers/`, `app/models/`, `app/services/`
+- Working with `db/migrate/`, `config/routes.rb`
+- Keywords: "controller", "model", "service", "migration", "ActiveRecord"
+
+**Status:** ✅ Installed and configured
+
+**[View Skill →](rails-backend-guidelines/)**
 
 ---
 
-### frontend-dev-guidelines
-**Purpose:** React/TypeScript/MUI v7 development patterns
+### rails-frontend-guidelines
 
-**Files:** 11 resource files (398 lines main + resources)
+**Purpose:** Rails frontend with Hotwire (Turbo + Stimulus) and Tailwind CSS
+
+**Files:** 12 resource files covering modern Rails frontend patterns
 
 **Covers:**
-- Modern React patterns (Suspense, lazy loading)
-- useSuspenseQuery for data fetching
-- MUI v7 styling (Grid with `size={{}}` prop)
-- TanStack Router
-- File organization (features/ pattern)
+
+- Hotwire (Turbo Frames, Turbo Streams)
+- Stimulus controllers and actions
+- Server-rendered HTML with progressive enhancement
+- Tailwind CSS styling patterns
+- ViewComponent architecture
+- ERB templates and partials
+- Data attributes and targets
 - Performance optimization
-- TypeScript best practices
+- Loading and error states
+- File organization
 
 **Use when:**
-- Creating React components
-- Fetching data with TanStack Query
-- Styling with MUI v7
-- Setting up routing
 
-**Customization:** ⚠️ Update `pathPatterns` + verify you use React/MUI
+- Creating views and partials
+- Building Stimulus controllers
+- Using Turbo Frames/Streams
+- Styling with Tailwind CSS
+- Implementing ViewComponents
+- Frontend JavaScript interactions
 
-**Example pathPatterns:**
-```json
-{
-  "pathPatterns": [
-    "src/**/*.tsx",          // Single React app
-    "frontend/src/**/*.tsx", // Frontend directory
-    "apps/web/**/*.tsx"      // Monorepo web app
-  ]
-}
-```
+**Auto-activates on:**
 
-**Note:** This skill is configured as a **guardrail** (enforcement: "block") to prevent MUI v6→v7 incompatibilities.
+- Editing files in `app/views/`, `app/javascript/controllers/`
+- Working with `.html.erb`, `.turbo_stream.erb` files
+- Keywords: "view", "Turbo", "Stimulus", "Hotwire", "Tailwind"
 
-**[View Skill →](frontend-dev-guidelines/)**
+**Status:** ✅ Installed and configured
+
+**[View Skill →](rails-frontend-guidelines/)**
 
 ---
 
-### route-tester
-**Purpose:** Testing authenticated API routes with JWT cookie auth
+## How Skills Auto-Activate
 
-**Files:** 1 main file (389 lines)
+Skills activate automatically when:
 
-**Covers:**
-- JWT cookie-based authentication testing
-- test-auth-route.js script patterns
-- cURL with cookie authentication
-- Debugging auth issues
-- Testing POST/PUT/DELETE operations
+1. **File-based triggers:**
+   - You edit a file in `app/controllers/` → rails-backend-guidelines activates
+   - You edit a file in `app/views/` → rails-frontend-guidelines activates
+   - You edit a file in `app/javascript/controllers/` → rails-frontend-guidelines activates
 
-**Use when:**
-- Testing API endpoints
-- Debugging authentication
-- Validating route functionality
+2. **Keyword triggers:**
+   - You mention "controller", "model", "migration" → rails-backend-guidelines
+   - You mention "Turbo", "Stimulus", "view" → rails-frontend-guidelines
 
-**Customization:** ⚠️ Requires JWT cookie auth setup
+3. **Intent pattern matching:**
+   - "Create a new controller" → rails-backend-guidelines
+   - "Add a Turbo Frame" → rails-frontend-guidelines
 
-**Ask first:** "Do you use JWT cookie-based authentication?"
-- If YES: Copy and customize service URLs
-- If NO: Skip or adapt for your auth method
-
-**[View Skill →](route-tester/)**
-
----
-
-### error-tracking
-**Purpose:** Sentry error tracking and monitoring patterns
-
-**Files:** 1 main file (~250 lines)
-
-**Covers:**
-- Sentry v8 initialization
-- Error capture patterns
-- Breadcrumbs and user context
-- Performance monitoring
-- Integration with Express and React
-
-**Use when:**
-- Setting up error tracking
-- Capturing exceptions
-- Adding error context
-- Debugging production issues
-
-**Customization:** ⚠️ Update `pathPatterns` for your backend
-
-**[View Skill →](error-tracking/)**
-
----
-
-## How to Add a Skill to Your Project
-
-### Quick Integration
-
-**For Claude Code:**
-```
-User: "Add the backend-dev-guidelines skill to my project"
-
-Claude should:
-1. Ask about project structure
-2. Copy skill directory
-3. Update skill-rules.json with their paths
-4. Verify integration
-```
-
-See [CLAUDE_INTEGRATION_GUIDE.md](../../CLAUDE_INTEGRATION_GUIDE.md) for complete instructions.
-
-### Manual Integration
-
-**Step 1: Copy the skill directory**
-```bash
-cp -r claude-code-infrastructure-showcase/.claude/skills/backend-dev-guidelines \\
-      your-project/.claude/skills/
-```
-
-**Step 2: Update skill-rules.json**
-
-If you don't have one, create it:
-```bash
-cp claude-code-infrastructure-showcase/.claude/skills/skill-rules.json \\
-   your-project/.claude/skills/
-```
-
-Then customize the `pathPatterns` for your project:
-```json
-{
-  "skills": {
-    "backend-dev-guidelines": {
-      "fileTriggers": {
-        "pathPatterns": [
-          "YOUR_BACKEND_PATH/**/*.ts"  // ← Update this!
-        ]
-      }
-    }
-  }
-}
-```
-
-**Step 3: Test**
-- Edit a file in your backend directory
-- The skill should activate automatically
+All this is configured in `skill-rules.json` with Rails-specific patterns.
 
 ---
 
 ## skill-rules.json Configuration
 
-### What It Does
-
-Defines when skills should activate based on:
-- **Keywords** in user prompts ("backend", "API", "route")
-- **Intent patterns** (regex matching user intent)
-- **File path patterns** (editing backend files)
-- **Content patterns** (code contains Prisma queries)
-
-### Configuration Format
+This project's skill-rules.json is configured for Rails:
 
 ```json
 {
-  "skill-name": {
-    "type": "domain" | "guardrail",
-    "enforcement": "suggest" | "block",
-    "priority": "high" | "medium" | "low",
-    "promptTriggers": {
-      "keywords": ["list", "of", "keywords"],
-      "intentPatterns": ["regex patterns"]
-    },
+  "rails-backend-guidelines": {
     "fileTriggers": {
-      "pathPatterns": ["path/to/files/**/*.ts"],
-      "contentPatterns": ["import.*Prisma"]
+      "pathPatterns": [
+        "app/controllers/**/*.rb",
+        "app/models/**/*.rb",
+        "app/services/**/*.rb",
+        "db/migrate/**/*.rb",
+        "config/routes.rb"
+      ]
+    },
+    "promptTriggers": {
+      "keywords": [
+        "controller",
+        "model",
+        "service",
+        "migration",
+        "ActiveRecord"
+      ]
+    }
+  },
+  "rails-frontend-guidelines": {
+    "fileTriggers": {
+      "pathPatterns": [
+        "app/views/**/*.html.erb",
+        "app/javascript/controllers/**/*_controller.js"
+      ]
+    },
+    "promptTriggers": {
+      "keywords": ["view", "Turbo", "Stimulus", "Hotwire", "Tailwind"]
     }
   }
 }
 ```
 
-### Enforcement Levels
+**Enforcement Levels:**
 
-- **suggest**: Skill appears as suggestion, doesn't block
-- **block**: Must use skill before proceeding (guardrail)
-
-**Use "block" for:**
-- Preventing breaking changes (MUI v6→v7)
-- Critical database operations
-- Security-sensitive code
-
-**Use "suggest" for:**
-- General best practices
-- Domain guidance
-- Code organization
+- **suggest**: Skill appears as suggestion (most skills)
+- **block**: Must use skill before proceeding (guardrails for critical changes)
 
 ---
 
-## Creating Your Own Skills
+## Adding New Skills
 
-See the **skill-developer** skill for complete guide on:
-- Skill YAML frontmatter structure
-- Resource file organization
-- Trigger pattern design
-- Testing skill activation
+### Step 1: Create skill directory
 
-**Quick template:**
+```bash
+mkdir -p .claude/skills/my-skill/resources
+```
+
+### Step 2: Create SKILL.md
+
 ```markdown
 ---
 name: my-skill
@@ -284,18 +209,45 @@ description: What this skill does
 # My Skill Title
 
 ## Purpose
+
 [Why this skill exists]
 
 ## When to Use This Skill
+
 [Auto-activation scenarios]
 
 ## Quick Reference
+
 [Key patterns and examples]
 
 ## Resource Files
+
 - [topic-1.md](resources/topic-1.md)
 - [topic-2.md](resources/topic-2.md)
 ```
+
+### Step 3: Add to skill-rules.json
+
+```json
+{
+  "my-skill": {
+    "type": "domain",
+    "enforcement": "suggest",
+    "priority": "high",
+    "fileTriggers": {
+      "pathPatterns": ["path/to/files/**/*.rb"]
+    },
+    "promptTriggers": {
+      "keywords": ["keyword1", "keyword2"]
+    }
+  }
+}
+```
+
+### Step 4: Test
+
+- Edit a file matching your path pattern
+- The skill should suggest automatically
 
 ---
 
@@ -304,13 +256,15 @@ description: What this skill does
 ### Skill isn't activating
 
 **Check:**
+
 1. Is skill directory in `.claude/skills/`?
 2. Is skill listed in `skill-rules.json`?
-3. Do `pathPatterns` match your files?
-4. Are hooks installed and working?
+3. Do `pathPatterns` match Rails file structure?
+4. Are hooks installed and executable?
 5. Is settings.json configured correctly?
 
 **Debug:**
+
 ```bash
 # Check skill exists
 ls -la .claude/skills/
@@ -321,48 +275,68 @@ cat .claude/skills/skill-rules.json | jq .
 # Check hooks are executable
 ls -la .claude/hooks/*.sh
 
-# Test hook manually
-./.claude/hooks/skill-activation-prompt.sh
+# Should see rwxr-xr-x permissions
 ```
 
 ### Skill activates too often
 
-Update skill-rules.json:
+Update `skill-rules.json`:
+
 - Make keywords more specific
 - Narrow `pathPatterns`
 - Increase specificity of `intentPatterns`
 
 ### Skill never activates
 
-Update skill-rules.json:
+Update `skill-rules.json`:
+
 - Add more keywords
 - Broaden `pathPatterns`
 - Add more `intentPatterns`
 
 ---
 
-## For Claude Code
+## Rails-Specific Notes
 
-**When integrating a skill for a user:**
+This skills configuration is optimized for Rails projects:
 
-1. **Read [CLAUDE_INTEGRATION_GUIDE.md](../../CLAUDE_INTEGRATION_GUIDE.md)** first
-2. Ask about their project structure
-3. Customize `pathPatterns` in skill-rules.json
-4. Verify the skill file has no hardcoded paths
-5. Test activation after integration
+- **No TypeScript/Node.js patterns** - Pure Rails focus
+- **Rails conventions** - Follows Rails file structure (`app/`, `db/`, `config/`)
+- **Hotwire patterns** - Modern Rails frontend with Turbo/Stimulus
+- **ActiveRecord focus** - Database patterns using ActiveRecord, not Prisma/ORMs
+- **Rails testing** - Minitest/RSpec patterns, not Jest/Vitest
 
-**Common mistakes:**
-- Keeping example paths (blog-api/, frontend/)
-- Not asking about monorepo vs single-app
-- Copying skill-rules.json without customization
+**File patterns match Rails structure:**
+
+```
+app/
+  controllers/  → rails-backend-guidelines
+  models/       → rails-backend-guidelines
+  services/     → rails-backend-guidelines
+  views/        → rails-frontend-guidelines
+  javascript/   → rails-frontend-guidelines
+  components/   → rails-frontend-guidelines
+db/
+  migrate/      → rails-backend-guidelines
+config/
+  routes.rb     → rails-backend-guidelines
+```
 
 ---
 
-## Next Steps
+## For Claude Code
 
-1. **Start simple:** Add one skill that matches your work
-2. **Verify activation:** Edit a relevant file, skill should suggest
-3. **Add more:** Once first skill works, add others
-4. **Customize:** Adjust triggers based on your workflow
+**When working in this project:**
 
-**Questions?** See [CLAUDE_INTEGRATION_GUIDE.md](../../CLAUDE_INTEGRATION_GUIDE.md) for comprehensive integration instructions.
+1. ✅ Skills are Rails-optimized
+2. ✅ Auto-activation configured for Rails file structure
+3. ✅ No TypeScript/React patterns (use Rails patterns)
+4. ✅ Hotwire/Turbo/Stimulus patterns included
+
+**Skills will automatically suggest when:**
+
+- You edit Rails controllers, models, or views
+- You mention Rails-specific keywords
+- You work with migrations or routes
+
+**Questions?** See [CLAUDE_INTEGRATION.md](../../CLAUDE_INTEGRATION.md) for complete integration details.

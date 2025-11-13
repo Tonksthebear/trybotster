@@ -1,12 +1,12 @@
 # Hooks Configuration Guide
 
-This guide explains how to configure and customize the hooks system for your project.
+This guide explains how to configure and customize the hooks system for Rails projects.
 
 ## Quick Start Configuration
 
 ### 1. Register Hooks in .claude/settings.json
 
-Create or update `.claude/settings.json` in your project root:
+Your `.claude/settings.json` is already configured with Rails-optimized hooks:
 
 ```json
 {
@@ -37,15 +37,7 @@ Create or update `.claude/settings.json` in your project root:
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-prettier-formatter.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-build-check-enhanced.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/error-handling-reminder.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/rubocop-check.sh"
           }
         ]
       }
@@ -54,14 +46,23 @@ Create or update `.claude/settings.json` in your project root:
 }
 ```
 
-### 2. Install Dependencies
+### 2. Dependencies
+
+No npm/Node.js dependencies needed! All hooks are pure bash scripts.
+
+**Optional:** Install RuboCop for linting:
 
 ```bash
-cd .claude/hooks
-npm install
+# Via Bundler (recommended)
+bundle add rubocop --group development
+
+# Or globally
+gem install rubocop
 ```
 
-### 3. Set Execute Permissions
+### 3. File Permissions
+
+All hooks are already executable:
 
 ```bash
 chmod +x .claude/hooks/*.sh
@@ -69,110 +70,128 @@ chmod +x .claude/hooks/*.sh
 
 ## Customization Options
 
-### Project Structure Detection
+### Rails Project Structure Detection
 
-By default, hooks detect these directory patterns:
+By default, hooks detect these Rails directory patterns:
 
-**Frontend:** `frontend/`, `client/`, `web/`, `app/`, `ui/`
-**Backend:** `backend/`, `server/`, `api/`, `src/`, `services/`
-**Database:** `database/`, `prisma/`, `migrations/`
-**Monorepo:** `packages/*`, `examples/*`
+**Rails App:** `app/controllers/`, `app/models/`, `app/views/`, `app/services/`
+**Frontend:** `app/javascript/`, `app/assets/`
+**Config:** `config/`, `lib/`
+**Database:** `db/migrate/`, `db/schema.rb`
 
 #### Adding Custom Directory Patterns
 
-Edit `.claude/hooks/post-tool-use-tracker.sh`, function `detect_repo()`:
+Edit `.claude/hooks/post-tool-use-tracker.sh`, function `detect_rails_component()`:
 
 ```bash
-case "$repo" in
-    # Add your custom directories here
-    my-custom-service)
-        echo "$repo"
-        ;;
-    admin-panel)
-        echo "$repo"
+case "$file_path" in
+    */app/custom_dir/*)
+        echo "custom_component"
         ;;
     # ... existing patterns
 esac
 ```
 
-### Build Command Detection
+### RuboCop Configuration
 
-The hooks auto-detect build commands based on:
-1. Presence of `package.json` with "build" script
-2. Package manager (pnpm > npm > yarn)
-3. Special cases (Prisma schemas)
+The RuboCop hook uses your project's `.rubocop.yml` configuration.
 
-#### Customizing Build Commands
+#### Customizing RuboCop Behavior
 
-Edit `.claude/hooks/post-tool-use-tracker.sh`, function `get_build_command()`:
+Edit `.rubocop.yml` in your project root:
 
-```bash
-# Add custom build logic
-if [[ "$repo" == "my-service" ]]; then
-    echo "cd $repo_path && make build"
-    return
-fi
+```yaml
+AllCops:
+  TargetRubyVersion: 3.2
+  NewCops: enable
+  Exclude:
+    - "db/schema.rb"
+    - "node_modules/**/*"
+    - "vendor/**/*"
+
+Style/Documentation:
+  Enabled: false
+
+Metrics/MethodLength:
+  Max: 15
 ```
 
-### TypeScript Configuration
+#### Customizing RuboCop Hook Behavior
 
-Hooks automatically detect:
-- `tsconfig.json` for standard TypeScript projects
-- `tsconfig.app.json` for Vite/React projects
-
-#### Custom TypeScript Configs
-
-Edit `.claude/hooks/post-tool-use-tracker.sh`, function `get_tsc_command()`:
+Edit `.claude/hooks/rubocop-check.sh`:
 
 ```bash
-if [[ "$repo" == "my-service" ]]; then
-    echo "cd $repo_path && npx tsc --project tsconfig.build.json --noEmit"
-    return
-fi
+# Change autocorrect behavior (line ~23)
+if rubocop --autocorrect-all --display-only-failed; then
+
+# Options:
+# --autocorrect-all : Fix all safe violations
+# --autocorrect     : Fix only safe violations (deprecated in newer RuboCop)
+# --safe-autocorrect: Only safe fixes
+# No flag           : Just report, don't fix
 ```
 
-### Prettier Configuration
+### Adding Rails Test Hooks
 
-The prettier hook searches for configs in this order:
-1. Current file directory (walking upward)
-2. Project root
-3. Falls back to Prettier defaults
+You can add a hook to run Rails tests:
 
-#### Custom Prettier Config Search
-
-Edit `.claude/hooks/stop-prettier-formatter.sh`, function `get_prettier_config()`:
+**Create `.claude/hooks/rails-test.sh`:**
 
 ```bash
-# Add custom config locations
-if [[ -f "$project_root/config/.prettierrc" ]]; then
-    echo "$project_root/config/.prettierrc"
-    return
+#!/bin/bash
+
+set -e
+
+cd "$CLAUDE_PROJECT_DIR" || exit 1
+
+echo "🧪 Running Rails tests..."
+
+# For Minitest (Rails default)
+if bin/rails test; then
+    echo "✅ Tests passed!"
+    exit 0
+else
+    echo "❌ Tests failed"
+    exit 1
 fi
+
+# For RSpec (if you use it)
+# if bundle exec rspec; then
+#     echo "✅ Tests passed!"
+#     exit 0
+# else
+#     echo "❌ Tests failed"
+#     exit 1
+# fi
 ```
 
-### Error Handling Reminders
+**Make executable:**
 
-Configure file category detection in `.claude/hooks/error-handling-reminder.ts`:
+```bash
+chmod +x .claude/hooks/rails-test.sh
+```
 
-```typescript
-function getFileCategory(filePath: string): 'backend' | 'frontend' | 'database' | 'other' {
-    // Add custom patterns
-    if (filePath.includes('/my-custom-dir/')) return 'backend';
-    // ... existing patterns
+**Add to settings.json:**
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/rubocop-check.sh"
+          },
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/rails-test.sh"
+          }
+        ]
+      }
+    ]
+  }
 }
-```
-
-### Error Threshold Configuration
-
-Change when to recommend the auto-error-resolver agent.
-
-Edit `.claude/hooks/stop-build-check-enhanced.sh`:
-
-```bash
-# Default is 5 errors - change to your preference
-if [[ $total_errors -ge 10 ]]; then  # Now requires 10+ errors
-    # Recommend agent
-fi
 ```
 
 ## Environment Variables
@@ -182,11 +201,11 @@ fi
 Set in your shell profile (`.bashrc`, `.zshrc`, etc.):
 
 ```bash
-# Disable error handling reminders
-export SKIP_ERROR_REMINDER=1
-
 # Custom project directory (if not using default)
-export CLAUDE_PROJECT_DIR=/path/to/your/project
+export CLAUDE_PROJECT_DIR=/path/to/your/rails/project
+
+# Skip RuboCop checks
+export SKIP_RUBOCOP=1
 ```
 
 ### Per-Session Environment Variables
@@ -194,7 +213,7 @@ export CLAUDE_PROJECT_DIR=/path/to/your/project
 Set before starting Claude Code:
 
 ```bash
-SKIP_ERROR_REMINDER=1 claude-code
+SKIP_RUBOCOP=1 claude-code
 ```
 
 ## Hook Execution Order
@@ -205,22 +224,21 @@ Stop hooks run in the order specified in `settings.json`:
 "Stop": [
   {
     "hooks": [
-      { "command": "...formatter.sh" },    // Runs FIRST
-      { "command": "...build-check.sh" },  // Runs SECOND
-      { "command": "...reminder.sh" }      // Runs THIRD
+      { "command": "...rubocop-check.sh" },  // Runs FIRST
+      { "command": "...rails-test.sh" }      // Runs SECOND
     ]
   }
 ]
 ```
 
 **Why this order matters:**
-1. Format files first (clean code)
-2. Then check for errors
-3. Finally show reminders
+
+1. Fix code style first (RuboCop)
+2. Then run tests (with clean code)
 
 ## Selective Hook Enabling
 
-You don't need all hooks. Choose what works for your project:
+You don't need all hooks. Choose what works for your workflow:
 
 ### Minimal Setup (Skill Activation Only)
 
@@ -241,11 +259,21 @@ You don't need all hooks. Choose what works for your project:
 }
 ```
 
-### Build Checking Only (No Formatting)
+### Without RuboCop (No Linting)
 
 ```json
 {
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/skill-activation-prompt.sh"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|MultiEdit|Write",
@@ -253,46 +281,6 @@ You don't need all hooks. Choose what works for your project:
           {
             "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post-tool-use-tracker.sh"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-build-check-enhanced.sh"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-### Formatting Only (No Build Checking)
-
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Edit|MultiEdit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post-tool-use-tracker.sh"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-prettier-formatter.sh"
           }
         ]
       }
@@ -306,22 +294,18 @@ You don't need all hooks. Choose what works for your project:
 ### Cache Location
 
 ```
-$CLAUDE_PROJECT_DIR/.claude/tsc-cache/[session_id]/
+$CLAUDE_PROJECT_DIR/.claude/cache/[session_id]/
 ```
 
 ### Manual Cache Cleanup
 
 ```bash
 # Remove all cached data
-rm -rf $CLAUDE_PROJECT_DIR/.claude/tsc-cache/*
+rm -rf $CLAUDE_PROJECT_DIR/.claude/cache/*
 
 # Remove specific session
-rm -rf $CLAUDE_PROJECT_DIR/.claude/tsc-cache/[session-id]
+rm -rf $CLAUDE_PROJECT_DIR/.claude/cache/[session-id]
 ```
-
-### Automatic Cleanup
-
-The build-check hook automatically cleans up session cache on successful builds.
 
 ## Troubleshooting Configuration
 
@@ -330,19 +314,27 @@ The build-check hook automatically cleans up session cache on successful builds.
 1. **Check registration:** Verify hook is in `.claude/settings.json`
 2. **Check permissions:** Run `chmod +x .claude/hooks/*.sh`
 3. **Check path:** Ensure `$CLAUDE_PROJECT_DIR` is set correctly
-4. **Check TypeScript:** Run `cd .claude/hooks && npx tsc` to check for errors
+4. **Check dependencies:** For RuboCop hook, verify RuboCop is installed
 
-### False Positive Detections
+### RuboCop Issues
 
-**Issue:** Hook triggers for files it shouldn't
+**Issue:** RuboCop not found
 
-**Solution:** Add skip conditions in the relevant hook:
+**Solution:** Install RuboCop:
 
 ```bash
-# In post-tool-use-tracker.sh
-if [[ "$file_path" =~ /generated/ ]]; then
-    exit 0  # Skip generated files
-fi
+bundle add rubocop --group development
+# or
+gem install rubocop
+```
+
+**Issue:** Too many RuboCop violations
+
+**Solution:** Configure `.rubocop.yml` to disable certain cops:
+
+```yaml
+Style/FrozenStringLiteralComment:
+  Enabled: false
 ```
 
 ### Performance Issues
@@ -350,18 +342,16 @@ fi
 **Issue:** Hooks are slow
 
 **Solutions:**
-1. Limit TypeScript checks to changed files only
-2. Use faster package managers (pnpm > npm)
-3. Add more skip conditions
-4. Disable Prettier for large files
 
-```bash
-# Skip large files in stop-prettier-formatter.sh
-file_size=$(wc -c < "$file" 2>/dev/null || echo 0)
-if [[ $file_size -gt 100000 ]]; then  # Skip files > 100KB
-    continue
-fi
-```
+1. Configure RuboCop to exclude directories (add to `.rubocop.yml`):
+   ```yaml
+   AllCops:
+     Exclude:
+       - "db/schema.rb"
+       - "node_modules/**/*"
+       - "vendor/**/*"
+   ```
+2. Use `--autocorrect` instead of `--autocorrect-all` for faster runs
 
 ### Debugging Hooks
 
@@ -373,7 +363,7 @@ set -x  # Enable debug mode
 
 # Or add specific debug lines
 echo "DEBUG: file_path=$file_path" >&2
-echo "DEBUG: repo=$repo" >&2
+echo "DEBUG: CLAUDE_PROJECT_DIR=$CLAUDE_PROJECT_DIR" >&2
 ```
 
 View hook execution in Claude Code's logs.
@@ -402,34 +392,29 @@ You can create your own hooks for other events:
 }
 ```
 
-### Monorepo Configuration
+### Rails Engine Projects
 
-For monorepos with multiple packages:
+For Rails engines or modular monoliths:
 
 ```bash
-# In post-tool-use-tracker.sh, detect_repo()
-case "$repo" in
-    packages)
-        # Get the package name
-        local package=$(echo "$relative_path" | cut -d'/' -f2)
-        if [[ -n "$package" ]]; then
-            echo "packages/$package"
-        else
-            echo "$repo"
-        fi
+# In post-tool-use-tracker.sh
+case "$file_path" in
+    */engines/*)
+        engine_name=$(echo "$file_path" | sed 's|.*/engines/\([^/]*\)/.*|\1|')
+        echo "engine:$engine_name"
         ;;
 esac
 ```
 
 ### Docker/Container Projects
 
-If your build commands need to run in containers:
+If your Rails app runs in containers:
 
 ```bash
-# In post-tool-use-tracker.sh, get_build_command()
-if [[ "$repo" == "api" ]]; then
-    echo "docker-compose exec api npm run build"
-    return
+# In rubocop-check.sh, replace the rubocop command
+if docker-compose exec web rubocop --autocorrect-all --display-only-failed; then
+    echo -e "${GREEN}✅ Rubocop checks passed!${NC}"
+    exit 0
 fi
 ```
 
@@ -440,9 +425,16 @@ fi
 3. **Document customizations** - Add comments to explain custom logic
 4. **Version control** - Commit `.claude/` directory to git
 5. **Team consistency** - Share configuration across team
+6. **Configure RuboCop** - Use `.rubocop.yml` for project-specific rules
+
+## Rails-Specific Best Practices
+
+1. **Exclude generated files** - Add `db/schema.rb` to RuboCop excludes
+2. **Use Bundler** - Add RuboCop to Gemfile for team consistency
+3. **Configure for Rails** - Use `rubocop-rails` gem for Rails-specific cops
+4. **Test hooks** - Verify hooks work with Rails structure (controllers, models, etc.)
 
 ## See Also
 
 - [README.md](./README.md) - Hooks overview
-- [../../docs/HOOKS_SYSTEM.md](../../docs/HOOKS_SYSTEM.md) - Complete hooks reference
-- [../../docs/SKILLS_SYSTEM.md](../../docs/SKILLS_SYSTEM.md) - Skills integration
+- [../../CLAUDE_INTEGRATION.md](../../CLAUDE_INTEGRATION.md) - Complete integration guide
