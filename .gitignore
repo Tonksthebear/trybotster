@@ -46,3 +46,6 @@
 config/github_app_private_key.pem
 mise.toml
 .agents/
+
+# macOS files
+.DS_Store

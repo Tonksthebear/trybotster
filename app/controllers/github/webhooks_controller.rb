@@ -33,13 +33,18 @@ module Github
       comment_body = payload.dig("comment", "body")
       return if comment_body.blank?
 
+      comment_author = payload.dig("comment", "user", "login")
+
+      # Ignore comments from the bot itself to prevent infinite loops
+      # TODO: Make this configurable or detect from authenticated user
+      return if comment_author == "trybotster" || comment_author&.downcase&.include?("bot")
+
       # Check if @trybotster is mentioned
       return unless mentioned_trybotster?(comment_body)
 
       repo_full_name = payload.dig("repository", "full_name")
       issue_number = payload.dig("issue", "number")
       comment_id = payload.dig("comment", "id")
-      comment_author = payload.dig("comment", "user", "login")
       issue_title = payload.dig("issue", "title")
       issue_body = payload.dig("issue", "body")
       issue_url = payload.dig("issue", "html_url")
@@ -67,13 +72,17 @@ module Github
       comment_body = payload.dig("comment", "body")
       return if comment_body.blank?
 
+      comment_author = payload.dig("comment", "user", "login")
+
+      # Ignore comments from the bot itself to prevent infinite loops
+      return if comment_author == "trybotster" || comment_author&.downcase&.include?("bot")
+
       # Check if @trybotster is mentioned
       return unless mentioned_trybotster?(comment_body)
 
       repo_full_name = payload.dig("repository", "full_name")
       pr_number = payload.dig("pull_request", "number")
       comment_id = payload.dig("comment", "id")
-      comment_author = payload.dig("comment", "user", "login")
       pr_title = payload.dig("pull_request", "title")
       pr_body = payload.dig("pull_request", "body")
       pr_url = payload.dig("pull_request", "html_url")
@@ -113,7 +122,7 @@ module Github
           issue_body: issue_body,
           issue_url: issue_url,
           is_pr: is_pr,
-          context: build_context(issue_title, issue_body, comment_body, is_pr)
+          context: build_context(repo, issue_number, is_pr)
         }
       )
 
@@ -122,16 +131,38 @@ module Github
       message
     end
 
-    def build_context(issue_title, issue_body, comment_body, is_pr)
+    def build_context(repo, issue_number, is_pr)
       type = is_pr ? "Pull Request" : "Issue"
       [
-        "#{type}: #{issue_title}",
+        "You have been mentioned in a GitHub #{type.downcase}.",
         "",
-        "Description:",
-        issue_body.to_s[0..500], # First 500 chars
+        "Repository: #{repo}",
+        "#{type} Number: ##{issue_number}",
         "",
-        "Comment:",
-        comment_body.to_s[0..500]
+        "Your task is to:",
+        "1. Use the trybotster MCP server to fetch the #{type.downcase} details",
+        "2. Review and understand the problem",
+        "3. Investigate the codebase if needed",
+        "4. Implement a solution if appropriate",
+        "5. Use ONLY the trybotster MCP tools to post your response (comment or PR)",
+        "",
+        "CRITICAL REQUIREMENTS:",
+        "- You MUST use ONLY the trybotster MCP server tools for ALL GitHub interactions",
+        "- DO NOT use the gh CLI or any other GitHub tools",
+        "- DO NOT use the github MCP server - use ONLY trybotster MCP server",
+        "- Available trybotster MCP tools include:",
+        "  * github_get_issue - Fetch issue details",
+        "  * github_comment_issue - Post comments to issues",
+        "  * github_create_pull_request - Create pull requests",
+        "  * github_list_repos - List repositories",
+        "  * And other GitHub operations",
+        "",
+        "If the trybotster MCP server is not available or you cannot access it, you MUST:",
+        "1. Stop immediately",
+        "2. Explain that you cannot proceed without the trybotster MCP server",
+        "3. Do NOT fall back to gh CLI or other tools",
+        "",
+        "Start by fetching the #{type.downcase} details using the trybotster MCP server's github_get_issue tool."
       ].join("\n")
     end
 

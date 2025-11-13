@@ -73,6 +73,39 @@ session_exists() {
     [[ -f "$(session_file "$session_key")" ]]
 }
 
+# Check if session is stale (completed or missing worktree)
+is_session_stale() {
+    local session_key="$1"
+
+    # If session file doesn't exist, it's not stale (it doesn't exist)
+    if ! session_exists "$session_key"; then
+        return 1
+    fi
+
+    local worktree_path=$(get_session_field "$session_key" "worktree_path")
+
+    # If worktree is missing, session is stale
+    if [[ ! -d "$worktree_path" ]]; then
+        log "Session ${session_key} is stale: worktree missing at ${worktree_path}" >&2
+        return 0
+    fi
+
+    # Check for completion marker (use hardcoded default to avoid config dependency)
+    local completion_marker=".botster_status"
+    local marker_file="${worktree_path}/${completion_marker}"
+
+    if [[ -f "$marker_file" ]]; then
+        local content=$(cat "$marker_file" 2>/dev/null)
+        if [[ "$content" == *"RESOLVED"* ]] || [[ "$content" == *"DONE"* ]]; then
+            log "Session ${session_key} is stale: completion marker found" >&2
+            return 0
+        fi
+    fi
+
+    # Session exists and is not completed
+    return 1
+}
+
 # Get session field
 get_session_field() {
     local session_key="$1"
@@ -179,6 +212,9 @@ completion_marker=.botster_status
 max_sessions=20
 poll_interval=5
 worktree_base=$HOME/botster-sessions
+claude_permission_mode=acceptEdits
+claude_dangerously_skip_permissions=false
+claude_allowed_tools=mcp__*
 EOF
         log "Created default config at $CONFIG_FILE"
     fi
@@ -246,7 +282,26 @@ poll_messages() {
         return 1
     fi
 
-    curl -s -H "X-API-Key: $api_key" "$server_url/bots/messages" 2>/dev/null
+    # Get the current git repository name (owner/repo format)
+    local repo_name=""
+    if git rev-parse --git-dir > /dev/null 2>&1; then
+        # Try to get from remote URL
+        local remote_url=$(git remote get-url origin 2>/dev/null)
+        if [[ -n "$remote_url" ]]; then
+            # Extract owner/repo from various Git URL formats
+            # SSH: git@github.com:owner/repo.git
+            # HTTPS: https://github.com/owner/repo.git
+            repo_name=$(echo "$remote_url" | sed -E 's#^(https?://[^/]+/|git@[^:]+:)##' | sed 's/\.git$//')
+        fi
+    fi
+
+    # Include repo parameter if detected
+    local url="$server_url/bots/messages"
+    if [[ -n "$repo_name" ]]; then
+        url="${url}?repo=${repo_name}"
+    fi
+
+    curl -s -H "X-API-Key: $api_key" "$url" 2>/dev/null
 }
 
 ack_message() {
@@ -279,22 +334,145 @@ create_worktree() {
     local repo_safe="${repo//\//-}"
     local branch_name="botster-${repo_safe}-${issue_number}"
     local worktree_base=$(get_config "worktree_base")
+    local clone_dir="$worktree_base/$repo_safe"
     local worktree_path="$worktree_base/${repo_safe}-${issue_number}"
 
-    # Check if we're in a git repo
-    if ! git rev-parse --git-dir > /dev/null 2>&1; then
-        log_error "Not in a git repository. Cannot create worktree."
-        return 1
+    # Clone the repo if it doesn't exist
+    if [[ ! -d "$clone_dir" ]]; then
+        log "Cloning repository: https://github.com/$repo.git to $clone_dir" >&2
+        if ! git clone "https://github.com/$repo.git" "$clone_dir" >> "$LOG_FILE" 2>&1; then
+            log_error "Failed to clone repository: $repo" >&2
+            return 1
+        fi
+    else
+        log "Using existing clone: $clone_dir" >&2
+        pushd "$clone_dir" > /dev/null
+        git pull >> "$LOG_FILE" 2>&1 || log_warn "Failed to pull latest changes" >&2
+        popd > /dev/null
     fi
 
-    # Create worktree (redirect output to log file only, not stdout)
-    if git worktree add "$worktree_path" -b "$branch_name" >> "$LOG_FILE" 2>&1; then
-        log_success "Created worktree: $worktree_path"
-        echo "$worktree_path"
+    # === CRITICAL: Use absolute path for worktree add ===
+    # git worktree add creates the directory relative to the current repo
+    # We must cd into the clone first, then use absolute path for the target
+    pushd "$clone_dir" > /dev/null
+
+    if [[ -d "$worktree_path" ]]; then
+        log "Reusing existing worktree: $worktree_path" >&2
     else
-        log_error "Failed to create worktree: $worktree_path"
-        return 1
+        if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+            log "Creating worktree from existing branch: $branch_name" >&2
+            git worktree add "$worktree_path" "$branch_name" >> "$LOG_FILE" 2>&1 || { popd > /dev/null; return 1; }
+        else
+            log "Creating worktree with new branch: $branch_name" >&2
+            git worktree add -b "$branch_name" "$worktree_path" >> "$LOG_FILE" 2>&1 || { popd > /dev/null; return 1; }
+        fi
+        log_success "Created worktree: $worktree_path" >&2
     fi
+
+    popd > /dev/null
+
+    # Pre-trust the directory
+    mkdir -p "$worktree_path/.claude"
+    touch "$worktree_path/.claude/trusted"
+    log "Pre-trusted worktree: $worktree_path" >&2
+
+    # Output ONLY the path to stdout (everything else goes to stderr)
+    echo "$worktree_path"
+}
+
+#############################################################################
+# Agent CLI Options Management
+#############################################################################
+
+# Build CLI options for Claude Code
+build_claude_code_options() {
+    local options=""
+
+    # Whitelisted Claude Code options
+    local model=$(get_config "claude_model")
+    local permission_mode=$(get_config "claude_permission_mode")
+    local max_turns=$(get_config "claude_max_turns")
+    local add_dir=$(get_config "claude_add_dir")
+    local system_prompt=$(get_config "claude_system_prompt")
+    local system_prompt_file=$(get_config "claude_system_prompt_file")
+    local append_system_prompt=$(get_config "claude_append_system_prompt")
+    local allowed_tools=$(get_config "claude_allowed_tools")
+    local disallowed_tools=$(get_config "claude_disallowed_tools")
+    local verbose=$(get_config "claude_verbose")
+    local dangerously_skip_permissions=$(get_config "claude_dangerously_skip_permissions")
+    local mcp_config=$(get_config "claude_mcp_config")
+    local settings=$(get_config "claude_settings")
+
+    # Build options string (only include non-empty values)
+    if [[ -n "$model" ]]; then
+        options="$options --model $model"
+    fi
+
+    if [[ -n "$permission_mode" ]]; then
+        options="$options --permission-mode $permission_mode"
+    fi
+
+    if [[ -n "$max_turns" ]]; then
+        options="$options --max-turns $max_turns"
+    fi
+
+    if [[ -n "$add_dir" ]]; then
+        options="$options --add-dir $add_dir"
+    fi
+
+    if [[ -n "$system_prompt" ]]; then
+        options="$options --system-prompt '$system_prompt'"
+    fi
+
+    if [[ -n "$system_prompt_file" ]]; then
+        options="$options --system-prompt-file $system_prompt_file"
+    fi
+
+    if [[ -n "$append_system_prompt" ]]; then
+        options="$options --append-system-prompt '$append_system_prompt'"
+    fi
+
+    if [[ -n "$allowed_tools" ]]; then
+        options="$options --allowedTools $allowed_tools"
+    fi
+
+    if [[ -n "$disallowed_tools" ]]; then
+        options="$options --disallowedTools $disallowed_tools"
+    fi
+
+    if [[ "$verbose" == "true" ]]; then
+        options="$options --verbose"
+    fi
+
+    if [[ "$dangerously_skip_permissions" == "true" ]]; then
+        options="$options --dangerously-skip-permissions"
+    fi
+
+    if [[ -n "$mcp_config" ]]; then
+        options="$options --mcp-config $mcp_config"
+    fi
+
+    if [[ -n "$settings" ]]; then
+        options="$options --settings $settings"
+    fi
+
+    # Trim leading space and return
+    echo "${options# }"
+}
+
+# Build CLI options based on agent command
+build_agent_options() {
+    local agent_command=$(get_config "agent_command")
+
+    case "$agent_command" in
+        claude|"claude code")
+            build_claude_code_options
+            ;;
+        *)
+            # No special options for other agents
+            echo ""
+            ;;
+    esac
 }
 
 #############################################################################
@@ -308,28 +486,112 @@ spawn_terminal() {
     local context="$4"
 
     local agent_command=$(get_config "agent_command")
+    local agent_options=$(build_agent_options)
     local completion_marker=$(get_config "completion_marker")
-    local server_url=$(get_config "server_url")
     local api_key=$(get_config "api_key")
 
-    # Escape for AppleScript (replace single quotes)
-    local escaped_path="${worktree_path//\'/\\\'}"
+    # Create temporary files for script and context
+    local script_file=$(mktemp)
+    local context_file=$(mktemp)
 
-    # AppleScript to spawn Terminal tab
-    local script="tell application \"Terminal\"
+    # Write context to file using printf to preserve exact content
+    printf '%s' "$context" > "$context_file"
+
+    # Write the shell script that will be executed in the terminal
+    # Register MCP server at local scope (project-specific user settings)
+    # This avoids needing approval for project-scoped .mcp.json
+    cat > "$script_file" <<SCRIPT_EOF
+#!/bin/bash
+cd '$worktree_path' || { echo "FATAL: Cannot cd to worktree: $worktree_path"; exit 1; }
+mkdir -p .claude && touch .claude/trusted
+export BOTSTER_API_KEY='$api_key'
+
+# Register trybotster MCP server at local scope (highest precedence, no approval needed)
+echo "Registering trybotster MCP server..."
+claude mcp add trybotster \\
+  --transport http \\
+  https://mcp-dev.trybotster.com \\
+  --header "Authorization: Bearer $api_key" \\
+  || echo "WARNING: Failed to register MCP server"
+
+# Verify server is available
+echo "Verifying MCP server..."
+claude mcp list
+
+# Create .claude directory structure
+mkdir -p .claude/hooks
+
+# Create settings.local.json with pre-approved MCP tools
+echo "Creating .claude/settings.local.json with allowed tools..."
+cat > .claude/settings.local.json <<SETTINGS_EOF
+{
+  "permissions": {
+    "allow": [
+      "mcp__trybotster__github_get_issue",
+      "mcp__trybotster__github_list_issues",
+      "mcp__trybotster__github_comment_issue",
+      "mcp__trybotster__github_update_issue",
+      "mcp__trybotster__github_create_issue",
+      "mcp__trybotster__github_create_pull_request",
+      "mcp__trybotster__github_get_pull_request",
+      "mcp__trybotster__github_list_repos",
+      "mcp__trybotster__github_search_repos"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
+SETTINGS_EOF
+
+echo "✓ Pre-approved trybotster MCP tools in .claude/settings.local.json"
+
+# Start Claude Code with context
+echo "Starting Claude Code..."
+$agent_command $agent_options -- "\$(cat '$context_file')" || echo 'Agent failed'
+echo 'DONE' > $completion_marker
+rm -f '$context_file' '$script_file'
+SCRIPT_EOF
+
+    chmod +x "$script_file"
+
+    # Escape for AppleScript
+    local esc_script="${script_file//\'/\'\\\'\'}"
+    local esc_title="Botster: ${repo//#/\\#}#${issue_number}"
+    esc_title="${esc_title//\'/\'\\\'\'}"
+
+    # AppleScript to spawn Terminal and get window ID by parsing do script output
+    local tab_desc
+    tab_desc=$(osascript <<EOF 2>&1
+tell application "Terminal"
     activate
-    set newTab to do script \"cd '$escaped_path' && export BOTSTER_API_KEY='$api_key' && $agent_command || echo 'Agent failed'; echo 'DONE' > $completion_marker\"
-    set custom title of front window to \"Botster: ${repo}#${issue_number}\"
-    return id of front window
-end tell"
+    do script "$esc_script"
+end tell
+EOF
+)
 
-    local terminal_id=$(osascript -e "$script" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        log_error "AppleScript failed: $tab_desc"
+        return 1
+    fi
 
-    if [[ $? -eq 0 ]]; then
+    # Parse window ID from tab description, e.g. "tab 1 of window id 12345"
+    local terminal_id=$(echo "$tab_desc" | sed -n 's/.*window id \([0-9]*\).*/\1/p')
+
+    # Set title (separate osascript, as it's now open)
+    if [[ -n "$terminal_id" ]]; then
+        osascript <<EOF 2>/dev/null
+tell application "Terminal"
+    set custom title of window id $terminal_id to "$esc_title"
+end tell
+EOF
+    fi
+
+    if [[ -n "$terminal_id" && "$terminal_id" =~ ^[0-9]+$ ]]; then
         log_success "Spawned terminal for ${repo}#${issue_number}"
+        log "Terminal ID: $terminal_id" >&2
         echo "$terminal_id"
     else
-        log_error "Failed to spawn terminal: $terminal_id"
+        log_error "Failed to spawn terminal: Invalid ID from $tab_desc"
         return 1
     fi
 }
@@ -380,9 +642,24 @@ process_messages() {
 
         # Check if session already exists
         if session_exists "$session_key"; then
-            log_warn "Session already exists for ${session_key}, skipping"
-            ack_message "$message_id"
-            continue
+            # Check if session is stale (completed or missing worktree)
+            if is_session_stale "$session_key"; then
+                log "Session ${session_key} is stale, cleaning up"
+
+                # Cleanup stale session
+                local worktree_path=$(get_session_field "$session_key" "worktree_path")
+                if [[ -d "$worktree_path" ]]; then
+                    git worktree remove "$worktree_path" --force >> "$LOG_FILE" 2>&1 || true
+                fi
+                remove_session "$session_key"
+
+                log_success "Cleaned up stale session: ${session_key}"
+                # Continue processing this message
+            else
+                log_warn "Session already exists for ${session_key}, skipping"
+                ack_message "$message_id"
+                continue
+            fi
         fi
 
         # Check max sessions
@@ -407,11 +684,31 @@ process_messages() {
         # Get context
         local context=$(json_extract_string "$payload" "context")
 
-        # Spawn terminal
-        local terminal_id=$(spawn_terminal "$worktree_path" "$repo" "$issue_number" "$context")
+        # Append trust snippet to context for Claude-Code
+        local agent_command=$(get_config "agent_command")
+        if [[ "$agent_command" == "claude" || "$agent_command" == "claude code" ]]; then
+            context+=$'\n\n**First action (run automatically):**
+```bash
+# Trust this directory once (creates .claude/trusted if needed)
+mkdir -p .claude && touch .claude/trusted
+echo "Directory trusted for this session"
+```'
+        fi
 
-        if [[ $? -ne 0 ]]; then
+        # Spawn terminal
+        local terminal_id
+        terminal_id=$(spawn_terminal "$worktree_path" "$repo" "$issue_number" "$context")
+        local spawn_status=$?
+
+        if [[ $spawn_status -ne 0 ]]; then
             log_error "Failed to spawn terminal for ${session_key}"
+            git worktree remove "$worktree_path" --force 2>/dev/null || true
+            continue
+        fi
+
+        # Verify terminal_id doesn't contain error messages
+        if [[ -z "$terminal_id" ]] || [[ "$terminal_id" == *"error"* ]] || [[ "$terminal_id" == *"syntax error"* ]]; then
+            log_error "Invalid terminal ID for ${session_key}: $terminal_id"
             git worktree remove "$worktree_path" --force 2>/dev/null || true
             continue
         fi
@@ -474,8 +771,31 @@ cmd_start() {
         exit 1
     fi
 
+    # Validate that we're in a git repository
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        log_error "Not in a git repository. Botster Hub must be run from the root of your project."
+        exit 1
+    fi
+
+    # Validate that we can detect the repository name
+    local remote_url=$(git remote get-url origin 2>/dev/null)
+    if [[ -z "$remote_url" ]]; then
+        log_error "No git remote 'origin' found. Please configure a remote first:"
+        log_error "  git remote add origin <url>"
+        exit 1
+    fi
+
+    # Extract and validate repo name
+    local repo_name=$(echo "$remote_url" | sed -E 's#^(https?://[^/]+/|git@[^:]+:)##' | sed 's/\.git$//')
+    if [[ -z "$repo_name" ]] || [[ ! "$repo_name" =~ / ]]; then
+        log_error "Could not extract repository name from remote URL: $remote_url"
+        log_error "Expected format: owner/repo"
+        exit 1
+    fi
+
     log_success "Starting Botster Hub v${VERSION}"
     log "Server: $(get_config server_url)"
+    log "Repository: $repo_name"
     log "Poll interval: $(get_config poll_interval)s"
 
     # Write PID
@@ -492,6 +812,35 @@ cmd_start() {
         check_sessions
         sleep "$poll_interval"
     done
+}
+
+# Test command - spawns a test terminal
+cmd_test() {
+    log "Testing terminal spawn in 3 seconds..."
+    sleep 3
+
+    local test_path=$(pwd)
+    local test_repo="test/repo"
+    local test_issue="999"
+    local test_context="This is a test message from botster_hub.
+
+Please confirm that:
+1. This terminal opened successfully
+2. Claude received this message
+3. You can see this context
+
+If you can see this, the terminal spawning is working!"
+
+    log "Spawning test terminal..."
+    spawn_terminal "$test_path" "$test_repo" "$test_issue" "$test_context"
+
+    log "Test terminal spawned. Check if new terminal opened."
+    log "Daemon will keep running for 30 seconds..."
+
+    # Keep running for 30 seconds to see if terminal stays open
+    sleep 30
+
+    log "Test complete."
 }
 
 cmd_status() {
@@ -601,6 +950,7 @@ Botster Hub v${VERSION} - GitHub mention → local agent automation
 
 Usage:
   botster_hub start                  Start the daemon
+  botster_hub test                   Test terminal spawning with Claude
   botster_hub status                 Show active sessions
   botster_hub kill <session_key>     Kill a specific session
   botster_hub cleanup                Clean up stale worktrees
@@ -615,6 +965,32 @@ Configuration ($CONFIG_FILE):
   max_sessions     - Max concurrent sessions (default: 20)
   poll_interval    - Seconds between polls (default: 5)
   worktree_base    - Base directory for worktrees
+
+Claude Code Agent Options (when agent_command=claude):
+  claude_model                        - Model to use (sonnet, opus, etc)
+  claude_permission_mode              - Permission mode (acceptEdits, plan, etc)
+  claude_max_turns                    - Max agentic turns in non-interactive mode
+  claude_add_dir                      - Additional working directories
+  claude_system_prompt                - Custom system prompt (replaces default)
+  claude_system_prompt_file           - Load system prompt from file
+  claude_append_system_prompt         - Append to default system prompt
+  claude_allowed_tools                - Tools permitted without prompting
+  claude_disallowed_tools             - Tools blocked
+  claude_verbose                      - Enable verbose logging (true/false)
+  claude_dangerously_skip_permissions - Skip permission prompts (true/false)
+  claude_mcp_config                   - Path to MCP config file or JSON string
+  claude_settings                     - Path to settings JSON file or JSON string
+
+Example: Configure Claude Code with acceptEdits permissions
+  botster_hub config agent_command claude
+  botster_hub config claude_permission_mode acceptEdits
+  botster_hub config claude_model sonnet
+
+Example: Use your home directory MCP config
+  botster_hub config claude_mcp_config ~/.config/claude/mcp_servers.json
+
+Example: Use your home directory settings
+  botster_hub config claude_settings ~/.config/claude/settings.json
 
 Session Files:
   Each session stored in: $SESSIONS_DIR/<repo>-<issue>
@@ -644,6 +1020,9 @@ main() {
     case "$command" in
         start)
             cmd_start
+            ;;
+        test)
+            cmd_test
             ;;
         status)
             cmd_status

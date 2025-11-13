@@ -10,9 +10,21 @@ module Bots
     # GET /bots/messages
     # Returns pending, unclaimed messages for repos the authenticated user has access to
     # First-come-first-served: daemon claims messages by polling
+    # Required query param: repo (e.g., ?repo=owner/repo) to filter by repository
     def index
-      # Get all pending, unclaimed messages
-      messages = Bot::Message.for_delivery.limit(50)
+      # Require repo parameter
+      if params[:repo].blank?
+        render json: {
+          error: "Missing required parameter: repo",
+          message: "Please provide the repository name in format: owner/repo"
+        }, status: :bad_request
+        return
+      end
+
+      # Get all pending, unclaimed messages for this specific repo
+      messages = Bot::Message.for_delivery
+        .where("payload->>'repo' = ?", params[:repo])
+        .limit(50)
 
       # Filter messages by repo access authorization
       authorized_messages = []
