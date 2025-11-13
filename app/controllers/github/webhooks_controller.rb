@@ -33,9 +33,8 @@ module Github
       comment_body = payload.dig("comment", "body")
       return if comment_body.blank?
 
-      # Find all @username mentions in the comment
-      mentioned_usernames = extract_mentions(comment_body)
-      return if mentioned_usernames.empty?
+      # Check if @trybotster is mentioned
+      return unless mentioned_trybotster?(comment_body)
 
       repo_full_name = payload.dig("repository", "full_name")
       issue_number = payload.dig("issue", "number")
@@ -46,29 +45,20 @@ module Github
       issue_url = payload.dig("issue", "html_url")
       is_pr = payload.dig("issue", "pull_request").present?
 
-      Rails.logger.info "Processing mentions: #{mentioned_usernames.join(', ')} in #{repo_full_name}##{issue_number}"
+      Rails.logger.info "Processing @trybotster mention in #{repo_full_name}##{issue_number}"
 
-      # Find users by GitHub username and create bot messages
-      mentioned_usernames.each do |username|
-        user = find_user_by_github_username(username)
-
-        if user
-          create_bot_message_for_user(
-            user: user,
-            repo: repo_full_name,
-            issue_number: issue_number,
-            comment_id: comment_id,
-            comment_body: comment_body,
-            comment_author: comment_author,
-            issue_title: issue_title,
-            issue_body: issue_body,
-            issue_url: issue_url,
-            is_pr: is_pr
-          )
-        else
-          Rails.logger.warn "User not found for GitHub username: #{username}"
-        end
-      end
+      # Create a single bot message (first daemon with repo access will claim it)
+      create_bot_message(
+        repo: repo_full_name,
+        issue_number: issue_number,
+        comment_id: comment_id,
+        comment_body: comment_body,
+        comment_author: comment_author,
+        issue_title: issue_title,
+        issue_body: issue_body,
+        issue_url: issue_url,
+        is_pr: is_pr
+      )
     end
 
     def handle_pr_review_comment(payload)
@@ -77,8 +67,8 @@ module Github
       comment_body = payload.dig("comment", "body")
       return if comment_body.blank?
 
-      mentioned_usernames = extract_mentions(comment_body)
-      return if mentioned_usernames.empty?
+      # Check if @trybotster is mentioned
+      return unless mentioned_trybotster?(comment_body)
 
       repo_full_name = payload.dig("repository", "full_name")
       pr_number = payload.dig("pull_request", "number")
@@ -88,43 +78,30 @@ module Github
       pr_body = payload.dig("pull_request", "body")
       pr_url = payload.dig("pull_request", "html_url")
 
-      Rails.logger.info "Processing PR review mentions: #{mentioned_usernames.join(', ')} in #{repo_full_name}##{pr_number}"
+      Rails.logger.info "Processing @trybotster mention in PR #{repo_full_name}##{pr_number}"
 
-      mentioned_usernames.each do |username|
-        user = find_user_by_github_username(username)
-
-        if user
-          create_bot_message_for_user(
-            user: user,
-            repo: repo_full_name,
-            issue_number: pr_number,
-            comment_id: comment_id,
-            comment_body: comment_body,
-            comment_author: comment_author,
-            issue_title: pr_title,
-            issue_body: pr_body,
-            issue_url: pr_url,
-            is_pr: true
-          )
-        else
-          Rails.logger.warn "User not found for GitHub username: #{username}"
-        end
-      end
+      # Create a single bot message (first daemon with repo access will claim it)
+      create_bot_message(
+        repo: repo_full_name,
+        issue_number: pr_number,
+        comment_id: comment_id,
+        comment_body: comment_body,
+        comment_author: comment_author,
+        issue_title: pr_title,
+        issue_body: pr_body,
+        issue_url: pr_url,
+        is_pr: true
+      )
     end
 
-    def extract_mentions(text)
-      # Extract @username mentions (GitHub format)
-      text.scan(/@([\w-]+)/).flatten.uniq
+    def mentioned_trybotster?(text)
+      # Check if @trybotster is mentioned in the text
+      text.match?(/@trybotster\b/i)
     end
 
-    def find_user_by_github_username(username)
-      # Find user by their GitHub username
-      User.find_by(username: username)
-    end
-
-    def create_bot_message_for_user(user:, repo:, issue_number:, comment_id:, comment_body:,
-                                     comment_author:, issue_title:, issue_body:, issue_url:, is_pr:)
-      message = user.bot_messages.create!(
+    def create_bot_message(repo:, issue_number:, comment_id:, comment_body:,
+                            comment_author:, issue_title:, issue_body:, issue_url:, is_pr:)
+      message = Bot::Message.create!(
         event_type: "github_mention",
         payload: {
           repo: repo,
@@ -140,10 +117,9 @@ module Github
         }
       )
 
-      Rails.logger.info "Created Bot::Message #{message.id} for user #{user.id} (#{user.username})"
+      Rails.logger.info "Created Bot::Message #{message.id} for #{repo}##{issue_number}"
 
-      # Broadcast to user's WebSocket channel if connected
-      broadcast_to_user(user, message)
+      message
     end
 
     def build_context(issue_title, issue_body, comment_body, is_pr)
@@ -159,21 +135,7 @@ module Github
       ].join("\n")
     end
 
-    def broadcast_to_user(user, message)
-      # Broadcast via ActionCable
-      BotChannel.broadcast_to(
-        user,
-        {
-          type: "new_message",
-          message_id: message.id,
-          event_type: message.event_type,
-          payload: message.payload,
-          created_at: message.created_at
-        }
-      )
-    rescue => e
-      Rails.logger.error "Failed to broadcast message to user #{user.id}: #{e.message}"
-    end
+
 
     def parse_webhook_payload
       @webhook_payload = JSON.parse(@payload_body)
