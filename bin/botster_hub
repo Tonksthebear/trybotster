@@ -525,7 +525,7 @@ claude mcp add trybotster \\
 echo "Verifying MCP server..."
 claude mcp list
 
-# Copy .claude settings from main project (but disable hooks for bot sessions)
+# Copy .claude settings from main project
 echo "Setting up .claude permissions..."
 mkdir -p .claude/hooks
 
@@ -538,6 +538,53 @@ else
   echo "  $main_project_dir/.claude/settings.local.json"
   echo "  Spawned Claude will use default permissions"
 fi
+
+# Create auto-exit hook script
+echo "Creating auto-exit hook for completion detection..."
+cat > .claude/hooks/check_completion.sh <<HOOK_EOF
+#!/bin/bash
+# Auto-exit hook - checks for completion marker and exits session
+
+COMPLETION_MARKER="$completion_marker"
+
+# Check if completion marker exists
+if [ -f "\\\$COMPLETION_MARKER" ]; then
+  content=\\\$(cat "\\\$COMPLETION_MARKER" 2>/dev/null)
+
+  # Check if Claude marked task as complete
+  if [[ "\\\$content" == *"RESOLVED"* ]] || [[ "\\\$content" == *"DONE"* ]]; then
+    echo ""
+    echo "✓ Task marked as complete. Exiting Claude Code session..."
+    echo ""
+
+    # Exit the Claude Code session
+    exit 0
+  fi
+fi
+HOOK_EOF
+
+chmod +x .claude/hooks/check_completion.sh
+
+# Create hooks configuration
+cat > .claude/hooks.json <<'HOOKS_JSON_EOF'
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/check_completion.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+HOOKS_JSON_EOF
+
+echo "✓ Created auto-exit hook configuration"
 
 # Pre-accept trust dialog for this worktree in ~/.claude.json
 echo "Pre-accepting workspace trust..."

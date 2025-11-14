@@ -313,6 +313,24 @@ module Github
       { success: false, error: e.message }
     end
 
+    # Get issue comments
+    # @param access_token [String] The GitHub access token
+    # @param repo [String] Repository in "owner/repo" format
+    # @param issue_number [Integer] Issue or PR number
+    # @return [Hash] Comments array or error
+    def get_issue_comments(access_token, repo:, issue_number:)
+      client = client(access_token)
+      comments = client.issue_comments(repo, issue_number)
+
+      {
+        success: true,
+        comments: comments.map(&:to_h)
+      }
+    rescue Octokit::Error => e
+      Rails.logger.error "GitHub App get issue comments error: #{e.message}"
+      { success: false, error: e.message }
+    end
+
     # Search repositories
     # @param access_token [String] The GitHub access token
     # @param query [String] Search query

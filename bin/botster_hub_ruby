@@ -1,0 +1,943 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Botster Hub - Ruby daemon for GitHub mention → local agent automation
+# ZERO dependencies - uses only Ruby 2.7+ standard library
+
+require 'fileutils'
+require 'json'
+require 'net/http'
+require 'uri'
+require 'logger'
+require 'time'
+require 'shellwords'
+
+VERSION = '0.2.0'
+
+# Color codes for terminal output
+module Colors
+  RED = "\e[0;31m"
+  GREEN = "\e[0;32m"
+  YELLOW = "\e[1;33m"
+  RESET = "\e[0m"
+end
+
+# Main Botster Hub application
+class BotsterHub
+  attr_reader :config_dir, :sessions_dir, :config_file, :log_file, :pid_file
+
+  def initialize
+    @config_dir = File.join(ENV['HOME'], '.botster_hub')
+    @sessions_dir = File.join(@config_dir, 'sessions')
+    @config_file = File.join(@config_dir, 'config.json')
+    @log_file = File.join(@config_dir, 'botster_hub.log')
+    @pid_file = File.join(@config_dir, 'botster_hub.pid')
+
+    init_dirs
+    setup_logger
+  end
+
+  def run(args)
+    command = args[0] || 'help'
+
+    case command
+    when 'start'
+      cmd_start
+    when 'test'
+      cmd_test
+    when 'status'
+      cmd_status
+    when 'kill'
+      cmd_kill(args[1])
+    when 'cleanup'
+      cmd_cleanup
+    when 'config'
+      cmd_config(args[1], args[2])
+    when 'version', '--version', '-v'
+      puts "Botster Hub v#{VERSION}"
+    when 'help', '--help', '-h'
+      cmd_help
+    else
+      puts "Unknown command: #{command}"
+      puts "Run 'botster_hub help' for usage"
+      exit 1
+    end
+  end
+
+  private
+
+  def init_dirs
+    FileUtils.mkdir_p(@config_dir)
+    FileUtils.mkdir_p(@sessions_dir)
+    FileUtils.mkdir_p(File.join(ENV['HOME'], 'botster-sessions'))
+
+    # Create default config if it doesn't exist
+    unless File.exist?(@config_file)
+      default_config = {
+        server_url: 'http://localhost:3000',
+        api_key: '',
+        agent_command: 'claude',
+        completion_marker: '.botster_status',
+        max_sessions: 20,
+        poll_interval: 5,
+        worktree_base: File.join(ENV['HOME'], 'botster-sessions'),
+        claude_permission_mode: 'acceptEdits',
+        claude_dangerously_skip_permissions: false,
+        claude_allowed_tools: 'mcp__*'
+      }
+      File.write(@config_file, JSON.pretty_generate(default_config))
+      log_info "Created default config at #{@config_file}"
+    end
+  end
+
+  def setup_logger
+    @logger = Logger.new(@log_file, 10, 1024000)
+    @logger.level = Logger::INFO
+    @logger.formatter = proc do |severity, datetime, _progname, msg|
+      "[#{datetime.strftime('%Y-%m-%d %H:%M:%S')}] #{severity}: #{msg}\n"
+    end
+  end
+
+  def log_info(msg)
+    puts msg
+    @logger.info(msg) if @logger
+  end
+
+  def log_error(msg)
+    puts "#{Colors::RED}ERROR: #{msg}#{Colors::RESET}"
+    @logger.error(msg) if @logger
+  end
+
+  def log_success(msg)
+    puts "#{Colors::GREEN}#{msg}#{Colors::RESET}"
+    @logger.info(msg) if @logger
+  end
+
+  def log_warn(msg)
+    puts "#{Colors::YELLOW}WARN: #{msg}#{Colors::RESET}"
+    @logger.warn(msg) if @logger
+  end
+
+  # Configuration management
+  def config
+    @config ||= begin
+      return {} unless File.exist?(@config_file)
+      JSON.parse(File.read(@config_file), symbolize_names: true)
+    rescue JSON::ParserError => e
+      log_error "Failed to parse config: #{e.message}"
+      {}
+    end
+  end
+
+  def set_config(key, value)
+    current = config
+    current[key.to_sym] = value
+    File.write(@config_file, JSON.pretty_generate(current))
+    @config = nil # Reset cache
+    log_info "Config updated: #{key} = #{value}"
+  end
+
+  def get_config(key, default = nil)
+    config.fetch(key.to_sym, default)
+  end
+
+  # Session management
+  def session_file(session_key)
+    File.join(@sessions_dir, session_key)
+  end
+
+  def session_exists?(session_key)
+    File.exist?(session_file(session_key))
+  end
+
+  def create_session(session_key, message_id, repo, issue_number, worktree_path, terminal_id)
+    session_data = {
+      message_id: message_id,
+      repo: repo,
+      issue_number: issue_number,
+      worktree_path: worktree_path,
+      terminal_id: terminal_id,
+      started_at: Time.now.utc.iso8601,
+      status: 'active'
+    }
+    File.write(session_file(session_key), JSON.pretty_generate(session_data))
+  end
+
+  def get_session(session_key)
+    return nil unless session_exists?(session_key)
+    JSON.parse(File.read(session_file(session_key)), symbolize_names: true)
+  rescue JSON::ParserError
+    nil
+  end
+
+  def get_session_field(session_key, field, default = nil)
+    session = get_session(session_key)
+    return default unless session
+    session.fetch(field.to_sym, default)
+  end
+
+  def remove_session(session_key)
+    file = session_file(session_key)
+    File.delete(file) if File.exist?(file)
+  end
+
+  def list_sessions
+    return [] unless Dir.exist?(@sessions_dir)
+    Dir.children(@sessions_dir).select { |f| File.file?(File.join(@sessions_dir, f)) }
+  end
+
+  def count_sessions
+    list_sessions.size
+  end
+
+  def session_stale?(session_key)
+    return false unless session_exists?(session_key)
+
+    worktree_path = get_session_field(session_key, :worktree_path)
+
+    # Check if worktree is missing
+    unless Dir.exist?(worktree_path)
+      log_warn "Session #{session_key} is stale: worktree missing at #{worktree_path}"
+      return true
+    end
+
+    # Check for completion marker
+    completion_marker = get_config(:completion_marker, '.botster_status')
+    marker_file = File.join(worktree_path, completion_marker)
+
+    if File.exist?(marker_file)
+      content = File.read(marker_file)
+      if content.include?('RESOLVED') || content.include?('DONE')
+        log_warn "Session #{session_key} is stale: completion marker found"
+        return true
+      end
+    end
+
+    false
+  end
+
+  # API communication
+  def poll_messages
+    server_url = get_config(:server_url)
+    api_key = get_config(:api_key)
+
+    unless api_key && !api_key.empty?
+      log_error 'API key not configured. Run: botster_hub config api_key YOUR_KEY'
+      return nil
+    end
+
+    # Get repository name from git remote
+    repo_name = detect_repo_name
+
+    url = "#{server_url}/bots/messages"
+    url += "?repo=#{URI.encode_www_form_component(repo_name)}" if repo_name
+
+    uri = URI(url)
+
+    begin
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == 'https')
+      http.open_timeout = 5
+      http.read_timeout = 10
+
+      request = Net::HTTP::Get.new(uri.request_uri)
+      request['X-API-Key'] = api_key
+
+      response = http.request(request)
+
+      if response.code == '200'
+        JSON.parse(response.body, symbolize_names: true)
+      else
+        log_warn "API returned status #{response.code}"
+        nil
+      end
+    rescue StandardError => e
+      log_error "Failed to poll messages: #{e.message}"
+      nil
+    end
+  end
+
+  def ack_message(message_id)
+    server_url = get_config(:server_url)
+    api_key = get_config(:api_key)
+
+    uri = URI("#{server_url}/bots/messages/#{message_id}")
+
+    begin
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == 'https')
+
+      request = Net::HTTP::Patch.new(uri.request_uri)
+      request['X-API-Key'] = api_key
+      request['Content-Type'] = 'application/json'
+
+      response = http.request(request)
+
+      if response.code == '200'
+        log_info "Acknowledged message: #{message_id}"
+      else
+        log_error "Failed to acknowledge message: #{message_id}"
+      end
+    rescue StandardError => e
+      log_error "Failed to acknowledge message: #{e.message}"
+    end
+  end
+
+  # Git operations
+  def detect_repo_name
+    remote_url = `git remote get-url origin 2>/dev/null`.strip
+    return nil if remote_url.empty?
+
+    # Extract owner/repo from various Git URL formats
+    remote_url.gsub(%r{^(https?://[^/]+/|git@[^:]+:)}, '').gsub(/\.git$/, '')
+  rescue
+    nil
+  end
+
+  def create_worktree(repo, issue_number)
+    repo_safe = repo.gsub('/', '-')
+    branch_name = "botster-#{repo_safe}-#{issue_number}"
+    worktree_base = get_config(:worktree_base)
+    clone_dir = File.join(worktree_base, repo_safe)
+    worktree_path = File.join(worktree_base, "#{repo_safe}-#{issue_number}")
+
+    # Clone the repo if it doesn't exist
+    unless Dir.exist?(clone_dir)
+      log_info "Cloning repository: https://github.com/#{repo}.git to #{clone_dir}"
+      system("git clone https://github.com/#{repo}.git #{Shellwords.escape(clone_dir)} >> #{Shellwords.escape(@log_file)} 2>&1")
+      unless $?.success?
+        log_error "Failed to clone repository: #{repo}"
+        return nil
+      end
+    else
+      log_info "Using existing clone: #{clone_dir}"
+      Dir.chdir(clone_dir) do
+        system("git pull >> #{Shellwords.escape(@log_file)} 2>&1")
+        log_warn "Failed to pull latest changes" unless $?.success?
+      end
+    end
+
+    # Create worktree
+    Dir.chdir(clone_dir) do
+      if Dir.exist?(worktree_path)
+        log_info "Reusing existing worktree: #{worktree_path}"
+      else
+        branch_exists = system("git show-ref --verify --quiet refs/heads/#{Shellwords.escape(branch_name)}")
+
+        if branch_exists
+          log_info "Creating worktree from existing branch: #{branch_name}"
+          cmd = "git worktree add #{Shellwords.escape(worktree_path)} #{Shellwords.escape(branch_name)} >> #{Shellwords.escape(@log_file)} 2>&1"
+        else
+          log_info "Creating worktree with new branch: #{branch_name}"
+          cmd = "git worktree add -b #{Shellwords.escape(branch_name)} #{Shellwords.escape(worktree_path)} >> #{Shellwords.escape(@log_file)} 2>&1"
+        end
+
+        system(cmd)
+        unless $?.success?
+          log_error "Failed to create worktree"
+          return nil
+        end
+        log_success "Created worktree: #{worktree_path}"
+      end
+    end
+
+    # Pre-trust the directory
+    claude_dir = File.join(worktree_path, '.claude')
+    FileUtils.mkdir_p(claude_dir)
+    FileUtils.touch(File.join(claude_dir, 'trusted'))
+    log_info "Pre-trusted worktree: #{worktree_path}"
+
+    worktree_path
+  end
+
+  # Terminal spawning
+  def spawn_terminal(worktree_path, repo, issue_number, context)
+    agent_command = get_config(:agent_command, 'claude')
+    agent_options = build_agent_options
+    completion_marker = get_config(:completion_marker, '.botster_status')
+    api_key = get_config(:api_key)
+    main_project_dir = Dir.pwd
+
+    # Create temporary files
+    script_file = "/tmp/botster_script_#{Process.pid}_#{Time.now.to_i}.sh"
+    context_file = "/tmp/botster_context_#{Process.pid}_#{Time.now.to_i}.txt"
+
+    File.write(context_file, context)
+
+    # Build the shell script
+    script = <<~SCRIPT
+      #!/bin/bash
+      cd '#{worktree_path}' || { echo "FATAL: Cannot cd to worktree: #{worktree_path}"; exit 1; }
+
+      # Create .claude directory and mark as trusted
+      mkdir -p .claude
+      touch .claude/trusted
+
+      export BOTSTER_API_KEY='#{api_key}'
+
+      # Register trybotster MCP server at local scope
+      echo "Registering trybotster MCP server..."
+      claude mcp add trybotster \\
+        --transport http \\
+        https://mcp-dev.trybotster.com \\
+        --header "Authorization: Bearer #{api_key}" \\
+        || echo "WARNING: Failed to register MCP server"
+
+      # Verify server is available
+      echo "Verifying MCP server..."
+      claude mcp list
+
+      # Copy .claude settings from main project
+      echo "Setting up .claude permissions..."
+      mkdir -p .claude/hooks
+
+      # Copy settings.local.json from main project if it exists
+      if [ -f "#{main_project_dir}/.claude/settings.local.json" ]; then
+        cp "#{main_project_dir}/.claude/settings.local.json" .claude/settings.local.json
+        echo "✓ Copied settings.local.json from main project"
+      else
+        echo "⚠ No settings.local.json found in main project"
+        echo "  Spawned Claude will use default permissions"
+      fi
+
+      # Create auto-exit hook script
+      echo "Creating auto-exit hook for completion detection..."
+      cat > .claude/hooks/check_completion.sh <<'HOOK_EOF'
+      #!/bin/bash
+      # Auto-exit hook - checks for completion marker and exits session
+
+      COMPLETION_MARKER="#{completion_marker}"
+
+      # Check if completion marker exists
+      if [ -f "$COMPLETION_MARKER" ]; then
+        content=$(cat "$COMPLETION_MARKER" 2>/dev/null)
+
+        # Check if Claude marked task as complete
+        if [[ "$content" == *"RESOLVED"* ]] || [[ "$content" == *"DONE"* ]]; then
+          echo ""
+          echo "✓ Task marked as complete. Exiting Claude Code session..."
+          echo ""
+
+          # Exit the Claude Code session
+          exit 0
+        fi
+      fi
+      HOOK_EOF
+
+      chmod +x .claude/hooks/check_completion.sh
+
+      # Create hooks configuration
+      cat > .claude/hooks.json <<'HOOKS_JSON_EOF'
+      {
+        "hooks": {
+          "Stop": [
+            {
+              "matcher": "",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": ".claude/hooks/check_completion.sh"
+                }
+              ]
+            }
+          ]
+        }
+      }
+      HOOKS_JSON_EOF
+
+      echo "✓ Created auto-exit hook configuration"
+
+      # Pre-accept trust dialog
+      echo "Pre-accepting workspace trust..."
+      node -e "
+      const fs = require('fs');
+      const path = require('path');
+      const configPath = path.join(process.env.HOME, '.claude.json');
+      try {
+        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        const projectPath = '#{worktree_path}';
+        if (!config.projects) config.projects = {};
+        if (!config.projects[projectPath]) {
+          config.projects[projectPath] = {
+            allowedTools: [],
+            mcpContextUris: [],
+            mcpServers: {},
+            enabledMcpjsonServers: [],
+            disabledMcpjsonServers: [],
+            hasTrustDialogAccepted: true,
+            projectOnboardingSeenCount: 0,
+            hasClaudeMdExternalIncludesApproved: false,
+            hasClaudeMdExternalIncludesWarningShown: false
+          };
+        } else {
+          config.projects[projectPath].hasTrustDialogAccepted = true;
+        }
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+        console.log('✓ Pre-accepted workspace trust for this worktree');
+      } catch (e) {
+        console.error('Warning: Failed to pre-accept trust:', e.message);
+      }
+      "
+
+      # Start Claude Code with context
+      echo "Starting Claude Code..."
+      #{agent_command} #{agent_options} --add-dir '#{worktree_path}' -- "$(cat '#{context_file}')" || echo 'Agent failed'
+      echo 'DONE' > #{completion_marker}
+      rm -f '#{context_file}' '#{script_file}'
+
+      # Wait a moment for cleanup, then close the terminal
+      echo ""
+      echo "Session complete. Terminal will close in 5 seconds..."
+      sleep 5
+      osascript -e 'tell application "Terminal" to close (every window whose name contains "Botster:")' 2>/dev/null || true
+    SCRIPT
+
+    File.write(script_file, script)
+    File.chmod(0755, script_file)
+
+    # Escape for AppleScript
+    esc_script = script_file.gsub("'", "'\\\\''")
+    esc_title = "Botster: #{repo}##{issue_number}".gsub("'", "'\\\\''")
+
+    # Spawn terminal using AppleScript
+    applescript = <<~APPLESCRIPT
+      tell application "Terminal"
+        activate
+        do script "#{esc_script}"
+      end tell
+    APPLESCRIPT
+
+    tab_desc = `osascript -e '#{applescript}' 2>&1`.strip
+
+    unless $?.success?
+      log_error "AppleScript failed: #{tab_desc}"
+      return nil
+    end
+
+    # Parse window ID from output
+    terminal_id = tab_desc[/window id (\d+)/, 1]
+
+    # Set terminal title
+    if terminal_id
+      title_script = <<~APPLESCRIPT
+        tell application "Terminal"
+          set custom title of window id #{terminal_id} to "#{esc_title}"
+        end tell
+      APPLESCRIPT
+      `osascript -e '#{title_script}' 2>/dev/null`
+    end
+
+    if terminal_id && terminal_id.match?(/^\d+$/)
+      log_success "Spawned terminal for #{repo}##{issue_number}"
+      log_info "Terminal ID: #{terminal_id}"
+      terminal_id
+    else
+      log_error "Failed to spawn terminal: Invalid ID from #{tab_desc}"
+      nil
+    end
+  end
+
+  def build_agent_options
+    agent_command = get_config(:agent_command, 'claude')
+    return '' unless ['claude', 'claude code'].include?(agent_command)
+
+    options = []
+
+    # Whitelisted Claude Code options
+    {
+      claude_model: '--model',
+      claude_permission_mode: '--permission-mode',
+      claude_max_turns: '--max-turns',
+      claude_add_dir: '--add-dir',
+      claude_system_prompt: '--system-prompt',
+      claude_system_prompt_file: '--system-prompt-file',
+      claude_append_system_prompt: '--append-system-prompt',
+      claude_allowed_tools: '--allowedTools',
+      claude_disallowed_tools: '--disallowedTools',
+      claude_mcp_config: '--mcp-config',
+      claude_settings: '--settings'
+    }.each do |key, flag|
+      value = get_config(key)
+      next unless value && !value.to_s.empty?
+
+      if [:claude_system_prompt, :claude_append_system_prompt].include?(key)
+        options << "#{flag} '#{value}'"
+      else
+        options << "#{flag} #{value}"
+      end
+    end
+
+    options << '--verbose' if get_config(:claude_verbose) == true
+    options << '--dangerously-skip-permissions' if get_config(:claude_dangerously_skip_permissions) == true
+
+    options.join(' ')
+  end
+
+  # Message processing
+  def process_messages
+    response = poll_messages
+    return unless response && response[:count] && response[:count] > 0
+
+    log_info "Received #{response[:count]} new message(s)"
+
+    messages = response[:messages] || []
+
+    messages.each do |message|
+      message_id = message[:id]
+      event_type = message[:event_type]
+
+      unless event_type == 'github_mention'
+        log_warn "Ignoring message type: #{event_type}"
+        ack_message(message_id)
+        next
+      end
+
+      payload = message[:payload]
+      repo = payload[:repo]
+      issue_number = payload[:issue_number]
+      repo_safe = repo.gsub('/', '-')
+      session_key = "#{repo_safe}-#{issue_number}"
+
+      # Check if session already exists
+      if session_exists?(session_key)
+        if session_stale?(session_key)
+          log_info "Session #{session_key} is stale, cleaning up"
+          cleanup_session(session_key)
+        else
+          log_warn "Session already exists for #{session_key}, skipping"
+          ack_message(message_id)
+          next
+        end
+      end
+
+      # Check max sessions
+      max_sessions = get_config(:max_sessions, 20)
+      if count_sessions >= max_sessions
+        log_warn "Max sessions (#{max_sessions}) reached, skipping"
+        next
+      end
+
+      log_info "Processing GitHub mention in #{repo}##{issue_number}"
+
+      # Create worktree
+      worktree_path = create_worktree(repo, issue_number)
+      unless worktree_path
+        log_error "Failed to create worktree for #{session_key}"
+        next
+      end
+
+      # Get context
+      context = payload[:context] || ''
+
+      # Append trust snippet for Claude Code
+      agent_command = get_config(:agent_command, 'claude')
+      if ['claude', 'claude code'].include?(agent_command)
+        context += "\n\n**First action (run automatically):**\n```bash\n# Trust this directory once (creates .claude/trusted if needed)\nmkdir -p .claude && touch .claude/trusted\necho \"Directory trusted for this session\"\n```"
+      end
+
+      # Spawn terminal
+      terminal_id = spawn_terminal(worktree_path, repo, issue_number, context)
+      unless terminal_id
+        log_error "Failed to spawn terminal for #{session_key}"
+        system("git worktree remove #{Shellwords.escape(worktree_path)} --force 2>/dev/null")
+        next
+      end
+
+      # Create session
+      create_session(session_key, message_id, repo, issue_number, worktree_path, terminal_id)
+
+      # Acknowledge message
+      ack_message(message_id)
+
+      log_success "Session created: #{session_key}"
+    end
+  end
+
+  # Session health monitoring
+  def check_sessions
+    completion_marker = get_config(:completion_marker, '.botster_status')
+
+    list_sessions.each do |session_key|
+      worktree_path = get_session_field(session_key, :worktree_path)
+
+      # Check if worktree still exists
+      unless Dir.exist?(worktree_path)
+        log_warn "Worktree missing for #{session_key}, cleaning up"
+        remove_session(session_key)
+        next
+      end
+
+      # Check for completion marker
+      marker_file = File.join(worktree_path, completion_marker)
+      next unless File.exist?(marker_file)
+
+      content = File.read(marker_file)
+      if content.include?('RESOLVED') || content.include?('DONE')
+        log_info "Session completed: #{session_key}"
+        cleanup_session(session_key)
+        log_success "Cleaned up session: #{session_key}"
+      end
+    end
+  end
+
+  def cleanup_session(session_key)
+    worktree_path = get_session_field(session_key, :worktree_path)
+
+    if worktree_path && Dir.exist?(worktree_path)
+      if system("git worktree remove #{Shellwords.escape(worktree_path)} --force >> #{Shellwords.escape(@log_file)} 2>&1")
+        log_info "Removed worktree: #{worktree_path}"
+      else
+        log_warn "Could not remove worktree (may be in use): #{worktree_path}"
+      end
+    end
+
+    remove_session(session_key)
+  end
+
+  # Daemon control
+  def running?
+    return false unless File.exist?(@pid_file)
+
+    pid = File.read(@pid_file).strip.to_i
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH, Errno::ENOENT
+    File.delete(@pid_file) if File.exist?(@pid_file)
+    false
+  end
+
+  # Commands
+  def cmd_start
+    if running?
+      puts "Botster Hub is already running (PID: #{File.read(@pid_file).strip})"
+      exit 1
+    end
+
+    # Validate git repository
+    unless system('git rev-parse --git-dir > /dev/null 2>&1')
+      log_error 'Not in a git repository. Botster Hub must be run from the root of your project.'
+      exit 1
+    end
+
+    # Validate remote URL
+    remote_url = `git remote get-url origin 2>/dev/null`.strip
+    if remote_url.empty?
+      log_error 'No git remote "origin" found. Please configure a remote first:'
+      log_error '  git remote add origin <url>'
+      exit 1
+    end
+
+    # Extract and validate repo name
+    repo_name = detect_repo_name
+    unless repo_name && repo_name.include?('/')
+      log_error "Could not extract repository name from remote URL: #{remote_url}"
+      log_error 'Expected format: owner/repo'
+      exit 1
+    end
+
+    log_success "Starting Botster Hub v#{VERSION}"
+    log_info "Server: #{get_config(:server_url)}"
+    log_info "Repository: #{repo_name}"
+    log_info "Poll interval: #{get_config(:poll_interval, 5)}s"
+
+    # Write PID
+    File.write(@pid_file, Process.pid.to_s)
+
+    # Setup signal handlers
+    trap('INT') { shutdown }
+    trap('TERM') { shutdown }
+
+    poll_interval = get_config(:poll_interval, 5)
+
+    # Main loop
+    loop do
+      process_messages
+      check_sessions
+      sleep poll_interval
+    end
+  end
+
+  def shutdown
+    log_info 'Shutting down...'
+    File.delete(@pid_file) if File.exist?(@pid_file)
+    exit 0
+  end
+
+  def cmd_test
+    log_info 'Testing terminal spawn in 3 seconds...'
+    sleep 3
+
+    test_path = Dir.pwd
+    test_repo = 'test/repo'
+    test_issue = '999'
+    test_context = <<~CONTEXT
+      This is a test message from botster_hub.
+
+      Please confirm that:
+      1. This terminal opened successfully
+      2. Claude received this message
+      3. You can see this context
+
+      If you can see this, the terminal spawning is working!
+    CONTEXT
+
+    log_info 'Spawning test terminal...'
+    spawn_terminal(test_path, test_repo, test_issue, test_context)
+
+    log_info 'Test terminal spawned. Check if new terminal opened.'
+    log_info 'Daemon will keep running for 30 seconds...'
+
+    sleep 30
+    log_info 'Test complete.'
+  end
+
+  def cmd_status
+    unless running?
+      puts 'Botster Hub is not running'
+      exit 1
+    end
+
+    session_count = count_sessions
+
+    if session_count == 0
+      puts 'No active sessions'
+      exit 0
+    end
+
+    puts "Active Sessions (#{session_count}):"
+    puts '=' * 80
+
+    list_sessions.each do |session_key|
+      session = get_session(session_key)
+      next unless session
+
+      puts "✓ #{session_key}"
+      puts "  Repo: #{session[:repo]}"
+      puts "  Issue: ##{session[:issue_number]}"
+      puts "  Path: #{session[:worktree_path]}"
+      puts "  Started: #{session[:started_at]}"
+      puts "  Status: #{session[:status]}"
+      puts
+    end
+  end
+
+  def cmd_kill(session_key)
+    unless session_key
+      puts 'Usage: botster_hub kill <session_key>'
+      exit 1
+    end
+
+    unless session_exists?(session_key)
+      puts "Session not found: #{session_key}"
+      exit 1
+    end
+
+    log_info "Killing session: #{session_key}"
+    cleanup_session(session_key)
+    log_success "Session killed: #{session_key}"
+  end
+
+  def cmd_cleanup
+    log_info 'Cleaning up stale sessions...'
+    removed = 0
+
+    list_sessions.each do |session_key|
+      worktree_path = get_session_field(session_key, :worktree_path)
+
+      unless Dir.exist?(worktree_path)
+        log_info "Removing stale session: #{session_key}"
+        remove_session(session_key)
+        removed += 1
+      end
+    end
+
+    puts "Cleaned up #{removed} stale session(s)"
+  end
+
+  def cmd_config(key = nil, value = nil)
+    if key.nil?
+      # Show all config
+      puts "Configuration (#{@config_file}):"
+      puts JSON.pretty_generate(config)
+      return
+    end
+
+    if value.nil?
+      # Show specific key
+      puts get_config(key)
+      return
+    end
+
+    # Set value
+    set_config(key, value)
+  end
+
+  def cmd_help
+    puts <<~HELP
+      Botster Hub v#{VERSION} - GitHub mention → local agent automation
+
+      Usage:
+        botster_hub start                  Start the daemon
+        botster_hub test                   Test terminal spawning with Claude
+        botster_hub status                 Show active sessions
+        botster_hub kill <session_key>     Kill a specific session
+        botster_hub cleanup                Clean up stale worktrees
+        botster_hub config [key] [value]   Show or set configuration
+        botster_hub version                Show version
+
+      Configuration (#{@config_file}):
+        server_url       - Rails server URL (default: http://localhost:3000)
+        api_key          - API key for authentication
+        agent_command    - Command to run (default: claude)
+        completion_marker - File to watch for completion (default: .botster_status)
+        max_sessions     - Max concurrent sessions (default: 20)
+        poll_interval    - Seconds between polls (default: 5)
+        worktree_base    - Base directory for worktrees
+
+      Claude Code Agent Options (when agent_command=claude):
+        claude_model                        - Model to use (sonnet, opus, etc)
+        claude_permission_mode              - Permission mode (acceptEdits, plan, etc)
+        claude_max_turns                    - Max agentic turns in non-interactive mode
+        claude_add_dir                      - Additional working directories
+        claude_system_prompt                - Custom system prompt (replaces default)
+        claude_system_prompt_file           - Load system prompt from file
+        claude_append_system_prompt         - Append to default system prompt
+        claude_allowed_tools                - Tools permitted without prompting
+        claude_disallowed_tools             - Tools blocked
+        claude_verbose                      - Enable verbose logging (true/false)
+        claude_dangerously_skip_permissions - Skip permission prompts (true/false)
+        claude_mcp_config                   - Path to MCP config file or JSON string
+        claude_settings                     - Path to settings JSON file or JSON string
+
+      Example: Configure Claude Code with acceptEdits permissions
+        botster_hub config agent_command claude
+        botster_hub config claude_permission_mode acceptEdits
+        botster_hub config claude_model sonnet
+
+      Example: Use your home directory MCP config
+        botster_hub config claude_mcp_config ~/.config/claude/mcp_servers.json
+
+      Example: Use your home directory settings
+        botster_hub config claude_settings ~/.config/claude/settings.json
+
+      Session Files:
+        Each session stored in: #{@sessions_dir}/<repo>-<issue>
+        JSON format, one session per file
+
+      Examples:
+        botster_hub config                          # Show all config
+        botster_hub config api_key                  # Show API key
+        botster_hub config api_key "your_key_here"  # Set API key
+        botster_hub config agent_command "aider"    # Change agent
+        botster_hub start                           # Start daemon
+
+      ZERO DEPENDENCIES - Uses only Ruby 2.7+ standard library!
+    HELP
+  end
+end
+
+# Run the application
+if __FILE__ == $PROGRAM_NAME
+  hub = BotsterHub.new
+  hub.run(ARGV)
+end
