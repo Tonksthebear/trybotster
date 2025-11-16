@@ -1,0 +1,843 @@
+use anyhow::{Context, Result};
+use botster_hub::{Agent, AgentStatus, Config, WorktreeManager};
+use clap::{Parser, Subcommand};
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    Frame, Terminal,
+};
+use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
+use std::{
+    io,
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant},
+};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Config {
+    server_url: String,
+    api_key: String,
+    agent_command: String,
+    poll_interval: u64,
+    agent_timeout: u64,
+    max_sessions: usize,
+    worktree_base: PathBuf,
+    claude_permission_mode: String,
+    claude_allowed_tools: String,
+    preserve_agent_ansi: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server_url: "http://localhost:3000".to_string(),
+            api_key: String::new(),
+            agent_command: "claude".to_string(),
+            poll_interval: 5,
+            agent_timeout: 3600,
+            max_sessions: 20,
+            worktree_base: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("botster-sessions"),
+            claude_permission_mode: "acceptEdits".to_string(),
+            claude_allowed_tools: "mcp__*".to_string(),
+            preserve_agent_ansi: false,
+        }
+    }
+}
+
+impl Config {
+    fn config_dir() -> Result<PathBuf> {
+        let dir = dirs::home_dir()
+            .context("No home directory")?
+            .join(".botster_hub");
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    fn load() -> Result<Self> {
+        let config_path = Self::config_dir()?.join("config.json");
+        if config_path.exists() {
+            let content = fs::read_to_string(&config_path)?;
+            Ok(serde_json::from_str(&content)?)
+        } else {
+            let default = Self::default();
+            default.save()?;
+            Ok(default)
+        }
+    }
+
+    fn save(&self) -> Result<()> {
+        let config_path = Self::config_dir()?.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Agent
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+enum AgentStatus {
+    Initializing,
+    Running,
+    Finished,
+    Failed(String),
+    Killed,
+}
+
+impl std::fmt::Display for AgentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentStatus::Initializing => write!(f, "initializing"),
+            AgentStatus::Running => write!(f, "running"),
+            AgentStatus::Finished => write!(f, "finished"),
+            AgentStatus::Failed(e) => write!(f, "failed: {}", e),
+            AgentStatus::Killed => write!(f, "killed"),
+        }
+    }
+}
+
+struct Agent {
+    id: uuid::Uuid,
+    repo: String,
+    issue_number: u32,
+    worktree_path: PathBuf,
+    start_time: chrono::DateTime<chrono::Utc>,
+    status: AgentStatus,
+    buffer: Arc<Mutex<VecDeque<String>>>,
+    writer: Option<Box<dyn Write + Send>>,
+    reader_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Agent {
+    fn new(id: uuid::Uuid, repo: String, issue_number: u32, worktree_path: PathBuf) -> Self {
+        Self {
+            id,
+            repo,
+            issue_number,
+            worktree_path,
+            start_time: chrono::Utc::now(),
+            status: AgentStatus::Initializing,
+            buffer: Arc::new(Mutex::new(VecDeque::new())),
+            writer: None,
+            reader_thread: None,
+        }
+    }
+
+    fn spawn(&mut self, command_str: &str, context: &str) -> Result<()> {
+        self.add_to_buffer(&format!(
+            "==> Spawning agent: {}#{}",
+            self.repo, self.issue_number
+        ));
+        self.add_to_buffer(&format!("==> Command: {}", command_str));
+        self.add_to_buffer(&format!("==> Worktree: {}", self.worktree_path.display()));
+        self.add_to_buffer("");
+
+        let pty_system = native_pty_system();
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        let pair = pty_system.openpty(size).context("Failed to open PTY")?;
+
+        // Parse command
+        let parts: Vec<&str> = command_str.split_whitespace().collect();
+        let mut cmd = CommandBuilder::new(parts[0]);
+        for arg in &parts[1..] {
+            cmd.arg(arg);
+        }
+        cmd.cwd(&self.worktree_path);
+
+        let _child = pair
+            .slave
+            .spawn_command(cmd)
+            .context("Failed to spawn command")?;
+
+        // Get writer for sending input
+        self.writer = Some(pair.master.take_writer()?);
+
+        // Spawn reader thread
+        let buffer = Arc::clone(&self.buffer);
+        let mut reader = pair.master.try_clone_reader()?;
+
+        self.reader_thread = Some(thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let output = String::from_utf8_lossy(&buf[..n]);
+                        let mut buffer_lock = buffer.lock().unwrap();
+                        for line in output.lines() {
+                            buffer_lock.push_back(line.to_string());
+                            if buffer_lock.len() > MAX_BUFFER_LINES {
+                                buffer_lock.pop_front();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Read error: {}", e);
+                        break;
+                    }
+                }
+            }
+        }));
+
+        self.status = AgentStatus::Running;
+
+        // Send context
+        if !context.is_empty() {
+            self.add_to_buffer("==> Sending context to agent...");
+            self.write_input(&format!("{}\n", context))?;
+        }
+
+        Ok(())
+    }
+
+    fn write_input(&mut self, input: &str) -> Result<()> {
+        if let Some(writer) = &mut self.writer {
+            writer.write_all(input.as_bytes())?;
+            writer.flush()?;
+            self.add_to_buffer(&format!("==> Sent: {}", input.trim_end()));
+        }
+        Ok(())
+    }
+
+    fn add_to_buffer(&self, line: &str) {
+        let mut buffer = self.buffer.lock().unwrap();
+        buffer.push_back(line.to_string());
+        if buffer.len() > MAX_BUFFER_LINES {
+            buffer.pop_front();
+        }
+    }
+
+    fn age(&self) -> Duration {
+        chrono::Utc::now()
+            .signed_duration_since(self.start_time)
+            .to_std()
+            .unwrap_or_default()
+    }
+
+    fn session_key(&self) -> String {
+        format!("{}-{}", self.repo.replace('/', "-"), self.issue_number)
+    }
+}
+
+// ============================================================================
+// Message Types
+// ============================================================================
+
+#[derive(Deserialize, Debug)]
+struct PollResponse {
+    #[allow(dead_code)]
+    count: usize,
+    messages: Vec<BotMessage>,
+}
+
+#[derive(Deserialize, Debug)]
+struct BotMessage {
+    id: i64,
+    event_type: String,
+    payload: MessagePayload,
+}
+
+#[derive(Deserialize, Debug)]
+struct MessagePayload {
+    repo: String,
+    issue_number: u32,
+    context: Option<String>,
+}
+
+// ============================================================================
+// App State
+// ============================================================================
+
+struct App {
+    agents: Vec<Agent>,
+    selected: usize,
+    config: Config,
+    client: Client,
+    should_quit: bool,
+    input_mode: bool,
+    input_buffer: String,
+    log_scroll: usize,
+    last_poll: Instant,
+}
+
+impl App {
+    fn new() -> Result<Self> {
+        let config = Config::load()?;
+        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+
+        Ok(Self {
+            agents: Vec::new(),
+            selected: 0,
+            config,
+            client,
+            should_quit: false,
+            input_mode: false,
+            input_buffer: String::new(),
+            log_scroll: 0,
+            last_poll: Instant::now(),
+        })
+    }
+
+    fn poll_messages(&mut self) -> Result<()> {
+        if self.last_poll.elapsed() < Duration::from_secs(self.config.poll_interval) {
+            return Ok(());
+        }
+
+        self.last_poll = Instant::now();
+
+        if self.config.api_key.is_empty() {
+            return Ok(());
+        }
+
+        let repo = self.detect_repo_name().unwrap_or_default();
+        let url = if !repo.is_empty() {
+            format!("{}/bots/messages?repo={}", self.config.server_url, repo)
+        } else {
+            format!("{}/bots/messages", self.config.server_url)
+        };
+
+        match self
+            .client
+            .get(&url)
+            .header("X-API-Key", &self.config.api_key)
+            .send()
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(poll_response) = resp.json::<PollResponse>() {
+                    for msg in poll_response.messages {
+                        if let Err(e) = self.process_message(msg) {
+                            log::error!("Process message error: {}", e);
+                        }
+                    }
+                }
+            }
+            Ok(resp) => {
+                log::warn!("Poll failed with status: {}", resp.status());
+            }
+            Err(e) => {
+                log::error!("Poll error: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_message(&mut self, msg: BotMessage) -> Result<()> {
+        if msg.event_type != "github_mention" {
+            self.ack_message(msg.id)?;
+            return Ok(());
+        }
+
+        let repo = msg.payload.repo;
+        let issue_number = msg.payload.issue_number;
+        let context = msg.payload.context.unwrap_or_default();
+
+        let session_key = format!("{}-{}", repo.replace('/', "-"), issue_number);
+
+        if self.agents.iter().any(|a| a.session_key() == session_key) {
+            log::info!("Agent already running for {}", session_key);
+            self.ack_message(msg.id)?;
+            return Ok(());
+        }
+
+        if self.agents.len() >= self.config.max_sessions {
+            log::warn!("Max sessions reached");
+            return Ok(());
+        }
+
+        let worktree_path = self.create_worktree(&repo, issue_number)?;
+        let id = uuid::Uuid::new_v4();
+        let mut agent = Agent::new(id, repo.clone(), issue_number, worktree_path.clone());
+
+        let command = self.build_command(&worktree_path);
+
+        match agent.spawn(&command, &context) {
+            Ok(_) => {
+                log::info!("Spawned agent for {}#{}", repo, issue_number);
+                self.agents.push(agent);
+                self.ack_message(msg.id)?;
+            }
+            Err(e) => {
+                log::error!("Failed to spawn agent: {}", e);
+                agent.status = AgentStatus::Failed(e.to_string());
+                self.agents.push(agent);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ack_message(&self, message_id: i64) -> Result<()> {
+        let url = format!("{}/bots/messages/{}", self.config.server_url, message_id);
+        self.client
+            .patch(&url)
+            .header("X-API-Key", &self.config.api_key)
+            .send()?;
+        Ok(())
+    }
+
+    fn create_worktree(&self, repo: &str, issue_number: u32) -> Result<PathBuf> {
+        let repo_safe = repo.replace('/', "-");
+        let base = &self.config.worktree_base;
+        fs::create_dir_all(base)?;
+
+        let clone_dir = base.join(&repo_safe);
+
+        // Clone if needed
+        if !clone_dir.exists() {
+            log::info!("Cloning {}...", repo);
+            let url = format!("https://github.com/{}.git", repo);
+            git2::Repository::clone(&url, &clone_dir).context("Failed to clone repository")?;
+        }
+
+        let branch_name = format!("botster-{}-{}", repo_safe, issue_number);
+        let worktree_path = base.join(format!("{}-{}", repo_safe, issue_number));
+
+        let repo = git2::Repository::open(&clone_dir)?;
+
+        // Remove existing worktree if present - use git command as git2 API is unreliable
+        let worktree_name = worktree_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        if !worktree_name.is_empty() {
+            std::process::Command::new("git")
+                .args(&["worktree", "remove", worktree_name, "--force"])
+                .current_dir(&clone_dir)
+                .output()
+                .ok();
+        }
+
+        // Check if branch exists and use it, or create new one
+        let head = repo.head()?;
+        let commit = head.peel_to_commit()?;
+
+        // Try to find existing branch, if not found create it
+        if repo
+            .find_branch(&branch_name, git2::BranchType::Local)
+            .is_err()
+        {
+            // Branch doesn't exist, create it
+            repo.branch(&branch_name, &commit, false)?;
+            log::info!("Created new branch: {}", branch_name);
+        } else {
+            log::info!("Using existing branch: {}", branch_name);
+        }
+
+        // Create worktree
+        repo.worktree(&branch_name, &worktree_path, None)?;
+
+        // Mark as trusted for Claude
+        let claude_dir = worktree_path.join(".claude");
+        fs::create_dir_all(&claude_dir)?;
+        fs::write(claude_dir.join("trusted"), "")?;
+
+        Ok(worktree_path)
+    }
+
+    fn build_command(&self, worktree_path: &PathBuf) -> String {
+        let mut cmd = self.config.agent_command.clone();
+
+        if self.config.agent_command == "claude" {
+            cmd.push_str(&format!(
+                " --permission-mode {} --allowedTools {} --add-dir {}",
+                self.config.claude_permission_mode,
+                self.config.claude_allowed_tools,
+                worktree_path.display()
+            ));
+        }
+
+        cmd
+    }
+
+    fn detect_repo_name(&self) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(&["remote", "get-url", "origin"])
+            .output()
+            .ok()?;
+
+        if output.status.success() {
+            let url = String::from_utf8_lossy(&output.stdout);
+            let cleaned = url
+                .trim()
+                .trim_start_matches("https://github.com/")
+                .trim_start_matches("git@github.com:")
+                .trim_end_matches(".git");
+            Some(cleaned.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn cleanup_agents(&mut self) {
+        let timeout = self.config.agent_timeout;
+        self.agents.retain(|agent| {
+            let should_keep = match &agent.status {
+                AgentStatus::Running if agent.age().as_secs() > timeout => false,
+                AgentStatus::Finished | AgentStatus::Killed | AgentStatus::Failed(_) => false,
+                _ => true,
+            };
+            should_keep
+        });
+    }
+
+    fn on_key(&mut self, key: KeyCode) {
+        if self.input_mode {
+            self.handle_input_mode(key);
+        } else {
+            self.handle_navigation_mode(key);
+        }
+    }
+
+    fn handle_navigation_mode(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
+            KeyCode::Char('i') | KeyCode::Char('I') if !self.agents.is_empty() => {
+                self.input_mode = true;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                    self.log_scroll = usize::MAX; // Auto-scroll to bottom
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.selected < self.agents.len().saturating_sub(1) {
+                    self.selected += 1;
+                    self.log_scroll = usize::MAX; // Auto-scroll to bottom
+                }
+            }
+            KeyCode::Char('u') => {
+                self.log_scroll = self.log_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('d') => {
+                self.log_scroll = self.log_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                self.log_scroll = self.log_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                self.log_scroll = self.log_scroll.saturating_add(10);
+            }
+            KeyCode::Char('K') => {
+                if let Some(agent) = self.agents.get_mut(self.selected) {
+                    agent.status = AgentStatus::Killed;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_input_mode(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => {
+                self.input_mode = false;
+                self.input_buffer.clear();
+            }
+            KeyCode::Enter => {
+                if let Some(agent) = self.agents.get_mut(self.selected) {
+                    let input = format!("{}\n", self.input_buffer);
+                    let _ = agent.write_input(&input);
+                }
+                self.input_buffer.clear();
+                self.input_mode = false;
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ============================================================================
+// TUI
+// ============================================================================
+
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let terminal = Terminal::new(backend)?;
+    Ok(terminal)
+}
+
+fn restore_terminal() -> Result<()> {
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    Ok(())
+}
+
+fn ui(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(f.area());
+
+    // Left panel: Agent list
+    let agents: Vec<ListItem> = app
+        .agents
+        .iter()
+        .map(|agent| {
+            let id_short = agent.id.to_string()[..8].to_string();
+            let repo_short = agent
+                .repo
+                .split('/')
+                .last()
+                .unwrap_or("")
+                .chars()
+                .take(12)
+                .collect::<String>();
+            let age_str = format_age(agent.age());
+
+            let color = match &agent.status {
+                AgentStatus::Running => Color::Green,
+                AgentStatus::Initializing => Color::Yellow,
+                _ => Color::Red,
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", id_short),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(format!("{}#{} ", repo_short, agent.issue_number)),
+                Span::styled(age_str, Style::default().fg(color)),
+            ]))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.selected));
+
+    let list = List::new(agents)
+        .block(
+            Block::default()
+                .title(format!(" Agents ({}) ", app.agents.len()))
+                .borders(Borders::ALL),
+        )
+        .highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::REVERSED),
+        )
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(list, chunks[0], &mut state);
+
+    // Right panel: Log view
+    if let Some(agent) = app.agents.get(app.selected) {
+        let buffer = agent.buffer.lock().unwrap();
+        let total_lines = buffer.len();
+
+        let visible_height = (chunks[1].height as usize).saturating_sub(3);
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        let scroll_pos = app.log_scroll.min(max_scroll);
+
+        let lines: Vec<Line> = buffer
+            .iter()
+            .skip(scroll_pos)
+            .take(visible_height)
+            .map(|s| Line::from(s.as_str()))
+            .collect();
+
+        let title = if app.input_mode {
+            format!(
+                " {}#{} [INPUT MODE - ESC to exit] ",
+                agent.repo, agent.issue_number
+            )
+        } else {
+            format!(" {}#{} ", agent.repo, agent.issue_number)
+        };
+
+        let para = Paragraph::new(lines)
+            .block(Block::default().title(title).borders(Borders::ALL))
+            .wrap(Wrap { trim: false });
+
+        f.render_widget(para, chunks[1]);
+
+        // Input bar
+        if app.input_mode {
+            let input_area = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(3)])
+                .split(chunks[1])[1];
+
+            let input = Paragraph::new(app.input_buffer.as_str())
+                .style(Style::default().fg(Color::Yellow))
+                .block(Block::default().borders(Borders::ALL).title(" Input "));
+
+            f.render_widget(input, input_area);
+        }
+    } else {
+        let msg = Paragraph::new("No agents running\n\nPress 'q' to quit")
+            .block(Block::default().title(" Log ").borders(Borders::ALL))
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(msg, chunks[1]);
+    }
+}
+
+fn format_age(age: Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
+// ============================================================================
+// CLI
+// ============================================================================
+
+#[derive(Parser)]
+#[command(name = "botster-hub")]
+#[command(version = VERSION)]
+#[command(about = "Interactive PTY-based daemon for GitHub automation")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the daemon
+    Start {
+        /// Run in headless mode (no TUI)
+        #[arg(long)]
+        headless: bool,
+    },
+    /// Show running agents
+    Status,
+    /// Show or update configuration
+    Config {
+        /// Config key to show/set
+        key: Option<String>,
+        /// Config value to set
+        value: Option<String>,
+    },
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+fn main() -> Result<()> {
+    env_logger::init();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Start { headless } => {
+            if headless {
+                run_headless()?;
+            } else {
+                run_interactive()?;
+            }
+        }
+        Commands::Status => {
+            println!("Status command not yet implemented");
+        }
+        Commands::Config { key, value } => {
+            let config = Config::load()?;
+            match (key, value) {
+                (None, None) => {
+                    println!("{}", serde_json::to_string_pretty(&config)?);
+                }
+                (Some(k), None) => {
+                    println!("Config key '{}' query not implemented", k);
+                }
+                (Some(k), Some(v)) => {
+                    println!("Would set {} = {}", k, v);
+                    // TODO: Implement dynamic config updates
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_headless() -> Result<()> {
+    println!("Starting Botster Hub v{} in headless mode...", VERSION);
+    let mut app = App::new()?;
+
+    loop {
+        app.poll_messages()?;
+        app.cleanup_agents();
+        thread::sleep(Duration::from_secs(app.config.poll_interval));
+    }
+}
+
+fn run_interactive() -> Result<()> {
+    let mut terminal = setup_terminal()?;
+    let mut app = App::new()?;
+
+    let tick_rate = Duration::from_millis(250);
+    let mut last_tick = Instant::now();
+
+    let result = (|| -> Result<()> {
+        loop {
+            terminal.draw(|f| ui(f, &app))?;
+
+            let timeout = tick_rate
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or_else(|| Duration::from_secs(0));
+
+            if event::poll(timeout)? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        app.on_key(key.code);
+                    }
+                }
+            }
+
+            if last_tick.elapsed() >= tick_rate {
+                let _ = app.poll_messages();
+                app.cleanup_agents();
+                last_tick = Instant::now();
+            }
+
+            if app.should_quit {
+                break;
+            }
+        }
+        Ok(())
+    })();
+
+    restore_terminal()?;
+    result
+}

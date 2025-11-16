@@ -1,0 +1,11 @@
+# Ignore bundler config.
+/.bundle
+
+# Copy any local credentials
+config/credentials/*.key
+.claude/settings.local.json
+
+# Ignore GitHub App private key
+/config/**.pem
+
+mise.toml

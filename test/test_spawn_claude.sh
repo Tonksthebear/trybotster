@@ -28,14 +28,19 @@ fi
 
 echo -e "${GREEN}✓ Rails server is running${NC}"
 
-# Check if botster_hub is running
-if ! pgrep -f "bin/botster_hub" > /dev/null; then
+# Check if botster_hub is running (Ruby or Rust version)
+if pgrep -f "bin/botster_hub" > /dev/null || pgrep -f "botster-hub" > /dev/null; then
+    if pgrep -f "botster-hub" > /dev/null; then
+        echo -e "${GREEN}✓ botster_hub daemon is running (Rust version)${NC}"
+    else
+        echo -e "${GREEN}✓ botster_hub daemon is running (Ruby version)${NC}"
+    fi
+else
     echo -e "${RED}✗ botster_hub daemon not running${NC}"
-    echo "  Start it with: bin/botster_hub start"
+    echo "  Start with Ruby: bin/botster_hub start"
+    echo "  Or start with Rust: cd botster_hub_rs && ./target/release/botster-hub start"
     exit 1
 fi
-
-echo -e "${GREEN}✓ botster_hub daemon is running${NC}"
 echo
 
 # Get test parameters (or use defaults)
@@ -50,23 +55,14 @@ echo
 # Create a test bot message directly in the database
 echo "Creating test bot message..."
 
-rails runner "
-  message = Bot::Message.create!(
-    event_type: 'github_mention',
-    payload: {
-      repo: '$REPO',
-      issue_number: $ISSUE_NUMBER,
-      comment_id: 999999,
-      comment_body: '@trybotster test spawn',
-      comment_author: 'test-user',
-      issue_title: 'Test Issue',
-      issue_body: 'Test issue body',
-      issue_url: 'https://github.com/$REPO/issues/$ISSUE_NUMBER',
-      is_pr: false,
-      context: 'You have been mentioned in a GitHub issue.
+# Create temporary Ruby script
+TEMP_SCRIPT=$(mktemp /tmp/botster_test.XXXXXX.rb)
 
-Repository: $REPO
-Issue Number: #$ISSUE_NUMBER
+cat > "$TEMP_SCRIPT" <<'RUBY_SCRIPT'
+context = "You have been mentioned in a GitHub issue.
+
+Repository: #{ENV['TEST_REPO']}
+Issue Number: ##{ENV['TEST_ISSUE_NUMBER']}
 
 Your task is to:
 1. Use the trybotster MCP server to fetch the issue details
@@ -80,16 +76,37 @@ IMPORTANT:
 - The trybotster MCP server is already configured in this project
 - If you cannot access the trybotster MCP server, explain that you need it to interact with GitHub
 
-Start by fetching the issue details using the trybotster MCP server.'
-    }
-  )
+Start by fetching the issue details using the trybotster MCP server."
 
-  puts \"Created Bot::Message #{message.id}\"
-  puts \"Status: #{message.status}\"
-  puts \"Claimed by: #{message.claimed_by || 'none'}\"
-"
+message = Bot::Message.create!(
+  event_type: 'github_mention',
+  payload: {
+    repo: ENV['TEST_REPO'],
+    issue_number: ENV['TEST_ISSUE_NUMBER'].to_i,
+    comment_id: 999999,
+    comment_body: '@trybotster test spawn',
+    comment_author: 'test-user',
+    issue_title: 'Test Issue',
+    issue_body: 'Test issue body',
+    issue_url: "https://github.com/#{ENV['TEST_REPO']}/issues/#{ENV['TEST_ISSUE_NUMBER']}",
+    is_pr: false,
+    context: context
+  }
+)
 
-if [ $? -eq 0 ]; then
+puts "Created Bot::Message #{message.id}"
+puts "Status: #{message.status}"
+puts "Claimed: #{message.claimed? ? 'yes' : 'no'}"
+RUBY_SCRIPT
+
+# Run with environment variables
+TEST_REPO="$REPO" TEST_ISSUE_NUMBER="$ISSUE_NUMBER" rails runner "$TEMP_SCRIPT"
+RESULT=$?
+
+# Cleanup
+rm -f "$TEMP_SCRIPT"
+
+if [ $RESULT -eq 0 ]; then
     echo -e "${GREEN}✓ Bot message created successfully${NC}"
 else
     echo -e "${RED}✗ Failed to create bot message${NC}"

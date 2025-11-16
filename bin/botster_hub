@@ -1,1141 +1,1048 @@
-#!/bin/bash
-# Botster Hub - Pure bash daemon for GitHub mention → local agent automation
-# ZERO dependencies - uses only macOS built-in tools (curl, grep, sed, osascript)
+#!/usr/bin/env ruby
+# frozen_string_literal: true
 
-set -euo pipefail
+# Botster Hub - Interactive PTY-based daemon for GitHub mention → local agent automation
+# ZERO gem dependencies - uses only Ruby 2.7+ standard library
 
-VERSION="0.1.0"
-CONFIG_DIR="$HOME/.botster_hub"
-SESSIONS_DIR="$CONFIG_DIR/sessions"
-CONFIG_FILE="$CONFIG_DIR/config"
-LOG_FILE="$CONFIG_DIR/botster_hub.log"
-PID_FILE="$CONFIG_DIR/botster_hub.pid"
+require 'net/http'
+require 'uri'
+require 'json'
+require 'pty'
+require 'io/wait'
+require 'io/console'
+require 'fileutils'
+require 'logger'
+require 'time'
+require 'shellwords'
+require 'stringio'
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+VERSION = '0.4.0'  # Bumped for updates
 
-#############################################################################
-# Config Management (Simple Key-Value)
-#############################################################################
+# ============================================================================
+# ANSI Terminal Control (zero dependencies!)
+# ============================================================================
 
-# Get config value
-get_config() {
-    local key="$1"
-    local default="${2:-}"
+module ANSI
+  # Cursor control
+  CLEAR_SCREEN = "\e[2J"
+  CLEAR_LINE = "\e[2K"
+  HIDE_CURSOR = "\e[?25l"
+  SHOW_CURSOR = "\e[?25h"
+  SAVE_CURSOR = "\e[s"
+  RESTORE_CURSOR = "\e[u"
+  HOME = "\e[H"
 
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        echo "$default"
-        return
-    fi
+  # Colors
+  RESET = "\e[0m"
+  BOLD = "\e[1m"
+  DIM = "\e[2m"
 
-    # Read value from key=value format
-    local value=$(grep "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2-)
-    echo "${value:-$default}"
-}
+  GREEN = "\e[32m"
+  YELLOW = "\e[33m"
+  RED = "\e[31m"
+  CYAN = "\e[36m"
 
-# Set config value
-set_config() {
-    local key="$1"
-    local value="$2"
+  def self.move(row, col)
+    "\e[#{row};#{col}H"
+  end
 
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        touch "$CONFIG_FILE"
-    fi
+  def self.color(text, color_code)
+    "#{color_code}#{text}#{RESET}"
+  end
 
-    # Remove existing key if present
-    if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
-        # macOS sed requires backup extension
-        sed -i '' "/^${key}=/d" "$CONFIG_FILE"
-    fi
+  def self.terminal_size
+    rows, cols = $stdout.winsize
+    [rows, cols]
+  rescue
+    [24, 80]
+  end
+end
 
-    # Add new value
-    echo "${key}=${value}" >> "$CONFIG_FILE"
+# ============================================================================
+# Configuration (edit these values)
+# ============================================================================
 
-    log "Config updated: $key = $value"
-}
+CONFIG_DIR = File.join(ENV['HOME'], '.botster_hub')
+CONFIG_FILE = File.join(CONFIG_DIR, 'config.json')
+SESSIONS_FILE = File.join(CONFIG_DIR, 'sessions.json')
+LOG_FILE = File.join(CONFIG_DIR, 'botster_hub.log')
+PID_FILE = File.join(CONFIG_DIR, 'botster_hub.pid')
 
-#############################################################################
-# Session Management (One File Per Session)
-#############################################################################
+DEFAULT_CONFIG = {
+  server_url: 'http://localhost:3000',
+  api_key: '',
+  agent_command: 'claude',
+  poll_interval: 5,        # seconds between polls
+  agent_timeout: 3600,     # auto-kill agents after 1 hour
+  max_sessions: 20,
+  worktree_base: File.join(ENV['HOME'], 'botster-sessions'),
+  completion_marker: '.botster_status',
+  claude_permission_mode: 'acceptEdits',
+  claude_allowed_tools: 'mcp__*',
+  preserve_agent_ansi: false  # New: If true, keep agent's ANSI (risky, may break TUI)
+}.freeze
 
-# Get session file path
-session_file() {
-    local session_key="$1"
-    echo "$SESSIONS_DIR/$session_key"
-}
+# ============================================================================
+# Agent Class - Manages a single Claude Code PTY session
+# ============================================================================
 
-# Check if session exists
-session_exists() {
-    local session_key="$1"
-    [[ -f "$(session_file "$session_key")" ]]
-}
+class Agent
+  attr_reader :id, :repo, :issue_number, :worktree_path, :start_time, :status
+  attr_accessor :buffer
 
-# Check if session is stale (completed or missing worktree)
-is_session_stale() {
-    local session_key="$1"
+  MAX_BUFFER_LINES = 20000  # Increased for more history
 
-    # If session file doesn't exist, it's not stale (it doesn't exist)
-    if ! session_exists "$session_key"; then
-        return 1
-    fi
+  ANSI_STRIP_REGEX = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -\/]*[@-~])/  # For stripping agent ANSI
 
-    local worktree_path=$(get_session_field "$session_key" "worktree_path")
+  def initialize(id, repo, issue_number, worktree_path, preserve_ansi)
+    @id = id
+    @repo = repo
+    @issue_number = issue_number
+    @worktree_path = worktree_path
+    @start_time = Time.now
+    @status = 'initializing'
+    @buffer = []
+    @pty_master = nil
+    @pty_slave = nil
+    @pid = nil
+    @dead = false
+    @preserve_ansi = preserve_ansi
+  end
 
-    # If worktree is missing, session is stale
-    if [[ ! -d "$worktree_path" ]]; then
-        log "Session ${session_key} is stale: worktree missing at ${worktree_path}" >&2
-        return 0
-    fi
+  def spawn_agent(command, context)
+    @status = 'spawning'
 
-    # Check for completion marker (use hardcoded default to avoid config dependency)
-    local completion_marker=".botster_status"
-    local marker_file="${worktree_path}/${completion_marker}"
+    begin
+      @pty_master, @pty_slave = PTY.open
+      @pty_slave.winsize = [24, 80]  # Small size to discourage full TUI
+      @pid = Process.spawn(
+        { 'TERM' => 'dumb' },
+        command,
+        in: @pty_slave,
+        out: @pty_slave,
+        err: @pty_slave,
+        chdir: @worktree_path
+      )
+      @pty_slave.close
+      @status = 'running'
+      @pty_master.sync = true
 
-    if [[ -f "$marker_file" ]]; then
-        local content=$(cat "$marker_file" 2>/dev/null)
-        if [[ "$content" == *"RESOLVED"* ]] || [[ "$content" == *"DONE"* ]]; then
-            log "Session ${session_key} is stale: completion marker found" >&2
-            return 0
-        fi
-    fi
+      add_to_buffer("==> Agent spawned: #{@repo}##{@issue_number}")
+      add_to_buffer("==> PID: #{@pid}")
+      add_to_buffer("==> Command: #{command}")
+      add_to_buffer("==> Worktree: #{@worktree_path}")
+      add_to_buffer("")
 
-    # Session exists and is not completed
-    return 1
-}
+      sleep 0.5
+      if context && !context.empty?
+        add_to_buffer("==> Sending context to agent...")
+        write("#{context}\n")
+      end
 
-# Get session field
-get_session_field() {
-    local session_key="$1"
-    local field="$2"
-    local default="${3:-}"
+      true
+    rescue StandardError => e
+      @status = 'failed'
+      add_to_buffer("ERROR: Failed to spawn agent: #{e.message}")
+      false
+    end
+  end
 
-    local file=$(session_file "$session_key")
+  def read_output
+    return unless @pty_master && !@pty_master.closed?
 
-    if [[ ! -f "$file" ]]; then
-        echo "$default"
-        return
-    fi
+    begin
+      data_read = false
+      loop do
+        break unless @pty_master.ready?
 
-    local value=$(grep "^${field}=" "$file" 2>/dev/null | cut -d'=' -f2-)
-    echo "${value:-$default}"
-}
+        chunk = @pty_master.read_nonblock(4096)
+        break if chunk.nil? || chunk.empty?
 
-# Create session
-create_session() {
-    local session_key="$1"
-    local message_id="$2"
-    local repo="$3"
-    local issue_number="$4"
-    local worktree_path="$5"
-    local terminal_id="$6"
+        data_read = true
+        chunk.each_line do |line|
+          add_to_buffer(line.chomp)
+        end
+        break if chunk.length < 4096
+      end
+    rescue IO::WaitReadable, IO::EAGAINWaitReadable
+      # Normal
+    rescue Errno::EIO, EOFError
+      @status = 'finished'
+      add_to_buffer("==> Agent finished")
+      close
+    rescue StandardError => e
+      add_to_buffer("ERROR reading output: #{e.message}")
+    end
+  end
 
-    local file=$(session_file "$session_key")
+  def write(input)
+    return unless @pty_master && !@pty_master.closed?
+    add_to_buffer("==> Sending input: #{input.inspect}")
+    @pty_master.write(input)
+    @pty_master.flush
+  rescue StandardError => e
+    add_to_buffer("ERROR writing input: #{e.message}")
+  end
 
-    cat > "$file" <<EOF
-message_id=$message_id
-repo=$repo
-issue_number=$issue_number
-worktree_path=$worktree_path
-terminal_id=$terminal_id
-started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-status=active
-EOF
-}
+  def alive?
+    return false if @dead || !@pid.is_a?(Integer)
+    Process.kill(0, @pid)
+    true
+  rescue Errno::ESRCH, Errno::EPERM
+    @dead = true
+    false
+  end
 
-# Remove session
-remove_session() {
-    local session_key="$1"
-    local file=$(session_file "$session_key")
+  def kill
+    return unless @pid.is_a?(Integer)
+    @status = 'killed'
+    add_to_buffer("==> Killing agent...")
+    Process.kill('TERM', @pid)
+    sleep 0.5
+    Process.kill('KILL', @pid) if alive?
+    close
+  rescue Errno::ESRCH
+    # Already dead
+  ensure
+    close
+  end
 
-    if [[ -f "$file" ]]; then
-        rm -f "$file"
-    fi
-}
+  def close
+    @pty_master.close if @pty_master && !@pty_master.closed?
+    @pty_master = nil
+  end
 
-# List all session keys
-list_sessions() {
-    if [[ ! -d "$SESSIONS_DIR" ]]; then
-        return
-    fi
+  def age
+    Time.now - @start_time
+  end
 
-    for file in "$SESSIONS_DIR"/*; do
-        if [[ -f "$file" ]]; then
-            basename "$file"
-        fi
-    done
-}
+  def session_key
+    @repo.gsub('/', '-') + "-#{@issue_number}"
+  end
 
-# Count sessions
-count_sessions() {
-    list_sessions | wc -l | tr -d ' '
-}
+  def to_h
+    {
+      id: @id,
+      repo: @repo,
+      issue_number: @issue_number,
+      worktree_path: @worktree_path,
+      start_time: @start_time.iso8601,
+      status: @status,
+      pid: @pid
+    }
+  end
 
-#############################################################################
-# Logging
-#############################################################################
+  private
 
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
-}
+  def add_to_buffer(line)
+    cleaned = @preserve_ansi ? line : line.gsub(ANSI_STRIP_REGEX, '')
+    @buffer << cleaned
+    @buffer.shift if @buffer.size > MAX_BUFFER_LINES
+  end
+end
 
-log_error() {
-    echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*${NC}" | tee -a "$LOG_FILE"
-}
+# ============================================================================
+# BotsterHub - Main daemon
+# ============================================================================
 
-log_success() {
-    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')] $*${NC}" | tee -a "$LOG_FILE"
-}
+class BotsterHub
+  attr_reader :agents, :config
 
-log_warn() {
-    echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] WARN: $*${NC}" | tee -a "$LOG_FILE"
-}
+  def initialize
+    FileUtils.mkdir_p(CONFIG_DIR)
+    load_config
+    setup_logger
+    @agents = []
+    @next_id = 1
+    @mutex = Mutex.new
+    @running = true
+  end
 
-#############################################################################
-# Initialization
-#############################################################################
+  def run(args)
+    command = args[0]
 
-init_dirs() {
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$SESSIONS_DIR"
-    mkdir -p "$HOME/botster-sessions"
-
-    # Create default config if it doesn't exist
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        cat > "$CONFIG_FILE" <<EOF
-server_url=http://localhost:3000
-api_key=
-agent_command=claude
-completion_marker=.botster_status
-max_sessions=20
-poll_interval=5
-worktree_base=$HOME/botster-sessions
-claude_permission_mode=acceptEdits
-claude_dangerously_skip_permissions=false
-claude_allowed_tools=mcp__*
-EOF
-        log "Created default config at $CONFIG_FILE"
-    fi
-}
-
-#############################################################################
-# Daemon Control
-#############################################################################
-
-is_running() {
-    if [[ -f "$PID_FILE" ]]; then
-        local pid=$(cat "$PID_FILE")
-        if ps -p "$pid" > /dev/null 2>&1; then
-            return 0
-        else
-            rm -f "$PID_FILE"
-            return 1
-        fi
-    fi
-    return 1
-}
-
-#############################################################################
-# Simple JSON Extraction (for API responses only)
-#############################################################################
-
-# Extract string value from JSON response
-json_extract_string() {
-    local json="$1"
-    local key="$2"
-    echo "$json" | grep -o "\"$key\":\"[^\"]*\"" | head -1 | sed 's/.*:"\(.*\)".*/\1/'
-}
-
-# Extract number from JSON response
-json_extract_number() {
-    local json="$1"
-    local key="$2"
-    echo "$json" | grep -o "\"$key\":[0-9]*" | head -1 | sed 's/.*:\([0-9]*\).*/\1/'
-}
-
-# Extract messages array and process each
-process_json_messages() {
-    local json="$1"
-
-    # Split messages by },{
-    echo "$json" | sed -n 's/.*"messages":\[\(.*\)\].*/\1/p' | sed 's/},{/}|{/g' | tr '|' '\n'
-}
-
-# Extract payload object from message
-json_extract_payload() {
-    local message="$1"
-    echo "$message" | sed -n 's/.*"payload":\({[^}]*}\).*/\1/p'
-}
-
-#############################################################################
-# API Communication
-#############################################################################
-
-poll_messages() {
-    local server_url=$(get_config "server_url")
-    local api_key=$(get_config "api_key")
-
-    if [[ -z "$api_key" ]]; then
-        log_error "API key not configured. Run: botster_hub config api_key YOUR_KEY"
-        return 1
-    fi
-
-    # Get the current git repository name (owner/repo format)
-    local repo_name=""
-    if git rev-parse --git-dir > /dev/null 2>&1; then
-        # Try to get from remote URL
-        local remote_url=$(git remote get-url origin 2>/dev/null)
-        if [[ -n "$remote_url" ]]; then
-            # Extract owner/repo from various Git URL formats
-            # SSH: git@github.com:owner/repo.git
-            # HTTPS: https://github.com/owner/repo.git
-            repo_name=$(echo "$remote_url" | sed -E 's#^(https?://[^/]+/|git@[^:]+:)##' | sed 's/\.git$//')
-        fi
-    fi
-
-    # Include repo parameter if detected
-    local url="$server_url/bots/messages"
-    if [[ -n "$repo_name" ]]; then
-        url="${url}?repo=${repo_name}"
-    fi
-
-    curl -s -H "X-API-Key: $api_key" "$url" 2>/dev/null
-}
-
-ack_message() {
-    local message_id="$1"
-    local server_url=$(get_config "server_url")
-    local api_key=$(get_config "api_key")
-
-    curl -s -X PATCH \
-        -H "X-API-Key: $api_key" \
-        -H "Content-Type: application/json" \
-        "$server_url/bots/messages/$message_id" \
-        > /dev/null 2>&1
-
-    if [[ $? -eq 0 ]]; then
-        log "Acknowledged message: $message_id"
+    case command
+    when 'start'
+      start_daemon(args)
+    when 'status'
+      cmd_status
+    when 'kill'
+      cmd_kill(args[1])
+    when 'cleanup'
+      cmd_cleanup
+    when 'config'
+      cmd_config(args[1], args[2])
+    when 'version', '--version', '-v'
+      puts "Botster Hub v#{VERSION}"
+    when 'help', '--help', '-h', nil
+      cmd_help
     else
-        log_error "Failed to acknowledge message: $message_id"
-    fi
-}
+      puts "Unknown command: #{command}"
+      puts "Run 'botster_hub help' for usage"
+      exit 1
+    end
+  end
 
-#############################################################################
-# Git Worktree Management
-#############################################################################
+  private
 
-create_worktree() {
-    local repo="$1"
-    local issue_number="$2"
+  def load_config
+    @config = File.exist?(CONFIG_FILE) ? JSON.parse(File.read(CONFIG_FILE), symbolize_names: true) : DEFAULT_CONFIG.dup
+    save_config unless File.exist?(CONFIG_FILE)
+  end
 
-    # Sanitize repo name for filesystem
-    local repo_safe="${repo//\//-}"
-    local branch_name="botster-${repo_safe}-${issue_number}"
-    local worktree_base=$(get_config "worktree_base")
-    local clone_dir="$worktree_base/$repo_safe"
-    local worktree_path="$worktree_base/${repo_safe}-${issue_number}"
+  def save_config
+    File.write(CONFIG_FILE, JSON.pretty_generate(@config))
+  end
 
-    # Clone the repo if it doesn't exist
-    if [[ ! -d "$clone_dir" ]]; then
-        log "Cloning repository: https://github.com/$repo.git to $clone_dir" >&2
-        if ! git clone "https://github.com/$repo.git" "$clone_dir" >> "$LOG_FILE" 2>&1; then
-            log_error "Failed to clone repository: $repo" >&2
-            return 1
-        fi
+  def setup_logger
+    @logger = Logger.new(LOG_FILE, 10, 1024000)
+    @logger.level = Logger::INFO
+  end
+
+  def log(msg)
+    @logger.info(msg) if @logger
+  end
+
+  def start_daemon(args)
+    if running?
+      puts "Botster Hub is already running (PID: #{File.read(PID_FILE).strip})"
+      exit 1
+    end
+
+    unless system('git rev-parse --git-dir > /dev/null 2>&1')
+      puts "ERROR: Not in a git repository"
+      exit 1
+    end
+
+    File.write(PID_FILE, Process.pid.to_s)
+
+    headless = args.include?('--headless') || !$stdout.tty?
+
+    trap('INT') { @running = false }
+    trap('TERM') { @running = false }
+    trap('WINCH') { @terminal_resized = true }  # Just set a flag, handle in main loop
+
+    log "Starting Botster Hub v#{VERSION} (#{headless ? 'headless' : 'interactive'})"
+
+    if headless
+      run_headless
     else
-        log "Using existing clone: $clone_dir" >&2
-        pushd "$clone_dir" > /dev/null
-        git pull >> "$LOG_FILE" 2>&1 || log_warn "Failed to pull latest changes" >&2
-        popd > /dev/null
-    fi
-
-    # === CRITICAL: Use absolute path for worktree add ===
-    # git worktree add creates the directory relative to the current repo
-    # We must cd into the clone first, then use absolute path for the target
-    pushd "$clone_dir" > /dev/null
-
-    if [[ -d "$worktree_path" ]]; then
-        log "Reusing existing worktree: $worktree_path" >&2
-    else
-        if git show-ref --verify --quiet "refs/heads/$branch_name"; then
-            log "Creating worktree from existing branch: $branch_name" >&2
-            git worktree add "$worktree_path" "$branch_name" >> "$LOG_FILE" 2>&1 || { popd > /dev/null; return 1; }
-        else
-            log "Creating worktree with new branch: $branch_name" >&2
-            git worktree add -b "$branch_name" "$worktree_path" >> "$LOG_FILE" 2>&1 || { popd > /dev/null; return 1; }
-        fi
-        log_success "Created worktree: $worktree_path" >&2
-    fi
-
-    popd > /dev/null
-
-    # Pre-trust the directory
-    mkdir -p "$worktree_path/.claude"
-    touch "$worktree_path/.claude/trusted"
-    log "Pre-trusted worktree: $worktree_path" >&2
-
-    # Output ONLY the path to stdout (everything else goes to stderr)
-    echo "$worktree_path"
-}
-
-#############################################################################
-# Agent CLI Options Management
-#############################################################################
-
-# Build CLI options for Claude Code
-build_claude_code_options() {
-    local options=""
-
-    # Whitelisted Claude Code options
-    local model=$(get_config "claude_model")
-    local permission_mode=$(get_config "claude_permission_mode")
-    local max_turns=$(get_config "claude_max_turns")
-    local add_dir=$(get_config "claude_add_dir")
-    local system_prompt=$(get_config "claude_system_prompt")
-    local system_prompt_file=$(get_config "claude_system_prompt_file")
-    local append_system_prompt=$(get_config "claude_append_system_prompt")
-    local allowed_tools=$(get_config "claude_allowed_tools")
-    local disallowed_tools=$(get_config "claude_disallowed_tools")
-    local verbose=$(get_config "claude_verbose")
-    local dangerously_skip_permissions=$(get_config "claude_dangerously_skip_permissions")
-    local mcp_config=$(get_config "claude_mcp_config")
-    local settings=$(get_config "claude_settings")
-
-    # Build options string (only include non-empty values)
-    if [[ -n "$model" ]]; then
-        options="$options --model $model"
-    fi
-
-    if [[ -n "$permission_mode" ]]; then
-        options="$options --permission-mode $permission_mode"
-    fi
-
-    if [[ -n "$max_turns" ]]; then
-        options="$options --max-turns $max_turns"
-    fi
-
-    if [[ -n "$add_dir" ]]; then
-        options="$options --add-dir $add_dir"
-    fi
-
-    if [[ -n "$system_prompt" ]]; then
-        options="$options --system-prompt '$system_prompt'"
-    fi
-
-    if [[ -n "$system_prompt_file" ]]; then
-        options="$options --system-prompt-file $system_prompt_file"
-    fi
-
-    if [[ -n "$append_system_prompt" ]]; then
-        options="$options --append-system-prompt '$append_system_prompt'"
-    fi
-
-    if [[ -n "$allowed_tools" ]]; then
-        options="$options --allowedTools $allowed_tools"
-    fi
-
-    if [[ -n "$disallowed_tools" ]]; then
-        options="$options --disallowedTools $disallowed_tools"
-    fi
-
-    if [[ "$verbose" == "true" ]]; then
-        options="$options --verbose"
-    fi
-
-    if [[ "$dangerously_skip_permissions" == "true" ]]; then
-        options="$options --dangerously-skip-permissions"
-    fi
-
-    if [[ -n "$mcp_config" ]]; then
-        options="$options --mcp-config $mcp_config"
-    fi
-
-    if [[ -n "$settings" ]]; then
-        options="$options --settings $settings"
-    fi
-
-    # Trim leading space and return
-    echo "${options# }"
-}
-
-# Build CLI options based on agent command
-build_agent_options() {
-    local agent_command=$(get_config "agent_command")
-
-    case "$agent_command" in
-        claude|"claude code")
-            build_claude_code_options
-            ;;
-        *)
-            # No special options for other agents
-            echo ""
-            ;;
-    esac
-}
-
-#############################################################################
-# Terminal Session Management
-#############################################################################
-
-spawn_terminal() {
-    local worktree_path="$1"
-    local repo="$2"
-    local issue_number="$3"
-    local context="$4"
-
-    local agent_command=$(get_config "agent_command")
-    local agent_options=$(build_agent_options)
-    local completion_marker=$(get_config "completion_marker")
-    local api_key=$(get_config "api_key")
-
-    # Get the main project directory (where the daemon is running from)
-    local main_project_dir="$(pwd)"
-
-    # Create temporary files for script and context
-    local script_file=$(mktemp)
-    local context_file=$(mktemp)
-
-    # Write context to file using printf to preserve exact content
-    printf '%s' "$context" > "$context_file"
-
-    # Write the shell script that will be executed in the terminal
-    # Register MCP server at local scope (project-specific user settings)
-    # This avoids needing approval for project-scoped .mcp.json
-    cat > "$script_file" <<SCRIPT_EOF
-#!/bin/bash
-cd '$worktree_path' || { echo "FATAL: Cannot cd to worktree: $worktree_path"; exit 1; }
-
-# Create .claude directory and mark as trusted
-mkdir -p .claude
-touch .claude/trusted
-
-export BOTSTER_API_KEY='$api_key'
-
-# Register trybotster MCP server at local scope (highest precedence, no approval needed)
-echo "Registering trybotster MCP server..."
-claude mcp add trybotster \\
-  --transport http \\
-  https://mcp-dev.trybotster.com \\
-  --header "Authorization: Bearer $api_key" \\
-  || echo "WARNING: Failed to register MCP server"
-
-# Verify server is available
-echo "Verifying MCP server..."
-claude mcp list
-
-# Copy .claude settings from main project
-echo "Setting up .claude permissions..."
-mkdir -p .claude/hooks
-
-# Copy settings.local.json from main project if it exists
-if [ -f "$main_project_dir/.claude/settings.local.json" ]; then
-  cp "$main_project_dir/.claude/settings.local.json" .claude/settings.local.json
-  echo "✓ Copied settings.local.json from main project"
-else
-  echo "⚠ No settings.local.json found in main project at:"
-  echo "  $main_project_dir/.claude/settings.local.json"
-  echo "  Spawned Claude will use default permissions"
-fi
-
-# Create auto-exit hook script
-echo "Creating auto-exit hook for completion detection..."
-cat > .claude/hooks/check_completion.sh <<HOOK_EOF
-#!/bin/bash
-# Auto-exit hook - checks for completion marker and exits session
-
-COMPLETION_MARKER="$completion_marker"
-
-# Check if completion marker exists
-if [ -f "\\\$COMPLETION_MARKER" ]; then
-  content=\\\$(cat "\\\$COMPLETION_MARKER" 2>/dev/null)
-
-  # Check if Claude marked task as complete
-  if [[ "\\\$content" == *"RESOLVED"* ]] || [[ "\\\$content" == *"DONE"* ]]; then
-    echo ""
-    echo "✓ Task marked as complete. Exiting Claude Code session..."
-    echo ""
-
-    # Exit the Claude Code session
-    exit 0
-  fi
-fi
-HOOK_EOF
-
-chmod +x .claude/hooks/check_completion.sh
-
-# Create hooks configuration
-cat > .claude/hooks.json <<'HOOKS_JSON_EOF'
-{
-  "hooks": {
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".claude/hooks/check_completion.sh"
-          }
-        ]
-      }
-    ]
-  }
-}
-HOOKS_JSON_EOF
-
-echo "✓ Created auto-exit hook configuration"
-
-# Pre-accept trust dialog for this worktree in ~/.claude.json
-echo "Pre-accepting workspace trust..."
-node -e "
-const fs = require('fs');
-const path = require('path');
-const configPath = path.join(process.env.HOME, '.claude.json');
-try {
-  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-  const projectPath = '$worktree_path';
-  if (!config.projects) config.projects = {};
-  if (!config.projects[projectPath]) {
-    config.projects[projectPath] = {
-      allowedTools: [],
-      mcpContextUris: [],
-      mcpServers: {},
-      enabledMcpjsonServers: [],
-      disabledMcpjsonServers: [],
-      hasTrustDialogAccepted: true,
-      projectOnboardingSeenCount: 0,
-      hasClaudeMdExternalIncludesApproved: false,
-      hasClaudeMdExternalIncludesWarningShown: false
-    };
-  } else {
-    config.projects[projectPath].hasTrustDialogAccepted = true;
-  }
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-  console.log('✓ Pre-accepted workspace trust for this worktree');
-} catch (e) {
-  console.error('Warning: Failed to pre-accept trust:', e.message);
-}
-"
-
-# Start Claude Code with context
-# Use --add-dir to pre-trust this worktree directory
-echo "Starting Claude Code..."
-$agent_command $agent_options --add-dir '$worktree_path' -- "\$(cat '$context_file')" || echo 'Agent failed'
-echo 'DONE' > $completion_marker
-rm -f '$context_file' '$script_file'
-
-# Wait a moment for cleanup, then close the terminal
-echo ""
-echo "Session complete. Terminal will close in 5 seconds..."
-sleep 5
-osascript -e 'tell application "Terminal" to close (every window whose name contains "Botster:")' 2>/dev/null || true
-SCRIPT_EOF
-
-    chmod +x "$script_file"
-
-    # Escape for AppleScript
-    local esc_script="${script_file//\'/\'\\\'\'}"
-    local esc_title="Botster: ${repo//#/\\#}#${issue_number}"
-    esc_title="${esc_title//\'/\'\\\'\'}"
-
-    # AppleScript to spawn Terminal and get window ID by parsing do script output
-    local tab_desc
-    tab_desc=$(osascript <<EOF 2>&1
-tell application "Terminal"
-    activate
-    do script "$esc_script"
-end tell
-EOF
-)
-
-    if [[ $? -ne 0 ]]; then
-        log_error "AppleScript failed: $tab_desc"
-        return 1
-    fi
-
-    # Parse window ID from tab description, e.g. "tab 1 of window id 12345"
-    local terminal_id=$(echo "$tab_desc" | sed -n 's/.*window id \([0-9]*\).*/\1/p')
-
-    # Set title (separate osascript, as it's now open)
-    if [[ -n "$terminal_id" ]]; then
-        osascript <<EOF 2>/dev/null
-tell application "Terminal"
-    set custom title of window id $terminal_id to "$esc_title"
-end tell
-EOF
-    fi
-
-    if [[ -n "$terminal_id" && "$terminal_id" =~ ^[0-9]+$ ]]; then
-        log_success "Spawned terminal for ${repo}#${issue_number}"
-        log "Terminal ID: $terminal_id" >&2
-        echo "$terminal_id"
-    else
-        log_error "Failed to spawn terminal: Invalid ID from $tab_desc"
-        return 1
-    fi
-}
-
-#############################################################################
-# Message Processing
-#############################################################################
-
-process_messages() {
-    local response=$(poll_messages)
-
-    if [[ -z "$response" ]]; then
-        return 0
-    fi
-
-    # Get count
-    local count=$(json_extract_number "$response" "count")
-
-    if [[ -z "$count" ]] || [[ "$count" -eq 0 ]]; then
-        return 0
-    fi
-
-    log "Received $count new message(s)"
-
-    # Process each message
-    process_json_messages "$response" | while IFS= read -r message; do
-        if [[ -z "$message" ]]; then
-            continue
-        fi
-
-        local message_id=$(json_extract_number "$message" "id")
-        local event_type=$(json_extract_string "$message" "event_type")
-
-        if [[ "$event_type" != "github_mention" ]]; then
-            log_warn "Ignoring message type: $event_type"
-            ack_message "$message_id"
-            continue
-        fi
-
-        # Extract payload
-        local payload=$(json_extract_payload "$message")
-
-        local repo=$(json_extract_string "$payload" "repo")
-        local issue_number=$(json_extract_number "$payload" "issue_number")
-        # Replace slash in repo name with dash for safe filesystem path
-        local repo_safe="${repo//\//-}"
-        local session_key="${repo_safe}-${issue_number}"
-
-        # Check if session already exists
-        if session_exists "$session_key"; then
-            # Check if session is stale (completed or missing worktree)
-            if is_session_stale "$session_key"; then
-                log "Session ${session_key} is stale, cleaning up"
-
-                # Cleanup stale session
-                local worktree_path=$(get_session_field "$session_key" "worktree_path")
-                if [[ -d "$worktree_path" ]]; then
-                    git worktree remove "$worktree_path" --force >> "$LOG_FILE" 2>&1 || true
-                fi
-                remove_session "$session_key"
-
-                log_success "Cleaned up stale session: ${session_key}"
-                # Continue processing this message
+      run_interactive
+    end
+  end
+
+  def run_headless
+    puts "Starting in headless mode... (press Ctrl+C to stop)"
+    log "Running in headless mode"
+
+    poll_interval = @config[:poll_interval] || 5
+
+    loop do
+      break unless @running
+      poll_and_spawn
+      @mutex.synchronize { @agents.each(&:read_output); cleanup_agents }
+      sleep poll_interval
+    end
+
+    cleanup_all_agents
+    File.delete(PID_FILE) if File.exist?(PID_FILE)
+    puts "\nShutdown complete"
+  end
+
+  def run_interactive
+    begin
+      print ANSI::HIDE_CURSOR
+      print ANSI::CLEAR_SCREEN
+
+      $stdin.raw!
+
+      @selected_index = 0
+      @log_scroll = 0
+      @terminal_height, @terminal_width = ANSI.terminal_size
+      @list_width = [@terminal_width / 3, 40].min
+      @input_mode = false
+      @input_buffer = ""
+      @input_cursor_pos = 0
+      @input_history = []  # Up to 10 lines
+      @input_history_index = 0
+
+      start_poll_thread
+
+      io_loop  # New select-based loop
+    ensure
+      $stdin.cooked! rescue nil
+      print ANSI::SHOW_CURSOR
+      print ANSI::CLEAR_SCREEN
+      print ANSI::HOME
+
+      @running = false
+      cleanup_all_agents
+      File.delete(PID_FILE) if File.exist?(PID_FILE)
+    end
+  end
+
+  def start_poll_thread
+    @poll_thread = Thread.new do
+      loop do
+        break unless @running
+        poll_and_spawn
+        sleep(@config[:poll_interval] || 5)
+      end
+    rescue StandardError => e
+      log "Poll thread error: #{e.message}"
+    end
+  end
+
+  def io_loop
+    loop do
+      break unless @running
+
+      @mutex.synchronize do
+        ios = @agents.map { |a| a.instance_variable_get(:@pty_master) }.compact + [$stdin]
+        readable, _, _ = IO.select(ios, nil, nil, 0.1)  # Timeout for redraws
+
+        if readable
+          readable.each do |io|
+            if io == $stdin
+              ch = io.getc
+              if @input_mode
+                handle_input_mode(ch)
+              else
+                handle_navigation_mode(ch)
+              end
             else
-                log_warn "Session already exists for ${session_key}, skipping"
-                ack_message "$message_id"
-                continue
-            fi
-        fi
-
-        # Check max sessions
-        local max_sessions=$(get_config "max_sessions" "20")
-        local current_sessions=$(count_sessions)
-
-        if [[ "$current_sessions" -ge "$max_sessions" ]]; then
-            log_warn "Max sessions ($max_sessions) reached, skipping"
-            continue
-        fi
-
-        log "Processing GitHub mention in ${repo}#${issue_number}"
-
-        # Create worktree
-        local worktree_path=$(create_worktree "$repo" "$issue_number")
-
-        if [[ $? -ne 0 ]]; then
-            log_error "Failed to create worktree for ${session_key}"
-            continue
-        fi
-
-        # Get context
-        local context=$(json_extract_string "$payload" "context")
-
-        # Append trust snippet to context for Claude-Code
-        local agent_command=$(get_config "agent_command")
-        if [[ "$agent_command" == "claude" || "$agent_command" == "claude code" ]]; then
-            context+=$'\n\n**First action (run automatically):**
-```bash
-# Trust this directory once (creates .claude/trusted if needed)
-mkdir -p .claude && touch .claude/trusted
-echo "Directory trusted for this session"
-```'
-        fi
-
-        # Spawn terminal
-        local terminal_id
-        terminal_id=$(spawn_terminal "$worktree_path" "$repo" "$issue_number" "$context")
-        local spawn_status=$?
-
-        if [[ $spawn_status -ne 0 ]]; then
-            log_error "Failed to spawn terminal for ${session_key}"
-            git worktree remove "$worktree_path" --force 2>/dev/null || true
-            continue
-        fi
-
-        # Verify terminal_id doesn't contain error messages
-        if [[ -z "$terminal_id" ]] || [[ "$terminal_id" == *"error"* ]] || [[ "$terminal_id" == *"syntax error"* ]]; then
-            log_error "Invalid terminal ID for ${session_key}: $terminal_id"
-            git worktree remove "$worktree_path" --force 2>/dev/null || true
-            continue
-        fi
-
-        # Create session file
-        create_session "$session_key" "$message_id" "$repo" "$issue_number" "$worktree_path" "$terminal_id"
-
-        # Acknowledge message
-        ack_message "$message_id"
-
-        log_success "Session created: ${session_key}"
-    done
-}
-
-#############################################################################
-# Session Health Monitoring
-#############################################################################
-
-check_sessions() {
-    local completion_marker=$(get_config "completion_marker")
-
-    for session_key in $(list_sessions); do
-        local worktree_path=$(get_session_field "$session_key" "worktree_path")
-
-        # Check if worktree still exists
-        if [[ ! -d "$worktree_path" ]]; then
-            log_warn "Worktree missing for ${session_key}, cleaning up"
-            remove_session "$session_key"
-            continue
-        fi
-
-        # Check for completion marker
-        local marker_file="${worktree_path}/${completion_marker}"
-
-        if [[ -f "$marker_file" ]]; then
-            local content=$(cat "$marker_file")
-
-            if [[ "$content" == *"RESOLVED"* ]] || [[ "$content" == *"DONE"* ]]; then
-                log "Session completed: ${session_key}"
-
-                # Cleanup worktree - check if it still exists first
-                if [[ -d "$worktree_path" ]]; then
-                    # Try to remove the worktree, but don't fail if it errors
-                    if git worktree remove "$worktree_path" --force >> "$LOG_FILE" 2>&1; then
-                        log "Removed worktree: $worktree_path"
-                    else
-                        log_warn "Could not remove worktree (may be in use): $worktree_path"
-                        # Still clean up the session - worktree will be cleaned up later
-                    fi
-                fi
-
-                # Remove session file
-                remove_session "$session_key"
-
-                log_success "Cleaned up session: ${session_key}"
-            fi
-        fi
-    done
-}
-
-#############################################################################
-# Commands
-#############################################################################
-
-cmd_start() {
-    if is_running; then
-        echo "Botster Hub is already running (PID: $(cat $PID_FILE))"
-        exit 1
-    fi
-
-    # Validate that we're in a git repository
-    if ! git rev-parse --git-dir > /dev/null 2>&1; then
-        log_error "Not in a git repository. Botster Hub must be run from the root of your project."
-        exit 1
-    fi
-
-    # Validate that we can detect the repository name
-    local remote_url=$(git remote get-url origin 2>/dev/null)
-    if [[ -z "$remote_url" ]]; then
-        log_error "No git remote 'origin' found. Please configure a remote first:"
-        log_error "  git remote add origin <url>"
-        exit 1
-    fi
-
-    # Extract and validate repo name
-    local repo_name=$(echo "$remote_url" | sed -E 's#^(https?://[^/]+/|git@[^:]+:)##' | sed 's/\.git$//')
-    if [[ -z "$repo_name" ]] || [[ ! "$repo_name" =~ / ]]; then
-        log_error "Could not extract repository name from remote URL: $remote_url"
-        log_error "Expected format: owner/repo"
-        exit 1
-    fi
-
-    log_success "Starting Botster Hub v${VERSION}"
-    log "Server: $(get_config server_url)"
-    log "Repository: $repo_name"
-    log "Poll interval: $(get_config poll_interval)s"
-
-    # Write PID
-    echo $$ > "$PID_FILE"
-
-    # Setup signal handlers
-    trap 'log "Shutting down..."; rm -f "$PID_FILE"; exit 0' INT TERM
-
-    local poll_interval=$(get_config "poll_interval" "5")
-
-    # Main loop
-    while true; do
-        process_messages
-        check_sessions
-        sleep "$poll_interval"
-    done
-}
-
-# Test command - spawns a test terminal
-cmd_test() {
-    log "Testing terminal spawn in 3 seconds..."
-    sleep 3
-
-    local test_path=$(pwd)
-    local test_repo="test/repo"
-    local test_issue="999"
-    local test_context="This is a test message from botster_hub.
-
-Please confirm that:
-1. This terminal opened successfully
-2. Claude received this message
-3. You can see this context
-
-If you can see this, the terminal spawning is working!"
-
-    log "Spawning test terminal..."
-    spawn_terminal "$test_path" "$test_repo" "$test_issue" "$test_context"
-
-    log "Test terminal spawned. Check if new terminal opened."
-    log "Daemon will keep running for 30 seconds..."
-
-    # Keep running for 30 seconds to see if terminal stays open
-    sleep 30
-
-    log "Test complete."
-}
-
-cmd_status() {
-    if ! is_running; then
-        echo "Botster Hub is not running"
-        exit 1
-    fi
-
-    local session_count=$(count_sessions)
-
-    if [[ "$session_count" -eq 0 ]]; then
-        echo "No active sessions"
-        exit 0
-    fi
-
-    echo "Active Sessions ($session_count):"
-    printf '=%.0s' {1..80}
-    echo
-
-    for session_key in $(list_sessions); do
-        local repo=$(get_session_field "$session_key" "repo")
-        local issue_number=$(get_session_field "$session_key" "issue_number")
-        local worktree_path=$(get_session_field "$session_key" "worktree_path")
-        local started_at=$(get_session_field "$session_key" "started_at")
-        local status=$(get_session_field "$session_key" "status")
-
-        echo "✓ ${session_key}"
-        echo "  Repo: ${repo}"
-        echo "  Issue: #${issue_number}"
-        echo "  Path: ${worktree_path}"
-        echo "  Started: ${started_at}"
-        echo "  Status: ${status}"
-        echo
-    done
-}
-
-cmd_kill() {
-    local session_key="$1"
-
-    if [[ -z "$session_key" ]]; then
-        echo "Usage: botster_hub kill <session_key>"
-        exit 1
-    fi
-
-    if ! session_exists "$session_key"; then
-        echo "Session not found: $session_key"
-        exit 1
-    fi
-
-    local worktree_path=$(get_session_field "$session_key" "worktree_path")
-
-    log "Killing session: $session_key"
-
-    # Remove worktree
-    if [[ -d "$worktree_path" ]]; then
-        git worktree remove "$worktree_path" --force 2>&1 | tee -a "$LOG_FILE" || true
-    fi
-
-    # Remove session file
-    remove_session "$session_key"
-
-    log_success "Session killed: $session_key"
-}
-
-cmd_cleanup() {
-    log "Cleaning up stale sessions..."
-
-    local removed=0
-
-    for session_key in $(list_sessions); do
-        local worktree_path=$(get_session_field "$session_key" "worktree_path")
-
-        if [[ ! -d "$worktree_path" ]]; then
-            log "Removing stale session: $session_key"
-            remove_session "$session_key"
-            ((removed++))
-        fi
-    done
-
-    echo "Cleaned up $removed stale session(s)"
-}
-
-cmd_config() {
-    local key="$1"
-    local value="$2"
-
-    if [[ -z "$key" ]]; then
-        # Show all config
-        echo "Configuration ($CONFIG_FILE):"
-        cat "$CONFIG_FILE"
-        exit 0
-    fi
-
-    if [[ -z "$value" ]]; then
-        # Show specific key
-        echo "$(get_config "$key")"
-        exit 0
-    fi
-
-    # Set value
-    set_config "$key" "$value"
-}
-
-cmd_help() {
-    cat <<EOF
-Botster Hub v${VERSION} - GitHub mention → local agent automation
-
-Usage:
-  botster_hub start                  Start the daemon
-  botster_hub test                   Test terminal spawning with Claude
-  botster_hub status                 Show active sessions
-  botster_hub kill <session_key>     Kill a specific session
-  botster_hub cleanup                Clean up stale worktrees
-  botster_hub config [key] [value]   Show or set configuration
-  botster_hub version                Show version
-
-Configuration ($CONFIG_FILE):
-  server_url       - Rails server URL (default: http://localhost:3000)
-  api_key          - API key for authentication
-  agent_command    - Command to run (default: claude)
-  completion_marker - File to watch for completion (default: .botster_status)
-  max_sessions     - Max concurrent sessions (default: 20)
-  poll_interval    - Seconds between polls (default: 5)
-  worktree_base    - Base directory for worktrees
-
-Claude Code Agent Options (when agent_command=claude):
-  claude_model                        - Model to use (sonnet, opus, etc)
-  claude_permission_mode              - Permission mode (acceptEdits, plan, etc)
-  claude_max_turns                    - Max agentic turns in non-interactive mode
-  claude_add_dir                      - Additional working directories
-  claude_system_prompt                - Custom system prompt (replaces default)
-  claude_system_prompt_file           - Load system prompt from file
-  claude_append_system_prompt         - Append to default system prompt
-  claude_allowed_tools                - Tools permitted without prompting
-  claude_disallowed_tools             - Tools blocked
-  claude_verbose                      - Enable verbose logging (true/false)
-  claude_dangerously_skip_permissions - Skip permission prompts (true/false)
-  claude_mcp_config                   - Path to MCP config file or JSON string
-  claude_settings                     - Path to settings JSON file or JSON string
-
-Example: Configure Claude Code with acceptEdits permissions
-  botster_hub config agent_command claude
-  botster_hub config claude_permission_mode acceptEdits
-  botster_hub config claude_model sonnet
-
-Example: Use your home directory MCP config
-  botster_hub config claude_mcp_config ~/.config/claude/mcp_servers.json
-
-Example: Use your home directory settings
-  botster_hub config claude_settings ~/.config/claude/settings.json
-
-Session Files:
-  Each session stored in: $SESSIONS_DIR/<repo>-<issue>
-  Simple key=value format, one session per file
-
-Examples:
-  botster_hub config                          # Show all config
-  botster_hub config api_key                  # Show API key
-  botster_hub config api_key "your_key_here"  # Set API key
-  botster_hub config agent_command "aider"    # Change agent
-  botster_hub start                           # Start daemon
-
-ZERO DEPENDENCIES - Uses only macOS built-ins!
-No jq, no Python, no Ruby - just pure bash!
-EOF
-}
-
-#############################################################################
-# Main
-#############################################################################
-
-main() {
-    init_dirs
-
-    local command="${1:-}"
-
-    case "$command" in
-        start)
-            cmd_start
-            ;;
-        test)
-            cmd_test
-            ;;
-        status)
-            cmd_status
-            ;;
-        kill)
-            cmd_kill "${2:-}"
-            ;;
-        cleanup)
-            cmd_cleanup
-            ;;
-        config)
-            cmd_config "${2:-}" "${3:-}"
-            ;;
-        version|--version|-v)
-            echo "Botster Hub v${VERSION}"
-            ;;
-        help|--help|-h|"")
-            cmd_help
-            ;;
-        *)
-            echo "Unknown command: $command"
-            echo "Run 'botster_hub help' for usage"
-            exit 1
-            ;;
-    esac
-}
-
-main "$@"
+              agent = @agents.find { |a| a.instance_variable_get(:@pty_master) == io }
+              agent.read_output if agent
+            end
+          end
+        end
+
+        cleanup_agents
+      end
+
+      # Handle resize if needed
+      if @terminal_resized
+        @terminal_height, @terminal_width = ANSI.terminal_size
+        @list_width = [@terminal_width / 3, 40].min
+        @terminal_resized = false
+      end
+
+      draw_ui
+    end
+  end
+
+  def handle_navigation_mode(ch)
+    esc_seq = ""
+    if ch == "\e"
+      esc_seq = ch + $stdin.read_nonblock(10) rescue ch  # Read full escape seq
+    else
+      esc_seq = ch
+    end
+
+    case esc_seq
+    when "\e[A", 'k'  # Up
+      old_index = @selected_index
+      @selected_index = [@selected_index - 1, 0].max
+      @log_scroll = Float::INFINITY if old_index != @selected_index  # Will be clamped to max
+    when "\e[B", 'j'  # Down
+      old_index = @selected_index
+      @selected_index = [@selected_index + 1, @agents.size - 1].max
+      @log_scroll = Float::INFINITY if old_index != @selected_index  # Will be clamped to max
+    when "\e[5~"  # Page Up
+      @log_scroll = [@log_scroll - 10, 0].max
+    when "\e[6~"  # Page Down
+      if (selected = _selected_agent_unsafe)
+        max_scroll = [selected.buffer.size - (@terminal_height - 2), 0].max
+        @log_scroll = [@log_scroll + 10, max_scroll].min
+      end
+    when 'u'  # Scroll up 1 line
+      @log_scroll = [@log_scroll - 1, 0].max
+    when 'd'  # Scroll down 1 line
+      if (selected = _selected_agent_unsafe)
+        max_scroll = [selected.buffer.size - (@terminal_height - 2), 0].max
+        @log_scroll = [@log_scroll + 1, max_scroll].min
+      end
+    when 'K'
+      # Don't call kill_selected_agent as it tries to acquire mutex
+      agent = _selected_agent_unsafe
+      if agent
+        agent.kill
+        cleanup_session(agent)
+      end
+    when 'i', 'I'
+      # Only enter input mode if there's an agent selected
+      if _selected_agent_unsafe
+        @input_mode = true
+        @input_buffer = ""
+        @input_cursor_pos = 0
+        @input_history_index = @input_history.size
+      end
+    when 'q', 'Q', "\x03"
+      @running = false
+    when 'h', 'H'
+      # Show help (overlay)
+      print ANSI::SAVE_CURSOR
+      print ANSI.color("Help: j/k nav, i input, K kill, u/d scroll, q quit", ANSI::YELLOW)
+      sleep 2
+      print ANSI::RESTORE_CURSOR
+    when 'r', 'R'
+      # Refresh
+    end
+  end
+
+  def handle_input_mode(ch)
+    log "handle_input_mode called: ch=#{ch.inspect}, input_mode=#{@input_mode}, buffer=#{@input_buffer.inspect}"
+
+    esc_seq = ""
+    if ch == "\e"
+      esc_seq = ch + ($stdin.read_nonblock(10) rescue "")
+    else
+      esc_seq = ch
+    end
+
+    log "handle_input_mode: esc_seq=#{esc_seq.inspect}"
+
+    case esc_seq
+    when "\e"  # Escape alone - exit mode
+      log "handle_input_mode: ESC pressed - exiting input mode"
+      @input_mode = false
+      @input_buffer = ""
+    when "\r", "\n"  # Enter
+      log "handle_input_mode: ENTER pressed - buffer=#{@input_buffer.inspect}"
+      agent = _selected_agent_unsafe
+      if agent
+        if !@input_buffer.empty?
+          agent.write("#{@input_buffer}\n")
+          @input_history << @input_buffer
+          @input_history.shift if @input_history.size > 10
+        else
+          agent.add_to_buffer("==> (empty input, not sent)")
+        end
+      else
+        # No agent selected - can't happen but just in case
+      end
+      @input_mode = false
+      @input_buffer = ""
+      @input_cursor_pos = 0
+    when "\x7F", "\x08", "\e[3~"  # Backspace/Delete
+      if @input_cursor_pos > 0
+        @input_buffer = @input_buffer[0...@input_cursor_pos - 1] + @input_buffer[@input_cursor_pos..]
+        @input_cursor_pos -= 1
+      end
+    when "\x03"  # Ctrl+C
+      @input_mode = false
+      @input_buffer = ""
+    when "\e[A"  # Up (history)
+      if @input_history_index > 0
+        @input_history_index -= 1
+        @input_buffer = @input_history[@input_history_index]
+        @input_cursor_pos = @input_buffer.length
+      end
+    when "\e[B"  # Down (history)
+      if @input_history_index < @input_history.size
+        @input_history_index += 1
+        @input_buffer = @input_history_index < @input_history.size ? @input_history[@input_history_index] : ""
+        @input_cursor_pos = @input_buffer.length
+      end
+    when "\e[D"  # Left
+      @input_cursor_pos = [@input_cursor_pos - 1, 0].max
+    when "\e[C"  # Right
+      @input_cursor_pos = [@input_cursor_pos + 1, @input_buffer.length].min
+    when "\e[H", "\e[1~"  # Home
+      @input_cursor_pos = 0
+    when "\e[F", "\e[4~"  # End
+      @input_cursor_pos = @input_buffer.length
+    else
+      if ch.match?(/[[:print:]]/)
+        @input_buffer = @input_buffer[0...@input_cursor_pos] + ch + @input_buffer[@input_cursor_pos..]
+        @input_cursor_pos += 1
+      end
+    end
+  end
+
+  def draw_ui
+    output = StringIO.new
+    output.print ANSI::CLEAR_SCREEN
+    output.print ANSI::HOME
+
+    draw_agent_list(output)
+    draw_log_view(output)
+
+    print output.string
+    $stdout.flush
+  end
+
+  def draw_agent_list(output)
+    (1..@terminal_height).each do |row|
+      output.print ANSI.move(row, 1)
+      output.print "│"
+      output.print ANSI.move(row, @list_width)
+      output.print "│"
+    end
+
+    output.print ANSI.move(1, 1)
+    output.print "┌" + ("─" * (@list_width - 2)) + "┐"
+
+    output.print ANSI.move(@terminal_height, 1)
+    output.print "└" + ("─" * (@list_width - 2)) + "┘"
+
+    output.print ANSI.move(1, 3)
+    output.print ANSI.color(" Agents (#{@agents.size}) ", ANSI::CYAN + ANSI::BOLD)
+
+    output.print ANSI.move(@terminal_height, 3)
+    if @input_mode
+      output.print ANSI.color("ESC:exit input mode", ANSI::YELLOW)
+    else
+      output.print ANSI.color("j/k:nav i:input K:kill q:quit h:help", ANSI::DIM)
+    end
+
+    @agents.each_with_index do |agent, idx|
+      row = idx + 2
+      break if row >= @terminal_height
+
+      output.print ANSI.move(row, 2)
+
+      status_color = case agent.status
+                     when 'running' then ANSI::GREEN
+                     when 'initializing', 'spawning' then ANSI::YELLOW
+                     else ANSI::RED
+                     end
+
+      line = format(
+        "[%02d] %s#%s %s",
+        agent.id,
+        agent.repo.split('/').last[0..10],
+        agent.issue_number,
+        format_age(agent.age)
+      )
+
+      max_width = @list_width - 3
+      line = line[0...max_width] if line.length > max_width
+
+      if idx == @selected_index
+        output.print ANSI::BOLD + "\e[7m" + line.ljust(max_width) + ANSI::RESET
+      else
+        output.print ANSI.color(line, status_color)
+      end
+    end
+  end
+
+  def draw_log_view(output)
+    log_start_col = @list_width + 1
+    log_width = @terminal_width - @list_width
+
+    (1..@terminal_height).each do |row|
+      output.print ANSI.move(row, @terminal_width)
+      output.print "│"
+    end
+
+    output.print ANSI.move(1, log_start_col)
+    output.print "┌" + ("─" * (log_width - 2)) + "┐"
+
+    output.print ANSI.move(@terminal_height, log_start_col)
+    output.print "└" + ("─" * (log_width - 2)) + "┘"
+
+    selected = selected_agent
+
+    if selected
+      output.print ANSI.move(1, log_start_col + 2)
+      title = " #{selected.repo}##{selected.issue_number} "
+      title = title[0...log_width - 4] if title.length > log_width - 4
+      output.print ANSI.color(title, ANSI::CYAN + ANSI::BOLD)
+
+      buffer = selected.buffer
+      visible_lines = @terminal_height - 2
+
+      # Calculate max scroll and clamp current position
+      max_scroll = [buffer.size - visible_lines, 0].max
+      @log_scroll = [@log_scroll, max_scroll].min
+      @log_scroll = [@log_scroll, 0].max
+
+      start_line = @log_scroll
+      lines_to_show = buffer[start_line, visible_lines] || []
+
+      lines_to_show.each_with_index do |line, idx|
+        row = idx + 2
+        break if row >= @terminal_height
+
+        output.print ANSI.move(row, log_start_col + 1)
+        display_line = line[0...log_width - 2] || ""
+        output.print display_line
+      end
+
+      if @input_mode
+        output.print ANSI.move(@terminal_height, log_start_col + 2)
+        prompt = "> " + @input_buffer[0...@input_cursor_pos] + "_" + @input_buffer[@input_cursor_pos..]
+        max_input_width = log_width - 4
+        display_input = prompt[0...max_input_width] || ""
+        output.print ANSI.color(display_input, ANSI::YELLOW + ANSI::BOLD)
+      else
+        if buffer.size > visible_lines
+          output.print ANSI.move(@terminal_height, @terminal_width - 35)
+          scroll_pct = max_scroll > 0 ? ((start_line.to_f / max_scroll) * 100).to_i : 100
+          end_line = [start_line + visible_lines, buffer.size].min
+          output.print ANSI.color("#{scroll_pct}% [#{start_line+1}-#{end_line}/#{buffer.size}] u/d", ANSI::DIM)
+        else
+          output.print ANSI.move(@terminal_height, @terminal_width - 20)
+          output.print ANSI.color("(all content shown)", ANSI::DIM)
+        end
+      end
+    else
+      msg = "No agents running"
+      output.print ANSI.move(@terminal_height / 2, log_start_col + (log_width - msg.length) / 2)
+      output.print ANSI.color(msg, ANSI::DIM)
+    end
+  end
+
+  def selected_agent
+    @mutex.synchronize do
+      _selected_agent_unsafe
+    end
+  end
+
+  def kill_selected_agent
+    agent = selected_agent
+    return unless agent
+
+    @mutex.synchronize do
+      agent.kill
+      cleanup_session(agent)
+    end
+  end
+
+  private
+
+  # Internal helper - only call when mutex is already held!
+  def _selected_agent_unsafe
+    return nil if @agents.empty?
+    @selected_index = [@selected_index, @agents.size - 1].min
+    @agents[@selected_index]
+  end
+
+  public
+
+  def format_age(seconds)
+    if seconds < 60
+      "#{seconds.to_i}s"
+    elsif seconds < 3600
+      "#{(seconds / 60).to_i}m"
+    else
+      "#{(seconds / 3600).to_i}h"
+    end
+  end
+
+  def poll_and_spawn
+    response = poll_messages
+    return unless response && response[:count] > 0
+
+    log "Received #{response[:count]} new message(s)"
+
+    messages = response[:messages] || []
+
+    @mutex.synchronize do
+      messages.each do |message|
+        process_message(message)
+      end
+    end
+  end
+
+  def process_message(message)
+    message_id = message[:id]
+    event_type = message[:event_type]
+
+    unless event_type == 'github_mention'
+      log "Ignoring message type: #{event_type}"
+      ack_message(message_id)
+      return
+    end
+
+    payload = message[:payload]
+    repo = payload[:repo]
+    issue_number = payload[:issue_number]
+
+    session_key = repo.gsub('/', '-') + "-#{issue_number}"
+
+    if @agents.any? { |a| a.session_key == session_key }
+      log "Agent already running for #{session_key}"
+      ack_message(message_id)
+      return
+    end
+
+    max_sessions = @config[:max_sessions] || 20
+    if @agents.size >= max_sessions
+      log "Max sessions (#{max_sessions}) reached"
+      return
+    end
+
+    log "Processing GitHub mention in #{repo}##{issue_number}"
+
+    worktree_path = create_worktree(repo, issue_number)
+    unless worktree_path
+      log "Failed to create worktree for #{session_key}"
+      return
+    end
+
+    agent = Agent.new(@next_id, repo, issue_number, worktree_path, @config[:preserve_agent_ansi])
+    @next_id += 1
+
+    command = build_agent_command(worktree_path)
+    context = payload[:context] || ''
+
+    if agent.spawn_agent(command, context)
+      @agents << agent
+      log "Agent #{agent.id} spawned for #{repo}##{issue_number}"
+      ack_message(message_id)
+      save_sessions
+    else
+      log "Failed to spawn agent for #{session_key}"
+      cleanup_worktree(worktree_path)
+    end
+  end
+
+  def cleanup_agents
+    timeout = @config[:agent_timeout] || 3600
+
+    @agents.reject! do |agent|
+      should_remove = !agent.alive? || agent.age > timeout || agent.status == 'finished'
+      if should_remove
+        cleanup_session(agent)
+        true
+      else
+        false
+      end
+    end
+
+    save_sessions
+  end
+
+  def cleanup_session(agent)
+    log "Cleaning up agent #{agent.id}: #{agent.repo}##{agent.issue_number}"
+    agent.close
+    cleanup_worktree(agent.worktree_path)
+  end
+
+  def create_worktree(repo, issue_number)
+    repo_safe = repo.gsub('/', '-')
+    branch_name = "botster-#{repo_safe}-#{issue_number}"
+    worktree_base = @config[:worktree_base]
+    clone_dir = File.join(worktree_base, repo_safe)
+    worktree_path = File.join(worktree_base, "#{repo_safe}-#{issue_number}")
+
+    FileUtils.mkdir_p(worktree_base)
+
+    unless Dir.exist?(clone_dir)
+      log "Cloning #{repo}..."
+      system("git clone https://github.com/#{repo}.git #{Shellwords.escape(clone_dir)} >> #{Shellwords.escape(LOG_FILE)} 2>&1")
+      return nil unless $?.success?
+    end
+
+    if Dir.exist?(worktree_path)
+      Dir.chdir(clone_dir) do
+        system("git worktree remove #{Shellwords.escape(worktree_path)} --force >> #{Shellwords.escape(LOG_FILE)} 2>&1")
+      end
+      FileUtils.rm_rf(worktree_path) if Dir.exist?(worktree_path)
+    end
+
+    Dir.chdir(clone_dir) do
+      branch_exists = system("git show-ref --verify --quiet refs/heads/#{Shellwords.escape(branch_name)}")
+      cmd = branch_exists ? "git worktree add #{Shellwords.escape(worktree_path)} #{Shellwords.escape(branch_name)}" :
+                            "git worktree add -b #{Shellwords.escape(branch_name)} #{Shellwords.escape(worktree_path)}"
+      system("#{cmd} >> #{Shellwords.escape(LOG_FILE)} 2>&1")
+      return nil unless $?.success?
+    end
+
+    claude_dir = File.join(worktree_path, '.claude')
+    FileUtils.mkdir_p(claude_dir)
+    FileUtils.touch(File.join(claude_dir, 'trusted'))
+
+    worktree_path
+  end
+
+  def cleanup_worktree(worktree_path)
+    return unless worktree_path && Dir.exist?(worktree_path)
+    system("git worktree remove #{Shellwords.escape(worktree_path)} --force >> #{Shellwords.escape(LOG_FILE)} 2>&1")
+  end
+
+  def build_agent_command(worktree_path)
+    agent_cmd = @config[:agent_command] || 'claude'
+    options = []
+    if agent_cmd == 'claude'
+      options << "--permission-mode #{@config[:claude_permission_mode]}" if @config[:claude_permission_mode]
+      options << "--allowedTools #{@config[:claude_allowed_tools]}" if @config[:claude_allowed_tools]
+      options << "--add-dir #{Shellwords.escape(worktree_path)}"
+    end
+    "#{agent_cmd} #{options.join(' ')}"
+  end
+
+  def poll_messages
+    server_url = @config[:server_url]
+    api_key = @config[:api_key]
+    return nil if api_key.empty?
+
+    repo_name = detect_repo_name
+    url = "#{server_url}/bots/messages"
+    url += "?repo=#{URI.encode_www_form_component(repo_name)}" if repo_name
+
+    uri = URI(url)
+
+    begin
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == 'https')
+      http.open_timeout = 5
+      http.read_timeout = 10
+
+      request = Net::HTTP::Get.new(uri.request_uri)
+      request['X-API-Key'] = api_key
+
+      response = http.request(request)
+      response.code == '200' ? JSON.parse(response.body, symbolize_names: true) : nil
+    rescue StandardError => e
+      log "Poll error: #{e.message}"
+      nil
+    end
+  end
+
+  def ack_message(message_id)
+    server_url = @config[:server_url]
+    api_key = @config[:api_key]
+
+    uri = URI("#{server_url}/bots/messages/#{message_id}")
+
+    begin
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == 'https')
+
+      request = Net::HTTP::Patch.new(uri.request_uri)
+      request['X-API-Key'] = api_key
+      request['Content-Type'] = 'application/json'
+
+      http.request(request)
+    rescue StandardError => e
+      log "Ack error: #{e.message}"
+    end
+  end
+
+  def detect_repo_name
+    `git remote get-url origin 2>/dev/null`.strip.gsub(%r{^(https?://[^/]+/|git@[^:]+:)}, '').gsub(/\.git$/, '')
+  rescue
+    nil
+  end
+
+  def save_sessions
+    sessions = @agents.map(&:to_h)
+    File.write(SESSIONS_FILE, JSON.pretty_generate(sessions))
+  rescue StandardError => e
+    log "Failed to save sessions: #{e.message}"
+  end
+
+  def running?
+    return false unless File.exist?(PID_FILE)
+    pid = File.read(PID_FILE).strip.to_i
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH, Errno::ENOENT
+    File.delete(PID_FILE) if File.exist?(PID_FILE)
+    false
+  end
+
+  def cleanup_all_agents
+    @poll_thread&.kill
+    @agents.each do |agent|
+      agent.kill
+      cleanup_worktree(agent.worktree_path)
+    end
+    @agents.clear
+  end
+
+  # CLI Commands (unchanged for brevity)
+  def cmd_status
+    unless running?
+      puts "Botster Hub is not running"
+      exit 1
+    end
+
+    unless File.exist?(SESSIONS_FILE)
+      puts "No active sessions"
+      exit 0
+    end
+
+    sessions = JSON.parse(File.read(SESSIONS_FILE), symbolize_names: true)
+
+    puts "Active Sessions (#{sessions.size}):"
+    puts "=" * 80
+
+    sessions.each do |session|
+      puts "✓ Agent #{session[:id]}: #{session[:repo]}##{session[:issue_number]}"
+      puts "  Path: #{session[:worktree_path]}"
+      puts "  Status: #{session[:status]}"
+      puts "  Started: #{session[:start_time]}"
+      puts
+    end
+  end
+
+  def cmd_kill(_session_id)
+    puts "To kill an agent, use the interactive UI (K key) or restart the daemon"
+  end
+
+  def cmd_cleanup
+    worktree_base = @config[:worktree_base]
+    return unless Dir.exist?(worktree_base)
+
+    puts "Cleaning up stale worktrees..."
+    Dir.glob(File.join(worktree_base, '*')).each do |path|
+      next unless Dir.exist?(path)
+      puts "  Found: #{path}"
+    end
+  end
+
+  def cmd_config(key = nil, value = nil)
+    if key.nil?
+      puts "Configuration (#{CONFIG_FILE}):"
+      puts JSON.pretty_generate(@config)
+      return
+    end
+
+    if value.nil?
+      puts @config[key.to_sym]
+      return
+    end
+
+    @config[key.to_sym] = value
+    save_config
+    puts "Config updated: #{key} = #{value}"
+  end
+
+  def cmd_help
+    puts <<~HELP
+      Botster Hub v#{VERSION} - Interactive PTY-based GitHub automation
+
+      Usage:
+        botster_hub start [--headless]  Start the daemon
+        botster_hub status              Show active sessions
+        botster_hub kill <id>           Kill a specific agent
+        botster_hub cleanup             Clean up stale worktrees
+        botster_hub config [key] [val]  Show or set configuration
+        botster_hub version             Show version
+
+      Interactive Mode:
+        j/k or arrows - Navigate agents
+        u/d - Scroll log (1 line)
+        PgUp/PgDn - Scroll log (10 lines)
+        i - Enter input mode (arrows for cursor/history, Enter to send)
+        K - Kill selected agent
+        h - Help
+        q - Quit
+
+      Configuration:
+        ... (same as before)
+        preserve_agent_ansi     - Keep agent's ANSI codes (default: false - risky!)
+
+      ZERO DEPENDENCIES!
+    HELP
+  end
+end
+
+if __FILE__ == $PROGRAM_NAME
+  hub = BotsterHub.new
+  hub.run(ARGV)
+end
