@@ -1,0 +1,12 @@
+# Teardown commands to run when deleting a worktree
+# These run before the worktree is deleted
+# Available environment variables:
+# - BOTSTER_REPO: Repository name (e.g., "owner/repo")
+# - BOTSTER_ISSUE_NUMBER: Issue number
+# - BOTSTER_WORKTREE_PATH: Path to the worktree being deleted
+# - BOTSTER_HUB_BIN: Path to the botster-hub binary
+
+# Remove the worktree from Claude's trusted projects
+"$BOTSTER_HUB_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH" "null"
+
+echo "Cleaned up worktree for issue #$BOTSTER_ISSUE_NUMBER"

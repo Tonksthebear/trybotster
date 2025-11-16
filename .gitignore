@@ -49,3 +49,7 @@ mise.toml
 
 # macOS files
 .DS_Store
+
+# Rust build artifacts
+/botster_hub_rs/target/
+/botster_hub_rs/Cargo.lock

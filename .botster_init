@@ -1,0 +1,14 @@
+# Init commands to run when agent shell starts
+mise trust
+
+# Change to the worktree directory
+cd "$BOTSTER_WORKTREE_PATH"
+
+# Auto-trust the worktree in Claude config using botster-hub's JSON tools
+"$BOTSTER_HUB_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
+
+echo "Botster agent initialized for issue #$BOTSTER_ISSUE_NUMBER"
+echo "Worktree: $BOTSTER_WORKTREE_PATH"
+
+# Start Claude with the prompt
+claude --permission-mode acceptEdits "$BOTSTER_PROMPT"

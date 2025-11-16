@@ -1,0 +1,57 @@
+[package]
+name = "botster-hub"
+version = "0.5.0"
+edition = "2021"
+authors = ["Jason Conigliari"]
+description = "Interactive PTY-based daemon for GitHub mention → local agent automation"
+
+[[bin]]
+name = "botster-hub"
+path = "src/main.rs"
+
+[dependencies]
+# TUI framework
+ratatui = "0.29"
+crossterm = "0.29"
+tui-term = "0.2"
+
+# PTY handling
+portable-pty = "0.9"
+
+# Async runtime
+tokio = { version = "1.48", features = ["full"] }
+tokio-util = { version = "0.7.17", features = ["io"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client
+reqwest = { version = "0.12.24", features = ["json", "blocking"] }
+
+# Git operations
+git2 = "0.20"
+globset = "0.4"
+
+# CLI argument parsing
+clap = { version = "4.5.51", features = ["derive"] }
+
+# Error handling & utilities
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+vt100 = "0.15"
+bytes = "1.0"
+shellexpand = "3.1"
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

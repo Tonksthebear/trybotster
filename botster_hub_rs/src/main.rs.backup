@@ -1,0 +1,690 @@
+use anyhow::Result;
+use botster_hub::{spawn_in_external_terminal, Agent, AgentStatus, Config, WorktreeManager};
+use clap::{Parser, Subcommand};
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEvent,
+        MouseEventKind,
+    },
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    Frame, Terminal,
+};
+use reqwest::blocking::Client;
+use serde::Deserialize;
+use std::{
+    io, thread,
+    time::{Duration, Instant},
+};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Message types
+#[derive(Deserialize, Debug)]
+struct PollResponse {
+    #[allow(dead_code)]
+    count: usize,
+    messages: Vec<BotMessage>,
+}
+
+#[derive(Deserialize, Debug)]
+struct BotMessage {
+    id: i64,
+    event_type: String,
+    payload: MessagePayload,
+}
+
+#[derive(Deserialize, Debug)]
+struct MessagePayload {
+    repo: String,
+    issue_number: u32,
+    context: Option<String>,
+}
+
+// App State
+struct App {
+    agents: Vec<Agent>,
+    selected: usize,
+    config: Config,
+    git_manager: WorktreeManager,
+    client: Client,
+    should_quit: bool,
+    input_mode: bool,
+    input_buffer: String,
+    log_scroll: usize,
+    last_poll: Instant,
+    focus_mode: bool, // When true, all keyboard input goes to selected agent's PTY
+}
+
+impl App {
+    fn new() -> Result<Self> {
+        let config = Config::load()?;
+        let git_manager = WorktreeManager::new(config.worktree_base.clone());
+        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+
+        Ok(Self {
+            agents: Vec::new(),
+            selected: 0,
+            config,
+            git_manager,
+            client,
+            should_quit: false,
+            input_mode: false,
+            input_buffer: String::new(),
+            log_scroll: 0,
+            last_poll: Instant::now(),
+            focus_mode: false,
+        })
+    }
+
+    fn poll_messages(&mut self) -> Result<()> {
+        if self.last_poll.elapsed() < Duration::from_secs(self.config.poll_interval) {
+            return Ok(());
+        }
+
+        self.last_poll = Instant::now();
+
+        if self.config.api_key.is_empty() {
+            return Ok(());
+        }
+
+        let repo = self.detect_repo_name().unwrap_or_default();
+        let url = if !repo.is_empty() {
+            format!("{}/bots/messages?repo={}", self.config.server_url, repo)
+        } else {
+            format!("{}/bots/messages", self.config.server_url)
+        };
+
+        match self
+            .client
+            .get(&url)
+            .header("X-API-Key", &self.config.api_key)
+            .send()
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(poll_response) = resp.json::<PollResponse>() {
+                    for msg in poll_response.messages {
+                        if let Err(e) = self.process_message(msg) {
+                            log::error!("Process message error: {}", e);
+                        }
+                    }
+                }
+            }
+            Ok(resp) => log::warn!("Poll failed with status: {}", resp.status()),
+            Err(e) => log::error!("Poll error: {}", e),
+        }
+
+        Ok(())
+    }
+
+    fn process_message(&mut self, msg: BotMessage) -> Result<()> {
+        if msg.event_type != "github_mention" {
+            self.ack_message(msg.id)?;
+            return Ok(());
+        }
+
+        let repo = msg.payload.repo;
+        let issue_number = msg.payload.issue_number;
+        let context = msg.payload.context.unwrap_or_default();
+
+        let session_key = format!("{}-{}", repo.replace('/', "-"), issue_number);
+
+        if self.agents.iter().any(|a| a.session_key() == session_key) {
+            log::info!("Agent already running for {}", session_key);
+            self.ack_message(msg.id)?;
+            return Ok(());
+        }
+
+        if self.agents.len() >= self.config.max_sessions {
+            log::warn!("Max sessions reached");
+            return Ok(());
+        }
+
+        // Use WorktreeManager to create worktree
+        let worktree_path = self.git_manager.create_worktree(&repo, issue_number)?;
+        let id = uuid::Uuid::new_v4();
+        let mut agent = Agent::new(id, repo.clone(), issue_number, worktree_path.clone());
+
+        let command = self.build_command(&worktree_path);
+
+        // Check spawn mode
+        if self.config.spawn_mode == "external" {
+            // Spawn in external terminal window (best for TUI apps like Claude)
+            let title = format!("{}#{}", repo, issue_number);
+            match spawn_in_external_terminal(&command, &worktree_path, &title) {
+                Ok(_) => {
+                    log::info!("Spawned external terminal for {}#{}", repo, issue_number);
+                    agent.status = AgentStatus::Running;
+                    self.agents.push(agent);
+                    self.ack_message(msg.id)?;
+                }
+                Err(e) => {
+                    log::error!("Failed to spawn external terminal: {}", e);
+                    agent.status = AgentStatus::Failed(e.to_string());
+                    self.agents.push(agent);
+                }
+            }
+        } else {
+            // Embedded mode (VT100 parsed PTY)
+            match agent.spawn(&command, &context) {
+                Ok(_) => {
+                    log::info!("Spawned embedded agent for {}#{}", repo, issue_number);
+                    self.agents.push(agent);
+                    self.ack_message(msg.id)?;
+                }
+                Err(e) => {
+                    log::error!("Failed to spawn agent: {}", e);
+                    agent.status = AgentStatus::Failed(e.to_string());
+                    self.agents.push(agent);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ack_message(&self, message_id: i64) -> Result<()> {
+        let url = format!("{}/bots/messages/{}", self.config.server_url, message_id);
+        self.client
+            .patch(&url)
+            .header("X-API-Key", &self.config.api_key)
+            .send()?;
+        Ok(())
+    }
+
+    fn build_command(&self, worktree_path: &std::path::Path) -> String {
+        let mut cmd = self.config.agent_command.clone();
+
+        if self.config.agent_command == "claude" {
+            cmd.push_str(&format!(
+                " --permission-mode {} --allowedTools {} --add-dir {}",
+                self.config.claude_permission_mode,
+                self.config.claude_allowed_tools,
+                worktree_path.display()
+            ));
+        }
+
+        cmd
+    }
+
+    fn detect_repo_name(&self) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(&["remote", "get-url", "origin"])
+            .output()
+            .ok()?;
+
+        if output.status.success() {
+            let url = String::from_utf8_lossy(&output.stdout);
+            let cleaned = url
+                .trim()
+                .trim_start_matches("https://github.com/")
+                .trim_start_matches("git@github.com:")
+                .trim_end_matches(".git");
+            Some(cleaned.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn cleanup_agents(&mut self) {
+        let timeout = self.config.agent_timeout;
+        self.agents.retain(|agent| {
+            let should_keep = match &agent.status {
+                AgentStatus::Running if agent.age().as_secs() > timeout => false,
+                AgentStatus::Finished | AgentStatus::Killed | AgentStatus::Failed(_) => false,
+                _ => true,
+            };
+            should_keep
+        });
+    }
+
+    fn on_key(&mut self, key: event::KeyEvent) {
+        if self.focus_mode {
+            self.handle_focus_mode(key);
+        } else if self.input_mode {
+            self.handle_input_mode(key.code);
+        } else {
+            self.handle_navigation_mode(key.code);
+        }
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        // Only handle mouse in navigation mode (not input mode or focus mode)
+        if self.input_mode || self.focus_mode {
+            return;
+        }
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.log_scroll = self.log_scroll.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown => {
+                // Calculate max scroll based on VT100 screen
+                if let Some(agent) = self.agents.get(self.selected) {
+                    let screen_lines = agent.get_vt100_screen();
+                    let total_lines = screen_lines.len();
+                    let max_scroll = total_lines.saturating_sub(20); // Approximate visible lines
+                    self.log_scroll = (self.log_scroll + 3).min(max_scroll);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_navigation_mode(&mut self, key: KeyCode) {
+        log::debug!(
+            "Navigation mode key: {:?}, current scroll: {}",
+            key,
+            self.log_scroll
+        );
+        match key {
+            KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
+            KeyCode::Char('f') | KeyCode::Char('F') if !self.agents.is_empty() => {
+                self.focus_mode = true;
+            }
+            KeyCode::Char('i') | KeyCode::Char('I') if !self.agents.is_empty() => {
+                self.input_mode = true;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                    self.log_scroll = 0; // Start at top when switching agents
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.selected < self.agents.len().saturating_sub(1) {
+                    self.selected += 1;
+                    self.log_scroll = 0; // Start at top when switching agents
+                }
+            }
+            KeyCode::Home => {
+                self.log_scroll = 0; // Jump to top
+            }
+            KeyCode::End => {
+                self.log_scroll = usize::MAX; // Jump to bottom
+            }
+            KeyCode::Char('u') => self.log_scroll = self.log_scroll.saturating_sub(1),
+            KeyCode::Char('d') => self.log_scroll = self.log_scroll.saturating_add(1),
+            KeyCode::PageUp => self.log_scroll = self.log_scroll.saturating_sub(10),
+            KeyCode::PageDown => self.log_scroll = self.log_scroll.saturating_add(10),
+            KeyCode::Char('K') => {
+                if let Some(agent) = self.agents.get_mut(self.selected) {
+                    agent.status = AgentStatus::Killed;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_focus_mode(&mut self, key: event::KeyEvent) {
+        use crossterm::event::KeyCode;
+
+        // Esc exits focus mode
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            self.focus_mode = false;
+            return;
+        }
+
+        // Convert key event to terminal input bytes and send to PTY
+        if let Some(agent) = self.agents.get_mut(self.selected) {
+            if let Some(bytes) = key_event_to_bytes(&key) {
+                let _ = agent.write_input(&bytes);
+            }
+        }
+    }
+
+    fn handle_input_mode(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => {
+                self.input_mode = false;
+                self.input_buffer.clear();
+            }
+            KeyCode::Enter => {
+                if let Some(agent) = self.agents.get_mut(self.selected) {
+                    let input = format!("{}\n", self.input_buffer);
+                    let _ = agent.write_input(&input);
+                }
+                self.input_buffer.clear();
+                self.input_mode = false;
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+}
+
+// Convert crossterm KeyEvent to terminal input bytes (including escape sequences)
+fn key_event_to_bytes(key: &event::KeyEvent) -> Option<String> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                // Ctrl+key sends ASCII control codes
+                let ctrl_code = match c {
+                    'a'..='z' => (c as u8 - b'a' + 1) as char,
+                    '@' => '\x00',
+                    '[' => '\x1b',
+                    '\\' => '\x1c',
+                    ']' => '\x1d',
+                    '^' => '\x1e',
+                    '_' => '\x1f',
+                    _ => c,
+                };
+                Some(ctrl_code.to_string())
+            } else if alt {
+                // Alt+key sends ESC prefix
+                Some(format!("\x1b{}", c))
+            } else {
+                Some(c.to_string())
+            }
+        }
+        KeyCode::Enter => Some("\r".to_string()),
+        KeyCode::Backspace => Some("\x7f".to_string()),
+        KeyCode::Tab => {
+            if shift {
+                // Shift+Tab (backtab) - used by Claude for "accept edits"
+                Some("\x1b[Z".to_string())
+            } else {
+                Some("\t".to_string())
+            }
+        }
+        KeyCode::Esc => Some("\x1b".to_string()),
+        KeyCode::Up => Some("\x1b[A".to_string()),
+        KeyCode::Down => Some("\x1b[B".to_string()),
+        KeyCode::Right => Some("\x1b[C".to_string()),
+        KeyCode::Left => Some("\x1b[D".to_string()),
+        KeyCode::Home => Some("\x1b[H".to_string()),
+        KeyCode::End => Some("\x1b[F".to_string()),
+        KeyCode::PageUp => Some("\x1b[5~".to_string()),
+        KeyCode::PageDown => Some("\x1b[6~".to_string()),
+        KeyCode::Delete => Some("\x1b[3~".to_string()),
+        KeyCode::Insert => Some("\x1b[2~".to_string()),
+        KeyCode::F(n) => {
+            // F1-F12 function keys
+            let seq = match n {
+                1 => "\x1bOP",
+                2 => "\x1bOQ",
+                3 => "\x1bOR",
+                4 => "\x1bOS",
+                5 => "\x1b[15~",
+                6 => "\x1b[17~",
+                7 => "\x1b[18~",
+                8 => "\x1b[19~",
+                9 => "\x1b[20~",
+                10 => "\x1b[21~",
+                11 => "\x1b[23~",
+                12 => "\x1b[24~",
+                _ => return None,
+            };
+            Some(seq.to_string())
+        }
+        _ => None,
+    }
+}
+
+// TUI
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let terminal = Terminal::new(backend)?;
+    Ok(terminal)
+}
+
+fn restore_terminal() -> Result<()> {
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    Ok(())
+}
+
+fn ui(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(f.area());
+
+    // Left panel: Agent list
+    let agents: Vec<ListItem> = app
+        .agents
+        .iter()
+        .map(|agent| {
+            let id_short = agent.id.to_string()[..8].to_string();
+            let repo_short = agent
+                .repo
+                .split('/')
+                .last()
+                .unwrap_or("")
+                .chars()
+                .take(12)
+                .collect::<String>();
+            let age_str = format_age(agent.age());
+
+            let color = match &agent.status {
+                AgentStatus::Running => Color::Green,
+                AgentStatus::Initializing => Color::Yellow,
+                _ => Color::Red,
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", id_short),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(format!("{}#{} ", repo_short, agent.issue_number)),
+                Span::styled(age_str, Style::default().fg(color)),
+            ]))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.selected));
+
+    let list = List::new(agents)
+        .block(
+            Block::default()
+                .title(format!(" Agents ({}) ", app.agents.len()))
+                .borders(Borders::ALL),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(list, chunks[0], &mut state);
+
+    // Right panel: VT100 rendered view (proper terminal emulation!)
+    if let Some(agent) = app.agents.get(app.selected) {
+        // Use VT100 screen for clean rendering of Claude's TUI
+        let screen_lines = agent.get_vt100_screen();
+        let total_lines = screen_lines.len();
+
+        let visible_height = (chunks[1].height as usize).saturating_sub(3);
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        let scroll_pos = app.log_scroll.min(max_scroll);
+
+        let lines: Vec<Line> = screen_lines
+            .iter()
+            .skip(scroll_pos)
+            .take(visible_height)
+            .map(|s| Line::from(s.as_str()))
+            .collect();
+
+        let title = if app.focus_mode {
+            format!(
+                " {}#{} [FOCUS MODE - All keys sent to agent - ESC to exit] ",
+                agent.repo, agent.issue_number
+            )
+        } else if app.input_mode {
+            format!(
+                " {}#{} [INPUT MODE - ESC to exit] ",
+                agent.repo, agent.issue_number
+            )
+        } else {
+            format!(
+                " {}#{} [F=focus i=input Home/End=scroll u/d/PgUp/PgDn=scroll] ",
+                agent.repo, agent.issue_number
+            )
+        };
+
+        let para = Paragraph::new(lines)
+            .block(Block::default().title(title).borders(Borders::ALL))
+            .wrap(Wrap { trim: false });
+
+        f.render_widget(para, chunks[1]);
+
+        // Input bar
+        if app.input_mode {
+            let input_area = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(3)])
+                .split(chunks[1])[1];
+
+            let input = Paragraph::new(app.input_buffer.as_str())
+                .style(Style::default().fg(Color::Yellow))
+                .block(Block::default().borders(Borders::ALL).title(" Input "));
+
+            f.render_widget(input, input_area);
+        }
+    } else {
+        let msg = Paragraph::new("No agents running\n\nPress 'q' to quit")
+            .block(Block::default().title(" Log ").borders(Borders::ALL))
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(msg, chunks[1]);
+    }
+}
+
+fn format_age(age: Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
+// CLI
+#[derive(Parser)]
+#[command(name = "botster-hub")]
+#[command(version = VERSION)]
+#[command(about = "Interactive PTY-based daemon for GitHub automation")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Start {
+        #[arg(long)]
+        headless: bool,
+    },
+    Status,
+    Config {
+        key: Option<String>,
+        value: Option<String>,
+    },
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Start { headless } => {
+            if headless {
+                run_headless()?;
+            } else {
+                run_interactive()?;
+            }
+        }
+        Commands::Status => {
+            println!("Status command not yet implemented");
+        }
+        Commands::Config { key, value } => {
+            let config = Config::load()?;
+            match (key, value) {
+                (None, None) => println!("{}", serde_json::to_string_pretty(&config)?),
+                (Some(k), None) => println!("Config key '{}' query not implemented", k),
+                (Some(k), Some(v)) => println!("Would set {} = {}", k, v),
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_headless() -> Result<()> {
+    println!("Starting Botster Hub v{} in headless mode...", VERSION);
+    let mut app = App::new()?;
+
+    loop {
+        app.poll_messages()?;
+        app.cleanup_agents();
+        thread::sleep(Duration::from_secs(app.config.poll_interval));
+    }
+}
+
+fn run_interactive() -> Result<()> {
+    let mut terminal = setup_terminal()?;
+    let mut app = App::new()?;
+
+    let tick_rate = Duration::from_millis(250);
+    let mut last_tick = Instant::now();
+
+    let result = (|| -> Result<()> {
+        loop {
+            terminal.draw(|f| ui(f, &app))?;
+
+            let timeout = tick_rate
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or_else(|| Duration::from_secs(0));
+
+            if event::poll(timeout)? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind == KeyEventKind::Press {
+                            app.on_key(key);
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        app.on_mouse(mouse);
+                    }
+                    _ => {}
+                }
+            }
+
+            if last_tick.elapsed() >= tick_rate {
+                let _ = app.poll_messages();
+                app.cleanup_agents();
+                last_tick = Instant::now();
+            }
+
+            if app.should_quit {
+                break;
+            }
+        }
+        Ok(())
+    })();
+
+    restore_terminal()?;
+    result
+}
