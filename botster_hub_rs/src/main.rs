@@ -185,8 +185,8 @@ impl BotsterApp {
     fn key_to_bytes(&self, key: &crossterm::event::KeyEvent) -> Option<Vec<u8>> {
         match key.code {
             KeyCode::Char(c) => Some(c.to_string().into_bytes()),
-            KeyCode::Enter => Some(vec![b'\n']),
-            KeyCode::Backspace => Some(vec![8]),
+            KeyCode::Enter => Some(vec![b'\r']),
+            KeyCode::Backspace => Some(vec![127]), // DEL character
             KeyCode::Tab => Some(vec![9]),
             KeyCode::Left => Some(vec![27, 91, 68]),
             KeyCode::Right => Some(vec![27, 91, 67]),
