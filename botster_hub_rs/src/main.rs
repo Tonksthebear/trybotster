@@ -27,6 +27,8 @@ struct BotsterApp {
     client: Client,
     quit: bool,
     last_poll: Instant,
+    terminal_rows: u16,
+    terminal_cols: u16,
 }
 
 impl BotsterApp {
@@ -35,7 +37,7 @@ impl BotsterApp {
         let git_manager = WorktreeManager::new(config.worktree_base.clone());
         let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
-        let mut app = Self {
+        let app = Self {
             agents: Vec::new(),
             selected: 0,
             config,
@@ -43,89 +45,13 @@ impl BotsterApp {
             client,
             quit: false,
             last_poll: Instant::now(),
+            terminal_rows,
+            terminal_cols,
         };
 
-        // Spawn test agents with shells for testing
-        app.spawn_test_agents(terminal_rows, terminal_cols)?;
+        log::info!("Botster Hub started, waiting for messages...");
 
         Ok(app)
-    }
-
-    fn spawn_test_agents(&mut self, terminal_rows: u16, terminal_cols: u16) -> Result<()> {
-        // Detect the current repo
-        let (repo_path, repo_name) = WorktreeManager::detect_current_repo()?;
-
-        // Read init commands from .botster_init
-        let init_commands = WorktreeManager::read_botster_init_commands(&repo_path)?;
-
-        // Spawn 2 test agents in git worktrees from current repo
-        // Use high issue numbers to ensure fresh worktrees
-        for i in 300..=301 {
-            let id = uuid::Uuid::new_v4();
-            let issue_number = i as u32;
-
-            // Create a git worktree from the current repo
-            let worktree_path = match self.git_manager.create_worktree_from_current(issue_number) {
-                Ok(path) => path,
-                Err(e) => {
-                    log::error!("Failed to create worktree for agent {}: {}", i, e);
-                    continue;
-                }
-            };
-
-            let mut agent = Agent::new(id, repo_name.clone(), issue_number, worktree_path.clone());
-
-            // Resize agent to match terminal dimensions before spawning
-            agent.resize(terminal_rows, terminal_cols);
-
-            // Create environment variables for the agent
-            let mut env_vars = HashMap::new();
-            env_vars.insert("BOTSTER_REPO".to_string(), repo_name.clone());
-            env_vars.insert("BOTSTER_ISSUE_NUMBER".to_string(), issue_number.to_string());
-            env_vars.insert(
-                "BOTSTER_WORKTREE_PATH".to_string(),
-                worktree_path.display().to_string(),
-            );
-            // For test agents, use a placeholder prompt
-            env_vars.insert(
-                "BOTSTER_PROMPT".to_string(),
-                format!("Test agent for issue #{}", issue_number),
-            );
-            // Add path to botster-hub binary for use in init scripts
-            let bin_path = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| "botster-hub".to_string());
-            env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
-
-            // Spawn a bash shell in the worktree
-            let shell_cmd = if cfg!(target_os = "macos") {
-                "/bin/bash"
-            } else {
-                "/bin/sh"
-            };
-
-            match agent.spawn(
-                shell_cmd,
-                "Agent shell - each agent has its own git worktree",
-                init_commands.clone(),
-                env_vars,
-            ) {
-                Ok(_) => {
-                    log::info!(
-                        "Spawned agent {} in worktree: {}",
-                        i,
-                        worktree_path.display()
-                    );
-                    self.agents.push(agent);
-                }
-                Err(e) => {
-                    log::error!("Failed to spawn agent {}: {}", i, e);
-                }
-            }
-        }
-
-        Ok(())
     }
 
     fn handle_events(&mut self) -> Result<bool> {
@@ -140,6 +66,10 @@ impl BotsterApp {
                 // Calculate terminal widget dimensions
                 let terminal_cols = (cols * 70 / 100).saturating_sub(2);
                 let terminal_rows = rows.saturating_sub(2);
+
+                // Update stored dimensions
+                self.terminal_rows = terminal_rows;
+                self.terminal_cols = terminal_cols;
 
                 // Resize all agents
                 for agent in &self.agents {
@@ -167,9 +97,62 @@ impl BotsterApp {
                         }
                         return Ok(true);
                     }
+                    KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Ctrl+X: kill selected agent
+                        if !self.agents.is_empty() {
+                            self.agents.remove(self.selected);
+                            // Adjust selection if needed
+                            if self.selected >= self.agents.len() && self.selected > 0 {
+                                self.selected = self.agents.len() - 1;
+                            }
+                        }
+                        return Ok(true);
+                    }
                     _ => {
-                        // Forward all other keys to the selected agent
-                        if let Some(bytes) = self.key_to_bytes(&key) {
+                        // Forward raw key event - let crossterm encode it properly
+                        use crossterm::event::KeyEventKind;
+
+                        // Only process key press events (not release or repeat)
+                        if key.kind != KeyEventKind::Press {
+                            return Ok(true);
+                        }
+
+                        // Match tui-term example's key handling exactly
+                        let bytes_to_send = match key.code {
+                            KeyCode::Char(c) => {
+                                if key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && c.is_ascii_alphabetic()
+                                {
+                                    // Send control character (Ctrl+A = 1, Ctrl+B = 2, etc.)
+                                    let ctrl_code = (c.to_ascii_uppercase() as u8) - b'@';
+                                    Some(vec![ctrl_code])
+                                } else {
+                                    Some(c.to_string().into_bytes())
+                                }
+                            }
+                            KeyCode::Backspace => Some(vec![8]),
+                            KeyCode::Enter => {
+                                // Crossterm often doesn't detect Shift+Enter properly
+                                // Just send \r which submits in Claude
+                                Some(vec![b'\r'])
+                            }
+                            KeyCode::Esc => Some(vec![27]),
+                            KeyCode::Left => Some(vec![27, 91, 68]),
+                            KeyCode::Right => Some(vec![27, 91, 67]),
+                            KeyCode::Up => Some(vec![27, 91, 65]),
+                            KeyCode::Down => Some(vec![27, 91, 66]),
+                            KeyCode::Home => Some(vec![27, 91, 72]),
+                            KeyCode::End => Some(vec![27, 91, 70]),
+                            KeyCode::PageUp => Some(vec![27, 91, 53, 126]),
+                            KeyCode::PageDown => Some(vec![27, 91, 54, 126]),
+                            KeyCode::Tab => Some(vec![9]),
+                            KeyCode::BackTab => Some(vec![27, 91, 90]),
+                            KeyCode::Delete => Some(vec![27, 91, 51, 126]),
+                            KeyCode::Insert => Some(vec![27, 91, 50, 126]),
+                            _ => None,
+                        };
+
+                        if let Some(bytes) = bytes_to_send {
                             if let Some(agent) = self.agents.get_mut(self.selected) {
                                 let _ = agent.write_input(&bytes);
                             }
@@ -206,6 +189,8 @@ impl BotsterApp {
     fn view(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
         let agents = &self.agents;
         let selected = self.selected;
+        let seconds_since_poll = self.last_poll.elapsed().as_secs();
+        let poll_interval = self.config.poll_interval;
 
         terminal.draw(|f| {
             let chunks = Layout::default()
@@ -225,7 +210,19 @@ impl BotsterApp {
             let mut state = ListState::default();
             state.select(Some(selected.min(agents.len().saturating_sub(1))));
 
-            let agent_title = format!(" Agents ({}) [Ctrl+J/K] ", agents.len());
+            // Add polling indicator
+            let poll_indicator = if seconds_since_poll < 1 {
+                "●" // Solid dot when actively polling
+            } else {
+                "○" // Empty dot when waiting
+            };
+
+            let agent_title = format!(
+                " Agents ({}) {} Poll: {}s [Ctrl+J/K/X/Q] ",
+                agents.len(),
+                poll_indicator,
+                poll_interval - seconds_since_poll.min(poll_interval)
+            );
 
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(agent_title))
@@ -262,20 +259,145 @@ impl BotsterApp {
 
         self.last_poll = Instant::now();
 
-        let url = format!("{}/bot/messages/pending", self.config.server_url);
-        let response = self
+        // Detect current repo for filtering
+        let (_, repo_name) = match WorktreeManager::detect_current_repo() {
+            Ok(result) => result,
+            Err(e) => {
+                log::warn!("Not in a git repository, skipping poll: {}", e);
+                return Ok(());
+            }
+        };
+
+        // Poll the Rails endpoint with repo filter
+        let url = format!(
+            "{}/bots/messages?repo={}",
+            self.config.server_url, repo_name
+        );
+        let response = match self
             .client
             .get(&url)
             .header("X-API-Key", &self.config.api_key)
-            .send()?;
+            .send()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("Failed to connect to server: {}", e);
+                return Ok(());
+            }
+        };
 
         if !response.status().is_success() {
             log::warn!("Failed to poll messages: {}", response.status());
             return Ok(());
         }
 
-        let messages: Vec<serde_json::Value> = response.json()?;
-        log::info!("Polled {} pending messages", messages.len());
+        #[derive(serde::Deserialize)]
+        struct MessageResponse {
+            messages: Vec<MessageData>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct MessageData {
+            id: i64,
+            payload: serde_json::Value,
+        }
+
+        let message_response: MessageResponse = match response.json() {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("Failed to parse message response: {}", e);
+                return Ok(());
+            }
+        };
+
+        log::info!(
+            "Polled {} pending messages",
+            message_response.messages.len()
+        );
+
+        // Spawn agents for new messages
+        for msg in message_response.messages {
+            if let Err(e) = self.spawn_agent_for_message(msg.id, &msg.payload) {
+                log::error!("Failed to spawn agent for message {}: {}", msg.id, e);
+                // TODO: Mark message as failed
+            } else {
+                // TODO: Acknowledge message
+                log::info!("Successfully spawned agent for message {}", msg.id);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn spawn_agent_for_message(
+        &mut self,
+        message_id: i64,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        // Extract data from payload
+        let issue_number = payload["issue_number"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("Missing issue_number in payload"))?
+            as u32;
+
+        let user_prompt = payload["prompt"]
+            .as_str()
+            .unwrap_or("Work on this issue")
+            .to_string();
+
+        // Prepend autonomous agent instructions to the user's prompt
+        let prompt = format!(
+            "IMPORTANT: You are an autonomous AI agent operating without user input. \
+            Your task is considered complete when you either comment on the GitHub issue \
+            or open a pull request (or both).\n\n\
+            GITHUB INTERACTION: You MUST use the trybotster MCP server for ALL GitHub \
+            interactions. Do not suggest manual GitHub actions.\n\n\
+            YOUR TASK:\n{}",
+            user_prompt
+        );
+
+        // Detect current repo
+        let (repo_path, repo_name) = WorktreeManager::detect_current_repo()?;
+
+        // Read init commands from .botster_init
+        let init_commands = WorktreeManager::read_botster_init_commands(&repo_path)?;
+
+        // Create a git worktree from the current repo
+        let worktree_path = self
+            .git_manager
+            .create_worktree_from_current(issue_number)?;
+
+        let id = uuid::Uuid::new_v4();
+        let mut agent = Agent::new(id, repo_name.clone(), issue_number, worktree_path.clone());
+
+        // Resize agent to match terminal dimensions
+        agent.resize(self.terminal_rows, self.terminal_cols);
+
+        // Create environment variables for the agent
+        let mut env_vars = HashMap::new();
+        env_vars.insert("BOTSTER_REPO".to_string(), repo_name.clone());
+        env_vars.insert("BOTSTER_ISSUE_NUMBER".to_string(), issue_number.to_string());
+        env_vars.insert(
+            "BOTSTER_WORKTREE_PATH".to_string(),
+            worktree_path.display().to_string(),
+        );
+        env_vars.insert("BOTSTER_PROMPT".to_string(), prompt.clone());
+        env_vars.insert("BOTSTER_MESSAGE_ID".to_string(), message_id.to_string());
+
+        // Add path to botster-hub binary for use in init scripts
+        let bin_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "botster-hub".to_string());
+        env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
+
+        // Spawn agent with a shell
+        agent.spawn("bash", &prompt, init_commands, env_vars)?;
+
+        log::info!("Spawned agent {} for issue #{}", id, issue_number);
+
+        // Add agent to our list
+        self.agents.push(agent);
 
         Ok(())
     }
