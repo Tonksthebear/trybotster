@@ -357,17 +357,34 @@ impl WorktreeManager {
 
     /// Cleans up a worktree using git command
     pub fn cleanup_worktree(&self, clone_dir: &PathBuf, worktree_path: &PathBuf) -> Result<()> {
-        let worktree_name = worktree_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        if worktree_path.exists() {
+            log::info!("Removing existing worktree at {}", worktree_path.display());
 
-        if !worktree_name.is_empty() {
-            std::process::Command::new("git")
-                .args(&["worktree", "remove", worktree_name, "--force"])
+            // Try to remove with git worktree remove
+            let remove_result = std::process::Command::new("git")
+                .args(&[
+                    "worktree",
+                    "remove",
+                    worktree_path.to_str().unwrap(),
+                    "--force",
+                ])
                 .current_dir(clone_dir)
-                .output()
-                .ok();
+                .output();
+
+            // If git command fails, try to prune and remove directory manually
+            if remove_result.is_err() || !remove_result.as_ref().unwrap().status.success() {
+                log::warn!("Git worktree remove failed, trying prune...");
+                std::process::Command::new("git")
+                    .args(&["worktree", "prune"])
+                    .current_dir(clone_dir)
+                    .output()
+                    .ok();
+
+                // Manually remove the directory if it still exists
+                if worktree_path.exists() {
+                    std::fs::remove_dir_all(worktree_path).ok();
+                }
+            }
         }
         Ok(())
     }
