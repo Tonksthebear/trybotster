@@ -1,5 +1,7 @@
 # Trybotster
 
+[![Test PR](https://img.shields.io/badge/status-testing-blue)](https://github.com)
+
 **GitHub Mention → Autonomous AI Agent**
 
 When someone mentions `@trybotster` in a GitHub issue or PR, an autonomous AI agent spawns in an isolated git worktree to investigate and resolve the issue.
