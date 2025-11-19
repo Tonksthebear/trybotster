@@ -308,7 +308,7 @@ mod tests {
         );
 
         assert_eq!(agent.repo, "test/repo");
-        assert_eq!(agent.issue_number, 42);
+        assert_eq!(agent.issue_number, Some(42));
         assert_eq!(agent.status, AgentStatus::Initializing);
     }
 
