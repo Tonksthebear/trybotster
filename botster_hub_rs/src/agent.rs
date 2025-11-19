@@ -37,7 +37,8 @@ impl std::fmt::Display for AgentStatus {
 pub struct Agent {
     pub id: uuid::Uuid,
     pub repo: String,
-    pub issue_number: u32,
+    pub issue_number: Option<u32>,
+    pub branch_name: String,
     pub worktree_path: PathBuf,
     pub start_time: chrono::DateTime<chrono::Utc>,
     pub status: AgentStatus,
@@ -51,7 +52,13 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(id: uuid::Uuid, repo: String, issue_number: u32, worktree_path: PathBuf) -> Self {
+    pub fn new(
+        id: uuid::Uuid,
+        repo: String,
+        issue_number: Option<u32>,
+        branch_name: String,
+        worktree_path: PathBuf,
+    ) -> Self {
         // Create VT100 parser with 0 scrollback (vt100 0.15 has scrollback bugs)
         let parser = Parser::new(24, 80, 0);
 
@@ -59,6 +66,7 @@ impl Agent {
             id,
             repo,
             issue_number,
+            branch_name,
             worktree_path,
             start_time: chrono::Utc::now(),
             status: AgentStatus::Initializing,
@@ -97,10 +105,12 @@ impl Agent {
         init_commands: Vec<String>,
         env_vars: HashMap<String, String>,
     ) -> Result<()> {
-        self.add_to_buffer(&format!(
-            "==> Spawning agent: {}#{}",
-            self.repo, self.issue_number
-        ));
+        let agent_label = if let Some(issue_num) = self.issue_number {
+            format!("{}#{}", self.repo, issue_num)
+        } else {
+            format!("{}/{}", self.repo, self.branch_name)
+        };
+        self.add_to_buffer(&format!("==> Spawning agent: {}", agent_label));
         self.add_to_buffer(&format!("==> Command: {}", command_str));
         self.add_to_buffer(&format!("==> Worktree: {}", self.worktree_path.display()));
         self.add_to_buffer("");
@@ -150,7 +160,7 @@ impl Agent {
         // Spawn reader thread with VT100 parser
         let buffer = Arc::clone(&self.buffer);
         let vt100_parser = Arc::clone(&self.vt100_parser);
-        let scrollback_history = Arc::clone(&self.scrollback_history);
+        let _scrollback_history = Arc::clone(&self.scrollback_history);
 
         self.reader_thread = Some(thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -239,7 +249,12 @@ impl Agent {
     }
 
     pub fn session_key(&self) -> String {
-        format!("{}-{}", self.repo.replace('/', "-"), self.issue_number)
+        let repo_safe = self.repo.replace('/', "-");
+        if let Some(issue_num) = self.issue_number {
+            format!("{}-{}", repo_safe, issue_num)
+        } else {
+            format!("{}-{}", repo_safe, self.branch_name.replace('/', "-"))
+        }
     }
 
     pub fn get_buffer_snapshot(&self) -> Vec<String> {
@@ -287,7 +302,8 @@ mod tests {
         let agent = Agent::new(
             id,
             "test/repo".to_string(),
-            42,
+            Some(42),
+            "test-branch".to_string(),
             temp_dir.path().to_path_buf(),
         );
 
@@ -303,7 +319,8 @@ mod tests {
         let agent = Agent::new(
             id,
             "owner/repo".to_string(),
-            123,
+            Some(123),
+            "test-branch".to_string(),
             temp_dir.path().to_path_buf(),
         );
 
@@ -317,7 +334,8 @@ mod tests {
         let agent = Agent::new(
             id,
             "test/repo".to_string(),
-            1,
+            Some(1),
+            "test-branch".to_string(),
             temp_dir.path().to_path_buf(),
         );
 
@@ -337,7 +355,8 @@ mod tests {
         let agent = Agent::new(
             id,
             "test/repo".to_string(),
-            1,
+            Some(1),
+            "test-branch".to_string(),
             temp_dir.path().to_path_buf(),
         );
 
@@ -359,7 +378,8 @@ mod tests {
         let agent = Agent::new(
             id,
             "test/repo".to_string(),
-            1,
+            Some(1),
+            "test-branch".to_string(),
             temp_dir.path().to_path_buf(),
         );
 
