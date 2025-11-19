@@ -433,8 +433,82 @@ impl WorktreeManager {
         worktree_path: &std::path::Path,
         branch_name: &str,
     ) -> Result<()> {
-        // Detect the current repo
-        let (repo_path, repo_name) = Self::detect_current_repo()?;
+        // Find the main repository from the worktree
+        // Worktrees have a .git file (not directory) that points to the main repo
+        let repo_obj = git2::Repository::open(worktree_path)
+            .context("Failed to open worktree as git repository")?;
+
+        log::info!("DEBUG: worktree_path = {}", worktree_path.display());
+        log::info!("DEBUG: is_worktree() = {}", repo_obj.is_worktree());
+        log::info!("DEBUG: repo_obj.path() = {:?}", repo_obj.path());
+        log::info!("DEBUG: repo_obj.commondir() = {:?}", repo_obj.commondir());
+
+        // CRITICAL CHECK: Don't try to delete the main repository!
+        if !repo_obj.is_worktree() {
+            log::warn!(
+                "Refusing to delete main repository at {}. This is not a worktree!",
+                worktree_path.display()
+            );
+            anyhow::bail!(
+                "Cannot delete main repository at {}. Only worktrees can be deleted.",
+                worktree_path.display()
+            );
+        }
+
+        let repo_path = if repo_obj.is_worktree() {
+            // This is a worktree - find the main repository
+            // Use commondir() which returns the path to the main repo's .git directory
+            let common_dir = repo_obj.commondir();
+            let result = common_dir
+                .parent()
+                .context("Failed to find main repository from commondir")?
+                .to_path_buf();
+            log::info!(
+                "DEBUG: Calculated repo_path from worktree = {}",
+                result.display()
+            );
+            result
+        } else {
+            // This is the main repository
+            let result = repo_obj
+                .path()
+                .parent()
+                .context("Failed to get repo path")?
+                .to_path_buf();
+            log::info!(
+                "DEBUG: Calculated repo_path from main repo = {}",
+                result.display()
+            );
+            result
+        };
+
+        // Get repo name from the remote URL or directory name
+        let repo_name = if let Ok(remote) = repo_obj.find_remote("origin") {
+            if let Some(url) = remote.url() {
+                // Extract owner/repo from URL like "https://github.com/owner/repo.git"
+                url.trim_end_matches(".git")
+                    .split('/')
+                    .rev()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("/")
+            } else {
+                repo_path
+                    .file_name()
+                    .context("No repo name")?
+                    .to_string_lossy()
+                    .to_string()
+            }
+        } else {
+            repo_path
+                .file_name()
+                .context("No repo name")?
+                .to_string_lossy()
+                .to_string()
+        };
 
         if !worktree_path.exists() {
             log::warn!(
@@ -497,7 +571,17 @@ impl WorktreeManager {
         }
 
         // Remove the worktree using git
-        log::info!("Removing worktree at {}", worktree_path.display());
+        log::info!("DEBUG: About to run git worktree remove");
+        log::info!(
+            "DEBUG: worktree_path argument = {}",
+            worktree_path.display()
+        );
+        log::info!("DEBUG: current_dir (repo_path) = {}", repo_path.display());
+        log::info!(
+            "DEBUG: Command: git worktree remove {} --force",
+            worktree_path.display()
+        );
+
         let output = std::process::Command::new("git")
             .args(&[
                 "worktree",
@@ -507,6 +591,16 @@ impl WorktreeManager {
             ])
             .current_dir(&repo_path)
             .output()?;
+
+        log::info!("DEBUG: git command exit status = {}", output.status);
+        log::info!(
+            "DEBUG: git stdout = {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        log::info!(
+            "DEBUG: git stderr = {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
