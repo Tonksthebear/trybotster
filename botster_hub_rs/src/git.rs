@@ -205,15 +205,15 @@ impl WorktreeManager {
         Ok((repo_path, repo_name))
     }
 
-    /// Creates a worktree from the current repository
-    pub fn create_worktree_from_current(&self, issue_number: u32) -> Result<PathBuf> {
+    /// Creates a worktree from the current repository with a custom branch name
+    pub fn create_worktree_with_branch(&self, branch_name: &str) -> Result<PathBuf> {
         let (repo_path, repo_name) = Self::detect_current_repo()?;
 
         let repo_safe = repo_name.replace('/', "-");
-        let branch_name = format!("botster-issue-{}", issue_number);
+        let sanitized_branch = branch_name.replace('/', "-");
         let worktree_path = self
             .base_dir
-            .join(format!("{}-{}", repo_safe, issue_number));
+            .join(format!("{}-{}", repo_safe, sanitized_branch));
 
         // Remove existing worktree if present
         self.cleanup_worktree(&repo_path, &worktree_path)?;
@@ -222,7 +222,7 @@ impl WorktreeManager {
 
         // Check if branch exists
         let branch_exists = repo_obj
-            .find_branch(&branch_name, git2::BranchType::Local)
+            .find_branch(branch_name, git2::BranchType::Local)
             .is_ok();
 
         // Create worktree using git command
@@ -233,7 +233,7 @@ impl WorktreeManager {
                     "worktree",
                     "add",
                     worktree_path.to_str().unwrap(),
-                    &branch_name,
+                    branch_name,
                 ])
                 .current_dir(&repo_path)
                 .output()?
@@ -244,7 +244,7 @@ impl WorktreeManager {
                     "worktree",
                     "add",
                     "-b",
-                    &branch_name,
+                    branch_name,
                     worktree_path.to_str().unwrap(),
                 ])
                 .current_dir(&repo_path)
@@ -274,6 +274,12 @@ impl WorktreeManager {
         Self::copy_botster_files(&repo_path, &worktree_path)?;
 
         Ok(worktree_path)
+    }
+
+    /// Creates a worktree from the current repository
+    pub fn create_worktree_from_current(&self, issue_number: u32) -> Result<PathBuf> {
+        let branch_name = format!("botster-issue-{}", issue_number);
+        self.create_worktree_with_branch(&branch_name)
     }
 
     /// Creates or reuses a git worktree for the given repo and issue (clone from GitHub)
@@ -421,6 +427,111 @@ impl WorktreeManager {
         Ok(())
     }
 
+    /// Deletes a worktree by path, running teardown scripts first
+    pub fn delete_worktree_by_path(
+        &self,
+        worktree_path: &std::path::Path,
+        branch_name: &str,
+    ) -> Result<()> {
+        // Detect the current repo
+        let (repo_path, repo_name) = Self::detect_current_repo()?;
+
+        if !worktree_path.exists() {
+            log::warn!(
+                "Worktree at {} does not exist, skipping deletion",
+                worktree_path.display()
+            );
+            return Ok(());
+        }
+
+        log::info!("Deleting worktree at {}", worktree_path.display());
+
+        // Read and run teardown commands
+        let teardown_commands = Self::read_botster_teardown_commands(&repo_path)?;
+
+        if !teardown_commands.is_empty() {
+            log::info!("Running {} teardown command(s)", teardown_commands.len());
+
+            for cmd in teardown_commands {
+                log::info!("Running teardown: {}", cmd);
+
+                // Parse issue number from branch name if it's an issue-based branch
+                let issue_number = if branch_name.starts_with("botster-issue-") {
+                    branch_name
+                        .strip_prefix("botster-issue-")
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+
+                // Run the command in a shell with environment variables
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .env("BOTSTER_REPO", &repo_name)
+                    .env("BOTSTER_ISSUE_NUMBER", issue_number.to_string())
+                    .env("BOTSTER_BRANCH_NAME", branch_name)
+                    .env("BOTSTER_WORKTREE_PATH", worktree_path.to_str().unwrap())
+                    .env(
+                        "BOTSTER_HUB_BIN",
+                        std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.to_str().map(|s| s.to_string()))
+                            .unwrap_or_else(|| "botster-hub".to_string()),
+                    )
+                    .output()?;
+
+                if !output.status.success() {
+                    log::warn!(
+                        "Teardown command failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                } else {
+                    log::debug!(
+                        "Teardown output: {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                }
+            }
+        }
+
+        // Remove the worktree using git
+        log::info!("Removing worktree at {}", worktree_path.display());
+        let output = std::process::Command::new("git")
+            .args(&[
+                "worktree",
+                "remove",
+                worktree_path.to_str().unwrap(),
+                "--force",
+            ])
+            .current_dir(&repo_path)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Failed to remove worktree: {}", stderr);
+        }
+
+        // Delete the branch
+        log::info!("Deleting branch {}", branch_name);
+        let output = std::process::Command::new("git")
+            .args(&["branch", "-D", branch_name])
+            .current_dir(&repo_path)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!("Failed to delete branch {}: {}", branch_name, stderr);
+        }
+
+        log::info!(
+            "Successfully deleted worktree at {}",
+            worktree_path.display()
+        );
+        Ok(())
+    }
+
     /// Deletes a worktree by issue number, running teardown scripts first
     pub fn delete_worktree_by_issue_number(&self, issue_number: u32) -> Result<()> {
         // Detect the current repo
@@ -433,11 +544,12 @@ impl WorktreeManager {
             .join(format!("{}-{}", repo_safe, issue_number));
 
         if !worktree_path.exists() {
-            anyhow::bail!(
-                "Worktree for issue #{} does not exist at {}",
+            log::warn!(
+                "Worktree for issue #{} does not exist at {}, skipping deletion",
                 issue_number,
                 worktree_path.display()
             );
+            return Ok(());
         }
 
         log::info!("Deleting worktree for issue #{}", issue_number);
@@ -457,6 +569,7 @@ impl WorktreeManager {
                     .arg(&cmd)
                     .env("BOTSTER_REPO", &repo_name)
                     .env("BOTSTER_ISSUE_NUMBER", issue_number.to_string())
+                    .env("BOTSTER_BRANCH_NAME", &branch_name)
                     .env("BOTSTER_WORKTREE_PATH", worktree_path.to_str().unwrap())
                     .env(
                         "BOTSTER_HUB_BIN",

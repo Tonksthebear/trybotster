@@ -7,6 +7,10 @@
 # - BOTSTER_HUB_BIN: Path to the botster-hub binary
 
 # Remove the worktree from Claude's trusted projects
-"$BOTSTER_HUB_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH" "null"
+"$BOTSTER_HUB_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
 
-echo "Cleaned up worktree for issue #$BOTSTER_ISSUE_NUMBER"
+if [ "$BOTSTER_ISSUE_NUMBER" != "0" ]; then
+  echo "Cleaned up worktree for issue #$BOTSTER_ISSUE_NUMBER"
+else
+  echo "Cleaned up worktree for branch: $BOTSTER_BRANCH_NAME"
+fi
