@@ -56,7 +56,8 @@ enum AppMode {
 }
 
 struct BotsterApp {
-    agents: Vec<Agent>,
+    agents: HashMap<String, Agent>, // Key: session_key (repo-safe-issue_number or repo-safe-branch)
+    agent_keys_ordered: Vec<String>, // Ordered list of agent keys for UI navigation
     selected: usize,
     config: Config,
     git_manager: WorktreeManager,
@@ -80,7 +81,8 @@ impl BotsterApp {
         let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
         let app = Self {
-            agents: Vec::new(),
+            agents: HashMap::new(),
+            agent_keys_ordered: Vec::new(),
             selected: 0,
             config,
             git_manager,
@@ -120,7 +122,7 @@ impl BotsterApp {
                 self.terminal_cols = terminal_cols;
 
                 // Resize all agents
-                for agent in &self.agents {
+                for agent in self.agents.values() {
                     agent.resize(terminal_rows, terminal_cols);
                 }
                 return Ok(true);
@@ -164,7 +166,7 @@ impl BotsterApp {
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+J: next agent
-                if self.selected < self.agents.len().saturating_sub(1) {
+                if self.selected < self.agent_keys_ordered.len().saturating_sub(1) {
                     self.selected += 1;
                 }
                 return Ok(true);
@@ -178,11 +180,12 @@ impl BotsterApp {
             }
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+X: kill selected agent
-                if !self.agents.is_empty() {
-                    self.agents.remove(self.selected);
+                if let Some(key) = self.agent_keys_ordered.get(self.selected) {
+                    self.agents.remove(key);
+                    self.agent_keys_ordered.remove(self.selected);
                     // Adjust selection if needed
-                    if self.selected >= self.agents.len() && self.selected > 0 {
-                        self.selected = self.agents.len() - 1;
+                    if self.selected >= self.agent_keys_ordered.len() && self.selected > 0 {
+                        self.selected = self.agent_keys_ordered.len() - 1;
                     }
                 }
                 return Ok(true);
@@ -219,8 +222,10 @@ impl BotsterApp {
                 };
 
                 if let Some(bytes) = bytes_to_send {
-                    if let Some(agent) = self.agents.get_mut(self.selected) {
-                        let _ = agent.write_input(&bytes);
+                    if let Some(key) = self.agent_keys_ordered.get(self.selected) {
+                        if let Some(agent) = self.agents.get_mut(key) {
+                            let _ = agent.write_input(&bytes);
+                        }
                     }
                 }
                 return Ok(true);
@@ -268,7 +273,7 @@ impl BotsterApp {
                     }
                     2 => {
                         // Close agent
-                        if !self.agents.is_empty() {
+                        if !self.agent_keys_ordered.is_empty() {
                             self.mode = AppMode::CloseAgentConfirm;
                         } else {
                             self.mode = AppMode::Normal;
@@ -387,54 +392,58 @@ impl BotsterApp {
             }
             KeyCode::Char('y') => {
                 // Close agent and ask about deleting worktree
-                if !self.agents.is_empty() {
-                    let agent = self.agents.remove(self.selected);
+                if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                    if let Some(agent) = self.agents.remove(&key) {
+                        self.agent_keys_ordered.remove(self.selected);
 
-                    // Adjust selection
-                    if self.selected >= self.agents.len() && self.selected > 0 {
-                        self.selected = self.agents.len() - 1;
+                        // Adjust selection
+                        if self.selected >= self.agent_keys_ordered.len() && self.selected > 0 {
+                            self.selected = self.agent_keys_ordered.len() - 1;
+                        }
+
+                        // TODO: Prompt whether to delete worktree
+                        // For now, just close the agent without deleting
+                        let label = if let Some(num) = agent.issue_number {
+                            format!("issue #{}", num)
+                        } else {
+                            format!("branch {}", agent.branch_name)
+                        };
+                        log::info!("Closed agent for {}", label);
                     }
-
-                    // TODO: Prompt whether to delete worktree
-                    // For now, just close the agent without deleting
-                    let label = if let Some(num) = agent.issue_number {
-                        format!("issue #{}", num)
-                    } else {
-                        format!("branch {}", agent.branch_name)
-                    };
-                    log::info!("Closed agent for {}", label);
                 }
                 self.mode = AppMode::Normal;
                 return Ok(true);
             }
             KeyCode::Char('d') => {
                 // Close agent and delete worktree
-                if !self.agents.is_empty() {
-                    let agent = self.agents.remove(self.selected);
+                if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                    if let Some(agent) = self.agents.remove(&key) {
+                        self.agent_keys_ordered.remove(self.selected);
 
-                    // Adjust selection
-                    if self.selected >= self.agents.len() && self.selected > 0 {
-                        self.selected = self.agents.len() - 1;
-                    }
+                        // Adjust selection
+                        if self.selected >= self.agent_keys_ordered.len() && self.selected > 0 {
+                            self.selected = self.agent_keys_ordered.len() - 1;
+                        }
 
-                    // Delete the worktree using the generic delete function
-                    if let Err(e) = self
-                        .git_manager
-                        .delete_worktree_by_path(&agent.worktree_path, &agent.branch_name)
-                    {
-                        let label = if let Some(num) = agent.issue_number {
-                            format!("issue #{}", num)
+                        // Delete the worktree using the generic delete function
+                        if let Err(e) = self
+                            .git_manager
+                            .delete_worktree_by_path(&agent.worktree_path, &agent.branch_name)
+                        {
+                            let label = if let Some(num) = agent.issue_number {
+                                format!("issue #{}", num)
+                            } else {
+                                format!("branch {}", agent.branch_name)
+                            };
+                            log::error!("Failed to delete worktree for {}: {}", label, e);
                         } else {
-                            format!("branch {}", agent.branch_name)
-                        };
-                        log::error!("Failed to delete worktree for {}: {}", label, e);
-                    } else {
-                        let label = if let Some(num) = agent.issue_number {
-                            format!("issue #{}", num)
-                        } else {
-                            format!("branch {}", agent.branch_name)
-                        };
-                        log::info!("Closed agent and deleted worktree for {}", label);
+                            let label = if let Some(num) = agent.issue_number {
+                                format!("issue #{}", num)
+                            } else {
+                                format!("branch {}", agent.branch_name)
+                            };
+                            log::info!("Closed agent and deleted worktree for {}", label);
+                        }
                     }
                 }
                 self.mode = AppMode::Normal;
@@ -491,7 +500,7 @@ impl BotsterApp {
         // 2. Worktrees that already have agents open
         let open_paths: std::collections::HashSet<_> = self
             .agents
-            .iter()
+            .values()
             .map(|a| a.worktree_path.display().to_string())
             .collect();
 
@@ -579,7 +588,11 @@ impl BotsterApp {
             env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
 
             agent.spawn("bash", &prompt, init_commands, env_vars)?;
-            self.agents.push(agent);
+
+            // Generate session key and add to tracking structures
+            let session_key = agent.session_key();
+            self.agent_keys_ordered.push(session_key.clone());
+            self.agents.insert(session_key, agent);
 
             let label = if let Some(num) = issue_number {
                 format!("issue #{}", num)
@@ -663,7 +676,11 @@ impl BotsterApp {
         env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
 
         agent.spawn("bash", &prompt, init_commands, env_vars)?;
-        self.agents.push(agent);
+
+        // Generate session key and add to tracking structures
+        let session_key = agent.session_key();
+        self.agent_keys_ordered.push(session_key.clone());
+        self.agents.insert(session_key, agent);
 
         log::info!(
             "Created worktree and spawned agent for branch '{}'",
@@ -674,6 +691,7 @@ impl BotsterApp {
     }
 
     fn view(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+        let agent_keys_ordered = &self.agent_keys_ordered;
         let agents = &self.agents;
         let selected = self.selected;
         let seconds_since_poll = self.last_poll.elapsed().as_secs();
@@ -698,8 +716,9 @@ impl BotsterApp {
                 .split(f.area());
 
             // Render agent list
-            let items: Vec<ListItem> = agents
+            let items: Vec<ListItem> = agent_keys_ordered
                 .iter()
+                .filter_map(|key| agents.get(key))
                 .map(|agent| {
                     let text = if let Some(issue_num) = agent.issue_number {
                         format!("{}#{}", agent.repo, issue_num)
@@ -711,7 +730,9 @@ impl BotsterApp {
                 .collect();
 
             let mut state = ListState::default();
-            state.select(Some(selected.min(agents.len().saturating_sub(1))));
+            state.select(Some(
+                selected.min(agent_keys_ordered.len().saturating_sub(1)),
+            ));
 
             // Add polling indicator
             let poll_status = if !polling_enabled {
@@ -724,7 +745,7 @@ impl BotsterApp {
 
             let agent_title = format!(
                 " Agents ({}) {} Poll: {}s [Ctrl+P menu | Ctrl+Q quit] ",
-                agents.len(),
+                agent_keys_ordered.len(),
                 poll_status,
                 if polling_enabled {
                     poll_interval - seconds_since_poll.min(poll_interval)
@@ -741,7 +762,10 @@ impl BotsterApp {
             f.render_stateful_widget(list, chunks[0], &mut state);
 
             // Render terminal view
-            if let Some(agent) = agents.get(selected) {
+            let selected_agent = agent_keys_ordered
+                .get(selected)
+                .and_then(|key| agents.get(key));
+            if let Some(agent) = selected_agent {
                 let parser = agent.vt100_parser.lock().unwrap();
                 let screen = parser.screen();
 
@@ -952,6 +976,7 @@ impl BotsterApp {
         #[derive(serde::Deserialize)]
         struct MessageData {
             id: i64,
+            event_type: String,
             payload: serde_json::Value,
         }
 
@@ -970,12 +995,21 @@ impl BotsterApp {
 
         // Spawn agents for new messages
         for msg in message_response.messages {
-            if let Err(e) = self.spawn_agent_for_message(msg.id, &msg.payload) {
-                log::error!("Failed to spawn agent for message {}: {}", msg.id, e);
+            if let Err(e) = self.spawn_agent_for_message(msg.id, &msg.payload, &msg.event_type) {
+                log::error!(
+                    "Failed to process message {} ({}): {}",
+                    msg.id,
+                    msg.event_type,
+                    e
+                );
                 // TODO: Mark message as failed
             } else {
                 // TODO: Acknowledge message
-                log::info!("Successfully spawned agent for message {}", msg.id);
+                log::info!(
+                    "Successfully processed message {} ({})",
+                    msg.id,
+                    msg.event_type
+                );
             }
         }
 
@@ -986,15 +1020,67 @@ impl BotsterApp {
         &mut self,
         message_id: i64,
         payload: &serde_json::Value,
+        event_type: &str,
     ) -> Result<()> {
+        // Handle cleanup messages (when issue/PR is closed)
+        if event_type == "agent_cleanup" {
+            return self.handle_cleanup_message(payload);
+        }
+
         // Extract data from payload
         let issue_number = payload["issue_number"]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("Missing issue_number in payload"))?
             as u32;
 
+        // Detect current repo
+        let (repo_path, repo_name) = WorktreeManager::detect_current_repo()?;
+
+        // Generate session key to check if agent already exists
+        let repo_safe = repo_name.replace('/', "-");
+        let session_key = format!("{}-{}", repo_safe, issue_number);
+
+        // Check if an agent already exists for this issue
+        if let Some(existing_agent) = self.agents.get_mut(&session_key) {
+            // Agent exists - ping it with the new message
+            log::info!(
+                "Agent already exists for issue #{}, pinging with new message",
+                issue_number
+            );
+
+            let comment_body = payload["comment_body"].as_str().unwrap_or("New mention");
+            let comment_author = payload["comment_author"].as_str().unwrap_or("unknown");
+
+            // Send notification to existing agent
+            // In Claude's TUI, we need to simulate Ctrl+D twice to submit the message
+            let notification = format!(
+                "=== NEW MENTION (automated notification) ===\n{} mentioned you: {}\n==================",
+                comment_author, comment_body
+            );
+
+            existing_agent.write_input_str(&notification)?;
+
+            // Wait a bit for the text to be processed
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            // Send two Enters (first goes to new line, second submits on empty line)
+            existing_agent.write_input(&[b'\r'])?;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            existing_agent.write_input(&[b'\r'])?;
+
+            log::info!(
+                "Sent notification to existing agent for issue #{}",
+                issue_number
+            );
+
+            return Ok(());
+        }
+
+        // No existing agent - create new one
         let user_prompt = payload["prompt"]
             .as_str()
+            .or_else(|| payload["comment_body"].as_str())
+            .or_else(|| payload["context"].as_str())
             .unwrap_or("Work on this issue")
             .to_string();
 
@@ -1008,9 +1094,6 @@ impl BotsterApp {
             YOUR TASK:\n{}",
             user_prompt
         );
-
-        // Detect current repo
-        let (repo_path, repo_name) = WorktreeManager::detect_current_repo()?;
 
         // Read init commands from .botster_init
         let init_commands = WorktreeManager::read_botster_init_commands(&repo_path)?;
@@ -1037,6 +1120,10 @@ impl BotsterApp {
         env_vars.insert("BOTSTER_REPO".to_string(), repo_name.clone());
         env_vars.insert("BOTSTER_ISSUE_NUMBER".to_string(), issue_number.to_string());
         env_vars.insert(
+            "BOTSTER_BRANCH_NAME".to_string(),
+            format!("botster-issue-{}", issue_number),
+        );
+        env_vars.insert(
             "BOTSTER_WORKTREE_PATH".to_string(),
             worktree_path.display().to_string(),
         );
@@ -1055,8 +1142,77 @@ impl BotsterApp {
 
         log::info!("Spawned agent {} for issue #{}", id, issue_number);
 
-        // Add agent to our list
-        self.agents.push(agent);
+        // Add agent to tracking structures using session key
+        let session_key = agent.session_key();
+        self.agent_keys_ordered.push(session_key.clone());
+        self.agents.insert(session_key, agent);
+
+        Ok(())
+    }
+
+    fn handle_cleanup_message(&mut self, payload: &serde_json::Value) -> Result<()> {
+        let repo = payload["repo"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing repo in cleanup payload"))?;
+        let issue_number = payload["issue_number"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("Missing issue_number in cleanup payload"))?
+            as u32;
+        let reason = payload["reason"].as_str().unwrap_or("closed");
+
+        // Generate session key
+        let repo_safe = repo.replace('/', "-");
+        let session_key = format!("{}-{}", repo_safe, issue_number);
+
+        log::info!(
+            "Processing cleanup for {}#{} (reason: {})",
+            repo,
+            issue_number,
+            reason
+        );
+
+        // Check if agent exists
+        if let Some(agent) = self.agents.remove(&session_key) {
+            // Remove from ordered list
+            if let Some(pos) = self
+                .agent_keys_ordered
+                .iter()
+                .position(|k| k == &session_key)
+            {
+                self.agent_keys_ordered.remove(pos);
+
+                // Adjust selection if needed
+                if self.selected >= self.agent_keys_ordered.len() && self.selected > 0 {
+                    self.selected = self.agent_keys_ordered.len() - 1;
+                }
+            }
+
+            // Delete the worktree
+            if let Err(e) = self
+                .git_manager
+                .delete_worktree_by_path(&agent.worktree_path, &agent.branch_name)
+            {
+                log::error!(
+                    "Failed to delete worktree for {}#{}: {}",
+                    repo,
+                    issue_number,
+                    e
+                );
+            } else {
+                log::info!(
+                    "Closed agent and deleted worktree for {}#{} (reason: {})",
+                    repo,
+                    issue_number,
+                    reason
+                );
+            }
+        } else {
+            log::info!(
+                "No active agent found for {}#{}, skipping cleanup",
+                repo,
+                issue_number
+            );
+        }
 
         Ok(())
     }

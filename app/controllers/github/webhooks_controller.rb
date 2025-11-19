@@ -108,8 +108,16 @@ module Github
     end
 
     def handle_issue(payload)
+      action = payload["action"]
+
+      # Handle closed issues
+      if action == "closed"
+        handle_issue_or_pr_closed(payload, is_pr: false)
+        return
+      end
+
       # Handle both opened and edited issues
-      return unless %w[opened edited].include?(payload["action"])
+      return unless %w[opened edited].include?(action)
 
       issue_body = payload.dig("issue", "body")
       return if issue_body.blank?
@@ -144,8 +152,16 @@ module Github
     end
 
     def handle_pull_request(payload)
+      action = payload["action"]
+
+      # Handle closed pull requests
+      if action == "closed"
+        handle_issue_or_pr_closed(payload, is_pr: true)
+        return
+      end
+
       # Handle both opened and edited pull requests
-      return unless %w[opened edited].include?(payload["action"])
+      return unless %w[opened edited].include?(action)
 
       pr_body = payload.dig("pull_request", "body")
       return if pr_body.blank?
@@ -177,6 +193,35 @@ module Github
         issue_url: pr_url,
         is_pr: true
       )
+    end
+
+    def handle_issue_or_pr_closed(payload, is_pr:)
+      repo_full_name = payload.dig("repository", "full_name")
+
+      if is_pr
+        number = payload.dig("pull_request", "number")
+        type = "PR"
+      else
+        number = payload.dig("issue", "number")
+        type = "Issue"
+      end
+
+      return if repo_full_name.blank? || number.blank?
+
+      Rails.logger.info "Processing closed #{type} #{repo_full_name}##{number}"
+
+      # Create a cleanup message for the daemon to process
+      Bot::Message.create!(
+        event_type: "agent_cleanup",
+        payload: {
+          repo: repo_full_name,
+          issue_number: number,
+          is_pr: is_pr,
+          reason: "#{type.downcase}_closed"
+        }
+      )
+
+      Rails.logger.info "Created cleanup message for #{repo_full_name}##{number}"
     end
 
     def mentioned_trybotster?(text)

@@ -1,94 +1,85 @@
-# Botster Hub
+# Trybotster
 
-**GitHub Mention → Local Agent Automation**
+**GitHub Mention → Autonomous AI Agent**
 
-Botster Hub automates GitHub issue/PR mentions (e.g., `@trybotster fix this`) into local CLI agent sessions. When someone mentions `@trybotster` in a GitHub issue or PR, all authorized users' local daemons receive the notification and can spawn a terminal session with their chosen agent (Claude Code, Aider, Cursor, etc.) to handle the request.
+When someone mentions `@trybotster` in a GitHub issue or PR, an autonomous AI agent spawns in an isolated git worktree to investigate and resolve the issue.
 
 ## 🎯 What It Does
 
 ```
-GitHub Issue Comment
+GitHub Issue/PR Comment
   "@trybotster can you fix this bug?"
         ↓
-  Rails webhook receives @trybotster mention
+  Rails webhook receives mention
         ↓
-  Creates pending messages for all active users
+  Creates message in queue
         ↓
-  Local daemons poll and detect new message
+  Rust daemon polls and detects message
         ↓
-  Server verifies user has repo access (via GitHub API)
+  Verifies user has repo access
         ↓
-  Authorized daemons receive the message
+  Creates git worktree
         ↓
-  Daemon creates git worktree
+  Spawns Claude agent in PTY
         ↓
-  Spawns terminal with your agent (Claude, Aider, etc.)
+  Agent investigates and fixes issue
         ↓
-  Agent analyzes issue and makes changes
+  Creates PR or comments on issue
         ↓
-  Marks complete → automatic cleanup
+  Issue/PR closed → automatic cleanup
 ```
 
 ### Key Features
 
+- **🤖 Autonomous**: Agents work independently without human intervention
 - **🔒 Local-first**: Your code never leaves your machine
-- **🤖 Agent-agnostic**: Works with Claude Code, Aider, Cursor CLI, or any CLI tool
-- **⚡ Zero dependencies**: Pure bash daemon using only macOS built-ins
-- **📡 Simple polling**: HTTP REST API (no WebSockets, no hanging connections)
-- **🎨 RESTful Rails**: Clean, conventional routing
-- **🔧 MCP Tools**: Agents can interact with GitHub via Model Context Protocol
+- **⚡ Interactive TUI**: Real-time view of all running agents
+- **🎨 Isolated Worktrees**: Each agent works in a separate git worktree
+- **🧹 Auto-cleanup**: Closes agents and deletes worktrees when issues are closed
+- **🔄 Smart Deduplication**: Multiple mentions to the same issue ping the existing agent
+- **📡 MCP Integration**: Agents interact with GitHub via Model Context Protocol
 
 ## 📦 Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    GitHub (External)                          │
-│  Someone mentions @trybotster in issue/PR comment            │
+│  Someone mentions @trybotster in issue/PR                    │
 └─────────────────────┬────────────────────────────────────────┘
                       │ Webhook
                       ↓
 ┌──────────────────────────────────────────────────────────────┐
-│              Rails Server (Notification Broker)               │
+│              Rails Server (Message Broker)                    │
 │                                                               │
-│  Models:                                                      │
-│  • Bot::Message - Message queue with lifecycle tracking      │
-│  • Github::App - GitHub API interactions                     │
-│  • User - Authentication, GitHub App tokens, repo access     │
+│  • Receives GitHub webhooks                                  │
+│  • Creates Bot::Message records                              │
+│  • Verifies repo access via GitHub API                       │
+│  • Provides MCP tools for agents                             │
+│  • Auto-cleanup on issue/PR close                            │
 │                                                               │
-│  Controllers:                                                 │
-│  • Github::WebhooksController - Receives @trybotster webhook │
-│  • Bots::MessagesController - REST API with repo auth check  │
-│                                                               │
-│  Authorization Flow:                                          │
-│  1. Webhook creates messages for all active users            │
-│  2. Daemon polls → controller checks repo access             │
-│  3. Only authorized users receive messages                   │
-│                                                               │
-│  MCP Tools (for agents):                                     │
-│  • github_get_issue                                          │
-│  • github_create_pull_request                                │
-│  • github_comment_issue                                      │
-│  • github_update_issue                                       │
-│  • + more...                                                 │
+│  Event Types:                                                │
+│  • github_mention - New @trybotster mention                  │
+│  • agent_cleanup - Issue/PR closed, cleanup agent            │
 └─────────────────────┬────────────────────────────────────────┘
-                      │ HTTP Polling (GET /bots/messages)
-                      │ + Repo Access Check (via GitHub API)
+                      │ HTTP Polling
                       ↓
 ┌──────────────────────────────────────────────────────────────┐
-│                  Local Machine (macOS)                        │
+│               Rust Daemon (botster-hub)                       │
 │                                                               │
-│  bin/botster_hub (Pure Bash Daemon)                          │
+│  • Interactive TUI (ratatui)                                 │
 │  • Polls Rails API every 5 seconds                           │
-│  • Manages session state (~/.botster_hub/sessions/)          │
-│  • Creates git worktrees                                     │
-│  • Spawns Terminal.app tabs                                  │
-│  • Monitors completion markers                               │
-│  • Cleans up on completion                                   │
+│  • Manages agents in HashMap by session key                  │
+│  • Creates/deletes git worktrees                             │
+│  • Spawns Claude in PTY for each agent                       │
+│  • Routes keyboard input to selected agent                   │
+│  • Handles cleanup on issue/PR close                         │
+│  • Pings existing agents on duplicate mentions               │
 │                                                               │
-│  Terminal Sessions (one per mention)                         │
-│  • Git worktree: ~/botster-sessions/org-repo-123/           │
-│  • Runs: claude, aider, cursor, etc.                         │
-│  • Has MCP access to GitHub via Rails                        │
+│  Agent Sessions:                                             │
+│  • Key: "repo-safe-issue_number"                            │
+│  • Worktree: ~/botster-sessions/org-repo-123/              │
+│  • Full VT100 terminal emulation                            │
+│  • Environment variables for context                         │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -100,12 +91,13 @@ GitHub Issue Comment
 
 - Ruby 3.3+
 - PostgreSQL
-- GitHub App (for bot interactions)
+- GitHub App (for webhooks and bot actions)
 
-**Client (Local Daemon):**
+**Client:**
 
-- macOS (for Terminal.app automation)
-- That's it! No gems, no dependencies, just bash
+- Rust (for building the daemon)
+- Claude Code CLI
+- Git
 
 ### 1. Server Setup
 
@@ -118,8 +110,8 @@ bundle install
 # Setup database
 rails db:create db:migrate
 
-# Configure GitHub App (see "GitHub App Setup" below)
-# You'll need to create a .env file or set environment variables
+# Configure GitHub App
+# See "GitHub App Setup" section below
 ```
 
 ### 2. GitHub App Setup
@@ -130,29 +122,25 @@ rails db:create db:migrate
    - Webhook URL: `https://your-domain.com/github/webhooks`
    - Webhook secret: Generate a random string
    - Subscribe to events:
-     - ✅ Issue comment
-     - ✅ Pull request review comment
+     - ✅ Issues (opened, edited, closed)
+     - ✅ Pull requests (opened, edited, closed)
+     - ✅ Issue comments
+     - ✅ Pull request review comments
 
 3. **Set permissions:**
    - Issues: Read & Write
    - Pull requests: Read & Write
-   - Metadata: Read-only
+   - Contents: Read & Write
 
-4. **Configure environment variables:**
+4. **Set environment variables:**
 
 ```bash
-# Required
 GITHUB_APP_ID=your_app_id
 GITHUB_APP_CLIENT_ID=your_client_id
 GITHUB_APP_CLIENT_SECRET=your_client_secret
-GITHUB_APP_PRIVATE_KEY=your_private_key
+GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n..."
 GITHUB_WEBHOOK_SECRET=your_webhook_secret
-
-# Optional
-APP_URL=http://localhost:3000  # For OAuth callbacks
 ```
-
-5. **Install the app** on your repositories
 
 ### 3. User Setup
 
@@ -160,198 +148,195 @@ APP_URL=http://localhost:3000  # For OAuth callbacks
 # Start Rails server
 rails server
 
-# 1. Visit http://localhost:3000
-# 2. Click "Login with GitHub"
-# 3. Authorize the GitHub App
-# 4. Generate your API key in Rails console:
+# Visit http://localhost:3000 and login with GitHub
+# Generate your API key in Rails console:
 
 rails console
-user = User.find_by(email: "you@example.com")
+user = User.find_by(username: "your_github_username")
 user.regenerate_api_key!
 puts user.api_key  # Save this!
 ```
 
-### 4. Local Daemon Setup
+### 4. Daemon Setup
+
+Build the daemon:
 
 ```bash
-# Configure the daemon
-bin/botster_hub config server_url "http://localhost:3000"
-bin/botster_hub config api_key "your_api_key_from_step_3"
-bin/botster_hub config agent_command "claude"  # or "aider", "cursor", etc.
+cd botster_hub
+cargo build --release
+```
 
-# Optional: Adjust polling interval and session limits
-bin/botster_hub config poll_interval 5      # seconds
-bin/botster_hub config max_sessions 20      # concurrent sessions
+The binary will be at `target/release/botster-hub`.
 
-# Start the daemon (stays in foreground)
-bin/botster_hub start
+Configure via environment variables:
+
+```bash
+export BOTSTER_API_KEY="your_api_key_from_step_3"
+# Optional overrides:
+# export BOTSTER_SERVER_URL="https://your-domain.com"  # default: https://trybotster.com
+# export BOTSTER_WORKTREE_BASE="$HOME/my-worktrees"    # default: ~/botster-sessions
+# export BOTSTER_POLL_INTERVAL="10"                    # default: 5 seconds
+```
+
+Start the daemon:
+
+```bash
+./target/release/botster-hub start
+```
+
+### 5. Repository Setup
+
+In each repository where you want to use Trybotster, create these files:
+
+**`.botster_init`** - Runs when agent starts:
+
+```bash
+#!/bin/bash
+# Trust worktree in Claude config
+"$BOTSTER_HUB_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
+
+# Register trybotster MCP server
+claude mcp add trybotster --transport http https://trybotster.com --header "Authorization: Bearer $BOTSTER_TOKEN"
+
+# Start Claude with prompt
+claude --permission-mode acceptEdits "$BOTSTER_PROMPT"
+```
+
+**`.botster_teardown`** - Runs before worktree deletion:
+
+```bash
+#!/bin/bash
+# Remove worktree from Claude's trusted projects
+"$BOTSTER_HUB_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
+```
+
+**`.botster_copy`** - Files to copy to each worktree:
+
+```
+.env
+config/credentials/*.key
+.bundle
+mise.toml
 ```
 
 ## 📖 Usage
 
-### Basic Workflow
+### Mentioning the Bot
 
-1. **Someone mentions @trybotster in GitHub:**
+Simply mention `@trybotster` in any GitHub issue or PR comment:
 
-   ```
-   GitHub issue/PR comment:
-   "@trybotster can you investigate this memory leak?"
-   ```
-
-2. **Daemon automatically responds:**
-
-   ```
-   [2025-11-12 10:30:45] Received 1 new message(s)
-   [2025-11-12 10:30:45] Processing GitHub mention in myorg/myrepo#123
-   [2025-11-12 10:30:46] ✓ Created worktree: ~/botster-sessions/myorg-myrepo-123
-   [2025-11-12 10:30:47] ✓ Spawned terminal for myorg/myrepo#123
-   [2025-11-12 10:30:47] ✓ Session created: myorg-myrepo-123
-   ```
-
-3. **Terminal opens with your agent:**
-   - New Terminal.app tab titled "Botster: myorg/myrepo#123"
-   - Working directory: `~/botster-sessions/myorg-myrepo-123/`
-   - Agent (claude/aider) running with issue context
-
-4. **Agent works on the issue:**
-   - Has access to issue details via MCP tools
-   - Can create PRs, comment on issues, etc.
-   - Makes changes in isolated git worktree
-
-5. **Mark as complete:**
-
-   ```bash
-   # In the spawned terminal, when done:
-   echo "RESOLVED" > .botster_status
-   # OR
-   echo "DONE" > .botster_status
-   ```
-
-6. **Automatic cleanup:**
-   - Daemon detects completion marker
-   - Removes git worktree
-   - Cleans up session state
-
-### Daemon Commands
-
-```bash
-# Start daemon (stays in foreground - use tmux/screen for background)
-bin/botster_hub start
-
-# Check active sessions
-bin/botster_hub status
-
-# Kill a specific session
-bin/botster_hub kill myorg-myrepo-123
-
-# Clean up stale worktrees
-bin/botster_hub cleanup
-
-# Show/set configuration
-bin/botster_hub config                          # Show all
-bin/botster_hub config api_key                  # Show specific
-bin/botster_hub config agent_command "aider"    # Set value
-
-# Show version
-bin/botster_hub version
+```
+@trybotster can you investigate this memory leak in the worker process?
 ```
 
-### Configuration
+The bot will:
 
-Configuration is stored in `~/.botster_hub/config` as simple key=value pairs:
+1. Create a git worktree for that issue
+2. Spawn a Claude agent
+3. Investigate and work on the issue
+4. Create a PR or comment with findings
 
-```bash
-server_url=http://localhost:3000
-api_key=your_api_key_here
-agent_command=claude
-completion_marker=.botster_status
-max_sessions=20
-poll_interval=5
-worktree_base=/Users/you/botster-sessions
+### TUI Controls
+
+When the daemon is running, you see an interactive TUI:
+
+```
+Ctrl+P  - Open menu
+Ctrl+J  - Next agent
+Ctrl+K  - Previous agent
+Ctrl+X  - Kill selected agent
+Ctrl+Q  - Quit daemon
+
+Menu options:
+  - Toggle Polling (pause/resume message polling)
+  - New Agent (manually create agent)
+  - Close Agent (close selected agent)
 ```
 
-### Session State
+### Agent Lifecycle
 
-Each active session has a file in `~/.botster_hub/sessions/<repo>-<issue>`:
+**Creation:**
+
+- Daemon detects new `github_mention` message
+- Checks if agent already exists for that issue
+- If exists: pings existing agent with new message
+- If not: creates new agent in fresh worktree
+
+**Running:**
+
+- Agent appears in TUI with label like `owner/repo#123`
+- Terminal output shown in right panel
+- Keyboard input routed to selected agent
+
+**Cleanup:**
+
+- When issue/PR is closed, Rails sends `agent_cleanup` message
+- Daemon kills agent, deletes worktree, runs teardown scripts
+- Agent removed from TUI
+
+### Environment Variables (in agents)
+
+Each spawned agent has access to:
 
 ```bash
-message_id=42
-repo=myorg/myrepo
-issue_number=123
-worktree_path=/Users/you/botster-sessions/myorg-myrepo-123
-terminal_id=12345
-started_at=2025-11-12T10:30:45Z
-status=active
+BOTSTER_REPO=owner/repo
+BOTSTER_ISSUE_NUMBER=123
+BOTSTER_BRANCH_NAME=botster-issue-123
+BOTSTER_WORKTREE_PATH=/path/to/worktree
+BOTSTER_PROMPT="User's request text"
+BOTSTER_MESSAGE_ID=42
+BOTSTER_HUB_BIN=/path/to/botster-hub
+BOTSTER_TOKEN=your_api_key  # For MCP server auth
 ```
 
-## 🛠️ MCP Tools for Agents
+## 🛠️ Configuration
 
-When your agent runs in a spawned session, it has access to these MCP tools via the Rails server:
+### Environment Variables
+
+**Required:**
+
+- `BOTSTER_API_KEY` - Your API key from Rails
+
+**Optional (with defaults):**
+
+- `BOTSTER_SERVER_URL` - Rails backend URL (default: `https://trybotster.com`)
+- `BOTSTER_WORKTREE_BASE` - Where to create worktrees (default: `~/botster-sessions`)
+- `BOTSTER_POLL_INTERVAL` - Seconds between polls (default: `5`)
+- `BOTSTER_MAX_SESSIONS` - Max concurrent agents (default: `20`)
+- `BOTSTER_AGENT_TIMEOUT` - Agent timeout in seconds (default: `3600`)
+
+### Config File (Optional)
+
+Create `~/.botster_hub/config.json` to set defaults:
+
+```json
+{
+  "server_url": "https://trybotster.com",
+  "api_key": "your_key_here",
+  "poll_interval": 5,
+  "agent_timeout": 3600,
+  "max_sessions": 20,
+  "worktree_base": "/Users/you/botster-sessions"
+}
+```
+
+Environment variables override config file values.
+
+## 🔧 MCP Tools
+
+Agents have access to these MCP tools via the trybotster server:
 
 ### GitHub Operations
 
 - **`github_get_issue`** - Get issue/PR details
-
-  ```
-  repo: "owner/repo"
-  issue_number: 123
-  ```
-
-- **`github_list_issues`** - List issues in a repository
-
-  ```
-  repo: "owner/repo"
-  state: "open" | "closed" | "all"
-  ```
-
+- **`github_list_issues`** - List repository issues
 - **`github_create_pull_request`** - Create a PR
-
-  ```
-  repo: "owner/repo"
-  title: "Fix memory leak"
-  head: "botster-fix-123"
-  base: "main"
-  body: "Description..."
-  ```
-
 - **`github_update_issue`** - Update issue status/labels
+- **`github_comment_issue`** - Comment on issue/PR
+- **`github_get_pull_request`** - Get PR details and diff
+- **`github_list_repos`** - List accessible repositories
 
-  ```
-  repo: "owner/repo"
-  issue_number: 123
-  state: "closed"
-  labels: ["bug", "fixed"]
-  ```
-
-- **`github_comment_issue`** - Add comment to issue/PR
-
-  ```
-  repo: "owner/repo"
-  issue_number: 123
-  body: "Fixed in PR #124"
-  ```
-
-- **`github_get_pull_request`** - Get PR details including diff
-  ```
-  repo: "owner/repo"
-  pull_number: 124
-  ```
-
-All GitHub operations show as **[bot]** attribution on GitHub.
-
-### Configuring Agent MCP Access
-
-**For Claude Code:**
-
-```bash
-# In spawned terminal, BOTSTER_API_KEY is already exported
-claude --mcp-server "rails:http://localhost:3000/mcp"
-```
-
-**For other agents**, ensure they can access the MCP endpoint:
-
-- Base URL: `http://localhost:3000/mcp`
-- Authentication: `X-API-Key: $BOTSTER_API_KEY` (auto-exported)
+All operations use the GitHub App, showing as `@trybotster[bot]` on GitHub.
 
 ## 🏗️ Project Structure
 
@@ -359,307 +344,96 @@ claude --mcp-server "rails:http://localhost:3000/mcp"
 trybotster/
 ├── app/
 │   ├── models/
-│   │   ├── bot.rb                    # Namespace module
-│   │   ├── bot/message.rb            # Message queue with lifecycle
-│   │   ├── github/app.rb             # GitHub API interactions
-│   │   └── user.rb                   # User auth & GitHub tokens
+│   │   ├── bot/message.rb           # Message queue
+│   │   ├── github/app.rb            # GitHub API wrapper
+│   │   └── user.rb                  # User auth
 │   │
 │   ├── controllers/
-│   │   ├── bots/
-│   │   │   └── messages_controller.rb    # REST API for daemon
-│   │   └── github/
-│   │       ├── webhooks_controller.rb    # Webhook receiver
-│   │       ├── authorization_controller.rb
-│   │       └── callbacks_controller.rb
+│   │   ├── bots/messages_controller.rb     # API for daemon
+│   │   └── github/webhooks_controller.rb   # Webhook receiver
 │   │
-│   └── mcp/
-│       └── tools/
-│           ├── application_mcp_tool.rb
-│           ├── github_get_issue_tool.rb
-│           ├── github_create_pull_request_tool.rb
-│           ├── github_comment_issue_tool.rb
-│           ├── github_update_issue_tool.rb
-│           ├── github_get_pull_request_tool.rb
-│           └── ...
+│   └── mcp/tools/                   # MCP tool implementations
 │
-├── bin/
-│   └── botster_hub              # Pure bash daemon (590 lines!)
+├── botster_hub/                     # Rust daemon
+│   ├── src/
+│   │   ├── main.rs                  # TUI and daemon logic
+│   │   ├── agent.rs                 # Agent PTY management
+│   │   ├── git.rs                   # Worktree operations
+│   │   └── config.rs                # Configuration
+│   └── Cargo.toml
 │
-├── config/
-│   └── routes.rb                # RESTful routes
-│
-├── db/
-│   ├── migrate/
-│   │   └── ..._create_bot_messages.rb
-│   └── schema.rb
-│
-└── BOTSTER_HUB.md              # Detailed architecture doc
+└── README.md                        # This file
 ```
 
 ## 🔒 Security
 
-### Webhook Signature Verification
+### Webhook Verification
 
-GitHub webhooks are verified using HMAC-SHA256:
+GitHub webhooks are verified using HMAC-SHA256 signatures.
 
-```ruby
-# In production, set this environment variable:
-GITHUB_WEBHOOK_SECRET=your_webhook_secret
+### API Authentication
 
-# Automatically verified in Github::WebhooksController
-```
+Daemon authenticates to Rails using `X-API-Key` header.
 
-### API Key Authentication
+### Repository Access
 
-- Each user has a unique encrypted API key
-- Used for daemon → Rails API communication
-- Regenerate anytime: `user.regenerate_api_key!`
+Users must have GitHub access to a repository to receive messages for it. The Rails server verifies access via GitHub API before delivering messages.
 
 ### Bot Attribution
 
-All GitHub actions via MCP tools use GitHub App installation tokens, showing as `[bot]` on GitHub.
-
-## 📊 Database Schema
-
-### `bot_messages`
-
-```ruby
-create_table :bot_messages do |t|
-  t.references :user, null: false, foreign_key: true
-  t.string :event_type, null: false           # "github_mention"
-  t.jsonb :payload, null: false, default: {}  # GitHub context
-  t.datetime :sent_at
-  t.datetime :acknowledged_at
-  t.string :status, default: "pending"        # pending → sent → acknowledged → failed
-  t.timestamps
-end
-```
-
-**Lifecycle:**
-
-1. `pending` - Created by webhook, waiting for daemon poll
-2. `sent` - Returned in API response to daemon
-3. `acknowledged` - Daemon confirmed receipt (via PATCH)
-4. `failed` - Error occurred
-
-### `users`
-
-```ruby
-# Key fields for Botster Hub:
-t.string :api_key                          # Encrypted, for daemon auth
-t.string :username                         # GitHub username
-t.string :github_app_token                 # OAuth token
-t.string :github_app_refresh_token         # For token refresh
-t.datetime :github_app_token_expires_at
-t.string :github_app_installation_id       # For bot attribution
-```
+All GitHub actions show as `@trybotster[bot]` using GitHub App installation tokens.
 
 ## 🧪 Testing
 
-### Manual End-to-End Test
+### Manual Test
 
-1. **Start Rails server:**
+1. Start Rails server: `rails server`
+2. Start daemon: `./botster-hub start`
+3. Mention `@trybotster` in a GitHub issue
+4. Watch agent spawn in TUI
+5. Close the issue on GitHub
+6. Watch agent cleanup automatically
 
-   ```bash
-   rails server
-   ```
-
-2. **Start daemon:**
-
-   ```bash
-   bin/botster_hub start
-   ```
-
-3. **Trigger a mention:**
-   - Comment on a GitHub issue: `@trybotster test this`
-
-4. **Verify flow:**
-
-   ```bash
-   # Check daemon log
-   tail -f ~/.botster_hub/botster_hub.log
-
-   # Check active sessions
-   bin/botster_hub status
-   ```
-
-5. **Test completion:**
-
-   ```bash
-   # In spawned terminal
-   echo "RESOLVED" > .botster_status
-
-   # Daemon should clean up within 5 seconds
-   ```
-
-### Testing Without GitHub
+### Test Without GitHub
 
 Create a test message in Rails console:
 
 ```ruby
-user = User.find_by(username: "yourusername")
-message = user.bot_messages.create!(
+user = User.find_by(username: "your_username")
+Bot::Message.create!(
   event_type: "github_mention",
   payload: {
-    repo: "test/repo",
+    repo: "owner/repo",
     issue_number: 999,
     comment_body: "@trybotster test this",
-    comment_author: "someone",
+    comment_author: "testuser",
     issue_title: "Test Issue",
-    issue_body: "Test description",
-    issue_url: "https://github.com/test/repo/issues/999",
+    issue_body: "Description",
+    issue_url: "https://github.com/owner/repo/issues/999",
     is_pr: false,
-    context: "Test Issue\n\nTest description\n\nComment:\n@trybotster test this"
+    context: "Work on issue #999"
   }
 )
-
-# Note: The message will only be delivered to users who have access to "test/repo"
-# You can bypass the repo check by setting repo to nil or empty string for testing
 ```
-
-## 🔧 Troubleshooting
-
-### Daemon Not Receiving Messages
-
-```bash
-# Check daemon is running
-bin/botster_hub status
-
-# Check configuration
-bin/botster_hub config
-
-# Verify API key is correct
-curl -H "X-API-Key: your_key" http://localhost:3000/bots/messages
-
-# Check daemon logs
-tail -f ~/.botster_hub/botster_hub.log
-```
-
-### Terminal Not Spawning
-
-```bash
-# Verify agent command is available
-which claude
-which aider
-
-# Check AppleScript permissions
-# System Preferences → Security & Privacy → Automation
-# Grant Terminal permission to control Terminal.app
-
-# Check worktree creation
-git worktree list
-```
-
-### Sessions Not Cleaning Up
-
-```bash
-# Check completion marker file
-cat ~/botster-sessions/org-repo-123/.botster_status
-# Should contain "RESOLVED" or "DONE"
-
-# Manual cleanup
-bin/botster_hub cleanup
-
-# Force kill session
-bin/botster_hub kill org-repo-123
-```
-
-### Webhook Not Working
-
-```bash
-# Check Rails logs
-tail -f log/development.log | grep GitHub
-
-# Verify webhook secret
-echo $GITHUB_WEBHOOK_SECRET
-
-# Test webhook locally with ngrok
-ngrok http 3000
-# Update GitHub App webhook URL to ngrok URL
-```
-
-## 🎨 Design Decisions
-
-### Why No `app/services/`?
-
-**Rule:** Project-specific logic lives in `app/models/`, generic utilities in `lib/`.
-
-- ✅ `app/models/github/app.rb` - Project-specific GitHub integration
-- ❌ `app/services/github_app_service.rb` - Unnecessary abstraction
-
-Services create unnecessary layers. Models are the natural home for business logic in Rails.
-
-### Why RESTful Routes Only?
-
-All routes use `resources` except webhooks (external API constraints).
-
-```ruby
-# ✅ RESTful
-resources :messages, only: [:index, :update]
-
-# ❌ Custom actions
-get 'messages/acknowledge'
-
-# ✅ Exception: External webhook naming
-post 'github/webhooks', to: 'github/webhooks#receive'
-```
-
-RESTful routes enforce consistency. The `update` action handles acknowledgment naturally.
-
-### Why HTTP Polling over WebSockets?
-
-- **Simple**: Just bash + curl, no WebSocket client needed
-- **Reliable**: No connection state to manage
-- **Proxy-friendly**: Works with any load balancer
-- **Good enough**: 5-second polling is fine for GitHub mentions
-- **Zero dependencies**: Pure bash with no external tools
-
-### Why Local-First?
-
-- **Privacy**: Code stays on your machine
-- **Control**: You decide what agents can do
-- **Flexibility**: Use any CLI tool
-- **Performance**: Direct git operations
 
 ## 🚧 Roadmap
 
-- [ ] iTerm2 support (better tab management)
-- [ ] Linux support (gnome-terminal, terminator)
-- [ ] Session timeout configuration
-- [ ] Web UI for monitoring active sessions
-- [ ] Rate limiting per user
-- [ ] Metrics dashboard
-- [ ] Multi-user worktree conflict resolution
-
-## 📚 Additional Documentation
-
-- [BOTSTER_HUB.md](BOTSTER_HUB.md) - Detailed architecture documentation
-- [GitHub App Setup](docs/github-app-setup.md) - Step-by-step GitHub App configuration
-- [MCP Tools](app/mcp/tools/) - MCP tool implementations
+- [x] Auto-cleanup on issue/PR close
+- [x] Smart agent deduplication
+- [x] Interactive TUI
+- [ ] Agent timeout handling
+- [ ] Metrics and monitoring
+- [ ] Multi-repo support in single daemon
+- [ ] Linux support (X11/Wayland terminals)
 
 ## 🤝 Contributing
 
-Contributions welcome! Please follow:
-
-1. RESTful routes only (except webhooks)
-2. No `app/services/` directory
-3. Models for project logic, `lib/` for generic utilities
-4. Comprehensive tests for new features
+Contributions welcome! This project follows Rails conventions and uses Rust for the daemon.
 
 ## 📄 License
 
-MIT License - See LICENSE file
-
-## 🙏 Acknowledgments
-
-Built with:
-
-- Ruby on Rails 8.1
-- GitHub Apps API
-- Model Context Protocol (MCP)
-- Pure bash (no dependencies!)
-- macOS Terminal.app AppleScript automation
+MIT License
 
 ---
 
-**Questions?** Open an issue or check the [detailed architecture docs](BOTSTER_HUB.md).
+**Questions?** Open an issue on GitHub.

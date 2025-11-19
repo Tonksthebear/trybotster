@@ -1,7 +1,7 @@
 class Bot::Message < ApplicationRecord
   # Validations
   validates :event_type, presence: true, inclusion: {
-    in: %w[github_mention manual_trigger system_notification],
+    in: %w[github_mention manual_trigger system_notification agent_cleanup],
     message: "%{value} is not a valid event type"
   }
   validates :payload, presence: true
@@ -68,6 +68,10 @@ class Bot::Message < ApplicationRecord
 
   def github_mention?
     event_type == "github_mention"
+  end
+
+  def agent_cleanup?
+    event_type == "agent_cleanup"
   end
 
   # Extract common payload fields
