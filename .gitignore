@@ -51,5 +51,5 @@ mise.toml
 .DS_Store
 
 # Rust build artifacts
-/botster_hub_rs/target/
-/botster_hub_rs/Cargo.lock
+/botster_hub/target/
+/botster_hub/Cargo.lock
