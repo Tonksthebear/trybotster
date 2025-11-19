@@ -6,33 +6,23 @@ use std::{fs, path::PathBuf};
 pub struct Config {
     pub server_url: String,
     pub api_key: String,
-    pub agent_command: String,
     pub poll_interval: u64,
     pub agent_timeout: u64,
     pub max_sessions: usize,
     pub worktree_base: PathBuf,
-    pub claude_permission_mode: String,
-    pub claude_allowed_tools: String,
-    pub preserve_agent_ansi: bool,
-    pub spawn_mode: String, // "embedded" or "external"
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            server_url: "http://localhost:3000".to_string(),
+            server_url: "https://trybotster.com".to_string(),
             api_key: String::new(),
-            agent_command: "claude".to_string(),
             poll_interval: 5,
             agent_timeout: 3600,
             max_sessions: 20,
             worktree_base: dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("botster-sessions"),
-            claude_permission_mode: "acceptEdits".to_string(),
-            claude_allowed_tools: "mcp__*".to_string(),
-            preserve_agent_ansi: false,
-            spawn_mode: "external".to_string(), // external = better for TUI apps!
         }
     }
 }
@@ -47,14 +37,56 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
+        // Priority: Environment variables > config file > defaults
+        let mut config = Self::load_from_file().unwrap_or_else(|_| Self::default());
+
+        // Override with environment variables if present
+        config.apply_env_overrides();
+
+        Ok(config)
+    }
+
+    fn load_from_file() -> Result<Self> {
         let config_path = Self::config_dir()?.join("config.json");
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
             Ok(serde_json::from_str(&content)?)
         } else {
-            let default = Self::default();
-            default.save()?;
-            Ok(default)
+            anyhow::bail!("Config file not found")
+        }
+    }
+
+    fn apply_env_overrides(&mut self) {
+        // Essential config
+        if let Ok(server_url) = std::env::var("BOTSTER_SERVER_URL") {
+            self.server_url = server_url;
+        }
+
+        if let Ok(api_key) = std::env::var("BOTSTER_API_KEY") {
+            self.api_key = api_key;
+        }
+
+        if let Ok(worktree_base) = std::env::var("BOTSTER_WORKTREE_BASE") {
+            self.worktree_base = PathBuf::from(worktree_base);
+        }
+
+        // Optional config
+        if let Ok(poll_interval) = std::env::var("BOTSTER_POLL_INTERVAL") {
+            if let Ok(interval) = poll_interval.parse::<u64>() {
+                self.poll_interval = interval;
+            }
+        }
+
+        if let Ok(max_sessions) = std::env::var("BOTSTER_MAX_SESSIONS") {
+            if let Ok(max) = max_sessions.parse::<usize>() {
+                self.max_sessions = max;
+            }
+        }
+
+        if let Ok(agent_timeout) = std::env::var("BOTSTER_AGENT_TIMEOUT") {
+            if let Ok(timeout) = agent_timeout.parse::<u64>() {
+                self.agent_timeout = timeout;
+            }
         }
     }
 
@@ -72,10 +104,10 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.server_url, "http://localhost:3000");
-        assert_eq!(config.agent_command, "claude");
+        assert_eq!(config.server_url, "https://trybotster.com");
         assert_eq!(config.poll_interval, 5);
         assert_eq!(config.max_sessions, 20);
+        assert_eq!(config.agent_timeout, 3600);
     }
 
     #[test]
