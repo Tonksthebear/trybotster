@@ -1,4 +1,4 @@
-use botster_hub::{Agent, WorktreeManager};
+use botster_hub::Agent;
 use std::process::Command;
 use tempfile::TempDir;
 use uuid::Uuid;
