@@ -136,13 +136,13 @@ fn spawn_in_terminal_linux(command: &str, worktree_path: &Path, title: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+
     use tempfile::TempDir;
 
     #[test]
     #[cfg(target_os = "macos")]
     fn test_terminal_spawning() {
-        let temp_dir = TempDir::new().unwrap();
+        let _temp_dir = TempDir::new().unwrap();
 
         // This will actually spawn a terminal window - only run manually
         // spawn_in_external_terminal("echo 'Test'", temp_dir.path(), "Test").unwrap();
