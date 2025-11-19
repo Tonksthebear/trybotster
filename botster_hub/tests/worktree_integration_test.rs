@@ -61,10 +61,16 @@ fn test_agent_spawns_with_echo_command() {
     let worktree = temp_dir.path().to_path_buf();
 
     let id = Uuid::new_v4();
-    let mut agent = Agent::new(id, "test/repo".to_string(), 1, worktree);
+    let mut agent = Agent::new(
+        id,
+        "test/repo".to_string(),
+        Some(1),
+        "test-branch".to_string(),
+        worktree,
+    );
 
     // Spawn with echo command (simple, won't fail)
-    let result = agent.spawn("echo test", "");
+    let result = agent.spawn("echo test", "", vec![], std::collections::HashMap::new());
 
     // Should succeed in spawning
     assert!(result.is_ok());
@@ -84,14 +90,16 @@ fn test_multiple_agents_different_issues() {
     let agent1 = Agent::new(
         Uuid::new_v4(),
         "owner/repo".to_string(),
-        1,
+        Some(1),
+        "botster-issue-1".to_string(),
         temp_dir.path().to_path_buf(),
     );
 
     let agent2 = Agent::new(
         Uuid::new_v4(),
         "owner/repo".to_string(),
-        2,
+        Some(2),
+        "botster-issue-2".to_string(),
         temp_dir.path().to_path_buf(),
     );
 
