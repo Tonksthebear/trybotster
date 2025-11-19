@@ -486,7 +486,9 @@ impl BotsterApp {
             worktrees.push((current_path, current_branch));
         }
 
-        // Filter out worktrees that already have agents
+        // Filter out:
+        // 1. The main repository (not a worktree, can't be deleted)
+        // 2. Worktrees that already have agents open
         let open_paths: std::collections::HashSet<_> = self
             .agents
             .iter()
@@ -495,7 +497,22 @@ impl BotsterApp {
 
         self.available_worktrees = worktrees
             .into_iter()
-            .filter(|(path, _)| !open_paths.contains(path))
+            .filter(|(path, _)| {
+                // Filter out worktrees already in use
+                if open_paths.contains(path) {
+                    return false;
+                }
+
+                // Filter out the main repository - check if it's actually a worktree
+                if let Ok(repo) = git2::Repository::open(path) {
+                    if !repo.is_worktree() {
+                        log::info!("Filtering out main repository from worktree list: {}", path);
+                        return false;
+                    }
+                }
+
+                true
+            })
             .collect();
 
         Ok(())
