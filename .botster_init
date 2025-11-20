@@ -4,9 +4,8 @@ mise trust
 # Change to the worktree directory
 cd "$BOTSTER_WORKTREE_PATH"
 
-# Fetch the system prompt and substitute the task description
-BOTSTER_PROMPT_TEMPLATE=$("$BOTSTER_HUB_BIN" get-prompt "$BOTSTER_WORKTREE_PATH")
-BOTSTER_PROMPT="${BOTSTER_PROMPT_TEMPLATE//\{TASK_DESCRIPTION\}/$BOTSTER_TASK_DESCRIPTION}"
+# Use the task description directly as the prompt (it's already complete)
+BOTSTER_PROMPT="$BOTSTER_TASK_DESCRIPTION"
 
 # Auto-trust the worktree in Claude config using botster-hub's JSON tools
 "$BOTSTER_HUB_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
