@@ -312,10 +312,16 @@ module Github
       Rails.logger.info "DEBUG: Found installation ID: #{installation_result[:installation_id]}"
 
       # Create installation token and fetch PR
-      installation_token = Github::App.create_installation_token(installation_result[:installation_id])
+      token_result = Github::App.get_installation_token(installation_result[:installation_id])
+
+      unless token_result[:success]
+        Rails.logger.warn "Could not create installation token: #{token_result[:error]}"
+        return nil
+      end
+
       Rails.logger.info "DEBUG: Created installation token, fetching PR..."
 
-      client = Github::App.client(installation_token)
+      client = Github::App.client(token_result[:token])
       pr = client.pull_request(repo_full_name, pr_number)
 
       Rails.logger.info "DEBUG: PR body: #{pr.body&.truncate(200) || 'empty'}"
