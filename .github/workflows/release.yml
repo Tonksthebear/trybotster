@@ -3,20 +3,21 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'  # Triggers on version tags like v0.5.0
+      - "v*" # Triggers on version tags like v0.5.0
 
 permissions:
-  contents: write  # Needed to create releases
+  contents: write # Needed to create releases
 
 jobs:
   build-and-release:
     strategy:
+      fail-fast: false # Continue building other platforms if one fails
       matrix:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: botster-hub-macos-arm64
-          - os: macos-latest
+          - os: macos-13 # Intel runner for x86_64
             target: x86_64-apple-darwin
             artifact_name: botster-hub-macos-x86_64
           - os: ubuntu-latest
