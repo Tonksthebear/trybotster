@@ -170,6 +170,43 @@ module Github
       { success: false, error: e.message }
     end
 
+    # Get the installation ID for a specific repository
+    # @param access_token [String] The user's access token
+    # @param repo [String] Repository in "owner/repo" format
+    # @return [Hash] Response with :success, :installation_id, :account, :error
+    def get_installation_for_repo(access_token, repo)
+      owner = repo.split("/").first
+      client = client(access_token)
+      installations = client.find_user_installations
+
+      if installations.total_count > 0
+        # Find installation that matches the repo owner
+        installation = installations.installations.find { |i| i.account.login.casecmp?(owner) }
+
+        if installation
+          {
+            success: true,
+            installation_id: installation.id,
+            account: installation.account.login,
+            account_type: installation.account.type
+          }
+        else
+          {
+            success: false,
+            error: "No installation found for #{owner}. Install the GitHub App on #{owner}'s account at https://github.com/settings/installations"
+          }
+        end
+      else
+        {
+          success: false,
+          error: "No GitHub App installations found. Please install the app first."
+        }
+      end
+    rescue Octokit::Error => e
+      Rails.logger.error "GitHub App installation lookup for repo error: #{e.message}"
+      { success: false, error: e.message }
+    end
+
     # Get user information from GitHub
     # @param access_token [String] The GitHub access token
     # @return [Hash] User information or error
@@ -406,21 +443,6 @@ module Github
     # OAuth callback URL
     def callback_url
       ENV["GITHUB_APP_CALLBACK_URL"] || "https://#{ENV['HOST_URL']}/github/callback"
-    end
-
-    # Determine which client to use based on user preference
-    # @param user [User] The user object
-    # @param use_bot [Boolean] Whether to use bot attribution (default: true)
-    # @return [Octokit::Client] The appropriate client
-    def client_for_user(user, use_bot: true)
-      if use_bot && user.github_app_installation_id.present?
-        # Use installation token (shows as [bot])
-        installation_client(user.github_app_installation_id)
-      else
-        # Use user token (shows as user)
-        token = user.valid_github_app_token
-        client(token)
-      end
     end
   end
   end

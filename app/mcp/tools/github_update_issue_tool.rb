@@ -23,19 +23,25 @@ class GithubUpdateIssueTool < ApplicationMCPTool
       return
     end
 
-    # Get installation ID
-    unless current_user.github_app_installation_id.present?
-      report_error("Installation ID not found. Please re-authorize the GitHub App.")
+    # Get the correct installation ID for this repository
+    access_token = current_user.valid_github_app_token
+    installation_result = Github::App.get_installation_for_repo(access_token, repo)
+
+    unless installation_result[:success]
+      report_error(installation_result[:error])
       return
     end
 
+    installation_id = installation_result[:installation_id]
+    Rails.logger.info "Using GitHub App installation ID: #{installation_id} for #{repo} (account: #{installation_result[:account]})"
+
     # Detect client for user feedback
     client_info = detect_client_type
-    render(text: "Updating #{repo}##{issue_number} as [bot] (via #{client_info})...")
+    render(text: "Updating #{repo}##{issue_number} as [bot] via #{installation_result[:account]} installation (#{client_info})...")
 
     # Get installation client (shows as [bot])
     begin
-      client = Github::App.installation_client(current_user.github_app_installation_id)
+      client = Github::App.installation_client(installation_id)
     rescue => e
       report_error("Failed to get bot credentials: #{e.message}")
       return

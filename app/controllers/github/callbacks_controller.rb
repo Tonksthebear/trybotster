@@ -46,15 +46,6 @@ module Github
             )
             Rails.logger.info "Tokens stored successfully"
 
-            # Fetch installation ID for bot features
-            installation_result = Github::App.get_user_installation(response[:access_token])
-            if installation_result[:success]
-              user.update!(github_app_installation_id: installation_result[:installation_id].to_s)
-              Rails.logger.info "Installation ID saved: #{installation_result[:installation_id]}"
-            else
-              Rails.logger.warn "Could not fetch installation ID: #{installation_result[:error]}"
-            end
-
             # Sign in the user
             sign_in(user)
             Rails.logger.info "User signed in with Devise"

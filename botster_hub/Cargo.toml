@@ -46,6 +46,7 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 vt100 = "0.15"
 bytes = "1.0"
 shellexpand = "3.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3.23"

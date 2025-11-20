@@ -93,12 +93,35 @@ impl WorktreeManager {
             return Ok(());
         }
 
+        log::info!(
+            "Found {} patterns in .botster_copy: {:?}",
+            patterns.len(),
+            patterns
+        );
+        log::info!("Source repo: {}", source_repo.display());
+        log::info!("Dest worktree: {}", dest_worktree.display());
+
+        // Write debug info to file for troubleshooting
+        let debug_log = format!(
+            "[copy_botster_files] patterns={:?}, source={}, dest={}\n",
+            patterns,
+            source_repo.display(),
+            dest_worktree.display()
+        );
+        std::fs::write("/tmp/botster_debug.log", &debug_log).ok();
+
         // Build globset from patterns
         let mut builder = GlobSetBuilder::new();
         for pattern in &patterns {
-            let glob = Glob::new(pattern)
-                .with_context(|| format!("Invalid pattern in .botster_copy: {}", pattern))?;
-            builder.add(glob);
+            match Glob::new(pattern) {
+                Ok(glob) => {
+                    builder.add(glob);
+                }
+                Err(e) => {
+                    log::warn!("Invalid pattern in .botster_copy: '{}' - {}", pattern, e);
+                    continue;
+                }
+            }
         }
         let globset = builder.build()?;
 
@@ -120,8 +143,20 @@ impl WorktreeManager {
             return Ok(());
         }
 
-        for entry in fs::read_dir(current_dir)? {
-            let entry = entry?;
+        let read_result = fs::read_dir(current_dir);
+        if let Err(e) = &read_result {
+            log::warn!("Failed to read directory {}: {}", current_dir.display(), e);
+            return Ok(()); // Continue despite errors
+        }
+
+        for entry in read_result.unwrap() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    log::warn!("Failed to read entry: {}", err);
+                    continue;
+                }
+            };
             let path = entry.path();
 
             // Skip .git directory
@@ -137,24 +172,60 @@ impl WorktreeManager {
             if path.is_dir() {
                 // Recurse into directories
                 Self::copy_matching_files(source_root, dest_root, &path, globset)?;
-            } else if globset.is_match(&rel_path) {
-                // Copy matching file
-                let dest_path = dest_root.join(&rel_path);
+            } else {
+                log::debug!(
+                    "Checking file: {} (rel_path: {})",
+                    path.display(),
+                    rel_path.display()
+                );
+                if globset.is_match(&rel_path) {
+                    // Copy matching file
+                    let dest_path = dest_root.join(&rel_path);
 
-                // Create parent directories if needed
-                if let Some(parent) = dest_path.parent() {
-                    fs::create_dir_all(parent)?;
+                    // Create parent directories if needed
+                    if let Some(parent) = dest_path.parent() {
+                        if let Err(e) = fs::create_dir_all(parent) {
+                            log::warn!(
+                                "Failed to create parent directory for {}: {}",
+                                dest_path.display(),
+                                e
+                            );
+                            continue;
+                        }
+                    }
+
+                    // Copy file, but continue on error
+                    match fs::copy(&path, &dest_path) {
+                        Ok(_) => {
+                            log::info!("Copied: {} to {}", rel_path.display(), dest_path.display());
+
+                            // Also append to debug file
+                            let debug_msg = format!(
+                                "COPIED: {} -> {}\n",
+                                rel_path.display(),
+                                dest_path.display()
+                            );
+                            use std::io::Write;
+                            if let Ok(mut file) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("/tmp/botster_debug.log")
+                            {
+                                file.write_all(debug_msg.as_bytes()).ok();
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to copy {} to {}: {} - continuing with remaining files",
+                                path.display(),
+                                dest_path.display(),
+                                e
+                            );
+                        }
+                    }
+                } else {
+                    log::debug!("Skipping (no match): {}", rel_path.display());
                 }
-
-                fs::copy(&path, &dest_path).with_context(|| {
-                    format!(
-                        "Failed to copy {} to {}",
-                        path.display(),
-                        dest_path.display()
-                    )
-                })?;
-
-                log::debug!("Copied: {}", rel_path.display());
             }
         }
 

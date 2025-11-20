@@ -70,19 +70,7 @@ class User < ApplicationRecord
 
   # GitHub App Authorization Methods
 
-  # Fetch and store installation ID for this user
-  def fetch_installation_id!
-    return unless github_app_token.present?
 
-    result = Github::App.get_user_installation(github_app_token)
-    if result[:success]
-      update(github_app_installation_id: result[:installation_id].to_s)
-      result[:installation_id]
-    else
-      Rails.logger.error "Failed to fetch installation ID: #{result[:error]}"
-      nil
-    end
-  end
 
   # Check if user has authorized the GitHub App
   def github_app_authorized?
@@ -109,9 +97,6 @@ class User < ApplicationRecord
       refresh_github_app_token!
     end
 
-    # Fetch installation ID if we don't have it yet
-    fetch_installation_id! if github_app_installation_id.blank?
-
     github_app_token
   end
 
@@ -127,9 +112,6 @@ class User < ApplicationRecord
         github_app_refresh_token: response[:refresh_token],
         github_app_token_expires_at: response[:expires_at]
       )
-
-      # Fetch installation ID with new token
-      fetch_installation_id! if github_app_installation_id.blank?
 
       true
     else
@@ -147,7 +129,6 @@ class User < ApplicationRecord
       github_app_token: nil,
       github_app_refresh_token: nil,
       github_app_token_expires_at: nil,
-      github_app_installation_id: nil,
       github_app_permissions: {}
     )
   end
