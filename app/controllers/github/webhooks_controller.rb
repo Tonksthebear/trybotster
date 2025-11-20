@@ -32,7 +32,7 @@ module Github
     private
 
     def handle_issue_comment(payload)
-      return unless payload["action"] == "created"
+      return unless %w[created edited].include?(payload["action"])
 
       comment_body = payload.dig("comment", "body")
       return if comment_body.blank?
@@ -83,7 +83,7 @@ module Github
     end
 
     def handle_pr_review_comment(payload)
-      return unless payload["action"] == "created"
+      return unless %w[created edited].include?(payload["action"])
 
       comment_body = payload.dig("comment", "body")
       return if comment_body.blank?
