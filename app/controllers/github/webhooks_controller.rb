@@ -56,10 +56,22 @@ module Github
 
       Rails.logger.info "Processing @trybotster mention in #{repo_full_name}##{issue_number}"
 
+      # If this is a PR comment, check if it links to an issue and route to that issue instead
+      target_issue_number = issue_number
+      if is_pr
+        linked_issue = fetch_linked_issue_for_pr(repo_full_name, issue_number)
+
+        if linked_issue
+          Rails.logger.info "PR ##{issue_number} links to issue ##{linked_issue}, routing to issue agent"
+          target_issue_number = linked_issue
+          is_pr = false  # Route to issue agent, not PR agent
+        end
+      end
+
       # Create a single bot message (first daemon with repo access will claim it)
       create_bot_message(
         repo: repo_full_name,
-        issue_number: issue_number,
+        issue_number: target_issue_number,
         comment_id: comment_id,
         comment_body: comment_body,
         comment_author: comment_author,
@@ -93,17 +105,29 @@ module Github
 
       Rails.logger.info "Processing @trybotster mention in PR #{repo_full_name}##{pr_number}"
 
+      # Check if this PR links to an issue and route to that issue instead
+      target_issue_number = pr_number
+      is_pr = true
+
+      linked_issue = fetch_linked_issue_for_pr(repo_full_name, pr_number)
+
+      if linked_issue
+        Rails.logger.info "PR ##{pr_number} links to issue ##{linked_issue}, routing to issue agent"
+        target_issue_number = linked_issue
+        is_pr = false  # Route to issue agent, not PR agent
+      end
+
       # Create a single bot message (first daemon with repo access will claim it)
       create_bot_message(
         repo: repo_full_name,
-        issue_number: pr_number,
+        issue_number: target_issue_number,
         comment_id: comment_id,
         comment_body: comment_body,
         comment_author: comment_author,
         issue_title: pr_title,
         issue_body: pr_body,
         issue_url: pr_url,
-        is_pr: true
+        is_pr: is_pr
       )
     end
 
@@ -227,6 +251,58 @@ module Github
     def mentioned_trybotster?(text)
       # Check if @trybotster is mentioned in the text
       text.match?(/@trybotster\b/i)
+    end
+
+    # Extract issue numbers referenced in PR body
+    # Supports: Fixes #123, Closes #123, Resolves #123, References #123
+    def extract_linked_issues(pr_body)
+      return [] if pr_body.blank?
+
+      issue_numbers = []
+
+      # Match common PR-to-issue linking keywords
+      # Regex matches: Fixes #123, Closes #456, etc.
+      pr_body.scan(/(?:fix(?:es|ed)?|close(?:s|d)?|resolve(?:s|d)?|references?)\s+#(\d+)/i) do |match|
+        issue_numbers << match[0].to_i
+      end
+
+      issue_numbers.uniq
+    end
+
+    # Get the linked issue number for a PR, if any
+    # Fetch the linked issue number for a PR using GitHub App authentication
+    def fetch_linked_issue_for_pr(repo_full_name, pr_number)
+      # Get any user with a valid GitHub token to lookup installation
+      user = User.where.not(github_app_token: nil).first
+
+      unless user&.valid_github_app_token
+        Rails.logger.warn "No valid GitHub App token available to fetch PR details"
+        return nil
+      end
+
+      # Get the installation for this repo
+      installation_result = Github::App.get_installation_for_repo(
+        user.valid_github_app_token,
+        repo_full_name
+      )
+
+      unless installation_result[:success]
+        Rails.logger.warn "Could not find installation for repo: #{repo_full_name}"
+        return nil
+      end
+
+      # Create installation token and fetch PR
+      installation_token = Github::App.create_installation_token(installation_result[:installation_id])
+      client = Github::App.client(installation_token)
+      pr = client.pull_request(repo_full_name, pr_number)
+
+      linked_issues = extract_linked_issues(pr.body)
+
+      # Return the first linked issue (most common case is one issue per PR)
+      linked_issues.first
+    rescue => e
+      Rails.logger.warn "Failed to fetch PR for linked issue extraction: #{e.message}"
+      nil
     end
 
     def create_bot_message(repo:, issue_number:, comment_id:, comment_body:,
