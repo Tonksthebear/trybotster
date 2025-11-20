@@ -1,0 +1,128 @@
+[tools]
+ruby = "latest"
+rust = "latest"
+
+[env]
+# Copy this file to mise.toml and fill in your values
+HOST_URL = "dev.trybotster.com"
+GITHUB_CLIENT_ID = "your-client-id"
+GITHUB_CLIENT_SECRET = "your-client-secret"
+GITHUB_APP_CLIENT_ID = "your-app-client-id"
+GITHUB_APP_CLIENT_SECRET = "your-app-client-secret"
+GITHUB_APP_ID = "your-app-id"
+GITHUB_APP_PRIVATE_KEY_PATH = "./config/your-private-key.pem"
+GITHUB_WEBHOOK_SECRET = "your-webhook-secret"
+APP_URL = "https://your-app-url.com"
+EDITOR= "your-editor"
+GOOGLE_GEMINI_API_KEY="your-gemini-key"
+OPENAI_API_KEY = "your-openai-key"
+BOTSTER_TOKEN = "your-botster-token"
+
+[tasks.mcp_server]
+run = "bin/rails s -c mcp.ru -p 62770 -b 0.0.0.0 -P tmp/pids/mcps0.pid"
+description = "Starts the MCP server"
+
+[tasks.build_hub]
+run = "cd botster_hub && cargo build --release"
+description = "Build botster-hub release binary"
+
+[tasks.install_hub]
+run = "cd botster_hub && cargo build --release && cp target/release/botster-hub ~/bin/"
+description = "Build and install botster-hub to ~/bin"
+
+[tasks.install_hub_release]
+run = '''
+#!/bin/bash
+set -e
+
+# Detect platform
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  if [[ "$(uname -m)" == "arm64" ]]; then
+    PLATFORM="macos-arm64"
+  else
+    PLATFORM="macos-x86_64"
+  fi
+elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+  PLATFORM="linux-x86_64"
+else
+  echo "Unsupported platform: $OSTYPE"
+  exit 1
+fi
+
+# Get latest release info
+LATEST_VERSION=$(curl -s https://api.github.com/repos/Tonksthebear/trybotster/releases/latest | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+echo "Latest version: $LATEST_VERSION"
+
+BINARY_NAME="botster-hub-$PLATFORM"
+DOWNLOAD_URL="https://github.com/Tonksthebear/trybotster/releases/download/v${LATEST_VERSION}/${BINARY_NAME}"
+CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+
+# Download binary
+echo "Downloading $BINARY_NAME..."
+curl -L -o "/tmp/botster-hub" "$DOWNLOAD_URL"
+
+# Download and verify checksum
+echo "Verifying checksum..."
+curl -L -o "/tmp/botster-hub.sha256" "$CHECKSUM_URL"
+cd /tmp
+if shasum -a 256 -c botster-hub.sha256; then
+  echo "✓ Checksum verified"
+else
+  echo "✗ Checksum verification failed!"
+  exit 1
+fi
+
+# Install to ~/bin
+mkdir -p ~/bin
+mv /tmp/botster-hub ~/bin/botster-hub
+chmod +x ~/bin/botster-hub
+rm /tmp/botster-hub.sha256
+
+echo "✓ Installed botster-hub v$LATEST_VERSION to ~/bin/botster-hub"
+'''
+description = "Download and install latest botster-hub release from GitHub"
+
+[tasks.release_hub]
+run = '''
+#!/bin/bash
+set -e
+
+if [ -z "$1" ]; then
+  echo "Usage: mise run release_hub <version>"
+  echo "Example: mise run release_hub 0.5.1"
+  exit 1
+fi
+
+VERSION="$1"
+
+# Validate version format (should be X.Y.Z)
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Error: Version must be in format X.Y.Z (e.g., 0.5.1)"
+  exit 1
+fi
+
+echo "Preparing release v$VERSION..."
+
+# Update version in Cargo.toml
+sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" botster_hub/Cargo.toml
+rm botster_hub/Cargo.toml.bak
+
+# Build to verify it compiles
+echo "Building to verify compilation..."
+cd botster_hub && cargo build --release && cd ..
+
+# Git operations
+echo "Committing version bump..."
+git add botster_hub/Cargo.toml
+git commit -m "Bump version to $VERSION"
+
+echo "Creating and pushing tag v$VERSION..."
+git tag "v$VERSION"
+git push origin main
+git push origin "v$VERSION"
+
+echo "✓ Release v$VERSION initiated!"
+echo "GitHub Actions will build binaries at:"
+echo "https://github.com/Tonksthebear/trybotster/actions"
+'''
+description = "Build, tag, and release a new version (usage: mise run release_hub <version>)"
