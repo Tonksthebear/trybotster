@@ -1,6 +1,6 @@
 [package]
 name = "botster-hub"
-version = "0.0.1"
+version = "0.5.1"
 edition = "2021"
 authors = ["Jason Conigliari"]
 description = "Interactive PTY-based daemon for GitHub mention → local agent automation"
