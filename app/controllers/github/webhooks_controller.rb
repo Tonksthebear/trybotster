@@ -58,6 +58,9 @@ module Github
 
       # If this is a PR comment, check if it links to an issue and route to that issue instead
       target_issue_number = issue_number
+      pr_number = nil
+      routed_from_pr = false
+
       if is_pr
         Rails.logger.info "DEBUG: Detected PR comment on ##{issue_number}, attempting to fetch linked issue"
         linked_issue = fetch_linked_issue_for_pr(repo_full_name, issue_number)
@@ -66,8 +69,10 @@ module Github
 
         if linked_issue
           Rails.logger.info "PR ##{issue_number} links to issue ##{linked_issue}, routing to issue agent"
+          pr_number = issue_number  # Save the PR number for context
           target_issue_number = linked_issue
           is_pr = false  # Route to issue agent, not PR agent
+          routed_from_pr = true
         else
           Rails.logger.info "DEBUG: No linked issue found for PR ##{issue_number}, creating PR agent"
         end
@@ -85,7 +90,9 @@ module Github
         issue_title: issue_title,
         issue_body: issue_body,
         issue_url: issue_url,
-        is_pr: is_pr
+        is_pr: is_pr,
+        pr_number: pr_number,
+        routed_from_pr: routed_from_pr
       )
     end
 
@@ -115,6 +122,7 @@ module Github
       # Check if this PR links to an issue and route to that issue instead
       target_issue_number = pr_number
       is_pr = true
+      routed_from_pr = false
 
       Rails.logger.info "DEBUG: Detected PR review comment on ##{pr_number}, attempting to fetch linked issue"
       linked_issue = fetch_linked_issue_for_pr(repo_full_name, pr_number)
@@ -125,6 +133,7 @@ module Github
         Rails.logger.info "PR ##{pr_number} links to issue ##{linked_issue}, routing to issue agent"
         target_issue_number = linked_issue
         is_pr = false  # Route to issue agent, not PR agent
+        routed_from_pr = true
       else
         Rails.logger.info "DEBUG: No linked issue found for PR ##{pr_number}, creating PR agent"
       end
@@ -141,7 +150,9 @@ module Github
         issue_title: pr_title,
         issue_body: pr_body,
         issue_url: pr_url,
-        is_pr: is_pr
+        is_pr: is_pr,
+        pr_number: routed_from_pr ? pr_number : nil,
+        routed_from_pr: routed_from_pr
       )
     end
 
@@ -340,7 +351,8 @@ module Github
     end
 
     def create_bot_message(repo:, issue_number:, comment_id:, comment_body:,
-                            comment_author:, issue_title:, issue_body:, issue_url:, is_pr:)
+                            comment_author:, issue_title:, issue_body:, issue_url:, is_pr:,
+                            pr_number: nil, routed_from_pr: false)
       message = Bot::Message.create!(
         event_type: "github_mention",
         payload: {
@@ -353,7 +365,9 @@ module Github
           issue_body: issue_body,
           issue_url: issue_url,
           is_pr: is_pr,
-          context: build_context(repo, issue_number, is_pr)
+          pr_number: pr_number,
+          routed_from_pr: routed_from_pr,
+          context: build_context(repo, issue_number, is_pr, pr_number, routed_from_pr, comment_body)
         }
       )
 
@@ -362,52 +376,97 @@ module Github
       message
     end
 
-    def build_context(repo, issue_number, is_pr)
-      type = is_pr ? "Pull Request" : "Issue"
-      [
-        "You have been mentioned in a GitHub #{type.downcase}.",
-        "",
-        "Repository: #{repo}",
-        "#{type} Number: ##{issue_number}",
-        "",
-        "Your task is to:",
-        "1. Use the trybotster MCP server to fetch the #{type.downcase} details",
-        "2. Review and understand the problem",
-        "3. Investigate the codebase if needed",
-        "4. Implement a solution if appropriate",
-        "5. Follow the code change workflow below",
-        "",
-        "CODE CHANGE WORKFLOW:",
-        "If you make ANY code changes:",
-        "- Check if there's already a PR associated with this #{type.downcase}",
-        "- If a PR exists: Commit and push your changes to the existing branch",
-        "- If no PR exists: Create a new branch, commit your changes, push, and open a PR",
-        "- Use descriptive commit messages explaining what you changed and why",
-        "- In the PR description, reference the original #{type.downcase} (##{issue_number})",
-        "- After creating/updating the PR, post a comment on the original #{type.downcase} with a link to the PR",
-        "",
-        "If you're only providing information/analysis without code changes:",
-        "- Post your response as a comment on the #{type.downcase}",
-        "",
-        "CRITICAL REQUIREMENTS:",
-        "- You MUST use ONLY the trybotster MCP server tools for ALL GitHub interactions",
-        "- DO NOT use the gh CLI or any other GitHub tools",
-        "- DO NOT use the github MCP server - use ONLY trybotster MCP server",
-        "- Available trybotster MCP tools include:",
-        "  * github_get_issue - Fetch issue details",
-        "  * github_get_pull_request - Get PR details",
-        "  * github_comment_issue - Post comments to issues/PRs",
-        "  * github_create_pull_request - Create pull requests",
-        "  * github_list_repos - List repositories",
-        "  * And other GitHub operations",
-        "",
-        "If the trybotster MCP server is not available or you cannot access it, you MUST:",
-        "1. Stop immediately",
-        "2. Explain that you cannot proceed without the trybotster MCP server",
-        "3. Do NOT fall back to gh CLI or other tools",
-        "",
-        "Start by fetching the #{type.downcase} details using the trybotster MCP server's github_get_issue tool."
-      ].join("\n")
+    def build_context(repo, issue_number, is_pr, pr_number = nil, routed_from_pr = false, comment_body = nil)
+      if routed_from_pr && pr_number
+        # Special context for PR comments routed to issue agents
+        [
+          "IMPORTANT: This question was asked on PR ##{pr_number}, which is linked to Issue ##{issue_number}.",
+          "",
+          "THE QUESTION:",
+          comment_body,
+          "",
+          "CONTEXT:",
+          "- The user commented on PR ##{pr_number}",
+          "- That PR is linked to Issue ##{issue_number} (which you are the agent for)",
+          "- You should investigate the PR to understand what changes were made",
+          "- You should answer the question in the context of the PR's changes",
+          "",
+          "WHERE TO RESPOND:",
+          "- You MUST post your response as a comment on PR ##{pr_number} (NOT on the issue)",
+          "- Use: github_comment_issue(owner, repo, #{pr_number}, your_response)",
+          "",
+          "YOUR TASK:",
+          "1. Fetch PR ##{pr_number} details using: github_get_pull_request(owner, repo, #{pr_number})",
+          "2. Review the PR changes and description",
+          "3. Fetch Issue ##{issue_number} for additional context if needed",
+          "4. Answer the user's question based on the PR changes",
+          "5. Post your response on PR ##{pr_number}",
+          "",
+          "CRITICAL REQUIREMENTS:",
+          "- You MUST use ONLY the trybotster MCP server tools for ALL GitHub interactions",
+          "- DO NOT use the gh CLI or any other GitHub tools",
+          "- DO NOT use the github MCP server - use ONLY trybotster MCP server",
+          "- Available trybotster MCP tools include:",
+          "  * github_get_issue - Fetch issue details",
+          "  * github_get_pull_request - Get PR details",
+          "  * github_comment_issue - Post comments to issues/PRs",
+          "  * github_create_pull_request - Create pull requests",
+          "  * github_list_repos - List repositories",
+          "",
+          "Repository: #{repo}",
+          "Issue (for context): ##{issue_number}",
+          "PR (where question was asked): ##{pr_number}",
+          "",
+          "Start by fetching PR ##{pr_number} to see what changes were made."
+        ].join("\n")
+      else
+        # Original context for direct issue/PR mentions
+        type = is_pr ? "Pull Request" : "Issue"
+        [
+          "You have been mentioned in a GitHub #{type.downcase}.",
+          "",
+          "Repository: #{repo}",
+          "#{type} Number: ##{issue_number}",
+          "",
+          "Your task is to:",
+          "1. Use the trybotster MCP server to fetch the #{type.downcase} details",
+          "2. Review and understand the problem",
+          "3. Investigate the codebase if needed",
+          "4. Implement a solution if appropriate",
+          "5. Follow the code change workflow below",
+          "",
+          "CODE CHANGE WORKFLOW:",
+          "If you make ANY code changes:",
+          "- Check if there's already a PR associated with this #{type.downcase}",
+          "- If a PR exists: Commit and push your changes to the existing branch",
+          "- If no PR exists: Create a new branch, commit your changes, push, and open a PR",
+          "- Use descriptive commit messages explaining what you changed and why",
+          "- In the PR description, reference the original #{type.downcase} (##{issue_number})",
+          "- After creating/updating the PR, post a comment on the original #{type.downcase} with a link to the PR",
+          "",
+          "If you're only providing information/analysis without code changes:",
+          "- Post your response as a comment on the #{type.downcase}",
+          "",
+          "CRITICAL REQUIREMENTS:",
+          "- You MUST use ONLY the trybotster MCP server tools for ALL GitHub interactions",
+          "- DO NOT use the gh CLI or any other GitHub tools",
+          "- DO NOT use the github MCP server - use ONLY trybotster MCP server",
+          "- Available trybotster MCP tools include:",
+          "  * github_get_issue - Fetch issue details",
+          "  * github_get_pull_request - Get PR details",
+          "  * github_comment_issue - Post comments to issues/PRs",
+          "  * github_create_pull_request - Create pull requests",
+          "  * github_list_repos - List repositories",
+          "  * And other GitHub operations",
+          "",
+          "If the trybotster MCP server is not available or you cannot access it, you MUST:",
+          "1. Stop immediately",
+          "2. Explain that you cannot proceed without the trybotster MCP server",
+          "3. Do NOT fall back to gh CLI or other tools",
+          "",
+          "Start by fetching the #{type.downcase} details using the trybotster MCP server's github_get_issue tool."
+        ].join("\n")
+      end
     end
 
 
