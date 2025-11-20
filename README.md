@@ -437,3 +437,5 @@ MIT License
 ---
 
 **Questions?** Open an issue on GitHub.
+
+<!-- Test change for issue #34 -->
