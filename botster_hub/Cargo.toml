@@ -47,6 +47,7 @@ vt100 = "0.15"
 bytes = "1.0"
 shellexpand = "3.1"
 sha2 = "0.10"
+semver = "1.0"
 
 [dev-dependencies]
 tempfile = "3.23"

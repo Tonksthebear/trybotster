@@ -1259,6 +1259,7 @@ fn run_interactive() -> Result<()> {
 }
 
 fn check_for_updates() -> Result<()> {
+    use semver::Version;
     use serde_json::Value;
 
     println!("Current version: {}", VERSION);
@@ -1275,23 +1276,29 @@ fn check_for_updates() -> Result<()> {
     }
 
     let release: Value = response.json()?;
-    let latest_version = release["tag_name"]
+    let latest_version_str = release["tag_name"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid release data"))?
         .trim_start_matches('v');
 
-    println!("Latest version: {}", latest_version);
+    println!("Latest version: {}", latest_version_str);
 
-    if latest_version == VERSION {
+    let current = Version::parse(VERSION)?;
+    let latest = Version::parse(latest_version_str)?;
+
+    if latest > current {
+        println!("→ Update available! Run 'botster-hub update' to install");
+    } else if latest == current {
         println!("✓ You are running the latest version");
     } else {
-        println!("→ Update available! Run 'botster-hub update' to install");
+        println!("✓ You are running a newer version than the latest release");
     }
 
     Ok(())
 }
 
 fn update_binary() -> Result<()> {
+    use semver::Version;
     use serde_json::Value;
     use std::env;
     use std::fs;
@@ -1310,15 +1317,18 @@ fn update_binary() -> Result<()> {
     }
 
     let release: Value = response.json()?;
-    let latest_version = release["tag_name"]
+    let latest_version_str = release["tag_name"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid release data"))?
         .trim_start_matches('v');
 
-    println!("Latest version: {}", latest_version);
+    println!("Latest version: {}", latest_version_str);
 
-    if latest_version == VERSION {
-        println!("✓ Already running the latest version");
+    let current = Version::parse(VERSION)?;
+    let latest = Version::parse(latest_version_str)?;
+
+    if latest <= current {
+        println!("✓ Already running the latest version (or newer)");
         return Ok(());
     }
 
@@ -1336,11 +1346,11 @@ fn update_binary() -> Result<()> {
     let binary_name = format!("botster-hub-{}", platform);
     let download_url = format!(
         "https://github.com/Tonksthebear/trybotster/releases/download/v{}/{}",
-        latest_version, binary_name
+        latest_version_str, binary_name
     );
     let checksum_url = format!("{}.sha256", download_url);
 
-    println!("Downloading version {}...", latest_version);
+    println!("Downloading version {}...", latest_version_str);
 
     // Download binary
     let binary_response = client
@@ -1400,7 +1410,7 @@ fn update_binary() -> Result<()> {
     // Replace current binary
     fs::rename(&temp_path, &current_exe)?;
 
-    println!("✓ Successfully updated to version {}", latest_version);
+    println!("✓ Successfully updated to version {}", latest_version_str);
     println!("Please restart botster-hub to use the new version");
 
     Ok(())
