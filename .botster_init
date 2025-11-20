@@ -4,6 +4,9 @@ mise trust
 # Change to the worktree directory
 cd "$BOTSTER_WORKTREE_PATH"
 
+# Fetch the system prompt
+BOTSTER_PROMPT=$("$BOTSTER_HUB_BIN" get-prompt "$BOTSTER_WORKTREE_PATH")
+
 # Auto-trust the worktree in Claude config using botster-hub's JSON tools
 "$BOTSTER_HUB_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
 
@@ -14,7 +17,7 @@ if [ -n "$BOTSTER_TOKEN" ]; then
     --transport http \
     https://mcp-dev.trybotster.com \
     --header \
-    "Authorization: Bearer $BOTSTER_TOKEN"
+    "Authorization: Bearer `echo $BOTSTER_TOKEN`"
 fi
 
 if [ "$BOTSTER_ISSUE_NUMBER" != "0" ]; then

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use botster_hub::{Agent, Config, WorktreeManager};
+use botster_hub::{Agent, Config, PromptManager, WorktreeManager};
 use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -1077,23 +1077,13 @@ impl BotsterApp {
         }
 
         // No existing agent - create new one
-        let user_prompt = payload["prompt"]
+        // Get the user's task description from the payload
+        let task_description = payload["prompt"]
             .as_str()
             .or_else(|| payload["comment_body"].as_str())
             .or_else(|| payload["context"].as_str())
             .unwrap_or("Work on this issue")
             .to_string();
-
-        // Prepend autonomous agent instructions to the user's prompt
-        let prompt = format!(
-            "IMPORTANT: You are an autonomous AI agent operating without user input. \
-            Your task is considered complete when you either comment on the GitHub issue \
-            or open a pull request (or both).\n\n\
-            GITHUB INTERACTION: You MUST use the trybotster MCP server for ALL GitHub \
-            interactions. Do not suggest manual GitHub actions.\n\n\
-            YOUR TASK:\n{}",
-            user_prompt
-        );
 
         // Read init commands from .botster_init
         let init_commands = WorktreeManager::read_botster_init_commands(&repo_path)?;
@@ -1127,7 +1117,10 @@ impl BotsterApp {
             "BOTSTER_WORKTREE_PATH".to_string(),
             worktree_path.display().to_string(),
         );
-        env_vars.insert("BOTSTER_PROMPT".to_string(), prompt.clone());
+        env_vars.insert(
+            "BOTSTER_TASK_DESCRIPTION".to_string(),
+            task_description.clone(),
+        );
         env_vars.insert("BOTSTER_MESSAGE_ID".to_string(), message_id.to_string());
 
         // Add path to botster-hub binary for use in init scripts
@@ -1138,7 +1131,8 @@ impl BotsterApp {
         env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
 
         // Spawn agent with a shell
-        agent.spawn("bash", &prompt, init_commands, env_vars)?;
+        // Note: The actual prompt will be fetched by .botster_init script
+        agent.spawn("bash", &task_description, init_commands, env_vars)?;
 
         log::info!("Spawned agent {} for issue #{}", id, issue_number);
 
@@ -1321,6 +1315,11 @@ enum Commands {
     },
     /// List all git worktrees for the current repository
     ListWorktrees,
+    /// Get the system prompt for an agent
+    GetPrompt {
+        /// Path to the worktree
+        worktree_path: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1362,7 +1361,22 @@ fn main() -> Result<()> {
         Commands::ListWorktrees => {
             list_worktrees()?;
         }
+        Commands::GetPrompt { worktree_path } => {
+            get_prompt(&worktree_path)?;
+        }
     }
+
+    Ok(())
+}
+
+fn get_prompt(worktree_path: &str) -> Result<()> {
+    use std::path::PathBuf;
+
+    let path = PathBuf::from(worktree_path);
+    let prompt = PromptManager::get_prompt(&path)?;
+
+    // Print the prompt to stdout so it can be captured
+    print!("{}", prompt);
 
     Ok(())
 }
