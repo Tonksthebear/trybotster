@@ -56,8 +56,13 @@ module Github
 
       Rails.logger.info "Processing @trybotster mention in #{repo_full_name}##{issue_number}"
 
-      # If this is a PR comment, check if it links to an issue and route to that issue instead
+      # Build structured context for routing
+      source_type = is_pr ? "pr_comment" : "issue_comment"
       target_issue_number = issue_number
+      target_is_pr = is_pr
+      routed_info = nil
+
+      # If this is a PR comment, check if it links to an issue and route to that issue instead
       if is_pr
         Rails.logger.info "DEBUG: Detected PR comment on ##{issue_number}, attempting to fetch linked issue"
         linked_issue = fetch_linked_issue_for_pr(repo_full_name, issue_number)
@@ -66,14 +71,24 @@ module Github
 
         if linked_issue
           Rails.logger.info "PR ##{issue_number} links to issue ##{linked_issue}, routing to issue agent"
+
+          # Build routing info for structured context
+          routed_info = {
+            source_number: issue_number,
+            source_type: "pr",
+            target_number: linked_issue,
+            target_type: "issue",
+            reason: "pr_linked_to_issue"
+          }
+
           target_issue_number = linked_issue
-          is_pr = false  # Route to issue agent, not PR agent
+          target_is_pr = false  # Route to issue agent, not PR agent
         else
           Rails.logger.info "DEBUG: No linked issue found for PR ##{issue_number}, creating PR agent"
         end
       end
 
-      Rails.logger.info "DEBUG: Creating bot message with issue_number=#{target_issue_number}, is_pr=#{is_pr}"
+      Rails.logger.info "DEBUG: Creating bot message with issue_number=#{target_issue_number}, is_pr=#{target_is_pr}"
 
       # Create a single bot message (first daemon with repo access will claim it)
       create_bot_message(
@@ -85,7 +100,9 @@ module Github
         issue_title: issue_title,
         issue_body: issue_body,
         issue_url: issue_url,
-        is_pr: is_pr
+        is_pr: target_is_pr,
+        source_type: source_type,
+        routed_info: routed_info
       )
     end
 
@@ -112,10 +129,13 @@ module Github
 
       Rails.logger.info "Processing @trybotster mention in PR #{repo_full_name}##{pr_number}"
 
-      # Check if this PR links to an issue and route to that issue instead
+      # Build structured context for routing
+      source_type = "pr_review_comment"
       target_issue_number = pr_number
-      is_pr = true
+      target_is_pr = true
+      routed_info = nil
 
+      # Check if this PR links to an issue and route to that issue instead
       Rails.logger.info "DEBUG: Detected PR review comment on ##{pr_number}, attempting to fetch linked issue"
       linked_issue = fetch_linked_issue_for_pr(repo_full_name, pr_number)
 
@@ -123,13 +143,23 @@ module Github
 
       if linked_issue
         Rails.logger.info "PR ##{pr_number} links to issue ##{linked_issue}, routing to issue agent"
+
+        # Build routing info for structured context
+        routed_info = {
+          source_number: pr_number,
+          source_type: "pr",
+          target_number: linked_issue,
+          target_type: "issue",
+          reason: "pr_linked_to_issue"
+        }
+
         target_issue_number = linked_issue
-        is_pr = false  # Route to issue agent, not PR agent
+        target_is_pr = false  # Route to issue agent, not PR agent
       else
         Rails.logger.info "DEBUG: No linked issue found for PR ##{pr_number}, creating PR agent"
       end
 
-      Rails.logger.info "DEBUG: Creating bot message with issue_number=#{target_issue_number}, is_pr=#{is_pr}"
+      Rails.logger.info "DEBUG: Creating bot message with issue_number=#{target_issue_number}, is_pr=#{target_is_pr}"
 
       # Create a single bot message (first daemon with repo access will claim it)
       create_bot_message(
@@ -141,7 +171,9 @@ module Github
         issue_title: pr_title,
         issue_body: pr_body,
         issue_url: pr_url,
-        is_pr: is_pr
+        is_pr: target_is_pr,
+        source_type: source_type,
+        routed_info: routed_info
       )
     end
 
@@ -340,10 +372,32 @@ module Github
     end
 
     def create_bot_message(repo:, issue_number:, comment_id:, comment_body:,
-                            comment_author:, issue_title:, issue_body:, issue_url:, is_pr:)
+                            comment_author:, issue_title:, issue_body:, issue_url:, is_pr:,
+                            source_type: nil, routed_info: nil)
+      # Build structured context hash
+      structured_context = build_structured_context(
+        repo: repo,
+        issue_number: issue_number,
+        is_pr: is_pr,
+        comment_body: comment_body,
+        comment_author: comment_author,
+        source_type: source_type,
+        routed_info: routed_info
+      )
+
+      # Format structured context as markdown for the agent prompt
+      formatted_context = format_structured_context(structured_context)
+
       message = Bot::Message.create!(
         event_type: "github_mention",
         payload: {
+          # Primary prompt field - used by botster-hub
+          prompt: formatted_context,
+
+          # Structured data for programmatic access
+          structured_context: structured_context,
+
+          # Raw data fields for custom prompt building
           repo: repo,
           issue_number: issue_number,
           comment_id: comment_id,
@@ -353,7 +407,9 @@ module Github
           issue_body: issue_body,
           issue_url: issue_url,
           is_pr: is_pr,
-          context: build_context(repo, issue_number, is_pr)
+
+          # Legacy context field (same as prompt)
+          context: formatted_context
         }
       )
 
@@ -362,7 +418,139 @@ module Github
       message
     end
 
-    def build_context(repo, issue_number, is_pr)
+    def build_structured_context(repo:, issue_number:, is_pr:, comment_body:, comment_author:,
+                                  source_type: nil, routed_info: nil)
+      owner, repo_name = repo.split("/")
+
+      if routed_info
+        # This comment was routed from a PR to an issue (or vice versa)
+        {
+          source: {
+            type: source_type,
+            repo: repo,
+            owner: owner,
+            repo_name: repo_name,
+            number: routed_info[:source_number],
+            comment_author: comment_author
+          },
+          routed_to: {
+            type: routed_info[:target_type],
+            number: routed_info[:target_number],
+            reason: routed_info[:reason]
+          },
+          respond_to: {
+            type: routed_info[:source_type],
+            number: routed_info[:source_number],
+            instruction: "Post your response as a comment on #{routed_info[:source_type].upcase} ##{routed_info[:source_number]}"
+          },
+          message: comment_body,
+          task: "Answer the question about the #{routed_info[:source_type].upcase} changes",
+          requirements: {
+            must_use_trybotster_mcp: true,
+            fetch_first: routed_info[:source_type],
+            number_to_fetch: routed_info[:source_number],
+            context_number: routed_info[:target_number],
+            must_include_closes_keyword: routed_info[:source_type] == "pr" ? "If you are opening a PR AND you are closing an issue, you MUST use \"Closes #\{ISSUE_NUMBER\}\" in the description so that the PR is linked to the issue" : nil
+          }.compact
+        }
+      else
+        # Direct mention on an issue or PR
+        type = is_pr ? "pr" : "issue"
+        {
+          source: {
+            type: source_type || (is_pr ? "pr_comment" : "issue_comment"),
+            repo: repo,
+            owner: owner,
+            repo_name: repo_name,
+            number: issue_number,
+            comment_author: comment_author
+          },
+          routed_to: nil,
+          respond_to: {
+            type: type,
+            number: issue_number,
+            instruction: "Post your response as a comment on #{type.upcase} ##{issue_number}"
+          },
+          message: comment_body,
+          task: "Address the #{type} mention",
+          requirements: {
+            must_use_trybotster_mcp: true,
+            fetch_first: type,
+            number_to_fetch: issue_number,
+            must_include_closes_keyword: is_pr ? nil : "If you are opening a PR AND you are closing an issue, you MUST use \"Closes #\{ISSUE_NUMBER\}\" in the description so that the PR is linked to the issue"
+          }.compact
+        }
+      end
+    end
+
+    def format_structured_context(ctx)
+      lines = []
+
+      # Add source information
+      if ctx[:source]
+        lines << "## Source"
+        lines << "Type: #{ctx[:source][:type]}" if ctx[:source][:type]
+        lines << "Repository: #{ctx[:source][:repo]}" if ctx[:source][:repo]
+        lines << "Number: ##{ctx[:source][:number]}" if ctx[:source][:number]
+        lines << "Author: #{ctx[:source][:comment_author]}" if ctx[:source][:comment_author]
+        lines << ""
+      end
+
+      # Add routing information if present
+      if ctx[:routed_to]
+        lines << "## Routing"
+        lines << "Routed to: #{ctx[:routed_to][:type]} ##{ctx[:routed_to][:number]}"
+        lines << "Reason: #{ctx[:routed_to][:reason]}"
+        lines << ""
+      end
+
+      # Add the actual message/question
+      if ctx[:message]
+        lines << "## Message"
+        lines << ctx[:message]
+        lines << ""
+      end
+
+      # Add where to respond
+      if ctx[:respond_to]
+        lines << "## Where to Respond"
+        lines << "#{ctx[:respond_to][:type].upcase} ##{ctx[:respond_to][:number]}"
+        lines << ctx[:respond_to][:instruction]
+        lines << ""
+      end
+
+      # Add task description
+      if ctx[:task]
+        lines << "## Your Task"
+        lines << ctx[:task]
+        lines << ""
+      end
+
+      # Add requirements
+      if ctx[:requirements]
+        lines << "## Requirements"
+
+        if ctx[:requirements][:must_use_trybotster_mcp]
+          lines << "- You MUST use ONLY the trybotster MCP server for ALL GitHub interactions"
+        end
+
+        if ctx[:requirements][:fetch_first] && ctx[:requirements][:number_to_fetch]
+          lines << "- Start by fetching #{ctx[:requirements][:fetch_first]} ##{ctx[:requirements][:number_to_fetch]} details"
+        end
+
+        if ctx[:requirements][:context_number]
+          lines << "- You may fetch issue ##{ctx[:requirements][:context_number]} for additional context if needed"
+        end
+
+        if ctx[:requirements][:must_include_closes_keyword]
+          lines << "- #{ctx[:requirements][:must_include_closes_keyword]}"
+        end
+      end
+
+      lines.join("\n")
+    end
+
+    def build_legacy_context(repo, issue_number, is_pr)
       type = is_pr ? "Pull Request" : "Issue"
       [
         "You have been mentioned in a GitHub #{type.downcase}.",
