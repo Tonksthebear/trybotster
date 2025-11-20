@@ -1258,6 +1258,154 @@ fn run_interactive() -> Result<()> {
     Ok(())
 }
 
+fn check_for_updates() -> Result<()> {
+    use serde_json::Value;
+
+    println!("Current version: {}", VERSION);
+    println!("Checking for updates...");
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get("https://api.github.com/repos/Tonksthebear/trybotster/releases/latest")
+        .header("User-Agent", "botster-hub")
+        .send()?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Failed to check for updates: {}", response.status());
+    }
+
+    let release: Value = response.json()?;
+    let latest_version = release["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid release data"))?
+        .trim_start_matches('v');
+
+    println!("Latest version: {}", latest_version);
+
+    if latest_version == VERSION {
+        println!("✓ You are running the latest version");
+    } else {
+        println!("→ Update available! Run 'botster-hub update' to install");
+    }
+
+    Ok(())
+}
+
+fn update_binary() -> Result<()> {
+    use serde_json::Value;
+    use std::env;
+    use std::fs;
+
+    println!("Current version: {}", VERSION);
+    println!("Checking for updates...");
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get("https://api.github.com/repos/Tonksthebear/trybotster/releases/latest")
+        .header("User-Agent", "botster-hub")
+        .send()?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Failed to check for updates: {}", response.status());
+    }
+
+    let release: Value = response.json()?;
+    let latest_version = release["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid release data"))?
+        .trim_start_matches('v');
+
+    println!("Latest version: {}", latest_version);
+
+    if latest_version == VERSION {
+        println!("✓ Already running the latest version");
+        return Ok(());
+    }
+
+    // Determine platform
+    let platform = if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        "macos-arm64"
+    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        "macos-x86_64"
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        "linux-x86_64"
+    } else {
+        anyhow::bail!("Unsupported platform");
+    };
+
+    let binary_name = format!("botster-hub-{}", platform);
+    let download_url = format!(
+        "https://github.com/Tonksthebear/trybotster/releases/download/v{}/{}",
+        latest_version, binary_name
+    );
+    let checksum_url = format!("{}.sha256", download_url);
+
+    println!("Downloading version {}...", latest_version);
+
+    // Download binary
+    let binary_response = client
+        .get(&download_url)
+        .header("User-Agent", "botster-hub")
+        .send()?;
+
+    if !binary_response.status().is_success() {
+        anyhow::bail!("Failed to download update: {}", binary_response.status());
+    }
+
+    let binary_data = binary_response.bytes()?;
+
+    // Download checksum
+    let checksum_response = client
+        .get(&checksum_url)
+        .header("User-Agent", "botster-hub")
+        .send()?;
+
+    if checksum_response.status().is_success() {
+        let checksum_text = checksum_response.text()?;
+        let expected_checksum = checksum_text
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Invalid checksum format"))?;
+
+        // Verify checksum
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&binary_data);
+        let actual_checksum = format!("{:x}", hasher.finalize());
+
+        if actual_checksum != expected_checksum {
+            anyhow::bail!("Checksum verification failed!");
+        }
+        println!("✓ Checksum verified");
+    } else {
+        log::warn!("Could not verify checksum (not found)");
+    }
+
+    // Get current binary path
+    let current_exe = env::current_exe()?;
+    let temp_path = current_exe.with_extension("new");
+
+    // Write new binary to temp location
+    fs::write(&temp_path, &binary_data)?;
+
+    // Make it executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&temp_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&temp_path, perms)?;
+    }
+
+    // Replace current binary
+    fs::rename(&temp_path, &current_exe)?;
+
+    println!("✓ Successfully updated to version {}", latest_version);
+    println!("Please restart botster-hub to use the new version");
+
+    Ok(())
+}
+
 fn run_headless() -> Result<()> {
     println!("Starting Botster Hub v{} in headless mode...", VERSION);
     println!("Headless mode not yet implemented");
@@ -1320,6 +1468,12 @@ enum Commands {
         /// Path to the worktree
         worktree_path: String,
     },
+    /// Update botster-hub to the latest version
+    Update {
+        /// Show version without updating
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1363,6 +1517,13 @@ fn main() -> Result<()> {
         }
         Commands::GetPrompt { worktree_path } => {
             get_prompt(&worktree_path)?;
+        }
+        Commands::Update { check } => {
+            if check {
+                check_for_updates()?;
+            } else {
+                update_binary()?;
+            }
         }
     }
 

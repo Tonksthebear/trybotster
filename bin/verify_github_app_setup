@@ -39,7 +39,6 @@ required_columns = {
   'github_app_token' => 'string',
   'github_app_refresh_token' => 'string',
   'github_app_token_expires_at' => 'datetime',
-  'github_app_installation_id' => 'string',
   'github_app_permissions' => 'jsonb'
 }
 
