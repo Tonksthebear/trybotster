@@ -59,14 +59,21 @@ module Github
       # If this is a PR comment, check if it links to an issue and route to that issue instead
       target_issue_number = issue_number
       if is_pr
+        Rails.logger.info "DEBUG: Detected PR comment on ##{issue_number}, attempting to fetch linked issue"
         linked_issue = fetch_linked_issue_for_pr(repo_full_name, issue_number)
+
+        Rails.logger.info "DEBUG: fetch_linked_issue_for_pr returned: #{linked_issue.inspect}"
 
         if linked_issue
           Rails.logger.info "PR ##{issue_number} links to issue ##{linked_issue}, routing to issue agent"
           target_issue_number = linked_issue
           is_pr = false  # Route to issue agent, not PR agent
+        else
+          Rails.logger.info "DEBUG: No linked issue found for PR ##{issue_number}, creating PR agent"
         end
       end
+
+      Rails.logger.info "DEBUG: Creating bot message with issue_number=#{target_issue_number}, is_pr=#{is_pr}"
 
       # Create a single bot message (first daemon with repo access will claim it)
       create_bot_message(
@@ -109,13 +116,20 @@ module Github
       target_issue_number = pr_number
       is_pr = true
 
+      Rails.logger.info "DEBUG: Detected PR review comment on ##{pr_number}, attempting to fetch linked issue"
       linked_issue = fetch_linked_issue_for_pr(repo_full_name, pr_number)
+
+      Rails.logger.info "DEBUG: fetch_linked_issue_for_pr returned: #{linked_issue.inspect}"
 
       if linked_issue
         Rails.logger.info "PR ##{pr_number} links to issue ##{linked_issue}, routing to issue agent"
         target_issue_number = linked_issue
         is_pr = false  # Route to issue agent, not PR agent
+      else
+        Rails.logger.info "DEBUG: No linked issue found for PR ##{pr_number}, creating PR agent"
       end
+
+      Rails.logger.info "DEBUG: Creating bot message with issue_number=#{target_issue_number}, is_pr=#{is_pr}"
 
       # Create a single bot message (first daemon with repo access will claim it)
       create_bot_message(
@@ -272,8 +286,11 @@ module Github
     # Get the linked issue number for a PR, if any
     # Fetch the linked issue number for a PR using GitHub App authentication
     def fetch_linked_issue_for_pr(repo_full_name, pr_number)
+      Rails.logger.info "DEBUG: fetch_linked_issue_for_pr - repo: #{repo_full_name}, pr: #{pr_number}"
+
       # Get any user with a valid GitHub token to lookup installation
       user = User.where.not(github_app_token: nil).first
+      Rails.logger.info "DEBUG: Found user with GitHub token: #{user&.username || 'none'}"
 
       unless user&.valid_github_app_token
         Rails.logger.warn "No valid GitHub App token available to fetch PR details"
@@ -281,6 +298,7 @@ module Github
       end
 
       # Get the installation for this repo
+      Rails.logger.info "DEBUG: Looking up installation for repo: #{repo_full_name}"
       installation_result = Github::App.get_installation_for_repo(
         user.valid_github_app_token,
         repo_full_name
@@ -291,17 +309,27 @@ module Github
         return nil
       end
 
+      Rails.logger.info "DEBUG: Found installation ID: #{installation_result[:installation_id]}"
+
       # Create installation token and fetch PR
       installation_token = Github::App.create_installation_token(installation_result[:installation_id])
+      Rails.logger.info "DEBUG: Created installation token, fetching PR..."
+
       client = Github::App.client(installation_token)
       pr = client.pull_request(repo_full_name, pr_number)
 
+      Rails.logger.info "DEBUG: PR body: #{pr.body&.truncate(200) || 'empty'}"
+
       linked_issues = extract_linked_issues(pr.body)
+      Rails.logger.info "DEBUG: Extracted linked issues: #{linked_issues.inspect}"
 
       # Return the first linked issue (most common case is one issue per PR)
-      linked_issues.first
+      result = linked_issues.first
+      Rails.logger.info "DEBUG: Returning linked issue: #{result.inspect}"
+      result
     rescue => e
-      Rails.logger.warn "Failed to fetch PR for linked issue extraction: #{e.message}"
+      Rails.logger.error "Failed to fetch PR for linked issue extraction: #{e.class} - #{e.message}"
+      Rails.logger.error e.backtrace.first(5).join("\n")
       nil
     end
 
