@@ -23,11 +23,11 @@ run = "bin/rails s -c mcp.ru -p 62770 -b 0.0.0.0 -P tmp/pids/mcps0.pid"
 description = "Starts the MCP server"
 
 [tasks.build_hub]
-run = "cd botster_hub && cargo build --release"
+run = "cd cli && cargo build --release"
 description = "Build botster-hub release binary"
 
 [tasks.install_hub]
-run = "cd botster_hub && cargo build --release && cp target/release/botster-hub ~/bin/"
+run = "cd cli && cargo build --release && cp target/release/botster-hub ~/bin/"
 description = "Build and install botster-hub to ~/bin"
 
 [tasks.install_hub_release]
@@ -104,16 +104,16 @@ fi
 echo "Preparing release v$VERSION..."
 
 # Update version in Cargo.toml
-sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" botster_hub/Cargo.toml
-rm botster_hub/Cargo.toml.bak
+sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" cli/Cargo.toml
+rm cli/Cargo.toml.bak
 
 # Build to verify it compiles
 echo "Building to verify compilation..."
-cd botster_hub && cargo build --release && cd ..
+cd cli && cargo build --release && cd ..
 
 # Git operations
 echo "Committing version bump..."
-git add botster_hub/Cargo.toml
+git add cli/Cargo.toml
 git commit -m "Bump version to $VERSION"
 
 echo "Creating and pushing tag v$VERSION..."
