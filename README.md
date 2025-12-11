@@ -162,7 +162,7 @@ puts user.api_key  # Save this!
 Build the daemon:
 
 ```bash
-cd botster_hub
+cd cli
 cargo build --release
 ```
 
@@ -354,7 +354,7 @@ trybotster/
 │   │
 │   └── mcp/tools/                   # MCP tool implementations
 │
-├── botster_hub/                     # Rust daemon
+├── cli/                             # Rust daemon (CLI)
 │   ├── src/
 │   │   ├── main.rs                  # TUI and daemon logic
 │   │   ├── agent.rs                 # Agent PTY management
@@ -421,6 +421,7 @@ Bot::Message.create!(
 - [x] Auto-cleanup on issue/PR close
 - [x] Smart agent deduplication
 - [x] Interactive TUI
+- [x] PR workflow verification
 - [ ] Agent timeout handling
 - [ ] Metrics and monitoring
 - [ ] Multi-repo support in single daemon

@@ -18,18 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/skill-activation-prompt.sh"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Edit|MultiEdit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".claude/hooks/post-tool-use-tracker.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/skill-activation-prompt.sh"
           }
         ]
       }
@@ -39,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/rubocop-check.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/rubocop-check.sh"
           }
         ]
       }

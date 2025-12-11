@@ -2,13 +2,13 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 const DEFAULT_PROMPT_REPO: &str = "Tonksthebear/trybotster";
-const DEFAULT_PROMPT_PATH: &str = "botster_hub/botster_prompt";
+const DEFAULT_PROMPT_PATH: &str = "cli/botster_prompt";
 
 pub struct PromptManager;
 
 impl PromptManager {
     /// Get the prompt for a worktree
-    /// Priority: local .botster_prompt > remote botster_hub/botster_prompt.*
+    /// Priority: local .botster_prompt > remote cli/botster_prompt.*
     pub fn get_prompt(worktree_path: &Path) -> Result<String> {
         // 1. Check for local .botster_prompt file
         let local_prompt_path = worktree_path.join(".botster_prompt");

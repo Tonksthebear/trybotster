@@ -37,12 +37,12 @@ jobs:
 
       - name: Build release binary
         run: |
-          cd botster_hub
+          cd cli
           cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
         run: |
-          cp botster_hub/target/${{ matrix.target }}/release/botster-hub ${{ matrix.artifact_name }}
+          cp cli/target/${{ matrix.target }}/release/botster-hub ${{ matrix.artifact_name }}
 
       - name: Create checksum
         run: |

@@ -712,14 +712,14 @@ end
 
 For detailed information on specific topics, see:
 
-- [Controllers & Routing](resources/controllers-and-routing.md) - RESTful patterns, strong params, filters
-- [Models & ActiveRecord](resources/models-and-active-record.md) - Associations, validations, scopes, queries
-- [Service Objects & Concerns](resources/service-objects-and-concerns.md) - When and how to extract logic
-- [Database & Migrations](resources/database-and-migrations.md) - Schema design, indexes, migrations
-- [Background Jobs](resources/background-jobs.md) - Solid Queue, Active Job patterns
-- [Action Cable](resources/action-cable.md) - WebSockets and real-time features
-- [Testing](resources/testing.md) - RSpec, fixtures, factories
-- [API Development](resources/api-development.md) - JSON APIs, serialization, versioning
+- [Routing & Controllers](resources/routing-and-controllers.md) - RESTful patterns, strong params, filters
+- [Database Patterns](resources/database-patterns.md) - Schema design, indexes, migrations, ActiveRecord
+- [Services & Repositories](resources/services-and-repositories.md) - When and how to extract logic
+- [Testing Guide](resources/testing-guide.md) - Rails testing with Minitest, fixtures, controller tests
+- [Webhook Implementation](resources/webhook-implementation.md) - GitHub webhooks, PR-to-issue routing, structured context
+- [Async & Errors](resources/async-and-errors.md) - Background jobs, error handling
+- [Configuration](resources/configuration.md) - Environment configuration, secrets
+- [Complete Examples](resources/complete-examples.md) - Full implementation examples
 
 ---
 
