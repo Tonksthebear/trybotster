@@ -4,8 +4,14 @@ mise trust
 # Change to the worktree directory
 cd "$BOTSTER_WORKTREE_PATH"
 
-# Use the task description directly as the prompt (it's already complete)
-BOTSTER_PROMPT="$BOTSTER_TASK_DESCRIPTION"
+# Read prompt from .botster_prompt file if it exists, otherwise use env var
+if [ -f ".botster_prompt" ]; then
+  BOTSTER_PROMPT=$(cat .botster_prompt)
+  echo "Using prompt from .botster_prompt file"
+else
+  BOTSTER_PROMPT="$BOTSTER_TASK_DESCRIPTION"
+  echo "Using prompt from BOTSTER_TASK_DESCRIPTION env var"
+fi
 
 # Auto-trust the worktree in Claude config using botster-hub's JSON tools
 "$BOTSTER_HUB_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"

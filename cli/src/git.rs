@@ -484,6 +484,56 @@ impl WorktreeManager {
         Ok(list.lines().map(|s| s.to_string()).collect())
     }
 
+    /// Finds an existing worktree for a given issue number
+    /// Returns the worktree path and branch name if found
+    pub fn find_existing_worktree_for_issue(&self, issue_number: u32) -> Result<Option<(PathBuf, String)>> {
+        let (repo_path, repo_name) = Self::detect_current_repo()?;
+        let repo_safe = repo_name.replace('/', "-");
+        let branch_name = format!("botster-issue-{}", issue_number);
+        let worktree_path = self.base_dir.join(format!("{}-{}", repo_safe, branch_name));
+
+        // Check if the worktree directory exists
+        if !worktree_path.exists() {
+            log::debug!("No worktree found at {}", worktree_path.display());
+            return Ok(None);
+        }
+
+        // Verify it's actually a git worktree
+        let git_file = worktree_path.join(".git");
+        if !git_file.exists() {
+            log::warn!("Directory exists but is not a git worktree: {}", worktree_path.display());
+            return Ok(None);
+        }
+
+        // Verify the worktree is valid by checking if git recognizes it
+        let output = std::process::Command::new("git")
+            .args(&["worktree", "list", "--porcelain"])
+            .current_dir(&repo_path)
+            .output()?;
+
+        if !output.status.success() {
+            log::warn!("Failed to list worktrees");
+            return Ok(None);
+        }
+
+        let worktree_output = String::from_utf8_lossy(&output.stdout);
+        let worktree_path_str = worktree_path.to_str().unwrap_or("");
+
+        // Check if our worktree path is in the list
+        for line in worktree_output.lines() {
+            if line.starts_with("worktree ") {
+                let path = line.strip_prefix("worktree ").unwrap_or("");
+                if path == worktree_path_str {
+                    log::info!("Found existing worktree for issue #{} at {}", issue_number, worktree_path.display());
+                    return Ok(Some((worktree_path, branch_name)));
+                }
+            }
+        }
+
+        log::debug!("Worktree directory exists but not registered with git");
+        Ok(None)
+    }
+
     /// Prunes all stale worktrees for a repo
     pub fn prune_stale_worktrees(&self, repo: &str) -> Result<()> {
         let repo_safe = repo.replace('/', "-");
