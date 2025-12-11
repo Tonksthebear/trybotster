@@ -421,6 +421,7 @@ Bot::Message.create!(
 - [x] Auto-cleanup on issue/PR close
 - [x] Smart agent deduplication
 - [x] Interactive TUI
+- [x] PR workflow verification
 - [ ] Agent timeout handling
 - [ ] Metrics and monitoring
 - [ ] Multi-repo support in single daemon
