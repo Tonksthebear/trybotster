@@ -430,6 +430,8 @@ Bot::Message.create!(
 
 Contributions welcome! This project follows Rails conventions and uses Rust for the daemon.
 
+Feel free to open an issue or submit a pull request.
+
 ## 📄 License
 
 MIT License
