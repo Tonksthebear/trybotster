@@ -134,11 +134,22 @@ class User < ApplicationRecord
   end
 
   # Check if user has access to a GitHub repository
+  # Results are cached for 5 minutes to prevent N+1 API calls
   # @param repo_full_name [String] Repository full name (e.g., "owner/repo")
   # @return [Boolean] true if user has access, false otherwise
   def has_github_repo_access?(repo_full_name)
     return false unless github_app_authorized?
 
+    cache_key = "user:#{id}:repo_access:#{repo_full_name}"
+
+    Rails.cache.fetch(cache_key, expires_in: 5.minutes) do
+      check_github_repo_access_uncached(repo_full_name)
+    end
+  end
+
+  private
+
+  def check_github_repo_access_uncached(repo_full_name)
     token = valid_github_app_token
     return false if token.blank?
 

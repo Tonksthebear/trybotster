@@ -19,6 +19,17 @@ use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Configuration for spawning a new agent
+struct AgentSpawnConfig {
+    issue_number: Option<u32>,
+    branch_name: String,
+    worktree_path: std::path::PathBuf,
+    repo_path: std::path::PathBuf,
+    repo_name: String,
+    prompt: String,
+    message_id: Option<i64>,
+}
+
 /// Helper function to create a centered rect
 fn centered_rect(
     percent_x: u16,
@@ -102,6 +113,75 @@ impl BotsterApp {
         log::info!("Botster Hub started, waiting for messages...");
 
         Ok(app)
+    }
+
+    /// Shared helper to spawn an agent with common configuration
+    /// This consolidates duplicate code from spawn_agent_from_worktree and create_and_spawn_agent
+    fn spawn_agent_with_config(&mut self, config: AgentSpawnConfig) -> Result<()> {
+        let id = uuid::Uuid::new_v4();
+        let mut agent = Agent::new(
+            id,
+            config.repo_name.clone(),
+            config.issue_number,
+            config.branch_name.clone(),
+            config.worktree_path.clone(),
+        );
+        agent.resize(self.terminal_rows, self.terminal_cols);
+
+        // Write prompt to .botster_prompt file
+        let prompt_file_path = config.worktree_path.join(".botster_prompt");
+        std::fs::write(&prompt_file_path, &config.prompt)?;
+
+        // Copy fresh .botster_init from main repo to worktree
+        let source_init = config.repo_path.join(".botster_init");
+        let dest_init = config.worktree_path.join(".botster_init");
+        if source_init.exists() {
+            std::fs::copy(&source_init, &dest_init)?;
+        }
+
+        // Build environment variables
+        let mut env_vars = HashMap::new();
+        env_vars.insert("BOTSTER_REPO".to_string(), config.repo_name.clone());
+        env_vars.insert(
+            "BOTSTER_ISSUE_NUMBER".to_string(),
+            config.issue_number
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "0".to_string()),
+        );
+        env_vars.insert("BOTSTER_BRANCH_NAME".to_string(), config.branch_name.clone());
+        env_vars.insert(
+            "BOTSTER_WORKTREE_PATH".to_string(),
+            config.worktree_path.display().to_string(),
+        );
+        env_vars.insert("BOTSTER_TASK_DESCRIPTION".to_string(), config.prompt.clone());
+
+        if let Some(msg_id) = config.message_id {
+            env_vars.insert("BOTSTER_MESSAGE_ID".to_string(), msg_id.to_string());
+        }
+
+        let bin_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "botster-hub".to_string());
+        env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
+
+        // Spawn the agent
+        let init_commands = vec!["source .botster_init".to_string()];
+        agent.spawn("bash", "", init_commands, env_vars)?;
+
+        // Register the agent
+        let session_key = agent.session_key();
+        self.agent_keys_ordered.push(session_key.clone());
+        self.agents.insert(session_key, agent);
+
+        let label = if let Some(num) = config.issue_number {
+            format!("issue #{}", num)
+        } else {
+            format!("branch {}", config.branch_name)
+        };
+        log::info!("Spawned agent for {}", label);
+
+        Ok(())
     }
 
     fn handle_events(&mut self) -> Result<bool> {
@@ -542,16 +622,6 @@ impl BotsterApp {
             let (repo_path, repo_name) = WorktreeManager::detect_current_repo()?;
             let worktree_path = std::path::PathBuf::from(&path);
 
-            let id = uuid::Uuid::new_v4();
-            let mut agent = Agent::new(
-                id,
-                repo_name.clone(),
-                issue_number,
-                branch.clone(),
-                worktree_path.clone(),
-            );
-            agent.resize(self.terminal_rows, self.terminal_cols);
-
             let prompt = if self.input_buffer.is_empty() {
                 if let Some(issue_num) = issue_number {
                     format!("Work on issue #{}", issue_num)
@@ -562,53 +632,15 @@ impl BotsterApp {
                 self.input_buffer.clone()
             };
 
-            // Write prompt to .botster_prompt file
-            let prompt_file_path = worktree_path.join(".botster_prompt");
-            std::fs::write(&prompt_file_path, &prompt)?;
-
-            // Copy fresh .botster_init from main repo to worktree
-            let source_init = repo_path.join(".botster_init");
-            let dest_init = worktree_path.join(".botster_init");
-            if source_init.exists() {
-                std::fs::copy(&source_init, &dest_init)?;
-            }
-
-            let mut env_vars = HashMap::new();
-            env_vars.insert("BOTSTER_REPO".to_string(), repo_name.clone());
-            env_vars.insert(
-                "BOTSTER_ISSUE_NUMBER".to_string(),
-                issue_number
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "0".to_string()),
-            );
-            env_vars.insert("BOTSTER_BRANCH_NAME".to_string(), branch.clone());
-            env_vars.insert(
-                "BOTSTER_WORKTREE_PATH".to_string(),
-                worktree_path.display().to_string(),
-            );
-            env_vars.insert("BOTSTER_TASK_DESCRIPTION".to_string(), prompt.clone());
-
-            let bin_path = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| "botster-hub".to_string());
-            env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
-
-            // Just run source .botster_init which handles everything
-            let init_commands = vec!["source .botster_init".to_string()];
-            agent.spawn("bash", "", init_commands, env_vars)?;
-
-            // Generate session key and add to tracking structures
-            let session_key = agent.session_key();
-            self.agent_keys_ordered.push(session_key.clone());
-            self.agents.insert(session_key, agent);
-
-            let label = if let Some(num) = issue_number {
-                format!("issue #{}", num)
-            } else {
-                format!("branch {}", branch)
-            };
-            log::info!("Spawned agent for {}", label);
+            self.spawn_agent_with_config(AgentSpawnConfig {
+                issue_number,
+                branch_name: branch,
+                worktree_path,
+                repo_path,
+                repo_name,
+                prompt,
+                message_id: None,
+            })?;
         }
 
         Ok(())
@@ -623,9 +655,9 @@ impl BotsterApp {
 
         // Try to parse as issue number, otherwise treat as custom branch name
         let (issue_number, actual_branch_name) = if let Ok(num) = branch_name.parse::<u32>() {
-            (num, format!("botster-issue-{}", num))
+            (Some(num), format!("botster-issue-{}", num))
         } else {
-            (0, branch_name.to_string())
+            (None, branch_name.to_string())
         };
 
         let (repo_path, repo_name) = WorktreeManager::detect_current_repo()?;
@@ -635,78 +667,21 @@ impl BotsterApp {
             .git_manager
             .create_worktree_with_branch(&actual_branch_name)?;
 
-        let id = uuid::Uuid::new_v4();
-        let mut agent = Agent::new(
-            id,
-            repo_name.clone(),
-            if issue_number > 0 {
-                Some(issue_number)
-            } else {
-                None
-            },
-            actual_branch_name.clone(),
-            worktree_path.clone(),
-        );
-        agent.resize(self.terminal_rows, self.terminal_cols);
-
-        let prompt = if issue_number > 0 {
-            format!("Work on issue #{}", issue_number)
+        let prompt = if let Some(num) = issue_number {
+            format!("Work on issue #{}", num)
         } else {
             format!("Work on {}", actual_branch_name)
         };
 
-        // Write prompt to .botster_prompt file
-        let prompt_file_path = worktree_path.join(".botster_prompt");
-        std::fs::write(&prompt_file_path, &prompt)?;
-
-        // Copy fresh .botster_init from main repo to worktree
-        let source_init = repo_path.join(".botster_init");
-        let dest_init = worktree_path.join(".botster_init");
-        if source_init.exists() {
-            std::fs::copy(&source_init, &dest_init)?;
-        }
-
-        let mut env_vars = HashMap::new();
-        env_vars.insert("BOTSTER_REPO".to_string(), repo_name.clone());
-        env_vars.insert(
-            "BOTSTER_ISSUE_NUMBER".to_string(),
-            if issue_number > 0 {
-                issue_number.to_string()
-            } else {
-                "0".to_string()
-            },
-        );
-        env_vars.insert(
-            "BOTSTER_BRANCH_NAME".to_string(),
-            actual_branch_name.clone(),
-        );
-        env_vars.insert(
-            "BOTSTER_WORKTREE_PATH".to_string(),
-            worktree_path.display().to_string(),
-        );
-        env_vars.insert("BOTSTER_TASK_DESCRIPTION".to_string(), prompt.clone());
-
-        let bin_path = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "botster-hub".to_string());
-        env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
-
-        // Just run source .botster_init which handles everything
-        let init_commands = vec!["source .botster_init".to_string()];
-        agent.spawn("bash", "", init_commands, env_vars)?;
-
-        // Generate session key and add to tracking structures
-        let session_key = agent.session_key();
-        self.agent_keys_ordered.push(session_key.clone());
-        self.agents.insert(session_key, agent);
-
-        log::info!(
-            "Created worktree and spawned agent for branch '{}'",
-            actual_branch_name
-        );
-
-        Ok(())
+        self.spawn_agent_with_config(AgentSpawnConfig {
+            issue_number,
+            branch_name: actual_branch_name,
+            worktree_path,
+            repo_path,
+            repo_name,
+            prompt,
+            message_id: None,
+        })
     }
 
     fn view(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
@@ -1044,6 +1019,19 @@ impl BotsterApp {
         // Handle cleanup messages (when issue/PR is closed)
         if event_type == "agent_cleanup" {
             return self.handle_cleanup_message(payload);
+        }
+
+        // Enforce max_sessions limit to prevent unbounded memory growth
+        if self.agents.len() >= self.config.max_sessions {
+            log::warn!(
+                "Max sessions limit ({}) reached. Cannot spawn new agent. Current agents: {}",
+                self.config.max_sessions,
+                self.agents.len()
+            );
+            anyhow::bail!(
+                "Maximum concurrent sessions ({}) reached. Close some agents before spawning new ones.",
+                self.config.max_sessions
+            );
         }
 
         // Extract data from payload
