@@ -23,14 +23,25 @@ class Bot::Message < ApplicationRecord
   # Callbacks
   before_create :set_default_status
 
+  # Custom error for already claimed messages
+  class AlreadyClaimedError < StandardError; end
+
   # Instance methods
   def claim!(user_id)
-    update!(
-      claimed_by_user_id: user_id,
-      claimed_at: Time.current,
-      status: "sent",
-      sent_at: Time.current
-    )
+    transaction do
+      lock!  # Pessimistic lock to prevent race conditions
+
+      if claimed?
+        raise AlreadyClaimedError, "Message #{id} already claimed by user #{claimed_by_user_id}"
+      end
+
+      update!(
+        claimed_by_user_id: user_id,
+        claimed_at: Time.current,
+        status: "sent",
+        sent_at: Time.current
+      )
+    end
   end
 
   def mark_as_sent!

@@ -6,6 +6,25 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Extension trait for safe path-to-string conversion
+trait PathExt {
+    fn to_str_safe(&self) -> Result<&str>;
+}
+
+impl PathExt for Path {
+    fn to_str_safe(&self) -> Result<&str> {
+        self.to_str()
+            .ok_or_else(|| anyhow::anyhow!("Path contains invalid UTF-8: {:?}", self))
+    }
+}
+
+impl PathExt for PathBuf {
+    fn to_str_safe(&self) -> Result<&str> {
+        self.to_str()
+            .ok_or_else(|| anyhow::anyhow!("Path contains invalid UTF-8: {:?}", self))
+    }
+}
+
 /// Manages git worktrees for agent sessions
 pub struct WorktreeManager {
     base_dir: PathBuf,
@@ -549,25 +568,65 @@ impl WorktreeManager {
     }
 
     /// Deletes a worktree by path, running teardown scripts first
+    ///
+    /// # Safety
+    /// This function has multiple defense-in-depth checks to prevent accidental
+    /// deletion of the main repository or other important directories.
     pub fn delete_worktree_by_path(
         &self,
         worktree_path: &std::path::Path,
         branch_name: &str,
     ) -> Result<()> {
+        // DEFENSE-IN-DEPTH CHECK 1: Verify path is within managed base directory
+        let canonical_worktree = worktree_path.canonicalize()
+            .context("Failed to canonicalize worktree path")?;
+        let canonical_base = self.base_dir.canonicalize()
+            .unwrap_or_else(|_| self.base_dir.clone());
+
+        if !canonical_worktree.starts_with(&canonical_base) {
+            log::error!(
+                "SECURITY: Refusing to delete path outside managed directory. Path: {}, Base: {}",
+                canonical_worktree.display(),
+                canonical_base.display()
+            );
+            anyhow::bail!(
+                "Worktree path {} is outside managed base directory {}",
+                worktree_path.display(),
+                self.base_dir.display()
+            );
+        }
+
+        // DEFENSE-IN-DEPTH CHECK 2: Verify branch name follows botster convention
+        if !branch_name.starts_with("botster-") {
+            log::warn!(
+                "Branch name '{}' doesn't follow botster convention (should start with 'botster-')",
+                branch_name
+            );
+            // Don't bail - just warn, as this might be intentional
+        }
+
+        // DEFENSE-IN-DEPTH CHECK 3: Check for Claude settings marker file
+        let marker_file = worktree_path.join(".claude/settings.local.json");
+        if !marker_file.exists() {
+            log::warn!(
+                "Missing botster marker file at {} - this may not be a managed worktree",
+                marker_file.display()
+            );
+            // Don't bail - just warn
+        }
+
         // Find the main repository from the worktree
         // Worktrees have a .git file (not directory) that points to the main repo
         let repo_obj = git2::Repository::open(worktree_path)
             .context("Failed to open worktree as git repository")?;
 
-        log::info!("DEBUG: worktree_path = {}", worktree_path.display());
-        log::info!("DEBUG: is_worktree() = {}", repo_obj.is_worktree());
-        log::info!("DEBUG: repo_obj.path() = {:?}", repo_obj.path());
-        log::info!("DEBUG: repo_obj.commondir() = {:?}", repo_obj.commondir());
+        log::debug!("worktree_path = {}", worktree_path.display());
+        log::debug!("is_worktree() = {}", repo_obj.is_worktree());
 
-        // CRITICAL CHECK: Don't try to delete the main repository!
+        // DEFENSE-IN-DEPTH CHECK 4: Git's is_worktree check
         if !repo_obj.is_worktree() {
-            log::warn!(
-                "Refusing to delete main repository at {}. This is not a worktree!",
+            log::error!(
+                "CRITICAL: Refusing to delete main repository at {}. This is not a worktree!",
                 worktree_path.display()
             );
             anyhow::bail!(
