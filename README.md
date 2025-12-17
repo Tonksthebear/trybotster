@@ -437,3 +437,7 @@ MIT License
 ---
 
 **Questions?** Open an issue on GitHub.
+
+---
+
+*Last tested: December 2025*
