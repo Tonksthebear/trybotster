@@ -1,26 +1,44 @@
 import { Controller } from "@hotwired/stimulus"
-import { Terminal } from "@xterm/xterm"
-import { FitAddon } from "@xterm/addon-fit"
 
-// WebRTC P2P connection to local CLI for viewing running agents
+// Lazy load xterm to avoid blocking if import fails
+let Terminal, FitAddon
+
+// WebRTC P2P connection to local CLI for viewing the full hub TUI
 // Handles signaling via Rails server, then establishes direct P2P connection
+// The browser becomes a remote terminal for the hub - see the full TUI and send keyboard input
 export default class extends Controller {
-  static targets = ["terminal", "status", "agentList", "connectButton"]
+  static targets = ["terminal", "status", "connectButton"]
   static values = {
     csrfToken: String,
     pollInterval: { type: Number, default: 1000 }
   }
 
   connect() {
+    console.log("WebRTC controller connected")
     this.peerConnection = null
     this.dataChannel = null
     this.terminal = null
     this.fitAddon = null
     this.sessionId = null
     this.pollTimer = null
-    this.subscribedAgentId = null
 
     this.updateStatus("disconnected", "Not connected")
+
+    // Lazy load xterm
+    this.loadXterm()
+  }
+
+  async loadXterm() {
+    try {
+      const xtermModule = await import("@xterm/xterm")
+      const fitModule = await import("@xterm/addon-fit")
+      // xterm exports as default.Terminal, fit exports as FitAddon directly
+      Terminal = xtermModule.Terminal || xtermModule.default?.Terminal
+      FitAddon = fitModule.FitAddon || fitModule.default?.FitAddon
+      console.log("xterm loaded successfully, Terminal:", Terminal, "FitAddon:", FitAddon)
+    } catch (error) {
+      console.error("Failed to load xterm:", error)
+    }
   }
 
   disconnect() {
@@ -29,7 +47,10 @@ export default class extends Controller {
 
   // Called when user clicks "Connect to Hub"
   async startConnection() {
+    console.log("startConnection called")
+
     if (this.peerConnection) {
+      console.log("Existing connection, cleaning up")
       this.cleanup()
       return
     }
@@ -39,8 +60,11 @@ export default class extends Controller {
     this.connectButtonTarget.textContent = "Connecting..."
 
     try {
+      console.log("Creating peer connection...")
       await this.createPeerConnection()
+      console.log("Creating offer...")
       await this.createOffer()
+      console.log("Starting polling for answer...")
       this.startPollingForAnswer()
     } catch (error) {
       console.error("Connection failed:", error)
@@ -60,17 +84,18 @@ export default class extends Controller {
     this.peerConnection = new RTCPeerConnection(config)
 
     // Create data channel for communication with CLI
-    this.dataChannel = this.peerConnection.createDataChannel("agents", {
+    this.dataChannel = this.peerConnection.createDataChannel("hub", {
       ordered: true
     })
 
     this.dataChannel.onopen = () => {
       console.log("Data channel opened")
-      this.updateStatus("connected", "Connected to Hub")
+      this.updateStatus("connected", "Connected to Hub - streaming TUI")
       this.connectButtonTarget.textContent = "Disconnect"
       this.connectButtonTarget.disabled = false
-      // Request agent list
-      this.sendMessage({ type: "get_agents" })
+
+      // Initialize terminal immediately for full TUI streaming
+      this.initializeTerminal()
     }
 
     this.dataChannel.onclose = () => {
@@ -99,47 +124,44 @@ export default class extends Controller {
       }
     }
 
-    // Wait for ICE gathering to complete
-    await new Promise((resolve) => {
-      if (this.peerConnection.iceGatheringState === "complete") {
-        resolve()
-      } else {
-        this.peerConnection.onicegatheringstatechange = () => {
-          if (this.peerConnection.iceGatheringState === "complete") {
-            resolve()
-          }
-        }
-        // Timeout after 10 seconds
-        setTimeout(resolve, 10000)
-      }
-    })
+    console.log("Peer connection created successfully")
   }
 
   async createOffer() {
+    console.log("Creating offer...")
     const offer = await this.peerConnection.createOffer()
+    console.log("Offer created, setting local description...")
     await this.peerConnection.setLocalDescription(offer)
+    console.log("Local description set, waiting for ICE gathering...")
 
     // Wait for ICE candidates to be gathered
     await new Promise((resolve) => {
       if (this.peerConnection.iceGatheringState === "complete") {
+        console.log("ICE gathering already complete")
         resolve()
       } else {
         const checkState = () => {
+          console.log("ICE gathering state:", this.peerConnection.iceGatheringState)
           if (this.peerConnection.iceGatheringState === "complete") {
             resolve()
           }
         }
         this.peerConnection.onicegatheringstatechange = checkState
-        setTimeout(resolve, 5000) // Timeout
+        setTimeout(() => {
+          console.log("ICE gathering timeout, proceeding anyway")
+          resolve()
+        }, 5000) // Timeout
       }
     })
 
     // Get the complete offer with ICE candidates
     const completeOffer = this.peerConnection.localDescription
+    console.log("Complete offer ready, SDP length:", completeOffer.sdp.length)
 
     this.updateStatus("connecting", "Sending offer to server...")
 
     // POST offer to Rails signaling endpoint
+    console.log("POSTing offer to server...")
     const response = await fetch("/api/webrtc/sessions", {
       method: "POST",
       headers: {
@@ -154,11 +176,15 @@ export default class extends Controller {
       })
     })
 
+    console.log("Server response status:", response.status)
     if (!response.ok) {
+      const errorText = await response.text()
+      console.error("Server error response:", errorText)
       throw new Error(`Server error: ${response.status}`)
     }
 
     const data = await response.json()
+    console.log("Session created:", data)
     this.sessionId = data.session_id
     this.updateStatus("connecting", "Waiting for CLI to respond...")
   }
@@ -210,80 +236,41 @@ export default class extends Controller {
   }
 
   handleMessage(message) {
-    console.log("Received message:", message)
-
     switch (message.type) {
-      case "agents":
-        this.renderAgentList(message.agents)
-        break
-      case "output":
-        if (message.agent_id === this.subscribedAgentId && this.terminal) {
-          // Decode base64 terminal output
-          const data = atob(message.data)
+      case "screen":
+        // Full TUI screen update - decode base64 and write to terminal
+        if (this.terminal) {
+          // Properly decode base64 → binary → UTF-8
+          // atob() returns a binary string, we need to convert to proper UTF-8
+          const binaryString = atob(message.data)
+          const bytes = Uint8Array.from(binaryString, c => c.charCodeAt(0))
+          const data = new TextDecoder().decode(bytes)
           this.terminal.write(data)
         }
-        break
-      case "status":
-        this.updateAgentStatus(message.agent_id, message.status)
         break
       case "error":
         console.error("CLI error:", message.message)
         break
+      default:
+        console.log("Unknown message type:", message.type, message)
     }
-  }
-
-  renderAgentList(agents) {
-    if (!this.hasAgentListTarget) return
-
-    if (agents.length === 0) {
-      this.agentListTarget.innerHTML = `
-        <p class="text-gray-500 text-sm">No running agents</p>
-      `
-      return
-    }
-
-    this.agentListTarget.innerHTML = agents.map(agent => `
-      <button
-        type="button"
-        class="w-full text-left px-4 py-3 hover:bg-gray-50 border-b border-gray-200 last:border-b-0 ${this.subscribedAgentId === agent.id ? 'bg-green-50' : ''}"
-        data-action="click->webrtc#selectAgent"
-        data-agent-id="${agent.id}"
-        data-agent-repo="${agent.repo}"
-        data-agent-issue="${agent.issue}"
-      >
-        <div class="font-medium text-gray-900">${agent.repo}#${agent.issue}</div>
-        <div class="text-sm text-gray-500">${agent.status}</div>
-      </button>
-    `).join("")
-  }
-
-  selectAgent(event) {
-    const agentId = event.currentTarget.dataset.agentId
-
-    // Unsubscribe from previous agent
-    if (this.subscribedAgentId) {
-      this.sendMessage({ type: "unsubscribe", agent_id: this.subscribedAgentId })
-    }
-
-    // Subscribe to new agent
-    this.subscribedAgentId = agentId
-    this.sendMessage({ type: "subscribe", agent_id: agentId })
-
-    // Initialize terminal if needed
-    if (!this.terminal && this.hasTerminalTarget) {
-      this.initializeTerminal()
-    } else if (this.terminal) {
-      this.terminal.clear()
-    }
-
-    // Re-render to show selection
-    this.sendMessage({ type: "get_agents" })
   }
 
   initializeTerminal() {
+    if (!Terminal) {
+      console.error("Terminal not loaded yet, retrying in 100ms...")
+      setTimeout(() => this.initializeTerminal(), 100)
+      return
+    }
+
+    if (this.terminal) {
+      return // Already initialized
+    }
+
+    console.log("Initializing terminal for full TUI streaming")
     this.terminal = new Terminal({
-      cursorBlink: false,
-      disableStdin: true, // Read-only for now
+      cursorBlink: true,
+      disableStdin: false, // Enable keyboard input
       fontSize: 14,
       fontFamily: "Menlo, Monaco, 'Courier New', monospace",
       theme: {
@@ -295,17 +282,77 @@ export default class extends Controller {
     this.fitAddon = new FitAddon()
     this.terminal.loadAddon(this.fitAddon)
     this.terminal.open(this.terminalTarget)
-    this.fitAddon.fit()
 
-    // Resize on window resize
-    window.addEventListener("resize", () => {
-      if (this.fitAddon) this.fitAddon.fit()
+    // Let xterm fit to container, then tell CLI to render at that size
+    requestAnimationFrame(() => {
+      this.fitAddon.fit()
+      console.log(`Terminal fitted to: ${this.terminal.cols}x${this.terminal.rows}`)
+      this.sendResize()
     })
+
+    // Capture keyboard input and send to CLI
+    this.terminal.onKey(({ key, domEvent }) => {
+      this.sendKeyPress(domEvent)
+    })
+
+    // Also capture special keys that onKey might miss
+    this.terminalTarget.addEventListener("keydown", (e) => {
+      if (this.shouldCaptureKey(e)) {
+        e.preventDefault()
+        this.sendKeyPress(e)
+      }
+    })
+
+    // Resize on window resize - re-fit and notify CLI
+    this.resizeHandler = () => {
+      if (this.fitAddon && this.terminal) {
+        this.fitAddon.fit()
+        console.log(`Window resized, terminal now: ${this.terminal.cols}x${this.terminal.rows}`)
+        this.sendResize()
+      }
+    }
+    window.addEventListener("resize", this.resizeHandler)
+
+    // Focus terminal for keyboard input
+    this.terminal.focus()
   }
 
-  updateAgentStatus(agentId, status) {
-    // Refresh agent list to show updated status
-    this.sendMessage({ type: "get_agents" })
+  sendResize() {
+    if (!this.terminal || !this.dataChannel || this.dataChannel.readyState !== "open") return
+
+    const message = {
+      type: "resize",
+      rows: this.terminal.rows,
+      cols: this.terminal.cols
+    }
+
+    console.log(`Sending resize: ${message.cols}x${message.rows}`)
+    this.dataChannel.send(JSON.stringify(message))
+  }
+
+  shouldCaptureKey(e) {
+    // Capture control key combinations and special keys
+    if (e.ctrlKey || e.altKey || e.metaKey) return true
+    if (["Escape", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+         "Home", "End", "PageUp", "PageDown", "Insert", "Delete",
+         "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"
+        ].includes(e.key)) return true
+    return false
+  }
+
+  sendKeyPress(domEvent) {
+    // Don't send if no connection
+    if (!this.dataChannel || this.dataChannel.readyState !== "open") return
+
+    const message = {
+      type: "key_press",
+      key: domEvent.key,
+      ctrl: domEvent.ctrlKey,
+      alt: domEvent.altKey,
+      shift: domEvent.shiftKey
+    }
+
+    this.dataChannel.send(JSON.stringify(message))
   }
 
   sendMessage(message) {
@@ -351,6 +398,11 @@ export default class extends Controller {
       this.peerConnection = null
     }
 
+    if (this.resizeHandler) {
+      window.removeEventListener("resize", this.resizeHandler)
+      this.resizeHandler = null
+    }
+
     if (this.terminal) {
       this.terminal.dispose()
       this.terminal = null
@@ -358,7 +410,6 @@ export default class extends Controller {
     }
 
     this.sessionId = null
-    this.subscribedAgentId = null
 
     if (this.hasConnectButtonTarget) {
       this.connectButtonTarget.disabled = false
@@ -366,9 +417,5 @@ export default class extends Controller {
     }
 
     this.updateStatus("disconnected", "Not connected")
-
-    if (this.hasAgentListTarget) {
-      this.agentListTarget.innerHTML = ""
-    }
   }
 }
