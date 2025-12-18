@@ -275,6 +275,132 @@ class GithubCommentIssueToolTest < ActiveSupport::TestCase
     tool = GithubCommentIssueTool.new(repo: "owner/repo", issue_number: 123, body: "")
     assert_not tool.valid?
   end
+
+  test "returns cached response when idempotency key exists and completed" do
+    # Create a completed idempotency key with cached response
+    cached_response = {
+      success: true,
+      text: "✅ Comment added successfully!\n\n💬 Comment on owner/repo#123\n   URL: https://github.com/owner/repo/issues/123#issuecomment-999"
+    }.to_json
+
+    idempotency_key = IdempotencyKey.create!(
+      key: "test-idempotency-key",
+      request_path: "github_comment_issue",
+      request_params: { repo: "owner/repo", issue_number: 123, body: "Great work!" }.to_json,
+      response_body: cached_response,
+      response_status: 200,
+      completed_at: Time.current
+    )
+
+    tool = GithubCommentIssueTool.new(repo: "owner/repo", issue_number: 123, body: "Great work!")
+    setup_tool_mocks(tool)
+
+    # Mock the idempotency key header
+    tool.define_singleton_method(:idempotency_key_from_request) { "test-idempotency-key" }
+
+    # The API should NOT be called since we have a cached response
+    Github::App.stub :get_installation_for_repo, ->(*) { raise "API should not be called" } do
+      tool.perform
+      rendered = tool.instance_variable_get(:@rendered)
+      assert rendered[:text]&.include?("Comment added successfully")
+    end
+  end
+
+  test "stores response in idempotency key after successful execution" do
+    tool = GithubCommentIssueTool.new(repo: "owner/repo", issue_number: 123, body: "New comment")
+    setup_tool_mocks(tool)
+
+    idempotency_key_value = "new-idempotency-key-#{SecureRandom.hex(8)}"
+    tool.define_singleton_method(:idempotency_key_from_request) { idempotency_key_value }
+
+    installation_result = { success: true, installation_id: 12345, account: "owner" }
+    comment_data = @comment
+    mock_client = Object.new
+    mock_client.define_singleton_method(:add_comment) do |*args|
+      resource = OpenStruct.new(comment_data)
+      resource.define_singleton_method(:to_h) { comment_data }
+      resource
+    end
+
+    Github::App.stub :get_installation_for_repo, installation_result do
+      Github::App.stub :installation_client, mock_client do
+        tool.perform
+        assert_nil tool.instance_variable_get(:@error)
+      end
+    end
+
+    # Verify idempotency key was stored
+    stored_key = IdempotencyKey.find_by(key: idempotency_key_value)
+    assert stored_key.present?, "Idempotency key should be stored"
+    assert stored_key.completed?, "Idempotency key should be marked completed"
+    assert_equal 200, stored_key.response_status
+  end
+
+  test "does not duplicate comment on retry with same idempotency key" do
+    idempotency_key_value = "retry-key-#{SecureRandom.hex(8)}"
+    api_call_count = 0
+
+    installation_result = { success: true, installation_id: 12345, account: "owner" }
+    comment_data = @comment
+    mock_client = Object.new
+    mock_client.define_singleton_method(:add_comment) do |*args|
+      api_call_count += 1
+      resource = OpenStruct.new(comment_data)
+      resource.define_singleton_method(:to_h) { comment_data }
+      resource
+    end
+
+    # First request - should call API
+    tool1 = GithubCommentIssueTool.new(repo: "owner/repo", issue_number: 123, body: "Retry test")
+    setup_tool_mocks(tool1)
+    tool1.define_singleton_method(:idempotency_key_from_request) { idempotency_key_value }
+
+    Github::App.stub :get_installation_for_repo, installation_result do
+      Github::App.stub :installation_client, mock_client do
+        tool1.perform
+      end
+    end
+
+    assert_equal 1, api_call_count, "First request should call API once"
+
+    # Second request with same key - should NOT call API
+    tool2 = GithubCommentIssueTool.new(repo: "owner/repo", issue_number: 123, body: "Retry test")
+    setup_tool_mocks(tool2)
+    tool2.define_singleton_method(:idempotency_key_from_request) { idempotency_key_value }
+
+    Github::App.stub :get_installation_for_repo, installation_result do
+      Github::App.stub :installation_client, mock_client do
+        tool2.perform
+      end
+    end
+
+    assert_equal 1, api_call_count, "Second request with same idempotency key should NOT call API again"
+  end
+
+  test "proceeds with API call when no idempotency key provided" do
+    tool = GithubCommentIssueTool.new(repo: "owner/repo", issue_number: 123, body: "No key test")
+    setup_tool_mocks(tool)
+    tool.define_singleton_method(:idempotency_key_from_request) { nil }
+
+    installation_result = { success: true, installation_id: 12345, account: "owner" }
+    comment_data = @comment
+    mock_client = Object.new
+    api_called = false
+    mock_client.define_singleton_method(:add_comment) do |*args|
+      api_called = true
+      resource = OpenStruct.new(comment_data)
+      resource.define_singleton_method(:to_h) { comment_data }
+      resource
+    end
+
+    Github::App.stub :get_installation_for_repo, installation_result do
+      Github::App.stub :installation_client, mock_client do
+        tool.perform
+      end
+    end
+
+    assert api_called, "API should be called when no idempotency key is provided"
+  end
 end
 
 class GithubUpdateIssueToolTest < ActiveSupport::TestCase
