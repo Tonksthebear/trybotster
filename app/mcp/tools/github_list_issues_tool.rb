@@ -46,13 +46,16 @@ class GithubListIssuesTool < ApplicationMCPTool
         is_pr = issue['pull_request'].present?
         icon = is_pr ? "🔀" : "🐛"
 
+        created_at = issue['created_at'].is_a?(String) ? Time.parse(issue['created_at']) : issue['created_at']
+        updated_at = issue['updated_at'].is_a?(String) ? Time.parse(issue['updated_at']) : issue['updated_at']
+
         issue_info = [
           "#{icon} ##{issue['number']}: #{issue['title']}",
           "   Repository: #{issue['repository_url']&.split('/')&.last(2)&.join('/')}",
           "   State: #{issue['state']} | Comments: #{issue['comments']}",
           "   URL: #{issue['html_url']}",
-          "   Created: #{Time.parse(issue['created_at']).strftime('%Y-%m-%d %H:%M')}",
-          "   Updated: #{Time.parse(issue['updated_at']).strftime('%Y-%m-%d %H:%M')}"
+          "   Created: #{created_at.strftime('%Y-%m-%d %H:%M')}",
+          "   Updated: #{updated_at.strftime('%Y-%m-%d %H:%M')}"
         ]
 
         if issue['labels']&.any?

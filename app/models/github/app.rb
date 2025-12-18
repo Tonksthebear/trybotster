@@ -350,6 +350,24 @@ module Github
       { success: false, error: e.message }
     end
 
+    # Get pull request details (with full PR-specific fields like head/base branches, mergeable state)
+    # @param access_token [String] The GitHub access token
+    # @param repo [String] Repository in "owner/repo" format
+    # @param pr_number [Integer] Pull request number
+    # @return [Hash] Pull request data or error
+    def get_pull_request(access_token, repo:, pr_number:)
+      client = client(access_token)
+      pr = client.pull_request(repo, pr_number)
+
+      {
+        success: true,
+        pull_request: pr.to_h
+      }
+    rescue Octokit::Error => e
+      Rails.logger.error "GitHub App get pull request error: #{e.message}"
+      { success: false, error: e.message }
+    end
+
     # Get issue comments
     # @param access_token [String] The GitHub access token
     # @param repo [String] Repository in "owner/repo" format

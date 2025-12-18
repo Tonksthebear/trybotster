@@ -1,0 +1,10 @@
+{
+  "id": 12345,
+  "html_url": "https://github.com/owner/repo/issues/123#issuecomment-12345",
+  "user": {
+    "login": "commenter"
+  },
+  "body": "Thanks for reporting this!",
+  "created_at": "2025-01-15T14:00:00Z",
+  "updated_at": "2025-01-15T14:00:00Z"
+}

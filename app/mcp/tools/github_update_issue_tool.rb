@@ -5,7 +5,7 @@ class GithubUpdateIssueTool < ApplicationMCPTool
   description "Update an existing GitHub issue or pull request. Can update state (open/closed), title, body, labels, and assignees."
 
   property :repo, type: "string", description: "Repository in 'owner/repo' format (e.g., 'octocat/Hello-World')", required: true
-  property :issue_number, type: "number", description: "Issue or PR number", required: true
+  property :issue_number, type: "integer", description: "Issue or PR number", required: true
   property :state, type: "string", description: "Issue state: 'open' or 'closed' (optional)", required: false
   property :title, type: "string", description: "New issue title (optional)", required: false
   property :body, type: "string", description: "New issue body (optional)", required: false
