@@ -288,6 +288,83 @@ impl Agent {
         // Use the old buffer-based scrollback
         self.get_buffer_snapshot()
     }
+
+    /// Get the screen as ANSI escape sequences for WebRTC streaming
+    /// This produces output that can be written directly to xterm.js
+    pub fn get_screen_as_ansi(&self) -> String {
+        use std::fmt::Write;
+
+        let parser = self.vt100_parser.lock().unwrap();
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+
+        let mut output = String::new();
+
+        // Reset and clear screen, move cursor to home
+        output.push_str("\x1b[0m\x1b[H\x1b[2J");
+
+        for row in 0..rows {
+            // Move cursor to start of row
+            let _ = write!(output, "\x1b[{};1H", row + 1);
+
+            for col in 0..cols {
+                let cell = screen.cell(row, col);
+                if let Some(cell) = cell {
+                    // Apply foreground color
+                    let fg = cell.fgcolor();
+                    match fg {
+                        vt100::Color::Default => output.push_str("\x1b[39m"),
+                        vt100::Color::Idx(i) => {
+                            let _ = write!(output, "\x1b[38;5;{}m", i);
+                        }
+                        vt100::Color::Rgb(r, g, b) => {
+                            let _ = write!(output, "\x1b[38;2;{};{};{}m", r, g, b);
+                        }
+                    }
+
+                    // Apply background color
+                    let bg = cell.bgcolor();
+                    match bg {
+                        vt100::Color::Default => output.push_str("\x1b[49m"),
+                        vt100::Color::Idx(i) => {
+                            let _ = write!(output, "\x1b[48;5;{}m", i);
+                        }
+                        vt100::Color::Rgb(r, g, b) => {
+                            let _ = write!(output, "\x1b[48;2;{};{};{}m", r, g, b);
+                        }
+                    }
+
+                    // Apply attributes
+                    if cell.bold() {
+                        output.push_str("\x1b[1m");
+                    }
+                    if cell.italic() {
+                        output.push_str("\x1b[3m");
+                    }
+                    if cell.underline() {
+                        output.push_str("\x1b[4m");
+                    }
+                    if cell.inverse() {
+                        output.push_str("\x1b[7m");
+                    }
+
+                    // Write the character
+                    output.push_str(&cell.contents());
+
+                    // Reset attributes
+                    output.push_str("\x1b[0m");
+                } else {
+                    output.push(' ');
+                }
+            }
+        }
+
+        // Position cursor at correct location
+        let cursor = screen.cursor_position();
+        let _ = write!(output, "\x1b[{};{}H", cursor.0 + 1, cursor.1 + 1);
+
+        output
+    }
 }
 
 #[cfg(test)]

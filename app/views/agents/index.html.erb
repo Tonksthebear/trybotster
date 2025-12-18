@@ -8,42 +8,152 @@
       overflow: hidden;
       background: #1e1e1e;
     }
+
+    /* Agent list scrollable */
+    .agent-list-container {
+      max-height: calc(100vh - 280px);
+      overflow-y: auto;
+    }
+
+    /* Mobile responsive */
+    @media (max-width: 1023px) {
+      .terminal-container {
+        height: calc(100vh - 450px);
+        min-height: 200px;
+      }
+      .agent-list-container {
+        max-height: 200px;
+      }
+    }
   </style>
 <% end %>
 
-<div class="w-full max-w-6xl mx-auto"
+<div class="w-full max-w-7xl mx-auto px-4 sm:px-6"
      data-controller="webrtc"
-     data-webrtc-csrf-token-value="<%= form_authenticity_token %>">
+     data-webrtc-csrf-token-value="<%= form_authenticity_token %>"
+     data-webrtc-mode-value="gui">
 
   <%# Header %>
   <div class="mb-4">
     <h1 class="text-2xl font-bold text-gray-900">Botster Hub Remote</h1>
     <p class="mt-1 text-sm text-gray-600">
-      Connect to your local Botster Hub to control running agents via P2P connection.
+      Connect to your local Botster Hub to manage running agents via P2P connection.
     </p>
   </div>
 
   <%# Connection controls %>
   <div class="bg-white shadow rounded-lg mb-4">
-    <div class="px-4 py-3 flex items-center justify-between">
+    <div class="px-4 py-3 flex flex-wrap items-center justify-between gap-2">
       <div data-webrtc-target="status" class="text-sm text-gray-500">
-        ○ Not connected
+        Not connected
       </div>
-      <button type="button"
-              data-webrtc-target="connectButton"
-              data-action="click->webrtc#startConnection"
-              class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500">
-        Connect to Hub
-      </button>
+      <div class="flex items-center gap-2">
+        <button type="button"
+                data-webrtc-target="modeToggle"
+                data-action="click->webrtc#toggleMode"
+                class="inline-flex items-center px-3 py-2 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+          Switch to TUI
+        </button>
+        <button type="button"
+                data-webrtc-target="connectButton"
+                data-action="click->webrtc#startConnection"
+                class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500">
+          Connect to Hub
+        </button>
+      </div>
     </div>
   </div>
 
-  <%# Terminal view %>
-  <div class="shadow rounded-lg overflow-hidden" style="background: #1e1e1e;">
-    <div class="px-4 py-2 border-b border-gray-700 flex items-center justify-between" style="background: #2d2d2d;">
-      <h2 class="text-sm font-medium text-gray-300">Hub Terminal</h2>
-      <span class="text-xs text-gray-500">Click terminal to focus for keyboard input</span>
+  <%# Main content area %>
+  <div class="grid grid-cols-1 lg:grid-cols-4 gap-4">
+    <%# Agent List Panel (GUI mode only) %>
+    <div data-webrtc-target="guiContainer" class="lg:col-span-1 bg-white shadow rounded-lg overflow-hidden">
+      <div class="px-4 py-3 border-b border-gray-200 bg-gray-50 flex items-center justify-between">
+        <h2 class="text-sm font-medium text-gray-900">Agents</h2>
+        <button type="button"
+                class="text-gray-400 hover:text-gray-600"
+                data-action="click->webrtc#requestAgentList"
+                title="Refresh">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+        </button>
+      </div>
+      <div data-webrtc-target="agentList" class="agent-list-container">
+        <div class="text-gray-500 text-center py-8">
+          <p class="text-sm">Connect to hub to see agents</p>
+        </div>
+      </div>
     </div>
-    <div data-webrtc-target="terminal" class="terminal-container"></div>
+
+    <%# Terminal Panel %>
+    <div data-webrtc-target="tuiContainer" class="lg:col-span-3 shadow rounded-lg overflow-hidden" style="background: #1e1e1e;">
+      <div class="px-4 py-2 border-b border-gray-700 flex items-center justify-between" style="background: #2d2d2d;">
+        <h2 class="text-sm font-medium text-gray-300" data-webrtc-target="terminalTitle">Terminal</h2>
+        <span class="text-xs text-gray-500">Click to focus for keyboard input</span>
+      </div>
+      <div data-webrtc-target="terminal" class="terminal-container"></div>
+    </div>
+  </div>
+
+  <%# Mobile touch controls %>
+  <div class="mt-4 lg:hidden">
+    <div class="bg-white shadow rounded-lg p-4">
+      <h3 class="text-sm font-medium text-gray-900 mb-3">Touch Controls</h3>
+      <div class="grid grid-cols-3 gap-2 mb-3">
+        <button type="button"
+                class="px-3 py-3 border border-gray-300 text-sm rounded-md text-gray-700 bg-white hover:bg-gray-50 active:bg-gray-100"
+                data-action="click->webrtc#sendCtrlC"
+                title="Send Ctrl+C">
+          Ctrl+C
+        </button>
+        <button type="button"
+                class="px-3 py-3 border border-gray-300 text-sm rounded-md text-gray-700 bg-white hover:bg-gray-50 active:bg-gray-100"
+                data-action="click->webrtc#sendEnter"
+                title="Send Enter">
+          Enter
+        </button>
+        <button type="button"
+                class="px-3 py-3 border border-gray-300 text-sm rounded-md text-gray-700 bg-white hover:bg-gray-50 active:bg-gray-100"
+                data-action="click->webrtc#sendEscape"
+                title="Send Escape">
+          Esc
+        </button>
+      </div>
+      <div class="grid grid-cols-4 gap-2">
+        <button type="button"
+                class="px-3 py-3 border border-gray-300 text-sm rounded-md text-gray-700 bg-white hover:bg-gray-50 active:bg-gray-100"
+                data-action="click->webrtc#sendArrowUp">
+          <span class="sr-only">Up</span>
+          <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7" />
+          </svg>
+        </button>
+        <button type="button"
+                class="px-3 py-3 border border-gray-300 text-sm rounded-md text-gray-700 bg-white hover:bg-gray-50 active:bg-gray-100"
+                data-action="click->webrtc#sendArrowDown">
+          <span class="sr-only">Down</span>
+          <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+        <button type="button"
+                class="px-3 py-3 border border-gray-300 text-sm rounded-md text-gray-700 bg-white hover:bg-gray-50 active:bg-gray-100"
+                data-action="click->webrtc#sendArrowLeft">
+          <span class="sr-only">Left</span>
+          <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+          </svg>
+        </button>
+        <button type="button"
+                class="px-3 py-3 border border-gray-300 text-sm rounded-md text-gray-700 bg-white hover:bg-gray-50 active:bg-gray-100"
+                data-action="click->webrtc#sendArrowRight">
+          <span class="sr-only">Right</span>
+          <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+          </svg>
+        </button>
+      </div>
+    </div>
   </div>
 </div>

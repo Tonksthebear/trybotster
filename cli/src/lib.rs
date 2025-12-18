@@ -12,4 +12,6 @@ pub use config::Config;
 pub use git::WorktreeManager;
 pub use prompt::PromptManager;
 pub use terminal::spawn_in_external_terminal;
-pub use webrtc_handler::{AgentInfo, BrowserDimensions, KeyInput, WebRTCHandler};
+pub use webrtc_handler::{
+    AgentInfo, BrowserCommand, BrowserDimensions, KeyInput, WebAgentInfo, WebRTCHandler,
+};

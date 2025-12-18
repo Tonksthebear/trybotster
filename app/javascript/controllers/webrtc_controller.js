@@ -3,14 +3,26 @@ import { Controller } from "@hotwired/stimulus"
 // Lazy load xterm to avoid blocking if import fails
 let Terminal, FitAddon
 
-// WebRTC P2P connection to local CLI for viewing the full hub TUI
-// Handles signaling via Rails server, then establishes direct P2P connection
-// The browser becomes a remote terminal for the hub - see the full TUI and send keyboard input
+// WebRTC P2P connection to local CLI for agent management
+// Supports two modes:
+// - TUI mode: streams the full hub terminal interface
+// - GUI mode: shows agent list with individual terminal view (mobile-friendly)
 export default class extends Controller {
-  static targets = ["terminal", "status", "connectButton"]
+  static targets = [
+    "terminal",       // Terminal container
+    "status",         // Connection status indicator
+    "connectButton",  // Connect/disconnect button
+    "agentList",      // Agent list container (GUI mode)
+    "modeToggle",     // Toggle between TUI and GUI modes
+    "tuiContainer",   // Terminal panel (expands in TUI mode)
+    "guiContainer",   // Agent list panel (GUI mode only)
+    "terminalTitle"   // Terminal title text
+  ]
+
   static values = {
     csrfToken: String,
-    pollInterval: { type: Number, default: 1000 }
+    pollInterval: { type: Number, default: 1000 },
+    mode: { type: String, default: "gui" } // "tui" or "gui"
   }
 
   connect() {
@@ -21,6 +33,8 @@ export default class extends Controller {
     this.fitAddon = null
     this.sessionId = null
     this.pollTimer = null
+    this.agents = []
+    this.selectedAgentId = null
 
     this.updateStatus("disconnected", "Not connected")
 
@@ -32,10 +46,9 @@ export default class extends Controller {
     try {
       const xtermModule = await import("@xterm/xterm")
       const fitModule = await import("@xterm/addon-fit")
-      // xterm exports as default.Terminal, fit exports as FitAddon directly
       Terminal = xtermModule.Terminal || xtermModule.default?.Terminal
       FitAddon = fitModule.FitAddon || fitModule.default?.FitAddon
-      console.log("xterm loaded successfully, Terminal:", Terminal, "FitAddon:", FitAddon)
+      console.log("xterm loaded successfully")
     } catch (error) {
       console.error("Failed to load xterm:", error)
     }
@@ -43,6 +56,52 @@ export default class extends Controller {
 
   disconnect() {
     this.cleanup()
+  }
+
+  // Toggle between TUI and GUI modes
+  toggleMode() {
+    this.modeValue = this.modeValue === "tui" ? "gui" : "tui"
+    this.updateModeDisplay()
+
+    // Request agent list when switching to GUI mode
+    if (this.modeValue === "gui" && this.dataChannel?.readyState === "open") {
+      this.requestAgentList()
+    }
+  }
+
+  updateModeDisplay() {
+    if (this.hasGuiContainerTarget && this.hasTuiContainerTarget) {
+      if (this.modeValue === "tui") {
+        // TUI mode: hide agent list, terminal takes full width
+        this.guiContainerTarget.classList.add("hidden")
+        this.tuiContainerTarget.classList.remove("lg:col-span-3")
+        this.tuiContainerTarget.classList.add("lg:col-span-4")
+      } else {
+        // GUI mode: show agent list, terminal takes 3/4 width
+        this.guiContainerTarget.classList.remove("hidden")
+        this.tuiContainerTarget.classList.remove("lg:col-span-4")
+        this.tuiContainerTarget.classList.add("lg:col-span-3")
+      }
+    }
+
+    if (this.hasModeToggleTarget) {
+      this.modeToggleTarget.textContent = this.modeValue === "tui" ? "Switch to GUI" : "Switch to TUI"
+    }
+
+    if (this.hasTerminalTitleTarget) {
+      this.terminalTitleTarget.textContent = this.modeValue === "tui" ? "Hub Terminal (TUI)" : "Agent Terminal"
+    }
+
+    // Clear and resize terminal when switching modes
+    if (this.terminal) {
+      this.terminal.clear()
+      requestAnimationFrame(() => {
+        if (this.fitAddon) {
+          this.fitAddon.fit()
+          this.sendResize()
+        }
+      })
+    }
   }
 
   // Called when user clicks "Connect to Hub"
@@ -60,11 +119,8 @@ export default class extends Controller {
     this.connectButtonTarget.textContent = "Connecting..."
 
     try {
-      console.log("Creating peer connection...")
       await this.createPeerConnection()
-      console.log("Creating offer...")
       await this.createOffer()
-      console.log("Starting polling for answer...")
       this.startPollingForAnswer()
     } catch (error) {
       console.error("Connection failed:", error)
@@ -83,19 +139,23 @@ export default class extends Controller {
 
     this.peerConnection = new RTCPeerConnection(config)
 
-    // Create data channel for communication with CLI
     this.dataChannel = this.peerConnection.createDataChannel("hub", {
       ordered: true
     })
 
     this.dataChannel.onopen = () => {
       console.log("Data channel opened")
-      this.updateStatus("connected", "Connected to Hub - streaming TUI")
+      this.updateStatus("connected", "Connected to Hub")
       this.connectButtonTarget.textContent = "Disconnect"
       this.connectButtonTarget.disabled = false
 
-      // Initialize terminal immediately for full TUI streaming
+      // Initialize terminal
       this.initializeTerminal()
+
+      // Request agent list for GUI mode
+      if (this.modeValue === "gui") {
+        this.requestAgentList()
+      }
     }
 
     this.dataChannel.onclose = () => {
@@ -113,7 +173,6 @@ export default class extends Controller {
       this.updateStatus("error", "Data channel error")
     }
 
-    // ICE connection state changes
     this.peerConnection.oniceconnectionstatechange = () => {
       const state = this.peerConnection.iceConnectionState
       console.log("ICE connection state:", state)
@@ -128,40 +187,26 @@ export default class extends Controller {
   }
 
   async createOffer() {
-    console.log("Creating offer...")
     const offer = await this.peerConnection.createOffer()
-    console.log("Offer created, setting local description...")
     await this.peerConnection.setLocalDescription(offer)
-    console.log("Local description set, waiting for ICE gathering...")
 
-    // Wait for ICE candidates to be gathered
     await new Promise((resolve) => {
       if (this.peerConnection.iceGatheringState === "complete") {
-        console.log("ICE gathering already complete")
         resolve()
       } else {
         const checkState = () => {
-          console.log("ICE gathering state:", this.peerConnection.iceGatheringState)
           if (this.peerConnection.iceGatheringState === "complete") {
             resolve()
           }
         }
         this.peerConnection.onicegatheringstatechange = checkState
-        setTimeout(() => {
-          console.log("ICE gathering timeout, proceeding anyway")
-          resolve()
-        }, 5000) // Timeout
+        setTimeout(resolve, 5000) // Timeout
       }
     })
 
-    // Get the complete offer with ICE candidates
     const completeOffer = this.peerConnection.localDescription
-    console.log("Complete offer ready, SDP length:", completeOffer.sdp.length)
-
     this.updateStatus("connecting", "Sending offer to server...")
 
-    // POST offer to Rails signaling endpoint
-    console.log("POSTing offer to server...")
     const response = await fetch("/api/webrtc/sessions", {
       method: "POST",
       headers: {
@@ -176,15 +221,11 @@ export default class extends Controller {
       })
     })
 
-    console.log("Server response status:", response.status)
     if (!response.ok) {
-      const errorText = await response.text()
-      console.error("Server error response:", errorText)
       throw new Error(`Server error: ${response.status}`)
     }
 
     const data = await response.json()
-    console.log("Session created:", data)
     this.sessionId = data.session_id
     this.updateStatus("connecting", "Waiting for CLI to respond...")
   }
@@ -193,14 +234,11 @@ export default class extends Controller {
     this.pollTimer = setInterval(async () => {
       try {
         const response = await fetch(`/api/webrtc/sessions/${this.sessionId}`, {
-          headers: {
-            "X-CSRF-Token": this.csrfTokenValue
-          }
+          headers: { "X-CSRF-Token": this.csrfTokenValue }
         })
 
         if (!response.ok) {
           if (response.status === 410) {
-            // Session expired
             this.updateStatus("error", "Session expired - CLI did not respond")
             this.cleanup()
           }
@@ -226,7 +264,6 @@ export default class extends Controller {
       }
     }, this.pollIntervalValue)
 
-    // Stop polling after 30 seconds if no answer
     setTimeout(() => {
       if (this.pollTimer) {
         this.updateStatus("error", "Timeout - CLI did not respond. Is botster-hub running?")
@@ -238,22 +275,179 @@ export default class extends Controller {
   handleMessage(message) {
     switch (message.type) {
       case "screen":
-        // Full TUI screen update - decode base64 and write to terminal
-        if (this.terminal) {
-          // Properly decode base64 → binary → UTF-8
-          // atob() returns a binary string, we need to convert to proper UTF-8
+        // Full TUI screen update (TUI mode)
+        if (this.modeValue === "tui" && this.terminal) {
           const binaryString = atob(message.data)
           const bytes = Uint8Array.from(binaryString, c => c.charCodeAt(0))
           const data = new TextDecoder().decode(bytes)
           this.terminal.write(data)
         }
         break
+
+      case "agents":
+        // Agent list update (GUI mode)
+        console.log("Received agent list:", message.agents)
+        this.agents = message.agents
+        this.renderAgentList()
+        break
+
+      case "agent_output":
+        // Individual agent terminal output (GUI mode)
+        if (this.modeValue === "gui" && this.terminal && message.id === this.selectedAgentId) {
+          const binaryString = atob(message.data)
+          const bytes = Uint8Array.from(binaryString, c => c.charCodeAt(0))
+          const data = new TextDecoder().decode(bytes)
+          this.terminal.write(data)
+        }
+        break
+
+      case "agent_selected":
+        console.log("Agent selected:", message.id)
+        this.selectedAgentId = message.id
+        this.renderAgentList()
+        break
+
+      case "agent_created":
+        console.log("Agent created:", message.id)
+        this.requestAgentList()
+        break
+
+      case "agent_deleted":
+        console.log("Agent deleted:", message.id)
+        if (this.selectedAgentId === message.id) {
+          this.selectedAgentId = null
+          if (this.terminal) {
+            this.terminal.clear()
+          }
+        }
+        this.requestAgentList()
+        break
+
       case "error":
         console.error("CLI error:", message.message)
+        this.showError(message.message)
         break
+
       default:
         console.log("Unknown message type:", message.type, message)
     }
+  }
+
+  // Render the agent list in GUI mode
+  renderAgentList() {
+    if (!this.hasAgentListTarget) return
+
+    if (this.agents.length === 0) {
+      this.agentListTarget.innerHTML = `
+        <div class="text-gray-500 text-center py-8">
+          <p>No agents running</p>
+          <p class="text-sm mt-2">Use the TUI to create agents</p>
+        </div>
+      `
+      return
+    }
+
+    const html = this.agents.map(agent => {
+      const isSelected = agent.id === this.selectedAgentId
+      const issueLabel = agent.issue_number ? `#${agent.issue_number}` : agent.branch_name
+      const statusColor = agent.status === "Running" ? "text-green-600" : "text-gray-500"
+
+      return `
+        <button
+          type="button"
+          data-action="click->webrtc#selectAgent"
+          data-agent-id="${agent.id}"
+          class="w-full text-left px-4 py-3 border-b border-gray-200 hover:bg-gray-50 transition-colors ${isSelected ? 'bg-blue-50 border-l-4 border-l-blue-500' : ''}"
+        >
+          <div class="flex items-center justify-between">
+            <div>
+              <span class="font-medium text-gray-900">${agent.repo}</span>
+              <span class="text-gray-600 ml-2">${issueLabel}</span>
+            </div>
+            <span class="${statusColor} text-sm">${agent.status}</span>
+          </div>
+        </button>
+      `
+    }).join("")
+
+    this.agentListTarget.innerHTML = html
+  }
+
+  // Select an agent to view its terminal
+  selectAgent(event) {
+    const agentId = event.currentTarget.dataset.agentId
+    console.log("Selecting agent:", agentId)
+
+    if (this.terminal) {
+      this.terminal.clear()
+    }
+
+    this.sendMessage({ type: "select_agent", id: agentId })
+  }
+
+  // Request the agent list from CLI
+  requestAgentList() {
+    this.sendMessage({ type: "list_agents" })
+  }
+
+  // Create a new agent
+  createAgent(repo, issueNumber) {
+    this.sendMessage({
+      type: "create_agent",
+      repo: repo,
+      issue_number: issueNumber
+    })
+  }
+
+  // Delete an agent
+  deleteAgent(agentId, deleteWorktree = false) {
+    this.sendMessage({
+      type: "delete_agent",
+      id: agentId,
+      delete_worktree: deleteWorktree
+    })
+  }
+
+  // Send raw input to selected agent
+  sendInput(data) {
+    this.sendMessage({
+      type: "send_input",
+      data: data
+    })
+  }
+
+  showError(message) {
+    // Could show a toast notification here
+    console.error("Error from CLI:", message)
+  }
+
+  // Touch-friendly control methods for mobile devices
+  sendCtrlC() {
+    this.sendMessage({ type: "key_press", key: "c", ctrl: true, alt: false, shift: false })
+  }
+
+  sendEnter() {
+    this.sendMessage({ type: "key_press", key: "Enter", ctrl: false, alt: false, shift: false })
+  }
+
+  sendEscape() {
+    this.sendMessage({ type: "key_press", key: "Escape", ctrl: false, alt: false, shift: false })
+  }
+
+  sendArrowUp() {
+    this.sendMessage({ type: "key_press", key: "ArrowUp", ctrl: false, alt: false, shift: false })
+  }
+
+  sendArrowDown() {
+    this.sendMessage({ type: "key_press", key: "ArrowDown", ctrl: false, alt: false, shift: false })
+  }
+
+  sendArrowLeft() {
+    this.sendMessage({ type: "key_press", key: "ArrowLeft", ctrl: false, alt: false, shift: false })
+  }
+
+  sendArrowRight() {
+    this.sendMessage({ type: "key_press", key: "ArrowRight", ctrl: false, alt: false, shift: false })
   }
 
   initializeTerminal() {
@@ -264,13 +458,13 @@ export default class extends Controller {
     }
 
     if (this.terminal) {
-      return // Already initialized
+      return
     }
 
-    console.log("Initializing terminal for full TUI streaming")
+    console.log("Initializing terminal")
     this.terminal = new Terminal({
       cursorBlink: true,
-      disableStdin: false, // Enable keyboard input
+      disableStdin: false,
       fontSize: 14,
       fontFamily: "Menlo, Monaco, 'Courier New', monospace",
       theme: {
@@ -283,7 +477,6 @@ export default class extends Controller {
     this.terminal.loadAddon(this.fitAddon)
     this.terminal.open(this.terminalTarget)
 
-    // Let xterm fit to container, then tell CLI to render at that size
     requestAnimationFrame(() => {
       this.fitAddon.fit()
       console.log(`Terminal fitted to: ${this.terminal.cols}x${this.terminal.rows}`)
@@ -295,7 +488,7 @@ export default class extends Controller {
       this.sendKeyPress(domEvent)
     })
 
-    // Also capture special keys that onKey might miss
+    // Capture special keys
     this.terminalTarget.addEventListener("keydown", (e) => {
       if (this.shouldCaptureKey(e)) {
         e.preventDefault()
@@ -303,35 +496,29 @@ export default class extends Controller {
       }
     })
 
-    // Resize on window resize - re-fit and notify CLI
+    // Resize on window resize
     this.resizeHandler = () => {
       if (this.fitAddon && this.terminal) {
         this.fitAddon.fit()
-        console.log(`Window resized, terminal now: ${this.terminal.cols}x${this.terminal.rows}`)
         this.sendResize()
       }
     }
     window.addEventListener("resize", this.resizeHandler)
 
-    // Focus terminal for keyboard input
     this.terminal.focus()
   }
 
   sendResize() {
     if (!this.terminal || !this.dataChannel || this.dataChannel.readyState !== "open") return
 
-    const message = {
+    this.sendMessage({
       type: "resize",
       rows: this.terminal.rows,
       cols: this.terminal.cols
-    }
-
-    console.log(`Sending resize: ${message.cols}x${message.rows}`)
-    this.dataChannel.send(JSON.stringify(message))
+    })
   }
 
   shouldCaptureKey(e) {
-    // Capture control key combinations and special keys
     if (e.ctrlKey || e.altKey || e.metaKey) return true
     if (["Escape", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
          "Home", "End", "PageUp", "PageDown", "Insert", "Delete",
@@ -341,18 +528,15 @@ export default class extends Controller {
   }
 
   sendKeyPress(domEvent) {
-    // Don't send if no connection
     if (!this.dataChannel || this.dataChannel.readyState !== "open") return
 
-    const message = {
+    this.sendMessage({
       type: "key_press",
       key: domEvent.key,
       ctrl: domEvent.ctrlKey,
       alt: domEvent.altKey,
       shift: domEvent.shiftKey
-    }
-
-    this.dataChannel.send(JSON.stringify(message))
+    })
   }
 
   sendMessage(message) {
@@ -410,10 +594,16 @@ export default class extends Controller {
     }
 
     this.sessionId = null
+    this.agents = []
+    this.selectedAgentId = null
 
     if (this.hasConnectButtonTarget) {
       this.connectButtonTarget.disabled = false
       this.connectButtonTarget.textContent = "Connect to Hub"
+    }
+
+    if (this.hasAgentListTarget) {
+      this.agentListTarget.innerHTML = ""
     }
 
     this.updateStatus("disconnected", "Not connected")
