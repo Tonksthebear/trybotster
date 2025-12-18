@@ -84,7 +84,15 @@
 }
           </pre>
 
-          <div class="mt-6">
+          <div class="mt-6 flex space-x-4">
+            <%= link_to agents_path,
+                        class: "inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-green-600 hover:bg-green-700" do %>
+              <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+              </svg>
+              View Running Agents
+            <% end %>
+
             <%= link_to "Logout", destroy_user_session_path,
                         method: :delete,
                         data: { turbo_method: :delete, turbo_confirm: "Are you sure?" },
