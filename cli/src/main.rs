@@ -1,5 +1,8 @@
 use anyhow::Result;
-use botster_hub::{Agent, AgentInfo, BrowserDimensions, Config, KeyInput, PromptManager, WebRTCHandler, WorktreeManager};
+use botster_hub::{
+    Agent, BrowserCommand, BrowserDimensions, Config, KeyInput, PromptManager, WebAgentInfo,
+    WebRTCHandler, WorktreeManager,
+};
 use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -1496,6 +1499,59 @@ impl BotsterApp {
         Ok(())
     }
 
+    /// Build the agent list for sending to WebRTC browsers
+    fn build_web_agent_list(&self) -> Vec<WebAgentInfo> {
+        self.agent_keys_ordered
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, key)| {
+                self.agents.get(key).map(|agent| WebAgentInfo {
+                    id: key.clone(),
+                    repo: agent.repo.clone(),
+                    issue_number: agent.issue_number,
+                    branch_name: agent.branch_name.clone(),
+                    status: format!("{:?}", agent.status),
+                    selected: idx == self.selected,
+                })
+            })
+            .collect()
+    }
+
+    /// Close an agent by session key, optionally deleting the worktree
+    fn close_agent(&mut self, session_key: &str, delete_worktree: bool) -> Result<()> {
+        if let Some(agent) = self.agents.remove(session_key) {
+            // Remove from ordered list
+            if let Some(pos) = self.agent_keys_ordered.iter().position(|k| k == session_key) {
+                self.agent_keys_ordered.remove(pos);
+
+                // Adjust selection if needed
+                if self.selected >= self.agent_keys_ordered.len() && self.selected > 0 {
+                    self.selected = self.agent_keys_ordered.len() - 1;
+                }
+            }
+
+            let label = if let Some(num) = agent.issue_number {
+                format!("issue #{}", num)
+            } else {
+                format!("branch {}", agent.branch_name)
+            };
+
+            if delete_worktree {
+                if let Err(e) = self
+                    .git_manager
+                    .delete_worktree_by_path(&agent.worktree_path, &agent.branch_name)
+                {
+                    log::error!("Failed to delete worktree for {}: {}", label, e);
+                } else {
+                    log::info!("Closed agent and deleted worktree for {}", label);
+                }
+            } else {
+                log::info!("Closed agent for {} (worktree preserved)", label);
+            }
+        }
+        Ok(())
+    }
+
     fn handle_cleanup_message(&mut self, payload: &serde_json::Value) -> Result<()> {
         let repo = payload["repo"]
             .as_str()
@@ -1697,7 +1753,7 @@ fn run_interactive() -> Result<()> {
         // Render current state and get ANSI output for WebRTC streaming
         let (ansi_output, rows, cols) = app.view(&mut terminal, browser_dims)?;
 
-        // Stream TUI screen to WebRTC connected browsers
+        // Stream TUI screen to WebRTC connected browsers (full TUI mode)
         {
             let webrtc_handler = Arc::clone(&app.webrtc_handler);
             let ansi_for_send = ansi_output.clone();
@@ -1709,6 +1765,26 @@ fn run_interactive() -> Result<()> {
                     }
                 }
             });
+        }
+
+        // Stream selected agent's individual terminal output (for web GUI mode)
+        {
+            if let Some(key) = app.agent_keys_ordered.get(app.selected) {
+                if let Some(agent) = app.agents.get(key) {
+                    let agent_output = agent.get_screen_as_ansi();
+                    let agent_id = key.clone();
+                    let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                    app.tokio_runtime.block_on(async move {
+                        let handler = webrtc_handler.lock().unwrap();
+                        if handler.is_ready().await {
+                            if let Err(e) = handler.send_agent_output(&agent_id, &agent_output).await
+                            {
+                                log::warn!("Failed to send agent output to WebRTC: {}", e);
+                            }
+                        }
+                    });
+                }
+            }
         }
 
         // Process keyboard input from WebRTC browser connections
@@ -1725,6 +1801,122 @@ fn run_interactive() -> Result<()> {
                 if let Some(key) = key_event {
                     if let Err(e) = app.handle_key_event(key) {
                         log::warn!("Error handling WebRTC key input: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Process commands from WebRTC browser connections
+        {
+            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+            let commands = app.tokio_runtime.block_on(async move {
+                let handler = webrtc_handler.lock().unwrap();
+                handler.get_pending_commands().await
+            });
+
+            for command in commands {
+                match command {
+                    BrowserCommand::ListAgents => {
+                        let agents = app.build_web_agent_list();
+                        let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                        app.tokio_runtime.block_on(async move {
+                            let handler = webrtc_handler.lock().unwrap();
+                            if let Err(e) = handler.send_agents(agents).await {
+                                log::warn!("Failed to send agent list: {}", e);
+                            }
+                        });
+                    }
+                    BrowserCommand::SelectAgent { id } => {
+                        // Find the agent index by session key
+                        if let Some(idx) = app.agent_keys_ordered.iter().position(|k| k == &id) {
+                            app.selected = idx;
+                            log::info!("WebRTC: Selected agent {}", id);
+                            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                            let id_clone = id.clone();
+                            app.tokio_runtime.block_on(async move {
+                                let handler = webrtc_handler.lock().unwrap();
+                                if let Err(e) = handler.send_agent_selected(&id_clone).await {
+                                    log::warn!("Failed to send agent selected: {}", e);
+                                }
+                            });
+                        } else {
+                            log::warn!("WebRTC: Agent not found: {}", id);
+                            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                            let error_msg = format!("Agent not found: {}", id);
+                            app.tokio_runtime.block_on(async move {
+                                let handler = webrtc_handler.lock().unwrap();
+                                let _ = handler.send_error(&error_msg).await;
+                            });
+                        }
+                    }
+                    BrowserCommand::CreateAgent { repo, issue_number } => {
+                        log::info!("WebRTC: Creating agent for {}#{}", repo, issue_number);
+                        // Create a synthetic payload for spawn_agent_for_message
+                        let payload = serde_json::json!({
+                            "issue_number": issue_number,
+                            "prompt": format!("Work on issue #{}", issue_number)
+                        });
+                        match app.spawn_agent_for_message(0, &payload, "web_create") {
+                            Ok(()) => {
+                                // Find the newly created agent's session key
+                                let repo_safe = repo.replace('/', "-");
+                                let session_key = format!("{}-{}", repo_safe, issue_number);
+                                let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                app.tokio_runtime.block_on(async move {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    if let Err(e) = handler.send_agent_created(&session_key).await {
+                                        log::warn!("Failed to send agent created: {}", e);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                log::error!("WebRTC: Failed to create agent: {}", e);
+                                let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                let error_msg = format!("Failed to create agent: {}", e);
+                                app.tokio_runtime.block_on(async move {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    let _ = handler.send_error(&error_msg).await;
+                                });
+                            }
+                        }
+                    }
+                    BrowserCommand::DeleteAgent { id, delete_worktree } => {
+                        log::info!(
+                            "WebRTC: Deleting agent {} (delete_worktree={})",
+                            id,
+                            delete_worktree
+                        );
+                        match app.close_agent(&id, delete_worktree) {
+                            Ok(()) => {
+                                let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                let id_clone = id.clone();
+                                app.tokio_runtime.block_on(async move {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    if let Err(e) = handler.send_agent_deleted(&id_clone).await {
+                                        log::warn!("Failed to send agent deleted: {}", e);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                log::error!("WebRTC: Failed to delete agent: {}", e);
+                                let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                let error_msg = format!("Failed to delete agent: {}", e);
+                                app.tokio_runtime.block_on(async move {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    let _ = handler.send_error(&error_msg).await;
+                                });
+                            }
+                        }
+                    }
+                    BrowserCommand::SendInput { data } => {
+                        // Send raw input to selected agent
+                        if let Some(key) = app.agent_keys_ordered.get(app.selected) {
+                            if let Some(agent) = app.agents.get_mut(key) {
+                                if let Err(e) = agent.write_input_str(&data) {
+                                    log::warn!("Failed to send input to agent: {}", e);
+                                }
+                            }
+                        }
                     }
                 }
             }
