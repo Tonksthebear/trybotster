@@ -1,0 +1,13 @@
+{
+  "id": 123456,
+  "name": "repo",
+  "full_name": "owner/repo",
+  "description": "A test repository",
+  "html_url": "https://github.com/owner/repo",
+  "language": "Ruby",
+  "stargazers_count": 42,
+  "forks_count": 10,
+  "updated_at": "2025-01-15T12:00:00Z",
+  "private": false,
+  "topics": ["rails", "ruby"]
+}

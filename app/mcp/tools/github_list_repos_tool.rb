@@ -4,7 +4,7 @@ class GithubListReposTool < ApplicationMCPTool
   tool_name "github_list_repos"
   description "List GitHub repositories for the authenticated user. Returns repository name, description, URL, language, stars, and last update."
 
-  property :per_page, type: "number", description: "Number of repositories per page (default: 30, max: 100)", required: false
+  property :per_page, type: "integer", description: "Number of repositories per page (default: 30, max: 100)", required: false
   property :sort, type: "string", description: "Sort by: created, updated, pushed, full_name (default: updated)", required: false
   property :direction, type: "string", description: "Sort direction: asc or desc (default: desc)", required: false
 
@@ -47,13 +47,15 @@ class GithubListReposTool < ApplicationMCPTool
       render(text: "Found #{repos.count} repositories:\n")
 
       repos.each do |repo|
+        updated_at = repo['updated_at'].is_a?(String) ? Time.parse(repo['updated_at']) : repo['updated_at']
+
         repo_info = [
           "📦 #{repo['full_name']}",
           "   Description: #{repo['description'] || 'No description'}",
           "   URL: #{repo['html_url']}",
           "   Language: #{repo['language'] || 'None'}",
           "   ⭐ Stars: #{repo['stargazers_count']}",
-          "   🔄 Updated: #{Time.parse(repo['updated_at']).strftime('%Y-%m-%d %H:%M')}"
+          "   🔄 Updated: #{updated_at.strftime('%Y-%m-%d %H:%M')}"
         ]
 
         render(text: repo_info.join("\n"))
