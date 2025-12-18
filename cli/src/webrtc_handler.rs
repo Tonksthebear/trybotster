@@ -1,13 +1,11 @@
 //! WebRTC P2P handler for browser connections
 //!
-//! Allows users to view their running agents directly in the browser
-//! via peer-to-peer WebRTC data channels. The Rails server only handles
-//! signaling - actual data never passes through the server.
+//! Streams the entire TUI interface to the browser and receives keyboard input.
+//! The browser sees exactly what the local terminal sees.
 
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -22,7 +20,7 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
-/// Information about a running agent
+/// Information about a running agent (kept for compatibility)
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentInfo {
     pub id: String,
@@ -35,46 +33,63 @@ pub struct AgentInfo {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrowserMessage {
-    GetAgents,
-    Subscribe { agent_id: String },
-    Unsubscribe { agent_id: String },
-    // Phase 2: Interactive mode
-    // Input { agent_id: String, data: String },
+    /// Keyboard input from browser
+    KeyPress {
+        key: String,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+    },
+    /// Browser terminal resize
+    Resize { rows: u16, cols: u16 },
 }
 
 /// Messages from CLI to browser
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CLIMessage {
-    Agents { agents: Vec<AgentInfo> },
-    Output { agent_id: String, data: String },
-    Status { agent_id: String, status: String },
+    /// Full TUI screen content (base64 encoded)
+    Screen { data: String, rows: u16, cols: u16 },
+    /// Error message
     Error { message: String },
+}
+
+/// Pending keyboard input from browser
+#[derive(Debug, Clone)]
+pub struct KeyInput {
+    pub key: String,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+/// Browser's terminal dimensions
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserDimensions {
+    pub rows: u16,
+    pub cols: u16,
 }
 
 /// Handles WebRTC peer connections with browsers
 pub struct WebRTCHandler {
-    /// Active peer connection (only one browser connection at a time for now)
+    /// Active peer connection
     peer_connection: Option<Arc<RTCPeerConnection>>,
-    /// Active data channel
-    data_channel: Option<Arc<RTCDataChannel>>,
-    /// Agent IDs the browser is subscribed to for output streaming
-    subscriptions: Arc<Mutex<HashSet<String>>>,
-    /// Callback to get current agent list
-    get_agents: Arc<dyn Fn() -> Vec<AgentInfo> + Send + Sync>,
+    /// Active data channel for sending/receiving
+    data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    /// Queue of keyboard inputs received from browser
+    input_queue: Arc<Mutex<Vec<KeyInput>>>,
+    /// Browser's terminal dimensions (for rendering at correct size)
+    browser_dimensions: Arc<Mutex<Option<BrowserDimensions>>>,
 }
 
 impl WebRTCHandler {
     /// Create a new WebRTC handler
-    pub fn new<F>(get_agents: F) -> Self
-    where
-        F: Fn() -> Vec<AgentInfo> + Send + Sync + 'static,
-    {
+    pub fn new() -> Self {
         Self {
             peer_connection: None,
-            data_channel: None,
-            subscriptions: Arc::new(Mutex::new(HashSet::new())),
-            get_agents: Arc::new(get_agents),
+            data_channel: Arc::new(Mutex::new(None)),
+            input_queue: Arc::new(Mutex::new(Vec::new())),
+            browser_dimensions: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -96,15 +111,15 @@ impl WebRTCHandler {
             .with_interceptor_registry(registry)
             .build();
 
-        // ICE configuration with public STUN servers
+        // ICE servers for NAT traversal
         let config = RTCConfiguration {
             ice_servers: vec![
                 RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
                     ..Default::default()
                 },
                 RTCIceServer {
-                    urls: vec!["stun:stun1.l.google.com:19302".to_owned()],
+                    urls: vec!["stun:stun1.l.google.com:19302".to_string()],
                     ..Default::default()
                 },
             ],
@@ -116,7 +131,7 @@ impl WebRTCHandler {
 
         // Set up connection state handler
         peer_connection.on_peer_connection_state_change(Box::new(move |state| {
-            log::info!("WebRTC connection state changed: {:?}", state);
+            log::info!("WebRTC connection state: {:?}", state);
             if state == RTCPeerConnectionState::Failed
                 || state == RTCPeerConnectionState::Disconnected
             {
@@ -126,87 +141,104 @@ impl WebRTCHandler {
         }));
 
         // Set up data channel handler
-        let subscriptions = Arc::clone(&self.subscriptions);
-        let get_agents = Arc::clone(&self.get_agents);
+        let data_channel_store = Arc::clone(&self.data_channel);
+        let input_queue = Arc::clone(&self.input_queue);
+        let browser_dimensions = Arc::clone(&self.browser_dimensions);
 
         peer_connection.on_data_channel(Box::new(move |dc| {
             let dc_label = dc.label().to_owned();
             log::info!("New data channel: {}", dc_label);
 
-            let subscriptions = Arc::clone(&subscriptions);
-            let get_agents = Arc::clone(&get_agents);
-            let dc_clone = Arc::clone(&dc);
+            let data_channel_store = Arc::clone(&data_channel_store);
+            let input_queue = Arc::clone(&input_queue);
+            let browser_dimensions = Arc::clone(&browser_dimensions);
+            let dc_for_store = Arc::clone(&dc);
 
-            // Handle incoming messages
+            // Handle incoming messages (keyboard input and resize)
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                let subscriptions = Arc::clone(&subscriptions);
-                let get_agents = Arc::clone(&get_agents);
-                let dc = Arc::clone(&dc_clone);
+                let input_queue = Arc::clone(&input_queue);
+                let browser_dimensions = Arc::clone(&browser_dimensions);
 
                 Box::pin(async move {
                     if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
-                        if let Err(e) =
-                            handle_browser_message(&text, &dc, &subscriptions, &get_agents).await
-                        {
-                            log::error!("Error handling browser message: {}", e);
+                        if let Ok(browser_msg) = serde_json::from_str::<BrowserMessage>(&text) {
+                            match browser_msg {
+                                BrowserMessage::KeyPress {
+                                    key,
+                                    ctrl,
+                                    alt,
+                                    shift,
+                                } => {
+                                    log::debug!(
+                                        "Received key: {} (ctrl={}, alt={}, shift={})",
+                                        key,
+                                        ctrl,
+                                        alt,
+                                        shift
+                                    );
+                                    input_queue.lock().await.push(KeyInput {
+                                        key,
+                                        ctrl,
+                                        alt,
+                                        shift,
+                                    });
+                                }
+                                BrowserMessage::Resize { rows, cols } => {
+                                    log::info!(
+                                        "Browser terminal resized to {}x{} (cols x rows)",
+                                        cols,
+                                        rows
+                                    );
+                                    *browser_dimensions.lock().await =
+                                        Some(BrowserDimensions { rows, cols });
+                                }
+                            }
                         }
                     }
                 })
             }));
 
+            // Store data channel when opened
             dc.on_open(Box::new(move || {
-                log::info!("Data channel '{}' opened", dc_label);
-                Box::pin(async {})
+                log::info!("Data channel '{}' opened - storing for screen streaming", dc_label);
+                let dc_for_store = Arc::clone(&dc_for_store);
+                let data_channel_store = Arc::clone(&data_channel_store);
+                Box::pin(async move {
+                    *data_channel_store.lock().await = Some(dc_for_store);
+                })
             }));
 
             Box::pin(async {})
         }));
 
-        // Parse and set remote description (the offer)
-        let offer = RTCSessionDescription::offer(offer_sdp.to_owned())?;
+        // Set remote description (the offer)
+        let offer = RTCSessionDescription::offer(offer_sdp.to_string())?;
         peer_connection.set_remote_description(offer).await?;
 
         // Create answer
         let answer = peer_connection.create_answer(None).await?;
 
         // Set local description
-        peer_connection
-            .set_local_description(answer.clone())
-            .await?;
+        peer_connection.set_local_description(answer).await?;
 
         // Wait for ICE gathering to complete
-        let (ice_done_tx, ice_done_rx) = tokio::sync::oneshot::channel::<()>();
-        let ice_done_tx = Arc::new(Mutex::new(Some(ice_done_tx)));
-
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
         peer_connection.on_ice_gathering_state_change(Box::new(move |state| {
             log::debug!("ICE gathering state: {:?}", state);
             if state == webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Complete {
-                let tx = Arc::clone(&ice_done_tx);
-                Box::pin(async move {
-                    if let Some(tx) = tx.lock().await.take() {
-                        let _ = tx.send(());
-                    }
-                })
-            } else {
-                Box::pin(async {})
+                let _ = tx.try_send(());
             }
+            Box::pin(async {})
         }));
 
-        // Wait for ICE gathering with timeout
-        tokio::select! {
-            _ = ice_done_rx => {
-                log::info!("ICE gathering complete");
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                log::warn!("ICE gathering timed out, proceeding with available candidates");
-            }
-        }
+        // Wait up to 5 seconds for ICE gathering
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
 
-        // Get the final local description with ICE candidates
+        // Get the local description with ICE candidates
         let local_desc = peer_connection
             .local_description()
             .await
-            .ok_or_else(|| anyhow::anyhow!("No local description available"))?;
+            .ok_or_else(|| anyhow::anyhow!("No local description after ICE gathering"))?;
 
         // Store peer connection
         self.peer_connection = Some(peer_connection);
@@ -215,18 +247,14 @@ impl WebRTCHandler {
         Ok(local_desc.sdp)
     }
 
-    /// Send terminal output to subscribed browsers
-    pub async fn send_output(&self, agent_id: &str, data: &[u8]) -> Result<()> {
-        let subscriptions = self.subscriptions.lock().await;
-        if !subscriptions.contains(agent_id) {
-            return Ok(()); // Not subscribed
-        }
-        drop(subscriptions);
-
-        if let Some(dc) = &self.data_channel {
-            let msg = CLIMessage::Output {
-                agent_id: agent_id.to_string(),
-                data: BASE64.encode(data),
+    /// Send the TUI screen content to connected browser
+    pub async fn send_screen(&self, screen_data: &str, rows: u16, cols: u16) -> Result<()> {
+        let dc = self.data_channel.lock().await;
+        if let Some(ref dc) = *dc {
+            let msg = CLIMessage::Screen {
+                data: BASE64.encode(screen_data.as_bytes()),
+                rows,
+                cols,
             };
             let json = serde_json::to_string(&msg)?;
             dc.send_text(json).await?;
@@ -234,17 +262,15 @@ impl WebRTCHandler {
         Ok(())
     }
 
-    /// Send agent status update to browser
-    pub async fn send_status(&self, agent_id: &str, status: &str) -> Result<()> {
-        if let Some(dc) = &self.data_channel {
-            let msg = CLIMessage::Status {
-                agent_id: agent_id.to_string(),
-                status: status.to_string(),
-            };
-            let json = serde_json::to_string(&msg)?;
-            dc.send_text(json).await?;
-        }
-        Ok(())
+    /// Get pending keyboard inputs from browser
+    pub async fn get_pending_inputs(&self) -> Vec<KeyInput> {
+        let mut queue = self.input_queue.lock().await;
+        std::mem::take(&mut *queue)
+    }
+
+    /// Get the browser's terminal dimensions (if set)
+    pub async fn get_browser_dimensions(&self) -> Option<BrowserDimensions> {
+        *self.browser_dimensions.lock().await
     }
 
     /// Check if there's an active P2P connection
@@ -252,47 +278,25 @@ impl WebRTCHandler {
         self.peer_connection.is_some()
     }
 
+    /// Check if data channel is ready for sending
+    pub async fn is_ready(&self) -> bool {
+        self.data_channel.lock().await.is_some()
+    }
+
     /// Close the peer connection
     pub async fn close(&mut self) -> Result<()> {
+        *self.data_channel.lock().await = None;
         if let Some(pc) = self.peer_connection.take() {
             pc.close().await?;
         }
-        self.data_channel = None;
-        self.subscriptions.lock().await.clear();
         Ok(())
     }
 }
 
-/// Handle a message from the browser
-async fn handle_browser_message(
-    msg: &str,
-    dc: &Arc<RTCDataChannel>,
-    subscriptions: &Arc<Mutex<HashSet<String>>>,
-    get_agents: &Arc<dyn Fn() -> Vec<AgentInfo> + Send + Sync>,
-) -> Result<()> {
-    let message: BrowserMessage = serde_json::from_str(msg)?;
-
-    match message {
-        BrowserMessage::GetAgents => {
-            let agents = get_agents();
-            let response = CLIMessage::Agents { agents };
-            let json = serde_json::to_string(&response)?;
-            dc.send_text(json).await?;
-        }
-        BrowserMessage::Subscribe { agent_id } => {
-            log::info!("Browser subscribed to agent: {}", agent_id);
-            subscriptions.lock().await.insert(agent_id);
-        }
-        BrowserMessage::Unsubscribe { agent_id } => {
-            log::info!("Browser unsubscribed from agent: {}", agent_id);
-            subscriptions.lock().await.remove(&agent_id);
-        } // Phase 2: Handle input
-          // BrowserMessage::Input { agent_id, data } => {
-          //     // Send to agent's PTY
-          // }
+impl Default for WebRTCHandler {
+    fn default() -> Self {
+        Self::new()
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -301,37 +305,31 @@ mod tests {
 
     #[test]
     fn test_browser_message_parsing() {
-        let msg = r#"{"type": "get_agents"}"#;
+        let msg = r#"{"type": "key_press", "key": "j", "ctrl": false, "alt": false, "shift": false}"#;
         let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
-        assert!(matches!(parsed, BrowserMessage::GetAgents));
+        assert!(matches!(
+            parsed,
+            BrowserMessage::KeyPress { key, ctrl: false, alt: false, shift: false } if key == "j"
+        ));
 
-        let msg = r#"{"type": "subscribe", "agent_id": "test-123"}"#;
+        let msg = r#"{"type": "key_press", "key": "q", "ctrl": true, "alt": false, "shift": false}"#;
         let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
-        assert!(matches!(parsed, BrowserMessage::Subscribe { agent_id } if agent_id == "test-123"));
+        assert!(matches!(
+            parsed,
+            BrowserMessage::KeyPress { key, ctrl: true, .. } if key == "q"
+        ));
     }
 
     #[test]
     fn test_cli_message_serialization() {
-        let msg = CLIMessage::Agents {
-            agents: vec![AgentInfo {
-                id: "test-123".to_string(),
-                repo: "owner/repo".to_string(),
-                issue: 42,
-                status: "running".to_string(),
-            }],
+        let msg = CLIMessage::Screen {
+            data: "dGVzdA==".to_string(), // "test" base64 encoded
+            rows: 24,
+            cols: 80,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"agents\""));
-        assert!(json.contains("\"id\":\"test-123\""));
-    }
-
-    #[test]
-    fn test_output_base64_encoding() {
-        let msg = CLIMessage::Output {
-            agent_id: "test".to_string(),
-            data: BASE64.encode(b"hello\x1b[32mworld\x1b[0m"),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"output\""));
+        assert!(json.contains("\"type\":\"screen\""));
+        assert!(json.contains("\"rows\":24"));
+        assert!(json.contains("\"cols\":80"));
     }
 }

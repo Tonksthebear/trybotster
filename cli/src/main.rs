@@ -1,5 +1,5 @@
 use anyhow::Result;
-use botster_hub::{Agent, AgentInfo, Config, PromptManager, WebRTCHandler, WorktreeManager};
+use botster_hub::{Agent, AgentInfo, BrowserDimensions, Config, KeyInput, PromptManager, WebRTCHandler, WorktreeManager};
 use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -7,11 +7,12 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    backend::{CrosstermBackend, TestBackend},
+    buffer::Buffer,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState},
-    Terminal,
+    Frame, Terminal,
 };
 use reqwest::blocking::Client;
 use std::collections::HashMap;
@@ -58,6 +59,208 @@ fn centered_rect(
         .split(popup_layout[1])[1]
 }
 
+/// Convert a ratatui Buffer to ANSI escape sequences for streaming to xterm.js
+/// If browser_dims is provided, output is clipped to those dimensions
+fn buffer_to_ansi(
+    buffer: &Buffer,
+    width: u16,
+    height: u16,
+    browser_dims: Option<BrowserDimensions>,
+) -> String {
+    use std::fmt::Write;
+
+    // Use browser dimensions if provided, otherwise use buffer dimensions
+    let (out_width, out_height) = if let Some(dims) = browser_dims {
+        (dims.cols.min(width), dims.rows.min(height))
+    } else {
+        (width, height)
+    };
+
+    let mut output = String::new();
+
+    // Reset and clear screen, move cursor to home
+    output.push_str("\x1b[0m\x1b[H\x1b[2J");
+
+    let mut last_fg = Color::Reset;
+    let mut last_bg = Color::Reset;
+    let mut last_modifiers = Modifier::empty();
+
+    for y in 0..out_height {
+        // Move cursor to start of line
+        write!(output, "\x1b[{};1H", y + 1).unwrap();
+
+        for x in 0..out_width {
+            let cell = buffer.cell((x, y));
+            if cell.is_none() {
+                output.push(' ');
+                continue;
+            }
+            let cell = cell.unwrap();
+
+            // Check if style changed
+            let fg = cell.fg;
+            let bg = cell.bg;
+            let modifiers = cell.modifier;
+
+            if fg != last_fg || bg != last_bg || modifiers != last_modifiers {
+                // Build SGR sequence
+                output.push_str("\x1b[0m"); // Reset first
+
+                // Apply modifiers
+                if modifiers.contains(Modifier::BOLD) {
+                    output.push_str("\x1b[1m");
+                }
+                if modifiers.contains(Modifier::DIM) {
+                    output.push_str("\x1b[2m");
+                }
+                if modifiers.contains(Modifier::ITALIC) {
+                    output.push_str("\x1b[3m");
+                }
+                if modifiers.contains(Modifier::UNDERLINED) {
+                    output.push_str("\x1b[4m");
+                }
+                if modifiers.contains(Modifier::REVERSED) {
+                    output.push_str("\x1b[7m");
+                }
+
+                // Apply foreground color
+                match fg {
+                    Color::Reset => {}
+                    Color::Black => output.push_str("\x1b[30m"),
+                    Color::Red => output.push_str("\x1b[31m"),
+                    Color::Green => output.push_str("\x1b[32m"),
+                    Color::Yellow => output.push_str("\x1b[33m"),
+                    Color::Blue => output.push_str("\x1b[34m"),
+                    Color::Magenta => output.push_str("\x1b[35m"),
+                    Color::Cyan => output.push_str("\x1b[36m"),
+                    Color::Gray => output.push_str("\x1b[90m"),
+                    Color::DarkGray => output.push_str("\x1b[90m"),
+                    Color::LightRed => output.push_str("\x1b[91m"),
+                    Color::LightGreen => output.push_str("\x1b[92m"),
+                    Color::LightYellow => output.push_str("\x1b[93m"),
+                    Color::LightBlue => output.push_str("\x1b[94m"),
+                    Color::LightMagenta => output.push_str("\x1b[95m"),
+                    Color::LightCyan => output.push_str("\x1b[96m"),
+                    Color::White => output.push_str("\x1b[37m"),
+                    Color::Rgb(r, g, b) => {
+                        write!(output, "\x1b[38;2;{};{};{}m", r, g, b).unwrap();
+                    }
+                    Color::Indexed(i) => {
+                        write!(output, "\x1b[38;5;{}m", i).unwrap();
+                    }
+                }
+
+                // Apply background color
+                match bg {
+                    Color::Reset => {}
+                    Color::Black => output.push_str("\x1b[40m"),
+                    Color::Red => output.push_str("\x1b[41m"),
+                    Color::Green => output.push_str("\x1b[42m"),
+                    Color::Yellow => output.push_str("\x1b[43m"),
+                    Color::Blue => output.push_str("\x1b[44m"),
+                    Color::Magenta => output.push_str("\x1b[45m"),
+                    Color::Cyan => output.push_str("\x1b[46m"),
+                    Color::Gray => output.push_str("\x1b[100m"),
+                    Color::DarkGray => output.push_str("\x1b[100m"),
+                    Color::LightRed => output.push_str("\x1b[101m"),
+                    Color::LightGreen => output.push_str("\x1b[102m"),
+                    Color::LightYellow => output.push_str("\x1b[103m"),
+                    Color::LightBlue => output.push_str("\x1b[104m"),
+                    Color::LightMagenta => output.push_str("\x1b[105m"),
+                    Color::LightCyan => output.push_str("\x1b[106m"),
+                    Color::White => output.push_str("\x1b[47m"),
+                    Color::Rgb(r, g, b) => {
+                        write!(output, "\x1b[48;2;{};{};{}m", r, g, b).unwrap();
+                    }
+                    Color::Indexed(i) => {
+                        write!(output, "\x1b[48;5;{}m", i).unwrap();
+                    }
+                }
+
+                last_fg = fg;
+                last_bg = bg;
+                last_modifiers = modifiers;
+            }
+
+            // Write the character
+            output.push_str(cell.symbol());
+        }
+    }
+
+    // Reset at end
+    output.push_str("\x1b[0m");
+
+    output
+}
+
+/// Convert browser keyboard input to crossterm KeyEvent
+fn convert_browser_key_to_crossterm(input: &KeyInput) -> Option<crossterm::event::KeyEvent> {
+    use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
+
+    let mut modifiers = KeyModifiers::empty();
+    if input.ctrl {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    if input.alt {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if input.shift {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+
+    // Map browser key names to crossterm KeyCode
+    let key_code = match input.key.as_str() {
+        // Single character keys
+        k if k.len() == 1 => {
+            let c = k.chars().next().unwrap();
+            KeyCode::Char(c)
+        }
+        // Special keys
+        "Enter" => KeyCode::Enter,
+        "Escape" => KeyCode::Esc,
+        "Backspace" => KeyCode::Backspace,
+        "Tab" => KeyCode::Tab,
+        "ArrowUp" => KeyCode::Up,
+        "ArrowDown" => KeyCode::Down,
+        "ArrowLeft" => KeyCode::Left,
+        "ArrowRight" => KeyCode::Right,
+        "Home" => KeyCode::Home,
+        "End" => KeyCode::End,
+        "PageUp" => KeyCode::PageUp,
+        "PageDown" => KeyCode::PageDown,
+        "Delete" => KeyCode::Delete,
+        "Insert" => KeyCode::Insert,
+        // Function keys
+        "F1" => KeyCode::F(1),
+        "F2" => KeyCode::F(2),
+        "F3" => KeyCode::F(3),
+        "F4" => KeyCode::F(4),
+        "F5" => KeyCode::F(5),
+        "F6" => KeyCode::F(6),
+        "F7" => KeyCode::F(7),
+        "F8" => KeyCode::F(8),
+        "F9" => KeyCode::F(9),
+        "F10" => KeyCode::F(10),
+        "F11" => KeyCode::F(11),
+        "F12" => KeyCode::F(12),
+        // Space
+        " " => KeyCode::Char(' '),
+        // Unknown keys - ignore
+        _ => {
+            log::debug!("Unknown browser key: {}", input.key);
+            return None;
+        }
+    };
+
+    Some(KeyEvent {
+        code: key_code,
+        modifiers,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::empty(),
+    })
+}
+
+#[derive(Clone)]
 enum AppMode {
     Normal,
     Menu,
@@ -98,9 +301,8 @@ impl BotsterApp {
         // Create tokio runtime for async WebRTC operations
         let tokio_runtime = tokio::runtime::Runtime::new()?;
 
-        // Create WebRTC handler with a placeholder get_agents callback
-        // This will be replaced with a proper callback that accesses self.agents
-        let webrtc_handler = Arc::new(StdMutex::new(WebRTCHandler::new(|| Vec::new())));
+        // Create WebRTC handler for full TUI streaming
+        let webrtc_handler = Arc::new(StdMutex::new(WebRTCHandler::new()));
 
         let app = Self {
             agents: HashMap::new(),
@@ -697,20 +899,29 @@ impl BotsterApp {
         })
     }
 
-    fn view(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
-        let agent_keys_ordered = &self.agent_keys_ordered;
+    /// Render the TUI and return ANSI output for WebRTC streaming
+    /// Returns (ansi_string, rows, cols) for sending to connected browsers
+    /// If browser_dims is provided, renders at those dimensions for proper layout
+    fn view(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        browser_dims: Option<BrowserDimensions>,
+    ) -> Result<(String, u16, u16)> {
+        // Collect all state needed for rendering
+        let agent_keys_ordered = self.agent_keys_ordered.clone();
         let agents = &self.agents;
         let selected = self.selected;
         let seconds_since_poll = self.last_poll.elapsed().as_secs();
         let poll_interval = self.config.poll_interval;
-        let mode = &self.mode;
+        let mode = self.mode.clone();
         let polling_enabled = self.polling_enabled;
         let menu_selected = self.menu_selected;
-        let available_worktrees = &self.available_worktrees;
+        let available_worktrees = self.available_worktrees.clone();
         let worktree_selected = self.worktree_selected;
-        let input_buffer = &self.input_buffer;
+        let input_buffer = self.input_buffer.clone();
 
-        terminal.draw(|f| {
+        // Helper to render UI to a frame
+        let render_ui = |f: &mut Frame, agents: &HashMap<String, Agent>| {
             use ratatui::{
                 layout::Alignment,
                 text::{Line, Span},
@@ -925,9 +1136,44 @@ impl BotsterApp {
                 }
                 AppMode::Normal => {}
             }
-        })?;
+        };
 
-        Ok(())
+        // Always render to real terminal for local display
+        terminal.draw(|f| render_ui(f, agents))?;
+
+        // For WebRTC streaming, render to browser-sized buffer if dimensions provided
+        let (ansi_output, out_rows, out_cols) = if let Some(dims) = browser_dims {
+            // Create a virtual terminal at browser dimensions
+            let backend = TestBackend::new(dims.cols, dims.rows);
+            let mut virtual_terminal = Terminal::new(backend)?;
+
+            // Render to virtual terminal at browser dimensions
+            let completed_frame = virtual_terminal.draw(|f| {
+                // Log once when dimensions change
+                static LAST_AREA: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let area = f.area();
+                let combined = ((area.width as u32) << 16) | (area.height as u32);
+                let last = LAST_AREA.swap(combined, std::sync::atomic::Ordering::Relaxed);
+                if last != combined {
+                    log::info!("Virtual terminal rendering at {}x{}", area.width, area.height);
+                }
+                render_ui(f, agents)
+            })?;
+
+            // Convert virtual buffer to ANSI
+            let ansi = buffer_to_ansi(
+                &completed_frame.buffer,
+                dims.cols,
+                dims.rows,
+                None, // No clipping needed, already at correct size
+            );
+            (ansi, dims.rows, dims.cols)
+        } else {
+            // No browser connected, return empty output
+            (String::new(), 0, 0)
+        };
+
+        Ok((ansi_output, out_rows, out_cols))
     }
 
     fn poll_messages(&mut self) -> Result<()> {
@@ -1382,19 +1628,6 @@ impl BotsterApp {
 
         Ok(())
     }
-
-    /// Get a list of current agents for WebRTC data channel responses
-    fn get_agents_info(&self) -> Vec<AgentInfo> {
-        self.agents
-            .values()
-            .map(|agent| AgentInfo {
-                id: agent.session_key(),
-                repo: agent.repo.clone(),
-                issue: agent.issue_number.unwrap_or(0),
-                status: "running".to_string(),
-            })
-            .collect()
-    }
 }
 
 fn run_interactive() -> Result<()> {
@@ -1416,10 +1649,88 @@ fn run_interactive() -> Result<()> {
 
     // Main loop
     while !app.quit {
-        // Render current state
-        app.view(&mut terminal)?;
+        // Get browser dimensions if WebRTC is connected
+        let browser_dims: Option<BrowserDimensions> = {
+            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+            app.tokio_runtime.block_on(async move {
+                let handler = webrtc_handler.lock().unwrap();
+                handler.get_browser_dimensions().await
+            })
+        };
 
-        // Handle keyboard input (non-blocking)
+        // Track browser connection state and resize agents accordingly
+        {
+            static LAST_DIMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            static WAS_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+            let is_connected = browser_dims.is_some();
+            let was_connected = WAS_CONNECTED.swap(is_connected, std::sync::atomic::Ordering::Relaxed);
+
+            if let Some(dims) = &browser_dims {
+                // Browser connected - resize to browser dimensions when they change
+                let combined = ((dims.cols as u32) << 16) | (dims.rows as u32);
+                let last = LAST_DIMS.swap(combined, std::sync::atomic::Ordering::Relaxed);
+                if last != combined {
+                    log::info!("Using browser dimensions: {}x{} (cols x rows)", dims.cols, dims.rows);
+                    // Resize all agents to browser dimensions (accounting for TUI chrome)
+                    let agent_cols = (dims.cols * 70 / 100).saturating_sub(2);
+                    let agent_rows = dims.rows.saturating_sub(2);
+                    log::info!("Resizing agents to {}x{}", agent_cols, agent_rows);
+                    for agent in app.agents.values() {
+                        agent.resize(agent_rows, agent_cols);
+                    }
+                }
+            } else if was_connected {
+                // Browser just disconnected - reset to local terminal dimensions
+                log::info!("Browser disconnected, resetting agents to local terminal size");
+                let terminal_size = terminal.size().unwrap_or_default();
+                let terminal_cols = (terminal_size.width * 70 / 100).saturating_sub(2);
+                let terminal_rows = terminal_size.height.saturating_sub(2);
+                log::info!("Resizing agents to {}x{}", terminal_cols, terminal_rows);
+                for agent in app.agents.values() {
+                    agent.resize(terminal_rows, terminal_cols);
+                }
+                LAST_DIMS.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // Render current state and get ANSI output for WebRTC streaming
+        let (ansi_output, rows, cols) = app.view(&mut terminal, browser_dims)?;
+
+        // Stream TUI screen to WebRTC connected browsers
+        {
+            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+            let ansi_for_send = ansi_output.clone();
+            app.tokio_runtime.block_on(async move {
+                let handler = webrtc_handler.lock().unwrap();
+                if handler.is_ready().await {
+                    if let Err(e) = handler.send_screen(&ansi_for_send, rows, cols).await {
+                        log::warn!("Failed to send screen to WebRTC: {}", e);
+                    }
+                }
+            });
+        }
+
+        // Process keyboard input from WebRTC browser connections
+        {
+            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+            let inputs = app.tokio_runtime.block_on(async move {
+                let handler = webrtc_handler.lock().unwrap();
+                handler.get_pending_inputs().await
+            });
+
+            for input in inputs {
+                // Convert browser key input to crossterm KeyEvent
+                let key_event = convert_browser_key_to_crossterm(&input);
+                if let Some(key) = key_event {
+                    if let Err(e) = app.handle_key_event(key) {
+                        log::warn!("Error handling WebRTC key input: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Handle local keyboard input (non-blocking)
         let _ = app.handle_events()?;
 
         // Poll for new messages from server
@@ -1672,7 +1983,14 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    // Set up file logging so TUI doesn't interfere with log output
+    let log_file = std::fs::File::create("/tmp/botster-hub.log")
+        .expect("Failed to create log file");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
+        .format_timestamp_secs()
+        .init();
+
     let cli = Cli::parse();
 
     match cli.command {

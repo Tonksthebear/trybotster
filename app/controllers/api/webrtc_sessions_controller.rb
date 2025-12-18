@@ -107,7 +107,7 @@ module Api
       Bot::Message.create!(
         event_type: "webrtc_offer",
         payload: {
-          session_id: session.id,
+          session_id: session.id.to_s,  # CLI expects string for URL building
           offer: session.offer,
           user_id: current_user.id
         }

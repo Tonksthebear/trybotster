@@ -40,7 +40,7 @@ module Api
       # Check the bot message was created
       message = Bot::Message.last
       assert_equal "webrtc_offer", message.event_type
-      assert_equal session.id, message.payload["session_id"]
+      assert_equal session.id.to_s, message.payload["session_id"]
     end
 
     test "create with missing offer returns error" do
