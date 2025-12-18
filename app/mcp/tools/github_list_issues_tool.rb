@@ -43,11 +43,11 @@ class GithubListIssuesTool < ApplicationMCPTool
 
       issues.each do |issue|
         # Determine if it's a PR or issue
-        is_pr = issue['pull_request'].present?
+        is_pr = issue["pull_request"].present?
         icon = is_pr ? "🔀" : "🐛"
 
-        created_at = issue['created_at'].is_a?(String) ? Time.parse(issue['created_at']) : issue['created_at']
-        updated_at = issue['updated_at'].is_a?(String) ? Time.parse(issue['updated_at']) : issue['updated_at']
+        created_at = issue["created_at"].is_a?(String) ? Time.parse(issue["created_at"]) : issue["created_at"]
+        updated_at = issue["updated_at"].is_a?(String) ? Time.parse(issue["updated_at"]) : issue["updated_at"]
 
         issue_info = [
           "#{icon} ##{issue['number']}: #{issue['title']}",
@@ -58,8 +58,8 @@ class GithubListIssuesTool < ApplicationMCPTool
           "   Updated: #{updated_at.strftime('%Y-%m-%d %H:%M')}"
         ]
 
-        if issue['labels']&.any?
-          labels = issue['labels'].map { |l| l['name'] }.join(', ')
+        if issue["labels"]&.any?
+          labels = issue["labels"].map { |l| l["name"] }.join(", ")
           issue_info << "   Labels: #{labels}"
         end
 

@@ -47,7 +47,7 @@ class GithubListReposTool < ApplicationMCPTool
       render(text: "Found #{repos.count} repositories:\n")
 
       repos.each do |repo|
-        updated_at = repo['updated_at'].is_a?(String) ? Time.parse(repo['updated_at']) : repo['updated_at']
+        updated_at = repo["updated_at"].is_a?(String) ? Time.parse(repo["updated_at"]) : repo["updated_at"]
 
         repo_info = [
           "📦 #{repo['full_name']}",
@@ -67,15 +67,15 @@ class GithubListReposTool < ApplicationMCPTool
         total: repos.count,
         repositories: repos.map { |r|
           {
-            name: r['name'],
-            full_name: r['full_name'],
-            description: r['description'],
-            url: r['html_url'],
-            language: r['language'],
-            stars: r['stargazers_count'],
-            forks: r['forks_count'],
-            updated_at: r['updated_at'],
-            private: r['private']
+            name: r["name"],
+            full_name: r["full_name"],
+            description: r["description"],
+            url: r["html_url"],
+            language: r["language"],
+            stars: r["stargazers_count"],
+            forks: r["forks_count"],
+            updated_at: r["updated_at"],
+            private: r["private"]
           }
         }
       }

@@ -73,7 +73,7 @@ module Github
 
       unless Rack::Utils.secure_compare(signature, expected_signature)
         Rails.logger.error "GitHub webhook signature verification failed"
-        return head :unauthorized
+        head :unauthorized
       end
     end
   end
