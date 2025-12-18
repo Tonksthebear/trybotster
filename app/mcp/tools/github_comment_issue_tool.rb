@@ -13,6 +13,13 @@ class GithubCommentIssueTool < ApplicationMCPTool
   validates :body, presence: true, length: { minimum: 1 }
 
   def perform
+    # Check for cached idempotency response first
+    cached_response = check_idempotency_cache
+    if cached_response
+      render(text: cached_response["text"])
+      return
+    end
+
     # Check if user has authorized GitHub App
     unless current_user&.github_app_authorized?
       report_error("GitHub App not authorized. Please authorize at /github_app/authorize")
@@ -73,7 +80,9 @@ class GithubCommentIssueTool < ApplicationMCPTool
         "View full comment at: #{comment[:html_url]}"
       ]
 
-      render(text: success_message.join("\n"))
+      response_text = success_message.join("\n")
+      store_idempotency_response(response_text)
+      render(text: response_text)
     else
       report_error("Failed to add comment: #{result[:error]}")
     end
