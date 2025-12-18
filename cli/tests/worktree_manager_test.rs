@@ -65,8 +65,8 @@ fn test_worktree_manager_handles_existing_branch() {
     let worktree_path = result.unwrap();
     assert!(worktree_path.exists(), "Worktree should be created");
     assert!(
-        worktree_path.join(".claude/trusted").exists(),
-        "Should be marked as trusted"
+        worktree_path.join(".claude/settings.local.json").exists(),
+        "Should have Claude settings file"
     );
 }
 
