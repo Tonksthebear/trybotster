@@ -1,5 +1,5 @@
 use anyhow::Result;
-use botster_hub::{Agent, Config, PromptManager, WorktreeManager};
+use botster_hub::{Agent, AgentInfo, Config, PromptManager, WebRTCHandler, WorktreeManager};
 use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -15,6 +15,7 @@ use ratatui::{
 };
 use reqwest::blocking::Client;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -83,6 +84,9 @@ struct BotsterApp {
     input_buffer: String,
     available_worktrees: Vec<(String, String)>, // (path, branch)
     worktree_selected: usize,
+    // WebRTC P2P support for browser connections
+    tokio_runtime: tokio::runtime::Runtime,
+    webrtc_handler: Arc<StdMutex<WebRTCHandler>>,
 }
 
 impl BotsterApp {
@@ -90,6 +94,13 @@ impl BotsterApp {
         let config = Config::load()?;
         let git_manager = WorktreeManager::new(config.worktree_base.clone());
         let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+
+        // Create tokio runtime for async WebRTC operations
+        let tokio_runtime = tokio::runtime::Runtime::new()?;
+
+        // Create WebRTC handler with a placeholder get_agents callback
+        // This will be replaced with a proper callback that accesses self.agents
+        let webrtc_handler = Arc::new(StdMutex::new(WebRTCHandler::new(|| Vec::new())));
 
         let app = Self {
             agents: HashMap::new(),
@@ -108,6 +119,8 @@ impl BotsterApp {
             input_buffer: String::new(),
             available_worktrees: Vec::new(),
             worktree_selected: 0,
+            tokio_runtime,
+            webrtc_handler,
         };
 
         log::info!("Botster Hub started, waiting for messages...");
@@ -1050,6 +1063,11 @@ impl BotsterApp {
             return self.handle_cleanup_message(payload);
         }
 
+        // Handle WebRTC signaling for P2P browser connections
+        if event_type == "webrtc_offer" {
+            return self.handle_webrtc_offer(payload);
+        }
+
         // Enforce max_sessions limit to prevent unbounded memory growth
         if self.agents.len() >= self.config.max_sessions {
             log::warn!(
@@ -1297,6 +1315,85 @@ impl BotsterApp {
         }
 
         Ok(())
+    }
+
+    /// Handle a WebRTC offer from a browser client (via Rails signaling)
+    /// Creates a peer connection, generates an answer, and posts it back to Rails
+    fn handle_webrtc_offer(&mut self, payload: &serde_json::Value) -> Result<()> {
+        let session_id = payload["session_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing session_id in webrtc_offer payload"))?;
+
+        let offer_sdp = payload["offer"]["sdp"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing offer.sdp in webrtc_offer payload"))?;
+
+        log::info!(
+            "Handling WebRTC offer for session {}, offer length: {} bytes",
+            session_id,
+            offer_sdp.len()
+        );
+
+        // Create the answer using the WebRTC handler (async operation)
+        let webrtc_handler = Arc::clone(&self.webrtc_handler);
+        let offer_sdp_owned = offer_sdp.to_string();
+
+        let answer_sdp = self.tokio_runtime.block_on(async move {
+            let mut handler = webrtc_handler.lock().unwrap();
+            handler.handle_offer(&offer_sdp_owned).await
+        })?;
+
+        log::info!(
+            "WebRTC answer created, length: {} bytes",
+            answer_sdp.len()
+        );
+
+        // Post the answer back to the Rails signaling server
+        let url = format!(
+            "{}/api/webrtc/sessions/{}",
+            self.config.server_url, session_id
+        );
+
+        let response = self
+            .client
+            .patch(&url)
+            .header("X-API-Key", &self.config.api_key)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "answer": {
+                    "type": "answer",
+                    "sdp": answer_sdp
+                }
+            }))
+            .send()?;
+
+        if response.status().is_success() {
+            log::info!(
+                "Successfully posted WebRTC answer for session {}",
+                session_id
+            );
+        } else {
+            log::error!(
+                "Failed to post WebRTC answer for session {}: {}",
+                session_id,
+                response.status()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Get a list of current agents for WebRTC data channel responses
+    fn get_agents_info(&self) -> Vec<AgentInfo> {
+        self.agents
+            .values()
+            .map(|agent| AgentInfo {
+                id: agent.session_key(),
+                repo: agent.repo.clone(),
+                issue: agent.issue_number.unwrap_or(0),
+                status: "running".to_string(),
+            })
+            .collect()
     }
 }
 
