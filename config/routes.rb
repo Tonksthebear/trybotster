@@ -28,6 +28,9 @@ Rails.application.routes.draw do
     resources :webrtc_sessions, path: "webrtc/sessions", only: [ :create, :show, :update ]
   end
 
+  # Agents dashboard - WebRTC P2P connection to local CLI
+  resources :agents, only: [ :index ]
+
   root to: "home#index"
   # Define your application routes per the DSL in https://guides.rubyonrails.org/routing.html
 

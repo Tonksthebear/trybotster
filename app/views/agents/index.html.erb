@@ -1,0 +1,71 @@
+<% content_for :head do %>
+  <%= stylesheet_link_tag "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" %>
+<% end %>
+
+<div class="w-full max-w-6xl mx-auto"
+     data-controller="webrtc"
+     data-webrtc-csrf-token-value="<%= form_authenticity_token %>">
+
+  <%# Header %>
+  <div class="mb-6">
+    <h1 class="text-2xl font-bold text-gray-900">Running Agents</h1>
+    <p class="mt-1 text-sm text-gray-600">
+      Connect to your local Botster Hub to view running agents via P2P connection.
+    </p>
+  </div>
+
+  <%# Connection controls %>
+  <div class="bg-white shadow rounded-lg mb-6">
+    <div class="px-4 py-4 sm:px-6 flex items-center justify-between">
+      <div data-webrtc-target="status" class="text-sm text-gray-500">
+        ○ Not connected
+      </div>
+      <button type="button"
+              data-webrtc-target="connectButton"
+              data-action="click->webrtc#startConnection"
+              class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500">
+        Connect to Hub
+      </button>
+    </div>
+  </div>
+
+  <%# Main content - agent list and terminal %>
+  <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+    <%# Agent list sidebar %>
+    <div class="lg:col-span-1">
+      <div class="bg-white shadow rounded-lg overflow-hidden">
+        <div class="px-4 py-3 bg-gray-50 border-b border-gray-200">
+          <h2 class="text-sm font-medium text-gray-900">Agents</h2>
+        </div>
+        <div data-webrtc-target="agentList" class="divide-y divide-gray-200">
+          <p class="px-4 py-3 text-sm text-gray-500">Connect to see agents</p>
+        </div>
+      </div>
+    </div>
+
+    <%# Terminal view %>
+    <div class="lg:col-span-3">
+      <div class="bg-gray-900 shadow rounded-lg overflow-hidden">
+        <div class="px-4 py-2 bg-gray-800 border-b border-gray-700">
+          <h2 class="text-sm font-medium text-gray-300">Terminal Output</h2>
+        </div>
+        <div data-webrtc-target="terminal"
+             class="h-96 lg:h-[500px]"
+             style="padding: 8px;">
+          <p class="text-gray-500 text-sm">Select an agent to view its terminal</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <%# Help text %>
+  <div class="mt-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
+    <h3 class="text-sm font-medium text-blue-800">How it works</h3>
+    <ul class="mt-2 text-sm text-blue-700 list-disc list-inside space-y-1">
+      <li>Make sure <code class="bg-blue-100 px-1 rounded">botster-hub start</code> is running on your machine</li>
+      <li>Click "Connect to Hub" to establish a direct P2P connection</li>
+      <li>Your terminal data never passes through our servers - it's fully private</li>
+      <li>Select an agent from the list to view its live terminal output</li>
+    </ul>
+  </div>
+</div>
