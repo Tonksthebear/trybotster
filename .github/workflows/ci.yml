@@ -176,4 +176,8 @@ jobs:
 
       - name: Run CLI tests
         working-directory: cli
-        run: cargo test --all-targets
+        run: |
+          # Ensure no config file exists that would interfere with tests
+          rm -rf ~/.botster_hub
+          # Run tests with single thread to avoid env var race conditions
+          cargo test --all-targets -- --test-threads=1
