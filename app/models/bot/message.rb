@@ -50,6 +50,32 @@ class Bot::Message < ApplicationRecord
 
   def acknowledge!
     update!(status: "acknowledged", acknowledged_at: Time.current)
+
+    # Add eyes reaction to the GitHub comment to provide user feedback
+    add_eyes_reaction_to_comment
+  end
+
+  # Add eyes emoji reaction to the GitHub comment that triggered this message
+  # This provides visual feedback that the bot saw the comment
+  def add_eyes_reaction_to_comment
+    return unless github_mention?
+    return unless installation_id.present? && repo.present? && comment_id.present?
+
+    result = Github::App.create_comment_reaction(
+      installation_id,
+      repo: repo,
+      comment_id: comment_id,
+      reaction: "eyes"
+    )
+
+    if result[:success]
+      Rails.logger.info "Added eyes reaction to comment #{comment_id} in #{repo}"
+    else
+      Rails.logger.warn "Failed to add eyes reaction to comment #{comment_id}: #{result[:error]}"
+    end
+  rescue => e
+    # Don't fail the acknowledge if reaction fails - it's just user feedback
+    Rails.logger.error "Error adding eyes reaction: #{e.message}"
   end
 
   def mark_as_failed!(error_message = nil)
@@ -96,6 +122,10 @@ class Bot::Message < ApplicationRecord
 
   def comment_id
     payload["comment_id"]
+  end
+
+  def installation_id
+    payload["installation_id"]
   end
 
   private

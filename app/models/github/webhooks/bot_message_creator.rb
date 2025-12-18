@@ -16,6 +16,7 @@ module Github
         @is_pr = params[:is_pr]
         @source_type = params[:source_type]
         @routed_info = params[:routed_info]
+        @installation_id = params[:installation_id]
       end
 
       def call
@@ -36,7 +37,8 @@ module Github
             issue_body: @issue_body,
             issue_url: @issue_url,
             is_pr: @is_pr,
-            context: formatted_context
+            context: formatted_context,
+            installation_id: @installation_id
           }
         )
 

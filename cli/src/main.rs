@@ -998,16 +998,45 @@ impl BotsterApp {
                 );
                 // TODO: Mark message as failed
             } else {
-                // TODO: Acknowledge message
-                log::info!(
-                    "Successfully processed message {} ({})",
-                    msg.id,
-                    msg.event_type
-                );
+                // Acknowledge message to trigger eyes reaction on GitHub
+                if let Err(e) = self.acknowledge_message(msg.id) {
+                    log::warn!("Failed to acknowledge message {}: {}", msg.id, e);
+                } else {
+                    log::info!(
+                        "Successfully processed and acknowledged message {} ({})",
+                        msg.id,
+                        msg.event_type
+                    );
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Acknowledge a message to the Rails server.
+    /// This triggers the server to add an eyes emoji reaction on GitHub,
+    /// providing visual feedback to the user that the bot saw their message.
+    fn acknowledge_message(&self, message_id: i64) -> Result<()> {
+        let url = format!("{}/bots/messages/{}", self.config.server_url, message_id);
+
+        let response = self
+            .client
+            .patch(&url)
+            .header("X-API-Key", &self.config.api_key)
+            .header("Content-Type", "application/json")
+            .send()?;
+
+        if response.status().is_success() {
+            log::debug!("Acknowledged message {}", message_id);
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Failed to acknowledge message {}: {}",
+                message_id,
+                response.status()
+            )
+        }
     }
 
     fn spawn_agent_for_message(

@@ -426,6 +426,25 @@ module Github
       { success: false, error: e.message }
     end
 
+    # Add a reaction to an issue comment (using installation token - shows as bot)
+    # @param installation_id [Integer] The GitHub App installation ID
+    # @param repo [String] Repository in "owner/repo" format
+    # @param comment_id [Integer] The comment ID to react to
+    # @param reaction [String] Reaction type: +1, -1, laugh, confused, heart, hooray, rocket, eyes
+    # @return [Hash] Reaction data or error
+    def create_comment_reaction(installation_id, repo:, comment_id:, reaction:)
+      client = installation_client(installation_id)
+      result = client.create_issue_comment_reaction(repo, comment_id, reaction)
+
+      {
+        success: true,
+        reaction: result.to_h
+      }
+    rescue Octokit::Error => e
+      Rails.logger.error "GitHub App create reaction error: #{e.message}"
+      { success: false, error: e.message }
+    end
+
     private
 
     # Parse token response from GitHub

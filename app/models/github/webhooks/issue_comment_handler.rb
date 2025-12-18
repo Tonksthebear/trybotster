@@ -21,7 +21,8 @@ module Github
           issue_url: issue_url,
           is_pr: target_is_pr,
           source_type: source_type,
-          routed_info: routed_info
+          routed_info: routed_info,
+          installation_id: installation_id
         )
       end
 
