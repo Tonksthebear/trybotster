@@ -23,6 +23,11 @@ Rails.application.routes.draw do
     resources :messages, only: [ :index, :update ] # update for acknowledgment
   end
 
+  # WebRTC signaling for P2P browser-to-CLI connections
+  namespace :api do
+    resources :webrtc_sessions, path: "webrtc/sessions", only: [ :create, :show, :update ]
+  end
+
   root to: "home#index"
   # Define your application routes per the DSL in https://guides.rubyonrails.org/routing.html
 
