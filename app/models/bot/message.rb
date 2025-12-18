@@ -55,23 +55,39 @@ class Bot::Message < ApplicationRecord
     add_eyes_reaction_to_comment
   end
 
-  # Add eyes emoji reaction to the GitHub comment that triggered this message
-  # This provides visual feedback that the bot saw the comment
+  # Add eyes emoji reaction to the GitHub comment or issue that triggered this message
+  # This provides visual feedback that the bot saw the mention
   def add_eyes_reaction_to_comment
     return unless github_mention?
-    return unless installation_id.present? && repo.present? && comment_id.present?
+    return unless installation_id.present? && repo.present?
 
-    result = Github::App.create_comment_reaction(
-      installation_id,
-      repo: repo,
-      comment_id: comment_id,
-      reaction: "eyes"
-    )
+    if comment_id.present?
+      # React to the comment
+      result = Github::App.create_comment_reaction(
+        installation_id,
+        repo: repo,
+        comment_id: comment_id,
+        reaction: "eyes"
+      )
+      target = "comment #{comment_id}"
+    elsif issue_number.present?
+      # React to the issue itself (for issue body mentions)
+      result = Github::App.create_issue_reaction(
+        installation_id,
+        repo: repo,
+        issue_number: issue_number,
+        reaction: "eyes"
+      )
+      target = "issue ##{issue_number}"
+    else
+      Rails.logger.warn "Cannot add reaction: no comment_id or issue_number"
+      return
+    end
 
     if result[:success]
-      Rails.logger.info "Added eyes reaction to comment #{comment_id} in #{repo}"
+      Rails.logger.info "Added eyes reaction to #{target} in #{repo}"
     else
-      Rails.logger.warn "Failed to add eyes reaction to comment #{comment_id}: #{result[:error]}"
+      Rails.logger.warn "Failed to add eyes reaction to #{target}: #{result[:error]}"
     end
   rescue => e
     # Don't fail the acknowledge if reaction fails - it's just user feedback

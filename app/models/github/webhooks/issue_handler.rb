@@ -45,7 +45,8 @@ module Github
           issue_title: issue_title,
           issue_body: issue_body,
           issue_url: issue_url,
-          is_pr: false
+          is_pr: false,
+          installation_id: installation_id
         )
       end
 
