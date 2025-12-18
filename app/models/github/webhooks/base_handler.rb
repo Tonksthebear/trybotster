@@ -23,6 +23,10 @@ module Github
         payload.dig("repository", "full_name")
       end
 
+      def installation_id
+        payload.dig("installation", "id")
+      end
+
       def mentioned_trybotster?(text)
         text.to_s.match?(/@trybotster\b/i)
       end
