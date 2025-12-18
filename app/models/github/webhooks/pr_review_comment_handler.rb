@@ -50,9 +50,9 @@ module Github
             reason: "pr_linked_to_issue"
           }
 
-          [linked_issue, false, routed_info]
+          [ linked_issue, false, routed_info ]
         else
-          [pr_number, true, nil]
+          [ pr_number, true, nil ]
         end
       end
 

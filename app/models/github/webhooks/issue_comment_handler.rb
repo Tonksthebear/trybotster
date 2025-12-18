@@ -53,11 +53,11 @@ module Github
               reason: "pr_linked_to_issue"
             }
 
-            return [linked_issue, false, routed_info]
+            return [ linked_issue, false, routed_info ]
           end
         end
 
-        [issue_number, pr_comment?, nil]
+        [ issue_number, pr_comment?, nil ]
       end
 
       def comment_body

@@ -22,8 +22,8 @@ class CreateMemoryTool < ApplicationMCPTool
     memory_attrs = {
       content: content,
       user: user,
-      memory_type: memory_type || 'other',
-      visibility: visibility || 'private',
+      memory_type: memory_type || "other",
+      visibility: visibility || "private",
       metadata: metadata || {}
     }
 

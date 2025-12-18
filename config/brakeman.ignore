@@ -1,0 +1,10 @@
+{
+  "ignored_warnings": [
+    {
+      "fingerprint": "691a2bc5a1deb96ad1c4a5253c9931862ab07c9945287cf58b3cd1936b76932e",
+      "note": "This redirect is intentional - it's part of the OAuth flow to GitHub's authorization URL"
+    }
+  ],
+  "updated": "2025-12-18",
+  "brakeman_version": "7.1.1"
+}

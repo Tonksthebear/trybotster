@@ -27,11 +27,11 @@ class FetchMemoriesTool < ApplicationMCPTool
 
     # Handle visibility filter
     if visibility.present?
-      options[:visibility] = [visibility]
+      options[:visibility] = [ visibility ]
     end
 
     # Perform semantic search
-    memories = Memory.similarity_search([query, user, options].join(" "))
+    memories = Memory.similarity_search([ query, user, options ].join(" "))
 
     if memories.empty?
       render(text: "No memories found matching your query.")

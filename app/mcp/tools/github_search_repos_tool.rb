@@ -48,7 +48,7 @@ class GithubSearchReposTool < ApplicationMCPTool
       render(text: "Found #{total_count} repositories (showing #{repos.count}):\n")
 
       repos.each_with_index do |repo, index|
-        updated_at = repo['updated_at'].is_a?(String) ? Time.parse(repo['updated_at']) : repo['updated_at']
+        updated_at = repo["updated_at"].is_a?(String) ? Time.parse(repo["updated_at"]) : repo["updated_at"]
 
         repo_info = [
           "#{index + 1}. 📦 #{repo['full_name']}",
@@ -59,7 +59,7 @@ class GithubSearchReposTool < ApplicationMCPTool
           "   Updated: #{updated_at.strftime('%Y-%m-%d')}"
         ]
 
-        if repo['topics']&.any?
+        if repo["topics"]&.any?
           repo_info << "   Topics: #{repo['topics'].join(', ')}"
         end
 
