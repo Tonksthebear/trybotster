@@ -174,7 +174,7 @@ class GithubGetIssueCommentsToolTest < ActiveSupport::TestCase
   include MCPToolTestHelper
 
   setup do
-    @comments = [symbolize_keys_deep(load_github_fixture("comment"))]
+    @comments = [ symbolize_keys_deep(load_github_fixture("comment")) ]
   end
 
   test "returns comments on success" do
@@ -377,7 +377,7 @@ class GithubListIssuesToolTest < ActiveSupport::TestCase
   include MCPToolTestHelper
 
   setup do
-    @issues = [symbolize_keys_deep(load_github_fixture("issue"))]
+    @issues = [ symbolize_keys_deep(load_github_fixture("issue")) ]
   end
 
   test "lists issues on success" do
@@ -406,7 +406,7 @@ class GithubListReposToolTest < ActiveSupport::TestCase
   include MCPToolTestHelper
 
   setup do
-    @repos = [symbolize_keys_deep(load_github_fixture("repository"))]
+    @repos = [ symbolize_keys_deep(load_github_fixture("repository")) ]
   end
 
   test "lists repositories on success" do
@@ -435,7 +435,7 @@ class GithubSearchReposToolTest < ActiveSupport::TestCase
   include MCPToolTestHelper
 
   setup do
-    @repos = [symbolize_keys_deep(load_github_fixture("repository"))]
+    @repos = [ symbolize_keys_deep(load_github_fixture("repository")) ]
   end
 
   test "searches repositories on success" do
