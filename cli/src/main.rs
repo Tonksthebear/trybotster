@@ -1845,14 +1845,30 @@ fn run_interactive() -> Result<()> {
                         if let Some(idx) = app.agent_keys_ordered.iter().position(|k| k == &id) {
                             app.selected = idx;
                             log::info!("WebRTC: Selected agent {}", id);
-                            let webrtc_handler = Arc::clone(&app.webrtc_handler);
-                            let id_clone = id.clone();
-                            app.tokio_runtime.block_on(async move {
-                                let handler = webrtc_handler.lock().unwrap();
-                                if let Err(e) = handler.send_agent_selected(&id_clone).await {
-                                    log::warn!("Failed to send agent selected: {}", e);
-                                }
-                            });
+
+                            // Clear the hash to force immediate screen send
+                            app.last_agent_screen_hash.remove(&id);
+
+                            // Immediately send the agent's screen
+                            if let Some(agent) = app.agents.get(&id) {
+                                let agent_output = agent.get_screen_as_ansi();
+                                let current_hash = agent.get_screen_hash();
+                                app.last_agent_screen_hash.insert(id.clone(), current_hash);
+
+                                let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                let id_clone = id.clone();
+                                app.tokio_runtime.block_on(async move {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    if let Err(e) = handler.send_agent_selected(&id_clone).await {
+                                        log::warn!("Failed to send agent selected: {}", e);
+                                    }
+                                    if let Err(e) =
+                                        handler.send_agent_output(&id_clone, &agent_output).await
+                                    {
+                                        log::warn!("Failed to send agent output: {}", e);
+                                    }
+                                });
+                            }
                         } else {
                             log::warn!("WebRTC: Agent not found: {}", id);
                             let webrtc_handler = Arc::clone(&app.webrtc_handler);
