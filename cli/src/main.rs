@@ -293,6 +293,8 @@ struct BotsterApp {
     // WebRTC P2P support for browser connections
     tokio_runtime: tokio::runtime::Runtime,
     webrtc_handler: Arc<StdMutex<WebRTCHandler>>,
+    // Track last agent screen hash for change detection (reduces bandwidth)
+    last_agent_screen_hash: HashMap<String, u64>,
 }
 
 impl BotsterApp {
@@ -326,6 +328,7 @@ impl BotsterApp {
             worktree_selected: 0,
             tokio_runtime,
             webrtc_handler,
+            last_agent_screen_hash: HashMap::new(),
         };
 
         log::info!("Botster Hub started, waiting for messages...");
@@ -1768,21 +1771,32 @@ fn run_interactive() -> Result<()> {
         }
 
         // Stream selected agent's individual terminal output (for web GUI mode)
+        // Only send when screen content actually changes to reduce bandwidth/lag
         {
             if let Some(key) = app.agent_keys_ordered.get(app.selected) {
                 if let Some(agent) = app.agents.get(key) {
-                    let agent_output = agent.get_screen_as_ansi();
-                    let agent_id = key.clone();
-                    let webrtc_handler = Arc::clone(&app.webrtc_handler);
-                    app.tokio_runtime.block_on(async move {
-                        let handler = webrtc_handler.lock().unwrap();
-                        if handler.is_ready().await {
-                            if let Err(e) = handler.send_agent_output(&agent_id, &agent_output).await
-                            {
-                                log::warn!("Failed to send agent output to WebRTC: {}", e);
+                    let current_hash = agent.get_screen_hash();
+                    let last_hash = app.last_agent_screen_hash.get(key).copied();
+
+                    // Only send if screen changed
+                    if last_hash != Some(current_hash) {
+                        app.last_agent_screen_hash
+                            .insert(key.clone(), current_hash);
+
+                        let agent_output = agent.get_screen_as_ansi();
+                        let agent_id = key.clone();
+                        let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                        app.tokio_runtime.block_on(async move {
+                            let handler = webrtc_handler.lock().unwrap();
+                            if handler.is_ready().await {
+                                if let Err(e) =
+                                    handler.send_agent_output(&agent_id, &agent_output).await
+                                {
+                                    log::warn!("Failed to send agent output to WebRTC: {}", e);
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
             }
         }
