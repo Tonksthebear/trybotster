@@ -7,7 +7,7 @@ pub mod terminal;
 pub mod webrtc_handler;
 
 // Re-export commonly used types
-pub use agent::{Agent, AgentStatus};
+pub use agent::{Agent, AgentNotification, AgentStatus};
 pub use config::Config;
 pub use git::WorktreeManager;
 pub use prompt::PromptManager;
