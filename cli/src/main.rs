@@ -1,7 +1,7 @@
 use anyhow::Result;
 use botster_hub::{
-    Agent, BrowserCommand, BrowserDimensions, Config, KeyInput, PromptManager, WebAgentInfo,
-    WebRTCHandler, WorktreeManager,
+    Agent, BrowserCommand, BrowserDimensions, BrowserMode, Config, IceServerConfig, KeyInput,
+    PromptManager, WebAgentInfo, WebRTCHandler, WebWorktreeInfo, WorktreeManager,
 };
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -1633,10 +1633,20 @@ impl BotsterApp {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing offer.sdp in webrtc_offer payload"))?;
 
+        // Parse ICE servers from payload (provided by Rails signaling server)
+        let ice_servers: Vec<IceServerConfig> = payload
+            .get("ice_servers")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_else(|| {
+                log::warn!("No ice_servers in payload - using default STUN servers");
+                Vec::new()
+            });
+
         log::info!(
-            "Handling WebRTC offer for session {}, offer length: {} bytes",
+            "Handling WebRTC offer for session {}, offer length: {} bytes, {} ICE server(s)",
             session_id,
-            offer_sdp.len()
+            offer_sdp.len(),
+            ice_servers.len()
         );
 
         // Create the answer using the WebRTC handler (async operation)
@@ -1645,7 +1655,7 @@ impl BotsterApp {
 
         let answer_sdp = self.tokio_runtime.block_on(async move {
             let mut handler = webrtc_handler.lock().unwrap();
-            handler.handle_offer(&offer_sdp_owned).await
+            handler.handle_offer(&offer_sdp_owned, &ice_servers).await
         })?;
 
         log::info!(
@@ -1727,17 +1737,34 @@ fn run_interactive() -> Result<()> {
 
             if let Some(dims) = &browser_dims {
                 // Browser connected - resize to browser dimensions when they change
-                let combined = ((dims.cols as u32) << 16) | (dims.rows as u32);
-                let last = LAST_DIMS.swap(combined, std::sync::atomic::Ordering::Relaxed);
-                if last != combined {
-                    log::info!("Using browser dimensions: {}x{} (cols x rows)", dims.cols, dims.rows);
-                    // Resize all agents to browser dimensions (accounting for TUI chrome)
-                    let agent_cols = (dims.cols * 70 / 100).saturating_sub(2);
-                    let agent_rows = dims.rows.saturating_sub(2);
-                    log::info!("Resizing agents to {}x{}", agent_cols, agent_rows);
-                    for agent in app.agents.values() {
-                        agent.resize(agent_rows, agent_cols);
+                // Only resize if dimensions are reasonable (sanity check)
+                if dims.cols >= 20 && dims.rows >= 5 {
+                    // Include mode in the combined value to detect mode changes
+                    let mode_bit = if dims.mode == BrowserMode::Gui { 1u32 << 31 } else { 0 };
+                    let combined = mode_bit | ((dims.cols as u32) << 16) | (dims.rows as u32);
+                    let last = LAST_DIMS.swap(combined, std::sync::atomic::Ordering::Relaxed);
+                    if last != combined {
+                        // Calculate agent terminal size based on mode
+                        let (agent_cols, agent_rows) = match dims.mode {
+                            BrowserMode::Gui => {
+                                // GUI mode: use full browser dimensions for agent terminal
+                                log::info!("GUI mode - using full browser dimensions: {}x{}", dims.cols, dims.rows);
+                                (dims.cols, dims.rows)
+                            }
+                            BrowserMode::Tui => {
+                                // TUI mode: terminal widget is 70% of width, minus borders
+                                let tui_cols = (dims.cols * 70 / 100).saturating_sub(2);
+                                let tui_rows = dims.rows.saturating_sub(2);
+                                log::info!("TUI mode - using 70% width: {}x{} (from {}x{})", tui_cols, tui_rows, dims.cols, dims.rows);
+                                (tui_cols, tui_rows)
+                            }
+                        };
+                        for agent in app.agents.values() {
+                            agent.resize(agent_rows, agent_cols);
+                        }
                     }
+                } else {
+                    log::warn!("Ignoring small browser dimensions: {}x{}", dims.cols, dims.rows);
                 }
             } else if was_connected {
                 // Browser just disconnected - reset to local terminal dimensions
@@ -1879,25 +1906,74 @@ fn run_interactive() -> Result<()> {
                             });
                         }
                     }
-                    BrowserCommand::CreateAgent { repo, issue_number } => {
-                        log::info!("WebRTC: Creating agent for {}#{}", repo, issue_number);
-                        // Create a synthetic payload for spawn_agent_for_message
-                        let payload = serde_json::json!({
-                            "issue_number": issue_number,
-                            "prompt": format!("Work on issue #{}", issue_number)
+                    BrowserCommand::ListWorktrees => {
+                        log::info!("WebRTC: Listing available worktrees");
+                        if let Err(e) = app.load_available_worktrees() {
+                            log::error!("Failed to load worktrees: {}", e);
+                        }
+                        let (_, repo_name) = WorktreeManager::detect_current_repo()
+                            .unwrap_or_else(|_| (std::path::PathBuf::new(), "unknown".to_string()));
+                        let worktrees: Vec<WebWorktreeInfo> = app.available_worktrees
+                            .iter()
+                            .map(|(path, branch)| {
+                                let issue_number = branch.strip_prefix("botster-issue-")
+                                    .and_then(|n| n.parse::<u32>().ok());
+                                WebWorktreeInfo {
+                                    path: path.clone(),
+                                    branch: branch.clone(),
+                                    issue_number,
+                                }
+                            })
+                            .collect();
+                        let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                        app.tokio_runtime.block_on(async move {
+                            let handler = webrtc_handler.lock().unwrap();
+                            if let Err(e) = handler.send_worktrees(&repo_name, worktrees).await {
+                                log::warn!("Failed to send worktrees: {}", e);
+                            }
                         });
-                        match app.spawn_agent_for_message(0, &payload, "web_create") {
+                    }
+                    BrowserCommand::CreateAgent { issue_or_branch, prompt } => {
+                        log::info!("WebRTC: Creating agent for {}", issue_or_branch);
+                        // Store the input and create agent
+                        app.input_buffer = issue_or_branch.clone();
+                        if let Some(p) = prompt {
+                            app.input_buffer = p; // Use the provided prompt
+                        }
+                        match app.create_and_spawn_agent() {
                             Ok(()) => {
-                                // Find the newly created agent's session key
-                                let repo_safe = repo.replace('/', "-");
-                                let session_key = format!("{}-{}", repo_safe, issue_number);
-                                let webrtc_handler = Arc::clone(&app.webrtc_handler);
-                                app.tokio_runtime.block_on(async move {
-                                    let handler = webrtc_handler.lock().unwrap();
-                                    if let Err(e) = handler.send_agent_created(&session_key).await {
-                                        log::warn!("Failed to send agent created: {}", e);
+                                // Get the last created agent's session key
+                                if let Some(session_key) = app.agent_keys_ordered.last().cloned() {
+                                    // Resize new agent to current browser dimensions
+                                    let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                    let browser_dims: Option<BrowserDimensions> = app.tokio_runtime.block_on(async {
+                                        let handler = webrtc_handler.lock().unwrap();
+                                        handler.get_browser_dimensions().await
+                                    });
+                                    if let Some(dims) = browser_dims {
+                                        if let Some(agent) = app.agents.get(&session_key) {
+                                            let (agent_cols, agent_rows) = match dims.mode {
+                                                BrowserMode::Gui => (dims.cols, dims.rows),
+                                                BrowserMode::Tui => {
+                                                    let tui_cols = (dims.cols * 70 / 100).saturating_sub(2);
+                                                    let tui_rows = dims.rows.saturating_sub(2);
+                                                    (tui_cols, tui_rows)
+                                                }
+                                            };
+                                            log::info!("Resizing new agent to browser dims: {}x{}", agent_cols, agent_rows);
+                                            agent.resize(agent_rows, agent_cols);
+                                        }
                                     }
-                                });
+
+                                    // Notify browser
+                                    let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                    app.tokio_runtime.block_on(async move {
+                                        let handler = webrtc_handler.lock().unwrap();
+                                        if let Err(e) = handler.send_agent_created(&session_key).await {
+                                            log::warn!("Failed to send agent created: {}", e);
+                                        }
+                                    });
+                                }
                             }
                             Err(e) => {
                                 log::error!("WebRTC: Failed to create agent: {}", e);
@@ -1908,6 +1984,68 @@ fn run_interactive() -> Result<()> {
                                     let _ = handler.send_error(&error_msg).await;
                                 });
                             }
+                        }
+                        app.input_buffer.clear();
+                    }
+                    BrowserCommand::ReopenWorktree { path, branch, prompt } => {
+                        log::info!("WebRTC: Reopening worktree {} ({})", path, branch);
+                        // Find the worktree in available_worktrees and set selection
+                        if let Some(idx) = app.available_worktrees.iter().position(|(p, _)| p == &path) {
+                            app.worktree_selected = idx + 1; // +1 because "Create New" is at 0
+                            app.input_buffer = prompt.unwrap_or_default();
+                            match app.spawn_agent_from_worktree() {
+                                Ok(()) => {
+                                    if let Some(session_key) = app.agent_keys_ordered.last().cloned() {
+                                        // Resize new agent to current browser dimensions
+                                        let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                        let browser_dims: Option<BrowserDimensions> = app.tokio_runtime.block_on(async {
+                                            let handler = webrtc_handler.lock().unwrap();
+                                            handler.get_browser_dimensions().await
+                                        });
+                                        if let Some(dims) = browser_dims {
+                                            if let Some(agent) = app.agents.get(&session_key) {
+                                                let (agent_cols, agent_rows) = match dims.mode {
+                                                    BrowserMode::Gui => (dims.cols, dims.rows),
+                                                    BrowserMode::Tui => {
+                                                        let tui_cols = (dims.cols * 70 / 100).saturating_sub(2);
+                                                        let tui_rows = dims.rows.saturating_sub(2);
+                                                        (tui_cols, tui_rows)
+                                                    }
+                                                };
+                                                log::info!("Resizing reopened agent to browser dims: {}x{}", agent_cols, agent_rows);
+                                                agent.resize(agent_rows, agent_cols);
+                                            }
+                                        }
+
+                                        // Notify browser
+                                        let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                        app.tokio_runtime.block_on(async move {
+                                            let handler = webrtc_handler.lock().unwrap();
+                                            if let Err(e) = handler.send_agent_created(&session_key).await {
+                                                log::warn!("Failed to send agent created: {}", e);
+                                            }
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("WebRTC: Failed to reopen worktree: {}", e);
+                                    let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                    let error_msg = format!("Failed to reopen worktree: {}", e);
+                                    app.tokio_runtime.block_on(async move {
+                                        let handler = webrtc_handler.lock().unwrap();
+                                        let _ = handler.send_error(&error_msg).await;
+                                    });
+                                }
+                            }
+                            app.input_buffer.clear();
+                        } else {
+                            log::error!("WebRTC: Worktree not found: {}", path);
+                            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                            let error_msg = format!("Worktree not found: {}", path);
+                            app.tokio_runtime.block_on(async move {
+                                let handler = webrtc_handler.lock().unwrap();
+                                let _ = handler.send_error(&error_msg).await;
+                            });
                         }
                     }
                     BrowserCommand::DeleteAgent { id, delete_worktree } => {

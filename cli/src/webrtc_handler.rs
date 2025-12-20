@@ -29,6 +29,47 @@ pub struct AgentInfo {
     pub status: String,
 }
 
+/// ICE server configuration from signaling server (metered.ca format)
+/// The server sends ICE servers directly so CLI doesn't need API keys
+#[derive(Debug, Clone, Deserialize)]
+pub struct IceServerConfig {
+    /// URL(s) - can be a single string or array of strings
+    pub urls: IceUrls,
+    /// TURN username (optional, only for TURN servers)
+    #[serde(default)]
+    pub username: Option<String>,
+    /// TURN credential (optional, only for TURN servers)
+    #[serde(default)]
+    pub credential: Option<String>,
+}
+
+/// Helper to deserialize urls which can be string or array
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum IceUrls {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl IceUrls {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            IceUrls::Single(s) => vec![s.clone()],
+            IceUrls::Multiple(v) => v.clone(),
+        }
+    }
+}
+
+/// Browser display mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrowserMode {
+    /// TUI mode - shows full hub terminal interface (terminal widgets are 70% width)
+    #[default]
+    Tui,
+    /// GUI mode - shows individual agent terminal directly (full width)
+    Gui,
+}
+
 /// Messages from browser to CLI
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -42,14 +83,29 @@ pub enum BrowserMessage {
     },
     /// Browser terminal resize
     Resize { rows: u16, cols: u16 },
+    /// Set browser display mode (tui or gui)
+    SetMode { mode: String },
     /// Request list of agents
     ListAgents,
+    /// Request list of available worktrees (for reopening)
+    ListWorktrees,
     /// Select an agent to view
     SelectAgent { id: String },
-    /// Create a new agent
+    /// Create a new agent (from issue number or branch name, with optional prompt)
     CreateAgent {
-        repo: String,
-        issue_number: u32,
+        /// Issue number or branch name
+        issue_or_branch: String,
+        /// Optional prompt for the agent
+        prompt: Option<String>,
+    },
+    /// Reopen an existing worktree
+    ReopenWorktree {
+        /// Path to the worktree
+        path: String,
+        /// Branch name
+        branch: String,
+        /// Optional prompt for the agent
+        prompt: Option<String>,
     },
     /// Delete an agent
     DeleteAgent {
@@ -71,6 +127,14 @@ pub struct WebAgentInfo {
     pub selected: bool,
 }
 
+/// Worktree info sent to browser
+#[derive(Debug, Clone, Serialize)]
+pub struct WebWorktreeInfo {
+    pub path: String,
+    pub branch: String,
+    pub issue_number: Option<u32>,
+}
+
 /// Messages from CLI to browser
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -79,6 +143,11 @@ pub enum CLIMessage {
     Screen { data: String, rows: u16, cols: u16 },
     /// List of agents
     Agents { agents: Vec<WebAgentInfo> },
+    /// List of available worktrees for reopening
+    Worktrees {
+        repo: String,
+        worktrees: Vec<WebWorktreeInfo>,
+    },
     /// Terminal output from selected agent (base64 encoded)
     AgentOutput { id: String, data: String },
     /// Agent selection confirmed
@@ -105,14 +174,17 @@ pub struct KeyInput {
 pub struct BrowserDimensions {
     pub rows: u16,
     pub cols: u16,
+    pub mode: BrowserMode,
 }
 
 /// Commands from browser to be processed by main loop
 #[derive(Debug, Clone)]
 pub enum BrowserCommand {
     ListAgents,
+    ListWorktrees,
     SelectAgent { id: String },
-    CreateAgent { repo: String, issue_number: u32 },
+    CreateAgent { issue_or_branch: String, prompt: Option<String> },
+    ReopenWorktree { path: String, branch: String, prompt: Option<String> },
     DeleteAgent { id: String, delete_worktree: bool },
     SendInput { data: String },
 }
@@ -129,6 +201,8 @@ pub struct WebRTCHandler {
     command_queue: Arc<Mutex<Vec<BrowserCommand>>>,
     /// Browser's terminal dimensions (for rendering at correct size)
     browser_dimensions: Arc<Mutex<Option<BrowserDimensions>>>,
+    /// Browser's display mode (TUI or GUI)
+    browser_mode: Arc<Mutex<BrowserMode>>,
 }
 
 impl WebRTCHandler {
@@ -140,12 +214,21 @@ impl WebRTCHandler {
             input_queue: Arc::new(Mutex::new(Vec::new())),
             command_queue: Arc::new(Mutex::new(Vec::new())),
             browser_dimensions: Arc::new(Mutex::new(None)),
+            browser_mode: Arc::new(Mutex::new(BrowserMode::default())),
         }
     }
 
     /// Handle an incoming WebRTC offer from a browser (via signaling server)
     /// Returns the SDP answer to send back
-    pub async fn handle_offer(&mut self, offer_sdp: &str) -> Result<String> {
+    ///
+    /// # Arguments
+    /// * `offer_sdp` - The SDP offer from the browser
+    /// * `ice_server_configs` - ICE servers from signaling server (STUN and TURN)
+    pub async fn handle_offer(
+        &mut self,
+        offer_sdp: &str,
+        ice_server_configs: &[IceServerConfig],
+    ) -> Result<String> {
         log::info!("Received WebRTC offer, creating answer...");
 
         // Create media engine and interceptor registry
@@ -161,9 +244,10 @@ impl WebRTCHandler {
             .with_interceptor_registry(registry)
             .build();
 
-        // ICE servers for NAT traversal
-        let config = RTCConfiguration {
-            ice_servers: vec![
+        // Convert ICE server configs to webrtc-rs format
+        let ice_servers: Vec<RTCIceServer> = if ice_server_configs.is_empty() {
+            log::warn!("No ICE servers provided - using default STUN servers");
+            vec![
                 RTCIceServer {
                     urls: vec!["stun:stun.l.google.com:19302".to_string()],
                     ..Default::default()
@@ -172,7 +256,36 @@ impl WebRTCHandler {
                     urls: vec!["stun:stun1.l.google.com:19302".to_string()],
                     ..Default::default()
                 },
-            ],
+            ]
+        } else {
+            let mut has_turn = false;
+            let servers: Vec<RTCIceServer> = ice_server_configs
+                .iter()
+                .map(|config| {
+                    let urls = config.urls.to_vec();
+                    if urls.iter().any(|u| u.starts_with("turn:") || u.starts_with("turns:")) {
+                        has_turn = true;
+                    }
+                    RTCIceServer {
+                        urls,
+                        username: config.username.clone().unwrap_or_default(),
+                        credential: config.credential.clone().unwrap_or_default(),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+
+            log::info!(
+                "Using {} ICE server(s) from signaling server (TURN: {})",
+                servers.len(),
+                if has_turn { "yes" } else { "no" }
+            );
+            servers
+        };
+
+        // ICE servers for NAT traversal
+        let config = RTCConfiguration {
+            ice_servers,
             ..Default::default()
         };
 
@@ -195,6 +308,7 @@ impl WebRTCHandler {
         let input_queue = Arc::clone(&self.input_queue);
         let command_queue = Arc::clone(&self.command_queue);
         let browser_dimensions = Arc::clone(&self.browser_dimensions);
+        let browser_mode = Arc::clone(&self.browser_mode);
 
         peer_connection.on_data_channel(Box::new(move |dc| {
             let dc_label = dc.label().to_owned();
@@ -204,6 +318,7 @@ impl WebRTCHandler {
             let input_queue = Arc::clone(&input_queue);
             let command_queue = Arc::clone(&command_queue);
             let browser_dimensions = Arc::clone(&browser_dimensions);
+            let browser_mode = Arc::clone(&browser_mode);
             let dc_for_store = Arc::clone(&dc);
 
             // Handle incoming messages
@@ -211,6 +326,7 @@ impl WebRTCHandler {
                 let input_queue = Arc::clone(&input_queue);
                 let command_queue = Arc::clone(&command_queue);
                 let browser_dimensions = Arc::clone(&browser_dimensions);
+                let browser_mode = Arc::clone(&browser_mode);
 
                 Box::pin(async move {
                     if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
@@ -237,25 +353,47 @@ impl WebRTCHandler {
                                     });
                                 }
                                 BrowserMessage::Resize { rows, cols } => {
+                                    let mode = *browser_mode.lock().await;
                                     log::info!(
-                                        "Browser terminal resized to {}x{} (cols x rows)",
+                                        "Browser terminal resized to {}x{} (cols x rows), mode={:?}",
                                         cols,
-                                        rows
+                                        rows,
+                                        mode
                                     );
                                     *browser_dimensions.lock().await =
-                                        Some(BrowserDimensions { rows, cols });
+                                        Some(BrowserDimensions { rows, cols, mode });
+                                }
+                                BrowserMessage::SetMode { mode } => {
+                                    let new_mode = match mode.as_str() {
+                                        "gui" => BrowserMode::Gui,
+                                        _ => BrowserMode::Tui,
+                                    };
+                                    log::info!("Browser mode set to {:?}", new_mode);
+                                    *browser_mode.lock().await = new_mode;
+                                    // Update dimensions with new mode if we have them
+                                    if let Some(dims) = browser_dimensions.lock().await.as_mut() {
+                                        dims.mode = new_mode;
+                                    }
                                 }
                                 BrowserMessage::ListAgents => {
                                     log::info!("Browser requested agent list");
                                     command_queue.lock().await.push(BrowserCommand::ListAgents);
                                 }
+                                BrowserMessage::ListWorktrees => {
+                                    log::info!("Browser requested worktree list");
+                                    command_queue.lock().await.push(BrowserCommand::ListWorktrees);
+                                }
                                 BrowserMessage::SelectAgent { id } => {
                                     log::info!("Browser selected agent: {}", id);
                                     command_queue.lock().await.push(BrowserCommand::SelectAgent { id });
                                 }
-                                BrowserMessage::CreateAgent { repo, issue_number } => {
-                                    log::info!("Browser requested create agent: {} #{}", repo, issue_number);
-                                    command_queue.lock().await.push(BrowserCommand::CreateAgent { repo, issue_number });
+                                BrowserMessage::CreateAgent { issue_or_branch, prompt } => {
+                                    log::info!("Browser requested create agent: {}", issue_or_branch);
+                                    command_queue.lock().await.push(BrowserCommand::CreateAgent { issue_or_branch, prompt });
+                                }
+                                BrowserMessage::ReopenWorktree { path, branch, prompt } => {
+                                    log::info!("Browser requested reopen worktree: {} ({})", path, branch);
+                                    command_queue.lock().await.push(BrowserCommand::ReopenWorktree { path, branch, prompt });
                                 }
                                 BrowserMessage::DeleteAgent { id, delete_worktree } => {
                                     log::info!("Browser requested delete agent: {} (delete_worktree={})", id, delete_worktree);
@@ -357,6 +495,20 @@ impl WebRTCHandler {
         let dc = self.data_channel.lock().await;
         if let Some(ref dc) = *dc {
             let msg = CLIMessage::Agents { agents };
+            let json = serde_json::to_string(&msg)?;
+            dc.send_text(json).await?;
+        }
+        Ok(())
+    }
+
+    /// Send available worktrees list to browser
+    pub async fn send_worktrees(&self, repo: &str, worktrees: Vec<WebWorktreeInfo>) -> Result<()> {
+        let dc = self.data_channel.lock().await;
+        if let Some(ref dc) = *dc {
+            let msg = CLIMessage::Worktrees {
+                repo: repo.to_string(),
+                worktrees,
+            };
             let json = serde_json::to_string(&msg)?;
             dc.send_text(json).await?;
         }
@@ -496,12 +648,20 @@ mod tests {
             BrowserMessage::SelectAgent { id } if id == "my-repo-123"
         ));
 
-        // Test CreateAgent
-        let msg = r#"{"type": "create_agent", "repo": "owner/repo", "issue_number": 42}"#;
+        // Test CreateAgent with issue number
+        let msg = r#"{"type": "create_agent", "issue_or_branch": "42"}"#;
         let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
         assert!(matches!(
             parsed,
-            BrowserMessage::CreateAgent { repo, issue_number } if repo == "owner/repo" && issue_number == 42
+            BrowserMessage::CreateAgent { issue_or_branch, prompt: None } if issue_or_branch == "42"
+        ));
+
+        // Test CreateAgent with branch name and prompt
+        let msg = r#"{"type": "create_agent", "issue_or_branch": "feature-branch", "prompt": "Fix the bug"}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(
+            parsed,
+            BrowserMessage::CreateAgent { issue_or_branch, prompt: Some(_) } if issue_or_branch == "feature-branch"
         ));
 
         // Test DeleteAgent
@@ -576,5 +736,116 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"error\""));
         assert!(json.contains("\"message\":\"Something went wrong\""));
+    }
+
+    #[test]
+    fn test_browser_mode_default() {
+        // BrowserMode should default to Tui
+        let mode = BrowserMode::default();
+        assert_eq!(mode, BrowserMode::Tui);
+    }
+
+    #[test]
+    fn test_set_mode_message_parsing() {
+        // Test SetMode with gui
+        let msg = r#"{"type": "set_mode", "mode": "gui"}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(
+            parsed,
+            BrowserMessage::SetMode { mode } if mode == "gui"
+        ));
+
+        // Test SetMode with tui
+        let msg = r#"{"type": "set_mode", "mode": "tui"}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(
+            parsed,
+            BrowserMessage::SetMode { mode } if mode == "tui"
+        ));
+    }
+
+    #[test]
+    fn test_resize_message_parsing() {
+        let msg = r#"{"type": "resize", "rows": 24, "cols": 80}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(
+            parsed,
+            BrowserMessage::Resize { rows: 24, cols: 80 }
+        ));
+    }
+
+    #[test]
+    fn test_browser_dimensions_with_mode() {
+        // Test that BrowserDimensions properly stores mode
+        let dims_gui = BrowserDimensions {
+            rows: 24,
+            cols: 80,
+            mode: BrowserMode::Gui,
+        };
+        assert_eq!(dims_gui.mode, BrowserMode::Gui);
+        assert_eq!(dims_gui.rows, 24);
+        assert_eq!(dims_gui.cols, 80);
+
+        let dims_tui = BrowserDimensions {
+            rows: 50,
+            cols: 100,
+            mode: BrowserMode::Tui,
+        };
+        assert_eq!(dims_tui.mode, BrowserMode::Tui);
+        assert_eq!(dims_tui.rows, 50);
+        assert_eq!(dims_tui.cols, 100);
+    }
+
+    #[test]
+    fn test_reopen_worktree_message_parsing() {
+        // Test ReopenWorktree without prompt
+        let msg = r#"{"type": "reopen_worktree", "path": "/path/to/worktree", "branch": "feature-123"}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(
+            parsed,
+            BrowserMessage::ReopenWorktree { path, branch, prompt: None }
+            if path == "/path/to/worktree" && branch == "feature-123"
+        ));
+
+        // Test ReopenWorktree with prompt
+        let msg = r#"{"type": "reopen_worktree", "path": "/path/to/worktree", "branch": "feature-123", "prompt": "Continue work"}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(
+            parsed,
+            BrowserMessage::ReopenWorktree { path, branch, prompt: Some(_) }
+            if path == "/path/to/worktree" && branch == "feature-123"
+        ));
+    }
+
+    #[test]
+    fn test_list_worktrees_message_parsing() {
+        let msg = r#"{"type": "list_worktrees"}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(parsed, BrowserMessage::ListWorktrees));
+    }
+
+    #[test]
+    fn test_worktrees_response_serialization() {
+        let worktrees = vec![
+            WebWorktreeInfo {
+                path: "/path/to/worktree".to_string(),
+                branch: "feature-123".to_string(),
+                issue_number: Some(123),
+            },
+            WebWorktreeInfo {
+                path: "/path/to/other".to_string(),
+                branch: "manual-branch".to_string(),
+                issue_number: None,
+            },
+        ];
+        let msg = CLIMessage::Worktrees {
+            repo: "owner/repo".to_string(),
+            worktrees,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"worktrees\""));
+        assert!(json.contains("\"repo\":\"owner/repo\""));
+        assert!(json.contains("\"issue_number\":123"));
+        assert!(json.contains("\"branch\":\"manual-branch\""));
     }
 }
