@@ -1,7 +1,8 @@
 use anyhow::Result;
 use botster_hub::{
-    Agent, BrowserCommand, BrowserDimensions, BrowserMode, Config, IceServerConfig, KeyInput,
-    PromptManager, WebAgentInfo, WebRTCHandler, WebWorktreeInfo, WorktreeManager,
+    Agent, AgentNotification, BrowserCommand, BrowserDimensions, BrowserMode, Config,
+    IceServerConfig, KeyInput, PromptManager, WebAgentInfo, WebRTCHandler, WebWorktreeInfo,
+    WorktreeManager,
 };
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -295,6 +296,8 @@ struct BotsterApp {
     webrtc_handler: Arc<StdMutex<WebRTCHandler>>,
     // Track last agent screen hash for change detection (reduces bandwidth)
     last_agent_screen_hash: HashMap<String, u64>,
+    // Track whether question UI is currently visible per agent (for state transition detection)
+    question_ui_visible: HashMap<String, bool>,
 }
 
 impl BotsterApp {
@@ -329,6 +332,7 @@ impl BotsterApp {
             tokio_runtime,
             webrtc_handler,
             last_agent_screen_hash: HashMap::new(),
+            question_ui_visible: HashMap::new(),
         };
 
         log::info!("Botster Hub started, waiting for messages...");
@@ -385,6 +389,10 @@ impl BotsterApp {
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_else(|| "botster-hub".to_string());
         env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
+
+        // Kill any existing orphaned claude processes for this worktree
+        // This prevents duplicate claude instances when reopening a worktree
+        Self::kill_orphaned_claude_processes(&config.worktree_path);
 
         // Spawn the agent
         let init_commands = vec!["source .botster_init".to_string()];
@@ -1304,6 +1312,243 @@ impl BotsterApp {
         }
     }
 
+    /// Patterns that indicate Claude Code is asking a question
+    const QUESTION_UI_PATTERNS: &'static [&'static str] = &[
+        "Enter to select",
+        "Tab/Arrow keys to navigate",
+        "Esc to cancel",
+        "Type to filter",
+    ];
+
+    /// Check if the current screen contains question UI patterns
+    fn screen_has_question_ui(screen_lines: &[String]) -> bool {
+        let screen_text = screen_lines.join("\n");
+        Self::QUESTION_UI_PATTERNS
+            .iter()
+            .any(|pattern| screen_text.contains(pattern))
+    }
+
+    /// Poll all agents for terminal notifications (BEL, OSC 9, etc.)
+    /// and send them to Rails to trigger GitHub comments
+    fn poll_agent_notifications(&mut self) {
+        // Collect agent info and check for question UI state transitions
+        let mut question_state_changes: Vec<(String, String, Option<u32>, bool)> = Vec::new();
+        let mut other_notifications: Vec<(String, String, Option<u32>, AgentNotification)> =
+            Vec::new();
+
+        for (session_key, agent) in &self.agents {
+            // Check current screen for question UI patterns
+            let screen_lines = agent.get_vt100_screen();
+            let question_visible_now = Self::screen_has_question_ui(&screen_lines);
+            let was_visible = self
+                .question_ui_visible
+                .get(session_key)
+                .copied()
+                .unwrap_or(false);
+
+            // Detect state transition: not visible -> visible
+            if question_visible_now != was_visible {
+                question_state_changes.push((
+                    session_key.clone(),
+                    agent.repo.clone(),
+                    agent.issue_number,
+                    question_visible_now,
+                ));
+            }
+
+            // Collect other notifications (Bell, OSC9, OSC777) - skip QuestionAsked from channel
+            let notifications = agent.poll_notifications();
+            for notification in notifications {
+                if !matches!(notification, AgentNotification::QuestionAsked) {
+                    other_notifications.push((
+                        session_key.clone(),
+                        agent.repo.clone(),
+                        agent.issue_number,
+                        notification,
+                    ));
+                }
+            }
+        }
+
+        // Process question UI state changes
+        for (session_key, repo, issue_number, is_visible) in question_state_changes {
+            self.question_ui_visible
+                .insert(session_key.clone(), is_visible);
+
+            // Only notify when question UI appears (transition to visible)
+            if is_visible {
+                if let Some(issue_num) = issue_number {
+                    log::info!(
+                        "Agent {} (issue #{}) question UI appeared - sending notification",
+                        session_key,
+                        issue_num
+                    );
+
+                    if let Err(e) = self.send_agent_notification(&repo, issue_num, "question_asked")
+                    {
+                        log::error!("Failed to send notification to Rails: {}", e);
+                    }
+                } else {
+                    log::debug!(
+                        "Agent {} question UI appeared but has no issue_number - skipping",
+                        session_key
+                    );
+                }
+            } else {
+                log::debug!("Agent {} question UI disappeared", session_key);
+            }
+        }
+
+        // Process other notifications (Bell, OSC9, OSC777)
+        for (session_key, repo, issue_number, notification) in other_notifications {
+            let notification_type = match &notification {
+                AgentNotification::Bell => "bell".to_string(),
+                AgentNotification::Osc9(msg) => {
+                    format!("osc9:{}", msg.as_deref().unwrap_or(""))
+                }
+                AgentNotification::Osc777 { title, body } => {
+                    format!("osc777:{}:{}", title, body)
+                }
+                AgentNotification::QuestionAsked => continue, // Already handled above
+            };
+
+            if let Some(issue_num) = issue_number {
+                log::info!(
+                    "Agent {} (issue #{}) sent notification: {}",
+                    session_key,
+                    issue_num,
+                    notification_type
+                );
+
+                if let Err(e) = self.send_agent_notification(&repo, issue_num, &notification_type) {
+                    log::error!("Failed to send notification to Rails: {}", e);
+                }
+            } else {
+                log::debug!(
+                    "Agent {} detected notification '{}' but has no issue_number - skipping",
+                    session_key,
+                    notification_type
+                );
+            }
+        }
+    }
+
+    /// Send an agent notification to Rails to trigger a GitHub comment
+    fn send_agent_notification(
+        &self,
+        repo: &str,
+        issue_number: u32,
+        notification_type: &str,
+    ) -> Result<()> {
+        let url = format!("{}/api/agent_notifications", self.config.server_url);
+
+        let payload = serde_json::json!({
+            "repo": repo,
+            "issue_number": issue_number,
+            "notification_type": notification_type,
+        });
+
+        let response = self
+            .client
+            .post(&url)
+            .header("X-API-Key", &self.config.api_key)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()?;
+
+        if response.status().is_success() {
+            log::info!(
+                "Sent notification to Rails for {}#{}: {}",
+                repo,
+                issue_number,
+                notification_type
+            );
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Failed to send notification: {} - {}",
+                response.status(),
+                response.text().unwrap_or_default()
+            )
+        }
+    }
+
+    /// Kill any orphaned claude processes running in the given worktree directory.
+    /// This is needed when reopening a worktree that has a lingering claude process
+    /// from a previous botster-hub session.
+    fn kill_orphaned_claude_processes(worktree_path: &std::path::Path) {
+        let worktree_str = worktree_path.to_string_lossy();
+
+        // Use pgrep to find claude processes, then filter by CWD
+        // macOS: lsof -d cwd to check working directory
+        #[cfg(target_os = "macos")]
+        {
+            use std::process::Command;
+
+            // Get all claude process PIDs
+            let pgrep_output = Command::new("pgrep").arg("-f").arg("claude").output();
+
+            if let Ok(output) = pgrep_output {
+                let pids_str = String::from_utf8_lossy(&output.stdout);
+                for pid_str in pids_str.lines() {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        // Check if this process's CWD matches our worktree
+                        let lsof_output = Command::new("lsof")
+                            .arg("-p")
+                            .arg(pid.to_string())
+                            .arg("-d")
+                            .arg("cwd")
+                            .arg("-Fn")
+                            .output();
+
+                        if let Ok(lsof) = lsof_output {
+                            let lsof_str = String::from_utf8_lossy(&lsof.stdout);
+                            // lsof -Fn output format: lines starting with 'n' contain the path
+                            if lsof_str.lines().any(|line| {
+                                line.starts_with('n') && line[1..].contains(&*worktree_str)
+                            }) {
+                                log::info!(
+                                    "Killing orphaned claude process {} in worktree {}",
+                                    pid,
+                                    worktree_str
+                                );
+                                let _ = Command::new("kill").arg(pid.to_string()).output();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::process::Command;
+
+            // Get all claude process PIDs
+            let pgrep_output = Command::new("pgrep").arg("-f").arg("claude").output();
+
+            if let Ok(output) = pgrep_output {
+                let pids_str = String::from_utf8_lossy(&output.stdout);
+                for pid_str in pids_str.lines() {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        // On Linux, check /proc/<pid>/cwd symlink
+                        let cwd_path = format!("/proc/{}/cwd", pid);
+                        if let Ok(cwd) = std::fs::read_link(&cwd_path) {
+                            if cwd.to_string_lossy().contains(&*worktree_str) {
+                                log::info!(
+                                    "Killing orphaned claude process {} in worktree {}",
+                                    pid,
+                                    worktree_str
+                                );
+                                let _ = Command::new("kill").arg(pid.to_string()).output();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn spawn_agent_for_message(
         &mut self,
         message_id: i64,
@@ -2097,6 +2342,9 @@ fn run_interactive() -> Result<()> {
         if let Err(e) = app.poll_messages() {
             log::error!("Failed to poll messages: {}", e);
         }
+
+        // Poll agents for terminal notifications (BEL, OSC) and send to Rails
+        app.poll_agent_notifications();
 
         // Small sleep to prevent CPU spinning (60 FPS max)
         std::thread::sleep(Duration::from_millis(16));

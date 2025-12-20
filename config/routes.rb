@@ -26,6 +26,7 @@ Rails.application.routes.draw do
   # WebRTC signaling for P2P browser-to-CLI connections
   namespace :api do
     resources :webrtc_sessions, path: "webrtc/sessions", only: [ :create, :show, :update ]
+    resources :agent_notifications, only: [ :create ]
   end
 
   # Agents dashboard - WebRTC P2P connection to local CLI
