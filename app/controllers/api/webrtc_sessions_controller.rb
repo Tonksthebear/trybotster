@@ -109,9 +109,46 @@ module Api
         payload: {
           session_id: session.id.to_s,  # CLI expects string for URL building
           offer: session.offer,
-          user_id: current_user.id
+          user_id: current_user.id,
+          ice_servers: build_ice_servers  # Include ICE servers so CLI doesn't need env vars
         }
       )
+    end
+
+    # Build ICE servers for WebRTC (shared with AgentsController)
+    def build_ice_servers
+      turn_api_key = ENV["METERED_TURN_API_KEY"]
+      if turn_api_key.present?
+        fetch_metered_ice_servers(turn_api_key)
+      else
+        Rails.logger.warn "No METERED_TURN_API_KEY - WebRTC may fail on cellular networks"
+        [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" }
+        ]
+      end
+    end
+
+    def fetch_metered_ice_servers(api_key)
+      Rails.cache.fetch("metered_ice_servers", expires_in: 1.hour) do
+        response = Faraday.get("https://trybotster.metered.live/api/v1/turn/credentials?apiKey=#{api_key}")
+
+        if response.success?
+          JSON.parse(response.body)
+        else
+          Rails.logger.error "Failed to fetch TURN credentials: #{response.status}"
+          [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun1.l.google.com:19302" }
+          ]
+        end
+      end
+    rescue Faraday::Error => e
+      Rails.logger.error "Failed to fetch TURN credentials: #{e.message}"
+      [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" }
+      ]
     end
   end
 end

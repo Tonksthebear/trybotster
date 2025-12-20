@@ -88,6 +88,8 @@ impl Config {
                 self.agent_timeout = timeout;
             }
         }
+        // Note: ICE/TURN servers are provided by the Rails signaling server
+        // so no environment variables are needed for WebRTC configuration
     }
 
     pub fn save(&self) -> Result<()> {

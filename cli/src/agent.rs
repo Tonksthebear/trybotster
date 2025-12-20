@@ -303,23 +303,43 @@ impl Agent {
         // Hide cursor during update to prevent flicker
         output.push_str("\x1b[?25l");
 
-        // Reset attributes and move to home position, clear screen
-        output.push_str("\x1b[0m\x1b[H\x1b[2J");
+        // Reset attributes, clear screen and scrollback, move to home
+        output.push_str("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
+
+        let mut last_fg = vt100::Color::Default;
+        let mut last_bg = vt100::Color::Default;
+        let mut last_bold = false;
+        let mut last_italic = false;
+        let mut last_underline = false;
+        let mut last_inverse = false;
 
         for row in 0..rows {
-            // Move cursor to start of row
+            // Explicitly position at start of each row to avoid drift
             let _ = write!(output, "\x1b[{};1H", row + 1);
 
-            let mut last_fg = vt100::Color::Default;
-            let mut last_bg = vt100::Color::Default;
-            let mut last_bold = false;
-            let mut last_italic = false;
-            let mut last_underline = false;
-            let mut last_inverse = false;
+            // Reset tracking for each row
+            last_fg = vt100::Color::Default;
+            last_bg = vt100::Color::Default;
+            last_bold = false;
+            last_italic = false;
+            last_underline = false;
+            last_inverse = false;
 
-            for col in 0..cols {
+            let mut col = 0u16;
+            while col < cols {
                 let cell = screen.cell(row, col);
                 if let Some(cell) = cell {
+                    let contents = cell.contents();
+
+                    // Skip empty cells (continuation of wide chars)
+                    if contents.is_empty() {
+                        col += 1;
+                        continue;
+                    }
+
+                    // Explicitly position for this cell to prevent drift from wide chars
+                    let _ = write!(output, "\x1b[{};{}H", row + 1, col + 1);
+
                     let fg = cell.fgcolor();
                     let bg = cell.bgcolor();
                     let bold = cell.bold();
@@ -381,10 +401,9 @@ impl Agent {
                     }
 
                     // Write the character
-                    output.push_str(&cell.contents());
-                } else {
-                    output.push(' ');
+                    output.push_str(&contents);
                 }
+                col += 1;
             }
         }
 
