@@ -10,6 +10,7 @@ class User < ApplicationRecord
   # Associations
   belongs_to :team, optional: true
   has_many :webrtc_sessions, dependent: :destroy
+  has_many :hubs, dependent: :destroy
 
   # Skip email/password validations for OAuth users
   validates :email, presence: true, uniqueness: true, if: -> { provider.blank? }  # Only if not OAuth

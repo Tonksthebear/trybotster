@@ -1,0 +1,33 @@
+<% hubs.group_by(&:repo).each do |repo, repo_hubs| %>
+  <div class="mb-6">
+    <h2 class="text-lg font-semibold mb-2 text-gray-900 dark:text-gray-100"><%= repo %></h2>
+    <% repo_hubs.each do |hub| %>
+      <div class="p-3 border rounded mb-2 flex justify-between items-center bg-white dark:bg-gray-800 border-gray-200 dark:border-gray-700">
+        <div>
+          <span class="font-mono text-sm text-gray-600 dark:text-gray-400"><%= hub.identifier.first(8) %>...</span>
+          <span class="text-gray-500 dark:text-gray-400 ml-2"><%= hub.hub_agents.size %> agent(s)</span>
+          <% if hub.hub_agents.any? %>
+            <div class="mt-1 text-xs text-gray-400 dark:text-gray-500">
+              <% hub.hub_agents.each do |agent| %>
+                <div class="ml-2">
+                  <span class="font-mono"><%= agent.session_key %></span>
+                  <% if agent.last_invocation_url.present? %>
+                    <a href="<%= agent.last_invocation_url %>" target="_blank" class="text-blue-500 hover:underline ml-1">view</a>
+                  <% end %>
+                </div>
+              <% end %>
+            </div>
+          <% end %>
+        </div>
+        <div class="flex items-center">
+          <span class="w-2 h-2 rounded-full bg-green-500 mr-2"></span>
+          <span class="text-sm text-gray-600 dark:text-gray-400">Active</span>
+        </div>
+      </div>
+    <% end %>
+  </div>
+<% end %>
+
+<% if hubs.empty? %>
+  <p class="text-gray-500 dark:text-gray-400">No active hubs. Start a CLI with your API key to see it here.</p>
+<% end %>

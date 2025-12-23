@@ -231,6 +231,13 @@ impl WebRTCHandler {
     ) -> Result<String> {
         log::info!("Received WebRTC offer, creating answer...");
 
+        // Close any existing connection before creating a new one
+        // This allows reconnection after disconnect
+        if self.peer_connection.is_some() {
+            log::info!("Closing existing peer connection before accepting new offer");
+            self.close().await?;
+        }
+
         // Create media engine and interceptor registry
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
@@ -293,12 +300,22 @@ impl WebRTCHandler {
         let peer_connection = Arc::new(api.new_peer_connection(config).await?);
 
         // Set up connection state handler
+        // Need to clear browser_dimensions when connection drops so PTY resizes back
+        let browser_dimensions_for_state = Arc::clone(&self.browser_dimensions);
+        let data_channel_for_state = Arc::clone(&self.data_channel);
         peer_connection.on_peer_connection_state_change(Box::new(move |state| {
             log::info!("WebRTC connection state: {:?}", state);
             if state == RTCPeerConnectionState::Failed
                 || state == RTCPeerConnectionState::Disconnected
+                || state == RTCPeerConnectionState::Closed
             {
-                log::warn!("WebRTC connection failed or disconnected");
+                log::warn!("WebRTC connection failed or disconnected - clearing browser dimensions");
+                let browser_dimensions = Arc::clone(&browser_dimensions_for_state);
+                let data_channel = Arc::clone(&data_channel_for_state);
+                return Box::pin(async move {
+                    *browser_dimensions.lock().await = None;
+                    *data_channel.lock().await = None;
+                });
             }
             Box::pin(async {})
         }));
@@ -583,9 +600,10 @@ impl WebRTCHandler {
         self.data_channel.lock().await.is_some()
     }
 
-    /// Close the peer connection
+    /// Close the peer connection and clear all connection state
     pub async fn close(&mut self) -> Result<()> {
         *self.data_channel.lock().await = None;
+        *self.browser_dimensions.lock().await = None;
         if let Some(pc) = self.peer_connection.take() {
             pc.close().await?;
         }
@@ -847,5 +865,40 @@ mod tests {
         assert!(json.contains("\"repo\":\"owner/repo\""));
         assert!(json.contains("\"issue_number\":123"));
         assert!(json.contains("\"branch\":\"manual-branch\""));
+    }
+
+    #[tokio::test]
+    async fn test_close_clears_browser_dimensions() {
+        let mut handler = WebRTCHandler::new();
+
+        // Manually set browser dimensions (simulating a connection)
+        *handler.browser_dimensions.lock().await = Some(BrowserDimensions {
+            rows: 24,
+            cols: 80,
+            mode: BrowserMode::Gui,
+        });
+
+        // Verify dimensions are set
+        assert!(handler.get_browser_dimensions().await.is_some());
+
+        // Close the handler
+        handler.close().await.unwrap();
+
+        // Verify browser_dimensions is cleared (so PTY can resize back)
+        assert!(handler.get_browser_dimensions().await.is_none());
+        // Also verify handler is no longer ready
+        assert!(!handler.is_ready().await);
+    }
+
+    #[tokio::test]
+    async fn test_new_handler_has_no_browser_dimensions() {
+        let handler = WebRTCHandler::new();
+        assert!(handler.get_browser_dimensions().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_handler_is_not_ready() {
+        let handler = WebRTCHandler::new();
+        assert!(!handler.is_ready().await);
     }
 }
