@@ -98,6 +98,11 @@ GitHub Issue/PR Comment
 - Rust (for building the daemon)
 - Claude Code CLI
 - Git
+- **Supported Terminals:**
+  - Ghostty (recommended)
+  - iTerm2
+  - Other terminals that support OSC 9 notifications
+  - Note: macOS Terminal.app does not support agent notifications
 
 ### 1. Server Setup
 

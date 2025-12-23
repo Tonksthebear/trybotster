@@ -18,43 +18,17 @@ const MAX_BUFFER_LINES: usize = 20000;
 /// Notification types detected from PTY output
 #[derive(Clone, Debug)]
 pub enum AgentNotification {
-    /// Terminal bell (BEL character \x07) - usually means input needed
-    Bell,
     /// OSC 9 notification with optional message
     Osc9(Option<String>),
     /// OSC 777 notification (rxvt-unicode style) with title and body
     Osc777 { title: String, body: String },
-    /// Claude Code is asking a question (detected from UI patterns)
-    QuestionAsked,
 }
 
-/// Patterns that indicate Claude Code is asking a question
-const QUESTION_UI_PATTERNS: &[&str] = &[
-    "Enter to select",
-    "Tab/Arrow keys to navigate",
-    "Esc to cancel",
-    "Type to filter",
-    // Claude's AskUserQuestion dialog patterns
-    "Select an option",
-    "Choose one",
-];
-
-/// Detect terminal notifications in raw PTY output
+/// Detect terminal notifications in raw PTY output (OSC 9, OSC 777)
 fn detect_notifications(data: &[u8]) -> Vec<AgentNotification> {
     let mut notifications = Vec::new();
 
-    // Check for Claude's question UI patterns in the text
-    let text = String::from_utf8_lossy(data);
-    for pattern in QUESTION_UI_PATTERNS {
-        if text.contains(pattern) {
-            log::info!("Detected question UI pattern: '{}'", pattern);
-            notifications.push(AgentNotification::QuestionAsked);
-            break; // Only add one QuestionAsked per chunk
-        }
-    }
-
-    // Check for standalone BEL character (ASCII 7)
-    // But skip if it's part of an OSC sequence (which ends with BEL)
+    // Parse OSC sequences (ESC ] ... BEL or ESC ] ... ESC \)
     let mut i = 0;
     while i < data.len() {
         // Check for OSC sequence start: ESC ]
@@ -79,13 +53,14 @@ fn detect_notifications(data: &[u8]) -> Vec<AgentNotification> {
                 let osc_content = &data[osc_start..end];
 
                 // Parse OSC 9: notification
+                // Filter out messages that look like escape sequences (only digits/semicolons)
                 if osc_content.starts_with(b"9;") {
                     let message = String::from_utf8_lossy(&osc_content[2..]).to_string();
-                    notifications.push(AgentNotification::Osc9(if message.is_empty() {
-                        None
-                    } else {
-                        Some(message)
-                    }));
+                    // Only add if message is meaningful (not just numbers/semicolons)
+                    let is_escape_sequence = message.chars().all(|c| c.is_ascii_digit() || c == ';');
+                    if !message.is_empty() && !is_escape_sequence {
+                        notifications.push(AgentNotification::Osc9(Some(message)));
+                    }
                 }
                 // Parse OSC 777: notify;title;body
                 else if osc_content.starts_with(b"777;notify;") {
@@ -93,18 +68,16 @@ fn detect_notifications(data: &[u8]) -> Vec<AgentNotification> {
                     let parts: Vec<&str> = content.splitn(2, ';').collect();
                     let title = parts.first().unwrap_or(&"").to_string();
                     let body = parts.get(1).unwrap_or(&"").to_string();
-                    notifications.push(AgentNotification::Osc777 { title, body });
+                    // Only add if there's meaningful content
+                    if !title.is_empty() || !body.is_empty() {
+                        notifications.push(AgentNotification::Osc777 { title, body });
+                    }
                 }
 
                 // Skip past the OSC sequence
                 i = end + 1;
                 continue;
             }
-        }
-
-        // Standalone BEL character (not part of OSC)
-        if data[i] == 0x07 {
-            notifications.push(AgentNotification::Bell);
         }
 
         i += 1;
@@ -143,6 +116,7 @@ pub struct Agent {
     pub worktree_path: PathBuf,
     pub start_time: chrono::DateTime<chrono::Utc>,
     pub status: AgentStatus,
+    pub last_invocation_url: Option<String>, // GitHub URL where this agent was last invoked from
     pub buffer: Arc<Mutex<VecDeque<String>>>, // Deprecated - keeping for compatibility
     pub vt100_parser: Arc<Mutex<Parser>>,     // VT100 terminal emulator
     pub scrollback_history: Arc<Mutex<Vec<String>>>, // Proper scrollback: snapshots of VT100 screen
@@ -172,6 +146,7 @@ impl Agent {
             worktree_path,
             start_time: chrono::Utc::now(),
             status: AgentStatus::Initializing,
+            last_invocation_url: None,
             buffer: Arc::new(Mutex::new(VecDeque::new())),
             vt100_parser: Arc::new(Mutex::new(parser)),
             scrollback_history: Arc::new(Mutex::new(Vec::new())),
@@ -684,12 +659,11 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_bell_notification() {
-        // Standalone BEL character
+    fn test_standalone_bell_ignored() {
+        // Standalone BEL character is ignored (legacy - not useful for Claude Code)
         let data = b"some output\x07more output";
         let notifications = detect_notifications(data);
-        assert_eq!(notifications.len(), 1);
-        assert!(matches!(notifications[0], AgentNotification::Bell));
+        assert_eq!(notifications.len(), 0, "Standalone BEL should be ignored");
     }
 
     #[test]
@@ -743,59 +717,36 @@ mod tests {
     }
 
     #[test]
+    fn test_osc9_filters_escape_sequence_messages() {
+        // OSC 9 with escape-sequence-like content (just numbers/semicolons) should be filtered
+        let data = b"\x1b]9;4;0;\x07";
+        let notifications = detect_notifications(data);
+        assert_eq!(notifications.len(), 0, "Should filter escape-sequence-like messages");
+
+        // But real messages should still work
+        let data = b"\x1b]9;Real notification message\x07";
+        let notifications = detect_notifications(data);
+        assert_eq!(notifications.len(), 1);
+        match &notifications[0] {
+            AgentNotification::Osc9(Some(msg)) => assert_eq!(msg, "Real notification message"),
+            _ => panic!("Expected Osc9 notification"),
+        }
+    }
+
+    #[test]
     fn test_multiple_notifications() {
-        // Multiple notifications in one buffer
+        // Multiple notifications in one buffer (without Bell since it's disabled)
         let data = b"\x07\x1b]9;first\x07\x07\x1b]9;second\x1b\\";
         let notifications = detect_notifications(data);
-        // Should detect: Bell, Osc9("first"), Bell, Osc9("second")
-        assert_eq!(notifications.len(), 4);
+        // Should detect: Osc9("first"), Osc9("second") - no standalone Bell
+        assert_eq!(notifications.len(), 2);
     }
 
     #[test]
-    fn test_detect_question_asked_enter_to_select() {
-        // Claude Code's question UI contains "Enter to select"
-        let data = b"Some output\nEnter to select\nMore output";
-        let notifications = detect_notifications(data);
-        assert_eq!(notifications.len(), 1);
-        assert!(matches!(notifications[0], AgentNotification::QuestionAsked));
-    }
-
-    #[test]
-    fn test_detect_question_asked_tab_arrow() {
-        // Claude Code's question UI contains navigation hint
-        let data = b"Tab/Arrow keys to navigate";
-        let notifications = detect_notifications(data);
-        assert_eq!(notifications.len(), 1);
-        assert!(matches!(notifications[0], AgentNotification::QuestionAsked));
-    }
-
-    #[test]
-    fn test_detect_question_asked_esc_cancel() {
-        // Claude Code's question UI contains cancel hint
-        let data = b"Make a choice\nEsc to cancel\n";
-        let notifications = detect_notifications(data);
-        assert_eq!(notifications.len(), 1);
-        assert!(matches!(notifications[0], AgentNotification::QuestionAsked));
-    }
-
-    #[test]
-    fn test_no_question_in_regular_output() {
-        // Regular output without question patterns
+    fn test_no_notifications_in_regular_output() {
+        // Regular output without OSC sequences
         let data = b"Building project...\nCompilation complete.";
         let notifications = detect_notifications(data);
         assert_eq!(notifications.len(), 0);
-    }
-
-    #[test]
-    fn test_question_asked_only_once_per_chunk() {
-        // Even with multiple patterns, only one QuestionAsked per chunk
-        let data = b"Enter to select\nTab/Arrow keys to navigate\nEsc to cancel";
-        let notifications = detect_notifications(data);
-        // Should only have one QuestionAsked, not three
-        let question_count = notifications
-            .iter()
-            .filter(|n| matches!(n, AgentNotification::QuestionAsked))
-            .count();
-        assert_eq!(question_count, 1);
     }
 }

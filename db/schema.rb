@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2025_12_18_044600) do
+ActiveRecord::Schema[8.1].define(version: 2025_12_20_051414) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "vector"
@@ -99,6 +99,28 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_18_044600) do
     t.index ["event_type"], name: "index_bot_messages_on_event_type"
     t.index ["sent_at"], name: "index_bot_messages_on_sent_at"
     t.index ["status"], name: "index_bot_messages_on_status"
+  end
+
+  create_table "hub_agents", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.bigint "hub_id", null: false
+    t.string "last_invocation_url"
+    t.string "session_key", null: false
+    t.datetime "updated_at", null: false
+    t.index ["hub_id", "session_key"], name: "index_hub_agents_on_hub_id_and_session_key", unique: true
+    t.index ["hub_id"], name: "index_hub_agents_on_hub_id"
+  end
+
+  create_table "hubs", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.string "identifier", null: false
+    t.datetime "last_seen_at", null: false
+    t.string "repo", null: false
+    t.datetime "updated_at", null: false
+    t.bigint "user_id", null: false
+    t.index ["identifier"], name: "index_hubs_on_identifier", unique: true
+    t.index ["repo", "last_seen_at"], name: "index_hubs_on_repo_and_last_seen_at"
+    t.index ["user_id"], name: "index_hubs_on_user_id"
   end
 
   create_table "idempotency_keys", force: :cascade do |t|
@@ -212,6 +234,8 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_18_044600) do
   add_foreign_key "action_mcp_session_resources", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_session_subscriptions", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_sse_events", "action_mcp_sessions", column: "session_id"
+  add_foreign_key "hub_agents", "hubs"
+  add_foreign_key "hubs", "users"
   add_foreign_key "memories", "memories", column: "parent_id"
   add_foreign_key "memories", "teams"
   add_foreign_key "memories", "users"

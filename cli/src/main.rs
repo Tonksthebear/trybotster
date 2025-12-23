@@ -34,6 +34,7 @@ struct AgentSpawnConfig {
     repo_name: String,
     prompt: String,
     message_id: Option<i64>,
+    invocation_url: Option<String>,
 }
 
 /// Helper function to create a centered rect
@@ -296,8 +297,10 @@ struct BotsterApp {
     webrtc_handler: Arc<StdMutex<WebRTCHandler>>,
     // Track last agent screen hash for change detection (reduces bandwidth)
     last_agent_screen_hash: HashMap<String, u64>,
-    // Track whether question UI is currently visible per agent (for state transition detection)
-    question_ui_visible: HashMap<String, bool>,
+    // Hub tracking - per-session UUID for identifying this CLI instance
+    hub_identifier: String,
+    // Track when we last sent a heartbeat to the server
+    last_heartbeat: Instant,
 }
 
 impl BotsterApp {
@@ -311,6 +314,10 @@ impl BotsterApp {
 
         // Create WebRTC handler for full TUI streaming
         let webrtc_handler = Arc::new(StdMutex::new(WebRTCHandler::new()));
+
+        // Generate per-session UUID for hub identification
+        let hub_identifier = uuid::Uuid::new_v4().to_string();
+        log::info!("Generated hub identifier: {}", hub_identifier);
 
         let app = Self {
             agents: HashMap::new(),
@@ -332,7 +339,8 @@ impl BotsterApp {
             tokio_runtime,
             webrtc_handler,
             last_agent_screen_hash: HashMap::new(),
-            question_ui_visible: HashMap::new(),
+            hub_identifier,
+            last_heartbeat: Instant::now(),
         };
 
         log::info!("Botster Hub started, waiting for messages...");
@@ -352,6 +360,17 @@ impl BotsterApp {
             config.worktree_path.clone(),
         );
         agent.resize(self.terminal_rows, self.terminal_cols);
+
+        // Set invocation URL for notifications
+        // Use provided URL, or construct from repo + issue_number if available
+        agent.last_invocation_url = config.invocation_url.or_else(|| {
+            config.issue_number.map(|num| {
+                format!("https://github.com/{}/issues/{}", config.repo_name, num)
+            })
+        });
+        if let Some(ref url) = agent.last_invocation_url {
+            log::info!("Agent invocation URL: {}", url);
+        }
 
         // Write prompt to .botster_prompt file
         let prompt_file_path = config.worktree_path.join(".botster_prompt");
@@ -414,33 +433,34 @@ impl BotsterApp {
     }
 
     fn handle_events(&mut self) -> Result<bool> {
-        // Check for events immediately (non-blocking)
-        if !event::poll(Duration::from_millis(0))? {
-            return Ok(false); // No events available
-        }
+        let mut handled_any = false;
 
-        // Event available - read it immediately
-        match event::read()? {
-            Event::Resize(cols, rows) => {
-                // Calculate terminal widget dimensions
-                let terminal_cols = (cols * 70 / 100).saturating_sub(2);
-                let terminal_rows = rows.saturating_sub(2);
+        // Process ALL pending events (not just one) to prevent event queue buildup
+        while event::poll(Duration::from_millis(0))? {
+            handled_any = true;
+            match event::read()? {
+                Event::Resize(cols, rows) => {
+                    // Calculate terminal widget dimensions
+                    let terminal_cols = (cols * 70 / 100).saturating_sub(2);
+                    let terminal_rows = rows.saturating_sub(2);
 
-                // Update stored dimensions
-                self.terminal_rows = terminal_rows;
-                self.terminal_cols = terminal_cols;
+                    // Update stored dimensions
+                    self.terminal_rows = terminal_rows;
+                    self.terminal_cols = terminal_cols;
 
-                // Resize all agents
-                for agent in self.agents.values() {
-                    agent.resize(terminal_rows, terminal_cols);
+                    // Resize all agents
+                    for agent in self.agents.values() {
+                        agent.resize(terminal_rows, terminal_cols);
+                    }
                 }
-                return Ok(true);
+                Event::Key(key) => {
+                    self.handle_key_event(key)?;
+                }
+                _ => {}
             }
-            Event::Key(key) => {
-                return self.handle_key_event(key);
-            }
-            _ => return Ok(false),
         }
+
+        Ok(handled_any)
     }
 
     fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
@@ -531,8 +551,8 @@ impl BotsterApp {
                 };
 
                 if let Some(bytes) = bytes_to_send {
-                    if let Some(key) = self.agent_keys_ordered.get(self.selected) {
-                        if let Some(agent) = self.agents.get_mut(key) {
+                    if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                        if let Some(agent) = self.agents.get_mut(&key) {
                             let _ = agent.write_input(&bytes);
                         }
                     }
@@ -869,6 +889,7 @@ impl BotsterApp {
                 repo_name,
                 prompt,
                 message_id: None,
+                invocation_url: None, // Will be auto-constructed from repo + issue_number
             })?;
         }
 
@@ -910,6 +931,7 @@ impl BotsterApp {
             repo_name,
             prompt,
             message_id: None,
+            invocation_url: None, // Will be auto-constructed from repo + issue_number
         })
     }
 
@@ -1312,120 +1334,53 @@ impl BotsterApp {
         }
     }
 
-    /// Patterns that indicate Claude Code is asking a question
-    const QUESTION_UI_PATTERNS: &'static [&'static str] = &[
-        "Enter to select",
-        "Tab/Arrow keys to navigate",
-        "Esc to cancel",
-        "Type to filter",
-    ];
-
-    /// Check if the current screen contains question UI patterns
-    fn screen_has_question_ui(screen_lines: &[String]) -> bool {
-        let screen_text = screen_lines.join("\n");
-        Self::QUESTION_UI_PATTERNS
-            .iter()
-            .any(|pattern| screen_text.contains(pattern))
-    }
-
-    /// Poll all agents for terminal notifications (BEL, OSC 9, etc.)
-    /// and send them to Rails to trigger GitHub comments
+    /// Poll all agents for terminal notifications (OSC 9, OSC 777)
+    /// and send them to Rails to trigger GitHub comments.
+    /// OSC 777 notifications (sent natively by Claude Code) are treated as "question_asked"
+    /// to alert the user that the agent needs attention.
     fn poll_agent_notifications(&mut self) {
-        // Collect agent info and check for question UI state transitions
-        let mut question_state_changes: Vec<(String, String, Option<u32>, bool)> = Vec::new();
-        let mut other_notifications: Vec<(String, String, Option<u32>, AgentNotification)> =
+        // Collect notifications: (session_key, repo, issue_number, invocation_url, notification)
+        let mut notifications_to_send: Vec<(String, String, Option<u32>, Option<String>, AgentNotification)> =
             Vec::new();
 
         for (session_key, agent) in &self.agents {
-            // Check current screen for question UI patterns
-            let screen_lines = agent.get_vt100_screen();
-            let question_visible_now = Self::screen_has_question_ui(&screen_lines);
-            let was_visible = self
-                .question_ui_visible
-                .get(session_key)
-                .copied()
-                .unwrap_or(false);
-
-            // Detect state transition: not visible -> visible
-            if question_visible_now != was_visible {
-                question_state_changes.push((
+            let notifications = agent.poll_notifications();
+            for notification in notifications {
+                notifications_to_send.push((
                     session_key.clone(),
                     agent.repo.clone(),
                     agent.issue_number,
-                    question_visible_now,
+                    agent.last_invocation_url.clone(),
+                    notification,
                 ));
             }
-
-            // Collect other notifications (Bell, OSC9, OSC777) - skip QuestionAsked from channel
-            let notifications = agent.poll_notifications();
-            for notification in notifications {
-                if !matches!(notification, AgentNotification::QuestionAsked) {
-                    other_notifications.push((
-                        session_key.clone(),
-                        agent.repo.clone(),
-                        agent.issue_number,
-                        notification,
-                    ));
-                }
-            }
         }
 
-        // Process question UI state changes
-        for (session_key, repo, issue_number, is_visible) in question_state_changes {
-            self.question_ui_visible
-                .insert(session_key.clone(), is_visible);
-
-            // Only notify when question UI appears (transition to visible)
-            if is_visible {
-                if let Some(issue_num) = issue_number {
-                    log::info!(
-                        "Agent {} (issue #{}) question UI appeared - sending notification",
-                        session_key,
-                        issue_num
-                    );
-
-                    if let Err(e) = self.send_agent_notification(&repo, issue_num, "question_asked")
-                    {
-                        log::error!("Failed to send notification to Rails: {}", e);
-                    }
-                } else {
-                    log::debug!(
-                        "Agent {} question UI appeared but has no issue_number - skipping",
-                        session_key
-                    );
-                }
-            } else {
-                log::debug!("Agent {} question UI disappeared", session_key);
-            }
-        }
-
-        // Process other notifications (Bell, OSC9, OSC777)
-        for (session_key, repo, issue_number, notification) in other_notifications {
+        // Process and send notifications
+        for (session_key, repo, issue_number, invocation_url, notification) in notifications_to_send {
+            // Claude Code sends OSC 9 notifications when it needs user attention
+            // (see: https://github.com/anthropics/claude-code/issues/3340)
+            // We treat both OSC 9 and OSC 777 as "question_asked" for a generic message
             let notification_type = match &notification {
-                AgentNotification::Bell => "bell".to_string(),
-                AgentNotification::Osc9(msg) => {
-                    format!("osc9:{}", msg.as_deref().unwrap_or(""))
+                AgentNotification::Osc9(_) | AgentNotification::Osc777 { .. } => {
+                    "question_asked".to_string()
                 }
-                AgentNotification::Osc777 { title, body } => {
-                    format!("osc777:{}:{}", title, body)
-                }
-                AgentNotification::QuestionAsked => continue, // Already handled above
             };
 
-            if let Some(issue_num) = issue_number {
+            if issue_number.is_some() || invocation_url.is_some() {
                 log::info!(
-                    "Agent {} (issue #{}) sent notification: {}",
+                    "Agent {} sent notification: {} (url: {:?})",
                     session_key,
-                    issue_num,
-                    notification_type
+                    notification_type,
+                    invocation_url
                 );
 
-                if let Err(e) = self.send_agent_notification(&repo, issue_num, &notification_type) {
+                if let Err(e) = self.send_agent_notification(&repo, issue_number, invocation_url.as_deref(), &notification_type) {
                     log::error!("Failed to send notification to Rails: {}", e);
                 }
             } else {
                 log::debug!(
-                    "Agent {} detected notification '{}' but has no issue_number - skipping",
+                    "Agent {} detected notification '{}' but has no issue_number or invocation_url - skipping",
                     session_key,
                     notification_type
                 );
@@ -1434,17 +1389,21 @@ impl BotsterApp {
     }
 
     /// Send an agent notification to Rails to trigger a GitHub comment
+    /// Prefers invocation_url if available, falls back to repo + issue_number
     fn send_agent_notification(
         &self,
         repo: &str,
-        issue_number: u32,
+        issue_number: Option<u32>,
+        invocation_url: Option<&str>,
         notification_type: &str,
     ) -> Result<()> {
         let url = format!("{}/api/agent_notifications", self.config.server_url);
 
+        // Build payload - include both old and new fields for backwards compatibility
         let payload = serde_json::json!({
             "repo": repo,
             "issue_number": issue_number,
+            "invocation_url": invocation_url,
             "notification_type": notification_type,
         });
 
@@ -1458,9 +1417,10 @@ impl BotsterApp {
 
         if response.status().is_success() {
             log::info!(
-                "Sent notification to Rails for {}#{}: {}",
+                "Sent notification to Rails: repo={}, issue={:?}, url={:?}, type={}",
                 repo,
                 issue_number,
+                invocation_url,
                 notification_type
             );
             Ok(())
@@ -1471,6 +1431,79 @@ impl BotsterApp {
                 response.text().unwrap_or_default()
             )
         }
+    }
+
+    /// Send heartbeat to Rails server to register this hub and its agents
+    /// Uses RESTful PUT /api/hubs/:identifier endpoint for upsert
+    fn send_heartbeat(&mut self) -> Result<()> {
+        // Check if 30 seconds have passed since last heartbeat
+        const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+        if self.last_heartbeat.elapsed() < Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
+            return Ok(());
+        }
+        self.last_heartbeat = Instant::now();
+
+        // Detect current repo
+        let (_, repo_name) = match WorktreeManager::detect_current_repo() {
+            Ok(result) => result,
+            Err(e) => {
+                log::debug!("Not in a git repository, skipping heartbeat: {}", e);
+                return Ok(());
+            }
+        };
+
+        // Build agents list for the heartbeat payload
+        let agents_list: Vec<serde_json::Value> = self
+            .agents
+            .values()
+            .map(|agent| {
+                serde_json::json!({
+                    "session_key": agent.session_key(),
+                    "last_invocation_url": agent.last_invocation_url,
+                })
+            })
+            .collect();
+
+        let url = format!(
+            "{}/api/hubs/{}",
+            self.config.server_url, self.hub_identifier
+        );
+
+        let payload = serde_json::json!({
+            "repo": repo_name,
+            "agents": agents_list,
+        });
+
+        log::debug!("Sending heartbeat to {}", url);
+
+        match self
+            .client
+            .put(&url)
+            .header("X-API-Key", &self.config.api_key)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    log::debug!(
+                        "Heartbeat sent successfully: {} agents registered",
+                        agents_list.len()
+                    );
+                } else {
+                    log::warn!(
+                        "Heartbeat failed: {} - {}",
+                        response.status(),
+                        response.text().unwrap_or_default()
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to send heartbeat: {}", e);
+            }
+        }
+
+        Ok(())
     }
 
     /// Kill any orphaned claude processes running in the given worktree directory.
@@ -1599,6 +1632,13 @@ impl BotsterApp {
                 issue_number
             );
 
+            // Update last_invocation_url to track where this interaction came from
+            // This ensures notifications go to the right place (issue, PR, etc.)
+            if let Some(issue_url) = payload["issue_url"].as_str() {
+                existing_agent.last_invocation_url = Some(issue_url.to_string());
+                log::info!("Updated last_invocation_url to: {}", issue_url);
+            }
+
             // Use the full prompt which includes routing information (where to respond)
             // This ensures the agent knows if the comment came from a PR and should respond there
             let full_prompt = payload["prompt"]
@@ -1701,11 +1741,25 @@ impl BotsterApp {
             worktree_path.clone(),
         );
 
+        // Set last_invocation_url from payload to track where this agent was invoked from
+        // Fall back to constructing URL from repo + issue_number if not provided
+        if let Some(issue_url) = payload["issue_url"].as_str() {
+            agent.last_invocation_url = Some(issue_url.to_string());
+            log::info!("Set last_invocation_url from payload: {}", issue_url);
+        } else {
+            // Construct URL from repo and issue number
+            let constructed_url = format!("https://github.com/{}/issues/{}", repo_name, issue_number);
+            agent.last_invocation_url = Some(constructed_url.clone());
+            log::info!("Constructed last_invocation_url: {}", constructed_url);
+        }
+
         // Resize agent to match terminal dimensions
         agent.resize(self.terminal_rows, self.terminal_cols);
 
         // Create environment variables for the agent
         let mut env_vars = HashMap::new();
+        // Set TERM to ensure Claude Code sends OSC 777 notifications
+        env_vars.insert("TERM".to_string(), "xterm-256color".to_string());
         env_vars.insert("BOTSTER_REPO".to_string(), repo_name.clone());
         env_vars.insert("BOTSTER_ISSUE_NUMBER".to_string(), issue_number.to_string());
         env_vars.insert(
@@ -2323,8 +2377,8 @@ fn run_interactive() -> Result<()> {
                     }
                     BrowserCommand::SendInput { data } => {
                         // Send raw input to selected agent
-                        if let Some(key) = app.agent_keys_ordered.get(app.selected) {
-                            if let Some(agent) = app.agents.get_mut(key) {
+                        if let Some(key) = app.agent_keys_ordered.get(app.selected).cloned() {
+                            if let Some(agent) = app.agents.get_mut(&key) {
                                 if let Err(e) = agent.write_input_str(&data) {
                                     log::warn!("Failed to send input to agent: {}", e);
                                 }
@@ -2341,6 +2395,11 @@ fn run_interactive() -> Result<()> {
         // Poll for new messages from server
         if let Err(e) = app.poll_messages() {
             log::error!("Failed to poll messages: {}", e);
+        }
+
+        // Send heartbeat to register hub and agents with server
+        if let Err(e) = app.send_heartbeat() {
+            log::error!("Failed to send heartbeat: {}", e);
         }
 
         // Poll agents for terminal notifications (BEL, OSC) and send to Rails
@@ -2877,4 +2936,40 @@ fn list_worktrees() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test AgentSpawnConfig invocation_url handling
+    #[test]
+    fn test_agent_spawn_config_has_invocation_url_field() {
+        let config = AgentSpawnConfig {
+            issue_number: Some(42),
+            branch_name: "botster-issue-42".to_string(),
+            worktree_path: std::path::PathBuf::from("/tmp/worktree"),
+            repo_path: std::path::PathBuf::from("/tmp/repo"),
+            repo_name: "owner/repo".to_string(),
+            prompt: "Test prompt".to_string(),
+            message_id: None,
+            invocation_url: Some("https://github.com/owner/repo/issues/42".to_string()),
+        };
+        assert_eq!(config.invocation_url, Some("https://github.com/owner/repo/issues/42".to_string()));
+    }
+
+    #[test]
+    fn test_agent_spawn_config_invocation_url_can_be_none() {
+        let config = AgentSpawnConfig {
+            issue_number: Some(42),
+            branch_name: "botster-issue-42".to_string(),
+            worktree_path: std::path::PathBuf::from("/tmp/worktree"),
+            repo_path: std::path::PathBuf::from("/tmp/repo"),
+            repo_name: "owner/repo".to_string(),
+            prompt: "Test prompt".to_string(),
+            message_id: None,
+            invocation_url: None,
+        };
+        assert!(config.invocation_url.is_none());
+    }
 }

@@ -11,14 +11,30 @@ module Api
 
     # POST /api/agent_notifications
     # CLI sends notification when terminal bell/alert is detected
+    # Accepts either:
+    # - invocation_url: GitHub URL (issue or PR) to post comment to
+    # - repo + issue_number: legacy format
     def create
-      repo = params[:repo]
-      issue_number = params[:issue_number].to_i
       notification_type = params[:notification_type]
 
-      # Validate required params
+      # Parse invocation_url if provided, otherwise use legacy params
+      if params[:invocation_url].present?
+        parsed = parse_github_url(params[:invocation_url])
+        if parsed.nil?
+          render json: { error: "Invalid invocation_url format" }, status: :unprocessable_entity
+          return
+        end
+        repo = parsed[:repo]
+        issue_number = parsed[:number]
+      else
+        # Legacy fallback
+        repo = params[:repo]
+        issue_number = params[:issue_number].to_i
+      end
+
+      # Validate we have the required params
       if repo.blank? || issue_number.zero?
-        render json: { error: "repo and issue_number required" }, status: :unprocessable_entity
+        render json: { error: "repo and issue_number required (or valid invocation_url)" }, status: :unprocessable_entity
         return
       end
 
@@ -52,6 +68,24 @@ module Api
 
     private
 
+    # Parse a GitHub URL to extract repo and issue/PR number
+    # Examples:
+    #   https://github.com/owner/repo/issues/123
+    #   https://github.com/owner/repo/pull/456
+    # Returns { repo: "owner/repo", number: 123 } or nil if invalid
+    def parse_github_url(url)
+      return nil if url.blank?
+
+      # Match GitHub issue or PR URLs
+      match = url.match(%r{github\.com/([^/]+/[^/]+)/(issues|pull)/(\d+)})
+      return nil unless match
+
+      {
+        repo: match[1],
+        number: match[3].to_i
+      }
+    end
+
     def build_notification_comment(notification_type)
       case notification_type
       when "bell"
@@ -60,8 +94,8 @@ module Api
         "Please check the terminal session and respond to continue."
       when "question_asked"
         "❓ **Agent is asking a question!**\n\n" \
-        "Claude is waiting for your input to continue. " \
-        "Please check the terminal session and respond to the question."
+        "The agent is waiting for your input to continue. " \
+        "Please check the terminal session and respond."
       when /^osc9:/
         message = notification_type.sub("osc9:", "").presence
         if message

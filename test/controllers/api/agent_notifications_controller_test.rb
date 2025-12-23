@@ -58,7 +58,7 @@ module Api
 
       assert_response :unprocessable_entity
       json = JSON.parse(response.body)
-      assert_equal "repo and issue_number required", json["error"]
+      assert_equal "repo and issue_number required (or valid invocation_url)", json["error"]
     end
 
     test "create requires issue_number parameter" do
@@ -69,7 +69,7 @@ module Api
 
       assert_response :unprocessable_entity
       json = JSON.parse(response.body)
-      assert_equal "repo and issue_number required", json["error"]
+      assert_equal "repo and issue_number required (or valid invocation_url)", json["error"]
     end
 
     test "create requires GitHub authorization" do
@@ -263,6 +263,131 @@ module Api
         assert_response :created
         assert_includes captured_body, "Agent is asking a question"
         assert_includes captured_body, "waiting for your input"
+      ensure
+        Github::App.define_singleton_method(:get_installation_for_repo, original_get_installation)
+        Github::App.define_singleton_method(:installation_client, original_installation_client)
+      end
+    end
+
+    test "create with invocation_url posts to correct issue" do
+      mock_comment = OpenStruct.new(id: 5, html_url: "https://github.com/owner/repo/issues/42#issuecomment-5")
+      captured_repo = nil
+      captured_issue = nil
+
+      original_get_installation = Github::App.method(:get_installation_for_repo)
+      original_installation_client = Github::App.method(:installation_client)
+
+      begin
+        Github::App.define_singleton_method(:get_installation_for_repo) do |_token, repo|
+          captured_repo = repo
+          { success: true, installation_id: 12345, account: "owner" }
+        end
+
+        mock_client = Object.new
+        mock_client.define_singleton_method(:add_comment) do |_repo, issue, _body|
+          captured_issue = issue
+          mock_comment
+        end
+
+        Github::App.define_singleton_method(:installation_client) { |_id| mock_client }
+
+        post api_agent_notifications_url,
+             params: { invocation_url: "https://github.com/owner/repo/issues/42", notification_type: "question_asked" },
+             headers: { "X-API-Key" => @user.api_key },
+             as: :json
+
+        assert_response :created
+        assert_equal "owner/repo", captured_repo
+        assert_equal 42, captured_issue
+      ensure
+        Github::App.define_singleton_method(:get_installation_for_repo, original_get_installation)
+        Github::App.define_singleton_method(:installation_client, original_installation_client)
+      end
+    end
+
+    test "create with invocation_url for PR posts to correct PR" do
+      mock_comment = OpenStruct.new(id: 6, html_url: "https://github.com/owner/repo/pull/99#issuecomment-6")
+      captured_repo = nil
+      captured_issue = nil
+
+      original_get_installation = Github::App.method(:get_installation_for_repo)
+      original_installation_client = Github::App.method(:installation_client)
+
+      begin
+        Github::App.define_singleton_method(:get_installation_for_repo) do |_token, repo|
+          captured_repo = repo
+          { success: true, installation_id: 12345, account: "owner" }
+        end
+
+        mock_client = Object.new
+        mock_client.define_singleton_method(:add_comment) do |_repo, issue, _body|
+          captured_issue = issue
+          mock_comment
+        end
+
+        Github::App.define_singleton_method(:installation_client) { |_id| mock_client }
+
+        post api_agent_notifications_url,
+             params: { invocation_url: "https://github.com/owner/repo/pull/99", notification_type: "bell" },
+             headers: { "X-API-Key" => @user.api_key },
+             as: :json
+
+        assert_response :created
+        assert_equal "owner/repo", captured_repo
+        assert_equal 99, captured_issue
+      ensure
+        Github::App.define_singleton_method(:get_installation_for_repo, original_get_installation)
+        Github::App.define_singleton_method(:installation_client, original_installation_client)
+      end
+    end
+
+    test "create with invalid invocation_url returns error" do
+      post api_agent_notifications_url,
+           params: { invocation_url: "https://example.com/not-github", notification_type: "bell" },
+           headers: { "X-API-Key" => @user.api_key },
+           as: :json
+
+      assert_response :unprocessable_entity
+      json = JSON.parse(response.body)
+      assert_equal "Invalid invocation_url format", json["error"]
+    end
+
+    test "create prefers invocation_url over legacy params" do
+      mock_comment = OpenStruct.new(id: 7, html_url: "https://github.com/other/repo/issues/77#issuecomment-7")
+      captured_repo = nil
+      captured_issue = nil
+
+      original_get_installation = Github::App.method(:get_installation_for_repo)
+      original_installation_client = Github::App.method(:installation_client)
+
+      begin
+        Github::App.define_singleton_method(:get_installation_for_repo) do |_token, repo|
+          captured_repo = repo
+          { success: true, installation_id: 12345, account: "other" }
+        end
+
+        mock_client = Object.new
+        mock_client.define_singleton_method(:add_comment) do |_repo, issue, _body|
+          captured_issue = issue
+          mock_comment
+        end
+
+        Github::App.define_singleton_method(:installation_client) { |_id| mock_client }
+
+        # Send both invocation_url and legacy params - invocation_url should win
+        post api_agent_notifications_url,
+             params: {
+               invocation_url: "https://github.com/other/repo/issues/77",
+               repo: "owner/repo",
+               issue_number: 1,
+               notification_type: "bell"
+             },
+             headers: { "X-API-Key" => @user.api_key },
+             as: :json
+
+        assert_response :created
+        assert_equal "other/repo", captured_repo  # Should use invocation_url's repo
+        assert_equal 77, captured_issue           # Should use invocation_url's issue
       ensure
         Github::App.define_singleton_method(:get_installation_for_repo, original_get_installation)
         Github::App.define_singleton_method(:installation_client, original_installation_client)
