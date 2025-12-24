@@ -8,4 +8,4 @@
 #
 # Customize this file for your project (Rails, Node, Python, etc.)
 
-bin/rails server -p "$BOTSTER_TUNNEL_PORT" -b 127.0.0.1
+PORT=$BOTSTER_TUNNEL_PORT bin/dev
