@@ -1,8 +1,8 @@
 use anyhow::Result;
 use botster_hub::{
     allocate_tunnel_port, Agent, AgentNotification, BrowserCommand, BrowserDimensions,
-    BrowserMode, Config, IceServerConfig, KeyInput, PromptManager, TunnelManager, WebAgentInfo,
-    WebRTCHandler, WebWorktreeInfo, WorktreeManager,
+    BrowserMode, Config, IceServerConfig, KeyInput, PromptManager, TunnelManager, TunnelStatus,
+    WebAgentInfo, WebRTCHandler, WebWorktreeInfo, WorktreeManager,
 };
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -992,6 +992,7 @@ impl BotsterApp {
         let available_worktrees = self.available_worktrees.clone();
         let worktree_selected = self.worktree_selected;
         let input_buffer = self.input_buffer.clone();
+        let tunnel_status = self.tunnel_manager.get_status();
 
         // Helper to render UI to a frame
         let render_ui = |f: &mut Frame, agents: &HashMap<String, Agent>| {
@@ -1034,15 +1035,23 @@ impl BotsterApp {
                 "○"
             };
 
+            // Add tunnel status indicator
+            let tunnel_indicator = match tunnel_status {
+                TunnelStatus::Connected => "⬤",    // Filled circle = connected
+                TunnelStatus::Connecting => "◐",   // Half circle = connecting
+                TunnelStatus::Disconnected => "○", // Empty circle = disconnected
+            };
+
             let agent_title = format!(
-                " Agents ({}) {} Poll: {}s [Ctrl+P menu | Ctrl+Q quit] ",
+                " Agents ({}) {} Poll: {}s | Tunnel: {} [Ctrl+P | Ctrl+Q] ",
                 agent_keys_ordered.len(),
                 poll_status,
                 if polling_enabled {
                     poll_interval - seconds_since_poll.min(poll_interval)
                 } else {
                     0
-                }
+                },
+                tunnel_indicator
             );
 
             let list = List::new(items)

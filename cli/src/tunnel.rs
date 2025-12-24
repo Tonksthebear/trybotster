@@ -2,9 +2,29 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+/// Tunnel connection status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TunnelStatus {
+    Disconnected = 0,
+    Connecting = 1,
+    Connected = 2,
+}
+
+impl From<u8> for TunnelStatus {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => TunnelStatus::Connecting,
+            2 => TunnelStatus::Connected,
+            _ => TunnelStatus::Disconnected,
+        }
+    }
+}
 
 /// Allocate an available port for an agent's tunnel
 pub fn allocate_tunnel_port() -> Option<u16> {
@@ -24,6 +44,8 @@ pub struct TunnelManager {
     server_url: String,
     // Map of session_key -> allocated port
     agent_ports: Arc<Mutex<HashMap<String, u16>>>,
+    // Connection status (atomic for lock-free access from TUI)
+    status: Arc<AtomicU8>,
 }
 
 impl TunnelManager {
@@ -33,7 +55,18 @@ impl TunnelManager {
             api_key,
             server_url,
             agent_ports: Arc::new(Mutex::new(HashMap::new())),
+            status: Arc::new(AtomicU8::new(TunnelStatus::Disconnected as u8)),
         }
+    }
+
+    /// Get the current tunnel connection status
+    pub fn get_status(&self) -> TunnelStatus {
+        TunnelStatus::from(self.status.load(Ordering::Relaxed))
+    }
+
+    /// Set the tunnel connection status
+    fn set_status(&self, status: TunnelStatus) {
+        self.status.store(status as u8, Ordering::Relaxed);
     }
 
     /// Register an agent's tunnel port
@@ -57,9 +90,16 @@ impl TunnelManager {
             self.api_key
         );
 
+        self.set_status(TunnelStatus::Connecting);
         debug!("[Tunnel] Connecting to {}", ws_url);
 
-        let (ws_stream, _) = connect_async(&ws_url).await?;
+        let (ws_stream, _) = match connect_async(&ws_url).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                self.set_status(TunnelStatus::Disconnected);
+                return Err(e.into());
+            }
+        };
         let (mut write, mut read) = ws_stream.split();
 
         // Subscribe to tunnel channel for this hub
@@ -104,6 +144,7 @@ impl TunnelManager {
             }
         }
 
+        self.set_status(TunnelStatus::Disconnected);
         Ok(())
     }
 
@@ -125,9 +166,11 @@ impl TunnelManager {
                     debug!("[Tunnel] ActionCable connection established");
                 }
                 "confirm_subscription" => {
-                    debug!("[Tunnel] Subscription confirmed");
+                    self.set_status(TunnelStatus::Connected);
+                    info!("[Tunnel] Subscription confirmed - tunnel connected");
                 }
                 "disconnect" => {
+                    self.set_status(TunnelStatus::Disconnected);
                     warn!("[Tunnel] Disconnected by server");
                 }
                 "ping" => {
