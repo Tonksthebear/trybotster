@@ -1560,6 +1560,7 @@ impl BotsterApp {
     /// from a previous botster-hub session.
     fn kill_orphaned_claude_processes(worktree_path: &std::path::Path) {
         let worktree_str = worktree_path.to_string_lossy();
+        let current_pid = std::process::id();
 
         // Use pgrep to find claude processes, then filter by CWD
         // macOS: lsof -d cwd to check working directory
@@ -1574,7 +1575,13 @@ impl BotsterApp {
                 let pids_str = String::from_utf8_lossy(&output.stdout);
                 for pid_str in pids_str.lines() {
                     if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        // Check if this process's CWD matches our worktree
+                        // Skip our own process
+                        if pid == current_pid {
+                            continue;
+                        }
+
+                        // Check if this process's CWD matches our worktree exactly
+                        // (or is a subdirectory of it)
                         let lsof_output = Command::new("lsof")
                             .arg("-p")
                             .arg(pid.to_string())
@@ -1587,7 +1594,13 @@ impl BotsterApp {
                             let lsof_str = String::from_utf8_lossy(&lsof.stdout);
                             // lsof -Fn output format: lines starting with 'n' contain the path
                             if lsof_str.lines().any(|line| {
-                                line.starts_with('n') && line[1..].contains(&*worktree_str)
+                                if line.starts_with('n') {
+                                    let cwd = &line[1..];
+                                    // Only kill if CWD is exactly the worktree or inside it
+                                    cwd == &*worktree_str || cwd.starts_with(&format!("{}/", worktree_str))
+                                } else {
+                                    false
+                                }
                             }) {
                                 log::info!(
                                     "Killing orphaned claude process {} in worktree {}",
@@ -1613,10 +1626,17 @@ impl BotsterApp {
                 let pids_str = String::from_utf8_lossy(&output.stdout);
                 for pid_str in pids_str.lines() {
                     if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        // Skip our own process
+                        if pid == current_pid {
+                            continue;
+                        }
+
                         // On Linux, check /proc/<pid>/cwd symlink
                         let cwd_path = format!("/proc/{}/cwd", pid);
                         if let Ok(cwd) = std::fs::read_link(&cwd_path) {
-                            if cwd.to_string_lossy().contains(&*worktree_str) {
+                            let cwd_str = cwd.to_string_lossy();
+                            // Only kill if CWD is exactly the worktree or inside it
+                            if cwd_str == worktree_str || cwd_str.starts_with(&format!("{}/", worktree_str)) {
                                 log::info!(
                                     "Killing orphaned claude process {} in worktree {}",
                                     pid,
