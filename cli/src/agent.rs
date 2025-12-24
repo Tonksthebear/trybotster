@@ -117,6 +117,7 @@ pub struct Agent {
     pub start_time: chrono::DateTime<chrono::Utc>,
     pub status: AgentStatus,
     pub last_invocation_url: Option<String>, // GitHub URL where this agent was last invoked from
+    pub tunnel_port: Option<u16>,            // Port for HTTP tunnel forwarding
     pub buffer: Arc<Mutex<VecDeque<String>>>, // Deprecated - keeping for compatibility
     pub vt100_parser: Arc<Mutex<Parser>>,     // VT100 terminal emulator
     pub scrollback_history: Arc<Mutex<Vec<String>>>, // Proper scrollback: snapshots of VT100 screen
@@ -147,6 +148,7 @@ impl Agent {
             start_time: chrono::Utc::now(),
             status: AgentStatus::Initializing,
             last_invocation_url: None,
+            tunnel_port: None,
             buffer: Arc::new(Mutex::new(VecDeque::new())),
             vt100_parser: Arc::new(Mutex::new(parser)),
             scrollback_history: Arc::new(Mutex::new(Vec::new())),

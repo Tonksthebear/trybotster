@@ -573,6 +573,16 @@ export default class extends Controller {
         const statusColor =
           agent.status === "Running" ? "text-green-600" : "text-gray-500";
 
+        // Build preview link if tunnel port is available
+        const previewLink = agent.tunnel_port
+          ? `<a href="/preview/${agent.hub_identifier}/${agent.id}" target="_blank"
+               class="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full bg-green-100 text-green-800 hover:bg-green-200"
+               onclick="event.stopPropagation()">
+               <span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>
+               Preview
+             </a>`
+          : "";
+
         return `
         <button
           type="button"
@@ -585,7 +595,10 @@ export default class extends Controller {
               <span class="font-medium text-gray-900">${agent.repo}</span>
               <span class="text-gray-600 ml-2">${issueLabel}</span>
             </div>
-            <span class="${statusColor} text-sm">${agent.status}</span>
+            <div class="flex items-center gap-2">
+              ${previewLink}
+              <span class="${statusColor} text-sm">${agent.status}</span>
+            </div>
           </div>
         </button>
       `;

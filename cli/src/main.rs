@@ -448,6 +448,9 @@ impl BotsterApp {
         // Register the agent
         let session_key = agent.session_key();
 
+        // Store tunnel port on the agent
+        agent.tunnel_port = tunnel_port;
+
         // Register tunnel port with the tunnel manager
         if let Some(port) = tunnel_port {
             let tunnel_manager = self.tunnel_manager.clone();
@@ -1849,6 +1852,9 @@ impl BotsterApp {
         // Add agent to tracking structures using session key
         let session_key = agent.session_key();
 
+        // Store tunnel port on the agent
+        agent.tunnel_port = tunnel_port;
+
         // Register tunnel port with the tunnel manager
         if let Some(port) = tunnel_port {
             let tunnel_manager = self.tunnel_manager.clone();
@@ -1866,6 +1872,7 @@ impl BotsterApp {
 
     /// Build the agent list for sending to WebRTC browsers
     fn build_web_agent_list(&self) -> Vec<WebAgentInfo> {
+        let hub_identifier = self.hub_identifier.clone();
         self.agent_keys_ordered
             .iter()
             .enumerate()
@@ -1877,6 +1884,8 @@ impl BotsterApp {
                     branch_name: agent.branch_name.clone(),
                     status: format!("{:?}", agent.status),
                     selected: idx == self.selected,
+                    tunnel_port: agent.tunnel_port,
+                    hub_identifier: hub_identifier.clone(),
                 })
             })
             .collect()
