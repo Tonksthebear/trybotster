@@ -9,12 +9,7 @@
           <% if hub.hub_agents.any? %>
             <div class="mt-1 text-xs text-gray-400 dark:text-gray-500">
               <% hub.hub_agents.each do |agent| %>
-                <div class="ml-2">
-                  <span class="font-mono"><%= agent.session_key %></span>
-                  <% if agent.last_invocation_url.present? %>
-                    <a href="<%= agent.last_invocation_url %>" target="_blank" class="text-blue-500 hover:underline ml-1">view</a>
-                  <% end %>
-                </div>
+                <%= render partial: "hub_agents/hub_agent", locals: { hub_agent: agent } %>
               <% end %>
             </div>
           <% end %>
