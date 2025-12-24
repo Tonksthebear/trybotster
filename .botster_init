@@ -37,5 +37,27 @@ else
 fi
 echo "Worktree: $BOTSTER_WORKTREE_PATH"
 
+# Start background dev server on tunnel port if available
+if [ -n "$BOTSTER_TUNNEL_PORT" ]; then
+  SERVER_LOG="$BOTSTER_WORKTREE_PATH/.botster_server.log"
+
+  if [ -f ".botster_server" ]; then
+    # Custom server script (e.g., for Node, Python, etc.)
+    echo "Starting custom dev server on port $BOTSTER_TUNNEL_PORT..."
+    bash .botster_server > "$SERVER_LOG" 2>&1 &
+    echo "Dev server PID: $!"
+  elif [ -f "bin/rails" ]; then
+    # Rails project - start Rails server
+    echo "Starting Rails server on port $BOTSTER_TUNNEL_PORT..."
+    bin/rails server -p "$BOTSTER_TUNNEL_PORT" -b 127.0.0.1 > "$SERVER_LOG" 2>&1 &
+    echo "Rails server PID: $!"
+  else
+    echo "No dev server configured. Create .botster_server script to auto-start a server."
+  fi
+
+  # Give the server a moment to start
+  sleep 2
+fi
+
 # Start Claude with the prompt
 claude --permission-mode acceptEdits "$BOTSTER_PROMPT"
