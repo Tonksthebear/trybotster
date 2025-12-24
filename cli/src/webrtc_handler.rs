@@ -125,6 +125,8 @@ pub struct WebAgentInfo {
     pub branch_name: String,
     pub status: String,
     pub selected: bool,
+    pub tunnel_port: Option<u16>,
+    pub hub_identifier: String,
 }
 
 /// Worktree info sent to browser
@@ -709,6 +711,8 @@ mod tests {
             branch_name: "botster-issue-123".to_string(),
             status: "Running".to_string(),
             selected: true,
+            tunnel_port: Some(4001),
+            hub_identifier: "test-hub-uuid".to_string(),
         }];
         let msg = CLIMessage::Agents { agents };
         let json = serde_json::to_string(&msg).unwrap();
