@@ -38,6 +38,8 @@ GitHub Issue/PR Comment
 - **🧹 Auto-cleanup**: Closes agents and deletes worktrees when issues are closed
 - **🔄 Smart Deduplication**: Multiple mentions to the same issue ping the existing agent
 - **📡 MCP Integration**: Agents interact with GitHub via Model Context Protocol
+- **🌐 HTTP Tunnel Preview**: View agent dev servers through trybotster.com
+- **🖥️ Web GUI**: Remote control agents via P2P WebRTC connection
 
 ## 📦 Architecture
 
@@ -215,6 +217,23 @@ claude --permission-mode acceptEdits "$BOTSTER_PROMPT"
 "$BOTSTER_HUB_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
 ```
 
+**`.botster_server`** - Background dev server for tunnel preview (optional):
+
+```bash
+#!/bin/bash
+# Runs when agent spawns with BOTSTER_TUNNEL_PORT set
+# Customize for your project (Rails, Node, Python, etc.)
+
+# For Rails with bin/dev (foreman/overmind):
+PORT=$BOTSTER_TUNNEL_PORT bin/dev
+
+# Or for Rails server only:
+# bin/rails server -p "$BOTSTER_TUNNEL_PORT" -b 127.0.0.1
+
+# Or for Node:
+# npm run dev -- --port $BOTSTER_TUNNEL_PORT
+```
+
 **`.botster_copy`** - Files to copy to each worktree:
 
 ```
@@ -292,6 +311,41 @@ BOTSTER_PROMPT="User's request text"
 BOTSTER_MESSAGE_ID=42
 BOTSTER_HUB_BIN=/path/to/botster-hub
 BOTSTER_TOKEN=your_api_key  # For MCP server auth
+BOTSTER_TUNNEL_PORT=4001    # Port for HTTP tunnel (if available)
+```
+
+### HTTP Tunnel Preview
+
+Each agent can run a dev server that's accessible through trybotster.com. This enables "Replit-style" live previews of apps being developed by agents.
+
+**How it works:**
+
+1. When an agent spawns, a port (4001-4999) is allocated
+2. If `.botster_server` exists, it runs with `BOTSTER_TUNNEL_PORT` set
+3. The dev server starts on that port
+4. WebSocket tunnel connects the port to trybotster.com
+5. Access the preview at: `https://trybotster.com/preview/:hub_id/:agent_id`
+
+**Setup:**
+
+1. Create `.botster_server` in your repo (see Repository Setup above)
+2. The TUI shows tunnel status: ⬤ connected, ◐ connecting, ○ disconnected
+3. Web GUI shows a green "Preview" link next to connected agents
+
+**Requirements:**
+
+- ActionCable WebSocket connection to trybotster.com
+- nginx must properly forward WebSocket upgrades for `/cable`:
+
+```nginx
+location /cable {
+    proxy_pass http://your_upstream;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "Upgrade";  # Capital U required
+    proxy_read_timeout 86400s;
+    proxy_send_timeout 86400s;
+}
 ```
 
 ## 🛠️ Configuration
@@ -364,7 +418,9 @@ trybotster/
 │   │   ├── main.rs                  # TUI and daemon logic
 │   │   ├── agent.rs                 # Agent PTY management
 │   │   ├── git.rs                   # Worktree operations
-│   │   └── config.rs                # Configuration
+│   │   ├── config.rs                # Configuration
+│   │   ├── tunnel.rs                # HTTP tunnel WebSocket client
+│   │   └── webrtc_handler.rs        # P2P WebRTC for web GUI
 │   └── Cargo.toml
 │
 └── README.md                        # This file
@@ -426,6 +482,8 @@ Bot::Message.create!(
 - [x] Auto-cleanup on issue/PR close
 - [x] Smart agent deduplication
 - [x] Interactive TUI
+- [x] HTTP tunnel preview (Replit-style dev server access)
+- [x] Web GUI with P2P WebRTC
 - [ ] Agent timeout handling
 - [ ] Metrics and monitoring
 - [ ] Multi-repo support in single daemon
