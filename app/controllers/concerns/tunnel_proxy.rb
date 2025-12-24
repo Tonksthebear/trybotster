@@ -7,8 +7,12 @@ module TunnelProxy
 
   def proxy_to_tunnel(hub_agent)
     request_id = SecureRandom.uuid
+    hub = hub_agent.hub
 
-    ActionCable.server.broadcast("tunnel_hub_#{hub_agent.hub_id}", {
+    # Stream name format: tunnel_hub_{user_id}_{hub_identifier}
+    stream_name = "tunnel_hub_#{hub.user_id}_#{hub.identifier}"
+
+    ActionCable.server.broadcast(stream_name, {
       type: "http_request",
       request_id: request_id,
       agent_session_key: hub_agent.session_key,
