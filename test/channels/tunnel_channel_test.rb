@@ -32,23 +32,30 @@ class TunnelChannelTest < ActionCable::Channel::TestCase
     subscribe hub_id: @hub.identifier
 
     assert subscription.confirmed?
-    assert_has_stream "tunnel_hub_#{@hub.id}"
+    # Stream name format: tunnel_hub_{user_id}_{identifier}
+    assert_has_stream "tunnel_hub_#{@user.id}_#{@hub.identifier}"
   end
 
-  test "rejects subscription for non-existent hub" do
+  test "accepts subscription for non-existent hub identifier" do
+    # Subscriptions are allowed even before hub exists (hub created by heartbeat)
     stub_connection current_user: @user
+    fake_identifier = "future-hub-#{SecureRandom.uuid}"
 
-    subscribe hub_id: "non-existent-hub"
+    subscribe hub_id: fake_identifier
 
-    assert subscription.rejected?
+    assert subscription.confirmed?
+    assert_has_stream "tunnel_hub_#{@user.id}_#{fake_identifier}"
   end
 
-  test "rejects subscription for other user's hub" do
+  test "different users can subscribe to same hub identifier" do
+    # Each user gets their own stream based on user_id + identifier
     stub_connection current_user: @other_user
 
     subscribe hub_id: @hub.identifier
 
-    assert subscription.rejected?
+    assert subscription.confirmed?
+    # Other user gets a different stream
+    assert_has_stream "tunnel_hub_#{@other_user.id}_#{@hub.identifier}"
   end
 
   test "register_agent_tunnel updates agent" do

@@ -169,6 +169,10 @@ impl TunnelManager {
                     self.set_status(TunnelStatus::Connected);
                     info!("[Tunnel] Subscription confirmed - tunnel connected");
                 }
+                "reject_subscription" => {
+                    // Hub doesn't exist yet - will retry after heartbeat creates it
+                    debug!("[Tunnel] Subscription rejected - hub not yet created");
+                }
                 "disconnect" => {
                     self.set_status(TunnelStatus::Disconnected);
                     warn!("[Tunnel] Disconnected by server");
