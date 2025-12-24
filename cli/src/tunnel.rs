@@ -1,4 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -56,7 +57,7 @@ impl TunnelManager {
             self.api_key
         );
 
-        eprintln!("[Tunnel] Connecting to {}", ws_url);
+        debug!("[Tunnel] Connecting to {}", ws_url);
 
         let (ws_stream, _) = connect_async(&ws_url).await?;
         let (mut write, mut read) = ws_stream.split();
@@ -73,7 +74,7 @@ impl TunnelManager {
             .send(Message::Text(subscribe_msg.to_string().into()))
             .await?;
 
-        eprintln!("[Tunnel] Subscribed to TunnelChannel for hub {}", self.hub_identifier);
+        debug!("[Tunnel] Subscribed to TunnelChannel for hub {}", self.hub_identifier);
 
         // Handle incoming HTTP request messages
         while let Some(msg) = read.next().await {
@@ -83,20 +84,20 @@ impl TunnelManager {
                         .handle_message(&text.to_string(), &mut write)
                         .await
                     {
-                        eprintln!("[Tunnel] Message error: {}", e);
+                        error!("[Tunnel] Message error: {}", e);
                     }
                 }
                 Ok(Message::Ping(data)) => {
                     if let Err(e) = write.send(Message::Pong(data)).await {
-                        eprintln!("[Tunnel] Failed to send pong: {}", e);
+                        warn!("[Tunnel] Failed to send pong: {}", e);
                     }
                 }
                 Ok(Message::Close(_)) => {
-                    eprintln!("[Tunnel] Connection closed by server");
+                    info!("[Tunnel] Connection closed by server");
                     break;
                 }
                 Err(e) => {
-                    eprintln!("[Tunnel] WebSocket error: {}", e);
+                    error!("[Tunnel] WebSocket error: {}", e);
                     break;
                 }
                 _ => {}
@@ -121,13 +122,13 @@ impl TunnelManager {
         if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
             match msg_type {
                 "welcome" => {
-                    eprintln!("[Tunnel] ActionCable connection established");
+                    debug!("[Tunnel] ActionCable connection established");
                 }
                 "confirm_subscription" => {
-                    eprintln!("[Tunnel] Subscription confirmed");
+                    debug!("[Tunnel] Subscription confirmed");
                 }
                 "disconnect" => {
-                    eprintln!("[Tunnel] Disconnected by server");
+                    warn!("[Tunnel] Disconnected by server");
                 }
                 "ping" => {
                     // ActionCable ping, no response needed
@@ -143,7 +144,7 @@ impl TunnelManager {
                 let request_id = message["request_id"].as_str().unwrap_or_default();
                 let agent_session_key = message["agent_session_key"].as_str().unwrap_or_default();
 
-                eprintln!(
+                debug!(
                     "[Tunnel] HTTP request for agent {}: {}",
                     agent_session_key,
                     message["path"].as_str().unwrap_or("/")
@@ -153,7 +154,7 @@ impl TunnelManager {
                 let port = match self.get_agent_port(agent_session_key).await {
                     Some(p) => p,
                     None => {
-                        eprintln!("[Tunnel] Agent {} not registered", agent_session_key);
+                        warn!("[Tunnel] Agent {} not registered", agent_session_key);
                         self.send_error_response(write, request_id, "Agent tunnel not registered")
                             .await?;
                         return Ok(());
@@ -286,12 +287,15 @@ impl TunnelManager {
                     content_type,
                 }
             }
-            Err(e) => TunnelResponse {
-                status: 502,
-                headers: HashMap::new(),
-                body: format!("Failed to connect to local server on port {}: {}", port, e),
-                content_type: "text/plain".to_string(),
-            },
+            Err(e) => {
+                error!("[Tunnel] Failed to forward request to port {}: {}", port, e);
+                TunnelResponse {
+                    status: 502,
+                    headers: HashMap::new(),
+                    body: format!("Failed to connect to local server on port {}: {}", port, e),
+                    content_type: "text/plain".to_string(),
+                }
+            }
         }
     }
 
