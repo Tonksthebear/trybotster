@@ -1043,7 +1043,7 @@ impl BotsterApp {
             };
 
             let agent_title = format!(
-                " Agents ({}) {} Poll: {}s | Tunnel: {} [Ctrl+P | Ctrl+Q] ",
+                " Agents ({}) {} {}s T:{} ",
                 agent_keys_ordered.len(),
                 poll_status,
                 if polling_enabled {
