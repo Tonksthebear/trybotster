@@ -9,6 +9,6 @@ class CreateHubs < ActiveRecord::Migration[8.1]
       t.timestamps
     end
     add_index :hubs, :identifier, unique: true
-    add_index :hubs, [:repo, :last_seen_at]
+    add_index :hubs, [ :repo, :last_seen_at ]
   end
 end

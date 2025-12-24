@@ -129,7 +129,7 @@ module Api
 
       # Only send agent1 in the heartbeat
       put api_hub_url(identifier: identifier),
-          params: { repo: "owner/repo", agents: [{ session_key: "owner-repo-1" }] },
+          params: { repo: "owner/repo", agents: [ { session_key: "owner-repo-1" } ] },
           headers: { "X-API-Key" => @user.api_key },
           as: :json
 
