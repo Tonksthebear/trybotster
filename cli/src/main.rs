@@ -1,5 +1,9 @@
 use anyhow::Result;
-use botster_hub::{Agent, Config, PromptManager, WorktreeManager};
+use botster_hub::{
+    allocate_tunnel_port, Agent, AgentNotification, BrowserCommand, BrowserDimensions,
+    BrowserMode, Config, IceServerConfig, KeyInput, PromptManager, TunnelManager, TunnelStatus,
+    WebAgentInfo, WebRTCHandler, WebWorktreeInfo, WorktreeManager,
+};
 use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -7,14 +11,16 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    backend::{CrosstermBackend, TestBackend},
+    buffer::Buffer,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState},
-    Terminal,
+    Frame, Terminal,
 };
 use reqwest::blocking::Client;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -28,6 +34,7 @@ struct AgentSpawnConfig {
     repo_name: String,
     prompt: String,
     message_id: Option<i64>,
+    invocation_url: Option<String>,
 }
 
 /// Helper function to create a centered rect
@@ -57,6 +64,208 @@ fn centered_rect(
         .split(popup_layout[1])[1]
 }
 
+/// Convert a ratatui Buffer to ANSI escape sequences for streaming to xterm.js
+/// If browser_dims is provided, output is clipped to those dimensions
+fn buffer_to_ansi(
+    buffer: &Buffer,
+    width: u16,
+    height: u16,
+    browser_dims: Option<BrowserDimensions>,
+) -> String {
+    use std::fmt::Write;
+
+    // Use browser dimensions if provided, otherwise use buffer dimensions
+    let (out_width, out_height) = if let Some(dims) = browser_dims {
+        (dims.cols.min(width), dims.rows.min(height))
+    } else {
+        (width, height)
+    };
+
+    let mut output = String::new();
+
+    // Reset and clear screen, move cursor to home
+    output.push_str("\x1b[0m\x1b[H\x1b[2J");
+
+    let mut last_fg = Color::Reset;
+    let mut last_bg = Color::Reset;
+    let mut last_modifiers = Modifier::empty();
+
+    for y in 0..out_height {
+        // Move cursor to start of line
+        write!(output, "\x1b[{};1H", y + 1).unwrap();
+
+        for x in 0..out_width {
+            let cell = buffer.cell((x, y));
+            if cell.is_none() {
+                output.push(' ');
+                continue;
+            }
+            let cell = cell.unwrap();
+
+            // Check if style changed
+            let fg = cell.fg;
+            let bg = cell.bg;
+            let modifiers = cell.modifier;
+
+            if fg != last_fg || bg != last_bg || modifiers != last_modifiers {
+                // Build SGR sequence
+                output.push_str("\x1b[0m"); // Reset first
+
+                // Apply modifiers
+                if modifiers.contains(Modifier::BOLD) {
+                    output.push_str("\x1b[1m");
+                }
+                if modifiers.contains(Modifier::DIM) {
+                    output.push_str("\x1b[2m");
+                }
+                if modifiers.contains(Modifier::ITALIC) {
+                    output.push_str("\x1b[3m");
+                }
+                if modifiers.contains(Modifier::UNDERLINED) {
+                    output.push_str("\x1b[4m");
+                }
+                if modifiers.contains(Modifier::REVERSED) {
+                    output.push_str("\x1b[7m");
+                }
+
+                // Apply foreground color
+                match fg {
+                    Color::Reset => {}
+                    Color::Black => output.push_str("\x1b[30m"),
+                    Color::Red => output.push_str("\x1b[31m"),
+                    Color::Green => output.push_str("\x1b[32m"),
+                    Color::Yellow => output.push_str("\x1b[33m"),
+                    Color::Blue => output.push_str("\x1b[34m"),
+                    Color::Magenta => output.push_str("\x1b[35m"),
+                    Color::Cyan => output.push_str("\x1b[36m"),
+                    Color::Gray => output.push_str("\x1b[90m"),
+                    Color::DarkGray => output.push_str("\x1b[90m"),
+                    Color::LightRed => output.push_str("\x1b[91m"),
+                    Color::LightGreen => output.push_str("\x1b[92m"),
+                    Color::LightYellow => output.push_str("\x1b[93m"),
+                    Color::LightBlue => output.push_str("\x1b[94m"),
+                    Color::LightMagenta => output.push_str("\x1b[95m"),
+                    Color::LightCyan => output.push_str("\x1b[96m"),
+                    Color::White => output.push_str("\x1b[37m"),
+                    Color::Rgb(r, g, b) => {
+                        write!(output, "\x1b[38;2;{};{};{}m", r, g, b).unwrap();
+                    }
+                    Color::Indexed(i) => {
+                        write!(output, "\x1b[38;5;{}m", i).unwrap();
+                    }
+                }
+
+                // Apply background color
+                match bg {
+                    Color::Reset => {}
+                    Color::Black => output.push_str("\x1b[40m"),
+                    Color::Red => output.push_str("\x1b[41m"),
+                    Color::Green => output.push_str("\x1b[42m"),
+                    Color::Yellow => output.push_str("\x1b[43m"),
+                    Color::Blue => output.push_str("\x1b[44m"),
+                    Color::Magenta => output.push_str("\x1b[45m"),
+                    Color::Cyan => output.push_str("\x1b[46m"),
+                    Color::Gray => output.push_str("\x1b[100m"),
+                    Color::DarkGray => output.push_str("\x1b[100m"),
+                    Color::LightRed => output.push_str("\x1b[101m"),
+                    Color::LightGreen => output.push_str("\x1b[102m"),
+                    Color::LightYellow => output.push_str("\x1b[103m"),
+                    Color::LightBlue => output.push_str("\x1b[104m"),
+                    Color::LightMagenta => output.push_str("\x1b[105m"),
+                    Color::LightCyan => output.push_str("\x1b[106m"),
+                    Color::White => output.push_str("\x1b[47m"),
+                    Color::Rgb(r, g, b) => {
+                        write!(output, "\x1b[48;2;{};{};{}m", r, g, b).unwrap();
+                    }
+                    Color::Indexed(i) => {
+                        write!(output, "\x1b[48;5;{}m", i).unwrap();
+                    }
+                }
+
+                last_fg = fg;
+                last_bg = bg;
+                last_modifiers = modifiers;
+            }
+
+            // Write the character
+            output.push_str(cell.symbol());
+        }
+    }
+
+    // Reset at end
+    output.push_str("\x1b[0m");
+
+    output
+}
+
+/// Convert browser keyboard input to crossterm KeyEvent
+fn convert_browser_key_to_crossterm(input: &KeyInput) -> Option<crossterm::event::KeyEvent> {
+    use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
+
+    let mut modifiers = KeyModifiers::empty();
+    if input.ctrl {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    if input.alt {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if input.shift {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+
+    // Map browser key names to crossterm KeyCode
+    let key_code = match input.key.as_str() {
+        // Single character keys
+        k if k.len() == 1 => {
+            let c = k.chars().next().unwrap();
+            KeyCode::Char(c)
+        }
+        // Special keys
+        "Enter" => KeyCode::Enter,
+        "Escape" => KeyCode::Esc,
+        "Backspace" => KeyCode::Backspace,
+        "Tab" => KeyCode::Tab,
+        "ArrowUp" => KeyCode::Up,
+        "ArrowDown" => KeyCode::Down,
+        "ArrowLeft" => KeyCode::Left,
+        "ArrowRight" => KeyCode::Right,
+        "Home" => KeyCode::Home,
+        "End" => KeyCode::End,
+        "PageUp" => KeyCode::PageUp,
+        "PageDown" => KeyCode::PageDown,
+        "Delete" => KeyCode::Delete,
+        "Insert" => KeyCode::Insert,
+        // Function keys
+        "F1" => KeyCode::F(1),
+        "F2" => KeyCode::F(2),
+        "F3" => KeyCode::F(3),
+        "F4" => KeyCode::F(4),
+        "F5" => KeyCode::F(5),
+        "F6" => KeyCode::F(6),
+        "F7" => KeyCode::F(7),
+        "F8" => KeyCode::F(8),
+        "F9" => KeyCode::F(9),
+        "F10" => KeyCode::F(10),
+        "F11" => KeyCode::F(11),
+        "F12" => KeyCode::F(12),
+        // Space
+        " " => KeyCode::Char(' '),
+        // Unknown keys - ignore
+        _ => {
+            log::debug!("Unknown browser key: {}", input.key);
+            return None;
+        }
+    };
+
+    Some(KeyEvent {
+        code: key_code,
+        modifiers,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::empty(),
+    })
+}
+
+#[derive(Clone)]
 enum AppMode {
     Normal,
     Menu,
@@ -83,6 +292,17 @@ struct BotsterApp {
     input_buffer: String,
     available_worktrees: Vec<(String, String)>, // (path, branch)
     worktree_selected: usize,
+    // WebRTC P2P support for browser connections
+    tokio_runtime: tokio::runtime::Runtime,
+    webrtc_handler: Arc<StdMutex<WebRTCHandler>>,
+    // Track last agent screen hash for change detection (reduces bandwidth)
+    last_agent_screen_hash: HashMap<String, u64>,
+    // Hub tracking - per-session UUID for identifying this CLI instance
+    hub_identifier: String,
+    // Track when we last sent a heartbeat to the server
+    last_heartbeat: Instant,
+    // HTTP tunnel manager for forwarding local dev servers
+    tunnel_manager: Arc<TunnelManager>,
 }
 
 impl BotsterApp {
@@ -90,6 +310,34 @@ impl BotsterApp {
         let config = Config::load()?;
         let git_manager = WorktreeManager::new(config.worktree_base.clone());
         let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+
+        // Create tokio runtime for async WebRTC operations
+        let tokio_runtime = tokio::runtime::Runtime::new()?;
+
+        // Create WebRTC handler for full TUI streaming
+        let webrtc_handler = Arc::new(StdMutex::new(WebRTCHandler::new()));
+
+        // Generate per-session UUID for hub identification
+        let hub_identifier = uuid::Uuid::new_v4().to_string();
+        log::info!("Generated hub identifier: {}", hub_identifier);
+
+        // Create tunnel manager for HTTP forwarding
+        let tunnel_manager = Arc::new(TunnelManager::new(
+            hub_identifier.clone(),
+            config.api_key.clone(),
+            config.server_url.clone(),
+        ));
+
+        // Start tunnel connection in background
+        let tunnel_manager_clone = tunnel_manager.clone();
+        tokio_runtime.spawn(async move {
+            loop {
+                if let Err(e) = tunnel_manager_clone.connect().await {
+                    log::warn!("Tunnel connection error: {}, reconnecting in 5s...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
+            }
+        });
 
         let app = Self {
             agents: HashMap::new(),
@@ -108,6 +356,12 @@ impl BotsterApp {
             input_buffer: String::new(),
             available_worktrees: Vec::new(),
             worktree_selected: 0,
+            tokio_runtime,
+            webrtc_handler,
+            last_agent_screen_hash: HashMap::new(),
+            hub_identifier,
+            last_heartbeat: Instant::now(),
+            tunnel_manager,
         };
 
         log::info!("Botster Hub started, waiting for messages...");
@@ -127,6 +381,17 @@ impl BotsterApp {
             config.worktree_path.clone(),
         );
         agent.resize(self.terminal_rows, self.terminal_cols);
+
+        // Set invocation URL for notifications
+        // Use provided URL, or construct from repo + issue_number if available
+        agent.last_invocation_url = config.invocation_url.or_else(|| {
+            config.issue_number.map(|num| {
+                format!("https://github.com/{}/issues/{}", config.repo_name, num)
+            })
+        });
+        if let Some(ref url) = agent.last_invocation_url {
+            log::info!("Agent invocation URL: {}", url);
+        }
 
         // Write prompt to .botster_prompt file
         let prompt_file_path = config.worktree_path.join(".botster_prompt");
@@ -165,12 +430,35 @@ impl BotsterApp {
             .unwrap_or_else(|| "botster-hub".to_string());
         env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
 
+        // Allocate a tunnel port for this agent
+        let tunnel_port = allocate_tunnel_port();
+        if let Some(port) = tunnel_port {
+            env_vars.insert("BOTSTER_TUNNEL_PORT".to_string(), port.to_string());
+            log::info!("Allocated tunnel port {} for agent", port);
+        }
+
+        // Kill any existing orphaned claude processes for this worktree
+        // This prevents duplicate claude instances when reopening a worktree
+        Self::kill_orphaned_claude_processes(&config.worktree_path);
+
         // Spawn the agent
         let init_commands = vec!["source .botster_init".to_string()];
         agent.spawn("bash", "", init_commands, env_vars)?;
 
         // Register the agent
         let session_key = agent.session_key();
+
+        // Store tunnel port on the agent
+        agent.tunnel_port = tunnel_port;
+
+        // Register tunnel port with the tunnel manager
+        if let Some(port) = tunnel_port {
+            let tunnel_manager = self.tunnel_manager.clone();
+            let session_key_clone = session_key.clone();
+            self.tokio_runtime.spawn(async move {
+                tunnel_manager.register_agent(session_key_clone, port).await;
+            });
+        }
         self.agent_keys_ordered.push(session_key.clone());
         self.agents.insert(session_key, agent);
 
@@ -185,33 +473,34 @@ impl BotsterApp {
     }
 
     fn handle_events(&mut self) -> Result<bool> {
-        // Check for events immediately (non-blocking)
-        if !event::poll(Duration::from_millis(0))? {
-            return Ok(false); // No events available
-        }
+        let mut handled_any = false;
 
-        // Event available - read it immediately
-        match event::read()? {
-            Event::Resize(cols, rows) => {
-                // Calculate terminal widget dimensions
-                let terminal_cols = (cols * 70 / 100).saturating_sub(2);
-                let terminal_rows = rows.saturating_sub(2);
+        // Process ALL pending events (not just one) to prevent event queue buildup
+        while event::poll(Duration::from_millis(0))? {
+            handled_any = true;
+            match event::read()? {
+                Event::Resize(cols, rows) => {
+                    // Calculate terminal widget dimensions
+                    let terminal_cols = (cols * 70 / 100).saturating_sub(2);
+                    let terminal_rows = rows.saturating_sub(2);
 
-                // Update stored dimensions
-                self.terminal_rows = terminal_rows;
-                self.terminal_cols = terminal_cols;
+                    // Update stored dimensions
+                    self.terminal_rows = terminal_rows;
+                    self.terminal_cols = terminal_cols;
 
-                // Resize all agents
-                for agent in self.agents.values() {
-                    agent.resize(terminal_rows, terminal_cols);
+                    // Resize all agents
+                    for agent in self.agents.values() {
+                        agent.resize(terminal_rows, terminal_cols);
+                    }
                 }
-                return Ok(true);
+                Event::Key(key) => {
+                    self.handle_key_event(key)?;
+                }
+                _ => {}
             }
-            Event::Key(key) => {
-                return self.handle_key_event(key);
-            }
-            _ => return Ok(false),
         }
+
+        Ok(handled_any)
     }
 
     fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
@@ -302,8 +591,8 @@ impl BotsterApp {
                 };
 
                 if let Some(bytes) = bytes_to_send {
-                    if let Some(key) = self.agent_keys_ordered.get(self.selected) {
-                        if let Some(agent) = self.agents.get_mut(key) {
+                    if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                        if let Some(agent) = self.agents.get_mut(&key) {
                             let _ = agent.write_input(&bytes);
                         }
                     }
@@ -640,6 +929,7 @@ impl BotsterApp {
                 repo_name,
                 prompt,
                 message_id: None,
+                invocation_url: None, // Will be auto-constructed from repo + issue_number
             })?;
         }
 
@@ -681,23 +971,34 @@ impl BotsterApp {
             repo_name,
             prompt,
             message_id: None,
+            invocation_url: None, // Will be auto-constructed from repo + issue_number
         })
     }
 
-    fn view(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
-        let agent_keys_ordered = &self.agent_keys_ordered;
+    /// Render the TUI and return ANSI output for WebRTC streaming
+    /// Returns (ansi_string, rows, cols) for sending to connected browsers
+    /// If browser_dims is provided, renders at those dimensions for proper layout
+    fn view(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        browser_dims: Option<BrowserDimensions>,
+    ) -> Result<(String, u16, u16)> {
+        // Collect all state needed for rendering
+        let agent_keys_ordered = self.agent_keys_ordered.clone();
         let agents = &self.agents;
         let selected = self.selected;
         let seconds_since_poll = self.last_poll.elapsed().as_secs();
         let poll_interval = self.config.poll_interval;
-        let mode = &self.mode;
+        let mode = self.mode.clone();
         let polling_enabled = self.polling_enabled;
         let menu_selected = self.menu_selected;
-        let available_worktrees = &self.available_worktrees;
+        let available_worktrees = self.available_worktrees.clone();
         let worktree_selected = self.worktree_selected;
-        let input_buffer = &self.input_buffer;
+        let input_buffer = self.input_buffer.clone();
+        let tunnel_status = self.tunnel_manager.get_status();
 
-        terminal.draw(|f| {
+        // Helper to render UI to a frame
+        let render_ui = |f: &mut Frame, agents: &HashMap<String, Agent>| {
             use ratatui::{
                 layout::Alignment,
                 text::{Line, Span},
@@ -737,15 +1038,23 @@ impl BotsterApp {
                 "○"
             };
 
+            // Add tunnel status indicator
+            let tunnel_indicator = match tunnel_status {
+                TunnelStatus::Connected => "⬤",    // Filled circle = connected
+                TunnelStatus::Connecting => "◐",   // Half circle = connecting
+                TunnelStatus::Disconnected => "○", // Empty circle = disconnected
+            };
+
             let agent_title = format!(
-                " Agents ({}) {} Poll: {}s [Ctrl+P menu | Ctrl+Q quit] ",
+                " Agents ({}) {} {}s T:{} ",
                 agent_keys_ordered.len(),
                 poll_status,
                 if polling_enabled {
                     poll_interval - seconds_since_poll.min(poll_interval)
                 } else {
                     0
-                }
+                },
+                tunnel_indicator
             );
 
             let list = List::new(items)
@@ -912,9 +1221,44 @@ impl BotsterApp {
                 }
                 AppMode::Normal => {}
             }
-        })?;
+        };
 
-        Ok(())
+        // Always render to real terminal for local display
+        terminal.draw(|f| render_ui(f, agents))?;
+
+        // For WebRTC streaming, render to browser-sized buffer if dimensions provided
+        let (ansi_output, out_rows, out_cols) = if let Some(dims) = browser_dims {
+            // Create a virtual terminal at browser dimensions
+            let backend = TestBackend::new(dims.cols, dims.rows);
+            let mut virtual_terminal = Terminal::new(backend)?;
+
+            // Render to virtual terminal at browser dimensions
+            let completed_frame = virtual_terminal.draw(|f| {
+                // Log once when dimensions change
+                static LAST_AREA: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let area = f.area();
+                let combined = ((area.width as u32) << 16) | (area.height as u32);
+                let last = LAST_AREA.swap(combined, std::sync::atomic::Ordering::Relaxed);
+                if last != combined {
+                    log::info!("Virtual terminal rendering at {}x{}", area.width, area.height);
+                }
+                render_ui(f, agents)
+            })?;
+
+            // Convert virtual buffer to ANSI
+            let ansi = buffer_to_ansi(
+                &completed_frame.buffer,
+                dims.cols,
+                dims.rows,
+                None, // No clipping needed, already at correct size
+            );
+            (ansi, dims.rows, dims.cols)
+        } else {
+            // No browser connected, return empty output
+            (String::new(), 0, 0)
+        };
+
+        Ok((ansi_output, out_rows, out_cols))
     }
 
     fn poll_messages(&mut self) -> Result<()> {
@@ -1039,6 +1383,274 @@ impl BotsterApp {
         }
     }
 
+    /// Poll all agents for terminal notifications (OSC 9, OSC 777)
+    /// and send them to Rails to trigger GitHub comments.
+    /// OSC 777 notifications (sent natively by Claude Code) are treated as "question_asked"
+    /// to alert the user that the agent needs attention.
+    fn poll_agent_notifications(&mut self) {
+        // Collect notifications: (session_key, repo, issue_number, invocation_url, notification)
+        let mut notifications_to_send: Vec<(String, String, Option<u32>, Option<String>, AgentNotification)> =
+            Vec::new();
+
+        for (session_key, agent) in &self.agents {
+            let notifications = agent.poll_notifications();
+            for notification in notifications {
+                notifications_to_send.push((
+                    session_key.clone(),
+                    agent.repo.clone(),
+                    agent.issue_number,
+                    agent.last_invocation_url.clone(),
+                    notification,
+                ));
+            }
+        }
+
+        // Process and send notifications
+        for (session_key, repo, issue_number, invocation_url, notification) in notifications_to_send {
+            // Claude Code sends OSC 9 notifications when it needs user attention
+            // (see: https://github.com/anthropics/claude-code/issues/3340)
+            // We treat both OSC 9 and OSC 777 as "question_asked" for a generic message
+            let notification_type = match &notification {
+                AgentNotification::Osc9(_) | AgentNotification::Osc777 { .. } => {
+                    "question_asked".to_string()
+                }
+            };
+
+            if issue_number.is_some() || invocation_url.is_some() {
+                log::info!(
+                    "Agent {} sent notification: {} (url: {:?})",
+                    session_key,
+                    notification_type,
+                    invocation_url
+                );
+
+                if let Err(e) = self.send_agent_notification(&repo, issue_number, invocation_url.as_deref(), &notification_type) {
+                    log::error!("Failed to send notification to Rails: {}", e);
+                }
+            } else {
+                log::debug!(
+                    "Agent {} detected notification '{}' but has no issue_number or invocation_url - skipping",
+                    session_key,
+                    notification_type
+                );
+            }
+        }
+    }
+
+    /// Send an agent notification to Rails to trigger a GitHub comment
+    /// Prefers invocation_url if available, falls back to repo + issue_number
+    fn send_agent_notification(
+        &self,
+        repo: &str,
+        issue_number: Option<u32>,
+        invocation_url: Option<&str>,
+        notification_type: &str,
+    ) -> Result<()> {
+        let url = format!("{}/api/agent_notifications", self.config.server_url);
+
+        // Build payload - include both old and new fields for backwards compatibility
+        let payload = serde_json::json!({
+            "repo": repo,
+            "issue_number": issue_number,
+            "invocation_url": invocation_url,
+            "notification_type": notification_type,
+        });
+
+        let response = self
+            .client
+            .post(&url)
+            .header("X-API-Key", &self.config.api_key)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()?;
+
+        if response.status().is_success() {
+            log::info!(
+                "Sent notification to Rails: repo={}, issue={:?}, url={:?}, type={}",
+                repo,
+                issue_number,
+                invocation_url,
+                notification_type
+            );
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Failed to send notification: {} - {}",
+                response.status(),
+                response.text().unwrap_or_default()
+            )
+        }
+    }
+
+    /// Send heartbeat to Rails server to register this hub and its agents
+    /// Uses RESTful PUT /api/hubs/:identifier endpoint for upsert
+    fn send_heartbeat(&mut self) -> Result<()> {
+        // Check if 30 seconds have passed since last heartbeat
+        const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+        if self.last_heartbeat.elapsed() < Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
+            return Ok(());
+        }
+        self.last_heartbeat = Instant::now();
+
+        // Detect current repo
+        let (_, repo_name) = match WorktreeManager::detect_current_repo() {
+            Ok(result) => result,
+            Err(e) => {
+                log::debug!("Not in a git repository, skipping heartbeat: {}", e);
+                return Ok(());
+            }
+        };
+
+        // Build agents list for the heartbeat payload
+        let agents_list: Vec<serde_json::Value> = self
+            .agents
+            .values()
+            .map(|agent| {
+                serde_json::json!({
+                    "session_key": agent.session_key(),
+                    "last_invocation_url": agent.last_invocation_url,
+                })
+            })
+            .collect();
+
+        let url = format!(
+            "{}/api/hubs/{}",
+            self.config.server_url, self.hub_identifier
+        );
+
+        let payload = serde_json::json!({
+            "repo": repo_name,
+            "agents": agents_list,
+        });
+
+        log::debug!("Sending heartbeat to {}", url);
+
+        match self
+            .client
+            .put(&url)
+            .header("X-API-Key", &self.config.api_key)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    log::debug!(
+                        "Heartbeat sent successfully: {} agents registered",
+                        agents_list.len()
+                    );
+                } else {
+                    log::warn!(
+                        "Heartbeat failed: {} - {}",
+                        response.status(),
+                        response.text().unwrap_or_default()
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to send heartbeat: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Kill any orphaned claude processes running in the given worktree directory.
+    /// This is needed when reopening a worktree that has a lingering claude process
+    /// from a previous botster-hub session.
+    fn kill_orphaned_claude_processes(worktree_path: &std::path::Path) {
+        let worktree_str = worktree_path.to_string_lossy();
+        let current_pid = std::process::id();
+
+        // Use pgrep to find claude processes, then filter by CWD
+        // macOS: lsof -d cwd to check working directory
+        #[cfg(target_os = "macos")]
+        {
+            use std::process::Command;
+
+            // Get all claude process PIDs
+            let pgrep_output = Command::new("pgrep").arg("-f").arg("claude").output();
+
+            if let Ok(output) = pgrep_output {
+                let pids_str = String::from_utf8_lossy(&output.stdout);
+                for pid_str in pids_str.lines() {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        // Skip our own process
+                        if pid == current_pid {
+                            continue;
+                        }
+
+                        // Check if this process's CWD matches our worktree exactly
+                        // (or is a subdirectory of it)
+                        let lsof_output = Command::new("lsof")
+                            .arg("-p")
+                            .arg(pid.to_string())
+                            .arg("-d")
+                            .arg("cwd")
+                            .arg("-Fn")
+                            .output();
+
+                        if let Ok(lsof) = lsof_output {
+                            let lsof_str = String::from_utf8_lossy(&lsof.stdout);
+                            // lsof -Fn output format: lines starting with 'n' contain the path
+                            if lsof_str.lines().any(|line| {
+                                if line.starts_with('n') {
+                                    let cwd = &line[1..];
+                                    // Only kill if CWD is exactly the worktree or inside it
+                                    cwd == &*worktree_str || cwd.starts_with(&format!("{}/", worktree_str))
+                                } else {
+                                    false
+                                }
+                            }) {
+                                log::info!(
+                                    "Killing orphaned claude process {} in worktree {}",
+                                    pid,
+                                    worktree_str
+                                );
+                                let _ = Command::new("kill").arg(pid.to_string()).output();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::process::Command;
+
+            // Get all claude process PIDs
+            let pgrep_output = Command::new("pgrep").arg("-f").arg("claude").output();
+
+            if let Ok(output) = pgrep_output {
+                let pids_str = String::from_utf8_lossy(&output.stdout);
+                for pid_str in pids_str.lines() {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        // Skip our own process
+                        if pid == current_pid {
+                            continue;
+                        }
+
+                        // On Linux, check /proc/<pid>/cwd symlink
+                        let cwd_path = format!("/proc/{}/cwd", pid);
+                        if let Ok(cwd) = std::fs::read_link(&cwd_path) {
+                            let cwd_str = cwd.to_string_lossy();
+                            // Only kill if CWD is exactly the worktree or inside it
+                            if cwd_str == worktree_str || cwd_str.starts_with(&format!("{}/", worktree_str)) {
+                                log::info!(
+                                    "Killing orphaned claude process {} in worktree {}",
+                                    pid,
+                                    worktree_str
+                                );
+                                let _ = Command::new("kill").arg(pid.to_string()).output();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn spawn_agent_for_message(
         &mut self,
         message_id: i64,
@@ -1048,6 +1660,11 @@ impl BotsterApp {
         // Handle cleanup messages (when issue/PR is closed)
         if event_type == "agent_cleanup" {
             return self.handle_cleanup_message(payload);
+        }
+
+        // Handle WebRTC signaling for P2P browser connections
+        if event_type == "webrtc_offer" {
+            return self.handle_webrtc_offer(payload);
         }
 
         // Enforce max_sessions limit to prevent unbounded memory growth
@@ -1083,6 +1700,13 @@ impl BotsterApp {
                 "Agent already exists for issue #{}, pinging with new message",
                 issue_number
             );
+
+            // Update last_invocation_url to track where this interaction came from
+            // This ensures notifications go to the right place (issue, PR, etc.)
+            if let Some(issue_url) = payload["issue_url"].as_str() {
+                existing_agent.last_invocation_url = Some(issue_url.to_string());
+                log::info!("Updated last_invocation_url to: {}", issue_url);
+            }
 
             // Use the full prompt which includes routing information (where to respond)
             // This ensures the agent knows if the comment came from a PR and should respond there
@@ -1186,11 +1810,25 @@ impl BotsterApp {
             worktree_path.clone(),
         );
 
+        // Set last_invocation_url from payload to track where this agent was invoked from
+        // Fall back to constructing URL from repo + issue_number if not provided
+        if let Some(issue_url) = payload["issue_url"].as_str() {
+            agent.last_invocation_url = Some(issue_url.to_string());
+            log::info!("Set last_invocation_url from payload: {}", issue_url);
+        } else {
+            // Construct URL from repo and issue number
+            let constructed_url = format!("https://github.com/{}/issues/{}", repo_name, issue_number);
+            agent.last_invocation_url = Some(constructed_url.clone());
+            log::info!("Constructed last_invocation_url: {}", constructed_url);
+        }
+
         // Resize agent to match terminal dimensions
         agent.resize(self.terminal_rows, self.terminal_cols);
 
         // Create environment variables for the agent
         let mut env_vars = HashMap::new();
+        // Set TERM to ensure Claude Code sends OSC 777 notifications
+        env_vars.insert("TERM".to_string(), "xterm-256color".to_string());
         env_vars.insert("BOTSTER_REPO".to_string(), repo_name.clone());
         env_vars.insert("BOTSTER_ISSUE_NUMBER".to_string(), issue_number.to_string());
         env_vars.insert(
@@ -1214,6 +1852,13 @@ impl BotsterApp {
             .unwrap_or_else(|| "botster-hub".to_string());
         env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
 
+        // Allocate a tunnel port for this agent
+        let tunnel_port = allocate_tunnel_port();
+        if let Some(port) = tunnel_port {
+            env_vars.insert("BOTSTER_TUNNEL_PORT".to_string(), port.to_string());
+            log::info!("Allocated tunnel port {} for agent", port);
+        }
+
         // Spawn agent with a shell
         // Just run 'source .botster_init' which handles everything:
         // - Reading .botster_prompt file
@@ -1226,9 +1871,78 @@ impl BotsterApp {
 
         // Add agent to tracking structures using session key
         let session_key = agent.session_key();
+
+        // Store tunnel port on the agent
+        agent.tunnel_port = tunnel_port;
+
+        // Register tunnel port with the tunnel manager
+        if let Some(port) = tunnel_port {
+            let tunnel_manager = self.tunnel_manager.clone();
+            let session_key_clone = session_key.clone();
+            self.tokio_runtime.spawn(async move {
+                tunnel_manager.register_agent(session_key_clone, port).await;
+            });
+        }
+
         self.agent_keys_ordered.push(session_key.clone());
         self.agents.insert(session_key, agent);
 
+        Ok(())
+    }
+
+    /// Build the agent list for sending to WebRTC browsers
+    fn build_web_agent_list(&self) -> Vec<WebAgentInfo> {
+        let hub_identifier = self.hub_identifier.clone();
+        self.agent_keys_ordered
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, key)| {
+                self.agents.get(key).map(|agent| WebAgentInfo {
+                    id: key.clone(),
+                    repo: agent.repo.clone(),
+                    issue_number: agent.issue_number,
+                    branch_name: agent.branch_name.clone(),
+                    status: format!("{:?}", agent.status),
+                    selected: idx == self.selected,
+                    tunnel_port: agent.tunnel_port,
+                    hub_identifier: hub_identifier.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Close an agent by session key, optionally deleting the worktree
+    fn close_agent(&mut self, session_key: &str, delete_worktree: bool) -> Result<()> {
+        if let Some(agent) = self.agents.remove(session_key) {
+            // Remove from ordered list
+            if let Some(pos) = self.agent_keys_ordered.iter().position(|k| k == session_key) {
+                self.agent_keys_ordered.remove(pos);
+
+                // Adjust selection if needed
+                if self.selected >= self.agent_keys_ordered.len() && self.selected > 0 {
+                    self.selected = self.agent_keys_ordered.len() - 1;
+                }
+            }
+
+            let label = if let Some(num) = agent.issue_number {
+                format!("issue #{}", num)
+            } else {
+                format!("branch {}", agent.branch_name)
+            };
+
+            if delete_worktree {
+                if let Err(e) = self
+                    .git_manager
+                    .delete_worktree_by_path(&agent.worktree_path, &agent.branch_name)
+                {
+                    log::error!("Failed to delete worktree for {}: {}", label, e);
+                } else {
+                    log::info!("Closed agent and deleted worktree for {}", label);
+                }
+            } else {
+                log::info!("Closed agent for {} (worktree preserved)", label);
+            }
+        }
         Ok(())
     }
 
@@ -1298,6 +2012,82 @@ impl BotsterApp {
 
         Ok(())
     }
+
+    /// Handle a WebRTC offer from a browser client (via Rails signaling)
+    /// Creates a peer connection, generates an answer, and posts it back to Rails
+    fn handle_webrtc_offer(&mut self, payload: &serde_json::Value) -> Result<()> {
+        let session_id = payload["session_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing session_id in webrtc_offer payload"))?;
+
+        let offer_sdp = payload["offer"]["sdp"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing offer.sdp in webrtc_offer payload"))?;
+
+        // Parse ICE servers from payload (provided by Rails signaling server)
+        let ice_servers: Vec<IceServerConfig> = payload
+            .get("ice_servers")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_else(|| {
+                log::warn!("No ice_servers in payload - using default STUN servers");
+                Vec::new()
+            });
+
+        log::info!(
+            "Handling WebRTC offer for session {}, offer length: {} bytes, {} ICE server(s)",
+            session_id,
+            offer_sdp.len(),
+            ice_servers.len()
+        );
+
+        // Create the answer using the WebRTC handler (async operation)
+        let webrtc_handler = Arc::clone(&self.webrtc_handler);
+        let offer_sdp_owned = offer_sdp.to_string();
+
+        let answer_sdp = self.tokio_runtime.block_on(async move {
+            let mut handler = webrtc_handler.lock().unwrap();
+            handler.handle_offer(&offer_sdp_owned, &ice_servers).await
+        })?;
+
+        log::info!(
+            "WebRTC answer created, length: {} bytes",
+            answer_sdp.len()
+        );
+
+        // Post the answer back to the Rails signaling server
+        let url = format!(
+            "{}/api/webrtc/sessions/{}",
+            self.config.server_url, session_id
+        );
+
+        let response = self
+            .client
+            .patch(&url)
+            .header("X-API-Key", &self.config.api_key)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "answer": {
+                    "type": "answer",
+                    "sdp": answer_sdp
+                }
+            }))
+            .send()?;
+
+        if response.status().is_success() {
+            log::info!(
+                "Successfully posted WebRTC answer for session {}",
+                session_id
+            );
+        } else {
+            log::error!(
+                "Failed to post WebRTC answer for session {}: {}",
+                session_id,
+                response.status()
+            );
+        }
+
+        Ok(())
+    }
 }
 
 fn run_interactive() -> Result<()> {
@@ -1319,16 +2109,393 @@ fn run_interactive() -> Result<()> {
 
     // Main loop
     while !app.quit {
-        // Render current state
-        app.view(&mut terminal)?;
+        // Get browser dimensions if WebRTC is connected
+        let browser_dims: Option<BrowserDimensions> = {
+            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+            app.tokio_runtime.block_on(async move {
+                let handler = webrtc_handler.lock().unwrap();
+                handler.get_browser_dimensions().await
+            })
+        };
 
-        // Handle keyboard input (non-blocking)
+        // Track browser connection state and resize agents accordingly
+        {
+            static LAST_DIMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            static WAS_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+            let is_connected = browser_dims.is_some();
+            let was_connected = WAS_CONNECTED.swap(is_connected, std::sync::atomic::Ordering::Relaxed);
+
+            if let Some(dims) = &browser_dims {
+                // Browser connected - resize to browser dimensions when they change
+                // Only resize if dimensions are reasonable (sanity check)
+                if dims.cols >= 20 && dims.rows >= 5 {
+                    // Include mode in the combined value to detect mode changes
+                    let mode_bit = if dims.mode == BrowserMode::Gui { 1u32 << 31 } else { 0 };
+                    let combined = mode_bit | ((dims.cols as u32) << 16) | (dims.rows as u32);
+                    let last = LAST_DIMS.swap(combined, std::sync::atomic::Ordering::Relaxed);
+                    if last != combined {
+                        // Calculate agent terminal size based on mode
+                        let (agent_cols, agent_rows) = match dims.mode {
+                            BrowserMode::Gui => {
+                                // GUI mode: use full browser dimensions for agent terminal
+                                log::info!("GUI mode - using full browser dimensions: {}x{}", dims.cols, dims.rows);
+                                (dims.cols, dims.rows)
+                            }
+                            BrowserMode::Tui => {
+                                // TUI mode: terminal widget is 70% of width, minus borders
+                                let tui_cols = (dims.cols * 70 / 100).saturating_sub(2);
+                                let tui_rows = dims.rows.saturating_sub(2);
+                                log::info!("TUI mode - using 70% width: {}x{} (from {}x{})", tui_cols, tui_rows, dims.cols, dims.rows);
+                                (tui_cols, tui_rows)
+                            }
+                        };
+                        for agent in app.agents.values() {
+                            agent.resize(agent_rows, agent_cols);
+                        }
+                    }
+                } else {
+                    log::warn!("Ignoring small browser dimensions: {}x{}", dims.cols, dims.rows);
+                }
+            } else if was_connected {
+                // Browser just disconnected - reset to local terminal dimensions
+                log::info!("Browser disconnected, resetting agents to local terminal size");
+                let terminal_size = terminal.size().unwrap_or_default();
+                let terminal_cols = (terminal_size.width * 70 / 100).saturating_sub(2);
+                let terminal_rows = terminal_size.height.saturating_sub(2);
+                log::info!("Resizing agents to {}x{}", terminal_cols, terminal_rows);
+                for agent in app.agents.values() {
+                    agent.resize(terminal_rows, terminal_cols);
+                }
+                LAST_DIMS.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // Render current state and get ANSI output for WebRTC streaming
+        let (ansi_output, rows, cols) = app.view(&mut terminal, browser_dims)?;
+
+        // Stream TUI screen to WebRTC connected browsers (full TUI mode)
+        {
+            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+            let ansi_for_send = ansi_output.clone();
+            app.tokio_runtime.block_on(async move {
+                let handler = webrtc_handler.lock().unwrap();
+                if handler.is_ready().await {
+                    if let Err(e) = handler.send_screen(&ansi_for_send, rows, cols).await {
+                        log::warn!("Failed to send screen to WebRTC: {}", e);
+                    }
+                }
+            });
+        }
+
+        // Stream selected agent's individual terminal output (for web GUI mode)
+        // Only send when screen content actually changes to reduce bandwidth/lag
+        {
+            if let Some(key) = app.agent_keys_ordered.get(app.selected) {
+                if let Some(agent) = app.agents.get(key) {
+                    let current_hash = agent.get_screen_hash();
+                    let last_hash = app.last_agent_screen_hash.get(key).copied();
+
+                    // Only send if screen changed
+                    if last_hash != Some(current_hash) {
+                        app.last_agent_screen_hash
+                            .insert(key.clone(), current_hash);
+
+                        let agent_output = agent.get_screen_as_ansi();
+                        let agent_id = key.clone();
+                        let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                        app.tokio_runtime.block_on(async move {
+                            let handler = webrtc_handler.lock().unwrap();
+                            if handler.is_ready().await {
+                                if let Err(e) =
+                                    handler.send_agent_output(&agent_id, &agent_output).await
+                                {
+                                    log::warn!("Failed to send agent output to WebRTC: {}", e);
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        // Process keyboard input from WebRTC browser connections
+        {
+            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+            let inputs = app.tokio_runtime.block_on(async move {
+                let handler = webrtc_handler.lock().unwrap();
+                handler.get_pending_inputs().await
+            });
+
+            for input in inputs {
+                // Convert browser key input to crossterm KeyEvent
+                let key_event = convert_browser_key_to_crossterm(&input);
+                if let Some(key) = key_event {
+                    if let Err(e) = app.handle_key_event(key) {
+                        log::warn!("Error handling WebRTC key input: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Process commands from WebRTC browser connections
+        {
+            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+            let commands = app.tokio_runtime.block_on(async move {
+                let handler = webrtc_handler.lock().unwrap();
+                handler.get_pending_commands().await
+            });
+
+            for command in commands {
+                match command {
+                    BrowserCommand::ListAgents => {
+                        let agents = app.build_web_agent_list();
+                        let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                        app.tokio_runtime.block_on(async move {
+                            let handler = webrtc_handler.lock().unwrap();
+                            if let Err(e) = handler.send_agents(agents).await {
+                                log::warn!("Failed to send agent list: {}", e);
+                            }
+                        });
+                    }
+                    BrowserCommand::SelectAgent { id } => {
+                        // Find the agent index by session key
+                        if let Some(idx) = app.agent_keys_ordered.iter().position(|k| k == &id) {
+                            app.selected = idx;
+                            log::info!("WebRTC: Selected agent {}", id);
+
+                            // Clear the hash to force immediate screen send
+                            app.last_agent_screen_hash.remove(&id);
+
+                            // Immediately send the agent's screen
+                            if let Some(agent) = app.agents.get(&id) {
+                                let agent_output = agent.get_screen_as_ansi();
+                                let current_hash = agent.get_screen_hash();
+                                app.last_agent_screen_hash.insert(id.clone(), current_hash);
+
+                                let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                let id_clone = id.clone();
+                                app.tokio_runtime.block_on(async move {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    if let Err(e) = handler.send_agent_selected(&id_clone).await {
+                                        log::warn!("Failed to send agent selected: {}", e);
+                                    }
+                                    if let Err(e) =
+                                        handler.send_agent_output(&id_clone, &agent_output).await
+                                    {
+                                        log::warn!("Failed to send agent output: {}", e);
+                                    }
+                                });
+                            }
+                        } else {
+                            log::warn!("WebRTC: Agent not found: {}", id);
+                            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                            let error_msg = format!("Agent not found: {}", id);
+                            app.tokio_runtime.block_on(async move {
+                                let handler = webrtc_handler.lock().unwrap();
+                                let _ = handler.send_error(&error_msg).await;
+                            });
+                        }
+                    }
+                    BrowserCommand::ListWorktrees => {
+                        log::info!("WebRTC: Listing available worktrees");
+                        if let Err(e) = app.load_available_worktrees() {
+                            log::error!("Failed to load worktrees: {}", e);
+                        }
+                        let (_, repo_name) = WorktreeManager::detect_current_repo()
+                            .unwrap_or_else(|_| (std::path::PathBuf::new(), "unknown".to_string()));
+                        let worktrees: Vec<WebWorktreeInfo> = app.available_worktrees
+                            .iter()
+                            .map(|(path, branch)| {
+                                let issue_number = branch.strip_prefix("botster-issue-")
+                                    .and_then(|n| n.parse::<u32>().ok());
+                                WebWorktreeInfo {
+                                    path: path.clone(),
+                                    branch: branch.clone(),
+                                    issue_number,
+                                }
+                            })
+                            .collect();
+                        let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                        app.tokio_runtime.block_on(async move {
+                            let handler = webrtc_handler.lock().unwrap();
+                            if let Err(e) = handler.send_worktrees(&repo_name, worktrees).await {
+                                log::warn!("Failed to send worktrees: {}", e);
+                            }
+                        });
+                    }
+                    BrowserCommand::CreateAgent { issue_or_branch, prompt } => {
+                        log::info!("WebRTC: Creating agent for {}", issue_or_branch);
+                        // Store the input and create agent
+                        app.input_buffer = issue_or_branch.clone();
+                        if let Some(p) = prompt {
+                            app.input_buffer = p; // Use the provided prompt
+                        }
+                        match app.create_and_spawn_agent() {
+                            Ok(()) => {
+                                // Get the last created agent's session key
+                                if let Some(session_key) = app.agent_keys_ordered.last().cloned() {
+                                    // Resize new agent to current browser dimensions
+                                    let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                    let browser_dims: Option<BrowserDimensions> = app.tokio_runtime.block_on(async {
+                                        let handler = webrtc_handler.lock().unwrap();
+                                        handler.get_browser_dimensions().await
+                                    });
+                                    if let Some(dims) = browser_dims {
+                                        if let Some(agent) = app.agents.get(&session_key) {
+                                            let (agent_cols, agent_rows) = match dims.mode {
+                                                BrowserMode::Gui => (dims.cols, dims.rows),
+                                                BrowserMode::Tui => {
+                                                    let tui_cols = (dims.cols * 70 / 100).saturating_sub(2);
+                                                    let tui_rows = dims.rows.saturating_sub(2);
+                                                    (tui_cols, tui_rows)
+                                                }
+                                            };
+                                            log::info!("Resizing new agent to browser dims: {}x{}", agent_cols, agent_rows);
+                                            agent.resize(agent_rows, agent_cols);
+                                        }
+                                    }
+
+                                    // Notify browser
+                                    let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                    app.tokio_runtime.block_on(async move {
+                                        let handler = webrtc_handler.lock().unwrap();
+                                        if let Err(e) = handler.send_agent_created(&session_key).await {
+                                            log::warn!("Failed to send agent created: {}", e);
+                                        }
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("WebRTC: Failed to create agent: {}", e);
+                                let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                let error_msg = format!("Failed to create agent: {}", e);
+                                app.tokio_runtime.block_on(async move {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    let _ = handler.send_error(&error_msg).await;
+                                });
+                            }
+                        }
+                        app.input_buffer.clear();
+                    }
+                    BrowserCommand::ReopenWorktree { path, branch, prompt } => {
+                        log::info!("WebRTC: Reopening worktree {} ({})", path, branch);
+                        // Find the worktree in available_worktrees and set selection
+                        if let Some(idx) = app.available_worktrees.iter().position(|(p, _)| p == &path) {
+                            app.worktree_selected = idx + 1; // +1 because "Create New" is at 0
+                            app.input_buffer = prompt.unwrap_or_default();
+                            match app.spawn_agent_from_worktree() {
+                                Ok(()) => {
+                                    if let Some(session_key) = app.agent_keys_ordered.last().cloned() {
+                                        // Resize new agent to current browser dimensions
+                                        let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                        let browser_dims: Option<BrowserDimensions> = app.tokio_runtime.block_on(async {
+                                            let handler = webrtc_handler.lock().unwrap();
+                                            handler.get_browser_dimensions().await
+                                        });
+                                        if let Some(dims) = browser_dims {
+                                            if let Some(agent) = app.agents.get(&session_key) {
+                                                let (agent_cols, agent_rows) = match dims.mode {
+                                                    BrowserMode::Gui => (dims.cols, dims.rows),
+                                                    BrowserMode::Tui => {
+                                                        let tui_cols = (dims.cols * 70 / 100).saturating_sub(2);
+                                                        let tui_rows = dims.rows.saturating_sub(2);
+                                                        (tui_cols, tui_rows)
+                                                    }
+                                                };
+                                                log::info!("Resizing reopened agent to browser dims: {}x{}", agent_cols, agent_rows);
+                                                agent.resize(agent_rows, agent_cols);
+                                            }
+                                        }
+
+                                        // Notify browser
+                                        let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                        app.tokio_runtime.block_on(async move {
+                                            let handler = webrtc_handler.lock().unwrap();
+                                            if let Err(e) = handler.send_agent_created(&session_key).await {
+                                                log::warn!("Failed to send agent created: {}", e);
+                                            }
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("WebRTC: Failed to reopen worktree: {}", e);
+                                    let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                    let error_msg = format!("Failed to reopen worktree: {}", e);
+                                    app.tokio_runtime.block_on(async move {
+                                        let handler = webrtc_handler.lock().unwrap();
+                                        let _ = handler.send_error(&error_msg).await;
+                                    });
+                                }
+                            }
+                            app.input_buffer.clear();
+                        } else {
+                            log::error!("WebRTC: Worktree not found: {}", path);
+                            let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                            let error_msg = format!("Worktree not found: {}", path);
+                            app.tokio_runtime.block_on(async move {
+                                let handler = webrtc_handler.lock().unwrap();
+                                let _ = handler.send_error(&error_msg).await;
+                            });
+                        }
+                    }
+                    BrowserCommand::DeleteAgent { id, delete_worktree } => {
+                        log::info!(
+                            "WebRTC: Deleting agent {} (delete_worktree={})",
+                            id,
+                            delete_worktree
+                        );
+                        match app.close_agent(&id, delete_worktree) {
+                            Ok(()) => {
+                                let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                let id_clone = id.clone();
+                                app.tokio_runtime.block_on(async move {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    if let Err(e) = handler.send_agent_deleted(&id_clone).await {
+                                        log::warn!("Failed to send agent deleted: {}", e);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                log::error!("WebRTC: Failed to delete agent: {}", e);
+                                let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                let error_msg = format!("Failed to delete agent: {}", e);
+                                app.tokio_runtime.block_on(async move {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    let _ = handler.send_error(&error_msg).await;
+                                });
+                            }
+                        }
+                    }
+                    BrowserCommand::SendInput { data } => {
+                        // Send raw input to selected agent
+                        if let Some(key) = app.agent_keys_ordered.get(app.selected).cloned() {
+                            if let Some(agent) = app.agents.get_mut(&key) {
+                                if let Err(e) = agent.write_input_str(&data) {
+                                    log::warn!("Failed to send input to agent: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle local keyboard input (non-blocking)
         let _ = app.handle_events()?;
 
         // Poll for new messages from server
         if let Err(e) = app.poll_messages() {
             log::error!("Failed to poll messages: {}", e);
         }
+
+        // Send heartbeat to register hub and agents with server
+        if let Err(e) = app.send_heartbeat() {
+            log::error!("Failed to send heartbeat: {}", e);
+        }
+
+        // Poll agents for terminal notifications (BEL, OSC) and send to Rails
+        app.poll_agent_notifications();
 
         // Small sleep to prevent CPU spinning (60 FPS max)
         std::thread::sleep(Duration::from_millis(16));
@@ -1575,7 +2742,14 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    // Set up file logging so TUI doesn't interfere with log output
+    let log_file = std::fs::File::create("/tmp/botster-hub.log")
+        .expect("Failed to create log file");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
+        .format_timestamp_secs()
+        .init();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -1854,4 +3028,40 @@ fn list_worktrees() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test AgentSpawnConfig invocation_url handling
+    #[test]
+    fn test_agent_spawn_config_has_invocation_url_field() {
+        let config = AgentSpawnConfig {
+            issue_number: Some(42),
+            branch_name: "botster-issue-42".to_string(),
+            worktree_path: std::path::PathBuf::from("/tmp/worktree"),
+            repo_path: std::path::PathBuf::from("/tmp/repo"),
+            repo_name: "owner/repo".to_string(),
+            prompt: "Test prompt".to_string(),
+            message_id: None,
+            invocation_url: Some("https://github.com/owner/repo/issues/42".to_string()),
+        };
+        assert_eq!(config.invocation_url, Some("https://github.com/owner/repo/issues/42".to_string()));
+    }
+
+    #[test]
+    fn test_agent_spawn_config_invocation_url_can_be_none() {
+        let config = AgentSpawnConfig {
+            issue_number: Some(42),
+            branch_name: "botster-issue-42".to_string(),
+            worktree_path: std::path::PathBuf::from("/tmp/worktree"),
+            repo_path: std::path::PathBuf::from("/tmp/repo"),
+            repo_name: "owner/repo".to_string(),
+            prompt: "Test prompt".to_string(),
+            message_id: None,
+            invocation_url: None,
+        };
+        assert!(config.invocation_url.is_none());
+    }
 }

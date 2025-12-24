@@ -22,6 +22,36 @@ Comprehensive guide for modern Rails frontend development using Hotwire (Turbo +
 
 ---
 
+## Critical Rules
+
+**NEVER do these things:**
+
+1. **NEVER use `<style>` tags** - Use Tailwind utility classes exclusively. No inline CSS, no `<style>` blocks, no custom CSS files.
+
+2. **NEVER run `bin/rails assets:precompile` in development** - This creates cached assets that override live code changes. If you accidentally run it, you must run `bin/rails assets:clobber` and restart the server.
+
+3. **NEVER write custom CSS** - Tailwind only. No exceptions.
+
+4. **Avoid arbitrary values** - Tailwind arbitrary values like `w-[123px]` are an **absolute last resort**. Always prefer standard Tailwind utilities first. If you find yourself repeatedly using arbitrary values, stop and reconsider the design. Arbitrary values defeat the purpose of a design system.
+
+5. **Single responsibility controllers** - Each Stimulus controller should do ONE thing. Don't mix unrelated concerns. A WebRTC controller shouldn't also handle modals. A form controller shouldn't also handle dropdowns. Extract separate controllers: `modal_controller.js`, `dropdown_controller.js`, etc.
+
+6. **Use implicit actions** - Stimulus has default events for elements. Omit the event when it's the default:
+   - `button`: default is `click` → use `data-action="controller#method"` not `data-action="click->controller#method"`
+   - `form`: default is `submit`
+   - `input`: default is `input`
+   - `select`: default is `change`
+
+   ```html
+   <%# Good - implicit click %>
+   <button data-action="modal#open">Open</button>
+
+   <%# Bad - redundant click %>
+   <button data-action="click->modal#open">Open</button>
+   ```
+
+---
+
 ## Quick Start
 
 ### New View Checklist
@@ -42,13 +72,14 @@ Creating a view? Follow this checklist:
 
 Creating a Stimulus controller? Follow this:
 
+- [ ] **Single responsibility** - Controller does ONE thing (not WebRTC + modals + forms)
 - [ ] Name matches HTML (data-controller matches filename)
 - [ ] Use targets for DOM elements
 - [ ] Use values for configuration
-- [ ] Use actions for events
-- [ ] Keep controllers small and focused (single responsibility)
+- [ ] Use implicit actions (omit `click->` for buttons, `submit->` for forms)
 - [ ] Clean up in disconnect() if needed
 - [ ] Use classes for CSS manipulation
+- [ ] Consider extracting to separate controller if scope grows
 
 ---
 

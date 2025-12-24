@@ -23,6 +23,38 @@ Rails.application.routes.draw do
     resources :messages, only: [ :index, :update ] # update for acknowledgment
   end
 
+  # WebRTC signaling for P2P browser-to-CLI connections
+  namespace :api do
+    resources :webrtc_sessions, path: "webrtc/sessions", only: [ :create, :show, :update ]
+    resources :agent_notifications, only: [ :create ]
+    resources :hubs, param: :identifier, only: [ :update, :destroy ]
+  end
+
+  # Agents dashboard - WebRTC P2P connection to local CLI
+  resources :agents, only: [ :index ]
+
+  # Hubs dashboard - live view of active CLI instances
+  resources :hubs, only: [ :index ]
+
+  # Tunnel sharing management (authenticated)
+  resources :tunnel_shares, only: [ :create, :destroy ], param: :hub_agent_id
+
+  # Private tunnel preview (authenticated, user's own hubs only)
+  get "preview/:hub_id/:agent_id", to: "preview#proxy", as: :tunnel_root, defaults: { path: "" }
+  get "preview/:hub_id/:agent_id/*path", to: "preview#proxy", as: :tunnel_preview
+  post "preview/:hub_id/:agent_id/*path", to: "preview#proxy"
+  patch "preview/:hub_id/:agent_id/*path", to: "preview#proxy"
+  put "preview/:hub_id/:agent_id/*path", to: "preview#proxy"
+  delete "preview/:hub_id/:agent_id/*path", to: "preview#proxy"
+
+  # Public shared tunnel (token-based, no auth required)
+  get "share/:token", to: "shared_tunnels#proxy", as: :shared_tunnel, defaults: { path: "" }
+  get "share/:token/*path", to: "shared_tunnels#proxy"
+  post "share/:token/*path", to: "shared_tunnels#proxy"
+  patch "share/:token/*path", to: "shared_tunnels#proxy"
+  put "share/:token/*path", to: "shared_tunnels#proxy"
+  delete "share/:token/*path", to: "shared_tunnels#proxy"
+
   root to: "home#index"
   # Define your application routes per the DSL in https://guides.rubyonrails.org/routing.html
 

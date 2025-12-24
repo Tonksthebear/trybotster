@@ -16,6 +16,10 @@ fi
 # Auto-trust the worktree in Claude config using botster-hub's JSON tools
 "$BOTSTER_HUB_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
 
+# Note: We detect when Claude asks questions by scanning for UI patterns like
+# "Enter to select" and "Tab/Arrow keys to navigate" in the terminal output.
+# This works regardless of notification settings.
+
 # Register trybotster MCP server for this worktree (if token is available)
 if [ -n "$BOTSTER_TOKEN" ]; then
   echo "Registering trybotster MCP server..."
@@ -32,6 +36,14 @@ else
   echo "Botster agent initialized for branch: $BOTSTER_BRANCH_NAME"
 fi
 echo "Worktree: $BOTSTER_WORKTREE_PATH"
+
+# Start background dev server if .botster_server script exists
+if [ -n "$BOTSTER_TUNNEL_PORT" ] && [ -f ".botster_server" ]; then
+  echo "Starting dev server on port $BOTSTER_TUNNEL_PORT..."
+  bash .botster_server > "$BOTSTER_WORKTREE_PATH/.botster_server.log" 2>&1 &
+  echo "Dev server PID: $!"
+  sleep 2
+fi
 
 # Start Claude with the prompt
 claude --permission-mode acceptEdits "$BOTSTER_PROMPT"
