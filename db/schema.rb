@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2025_12_20_051414) do
+ActiveRecord::Schema[8.1].define(version: 2025_12_23_234751) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "vector"
@@ -106,9 +106,16 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_20_051414) do
     t.bigint "hub_id", null: false
     t.string "last_invocation_url"
     t.string "session_key", null: false
+    t.datetime "tunnel_connected_at"
+    t.datetime "tunnel_last_request_at"
+    t.integer "tunnel_port"
+    t.boolean "tunnel_share_enabled", default: false
+    t.string "tunnel_share_token"
+    t.string "tunnel_status", default: "disconnected"
     t.datetime "updated_at", null: false
     t.index ["hub_id", "session_key"], name: "index_hub_agents_on_hub_id_and_session_key", unique: true
     t.index ["hub_id"], name: "index_hub_agents_on_hub_id"
+    t.index ["tunnel_share_token"], name: "index_hub_agents_on_tunnel_share_token", unique: true
   end
 
   create_table "hubs", force: :cascade do |t|

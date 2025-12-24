@@ -1,8 +1,8 @@
 use anyhow::Result;
 use botster_hub::{
-    Agent, AgentNotification, BrowserCommand, BrowserDimensions, BrowserMode, Config,
-    IceServerConfig, KeyInput, PromptManager, WebAgentInfo, WebRTCHandler, WebWorktreeInfo,
-    WorktreeManager,
+    allocate_tunnel_port, Agent, AgentNotification, BrowserCommand, BrowserDimensions,
+    BrowserMode, Config, IceServerConfig, KeyInput, PromptManager, TunnelManager, WebAgentInfo,
+    WebRTCHandler, WebWorktreeInfo, WorktreeManager,
 };
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -301,6 +301,8 @@ struct BotsterApp {
     hub_identifier: String,
     // Track when we last sent a heartbeat to the server
     last_heartbeat: Instant,
+    // HTTP tunnel manager for forwarding local dev servers
+    tunnel_manager: Arc<TunnelManager>,
 }
 
 impl BotsterApp {
@@ -318,6 +320,24 @@ impl BotsterApp {
         // Generate per-session UUID for hub identification
         let hub_identifier = uuid::Uuid::new_v4().to_string();
         log::info!("Generated hub identifier: {}", hub_identifier);
+
+        // Create tunnel manager for HTTP forwarding
+        let tunnel_manager = Arc::new(TunnelManager::new(
+            hub_identifier.clone(),
+            config.api_key.clone(),
+            config.server_url.clone(),
+        ));
+
+        // Start tunnel connection in background
+        let tunnel_manager_clone = tunnel_manager.clone();
+        tokio_runtime.spawn(async move {
+            loop {
+                if let Err(e) = tunnel_manager_clone.connect().await {
+                    log::warn!("Tunnel connection error: {}, reconnecting in 5s...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
+            }
+        });
 
         let app = Self {
             agents: HashMap::new(),
@@ -341,6 +361,7 @@ impl BotsterApp {
             last_agent_screen_hash: HashMap::new(),
             hub_identifier,
             last_heartbeat: Instant::now(),
+            tunnel_manager,
         };
 
         log::info!("Botster Hub started, waiting for messages...");
@@ -409,6 +430,13 @@ impl BotsterApp {
             .unwrap_or_else(|| "botster-hub".to_string());
         env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
 
+        // Allocate a tunnel port for this agent
+        let tunnel_port = allocate_tunnel_port();
+        if let Some(port) = tunnel_port {
+            env_vars.insert("BOTSTER_TUNNEL_PORT".to_string(), port.to_string());
+            log::info!("Allocated tunnel port {} for agent", port);
+        }
+
         // Kill any existing orphaned claude processes for this worktree
         // This prevents duplicate claude instances when reopening a worktree
         Self::kill_orphaned_claude_processes(&config.worktree_path);
@@ -419,6 +447,15 @@ impl BotsterApp {
 
         // Register the agent
         let session_key = agent.session_key();
+
+        // Register tunnel port with the tunnel manager
+        if let Some(port) = tunnel_port {
+            let tunnel_manager = self.tunnel_manager.clone();
+            let session_key_clone = session_key.clone();
+            self.tokio_runtime.spawn(async move {
+                tunnel_manager.register_agent(session_key_clone, port).await;
+            });
+        }
         self.agent_keys_ordered.push(session_key.clone());
         self.agents.insert(session_key, agent);
 
@@ -1783,6 +1820,13 @@ impl BotsterApp {
             .unwrap_or_else(|| "botster-hub".to_string());
         env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
 
+        // Allocate a tunnel port for this agent
+        let tunnel_port = allocate_tunnel_port();
+        if let Some(port) = tunnel_port {
+            env_vars.insert("BOTSTER_TUNNEL_PORT".to_string(), port.to_string());
+            log::info!("Allocated tunnel port {} for agent", port);
+        }
+
         // Spawn agent with a shell
         // Just run 'source .botster_init' which handles everything:
         // - Reading .botster_prompt file
@@ -1795,6 +1839,16 @@ impl BotsterApp {
 
         // Add agent to tracking structures using session key
         let session_key = agent.session_key();
+
+        // Register tunnel port with the tunnel manager
+        if let Some(port) = tunnel_port {
+            let tunnel_manager = self.tunnel_manager.clone();
+            let session_key_clone = session_key.clone();
+            self.tokio_runtime.spawn(async move {
+                tunnel_manager.register_agent(session_key_clone, port).await;
+            });
+        }
+
         self.agent_keys_ordered.push(session_key.clone());
         self.agents.insert(session_key, agent);
 
