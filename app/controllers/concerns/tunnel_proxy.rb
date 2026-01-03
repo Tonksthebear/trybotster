@@ -53,8 +53,22 @@ module TunnelProxy
   end
 
   def render_proxied_response(data)
-    data["headers"]&.each do |key, value|
-      next if %w[transfer-encoding connection].include?(key.downcase)
+    headers = data["headers"] || {}
+    status = data["status"].to_i
+    content_encoding = headers["content-encoding"]&.downcase
+
+    # Handle redirects - pass through Location header and let browser navigate
+    # Use case-insensitive lookup since HTTP headers are case-insensitive
+    location = headers.find { |k, _| k.downcase == "location" }&.last
+    if status >= 300 && status < 400 && location.present?
+      response.headers["Location"] = location
+      return head status
+    end
+
+    # Skip content-encoding header - the CLI should decompress before sending
+    # If we pass through gzip-encoded content, our HTML transformations corrupt it
+    headers.each do |key, value|
+      next if %w[transfer-encoding connection content-encoding].include?(key.downcase)
 
       response.headers[key] = value
     end
@@ -63,11 +77,12 @@ module TunnelProxy
     content_type = data["content_type"]
 
     # Inject <base> tag for HTML responses so relative/absolute URLs resolve through the proxy
-    if content_type&.include?("text/html") && body.present?
+    # Only transform if not compressed (gzip content would be corrupted by string operations)
+    if content_type&.include?("text/html") && body.present? && content_encoding.nil?
       body = inject_base_tag(body)
     end
 
-    render body: body, status: data["status"], content_type: content_type
+    render body: body, status: status, content_type: content_type
   end
 
   # Rewrite URLs in HTML to route through the proxy

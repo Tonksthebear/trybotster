@@ -3,8 +3,17 @@
 class SharedTunnelsController < ApplicationController
   include TunnelProxy
 
-  # No authentication required - token-based access
-  skip_before_action :verify_authenticity_token
+  # Public tunnel sharing security model:
+  # 1. Token-based access (no authentication required)
+  # 2. Token is cryptographically random (SecureRandom)
+  # 3. Sharing must be explicitly enabled by hub owner
+  # 4. Owner can revoke access by disabling sharing (regenerates token)
+  #
+  # We skip forgery protection because:
+  # - Public access means no session/CSRF context
+  # - verify_same_origin_request blocks cross-origin JS serving (needed for assets)
+  # - The token acts as the authorization mechanism
+  skip_forgery_protection only: :proxy
   before_action :find_shared_agent
 
   def proxy
