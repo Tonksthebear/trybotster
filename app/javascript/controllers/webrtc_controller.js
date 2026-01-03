@@ -573,15 +573,39 @@ export default class extends Controller {
         const statusColor =
           agent.status === "Running" ? "text-green-600" : "text-gray-500";
 
-        // Build preview link if tunnel port is available
-        const previewLink = agent.tunnel_port
-          ? `<a href="/preview/${agent.hub_identifier}/${agent.id}" target="_blank"
+        // Build preview/server status indicator
+        let serverBadge = "";
+        if (agent.tunnel_port) {
+          if (agent.server_running) {
+            // Server running - show clickable preview link
+            serverBadge = `<a href="/preview/${agent.hub_identifier}/${agent.id}" target="_blank"
                class="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full bg-green-100 text-green-800 hover:bg-green-200"
                onclick="event.stopPropagation()">
                <span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>
-               Preview
-             </a>`
-          : "";
+               :${agent.tunnel_port}
+             </a>`;
+          } else {
+            // Server not running - show gray port indicator
+            serverBadge = `<span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full bg-gray-100 text-gray-600">
+               <span class="w-1.5 h-1.5 rounded-full bg-gray-400"></span>
+               :${agent.tunnel_port}
+             </span>`;
+          }
+        }
+
+        // PTY view indicator (only show if agent has server PTY)
+        let ptyViewBadge = "";
+        if (agent.has_server_pty) {
+          const viewLabel = agent.active_pty_view === "server" ? "SRV" : "CLI";
+          const viewColor = agent.active_pty_view === "server" ? "bg-purple-100 text-purple-800" : "bg-blue-100 text-blue-800";
+          ptyViewBadge = `<span class="inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded ${viewColor}">${viewLabel}</span>`;
+        }
+
+        // Scroll indicator
+        let scrollBadge = "";
+        if (agent.scroll_offset > 0) {
+          scrollBadge = `<span class="inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded bg-yellow-100 text-yellow-800">↑${agent.scroll_offset}</span>`;
+        }
 
         return `
         <button
@@ -596,7 +620,9 @@ export default class extends Controller {
               <span class="text-gray-600 ml-2">${issueLabel}</span>
             </div>
             <div class="flex items-center gap-2">
-              ${previewLink}
+              ${scrollBadge}
+              ${ptyViewBadge}
+              ${serverBadge}
               <span class="${statusColor} text-sm">${agent.status}</span>
             </div>
           </div>
@@ -761,6 +787,77 @@ export default class extends Controller {
     });
   }
 
+  // Scroll controls - scroll the terminal view via WebRTC
+  scrollUp(lines = 3) {
+    if (!this.dataChannel || this.dataChannel.readyState !== "open") {
+      console.warn("Cannot scroll - data channel not open");
+      return;
+    }
+    console.log(`Sending scroll up ${lines} lines`);
+    this.sendMessage({
+      type: "scroll",
+      direction: "up",
+      lines: lines,
+    });
+  }
+
+  scrollDown(lines = 3) {
+    if (!this.dataChannel || this.dataChannel.readyState !== "open") {
+      console.warn("Cannot scroll - data channel not open");
+      return;
+    }
+    console.log(`Sending scroll down ${lines} lines`);
+    this.sendMessage({
+      type: "scroll",
+      direction: "down",
+      lines: lines,
+    });
+  }
+
+  scrollToTop() {
+    console.log("Sending scroll to top");
+    this.sendMessage({ type: "scroll_to_top" });
+  }
+
+  scrollToBottom() {
+    console.log("Sending scroll to bottom");
+    this.sendMessage({ type: "scroll_to_bottom" });
+  }
+
+  // Handle wheel events on terminal for scrollback
+  handleTerminalWheel(event) {
+    // Only handle if we have a connection and are in GUI mode
+    if (!this.dataChannel || this.dataChannel.readyState !== "open") return;
+    if (this.modeValue !== "gui") return;
+
+    // Prevent default scrolling behavior
+    event.preventDefault();
+
+    // Calculate lines to scroll based on wheel delta
+    // deltaY is positive for scroll down, negative for scroll up
+    const lines = Math.max(1, Math.abs(Math.round(event.deltaY / 30)));
+
+    if (event.deltaY < 0) {
+      this.scrollUp(lines);
+    } else if (event.deltaY > 0) {
+      this.scrollDown(lines);
+    }
+  }
+
+  // PTY view toggle - switch between CLI and Server terminal views
+  togglePtyView() {
+    if (!this.dataChannel || this.dataChannel.readyState !== "open") {
+      console.warn("Cannot toggle PTY view - data channel not open");
+      return;
+    }
+    console.log("Sending toggle PTY view");
+    this.sendMessage({ type: "toggle_pty_view" });
+    // Clear terminal when switching views
+    if (this.terminal) {
+      this.terminal.clear();
+    }
+  }
+
   // New Agent Modal
   showNewAgentModal() {
     if (!this.hasNewAgentModalTarget) return;
@@ -899,8 +996,32 @@ export default class extends Controller {
       const issueLabel = agent.issue_number
         ? `#${agent.issue_number}`
         : agent.branch_name;
-      this.selectedAgentLabelTarget.textContent = `${agent.repo} ${issueLabel}`;
+
+      // Build label with PTY view indicator if server PTY exists
+      let label = `${agent.repo} ${issueLabel}`;
+      if (agent.has_server_pty) {
+        const viewLabel = agent.active_pty_view === "server" ? "[Server]" : "[CLI]";
+        label += ` ${viewLabel}`;
+      }
+
+      // Add scroll indicator if scrolled
+      if (agent.scroll_offset > 0) {
+        label += ` [↑${agent.scroll_offset}]`;
+      }
+
+      this.selectedAgentLabelTarget.textContent = label;
     }
+  }
+
+  // Get the currently selected agent
+  getSelectedAgent() {
+    return this.agents.find((a) => a.id === this.selectedAgentId);
+  }
+
+  // Check if the selected agent has a server PTY
+  selectedAgentHasServerPty() {
+    const agent = this.getSelectedAgent();
+    return agent?.has_server_pty || false;
   }
 
   initializeTerminal() {
@@ -974,6 +1095,12 @@ export default class extends Controller {
         e.preventDefault();
         this.sendKeyPress(e);
       }
+    });
+
+    // Capture wheel events for scrollback (GUI mode only)
+    this.wheelHandler = this.handleTerminalWheel.bind(this);
+    this.terminalTarget.addEventListener("wheel", this.wheelHandler, {
+      passive: false,
     });
 
     // Debounced resize handler for window resize and orientation change
@@ -1124,6 +1251,11 @@ export default class extends Controller {
       window.removeEventListener("resize", this.resizeHandler);
       window.removeEventListener("orientationchange", this.resizeHandler);
       this.resizeHandler = null;
+    }
+
+    if (this.wheelHandler && this.hasTerminalTarget) {
+      this.terminalTarget.removeEventListener("wheel", this.wheelHandler);
+      this.wheelHandler = null;
     }
 
     if (this.terminal) {

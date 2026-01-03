@@ -17,6 +17,25 @@ fi
 backend_match=0
 frontend_match=0
 skill_dev_match=0
+rust_match=0
+
+# Rust skill keywords
+if echo "$prompt" | grep -qE "(rust|cargo|rustc|crate|struct|enum|impl|trait|tokio|anyhow|thiserror|serde|derive|lifetime|borrow|ownership|unwrap|expect|vec<|hashmap|arc|mutex|refcell|async fn|pub fn|pub struct|pub enum|\\.rs)"; then
+    rust_match=1
+fi
+
+# Rust intent patterns
+if echo "$prompt" | grep -qiE "(create|add|implement|build|write|modify).*(rust|crate|module|struct|enum|trait)"; then
+    rust_match=1
+fi
+
+if echo "$prompt" | grep -qiE "(fix|handle|debug).*(rust|cargo|compile|borrow)"; then
+    rust_match=1
+fi
+
+if echo "$prompt" | grep -qiE "(refactor|improve|optimize).*(rust|cli|main\\.rs)"; then
+    rust_match=1
+fi
 
 # Backend skill keywords
 if echo "$prompt" | grep -qE "(controller|model|activerecord|migration|database|validation|association|scope|has_many|belongs_to|restful|route|routing|webhook|rails generate|rails g|db:migrate|schema|strong param|callback|concern|background job|solid queue|active job|action cable)"; then
@@ -47,13 +66,18 @@ if echo "$prompt" | grep -qiE "(create|add|make|build).*(view|partial|component|
 fi
 
 # If any matches found, output suggestion
-if [ $backend_match -eq 1 ] || [ $frontend_match -eq 1 ] || [ $skill_dev_match -eq 1 ]; then
+if [ $backend_match -eq 1 ] || [ $frontend_match -eq 1 ] || [ $skill_dev_match -eq 1 ] || [ $rust_match -eq 1 ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "🎯 SKILL ACTIVATION CHECK"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
-    # Critical skills (none currently)
+    # Critical skills - Rust is mandatory for any .rs work
+    if [ $rust_match -eq 1 ]; then
+        echo "🦀 CRITICAL (Rust code detected):"
+        echo "  → ms-rust (MANDATORY before ANY Rust changes)"
+        echo ""
+    fi
 
     # High priority skills
     if [ $backend_match -eq 1 ] || [ $frontend_match -eq 1 ] || [ $skill_dev_match -eq 1 ]; then

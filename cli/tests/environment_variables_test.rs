@@ -3,36 +3,28 @@
 //
 // IMPORTANT: Run with --test-threads=1 to avoid env var contamination between tests
 //
-// KNOWN LIMITATION: Config::load() will load from ~/.botster_hub/config.json
-// if it exists on the system. This means tests may fail if you have a real
-// config file with non-default values. This is a testing limitation that should
-// be fixed by making Config use a test-specific directory.
-//
-// TODO: Make Config::config_dir() respect TEST_CONFIG_DIR environment variable
-// so tests can use a temporary directory instead of ~/.botster_hub
+// Tests use BOTSTER_CONFIG_DIR to isolate from real user config at ~/.botster_hub
 
 use botster_hub::Config;
 use std::env;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-/// Helper to create a config that only uses env vars, not config file
-fn load_config_from_env_only() -> Config {
-    let mut config = Config::default();
-    // We can't call apply_env_overrides directly as it's private
-    // So we use Config::load() which does it for us
-    // But this will also load from file, which we don't want in tests
-    // For now, we'll document this limitation
-    Config::load().unwrap_or_else(|_| Config::default())
-}
-
-/// Helper to set environment variables for a test and clean them up after
+/// Helper to set environment variables for a test and clean them up after.
+/// Also sets BOTSTER_CONFIG_DIR to a temp directory to isolate from real config.
 struct EnvGuard {
     keys: Vec<String>,
+    _temp_dir: TempDir, // Keep temp dir alive for duration of test
 }
 
 impl EnvGuard {
     fn new() -> Self {
+        // Create a temp directory for config isolation
+        let temp_dir = TempDir::new().expect("Failed to create temp dir for test");
+
+        // Set config dir to temp directory to avoid reading real config
+        env::set_var("BOTSTER_CONFIG_DIR", temp_dir.path());
+
         // Clear all known botster env vars when creating a new guard
         env::remove_var("BOTSTER_SERVER_URL");
         env::remove_var("BOTSTER_API_KEY");
@@ -41,7 +33,10 @@ impl EnvGuard {
         env::remove_var("BOTSTER_MAX_SESSIONS");
         env::remove_var("BOTSTER_AGENT_TIMEOUT");
 
-        Self { keys: Vec::new() }
+        Self {
+            keys: vec!["BOTSTER_CONFIG_DIR".to_string()],
+            _temp_dir: temp_dir,
+        }
     }
 
     fn set(&mut self, key: &str, value: &str) {
@@ -63,6 +58,7 @@ impl Drop for EnvGuard {
         env::remove_var("BOTSTER_POLL_INTERVAL");
         env::remove_var("BOTSTER_MAX_SESSIONS");
         env::remove_var("BOTSTER_AGENT_TIMEOUT");
+        env::remove_var("BOTSTER_CONFIG_DIR");
     }
 }
 

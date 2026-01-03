@@ -20,4 +20,8 @@ class SharedTunnelsController < ApplicationController
   def find_shared_agent
     @hub_agent = HubAgent.find_by(tunnel_share_token: params[:token])
   end
+
+  def proxy_base_url
+    "/share/#{params[:token]}/"
+  end
 end

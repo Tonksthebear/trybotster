@@ -114,6 +114,24 @@ pub enum BrowserMessage {
     },
     /// Send raw input to selected agent
     SendInput { data: String },
+    /// Scroll the terminal view
+    Scroll {
+        /// Direction: "up" or "down"
+        direction: String,
+        /// Number of lines to scroll (default: 3)
+        #[serde(default = "default_scroll_lines")]
+        lines: usize,
+    },
+    /// Scroll to top of terminal buffer
+    ScrollToTop,
+    /// Scroll to bottom of terminal buffer (return to live view)
+    ScrollToBottom,
+    /// Toggle between CLI and Server PTY views
+    TogglePtyView,
+}
+
+fn default_scroll_lines() -> usize {
+    3
 }
 
 /// Agent info sent to browser
@@ -127,6 +145,13 @@ pub struct WebAgentInfo {
     pub selected: bool,
     pub tunnel_port: Option<u16>,
     pub hub_identifier: String,
+    pub server_running: bool,
+    /// Whether agent has a server PTY (for showing toggle button)
+    pub has_server_pty: bool,
+    /// Current PTY view: "cli" or "server"
+    pub active_pty_view: String,
+    /// Current scroll offset (0 = live view)
+    pub scroll_offset: usize,
 }
 
 /// Worktree info sent to browser
@@ -189,6 +214,10 @@ pub enum BrowserCommand {
     ReopenWorktree { path: String, branch: String, prompt: Option<String> },
     DeleteAgent { id: String, delete_worktree: bool },
     SendInput { data: String },
+    Scroll { direction: String, lines: usize },
+    ScrollToTop,
+    ScrollToBottom,
+    TogglePtyView,
 }
 
 /// Handles WebRTC peer connections with browsers
@@ -421,6 +450,22 @@ impl WebRTCHandler {
                                 BrowserMessage::SendInput { data } => {
                                     log::debug!("Browser sent input: {} bytes", data.len());
                                     command_queue.lock().await.push(BrowserCommand::SendInput { data });
+                                }
+                                BrowserMessage::Scroll { direction, lines } => {
+                                    log::debug!("Browser requested scroll: {} {} lines", direction, lines);
+                                    command_queue.lock().await.push(BrowserCommand::Scroll { direction, lines });
+                                }
+                                BrowserMessage::ScrollToTop => {
+                                    log::debug!("Browser requested scroll to top");
+                                    command_queue.lock().await.push(BrowserCommand::ScrollToTop);
+                                }
+                                BrowserMessage::ScrollToBottom => {
+                                    log::debug!("Browser requested scroll to bottom");
+                                    command_queue.lock().await.push(BrowserCommand::ScrollToBottom);
+                                }
+                                BrowserMessage::TogglePtyView => {
+                                    log::debug!("Browser requested PTY view toggle");
+                                    command_queue.lock().await.push(BrowserCommand::TogglePtyView);
                                 }
                             }
                         }
@@ -702,6 +747,42 @@ mod tests {
     }
 
     #[test]
+    fn test_scroll_message_parsing() {
+        // Test Scroll up
+        let msg = r#"{"type": "scroll", "direction": "up", "lines": 5}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(
+            parsed,
+            BrowserMessage::Scroll { direction, lines } if direction == "up" && lines == 5
+        ));
+
+        // Test Scroll down with default lines
+        let msg = r#"{"type": "scroll", "direction": "down"}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(
+            parsed,
+            BrowserMessage::Scroll { direction, lines } if direction == "down" && lines == 3
+        ));
+
+        // Test ScrollToTop
+        let msg = r#"{"type": "scroll_to_top"}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(parsed, BrowserMessage::ScrollToTop));
+
+        // Test ScrollToBottom
+        let msg = r#"{"type": "scroll_to_bottom"}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(parsed, BrowserMessage::ScrollToBottom));
+    }
+
+    #[test]
+    fn test_toggle_pty_view_message_parsing() {
+        let msg = r#"{"type": "toggle_pty_view"}"#;
+        let parsed: BrowserMessage = serde_json::from_str(msg).unwrap();
+        assert!(matches!(parsed, BrowserMessage::TogglePtyView));
+    }
+
+    #[test]
     fn test_cli_response_messages() {
         // Test Agents list
         let agents = vec![WebAgentInfo {
@@ -713,6 +794,10 @@ mod tests {
             selected: true,
             tunnel_port: Some(4001),
             hub_identifier: "test-hub-uuid".to_string(),
+            server_running: true,
+            has_server_pty: true,
+            active_pty_view: "cli".to_string(),
+            scroll_offset: 0,
         }];
         let msg = CLIMessage::Agents { agents };
         let json = serde_json::to_string(&msg).unwrap();

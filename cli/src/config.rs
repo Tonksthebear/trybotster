@@ -29,9 +29,14 @@ impl Default for Config {
 
 impl Config {
     pub fn config_dir() -> Result<PathBuf> {
-        let dir = dirs::home_dir()
-            .context("No home directory")?
-            .join(".botster_hub");
+        // Allow tests to override the config directory
+        let dir = if let Ok(test_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
+            PathBuf::from(test_dir)
+        } else {
+            dirs::home_dir()
+                .context("No home directory")?
+                .join(".botster_hub")
+        };
         fs::create_dir_all(&dir)?;
         Ok(dir)
     }

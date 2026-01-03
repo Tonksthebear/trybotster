@@ -74,15 +74,34 @@ class TunnelChannelTest < ActionCable::Channel::TestCase
     assert_not_nil @hub_agent.tunnel_connected_at
   end
 
-  test "register_agent_tunnel ignores non-existent agent" do
+  test "register_agent_tunnel creates non-existent agent" do
+    # This tests the race condition fix: tunnel registration can arrive before heartbeat
     stub_connection current_user: @user
     subscribe hub_id: @hub.identifier
 
-    # Should not raise an error
-    perform :register_agent_tunnel, { session_key: "non-existent", port: 4001 }
+    new_session_key = "owner-repo-new-agent"
+    assert_nil @hub.hub_agents.find_by(session_key: new_session_key)
 
-    @hub_agent.reload
-    assert_not @hub_agent.tunnel_connected?
+    perform :register_agent_tunnel, { session_key: new_session_key, port: 4001 }
+
+    # Agent should be created
+    new_agent = @hub.hub_agents.find_by(session_key: new_session_key)
+    assert_not_nil new_agent
+    assert_equal 4001, new_agent.tunnel_port
+    assert_equal "connected", new_agent.tunnel_status
+    assert new_agent.tunnel_connected?
+  end
+
+  test "register_agent_tunnel ignores registration when hub does not exist" do
+    stub_connection current_user: @user
+    fake_hub_id = "non-existent-hub-#{SecureRandom.uuid}"
+    subscribe hub_id: fake_hub_id
+
+    # Should not raise an error but also should not create anything
+    perform :register_agent_tunnel, { session_key: "some-agent", port: 4001 }
+
+    # No hub should be created (we don't have enough info to create one)
+    assert_nil Hub.find_by(identifier: fake_hub_id)
   end
 
   test "register_agent_tunnel updates existing tunnel info" do

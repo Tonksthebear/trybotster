@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::Message, tungstenite::client::IntoClientRequest};
 
 /// Tunnel connection status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,13 @@ pub fn allocate_tunnel_port() -> Option<u16> {
     None
 }
 
+/// Pending agent registration to notify Rails about
+#[derive(Debug, Clone)]
+pub struct PendingRegistration {
+    pub session_key: String,
+    pub port: u16,
+}
+
 /// Manages tunnel connections for all agents on this hub
 pub struct TunnelManager {
     hub_identifier: String,
@@ -46,16 +54,22 @@ pub struct TunnelManager {
     agent_ports: Arc<Mutex<HashMap<String, u16>>>,
     // Connection status (atomic for lock-free access from TUI)
     status: Arc<AtomicU8>,
+    // Channel for pending agent registrations that need to be sent to Rails
+    pending_tx: mpsc::UnboundedSender<PendingRegistration>,
+    pending_rx: Arc<Mutex<mpsc::UnboundedReceiver<PendingRegistration>>>,
 }
 
 impl TunnelManager {
     pub fn new(hub_identifier: String, api_key: String, server_url: String) -> Self {
+        let (pending_tx, pending_rx) = mpsc::unbounded_channel();
         Self {
             hub_identifier,
             api_key,
             server_url,
             agent_ports: Arc::new(Mutex::new(HashMap::new())),
             status: Arc::new(AtomicU8::new(TunnelStatus::Disconnected as u8)),
+            pending_tx,
+            pending_rx: Arc::new(Mutex::new(pending_rx)),
         }
     }
 
@@ -69,10 +83,21 @@ impl TunnelManager {
         self.status.store(status as u8, Ordering::Relaxed);
     }
 
-    /// Register an agent's tunnel port
+    /// Register an agent's tunnel port and queue notification to Rails
     pub async fn register_agent(&self, session_key: String, port: u16) {
         let mut ports = self.agent_ports.lock().await;
-        ports.insert(session_key, port);
+        ports.insert(session_key.clone(), port);
+        drop(ports); // Release lock before sending
+
+        // Queue notification to Rails (will be sent when connection is established)
+        if let Err(e) = self.pending_tx.send(PendingRegistration {
+            session_key: session_key.clone(),
+            port,
+        }) {
+            warn!("[Tunnel] Failed to queue agent registration: {}", e);
+        } else {
+            debug!("[Tunnel] Queued registration for agent {} on port {}", session_key, port);
+        }
     }
 
     /// Get the port for an agent
@@ -91,11 +116,31 @@ impl TunnelManager {
         );
 
         self.set_status(TunnelStatus::Connecting);
-        debug!("[Tunnel] Connecting to {}", ws_url);
+        info!("[Tunnel] Connecting to {}", ws_url);
 
-        let (ws_stream, _) = match connect_async(&ws_url).await {
-            Ok(stream) => stream,
+        // Build request with Origin header (required by ActionCable)
+        let mut request = match ws_url.into_client_request() {
+            Ok(req) => req,
             Err(e) => {
+                error!("[Tunnel] Failed to build WebSocket request: {}", e);
+                self.set_status(TunnelStatus::Disconnected);
+                return Err(e.into());
+            }
+        };
+        // Set Origin header to match the server URL (ActionCable requires this)
+        let origin = self.server_url.clone();
+        request.headers_mut().insert(
+            "Origin",
+            origin.parse().unwrap_or_else(|_| "http://localhost".parse().unwrap()),
+        );
+
+        let (ws_stream, _) = match connect_async(request).await {
+            Ok(stream) => {
+                info!("[Tunnel] WebSocket connected successfully");
+                stream
+            }
+            Err(e) => {
+                error!("[Tunnel] WebSocket connection failed: {}", e);
                 self.set_status(TunnelStatus::Disconnected);
                 return Err(e.into());
             }
@@ -110,37 +155,75 @@ impl TunnelManager {
                 "hub_id": self.hub_identifier
             }).to_string()
         });
+        info!("[Tunnel] Sending subscribe message: {}", subscribe_msg);
         write
             .send(Message::Text(subscribe_msg.to_string().into()))
             .await?;
 
-        debug!("[Tunnel] Subscribed to TunnelChannel for hub {}", self.hub_identifier);
+        info!("[Tunnel] Subscribe sent, entering message loop for hub {}", self.hub_identifier);
 
-        // Handle incoming HTTP request messages
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if let Err(e) = self
-                        .handle_message(&text.to_string(), &mut write)
-                        .await
-                    {
-                        error!("[Tunnel] Message error: {}", e);
+        // Handle incoming HTTP request messages and pending registrations
+        loop {
+            // Lock pending_rx for this iteration
+            let mut pending_rx = self.pending_rx.lock().await;
+
+            tokio::select! {
+                // Handle incoming WebSocket messages
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            drop(pending_rx); // Release lock before handling message
+                            if let Err(e) = self
+                                .handle_message(&text.to_string(), &mut write)
+                                .await
+                            {
+                                error!("[Tunnel] Message error: {}", e);
+                            }
+                        }
+                        Some(Ok(Message::Ping(data))) => {
+                            drop(pending_rx);
+                            if let Err(e) = write.send(Message::Pong(data)).await {
+                                warn!("[Tunnel] Failed to send pong: {}", e);
+                            }
+                        }
+                        Some(Ok(Message::Close(frame))) => {
+                            info!("[Tunnel] Connection closed by server: {:?}", frame);
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            error!("[Tunnel] WebSocket error: {}", e);
+                            break;
+                        }
+                        None => {
+                            info!("[Tunnel] WebSocket stream ended (None received)");
+                            break;
+                        }
+                        Some(Ok(other)) => {
+                            debug!("[Tunnel] Received other message type: {:?}", other);
+                        }
                     }
                 }
-                Ok(Message::Ping(data)) => {
-                    if let Err(e) = write.send(Message::Pong(data)).await {
-                        warn!("[Tunnel] Failed to send pong: {}", e);
+                // Handle pending agent registrations
+                Some(registration) = pending_rx.recv() => {
+                    drop(pending_rx); // Release lock before sending
+                    // Only send if we're connected
+                    if self.get_status() == TunnelStatus::Connected {
+                        info!("[Tunnel] Notifying Rails of agent {} on port {}",
+                            registration.session_key, registration.port);
+                        if let Err(e) = self.notify_agent_tunnel(
+                            &mut write,
+                            &registration.session_key,
+                            registration.port
+                        ).await {
+                            warn!("[Tunnel] Failed to notify agent tunnel: {}", e);
+                        }
+                    } else {
+                        debug!("[Tunnel] Skipping registration (not connected yet): {}",
+                            registration.session_key);
+                        // Re-queue for later
+                        let _ = self.pending_tx.send(registration);
                     }
                 }
-                Ok(Message::Close(_)) => {
-                    info!("[Tunnel] Connection closed by server");
-                    break;
-                }
-                Err(e) => {
-                    error!("[Tunnel] WebSocket error: {}", e);
-                    break;
-                }
-                _ => {}
             }
         }
 
@@ -163,11 +246,20 @@ impl TunnelManager {
         if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
             match msg_type {
                 "welcome" => {
-                    debug!("[Tunnel] ActionCable connection established");
+                    info!("[Tunnel] ActionCable welcome received");
                 }
                 "confirm_subscription" => {
                     self.set_status(TunnelStatus::Connected);
                     info!("[Tunnel] Subscription confirmed - tunnel connected");
+
+                    // Send all existing registered agents to Rails
+                    let ports = self.agent_ports.lock().await;
+                    for (session_key, port) in ports.iter() {
+                        info!("[Tunnel] Registering existing agent {} on port {}", session_key, port);
+                        if let Err(e) = self.notify_agent_tunnel(write, session_key, *port).await {
+                            warn!("[Tunnel] Failed to notify agent tunnel: {}", e);
+                        }
+                    }
                 }
                 "reject_subscription" => {
                     // Hub doesn't exist yet - will retry after heartbeat creates it

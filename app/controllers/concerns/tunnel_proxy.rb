@@ -59,6 +59,53 @@ module TunnelProxy
       response.headers[key] = value
     end
 
-    render body: data["body"], status: data["status"], content_type: data["content_type"]
+    body = data["body"]
+    content_type = data["content_type"]
+
+    # Inject <base> tag for HTML responses so relative/absolute URLs resolve through the proxy
+    if content_type&.include?("text/html") && body.present?
+      body = inject_base_tag(body)
+    end
+
+    render body: body, status: data["status"], content_type: content_type
+  end
+
+  # Rewrite URLs in HTML to route through the proxy
+  # This handles absolute URLs like /assets/foo.css which <base> doesn't fix
+  def inject_base_tag(html)
+    base_url = proxy_base_url.chomp("/") # Remove trailing slash for clean concatenation
+
+    # Rewrite absolute URLs in common HTML attributes
+    # Matches: href="/...", src="/...", action="/...", data-src="/..."
+    # Handles both single and double quotes
+    result = html.gsub(/(\s(?:href|src|action|data-src)\s*=\s*)(["'])\/(?!\/)/i) do |_match|
+      attr_prefix = $1
+      quote = $2
+      "#{attr_prefix}#{quote}#{base_url}/"
+    end
+
+    # Also rewrite url() in inline styles: url(/assets/...)
+    result = result.gsub(/url\(\s*(["']?)\/(?!\/)/) do |_match|
+      quote = $1
+      "url(#{quote}#{base_url}/"
+    end
+
+    # Inject <base> tag for relative URLs as well
+    base_tag = %(<base href="#{base_url}/">)
+
+    if result.include?("<head>")
+      result.sub("<head>", "<head>\n#{base_tag}")
+    elsif result.include?("<HEAD>")
+      result.sub("<HEAD>", "<HEAD>\n#{base_tag}")
+    elsif result.include?("<html>") || result.include?("<HTML>")
+      result.sub(/<html>/i, "\\0\n<head>#{base_tag}</head>")
+    else
+      "#{base_tag}\n#{result}"
+    end
+  end
+
+  # Build the base URL for the proxy (e.g., /preview/hub-id/agent-id/)
+  def proxy_base_url
+    raise NotImplementedError, "Subclass must implement proxy_base_url"
   end
 end
