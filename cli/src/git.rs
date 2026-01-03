@@ -6,25 +6,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Extension trait for safe path-to-string conversion
-trait PathExt {
-    fn to_str_safe(&self) -> Result<&str>;
-}
-
-impl PathExt for Path {
-    fn to_str_safe(&self) -> Result<&str> {
-        self.to_str()
-            .ok_or_else(|| anyhow::anyhow!("Path contains invalid UTF-8: {:?}", self))
-    }
-}
-
-impl PathExt for PathBuf {
-    fn to_str_safe(&self) -> Result<&str> {
-        self.to_str()
-            .ok_or_else(|| anyhow::anyhow!("Path contains invalid UTF-8: {:?}", self))
-    }
-}
-
 /// Manages git worktrees for agent sessions
 pub struct WorktreeManager {
     base_dir: PathBuf,

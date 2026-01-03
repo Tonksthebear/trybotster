@@ -79,7 +79,9 @@ class SharedTunnelsControllerTest < ActionDispatch::IntegrationTest
     end
 
     assert_response :ok
-    assert_equal "<h1>Shared View</h1>", response.body
+    # HTML responses get a base tag injected for proper asset URL resolution
+    assert_includes response.body, "<h1>Shared View</h1>"
+    assert_includes response.body, "<base href="
   end
 
   test "returns gateway timeout when tunnel doesn't respond" do
@@ -162,6 +164,20 @@ class SharedTunnelsControllerTest < ActionDispatch::IntegrationTest
     end
 
     assert_response :ok
-    assert_equal "Nested", response.body
+    # HTML responses get a base tag injected for proper asset URL resolution
+    assert_includes response.body, "Nested"
+  end
+
+  test "rewrites absolute URLs in HTML to use share proxy path" do
+    html_with_absolute_urls = '<link href="/assets/app.css"><a href="/page">'
+    response_data = { "status" => 200, "body" => html_with_absolute_urls, "content_type" => "text/html" }
+
+    MockHelper.mock_tunnel_response_store(response_data) do
+      get shared_tunnel_url(token: @hub_agent.tunnel_share_token)
+    end
+
+    assert_response :ok
+    assert_includes response.body, "href=\"/share/#{@hub_agent.tunnel_share_token}/assets/app.css\""
+    assert_includes response.body, "href=\"/share/#{@hub_agent.tunnel_share_token}/page\""
   end
 end

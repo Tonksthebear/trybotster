@@ -37,13 +37,7 @@ else
 fi
 echo "Worktree: $BOTSTER_WORKTREE_PATH"
 
-# Start background dev server if .botster_server script exists
-if [ -n "$BOTSTER_TUNNEL_PORT" ] && [ -f ".botster_server" ]; then
-  echo "Starting dev server on port $BOTSTER_TUNNEL_PORT..."
-  bash .botster_server > "$BOTSTER_WORKTREE_PATH/.botster_server.log" 2>&1 &
-  echo "Dev server PID: $!"
-  sleep 2
-fi
+# Server is now spawned in a separate PTY by botster-hub (Ctrl+T to toggle view)
 
 # Start Claude with the prompt
 claude --permission-mode acceptEdits "$BOTSTER_PROMPT"

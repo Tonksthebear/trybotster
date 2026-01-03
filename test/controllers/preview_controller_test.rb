@@ -80,7 +80,9 @@ class PreviewControllerTest < ActionDispatch::IntegrationTest
     end
 
     assert_response :ok
-    assert_equal "<h1>Hello</h1>", response.body
+    # HTML responses get a base tag injected for proper asset URL resolution
+    assert_includes response.body, "<h1>Hello</h1>"
+    assert_includes response.body, "<base href="
   end
 
   test "returns gateway timeout when tunnel doesn't respond" do
@@ -173,6 +175,39 @@ class PreviewControllerTest < ActionDispatch::IntegrationTest
     end
 
     assert_response :ok
-    assert_equal "Root", response.body
+    # HTML responses get a base tag injected for proper asset URL resolution
+    assert_includes response.body, "Root"
+  end
+
+  test "rewrites absolute URLs in HTML to use proxy path" do
+    sign_in @user
+    html_with_absolute_urls = <<~HTML
+      <html>
+      <head>
+        <link rel="stylesheet" href="/assets/tailwind.css">
+        <script src="/assets/application.js"></script>
+      </head>
+      <body>
+        <img src="/images/logo.png">
+        <a href="/about">About</a>
+        <form action="/submit"></form>
+        <div style="background: url(/images/bg.png)"></div>
+      </body>
+      </html>
+    HTML
+    response_data = { "status" => 200, "body" => html_with_absolute_urls, "content_type" => "text/html" }
+
+    MockHelper.mock_tunnel_response_store(response_data) do
+      get tunnel_preview_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key, path: "page")
+    end
+
+    assert_response :ok
+    # Absolute URLs should be rewritten to include the proxy path
+    assert_includes response.body, "href=\"/preview/#{@hub.identifier}/#{@hub_agent.session_key}/assets/tailwind.css\""
+    assert_includes response.body, "src=\"/preview/#{@hub.identifier}/#{@hub_agent.session_key}/assets/application.js\""
+    assert_includes response.body, "src=\"/preview/#{@hub.identifier}/#{@hub_agent.session_key}/images/logo.png\""
+    assert_includes response.body, "href=\"/preview/#{@hub.identifier}/#{@hub_agent.session_key}/about\""
+    assert_includes response.body, "action=\"/preview/#{@hub.identifier}/#{@hub_agent.session_key}/submit\""
+    assert_includes response.body, "url(/preview/#{@hub.identifier}/#{@hub_agent.session_key}/images/bg.png)"
   end
 end

@@ -112,8 +112,33 @@
     <div data-webrtc-target="tuiContainer" class="lg:col-span-3">
       <div class="shadow lg:rounded-lg overflow-hidden bg-[#1e1e1e]">
         <div class="px-2 py-1.5 lg:px-3 lg:py-2 border-b border-gray-700 flex items-center justify-between bg-[#2d2d2d]">
-          <h2 class="text-xs lg:text-sm font-medium text-gray-300" data-webrtc-target="terminalTitle">Terminal</h2>
-          <span class="text-xs text-gray-500" data-webrtc-target="selectedAgentLabel">No agent selected</span>
+          <div class="flex items-center gap-2">
+            <h2 class="text-xs lg:text-sm font-medium text-gray-300" data-webrtc-target="terminalTitle">Terminal</h2>
+            <%# PTY Toggle Button - toggles between CLI and Server view %>
+            <button type="button"
+                    data-action="webrtc#togglePtyView"
+                    class="inline-flex items-center px-2 py-1 text-xs font-medium rounded bg-gray-600 text-gray-300 hover:bg-gray-500"
+                    title="Toggle between CLI and Server terminal">
+              <svg class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+              </svg>
+              <span class="hidden sm:inline">Toggle View</span>
+            </button>
+            <%# Return to Live button - shows when scrolled %>
+            <button type="button"
+                    data-action="webrtc#scrollToBottom"
+                    class="inline-flex items-center px-2 py-1 text-xs font-medium rounded bg-yellow-600 text-white hover:bg-yellow-500"
+                    title="Return to live view (scroll to bottom)">
+              <svg class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 13l-7 7-7-7m14-8l-7 7-7-7" />
+              </svg>
+              <span class="hidden sm:inline">Live</span>
+            </button>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-gray-400 hidden sm:inline">Scroll: mouse wheel</span>
+            <span class="text-xs text-gray-500" data-webrtc-target="selectedAgentLabel">No agent selected</span>
+          </div>
         </div>
         <div data-webrtc-target="terminal" class="terminal-container h-[calc(100vh-380px)] min-h-[250px] lg:h-[calc(100vh-280px)] lg:min-h-[300px] overflow-hidden bg-[#1e1e1e] w-full"></div>
       </div>
@@ -130,7 +155,7 @@
         <button type="button" class="px-3 py-3 border border-gray-300 text-sm rounded-md text-gray-700 bg-white hover:bg-gray-50 active:bg-gray-100" data-action="webrtc#sendEscape">Esc</button>
         <button type="button" class="px-3 py-3 border border-gray-300 text-sm rounded-md text-gray-700 bg-white hover:bg-gray-50 active:bg-gray-100" data-action="webrtc#sendTab">Tab</button>
       </div>
-      <div class="grid grid-cols-4 gap-2">
+      <div class="grid grid-cols-4 gap-2 mb-3">
         <button type="button" class="px-3 py-3 border border-gray-300 text-sm rounded-md text-gray-700 bg-white hover:bg-gray-50 active:bg-gray-100" data-action="webrtc#sendArrowUp">
           <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7" /></svg>
         </button>
@@ -142,6 +167,19 @@
         </button>
         <button type="button" class="px-3 py-3 border border-gray-300 text-sm rounded-md text-gray-700 bg-white hover:bg-gray-50 active:bg-gray-100" data-action="webrtc#sendArrowRight">
           <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" /></svg>
+        </button>
+      </div>
+
+      <%# View Controls - just toggle and live %>
+      <h3 class="text-sm font-medium text-gray-900 mb-3 mt-4">View Controls</h3>
+      <div class="grid grid-cols-2 gap-2">
+        <button type="button" class="px-3 py-3 border border-purple-300 text-sm rounded-md text-purple-700 bg-purple-50 hover:bg-purple-100 active:bg-purple-200 flex items-center justify-center gap-2" data-action="webrtc#togglePtyView" title="Toggle CLI/Server">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
+          Toggle View
+        </button>
+        <button type="button" class="px-3 py-3 border border-yellow-300 text-sm rounded-md text-yellow-700 bg-yellow-50 hover:bg-yellow-100 active:bg-yellow-200 flex items-center justify-center gap-2" data-action="webrtc#scrollToBottom" title="Return to live view">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 13l-7 7-7-7m14-8l-7 7-7-7" /></svg>
+          Live
         </button>
       </div>
     </div>

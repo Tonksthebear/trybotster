@@ -2,6 +2,82 @@
   "version": "1.0",
   "description": "Skill activation triggers for Claude Code working with Rails + Hotwire application",
   "skills": {
+    "ms-rust": {
+      "type": "guardrail",
+      "enforcement": "suggest",
+      "priority": "high",
+      "description": "Microsoft Rust coding guidelines for all Rust development",
+      "promptTriggers": {
+        "keywords": [
+          "Rust",
+          "cargo",
+          "Cargo.toml",
+          "rustc",
+          "crate",
+          "module",
+          "impl",
+          "trait",
+          "struct",
+          "enum",
+          "async",
+          "tokio",
+          "anyhow",
+          "thiserror",
+          "serde",
+          "derive",
+          "lifetime",
+          "borrow",
+          "ownership",
+          "Result<",
+          "Option<",
+          "unwrap",
+          "expect",
+          "match",
+          "Vec<",
+          "HashMap",
+          "Arc",
+          "Mutex",
+          "RefCell",
+          "Rc",
+          "Box<",
+          "dyn",
+          "pub fn",
+          "pub struct",
+          "pub enum",
+          "#[derive",
+          "#[cfg",
+          "#[test]"
+        ],
+        "intentPatterns": [
+          "(create|add|implement|build|write|modify).*?(rust|crate|module|struct|enum|trait)",
+          "(fix|handle|debug).*?(rust|cargo|compile|borrow)",
+          "(refactor|improve|optimize).*?(rust|code|performance)",
+          "(how to|best practice).*?(rust|cargo|async|error handling)"
+        ]
+      },
+      "fileTriggers": {
+        "pathPatterns": [
+          "**/*.rs",
+          "**/Cargo.toml",
+          "**/Cargo.lock",
+          "cli/**/*.rs",
+          "cli/src/**/*.rs"
+        ],
+        "pathExclusions": [
+          "**/target/**",
+          "**/.cargo/**"
+        ],
+        "contentPatterns": [
+          "^use\\s+",
+          "^mod\\s+",
+          "^pub\\s+(fn|struct|enum|trait|mod)",
+          "^impl\\s+",
+          "#\\[derive\\(",
+          "fn\\s+\\w+\\s*\\(",
+          "async\\s+fn"
+        ]
+      }
+    },
     "skill-developer": {
       "type": "domain",
       "enforcement": "suggest",

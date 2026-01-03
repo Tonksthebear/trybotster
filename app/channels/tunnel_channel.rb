@@ -7,6 +7,8 @@ class TunnelChannel < ApplicationCable::Channel
     @hub_identifier = params[:hub_id]
     @user_id = current_user.id
 
+    Rails.logger.info "[TunnelChannel] Subscribed: user=#{@user_id} hub=#{@hub_identifier}"
+
     # Stream for this hub identifier - hub record will be created by heartbeat
     stream_from "tunnel_hub_#{@user_id}_#{@hub_identifier}"
   end
@@ -18,14 +20,20 @@ class TunnelChannel < ApplicationCable::Channel
   end
 
   # CLI registers an agent's tunnel port
+  # Note: Agent may not exist yet if this arrives before heartbeat, so we create it
   def register_agent_tunnel(data)
+    Rails.logger.info "[TunnelChannel] register_agent_tunnel: #{data.inspect}"
+
     hub = current_user.hubs.find_by(identifier: @hub_identifier)
-    return unless hub
+    unless hub
+      Rails.logger.warn "[TunnelChannel] Hub not found: #{@hub_identifier}"
+      return
+    end
 
-    agent = hub.hub_agents.find_by(session_key: data["session_key"])
-    return unless agent
-
+    # Find or create the agent - tunnel registration can arrive before heartbeat
+    agent = hub.hub_agents.find_or_create_by!(session_key: data["session_key"])
     agent.update!(tunnel_port: data["port"], tunnel_status: "connected", tunnel_connected_at: Time.current)
+    Rails.logger.info "[TunnelChannel] Agent tunnel registered: #{agent.session_key} on port #{data['port']}"
 
     # Broadcast tunnel URL to web UI
     Turbo::StreamsChannel.broadcast_update_to(

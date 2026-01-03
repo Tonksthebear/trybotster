@@ -21,4 +21,8 @@ class PreviewController < ApplicationController
     @hub = current_user.hubs.find_by(identifier: params[:hub_id])
     @hub_agent = @hub&.hub_agents&.find_by(session_key: params[:agent_id])
   end
+
+  def proxy_base_url
+    "/preview/#{params[:hub_id]}/#{params[:agent_id]}/"
+  end
 end

@@ -1,279 +1,47 @@
 use anyhow::Result;
 use botster_hub::{
-    allocate_tunnel_port, Agent, AgentNotification, BrowserCommand, BrowserDimensions,
-    BrowserMode, Config, IceServerConfig, KeyInput, PromptManager, TunnelManager, TunnelStatus,
-    WebAgentInfo, WebRTCHandler, WebWorktreeInfo, WorktreeManager,
+    agents, allocate_tunnel_port, app, commands, constants, kill_orphaned_processes,
+    render_agent_terminal, Agent, AgentNotification, BrowserCommand, BrowserDimensions,
+    BrowserMode, Config, IceServerConfig, PtyView, TunnelManager, TunnelStatus, WebAgentInfo,
+    WebRTCHandler, WebWorktreeInfo, WorktreeManager,
 };
+use app::{buffer_to_ansi, centered_rect, convert_browser_key_to_crossterm, InputAction};
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::{CrosstermBackend, TestBackend},
-    buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::{Constraint, Direction, Layout},
+    style::{Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState},
     Frame, Terminal,
 };
 use reqwest::blocking::Client;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Version constant re-exported from commands module.
+use commands::update::VERSION;
 
-/// Configuration for spawning a new agent
-struct AgentSpawnConfig {
-    issue_number: Option<u32>,
-    branch_name: String,
-    worktree_path: std::path::PathBuf,
-    repo_path: std::path::PathBuf,
-    repo_name: String,
-    prompt: String,
-    message_id: Option<i64>,
-    invocation_url: Option<String>,
+/// Global flag for signal-triggered shutdown (as Arc for signal-hook compatibility)
+static SHUTDOWN_FLAG: std::sync::LazyLock<Arc<AtomicBool>> =
+    std::sync::LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+
+/// Check if shutdown has been requested
+fn shutdown_requested() -> bool {
+    SHUTDOWN_FLAG.load(Ordering::SeqCst)
 }
 
-/// Helper function to create a centered rect
-fn centered_rect(
-    percent_x: u16,
-    percent_y: u16,
-    r: ratatui::layout::Rect,
-) -> ratatui::layout::Rect {
-    use ratatui::layout::{Constraint, Direction, Layout};
+/// Re-export AgentSpawnConfig from agents module
+type AgentSpawnConfig = agents::AgentSpawnConfig;
 
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-/// Convert a ratatui Buffer to ANSI escape sequences for streaming to xterm.js
-/// If browser_dims is provided, output is clipped to those dimensions
-fn buffer_to_ansi(
-    buffer: &Buffer,
-    width: u16,
-    height: u16,
-    browser_dims: Option<BrowserDimensions>,
-) -> String {
-    use std::fmt::Write;
-
-    // Use browser dimensions if provided, otherwise use buffer dimensions
-    let (out_width, out_height) = if let Some(dims) = browser_dims {
-        (dims.cols.min(width), dims.rows.min(height))
-    } else {
-        (width, height)
-    };
-
-    let mut output = String::new();
-
-    // Reset and clear screen, move cursor to home
-    output.push_str("\x1b[0m\x1b[H\x1b[2J");
-
-    let mut last_fg = Color::Reset;
-    let mut last_bg = Color::Reset;
-    let mut last_modifiers = Modifier::empty();
-
-    for y in 0..out_height {
-        // Move cursor to start of line
-        write!(output, "\x1b[{};1H", y + 1).unwrap();
-
-        for x in 0..out_width {
-            let cell = buffer.cell((x, y));
-            if cell.is_none() {
-                output.push(' ');
-                continue;
-            }
-            let cell = cell.unwrap();
-
-            // Check if style changed
-            let fg = cell.fg;
-            let bg = cell.bg;
-            let modifiers = cell.modifier;
-
-            if fg != last_fg || bg != last_bg || modifiers != last_modifiers {
-                // Build SGR sequence
-                output.push_str("\x1b[0m"); // Reset first
-
-                // Apply modifiers
-                if modifiers.contains(Modifier::BOLD) {
-                    output.push_str("\x1b[1m");
-                }
-                if modifiers.contains(Modifier::DIM) {
-                    output.push_str("\x1b[2m");
-                }
-                if modifiers.contains(Modifier::ITALIC) {
-                    output.push_str("\x1b[3m");
-                }
-                if modifiers.contains(Modifier::UNDERLINED) {
-                    output.push_str("\x1b[4m");
-                }
-                if modifiers.contains(Modifier::REVERSED) {
-                    output.push_str("\x1b[7m");
-                }
-
-                // Apply foreground color
-                match fg {
-                    Color::Reset => {}
-                    Color::Black => output.push_str("\x1b[30m"),
-                    Color::Red => output.push_str("\x1b[31m"),
-                    Color::Green => output.push_str("\x1b[32m"),
-                    Color::Yellow => output.push_str("\x1b[33m"),
-                    Color::Blue => output.push_str("\x1b[34m"),
-                    Color::Magenta => output.push_str("\x1b[35m"),
-                    Color::Cyan => output.push_str("\x1b[36m"),
-                    Color::Gray => output.push_str("\x1b[90m"),
-                    Color::DarkGray => output.push_str("\x1b[90m"),
-                    Color::LightRed => output.push_str("\x1b[91m"),
-                    Color::LightGreen => output.push_str("\x1b[92m"),
-                    Color::LightYellow => output.push_str("\x1b[93m"),
-                    Color::LightBlue => output.push_str("\x1b[94m"),
-                    Color::LightMagenta => output.push_str("\x1b[95m"),
-                    Color::LightCyan => output.push_str("\x1b[96m"),
-                    Color::White => output.push_str("\x1b[37m"),
-                    Color::Rgb(r, g, b) => {
-                        write!(output, "\x1b[38;2;{};{};{}m", r, g, b).unwrap();
-                    }
-                    Color::Indexed(i) => {
-                        write!(output, "\x1b[38;5;{}m", i).unwrap();
-                    }
-                }
-
-                // Apply background color
-                match bg {
-                    Color::Reset => {}
-                    Color::Black => output.push_str("\x1b[40m"),
-                    Color::Red => output.push_str("\x1b[41m"),
-                    Color::Green => output.push_str("\x1b[42m"),
-                    Color::Yellow => output.push_str("\x1b[43m"),
-                    Color::Blue => output.push_str("\x1b[44m"),
-                    Color::Magenta => output.push_str("\x1b[45m"),
-                    Color::Cyan => output.push_str("\x1b[46m"),
-                    Color::Gray => output.push_str("\x1b[100m"),
-                    Color::DarkGray => output.push_str("\x1b[100m"),
-                    Color::LightRed => output.push_str("\x1b[101m"),
-                    Color::LightGreen => output.push_str("\x1b[102m"),
-                    Color::LightYellow => output.push_str("\x1b[103m"),
-                    Color::LightBlue => output.push_str("\x1b[104m"),
-                    Color::LightMagenta => output.push_str("\x1b[105m"),
-                    Color::LightCyan => output.push_str("\x1b[106m"),
-                    Color::White => output.push_str("\x1b[47m"),
-                    Color::Rgb(r, g, b) => {
-                        write!(output, "\x1b[48;2;{};{};{}m", r, g, b).unwrap();
-                    }
-                    Color::Indexed(i) => {
-                        write!(output, "\x1b[48;5;{}m", i).unwrap();
-                    }
-                }
-
-                last_fg = fg;
-                last_bg = bg;
-                last_modifiers = modifiers;
-            }
-
-            // Write the character
-            output.push_str(cell.symbol());
-        }
-    }
-
-    // Reset at end
-    output.push_str("\x1b[0m");
-
-    output
-}
-
-/// Convert browser keyboard input to crossterm KeyEvent
-fn convert_browser_key_to_crossterm(input: &KeyInput) -> Option<crossterm::event::KeyEvent> {
-    use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
-
-    let mut modifiers = KeyModifiers::empty();
-    if input.ctrl {
-        modifiers |= KeyModifiers::CONTROL;
-    }
-    if input.alt {
-        modifiers |= KeyModifiers::ALT;
-    }
-    if input.shift {
-        modifiers |= KeyModifiers::SHIFT;
-    }
-
-    // Map browser key names to crossterm KeyCode
-    let key_code = match input.key.as_str() {
-        // Single character keys
-        k if k.len() == 1 => {
-            let c = k.chars().next().unwrap();
-            KeyCode::Char(c)
-        }
-        // Special keys
-        "Enter" => KeyCode::Enter,
-        "Escape" => KeyCode::Esc,
-        "Backspace" => KeyCode::Backspace,
-        "Tab" => KeyCode::Tab,
-        "ArrowUp" => KeyCode::Up,
-        "ArrowDown" => KeyCode::Down,
-        "ArrowLeft" => KeyCode::Left,
-        "ArrowRight" => KeyCode::Right,
-        "Home" => KeyCode::Home,
-        "End" => KeyCode::End,
-        "PageUp" => KeyCode::PageUp,
-        "PageDown" => KeyCode::PageDown,
-        "Delete" => KeyCode::Delete,
-        "Insert" => KeyCode::Insert,
-        // Function keys
-        "F1" => KeyCode::F(1),
-        "F2" => KeyCode::F(2),
-        "F3" => KeyCode::F(3),
-        "F4" => KeyCode::F(4),
-        "F5" => KeyCode::F(5),
-        "F6" => KeyCode::F(6),
-        "F7" => KeyCode::F(7),
-        "F8" => KeyCode::F(8),
-        "F9" => KeyCode::F(9),
-        "F10" => KeyCode::F(10),
-        "F11" => KeyCode::F(11),
-        "F12" => KeyCode::F(12),
-        // Space
-        " " => KeyCode::Char(' '),
-        // Unknown keys - ignore
-        _ => {
-            log::debug!("Unknown browser key: {}", input.key);
-            return None;
-        }
-    };
-
-    Some(KeyEvent {
-        code: key_code,
-        modifiers,
-        kind: KeyEventKind::Press,
-        state: KeyEventState::empty(),
-    })
-}
-
-#[derive(Clone)]
-enum AppMode {
-    Normal,
-    Menu,
-    NewAgentSelectWorktree,
-    NewAgentCreateWorktree,
-    NewAgentPrompt,
-    CloseAgentConfirm,
-}
+// AppMode is imported from app::state module
+use app::AppMode;
 
 struct BotsterApp {
     agents: HashMap<String, Agent>, // Key: session_key (repo-safe-issue_number or repo-safe-branch)
@@ -439,28 +207,39 @@ impl BotsterApp {
 
         // Kill any existing orphaned claude processes for this worktree
         // This prevents duplicate claude instances when reopening a worktree
-        Self::kill_orphaned_claude_processes(&config.worktree_path);
+        kill_orphaned_processes(&config.worktree_path);
 
         // Spawn the agent
         let init_commands = vec!["source .botster_init".to_string()];
-        agent.spawn("bash", "", init_commands, env_vars)?;
-
-        // Register the agent
-        let session_key = agent.session_key();
+        agent.spawn("bash", "", init_commands, env_vars.clone())?;
 
         // Store tunnel port on the agent
         agent.tunnel_port = tunnel_port;
 
-        // Register tunnel port with the tunnel manager
+        // Spawn server PTY if tunnel port is allocated and .botster_server exists
         if let Some(port) = tunnel_port {
-            let tunnel_manager = self.tunnel_manager.clone();
-            let session_key_clone = session_key.clone();
-            self.tokio_runtime.spawn(async move {
-                tunnel_manager.register_agent(session_key_clone, port).await;
-            });
+            let server_script = config.worktree_path.join(".botster_server");
+            if server_script.exists() {
+                log::info!("Spawning server PTY on port {} using .botster_server", port);
+                let mut server_env = HashMap::new();
+                server_env.insert("BOTSTER_TUNNEL_PORT".to_string(), port.to_string());
+                server_env.insert(
+                    "BOTSTER_WORKTREE_PATH".to_string(),
+                    config.worktree_path.display().to_string(),
+                );
+                // Spawn server in its own PTY (uses bash + source, like CLI PTY)
+                if let Err(e) = agent.spawn_server_pty(".botster_server", server_env) {
+                    log::warn!("Failed to spawn server PTY: {}", e);
+                }
+            }
         }
+
+        // Register the agent
+        let session_key = agent.session_key();
+        let has_tunnel = tunnel_port.is_some();
+
         self.agent_keys_ordered.push(session_key.clone());
-        self.agents.insert(session_key, agent);
+        self.agents.insert(session_key.clone(), agent);
 
         let label = if let Some(num) = config.issue_number {
             format!("issue #{}", num)
@@ -468,6 +247,25 @@ impl BotsterApp {
             format!("branch {}", config.branch_name)
         };
         log::info!("Spawned agent for {}", label);
+
+        // For tunnel agents, send heartbeat FIRST to ensure Hub exists in Rails
+        // before the tunnel manager tries to register the agent
+        if has_tunnel {
+            log::debug!("Sending immediate heartbeat for tunnel agent");
+            self.last_heartbeat = Instant::now() - Duration::from_secs(60);
+            if let Err(e) = self.send_heartbeat() {
+                log::warn!("Failed to send pre-tunnel heartbeat: {}", e);
+            }
+        }
+
+        // Register tunnel port with the tunnel manager (AFTER heartbeat creates the Hub)
+        if let Some(port) = tunnel_port {
+            let tunnel_manager = self.tunnel_manager.clone();
+            let session_key_clone = session_key.clone();
+            self.tokio_runtime.spawn(async move {
+                tunnel_manager.register_agent(session_key_clone, port).await;
+            });
+        }
 
         Ok(())
     }
@@ -496,11 +294,45 @@ impl BotsterApp {
                 Event::Key(key) => {
                     self.handle_key_event(key)?;
                 }
+                Event::Mouse(mouse) => {
+                    self.handle_mouse_event(mouse)?;
+                }
                 _ => {}
             }
         }
 
         Ok(handled_any)
+    }
+
+    fn handle_mouse_event(&mut self, mouse: crossterm::event::MouseEvent) -> Result<bool> {
+        use crossterm::event::MouseEventKind;
+
+        // Only handle mouse events in normal mode
+        if self.mode != AppMode::Normal {
+            return Ok(true);
+        }
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                // Scroll up in scrollback buffer
+                if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                    if let Some(agent) = self.agents.get_mut(&key) {
+                        agent.scroll_up(3); // Scroll 3 lines per mouse wheel tick
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                // Scroll down in scrollback buffer
+                if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                    if let Some(agent) = self.agents.get_mut(&key) {
+                        agent.scroll_down(3); // Scroll 3 lines per mouse wheel tick
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(true)
     }
 
     fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
@@ -511,127 +343,116 @@ impl BotsterApp {
             return Ok(true);
         }
 
-        match self.mode {
-            AppMode::Normal => self.handle_normal_mode_key(key),
-            AppMode::Menu => self.handle_menu_mode_key(key),
-            AppMode::NewAgentSelectWorktree => self.handle_worktree_select_key(key),
-            AppMode::NewAgentCreateWorktree => self.handle_create_worktree_key(key),
-            AppMode::NewAgentPrompt => self.handle_prompt_input_key(key),
-            AppMode::CloseAgentConfirm => self.handle_close_confirm_key(key),
-        }
+        // Dispatch to input module and get action
+        let action = app::dispatch_key_event(
+            &self.mode,
+            key.code,
+            key.modifiers,
+            self.terminal_rows,
+            self.menu_selected,
+            constants::MENU_ITEMS.len(),
+            self.worktree_selected,
+            self.available_worktrees.len(),
+        );
+
+        // Process the action
+        self.process_input_action(action)
     }
 
-    fn handle_normal_mode_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
-        match key.code {
-            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+    /// Process an input action and apply the corresponding state changes.
+    fn process_input_action(&mut self, action: InputAction) -> Result<bool> {
+        match action {
+            InputAction::None => {}
+            InputAction::Quit => {
                 self.quit = true;
-                return Ok(true);
             }
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+P: Open menu
+            InputAction::OpenMenu => {
                 self.mode = AppMode::Menu;
                 self.menu_selected = 0;
-                return Ok(true);
             }
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+J: next agent
-                if self.selected < self.agent_keys_ordered.len().saturating_sub(1) {
-                    self.selected += 1;
-                }
-                return Ok(true);
+            InputAction::CloseModal => {
+                self.mode = AppMode::Normal;
+                self.input_buffer.clear();
             }
-            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+K: previous agent
+            InputAction::PreviousAgent => {
                 if self.selected > 0 {
                     self.selected -= 1;
                 }
-                return Ok(true);
             }
-            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+X: kill selected agent
-                if let Some(key) = self.agent_keys_ordered.get(self.selected) {
-                    self.agents.remove(key);
+            InputAction::NextAgent => {
+                if self.selected < self.agent_keys_ordered.len().saturating_sub(1) {
+                    self.selected += 1;
+                }
+            }
+            InputAction::KillAgent => {
+                if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                    self.agents.remove(&key);
                     self.agent_keys_ordered.remove(self.selected);
-                    // Adjust selection if needed
                     if self.selected >= self.agent_keys_ordered.len() && self.selected > 0 {
                         self.selected = self.agent_keys_ordered.len() - 1;
                     }
                 }
-                return Ok(true);
             }
-            _ => {
-                // Forward key input to selected agent's terminal
-                let bytes_to_send = match key.code {
-                    KeyCode::Char(c) => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) && c.is_ascii_alphabetic()
-                        {
-                            // Send control character (Ctrl+A = 1, Ctrl+B = 2, etc.)
-                            let ctrl_code = (c.to_ascii_uppercase() as u8) - b'@';
-                            Some(vec![ctrl_code])
-                        } else {
-                            Some(c.to_string().into_bytes())
-                        }
-                    }
-                    KeyCode::Backspace => Some(vec![8]),
-                    KeyCode::Enter => Some(vec![b'\r']),
-                    KeyCode::Esc => Some(vec![27]),
-                    KeyCode::Left => Some(vec![27, 91, 68]),
-                    KeyCode::Right => Some(vec![27, 91, 67]),
-                    KeyCode::Up => Some(vec![27, 91, 65]),
-                    KeyCode::Down => Some(vec![27, 91, 66]),
-                    KeyCode::Home => Some(vec![27, 91, 72]),
-                    KeyCode::End => Some(vec![27, 91, 70]),
-                    KeyCode::PageUp => Some(vec![27, 91, 53, 126]),
-                    KeyCode::PageDown => Some(vec![27, 91, 54, 126]),
-                    KeyCode::Tab => Some(vec![9]),
-                    KeyCode::BackTab => Some(vec![27, 91, 90]),
-                    KeyCode::Delete => Some(vec![27, 91, 51, 126]),
-                    KeyCode::Insert => Some(vec![27, 91, 50, 126]),
-                    _ => None,
-                };
-
-                if let Some(bytes) = bytes_to_send {
-                    if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
-                        if let Some(agent) = self.agents.get_mut(&key) {
-                            let _ = agent.write_input(&bytes);
-                        }
+            InputAction::TogglePtyView => {
+                if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                    if let Some(agent) = self.agents.get_mut(&key) {
+                        agent.toggle_pty_view();
                     }
                 }
-                return Ok(true);
             }
-        }
-    }
-
-    fn handle_menu_mode_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
-        const MENU_ITEMS: &[&str] = &["Toggle Polling", "New Agent", "Close Agent"];
-
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.mode = AppMode::Normal;
-                return Ok(true);
+            InputAction::ScrollUp(lines) => {
+                if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                    if let Some(agent) = self.agents.get_mut(&key) {
+                        agent.scroll_up(lines);
+                    }
+                }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            InputAction::ScrollDown(lines) => {
+                if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                    if let Some(agent) = self.agents.get_mut(&key) {
+                        agent.scroll_down(lines);
+                    }
+                }
+            }
+            InputAction::ScrollToTop => {
+                if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                    if let Some(agent) = self.agents.get_mut(&key) {
+                        agent.scroll_to_top();
+                    }
+                }
+            }
+            InputAction::ScrollToBottom => {
+                if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                    if let Some(agent) = self.agents.get_mut(&key) {
+                        agent.scroll_to_bottom();
+                    }
+                }
+            }
+            InputAction::ForwardToPty(bytes) => {
+                if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
+                    if let Some(agent) = self.agents.get_mut(&key) {
+                        agent.scroll_to_bottom();
+                        let _ = agent.write_to_active_pty(&bytes);
+                    }
+                }
+            }
+            InputAction::MenuUp => {
                 if self.menu_selected > 0 {
                     self.menu_selected -= 1;
                 }
-                return Ok(true);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.menu_selected < MENU_ITEMS.len() - 1 {
+            InputAction::MenuDown => {
+                if self.menu_selected < constants::MENU_ITEMS.len() - 1 {
                     self.menu_selected += 1;
                 }
-                return Ok(true);
             }
-            KeyCode::Enter => {
-                // Execute selected menu item
-                match self.menu_selected {
-                    0 => {
-                        // Toggle polling
+            InputAction::MenuSelect(index) => {
+                match index {
+                    constants::MENU_INDEX_TOGGLE_POLLING => {
                         self.polling_enabled = !self.polling_enabled;
                         self.mode = AppMode::Normal;
                     }
-                    1 => {
-                        // New agent - load worktrees
+                    constants::MENU_INDEX_NEW_AGENT => {
                         if let Err(e) = self.load_available_worktrees() {
                             log::error!("Failed to load worktrees: {}", e);
                             self.mode = AppMode::Normal;
@@ -640,8 +461,7 @@ impl BotsterApp {
                             self.worktree_selected = 0;
                         }
                     }
-                    2 => {
-                        // Close agent
+                    constants::MENU_INDEX_CLOSE_AGENT => {
                         if !self.agent_keys_ordered.is_empty() {
                             self.mode = AppMode::CloseAgentConfirm;
                         } else {
@@ -652,126 +472,59 @@ impl BotsterApp {
                         self.mode = AppMode::Normal;
                     }
                 }
-                return Ok(true);
             }
-            _ => return Ok(true),
-        }
-    }
-
-    fn handle_worktree_select_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
-        // Total items = 1 (Create New) + available worktrees
-        let total_items = self.available_worktrees.len() + 1;
-
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.mode = AppMode::Normal;
-                return Ok(true);
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
+            InputAction::WorktreeUp => {
                 if self.worktree_selected > 0 {
                     self.worktree_selected -= 1;
                 }
-                return Ok(true);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.worktree_selected < total_items.saturating_sub(1) {
+            InputAction::WorktreeDown => {
+                if self.worktree_selected < self.available_worktrees.len() {
                     self.worktree_selected += 1;
                 }
-                return Ok(true);
             }
-            KeyCode::Enter => {
-                if self.worktree_selected == 0 {
-                    // "Create New" option selected
+            InputAction::WorktreeSelect(index) => {
+                if index == 0 {
                     self.mode = AppMode::NewAgentCreateWorktree;
                     self.input_buffer.clear();
                 } else {
-                    // Existing worktree selected
                     self.mode = AppMode::NewAgentPrompt;
                     self.input_buffer.clear();
                 }
-                return Ok(true);
             }
-            _ => return Ok(true),
-        }
-    }
-
-    fn handle_create_worktree_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = AppMode::Normal;
-                self.input_buffer.clear();
-                return Ok(true);
-            }
-            KeyCode::Char(c) if !c.is_control() && c != ' ' => {
+            InputAction::InputChar(c) => {
                 self.input_buffer.push(c);
-                return Ok(true);
             }
-            KeyCode::Backspace => {
+            InputAction::InputBackspace => {
                 self.input_buffer.pop();
-                return Ok(true);
             }
-            KeyCode::Enter => {
-                // Only create if buffer is not empty
-                if !self.input_buffer.is_empty() {
-                    if let Err(e) = self.create_and_spawn_agent() {
-                        log::error!("Failed to create worktree and spawn agent: {}", e);
+            InputAction::InputSubmit => {
+                // Handle based on current mode
+                match self.mode {
+                    AppMode::NewAgentCreateWorktree => {
+                        if !self.input_buffer.is_empty() {
+                            if let Err(e) = self.create_and_spawn_agent() {
+                                log::error!("Failed to create worktree and spawn agent: {}", e);
+                            }
+                        }
                     }
+                    AppMode::NewAgentPrompt => {
+                        if let Err(e) = self.spawn_agent_from_worktree() {
+                            log::error!("Failed to spawn agent: {}", e);
+                        }
+                    }
+                    _ => {}
                 }
                 self.mode = AppMode::Normal;
                 self.input_buffer.clear();
-                return Ok(true);
             }
-            _ => return Ok(true),
-        }
-    }
-
-    fn handle_prompt_input_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = AppMode::Normal;
-                self.input_buffer.clear();
-                return Ok(true);
-            }
-            KeyCode::Char(c) => {
-                self.input_buffer.push(c);
-                return Ok(true);
-            }
-            KeyCode::Backspace => {
-                self.input_buffer.pop();
-                return Ok(true);
-            }
-            KeyCode::Enter => {
-                // Create agent with the prompt
-                if let Err(e) = self.spawn_agent_from_worktree() {
-                    log::error!("Failed to spawn agent: {}", e);
-                }
-                self.mode = AppMode::Normal;
-                self.input_buffer.clear();
-                return Ok(true);
-            }
-            _ => return Ok(true),
-        }
-    }
-
-    fn handle_close_confirm_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('n') => {
-                self.mode = AppMode::Normal;
-                return Ok(true);
-            }
-            KeyCode::Char('y') => {
-                // Close agent and ask about deleting worktree
+            InputAction::CloseAgentKeepWorktree => {
                 if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
                     if let Some(agent) = self.agents.remove(&key) {
                         self.agent_keys_ordered.remove(self.selected);
-
-                        // Adjust selection
                         if self.selected >= self.agent_keys_ordered.len() && self.selected > 0 {
                             self.selected = self.agent_keys_ordered.len() - 1;
                         }
-
-                        // TODO: Prompt whether to delete worktree
-                        // For now, just close the agent without deleting
                         let label = if let Some(num) = agent.issue_number {
                             format!("issue #{}", num)
                         } else {
@@ -781,20 +534,14 @@ impl BotsterApp {
                     }
                 }
                 self.mode = AppMode::Normal;
-                return Ok(true);
             }
-            KeyCode::Char('d') => {
-                // Close agent and delete worktree
+            InputAction::CloseAgentDeleteWorktree => {
                 if let Some(key) = self.agent_keys_ordered.get(self.selected).cloned() {
                     if let Some(agent) = self.agents.remove(&key) {
                         self.agent_keys_ordered.remove(self.selected);
-
-                        // Adjust selection
                         if self.selected >= self.agent_keys_ordered.len() && self.selected > 0 {
                             self.selected = self.agent_keys_ordered.len() - 1;
                         }
-
-                        // Delete the worktree using the generic delete function
                         if let Err(e) = self
                             .git_manager
                             .delete_worktree_by_path(&agent.worktree_path, &agent.branch_name)
@@ -816,10 +563,9 @@ impl BotsterApp {
                     }
                 }
                 self.mode = AppMode::Normal;
-                return Ok(true);
             }
-            _ => return Ok(true),
         }
+        Ok(true)
     }
 
     fn load_available_worktrees(&mut self) -> Result<()> {
@@ -1015,12 +761,25 @@ impl BotsterApp {
                 .iter()
                 .filter_map(|key| agents.get(key))
                 .map(|agent| {
-                    let text = if let Some(issue_num) = agent.issue_number {
+                    let base_text = if let Some(issue_num) = agent.issue_number {
                         format!("{}#{}", agent.repo, issue_num)
                     } else {
                         format!("{}/{}", agent.repo, agent.branch_name)
                     };
-                    ListItem::new(text)
+
+                    // Add server status indicator if tunnel port is assigned
+                    let server_info = if let Some(port) = agent.tunnel_port {
+                        let server_icon = if agent.is_server_running() {
+                            "▶" // Server running
+                        } else {
+                            "○" // Server not running
+                        };
+                        format!(" {}:{}", server_icon, port)
+                    } else {
+                        String::new()
+                    };
+
+                    ListItem::new(format!("{}{}", base_text, server_info))
                 })
                 .collect();
 
@@ -1064,30 +823,13 @@ impl BotsterApp {
 
             f.render_stateful_widget(list, chunks[0], &mut state);
 
-            // Render terminal view
+            // Render terminal view using the extracted render function
+            // This ensures we test the exact same code path
             let selected_agent = agent_keys_ordered
                 .get(selected)
                 .and_then(|key| agents.get(key));
             if let Some(agent) = selected_agent {
-                let parser = agent.vt100_parser.lock().unwrap();
-                let screen = parser.screen();
-
-                let terminal_title = if let Some(issue_num) = agent.issue_number {
-                    format!(
-                        " {}#{} [Ctrl+P menu | Ctrl+J/K switch] ",
-                        agent.repo, issue_num
-                    )
-                } else {
-                    format!(
-                        " {}/{} [Ctrl+P menu | Ctrl+J/K switch] ",
-                        agent.repo, agent.branch_name
-                    )
-                };
-
-                let block = Block::default().borders(Borders::ALL).title(terminal_title);
-                let pseudo_term = tui_term::widget::PseudoTerminal::new(screen).block(block);
-
-                f.render_widget(pseudo_term, chunks[1]);
+                render_agent_terminal(agent, chunks[1], f.buffer_mut());
             }
 
             // Render modal overlays based on mode
@@ -1095,15 +837,28 @@ impl BotsterApp {
                 AppMode::Menu => {
                     let menu_items = vec![
                         format!(
-                            "{} Toggle Polling ({})",
-                            if menu_selected == 0 { ">" } else { " " },
+                            "{} {} ({})",
+                            if menu_selected == constants::MENU_INDEX_TOGGLE_POLLING { ">" } else { " " },
+                            constants::MENU_ITEMS[constants::MENU_INDEX_TOGGLE_POLLING],
                             if polling_enabled { "ON" } else { "OFF" }
                         ),
-                        format!("{} New Agent", if menu_selected == 1 { ">" } else { " " }),
-                        format!("{} Close Agent", if menu_selected == 2 { ">" } else { " " }),
+                        format!(
+                            "{} {}",
+                            if menu_selected == constants::MENU_INDEX_NEW_AGENT { ">" } else { " " },
+                            constants::MENU_ITEMS[constants::MENU_INDEX_NEW_AGENT]
+                        ),
+                        format!(
+                            "{} {}",
+                            if menu_selected == constants::MENU_INDEX_CLOSE_AGENT { ">" } else { " " },
+                            constants::MENU_ITEMS[constants::MENU_INDEX_CLOSE_AGENT]
+                        ),
                     ];
 
-                    let area = centered_rect(50, 30, f.area());
+                    let area = centered_rect(
+                        constants::MENU_MODAL_WIDTH_PERCENT,
+                        constants::MENU_MODAL_HEIGHT_PERCENT,
+                        f.area(),
+                    );
                     f.render_widget(Clear, area);
 
                     let menu_text: Vec<Line> = menu_items
@@ -1251,6 +1006,7 @@ impl BotsterApp {
                 dims.cols,
                 dims.rows,
                 None, // No clipping needed, already at correct size
+                None,
             );
             (ansi, dims.rows, dims.cols)
         } else {
@@ -1262,8 +1018,13 @@ impl BotsterApp {
     }
 
     fn poll_messages(&mut self) -> Result<()> {
-        // Skip polling if disabled
-        if !self.polling_enabled {
+        // Skip if shutdown requested (prevents blocking during exit)
+        if shutdown_requested() {
+            return Ok(());
+        }
+
+        // Skip polling if disabled (or BOTSTER_OFFLINE_MODE env var is set)
+        if !self.polling_enabled || std::env::var("BOTSTER_OFFLINE_MODE").is_ok() {
             return Ok(());
         }
 
@@ -1485,6 +1246,16 @@ impl BotsterApp {
     /// Send heartbeat to Rails server to register this hub and its agents
     /// Uses RESTful PUT /api/hubs/:identifier endpoint for upsert
     fn send_heartbeat(&mut self) -> Result<()> {
+        // Skip if shutdown requested (prevents blocking during exit)
+        if shutdown_requested() {
+            return Ok(());
+        }
+
+        // Skip heartbeat in offline mode
+        if std::env::var("BOTSTER_OFFLINE_MODE").is_ok() {
+            return Ok(());
+        }
+
         // Check if 30 seconds have passed since last heartbeat
         const HEARTBEAT_INTERVAL_SECS: u64 = 30;
         if self.last_heartbeat.elapsed() < Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
@@ -1553,102 +1324,6 @@ impl BotsterApp {
         }
 
         Ok(())
-    }
-
-    /// Kill any orphaned claude processes running in the given worktree directory.
-    /// This is needed when reopening a worktree that has a lingering claude process
-    /// from a previous botster-hub session.
-    fn kill_orphaned_claude_processes(worktree_path: &std::path::Path) {
-        let worktree_str = worktree_path.to_string_lossy();
-        let current_pid = std::process::id();
-
-        // Use pgrep to find claude processes, then filter by CWD
-        // macOS: lsof -d cwd to check working directory
-        #[cfg(target_os = "macos")]
-        {
-            use std::process::Command;
-
-            // Get all claude process PIDs
-            let pgrep_output = Command::new("pgrep").arg("-f").arg("claude").output();
-
-            if let Ok(output) = pgrep_output {
-                let pids_str = String::from_utf8_lossy(&output.stdout);
-                for pid_str in pids_str.lines() {
-                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        // Skip our own process
-                        if pid == current_pid {
-                            continue;
-                        }
-
-                        // Check if this process's CWD matches our worktree exactly
-                        // (or is a subdirectory of it)
-                        let lsof_output = Command::new("lsof")
-                            .arg("-p")
-                            .arg(pid.to_string())
-                            .arg("-d")
-                            .arg("cwd")
-                            .arg("-Fn")
-                            .output();
-
-                        if let Ok(lsof) = lsof_output {
-                            let lsof_str = String::from_utf8_lossy(&lsof.stdout);
-                            // lsof -Fn output format: lines starting with 'n' contain the path
-                            if lsof_str.lines().any(|line| {
-                                if line.starts_with('n') {
-                                    let cwd = &line[1..];
-                                    // Only kill if CWD is exactly the worktree or inside it
-                                    cwd == &*worktree_str || cwd.starts_with(&format!("{}/", worktree_str))
-                                } else {
-                                    false
-                                }
-                            }) {
-                                log::info!(
-                                    "Killing orphaned claude process {} in worktree {}",
-                                    pid,
-                                    worktree_str
-                                );
-                                let _ = Command::new("kill").arg(pid.to_string()).output();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            use std::process::Command;
-
-            // Get all claude process PIDs
-            let pgrep_output = Command::new("pgrep").arg("-f").arg("claude").output();
-
-            if let Ok(output) = pgrep_output {
-                let pids_str = String::from_utf8_lossy(&output.stdout);
-                for pid_str in pids_str.lines() {
-                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        // Skip our own process
-                        if pid == current_pid {
-                            continue;
-                        }
-
-                        // On Linux, check /proc/<pid>/cwd symlink
-                        let cwd_path = format!("/proc/{}/cwd", pid);
-                        if let Ok(cwd) = std::fs::read_link(&cwd_path) {
-                            let cwd_str = cwd.to_string_lossy();
-                            // Only kill if CWD is exactly the worktree or inside it
-                            if cwd_str == worktree_str || cwd_str.starts_with(&format!("{}/", worktree_str)) {
-                                log::info!(
-                                    "Killing orphaned claude process {} in worktree {}",
-                                    pid,
-                                    worktree_str
-                                );
-                                let _ = Command::new("kill").arg(pid.to_string()).output();
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 
     fn spawn_agent_for_message(
@@ -1801,6 +1476,10 @@ impl BotsterApp {
             log::info!("Copied .botster_init from main repo to worktree");
         }
 
+        // Kill any existing orphaned claude processes for this worktree
+        // (Currently just logs diagnostics without killing)
+        kill_orphaned_processes(&worktree_path);
+
         let id = uuid::Uuid::new_v4();
         let mut agent = Agent::new(
             id,
@@ -1871,11 +1550,25 @@ impl BotsterApp {
 
         // Add agent to tracking structures using session key
         let session_key = agent.session_key();
+        let has_tunnel = tunnel_port.is_some();
 
         // Store tunnel port on the agent
         agent.tunnel_port = tunnel_port;
 
-        // Register tunnel port with the tunnel manager
+        self.agent_keys_ordered.push(session_key.clone());
+        self.agents.insert(session_key.clone(), agent);
+
+        // For tunnel agents, send heartbeat FIRST to ensure Hub exists in Rails
+        // before the tunnel manager tries to register the agent
+        if has_tunnel {
+            log::debug!("Sending immediate heartbeat for tunnel agent (from message)");
+            self.last_heartbeat = Instant::now() - Duration::from_secs(60);
+            if let Err(e) = self.send_heartbeat() {
+                log::warn!("Failed to send pre-tunnel heartbeat: {}", e);
+            }
+        }
+
+        // Register tunnel port with the tunnel manager (AFTER heartbeat creates the Hub)
         if let Some(port) = tunnel_port {
             let tunnel_manager = self.tunnel_manager.clone();
             let session_key_clone = session_key.clone();
@@ -1883,9 +1576,6 @@ impl BotsterApp {
                 tunnel_manager.register_agent(session_key_clone, port).await;
             });
         }
-
-        self.agent_keys_ordered.push(session_key.clone());
-        self.agents.insert(session_key, agent);
 
         Ok(())
     }
@@ -1906,6 +1596,13 @@ impl BotsterApp {
                     selected: idx == self.selected,
                     tunnel_port: agent.tunnel_port,
                     hub_identifier: hub_identifier.clone(),
+                    server_running: agent.is_server_running(),
+                    has_server_pty: agent.has_server_pty(),
+                    active_pty_view: match agent.active_pty {
+                        PtyView::Cli => "cli".to_string(),
+                        PtyView::Server => "server".to_string(),
+                    },
+                    scroll_offset: agent.get_scroll_offset(),
                 })
             })
             .collect()
@@ -2044,9 +1741,18 @@ impl BotsterApp {
         let webrtc_handler = Arc::clone(&self.webrtc_handler);
         let offer_sdp_owned = offer_sdp.to_string();
 
+        // Use timeout to prevent blocking if WebRTC handler hangs
         let answer_sdp = self.tokio_runtime.block_on(async move {
-            let mut handler = webrtc_handler.lock().unwrap();
-            handler.handle_offer(&offer_sdp_owned, &ice_servers).await
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                async {
+                    let mut handler = webrtc_handler.lock().unwrap();
+                    handler.handle_offer(&offer_sdp_owned, &ice_servers).await
+                }
+            ).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("WebRTC offer handling timed out")),
+            }
         })?;
 
         log::info!(
@@ -2090,11 +1796,42 @@ impl BotsterApp {
     }
 }
 
+/// Guard struct that ensures terminal cleanup on drop (including panics)
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        // Always attempt to restore terminal state
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
+        // Try to show cursor
+        let _ = execute!(std::io::stdout(), crossterm::cursor::Show);
+    }
+}
+
 fn run_interactive() -> Result<()> {
+    // Set up signal handlers for clean shutdown (Ctrl+C/SIGINT, SIGTERM, SIGHUP)
+    // Using signal-hook's flag API for reliable signal handling in PTY environments
+    use signal_hook::consts::signal::*;
+    use signal_hook::flag;
+
+    // Register signal handlers that directly set the SHUTDOWN_FLAG
+    // This is more reliable than using a separate thread, especially in forked processes
+    flag::register(SIGINT, Arc::clone(&SHUTDOWN_FLAG))?;
+    flag::register(SIGTERM, Arc::clone(&SHUTDOWN_FLAG))?;
+    flag::register(SIGHUP, Arc::clone(&SHUTDOWN_FLAG))?;
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
+    // Create guard AFTER setup - it will cleanup on drop (including panics)
+    let _terminal_guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -2107,14 +1844,31 @@ fn run_interactive() -> Result<()> {
     // Create app with initial dimensions
     let mut app = BotsterApp::new(terminal_rows, terminal_cols)?;
 
-    // Main loop
-    while !app.quit {
-        // Get browser dimensions if WebRTC is connected
+    // Main loop - check both app.quit and signal-triggered shutdown
+    while !app.quit && !shutdown_requested() {
+        // IMPORTANT: Handle keyboard input FIRST before any blocking operations
+        // This ensures Ctrl+Q always works even if WebRTC operations are slow
+        let _ = app.handle_events()?;
+
+        // Check for shutdown after handling events (in case Ctrl+Q was pressed)
+        if app.quit || shutdown_requested() {
+            break;
+        }
+
+        // Get browser dimensions if WebRTC is connected (with timeout to prevent blocking)
         let browser_dims: Option<BrowserDimensions> = {
             let webrtc_handler = Arc::clone(&app.webrtc_handler);
             app.tokio_runtime.block_on(async move {
-                let handler = webrtc_handler.lock().unwrap();
-                handler.get_browser_dimensions().await
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    async {
+                        let handler = webrtc_handler.lock().unwrap();
+                        handler.get_browser_dimensions().await
+                    }
+                ).await {
+                    Ok(dims) => dims,
+                    Err(_) => None, // Timeout - skip this iteration
+                }
             })
         };
 
@@ -2175,16 +1929,22 @@ fn run_interactive() -> Result<()> {
         let (ansi_output, rows, cols) = app.view(&mut terminal, browser_dims)?;
 
         // Stream TUI screen to WebRTC connected browsers (full TUI mode)
+        // Use timeout to prevent blocking if WebRTC connection is in bad state
         {
             let webrtc_handler = Arc::clone(&app.webrtc_handler);
             let ansi_for_send = ansi_output.clone();
             app.tokio_runtime.block_on(async move {
-                let handler = webrtc_handler.lock().unwrap();
-                if handler.is_ready().await {
-                    if let Err(e) = handler.send_screen(&ansi_for_send, rows, cols).await {
-                        log::warn!("Failed to send screen to WebRTC: {}", e);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    async {
+                        let handler = webrtc_handler.lock().unwrap();
+                        if handler.is_ready().await {
+                            if let Err(e) = handler.send_screen(&ansi_for_send, rows, cols).await {
+                                log::warn!("Failed to send screen to WebRTC: {}", e);
+                            }
+                        }
                     }
-                }
+                ).await;
             });
         }
 
@@ -2204,15 +1964,21 @@ fn run_interactive() -> Result<()> {
                         let agent_output = agent.get_screen_as_ansi();
                         let agent_id = key.clone();
                         let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                        // Use timeout to prevent blocking main loop
                         app.tokio_runtime.block_on(async move {
-                            let handler = webrtc_handler.lock().unwrap();
-                            if handler.is_ready().await {
-                                if let Err(e) =
-                                    handler.send_agent_output(&agent_id, &agent_output).await
-                                {
-                                    log::warn!("Failed to send agent output to WebRTC: {}", e);
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(50),
+                                async {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    if handler.is_ready().await {
+                                        if let Err(e) =
+                                            handler.send_agent_output(&agent_id, &agent_output).await
+                                        {
+                                            log::warn!("Failed to send agent output to WebRTC: {}", e);
+                                        }
+                                    }
                                 }
-                            }
+                            ).await;
                         });
                     }
                 }
@@ -2222,9 +1988,18 @@ fn run_interactive() -> Result<()> {
         // Process keyboard input from WebRTC browser connections
         {
             let webrtc_handler = Arc::clone(&app.webrtc_handler);
+            // Use timeout to prevent blocking main loop
             let inputs = app.tokio_runtime.block_on(async move {
-                let handler = webrtc_handler.lock().unwrap();
-                handler.get_pending_inputs().await
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(5),
+                    async {
+                        let handler = webrtc_handler.lock().unwrap();
+                        handler.get_pending_inputs().await
+                    }
+                ).await {
+                    Ok(inputs) => inputs,
+                    Err(_) => vec![], // Timeout - no inputs this iteration
+                }
             });
 
             for input in inputs {
@@ -2240,10 +2015,19 @@ fn run_interactive() -> Result<()> {
 
         // Process commands from WebRTC browser connections
         {
+            // Get pending commands with a short timeout to prevent blocking
             let webrtc_handler = Arc::clone(&app.webrtc_handler);
             let commands = app.tokio_runtime.block_on(async move {
-                let handler = webrtc_handler.lock().unwrap();
-                handler.get_pending_commands().await
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(5),
+                    async {
+                        let handler = webrtc_handler.lock().unwrap();
+                        handler.get_pending_commands().await
+                    }
+                ).await {
+                    Ok(cmds) => cmds,
+                    Err(_) => vec![], // Timeout - no commands this iteration
+                }
             });
 
             for command in commands {
@@ -2251,11 +2035,17 @@ fn run_interactive() -> Result<()> {
                     BrowserCommand::ListAgents => {
                         let agents = app.build_web_agent_list();
                         let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                        // Use timeout to prevent blocking main loop
                         app.tokio_runtime.block_on(async move {
-                            let handler = webrtc_handler.lock().unwrap();
-                            if let Err(e) = handler.send_agents(agents).await {
-                                log::warn!("Failed to send agent list: {}", e);
-                            }
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(50),
+                                async {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    if let Err(e) = handler.send_agents(agents).await {
+                                        log::warn!("Failed to send agent list: {}", e);
+                                    }
+                                }
+                            ).await;
                         });
                     }
                     BrowserCommand::SelectAgent { id } => {
@@ -2275,16 +2065,22 @@ fn run_interactive() -> Result<()> {
 
                                 let webrtc_handler = Arc::clone(&app.webrtc_handler);
                                 let id_clone = id.clone();
+                                // Use timeout to prevent blocking main loop
                                 app.tokio_runtime.block_on(async move {
-                                    let handler = webrtc_handler.lock().unwrap();
-                                    if let Err(e) = handler.send_agent_selected(&id_clone).await {
-                                        log::warn!("Failed to send agent selected: {}", e);
-                                    }
-                                    if let Err(e) =
-                                        handler.send_agent_output(&id_clone, &agent_output).await
-                                    {
-                                        log::warn!("Failed to send agent output: {}", e);
-                                    }
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(50),
+                                        async {
+                                            let handler = webrtc_handler.lock().unwrap();
+                                            if let Err(e) = handler.send_agent_selected(&id_clone).await {
+                                                log::warn!("Failed to send agent selected: {}", e);
+                                            }
+                                            if let Err(e) =
+                                                handler.send_agent_output(&id_clone, &agent_output).await
+                                            {
+                                                log::warn!("Failed to send agent output: {}", e);
+                                            }
+                                        }
+                                    ).await;
                                 });
                             }
                         } else {
@@ -2292,8 +2088,13 @@ fn run_interactive() -> Result<()> {
                             let webrtc_handler = Arc::clone(&app.webrtc_handler);
                             let error_msg = format!("Agent not found: {}", id);
                             app.tokio_runtime.block_on(async move {
-                                let handler = webrtc_handler.lock().unwrap();
-                                let _ = handler.send_error(&error_msg).await;
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(50),
+                                    async {
+                                        let handler = webrtc_handler.lock().unwrap();
+                                        let _ = handler.send_error(&error_msg).await;
+                                    }
+                                ).await;
                             });
                         }
                     }
@@ -2317,11 +2118,17 @@ fn run_interactive() -> Result<()> {
                             })
                             .collect();
                         let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                        // Use timeout to prevent blocking main loop
                         app.tokio_runtime.block_on(async move {
-                            let handler = webrtc_handler.lock().unwrap();
-                            if let Err(e) = handler.send_worktrees(&repo_name, worktrees).await {
-                                log::warn!("Failed to send worktrees: {}", e);
-                            }
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(50),
+                                async {
+                                    let handler = webrtc_handler.lock().unwrap();
+                                    if let Err(e) = handler.send_worktrees(&repo_name, worktrees).await {
+                                        log::warn!("Failed to send worktrees: {}", e);
+                                    }
+                                }
+                            ).await;
                         });
                     }
                     BrowserCommand::CreateAgent { issue_or_branch, prompt } => {
@@ -2337,9 +2144,18 @@ fn run_interactive() -> Result<()> {
                                 if let Some(session_key) = app.agent_keys_ordered.last().cloned() {
                                     // Resize new agent to current browser dimensions
                                     let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                    // Use timeout to prevent blocking
                                     let browser_dims: Option<BrowserDimensions> = app.tokio_runtime.block_on(async {
-                                        let handler = webrtc_handler.lock().unwrap();
-                                        handler.get_browser_dimensions().await
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_millis(50),
+                                            async {
+                                                let handler = webrtc_handler.lock().unwrap();
+                                                handler.get_browser_dimensions().await
+                                            }
+                                        ).await {
+                                            Ok(dims) => dims,
+                                            Err(_) => None,
+                                        }
                                     });
                                     if let Some(dims) = browser_dims {
                                         if let Some(agent) = app.agents.get(&session_key) {
@@ -2358,11 +2174,17 @@ fn run_interactive() -> Result<()> {
 
                                     // Notify browser
                                     let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                    // Use timeout to prevent blocking
                                     app.tokio_runtime.block_on(async move {
-                                        let handler = webrtc_handler.lock().unwrap();
-                                        if let Err(e) = handler.send_agent_created(&session_key).await {
-                                            log::warn!("Failed to send agent created: {}", e);
-                                        }
+                                        let _ = tokio::time::timeout(
+                                            std::time::Duration::from_millis(50),
+                                            async {
+                                                let handler = webrtc_handler.lock().unwrap();
+                                                if let Err(e) = handler.send_agent_created(&session_key).await {
+                                                    log::warn!("Failed to send agent created: {}", e);
+                                                }
+                                            }
+                                        ).await;
                                     });
                                 }
                             }
@@ -2370,9 +2192,15 @@ fn run_interactive() -> Result<()> {
                                 log::error!("WebRTC: Failed to create agent: {}", e);
                                 let webrtc_handler = Arc::clone(&app.webrtc_handler);
                                 let error_msg = format!("Failed to create agent: {}", e);
+                                // Use timeout to prevent blocking
                                 app.tokio_runtime.block_on(async move {
-                                    let handler = webrtc_handler.lock().unwrap();
-                                    let _ = handler.send_error(&error_msg).await;
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(50),
+                                        async {
+                                            let handler = webrtc_handler.lock().unwrap();
+                                            let _ = handler.send_error(&error_msg).await;
+                                        }
+                                    ).await;
                                 });
                             }
                         }
@@ -2389,9 +2217,18 @@ fn run_interactive() -> Result<()> {
                                     if let Some(session_key) = app.agent_keys_ordered.last().cloned() {
                                         // Resize new agent to current browser dimensions
                                         let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                        // Use timeout to prevent blocking
                                         let browser_dims: Option<BrowserDimensions> = app.tokio_runtime.block_on(async {
-                                            let handler = webrtc_handler.lock().unwrap();
-                                            handler.get_browser_dimensions().await
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_millis(50),
+                                                async {
+                                                    let handler = webrtc_handler.lock().unwrap();
+                                                    handler.get_browser_dimensions().await
+                                                }
+                                            ).await {
+                                                Ok(dims) => dims,
+                                                Err(_) => None,
+                                            }
                                         });
                                         if let Some(dims) = browser_dims {
                                             if let Some(agent) = app.agents.get(&session_key) {
@@ -2410,11 +2247,17 @@ fn run_interactive() -> Result<()> {
 
                                         // Notify browser
                                         let webrtc_handler = Arc::clone(&app.webrtc_handler);
+                                        // Use timeout to prevent blocking
                                         app.tokio_runtime.block_on(async move {
-                                            let handler = webrtc_handler.lock().unwrap();
-                                            if let Err(e) = handler.send_agent_created(&session_key).await {
-                                                log::warn!("Failed to send agent created: {}", e);
-                                            }
+                                            let _ = tokio::time::timeout(
+                                                std::time::Duration::from_millis(50),
+                                                async {
+                                                    let handler = webrtc_handler.lock().unwrap();
+                                                    if let Err(e) = handler.send_agent_created(&session_key).await {
+                                                        log::warn!("Failed to send agent created: {}", e);
+                                                    }
+                                                }
+                                            ).await;
                                         });
                                     }
                                 }
@@ -2422,9 +2265,15 @@ fn run_interactive() -> Result<()> {
                                     log::error!("WebRTC: Failed to reopen worktree: {}", e);
                                     let webrtc_handler = Arc::clone(&app.webrtc_handler);
                                     let error_msg = format!("Failed to reopen worktree: {}", e);
+                                    // Use timeout to prevent blocking
                                     app.tokio_runtime.block_on(async move {
-                                        let handler = webrtc_handler.lock().unwrap();
-                                        let _ = handler.send_error(&error_msg).await;
+                                        let _ = tokio::time::timeout(
+                                            std::time::Duration::from_millis(50),
+                                            async {
+                                                let handler = webrtc_handler.lock().unwrap();
+                                                let _ = handler.send_error(&error_msg).await;
+                                            }
+                                        ).await;
                                     });
                                 }
                             }
@@ -2433,9 +2282,15 @@ fn run_interactive() -> Result<()> {
                             log::error!("WebRTC: Worktree not found: {}", path);
                             let webrtc_handler = Arc::clone(&app.webrtc_handler);
                             let error_msg = format!("Worktree not found: {}", path);
+                            // Use timeout to prevent blocking
                             app.tokio_runtime.block_on(async move {
-                                let handler = webrtc_handler.lock().unwrap();
-                                let _ = handler.send_error(&error_msg).await;
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(50),
+                                    async {
+                                        let handler = webrtc_handler.lock().unwrap();
+                                        let _ = handler.send_error(&error_msg).await;
+                                    }
+                                ).await;
                             });
                         }
                     }
@@ -2449,20 +2304,32 @@ fn run_interactive() -> Result<()> {
                             Ok(()) => {
                                 let webrtc_handler = Arc::clone(&app.webrtc_handler);
                                 let id_clone = id.clone();
+                                // Use timeout to prevent blocking
                                 app.tokio_runtime.block_on(async move {
-                                    let handler = webrtc_handler.lock().unwrap();
-                                    if let Err(e) = handler.send_agent_deleted(&id_clone).await {
-                                        log::warn!("Failed to send agent deleted: {}", e);
-                                    }
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(50),
+                                        async {
+                                            let handler = webrtc_handler.lock().unwrap();
+                                            if let Err(e) = handler.send_agent_deleted(&id_clone).await {
+                                                log::warn!("Failed to send agent deleted: {}", e);
+                                            }
+                                        }
+                                    ).await;
                                 });
                             }
                             Err(e) => {
                                 log::error!("WebRTC: Failed to delete agent: {}", e);
                                 let webrtc_handler = Arc::clone(&app.webrtc_handler);
                                 let error_msg = format!("Failed to delete agent: {}", e);
+                                // Use timeout to prevent blocking
                                 app.tokio_runtime.block_on(async move {
-                                    let handler = webrtc_handler.lock().unwrap();
-                                    let _ = handler.send_error(&error_msg).await;
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(50),
+                                        async {
+                                            let handler = webrtc_handler.lock().unwrap();
+                                            let _ = handler.send_error(&error_msg).await;
+                                        }
+                                    ).await;
                                 });
                             }
                         }
@@ -2477,12 +2344,67 @@ fn run_interactive() -> Result<()> {
                             }
                         }
                     }
+                    BrowserCommand::Scroll { direction, lines } => {
+                        // Scroll the selected agent's terminal
+                        if let Some(key) = app.agent_keys_ordered.get(app.selected).cloned() {
+                            if let Some(agent) = app.agents.get_mut(&key) {
+                                match direction.as_str() {
+                                    "up" => {
+                                        agent.scroll_up(lines);
+                                        log::debug!("WebRTC: Scrolled up {} lines, offset now {}", lines, agent.get_scroll_offset());
+                                    }
+                                    "down" => {
+                                        agent.scroll_down(lines);
+                                        log::debug!("WebRTC: Scrolled down {} lines, offset now {}", lines, agent.get_scroll_offset());
+                                    }
+                                    _ => {
+                                        log::warn!("WebRTC: Unknown scroll direction: {}", direction);
+                                    }
+                                }
+                                // Force screen refresh by clearing the hash
+                                app.last_agent_screen_hash.remove(&key);
+                            }
+                        }
+                    }
+                    BrowserCommand::ScrollToTop => {
+                        // Scroll to top of selected agent's terminal
+                        if let Some(key) = app.agent_keys_ordered.get(app.selected).cloned() {
+                            if let Some(agent) = app.agents.get_mut(&key) {
+                                agent.scroll_to_top();
+                                log::debug!("WebRTC: Scrolled to top, offset now {}", agent.get_scroll_offset());
+                                // Force screen refresh
+                                app.last_agent_screen_hash.remove(&key);
+                            }
+                        }
+                    }
+                    BrowserCommand::ScrollToBottom => {
+                        // Scroll to bottom of selected agent's terminal (return to live view)
+                        if let Some(key) = app.agent_keys_ordered.get(app.selected).cloned() {
+                            if let Some(agent) = app.agents.get_mut(&key) {
+                                agent.scroll_to_bottom();
+                                log::debug!("WebRTC: Scrolled to bottom (live view)");
+                                // Force screen refresh
+                                app.last_agent_screen_hash.remove(&key);
+                            }
+                        }
+                    }
+                    BrowserCommand::TogglePtyView => {
+                        // Toggle between CLI and Server PTY views for selected agent
+                        if let Some(key) = app.agent_keys_ordered.get(app.selected).cloned() {
+                            if let Some(agent) = app.agents.get_mut(&key) {
+                                agent.toggle_pty_view();
+                                log::info!("WebRTC: Toggled PTY view to {:?}", agent.active_pty);
+                                // Force screen refresh
+                                app.last_agent_screen_hash.remove(&key);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // Handle local keyboard input (non-blocking)
-        let _ = app.handle_events()?;
+        // Note: handle_events() is called at the START of the loop to ensure
+        // keyboard input (especially Ctrl+Q) is always responsive
 
         // Poll for new messages from server
         if let Err(e) = app.poll_messages() {
@@ -2501,173 +2423,8 @@ fn run_interactive() -> Result<()> {
         std::thread::sleep(Duration::from_millis(16));
     }
 
-    // Cleanup
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    Ok(())
-}
-
-fn check_for_updates() -> Result<()> {
-    use semver::Version;
-    use serde_json::Value;
-
-    println!("Current version: {}", VERSION);
-    println!("Checking for updates...");
-
-    let client = reqwest::blocking::Client::new();
-    let response = client
-        .get("https://api.github.com/repos/Tonksthebear/trybotster/releases/latest")
-        .header("User-Agent", "botster-hub")
-        .send()?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("Failed to check for updates: {}", response.status());
-    }
-
-    let release: Value = response.json()?;
-    let latest_version_str = release["tag_name"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid release data"))?
-        .trim_start_matches('v');
-
-    println!("Latest version: {}", latest_version_str);
-
-    let current = Version::parse(VERSION)?;
-    let latest = Version::parse(latest_version_str)?;
-
-    if latest > current {
-        println!("→ Update available! Run 'botster-hub update' to install");
-    } else if latest == current {
-        println!("✓ You are running the latest version");
-    } else {
-        println!("✓ You are running a newer version than the latest release");
-    }
-
-    Ok(())
-}
-
-fn update_binary() -> Result<()> {
-    use semver::Version;
-    use serde_json::Value;
-    use std::env;
-    use std::fs;
-
-    println!("Current version: {}", VERSION);
-    println!("Checking for updates...");
-
-    let client = reqwest::blocking::Client::new();
-    let response = client
-        .get("https://api.github.com/repos/Tonksthebear/trybotster/releases/latest")
-        .header("User-Agent", "botster-hub")
-        .send()?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("Failed to check for updates: {}", response.status());
-    }
-
-    let release: Value = response.json()?;
-    let latest_version_str = release["tag_name"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid release data"))?
-        .trim_start_matches('v');
-
-    println!("Latest version: {}", latest_version_str);
-
-    let current = Version::parse(VERSION)?;
-    let latest = Version::parse(latest_version_str)?;
-
-    if latest <= current {
-        println!("✓ Already running the latest version (or newer)");
-        return Ok(());
-    }
-
-    // Determine platform
-    let platform = if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        "macos-arm64"
-    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        "macos-x86_64"
-    } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        "linux-x86_64"
-    } else {
-        anyhow::bail!("Unsupported platform");
-    };
-
-    let binary_name = format!("botster-hub-{}", platform);
-    let download_url = format!(
-        "https://github.com/Tonksthebear/trybotster/releases/download/v{}/{}",
-        latest_version_str, binary_name
-    );
-    let checksum_url = format!("{}.sha256", download_url);
-
-    println!("Downloading version {}...", latest_version_str);
-
-    // Download binary
-    let binary_response = client
-        .get(&download_url)
-        .header("User-Agent", "botster-hub")
-        .send()?;
-
-    if !binary_response.status().is_success() {
-        anyhow::bail!("Failed to download update: {}", binary_response.status());
-    }
-
-    let binary_data = binary_response.bytes()?;
-
-    // Download checksum
-    let checksum_response = client
-        .get(&checksum_url)
-        .header("User-Agent", "botster-hub")
-        .send()?;
-
-    if checksum_response.status().is_success() {
-        let checksum_text = checksum_response.text()?;
-        let expected_checksum = checksum_text
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Invalid checksum format"))?;
-
-        // Verify checksum
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(&binary_data);
-        let actual_checksum = format!("{:x}", hasher.finalize());
-
-        if actual_checksum != expected_checksum {
-            anyhow::bail!("Checksum verification failed!");
-        }
-        println!("✓ Checksum verified");
-    } else {
-        log::warn!("Could not verify checksum (not found)");
-    }
-
-    // Get current binary path
-    let current_exe = env::current_exe()?;
-    let temp_path = current_exe.with_extension("new");
-
-    // Write new binary to temp location
-    fs::write(&temp_path, &binary_data)?;
-
-    // Make it executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&temp_path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&temp_path, perms)?;
-    }
-
-    // Replace current binary
-    fs::rename(&temp_path, &current_exe)?;
-
-    println!("✓ Successfully updated to version {}", latest_version_str);
-    println!("Please restart botster-hub to use the new version");
-
+    // Cleanup is handled by TerminalGuard's Drop implementation
+    // This ensures proper cleanup even on panic
     Ok(())
 }
 
@@ -2750,6 +2507,25 @@ fn main() -> Result<()> {
         .format_timestamp_secs()
         .init();
 
+    // Set up panic hook to log panics and ensure terminal cleanup
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // Log the panic
+        log::error!("PANIC: {:?}", panic_info);
+
+        // Ensure terminal is cleaned up before printing panic
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            crossterm::cursor::Show
+        );
+
+        // Call the default panic handler
+        default_hook(panic_info);
+    }));
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -2773,257 +2549,29 @@ fn main() -> Result<()> {
             }
         }
         Commands::JsonGet { file, key } => {
-            json_get(&file, &key)?;
+            commands::json::get(&file, &key)?;
         }
         Commands::JsonSet { file, key, value } => {
-            json_set(&file, &key, &value)?;
+            commands::json::set(&file, &key, &value)?;
         }
         Commands::JsonDelete { file, key } => {
-            json_delete(&file, &key)?;
+            commands::json::delete(&file, &key)?;
         }
         Commands::DeleteWorktree { issue_number } => {
-            delete_worktree(issue_number)?;
+            commands::worktree::delete(issue_number)?;
         }
         Commands::ListWorktrees => {
-            list_worktrees()?;
+            commands::worktree::list()?;
         }
         Commands::GetPrompt { worktree_path } => {
-            get_prompt(&worktree_path)?;
+            commands::prompt::get(&worktree_path)?;
         }
         Commands::Update { check } => {
             if check {
-                check_for_updates()?;
+                commands::update::check()?;
             } else {
-                update_binary()?;
+                commands::update::install()?;
             }
-        }
-    }
-
-    Ok(())
-}
-
-fn get_prompt(worktree_path: &str) -> Result<()> {
-    use std::path::PathBuf;
-
-    let path = PathBuf::from(worktree_path);
-    let prompt = PromptManager::get_prompt(&path)?;
-
-    // Print the prompt to stdout so it can be captured
-    print!("{}", prompt);
-
-    Ok(())
-}
-
-fn json_get(file_path: &str, key_path: &str) -> Result<()> {
-    use anyhow::Context;
-    use std::fs;
-    use std::path::Path;
-
-    let path = shellexpand::tilde(file_path);
-    let content = fs::read_to_string(Path::new(path.as_ref()))
-        .with_context(|| format!("Failed to read {}", file_path))?;
-
-    let mut value: serde_json::Value = serde_json::from_str(&content)?;
-
-    // Navigate through the key path
-    for key in key_path.split('.') {
-        value = value
-            .get(key)
-            .with_context(|| format!("Key '{}' not found in path '{}'", key, key_path))?
-            .clone();
-    }
-
-    println!("{}", serde_json::to_string_pretty(&value)?);
-    Ok(())
-}
-
-fn json_set(file_path: &str, key_path: &str, new_value: &str) -> Result<()> {
-    use anyhow::Context;
-    use std::fs;
-    use std::path::Path;
-
-    let path = shellexpand::tilde(file_path);
-    let content = fs::read_to_string(Path::new(path.as_ref()))
-        .with_context(|| format!("Failed to read {}", file_path))?;
-
-    let mut root: serde_json::Value = serde_json::from_str(&content)?;
-
-    // Parse the new value as JSON
-    let parsed_value: serde_json::Value = serde_json::from_str(new_value)
-        .unwrap_or_else(|_| serde_json::Value::String(new_value.to_string()));
-
-    // Split the path and navigate/create structure
-    let keys: Vec<&str> = key_path.split('.').collect();
-    let mut current = &mut root;
-
-    for (i, key) in keys.iter().enumerate() {
-        if i == keys.len() - 1 {
-            // Last key - set the value
-            if let Some(obj) = current.as_object_mut() {
-                obj.insert(key.to_string(), parsed_value.clone());
-            } else {
-                anyhow::bail!("Cannot set key '{}' - parent is not an object", key);
-            }
-        } else {
-            // Navigate/create intermediate objects
-            if !current.is_object() {
-                anyhow::bail!("Cannot navigate through '{}' - not an object", key);
-            }
-
-            let obj = current.as_object_mut().unwrap();
-
-            // If key doesn't exist or exists but isn't an object, create/replace with empty object
-            if !obj.contains_key(*key) || !obj[*key].is_object() {
-                obj.insert(key.to_string(), serde_json::json!({}));
-            }
-            current = obj.get_mut(*key).unwrap();
-        }
-    }
-
-    // Write back to file
-    fs::write(
-        Path::new(path.as_ref()),
-        serde_json::to_string_pretty(&root)?,
-    )?;
-    Ok(())
-}
-
-fn json_delete(file_path: &str, key_path: &str) -> Result<()> {
-    use anyhow::Context;
-    use std::fs;
-    use std::path::Path;
-
-    let path = shellexpand::tilde(file_path);
-    let content = fs::read_to_string(Path::new(path.as_ref()))
-        .with_context(|| format!("Failed to read {}", file_path))?;
-
-    let mut root: serde_json::Value = serde_json::from_str(&content)?;
-
-    // Split the path and navigate to parent
-    let keys: Vec<&str> = key_path.split('.').collect();
-    if keys.is_empty() {
-        anyhow::bail!("Cannot delete root");
-    }
-
-    let mut current = &mut root;
-
-    // Navigate to the parent of the key we want to delete
-    for (i, key) in keys.iter().enumerate() {
-        if i == keys.len() - 1 {
-            // Last key - delete it
-            if let Some(obj) = current.as_object_mut() {
-                obj.remove(*key);
-            } else {
-                anyhow::bail!("Cannot delete key '{}' - parent is not an object", key);
-            }
-        } else {
-            // Navigate to next level
-            if !current.is_object() {
-                anyhow::bail!("Cannot navigate through '{}' - not an object", key);
-            }
-
-            let obj = current.as_object_mut().unwrap();
-            if !obj.contains_key(*key) {
-                // Key doesn't exist, nothing to delete
-                return Ok(());
-            }
-
-            current = obj.get_mut(*key).unwrap();
-        }
-    }
-
-    // Write back to file
-    fs::write(
-        Path::new(path.as_ref()),
-        serde_json::to_string_pretty(&root)?,
-    )?;
-    Ok(())
-}
-
-fn delete_worktree(issue_number: u32) -> Result<()> {
-    let config = Config::load()?;
-    let git_manager = WorktreeManager::new(config.worktree_base);
-
-    git_manager.delete_worktree_by_issue_number(issue_number)?;
-
-    println!("Successfully deleted worktree for issue #{}", issue_number);
-    Ok(())
-}
-
-fn list_worktrees() -> Result<()> {
-    use std::process::Command;
-
-    // Detect current repository
-    let (repo_path, repo_name) = WorktreeManager::detect_current_repo()?;
-
-    println!("Worktrees for repository: {}", repo_name);
-    println!();
-
-    // Run `git worktree list --porcelain` for machine-readable output
-    let output = Command::new("git")
-        .args(&["worktree", "list", "--porcelain"])
-        .current_dir(&repo_path)
-        .output()?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "Failed to list worktrees: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let worktree_output = String::from_utf8_lossy(&output.stdout);
-
-    // Parse porcelain output
-    // Format is:
-    // worktree <path>
-    // HEAD <sha>
-    // branch <ref>
-    // <blank line>
-
-    let mut current_path = String::new();
-    let mut current_branch = String::new();
-    let mut worktrees = Vec::new();
-
-    for line in worktree_output.lines() {
-        if line.starts_with("worktree ") {
-            current_path = line.strip_prefix("worktree ").unwrap_or("").to_string();
-        } else if line.starts_with("branch ") {
-            current_branch = line
-                .strip_prefix("branch refs/heads/")
-                .unwrap_or("")
-                .to_string();
-        } else if line.is_empty() && !current_path.is_empty() {
-            // End of worktree entry
-            worktrees.push((current_path.clone(), current_branch.clone()));
-            current_path.clear();
-            current_branch.clear();
-        }
-    }
-
-    // Handle last entry if file doesn't end with blank line
-    if !current_path.is_empty() {
-        worktrees.push((current_path, current_branch));
-    }
-
-    // Display worktrees in a formatted way
-    if worktrees.is_empty() {
-        println!("No worktrees found");
-    } else {
-        println!("{:<40} {}", "Path", "Branch");
-        println!("{}", "-".repeat(70));
-
-        for (path, branch) in worktrees {
-            // Try to extract issue number from branch name if it follows botster pattern
-            let display_branch = if branch.starts_with("issue-") {
-                branch
-            } else if branch.is_empty() {
-                "(detached)".to_string()
-            } else {
-                branch
-            };
-
-            println!("{:<40} {}", path, display_branch);
         }
     }
 
