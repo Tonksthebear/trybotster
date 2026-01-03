@@ -378,7 +378,12 @@ impl TunnelManager {
         headers: &HashMap<String, String>,
         body: &str,
     ) -> TunnelResponse {
-        let client = reqwest::Client::new();
+        // Don't follow redirects - return them to the browser so it can navigate
+        // This is important for OAuth flows that redirect to external sites
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let url = if query.is_empty() {
             format!("http://localhost:{}{}", port, path)
         } else {
@@ -412,9 +417,16 @@ impl TunnelManager {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("text/html")
                     .to_string();
+                // Filter out headers that shouldn't be forwarded:
+                // - content-encoding: reqwest auto-decompresses, so this would be misleading
+                // - transfer-encoding: handled by the WebSocket transport
                 let resp_headers: HashMap<String, String> = resp
                     .headers()
                     .iter()
+                    .filter(|(k, _)| {
+                        let name = k.as_str().to_lowercase();
+                        name != "content-encoding" && name != "transfer-encoding"
+                    })
                     .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
                     .collect();
                 let body = resp.text().await.unwrap_or_default();

@@ -40,12 +40,14 @@ Rails.application.routes.draw do
   resources :tunnel_shares, only: [ :create, :destroy ], param: :hub_agent_id
 
   # Private tunnel preview (authenticated, user's own hubs only)
+  # format: false prevents Rails from extracting .css/.js as format (keeps full path)
   get "preview/:hub_id/:agent_id", to: "preview#proxy", as: :tunnel_root, defaults: { path: "" }
-  get "preview/:hub_id/:agent_id/*path", to: "preview#proxy", as: :tunnel_preview
-  post "preview/:hub_id/:agent_id/*path", to: "preview#proxy"
-  patch "preview/:hub_id/:agent_id/*path", to: "preview#proxy"
-  put "preview/:hub_id/:agent_id/*path", to: "preview#proxy"
-  delete "preview/:hub_id/:agent_id/*path", to: "preview#proxy"
+  get "preview/:hub_id/:agent_id/sw.js", to: "preview#service_worker", as: :tunnel_service_worker
+  get "preview/:hub_id/:agent_id/*path", to: "preview#proxy", as: :tunnel_preview, format: false
+  post "preview/:hub_id/:agent_id/*path", to: "preview#proxy", format: false
+  patch "preview/:hub_id/:agent_id/*path", to: "preview#proxy", format: false
+  put "preview/:hub_id/:agent_id/*path", to: "preview#proxy", format: false
+  delete "preview/:hub_id/:agent_id/*path", to: "preview#proxy", format: false
 
   # Public shared tunnel (token-based, no auth required)
   get "share/:token", to: "shared_tunnels#proxy", as: :shared_tunnel, defaults: { path: "" }

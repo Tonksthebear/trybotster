@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Loading Preview...</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #111827;
+      color: white;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0;
+    }
+    .container { text-align: center; }
+    .spinner {
+      width: 48px;
+      height: 48px;
+      border: 3px solid transparent;
+      border-top-color: white;
+      border-radius: 50%;
+      margin: 0 auto 16px;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .title { font-size: 18px; font-weight: 500; margin: 0 0 8px; }
+    .subtitle { font-size: 14px; color: #9ca3af; margin: 0; }
+    .error { color: #ef4444; }
+  </style>
+</head>
+<body>
+  <div class="container" id="status">
+    <div class="spinner"></div>
+    <p class="title">Initializing secure tunnel...</p>
+    <p class="subtitle">This only happens once per session</p>
+  </div>
+
+  <script>
+    (function() {
+      const SW_PATH = '<%= @sw_path %>';
+      const SCOPE = '<%= @scope %>';
+      const SW_VERSION = '<%= @sw_version %>';
+
+      if (!('serviceWorker' in navigator)) {
+        showError('Service Workers not supported in this browser');
+        return;
+      }
+
+      initServiceWorker();
+
+      async function initServiceWorker() {
+        try {
+          // Unregister any existing SW for this scope to ensure fresh install
+          const registrations = await navigator.serviceWorker.getRegistrations();
+          for (const reg of registrations) {
+            if (reg.scope.includes(SCOPE)) {
+              await reg.unregister();
+            }
+          }
+
+          // Register fresh SW
+          const registration = await navigator.serviceWorker.register(SW_PATH, { scope: SCOPE });
+          const sw = registration.installing || registration.waiting || registration.active;
+
+          if (sw.state === 'activated') {
+            await waitForControlled();
+            onReady();
+          } else {
+            sw.addEventListener('statechange', async function() {
+              if (sw.state === 'activated') {
+                await waitForControlled();
+                onReady();
+              }
+            });
+          }
+        } catch (error) {
+          console.error('SW initialization failed:', error);
+          showError('Failed to initialize tunnel: ' + error.message);
+        }
+      }
+
+      // Wait for the SW to actually control this page (after clients.claim())
+      async function waitForControlled() {
+        if (navigator.serviceWorker.controller) {
+          return;
+        }
+        return new Promise(resolve => {
+          navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
+        });
+      }
+
+      function onReady() {
+        // Set cookie with version to track SW state
+        const cookiePath = SCOPE.replace(/\/$/, '');
+        document.cookie = 'tunnel_sw=' + SW_VERSION + '; path=' + cookiePath + '; SameSite=Strict';
+        location.reload();
+      }
+
+      function showError(message) {
+        document.getElementById('status').innerHTML =
+          '<p class="title error">Tunnel Error</p>' +
+          '<p class="subtitle">' + message + '</p>';
+      }
+    })();
+  </script>
+</body>
+</html>

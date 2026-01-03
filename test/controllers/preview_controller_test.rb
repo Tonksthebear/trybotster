@@ -5,6 +5,14 @@ require "test_helper"
 class PreviewControllerTest < ActionDispatch::IntegrationTest
   include Devise::Test::IntegrationHelpers
 
+  # Helper to get request options with SW cookie (version hash)
+  def with_sw_cookie
+    version = Digest::MD5.hexdigest(
+      File.read(Rails.root.join("app/views/preview/service_worker.js.erb"))
+    )[0..7]
+    { headers: { "Cookie" => "tunnel_sw=#{version}" } }
+  end
+
   setup do
     @user = users(:one)
     @other_user = users(:two)
@@ -71,12 +79,35 @@ class PreviewControllerTest < ActionDispatch::IntegrationTest
     assert_includes response.body, "Hub not found"
   end
 
+  test "shows bootstrap page when service worker not installed" do
+    sign_in @user
+
+    get tunnel_root_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key)
+
+    assert_response :ok
+    assert_includes response.body, "Initializing secure tunnel"
+    assert_includes response.body, "serviceWorker"
+    assert_includes response.body, "/preview/#{@hub.identifier}/#{@hub_agent.session_key}/sw.js"
+  end
+
+  test "serves service worker javascript" do
+    sign_in @user
+
+    get tunnel_service_worker_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key)
+
+    assert_response :ok
+    assert_equal "application/javascript", response.content_type
+    assert_includes response.body, "PROXY_BASE"
+    assert_includes response.body, "/preview/#{@hub.identifier}/#{@hub_agent.session_key}"
+    assert_includes response.body, "self.addEventListener('fetch'"
+  end
+
   test "proxies request when tunnel connected" do
     sign_in @user
     response_data = { "status" => 200, "body" => "<h1>Hello</h1>", "content_type" => "text/html" }
 
     MockHelper.mock_tunnel_response_store(response_data) do
-      get tunnel_preview_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key, path: "posts")
+      get tunnel_preview_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key, path: "posts"), **with_sw_cookie
     end
 
     assert_response :ok
@@ -89,7 +120,7 @@ class PreviewControllerTest < ActionDispatch::IntegrationTest
     sign_in @user
 
     MockHelper.mock_tunnel_response_store(nil) do
-      get tunnel_preview_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key, path: "posts")
+      get tunnel_preview_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key, path: "posts"), **with_sw_cookie
     end
 
     assert_response :gateway_timeout
@@ -102,7 +133,7 @@ class PreviewControllerTest < ActionDispatch::IntegrationTest
 
     MockHelper.mock_tunnel_response_store(response_data) do
       post tunnel_preview_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key, path: "posts"),
-           params: { title: "Test" }
+           params: { title: "Test" }, **with_sw_cookie
     end
 
     assert_response :created
@@ -114,7 +145,7 @@ class PreviewControllerTest < ActionDispatch::IntegrationTest
 
     MockHelper.mock_tunnel_response_store(response_data) do
       put tunnel_preview_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key, path: "posts/1"),
-          params: { title: "Updated" }
+          params: { title: "Updated" }, **with_sw_cookie
     end
 
     assert_response :ok
@@ -125,7 +156,7 @@ class PreviewControllerTest < ActionDispatch::IntegrationTest
     response_data = { "status" => 204, "body" => "", "content_type" => "text/plain" }
 
     MockHelper.mock_tunnel_response_store(response_data) do
-      delete tunnel_preview_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key, path: "posts/1")
+      delete tunnel_preview_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key, path: "posts/1"), **with_sw_cookie
     end
 
     assert_response :no_content
@@ -138,7 +169,7 @@ class PreviewControllerTest < ActionDispatch::IntegrationTest
     @hub_agent.update!(tunnel_last_request_at: nil)
 
     MockHelper.mock_tunnel_response_store(response_data) do
-      get tunnel_root_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key)
+      get tunnel_root_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key), **with_sw_cookie
     end
 
     @hub_agent.reload
@@ -158,7 +189,7 @@ class PreviewControllerTest < ActionDispatch::IntegrationTest
     }
 
     MockHelper.mock_tunnel_response_store(response_data) do
-      get tunnel_root_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key)
+      get tunnel_root_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key), **with_sw_cookie
     end
 
     assert_response :ok
@@ -171,7 +202,7 @@ class PreviewControllerTest < ActionDispatch::IntegrationTest
     response_data = { "status" => 200, "body" => "Root", "content_type" => "text/html" }
 
     MockHelper.mock_tunnel_response_store(response_data) do
-      get tunnel_root_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key)
+      get tunnel_root_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key), **with_sw_cookie
     end
 
     assert_response :ok
@@ -198,7 +229,7 @@ class PreviewControllerTest < ActionDispatch::IntegrationTest
     response_data = { "status" => 200, "body" => html_with_absolute_urls, "content_type" => "text/html" }
 
     MockHelper.mock_tunnel_response_store(response_data) do
-      get tunnel_preview_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key, path: "page")
+      get tunnel_preview_url(hub_id: @hub.identifier, agent_id: @hub_agent.session_key, path: "page"), **with_sw_cookie
     end
 
     assert_response :ok

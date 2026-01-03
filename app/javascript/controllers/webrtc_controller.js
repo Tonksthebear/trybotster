@@ -1024,6 +1024,45 @@ export default class extends Controller {
     return agent?.has_server_pty || false;
   }
 
+  // Clear tunnel service worker and cookie for selected agent (debug helper)
+  async clearTunnelCache() {
+    const agent = this.getSelectedAgent();
+    if (!agent) {
+      alert("No agent selected");
+      return;
+    }
+
+    if (!agent.hub_identifier) {
+      alert("Agent has no hub identifier");
+      return;
+    }
+
+    const scope = `/preview/${agent.hub_identifier}/${agent.id}/`;
+    const cookiePath = `/preview/${agent.hub_identifier}/${agent.id}`;
+
+    try {
+      // Unregister service worker for this scope
+      if ("serviceWorker" in navigator) {
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        for (const registration of registrations) {
+          if (registration.scope.includes(scope) || registration.scope.includes(cookiePath)) {
+            await registration.unregister();
+            console.log(`Unregistered SW for scope: ${registration.scope}`);
+          }
+        }
+      }
+
+      // Clear the tunnel_sw cookie by setting it to expire
+      document.cookie = `tunnel_sw=; path=${cookiePath}; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Strict`;
+      document.cookie = `tunnel_sw=; path=${scope}; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Strict`;
+
+      alert(`Cleared tunnel cache for ${agent.id}\n\nScope: ${scope}\n\nRefresh the preview page to re-initialize.`);
+    } catch (error) {
+      console.error("Failed to clear tunnel cache:", error);
+      alert(`Error clearing tunnel cache: ${error.message}`);
+    }
+  }
+
   initializeTerminal() {
     if (!Terminal) {
       console.error("Terminal not loaded yet, retrying in 100ms...");

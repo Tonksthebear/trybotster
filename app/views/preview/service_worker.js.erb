@@ -1,0 +1,57 @@
+// Tunnel Service Worker
+// Intercepts requests and rewrites URLs to route through the tunnel proxy
+
+const SW_VERSION = '<%= Digest::MD5.hexdigest(File.read(Rails.root.join("app/views/preview/service_worker.js.erb")))[0..7] %>';
+const PROXY_BASE = '<%= @proxy_base %>';
+
+// Take control immediately on activation
+self.addEventListener('activate', (event) => {
+  event.waitUntil(clients.claim());
+});
+
+// Skip waiting when installed
+self.addEventListener('install', (event) => {
+  event.waitUntil(self.skipWaiting());
+});
+
+// Intercept all fetch requests
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+
+  // Only intercept same-origin requests
+  if (url.origin !== location.origin) {
+    return;
+  }
+
+  // Skip if already going through proxy
+  if (url.pathname.startsWith('/preview/') || url.pathname.startsWith('/share/')) {
+    return;
+  }
+
+  // Rewrite all other same-origin requests to go through the tunnel proxy
+  const proxiedUrl = new URL(PROXY_BASE + url.pathname + url.search, location.origin);
+
+  event.respondWith(
+    fetch(proxiedUrl.toString(), {
+      method: event.request.method,
+      headers: event.request.headers,
+      body: event.request.body,
+      mode: 'same-origin',
+      credentials: 'same-origin',
+      redirect: 'manual'  // Don't follow redirects - let browser handle navigation
+    }).then((response) => {
+      // For redirect responses, return them as-is so browser can navigate
+      // This handles OAuth redirects to external sites like github.com
+      if (response.type === 'opaqueredirect' || response.status >= 300 && response.status < 400) {
+        return response;
+      }
+      return response;
+    }).catch((error) => {
+      console.error('Tunnel SW fetch error:', error);
+      return new Response(`Tunnel error: ${error.message}`, {
+        status: 502,
+        statusText: 'Bad Gateway'
+      });
+    })
+  );
+});
