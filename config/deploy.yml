@@ -89,16 +89,16 @@ builder:
   # secrets:
   #   - GITHUB_TOKEN
   #   - RAILS_MASTER_KEY
+
 # Use a different ssh user than root
 # ssh:
 #   user: app
 
-# Use accessory services (secrets come from .kamal/secrets).
+# No accessories needed - terminal relay is handled by Action Cable within the Rails app
 # accessories:
 #   db:
 #     image: mysql:8.0
 #     host: 192.168.0.2
-#     # Change to 3306 to expose port to the world instead of just local network.
 #     port: "127.0.0.1:3306:3306"
 #     env:
 #       clear:

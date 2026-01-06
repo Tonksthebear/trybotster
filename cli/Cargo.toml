@@ -50,14 +50,22 @@ bytes = "1.0"
 shellexpand = "3.1"
 sha2 = "0.10"
 semver = "1.0"
+hostname = "0.4"
 
-# WebRTC for P2P browser connection
-webrtc = "0.11"
+# E2E encryption - compatible with TweetNaCl box API (X25519 + XSalsa20-Poly1305)
+crypto_box = "0.9"
+rand = "0.8"
 base64 = "0.22"
 
-# WebSocket for tunnel connection
-tokio-tungstenite = "0.24"
+# WebSocket for Action Cable terminal relay
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
+
+# QR code generation for browser connection
+qrcode = "0.14"
+
+# Clipboard support for copying URLs
+arboard = "3.4"
 
 [dev-dependencies]
 tempfile = "3.23"

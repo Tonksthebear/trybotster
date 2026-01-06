@@ -23,7 +23,15 @@ use ratatui::{
 };
 use std::fmt::Write;
 
-use crate::webrtc_handler::KeyInput;
+/// Browser keyboard input - sent from browser terminal to CLI.
+#[derive(Debug, Clone)]
+pub struct KeyInput {
+    pub key: String,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+}
 
 /// Creates a centered rectangle within a parent area.
 ///
@@ -376,6 +384,7 @@ mod tests {
             ctrl: false,
             alt: false,
             shift: false,
+            meta: false,
         };
         let result = convert_browser_key_to_crossterm(&input);
 
@@ -392,6 +401,7 @@ mod tests {
             ctrl: true,
             alt: false,
             shift: false,
+            meta: false,
         };
         let result = convert_browser_key_to_crossterm(&input);
 
@@ -408,6 +418,7 @@ mod tests {
             ctrl: false,
             alt: false,
             shift: false,
+            meta: false,
         };
         let result = convert_browser_key_to_crossterm(&input);
 
@@ -422,6 +433,7 @@ mod tests {
             ctrl: false,
             alt: false,
             shift: false,
+            meta: false,
         };
         let result = convert_browser_key_to_crossterm(&input);
 
@@ -436,6 +448,7 @@ mod tests {
             ctrl: false,
             alt: false,
             shift: false,
+            meta: false,
         };
         let result = convert_browser_key_to_crossterm(&input);
 
@@ -449,6 +462,7 @@ mod tests {
             ctrl: false,
             alt: false,
             shift: false,
+            meta: false,
         };
         let result = convert_browser_key_to_crossterm(&input);
 

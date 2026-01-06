@@ -38,7 +38,7 @@ GitHub Issue/PR Comment
 - **🧹 Auto-cleanup**: Closes agents and deletes worktrees when issues are closed
 - **🔄 Smart Deduplication**: Multiple mentions to the same issue ping the existing agent
 - **📡 MCP Integration**: Agents interact with GitHub via Model Context Protocol
-- **🌐 HTTP Tunnel Preview**: View agent dev servers through trybotster.com
+- **🔐 WireGuard VPN**: Direct network access to agent dev servers
 - **🖥️ Web GUI**: Remote control agents via P2P WebRTC connection
 
 ## 📦 Architecture
@@ -57,6 +57,7 @@ GitHub Issue/PR Comment
 │  • Creates Bot::Message records                              │
 │  • Verifies repo access via GitHub API                       │
 │  • Provides MCP tools for agents                             │
+│  • WireGuard VPN coordination (key exchange, IP allocation)  │
 │  • Auto-cleanup on issue/PR close                            │
 │                                                               │
 │  Event Types:                                                │
@@ -314,39 +315,24 @@ BOTSTER_TOKEN=your_api_key  # For MCP server auth
 BOTSTER_TUNNEL_PORT=4001    # Port for HTTP tunnel (if available)
 ```
 
-### HTTP Tunnel Preview
+### WireGuard VPN
 
-Each agent can run a dev server that's accessible through trybotster.com. This enables "Replit-style" live previews of apps being developed by agents.
+Agents connect via WireGuard VPN for direct network access to dev servers.
 
 **How it works:**
 
-1. When an agent spawns, a port (4001-4999) is allocated
-2. If `.botster_server` exists, it runs with `BOTSTER_TUNNEL_PORT` set
-3. The dev server starts on that port
-4. WebSocket tunnel connects the port to trybotster.com
-5. Access the preview at: `https://trybotster.com/preview/:hub_id/:agent_id`
-
-**Setup:**
-
-1. Create `.botster_server` in your repo (see Repository Setup above)
-2. The TUI shows tunnel status: ⬤ connected, ◐ connecting, ○ disconnected
-3. Web GUI shows a green "Preview" link next to connected agents
+1. CLI generates WireGuard keypair locally (stored in `~/.config/botster/wireguard.key`)
+2. CLI registers with Rails (`POST /api/vpn/register`), sends public key
+3. Rails allocates VPN IP (10.100.x.x), returns server config
+4. CLI configures WireGuard interface (`botster0`)
+5. Direct connectivity to agent dev servers via VPN
 
 **Requirements:**
 
-- ActionCable WebSocket connection to trybotster.com
-- nginx must properly forward WebSocket upgrades for `/cable`:
+- **Linux:** WireGuard kernel module
+- **macOS:** `wireguard-go` installed (`brew install wireguard-go`)
 
-```nginx
-location /cable {
-    proxy_pass http://your_upstream;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "Upgrade";  # Capital U required
-    proxy_read_timeout 86400s;
-    proxy_send_timeout 86400s;
-}
-```
+**VPN Status in TUI:** ⬤ connected, ◐ connecting, ○ disconnected
 
 ## 🛠️ Configuration
 
@@ -404,8 +390,12 @@ trybotster/
 ├── app/
 │   ├── models/
 │   │   ├── bot/message.rb           # Message queue
+│   │   ├── vpn_node.rb              # VPN node records
 │   │   ├── github/app.rb            # GitHub API wrapper
 │   │   └── user.rb                  # User auth
+│   │
+│   ├── services/
+│   │   └── wireguard_coordinator.rb # VPN key exchange
 │   │
 │   ├── controllers/
 │   │   ├── bots/messages_controller.rb     # API for daemon
@@ -419,7 +409,7 @@ trybotster/
 │   │   ├── agent.rs                 # Agent PTY management
 │   │   ├── git.rs                   # Worktree operations
 │   │   ├── config.rs                # Configuration
-│   │   ├── tunnel.rs                # HTTP tunnel WebSocket client
+│   │   ├── wireguard.rs             # WireGuard VPN client
 │   │   └── webrtc_handler.rs        # P2P WebRTC for web GUI
 │   └── Cargo.toml
 │
@@ -482,7 +472,7 @@ Bot::Message.create!(
 - [x] Auto-cleanup on issue/PR close
 - [x] Smart agent deduplication
 - [x] Interactive TUI
-- [x] HTTP tunnel preview (Replit-style dev server access)
+- [x] WireGuard VPN (direct network access to dev servers)
 - [x] Web GUI with P2P WebRTC
 - [ ] Agent timeout handling
 - [ ] Metrics and monitoring

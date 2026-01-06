@@ -72,6 +72,8 @@ pub enum InputAction {
     CloseAgentKeepWorktree,
     /// Close agent and delete worktree.
     CloseAgentDeleteWorktree,
+    /// Copy connection URL to clipboard.
+    CopyConnectionUrl,
 }
 
 /// Converts a key event to bytes for forwarding to a PTY.
@@ -292,6 +294,143 @@ pub fn handle_close_confirm_key(code: KeyCode) -> InputAction {
     }
 }
 
+/// Handles key input in connection code display mode.
+///
+/// # Arguments
+///
+/// * `code` - The key code pressed
+///
+/// # Returns
+///
+/// The action to take in response to the key press.
+pub fn handle_connection_code_key(code: KeyCode) -> InputAction {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => InputAction::CloseModal,
+        KeyCode::Char('c') => InputAction::CopyConnectionUrl,
+        _ => InputAction::None,
+    }
+}
+
+/// Parses raw terminal input bytes into KeyCode and KeyModifiers.
+///
+/// This is used to convert browser input (which comes as raw escape sequences)
+/// into structured key events for processing.
+///
+/// # Arguments
+///
+/// * `input` - Raw input string from browser terminal
+///
+/// # Returns
+///
+/// A vector of (KeyCode, KeyModifiers) pairs parsed from the input.
+pub fn parse_terminal_input(input: &str) -> Vec<(KeyCode, KeyModifiers)> {
+    let bytes = input.as_bytes();
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == 27 && i + 2 < bytes.len() && bytes[i + 1] == 91 {
+            // ESC [ sequence - arrow keys, function keys, etc.
+            match bytes.get(i + 2) {
+                Some(65) => {
+                    // Up arrow
+                    result.push((KeyCode::Up, KeyModifiers::NONE));
+                    i += 3;
+                }
+                Some(66) => {
+                    // Down arrow
+                    result.push((KeyCode::Down, KeyModifiers::NONE));
+                    i += 3;
+                }
+                Some(67) => {
+                    // Right arrow
+                    result.push((KeyCode::Right, KeyModifiers::NONE));
+                    i += 3;
+                }
+                Some(68) => {
+                    // Left arrow
+                    result.push((KeyCode::Left, KeyModifiers::NONE));
+                    i += 3;
+                }
+                Some(72) => {
+                    // Home
+                    result.push((KeyCode::Home, KeyModifiers::NONE));
+                    i += 3;
+                }
+                Some(70) => {
+                    // End
+                    result.push((KeyCode::End, KeyModifiers::NONE));
+                    i += 3;
+                }
+                Some(90) => {
+                    // Shift+Tab (BackTab)
+                    result.push((KeyCode::BackTab, KeyModifiers::SHIFT));
+                    i += 3;
+                }
+                Some(51) if bytes.get(i + 3) == Some(&126) => {
+                    // Delete
+                    result.push((KeyCode::Delete, KeyModifiers::NONE));
+                    i += 4;
+                }
+                Some(50) if bytes.get(i + 3) == Some(&126) => {
+                    // Insert
+                    result.push((KeyCode::Insert, KeyModifiers::NONE));
+                    i += 4;
+                }
+                Some(53) if bytes.get(i + 3) == Some(&126) => {
+                    // Page Up
+                    result.push((KeyCode::PageUp, KeyModifiers::NONE));
+                    i += 4;
+                }
+                Some(54) if bytes.get(i + 3) == Some(&126) => {
+                    // Page Down
+                    result.push((KeyCode::PageDown, KeyModifiers::NONE));
+                    i += 4;
+                }
+                _ => {
+                    // Unknown escape sequence, skip ESC
+                    result.push((KeyCode::Esc, KeyModifiers::NONE));
+                    i += 1;
+                }
+            }
+        } else if bytes[i] == 27 {
+            // Bare ESC
+            result.push((KeyCode::Esc, KeyModifiers::NONE));
+            i += 1;
+        } else if bytes[i] == 13 || bytes[i] == 10 {
+            // Enter (CR or LF)
+            result.push((KeyCode::Enter, KeyModifiers::NONE));
+            i += 1;
+        } else if bytes[i] == 9 {
+            // Tab
+            result.push((KeyCode::Tab, KeyModifiers::NONE));
+            i += 1;
+        } else if bytes[i] == 127 || bytes[i] == 8 {
+            // Backspace (DEL or BS)
+            result.push((KeyCode::Backspace, KeyModifiers::NONE));
+            i += 1;
+        } else if bytes[i] < 32 {
+            // Control character (Ctrl+A = 1, Ctrl+B = 2, etc.)
+            let char_code = bytes[i] + b'@';
+            if char_code.is_ascii_alphabetic() {
+                result.push((
+                    KeyCode::Char((char_code as char).to_ascii_lowercase()),
+                    KeyModifiers::CONTROL,
+                ));
+            }
+            i += 1;
+        } else {
+            // Regular character
+            if let Some(c) = char::from_u32(bytes[i] as u32) {
+                result.push((KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            i += 1;
+        }
+    }
+
+    result
+}
+
 /// Dispatches key handling to the appropriate handler based on mode.
 ///
 /// # Arguments
@@ -328,6 +467,7 @@ pub fn dispatch_key_event(
         AppMode::NewAgentCreateWorktree => handle_create_worktree_key(code),
         AppMode::NewAgentPrompt => handle_prompt_input_key(code),
         AppMode::CloseAgentConfirm => handle_close_confirm_key(code),
+        AppMode::ConnectionCode => handle_connection_code_key(code),
     }
 }
 
@@ -523,5 +663,38 @@ mod tests {
             5,
         );
         assert_eq!(action, InputAction::MenuSelect(1));
+    }
+
+    #[test]
+    fn test_connection_code_close() {
+        let esc = handle_connection_code_key(KeyCode::Esc);
+        assert_eq!(esc, InputAction::CloseModal);
+
+        let q = handle_connection_code_key(KeyCode::Char('q'));
+        assert_eq!(q, InputAction::CloseModal);
+
+        let enter = handle_connection_code_key(KeyCode::Enter);
+        assert_eq!(enter, InputAction::CloseModal);
+    }
+
+    #[test]
+    fn test_connection_code_ignores_other_keys() {
+        let action = handle_connection_code_key(KeyCode::Char('a'));
+        assert_eq!(action, InputAction::None);
+    }
+
+    #[test]
+    fn test_dispatch_key_event_connection_code_mode() {
+        let action = dispatch_key_event(
+            &AppMode::ConnectionCode,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            24,
+            0,
+            3,
+            0,
+            5,
+        );
+        assert_eq!(action, InputAction::CloseModal);
     }
 }

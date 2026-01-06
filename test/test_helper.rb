@@ -1,6 +1,10 @@
 ENV["RAILS_ENV"] ||= "test"
 require_relative "../config/environment"
 require "rails/test_help"
+require "webmock/minitest"
+
+# Allow localhost connections for ActionCable tests
+WebMock.disable_net_connect!(allow_localhost: true)
 
 # Set default host for URL generation in tests
 Rails.application.routes.default_url_options[:host] = "test.host"

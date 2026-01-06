@@ -5,6 +5,7 @@ module TunnelProxy
 
   private
 
+  # Proxy HTTP requests through ActionCable to the CLI's local server
   def proxy_to_tunnel(hub_agent)
     request_id = SecureRandom.uuid
     hub = hub_agent.hub
