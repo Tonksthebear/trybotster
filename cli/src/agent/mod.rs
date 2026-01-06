@@ -450,17 +450,59 @@ impl Agent {
     }
 
     /// Resize all PTY sessions to new dimensions.
+    ///
+    /// This clears the vt100 parser screens to ensure content renders at the new
+    /// dimensions. Old content would otherwise be stuck at the old column width.
     pub fn resize(&self, rows: u16, cols: u16) {
+        // Resize the fallback parser
         {
             let mut parser = self.vt100_parser.lock().unwrap();
             parser.screen_mut().set_size(rows, cols);
         }
 
+        // Resize CLI PTY and clear its parser
         if let Some(cli_pty) = &self.cli_pty {
+            let needs_clear = {
+                let parser = cli_pty.vt100_parser.lock().unwrap();
+                let (current_rows, current_cols) = parser.screen().size();
+                current_rows != rows || current_cols != cols
+            };
+
+            if needs_clear {
+                log::info!(
+                    "CLI PTY resize: clearing screen and setting {}x{}",
+                    cols, rows
+                );
+                let mut parser = cli_pty.vt100_parser.lock().unwrap();
+                // Clear screen and scrollback, then set new size
+                // Also reset scroll offset to 0 since scrollback is cleared
+                parser.process(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
+                parser.screen_mut().set_scrollback(0);
+                parser.screen_mut().set_size(rows, cols);
+            }
             cli_pty.resize(rows, cols);
         }
 
+        // Resize Server PTY and clear its parser
         if let Some(server_pty) = &self.server_pty {
+            let needs_clear = {
+                let parser = server_pty.vt100_parser.lock().unwrap();
+                let (current_rows, current_cols) = parser.screen().size();
+                current_rows != rows || current_cols != cols
+            };
+
+            if needs_clear {
+                log::info!(
+                    "Server PTY resize: clearing screen and setting {}x{}",
+                    cols, rows
+                );
+                let mut parser = server_pty.vt100_parser.lock().unwrap();
+                // Clear screen and scrollback, then set new size
+                // Also reset scroll offset to 0 since scrollback is cleared
+                parser.process(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
+                parser.screen_mut().set_scrollback(0);
+                parser.screen_mut().set_size(rows, cols);
+            }
             server_pty.resize(rows, cols);
         }
     }
@@ -811,17 +853,39 @@ impl Agent {
         Ok(())
     }
 
-    /// Write input to the CLI PTY.
+    /// Write input to the currently active PTY (CLI or Server based on active_pty).
     pub fn write_input(&mut self, input: &[u8]) -> Result<()> {
-        if let Some(cli_pty) = &mut self.cli_pty {
-            cli_pty.write_input(input)?;
+        match self.active_pty {
+            PtyView::Cli => {
+                if let Some(cli_pty) = &mut self.cli_pty {
+                    cli_pty.write_input(input)?;
+                }
+            }
+            PtyView::Server => {
+                if let Some(server_pty) = &mut self.server_pty {
+                    server_pty.write_input(input)?;
+                } else {
+                    // Fall back to CLI if no server PTY
+                    if let Some(cli_pty) = &mut self.cli_pty {
+                        cli_pty.write_input(input)?;
+                    }
+                }
+            }
         }
         Ok(())
     }
 
-    /// Write a string to the CLI PTY.
+    /// Write a string to the currently active PTY.
     pub fn write_input_str(&mut self, input: &str) -> Result<()> {
         self.write_input(input.as_bytes())
+    }
+
+    /// Write input specifically to the CLI PTY (for notifications, etc.).
+    pub fn write_input_to_cli(&mut self, input: &[u8]) -> Result<()> {
+        if let Some(cli_pty) = &mut self.cli_pty {
+            cli_pty.write_input(input)?;
+        }
+        Ok(())
     }
 
     /// Add a line to the buffer.
@@ -1016,6 +1080,21 @@ impl Agent {
         screen.scrollback().hash(&mut hasher);
         hasher.finish()
     }
+
+    /// Get the current screen dimensions for debugging.
+    pub fn get_screen_info(&self) -> ScreenInfo {
+        let active_parser = self.get_active_parser();
+        let parser = active_parser.lock().unwrap();
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        ScreenInfo { rows, cols }
+    }
+}
+
+/// Screen dimension info for debugging.
+pub struct ScreenInfo {
+    pub rows: u16,
+    pub cols: u16,
 }
 
 impl Drop for Agent {

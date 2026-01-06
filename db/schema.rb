@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2025_12_23_234751) do
+ActiveRecord::Schema[8.1].define(version: 2026_01_06_012212) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "vector"
@@ -101,6 +101,21 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_23_234751) do
     t.index ["status"], name: "index_bot_messages_on_status"
   end
 
+  create_table "devices", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.string "device_type", null: false
+    t.string "fingerprint", null: false
+    t.datetime "last_seen_at"
+    t.string "name", null: false
+    t.string "public_key", null: false
+    t.datetime "updated_at", null: false
+    t.bigint "user_id", null: false
+    t.index ["fingerprint"], name: "index_devices_on_fingerprint"
+    t.index ["public_key"], name: "index_devices_on_public_key", unique: true
+    t.index ["user_id", "device_type"], name: "index_devices_on_user_id_and_device_type"
+    t.index ["user_id"], name: "index_devices_on_user_id"
+  end
+
   create_table "hub_agents", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.bigint "hub_id", null: false
@@ -120,11 +135,13 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_23_234751) do
 
   create_table "hubs", force: :cascade do |t|
     t.datetime "created_at", null: false
+    t.bigint "device_id"
     t.string "identifier", null: false
     t.datetime "last_seen_at", null: false
     t.string "repo", null: false
     t.datetime "updated_at", null: false
     t.bigint "user_id", null: false
+    t.index ["device_id"], name: "index_hubs_on_device_id"
     t.index ["identifier"], name: "index_hubs_on_identifier", unique: true
     t.index ["repo", "last_seen_at"], name: "index_hubs_on_repo_and_last_seen_at"
     t.index ["user_id"], name: "index_hubs_on_user_id"
@@ -146,7 +163,7 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_23_234751) do
   create_table "memories", force: :cascade do |t|
     t.text "content", null: false
     t.datetime "created_at", null: false
-    t.vector "embedding", limit: 1536
+    t.vector "embedding"
     t.string "memory_type", default: "other"
     t.jsonb "metadata", default: {}
     t.bigint "parent_id"
@@ -212,6 +229,7 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_23_234751) do
     t.string "last_sign_in_ip"
     t.string "provider"
     t.datetime "remember_created_at"
+    t.boolean "server_assisted_pairing", default: false, null: false
     t.integer "sign_in_count", default: 0, null: false
     t.bigint "team_id"
     t.string "uid"
@@ -224,24 +242,13 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_23_234751) do
     t.index ["team_id"], name: "index_users_on_team_id"
   end
 
-  create_table "webrtc_sessions", force: :cascade do |t|
-    t.jsonb "answer"
-    t.datetime "created_at", null: false
-    t.datetime "expires_at", null: false
-    t.jsonb "offer", null: false
-    t.string "status", default: "pending", null: false
-    t.datetime "updated_at", null: false
-    t.bigint "user_id", null: false
-    t.index ["expires_at"], name: "index_webrtc_sessions_on_expires_at"
-    t.index ["status"], name: "index_webrtc_sessions_on_status"
-    t.index ["user_id"], name: "index_webrtc_sessions_on_user_id"
-  end
-
   add_foreign_key "action_mcp_session_messages", "action_mcp_sessions", column: "session_id", name: "fk_action_mcp_session_messages_session_id", on_update: :cascade, on_delete: :cascade
   add_foreign_key "action_mcp_session_resources", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_session_subscriptions", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_sse_events", "action_mcp_sessions", column: "session_id"
+  add_foreign_key "devices", "users"
   add_foreign_key "hub_agents", "hubs"
+  add_foreign_key "hubs", "devices"
   add_foreign_key "hubs", "users"
   add_foreign_key "memories", "memories", column: "parent_id"
   add_foreign_key "memories", "teams"
@@ -249,5 +256,4 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_23_234751) do
   add_foreign_key "memory_tags", "memories"
   add_foreign_key "memory_tags", "tags"
   add_foreign_key "users", "teams"
-  add_foreign_key "webrtc_sessions", "users"
 end

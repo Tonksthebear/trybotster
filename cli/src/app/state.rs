@@ -70,6 +70,14 @@ pub enum AppMode {
     /// - `y/Y/Enter`: Confirm close
     /// - `n/N/Esc/q`: Cancel, return to Normal
     CloseAgentConfirm,
+
+    /// Displaying connection code and QR code for browser access.
+    ///
+    /// Shows the hub identifier and a QR code that can be scanned
+    /// to connect from the web interface.
+    /// Key bindings:
+    /// - `Esc/q/Enter`: Close, return to Normal
+    ConnectionCode,
 }
 
 impl AppMode {
@@ -95,6 +103,7 @@ impl AppMode {
             AppMode::NewAgentCreateWorktree => "Create Worktree",
             AppMode::NewAgentPrompt => "Enter Prompt",
             AppMode::CloseAgentConfirm => "Confirm Close",
+            AppMode::ConnectionCode => "Connection Code",
         }
     }
 }
@@ -135,6 +144,7 @@ mod tests {
         assert!(AppMode::NewAgentCreateWorktree.is_modal());
         assert!(AppMode::NewAgentPrompt.is_modal());
         assert!(AppMode::CloseAgentConfirm.is_modal());
+        assert!(AppMode::ConnectionCode.is_modal());
     }
 
     #[test]
@@ -145,6 +155,7 @@ mod tests {
         assert!(AppMode::NewAgentCreateWorktree.accepts_text_input());
         assert!(AppMode::NewAgentPrompt.accepts_text_input());
         assert!(!AppMode::CloseAgentConfirm.accepts_text_input());
+        assert!(!AppMode::ConnectionCode.accepts_text_input());
     }
 
     #[test]

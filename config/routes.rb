@@ -23,18 +23,36 @@ Rails.application.routes.draw do
     resources :messages, only: [ :index, :update ] # update for acknowledgment
   end
 
-  # WebRTC signaling for P2P browser-to-CLI connections
+  # API namespace for CLI and browser communication
   namespace :api do
-    resources :webrtc_sessions, path: "webrtc/sessions", only: [ :create, :show, :update ]
     resources :agent_notifications, only: [ :create ]
-    resources :hubs, param: :identifier, only: [ :update, :destroy ]
+
+    # Device registration for E2E encryption
+    resources :devices, only: [ :index, :create, :destroy ] do
+      resource :heartbeat, only: [ :update ], controller: "devices/heartbeats"
+    end
+
+    # Hub management (CLI registers/updates hubs)
+    resources :hubs, param: :identifier, only: [ :index, :show, :update, :destroy ] do
+      # Connection info for E2E key exchange (browser fetches CLI's public key)
+      resource :connection, only: [ :show ], controller: "hubs/connections"
+    end
   end
 
   # Agents dashboard - WebRTC P2P connection to local CLI
-  resources :agents, only: [ :index ]
+  resources :agents, only: [ :index ] do
+    collection do
+      # Secure E2E connection - key exchange via URL fragment (MITM-proof)
+      get :connect
+    end
+  end
 
   # Hubs dashboard - live view of active CLI instances
   resources :hubs, only: [ :index ]
+
+  # Connect to a hub by entering connection code
+  get "connect", to: "hubs#connect"
+  post "connect", to: "hubs#lookup"
 
   # Tunnel sharing management (authenticated)
   resources :tunnel_shares, only: [ :create, :destroy ], param: :hub_agent_id

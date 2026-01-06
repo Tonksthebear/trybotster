@@ -235,5 +235,82 @@ module Api
 
       assert_response :success
     end
+
+    # Device association tests - critical for E2E encryption
+    test "update with device_id associates device with hub" do
+      device = Device.create!(
+        user: @user,
+        public_key: "test_public_key_base64",
+        device_type: "cli",
+        name: "Test CLI Device"
+      )
+      identifier = SecureRandom.uuid
+
+      put api_hub_url(identifier: identifier),
+          params: { repo: "owner/repo", agents: [], device_id: device.id },
+          headers: { "X-API-Key" => @user.api_key },
+          as: :json
+
+      assert_response :success
+      json = JSON.parse(response.body)
+      assert json["e2e_enabled"], "E2E should be enabled when device is associated"
+
+      hub = Hub.find(json["hub_id"])
+      assert_equal device, hub.device, "Hub should be associated with the device"
+    end
+
+    test "update without device_id leaves hub device nil" do
+      identifier = SecureRandom.uuid
+
+      put api_hub_url(identifier: identifier),
+          params: { repo: "owner/repo", agents: [] },
+          headers: { "X-API-Key" => @user.api_key },
+          as: :json
+
+      assert_response :success
+      json = JSON.parse(response.body)
+      refute json["e2e_enabled"], "E2E should be disabled when no device is associated"
+
+      hub = Hub.find(json["hub_id"])
+      assert_nil hub.device, "Hub should not have a device when device_id not provided"
+    end
+
+    test "update with invalid device_id ignores device association" do
+      identifier = SecureRandom.uuid
+
+      put api_hub_url(identifier: identifier),
+          params: { repo: "owner/repo", agents: [], device_id: 999999 },
+          headers: { "X-API-Key" => @user.api_key },
+          as: :json
+
+      assert_response :success
+      json = JSON.parse(response.body)
+      refute json["e2e_enabled"], "E2E should be disabled when device_id is invalid"
+
+      hub = Hub.find(json["hub_id"])
+      assert_nil hub.device, "Hub should not have a device when device_id is invalid"
+    end
+
+    test "update with other user device_id ignores device association" do
+      other_device = Device.create!(
+        user: @other_user,
+        public_key: "other_user_public_key",
+        device_type: "cli",
+        name: "Other User CLI"
+      )
+      identifier = SecureRandom.uuid
+
+      put api_hub_url(identifier: identifier),
+          params: { repo: "owner/repo", agents: [], device_id: other_device.id },
+          headers: { "X-API-Key" => @user.api_key },
+          as: :json
+
+      assert_response :success
+      json = JSON.parse(response.body)
+      refute json["e2e_enabled"], "E2E should be disabled when device belongs to other user"
+
+      hub = Hub.find(json["hub_id"])
+      assert_nil hub.device, "Hub should not have a device that belongs to another user"
+    end
   end
 end

@@ -155,7 +155,12 @@ pub const PTY_BORDER_PADDING: u16 = 2;
 // ============================================================================
 
 /// Menu item labels for the main menu popup.
-pub const MENU_ITEMS: &[&str] = &["Toggle Polling", "New Agent", "Close Agent"];
+pub const MENU_ITEMS: &[&str] = &[
+    "Toggle Polling",
+    "New Agent",
+    "Close Agent",
+    "Show Connection Code",
+];
 
 /// Index for "Toggle Polling" menu item.
 pub const MENU_INDEX_TOGGLE_POLLING: usize = 0;
@@ -165,6 +170,9 @@ pub const MENU_INDEX_NEW_AGENT: usize = 1;
 
 /// Index for "Close Agent" menu item.
 pub const MENU_INDEX_CLOSE_AGENT: usize = 2;
+
+/// Index for "Show Connection Code" menu item.
+pub const MENU_INDEX_CONNECTION_CODE: usize = 3;
 
 #[cfg(test)]
 mod tests {
@@ -195,6 +203,7 @@ mod tests {
         assert!(MENU_INDEX_TOGGLE_POLLING < MENU_ITEMS.len());
         assert!(MENU_INDEX_NEW_AGENT < MENU_ITEMS.len());
         assert!(MENU_INDEX_CLOSE_AGENT < MENU_ITEMS.len());
+        assert!(MENU_INDEX_CONNECTION_CODE < MENU_ITEMS.len());
     }
 
     #[test]
