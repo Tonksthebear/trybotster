@@ -11,15 +11,17 @@ module ApplicationCable
     private
 
     def find_verified_user
-      # Try API key auth (for CLI)
-      if (api_key = request.params[:api_key])
-        if (user = User.find_by_api_key(api_key))
-          return user
+      # Try DeviceToken auth (for CLI)
+      if (token = request.params[:api_key])
+        device_token = DeviceToken.find_by(token: token)
+        if device_token
+          device_token.touch_usage!(ip: request.remote_ip)
+          return device_token.user
         end
       end
 
       # Try session auth (for browser)
-      if (user = env["warden"].user)
+      if env["warden"] && (user = env["warden"].user)
         return user
       end
 

@@ -2,7 +2,11 @@
 pub mod agent;
 pub mod agents;
 pub mod app;
+pub mod auth;
 pub mod commands;
+
+// Re-export auth types for tests
+pub use auth::{DeviceCodeResponse, ErrorResponse, TokenResponse};
 pub mod compat;
 pub mod config;
 pub mod constants;

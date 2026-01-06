@@ -24,7 +24,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::Message, tungstenite::client::IntoClientRequest};
 
 /// Message types for terminal relay (CLI -> browser)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,12 +386,50 @@ impl TerminalRelay {
 
         log::info!("Connecting to Action Cable: {}", ws_url);
 
+        // Build request with Origin header (required by ActionCable)
+        let mut request = ws_url
+            .into_client_request()
+            .context("Failed to build WebSocket request")?;
+        // Set Origin header to match the server URL (ActionCable requires this)
+        request.headers_mut().insert(
+            "Origin",
+            self.server_url
+                .parse()
+                .unwrap_or_else(|_| "http://localhost".parse().unwrap()),
+        );
+
         // Connect to WebSocket
-        let (ws_stream, _) = connect_async(&ws_url)
+        let (ws_stream, _) = connect_async(request)
             .await
             .context("Failed to connect to Action Cable")?;
 
         let (mut write, mut read) = ws_stream.split();
+
+        // Wait for Action Cable "welcome" message before subscribing
+        // Action Cable requires this handshake before accepting commands
+        log::debug!("Waiting for Action Cable welcome message...");
+        let welcome_timeout = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                while let Some(msg) = read.next().await {
+                    if let Ok(Message::Text(text)) = msg {
+                        if let Ok(cable_msg) = serde_json::from_str::<IncomingCableMessage>(&text) {
+                            if cable_msg.msg_type.as_deref() == Some("welcome") {
+                                log::info!("Action Cable welcome received");
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                anyhow::bail!("WebSocket closed before welcome")
+            }
+        ).await;
+
+        match welcome_timeout {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!("Timeout waiting for Action Cable welcome"),
+        }
 
         // Build channel identifier
         let identifier = ChannelIdentifier {
@@ -401,7 +439,7 @@ impl TerminalRelay {
         };
         let identifier_json = serde_json::to_string(&identifier)?;
 
-        // Subscribe to channel
+        // Now subscribe to channel (after welcome received)
         let subscribe = CableMessage {
             command: "subscribe".to_string(),
             identifier: identifier_json.clone(),
@@ -409,7 +447,7 @@ impl TerminalRelay {
         };
         write.send(Message::Text(serde_json::to_string(&subscribe)?)).await?;
 
-        log::info!("Subscribed to TerminalChannel for hub {}", hub_identifier);
+        log::info!("Sent subscribe to TerminalChannel for hub {}", hub_identifier);
 
         // Create output sender handle
         let output_sender = TerminalOutputSender {

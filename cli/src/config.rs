@@ -5,6 +5,11 @@ use std::{fs, path::PathBuf};
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
     pub server_url: String,
+    /// New device token from device authorization flow (preferred)
+    #[serde(default)]
+    pub token: String,
+    /// Legacy API key (deprecated, kept for backward compatibility)
+    #[serde(default)]
     pub api_key: String,
     pub poll_interval: u64,
     pub agent_timeout: u64,
@@ -20,6 +25,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server_url: "https://trybotster.com".to_string(),
+            token: String::new(),
             api_key: String::new(),
             poll_interval: 5,
             agent_timeout: 3600,
@@ -73,6 +79,12 @@ impl Config {
             self.server_url = server_url;
         }
 
+        // New token takes precedence over legacy api_key
+        if let Ok(token) = std::env::var("BOTSTER_TOKEN") {
+            self.token = token;
+        }
+
+        // Legacy api_key support
         if let Ok(api_key) = std::env::var("BOTSTER_API_KEY") {
             self.api_key = api_key;
         }
@@ -113,6 +125,47 @@ impl Config {
         fs::write(&config_path, serde_json::to_string_pretty(self)?)?;
         Ok(())
     }
+
+    /// Get the API key to use for authentication.
+    /// Returns the new device token if set, otherwise falls back to legacy api_key.
+    pub fn get_api_key(&self) -> &str {
+        if !self.token.is_empty() {
+            &self.token
+        } else {
+            &self.api_key
+        }
+    }
+
+    /// Check if we have a valid authentication token.
+    /// Only returns true if the token has the expected `btstr_` prefix.
+    /// This ensures legacy api_key values trigger re-authentication.
+    pub fn has_token(&self) -> bool {
+        const TOKEN_PREFIX: &str = "btstr_";
+
+        // New token format takes precedence
+        if !self.token.is_empty() {
+            return self.token.starts_with(TOKEN_PREFIX);
+        }
+
+        // Legacy api_key - only valid if it happens to have btstr_ prefix (unlikely)
+        if !self.api_key.is_empty() {
+            return self.api_key.starts_with(TOKEN_PREFIX);
+        }
+
+        false
+    }
+
+    /// Save a new device token to the config file.
+    pub fn save_token(&mut self, token: &str) -> Result<()> {
+        self.token = token.to_string();
+        self.save()
+    }
+
+    /// Clear the token (for logout).
+    pub fn clear_token(&mut self) -> Result<()> {
+        self.token.clear();
+        self.save()
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +187,43 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(config.server_url, deserialized.server_url);
+    }
+
+    #[test]
+    fn test_get_api_key_prefers_token() {
+        let mut config = Config::default();
+        config.api_key = "legacy_key".to_string();
+        config.token = "new_token".to_string();
+        assert_eq!(config.get_api_key(), "new_token");
+    }
+
+    #[test]
+    fn test_get_api_key_falls_back_to_api_key() {
+        let mut config = Config::default();
+        config.api_key = "legacy_key".to_string();
+        assert_eq!(config.get_api_key(), "legacy_key");
+    }
+
+    #[test]
+    fn test_has_token() {
+        let mut config = Config::default();
+        assert!(!config.has_token());
+
+        // Token must have btstr_ prefix to be valid
+        config.token = "btstr_token123".to_string();
+        assert!(config.has_token());
+
+        // Token without prefix is not valid
+        config.token = "invalid_token".to_string();
+        assert!(!config.has_token());
+
+        // Legacy api_key without prefix is not valid
+        config.token.clear();
+        config.api_key = "legacy_key".to_string();
+        assert!(!config.has_token());
+
+        // api_key with btstr_ prefix would be valid (edge case)
+        config.api_key = "btstr_legacy_key".to_string();
+        assert!(config.has_token());
     }
 }

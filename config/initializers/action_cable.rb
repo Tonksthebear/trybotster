@@ -1,16 +1,16 @@
 # frozen_string_literal: true
 
-# Custom ActionCable configuration to allow API-key authenticated connections
+# Custom ActionCable configuration to allow DeviceToken authenticated connections
 # to bypass origin checking (for CLI WebSocket connections)
 
 Rails.application.config.after_initialize do
   ActionCable::Connection::Base.class_eval do
-    # Override the default origin checking to allow API key authenticated requests
+    # Override the default origin checking to allow DeviceToken authenticated requests
     def allow_request_origin?
-      # If request has a valid API key, skip origin check
+      # If request has a valid DeviceToken, skip origin check (CLI connections)
       if request.params[:api_key].present?
-        user = User.find_by_api_key(request.params[:api_key])
-        return true if user.present?
+        device_token = DeviceToken.find_by(token: request.params[:api_key])
+        return true if device_token.present?
       end
 
       # Otherwise, fall back to default origin checking
