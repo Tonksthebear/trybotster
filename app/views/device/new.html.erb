@@ -1,0 +1,43 @@
+<div class="min-h-screen flex items-center justify-center px-4 py-12">
+  <div class="max-w-md w-full space-y-8">
+    <div class="text-center">
+      <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100">Authorize Device</h1>
+      <p class="mt-2 text-sm text-gray-600 dark:text-gray-400">
+        Enter the code displayed in your CLI terminal
+      </p>
+    </div>
+
+    <% if flash[:alert] %>
+      <div class="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4">
+        <p class="text-sm text-red-700 dark:text-red-300"><%= flash[:alert] %></p>
+      </div>
+    <% end %>
+
+    <%= form_with url: device_path, method: :post, class: "mt-8 space-y-6" do |f| %>
+      <div>
+        <label for="user_code" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+          Device Code
+        </label>
+        <div class="mt-1">
+          <input type="text"
+                 name="user_code"
+                 id="user_code"
+                 autofocus
+                 autocomplete="off"
+                 placeholder="XXXX-XXXX"
+                 class="appearance-none block w-full px-3 py-4 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm placeholder-gray-400 dark:placeholder-gray-500 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 font-mono text-2xl text-center tracking-widest uppercase">
+        </div>
+        <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+          The code is displayed when you run the Botster CLI
+        </p>
+      </div>
+
+      <div>
+        <button type="submit"
+                class="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors">
+          Continue
+        </button>
+      </div>
+    <% end %>
+  </div>
+</div>

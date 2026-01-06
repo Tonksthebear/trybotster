@@ -27,6 +27,9 @@ Rails.application.routes.draw do
   namespace :api do
     resources :agent_notifications, only: [ :create ]
 
+    # Device authorization flow (RFC 8628)
+    resources :device_codes, only: [ :create, :show ], param: :device_code
+
     # Device registration for E2E encryption
     resources :devices, only: [ :index, :create, :destroy ] do
       resource :heartbeat, only: [ :update ], controller: "devices/heartbeats"
@@ -38,6 +41,13 @@ Rails.application.routes.draw do
       resource :connection, only: [ :show ], controller: "hubs/connections"
     end
   end
+
+  # Device authorization (browser UI)
+  get "device", to: "device#new", as: :device
+  post "device", to: "device#lookup"
+  get "device/confirm", to: "device#confirm", as: :device_confirm
+  post "device/approve", to: "device#approve", as: :device_approve
+  post "device/deny", to: "device#deny", as: :device_deny
 
   # Agents dashboard - WebRTC P2P connection to local CLI
   resources :agents, only: [ :index ] do

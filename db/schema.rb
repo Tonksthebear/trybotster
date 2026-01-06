@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_01_06_012212) do
+ActiveRecord::Schema[8.1].define(version: 2026_01_06_220135) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "vector"
@@ -101,17 +101,43 @@ ActiveRecord::Schema[8.1].define(version: 2026_01_06_012212) do
     t.index ["status"], name: "index_bot_messages_on_status"
   end
 
+  create_table "device_authorizations", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.string "device_code", null: false
+    t.string "device_name"
+    t.datetime "expires_at", null: false
+    t.string "status", default: "pending", null: false
+    t.datetime "updated_at", null: false
+    t.string "user_code", null: false
+    t.bigint "user_id"
+    t.index ["device_code"], name: "index_device_authorizations_on_device_code", unique: true
+    t.index ["user_code"], name: "index_device_authorizations_on_user_code", unique: true
+    t.index ["user_id"], name: "index_device_authorizations_on_user_id"
+  end
+
+  create_table "device_tokens", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.string "last_ip"
+    t.datetime "last_used_at"
+    t.string "name"
+    t.string "token", null: false
+    t.datetime "updated_at", null: false
+    t.bigint "user_id", null: false
+    t.index ["token"], name: "index_device_tokens_on_token", unique: true
+    t.index ["user_id"], name: "index_device_tokens_on_user_id"
+  end
+
   create_table "devices", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.string "device_type", null: false
     t.string "fingerprint", null: false
     t.datetime "last_seen_at"
     t.string "name", null: false
-    t.string "public_key", null: false
+    t.string "public_key"
     t.datetime "updated_at", null: false
     t.bigint "user_id", null: false
     t.index ["fingerprint"], name: "index_devices_on_fingerprint"
-    t.index ["public_key"], name: "index_devices_on_public_key", unique: true
+    t.index ["public_key"], name: "index_devices_on_public_key", unique: true, where: "(public_key IS NOT NULL)"
     t.index ["user_id", "device_type"], name: "index_devices_on_user_id_and_device_type"
     t.index ["user_id"], name: "index_devices_on_user_id"
   end
@@ -246,6 +272,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_01_06_012212) do
   add_foreign_key "action_mcp_session_resources", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_session_subscriptions", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_sse_events", "action_mcp_sessions", column: "session_id"
+  add_foreign_key "device_authorizations", "users"
+  add_foreign_key "device_tokens", "users"
   add_foreign_key "devices", "users"
   add_foreign_key "hub_agents", "hubs"
   add_foreign_key "hubs", "devices"

@@ -41,27 +41,20 @@ fn shutdown_requested() -> bool {
 
 /// Generate QR code as terminal-renderable lines that fits within given dimensions.
 ///
-/// Uses the qrcode crate to generate a QR code and converts it to lines of
-/// Unicode block characters. Automatically scales down to fit the available space.
+/// Uses Unicode half-block characters to render 2 QR rows per terminal row,
+/// which produces correct aspect ratio since terminal chars are ~2:1 (height:width).
 ///
 /// # Arguments
 /// * `data` - The data to encode in the QR code
 /// * `max_width` - Maximum width in terminal columns
 /// * `max_height` - Maximum height in terminal rows
 fn generate_qr_code_lines(data: &str, max_width: u16, max_height: u16) -> Vec<String> {
-    use qrcode::{EcLevel, QrCode};
+    use qrcode::{EcLevel, QrCode, Color};
 
-    // Try different strategies to fit the QR code, from highest to lowest quality
-    let strategies: &[(u32, u32, bool, Option<EcLevel>)] = &[
-        // (width_mult, height_mult, quiet_zone, ec_level)
-        (2, 1, true, None),         // Default: 2 chars wide, 1 char tall, with quiet zone
-        (2, 1, false, None),        // No quiet zone (saves ~4 chars each side)
-        (1, 1, true, None),         // Compact: 1 char per module
-        (1, 1, false, None),        // Compact without quiet zone
-        (1, 1, false, Some(EcLevel::L)), // Smallest: low error correction, no quiet zone
-    ];
+    // Try different error correction levels, from highest to lowest quality
+    let ec_levels = [None, Some(EcLevel::M), Some(EcLevel::L)];
 
-    for &(w_mult, h_mult, quiet, ec_level) in strategies {
+    for ec_level in ec_levels {
         let code_result = if let Some(ec) = ec_level {
             QrCode::with_error_correction_level(data, ec)
         } else {
@@ -69,22 +62,67 @@ fn generate_qr_code_lines(data: &str, max_width: u16, max_height: u16) -> Vec<St
         };
 
         if let Ok(code) = code_result {
-            let image = code
-                .render::<char>()
-                .quiet_zone(quiet)
-                .module_dimensions(w_mult, h_mult)
-                .build();
+            // Get raw QR matrix with quiet zone
+            let colors = code.to_colors();
+            let size = code.width();
+            let quiet_zone = 2; // Standard 2-module quiet zone
+            let total_size = size + quiet_zone * 2;
 
-            let lines: Vec<String> = image.lines().map(|s| s.to_string()).collect();
-
-            // Check if it fits
-            let qr_width = lines.first().map(|l| l.chars().count()).unwrap_or(0) as u16;
-            let qr_height = lines.len() as u16;
+            // Each QR module = 1 terminal char wide
+            // Each 2 QR rows = 1 terminal row using half-block chars
+            // This gives ~square aspect ratio since terminal chars are ~2:1 height:width
+            let qr_width = total_size as u16;
+            let qr_height = ((total_size + 1) / 2) as u16; // Ceiling division
 
             if qr_width <= max_width && qr_height <= max_height {
+                let mut lines = Vec::new();
+
+                // Helper to get color at position (with quiet zone padding)
+                let get_color = |x: usize, y: usize| -> bool {
+                    if x < quiet_zone || y < quiet_zone {
+                        return false; // White (quiet zone)
+                    }
+                    let qx = x - quiet_zone;
+                    let qy = y - quiet_zone;
+                    if qx >= size || qy >= size {
+                        return false; // White (quiet zone)
+                    }
+                    colors[qy * size + qx] == Color::Dark
+                };
+
+                // Render 2 rows at a time using half-block characters
+                // ▀ = top half (upper row dark, lower row light)
+                // ▄ = bottom half (upper row light, lower row dark)
+                // █ = full block (both dark)
+                // ' ' = space (both light)
+                for row_pair in 0..((total_size + 1) / 2) {
+                    let upper_y = row_pair * 2;
+                    let lower_y = row_pair * 2 + 1;
+                    let mut line = String::new();
+
+                    for x in 0..total_size {
+                        let upper = get_color(x, upper_y);
+                        let lower = if lower_y < total_size {
+                            get_color(x, lower_y)
+                        } else {
+                            false // Padding row is white
+                        };
+
+                        // Use 1 char per module - half-blocks handle the vertical compression
+                        let ch = match (upper, lower) {
+                            (true, true) => '█',
+                            (true, false) => '▀',
+                            (false, true) => '▄',
+                            (false, false) => ' ',
+                        };
+                        line.push(ch);
+                    }
+                    lines.push(line);
+                }
+
                 log::debug!(
-                    "QR code fits with strategy: {}x{} mult, quiet={}, ec={:?} -> {}x{} (max: {}x{})",
-                    w_mult, h_mult, quiet, ec_level, qr_width, qr_height, max_width, max_height
+                    "QR code fits with ec={:?} -> {}x{} (max: {}x{})",
+                    ec_level, qr_width, qr_height, max_width, max_height
                 );
                 return lines;
             }
@@ -98,9 +136,9 @@ fn generate_qr_code_lines(data: &str, max_width: u16, max_height: u16) -> Vec<St
         max_height
     );
     vec![
-        format!("QR code too large for terminal"),
-        format!("Please resize your terminal window"),
-        format!("(need at least 60x30 characters)"),
+        "QR code too large for terminal".to_string(),
+        "Please resize your terminal window".to_string(),
+        "(need at least 60x30 characters)".to_string(),
     ]
 }
 
@@ -174,7 +212,7 @@ impl BotsterApp {
             match device.register(
                 &client,
                 &config.server_url,
-                &config.api_key,
+                config.get_api_key(),
                 config.server_assisted_pairing,
             ) {
                 Ok(id) => log::info!("Device registered with server: id={}", id),
@@ -203,7 +241,7 @@ impl BotsterApp {
                 .put(&url)
                 .header("Content-Type", "application/json")
                 .header("X-Hub-Identifier", &hub_identifier)
-                .header("X-API-Key", &config.api_key)
+                .header("X-API-Key", config.get_api_key())
                 .json(&payload)
                 .send()
             {
@@ -222,7 +260,7 @@ impl BotsterApp {
         // Create tunnel manager for HTTP forwarding
         let tunnel_manager = Arc::new(TunnelManager::new(
             hub_identifier.clone(),
-            config.api_key.clone(),
+            config.get_api_key().to_string(),
             config.server_url.clone(),
         ));
 
@@ -243,7 +281,7 @@ impl BotsterApp {
                 device.secret_key.clone(),
                 hub_identifier.clone(),
                 config.server_url.clone(),
-                config.api_key.clone(),
+                config.get_api_key().to_string(),
             );
             match tokio_runtime.block_on(relay.connect()) {
                 Ok((sender, rx)) => {
@@ -1431,7 +1469,7 @@ impl BotsterApp {
         let response = match self
             .client
             .get(&url)
-            .header("X-API-Key", &self.config.api_key)
+            .header("X-API-Key", self.config.get_api_key())
             .send()
         {
             Ok(r) => r,
@@ -1507,7 +1545,7 @@ impl BotsterApp {
         let response = self
             .client
             .patch(&url)
-            .header("X-API-Key", &self.config.api_key)
+            .header("X-API-Key", self.config.get_api_key())
             .header("Content-Type", "application/json")
             .send()?;
 
@@ -1599,7 +1637,7 @@ impl BotsterApp {
         let response = self
             .client
             .post(&url)
-            .header("X-API-Key", &self.config.api_key)
+            .header("X-API-Key", self.config.get_api_key())
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()?;
@@ -1679,7 +1717,7 @@ impl BotsterApp {
         match self
             .client
             .put(&url)
-            .header("X-API-Key", &self.config.api_key)
+            .header("X-API-Key", self.config.get_api_key())
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()
@@ -2136,7 +2174,52 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Ensure we have a valid authentication token.
+/// If no token exists or token is invalid, runs the device authorization flow.
+fn ensure_authenticated() -> Result<()> {
+    use botster_hub::auth;
+
+    let mut config = Config::load()?;
+    let using_env_var =
+        std::env::var("BOTSTER_TOKEN").is_ok() || std::env::var("BOTSTER_API_KEY").is_ok();
+
+    // Check if we have a token at all
+    if !config.has_token() {
+        println!("No authentication token found. Starting device authorization...");
+        let token = auth::device_flow(&config.server_url)?;
+        config.save_token(&token)?;
+        println!("Token saved successfully.");
+        return Ok(());
+    }
+
+    // Validate the token - even if from env var, we need to check it works
+    println!("Checking authentication...");
+    if !auth::validate_token(&config.server_url, config.get_api_key()) {
+        println!("Token invalid or expired. Re-authenticating...");
+        let token = auth::device_flow(&config.server_url)?;
+
+        if using_env_var {
+            // Don't save to config - user is managing token via env var
+            // Just print instructions
+            println!();
+            println!("New token obtained. Update your environment variable:");
+            println!("  export BOTSTER_TOKEN={}", token);
+            println!();
+            anyhow::bail!("Please update your environment variable and restart.");
+        } else {
+            config.save_token(&token)?;
+            println!("Token saved successfully.");
+        }
+    }
+
+    Ok(())
+}
+
 fn run_interactive() -> Result<()> {
+    // Ensure we have a valid authentication token before starting the TUI
+    // This runs the device authorization flow if needed
+    ensure_authenticated()?;
+
     // Set up signal handlers for clean shutdown (Ctrl+C/SIGINT, SIGTERM, SIGHUP)
     // Using signal-hook's flag API for reliable signal handling in PTY environments
     use signal_hook::consts::signal::*;
@@ -2845,7 +2928,7 @@ fn run_interactive() -> Result<()> {
     log::info!("Sending shutdown notification to server...");
     let shutdown_url = format!("{}/api/hubs/{}", app.config.server_url, app.hub_identifier);
     match app.client.delete(&shutdown_url)
-        .header("X-API-Key", &app.config.api_key)
+        .header("X-API-Key", app.config.get_api_key())
         .send()
     {
         Ok(response) => {

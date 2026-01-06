@@ -10,6 +10,7 @@ class User < ApplicationRecord
   # Associations
   belongs_to :team, optional: true
   has_many :devices, dependent: :destroy
+  has_many :device_tokens, dependent: :destroy
   has_many :hubs, dependent: :destroy
 
   # Skip email/password validations for OAuth users

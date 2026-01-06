@@ -198,6 +198,17 @@ impl Device {
         self.save()
     }
 
+    /// Clear stale device ID (e.g., after database reset)
+    /// Call this when the server returns "device not found" errors.
+    pub fn clear_device_id(&mut self) -> Result<()> {
+        if self.device_id.is_some() {
+            log::info!("Clearing stale device_id={:?}", self.device_id);
+            self.device_id = None;
+            self.save()?;
+        }
+        Ok(())
+    }
+
     /// Register device with server (POST /api/devices)
     ///
     /// If `share_public_key` is true (convenience mode), the public key is sent to the server.

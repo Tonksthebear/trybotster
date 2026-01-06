@@ -18,7 +18,7 @@ module ApiKeyAuthenticatable
       return
     end
 
-    @current_api_user = User.find_by(api_key: api_key)
+    @current_api_user = find_user_by_token(api_key)
 
     unless @current_api_user
       render_unauthorized("Invalid API key")
@@ -36,5 +36,13 @@ module ApiKeyAuthenticatable
 
   def render_unauthorized(message)
     render json: { error: message }, status: :unauthorized
+  end
+
+  def find_user_by_token(token)
+    device_token = DeviceToken.find_by(token: token)
+    return nil unless device_token
+
+    device_token.touch_usage!(ip: request.remote_ip)
+    device_token.user
   end
 end
