@@ -1,0 +1,49 @@
+<div class="min-h-screen flex items-center justify-center px-4 py-12">
+  <div class="max-w-md w-full space-y-8">
+    <div class="text-center">
+      <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100">Connect to Hub</h1>
+      <p class="mt-2 text-sm text-gray-600 dark:text-gray-400">
+        Enter the connection code displayed in your CLI terminal
+      </p>
+    </div>
+
+    <% if flash[:alert] %>
+      <div class="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4">
+        <p class="text-sm text-red-700 dark:text-red-300"><%= flash[:alert] %></p>
+      </div>
+    <% end %>
+
+    <%= form_with url: hub_connection_path, method: :post, class: "mt-8 space-y-6" do |f| %>
+      <div>
+        <label for="code" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+          Connection Code
+        </label>
+        <div class="mt-1">
+          <input type="text"
+                 name="code"
+                 id="code"
+                 autofocus
+                 autocomplete="off"
+                 placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                 class="appearance-none block w-full px-3 py-3 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm placeholder-gray-400 dark:placeholder-gray-500 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 font-mono text-sm">
+        </div>
+        <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+          Press <kbd class="px-1.5 py-0.5 text-xs font-semibold bg-gray-100 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded">Ctrl+P</kbd> in the CLI, then select "Show Connection Code"
+        </p>
+      </div>
+
+      <div>
+        <button type="submit"
+                class="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors">
+          Connect
+        </button>
+      </div>
+    <% end %>
+
+    <div class="text-center">
+      <p class="text-xs text-gray-500 dark:text-gray-400">
+        You can also scan the QR code displayed in the CLI
+      </p>
+    </div>
+  </div>
+</div>
