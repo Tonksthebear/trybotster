@@ -19,11 +19,10 @@ use ratatui::{
 };
 
 use crate::app::{buffer_to_ansi, centered_rect, AppMode};
-use crate::constants;
-use crate::hub::Hub;
+use crate::hub::{build_menu, Hub, MenuContext};
 use crate::render::render_agent_terminal;
 use crate::tunnel::TunnelStatus;
-use crate::{Agent, BrowserDimensions, VpnStatus};
+use crate::{Agent, BrowserDimensions, PtyView, VpnStatus};
 
 /// Render the TUI and return ANSI output for browser streaming.
 ///
@@ -62,6 +61,18 @@ pub fn render(
     let vpn_status: Option<VpnStatus> = None;
     // E2E encryption: connection URL for QR code display
     let connection_url = hub.connection_url.clone();
+
+    // Build menu context from current state
+    let selected_agent = agent_keys_ordered
+        .get(selected)
+        .and_then(|key| hub.state.agents.get(key));
+    let menu_context = MenuContext {
+        has_agent: selected_agent.is_some(),
+        has_server_pty: selected_agent.map_or(false, |a| a.has_server_pty()),
+        active_pty: selected_agent.map_or(PtyView::Cli, |a| a.active_pty),
+        polling_enabled,
+    };
+    let menu_items = build_menu(&menu_context);
 
     // Helper to render UI to a frame
     let render_ui = |f: &mut Frame, agents: &HashMap<String, Agent>| {
@@ -158,7 +169,7 @@ pub fn render(
         // Render modal overlays based on mode
         match mode {
             AppMode::Menu => {
-                render_menu_modal(f, menu_selected, polling_enabled);
+                render_menu_modal(f, &menu_items, menu_selected);
             }
             AppMode::NewAgentSelectWorktree => {
                 render_worktree_select_modal(f, &available_worktrees, worktree_selected);
@@ -224,39 +235,51 @@ pub fn render(
 
 // === Modal Rendering Helpers ===
 
-fn render_menu_modal(f: &mut Frame, menu_selected: usize, polling_enabled: bool) {
-    let menu_items = [format!(
-            "{} {} ({})",
-            if menu_selected == constants::MENU_INDEX_TOGGLE_POLLING { ">" } else { " " },
-            constants::MENU_ITEMS[constants::MENU_INDEX_TOGGLE_POLLING],
-            if polling_enabled { "ON" } else { "OFF" }
-        ),
-        format!(
-            "{} {}",
-            if menu_selected == constants::MENU_INDEX_NEW_AGENT { ">" } else { " " },
-            constants::MENU_ITEMS[constants::MENU_INDEX_NEW_AGENT]
-        ),
-        format!(
-            "{} {}",
-            if menu_selected == constants::MENU_INDEX_CLOSE_AGENT { ">" } else { " " },
-            constants::MENU_ITEMS[constants::MENU_INDEX_CLOSE_AGENT]
-        ),
-        format!(
-            "{} {}",
-            if menu_selected == constants::MENU_INDEX_CONNECTION_CODE { ">" } else { " " },
-            constants::MENU_ITEMS[constants::MENU_INDEX_CONNECTION_CODE]
-        )];
+fn render_menu_modal(
+    f: &mut Frame,
+    menu_items: &[crate::hub::MenuItem],
+    menu_selected: usize,
+) {
+    use crate::hub::menu::selectable_count;
 
-    let area = centered_rect(
-        constants::MENU_MODAL_WIDTH_PERCENT,
-        constants::MENU_MODAL_HEIGHT_PERCENT,
-        f.area(),
-    );
+    // Build display lines with selection indicator
+    let mut lines: Vec<Line> = Vec::new();
+    let mut selectable_idx = 0;
+
+    for item in menu_items {
+        if item.is_header {
+            // Section headers are dimmed and not selectable
+            lines.push(Line::from(Span::styled(
+                item.label.clone(),
+                Style::default()
+                    .fg(ratatui::style::Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            // Selectable items with cursor indicator
+            let is_selected = selectable_idx == menu_selected;
+            let cursor = if is_selected { ">" } else { " " };
+            let style = if is_selected {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{} {}", cursor, item.label),
+                style,
+            )));
+            selectable_idx += 1;
+        }
+    }
+
+    // Calculate modal height based on content (min 30%, scale with items)
+    let content_height = lines.len() as u16 + 4; // +4 for borders and padding
+    let modal_height = content_height.max(8).min(50); // Clamp between 8 and 50%
+
+    let area = centered_rect(50, modal_height, f.area());
     f.render_widget(Clear, area);
 
-    let menu_text: Vec<Line> = menu_items.iter().map(|item| Line::from(item.clone())).collect();
-
-    let menu = Paragraph::new(menu_text)
+    let menu = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -265,6 +288,9 @@ fn render_menu_modal(f: &mut Frame, menu_selected: usize, polling_enabled: bool)
         .alignment(Alignment::Left);
 
     f.render_widget(menu, area);
+
+    // Suppress unused warning - selectable_count is used for validation elsewhere
+    let _ = selectable_count(menu_items);
 }
 
 fn render_worktree_select_modal(
