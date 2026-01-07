@@ -1,0 +1,60 @@
+<div class="w-full max-w-2xl mx-auto px-4 py-8">
+  <div class="mb-6">
+    <h1 class="text-2xl font-bold text-gray-900 dark:text-gray-100">Settings</h1>
+    <p class="mt-1 text-sm text-gray-600 dark:text-gray-400">
+      Manage your account preferences
+    </p>
+  </div>
+
+  <% if flash[:notice] %>
+    <div class="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg p-4 mb-6">
+      <p class="text-sm text-green-700 dark:text-green-300"><%= flash[:notice] %></p>
+    </div>
+  <% end %>
+
+  <%= form_with model: current_user, url: settings_path, method: :patch, class: "space-y-6" do |f| %>
+    <div class="bg-white dark:bg-gray-900 shadow rounded-lg p-6">
+      <h2 class="text-lg font-medium text-gray-900 dark:text-gray-100 mb-4">Security</h2>
+
+      <div class="space-y-4">
+        <div class="flex items-start">
+          <div class="flex items-center h-5">
+            <%= f.check_box :server_assisted_pairing,
+                            class: "h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" %>
+          </div>
+          <div class="ml-3">
+            <label for="user_server_assisted_pairing" class="text-sm font-medium text-gray-700 dark:text-gray-300">
+              Enable Convenience Mode (Server-Assisted Pairing)
+            </label>
+            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+              When enabled, you can click on hubs in the dashboard to connect directly.
+              This is less secure because the server can see the encryption keys.
+            </p>
+            <div class="mt-2 p-3 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg">
+              <p class="text-xs text-yellow-700 dark:text-yellow-300">
+                <strong>Note:</strong> For maximum security, keep this disabled and scan the QR code
+                from your CLI instead. The QR code transmits the encryption key via URL fragment,
+                which never reaches the server (MITM-proof).
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex justify-end">
+      <button type="submit"
+              class="px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+        Save Settings
+      </button>
+    </div>
+  <% end %>
+
+  <div class="mt-8 bg-white dark:bg-gray-900 shadow rounded-lg p-6">
+    <h2 class="text-lg font-medium text-gray-900 dark:text-gray-100 mb-4">Account</h2>
+    <div class="text-sm text-gray-600 dark:text-gray-400">
+      <p><strong>Email:</strong> <%= current_user.email %></p>
+      <p class="mt-2"><strong>GitHub:</strong> <%= current_user.github_username || "Not connected" %></p>
+    </div>
+  </div>
+</div>
