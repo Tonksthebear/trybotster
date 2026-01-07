@@ -7,7 +7,7 @@
 //! # Notification Types
 //!
 //! - **OSC 9**: Standard desktop notification escape sequence
-//! - **OSC 777**: Extended notification used by Claude Code
+//! - **OSC 777**: Extended notification (rxvt-unicode style)
 //!
 //! Both are treated as "question_asked" notifications, indicating the agent
 //! needs user input.

@@ -37,6 +37,9 @@ globset = "0.4"
 # CLI argument parsing
 clap = { version = "4.5.51", features = ["derive"] }
 
+# Performance - global allocator (M-MIMALLOC-APPS)
+mimalloc = "0.1"
+
 # Error handling & utilities
 anyhow = "1.0"
 log = "0.4"
@@ -81,4 +84,29 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[profile.bench]
+debug = 1  # Enable symbols for profiling (M-HOTPATH)
+
+# Lint configuration (M-STATIC-VERIFICATION)
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+# Enable pedantic lints as warnings (not errors to avoid blocking builds)
+pedantic = { level = "warn", priority = -1 }
+
+# Specific lints to watch for
+unwrap_used = "warn"
+clone_on_ref_ptr = "warn"
+large_futures = "warn"
+
+# Allow specific pedantic lints that are too noisy for this codebase
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
 
