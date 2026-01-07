@@ -12,23 +12,31 @@ use std::time::Duration;
 /// Response from POST /api/device_codes
 #[derive(Debug, Deserialize)]
 pub struct DeviceCodeResponse {
+    /// Opaque code for polling.
     pub device_code: String,
+    /// Human-readable code to display to user.
     pub user_code: String,
+    /// URL where user should enter the code.
     pub verification_uri: String,
+    /// Seconds until the code expires.
     pub expires_in: u64,
+    /// Minimum polling interval in seconds.
     pub interval: u64,
 }
 
 /// Successful token response from GET /api/device_codes/:device_code
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
+    /// The access token for API authentication.
     pub access_token: String,
+    /// Token type (typically "Bearer").
     pub token_type: String,
 }
 
 /// Error response during polling
 #[derive(Debug, Deserialize)]
 pub struct ErrorResponse {
+    /// Error code (e.g., "authorization_pending", "slow_down").
     pub error: String,
 }
 

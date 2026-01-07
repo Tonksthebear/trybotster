@@ -104,6 +104,20 @@ pub struct Agent {
     notification_rx: Option<Receiver<AgentNotification>>,
 }
 
+impl std::fmt::Debug for Agent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Agent")
+            .field("id", &self.id)
+            .field("repo", &self.repo)
+            .field("issue_number", &self.issue_number)
+            .field("branch_name", &self.branch_name)
+            .field("worktree_path", &self.worktree_path)
+            .field("status", &self.status)
+            .field("active_pty", &self.active_pty)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Agent {
     /// Creates a new agent for the specified repository and worktree.
     #[must_use]
@@ -257,7 +271,7 @@ impl Agent {
         command_str: &str,
         context: &str,
         init_commands: Vec<String>,
-        env_vars: HashMap<String, String>,
+        env_vars: &HashMap<String, String>,
     ) -> Result<()> {
         let agent_label = self.issue_number.map_or_else(
             || format!("{}/{}", self.repo, self.branch_name),
@@ -273,7 +287,7 @@ impl Agent {
             &mut self.cli_pty,
             &self.worktree_path,
             command_str,
-            &env_vars,
+            env_vars,
             init_commands,
             context,
         )?;
@@ -292,7 +306,7 @@ impl Agent {
     pub fn spawn_server_pty(
         &mut self,
         init_script: &str,
-        env_vars: HashMap<String, String>,
+        env_vars: &HashMap<String, String>,
     ) -> Result<()> {
         let (rows, cols) = {
             let parser = self.cli_pty.vt100_parser.lock().expect("parser lock poisoned");
@@ -303,7 +317,7 @@ impl Agent {
         let server_pty = pty::spawn_server_pty(
             &self.worktree_path,
             init_script,
-            &env_vars,
+            env_vars,
             (rows, cols),
         )?;
 

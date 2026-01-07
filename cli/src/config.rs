@@ -1,19 +1,30 @@
+//! Configuration loading and persistence.
+//!
+//! Handles reading and writing the botster-hub configuration file,
+//! which stores server URL, API tokens, and other settings.
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
+/// Configuration for the botster-hub CLI.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
+    /// URL of the botster server.
     pub server_url: String,
-    /// New device token from device authorization flow (preferred)
+    /// New device token from device authorization flow (preferred).
     #[serde(default)]
     pub token: String,
-    /// Legacy API key (deprecated, kept for backward compatibility)
+    /// Legacy API key (deprecated, kept for backward compatibility).
     #[serde(default)]
     pub api_key: String,
+    /// Interval in seconds between server polls.
     pub poll_interval: u64,
+    /// Timeout in seconds before an idle agent is stopped.
     pub agent_timeout: u64,
+    /// Maximum number of concurrent agent sessions.
     pub max_sessions: usize,
+    /// Base directory for creating worktrees.
     pub worktree_base: PathBuf,
     /// If true, CLI shares its public key with the server for convenience.
     /// If false (default), key exchange only happens via QR code (MITM-proof).
@@ -40,6 +51,7 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Returns the configuration directory path, creating it if necessary.
     pub fn config_dir() -> Result<PathBuf> {
         // Allow tests to override the config directory
         let dir = if let Ok(test_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
@@ -53,6 +65,7 @@ impl Config {
         Ok(dir)
     }
 
+    /// Loads configuration from file, with environment variable overrides.
     pub fn load() -> Result<Self> {
         // Priority: Environment variables > config file > defaults
         let mut config = Self::load_from_file().unwrap_or_else(|_| Self::default());
@@ -120,6 +133,7 @@ impl Config {
         }
     }
 
+    /// Persists the current configuration to disk.
     pub fn save(&self) -> Result<()> {
         let config_path = Self::config_dir()?.join("config.json");
         fs::write(&config_path, serde_json::to_string_pretty(self)?)?;

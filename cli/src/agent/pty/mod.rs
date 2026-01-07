@@ -113,6 +113,17 @@ pub struct PtySession {
     child: Option<Box<dyn Child + Send>>,
 }
 
+impl std::fmt::Debug for PtySession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtySession")
+            .field("has_master_pty", &self.master_pty.is_some())
+            .field("has_writer", &self.writer.is_some())
+            .field("has_reader_thread", &self.reader_thread.is_some())
+            .field("has_child", &self.child.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl PtySession {
     /// Creates a new PTY session with the specified dimensions.
     ///

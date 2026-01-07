@@ -79,7 +79,7 @@ pub fn run_event_loop(
         });
 
         // 3. Handle browser resize
-        handle_browser_resize_action(hub, &browser_dims, terminal);
+        handle_browser_resize_action(hub, browser_dims.as_ref(), terminal);
 
         // 4. Render using tui::render()
         let (ansi_output, _rows, _cols) = tui::render(terminal, hub, browser_dims.clone())?;
@@ -104,10 +104,10 @@ pub fn run_event_loop(
 /// Handle browser resize by applying dimension changes to agents.
 fn handle_browser_resize_action(
     hub: &mut Hub,
-    browser_dims: &Option<BrowserDimensions>,
+    browser_dims: Option<&BrowserDimensions>,
     terminal: &Terminal<CrosstermBackend<Stdout>>,
 ) {
-    let dims_tuple = browser_dims.as_ref().map(|d| (d.rows, d.cols, d.mode));
+    let dims_tuple = browser_dims.map(|d| (d.rows, d.cols, d.mode));
     let terminal_size = terminal.size().unwrap_or_default();
     let local_dims = (terminal_size.height, terminal_size.width);
 

@@ -61,7 +61,7 @@ pub fn render_agent_terminal(agent: &Agent, area: Rect, buf: &mut Buffer) -> Str
 
     // Lock parser for rendering
     let parser = agent.get_active_parser();
-    let parser_lock = parser.lock().unwrap();
+    let parser_lock = parser.lock().expect("parser lock not poisoned");
     let screen = parser_lock.screen();
 
     // CRITICAL: Check scrollback from the lock we already hold

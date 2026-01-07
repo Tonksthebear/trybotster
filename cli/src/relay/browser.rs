@@ -33,7 +33,7 @@ use crate::relay::{BrowserEvent, BrowserSendContext};
 use crate::WorktreeManager;
 
 /// Get browser send context if browser is connected.
-fn browser_ctx(hub: &Hub) -> Option<BrowserSendContext> {
+fn browser_ctx(hub: &Hub) -> Option<BrowserSendContext<'_>> {
     hub.browser.sender.as_ref().map(|sender| BrowserSendContext {
         sender,
         runtime: &hub.tokio_runtime,
@@ -195,19 +195,7 @@ pub fn send_agent_list(hub: &Hub) {
 
     let agents = hub.state.agent_keys_ordered.iter()
         .filter_map(|key| hub.state.agents.get(key).map(|a| (key, a)))
-        .map(|(id, a)| crate::relay::build_agent_info(
-            id,
-            &a.repo,
-            a.issue_number,
-            &a.branch_name,
-            &format!("{:?}", a.status),
-            a.tunnel_port,
-            a.is_server_running(),
-            a.has_server_pty(),
-            &format!("{:?}", a.active_pty).to_lowercase(),
-            a.get_scroll_offset() as u32,
-            &hub.hub_identifier,
-        ))
+        .map(|(id, a)| crate::relay::build_agent_info(id, a, &hub.hub_identifier))
         .collect();
 
     crate::relay::send_agent_list(&ctx, agents);

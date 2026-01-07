@@ -9,6 +9,7 @@
 //! matches on the action type and modifies hub state accordingly.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::app::AppMode;
 use crate::constants;
@@ -291,11 +292,11 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
                 .as_ref()
                 .map_or(hub.terminal_dims, |d| (d.rows, d.cols));
 
-            match lifecycle::spawn_agent(&mut hub.state, config, dims) {
+            match lifecycle::spawn_agent(&mut hub.state, &config, dims) {
                 Ok(result) => {
                     log::info!("Spawned agent: {}", result.session_key);
                     if let Some(port) = result.tunnel_port {
-                        let tm = hub.tunnel_manager.clone();
+                        let tm = Arc::clone(&hub.tunnel_manager);
                         let key = result.session_key.clone();
                         hub.tokio_runtime.spawn(async move {
                             tm.register_agent(key, port).await;
@@ -507,7 +508,7 @@ fn spawn_agent_from_worktree(hub: &mut Hub) -> anyhow::Result<()> {
             hub.input_buffer.clone()
         };
 
-        spawn_agent_with_tunnel(hub, crate::agents::AgentSpawnConfig {
+        let config = crate::agents::AgentSpawnConfig {
             issue_number,
             branch_name: branch,
             worktree_path,
@@ -516,7 +517,8 @@ fn spawn_agent_from_worktree(hub: &mut Hub) -> anyhow::Result<()> {
             prompt,
             message_id: None,
             invocation_url: None,
-        })?;
+        };
+        spawn_agent_with_tunnel(hub, &config)?;
     }
 
     Ok(())
@@ -544,7 +546,7 @@ fn create_and_spawn_agent(hub: &mut Hub) -> anyhow::Result<()> {
         |n| format!("Work on issue #{n}"),
     );
 
-    spawn_agent_with_tunnel(hub, crate::agents::AgentSpawnConfig {
+    let config = crate::agents::AgentSpawnConfig {
         issue_number,
         branch_name: actual_branch_name,
         worktree_path,
@@ -553,20 +555,21 @@ fn create_and_spawn_agent(hub: &mut Hub) -> anyhow::Result<()> {
         prompt,
         message_id: None,
         invocation_url: None,
-    })?;
+    };
+    spawn_agent_with_tunnel(hub, &config)?;
 
     Ok(())
 }
 
 /// Helper to spawn an agent and register its tunnel.
-fn spawn_agent_with_tunnel(hub: &mut Hub, config: crate::agents::AgentSpawnConfig) -> anyhow::Result<()> {
+fn spawn_agent_with_tunnel(hub: &mut Hub, config: &crate::agents::AgentSpawnConfig) -> anyhow::Result<()> {
     let dims = hub.browser.dims
         .as_ref()
         .map_or(hub.terminal_dims, |d| (d.rows, d.cols));
 
     let result = lifecycle::spawn_agent(&mut hub.state, config, dims)?;
     if let Some(port) = result.tunnel_port {
-        let tm = hub.tunnel_manager.clone();
+        let tm = Arc::clone(&hub.tunnel_manager);
         let key = result.session_key;
         hub.tokio_runtime.spawn(async move {
             tm.register_agent(key, port).await;

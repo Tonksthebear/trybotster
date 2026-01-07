@@ -19,6 +19,24 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::AppMode;
 
+/// Context for dispatching key events.
+///
+/// Contains all the state needed to determine the appropriate action
+/// for a key press.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyEventContext {
+    /// Terminal height for scroll calculations.
+    pub terminal_rows: u16,
+    /// Currently selected menu item index.
+    pub menu_selection: usize,
+    /// Total number of menu items.
+    pub menu_size: usize,
+    /// Currently selected worktree index.
+    pub worktree_selection: usize,
+    /// Total number of worktrees available.
+    pub worktree_count: usize,
+}
+
 /// Result of handling a key event.
 ///
 /// Indicates what action the application should take after processing input.
@@ -451,18 +469,14 @@ pub fn dispatch_key_event(
     mode: &AppMode,
     code: KeyCode,
     modifiers: KeyModifiers,
-    terminal_rows: u16,
-    menu_selection: usize,
-    menu_size: usize,
-    worktree_selection: usize,
-    worktree_count: usize,
+    ctx: KeyEventContext,
 ) -> InputAction {
     match mode {
-        AppMode::Normal => handle_normal_mode_key(code, modifiers, terminal_rows),
-        AppMode::Menu => handle_menu_mode_key(code, menu_selection, menu_size),
+        AppMode::Normal => handle_normal_mode_key(code, modifiers, ctx.terminal_rows),
+        AppMode::Menu => handle_menu_mode_key(code, ctx.menu_selection, ctx.menu_size),
         AppMode::NewAgentSelectWorktree => {
             // Total items = 1 (Create New) + worktree_count
-            handle_worktree_select_key(code, worktree_selection, worktree_count + 1)
+            handle_worktree_select_key(code, ctx.worktree_selection, ctx.worktree_count + 1)
         }
         AppMode::NewAgentCreateWorktree => handle_create_worktree_key(code),
         AppMode::NewAgentPrompt => handle_prompt_input_key(code),
@@ -637,30 +651,36 @@ mod tests {
 
     #[test]
     fn test_dispatch_key_event_normal_mode() {
+        let ctx = KeyEventContext {
+            terminal_rows: 24,
+            menu_selection: 0,
+            menu_size: 3,
+            worktree_selection: 0,
+            worktree_count: 5,
+        };
         let action = dispatch_key_event(
             &AppMode::Normal,
             KeyCode::Char('q'),
             KeyModifiers::CONTROL,
-            24,
-            0,
-            3,
-            0,
-            5,
+            ctx,
         );
         assert_eq!(action, InputAction::Quit);
     }
 
     #[test]
     fn test_dispatch_key_event_menu_mode() {
+        let ctx = KeyEventContext {
+            terminal_rows: 24,
+            menu_selection: 1,
+            menu_size: 3,
+            worktree_selection: 0,
+            worktree_count: 5,
+        };
         let action = dispatch_key_event(
             &AppMode::Menu,
             KeyCode::Enter,
             KeyModifiers::NONE,
-            24,
-            1,
-            3,
-            0,
-            5,
+            ctx,
         );
         assert_eq!(action, InputAction::MenuSelect(1));
     }
@@ -685,15 +705,18 @@ mod tests {
 
     #[test]
     fn test_dispatch_key_event_connection_code_mode() {
+        let ctx = KeyEventContext {
+            terminal_rows: 24,
+            menu_selection: 0,
+            menu_size: 3,
+            worktree_selection: 0,
+            worktree_count: 5,
+        };
         let action = dispatch_key_event(
             &AppMode::ConnectionCode,
             KeyCode::Esc,
             KeyModifiers::NONE,
-            24,
-            0,
-            3,
-            0,
-            5,
+            ctx,
         );
         assert_eq!(action, InputAction::CloseModal);
     }

@@ -1,9 +1,16 @@
+//! Prompt management for agent sessions.
+//!
+//! Handles loading and writing prompt files that configure agent behavior
+//! in each worktree.
+
 use anyhow::{Context, Result};
 use std::path::Path;
 
 const DEFAULT_PROMPT_REPO: &str = "Tonksthebear/trybotster";
 const DEFAULT_PROMPT_PATH: &str = "cli/botster_prompt";
 
+/// Manages prompt loading for agent sessions.
+#[derive(Debug)]
 pub struct PromptManager;
 
 impl PromptManager {

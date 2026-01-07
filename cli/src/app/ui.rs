@@ -26,10 +26,15 @@ use std::fmt::Write;
 /// Browser keyboard input - sent from browser terminal to CLI.
 #[derive(Debug, Clone)]
 pub struct KeyInput {
+    /// The key pressed (e.g., "a", "Enter", "Escape").
     pub key: String,
+    /// Whether Ctrl was held.
     pub ctrl: bool,
+    /// Whether Alt was held.
     pub alt: bool,
+    /// Whether Shift was held.
     pub shift: bool,
+    /// Whether Meta/Cmd was held.
     pub meta: bool,
 }
 
@@ -119,15 +124,13 @@ pub fn buffer_to_ansi(
 
     for y in 0..out_height {
         // Move cursor to start of line
-        write!(output, "\x1b[{};1H", y + 1).unwrap();
+        write!(output, "\x1b[{};1H", y + 1).expect("string write is infallible");
 
         for x in 0..out_width {
-            let cell = buffer.cell((x, y));
-            if cell.is_none() {
+            let Some(cell) = buffer.cell((x, y)) else {
                 output.push(' ');
                 continue;
-            }
-            let cell = cell.unwrap();
+            };
 
             let fg = cell.fg;
             let bg = cell.bg;
@@ -200,10 +203,10 @@ fn apply_foreground_color(output: &mut String, color: Color) {
         Color::LightCyan => output.push_str("\x1b[96m"),
         Color::White => output.push_str("\x1b[37m"),
         Color::Rgb(r, g, b) => {
-            write!(output, "\x1b[38;2;{};{};{}m", r, g, b).unwrap();
+            write!(output, "\x1b[38;2;{};{};{}m", r, g, b).expect("string write is infallible");
         }
         Color::Indexed(i) => {
-            write!(output, "\x1b[38;5;{}m", i).unwrap();
+            write!(output, "\x1b[38;5;{}m", i).expect("string write is infallible");
         }
     }
 }
@@ -229,10 +232,10 @@ fn apply_background_color(output: &mut String, color: Color) {
         Color::LightCyan => output.push_str("\x1b[106m"),
         Color::White => output.push_str("\x1b[47m"),
         Color::Rgb(r, g, b) => {
-            write!(output, "\x1b[48;2;{};{};{}m", r, g, b).unwrap();
+            write!(output, "\x1b[48;2;{};{};{}m", r, g, b).expect("string write is infallible");
         }
         Color::Indexed(i) => {
-            write!(output, "\x1b[48;5;{}m", i).unwrap();
+            write!(output, "\x1b[48;5;{}m", i).expect("string write is infallible");
         }
     }
 }
@@ -283,7 +286,7 @@ pub fn convert_browser_key_to_crossterm(input: &KeyInput) -> Option<KeyEvent> {
     let key_code = match input.key.as_str() {
         // Single character keys
         k if k.len() == 1 => {
-            let c = k.chars().next().unwrap();
+            let c = k.chars().next().expect("single char string has at least one char");
             KeyCode::Char(c)
         }
         // Special keys

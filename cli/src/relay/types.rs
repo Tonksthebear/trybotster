@@ -23,52 +23,87 @@ use serde::{Deserialize, Serialize};
 pub enum TerminalMessage {
     /// Terminal output from CLI to browser.
     #[serde(rename = "output")]
-    Output { data: String },
+    Output {
+        /// Terminal output data.
+        data: String,
+    },
     /// Agent list response.
     #[serde(rename = "agents")]
-    Agents { agents: Vec<AgentInfo> },
+    Agents {
+        /// List of available agents.
+        agents: Vec<AgentInfo>,
+    },
     /// Worktree list response.
     #[serde(rename = "worktrees")]
     Worktrees {
+        /// List of available worktrees.
         worktrees: Vec<WorktreeInfo>,
+        /// Repository name.
         repo: Option<String>,
     },
     /// Agent selected confirmation.
     #[serde(rename = "agent_selected")]
-    AgentSelected { id: String },
+    AgentSelected {
+        /// Selected agent's session key.
+        id: String,
+    },
     /// Agent created confirmation.
     #[serde(rename = "agent_created")]
-    AgentCreated { id: String },
+    AgentCreated {
+        /// Created agent's session key.
+        id: String,
+    },
     /// Agent deleted confirmation.
     #[serde(rename = "agent_deleted")]
-    AgentDeleted { id: String },
+    AgentDeleted {
+        /// Deleted agent's session key.
+        id: String,
+    },
     /// Error message.
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        /// Error description.
+        message: String,
+    },
 }
 
 /// Agent info for list response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
+    /// Unique agent identifier (session key).
     pub id: String,
+    /// Repository name in "owner/repo" format.
     pub repo: Option<String>,
+    /// GitHub issue number the agent is working on.
     pub issue_number: Option<u64>,
+    /// Git branch name for the agent's worktree.
     pub branch_name: Option<String>,
+    /// Human-readable agent name.
     pub name: Option<String>,
+    /// Current agent status (e.g., "Running", "Idle").
     pub status: Option<String>,
+    /// Port number for the agent's HTTP tunnel.
     pub tunnel_port: Option<u16>,
+    /// Whether a dev server is running.
     pub server_running: Option<bool>,
+    /// Whether a server PTY exists.
     pub has_server_pty: Option<bool>,
+    /// Currently active PTY view ("cli" or "server").
     pub active_pty_view: Option<String>,
+    /// Scrollback offset in lines.
     pub scroll_offset: Option<u32>,
+    /// Hub identifier where this agent runs.
     pub hub_identifier: Option<String>,
 }
 
 /// Worktree info for list response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeInfo {
+    /// Filesystem path to the worktree.
     pub path: String,
+    /// Git branch name.
     pub branch: String,
+    /// Associated issue number, if any.
     pub issue_number: Option<u64>,
 }
 
@@ -78,10 +113,16 @@ pub struct WorktreeInfo {
 pub enum BrowserCommand {
     /// Terminal input from browser.
     #[serde(rename = "input")]
-    Input { data: String },
+    Input {
+        /// Input data to send to terminal.
+        data: String,
+    },
     /// Set display mode (tui/gui).
     #[serde(rename = "set_mode")]
-    SetMode { mode: String },
+    SetMode {
+        /// Display mode ("tui" or "gui").
+        mode: String,
+    },
     /// List all agents.
     #[serde(rename = "list_agents")]
     ListAgents,
@@ -90,24 +131,34 @@ pub enum BrowserCommand {
     ListWorktrees,
     /// Select an agent.
     #[serde(rename = "select_agent")]
-    SelectAgent { id: String },
+    SelectAgent {
+        /// Agent session key to select.
+        id: String,
+    },
     /// Create a new agent.
     #[serde(rename = "create_agent")]
     CreateAgent {
+        /// Issue number or branch name.
         issue_or_branch: Option<String>,
+        /// Initial prompt for the agent.
         prompt: Option<String>,
     },
     /// Reopen an existing worktree.
     #[serde(rename = "reopen_worktree")]
     ReopenWorktree {
+        /// Path to the worktree.
         path: String,
+        /// Branch name.
         branch: String,
+        /// Initial prompt for the agent.
         prompt: Option<String>,
     },
     /// Delete an agent.
     #[serde(rename = "delete_agent")]
     DeleteAgent {
+        /// Agent session key to delete.
         id: String,
+        /// Whether to delete the worktree as well.
         delete_worktree: Option<bool>,
     },
     /// Toggle PTY view (CLI/Server).
@@ -116,7 +167,9 @@ pub enum BrowserCommand {
     /// Scroll terminal.
     #[serde(rename = "scroll")]
     Scroll {
+        /// Scroll direction ("up" or "down").
         direction: String,
+        /// Number of lines to scroll.
         lines: Option<u32>,
     },
     /// Scroll to bottom (return to live).
@@ -139,7 +192,9 @@ pub struct EncryptedEnvelope {
 /// Browser resize event.
 #[derive(Debug, Clone)]
 pub struct BrowserResize {
+    /// Terminal width in columns.
     pub cols: u16,
+    /// Terminal height in rows.
     pub rows: u16,
 }
 
@@ -150,7 +205,12 @@ pub struct BrowserResize {
 #[derive(Debug, Clone)]
 pub enum BrowserEvent {
     /// Browser connected and sent its public key.
-    Connected { public_key: String, device_name: String },
+    Connected {
+        /// Browser's public key for encryption.
+        public_key: String,
+        /// Name of the connected device.
+        device_name: String,
+    },
     /// Browser disconnected.
     Disconnected,
     /// Terminal input from browser (already decrypted).
@@ -158,30 +218,51 @@ pub enum BrowserEvent {
     /// Browser resized terminal.
     Resize(BrowserResize),
     /// Set display mode (tui/gui).
-    SetMode { mode: String },
+    SetMode {
+        /// Display mode ("tui" or "gui").
+        mode: String,
+    },
     /// List all agents.
     ListAgents,
     /// List available worktrees.
     ListWorktrees,
     /// Select an agent.
-    SelectAgent { id: String },
+    SelectAgent {
+        /// Agent session key to select.
+        id: String,
+    },
     /// Create a new agent.
     CreateAgent {
+        /// Issue number or branch name.
         issue_or_branch: Option<String>,
+        /// Initial prompt for the agent.
         prompt: Option<String>,
     },
     /// Reopen an existing worktree.
     ReopenWorktree {
+        /// Path to the worktree.
         path: String,
+        /// Branch name.
         branch: String,
+        /// Initial prompt for the agent.
         prompt: Option<String>,
     },
     /// Delete an agent.
-    DeleteAgent { id: String, delete_worktree: bool },
+    DeleteAgent {
+        /// Agent session key to delete.
+        id: String,
+        /// Whether to delete the worktree as well.
+        delete_worktree: bool,
+    },
     /// Toggle PTY view (CLI/Server).
     TogglePtyView,
     /// Scroll terminal.
-    Scroll { direction: String, lines: u32 },
+    Scroll {
+        /// Scroll direction ("up" or "down").
+        direction: String,
+        /// Number of lines to scroll.
+        lines: u32,
+    },
     /// Scroll to bottom (return to live).
     ScrollToBottom,
     /// Scroll to top.

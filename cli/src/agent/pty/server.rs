@@ -51,6 +51,7 @@ use crate::agent::spawn;
 /// # Errors
 ///
 /// Returns an error if PTY creation or shell spawn fails.
+#[allow(clippy::implicit_hasher, reason = "internal API doesn't need hasher generalization")]
 pub fn spawn_server_pty(
     worktree_path: &Path,
     init_script: &str,

@@ -39,11 +39,24 @@ const USER_AGENT: &str = "botster-hub";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateStatus {
     /// A newer version is available.
-    UpdateAvailable { current: String, latest: String },
+    UpdateAvailable {
+        /// Currently installed version.
+        current: String,
+        /// Latest available version.
+        latest: String,
+    },
     /// Already running the latest version.
-    UpToDate { version: String },
+    UpToDate {
+        /// Current version string.
+        version: String,
+    },
     /// Running a version newer than the latest release.
-    AheadOfRelease { current: String, latest: String },
+    AheadOfRelease {
+        /// Currently installed version.
+        current: String,
+        /// Latest release version.
+        latest: String,
+    },
 }
 
 /// Checks for available updates by querying the GitHub releases API.
@@ -102,20 +115,18 @@ pub fn get_update_status() -> Result<UpdateStatus> {
     let current = Version::parse(VERSION)?;
     let latest = Version::parse(&latest_version_str)?;
 
-    if latest > current {
-        Ok(UpdateStatus::UpdateAvailable {
+    match latest.cmp(&current) {
+        std::cmp::Ordering::Greater => Ok(UpdateStatus::UpdateAvailable {
             current: VERSION.to_string(),
             latest: latest_version_str,
-        })
-    } else if latest == current {
-        Ok(UpdateStatus::UpToDate {
+        }),
+        std::cmp::Ordering::Equal => Ok(UpdateStatus::UpToDate {
             version: VERSION.to_string(),
-        })
-    } else {
-        Ok(UpdateStatus::AheadOfRelease {
+        }),
+        std::cmp::Ordering::Less => Ok(UpdateStatus::AheadOfRelease {
             current: VERSION.to_string(),
             latest: latest_version_str,
-        })
+        }),
     }
 }
 

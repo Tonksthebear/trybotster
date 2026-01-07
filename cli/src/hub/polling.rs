@@ -19,6 +19,15 @@ use crate::server::types::MessageData;
 
 use super::Hub;
 
+/// Notification data collected from an agent for sending to Rails.
+struct AgentNotificationData {
+    session_key: String,
+    repo: String,
+    issue_number: Option<u32>,
+    invocation_url: Option<String>,
+    notification_type: String,
+}
+
 /// Configuration for server polling operations.
 #[derive(Debug)]
 pub struct PollingConfig<'a> {
@@ -323,7 +332,7 @@ pub fn poll_and_send_agent_notifications(hub: &mut Hub) {
     use crate::agent::AgentNotification;
 
     // Collect notifications
-    let mut notifications: Vec<(String, String, Option<u32>, Option<String>, String)> = Vec::new();
+    let mut notifications: Vec<AgentNotificationData> = Vec::new();
 
     for (session_key, agent) in &hub.state.agents {
         for notification in agent.poll_notifications() {
@@ -331,13 +340,13 @@ pub fn poll_and_send_agent_notifications(hub: &mut Hub) {
                 AgentNotification::Osc9(_) | AgentNotification::Osc777 { .. } => "question_asked",
             };
 
-            notifications.push((
-                session_key.clone(),
-                agent.repo.clone(),
-                agent.issue_number,
-                agent.last_invocation_url.clone(),
-                notification_type.to_string(),
-            ));
+            notifications.push(AgentNotificationData {
+                session_key: session_key.clone(),
+                repo: agent.repo.clone(),
+                issue_number: agent.issue_number,
+                invocation_url: agent.last_invocation_url.clone(),
+                notification_type: notification_type.to_string(),
+            });
         }
     }
 
@@ -350,17 +359,18 @@ pub fn poll_and_send_agent_notifications(hub: &mut Hub) {
         hub_identifier: &hub.hub_identifier,
     };
 
-    for (session_key, repo, issue_number, invocation_url, notification_type) in notifications {
-        if issue_number.is_some() || invocation_url.is_some() {
+    for notif in notifications {
+        if notif.issue_number.is_some() || notif.invocation_url.is_some() {
             log::info!(
-                "Agent {session_key} sent notification: {notification_type} (url: {invocation_url:?})"
+                "Agent {} sent notification: {} (url: {:?})",
+                notif.session_key, notif.notification_type, notif.invocation_url
             );
 
             let payload = AgentNotificationPayload {
-                repo: &repo,
-                issue_number,
-                invocation_url: invocation_url.as_deref(),
-                notification_type: &notification_type,
+                repo: &notif.repo,
+                issue_number: notif.issue_number,
+                invocation_url: notif.invocation_url.as_deref(),
+                notification_type: &notif.notification_type,
             };
 
             if let Err(e) = send_agent_notification(&config, &payload) {

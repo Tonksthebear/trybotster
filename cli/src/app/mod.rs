@@ -24,6 +24,6 @@ pub mod ui;
 pub use state::AppMode;
 
 // Re-export commonly used types
-pub use input::{dispatch_key_event, parse_terminal_input, InputAction};
+pub use input::{dispatch_key_event, parse_terminal_input, InputAction, KeyEventContext};
 pub use state::WorktreeSelection;
 pub use ui::{buffer_to_ansi, centered_rect, convert_browser_key_to_crossterm, KeyInput};

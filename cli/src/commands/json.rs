@@ -115,13 +115,13 @@ pub fn set(file_path: &str, key_path: &str, new_value: &str) -> Result<()> {
                 anyhow::bail!("Cannot navigate through '{}' - not an object", key);
             }
 
-            let obj = current.as_object_mut().unwrap();
+            let obj = current.as_object_mut().expect("checked is_object() above");
 
             // If key doesn't exist or exists but isn't an object, create/replace with empty object
             if !obj.contains_key(*key) || !obj[*key].is_object() {
                 obj.insert(key.to_string(), serde_json::json!({}));
             }
-            current = obj.get_mut(*key).unwrap();
+            current = obj.get_mut(*key).expect("key was just inserted if missing");
         }
     }
 
@@ -186,13 +186,13 @@ pub fn delete(file_path: &str, key_path: &str) -> Result<()> {
                 anyhow::bail!("Cannot navigate through '{}' - not an object", key);
             }
 
-            let obj = current.as_object_mut().unwrap();
+            let obj = current.as_object_mut().expect("checked is_object() above");
             if !obj.contains_key(*key) {
                 // Key doesn't exist, nothing to delete (idempotent)
                 return Ok(());
             }
 
-            current = obj.get_mut(*key).unwrap();
+            current = obj.get_mut(*key).expect("checked contains_key() above");
         }
     }
 

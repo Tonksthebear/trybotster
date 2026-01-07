@@ -45,12 +45,29 @@ pub struct StoredDevice {
 
 /// Runtime device identity with parsed keys
 pub struct Device {
+    /// X25519 public key for encryption.
     pub public_key: PublicKey,
+    /// X25519 secret key (never leaves device).
     pub secret_key: SecretKey,
+    /// Human-readable fingerprint for verification.
     pub fingerprint: String,
+    /// Device name (e.g., hostname).
     pub name: String,
+    /// Server-assigned device ID after registration.
     pub device_id: Option<i64>,
+    /// Path to the device config file.
     config_path: PathBuf,
+}
+
+impl std::fmt::Debug for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Device")
+            .field("fingerprint", &self.fingerprint)
+            .field("name", &self.name)
+            .field("device_id", &self.device_id)
+            .field("config_path", &self.config_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Device {

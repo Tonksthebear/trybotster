@@ -1,3 +1,9 @@
+//! HTTP tunnel management for agent dev servers.
+//!
+//! Provides WebSocket-based tunneling to forward HTTP requests from the Rails
+//! server to local dev servers running in agent worktrees. Supports multiple
+//! concurrent agent tunnels with automatic port allocation.
+
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
@@ -12,8 +18,11 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, tungstenite::client
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TunnelStatus {
+    /// Not connected to tunnel server.
     Disconnected = 0,
+    /// Establishing tunnel connection.
     Connecting = 1,
+    /// Tunnel connection active.
     Connected = 2,
 }
 
@@ -41,7 +50,9 @@ pub fn allocate_tunnel_port() -> Option<u16> {
 /// Pending agent registration to notify Rails about
 #[derive(Debug, Clone)]
 pub struct PendingRegistration {
+    /// Agent session key to register.
     pub session_key: String,
+    /// Allocated tunnel port.
     pub port: u16,
 }
 
@@ -59,7 +70,18 @@ pub struct TunnelManager {
     pending_rx: Arc<Mutex<mpsc::UnboundedReceiver<PendingRegistration>>>,
 }
 
+impl std::fmt::Debug for TunnelManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunnelManager")
+            .field("hub_identifier", &self.hub_identifier)
+            .field("server_url", &self.server_url)
+            .field("status", &self.get_status())
+            .finish_non_exhaustive()
+    }
+}
+
 impl TunnelManager {
+    /// Creates a new tunnel manager.
     pub fn new(hub_identifier: String, api_key: String, server_url: String) -> Self {
         let (pending_tx, pending_rx) = mpsc::unbounded_channel();
         Self {
@@ -106,6 +128,7 @@ impl TunnelManager {
         ports.get(session_key).copied()
     }
 
+    /// Connects to the tunnel server and starts the message loop.
     pub async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ws_url = format!(
             "{}/cable?api_key={}",
@@ -131,7 +154,7 @@ impl TunnelManager {
         let origin = self.server_url.clone();
         request.headers_mut().insert(
             "Origin",
-            origin.parse().unwrap_or_else(|_| "http://localhost".parse().unwrap()),
+            origin.parse().unwrap_or_else(|_| "http://localhost".parse().expect("localhost is a valid header value")),
         );
 
         let (ws_stream, _) = match connect_async(request).await {
@@ -290,7 +313,7 @@ impl TunnelManager {
                 );
 
                 // Find the port for this agent
-                let port = if let Some(p) = self.get_agent_port(agent_session_key).await { p } else {
+                let Some(port) = self.get_agent_port(agent_session_key).await else {
                     warn!("[Tunnel] Agent {} not registered", agent_session_key);
                     self.send_error_response(write, request_id, "Agent tunnel not registered")
                         .await?;
