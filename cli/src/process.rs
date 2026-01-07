@@ -62,20 +62,20 @@ pub fn kill_orphaned_processes(worktree_path: &Path) {
 
     // Safety check: only proceed if the worktree path contains "botster-sessions"
     if !worktree_str.contains("botster-sessions") {
-        eprintln!(
+        log::debug!(
             "[orphan-cleanup] Skipping - path doesn't contain botster-sessions: {}",
             worktree_str
         );
         return;
     }
 
-    eprintln!("[orphan-cleanup] Checking for orphans in: {}", worktree_str);
+    log::debug!("[orphan-cleanup] Checking for orphans in: {}", worktree_str);
 
     // Get our own PID and parent PID to exclude from killing
     let our_pid = std::process::id();
     let our_ppid = get_parent_pid(our_pid);
 
-    eprintln!(
+    log::debug!(
         "[orphan-cleanup] Our PID: {}, Parent PID: {:?}",
         our_pid, our_ppid
     );
@@ -83,7 +83,7 @@ pub fn kill_orphaned_processes(worktree_path: &Path) {
     let pids_to_kill = find_processes_in_directory(worktree_path, our_pid, our_ppid);
 
     if pids_to_kill.is_empty() {
-        eprintln!("[orphan-cleanup] No orphaned processes found");
+        log::debug!("[orphan-cleanup] No orphaned processes found");
         return;
     }
 
@@ -134,11 +134,11 @@ fn find_processes_in_directory(
                         {
                             // Skip our own process and parent
                             if pid == exclude_pid {
-                                eprintln!("[orphan-cleanup] Skipping own PID {}", pid);
+                                log::debug!("[orphan-cleanup] Skipping own PID {}", pid);
                             } else if Some(pid) == exclude_ppid {
-                                eprintln!("[orphan-cleanup] Skipping parent PID {}", pid);
+                                log::debug!("[orphan-cleanup] Skipping parent PID {}", pid);
                             } else {
-                                eprintln!(
+                                log::debug!(
                                     "[orphan-cleanup] Found orphan PID {} (CWD: {})",
                                     pid, cwd
                                 );
@@ -169,7 +169,7 @@ fn find_processes_in_directory(
                         if cwd_str == worktree_str
                             || cwd_str.starts_with(&format!("{}/", worktree_str))
                         {
-                            eprintln!(
+                            log::debug!(
                                 "[orphan-cleanup] Found orphan PID {} (CWD: {})",
                                 pid, cwd_str
                             );
@@ -195,7 +195,7 @@ fn find_processes_in_directory(
 fn graceful_kill_processes(pids: &[u32]) {
     // Send SIGTERM first
     for pid in pids {
-        eprintln!("[orphan-cleanup] Sending SIGTERM to PID {}", pid);
+        log::debug!("[orphan-cleanup] Sending SIGTERM to PID {}", pid);
         let _ = Command::new("kill").arg(pid.to_string()).output();
     }
 
@@ -218,7 +218,7 @@ fn graceful_kill_processes(pids: &[u32]) {
             }
         }
         if all_dead {
-            eprintln!("[orphan-cleanup] All processes exited gracefully");
+            log::debug!("[orphan-cleanup] All processes exited gracefully");
             return;
         }
     }
@@ -232,7 +232,7 @@ fn graceful_kill_processes(pids: &[u32]) {
             .map(|o| o.status.success())
             .unwrap_or(false)
         {
-            eprintln!("[orphan-cleanup] Force killing PID {} with SIGKILL", pid);
+            log::debug!("[orphan-cleanup] Force killing PID {} with SIGKILL", pid);
             let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
         }
     }

@@ -24,12 +24,12 @@ pub fn render_agent_terminal(agent: &Agent, area: Rect, buf: &mut Buffer) -> Str
     let view_indicator = match agent.active_pty {
         PtyView::Cli => {
             if agent.has_server_pty() {
-                "[CLI | Ctrl+T: Server]"
+                "[CLI | Ctrl+]: Server]"
             } else {
                 "[CLI]"
             }
         }
-        PtyView::Server => "[SERVER | Ctrl+T: CLI]",
+        PtyView::Server => "[SERVER | Ctrl+]: CLI]",
     };
 
     // Add scroll indicator if scrolled

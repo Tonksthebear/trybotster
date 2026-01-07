@@ -204,6 +204,8 @@ pub fn close_agent(
 /// Build environment variables for agent spawn.
 ///
 /// Creates a HashMap of environment variables needed by the agent process.
+/// Also overrides certain inherited variables that could cause issues
+/// (e.g., RUST_LOG=debug causes Claude Code to dump verbose output).
 fn build_spawn_environment(config: &AgentSpawnConfig) -> HashMap<String, String> {
     let mut env_vars = HashMap::new();
 
