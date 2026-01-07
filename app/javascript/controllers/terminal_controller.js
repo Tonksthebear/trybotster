@@ -53,6 +53,7 @@ export default class extends Controller {
     "ptyToggle",
     "scrollToLive",
     "selectedAgentLabel",
+    "closeAgentButton",
   ];
 
   static values = {
@@ -1166,6 +1167,9 @@ export default class extends Controller {
       .join("");
 
     this.agentListTarget.innerHTML = html;
+
+    // Update controls based on current selection (agent state may have changed)
+    this.updateSelectedAgentLabel();
   }
 
   // Update selected agent label
@@ -1174,6 +1178,7 @@ export default class extends Controller {
 
     if (!this.selectedAgentId) {
       this.selectedAgentLabelTarget.textContent = "No agent selected";
+      this.updateAgentControls(null);
       return;
     }
 
@@ -1193,7 +1198,42 @@ export default class extends Controller {
       }
 
       this.selectedAgentLabelTarget.textContent = label;
+      this.updateAgentControls(agent);
+    } else {
+      this.updateAgentControls(null);
     }
+  }
+
+  // Update UI controls based on selected agent state
+  updateAgentControls(agent) {
+    // Update PTY toggle buttons visibility and text (there may be multiple - header + mobile)
+    const buttonText = agent?.active_pty_view === "server" ? "View Agent" : "View Server";
+    this.ptyToggleTargets.forEach((button) => {
+      if (agent && agent.has_server_pty) {
+        button.classList.remove("hidden");
+        // Update button text based on current view
+        const textSpan = button.querySelector("span");
+        if (textSpan) {
+          textSpan.textContent = buttonText;
+        }
+      } else {
+        button.classList.add("hidden");
+      }
+    });
+
+    // Update scroll to live buttons visibility (there may be multiple)
+    this.scrollToLiveTargets.forEach((button) => {
+      if (agent && agent.scroll_offset > 0) {
+        button.classList.remove("hidden");
+      } else {
+        button.classList.add("hidden");
+      }
+    });
+
+    // Update close agent button enabled state (there may be multiple)
+    this.closeAgentButtonTargets.forEach((button) => {
+      button.disabled = !agent;
+    });
   }
 
   // Get the currently selected agent
