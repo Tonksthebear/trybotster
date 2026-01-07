@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use std::thread;
 use std::time::Duration;
 
-/// Response from POST /api/device_codes
+/// Response from POST /hubs/codes
 #[derive(Debug, Deserialize)]
 pub struct DeviceCodeResponse {
     /// Opaque code for polling.
@@ -24,7 +24,7 @@ pub struct DeviceCodeResponse {
     pub interval: u64,
 }
 
-/// Successful token response from GET /api/device_codes/:device_code
+/// Successful token response from GET /hubs/codes/:id
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
     /// The access token for API authentication.
@@ -60,7 +60,7 @@ pub fn device_flow(server_url: &str) -> Result<String> {
         .unwrap_or_else(|| "Botster CLI".to_string());
 
     // Step 1: Request device code
-    let url = format!("{}/api/device_codes", server_url);
+    let url = format!("{}/hubs/codes", server_url);
     let response = client
         .post(&url)
         .json(&serde_json::json!({ "device_name": device_name }))
@@ -115,7 +115,7 @@ pub fn device_flow(server_url: &str) -> Result<String> {
     io::stdout().flush()?;
 
     // Step 3: Poll for authorization
-    let poll_url = format!("{}/api/device_codes/{}", server_url, device_code.device_code);
+    let poll_url = format!("{}/hubs/codes/{}", server_url, device_code.device_code);
     let poll_interval = Duration::from_secs(device_code.interval.max(5));
     let max_attempts = device_code.expires_in / device_code.interval.max(5);
 
@@ -245,7 +245,7 @@ pub fn validate_token(server_url: &str, token: &str) -> bool {
     };
 
     // Try to list devices - a simple authenticated endpoint
-    let url = format!("{}/api/devices", server_url);
+    let url = format!("{}/devices", server_url);
     println!("  Validating token against {}...", url);
 
     match client.get(&url).header("X-API-Key", token).send() {

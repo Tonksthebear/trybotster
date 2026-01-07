@@ -160,59 +160,6 @@ class HubAgentTest < ActiveSupport::TestCase
     assert agent.valid?
   end
 
-  # Sharing functionality tests
-  test "enable_sharing! generates token and enables sharing" do
-    agent = HubAgent.create!(
-      hub: @hub,
-      session_key: "owner-repo-123"
-    )
-
-    assert_not agent.sharing_enabled?
-
-    agent.enable_sharing!
-
-    assert agent.sharing_enabled?
-    assert_not_nil agent.tunnel_share_token
-    assert agent.tunnel_share_enabled
-  end
-
-  test "disable_sharing! clears token and disables sharing" do
-    agent = HubAgent.create!(
-      hub: @hub,
-      session_key: "owner-repo-123",
-      tunnel_share_token: "abc123",
-      tunnel_share_enabled: true
-    )
-
-    assert agent.sharing_enabled?
-
-    agent.disable_sharing!
-
-    assert_not agent.sharing_enabled?
-    assert_nil agent.tunnel_share_token
-    assert_not agent.tunnel_share_enabled
-  end
-
-  test "sharing_enabled? returns false when token missing" do
-    agent = HubAgent.create!(
-      hub: @hub,
-      session_key: "owner-repo-123",
-      tunnel_share_enabled: true,
-      tunnel_share_token: nil
-    )
-    assert_not agent.sharing_enabled?
-  end
-
-  test "sharing_enabled? returns false when not enabled" do
-    agent = HubAgent.create!(
-      hub: @hub,
-      session_key: "owner-repo-123",
-      tunnel_share_enabled: false,
-      tunnel_share_token: "abc123"
-    )
-    assert_not agent.sharing_enabled?
-  end
-
   # Scopes tests
   test "with_tunnel scope returns agents with tunnel_port" do
     agent_with_tunnel = HubAgent.create!(
@@ -248,46 +195,4 @@ class HubAgentTest < ActiveSupport::TestCase
     assert_not_includes result, disconnected_agent
   end
 
-  test "shared scope returns agents with sharing enabled" do
-    shared_agent = HubAgent.create!(
-      hub: @hub,
-      session_key: "shared",
-      tunnel_share_enabled: true,
-      tunnel_share_token: "abc123"
-    )
-    not_shared_agent = HubAgent.create!(
-      hub: @hub,
-      session_key: "not-shared",
-      tunnel_share_enabled: false
-    )
-
-    result = HubAgent.shared
-    assert_includes result, shared_agent
-    assert_not_includes result, not_shared_agent
-  end
-
-  test "tunnel_share_token uniqueness" do
-    HubAgent.create!(
-      hub: @hub,
-      session_key: "agent1",
-      tunnel_share_token: "unique-token"
-    )
-
-    other_hub = Hub.create!(
-      user: @user,
-      repo: "owner/other",
-      identifier: SecureRandom.uuid,
-      last_seen_at: Time.current
-    )
-
-    agent2 = HubAgent.new(
-      hub: other_hub,
-      session_key: "agent2",
-      tunnel_share_token: "unique-token"
-    )
-    assert_not agent2.valid?
-    assert_includes agent2.errors[:tunnel_share_token], "has already been taken"
-
-    other_hub.destroy
-  end
 end

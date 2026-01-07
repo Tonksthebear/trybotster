@@ -19,7 +19,7 @@ module Api
     # Test that device tokens work for authentication
 
     test "device token authenticates successfully" do
-      get api_devices_url,
+      get devices_url,
           headers: { "X-API-Key" => @device_token.token },
           as: :json
 
@@ -27,7 +27,7 @@ module Api
     end
 
     test "invalid device token returns unauthorized" do
-      get api_devices_url,
+      get devices_url,
           headers: { "X-API-Key" => "btstr_invalid_token_here" },
           as: :json
 
@@ -37,7 +37,7 @@ module Api
     end
 
     test "invalid token without btstr prefix returns unauthorized" do
-      get api_devices_url,
+      get devices_url,
           headers: { "X-API-Key" => "some_random_token" },
           as: :json
 
@@ -47,7 +47,7 @@ module Api
     end
 
     test "missing api key returns unauthorized for json" do
-      get api_devices_url, as: :json
+      get devices_url, as: :json
 
       # DevicesController falls back to Devise session auth
       # For JSON requests without auth, Devise returns 401
@@ -57,7 +57,7 @@ module Api
     test "device token updates last_used_at on successful auth" do
       assert_nil @device_token.last_used_at
 
-      get api_devices_url,
+      get devices_url,
           headers: { "X-API-Key" => @device_token.token },
           as: :json
 
@@ -67,7 +67,7 @@ module Api
     end
 
     test "device token records last_ip on successful auth" do
-      get api_devices_url,
+      get devices_url,
           headers: { "X-API-Key" => @device_token.token },
           as: :json
 
@@ -82,7 +82,7 @@ module Api
       token_value = @device_token.token
       @device_token.destroy
 
-      get api_devices_url,
+      get devices_url,
           headers: { "X-API-Key" => token_value },
           as: :json
 

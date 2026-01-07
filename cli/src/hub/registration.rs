@@ -59,7 +59,7 @@ pub fn register_hub_with_server(
         .map(|(_, name)| name)
         .unwrap_or_default();
 
-    let url = format!("{server_url}/api/hubs/{hub_identifier}");
+    let url = format!("{server_url}/hubs/{hub_identifier}");
     let payload = serde_json::json!({
         "repo": repo_name,
         "agents": [],
@@ -151,7 +151,7 @@ pub fn shutdown(
     api_key: &str,
 ) {
     log::info!("Sending shutdown notification to server...");
-    let shutdown_url = format!("{server_url}/api/hubs/{hub_identifier}");
+    let shutdown_url = format!("{server_url}/hubs/{hub_identifier}");
 
     match client
         .delete(&shutdown_url)

@@ -19,6 +19,7 @@
 //!     client,
 //!     "https://api.example.com".to_string(),
 //!     "api-key".to_string(),
+//!     "hub-identifier".to_string(),
 //! );
 //!
 //! sender.send_notification(
@@ -66,6 +67,7 @@ pub struct NotificationSender {
     client: Client,
     server_url: String,
     api_key: String,
+    hub_identifier: String,
 }
 
 impl NotificationSender {
@@ -76,11 +78,13 @@ impl NotificationSender {
     /// * `client` - HTTP client for making requests
     /// * `server_url` - Base URL of the Rails server
     /// * `api_key` - API key for authentication
-    pub fn new(client: Client, server_url: String, api_key: String) -> Self {
+    /// * `hub_identifier` - Hub identifier for routing notifications
+    pub fn new(client: Client, server_url: String, api_key: String, hub_identifier: String) -> Self {
         Self {
             client,
             server_url,
             api_key,
+            hub_identifier,
         }
     }
 
@@ -111,7 +115,10 @@ impl NotificationSender {
         invocation_url: Option<&str>,
         notification_type: NotificationType,
     ) -> Result<()> {
-        let url = format!("{}/api/agent_notifications", self.server_url);
+        let url = format!(
+            "{}/hubs/{}/notifications",
+            self.server_url, self.hub_identifier
+        );
 
         // Build payload - include both old and new fields for backwards compatibility
         let payload = serde_json::json!({
@@ -213,9 +220,11 @@ mod tests {
             client,
             "https://example.com".to_string(),
             "test-key".to_string(),
+            "hub-123".to_string(),
         );
 
         assert_eq!(sender.server_url, "https://example.com");
         assert_eq!(sender.api_key, "test-key");
+        assert_eq!(sender.hub_identifier, "hub-123");
     }
 }

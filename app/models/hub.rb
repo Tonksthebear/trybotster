@@ -18,4 +18,59 @@ class Hub < ApplicationRecord
   def e2e_enabled?
     device.present?
   end
+
+  # Synchronize hub_agents with data from CLI heartbeat.
+  # Removes agents not in the list, creates/updates those present.
+  # @param agents_data [Array<Hash>, ActionController::Parameters] Agent data from CLI
+  def sync_agents(agents_data)
+    agents_array = normalize_agents_data(agents_data)
+    session_keys = agents_array.filter_map { |a| a[:session_key] || a["session_key"] }
+
+    # Remove agents no longer reported by CLI
+    hub_agents.where.not(session_key: session_keys).destroy_all
+
+    # Create or update agents
+    agents_array.each do |agent_data|
+      session_key = agent_data[:session_key] || agent_data["session_key"]
+      next if session_key.blank?
+
+      agent = hub_agents.find_or_initialize_by(session_key: session_key)
+      agent.last_invocation_url = agent_data[:last_invocation_url] || agent_data["last_invocation_url"]
+      agent.save!
+    end
+  end
+
+  # Broadcast Turbo Stream update for user dashboard
+  def broadcast_update!
+    Turbo::StreamsChannel.broadcast_update_to(
+      turbo_stream_name,
+      target: "hubs_list",
+      partial: "hubs/list",
+      locals: { hubs: user.hubs.active.includes(:hub_agents) }
+    )
+  rescue => e
+    Rails.logger.warn "Failed to broadcast hub update: #{e.message}"
+  end
+
+  # Broadcast Turbo Stream update after hub removal (call before destroy)
+  def broadcast_removal!
+    Turbo::StreamsChannel.broadcast_update_to(
+      turbo_stream_name,
+      target: "hubs_list",
+      partial: "hubs/list",
+      locals: { hubs: user.hubs.active.includes(:hub_agents) }
+    )
+  rescue => e
+    Rails.logger.warn "Failed to broadcast hub removal: #{e.message}"
+  end
+
+  private
+
+  def normalize_agents_data(data)
+    data.is_a?(ActionController::Parameters) ? data.values : Array(data)
+  end
+
+  def turbo_stream_name
+    "user_#{user_id}_hubs"
+  end
 end

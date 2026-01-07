@@ -333,7 +333,7 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
 
         HubAction::ShowConnectionCode => {
             hub.connection_url = Some(format!(
-                "{}/agents/connect#key={}&hub={}",
+                "{}/hub_connection#key={}&hub={}",
                 hub.config.server_url,
                 hub.device.public_key_base64url(),
                 hub.hub_identifier
