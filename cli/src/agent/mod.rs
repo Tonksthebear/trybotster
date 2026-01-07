@@ -26,6 +26,7 @@
 pub mod notification;
 pub mod pty;
 pub mod screen;
+pub mod scroll;
 pub mod spawn;
 
 pub use notification::{detect_notifications, AgentNotification, AgentStatus};
@@ -132,49 +133,41 @@ impl Agent {
     }
 
     /// Check if we're in scrollback mode (scrolled up from live view).
+    /// Delegates to `scroll::is_scrolled()`.
     #[must_use]
     pub fn is_scrolled(&self) -> bool {
-        let parser = self.get_active_parser();
-        let p = parser.lock().expect("parser lock poisoned");
-        p.screen().scrollback() > 0
+        scroll::is_scrolled(self)
     }
 
     /// Get current scroll offset from vt100.
+    /// Delegates to `scroll::get_offset()`.
     #[must_use]
     pub fn get_scroll_offset(&self) -> usize {
-        let parser = self.get_active_parser();
-        let p = parser.lock().expect("parser lock poisoned");
-        p.screen().scrollback()
+        scroll::get_offset(self)
     }
 
     /// Scroll up by the specified number of lines.
+    /// Delegates to `scroll::up()`.
     pub fn scroll_up(&mut self, lines: usize) {
-        let parser = self.get_active_parser();
-        let mut p = parser.lock().expect("parser lock poisoned");
-        let current = p.screen().scrollback();
-        p.screen_mut().set_scrollback(current.saturating_add(lines));
+        scroll::up(self, lines);
     }
 
     /// Scroll down by the specified number of lines.
+    /// Delegates to `scroll::down()`.
     pub fn scroll_down(&mut self, lines: usize) {
-        let parser = self.get_active_parser();
-        let mut p = parser.lock().expect("parser lock poisoned");
-        let current = p.screen().scrollback();
-        p.screen_mut().set_scrollback(current.saturating_sub(lines));
+        scroll::down(self, lines);
     }
 
     /// Scroll to the bottom (return to live view).
+    /// Delegates to `scroll::to_bottom()`.
     pub fn scroll_to_bottom(&mut self) {
-        let parser = self.get_active_parser();
-        let mut p = parser.lock().expect("parser lock poisoned");
-        p.screen_mut().set_scrollback(0);
+        scroll::to_bottom(self);
     }
 
     /// Scroll to the top of the scrollback buffer.
+    /// Delegates to `scroll::to_top()`.
     pub fn scroll_to_top(&mut self) {
-        let parser = self.get_active_parser();
-        let mut p = parser.lock().expect("parser lock poisoned");
-        p.screen_mut().set_scrollback(usize::MAX);
+        scroll::to_top(self);
     }
 
     /// Get the buffer for the currently active PTY.
@@ -227,24 +220,6 @@ impl Agent {
                     Arc::clone(&server_pty.vt100_parser)
                 } else {
                     Arc::clone(&self.cli_pty.vt100_parser)
-                }
-            }
-        }
-    }
-
-    /// Write input to the currently active PTY.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the write fails.
-    pub fn write_to_active_pty(&mut self, input: &[u8]) -> Result<()> {
-        match self.active_pty {
-            PtyView::Cli => self.write_input(input),
-            PtyView::Server => {
-                if let Some(server_pty) = &mut self.server_pty {
-                    server_pty.write_input(input)
-                } else {
-                    self.write_input(input)
                 }
             }
         }

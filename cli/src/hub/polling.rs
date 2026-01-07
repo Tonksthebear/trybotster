@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use crate::server::types::MessageData;
 
+use super::Hub;
+
 /// Configuration for server polling operations.
 #[derive(Debug)]
 pub struct PollingConfig<'a> {
@@ -263,6 +265,109 @@ pub fn should_skip_polling(quit: bool, polling_enabled: bool) -> bool {
     }
 
     false
+}
+
+/// Send heartbeat to server if due.
+///
+/// Checks interval, gathers agent info, and sends heartbeat.
+/// This function encapsulates the entire heartbeat logic from Hub.
+pub fn send_heartbeat_if_due(hub: &mut Hub) {
+    // Skip if shutdown requested or offline
+    if should_skip_polling(hub.quit, true) {
+        return;
+    }
+
+    // Check heartbeat interval (30 seconds)
+    const HEARTBEAT_INTERVAL: u64 = 30;
+    if hub.last_heartbeat.elapsed() < Duration::from_secs(HEARTBEAT_INTERVAL) {
+        return;
+    }
+    hub.last_heartbeat = Instant::now();
+
+    // Detect current repo
+    let repo_name = match crate::git::WorktreeManager::detect_current_repo() {
+        Ok((_, name)) => name,
+        Err(e) => {
+            log::debug!("Not in a git repository, skipping heartbeat: {e}");
+            return;
+        }
+    };
+
+    // Build agents list for heartbeat
+    let agents: Vec<HeartbeatAgentInfo> = hub
+        .state
+        .agents
+        .values()
+        .map(|agent| HeartbeatAgentInfo {
+            session_key: agent.session_key(),
+            last_invocation_url: agent.last_invocation_url.clone(),
+        })
+        .collect();
+
+    let config = PollingConfig {
+        client: &hub.client,
+        server_url: &hub.config.server_url,
+        api_key: hub.config.get_api_key(),
+        poll_interval: hub.config.poll_interval,
+        hub_identifier: &hub.hub_identifier,
+    };
+
+    send_heartbeat(&config, &repo_name, &agents, hub.device.device_id);
+}
+
+/// Poll agents for terminal notifications and send to Rails.
+///
+/// When agents emit notifications (OSC 9, OSC 777), sends them to Rails
+/// for GitHub comments.
+pub fn poll_and_send_agent_notifications(hub: &mut Hub) {
+    use crate::agent::AgentNotification;
+
+    // Collect notifications
+    let mut notifications: Vec<(String, String, Option<u32>, Option<String>, String)> = Vec::new();
+
+    for (session_key, agent) in &hub.state.agents {
+        for notification in agent.poll_notifications() {
+            let notification_type = match &notification {
+                AgentNotification::Osc9(_) | AgentNotification::Osc777 { .. } => "question_asked",
+            };
+
+            notifications.push((
+                session_key.clone(),
+                agent.repo.clone(),
+                agent.issue_number,
+                agent.last_invocation_url.clone(),
+                notification_type.to_string(),
+            ));
+        }
+    }
+
+    // Send notifications to Rails
+    let config = PollingConfig {
+        client: &hub.client,
+        server_url: &hub.config.server_url,
+        api_key: hub.config.get_api_key(),
+        poll_interval: hub.config.poll_interval,
+        hub_identifier: &hub.hub_identifier,
+    };
+
+    for (session_key, repo, issue_number, invocation_url, notification_type) in notifications {
+        if issue_number.is_some() || invocation_url.is_some() {
+            log::info!(
+                "Agent {session_key} sent notification: {notification_type} (url: {invocation_url:?})"
+            );
+
+            let payload = AgentNotificationPayload {
+                repo: &repo,
+                issue_number,
+                invocation_url: invocation_url.as_deref(),
+                notification_type: &notification_type,
+            };
+
+            if let Err(e) = send_agent_notification(&config, &payload) {
+                log::error!("Failed to send notification to Rails: {e}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

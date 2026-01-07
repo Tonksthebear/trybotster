@@ -385,90 +385,17 @@ impl Hub {
     /// Send heartbeat to the server.
     ///
     /// Registers this hub instance and its active agents with the server.
+    /// Delegates to `polling::send_heartbeat_if_due()`.
     pub fn send_heartbeat(&mut self) {
-        use std::time::Duration;
-
-        // Skip if shutdown requested or offline
-        if polling::should_skip_polling(self.quit, true) {
-            return;
-        }
-
-        // Check heartbeat interval (30 seconds)
-        const HEARTBEAT_INTERVAL: u64 = 30;
-        if self.last_heartbeat.elapsed() < Duration::from_secs(HEARTBEAT_INTERVAL) {
-            return;
-        }
-        self.last_heartbeat = Instant::now();
-
-        // Detect current repo
-        let repo_name = match crate::git::WorktreeManager::detect_current_repo() {
-            Ok((_, name)) => name,
-            Err(e) => {
-                log::debug!("Not in a git repository, skipping heartbeat: {e}");
-                return;
-            }
-        };
-
-        // Build agents list for heartbeat
-        let agents: Vec<polling::HeartbeatAgentInfo> = self
-            .state
-            .agents
-            .values()
-            .map(|agent| polling::HeartbeatAgentInfo {
-                session_key: agent.session_key(),
-                last_invocation_url: agent.last_invocation_url.clone(),
-            })
-            .collect();
-
-        let config = self.polling_config();
-        polling::send_heartbeat(&config, &repo_name, &agents, self.device.device_id);
+        polling::send_heartbeat_if_due(self);
     }
 
     /// Poll agents for terminal notifications (OSC 9, OSC 777).
     ///
     /// When agents emit notifications, sends them to Rails for GitHub comments.
+    /// Delegates to `polling::poll_and_send_agent_notifications()`.
     pub fn poll_agent_notifications(&mut self) {
-        use crate::agent::AgentNotification;
-
-        // Collect notifications
-        let mut notifications: Vec<(String, String, Option<u32>, Option<String>, String)> = Vec::new();
-
-        for (session_key, agent) in &self.state.agents {
-            for notification in agent.poll_notifications() {
-                let notification_type = match &notification {
-                    AgentNotification::Osc9(_) | AgentNotification::Osc777 { .. } => "question_asked",
-                };
-
-                notifications.push((
-                    session_key.clone(),
-                    agent.repo.clone(),
-                    agent.issue_number,
-                    agent.last_invocation_url.clone(),
-                    notification_type.to_string(),
-                ));
-            }
-        }
-
-        // Send notifications to Rails
-        let config = self.polling_config();
-        for (session_key, repo, issue_number, invocation_url, notification_type) in notifications {
-            if issue_number.is_some() || invocation_url.is_some() {
-                log::info!(
-                    "Agent {session_key} sent notification: {notification_type} (url: {invocation_url:?})"
-                );
-
-                let payload = polling::AgentNotificationPayload {
-                    repo: &repo,
-                    issue_number,
-                    invocation_url: invocation_url.as_deref(),
-                    notification_type: &notification_type,
-                };
-
-                if let Err(e) = polling::send_agent_notification(&config, &payload) {
-                    log::error!("Failed to send notification to Rails: {e}");
-                }
-            }
-        }
+        polling::poll_and_send_agent_notifications(self);
     }
 
     // === Connection Setup ===
