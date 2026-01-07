@@ -1,9 +1,61 @@
 ---
 name: rails-frontend-guidelines
-description: Rails frontend development guidelines using Hotwire (Turbo + Stimulus), Tailwind CSS, and ViewComponent. Modern patterns for server-rendered HTML with progressive enhancement, zero-build frontend architecture, and Rails conventions. Use when creating views, components, Stimulus controllers, partials, or working with frontend code.
+description: Rails frontend development guidelines using Hotwire (Turbo + Stimulus), Tailwind CSS, and ViewComponent. Combines bold design thinking with modern patterns for server-rendered HTML with progressive enhancement. Use when creating views, components, Stimulus controllers, partials, or working with frontend code.
 ---
 
 # Rails Frontend Guidelines
+
+## Design Thinking (before coding)
+
+Before writing any Tailwind classes, commit to a **BOLD aesthetic direction**:
+
+### Key Questions
+- **Purpose**: What problem does this interface solve? Who uses it?
+- **Tone**: Pick a direction and commit fully:
+  - Brutally minimal
+  - Maximalist chaos
+  - Retro-futuristic
+  - Editorial/magazine
+  - Luxury/refined
+  - Playful/toy-like
+  - Industrial/utilitarian
+  - Soft/pastel
+- **Differentiation**: What's the one thing someone will remember?
+
+Bold maximalism and refined minimalism both work—the key is **intentionality, not intensity**.
+
+### Typography
+- **Avoid generic fonts**: Inter, Roboto, Arial, system fonts are forgettable
+- Pair a distinctive display font with a refined body font
+- Unexpected, characterful font choices elevate everything
+
+### Color & Theme
+- **Dominant colors with sharp accents** outperform timid, evenly-distributed palettes
+- Commit to a cohesive aesthetic—use Tailwind's color system consistently
+- Light vs dark: make a choice, execute it fully
+
+### Spatial Composition
+- Unexpected layouts, asymmetry, overlap
+- Generous negative space OR controlled density (pick one)
+- Grid-breaking elements where they serve the design
+
+### Motion
+- Focus on **high-impact moments**: one well-orchestrated page load with staggered reveals creates more delight than scattered micro-interactions
+- Scroll-triggering and hover states that surprise
+- CSS transitions via Tailwind (`transition-all`, `duration-300`, etc.)
+
+### Visual Depth
+- Create atmosphere rather than defaulting to solid colors
+- Gradient meshes, noise textures, layered transparencies
+- Dramatic shadows, decorative borders
+
+### Anti-Patterns (never do these)
+- Purple gradients on white backgrounds (cliché AI aesthetic)
+- Cookie-cutter layouts and predictable component patterns
+- Converging on common choices—each design should be unique
+- Generic styling that lacks context-specific character
+
+---
 
 ## Critical Rules
 
