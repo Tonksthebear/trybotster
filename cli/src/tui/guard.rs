@@ -33,6 +33,7 @@ use crossterm::{
 ///     Ok(())
 /// }
 /// ```
+#[derive(Debug)]
 pub struct TerminalGuard;
 
 impl TerminalGuard {

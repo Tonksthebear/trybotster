@@ -12,14 +12,14 @@
 
 // Rust guideline compliant 2025-01
 
+use std::sync::Arc;
+
 use reqwest::blocking::Client;
 
 use crate::config::Config;
 use crate::device::Device;
 use crate::relay::{connection::TerminalRelay, BrowserState};
 use crate::tunnel::TunnelManager;
-
-use std::sync::Arc;
 
 /// Register the device with the server if not already registered.
 ///
@@ -94,7 +94,7 @@ pub fn start_tunnel(
     tunnel_manager: &Arc<TunnelManager>,
     runtime: &tokio::runtime::Runtime,
 ) {
-    let tm = tunnel_manager.clone();
+    let tm = Arc::clone(tunnel_manager);
     runtime.spawn(async move {
         loop {
             if let Err(e) = tm.connect().await {

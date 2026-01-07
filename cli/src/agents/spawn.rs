@@ -85,6 +85,7 @@ impl AgentSpawnConfig {
 /// Session keys are used to identify agents across the system.
 /// Format: `{repo-safe}-{identifier}` where identifier is either
 /// the issue number or a sanitized branch name.
+#[derive(Debug)]
 pub struct SessionKeyGenerator;
 
 impl SessionKeyGenerator {

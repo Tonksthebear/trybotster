@@ -35,7 +35,12 @@ pub enum AgentNotification {
     /// OSC 777 notification (rxvt-unicode style) with title and body.
     ///
     /// Format: `ESC ] 777 ; notify ; title ; body BEL`
-    Osc777 { title: String, body: String },
+    Osc777 {
+        /// Notification title.
+        title: String,
+        /// Notification body text.
+        body: String,
+    },
 }
 
 /// Agent execution status.
@@ -43,7 +48,6 @@ pub enum AgentNotification {
 /// Tracks the lifecycle state of an agent from initialization through
 /// completion or failure.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[expect(dead_code, reason = "Variants used by different codepaths, keeping for API completeness")]
 pub enum AgentStatus {
     /// Agent is starting up.
     Initializing,

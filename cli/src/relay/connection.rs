@@ -164,6 +164,12 @@ pub struct TerminalOutputSender {
     state: Arc<RwLock<RelayState>>,
 }
 
+impl std::fmt::Debug for TerminalOutputSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalOutputSender").finish_non_exhaustive()
+    }
+}
+
 impl TerminalOutputSender {
     /// Send terminal output to browser (will be encrypted)
     pub async fn send(&self, output: &str) -> Result<()> {
@@ -192,6 +198,15 @@ pub struct TerminalRelay {
     api_key: String,
 }
 
+impl std::fmt::Debug for TerminalRelay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalRelay")
+            .field("hub_identifier", &self.hub_identifier)
+            .field("server_url", &self.server_url)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TerminalRelay {
     /// Create a new terminal relay
     pub fn new(
@@ -215,7 +230,7 @@ impl TerminalRelay {
     /// - `mpsc::Receiver<BrowserEvent>` - for receiving events from browser
     pub async fn connect(self) -> Result<(TerminalOutputSender, mpsc::Receiver<BrowserEvent>)> {
         // Build WebSocket URL before moving self
-        let ws_url = self.build_ws_url()?;
+        let ws_url = self.build_ws_url();
         let hub_identifier = self.hub_identifier.clone();
 
         // Create shared state (consumes secret_key)
@@ -236,7 +251,7 @@ impl TerminalRelay {
             "Origin",
             self.server_url
                 .parse()
-                .unwrap_or_else(|_| "http://localhost".parse().unwrap()),
+                .unwrap_or_else(|_| "http://localhost".parse().expect("localhost is a valid header value")),
         );
 
         // Connect to WebSocket
@@ -293,16 +308,16 @@ impl TerminalRelay {
         // Create output sender handle
         let output_sender = TerminalOutputSender {
             tx: output_tx,
-            state: state.clone(),
+            state: Arc::clone(&state),
         };
 
         // Wrap write in Arc<Mutex> for sharing
         let write = Arc::new(Mutex::new(write));
 
         // Spawn task to handle outgoing messages (CLI -> browser)
-        let state_out = state.clone();
+        let state_out = Arc::clone(&state);
         let identifier_out = identifier_json.clone();
-        let write_out = write.clone();
+        let write_out = Arc::clone(&write);
         tokio::spawn(async move {
             while let Some(output) = output_rx.recv().await {
                 let state = state_out.read().await;
@@ -325,11 +340,11 @@ impl TerminalRelay {
                         let cable_msg = CableMessage {
                             command: "message".to_string(),
                             identifier: identifier_out.clone(),
-                            data: Some(serde_json::to_string(&data).unwrap()),
+                            data: Some(serde_json::to_string(&data).expect("TerminalData is serializable")),
                         };
 
                         let mut write = write_out.lock().await;
-                        if let Err(e) = write.send(Message::Text(serde_json::to_string(&cable_msg).unwrap())).await {
+                        if let Err(e) = write.send(Message::Text(serde_json::to_string(&cable_msg).expect("CableMessage is serializable"))).await {
                             log::error!("Failed to send output: {}", e);
                             break;
                         }
@@ -339,7 +354,7 @@ impl TerminalRelay {
         });
 
         // Spawn task to handle incoming messages (browser -> CLI)
-        let state_in = state.clone();
+        let state_in = Arc::clone(&state);
         tokio::spawn(async move {
             while let Some(msg) = read.next().await {
                 match msg {
@@ -504,14 +519,14 @@ impl TerminalRelay {
         Ok((output_sender, event_rx))
     }
 
-    /// Build WebSocket URL for Action Cable
-    fn build_ws_url(&self) -> Result<String> {
+    /// Build WebSocket URL for Action Cable.
+    fn build_ws_url(&self) -> String {
         let base = self.server_url
             .replace("https://", "wss://")
             .replace("http://", "ws://");
 
         // Action Cable endpoint with API key for authentication
-        Ok(format!("{}/cable?api_key={}", base, self.api_key))
+        format!("{}/cable?api_key={}", base, self.api_key)
     }
 }
 

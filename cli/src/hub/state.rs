@@ -59,6 +59,16 @@ pub struct HubState {
     pub git_manager: WorktreeManager,
 }
 
+impl std::fmt::Debug for HubState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubState")
+            .field("agents", &self.agents.len())
+            .field("selected", &self.selected)
+            .field("available_worktrees", &self.available_worktrees.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl HubState {
     /// Creates a new HubState with the given worktree base directory.
     pub fn new(worktree_base: std::path::PathBuf) -> Self {

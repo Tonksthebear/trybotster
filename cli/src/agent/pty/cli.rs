@@ -66,6 +66,7 @@ pub struct CliSpawnResult {
 /// # Errors
 ///
 /// Returns an error if PTY creation or command spawn fails.
+#[allow(clippy::implicit_hasher, reason = "internal API doesn't need hasher generalization")]
 pub fn spawn_cli_pty(
     pty: &mut PtySession,
     worktree_path: &Path,

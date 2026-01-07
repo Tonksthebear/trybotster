@@ -60,7 +60,7 @@ pub fn browser_event_to_hub_action(
             prompt,
         } => {
             // Parse issue_or_branch to determine if it's an issue number or branch name
-            let (issue_number, branch_name) = parse_issue_or_branch(issue_or_branch);
+            let (issue_number, branch_name) = parse_issue_or_branch(issue_or_branch.as_ref());
             let actual_branch = branch_name.unwrap_or_else(|| {
                 issue_number.map_or_else(|| "new-branch".to_string(), |n| format!("botster-issue-{n}"))
             });
@@ -138,7 +138,7 @@ pub struct BrowserEventContext {
 }
 
 /// Parse an issue_or_branch string into issue number and branch name.
-fn parse_issue_or_branch(value: &Option<String>) -> (Option<u32>, Option<String>) {
+fn parse_issue_or_branch(value: Option<&String>) -> (Option<u32>, Option<String>) {
     let Some(v) = value else {
         return (None, None);
     };
@@ -200,9 +200,19 @@ pub enum ResizeAction {
     /// No action needed (dimensions unchanged or browser disconnected).
     None,
     /// Resize agents to these dimensions.
-    ResizeAgents { rows: u16, cols: u16 },
+    ResizeAgents {
+        /// Terminal height in rows.
+        rows: u16,
+        /// Terminal width in columns.
+        cols: u16,
+    },
     /// Browser disconnected - reset to local terminal dimensions.
-    ResetToLocal { rows: u16, cols: u16 },
+    ResetToLocal {
+        /// Terminal height in rows.
+        rows: u16,
+        /// Terminal width in columns.
+        cols: u16,
+    },
 }
 
 /// Check if browser dimensions have changed and return resize action.
@@ -446,21 +456,23 @@ mod tests {
 
     #[test]
     fn test_parse_issue_or_branch_number() {
-        let (issue, branch) = parse_issue_or_branch(&Some("42".to_string()));
+        let value = Some("42".to_string());
+        let (issue, branch) = parse_issue_or_branch(value.as_ref());
         assert_eq!(issue, Some(42));
         assert!(branch.is_none());
     }
 
     #[test]
     fn test_parse_issue_or_branch_string() {
-        let (issue, branch) = parse_issue_or_branch(&Some("feature-branch".to_string()));
+        let value = Some("feature-branch".to_string());
+        let (issue, branch) = parse_issue_or_branch(value.as_ref());
         assert!(issue.is_none());
         assert_eq!(branch, Some("feature-branch".to_string()));
     }
 
     #[test]
     fn test_parse_issue_or_branch_none() {
-        let (issue, branch) = parse_issue_or_branch(&None);
+        let (issue, branch) = parse_issue_or_branch(None);
         assert!(issue.is_none());
         assert!(branch.is_none());
     }

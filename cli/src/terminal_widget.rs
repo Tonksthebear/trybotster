@@ -14,8 +14,11 @@ use ratatui::{
 /// Configuration for cursor rendering
 #[derive(Debug, Clone)]
 pub struct CursorConfig {
+    /// Whether to display the cursor.
     pub show: bool,
+    /// Character to display as the cursor.
     pub symbol: String,
+    /// Style for the cursor (color, modifiers).
     pub style: Style,
 }
 
@@ -34,6 +37,15 @@ pub struct TerminalWidget<'a> {
     screen: &'a vt100::Screen,
     block: Option<Block<'a>>,
     cursor: CursorConfig,
+}
+
+impl std::fmt::Debug for TerminalWidget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalWidget")
+            .field("cursor", &self.cursor)
+            .field("has_block", &self.block.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> TerminalWidget<'a> {

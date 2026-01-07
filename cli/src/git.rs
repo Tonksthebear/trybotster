@@ -1,3 +1,9 @@
+//! Git worktree management.
+//!
+//! Provides functionality for creating, managing, and deleting git worktrees
+//! for agent sessions. Each agent runs in an isolated worktree to prevent
+//! conflicts between concurrent tasks.
+
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSetBuilder};
 use std::{
@@ -5,12 +11,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Manages git worktrees for agent sessions
+/// Manages git worktrees for agent sessions.
+#[derive(Debug)]
 pub struct WorktreeManager {
+    /// Base directory for worktree storage.
     base_dir: PathBuf,
 }
 
 impl WorktreeManager {
+    /// Creates a new worktree manager with the specified base directory.
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
     }
@@ -148,7 +157,7 @@ impl WorktreeManager {
             return Ok(()); // Continue despite errors
         }
 
-        for entry in read_result.unwrap() {
+        for entry in read_result.expect("checked is_ok() above") {
             let entry = match entry {
                 Ok(e) => e,
                 Err(err) => {
@@ -302,7 +311,7 @@ impl WorktreeManager {
                 .args([
                     "worktree",
                     "add",
-                    worktree_path.to_str().unwrap(),
+                    worktree_path.to_str().expect("path is valid UTF-8"),
                     branch_name,
                 ])
                 .current_dir(&repo_path)
@@ -315,7 +324,7 @@ impl WorktreeManager {
                     "add",
                     "-b",
                     branch_name,
-                    worktree_path.to_str().unwrap(),
+                    worktree_path.to_str().expect("path is valid UTF-8"),
                 ])
                 .current_dir(&repo_path)
                 .output()?
@@ -332,7 +341,7 @@ impl WorktreeManager {
 
         // Create settings.local.json to pre-authorize the directory
         let settings = serde_json::json!({
-            "allowedDirectories": [worktree_path.to_str().unwrap()],
+            "allowedDirectories": [worktree_path.to_str().expect("path is valid UTF-8")],
             "permissionMode": "acceptEdits"
         });
         fs::write(
@@ -389,7 +398,7 @@ impl WorktreeManager {
                 .args([
                     "worktree",
                     "add",
-                    worktree_path.to_str().unwrap(),
+                    worktree_path.to_str().expect("path is valid UTF-8"),
                     &branch_name,
                 ])
                 .current_dir(&clone_dir)
@@ -403,7 +412,7 @@ impl WorktreeManager {
                     "add",
                     "-b",
                     &branch_name,
-                    worktree_path.to_str().unwrap(),
+                    worktree_path.to_str().expect("path is valid UTF-8"),
                 ])
                 .current_dir(&clone_dir)
                 .output()?
@@ -420,7 +429,7 @@ impl WorktreeManager {
 
         // Create settings.local.json to pre-authorize the directory
         let settings = serde_json::json!({
-            "allowedDirectories": [worktree_path.to_str().unwrap()],
+            "allowedDirectories": [worktree_path.to_str().expect("path is valid UTF-8")],
             "permissionMode": "acceptEdits"
         });
         fs::write(
@@ -441,14 +450,14 @@ impl WorktreeManager {
                 .args([
                     "worktree",
                     "remove",
-                    worktree_path.to_str().unwrap(),
+                    worktree_path.to_str().expect("path is valid UTF-8"),
                     "--force",
                 ])
                 .current_dir(clone_dir)
                 .output();
 
             // If git command fails, try to prune and remove directory manually
-            if remove_result.is_err() || !remove_result.as_ref().unwrap().status.success() {
+            if remove_result.as_ref().is_err() || remove_result.as_ref().is_ok_and(|r| !r.status.success()) {
                 log::warn!("Git worktree remove failed, trying prune...");
                 let _ = std::process::Command::new("git")
                     .args(["worktree", "prune"])
@@ -546,9 +555,10 @@ impl WorktreeManager {
         Ok(())
     }
 
-    /// Deletes a worktree by path, running teardown scripts first
+    /// Deletes a worktree by path, running teardown scripts first.
     ///
-    /// # Safety
+    /// # Note
+    ///
     /// This function has multiple defense-in-depth checks to prevent accidental
     /// deletion of the main repository or other important directories.
     pub fn delete_worktree_by_path(
@@ -705,7 +715,7 @@ impl WorktreeManager {
                     .env("BOTSTER_REPO", &repo_name)
                     .env("BOTSTER_ISSUE_NUMBER", issue_number.to_string())
                     .env("BOTSTER_BRANCH_NAME", branch_name)
-                    .env("BOTSTER_WORKTREE_PATH", worktree_path.to_str().unwrap())
+                    .env("BOTSTER_WORKTREE_PATH", worktree_path.to_str().expect("path is valid UTF-8"))
                     .env(
                         "BOTSTER_HUB_BIN",
                         std::env::current_exe()
@@ -745,7 +755,7 @@ impl WorktreeManager {
             .args([
                 "worktree",
                 "remove",
-                worktree_path.to_str().unwrap(),
+                worktree_path.to_str().expect("path is valid UTF-8"),
                 "--force",
             ])
             .current_dir(&repo_path)
@@ -823,7 +833,7 @@ impl WorktreeManager {
                     .env("BOTSTER_REPO", &repo_name)
                     .env("BOTSTER_ISSUE_NUMBER", issue_number.to_string())
                     .env("BOTSTER_BRANCH_NAME", &branch_name)
-                    .env("BOTSTER_WORKTREE_PATH", worktree_path.to_str().unwrap())
+                    .env("BOTSTER_WORKTREE_PATH", worktree_path.to_str().expect("path is valid UTF-8"))
                     .env(
                         "BOTSTER_HUB_BIN",
                         std::env::current_exe()
@@ -853,7 +863,7 @@ impl WorktreeManager {
             .args([
                 "worktree",
                 "remove",
-                worktree_path.to_str().unwrap(),
+                worktree_path.to_str().expect("path is valid UTF-8"),
                 "--force",
             ])
             .current_dir(&repo_path)

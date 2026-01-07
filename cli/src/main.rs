@@ -1,3 +1,8 @@
+//! Botster Hub CLI - manages autonomous Claude agents for GitHub issues.
+//!
+//! This is the main binary entry point. See the `botster_hub` library
+//! for the core functionality.
+
 use anyhow::Result;
 use botster_hub::{commands, tui, Config, Hub};
 use mimalloc::MiMalloc;
@@ -62,6 +67,8 @@ fn ensure_authenticated() -> Result<()> {
     Ok(())
 }
 
+/// Runs the hub in headless mode (no TUI).
+#[expect(clippy::unnecessary_wraps, reason = "Will return errors when fully implemented")]
 fn run_headless() -> Result<()> {
     println!("Starting Botster Hub v{} in headless mode...", VERSION);
     println!("Headless mode not yet implemented");

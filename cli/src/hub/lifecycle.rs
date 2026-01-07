@@ -73,7 +73,7 @@ pub struct SpawnResult {
 /// - Spawning the PTY fails
 pub fn spawn_agent(
     state: &mut HubState,
-    config: AgentSpawnConfig,
+    config: &AgentSpawnConfig,
     terminal_dims: (u16, u16),
 ) -> Result<SpawnResult> {
     let id = uuid::Uuid::new_v4();
@@ -113,7 +113,7 @@ pub fn spawn_agent(
     }
 
     // Build environment variables
-    let env_vars = build_spawn_environment(&config);
+    let env_vars = build_spawn_environment(config);
 
     // Allocate a tunnel port for this agent
     let tunnel_port = allocate_tunnel_port();
@@ -131,7 +131,7 @@ pub fn spawn_agent(
     }
 
     let init_commands = vec!["source .botster_init".to_string()];
-    agent.spawn("bash", "", init_commands, spawn_env.clone())?;
+    agent.spawn("bash", "", init_commands, &spawn_env)?;
 
     // Store tunnel port on the agent
     agent.tunnel_port = tunnel_port;
@@ -255,7 +255,7 @@ fn spawn_server_pty_if_exists(agent: &mut Agent, worktree_path: &Path, port: u16
         worktree_path.display().to_string(),
     );
 
-    match agent.spawn_server_pty(".botster_server", server_env) {
+    match agent.spawn_server_pty(".botster_server", &server_env) {
         Ok(()) => true,
         Err(e) => {
             log::warn!("Failed to spawn server PTY: {e}");

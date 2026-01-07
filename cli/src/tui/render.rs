@@ -51,7 +51,7 @@ pub fn render(
     let selected = hub.state.selected;
     let seconds_since_poll = hub.last_poll.elapsed().as_secs();
     let poll_interval = hub.config.poll_interval;
-    let mode = hub.mode.clone();
+    let mode = hub.mode;
     let polling_enabled = hub.polling_enabled;
     let menu_selected = hub.menu_selected;
     let available_worktrees = hub.state.available_worktrees.clone();

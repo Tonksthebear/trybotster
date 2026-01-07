@@ -109,6 +109,19 @@ pub struct Hub {
     pub browser: crate::relay::BrowserState,
 }
 
+impl std::fmt::Debug for Hub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hub")
+            .field("state", &self.state)
+            .field("hub_identifier", &self.hub_identifier)
+            .field("quit", &self.quit)
+            .field("polling_enabled", &self.polling_enabled)
+            .field("terminal_dims", &self.terminal_dims)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Hub {
     /// Create a new Hub with the given configuration and terminal dimensions.
     ///
@@ -272,7 +285,7 @@ impl Hub {
     // === Server Communication ===
 
     /// Build polling configuration from Hub state.
-    fn polling_config(&self) -> polling::PollingConfig {
+    fn polling_config(&self) -> polling::PollingConfig<'_> {
         polling::PollingConfig {
             client: &self.client,
             server_url: &self.config.server_url,
@@ -348,17 +361,15 @@ impl Hub {
         parsed: &crate::server::messages::ParsedMessage,
         default_repo: &str,
     ) -> bool {
-        let issue_number = match parsed.issue_number {
-            Some(n) => n,
-            None => return false,
+        let Some(issue_number) = parsed.issue_number else {
+            return false;
         };
 
         let repo_safe = parsed.repo.as_deref().unwrap_or(default_repo).replace('/', "-");
         let session_key = format!("{repo_safe}-{issue_number}");
 
-        let agent = match self.state.agents.get_mut(&session_key) {
-            Some(a) => a,
-            None => return false,
+        let Some(agent) = self.state.agents.get_mut(&session_key) else {
+            return false;
         };
 
         log::info!("Agent exists for issue #{issue_number}, sending notification");

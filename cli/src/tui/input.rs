@@ -50,7 +50,7 @@ pub fn event_to_hub_action(
 ) -> Option<HubAction> {
     match event {
         Event::Key(key) => key_event_to_action(key, mode, context),
-        Event::Mouse(mouse) => mouse_event_to_action(mouse, mode),
+        Event::Mouse(mouse) => mouse_event_to_action(*mouse, *mode),
         Event::Resize(cols, rows) => Some(HubAction::Resize {
             rows: *rows,
             cols: *cols,
@@ -198,9 +198,9 @@ fn connection_code_key(key: &KeyEvent) -> Option<HubAction> {
 }
 
 /// Convert a mouse event to a HubAction.
-fn mouse_event_to_action(mouse: &MouseEvent, mode: &AppMode) -> Option<HubAction> {
+fn mouse_event_to_action(mouse: MouseEvent, mode: AppMode) -> Option<HubAction> {
     // Only handle mouse in normal mode
-    if *mode != AppMode::Normal {
+    if mode != AppMode::Normal {
         return None;
     }
 
@@ -322,7 +322,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        let action = mouse_event_to_action(&mouse_up, &AppMode::Normal);
+        let action = mouse_event_to_action(mouse_up, AppMode::Normal);
         assert_eq!(action, Some(HubAction::ScrollUp(3)));
     }
 
@@ -335,7 +335,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        let action = mouse_event_to_action(&mouse_up, &AppMode::Menu);
+        let action = mouse_event_to_action(mouse_up, AppMode::Menu);
         assert_eq!(action, None);
     }
 

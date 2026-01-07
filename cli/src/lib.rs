@@ -48,7 +48,7 @@ pub mod tunnel;
 
 // Re-export commonly used types
 pub use agent::{Agent, AgentNotification, AgentStatus, PtyView, ScreenInfo};
-pub use app::{dispatch_key_event, parse_terminal_input, InputAction, KeyInput};
+pub use app::{dispatch_key_event, parse_terminal_input, InputAction, KeyEventContext, KeyInput};
 pub use compat::{BrowserDimensions, BrowserMode, VpnStatus};
 pub use config::Config;
 pub use device::Device;

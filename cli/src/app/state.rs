@@ -15,7 +15,7 @@
 /// - Pressing 'm' or 'M' opens the `Menu`
 /// - From Menu, users can select actions that transition to other modes
 /// - All modes can return to `Normal` via Escape
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum AppMode {
     /// Default mode: showing agent list and selected agent's terminal.
     ///

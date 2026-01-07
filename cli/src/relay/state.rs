@@ -27,6 +27,7 @@ use crate::{AgentInfo, BrowserMode, TerminalMessage, WorktreeInfo, WorktreeManag
 /// Browser connection state.
 ///
 /// Consolidates all browser-related fields from Hub into a single struct.
+#[derive(Default)]
 pub struct BrowserState {
     /// Terminal output sender for encrypted relay.
     pub sender: Option<TerminalOutputSender>,
@@ -44,17 +45,13 @@ pub struct BrowserState {
     pub last_screen_hash: Option<u64>,
 }
 
-impl Default for BrowserState {
-    fn default() -> Self {
-        Self {
-            sender: None,
-            event_rx: None,
-            connected: false,
-            dims: None,
-            mode: None,
-            agent_screen_hashes: HashMap::new(),
-            last_screen_hash: None,
-        }
+impl std::fmt::Debug for BrowserState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserState")
+            .field("connected", &self.connected)
+            .field("dims", &self.dims)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
     }
 }
 
@@ -136,8 +133,16 @@ impl BrowserState {
 
 /// Context needed for sending browser messages.
 pub struct BrowserSendContext<'a> {
+    /// Terminal output sender for encrypted relay.
     pub sender: &'a TerminalOutputSender,
+    /// Async runtime for spawning send tasks.
     pub runtime: &'a tokio::runtime::Runtime,
+}
+
+impl std::fmt::Debug for BrowserSendContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserSendContext").finish_non_exhaustive()
+    }
 }
 
 /// Build AgentInfo from agent data.
@@ -146,29 +151,21 @@ pub struct BrowserSendContext<'a> {
 #[must_use]
 pub fn build_agent_info(
     id: &str,
-    repo: &str,
-    issue_number: Option<u32>,
-    branch_name: &str,
-    status: &str,
-    tunnel_port: Option<u16>,
-    server_running: bool,
-    has_server_pty: bool,
-    active_pty_view: &str,
-    scroll_offset: u32,
+    agent: &crate::Agent,
     hub_identifier: &str,
 ) -> AgentInfo {
     AgentInfo {
         id: id.to_string(),
-        repo: Some(repo.to_string()),
-        issue_number: issue_number.map(u64::from),
-        branch_name: Some(branch_name.to_string()),
+        repo: Some(agent.repo.clone()),
+        issue_number: agent.issue_number.map(u64::from),
+        branch_name: Some(agent.branch_name.clone()),
         name: None,
-        status: Some(status.to_string()),
-        tunnel_port,
-        server_running: Some(server_running),
-        has_server_pty: Some(has_server_pty),
-        active_pty_view: Some(active_pty_view.to_string()),
-        scroll_offset: Some(scroll_offset),
+        status: Some(format!("{:?}", agent.status)),
+        tunnel_port: agent.tunnel_port,
+        server_running: Some(agent.is_server_running()),
+        has_server_pty: Some(agent.has_server_pty()),
+        active_pty_view: Some(format!("{:?}", agent.active_pty).to_lowercase()),
+        scroll_offset: Some(agent.get_scroll_offset() as u32),
         hub_identifier: Some(hub_identifier.to_string()),
     }
 }

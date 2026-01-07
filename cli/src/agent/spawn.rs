@@ -18,6 +18,7 @@ use super::notification::{detect_notifications, AgentNotification};
 use super::pty::MAX_BUFFER_LINES;
 
 /// Configuration for spawning a PTY process.
+#[derive(Debug)]
 pub struct PtySpawnConfig<'a> {
     /// Terminal rows.
     pub rows: u16,
@@ -42,6 +43,7 @@ pub fn open_pty(rows: u16, cols: u16) -> Result<PtyPair> {
 }
 
 /// Build a command from a command string.
+#[allow(clippy::implicit_hasher, reason = "internal API doesn't need hasher generalization")]
 pub fn build_command(
     command_str: &str,
     cwd: &std::path::Path,

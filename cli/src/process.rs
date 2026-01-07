@@ -37,7 +37,7 @@ use std::time::Duration;
 ///
 /// * `worktree_path` - Path to the worktree directory to check for orphaned processes
 ///
-/// # Safety
+/// # Safeguards
 ///
 /// Only processes with working directories containing "botster-sessions" in their
 /// path are considered. The calling process and its parent are always excluded.
@@ -124,8 +124,8 @@ fn find_processes_in_directory(
             let mut current_pid: Option<u32> = None;
 
             for line in lsof_str.lines() {
-                if line.starts_with('p') {
-                    current_pid = line[1..].parse().ok();
+                if let Some(pid_str) = line.strip_prefix('p') {
+                    current_pid = pid_str.parse().ok();
                 } else if let Some(cwd) = line.strip_prefix('n') {
                     if let Some(pid) = current_pid {
                         // Check if CWD matches our worktree
