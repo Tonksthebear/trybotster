@@ -42,14 +42,14 @@ impl MessageData {
         self.payload
             .get("issue")
             .and_then(|i| i.get("number"))
-            .and_then(|n| n.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .map(|n| n as u32)
             .or_else(|| {
                 // Fall back to pull_request.number
                 self.payload
                     .get("pull_request")
                     .and_then(|pr| pr.get("number"))
-                    .and_then(|n| n.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .map(|n| n as u32)
             })
     }

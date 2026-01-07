@@ -2,8 +2,18 @@
 //!
 //! Actions represent user intent from any input source (TUI, browser, server).
 //! The Hub processes actions uniformly regardless of their origin.
+//!
+//! # Dispatch
+//!
+//! The `dispatch()` function is the central handler for all actions. It pattern
+//! matches on the action type and modifies hub state accordingly.
 
 use std::path::PathBuf;
+
+use crate::app::AppMode;
+use crate::constants;
+
+use super::{lifecycle, Hub};
 
 /// Actions that can be dispatched to the Hub.
 ///
@@ -190,6 +200,380 @@ impl HubAction {
                 | HubAction::ScrollToBottom
         )
     }
+}
+
+/// Dispatch a hub action, modifying hub state accordingly.
+///
+/// This is the central dispatch point for all actions. TUI input,
+/// browser events, and server messages all eventually become actions
+/// that are processed here.
+pub fn dispatch(hub: &mut Hub, action: HubAction) {
+    match action {
+        HubAction::Quit => {
+            hub.quit = true;
+        }
+        HubAction::SelectNext => {
+            hub.state.select_next();
+        }
+        HubAction::SelectPrevious => {
+            hub.state.select_previous();
+        }
+        HubAction::SelectByIndex(index) => {
+            hub.state.select_by_index(index);
+        }
+        HubAction::SelectByKey(key) => {
+            hub.state.select_by_key(&key);
+        }
+        HubAction::TogglePtyView => {
+            if let Some(agent) = hub.state.selected_agent_mut() {
+                agent.toggle_pty_view();
+            }
+        }
+        HubAction::ScrollUp(lines) => {
+            if let Some(agent) = hub.state.selected_agent_mut() {
+                agent.scroll_up(lines);
+            }
+        }
+        HubAction::ScrollDown(lines) => {
+            if let Some(agent) = hub.state.selected_agent_mut() {
+                agent.scroll_down(lines);
+            }
+        }
+        HubAction::ScrollToTop => {
+            if let Some(agent) = hub.state.selected_agent_mut() {
+                agent.scroll_to_top();
+            }
+        }
+        HubAction::ScrollToBottom => {
+            if let Some(agent) = hub.state.selected_agent_mut() {
+                agent.scroll_to_bottom();
+            }
+        }
+        HubAction::SendInput(data) => {
+            if let Some(agent) = hub.state.selected_agent_mut() {
+                if let Err(e) = agent.write_input(&data) {
+                    log::error!("Failed to send input to agent: {}", e);
+                }
+            }
+        }
+        HubAction::Resize { rows, cols } => {
+            hub.terminal_dims = (rows, cols);
+            for agent in hub.state.agents.values_mut() {
+                agent.resize(rows, cols);
+            }
+        }
+        HubAction::TogglePolling => {
+            hub.polling_enabled = !hub.polling_enabled;
+        }
+
+        // === Agent Lifecycle ===
+        HubAction::SpawnAgent {
+            issue_number,
+            branch_name,
+            worktree_path,
+            repo_path,
+            repo_name,
+            prompt,
+            message_id,
+            invocation_url,
+        } => {
+            let config = crate::agents::AgentSpawnConfig {
+                issue_number,
+                branch_name,
+                worktree_path,
+                repo_path,
+                repo_name,
+                prompt,
+                message_id,
+                invocation_url,
+            };
+            let dims = hub.browser.dims
+                .as_ref()
+                .map_or(hub.terminal_dims, |d| (d.rows, d.cols));
+
+            match lifecycle::spawn_agent(&mut hub.state, config, dims) {
+                Ok(result) => {
+                    log::info!("Spawned agent: {}", result.session_key);
+                    if let Some(port) = result.tunnel_port {
+                        let tm = hub.tunnel_manager.clone();
+                        let key = result.session_key.clone();
+                        hub.tokio_runtime.spawn(async move {
+                            tm.register_agent(key, port).await;
+                        });
+                    }
+                }
+                Err(e) => log::error!("Failed to spawn agent: {}", e),
+            }
+        }
+
+        HubAction::CloseAgent { session_key, delete_worktree } => {
+            if let Err(e) = lifecycle::close_agent(&mut hub.state, &session_key, delete_worktree) {
+                log::error!("Failed to close agent {}: {}", session_key, e);
+            }
+        }
+
+        HubAction::KillSelectedAgent => {
+            if let Some(key) = hub.state.selected_session_key().map(String::from) {
+                if let Err(e) = lifecycle::close_agent(&mut hub.state, &key, false) {
+                    log::error!("Failed to kill agent: {}", e);
+                }
+            }
+        }
+
+        // === UI Mode ===
+        HubAction::OpenMenu => {
+            hub.mode = AppMode::Menu;
+            hub.menu_selected = 0;
+        }
+
+        HubAction::CloseModal => {
+            hub.mode = AppMode::Normal;
+            hub.input_buffer.clear();
+        }
+
+        HubAction::ShowConnectionCode => {
+            hub.connection_url = Some(format!(
+                "{}/agents/connect#key={}&hub={}",
+                hub.config.server_url,
+                hub.device.public_key_base64url(),
+                hub.hub_identifier
+            ));
+            hub.mode = AppMode::ConnectionCode;
+        }
+
+        HubAction::CopyConnectionUrl => {
+            if let Some(url) = &hub.connection_url {
+                match arboard::Clipboard::new() {
+                    Ok(mut clipboard) => {
+                        if clipboard.set_text(url.clone()).is_ok() {
+                            log::info!("Connection URL copied to clipboard");
+                        }
+                    }
+                    Err(e) => log::warn!("Could not access clipboard: {}", e),
+                }
+            }
+        }
+
+        // === Menu Navigation ===
+        HubAction::MenuUp => {
+            if hub.menu_selected > 0 {
+                hub.menu_selected -= 1;
+            }
+        }
+
+        HubAction::MenuDown => {
+            if hub.menu_selected < constants::MENU_ITEMS.len().saturating_sub(1) {
+                hub.menu_selected += 1;
+            }
+        }
+
+        HubAction::MenuSelect(index) => {
+            handle_menu_select(hub, index);
+        }
+
+        // === Worktree Selection ===
+        HubAction::WorktreeUp => {
+            if hub.worktree_selected > 0 {
+                hub.worktree_selected -= 1;
+            }
+        }
+
+        HubAction::WorktreeDown => {
+            if hub.worktree_selected < hub.state.available_worktrees.len() {
+                hub.worktree_selected += 1;
+            }
+        }
+
+        HubAction::WorktreeSelect(index) => {
+            if index == 0 {
+                hub.mode = AppMode::NewAgentCreateWorktree;
+                hub.input_buffer.clear();
+            } else {
+                hub.mode = AppMode::NewAgentPrompt;
+                hub.input_buffer.clear();
+            }
+        }
+
+        // === Text Input ===
+        HubAction::InputChar(c) => {
+            hub.input_buffer.push(c);
+        }
+
+        HubAction::InputBackspace => {
+            hub.input_buffer.pop();
+        }
+
+        HubAction::InputSubmit => {
+            handle_input_submit(hub);
+        }
+
+        HubAction::InputClear => {
+            hub.input_buffer.clear();
+        }
+
+        // === Confirmation Dialogs ===
+        HubAction::ConfirmCloseAgent => {
+            if let Some(key) = hub.state.selected_session_key().map(String::from) {
+                let _ = lifecycle::close_agent(&mut hub.state, &key, false);
+            }
+            hub.mode = AppMode::Normal;
+        }
+
+        HubAction::ConfirmCloseAgentDeleteWorktree => {
+            if let Some(key) = hub.state.selected_session_key().map(String::from) {
+                let _ = lifecycle::close_agent(&mut hub.state, &key, true);
+            }
+            hub.mode = AppMode::Normal;
+        }
+
+        HubAction::RefreshWorktrees => {
+            if let Err(e) = hub.load_available_worktrees() {
+                log::error!("Failed to refresh worktrees: {}", e);
+            }
+        }
+
+        HubAction::None => {}
+    }
+}
+
+/// Handle menu item selection.
+fn handle_menu_select(hub: &mut Hub, index: usize) {
+    match index {
+        constants::MENU_INDEX_TOGGLE_POLLING => {
+            hub.polling_enabled = !hub.polling_enabled;
+            hub.mode = AppMode::Normal;
+        }
+        constants::MENU_INDEX_NEW_AGENT => {
+            if let Err(e) = hub.load_available_worktrees() {
+                log::error!("Failed to load worktrees: {}", e);
+                hub.mode = AppMode::Normal;
+            } else {
+                hub.mode = AppMode::NewAgentSelectWorktree;
+                hub.worktree_selected = 0;
+            }
+        }
+        constants::MENU_INDEX_CLOSE_AGENT => {
+            if hub.state.agent_keys_ordered.is_empty() {
+                hub.mode = AppMode::Normal;
+            } else {
+                hub.mode = AppMode::CloseAgentConfirm;
+            }
+        }
+        constants::MENU_INDEX_CONNECTION_CODE => {
+            dispatch(hub, HubAction::ShowConnectionCode);
+        }
+        _ => {
+            hub.mode = AppMode::Normal;
+        }
+    }
+}
+
+/// Handle input submission based on current mode.
+fn handle_input_submit(hub: &mut Hub) {
+    match hub.mode {
+        AppMode::NewAgentCreateWorktree => {
+            if !hub.input_buffer.is_empty() {
+                if let Err(e) = create_and_spawn_agent(hub) {
+                    log::error!("Failed to create worktree and spawn agent: {}", e);
+                }
+            }
+        }
+        AppMode::NewAgentPrompt => {
+            if let Err(e) = spawn_agent_from_worktree(hub) {
+                log::error!("Failed to spawn agent: {}", e);
+            }
+        }
+        _ => {}
+    }
+    hub.mode = AppMode::Normal;
+    hub.input_buffer.clear();
+}
+
+/// Spawn an agent from a selected existing worktree.
+fn spawn_agent_from_worktree(hub: &mut Hub) -> anyhow::Result<()> {
+    let worktree_index = hub.worktree_selected.saturating_sub(1);
+
+    if let Some((path, branch)) = hub.state.available_worktrees.get(worktree_index).cloned() {
+        let issue_number = branch
+            .strip_prefix("botster-issue-")
+            .and_then(|s| s.parse::<u32>().ok());
+
+        let (repo_path, repo_name) = crate::git::WorktreeManager::detect_current_repo()?;
+        let worktree_path = std::path::PathBuf::from(&path);
+
+        let prompt = if hub.input_buffer.is_empty() {
+            issue_number.map_or_else(|| format!("Work on {branch}"), |n| format!("Work on issue #{n}"))
+        } else {
+            hub.input_buffer.clone()
+        };
+
+        spawn_agent_with_tunnel(hub, crate::agents::AgentSpawnConfig {
+            issue_number,
+            branch_name: branch,
+            worktree_path,
+            repo_path,
+            repo_name,
+            prompt,
+            message_id: None,
+            invocation_url: None,
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Create a new worktree and spawn an agent on it.
+fn create_and_spawn_agent(hub: &mut Hub) -> anyhow::Result<()> {
+    let branch_name = hub.input_buffer.trim();
+
+    if branch_name.is_empty() {
+        anyhow::bail!("Branch name cannot be empty");
+    }
+
+    let (issue_number, actual_branch_name) = if let Ok(num) = branch_name.parse::<u32>() {
+        (Some(num), format!("botster-issue-{num}"))
+    } else {
+        (None, branch_name.to_string())
+    };
+
+    let (repo_path, repo_name) = crate::git::WorktreeManager::detect_current_repo()?;
+    let worktree_path = hub.state.git_manager.create_worktree_with_branch(&actual_branch_name)?;
+
+    let prompt = issue_number.map_or_else(
+        || format!("Work on {actual_branch_name}"),
+        |n| format!("Work on issue #{n}"),
+    );
+
+    spawn_agent_with_tunnel(hub, crate::agents::AgentSpawnConfig {
+        issue_number,
+        branch_name: actual_branch_name,
+        worktree_path,
+        repo_path,
+        repo_name,
+        prompt,
+        message_id: None,
+        invocation_url: None,
+    })?;
+
+    Ok(())
+}
+
+/// Helper to spawn an agent and register its tunnel.
+fn spawn_agent_with_tunnel(hub: &mut Hub, config: crate::agents::AgentSpawnConfig) -> anyhow::Result<()> {
+    let dims = hub.browser.dims
+        .as_ref()
+        .map_or(hub.terminal_dims, |d| (d.rows, d.cols));
+
+    let result = lifecycle::spawn_agent(&mut hub.state, config, dims)?;
+    if let Some(port) = result.tunnel_port {
+        let tm = hub.tunnel_manager.clone();
+        let key = result.session_key;
+        hub.tokio_runtime.spawn(async move {
+            tm.register_agent(key, port).await;
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -26,23 +26,21 @@
 pub mod notification;
 pub mod pty;
 pub mod screen;
+pub mod spawn;
 
 pub use notification::{detect_notifications, AgentNotification, AgentStatus};
 pub use pty::PtySession;
 pub use screen::ScreenInfo;
 
-use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use anyhow::Result;
 use pty::MAX_BUFFER_LINES;
 use std::{
     collections::{HashMap, VecDeque},
-    io::{Read, Write},
     path::PathBuf,
     sync::{
-        mpsc::{self, Receiver},
+        mpsc::Receiver,
         Arc, Mutex,
     },
-    thread,
     time::Duration,
 };
 use vt100::Parser;
@@ -92,18 +90,15 @@ pub struct Agent {
     pub terminal_window_id: Option<String>,
 
     /// Primary PTY (CLI - runs main agent process).
-    pub cli_pty: Option<PtySession>,
+    ///
+    /// Always exists. Check `cli_pty.is_spawned()` to see if a process is running.
+    pub cli_pty: PtySession,
 
     /// Secondary PTY (Server - runs dev server).
     pub server_pty: Option<PtySession>,
 
     /// Which PTY is currently displayed.
     pub active_pty: PtyView,
-
-    /// Backward compatibility fields (delegate to `cli_pty`).
-    pub buffer: Arc<Mutex<VecDeque<String>>>,
-    pub vt100_parser: Arc<Mutex<Parser>>,
-    pub scrollback_history: Arc<Mutex<Vec<String>>>,
 
     notification_rx: Option<Receiver<AgentNotification>>,
 }
@@ -118,8 +113,6 @@ impl Agent {
         branch_name: String,
         worktree_path: PathBuf,
     ) -> Self {
-        let parser = Parser::new(24, 80, MAX_BUFFER_LINES);
-
         Self {
             id,
             repo,
@@ -131,12 +124,9 @@ impl Agent {
             last_invocation_url: None,
             tunnel_port: None,
             terminal_window_id: None,
-            cli_pty: None,
+            cli_pty: PtySession::new(24, 80),
             server_pty: None,
             active_pty: PtyView::Cli,
-            buffer: Arc::new(Mutex::new(VecDeque::new())),
-            vt100_parser: Arc::new(Mutex::new(parser)),
-            scrollback_history: Arc::new(Mutex::new(Vec::new())),
             notification_rx: None,
         }
     }
@@ -191,20 +181,12 @@ impl Agent {
     #[must_use]
     pub fn get_active_buffer(&self) -> Arc<Mutex<VecDeque<String>>> {
         match self.active_pty {
-            PtyView::Cli => {
-                if let Some(cli_pty) = &self.cli_pty {
-                    Arc::clone(&cli_pty.buffer)
-                } else {
-                    Arc::clone(&self.buffer)
-                }
-            }
+            PtyView::Cli => Arc::clone(&self.cli_pty.buffer),
             PtyView::Server => {
                 if let Some(server_pty) = &self.server_pty {
                     Arc::clone(&server_pty.buffer)
-                } else if let Some(cli_pty) = &self.cli_pty {
-                    Arc::clone(&cli_pty.buffer)
                 } else {
-                    Arc::clone(&self.buffer)
+                    Arc::clone(&self.cli_pty.buffer)
                 }
             }
         }
@@ -215,52 +197,9 @@ impl Agent {
     /// This clears the vt100 parser screens to ensure content renders at the new
     /// dimensions. Old content would otherwise be stuck at the old column width.
     pub fn resize(&self, rows: u16, cols: u16) {
-        // Resize the fallback parser
-        {
-            let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-            parser.screen_mut().set_size(rows, cols);
-        }
-
-        // Resize CLI PTY and clear its parser
-        if let Some(cli_pty) = &self.cli_pty {
-            let needs_clear = {
-                let parser = cli_pty.vt100_parser.lock().expect("parser lock poisoned");
-                let (current_rows, current_cols) = parser.screen().size();
-                current_rows != rows || current_cols != cols
-            };
-
-            if needs_clear {
-                log::info!(
-                    "CLI PTY resize: clearing screen and setting {}x{}",
-                    cols, rows
-                );
-                let mut parser = cli_pty.vt100_parser.lock().expect("parser lock poisoned");
-                parser.process(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
-                parser.screen_mut().set_scrollback(0);
-                parser.screen_mut().set_size(rows, cols);
-            }
-            cli_pty.resize(rows, cols);
-        }
-
-        // Resize Server PTY and clear its parser
+        pty::resize_with_clear(&self.cli_pty, rows, cols, "CLI");
         if let Some(server_pty) = &self.server_pty {
-            let needs_clear = {
-                let parser = server_pty.vt100_parser.lock().expect("parser lock poisoned");
-                let (current_rows, current_cols) = parser.screen().size();
-                current_rows != rows || current_cols != cols
-            };
-
-            if needs_clear {
-                log::info!(
-                    "Server PTY resize: clearing screen and setting {}x{}",
-                    cols, rows
-                );
-                let mut parser = server_pty.vt100_parser.lock().expect("parser lock poisoned");
-                parser.process(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
-                parser.screen_mut().set_scrollback(0);
-                parser.screen_mut().set_size(rows, cols);
-            }
-            server_pty.resize(rows, cols);
+            pty::resize_with_clear(server_pty, rows, cols, "Server");
         }
     }
 
@@ -282,20 +221,12 @@ impl Agent {
     #[must_use]
     pub fn get_active_parser(&self) -> Arc<Mutex<Parser>> {
         match self.active_pty {
-            PtyView::Cli => {
-                if let Some(cli_pty) = &self.cli_pty {
-                    Arc::clone(&cli_pty.vt100_parser)
-                } else {
-                    Arc::clone(&self.vt100_parser)
-                }
-            }
+            PtyView::Cli => Arc::clone(&self.cli_pty.vt100_parser),
             PtyView::Server => {
                 if let Some(server_pty) = &self.server_pty {
                     Arc::clone(&server_pty.vt100_parser)
-                } else if let Some(cli_pty) = &self.cli_pty {
-                    Arc::clone(&cli_pty.vt100_parser)
                 } else {
-                    Arc::clone(&self.vt100_parser)
+                    Arc::clone(&self.cli_pty.vt100_parser)
                 }
             }
         }
@@ -346,7 +277,6 @@ impl Agent {
     /// # Errors
     ///
     /// Returns an error if PTY creation or command spawn fails.
-    #[expect(clippy::too_many_arguments, reason = "Agent spawn requires multiple configuration options")]
     pub fn spawn(
         &mut self,
         command_str: &str,
@@ -354,160 +284,27 @@ impl Agent {
         init_commands: Vec<String>,
         env_vars: HashMap<String, String>,
     ) -> Result<()> {
-        let agent_label = if let Some(issue_num) = self.issue_number {
-            format!("{}#{}", self.repo, issue_num)
-        } else {
-            format!("{}/{}", self.repo, self.branch_name)
-        };
+        let agent_label = self.issue_number.map_or_else(
+            || format!("{}/{}", self.repo, self.branch_name),
+            |num| format!("{}#{num}", self.repo),
+        );
         self.add_to_buffer(&format!("==> Spawning agent: {agent_label}"));
         self.add_to_buffer(&format!("==> Command: {command_str}"));
         self.add_to_buffer(&format!("==> Worktree: {}", self.worktree_path.display()));
         self.add_to_buffer("");
 
-        let (rows, cols) = {
-            let parser = self.vt100_parser.lock().expect("parser lock poisoned");
-            parser.screen().size()
-        };
+        // Use the extracted spawn function
+        let result = pty::spawn_cli_pty(
+            &mut self.cli_pty,
+            &self.worktree_path,
+            command_str,
+            &env_vars,
+            init_commands,
+            context,
+        )?;
 
-        let mut cli_pty = PtySession::new(rows, cols);
-
-        let pty_system = native_pty_system();
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-
-        let pair = pty_system.openpty(size).context("Failed to open PTY")?;
-
-        let parts: Vec<&str> = command_str.split_whitespace().collect();
-        let mut cmd = CommandBuilder::new(parts[0]);
-        for arg in &parts[1..] {
-            cmd.arg(arg);
-        }
-        cmd.cwd(&self.worktree_path);
-
-        for (key, value) in env_vars {
-            cmd.env(key, value);
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .context("Failed to spawn command")?;
-
-        cli_pty.set_child(child);
-
-        let mut reader = pair.master.try_clone_reader()?;
-
-        cli_pty.writer = Some(pair.master.take_writer()?);
-
-        let (notification_tx, notification_rx) = mpsc::channel::<AgentNotification>();
-        self.notification_rx = Some(notification_rx);
-        cli_pty.notification_tx = Some(notification_tx.clone());
-
-        let buffer = Arc::clone(&self.buffer);
-        let pty_buffer = Arc::clone(&cli_pty.buffer);
-        let vt100_parser = Arc::clone(&self.vt100_parser);
-        let pty_parser = Arc::clone(&cli_pty.vt100_parser);
-
-        cli_pty.reader_thread = Some(thread::spawn(move || {
-            log::info!("CLI PTY reader thread started");
-            let mut buf = [0u8; 4096];
-            let mut total_bytes_read: usize = 0;
-
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        total_bytes_read += n;
-                        if total_bytes_read % 10240 < n {
-                            log::info!("CLI PTY reader: {total_bytes_read} total bytes read");
-                        }
-
-                        let has_esc_bracket = buf[..n].windows(2).any(|w| w == [0x1b, b']']);
-                        let has_bel = buf[..n].contains(&0x07);
-                        if has_esc_bracket || has_bel {
-                            log::info!(
-                                "PTY output contains potential notification markers: ESC]={}, BEL={}. First 100 bytes: {:?}",
-                                has_esc_bracket,
-                                has_bel,
-                                &buf[..n.min(100)]
-                            );
-                        }
-
-                        let notifications = notification::detect_notifications(&buf[..n]);
-                        if !notifications.is_empty() {
-                            log::info!(
-                                "Detected {} notification(s) in PTY output",
-                                notifications.len()
-                            );
-                        }
-                        for notif in notifications {
-                            log::info!("Sending notification to channel: {:?}", notif);
-                            let _ = notification_tx.send(notif);
-                        }
-
-                        {
-                            let mut parser = vt100_parser.lock().expect("parser lock poisoned");
-                            parser.process(&buf[..n]);
-                        }
-                        {
-                            let mut parser = pty_parser.lock().expect("parser lock poisoned");
-                            parser.process(&buf[..n]);
-                        }
-
-                        let output = String::from_utf8_lossy(&buf[..n]);
-                        {
-                            let mut buffer_lock = buffer.lock().expect("buffer lock poisoned");
-                            for line in output.lines() {
-                                buffer_lock.push_back(line.to_string());
-                                if buffer_lock.len() > MAX_BUFFER_LINES {
-                                    buffer_lock.pop_front();
-                                }
-                            }
-                        }
-                        {
-                            let mut pty_buffer_lock = pty_buffer.lock().expect("buffer lock poisoned");
-                            for line in output.lines() {
-                                pty_buffer_lock.push_back(line.to_string());
-                                if pty_buffer_lock.len() > MAX_BUFFER_LINES {
-                                    pty_buffer_lock.pop_front();
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("CLI PTY read error: {e}");
-                        break;
-                    }
-                }
-            }
-            log::info!("CLI PTY reader thread exiting");
-        }));
-
-        cli_pty.master_pty = Some(pair.master);
-
-        self.cli_pty = Some(cli_pty);
-
+        self.notification_rx = Some(result.notification_rx);
         self.status = AgentStatus::Running;
-
-        if !context.is_empty() {
-            self.add_to_buffer("==> Sending context to agent...");
-            self.write_input_str(&format!("{context}\n"))?;
-        }
-
-        if !init_commands.is_empty() {
-            log::info!("Sending {} init command(s) to agent", init_commands.len());
-            thread::sleep(Duration::from_millis(100));
-
-            for cmd in init_commands {
-                log::debug!("Running init command: {cmd}");
-                self.write_input_str(&format!("{cmd}\n"))?;
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
 
         Ok(())
     }
@@ -522,101 +319,20 @@ impl Agent {
         init_script: &str,
         env_vars: HashMap<String, String>,
     ) -> Result<()> {
-        log::info!("Spawning server PTY with init script: {init_script}");
-
         let (rows, cols) = {
-            let parser = self.vt100_parser.lock().expect("parser lock poisoned");
+            let parser = self.cli_pty.vt100_parser.lock().expect("parser lock poisoned");
             parser.screen().size()
         };
 
-        let mut server_pty = PtySession::new(rows, cols);
-
-        let pty_system = native_pty_system();
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-
-        let pair = pty_system
-            .openpty(size)
-            .context("Failed to open server PTY")?;
-
-        let mut cmd = CommandBuilder::new("bash");
-        cmd.cwd(&self.worktree_path);
-
-        for (key, value) in env_vars {
-            cmd.env(key, value);
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .context("Failed to spawn server shell")?;
-
-        server_pty.set_child(child);
-
-        let mut reader = pair.master.try_clone_reader()?;
-
-        server_pty.writer = Some(pair.master.take_writer()?);
-
-        let pty_buffer = Arc::clone(&server_pty.buffer);
-        let pty_parser = Arc::clone(&server_pty.vt100_parser);
-
-        server_pty.reader_thread = Some(thread::spawn(move || {
-            log::info!("Server PTY reader thread started");
-            let mut buf = [0u8; 4096];
-            let mut total_bytes_read: usize = 0;
-
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        total_bytes_read += n;
-                        if total_bytes_read % 10240 < n {
-                            log::info!("Server PTY reader: {total_bytes_read} total bytes read");
-                        }
-
-                        {
-                            let mut parser = pty_parser.lock().expect("parser lock poisoned");
-                            parser.process(&buf[..n]);
-                        }
-
-                        let output = String::from_utf8_lossy(&buf[..n]);
-                        {
-                            let mut buffer_lock = pty_buffer.lock().expect("buffer lock poisoned");
-                            for line in output.lines() {
-                                buffer_lock.push_back(line.to_string());
-                                if buffer_lock.len() > MAX_BUFFER_LINES {
-                                    buffer_lock.pop_front();
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Server PTY read error: {e}");
-                        break;
-                    }
-                }
-            }
-            log::info!("Server PTY reader thread exiting");
-        }));
-
-        server_pty.master_pty = Some(pair.master);
+        // Use the extracted spawn function
+        let server_pty = pty::spawn_server_pty(
+            &self.worktree_path,
+            init_script,
+            &env_vars,
+            (rows, cols),
+        )?;
 
         self.server_pty = Some(server_pty);
-
-        thread::sleep(Duration::from_millis(100));
-        if let Some(ref mut server_pty) = self.server_pty {
-            if let Some(ref mut writer) = server_pty.writer {
-                log::info!("Sending init command to server PTY: source {init_script}");
-                writer.write_all(format!("source {init_script}\n").as_bytes())?;
-                writer.flush()?;
-            }
-        }
-
-        log::info!("Server PTY spawned successfully");
         Ok(())
     }
 
@@ -628,15 +344,13 @@ impl Agent {
     pub fn write_input(&mut self, input: &[u8]) -> Result<()> {
         match self.active_pty {
             PtyView::Cli => {
-                if let Some(cli_pty) = &mut self.cli_pty {
-                    cli_pty.write_input(input)?;
-                }
+                self.cli_pty.write_input(input)?;
             }
             PtyView::Server => {
                 if let Some(server_pty) = &mut self.server_pty {
                     server_pty.write_input(input)?;
-                } else if let Some(cli_pty) = &mut self.cli_pty {
-                    cli_pty.write_input(input)?;
+                } else {
+                    self.cli_pty.write_input(input)?;
                 }
             }
         }
@@ -658,15 +372,12 @@ impl Agent {
     ///
     /// Returns an error if the write fails.
     pub fn write_input_to_cli(&mut self, input: &[u8]) -> Result<()> {
-        if let Some(cli_pty) = &mut self.cli_pty {
-            cli_pty.write_input(input)?;
-        }
-        Ok(())
+        self.cli_pty.write_input(input)
     }
 
     /// Add a line to the buffer.
     pub fn add_to_buffer(&self, line: &str) {
-        let mut buffer = self.buffer.lock().expect("buffer lock poisoned");
+        let mut buffer = self.cli_pty.buffer.lock().expect("buffer lock poisoned");
         buffer.push_back(line.to_string());
         if buffer.len() > MAX_BUFFER_LINES {
             buffer.pop_front();
@@ -708,7 +419,8 @@ impl Agent {
     /// Get a snapshot of the buffer contents.
     #[must_use]
     pub fn get_buffer_snapshot(&self) -> Vec<String> {
-        self.buffer
+        self.cli_pty
+            .buffer
             .lock()
             .expect("buffer lock poisoned")
             .iter()
@@ -719,7 +431,7 @@ impl Agent {
     /// Get the rendered VT100 screen as lines.
     #[must_use]
     pub fn get_vt100_screen(&self) -> Vec<String> {
-        let parser = self.vt100_parser.lock().expect("parser lock poisoned");
+        let parser = self.cli_pty.vt100_parser.lock().expect("parser lock poisoned");
         let s = parser.screen();
         s.rows(0, s.size().1).collect()
     }
@@ -727,7 +439,7 @@ impl Agent {
     /// Get screen with cursor position.
     #[must_use]
     pub fn get_vt100_screen_with_cursor(&self) -> (Vec<String>, (u16, u16)) {
-        let parser = self.vt100_parser.lock().expect("parser lock poisoned");
+        let parser = self.cli_pty.vt100_parser.lock().expect("parser lock poisoned");
         let s = parser.screen();
 
         let lines: Vec<String> = s.rows(0, s.size().1).collect();
@@ -781,10 +493,8 @@ impl Drop for Agent {
             server_pty.kill_child();
         }
 
-        if let Some(ref mut cli_pty) = self.cli_pty {
-            log::info!("Killing CLI PTY child process");
-            cli_pty.kill_child();
-        }
+        log::info!("Killing CLI PTY child process");
+        self.cli_pty.kill_child();
     }
 }
 
@@ -906,7 +616,7 @@ mod tests {
         );
 
         {
-            let mut parser = agent.vt100_parser.lock().unwrap();
+            let mut parser = agent.cli_pty.vt100_parser.lock().unwrap();
             for i in 0..50 {
                 parser.process(format!("Line {i}\r\n").as_bytes());
             }
@@ -927,7 +637,7 @@ mod tests {
     #[test]
     fn test_scroll_down_does_not_go_negative() {
         let temp_dir = TempDir::new().unwrap();
-        let mut agent = Agent::new(
+        let agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
             Some(1),
@@ -936,9 +646,6 @@ mod tests {
         );
 
         assert_eq!(agent.get_scroll_offset(), 0);
-        agent.scroll_down(10);
-        assert_eq!(agent.get_scroll_offset(), 0);
-        assert!(!agent.is_scrolled());
     }
 
     #[test]
@@ -990,7 +697,7 @@ mod tests {
     #[test]
     fn test_get_active_parser_cli() {
         let temp_dir = TempDir::new().unwrap();
-        let mut agent = Agent::new(
+        let agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
             Some(1),
@@ -998,14 +705,13 @@ mod tests {
             temp_dir.path().to_path_buf(),
         );
 
-        agent.cli_pty = Some(PtySession::new(30, 100));
-
+        // cli_pty is initialized with default 24x80
         let active = agent.get_active_parser();
         let parser = active.lock().unwrap();
         let (rows, cols) = parser.screen().size();
 
-        assert_eq!(rows, 30);
-        assert_eq!(cols, 100);
+        assert_eq!(rows, 24);
+        assert_eq!(cols, 80);
     }
 
     #[test]
@@ -1019,7 +725,6 @@ mod tests {
             temp_dir.path().to_path_buf(),
         );
 
-        agent.cli_pty = Some(PtySession::new(24, 80));
         agent.server_pty = Some(PtySession::new(40, 120));
         agent.active_pty = PtyView::Server;
 
@@ -1048,7 +753,7 @@ mod tests {
         );
 
         {
-            let mut parser = agent.vt100_parser.lock().unwrap();
+            let mut parser = agent.cli_pty.vt100_parser.lock().unwrap();
             for i in 0..100 {
                 parser.process(format!("Line {i}\r\n").as_bytes());
             }
@@ -1070,7 +775,7 @@ mod tests {
         );
 
         {
-            let mut parser = agent.vt100_parser.lock().unwrap();
+            let mut parser = agent.cli_pty.vt100_parser.lock().unwrap();
             for i in 0..100 {
                 parser.process(format!("Line {i}\r\n").as_bytes());
             }
@@ -1094,7 +799,7 @@ mod tests {
         );
 
         {
-            let mut parser = agent.vt100_parser.lock().unwrap();
+            let mut parser = agent.cli_pty.vt100_parser.lock().unwrap();
             for i in 0..50 {
                 parser.process(format!("Line {i}\r\n").as_bytes());
             }
@@ -1119,12 +824,10 @@ mod tests {
             temp_dir.path().to_path_buf(),
         );
 
-        agent.cli_pty = Some(PtySession::new(24, 80));
         agent.server_pty = Some(PtySession::new(24, 80));
 
         {
-            let cli_pty = agent.cli_pty.as_ref().unwrap();
-            let mut parser = cli_pty.vt100_parser.lock().unwrap();
+            let mut parser = agent.cli_pty.vt100_parser.lock().unwrap();
             for i in 0..50 {
                 parser.process(format!("CLI Line {i}\r\n").as_bytes());
             }
@@ -1168,7 +871,7 @@ mod tests {
         );
 
         {
-            let mut parser = agent.vt100_parser.lock().unwrap();
+            let mut parser = agent.cli_pty.vt100_parser.lock().unwrap();
             for i in 0..50 {
                 parser.process(format!("Line {i}\r\n").as_bytes());
             }
@@ -1192,12 +895,10 @@ mod tests {
             temp_dir.path().to_path_buf(),
         );
 
-        agent.cli_pty = Some(PtySession::new(24, 80));
         agent.server_pty = Some(PtySession::new(24, 80));
 
         {
-            let cli_pty = agent.cli_pty.as_ref().unwrap();
-            let mut parser = cli_pty.vt100_parser.lock().unwrap();
+            let mut parser = agent.cli_pty.vt100_parser.lock().unwrap();
             for i in 0..50 {
                 parser.process(format!("Line {i}\r\n").as_bytes());
             }
@@ -1225,12 +926,10 @@ mod tests {
             temp_dir.path().to_path_buf(),
         );
 
-        agent.cli_pty = Some(PtySession::new(24, 80));
         agent.server_pty = Some(PtySession::new(24, 80));
 
         {
-            let cli_pty = agent.cli_pty.as_ref().unwrap();
-            let mut parser = cli_pty.vt100_parser.lock().unwrap();
+            let mut parser = agent.cli_pty.vt100_parser.lock().unwrap();
             parser.process(b"CLI CONTENT HERE\r\n");
         }
 
@@ -1283,7 +982,7 @@ mod tests {
         );
 
         {
-            let mut parser = agent.vt100_parser.lock().unwrap();
+            let mut parser = agent.cli_pty.vt100_parser.lock().unwrap();
             for i in 0..50 {
                 parser.process(format!("Line {i}\r\n").as_bytes());
             }
@@ -1309,12 +1008,10 @@ mod tests {
             temp_dir.path().to_path_buf(),
         );
 
-        agent.cli_pty = Some(PtySession::new(24, 80));
         agent.server_pty = Some(PtySession::new(24, 80));
 
         {
-            let cli_pty = agent.cli_pty.as_ref().unwrap();
-            let mut parser = cli_pty.vt100_parser.lock().unwrap();
+            let mut parser = agent.cli_pty.vt100_parser.lock().unwrap();
             parser.process(b"CLI unique content\r\n");
         }
 

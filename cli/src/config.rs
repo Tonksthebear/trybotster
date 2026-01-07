@@ -129,10 +129,10 @@ impl Config {
     /// Get the API key to use for authentication.
     /// Returns the new device token if set, otherwise falls back to legacy api_key.
     pub fn get_api_key(&self) -> &str {
-        if !self.token.is_empty() {
-            &self.token
-        } else {
+        if self.token.is_empty() {
             &self.api_key
+        } else {
+            &self.token
         }
     }
 

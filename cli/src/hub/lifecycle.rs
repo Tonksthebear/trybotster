@@ -211,9 +211,7 @@ fn build_spawn_environment(config: &AgentSpawnConfig) -> HashMap<String, String>
     env_vars.insert(
         "BOTSTER_ISSUE_NUMBER".to_string(),
         config
-            .issue_number
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "0".to_string()),
+            .issue_number.map_or_else(|| "0".to_string(), |n| n.to_string()),
     );
     env_vars.insert("BOTSTER_BRANCH_NAME".to_string(), config.branch_name.clone());
     env_vars.insert(
@@ -232,7 +230,7 @@ fn build_spawn_environment(config: &AgentSpawnConfig) -> HashMap<String, String>
     // Add the hub binary path for subprocesses
     let bin_path = std::env::current_exe()
         .ok()
-        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .and_then(|p| p.to_str().map(std::string::ToString::to_string))
         .unwrap_or_else(|| "botster-hub".to_string());
     env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
 

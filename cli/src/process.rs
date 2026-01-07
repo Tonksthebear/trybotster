@@ -126,10 +126,8 @@ fn find_processes_in_directory(
             for line in lsof_str.lines() {
                 if line.starts_with('p') {
                     current_pid = line[1..].parse().ok();
-                } else if line.starts_with('n') {
+                } else if let Some(cwd) = line.strip_prefix('n') {
                     if let Some(pid) = current_pid {
-                        let cwd = &line[1..];
-
                         // Check if CWD matches our worktree
                         if cwd == worktree_str
                             || cwd.starts_with(&format!("{}/", worktree_str))

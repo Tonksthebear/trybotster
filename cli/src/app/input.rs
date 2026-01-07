@@ -421,7 +421,7 @@ pub fn parse_terminal_input(input: &str) -> Vec<(KeyCode, KeyModifiers)> {
             i += 1;
         } else {
             // Regular character
-            if let Some(c) = char::from_u32(bytes[i] as u32) {
+            if let Some(c) = char::from_u32(u32::from(bytes[i])) {
                 result.push((KeyCode::Char(c), KeyModifiers::NONE));
             }
             i += 1;

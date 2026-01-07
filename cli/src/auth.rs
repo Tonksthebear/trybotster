@@ -92,7 +92,7 @@ pub fn device_flow(server_url: &str) -> Result<String> {
             let mut input = String::new();
             if io::stdin().read_line(&mut input).is_ok() {
                 match open_browser(&verification_uri) {
-                    Ok(_) => println!("\r  Browser opened.                    "),
+                    Ok(()) => println!("\r  Browser opened.                    "),
                     Err(e) => println!("\r  Could not open browser: {}         ", e),
                 }
             }

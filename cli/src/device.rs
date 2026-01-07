@@ -157,9 +157,7 @@ impl Device {
     fn default_name() -> String {
         hostname::get()
             .ok()
-            .and_then(|h| h.into_string().ok())
-            .map(|h| format!("Botster CLI ({})", h))
-            .unwrap_or_else(|| "Botster CLI".to_string())
+            .and_then(|h| h.into_string().ok()).map_or_else(|| "Botster CLI".to_string(), |h| format!("Botster CLI ({})", h))
     }
 
     /// Get public key as base64 string (for sending to server)

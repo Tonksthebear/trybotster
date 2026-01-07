@@ -27,6 +27,12 @@
 
 // Rust guideline compliant 2025-01
 
+pub mod cli;
+pub mod server;
+
+pub use cli::{spawn_cli_pty, CliSpawnResult};
+pub use server::spawn_server_pty;
+
 use anyhow::Result;
 use portable_pty::{Child, MasterPty, PtySize};
 use std::{
@@ -39,6 +45,37 @@ use vt100::Parser;
 
 use super::notification::AgentNotification;
 use super::screen;
+
+/// Resize a PTY session with screen clearing if dimensions changed.
+///
+/// Clears the VT100 screen before resizing to prevent content from being stuck
+/// at old dimensions. This is necessary because terminal emulators don't
+/// automatically reflow content.
+///
+/// # Arguments
+///
+/// * `pty` - The PTY session to resize
+/// * `rows` - New terminal height
+/// * `cols` - New terminal width
+/// * `label` - Label for logging (e.g., "CLI" or "Server")
+pub fn resize_with_clear(pty: &PtySession, rows: u16, cols: u16, label: &str) {
+    let needs_clear = {
+        let parser = pty.vt100_parser.lock().expect("parser lock poisoned");
+        let (current_rows, current_cols) = parser.screen().size();
+        current_rows != rows || current_cols != cols
+    };
+
+    if needs_clear {
+        log::info!("{label} PTY resize: clearing screen and setting {cols}x{rows}");
+        let mut parser = pty.vt100_parser.lock().expect("parser lock poisoned");
+        // Reset attributes, clear screen, clear scrollback, move cursor home
+        parser.process(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
+        parser.screen_mut().set_scrollback(0);
+        parser.screen_mut().set_size(rows, cols);
+    }
+
+    pty.resize(rows, cols);
+}
 
 /// Maximum lines to keep in scrollback buffer.
 ///
@@ -97,6 +134,12 @@ impl PtySession {
             notification_tx: None,
             child: None,
         }
+    }
+
+    /// Check if a process has been spawned in this PTY session.
+    #[must_use]
+    pub fn is_spawned(&self) -> bool {
+        self.master_pty.is_some()
     }
 
     /// Store the child process handle (called after spawn).

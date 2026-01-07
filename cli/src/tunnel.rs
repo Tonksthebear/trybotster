@@ -157,7 +157,7 @@ impl TunnelManager {
         });
         info!("[Tunnel] Sending subscribe message: {}", subscribe_msg);
         write
-            .send(Message::Text(subscribe_msg.to_string().into()))
+            .send(Message::Text(subscribe_msg.to_string()))
             .await?;
 
         info!("[Tunnel] Subscribe sent, entering message loop for hub {}", self.hub_identifier);
@@ -174,7 +174,7 @@ impl TunnelManager {
                         Some(Ok(Message::Text(text))) => {
                             drop(pending_rx); // Release lock before handling message
                             if let Err(e) = self
-                                .handle_message(&text.to_string(), &mut write)
+                                .handle_message(&text.clone(), &mut write)
                                 .await
                             {
                                 error!("[Tunnel] Message error: {}", e);
@@ -290,14 +290,11 @@ impl TunnelManager {
                 );
 
                 // Find the port for this agent
-                let port = match self.get_agent_port(agent_session_key).await {
-                    Some(p) => p,
-                    None => {
-                        warn!("[Tunnel] Agent {} not registered", agent_session_key);
-                        self.send_error_response(write, request_id, "Agent tunnel not registered")
-                            .await?;
-                        return Ok(());
-                    }
+                let port = if let Some(p) = self.get_agent_port(agent_session_key).await { p } else {
+                    warn!("[Tunnel] Agent {} not registered", agent_session_key);
+                    self.send_error_response(write, request_id, "Agent tunnel not registered")
+                        .await?;
+                    return Ok(());
                 };
 
                 let method = message["method"].as_str().unwrap_or("GET");
@@ -330,7 +327,7 @@ impl TunnelManager {
                 });
 
                 write
-                    .send(Message::Text(response_msg.to_string().into()))
+                    .send(Message::Text(response_msg.to_string()))
                     .await?;
             }
         }
@@ -364,7 +361,7 @@ impl TunnelManager {
             }).to_string()
         });
         write
-            .send(Message::Text(response_msg.to_string().into()))
+            .send(Message::Text(response_msg.to_string()))
             .await?;
         Ok(())
     }
@@ -473,7 +470,7 @@ impl TunnelManager {
                 "port": port
             }).to_string()
         });
-        write.send(Message::Text(msg.to_string().into())).await?;
+        write.send(Message::Text(msg.to_string())).await?;
         Ok(())
     }
 }
