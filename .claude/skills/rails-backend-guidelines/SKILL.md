@@ -107,10 +107,7 @@ end
 
 ## Resources
 
-For specific patterns when needed:
-
-- [Routing & Controllers](resources/routing-and-controllers.md)
-- [Database Patterns](resources/database-patterns.md)
-- [Testing Guide](resources/testing-guide.md)
-- [Webhook Implementation](resources/webhook-implementation.md)
-- [Async & Errors](resources/async-and-errors.md)
+- [Models & Concerns](resources/models-and-concerns.md) - 37signals style: state as records, composable concerns, Current attributes
+- [Routing & Controllers](resources/routing-and-controllers.md) - 37signals style: CRUD routing, controller concerns
+- [Testing Guide](resources/testing-guide.md) - Rails Minitest patterns
+- [Webhook Implementation](resources/webhook-implementation.md) - GitHub webhook handling

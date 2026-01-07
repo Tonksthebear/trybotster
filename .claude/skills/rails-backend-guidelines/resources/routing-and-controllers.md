@@ -1,756 +1,336 @@
-# Routing and Controllers - Best Practices
+# Routing and Controllers (37signals Style)
 
-Complete guide to clean route definitions and controller patterns.
-
-## Table of Contents
-
-- [Routes: Routing Only](#routes-routing-only)
-- [BaseController Pattern](#basecontroller-pattern)
-- [Good Examples](#good-examples)
-- [Anti-Patterns](#anti-patterns)
-- [Refactoring Guide](#refactoring-guide)
-- [Error Handling](#error-handling)
-- [HTTP Status Codes](#http-status-codes)
+Thin controllers, rich models, composable concerns. Controllers orchestrate; models execute.
 
 ---
 
-## Routes: Routing Only
+## Routing: Everything is CRUD
 
-### The Golden Rule
+Map all actions to Create, Read, Update, or Destroy. When something doesn't fit, create a new resource instead of adding custom actions.
 
-**Routes should ONLY:**
-- ✅ Define route paths
-- ✅ Register middleware
-- ✅ Delegate to controllers
+### Convert Verbs to Nouns
 
-**Routes should NEVER:**
-- ❌ Contain business logic
-- ❌ Access database directly
-- ❌ Implement validation logic (use Zod + controller)
-- ❌ Format complex responses
-- ❌ Handle complex error scenarios
+Don't add custom actions—create resources:
 
-### Clean Route Pattern
+```ruby
+# BAD: Custom actions
+resources :cards do
+  post :close
+  post :reopen
+  post :archive
+end
 
-```typescript
-// routes/userRoutes.ts
-import { Router } from 'express';
-import { UserController } from '../controllers/UserController';
-import { SSOMiddlewareClient } from '../middleware/SSOMiddleware';
-import { auditMiddleware } from '../middleware/auditMiddleware';
+# GOOD: Noun-based resources
+resources :cards do
+  resource :closure, only: [:create, :destroy]  # POST closes, DELETE reopens
+  resource :archival, only: [:create, :destroy]
+end
 
-const router = Router();
-const controller = new UserController();
-
-// ✅ CLEAN: Route definition only
-router.get('/:id',
-    SSOMiddlewareClient.verifyLoginStatus,
-    auditMiddleware,
-    async (req, res) => controller.getUser(req, res)
-);
-
-router.post('/',
-    SSOMiddlewareClient.verifyLoginStatus,
-    auditMiddleware,
-    async (req, res) => controller.createUser(req, res)
-);
-
-router.put('/:id',
-    SSOMiddlewareClient.verifyLoginStatus,
-    auditMiddleware,
-    async (req, res) => controller.updateUser(req, res)
-);
-
-export default router;
+# More examples:
+# "Watch a board" → board.watching
+# "Pin an item" → item.pin
+# "Publish a post" → post.publication
 ```
 
-**Key Points:**
-- Each route: method, path, middleware chain, controller delegation
-- No try-catch needed (controller handles errors)
-- Clean, readable, maintainable
-- Easy to see all endpoints at a glance
+### Singular vs Plural Resources
 
----
+Use `resource` (singular) for one-per-parent relationships:
 
-## BaseController Pattern
-
-### Why BaseController?
-
-**Benefits:**
-- Consistent error handling across all controllers
-- Automatic Sentry integration
-- Standardized response formats
-- Reusable helper methods
-- Performance tracking utilities
-- Logging and breadcrumb helpers
-
-### BaseController Pattern (Template)
-
-**File:** `/email/src/controllers/BaseController.ts`
-
-```typescript
-import * as Sentry from '@sentry/node';
-import { Response } from 'express';
-
-export abstract class BaseController {
-    /**
-     * Handle errors with Sentry integration
-     */
-    protected handleError(
-        error: unknown,
-        res: Response,
-        context: string,
-        statusCode = 500
-    ): void {
-        Sentry.withScope((scope) => {
-            scope.setTag('controller', this.constructor.name);
-            scope.setTag('operation', context);
-            scope.setUser({ id: res.locals?.claims?.userId });
-
-            if (error instanceof Error) {
-                scope.setContext('error_details', {
-                    message: error.message,
-                    stack: error.stack,
-                });
-            }
-
-            Sentry.captureException(error);
-        });
-
-        res.status(statusCode).json({
-            success: false,
-            error: {
-                message: error instanceof Error ? error.message : 'An error occurred',
-                code: statusCode,
-            },
-        });
-    }
-
-    /**
-     * Handle success responses
-     */
-    protected handleSuccess<T>(
-        res: Response,
-        data: T,
-        message?: string,
-        statusCode = 200
-    ): void {
-        res.status(statusCode).json({
-            success: true,
-            message,
-            data,
-        });
-    }
-
-    /**
-     * Performance tracking wrapper
-     */
-    protected async withTransaction<T>(
-        name: string,
-        operation: string,
-        callback: () => Promise<T>
-    ): Promise<T> {
-        return await Sentry.startSpan(
-            { name, op: operation },
-            callback
-        );
-    }
-
-    /**
-     * Validate required fields
-     */
-    protected validateRequest(
-        required: string[],
-        actual: Record<string, any>,
-        res: Response
-    ): boolean {
-        const missing = required.filter((field) => !actual[field]);
-
-        if (missing.length > 0) {
-            Sentry.captureMessage(
-                `Missing required fields: ${missing.join(', ')}`,
-                'warning'
-            );
-
-            res.status(400).json({
-                success: false,
-                error: {
-                    message: 'Missing required fields',
-                    code: 'VALIDATION_ERROR',
-                    details: { missing },
-                },
-            });
-            return false;
-        }
-        return true;
-    }
-
-    /**
-     * Logging helpers
-     */
-    protected logInfo(message: string, context?: Record<string, any>): void {
-        Sentry.addBreadcrumb({
-            category: this.constructor.name,
-            message,
-            level: 'info',
-            data: context,
-        });
-    }
-
-    protected logWarning(message: string, context?: Record<string, any>): void {
-        Sentry.captureMessage(message, {
-            level: 'warning',
-            tags: { controller: this.constructor.name },
-            extra: context,
-        });
-    }
-
-    /**
-     * Add Sentry breadcrumb
-     */
-    protected addBreadcrumb(
-        message: string,
-        category: string,
-        data?: Record<string, any>
-    ): void {
-        Sentry.addBreadcrumb({ message, category, level: 'info', data });
-    }
-
-    /**
-     * Capture custom metric
-     */
-    protected captureMetric(name: string, value: number, unit: string): void {
-        Sentry.metrics.gauge(name, value, { unit });
-    }
-}
+```ruby
+resources :cards do
+  resource :closure, only: [:create, :destroy]     # One closure per card
+  resources :comments                               # Many comments per card
+end
 ```
 
-### Using BaseController
+### Shallow Nesting
 
-```typescript
-// controllers/UserController.ts
-import { Request, Response } from 'express';
-import { BaseController } from './BaseController';
-import { UserService } from '../services/userService';
-import { createUserSchema } from '../validators/userSchemas';
+Avoid deeply nested URLs with `shallow: true`:
 
-export class UserController extends BaseController {
-    private userService: UserService;
+```ruby
+resources :boards, shallow: true do
+  resources :cards do
+    resources :comments
+  end
+end
 
-    constructor() {
-        super();
-        this.userService = new UserService();
-    }
-
-    async getUser(req: Request, res: Response): Promise<void> {
-        try {
-            this.addBreadcrumb('Fetching user', 'user_controller', { userId: req.params.id });
-
-            const user = await this.userService.findById(req.params.id);
-
-            if (!user) {
-                return this.handleError(
-                    new Error('User not found'),
-                    res,
-                    'getUser',
-                    404
-                );
-            }
-
-            this.handleSuccess(res, user);
-        } catch (error) {
-            this.handleError(error, res, 'getUser');
-        }
-    }
-
-    async createUser(req: Request, res: Response): Promise<void> {
-        try {
-            // Validate input
-            const validated = createUserSchema.parse(req.body);
-
-            // Track performance
-            const user = await this.withTransaction(
-                'user.create',
-                'db.query',
-                () => this.userService.create(validated)
-            );
-
-            this.handleSuccess(res, user, 'User created successfully', 201);
-        } catch (error) {
-            this.handleError(error, res, 'createUser');
-        }
-    }
-
-    async updateUser(req: Request, res: Response): Promise<void> {
-        try {
-            const validated = updateUserSchema.parse(req.body);
-            const user = await this.userService.update(req.params.id, validated);
-            this.handleSuccess(res, user, 'User updated');
-        } catch (error) {
-            this.handleError(error, res, 'updateUser');
-        }
-    }
-}
+# Produces:
+# /boards/:board_id/cards (index, create)
+# /cards/:id (show, update, destroy) - shallow!
+# /cards/:card_id/comments (index, create)
+# /comments/:id (show, update, destroy) - shallow!
 ```
 
-**Benefits:**
-- Consistent error handling
-- Automatic Sentry integration
-- Performance tracking
-- Clean, readable code
-- Easy to test
+### Module Scoping
 
----
+Group related controllers without changing URLs:
 
-## Good Examples
+```ruby
+# Same URLs, organized controllers
+scope module: :admin do
+  resources :users  # Admin::UsersController, /users
+end
 
-### Example 1: Email Notification Routes (Excellent ✅)
-
-**File:** `/email/src/routes/notificationRoutes.ts`
-
-```typescript
-import { Router } from 'express';
-import { NotificationController } from '../controllers/NotificationController';
-import { SSOMiddlewareClient } from '../middleware/SSOMiddleware';
-
-const router = Router();
-const controller = new NotificationController();
-
-// ✅ EXCELLENT: Clean delegation
-router.get('/',
-    SSOMiddlewareClient.verifyLoginStatus,
-    async (req, res) => controller.getNotifications(req, res)
-);
-
-router.post('/',
-    SSOMiddlewareClient.verifyLoginStatus,
-    async (req, res) => controller.createNotification(req, res)
-);
-
-router.put('/:id/read',
-    SSOMiddlewareClient.verifyLoginStatus,
-    async (req, res) => controller.markAsRead(req, res)
-);
-
-export default router;
+# URL prefix + organized controllers
+namespace :admin do
+  resources :users  # Admin::UsersController, /admin/users
+end
 ```
 
-**What Makes This Excellent:**
-- Zero business logic in routes
-- Clear middleware chain
-- Consistent pattern
-- Easy to understand
+### API Responses
 
-### Example 2: Proxy Routes with Validation (Good ✅)
+Same controllers handle both HTML and JSON—no separate API namespace:
 
-**File:** `/form/src/routes/proxyRoutes.ts`
+```ruby
+def create
+  @card = @board.cards.create!(card_params)
 
-```typescript
-import { z } from 'zod';
+  respond_to do |format|
+    format.html { redirect_to @card }
+    format.json { render json: @card, status: :created, location: @card }
+  end
+end
 
-const createProxySchema = z.object({
-    originalUserID: z.string().min(1),
-    proxyUserID: z.string().min(1),
-    startsAt: z.string().datetime(),
-    expiresAt: z.string().datetime(),
-});
+def destroy
+  @card.destroy!
 
-router.post('/',
-    SSOMiddlewareClient.verifyLoginStatus,
-    async (req, res) => {
-        try {
-            const validated = createProxySchema.parse(req.body);
-            const proxy = await proxyService.createProxyRelationship(validated);
-            res.status(201).json({ success: true, data: proxy });
-        } catch (error) {
-            handler.handleException(res, error);
-        }
-    }
-);
-```
-
-**What Makes This Good:**
-- Zod validation
-- Delegates to service
-- Proper HTTP status codes
-- Error handling
-
-**Could Be Better:**
-- Move validation to controller
-- Use BaseController
-
----
-
-## Anti-Patterns
-
-### Anti-Pattern 1: Business Logic in Routes (Bad ❌)
-
-**File:** `/form/src/routes/responseRoutes.ts` (actual production code)
-
-```typescript
-// ❌ ANTI-PATTERN: 200+ lines of business logic in route
-router.post('/:formID/submit', async (req: Request, res: Response) => {
-    try {
-        const username = res.locals.claims.preferred_username;
-        const responses = req.body.responses;
-        const stepInstanceId = req.body.stepInstanceId;
-
-        // ❌ Permission checking in route
-        const userId = await userProfileService.getProfileByEmail(username).then(p => p.id);
-        const canComplete = await permissionService.canCompleteStep(userId, stepInstanceId);
-        if (!canComplete) {
-            return res.status(403).json({ error: 'No permission' });
-        }
-
-        // ❌ Workflow logic in route
-        const { createWorkflowEngine, CompleteStepCommand } = require('../workflow/core/WorkflowEngineV3');
-        const engine = await createWorkflowEngine();
-        const command = new CompleteStepCommand(
-            stepInstanceId,
-            userId,
-            responses,
-            additionalContext
-        );
-        const events = await engine.executeCommand(command);
-
-        // ❌ Impersonation handling in route
-        if (res.locals.isImpersonating) {
-            impersonationContextStore.storeContext(stepInstanceId, {
-                originalUserId: res.locals.originalUserId,
-                effectiveUserId: userId,
-            });
-        }
-
-        // ❌ Response processing in route
-        const post = await PrismaService.main.post.findUnique({
-            where: { id: postData.id },
-            include: { comments: true },
-        });
-
-        // ❌ Permission check in route
-        await checkPostPermissions(post, userId);
-
-        // ... 100+ more lines of business logic
-
-        res.json({ success: true, data: result });
-    } catch (e) {
-        handler.handleException(res, e);
-    }
-});
-```
-
-**Why This Is Terrible:**
-- 200+ lines of business logic
-- Hard to test (requires HTTP mocking)
-- Hard to reuse (tied to route)
-- Mixed responsibilities
-- Difficult to debug
-- Performance tracking difficult
-
-### How to Refactor (Step-by-Step)
-
-**Step 1: Create Controller**
-
-```typescript
-// controllers/PostController.ts
-export class PostController extends BaseController {
-    private postService: PostService;
-
-    constructor() {
-        super();
-        this.postService = new PostService();
-    }
-
-    async createPost(req: Request, res: Response): Promise<void> {
-        try {
-            const validated = createPostSchema.parse({
-                ...req.body,
-            });
-
-            const result = await this.postService.createPost(
-                validated,
-                res.locals.userId
-            );
-
-            this.handleSuccess(res, result, 'Post created successfully');
-        } catch (error) {
-            this.handleError(error, res, 'createPost');
-        }
-    }
-}
-```
-
-**Step 2: Create Service**
-
-```typescript
-// services/postService.ts
-export class PostService {
-    async createPost(
-        data: CreatePostDTO,
-        userId: string
-    ): Promise<PostResult> {
-        // Permission check
-        const canCreate = await permissionService.canCreatePost(userId);
-        if (!canCreate) {
-            throw new ForbiddenError('No permission to create post');
-        }
-
-        // Execute workflow
-        const engine = await createWorkflowEngine();
-        const command = new CompleteStepCommand(/* ... */);
-        const events = await engine.executeCommand(command);
-
-        // Handle impersonation if needed
-        if (context.isImpersonating) {
-            await this.handleImpersonation(data.stepInstanceId, context);
-        }
-
-        // Synchronize roles
-        await this.synchronizeRoles(events, userId);
-
-        return { events, success: true };
-    }
-
-    private async handleImpersonation(stepInstanceId: number, context: any) {
-        impersonationContextStore.storeContext(stepInstanceId, {
-            originalUserId: context.originalUserId,
-            effectiveUserId: context.effectiveUserId,
-        });
-    }
-
-    private async synchronizeRoles(events: WorkflowEvent[], userId: string) {
-        // Role synchronization logic
-    }
-}
-```
-
-**Step 3: Update Route**
-
-```typescript
-// routes/postRoutes.ts
-import { PostController } from '../controllers/PostController';
-
-const router = Router();
-const controller = new PostController();
-
-// ✅ CLEAN: Just routing
-router.post('/',
-    SSOMiddlewareClient.verifyLoginStatus,
-    auditMiddleware,
-    async (req, res) => controller.createPost(req, res)
-);
-```
-
-**Result:**
-- Route: 8 lines (was 200+)
-- Controller: 25 lines (request handling)
-- Service: 50 lines (business logic)
-- Testable, reusable, maintainable!
-
----
-
-## Error Handling
-
-### Controller Error Handling
-
-```typescript
-async createUser(req: Request, res: Response): Promise<void> {
-    try {
-        const result = await this.userService.create(req.body);
-        this.handleSuccess(res, result, 'User created', 201);
-    } catch (error) {
-        // BaseController.handleError automatically:
-        // - Captures to Sentry with context
-        // - Sets appropriate status code
-        // - Returns formatted error response
-        this.handleError(error, res, 'createUser');
-    }
-}
-```
-
-### Custom Error Status Codes
-
-```typescript
-async getUser(req: Request, res: Response): Promise<void> {
-    try {
-        const user = await this.userService.findById(req.params.id);
-
-        if (!user) {
-            // Custom 404 status
-            return this.handleError(
-                new Error('User not found'),
-                res,
-                'getUser',
-                404  // Custom status code
-            );
-        }
-
-        this.handleSuccess(res, user);
-    } catch (error) {
-        this.handleError(error, res, 'getUser');
-    }
-}
-```
-
-### Validation Errors
-
-```typescript
-async createUser(req: Request, res: Response): Promise<void> {
-    try {
-        const validated = createUserSchema.parse(req.body);
-        const user = await this.userService.create(validated);
-        this.handleSuccess(res, user, 'User created', 201);
-    } catch (error) {
-        // Zod errors get 400 status
-        if (error instanceof z.ZodError) {
-            return this.handleError(error, res, 'createUser', 400);
-        }
-        this.handleError(error, res, 'createUser');
-    }
-}
+  respond_to do |format|
+    format.html { redirect_to board_cards_path(@board) }
+    format.json { head :no_content }
+  end
+end
 ```
 
 ---
 
-## HTTP Status Codes
+## Controllers: Thin and Composable
 
-### Standard Codes
+### The Pattern
 
-| Code | Use Case | Example |
-|------|----------|---------|
-| 200 | Success (GET, PUT) | User retrieved, Updated |
-| 201 | Created (POST) | User created |
-| 204 | No Content (DELETE) | User deleted |
-| 400 | Bad Request | Invalid input data |
-| 401 | Unauthorized | Not authenticated |
-| 403 | Forbidden | No permission |
-| 404 | Not Found | Resource doesn't exist |
-| 409 | Conflict | Duplicate resource |
-| 422 | Unprocessable Entity | Validation failed |
-| 500 | Internal Server Error | Unexpected error |
+Controllers handle HTTP concerns only. Business logic lives in models.
 
-### Usage Examples
+```ruby
+class CardsController < ApplicationController
+  include BoardScoped  # Loads @board, handles auth
 
-```typescript
-// 200 - Success (default)
-this.handleSuccess(res, user);
+  def create
+    @card = @board.cards.create!(card_params)
+    redirect_to @card
+  end
 
-// 201 - Created
-this.handleSuccess(res, user, 'Created', 201);
+  def update
+    @card = @board.cards.find(params[:id])
+    @card.update!(card_params)
+    render_card_replacement  # From BoardScoped concern
+  end
+end
+```
 
-// 400 - Bad Request
-this.handleError(error, res, 'operation', 400);
+### Authorization Pattern
 
-// 404 - Not Found
-this.handleError(new Error('Not found'), res, 'operation', 404);
+Controllers **check**; models **define**:
 
-// 403 - Forbidden
-this.handleError(new ForbiddenError('No permission'), res, 'operation', 403);
+```ruby
+# Controller checks
+class CardsController < ApplicationController
+  before_action :ensure_can_administer, only: [:edit, :update, :destroy]
+
+  private
+
+  def ensure_can_administer
+    unless Current.user.can_administer_card?(@card)
+      redirect_to @card, alert: "Not authorized"
+    end
+  end
+end
+
+# Model defines what "administer" means
+class User < ApplicationRecord
+  def can_administer_card?(card)
+    card.board.administrators.include?(self) || card.creator == self
+  end
+end
 ```
 
 ---
 
-## Refactoring Guide
+## Controller Concerns
 
-### Identify Routes Needing Refactoring
+### Resource Scoping
 
-**Red Flags:**
-- Route file > 100 lines
-- Multiple try-catch blocks in one route
-- Direct database access (Prisma calls)
-- Complex business logic (if statements, loops)
-- Permission checks in routes
+Load parent resources and provide shared methods:
 
-**Check your routes:**
-```bash
-# Find large route files
-wc -l form/src/routes/*.ts | sort -n
+```ruby
+# app/controllers/concerns/board_scoped.rb
+module BoardScoped
+  extend ActiveSupport::Concern
 
-# Find routes with Prisma usage
-grep -r "PrismaService" form/src/routes/
+  included do
+    before_action :set_board
+    before_action :ensure_board_access
+  end
+
+  private
+
+  def set_board
+    @board = Current.account.boards.find(params[:board_id])
+  end
+
+  def ensure_board_access
+    unless Current.user.can_access_board?(@board)
+      redirect_to boards_path, alert: "Access denied"
+    end
+  end
+
+  # Shared rendering for Turbo responses
+  def render_card_replacement(card = @card)
+    render turbo_stream: turbo_stream.replace(card)
+  end
+end
 ```
 
-### Refactoring Process
+```ruby
+# app/controllers/concerns/card_scoped.rb
+module CardScoped
+  extend ActiveSupport::Concern
+  include BoardScoped
 
-**1. Extract to Controller:**
-```typescript
-// Before: Route with logic
-router.post('/action', async (req, res) => {
-    try {
-        // 50 lines of logic
-    } catch (e) {
-        handler.handleException(res, e);
-    }
-});
+  included do
+    before_action :set_card
+  end
 
-// After: Clean route
-router.post('/action', (req, res) => controller.performAction(req, res));
+  private
 
-// New controller method
-async performAction(req: Request, res: Response): Promise<void> {
-    try {
-        const result = await this.service.performAction(req.body);
-        this.handleSuccess(res, result);
-    } catch (error) {
-        this.handleError(error, res, 'performAction');
-    }
-}
+  def set_card
+    @card = @board.cards.find(params[:card_id])
+  end
+end
 ```
 
-**2. Extract to Service:**
-```typescript
-// Controller stays thin
-async performAction(req: Request, res: Response): Promise<void> {
-    try {
-        const validated = actionSchema.parse(req.body);
-        const result = await this.actionService.execute(validated);
-        this.handleSuccess(res, result);
-    } catch (error) {
-        this.handleError(error, res, 'performAction');
-    }
-}
+### Request Context
 
-// Service contains business logic
-export class ActionService {
-    async execute(data: ActionDTO): Promise<Result> {
-        // All business logic here
-        // Permission checks
-        // Database operations
-        // Complex transformations
-        return result;
-    }
-}
+Populate `Current` with request metadata:
+
+```ruby
+# app/controllers/concerns/current_request.rb
+module CurrentRequest
+  extend ActiveSupport::Concern
+
+  included do
+    before_action :set_current_request_details
+  end
+
+  private
+
+  def set_current_request_details
+    Current.request_id = request.request_id
+    Current.user_agent = request.user_agent
+    Current.ip_address = request.remote_ip
+  end
+end
 ```
 
-**3. Add Repository (if needed):**
-```typescript
-// Service calls repository
-export class ActionService {
-    constructor(private actionRepository: ActionRepository) {}
+### Timezone Handling
 
-    async execute(data: ActionDTO): Promise<Result> {
-        // Business logic
-        const entity = await this.actionRepository.findById(data.id);
-        // More logic
-        return await this.actionRepository.update(data.id, changes);
-    }
-}
+Wrap requests in user's timezone:
 
-// Repository handles data access
-export class ActionRepository {
-    async findById(id: number): Promise<Entity | null> {
-        return PrismaService.main.entity.findUnique({ where: { id } });
-    }
+```ruby
+# app/controllers/concerns/current_timezone.rb
+module CurrentTimezone
+  extend ActiveSupport::Concern
 
-    async update(id: number, data: Partial<Entity>): Promise<Entity> {
-        return PrismaService.main.entity.update({ where: { id }, data });
-    }
-}
+  included do
+    around_action :set_timezone
+  end
+
+  private
+
+  def set_timezone(&block)
+    timezone = Current.user&.timezone || cookies[:timezone] || "UTC"
+    Time.use_zone(timezone, &block)
+  end
+end
 ```
 
 ---
 
-**Related Files:**
-- [SKILL.md](SKILL.md) - Main guide
-- [services-and-repositories.md](services-and-repositories.md) - Service layer details
-- [complete-examples.md](complete-examples.md) - Full refactoring examples
+## ApplicationController
+
+Compose concerns for shared behavior:
+
+```ruby
+class ApplicationController < ActionController::Base
+  include CurrentRequest
+  include CurrentTimezone
+  include Authentication  # Your auth concern
+
+  # Security
+  protect_from_forgery with: :exception
+
+  # Turbo-friendly flash
+  add_flash_types :success, :warning, :error
+end
+```
+
+---
+
+## Composable Rendering
+
+Scoping concerns provide reusable render helpers:
+
+```ruby
+module BoardScoped
+  # ... scoping logic ...
+
+  def render_board_update
+    render turbo_stream: turbo_stream.replace(@board)
+  end
+
+  def render_card_append(card)
+    render turbo_stream: turbo_stream.append("cards", card)
+  end
+
+  def render_card_removal(card)
+    render turbo_stream: turbo_stream.remove(card)
+  end
+end
+
+# Multiple controllers use the same rendering
+class CardsController < ApplicationController
+  include BoardScoped
+
+  def create
+    @card = @board.cards.create!(card_params)
+    render_card_append(@card)
+  end
+
+  def destroy
+    @card.destroy
+    render_card_removal(@card)
+  end
+end
+
+class Card::ArchivalsController < ApplicationController
+  include CardScoped
+
+  def create
+    @card.archive!
+    render_card_removal(@card)  # Same helper, different context
+  end
+end
+```
+
+---
+
+## Quick Reference
+
+| Pattern | Example |
+|---------|---------|
+| Custom action → Resource | `post :close` → `resource :closure` |
+| Verb → Noun | "watch" → `watching`, "pin" → `pin` |
+| One-per-parent | `resource :closure` (singular) |
+| Many-per-parent | `resources :comments` (plural) |
+| Auth check | Controller calls `Current.user.can_X?` |
+| Auth logic | Model defines `can_X?` method |
+| Shared loading | `include BoardScoped` |
+| Shared rendering | `render_card_replacement` from concern |
