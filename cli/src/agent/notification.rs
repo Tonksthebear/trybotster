@@ -43,7 +43,7 @@ pub enum AgentNotification {
 /// Tracks the lifecycle state of an agent from initialization through
 /// completion or failure.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "Variants used by different codepaths, keeping for API completeness")]
 pub enum AgentStatus {
     /// Agent is starting up.
     Initializing,

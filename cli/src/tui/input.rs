@@ -77,7 +77,10 @@ pub struct InputContext {
 }
 
 /// Convert a key event to a HubAction.
-fn key_event_to_action(
+///
+/// This is public to allow the Hub to convert browser input events
+/// using the same logic as local terminal input.
+pub fn key_event_to_action(
     key: &KeyEvent,
     mode: &AppMode,
     context: &InputContext,
@@ -104,7 +107,7 @@ fn normal_mode_key(key: &KeyEvent, context: &InputContext) -> Option<HubAction> 
     match key.code {
         KeyCode::Char('q') if !ctrl => Some(HubAction::Quit),
         KeyCode::Char('c') if ctrl => Some(HubAction::Quit),
-        KeyCode::Char('m') | KeyCode::Char(' ') => Some(HubAction::OpenMenu),
+        KeyCode::Char('m' | ' ') => Some(HubAction::OpenMenu),
         KeyCode::Char('k') | KeyCode::Up => Some(HubAction::SelectPrevious),
         KeyCode::Char('j') | KeyCode::Down => Some(HubAction::SelectNext),
         KeyCode::Char('x') => Some(HubAction::KillSelectedAgent),
@@ -145,11 +148,7 @@ fn menu_mode_key(key: &KeyEvent, context: &InputContext) -> Option<HubAction> {
         }
         KeyCode::Char(c @ '1'..='9') => {
             let idx = (c.to_digit(10)? as usize).saturating_sub(1);
-            if idx < context.menu_count {
-                Some(HubAction::MenuSelect(idx))
-            } else {
-                None
-            }
+            (idx < context.menu_count).then_some(HubAction::MenuSelect(idx))
         }
         _ => None,
     }
@@ -182,7 +181,7 @@ fn text_input_key(key: &KeyEvent) -> Option<HubAction> {
 /// Key handling for close agent confirmation.
 fn close_confirm_key(key: &KeyEvent) -> Option<HubAction> {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => Some(HubAction::CloseModal),
+        KeyCode::Esc | KeyCode::Char('n' | 'q') => Some(HubAction::CloseModal),
         KeyCode::Char('y') | KeyCode::Enter => Some(HubAction::ConfirmCloseAgent),
         KeyCode::Char('d') => Some(HubAction::ConfirmCloseAgentDeleteWorktree),
         _ => None,

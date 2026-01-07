@@ -54,10 +54,9 @@ fn ensure_authenticated() -> Result<()> {
             println!("  export BOTSTER_TOKEN={}", token);
             println!();
             anyhow::bail!("Please update your environment variable and restart.");
-        } else {
-            config.save_token(&token)?;
-            println!("Token saved successfully.");
         }
+        config.save_token(&token)?;
+        println!("Token saved successfully.");
     }
 
     Ok(())
@@ -77,7 +76,7 @@ fn run_with_hub() -> Result<()> {
     ensure_authenticated()?;
 
     // Set up signal handlers
-    use signal_hook::consts::signal::*;
+    use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGHUP};
     use signal_hook::flag;
     flag::register(SIGINT, Arc::clone(&SHUTDOWN_FLAG))?;
     flag::register(SIGTERM, Arc::clone(&SHUTDOWN_FLAG))?;

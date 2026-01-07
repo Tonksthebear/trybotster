@@ -54,7 +54,7 @@ pub fn generate_qr_code_lines(data: &str, max_width: u16, max_height: u16) -> Ve
             // This gives ~square aspect ratio since terminal chars are ~2:1 height:width
             let qr_width = total_size as u16;
             // Ceiling division
-            let qr_height = ((total_size + 1) / 2) as u16;
+            let qr_height = total_size.div_ceil(2) as u16;
 
             if qr_width <= max_width && qr_height <= max_height {
                 let mut lines = Vec::with_capacity(qr_height as usize);
@@ -77,7 +77,7 @@ pub fn generate_qr_code_lines(data: &str, max_width: u16, max_height: u16) -> Ve
                 // ▄ = bottom half (upper row light, lower row dark)
                 // █ = full block (both dark)
                 // ' ' = space (both light)
-                for row_pair in 0..((total_size + 1) / 2) {
+                for row_pair in 0..total_size.div_ceil(2) {
                     let upper_y = row_pair * 2;
                     let lower_y = row_pair * 2 + 1;
                     let mut line = String::with_capacity(total_size);

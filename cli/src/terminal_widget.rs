@@ -134,7 +134,7 @@ fn render_cursor(
 fn apply_cell(vt_cell: &vt100::Cell, buf_cell: &mut ratatui::buffer::Cell) {
     // Set content
     if vt_cell.has_contents() {
-        buf_cell.set_symbol(&vt_cell.contents());
+        buf_cell.set_symbol(vt_cell.contents());
     }
 
     // Build style from vt100 cell attributes

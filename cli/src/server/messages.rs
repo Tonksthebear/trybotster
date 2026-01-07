@@ -64,18 +64,18 @@ impl ParsedMessage {
         // Extract issue number
         let issue_number = payload
             .get("issue_number")
-            .and_then(|n| n.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .or_else(|| {
                 payload
                     .get("issue")
                     .and_then(|i| i.get("number"))
-                    .and_then(|n| n.as_u64())
+                    .and_then(serde_json::Value::as_u64)
             })
             .or_else(|| {
                 payload
                     .get("pull_request")
                     .and_then(|pr| pr.get("number"))
-                    .and_then(|n| n.as_u64())
+                    .and_then(serde_json::Value::as_u64)
             })
             .map(|n| n as u32);
 

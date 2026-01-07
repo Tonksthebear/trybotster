@@ -23,17 +23,33 @@
 //!
 //! # Modules
 //!
+//! - [`connection`] - WebSocket transport and encryption
 //! - [`events`] - Browser event to Hub action conversion
+//! - [`state`] - Browser connection state management
+//! - [`types`] - Protocol message types
 
 // Rust guideline compliant 2025-01
 
+pub mod browser;
 pub mod connection;
 pub mod events;
+pub mod state;
+pub mod types;
 
-pub use events::{browser_event_to_hub_action, command_to_event, BrowserEventContext};
-
-// Re-export connection types (formerly terminal_relay)
-pub use connection::{
-    AgentInfo, BrowserCommand, BrowserEvent, BrowserResize, EncryptedEnvelope, TerminalMessage,
-    TerminalOutputSender, TerminalRelay, WorktreeInfo,
+pub use events::{
+    browser_event_to_hub_action, check_browser_resize, command_to_event, BrowserEventContext,
+    BrowserEventResult, BrowserResponse, ResizeAction,
 };
+pub use state::{
+    build_agent_info, build_worktree_info, send_agent_list, send_agent_selected,
+    send_worktree_list, BrowserSendContext, BrowserState,
+};
+
+// Re-export types for external use
+pub use types::{
+    AgentInfo, BrowserCommand, BrowserEvent, BrowserResize, EncryptedEnvelope, TerminalMessage,
+    WorktreeInfo,
+};
+
+// Re-export connection types
+pub use connection::{TerminalOutputSender, TerminalRelay};

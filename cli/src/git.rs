@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSetBuilder};
-use serde_json;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -29,9 +28,9 @@ impl WorktreeManager {
 
         let patterns: Vec<String> = content
             .lines()
-            .map(|line| line.trim())
+            .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| line.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
 
         Ok(patterns)
@@ -50,9 +49,9 @@ impl WorktreeManager {
 
         let commands: Vec<String> = content
             .lines()
-            .map(|line| line.trim())
+            .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| line.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
 
         log::info!("Read {} init command(s) from .botster_init", commands.len());
@@ -72,9 +71,9 @@ impl WorktreeManager {
 
         let commands: Vec<String> = content
             .lines()
-            .map(|line| line.trim())
+            .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| line.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
 
         log::info!(
@@ -108,7 +107,7 @@ impl WorktreeManager {
             source_repo.display(),
             dest_worktree.display()
         );
-        std::fs::write("/tmp/botster_debug.log", &debug_log).ok();
+        let _ = std::fs::write("/tmp/botster_debug.log", &debug_log);
 
         // Build globset from patterns
         let mut builder = GlobSetBuilder::new();
@@ -178,9 +177,9 @@ impl WorktreeManager {
                     path.display(),
                     rel_path.display()
                 );
-                if globset.is_match(&rel_path) {
+                if globset.is_match(rel_path) {
                     // Copy matching file
-                    let dest_path = dest_root.join(&rel_path);
+                    let dest_path = dest_root.join(rel_path);
 
                     // Create parent directories if needed
                     if let Some(parent) = dest_path.parent() {
@@ -211,7 +210,7 @@ impl WorktreeManager {
                                 .append(true)
                                 .open("/tmp/botster_debug.log")
                             {
-                                file.write_all(debug_msg.as_bytes()).ok();
+                                let _ = file.write_all(debug_msg.as_bytes());
                             }
                         }
                         Err(e) => {
@@ -300,7 +299,7 @@ impl WorktreeManager {
         let output = if branch_exists {
             log::info!("Using existing branch: {}", branch_name);
             std::process::Command::new("git")
-                .args(&[
+                .args([
                     "worktree",
                     "add",
                     worktree_path.to_str().unwrap(),
@@ -311,7 +310,7 @@ impl WorktreeManager {
         } else {
             log::info!("Creating new branch: {}", branch_name);
             std::process::Command::new("git")
-                .args(&[
+                .args([
                     "worktree",
                     "add",
                     "-b",
@@ -387,7 +386,7 @@ impl WorktreeManager {
             // Branch exists - checkout existing branch (no -b flag)
             log::info!("Using existing branch: {}", branch_name);
             std::process::Command::new("git")
-                .args(&[
+                .args([
                     "worktree",
                     "add",
                     worktree_path.to_str().unwrap(),
@@ -399,7 +398,7 @@ impl WorktreeManager {
             // Branch doesn't exist - create new branch with -b flag
             log::info!("Creating new branch: {}", branch_name);
             std::process::Command::new("git")
-                .args(&[
+                .args([
                     "worktree",
                     "add",
                     "-b",
@@ -439,7 +438,7 @@ impl WorktreeManager {
 
             // Try to remove with git worktree remove
             let remove_result = std::process::Command::new("git")
-                .args(&[
+                .args([
                     "worktree",
                     "remove",
                     worktree_path.to_str().unwrap(),
@@ -451,15 +450,14 @@ impl WorktreeManager {
             // If git command fails, try to prune and remove directory manually
             if remove_result.is_err() || !remove_result.as_ref().unwrap().status.success() {
                 log::warn!("Git worktree remove failed, trying prune...");
-                std::process::Command::new("git")
-                    .args(&["worktree", "prune"])
+                let _ = std::process::Command::new("git")
+                    .args(["worktree", "prune"])
                     .current_dir(clone_dir)
-                    .output()
-                    .ok();
+                    .output();
 
                 // Manually remove the directory if it still exists
                 if worktree_path.exists() {
-                    std::fs::remove_dir_all(worktree_path).ok();
+                    let _ = std::fs::remove_dir_all(worktree_path);
                 }
             }
         }
@@ -476,12 +474,12 @@ impl WorktreeManager {
         }
 
         let output = std::process::Command::new("git")
-            .args(&["worktree", "list"])
+            .args(["worktree", "list"])
             .current_dir(&clone_dir)
             .output()?;
 
         let list = String::from_utf8_lossy(&output.stdout);
-        Ok(list.lines().map(|s| s.to_string()).collect())
+        Ok(list.lines().map(std::string::ToString::to_string).collect())
     }
 
     /// Finds an existing worktree for a given issue number
@@ -507,7 +505,7 @@ impl WorktreeManager {
 
         // Verify the worktree is valid by checking if git recognizes it
         let output = std::process::Command::new("git")
-            .args(&["worktree", "list", "--porcelain"])
+            .args(["worktree", "list", "--porcelain"])
             .current_dir(&repo_path)
             .output()?;
 
@@ -541,7 +539,7 @@ impl WorktreeManager {
 
         if clone_dir.exists() {
             std::process::Command::new("git")
-                .args(&["worktree", "prune"])
+                .args(["worktree", "prune"])
                 .current_dir(&clone_dir)
                 .output()?;
         }
@@ -712,20 +710,20 @@ impl WorktreeManager {
                         "BOTSTER_HUB_BIN",
                         std::env::current_exe()
                             .ok()
-                            .and_then(|p| p.to_str().map(|s| s.to_string()))
+                            .and_then(|p| p.to_str().map(std::string::ToString::to_string))
                             .unwrap_or_else(|| "botster-hub".to_string()),
                     )
                     .output()?;
 
-                if !output.status.success() {
-                    log::warn!(
-                        "Teardown command failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                } else {
+                if output.status.success() {
                     log::debug!(
                         "Teardown output: {}",
                         String::from_utf8_lossy(&output.stdout)
+                    );
+                } else {
+                    log::warn!(
+                        "Teardown command failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
                     );
                 }
             }
@@ -744,7 +742,7 @@ impl WorktreeManager {
         );
 
         let output = std::process::Command::new("git")
-            .args(&[
+            .args([
                 "worktree",
                 "remove",
                 worktree_path.to_str().unwrap(),
@@ -771,7 +769,7 @@ impl WorktreeManager {
         // Delete the branch
         log::info!("Deleting branch {}", branch_name);
         let output = std::process::Command::new("git")
-            .args(&["branch", "-D", branch_name])
+            .args(["branch", "-D", branch_name])
             .current_dir(&repo_path)
             .output()?;
 
@@ -830,20 +828,20 @@ impl WorktreeManager {
                         "BOTSTER_HUB_BIN",
                         std::env::current_exe()
                             .ok()
-                            .and_then(|p| p.to_str().map(|s| s.to_string()))
+                            .and_then(|p| p.to_str().map(std::string::ToString::to_string))
                             .unwrap_or_else(|| "botster-hub".to_string()),
                     )
                     .output()?;
 
-                if !output.status.success() {
-                    log::warn!(
-                        "Teardown command failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                } else {
+                if output.status.success() {
                     log::debug!(
                         "Teardown output: {}",
                         String::from_utf8_lossy(&output.stdout)
+                    );
+                } else {
+                    log::warn!(
+                        "Teardown command failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
                     );
                 }
             }
@@ -852,7 +850,7 @@ impl WorktreeManager {
         // Remove the worktree using git
         log::info!("Removing worktree at {}", worktree_path.display());
         let output = std::process::Command::new("git")
-            .args(&[
+            .args([
                 "worktree",
                 "remove",
                 worktree_path.to_str().unwrap(),
@@ -869,7 +867,7 @@ impl WorktreeManager {
         // Delete the branch
         log::info!("Deleting branch {}", branch_name);
         let output = std::process::Command::new("git")
-            .args(&["branch", "-D", &branch_name])
+            .args(["branch", "-D", &branch_name])
             .current_dir(&repo_path)
             .output()?;
 

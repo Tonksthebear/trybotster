@@ -66,3 +66,4 @@ pub use tunnel::{allocate_tunnel_port, TunnelManager, TunnelStatus};
 
 // Re-export Hub types
 pub use hub::{Hub, HubAction, HubState};
+pub use agents::AgentSpawnConfig;

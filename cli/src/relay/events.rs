@@ -8,13 +8,21 @@
 //! ```text
 //! Browser ──► WebSocket ──► BrowserEvent ──► HubAction ──► Hub
 //! ```
+//!
+//! # Resize Handling
+//!
+//! Browser resize events are tracked for dimension changes. The resize
+//! handler returns actions to apply (agent resize dimensions) based on
+//! browser mode (TUI vs GUI) and connection state.
 
 // Rust guideline compliant 2025-01
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::hub::HubAction;
-use crate::relay::connection::{BrowserCommand, BrowserEvent};
+use crate::BrowserMode;
+use super::types::{BrowserCommand, BrowserEvent};
 
 /// Convert a BrowserEvent to a HubAction.
 ///
@@ -54,16 +62,12 @@ pub fn browser_event_to_hub_action(
             // Parse issue_or_branch to determine if it's an issue number or branch name
             let (issue_number, branch_name) = parse_issue_or_branch(issue_or_branch);
             let actual_branch = branch_name.unwrap_or_else(|| {
-                issue_number
-                    .map(|n| format!("botster-issue-{n}"))
-                    .unwrap_or_else(|| "new-branch".to_string())
+                issue_number.map_or_else(|| "new-branch".to_string(), |n| format!("botster-issue-{n}"))
             });
 
             let worktree_path = context
                 .worktree_base
-                .as_ref()
-                .map(|base| base.join(&actual_branch))
-                .unwrap_or_else(|| PathBuf::from("/tmp").join(&actual_branch));
+                .as_ref().map_or_else(|| PathBuf::from("/tmp").join(&actual_branch), |base| base.join(&actual_branch));
 
             Some(HubAction::SpawnAgent {
                 issue_number,
@@ -190,10 +194,130 @@ pub fn command_to_event(cmd: &BrowserCommand) -> BrowserEvent {
     }
 }
 
+/// Result of checking browser resize state.
+#[derive(Debug, Clone)]
+pub enum ResizeAction {
+    /// No action needed (dimensions unchanged or browser disconnected).
+    None,
+    /// Resize agents to these dimensions.
+    ResizeAgents { rows: u16, cols: u16 },
+    /// Browser disconnected - reset to local terminal dimensions.
+    ResetToLocal { rows: u16, cols: u16 },
+}
+
+/// Check if browser dimensions have changed and return resize action.
+///
+/// This function tracks dimension state across calls using atomic variables.
+/// It handles:
+/// - Browser mode changes (GUI uses full dims, TUI uses 70% width)
+/// - Connection/disconnection transitions
+/// - Dimension validation (min 20 cols, 5 rows)
+///
+/// # Arguments
+///
+/// * `browser_dims` - Current browser dimensions, or None if disconnected
+/// * `local_dims` - Local terminal dimensions (rows, cols) for fallback
+///
+/// # Returns
+///
+/// A `ResizeAction` indicating what should be done.
+pub fn check_browser_resize(
+    browser_dims: Option<(u16, u16, BrowserMode)>,
+    local_dims: (u16, u16),
+) -> ResizeAction {
+    static LAST_DIMS: AtomicU32 = AtomicU32::new(0);
+    static WAS_CONNECTED: AtomicBool = AtomicBool::new(false);
+
+    let is_connected = browser_dims.is_some();
+    let was_connected = WAS_CONNECTED.swap(is_connected, Ordering::Relaxed);
+
+    if let Some((rows, cols, mode)) = browser_dims {
+        if cols >= 20 && rows >= 5 {
+            let mode_bit = if mode == BrowserMode::Gui { 1u32 << 31 } else { 0 };
+            let combined = mode_bit | (u32::from(cols) << 16) | u32::from(rows);
+            let last = LAST_DIMS.swap(combined, Ordering::Relaxed);
+
+            if last != combined {
+                let (agent_cols, agent_rows) = match mode {
+                    BrowserMode::Gui => {
+                        log::info!("GUI mode - using full browser dimensions: {cols}x{rows}");
+                        (cols, rows)
+                    }
+                    BrowserMode::Tui => {
+                        let tui_cols = (cols * 70 / 100).saturating_sub(2);
+                        let tui_rows = rows.saturating_sub(2);
+                        log::info!("TUI mode - using 70% width: {tui_cols}x{tui_rows} (from {cols}x{rows})");
+                        (tui_cols, tui_rows)
+                    }
+                };
+                return ResizeAction::ResizeAgents {
+                    rows: agent_rows,
+                    cols: agent_cols,
+                };
+            }
+        }
+        ResizeAction::None
+    } else if was_connected {
+        log::info!("Browser disconnected, resetting agents to local terminal size");
+        LAST_DIMS.store(0, Ordering::Relaxed);
+        let (local_rows, local_cols) = local_dims;
+        let terminal_cols = (local_cols * 70 / 100).saturating_sub(2);
+        let terminal_rows = local_rows.saturating_sub(2);
+        ResizeAction::ResetToLocal {
+            rows: terminal_rows,
+            cols: terminal_cols,
+        }
+    } else {
+        ResizeAction::None
+    }
+}
+
+/// Process a single browser event and return actions to take.
+///
+/// Returns a tuple of:
+/// - Optional `HubAction` to dispatch
+/// - Optional resize dimensions (rows, cols) for agent resizing
+/// - Whether the screen should be invalidated
+#[derive(Debug)]
+pub struct BrowserEventResult {
+    /// Hub action to dispatch, if any.
+    pub action: Option<HubAction>,
+    /// Agent resize dimensions, if needed.
+    pub resize: Option<(u16, u16)>,
+    /// Whether screen cache should be invalidated.
+    pub invalidate_screen: bool,
+    /// Response to send back to browser.
+    pub response: BrowserResponse,
+}
+
+/// Response to send back to browser after processing an event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BrowserResponse {
+    /// No response needed.
+    None,
+    /// Send agent list to browser.
+    SendAgentList,
+    /// Send worktree list to browser.
+    SendWorktreeList,
+    /// Send agent selected notification.
+    SendAgentSelected(String),
+}
+
+impl Default for BrowserEventResult {
+    fn default() -> Self {
+        Self {
+            action: None,
+            resize: None,
+            invalidate_screen: false,
+            response: BrowserResponse::None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay::connection::BrowserResize;
+    use crate::relay::BrowserResize;
 
     fn default_context() -> BrowserEventContext {
         BrowserEventContext {

@@ -108,7 +108,6 @@ mod tests {
     #[test]
     fn test_render_agent_terminal_no_deadlock() {
         let (mut agent, _temp_dir) = create_test_agent();
-        agent.cli_pty = Some(PtySession::new(24, 80));
 
         // Add content
         {
@@ -139,7 +138,6 @@ mod tests {
 
         let handle = thread::spawn(move || {
             let (mut agent, _temp_dir) = create_test_agent();
-            agent.cli_pty = Some(PtySession::new(24, 80));
 
             // Add content
             {
@@ -180,18 +178,11 @@ mod tests {
     #[test]
     fn test_render_with_pty_switch() {
         let (mut agent, _temp_dir) = create_test_agent();
-        agent.cli_pty = Some(PtySession::new(24, 80));
         agent.server_pty = Some(PtySession::new(24, 80));
 
         // Add content to both
         {
-            let mut p = agent
-                .cli_pty
-                .as_ref()
-                .unwrap()
-                .vt100_parser
-                .lock()
-                .unwrap();
+            let mut p = agent.cli_pty.vt100_parser.lock().unwrap();
             for i in 0..30 {
                 p.process(format!("CLI {}\r\n", i).as_bytes());
             }

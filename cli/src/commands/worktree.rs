@@ -161,7 +161,7 @@ const TABLE_WIDTH: usize = 70;
 
 /// Prints worktree information as a formatted table.
 fn print_worktree_table(worktrees: &[WorktreeInfo]) {
-    println!("{:<PATH_COLUMN_WIDTH$} {}", "Path", "Branch");
+    println!("{:<PATH_COLUMN_WIDTH$} Branch", "Path");
     println!("{}", "-".repeat(TABLE_WIDTH));
 
     for wt in worktrees {

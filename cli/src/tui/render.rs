@@ -193,7 +193,7 @@ pub fn render(
             // Log once when dimensions change
             static LAST_AREA: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let area = f.area();
-            let combined = ((area.width as u32) << 16) | (area.height as u32);
+            let combined = (u32::from(area.width) << 16) | u32::from(area.height);
             let last = LAST_AREA.swap(combined, std::sync::atomic::Ordering::Relaxed);
             if last != combined {
                 log::info!(
@@ -202,12 +202,12 @@ pub fn render(
                     area.height
                 );
             }
-            render_ui(f, agents)
+            render_ui(f, agents);
         })?;
 
         // Convert virtual buffer to ANSI
         let ansi = buffer_to_ansi(
-            &completed_frame.buffer,
+            completed_frame.buffer,
             dims.cols,
             dims.rows,
             None, // No clipping needed, already at correct size
@@ -225,8 +225,7 @@ pub fn render(
 // === Modal Rendering Helpers ===
 
 fn render_menu_modal(f: &mut Frame, menu_selected: usize, polling_enabled: bool) {
-    let menu_items = vec![
-        format!(
+    let menu_items = [format!(
             "{} {} ({})",
             if menu_selected == constants::MENU_INDEX_TOGGLE_POLLING { ">" } else { " " },
             constants::MENU_ITEMS[constants::MENU_INDEX_TOGGLE_POLLING],
@@ -246,8 +245,7 @@ fn render_menu_modal(f: &mut Frame, menu_selected: usize, polling_enabled: bool)
             "{} {}",
             if menu_selected == constants::MENU_INDEX_CONNECTION_CODE { ">" } else { " " },
             constants::MENU_ITEMS[constants::MENU_INDEX_CONNECTION_CODE]
-        ),
-    ];
+        )];
 
     let area = centered_rect(
         constants::MENU_MODAL_WIDTH_PERCENT,

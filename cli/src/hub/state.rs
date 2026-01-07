@@ -97,10 +97,10 @@ impl HubState {
         let agent = self.agents.remove(session_key);
 
         // Clamp selection to valid range
-        if !self.agent_keys_ordered.is_empty() {
-            self.selected = self.selected.min(self.agent_keys_ordered.len() - 1);
-        } else {
+        if self.agent_keys_ordered.is_empty() {
             self.selected = 0;
+        } else {
+            self.selected = self.selected.min(self.agent_keys_ordered.len() - 1);
         }
 
         agent
@@ -175,6 +175,79 @@ impl HubState {
         self.agent_keys_ordered
             .iter()
             .filter_map(|key| self.agents.get(key).map(|agent| (key.as_str(), agent)))
+    }
+
+    /// Load available worktrees for the selection UI.
+    ///
+    /// Queries git for all worktrees and filters out:
+    /// - Worktrees that already have active agents
+    /// - The main repository (not a worktree)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if git commands fail.
+    pub fn load_available_worktrees(&mut self) -> anyhow::Result<()> {
+        use std::collections::HashSet;
+        use std::process::Command;
+
+        let (repo_path, _) = WorktreeManager::detect_current_repo()?;
+
+        let output = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&repo_path)
+            .output()?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to list worktrees: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let worktree_output = String::from_utf8_lossy(&output.stdout);
+        let mut current_path = String::new();
+        let mut current_branch = String::new();
+        let mut worktrees = Vec::new();
+
+        for line in worktree_output.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                current_path = path.to_string();
+            } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+                current_branch = branch.to_string();
+            } else if line.is_empty() && !current_path.is_empty() {
+                worktrees.push((current_path.clone(), current_branch.clone()));
+                current_path.clear();
+                current_branch.clear();
+            }
+        }
+
+        if !current_path.is_empty() {
+            worktrees.push((current_path, current_branch));
+        }
+
+        // Filter out worktrees already in use and the main repository
+        let open_paths: HashSet<_> = self
+            .agents
+            .values()
+            .map(|a| a.worktree_path.display().to_string())
+            .collect();
+
+        self.available_worktrees = worktrees
+            .into_iter()
+            .filter(|(path, _)| {
+                if open_paths.contains(path) {
+                    return false;
+                }
+                if let Ok(repo) = git2::Repository::open(path) {
+                    if !repo.is_worktree() {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        Ok(())
     }
 }
 

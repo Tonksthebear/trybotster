@@ -15,7 +15,7 @@
 //! 5. All terminal data is encrypted with the shared secret
 //! 6. Server only sees encrypted blobs - zero knowledge
 //!
-//! Rust guideline compliant 2025-01-05
+//! Rust guideline compliant 2025-01
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -24,120 +24,13 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tokio_tungstenite::{connect_async, tungstenite::Message, tungstenite::client::IntoClientRequest};
+use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message};
 
-/// Message types for terminal relay (CLI -> browser)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum TerminalMessage {
-    /// Terminal output from CLI to browser
-    #[serde(rename = "output")]
-    Output { data: String },
-    /// Agent list response
-    #[serde(rename = "agents")]
-    Agents { agents: Vec<AgentInfo> },
-    /// Worktree list response
-    #[serde(rename = "worktrees")]
-    Worktrees { worktrees: Vec<WorktreeInfo>, repo: Option<String> },
-    /// Agent selected confirmation
-    #[serde(rename = "agent_selected")]
-    AgentSelected { id: String },
-    /// Agent created confirmation
-    #[serde(rename = "agent_created")]
-    AgentCreated { id: String },
-    /// Agent deleted confirmation
-    #[serde(rename = "agent_deleted")]
-    AgentDeleted { id: String },
-    /// Error message
-    #[serde(rename = "error")]
-    Error { message: String },
-}
+use super::types::{
+    BrowserCommand, BrowserEvent, BrowserResize, EncryptedEnvelope, TerminalMessage,
+};
 
-/// Agent info for list response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentInfo {
-    pub id: String,
-    pub repo: Option<String>,
-    pub issue_number: Option<u64>,
-    pub branch_name: Option<String>,
-    pub name: Option<String>,
-    pub status: Option<String>,
-    pub tunnel_port: Option<u16>,
-    pub server_running: Option<bool>,
-    pub has_server_pty: Option<bool>,
-    pub active_pty_view: Option<String>,
-    pub scroll_offset: Option<u32>,
-    pub hub_identifier: Option<String>,
-}
-
-/// Worktree info for list response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorktreeInfo {
-    pub path: String,
-    pub branch: String,
-    pub issue_number: Option<u64>,
-}
-
-/// Browser command types (browser -> CLI)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum BrowserCommand {
-    /// Terminal input from browser
-    #[serde(rename = "input")]
-    Input { data: String },
-    /// Set display mode (tui/gui)
-    #[serde(rename = "set_mode")]
-    SetMode { mode: String },
-    /// List all agents
-    #[serde(rename = "list_agents")]
-    ListAgents,
-    /// List available worktrees
-    #[serde(rename = "list_worktrees")]
-    ListWorktrees,
-    /// Select an agent
-    #[serde(rename = "select_agent")]
-    SelectAgent { id: String },
-    /// Create a new agent
-    #[serde(rename = "create_agent")]
-    CreateAgent {
-        issue_or_branch: Option<String>,
-        prompt: Option<String>,
-    },
-    /// Reopen an existing worktree
-    #[serde(rename = "reopen_worktree")]
-    ReopenWorktree {
-        path: String,
-        branch: String,
-        prompt: Option<String>,
-    },
-    /// Delete an agent
-    #[serde(rename = "delete_agent")]
-    DeleteAgent {
-        id: String,
-        delete_worktree: Option<bool>,
-    },
-    /// Toggle PTY view (CLI/Server)
-    #[serde(rename = "toggle_pty_view")]
-    TogglePtyView,
-    /// Scroll terminal
-    #[serde(rename = "scroll")]
-    Scroll { direction: String, lines: Option<u32> },
-    /// Scroll to bottom (return to live)
-    #[serde(rename = "scroll_to_bottom")]
-    ScrollToBottom,
-    /// Scroll to top
-    #[serde(rename = "scroll_to_top")]
-    ScrollToTop,
-}
-
-/// Encrypted message envelope (sent via Action Cable)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncryptedEnvelope {
-    pub blob: String,  // Base64 encrypted data
-    pub nonce: String, // Base64 nonce
-}
-
-/// Action Cable message format
+/// Action Cable message format.
 #[derive(Debug, Serialize, Deserialize)]
 struct CableMessage {
     command: String,
@@ -146,7 +39,7 @@ struct CableMessage {
     data: Option<String>,
 }
 
-/// Action Cable subscription identifier
+/// Action Cable subscription identifier.
 #[derive(Debug, Serialize, Deserialize)]
 struct ChannelIdentifier {
     channel: String,
@@ -154,64 +47,12 @@ struct ChannelIdentifier {
     device_type: String,
 }
 
-/// Incoming Action Cable message
+/// Incoming Action Cable message.
 #[derive(Debug, Deserialize)]
 struct IncomingCableMessage {
     #[serde(rename = "type")]
     msg_type: Option<String>,
     message: Option<serde_json::Value>,
-}
-
-/// Browser resize event
-#[derive(Debug, Clone)]
-pub struct BrowserResize {
-    pub cols: u16,
-    pub rows: u16,
-}
-
-/// Events received from the browser via the relay
-#[derive(Debug, Clone)]
-pub enum BrowserEvent {
-    /// Browser connected and sent its public key
-    Connected { public_key: String, device_name: String },
-    /// Browser disconnected
-    Disconnected,
-    /// Terminal input from browser (already decrypted)
-    Input(String),
-    /// Browser resized terminal
-    Resize(BrowserResize),
-    /// Set display mode (tui/gui)
-    SetMode { mode: String },
-    /// List all agents
-    ListAgents,
-    /// List available worktrees
-    ListWorktrees,
-    /// Select an agent
-    SelectAgent { id: String },
-    /// Create a new agent
-    CreateAgent {
-        issue_or_branch: Option<String>,
-        prompt: Option<String>,
-    },
-    /// Reopen an existing worktree
-    ReopenWorktree {
-        path: String,
-        branch: String,
-        prompt: Option<String>,
-    },
-    /// Delete an agent
-    DeleteAgent {
-        id: String,
-        delete_worktree: bool,
-    },
-    /// Toggle PTY view (CLI/Server)
-    TogglePtyView,
-    /// Scroll terminal
-    Scroll { direction: String, lines: u32 },
-    /// Scroll to bottom (return to live)
-    ScrollToBottom,
-    /// Scroll to top
-    ScrollToTop,
 }
 
 /// Shared state for the terminal relay
@@ -261,7 +102,7 @@ impl RelayState {
 
         Ok(EncryptedEnvelope {
             blob: BASE64.encode(&ciphertext),
-            nonce: BASE64.encode(&nonce),
+            nonce: BASE64.encode(nonce),
         })
     }
 
@@ -628,8 +469,8 @@ impl TerminalRelay {
                                             // Browser sent resize event
                                             if message.get("from").and_then(|v| v.as_str()) == Some("browser") {
                                                 if let (Some(cols), Some(rows)) = (
-                                                    message.get("cols").and_then(|v| v.as_i64()),
-                                                    message.get("rows").and_then(|v| v.as_i64()),
+                                                    message.get("cols").and_then(serde_json::Value::as_i64),
+                                                    message.get("rows").and_then(serde_json::Value::as_i64),
                                                 ) {
                                                     log::info!("Browser resize: {}x{}", cols, rows);
                                                     if let Err(e) = event_tx.send(BrowserEvent::Resize(BrowserResize {
@@ -690,10 +531,14 @@ mod tests {
         let mut state = RelayState::new(cli_secret);
 
         // Set browser's public key (compute shared secret)
-        state.set_peer_public_key(&BASE64.encode(browser_public.as_bytes())).unwrap();
+        state
+            .set_peer_public_key(&BASE64.encode(browser_public.as_bytes()))
+            .unwrap();
 
         // Encrypt a message
-        let message = TerminalMessage::Output { data: "Hello, browser!".to_string() };
+        let message = TerminalMessage::Output {
+            data: "Hello, browser!".to_string(),
+        };
         let envelope = state.encrypt(&message).unwrap();
 
         // Decrypt the message
@@ -707,279 +552,25 @@ mod tests {
         }
     }
 
-    // ========== TerminalMessage Serialization Tests ==========
-
     #[test]
-    fn test_terminal_message_output_serialization() {
-        let msg = TerminalMessage::Output { data: "hello".to_string() };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"output""#));
-        assert!(json.contains(r#""data":"hello""#));
+    fn test_relay_state_is_ready() {
+        let secret = SecretKey::generate(&mut OsRng);
+        let state = RelayState::new(secret);
+        assert!(!state.is_ready());
     }
 
     #[test]
-    fn test_terminal_message_agents_serialization() {
-        let msg = TerminalMessage::Agents {
-            agents: vec![AgentInfo {
-                id: "test-id".to_string(),
-                repo: Some("owner/repo".to_string()),
-                issue_number: Some(42),
-                branch_name: Some("botster-issue-42".to_string()),
-                name: None,
-                status: Some("Running".to_string()),
-                tunnel_port: Some(3000),
-                server_running: Some(true),
-                has_server_pty: Some(true),
-                active_pty_view: Some("cli".to_string()),
-                scroll_offset: Some(0),
-                hub_identifier: Some("hub-123".to_string()),
-            }],
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"agents""#));
-        assert!(json.contains(r#""id":"test-id""#));
-        assert!(json.contains(r#""issue_number":42"#));
-    }
+    fn test_relay_state_becomes_ready_after_peer_key() {
+        let cli_secret = SecretKey::generate(&mut OsRng);
+        let browser_secret = SecretKey::generate(&mut OsRng);
+        let browser_public = browser_secret.public_key();
 
-    #[test]
-    fn test_terminal_message_worktrees_serialization() {
-        let msg = TerminalMessage::Worktrees {
-            worktrees: vec![WorktreeInfo {
-                path: "/path/to/worktree".to_string(),
-                branch: "feature-branch".to_string(),
-                issue_number: None,
-            }],
-            repo: Some("owner/repo".to_string()),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"worktrees""#));
-        assert!(json.contains(r#""path":"/path/to/worktree""#));
-    }
+        let mut state = RelayState::new(cli_secret);
+        assert!(!state.is_ready());
 
-    #[test]
-    fn test_terminal_message_agent_selected_serialization() {
-        let msg = TerminalMessage::AgentSelected { id: "agent-123".to_string() };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"agent_selected""#));
-        assert!(json.contains(r#""id":"agent-123""#));
-    }
-
-    #[test]
-    fn test_terminal_message_error_serialization() {
-        let msg = TerminalMessage::Error { message: "Something went wrong".to_string() };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"error""#));
-        assert!(json.contains(r#""message":"Something went wrong""#));
-    }
-
-    // ========== Structured Message Detection Tests ==========
-    // Tests the logic that detects if a string is already a TerminalMessage
-
-    #[test]
-    fn test_structured_message_detection_output() {
-        let json = r#"{"type":"output","data":"hello"}"#;
-        let parsed: Result<TerminalMessage, _> = serde_json::from_str(json);
-        assert!(parsed.is_ok());
-        match parsed.unwrap() {
-            TerminalMessage::Output { data } => assert_eq!(data, "hello"),
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_structured_message_detection_agents() {
-        let json = r#"{"type":"agents","agents":[]}"#;
-        let parsed: Result<TerminalMessage, _> = serde_json::from_str(json);
-        assert!(parsed.is_ok());
-        match parsed.unwrap() {
-            TerminalMessage::Agents { agents } => assert!(agents.is_empty()),
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_structured_message_detection_worktrees() {
-        let json = r#"{"type":"worktrees","worktrees":[],"repo":"test/repo"}"#;
-        let parsed: Result<TerminalMessage, _> = serde_json::from_str(json);
-        assert!(parsed.is_ok());
-        match parsed.unwrap() {
-            TerminalMessage::Worktrees { worktrees, repo } => {
-                assert!(worktrees.is_empty());
-                assert_eq!(repo, Some("test/repo".to_string()));
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_raw_output_not_detected_as_structured() {
-        // Raw terminal output should NOT parse as TerminalMessage
-        let raw_output = "Hello, this is terminal output with special chars: \x1b[32mgreen\x1b[0m";
-        let parsed: Result<TerminalMessage, _> = serde_json::from_str(raw_output);
-        assert!(parsed.is_err(), "Raw output should not parse as TerminalMessage");
-    }
-
-    #[test]
-    fn test_partial_json_not_detected_as_structured() {
-        // Partial/invalid JSON should not parse
-        let partial = r#"{"type":"output""#;
-        let parsed: Result<TerminalMessage, _> = serde_json::from_str(partial);
-        assert!(parsed.is_err());
-    }
-
-    // ========== BrowserCommand Parsing Tests ==========
-
-    #[test]
-    fn test_browser_command_input_parsing() {
-        let json = r#"{"type":"input","data":"ls -la"}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            BrowserCommand::Input { data } => assert_eq!(data, "ls -la"),
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_browser_command_set_mode_parsing() {
-        let json = r#"{"type":"set_mode","mode":"gui"}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            BrowserCommand::SetMode { mode } => assert_eq!(mode, "gui"),
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_browser_command_list_agents_parsing() {
-        let json = r#"{"type":"list_agents"}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, BrowserCommand::ListAgents));
-    }
-
-    #[test]
-    fn test_browser_command_list_worktrees_parsing() {
-        let json = r#"{"type":"list_worktrees"}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, BrowserCommand::ListWorktrees));
-    }
-
-    #[test]
-    fn test_browser_command_select_agent_parsing() {
-        let json = r#"{"type":"select_agent","id":"agent-abc-123"}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            BrowserCommand::SelectAgent { id } => assert_eq!(id, "agent-abc-123"),
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_browser_command_create_agent_parsing() {
-        let json = r#"{"type":"create_agent","issue_or_branch":"42","prompt":"Fix the bug"}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            BrowserCommand::CreateAgent { issue_or_branch, prompt } => {
-                assert_eq!(issue_or_branch, Some("42".to_string()));
-                assert_eq!(prompt, Some("Fix the bug".to_string()));
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_browser_command_create_agent_minimal_parsing() {
-        // With null/missing optional fields
-        let json = r#"{"type":"create_agent","issue_or_branch":"feature-branch","prompt":null}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            BrowserCommand::CreateAgent { issue_or_branch, prompt } => {
-                assert_eq!(issue_or_branch, Some("feature-branch".to_string()));
-                assert_eq!(prompt, None);
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_browser_command_reopen_worktree_parsing() {
-        let json = r#"{"type":"reopen_worktree","path":"/path/to/wt","branch":"test-branch","prompt":"Continue work"}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            BrowserCommand::ReopenWorktree { path, branch, prompt } => {
-                assert_eq!(path, "/path/to/wt");
-                assert_eq!(branch, "test-branch");
-                assert_eq!(prompt, Some("Continue work".to_string()));
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_browser_command_delete_agent_parsing() {
-        let json = r#"{"type":"delete_agent","id":"agent-to-delete","delete_worktree":true}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            BrowserCommand::DeleteAgent { id, delete_worktree } => {
-                assert_eq!(id, "agent-to-delete");
-                assert_eq!(delete_worktree, Some(true));
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_browser_command_toggle_pty_view_parsing() {
-        let json = r#"{"type":"toggle_pty_view"}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, BrowserCommand::TogglePtyView));
-    }
-
-    #[test]
-    fn test_browser_command_scroll_parsing() {
-        let json = r#"{"type":"scroll","direction":"up","lines":5}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            BrowserCommand::Scroll { direction, lines } => {
-                assert_eq!(direction, "up");
-                assert_eq!(lines, Some(5));
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_browser_command_scroll_to_bottom_parsing() {
-        let json = r#"{"type":"scroll_to_bottom"}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, BrowserCommand::ScrollToBottom));
-    }
-
-    #[test]
-    fn test_browser_command_scroll_to_top_parsing() {
-        let json = r#"{"type":"scroll_to_top"}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, BrowserCommand::ScrollToTop));
-    }
-
-    // ========== BrowserEvent Mapping Tests ==========
-
-    #[test]
-    fn test_browser_command_to_event_input() {
-        let cmd = BrowserCommand::Input { data: "test".to_string() };
-        let event = match cmd {
-            BrowserCommand::Input { data } => BrowserEvent::Input(data),
-            _ => panic!("Wrong type"),
-        };
-        assert!(matches!(event, BrowserEvent::Input(s) if s == "test"));
-    }
-
-    #[test]
-    fn test_browser_command_to_event_set_mode() {
-        let cmd = BrowserCommand::SetMode { mode: "tui".to_string() };
-        let event = match cmd {
-            BrowserCommand::SetMode { mode } => BrowserEvent::SetMode { mode },
-            _ => panic!("Wrong type"),
-        };
-        assert!(matches!(event, BrowserEvent::SetMode { mode } if mode == "tui"));
+        state
+            .set_peer_public_key(&BASE64.encode(browser_public.as_bytes()))
+            .unwrap();
+        assert!(state.is_ready());
     }
 }
