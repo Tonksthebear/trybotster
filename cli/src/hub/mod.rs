@@ -34,6 +34,7 @@
 
 pub mod actions;
 pub mod lifecycle;
+pub mod menu;
 pub mod polling;
 pub mod registration;
 pub mod run;
@@ -42,6 +43,7 @@ pub mod state;
 pub use actions::HubAction;
 pub use crate::agents::AgentSpawnConfig;
 pub use lifecycle::{close_agent, spawn_agent, SpawnResult};
+pub use menu::{build_menu, MenuAction, MenuContext, MenuItem};
 pub use state::HubState;
 
 use std::sync::Arc;

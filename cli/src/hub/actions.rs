@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::app::AppMode;
-use crate::constants;
 
 use super::{lifecycle, Hub};
 
@@ -363,7 +362,10 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         }
 
         HubAction::MenuDown => {
-            if hub.menu_selected < constants::MENU_ITEMS.len().saturating_sub(1) {
+            let menu_ctx = build_menu_context(hub);
+            let items = super::menu::build_menu(&menu_ctx);
+            let selectable = super::menu::selectable_count(&items);
+            if hub.menu_selected < selectable.saturating_sub(1) {
                 hub.menu_selected += 1;
             }
         }
@@ -437,14 +439,47 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
     }
 }
 
+/// Build menu context from current hub state.
+fn build_menu_context(hub: &Hub) -> super::MenuContext {
+    let selected_agent = hub
+        .state
+        .agent_keys_ordered
+        .get(hub.state.selected)
+        .and_then(|key| hub.state.agents.get(key));
+
+    super::MenuContext {
+        has_agent: selected_agent.is_some(),
+        has_server_pty: selected_agent.map_or(false, |a| a.has_server_pty()),
+        active_pty: selected_agent.map_or(crate::PtyView::Cli, |a| a.active_pty),
+        polling_enabled: hub.polling_enabled,
+    }
+}
+
 /// Handle menu item selection.
-fn handle_menu_select(hub: &mut Hub, index: usize) {
-    match index {
-        constants::MENU_INDEX_TOGGLE_POLLING => {
-            hub.polling_enabled = !hub.polling_enabled;
+fn handle_menu_select(hub: &mut Hub, selection_index: usize) {
+    use super::menu::{build_menu, get_action_for_selection, MenuAction};
+
+    let ctx = build_menu_context(hub);
+    let items = build_menu(&ctx);
+
+    let Some(action) = get_action_for_selection(&items, selection_index) else {
+        hub.mode = AppMode::Normal;
+        return;
+    };
+
+    match action {
+        MenuAction::TogglePtyView => {
+            dispatch(hub, HubAction::TogglePtyView);
             hub.mode = AppMode::Normal;
         }
-        constants::MENU_INDEX_NEW_AGENT => {
+        MenuAction::CloseAgent => {
+            if hub.state.agent_keys_ordered.is_empty() {
+                hub.mode = AppMode::Normal;
+            } else {
+                hub.mode = AppMode::CloseAgentConfirm;
+            }
+        }
+        MenuAction::NewAgent => {
             if let Err(e) = hub.load_available_worktrees() {
                 log::error!("Failed to load worktrees: {}", e);
                 hub.mode = AppMode::Normal;
@@ -453,17 +488,11 @@ fn handle_menu_select(hub: &mut Hub, index: usize) {
                 hub.worktree_selected = 0;
             }
         }
-        constants::MENU_INDEX_CLOSE_AGENT => {
-            if hub.state.agent_keys_ordered.is_empty() {
-                hub.mode = AppMode::Normal;
-            } else {
-                hub.mode = AppMode::CloseAgentConfirm;
-            }
-        }
-        constants::MENU_INDEX_CONNECTION_CODE => {
+        MenuAction::ShowConnectionCode => {
             dispatch(hub, HubAction::ShowConnectionCode);
         }
-        _ => {
+        MenuAction::TogglePolling => {
+            hub.polling_enabled = !hub.polling_enabled;
             hub.mode = AppMode::Normal;
         }
     }
