@@ -1,7 +1,7 @@
 //! Terminal notification detection for agent PTY output.
 //!
 //! This module handles parsing of OSC (Operating System Command) escape sequences
-//! that terminals use for notifications. Claude Code uses these to signal events
+//! that terminals use for notifications. Agents can use these to signal events
 //! like task completion.
 //!
 //! # Supported Notification Types
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_standalone_bell_ignored() {
-        // Standalone BEL character is ignored (legacy - not useful for Claude Code)
+        // Standalone BEL character is ignored (not useful for agent notifications)
         let data = b"some output\x07more output";
         let notifications = detect_notifications(data);
         assert_eq!(notifications.len(), 0, "Standalone BEL should be ignored");
@@ -175,12 +175,12 @@ mod tests {
     #[test]
     fn test_detect_osc9_with_st_terminator() {
         // OSC 9 with ST terminator: ESC ] 9 ; message ESC \
-        // This is what Claude Code uses: \033]9;message\033\\
-        let data = b"\x1b]9;Claude notification\x1b\\";
+        // Example: \033]9;message\033\\
+        let data = b"\x1b]9;Agent notification\x1b\\";
         let notifications = detect_notifications(data);
         assert_eq!(notifications.len(), 1);
         match &notifications[0] {
-            AgentNotification::Osc9(Some(msg)) => assert_eq!(msg, "Claude notification"),
+            AgentNotification::Osc9(Some(msg)) => assert_eq!(msg, "Agent notification"),
             _ => panic!("Expected Osc9 notification with ST terminator"),
         }
     }
