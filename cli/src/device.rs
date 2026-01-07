@@ -271,7 +271,7 @@ impl Device {
             server_assisted_pairing: share_public_key,
         };
 
-        let url = format!("{}/api/devices", server_url);
+        let url = format!("{}/devices", server_url);
         let response = client
             .post(&url)
             .header("X-API-Key", api_key)

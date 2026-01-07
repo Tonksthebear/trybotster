@@ -96,7 +96,10 @@ pub struct MessageResponse {
 /// Returns messages if polling succeeds, or an empty vec if skipped/failed.
 /// Logs warnings on failure but does not propagate errors.
 pub fn poll_messages(config: &PollingConfig, repo_name: &str) -> Vec<MessageData> {
-    let url = format!("{}/bots/messages?repo={}", config.server_url, repo_name);
+    let url = format!(
+        "{}/hubs/{}/messages?repo={}",
+        config.server_url, config.hub_identifier, repo_name
+    );
 
     let response = match config
         .client
@@ -134,7 +137,10 @@ pub fn poll_messages(config: &PollingConfig, repo_name: &str) -> Vec<MessageData
 ///
 /// Marks the message as processed so it won't be returned again.
 pub fn acknowledge_message(config: &PollingConfig, message_id: i64) {
-    let url = format!("{}/bots/messages/{message_id}", config.server_url);
+    let url = format!(
+        "{}/hubs/{}/messages/{message_id}",
+        config.server_url, config.hub_identifier
+    );
 
     match config
         .client
@@ -186,7 +192,7 @@ pub fn send_heartbeat(
         })
         .collect();
 
-    let url = format!("{}/api/hubs/{}", config.server_url, config.hub_identifier);
+    let url = format!("{}/hubs/{}", config.server_url, config.hub_identifier);
     let payload = serde_json::json!({
         "repo": repo_name,
         "agents": agents_list,
@@ -230,7 +236,10 @@ pub struct AgentNotificationPayload<'a> {
 ///
 /// Used when agents emit OSC notifications that should be forwarded.
 pub fn send_agent_notification(config: &PollingConfig, payload: &AgentNotificationPayload) -> Result<()> {
-    let url = format!("{}/api/agent_notifications", config.server_url);
+    let url = format!(
+        "{}/hubs/{}/notifications",
+        config.server_url, config.hub_identifier
+    );
 
     let json_payload = serde_json::json!({
         "repo": payload.repo,

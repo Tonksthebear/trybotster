@@ -8,91 +8,49 @@ Rails.application.routes.draw do
 
   # GitHub namespace - all GitHub-related controllers
   namespace :github do
-    # OAuth - RESTful resource for authorization
     resource :authorization, only: [ :new, :destroy ]
-
-    # OAuth callback - separate controller for handling GitHub redirects
-    resource :callback, only: [ :show ]  # GitHub OAuth callback (external constraint)
-
-    # Webhooks - Exception: External API naming constraints
-    post "webhooks", to: "webhooks#receive"  # GitHub webhook endpoint (external constraint)
+    resource :callback, only: [ :show ]
+    post "webhooks", to: "webhooks#receive"
   end
 
-  # Botster Hub - RESTful resources
-  namespace :bots do
-    resources :messages, only: [ :index, :update ] # update for acknowledgment
+  # User adding hubs to their account (browser authorization flow)
+  namespace :users do
+    resources :hubs, only: [ :new, :create ]
   end
 
-  # API namespace for CLI and browser communication
-  namespace :api do
-    resources :agent_notifications, only: [ :create ]
-
-    # Device authorization flow (RFC 8628)
-    resources :device_codes, only: [ :create, :show ], param: :device_code
-
-    # Device registration for E2E encryption
-    resources :devices, only: [ :index, :create, :destroy ] do
-      resource :heartbeat, only: [ :update ], controller: "devices/heartbeats"
-    end
-
-    # Hub management (CLI registers/updates hubs)
-    resources :hubs, param: :identifier, only: [ :index, :show, :update, :destroy ] do
-      # Connection info for E2E key exchange (browser fetches CLI's public key)
-      resource :connection, only: [ :show ], controller: "hubs/connections"
-    end
-  end
-
-  # Device authorization (browser UI)
-  get "device", to: "device#new", as: :device
-  post "device", to: "device#lookup"
-  get "device/confirm", to: "device#confirm", as: :device_confirm
-  post "device/approve", to: "device#approve", as: :device_approve
-  post "device/deny", to: "device#deny", as: :device_deny
-
-  # Agents dashboard - WebRTC P2P connection to local CLI
-  resources :agents, only: [ :index ] do
+  # Hubs - the central resource
+  resources :hubs, param: :identifier, only: [ :index, :update, :destroy ] do
     collection do
-      # Secure E2E connection - key exchange via URL fragment (MITM-proof)
-      get :connect
+      scope module: :hubs do
+        resources :codes, only: [ :create, :show ]
+      end
+    end
+
+    scope module: :hubs do
+      resource :heartbeat, only: [ :update ]
+      resources :messages, only: [ :index, :update ]
+      resources :notifications, only: [ :create ]
+      resource :connection, only: [ :show ]
     end
   end
 
-  # Hubs dashboard - live view of active CLI instances
-  resources :hubs, only: [ :index ]
+  # E2E pairing page (URL fragment based)
+  resource :hub_connection, only: [ :show ]
 
-  # Connect to a hub by entering connection code
-  get "connect", to: "hubs#connect"
-  post "connect", to: "hubs#lookup"
+  # E2E devices (browser keypairs - no heartbeat, they're session-based)
+  resources :devices, only: [ :index, :create, :destroy ]
 
-  # Tunnel sharing management (authenticated)
-  resources :tunnel_shares, only: [ :create, :destroy ], param: :hub_agent_id
+  # User settings
+  resource :settings, only: [ :show, :update ]
 
   # Private tunnel preview (authenticated, user's own hubs only)
-  # format: false prevents Rails from extracting .css/.js as format (keeps full path)
   get "preview/:hub_id/:agent_id", to: "preview#proxy", as: :tunnel_root, defaults: { path: "" }
   get "preview/:hub_id/:agent_id/sw.js", to: "preview#service_worker", as: :tunnel_service_worker
   get "preview/:hub_id/:agent_id/*path", to: "preview#proxy", as: :tunnel_preview, format: false
-  post "preview/:hub_id/:agent_id/*path", to: "preview#proxy", format: false
-  patch "preview/:hub_id/:agent_id/*path", to: "preview#proxy", format: false
-  put "preview/:hub_id/:agent_id/*path", to: "preview#proxy", format: false
-  delete "preview/:hub_id/:agent_id/*path", to: "preview#proxy", format: false
-
-  # Public shared tunnel (token-based, no auth required)
-  get "share/:token", to: "shared_tunnels#proxy", as: :shared_tunnel, defaults: { path: "" }
-  get "share/:token/*path", to: "shared_tunnels#proxy"
-  post "share/:token/*path", to: "shared_tunnels#proxy"
-  patch "share/:token/*path", to: "shared_tunnels#proxy"
-  put "share/:token/*path", to: "shared_tunnels#proxy"
-  delete "share/:token/*path", to: "shared_tunnels#proxy"
+  match "preview/:hub_id/:agent_id/*path", to: "preview#proxy", via: [ :post, :patch, :put, :delete ], format: false
 
   root to: "home#index"
-  # Define your application routes per the DSL in https://guides.rubyonrails.org/routing.html
 
-  # Reveal health status on /up that returns 200 if the app boots with no exceptions, otherwise 500.
-  # Can be used by load balancers and uptime monitors to verify that the app is live.
+  # Health check for load balancers and uptime monitors
   get "up" => "rails/health#show", as: :rails_health_check
-
-  # Render dynamic PWA files from app/views/pwa/* (remember to link manifest in application.html.erb)
-  # get "manifest" => "rails/pwa#manifest", as: :pwa_manifest
-  # get "service-worker" => "rails/pwa#service_worker", as: :pwa_service_worker
 end

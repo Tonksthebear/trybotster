@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_01_06_220135) do
+ActiveRecord::Schema[8.1].define(version: 2026_01_07_234414) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "vector"
@@ -150,13 +150,10 @@ ActiveRecord::Schema[8.1].define(version: 2026_01_06_220135) do
     t.datetime "tunnel_connected_at"
     t.datetime "tunnel_last_request_at"
     t.integer "tunnel_port"
-    t.boolean "tunnel_share_enabled", default: false
-    t.string "tunnel_share_token"
     t.string "tunnel_status", default: "disconnected"
     t.datetime "updated_at", null: false
     t.index ["hub_id", "session_key"], name: "index_hub_agents_on_hub_id_and_session_key", unique: true
     t.index ["hub_id"], name: "index_hub_agents_on_hub_id"
-    t.index ["tunnel_share_token"], name: "index_hub_agents_on_tunnel_share_token", unique: true
   end
 
   create_table "hubs", force: :cascade do |t|
@@ -268,6 +265,19 @@ ActiveRecord::Schema[8.1].define(version: 2026_01_06_220135) do
     t.index ["team_id"], name: "index_users_on_team_id"
   end
 
+  create_table "webrtc_sessions", force: :cascade do |t|
+    t.jsonb "answer"
+    t.datetime "created_at", null: false
+    t.datetime "expires_at", null: false
+    t.jsonb "offer", null: false
+    t.string "status", default: "pending", null: false
+    t.datetime "updated_at", null: false
+    t.bigint "user_id", null: false
+    t.index ["expires_at"], name: "index_webrtc_sessions_on_expires_at"
+    t.index ["status"], name: "index_webrtc_sessions_on_status"
+    t.index ["user_id"], name: "index_webrtc_sessions_on_user_id"
+  end
+
   add_foreign_key "action_mcp_session_messages", "action_mcp_sessions", column: "session_id", name: "fk_action_mcp_session_messages_session_id", on_update: :cascade, on_delete: :cascade
   add_foreign_key "action_mcp_session_resources", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_session_subscriptions", "action_mcp_sessions", column: "session_id", on_delete: :cascade
@@ -284,4 +294,5 @@ ActiveRecord::Schema[8.1].define(version: 2026_01_06_220135) do
   add_foreign_key "memory_tags", "memories"
   add_foreign_key "memory_tags", "tags"
   add_foreign_key "users", "teams"
+  add_foreign_key "webrtc_sessions", "users"
 end
