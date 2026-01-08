@@ -18,13 +18,14 @@
 //! # Encryption
 //!
 //! All communication between the CLI and browser is E2E encrypted using
-//! crypto_box (TweetNaCl compatible). The Rails server only sees encrypted
-//! blobs and cannot read the terminal content.
+//! Double Ratchet (Signal protocol compatible) with per-message forward secrecy.
+//! The Rails server only sees encrypted blobs and cannot read the terminal content.
 //!
 //! # Modules
 //!
 //! - [`connection`] - WebSocket transport and encryption
 //! - [`events`] - Browser event to Hub action conversion
+//! - [`ratchet`] - Double Ratchet implementation for E2E encryption
 //! - [`state`] - Browser connection state management
 //! - [`types`] - Protocol message types
 
@@ -33,6 +34,7 @@
 pub mod browser;
 pub mod connection;
 pub mod events;
+pub mod ratchet;
 pub mod state;
 pub mod types;
 
@@ -53,3 +55,6 @@ pub use types::{
 
 // Re-export connection types
 pub use connection::{TerminalOutputSender, TerminalRelay};
+
+// Re-export ratchet types
+pub use ratchet::{RatchetEnvelope, RatchetHeader, RatchetSession};

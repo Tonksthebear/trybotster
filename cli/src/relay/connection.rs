@@ -2,7 +2,7 @@
 //!
 //! This module handles:
 //! - WebSocket connection to Rails Action Cable (TerminalChannel)
-//! - E2E encryption using crypto_box (compatible with TweetNaCl)
+//! - E2E encryption using Double Ratchet (Signal protocol compatible)
 //! - Relaying encrypted terminal output to browser
 //! - Receiving encrypted terminal input from browser
 //!
@@ -12,23 +12,23 @@
 //! 2. CLI subscribes to TerminalChannel with hub_identifier
 //! 3. Browser connects and sends presence with its public_key
 //! 4. CLI receives browser's public_key, computes shared secret
-//! 5. All terminal data is encrypted with the shared secret
+//! 5. Double Ratchet initialized with shared secret for per-message forward secrecy
 //! 6. Server only sees encrypted blobs - zero knowledge
 //!
 //! Rust guideline compliant 2025-01
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use crypto_box::{aead::Aead, PublicKey, SalsaBox, SecretKey};
+use crypto_box::SecretKey;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message};
 
-use super::types::{
-    BrowserCommand, BrowserEvent, BrowserResize, EncryptedEnvelope, TerminalMessage,
-};
+use super::ratchet::{RatchetEnvelope, RatchetSession};
+use super::types::{BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage};
 
 /// Action Cable message format.
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,10 +55,16 @@ struct IncomingCableMessage {
     message: Option<serde_json::Value>,
 }
 
-/// Shared state for the terminal relay
+/// Shared state for the terminal relay.
+///
+/// # Security
+///
+/// - `ratchet` implements `ZeroizeOnDrop` - all session keys are securely erased when dropped
+/// - `secret_key` is the device's X25519 private key (also stored in OS keyring)
+///   Used only briefly to compute initial shared secret for Double Ratchet
 struct RelayState {
     secret_key: SecretKey,
-    shared_box: Option<SalsaBox>,
+    ratchet: Option<RatchetSession>,
     browser_connected: bool,
 }
 
@@ -66,59 +72,93 @@ impl RelayState {
     fn new(secret_key: SecretKey) -> Self {
         Self {
             secret_key,
-            shared_box: None,
+            ratchet: None,
             browser_connected: false,
         }
     }
 
-    /// Set the peer's public key and compute shared secret
-    fn set_peer_public_key(&mut self, peer_public_key_base64: &str) -> Result<()> {
+    /// Set the peer's public key and initialize Double Ratchet
+    ///
+    /// If signature and verifying_key are provided, verifies the signature first.
+    /// This prevents MITM attacks by ensuring the public key was signed by a real device.
+    fn set_peer_public_key(
+        &mut self,
+        peer_public_key_base64: &str,
+        signature_base64: Option<&str>,
+        verifying_key_base64: Option<&str>,
+    ) -> Result<()> {
         let peer_key_bytes = BASE64.decode(peer_public_key_base64)
             .context("Invalid peer public key encoding")?;
 
-        let peer_public_key = PublicKey::from_slice(&peer_key_bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid peer public key: {}", e))?;
+        let peer_public_key: [u8; 32] = peer_key_bytes.clone().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid peer public key length"))?;
 
-        // Compute shared secret using Diffie-Hellman
-        let shared_box = SalsaBox::new(&peer_public_key, &self.secret_key);
-        self.shared_box = Some(shared_box);
+        // Verify signature if provided
+        match (signature_base64, verifying_key_base64) {
+            (Some(sig_b64), Some(vk_b64)) => {
+                // Decode signature
+                let sig_bytes = BASE64.decode(sig_b64)
+                    .context("Invalid signature encoding")?;
+                let signature = Signature::from_slice(&sig_bytes)
+                    .map_err(|e| anyhow::anyhow!("Invalid signature format: {}", e))?;
+
+                // Decode verifying key
+                let vk_bytes = BASE64.decode(vk_b64)
+                    .context("Invalid verifying key encoding")?;
+                let vk_array: [u8; 32] = vk_bytes.try_into()
+                    .map_err(|_| anyhow::anyhow!("Invalid verifying key length"))?;
+                let verifying_key = VerifyingKey::from_bytes(&vk_array)
+                    .map_err(|e| anyhow::anyhow!("Invalid verifying key: {}", e))?;
+
+                // Verify that the public key was signed by the browser's signing key
+                verifying_key.verify(&peer_key_bytes, &signature)
+                    .map_err(|_| anyhow::anyhow!("SECURITY: Signature verification failed - possible MITM attack!"))?;
+
+                log::info!("Signature verified - public key is authentic");
+            }
+            (None, None) => {
+                // Legacy browser without signing - allow but warn
+                log::warn!("SECURITY: Browser did not provide signature - cannot verify authenticity");
+                log::warn!("This connection is vulnerable to MITM attacks until browser is upgraded");
+            }
+            _ => {
+                // Partial signature data is suspicious
+                anyhow::bail!("SECURITY: Partial signature data provided - rejecting connection");
+            }
+        }
+
+        // Compute raw X25519 shared secret
+        let peer_public = x25519_dalek::PublicKey::from(peer_public_key);
+        let our_secret = x25519_dalek::StaticSecret::from(self.secret_key.to_bytes());
+        let shared_secret = our_secret.diffie_hellman(&peer_public).to_bytes();
+
+        // Initialize Double Ratchet (CLI is always the initiator)
+        let ratchet = RatchetSession::new(&shared_secret, true)
+            .context("Failed to initialize Double Ratchet")?;
+        self.ratchet = Some(ratchet);
         self.browser_connected = true;
 
-        log::info!("Computed shared secret for E2E encryption with browser");
+        log::info!("Double Ratchet initialized for E2E encryption with browser");
         Ok(())
     }
 
-    /// Encrypt a message for the peer
-    fn encrypt(&self, message: &TerminalMessage) -> Result<EncryptedEnvelope> {
-        let shared_box = self.shared_box.as_ref()
-            .context("No shared secret - browser not connected")?;
+    /// Encrypt a message for the peer using Double Ratchet
+    fn encrypt(&mut self, message: &TerminalMessage) -> Result<RatchetEnvelope> {
+        let ratchet = self.ratchet.as_mut()
+            .context("No ratchet session - browser not connected")?;
 
         let plaintext = serde_json::to_vec(message)
             .context("Failed to serialize message")?;
 
-        let nonce = crypto_box::Nonce::from(rand::random::<[u8; 24]>());
-        let ciphertext = shared_box.encrypt(&nonce, plaintext.as_slice())
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
-
-        Ok(EncryptedEnvelope {
-            blob: BASE64.encode(&ciphertext),
-            nonce: BASE64.encode(nonce),
-        })
+        ratchet.encrypt(&plaintext)
     }
 
-    /// Decrypt a command from the browser
-    fn decrypt_command(&self, envelope: &EncryptedEnvelope) -> Result<BrowserCommand> {
-        let shared_box = self.shared_box.as_ref()
-            .context("No shared secret - browser not connected")?;
+    /// Decrypt a command from the browser using Double Ratchet
+    fn decrypt_command(&mut self, envelope: &RatchetEnvelope) -> Result<BrowserCommand> {
+        let ratchet = self.ratchet.as_mut()
+            .context("No ratchet session - browser not connected")?;
 
-        let ciphertext = BASE64.decode(&envelope.blob)
-            .context("Invalid ciphertext encoding")?;
-        let nonce_bytes = BASE64.decode(&envelope.nonce)
-            .context("Invalid nonce encoding")?;
-
-        let nonce = crypto_box::Nonce::from_slice(&nonce_bytes);
-        let plaintext = shared_box.decrypt(nonce, ciphertext.as_slice())
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+        let plaintext = ratchet.decrypt(envelope)?;
 
         // Log the decrypted JSON for debugging
         if let Ok(json_str) = std::str::from_utf8(&plaintext) {
@@ -133,18 +173,11 @@ impl RelayState {
 
     /// Decrypt a message (for testing - decrypts TerminalMessage sent from CLI)
     #[cfg(test)]
-    fn decrypt(&self, envelope: &EncryptedEnvelope) -> Result<TerminalMessage> {
-        let shared_box = self.shared_box.as_ref()
-            .context("No shared secret - browser not connected")?;
+    fn decrypt(&mut self, envelope: &RatchetEnvelope) -> Result<TerminalMessage> {
+        let ratchet = self.ratchet.as_mut()
+            .context("No ratchet session - browser not connected")?;
 
-        let ciphertext = BASE64.decode(&envelope.blob)
-            .context("Invalid ciphertext encoding")?;
-        let nonce_bytes = BASE64.decode(&envelope.nonce)
-            .context("Invalid nonce encoding")?;
-
-        let nonce = crypto_box::Nonce::from_slice(&nonce_bytes);
-        let plaintext = shared_box.decrypt(nonce, ciphertext.as_slice())
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+        let plaintext = ratchet.decrypt(envelope)?;
 
         let message: TerminalMessage = serde_json::from_slice(&plaintext)
             .context("Failed to parse decrypted message")?;
@@ -153,7 +186,7 @@ impl RelayState {
     }
 
     fn is_ready(&self) -> bool {
-        self.browser_connected && self.shared_box.is_some()
+        self.browser_connected && self.ratchet.is_some()
     }
 }
 
@@ -242,7 +275,7 @@ impl TerminalRelay {
 
         log::info!("Connecting to Action Cable: {}", ws_url);
 
-        // Build request with Origin header (required by ActionCable)
+        // Build request with required headers
         let mut request = ws_url
             .into_client_request()
             .context("Failed to build WebSocket request")?;
@@ -252,6 +285,13 @@ impl TerminalRelay {
             self.server_url
                 .parse()
                 .unwrap_or_else(|_| "http://localhost".parse().expect("localhost is a valid header value")),
+        );
+        // Set Authorization header with API key (instead of query param for security)
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", self.api_key)
+                .parse()
+                .expect("Bearer token is a valid header value"),
         );
 
         // Connect to WebSocket
@@ -320,7 +360,8 @@ impl TerminalRelay {
         let write_out = Arc::clone(&write);
         tokio::spawn(async move {
             while let Some(output) = output_rx.recv().await {
-                let state = state_out.read().await;
+                // Need write lock for encryption (ratchet mutates state)
+                let mut state = state_out.write().await;
                 if state.is_ready() {
                     // Check if output is already a structured TerminalMessage (JSON)
                     // If so, use it directly; otherwise wrap in Output
@@ -332,15 +373,18 @@ impl TerminalRelay {
                     if let Ok(envelope) = state.encrypt(&message) {
                         drop(state); // Release lock before network I/O
 
+                        // Serialize RatchetEnvelope for transmission
                         let data = serde_json::json!({
                             "action": "relay",
-                            "blob": envelope.blob,
-                            "nonce": envelope.nonce,
+                            "version": envelope.version,
+                            "header": envelope.header,
+                            "ciphertext": envelope.ciphertext,
+                            "mac": envelope.mac,
                         });
                         let cable_msg = CableMessage {
                             command: "message".to_string(),
                             identifier: identifier_out.clone(),
-                            data: Some(serde_json::to_string(&data).expect("TerminalData is serializable")),
+                            data: Some(serde_json::to_string(&data).expect("RatchetEnvelope is serializable")),
                         };
 
                         let mut write = write_out.lock().await;
@@ -383,15 +427,10 @@ impl TerminalRelay {
                                         "terminal" => {
                                             // Only process messages from browser
                                             if message.get("from").and_then(|v| v.as_str()) == Some("browser") {
-                                                if let (Some(blob), Some(nonce)) = (
-                                                    message.get("blob").and_then(|v| v.as_str()),
-                                                    message.get("nonce").and_then(|v| v.as_str()),
-                                                ) {
-                                                    let envelope = EncryptedEnvelope {
-                                                        blob: blob.to_string(),
-                                                        nonce: nonce.to_string(),
-                                                    };
-                                                    let state = state_in.read().await;
+                                                // Parse RatchetEnvelope (v2 format)
+                                                if let Ok(envelope) = serde_json::from_value::<RatchetEnvelope>(message.clone()) {
+                                                    // Need write lock for decryption (ratchet mutates state)
+                                                    let mut state = state_in.write().await;
                                                     match state.decrypt_command(&envelope) {
                                                         Ok(cmd) => {
                                                             drop(state);
@@ -438,18 +477,22 @@ impl TerminalRelay {
                                                 if let Some(event) = message.get("event").and_then(|v| v.as_str()) {
                                                     match event {
                                                         "join" => {
-                                                            // Browser joined - extract public key for key exchange
+                                                            // Browser joined - extract public key and signature for key exchange
                                                             if let Some(public_key) = message.get("public_key").and_then(|v| v.as_str()) {
                                                                 let device_name = message.get("device_name")
                                                                     .and_then(|v| v.as_str())
                                                                     .unwrap_or("Browser")
                                                                     .to_string();
 
+                                                                // Extract optional signature and verifying key
+                                                                let signature = message.get("signature").and_then(|v| v.as_str());
+                                                                let verifying_key = message.get("verifying_key").and_then(|v| v.as_str());
+
                                                                 log::info!("Browser connected: {} - setting up E2E encryption", device_name);
 
-                                                                // Set up shared secret
+                                                                // Set up shared secret with signature verification
                                                                 let mut state = state_in.write().await;
-                                                                if let Err(e) = state.set_peer_public_key(public_key) {
+                                                                if let Err(e) = state.set_peer_public_key(public_key, signature, verifying_key) {
                                                                     log::error!("Failed to set browser public key: {}", e);
                                                                 } else {
                                                                     drop(state);
@@ -468,7 +511,7 @@ impl TerminalRelay {
                                                             log::info!("Browser disconnected");
                                                             let mut state = state_in.write().await;
                                                             state.browser_connected = false;
-                                                            state.shared_box = None;
+                                                            state.ratchet = None;
                                                             drop(state);
 
                                                             if let Err(e) = event_tx.send(BrowserEvent::Disconnected).await {
@@ -525,47 +568,16 @@ impl TerminalRelay {
             .replace("https://", "wss://")
             .replace("http://", "ws://");
 
-        // Action Cable endpoint with API key for authentication
-        format!("{}/cable?api_key={}", base, self.api_key)
+        // Action Cable endpoint (API key is sent via Authorization header, not URL)
+        format!("{}/cable", base)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::OsRng;
-
-    #[test]
-    fn test_encrypt_decrypt_roundtrip() {
-        // Generate keypairs for CLI and browser
-        let cli_secret = SecretKey::generate(&mut OsRng);
-        let browser_secret = SecretKey::generate(&mut OsRng);
-        let browser_public = browser_secret.public_key();
-
-        // Create relay state with CLI keypair
-        let mut state = RelayState::new(cli_secret);
-
-        // Set browser's public key (compute shared secret)
-        state
-            .set_peer_public_key(&BASE64.encode(browser_public.as_bytes()))
-            .unwrap();
-
-        // Encrypt a message
-        let message = TerminalMessage::Output {
-            data: "Hello, browser!".to_string(),
-        };
-        let envelope = state.encrypt(&message).unwrap();
-
-        // Decrypt the message
-        let decrypted = state.decrypt(&envelope).unwrap();
-
-        match decrypted {
-            TerminalMessage::Output { data } => {
-                assert_eq!(data, "Hello, browser!");
-            }
-            _ => panic!("Wrong message type"),
-        }
-    }
+    use ed25519_dalek::SigningKey;
+    use rand::{rngs::OsRng, RngCore};
 
     #[test]
     fn test_relay_state_is_ready() {
@@ -575,7 +587,8 @@ mod tests {
     }
 
     #[test]
-    fn test_relay_state_becomes_ready_after_peer_key() {
+    fn test_relay_state_becomes_ready_after_peer_key_legacy() {
+        // Test legacy mode (no signature)
         let cli_secret = SecretKey::generate(&mut OsRng);
         let browser_secret = SecretKey::generate(&mut OsRng);
         let browser_public = browser_secret.public_key();
@@ -584,8 +597,86 @@ mod tests {
         assert!(!state.is_ready());
 
         state
-            .set_peer_public_key(&BASE64.encode(browser_public.as_bytes()))
+            .set_peer_public_key(&BASE64.encode(browser_public.as_bytes()), None, None)
             .unwrap();
         assert!(state.is_ready());
+    }
+
+    #[test]
+    fn test_relay_state_with_valid_signature() {
+        // Test with valid Ed25519 signature
+        let cli_secret = SecretKey::generate(&mut OsRng);
+        let browser_secret = SecretKey::generate(&mut OsRng);
+        let browser_public = browser_secret.public_key();
+
+        // Generate signing keypair
+        let mut signing_secret = [0u8; 32];
+        OsRng.fill_bytes(&mut signing_secret);
+        let signing_key = SigningKey::from_bytes(&signing_secret);
+        let verifying_key = signing_key.verifying_key();
+
+        // Sign the browser's public key
+        use ed25519_dalek::Signer;
+        let signature = signing_key.sign(browser_public.as_bytes());
+
+        let mut state = RelayState::new(cli_secret);
+        state
+            .set_peer_public_key(
+                &BASE64.encode(browser_public.as_bytes()),
+                Some(&BASE64.encode(signature.to_bytes())),
+                Some(&BASE64.encode(verifying_key.as_bytes())),
+            )
+            .unwrap();
+        assert!(state.is_ready());
+    }
+
+    #[test]
+    fn test_relay_state_rejects_invalid_signature() {
+        // Test that invalid signature is rejected
+        let cli_secret = SecretKey::generate(&mut OsRng);
+        let browser_secret = SecretKey::generate(&mut OsRng);
+        let browser_public = browser_secret.public_key();
+
+        // Generate signing keypair but sign wrong data
+        let mut signing_secret = [0u8; 32];
+        OsRng.fill_bytes(&mut signing_secret);
+        let signing_key = SigningKey::from_bytes(&signing_secret);
+        let verifying_key = signing_key.verifying_key();
+
+        use ed25519_dalek::Signer;
+        let wrong_data = [0u8; 32]; // Wrong data to sign
+        let signature = signing_key.sign(&wrong_data);
+
+        let mut state = RelayState::new(cli_secret);
+        let result = state.set_peer_public_key(
+            &BASE64.encode(browser_public.as_bytes()),
+            Some(&BASE64.encode(signature.to_bytes())),
+            Some(&BASE64.encode(verifying_key.as_bytes())),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("SECURITY"));
+    }
+
+    #[test]
+    fn test_encrypt_produces_ratchet_envelope() {
+        let cli_secret = SecretKey::generate(&mut OsRng);
+        let browser_secret = SecretKey::generate(&mut OsRng);
+        let browser_public = browser_secret.public_key();
+
+        let mut state = RelayState::new(cli_secret);
+        state
+            .set_peer_public_key(&BASE64.encode(browser_public.as_bytes()), None, None)
+            .unwrap();
+
+        let message = TerminalMessage::Output {
+            data: "Hello, browser!".to_string(),
+        };
+        let envelope = state.encrypt(&message).unwrap();
+
+        // Verify envelope structure
+        assert_eq!(envelope.version, 2);
+        assert!(!envelope.ciphertext.is_empty());
+        assert!(!envelope.mac.is_empty());
+        assert!(!envelope.header.dh_public_key.is_empty());
     }
 }

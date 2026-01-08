@@ -30,11 +30,7 @@ module ApplicationCable
     end
 
     def extract_api_token
-      # Support query param (WebSocket standard) or Authorization header
-      request.params[:api_key] || extract_bearer_token
-    end
-
-    def extract_bearer_token
+      # Only accept Authorization header (not query param - exposes key in logs/history)
       auth_header = request.headers["Authorization"]
       auth_header&.delete_prefix("Bearer ")
     end
