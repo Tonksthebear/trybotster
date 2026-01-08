@@ -274,7 +274,7 @@ impl Device {
         let url = format!("{}/devices", server_url);
         let response = client
             .post(&url)
-            .header("X-API-Key", api_key)
+            .bearer_auth(api_key)
             .json(&request)
             .send()
             .context("Failed to send device registration request")?;

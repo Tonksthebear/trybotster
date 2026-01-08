@@ -11,9 +11,8 @@
 class DevicesController < ApplicationController
   include ApiKeyAuthenticatable
 
-  skip_before_action :verify_authenticity_token
-
-  # CLI uses API key auth, browser uses session auth
+  # CLI uses Bearer token auth, browser uses session auth
+  # CSRF is skipped for Bearer requests via ApplicationController
   before_action :authenticate_device_request!
 
   # GET /devices
@@ -75,7 +74,7 @@ class DevicesController < ApplicationController
   private
 
   def authenticate_device_request!
-    if request.headers["X-API-Key"].present?
+    if api_key_present?
       authenticate_with_api_key!
     else
       authenticate_user!

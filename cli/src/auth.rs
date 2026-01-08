@@ -248,7 +248,7 @@ pub fn validate_token(server_url: &str, token: &str) -> bool {
     let url = format!("{}/devices", server_url);
     println!("  Validating token against {}...", url);
 
-    match client.get(&url).header("X-API-Key", token).send() {
+    match client.get(&url).bearer_auth(token).send() {
         Ok(response) => {
             let status = response.status();
             if status.is_success() {

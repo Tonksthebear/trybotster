@@ -9,3 +9,9 @@ one:
 two:
   email: test2@example.com
   username: testuser2
+
+jason:
+  email: jason@example.com
+  username: jason
+  github_app_token: jason_token_123
+  github_app_token_expires_at: <%= 1.hour.from_now %>

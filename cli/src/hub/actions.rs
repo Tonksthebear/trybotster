@@ -333,10 +333,10 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
 
         HubAction::ShowConnectionCode => {
             hub.connection_url = Some(format!(
-                "{}/hub_connection#key={}&hub={}",
+                "{}/hubs/{}#key={}",
                 hub.config.server_url,
-                hub.device.public_key_base64url(),
-                hub.hub_identifier
+                hub.hub_identifier,
+                hub.device.public_key_base64url()
             ));
             hub.mode = AppMode::ConnectionCode;
         }

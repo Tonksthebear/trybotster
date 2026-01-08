@@ -140,6 +140,46 @@ class HubTest < ActiveSupport::TestCase
     assert_not_includes result, hub2
   end
 
+  test "active? returns true for hub seen within 2 minutes" do
+    hub = Hub.new(
+      user: @user,
+      repo: "owner/repo",
+      identifier: SecureRandom.uuid,
+      last_seen_at: 1.minute.ago
+    )
+    assert hub.active?
+  end
+
+  test "active? returns false for hub not seen within 2 minutes" do
+    hub = Hub.new(
+      user: @user,
+      repo: "owner/repo",
+      identifier: SecureRandom.uuid,
+      last_seen_at: 5.minutes.ago
+    )
+    assert_not hub.active?
+  end
+
+  test "active? returns true for hub seen just now" do
+    hub = Hub.new(
+      user: @user,
+      repo: "owner/repo",
+      identifier: SecureRandom.uuid,
+      last_seen_at: Time.current
+    )
+    assert hub.active?
+  end
+
+  test "active? returns false for hub seen exactly 2 minutes ago" do
+    hub = Hub.new(
+      user: @user,
+      repo: "owner/repo",
+      identifier: SecureRandom.uuid,
+      last_seen_at: 2.minutes.ago
+    )
+    assert_not hub.active?
+  end
+
   test "destroying hub destroys associated hub_agents" do
     hub = Hub.create!(
       user: @user,

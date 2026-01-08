@@ -71,7 +71,7 @@ pub fn register_hub_with_server(
         .put(&url)
         .header("Content-Type", "application/json")
         .header("X-Hub-Identifier", hub_identifier)
-        .header("X-API-Key", api_key)
+        .bearer_auth(api_key)
         .json(&payload)
         .send()
     {
@@ -155,7 +155,7 @@ pub fn shutdown(
 
     match client
         .delete(&shutdown_url)
-        .header("X-API-Key", api_key)
+        .bearer_auth(api_key)
         .send()
     {
         Ok(response) if response.status().is_success() => {

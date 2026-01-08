@@ -1,0 +1,17 @@
+# Devices for E2E encryption testing
+
+cli_device:
+  user: jason
+  device_type: cli
+  name: Test CLI Device
+  fingerprint: "aa:bb:cc:dd:ee:ff:00:11"
+  public_key: "test_public_key_base64_encoded_32bytes"
+  last_seen_at: <%= Time.current %>
+
+browser_device:
+  user: jason
+  device_type: browser
+  name: Chrome Browser
+  fingerprint: "11:22:33:44:55:66:77:88"
+  public_key: "browser_public_key_base64_encoded"
+  last_seen_at: <%= Time.current %>

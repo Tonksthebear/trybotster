@@ -131,7 +131,7 @@ impl NotificationSender {
         let response = self
             .client
             .post(&url)
-            .header("X-API-Key", &self.api_key)
+            .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()?;

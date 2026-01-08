@@ -6,7 +6,6 @@ module Hubs
   class NotificationsController < ApplicationController
     include ApiKeyAuthenticatable
 
-    skip_before_action :verify_authenticity_token
     before_action :authenticate_with_api_key!
     before_action :set_hub
 

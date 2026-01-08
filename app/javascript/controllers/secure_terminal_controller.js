@@ -312,7 +312,7 @@ export default class extends Controller {
   // Register browser device with server
   async registerDevice() {
     try {
-      const response = await fetch("/api/devices", {
+      const response = await fetch("/devices", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

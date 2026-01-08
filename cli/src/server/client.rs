@@ -78,7 +78,7 @@ impl ApiClient {
         let response = self
             .client
             .get(&url)
-            .header("X-API-Key", &self.api_key)
+            .bearer_auth(&self.api_key)
             .send()?;
 
         if !response.status().is_success() {
@@ -108,7 +108,7 @@ impl ApiClient {
         let response = self
             .client
             .patch(&url)
-            .header("X-API-Key", &self.api_key)
+            .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .send()?;
 
@@ -156,7 +156,7 @@ impl ApiClient {
         match self
             .client
             .put(&url)
-            .header("X-API-Key", &self.api_key)
+            .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()
@@ -220,7 +220,7 @@ impl ApiClient {
         let response = self
             .client
             .post(&url)
-            .header("X-API-Key", &self.api_key)
+            .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()?;

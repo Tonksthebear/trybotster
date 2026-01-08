@@ -260,9 +260,13 @@ fn render_menu_modal(
             let is_selected = selectable_idx == menu_selected;
             let cursor = if is_selected { ">" } else { " " };
             let style = if is_selected {
-                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-            } else {
                 Style::default()
+                    .fg(ratatui::style::Color::Black)
+                    .bg(ratatui::style::Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                // Explicit white foreground for xterm.js compatibility
+                Style::default().fg(ratatui::style::Color::White)
             };
             lines.push(Line::from(Span::styled(
                 format!("{} {}", cursor, item.label),
@@ -272,11 +276,14 @@ fn render_menu_modal(
         }
     }
 
-    // Calculate modal height based on content (min 30%, scale with items)
-    let content_height = lines.len() as u16 + 4; // +4 for borders and padding
-    let modal_height = content_height.max(8).min(50); // Clamp between 8 and 50%
+    // Calculate modal height as percentage of terminal
+    // Need enough space for content + borders (lines.len() + 4 padding)
+    let content_rows = lines.len() as u16 + 4;
+    let terminal_height = f.area().height;
+    // Convert absolute rows to percentage, with minimum 30% for visibility
+    let height_percent = ((content_rows * 100) / terminal_height.max(1)).max(30).min(60);
 
-    let area = centered_rect(50, modal_height, f.area());
+    let area = centered_rect(50, height_percent, f.area());
     f.render_widget(Clear, area);
 
     let menu = Paragraph::new(lines)

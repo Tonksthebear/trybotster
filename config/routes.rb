@@ -19,7 +19,7 @@ Rails.application.routes.draw do
   end
 
   # Hubs - the central resource
-  resources :hubs, param: :identifier, only: [ :index, :update, :destroy ] do
+  resources :hubs, param: :identifier, only: [ :index, :show, :update, :destroy ] do
     collection do
       scope module: :hubs do
         resources :codes, only: [ :create, :show ]
@@ -33,9 +33,6 @@ Rails.application.routes.draw do
       resource :connection, only: [ :show ]
     end
   end
-
-  # E2E pairing page (URL fragment based)
-  resource :hub_connection, only: [ :show ]
 
   # E2E devices (browser keypairs - no heartbeat, they're session-based)
   resources :devices, only: [ :index, :create, :destroy ]
