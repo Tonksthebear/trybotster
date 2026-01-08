@@ -19,6 +19,11 @@ class Hub < ApplicationRecord
     device.present?
   end
 
+  # Check if this hub is active (seen within 2 minutes)
+  def active?
+    last_seen_at > 2.minutes.ago
+  end
+
   # Synchronize hub_agents with data from CLI heartbeat.
   # Removes agents not in the list, creates/updates those present.
   # @param agents_data [Array<Hash>, ActionController::Parameters] Agent data from CLI

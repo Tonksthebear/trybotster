@@ -59,7 +59,8 @@ export default class extends Controller {
   static values = {
     csrfToken: String,
     browserDeviceId: Number,
-    autoConnectHub: String,
+    hubIdentifier: String, // Hub identifier from URL path (show page)
+    autoConnectHub: String, // Legacy: hub parameter
     mode: { type: String, default: "tui" },
   };
 
@@ -73,6 +74,9 @@ export default class extends Controller {
     this.worktrees = [];
     this.currentRepo = null;
 
+    // Parse URL fragment for secure key exchange (QR code flow)
+    this.parseUrlFragment();
+
     this.initTerminal();
     this.loadOrCreateKeypair();
     this.updateModeDisplay();
@@ -80,6 +84,44 @@ export default class extends Controller {
     // Listen for modal closed events to do cleanup
     this.boundHandleModalClosed = this.handleModalClosed.bind(this);
     this.element.addEventListener("modal:closed", this.boundHandleModalClosed);
+
+    // Listen for hash changes (back/forward navigation)
+    window.addEventListener("hashchange", () => this.parseUrlFragment());
+  }
+
+  // Parse CLI public key from URL fragment
+  // Fragment is NEVER sent to server - this is the MITM-proof key exchange
+  // Format: /hubs/:identifier#key=BASE64URL
+  parseUrlFragment() {
+    const hash = window.location.hash;
+    if (!hash || hash.length < 2) {
+      this.fragmentKey = null;
+      return;
+    }
+
+    const params = new URLSearchParams(hash.substring(1));
+    const keyBase64Url = params.get("key");
+
+    if (keyBase64Url) {
+      // Convert from base64url to standard base64
+      let keyBase64 = keyBase64Url.replace(/-/g, "+").replace(/_/g, "/");
+      const padding = keyBase64.length % 4;
+      if (padding === 2) keyBase64 += "==";
+      else if (padding === 3) keyBase64 += "=";
+
+      this.fragmentKey = keyBase64;
+    }
+  }
+
+  // Update URL hash when connecting to a hub (for refresh persistence)
+  updateUrlHash(hubIdentifier, keyBase64 = null) {
+    let hash = `hub=${hubIdentifier}`;
+    if (keyBase64) {
+      // Convert to base64url for URL safety
+      const keyBase64Url = keyBase64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      hash = `key=${keyBase64Url}&${hash}`;
+    }
+    history.replaceState(null, "", `#${hash}`);
   }
 
   // Handle modal closed events for cleanup
@@ -270,13 +312,51 @@ export default class extends Controller {
         await this.registerDevice();
       }
 
-      // Auto-connect to hub if specified via URL parameter
-      if (this.autoConnectHubValue) {
-        this.autoConnectToHub(this.autoConnectHubValue);
+      // Priority: hubIdentifierValue (show page) > autoConnectHubValue > manual selection
+      const hubId = this.hubIdentifierValue || this.autoConnectHubValue;
+
+      if (hubId && this.fragmentKey) {
+        // Secure QR code flow - key from URL fragment (MITM-proof)
+        this.connectWithFragmentKey(hubId);
+      } else if (hubId) {
+        // Hub specified - try cached or server-assisted
+        this.autoConnectToHub(hubId);
       }
     } catch (error) {
       console.error("Failed to load/create keypair:", error);
       this.updateStatus("Crypto error - try refreshing");
+    }
+  }
+
+  // Connect using key from URL fragment (secure QR code flow)
+  async connectWithFragmentKey(hubIdentifier) {
+    if (!this.keypair || !this.fragmentKey || !hubIdentifier) return;
+
+    try {
+      const peerPublicKey = decodeBase64(this.fragmentKey);
+      if (!peerPublicKey || peerPublicKey.length !== 32) {
+        this.updateStatus("Invalid key in URL");
+        return;
+      }
+
+      // Compute shared secret using Diffie-Hellman
+      this.peerPublicKey = peerPublicKey;
+      this.sharedSecret = nacl.box.before(this.peerPublicKey, this.keypair.secretKey);
+      this.selectedHubIdentifier = hubIdentifier;
+
+      // Cache this key for future reconnections
+      const fingerprint = await this.computeFingerprint(peerPublicKey);
+      await this.storePairedKey(fingerprint, this.fragmentKey, "CLI Device");
+      console.log("Cached CLI key from QR code, fingerprint:", fingerprint);
+
+      this.terminal.writeln("\r\n[Secure connection via QR code - MITM-proof]");
+      this.updateStatus(`Connecting to ${hubIdentifier}...`);
+
+      // Subscribe to terminal channel
+      this.subscribeToTerminal(hubIdentifier);
+    } catch (error) {
+      console.error("Failed to connect with fragment key:", error);
+      this.updateStatus("Connection failed");
     }
   }
 
@@ -354,7 +434,7 @@ export default class extends Controller {
   // Register browser device with server
   async registerDevice() {
     try {
-      const response = await fetch("/api/devices", {
+      const response = await fetch("/devices", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -406,7 +486,7 @@ export default class extends Controller {
     // Fetch CLI device's public key for key exchange
     // This only works if user has enabled server-assisted pairing
     try {
-      const response = await fetch(`/api/hubs/${hubIdentifier}/connection`, {
+      const response = await fetch(`/hubs/${hubIdentifier}/connection`, {
         headers: { "X-CSRF-Token": this.csrfTokenValue },
       });
 
@@ -485,7 +565,7 @@ export default class extends Controller {
     // Fetch CLI device's public key for key exchange
     // This only works if user has enabled server-assisted pairing
     try {
-      const response = await fetch(`/api/hubs/${hubIdentifier}/connection`, {
+      const response = await fetch(`/hubs/${hubIdentifier}/connection`, {
         headers: { "X-CSRF-Token": this.csrfTokenValue },
       });
 

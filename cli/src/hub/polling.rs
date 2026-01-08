@@ -104,7 +104,7 @@ pub fn poll_messages(config: &PollingConfig, repo_name: &str) -> Vec<MessageData
     let response = match config
         .client
         .get(&url)
-        .header("X-API-Key", config.api_key)
+        .bearer_auth(config.api_key)
         .send()
     {
         Ok(r) => r,
@@ -145,7 +145,7 @@ pub fn acknowledge_message(config: &PollingConfig, message_id: i64) {
     match config
         .client
         .patch(&url)
-        .header("X-API-Key", config.api_key)
+        .bearer_auth(config.api_key)
         .header("Content-Type", "application/json")
         .send()
     {
@@ -202,7 +202,7 @@ pub fn send_heartbeat(
     match config
         .client
         .put(&url)
-        .header("X-API-Key", config.api_key)
+        .bearer_auth(config.api_key)
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
@@ -251,7 +251,7 @@ pub fn send_agent_notification(config: &PollingConfig, payload: &AgentNotificati
     let response = config
         .client
         .post(&url)
-        .header("X-API-Key", config.api_key)
+        .bearer_auth(config.api_key)
         .header("Content-Type", "application/json")
         .json(&json_payload)
         .send()?;

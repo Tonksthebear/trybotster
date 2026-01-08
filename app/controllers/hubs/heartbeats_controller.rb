@@ -5,7 +5,6 @@ module Hubs
   class HeartbeatsController < ApplicationController
     include ApiKeyAuthenticatable
 
-    skip_before_action :verify_authenticity_token
     before_action :authenticate_hub_request!
     before_action :set_hub
 
@@ -19,7 +18,7 @@ module Hubs
     private
 
     def authenticate_hub_request!
-      if request.headers["X-API-Key"].present?
+      if api_key_present?
         authenticate_with_api_key!
       else
         authenticate_user!

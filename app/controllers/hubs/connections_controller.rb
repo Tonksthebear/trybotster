@@ -55,7 +55,7 @@ module Hubs
         message: "For security, key exchange requires scanning the QR code displayed on your CLI. " \
                  "The key is transmitted via URL fragment which never reaches the server (MITM-proof). " \
                  "To enable server-assisted pairing (less secure), update your settings.",
-        secure_connect_url: "/hub_connection",
+        secure_connect_url: @hub ? "/hubs/#{@hub.identifier}" : "/hubs",
         enable_convenience_url: "/settings",
         device: device_info
       }, status: :forbidden

@@ -3,16 +3,26 @@
 class HubsController < ApplicationController
   include ApiKeyAuthenticatable
 
-  before_action :authenticate_user!, only: [ :index ]
+  before_action :authenticate_user!, only: [ :index, :show ]
   before_action :authenticate_hub_request!, only: [ :update, :destroy ]
-  before_action :set_hub, only: [ :destroy ]
+  before_action :set_hub, only: [ :show, :destroy ]
 
   # GET /hubs
-  # Dashboard showing running agents with E2E encrypted terminal access
+  # Dashboard showing list of hubs with health status
   def index
     @hubs = current_user.hubs.active.includes(:device, :hub_agents)
+  end
+
+  # GET /hubs/:identifier
+  # Terminal view for a specific hub
+  # URL fragment contains E2E key: /hubs/:identifier#key=...
+  def show
+    unless @hub
+      redirect_to hubs_path, alert: "Hub not found"
+      return
+    end
+
     @browser_device = current_user.devices.browser_devices.order(last_seen_at: :desc).first
-    @auto_connect_hub = params[:hub]
   end
 
   # PUT /hubs/:identifier
@@ -53,7 +63,7 @@ class HubsController < ApplicationController
   private
 
   def authenticate_hub_request!
-    if request.headers["X-API-Key"].present?
+    if api_key_present?
       authenticate_with_api_key!
     elsif request.format.json? || request.content_type&.include?("json")
       render json: { error: "API key required" }, status: :unauthorized

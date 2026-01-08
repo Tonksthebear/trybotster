@@ -1,0 +1,360 @@
+<% content_for :head do %>
+  <%= stylesheet_link_tag "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" %>
+<% end %>
+
+<div class="min-h-[calc(100vh-8rem)]"
+     data-controller="terminal"
+     data-terminal-csrf-token-value="<%= form_authenticity_token %>"
+     data-terminal-browser-device-id-value="<%= @browser_device&.id %>"
+     data-terminal-hub-identifier-value="<%= @hub.identifier %>"
+     data-terminal-mode-value="gui">
+
+  <%# Header %>
+  <div class="border-b border-zinc-800 bg-zinc-900/50">
+    <div class="max-w-7xl mx-auto px-4 py-4">
+      <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div class="flex items-center gap-4">
+          <%= link_to hubs_path, class: "text-zinc-500 hover:text-zinc-300 transition-colors" do %>
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+            </svg>
+          <% end %>
+          <div>
+            <h1 class="text-xl font-bold text-zinc-100 font-mono"><%= @hub.identifier.truncate(24) %></h1>
+            <p class="text-sm text-zinc-500 mt-0.5">
+              <%= @hub.repo || "No repository" %> &mdash; <%= @hub.hub_agents.count %> agents
+            </p>
+          </div>
+        </div>
+
+        <%# Connection controls %>
+        <div class="flex items-center gap-3">
+          <div data-terminal-target="status" class="text-sm font-mono text-zinc-500">
+            <span class="inline-flex items-center gap-2">
+              <span class="w-2 h-2 rounded-full bg-zinc-600"></span>
+              Connecting...
+            </span>
+          </div>
+          <button type="button"
+                  data-terminal-target="modeToggle"
+                  data-action="terminal#toggleMode"
+                  class="px-3 py-1.5 text-sm font-medium text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-600 rounded transition-colors">
+            Switch to TUI
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <%# Security Mode Banner %>
+  <% if current_user.server_assisted_pairing? %>
+    <div class="border-b border-amber-500/20 bg-amber-500/5">
+      <div class="max-w-7xl mx-auto px-4 py-3">
+        <div class="flex items-center gap-3">
+          <svg class="w-4 h-4 text-amber-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+          </svg>
+          <p class="text-sm text-amber-200/80">
+            <strong class="text-amber-300">Convenience Mode</strong> &mdash; Using server-assisted pairing.
+          </p>
+        </div>
+      </div>
+    </div>
+  <% else %>
+    <div class="border-b border-emerald-500/20 bg-emerald-500/5">
+      <div class="max-w-7xl mx-auto px-4 py-3">
+        <div class="flex items-center gap-3">
+          <svg class="w-4 h-4 text-emerald-400 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+            <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
+          </svg>
+          <p class="text-sm text-emerald-200/80">
+            <strong class="text-emerald-300">Secure Mode</strong> &mdash; E2E encrypted connection.
+          </p>
+        </div>
+      </div>
+    </div>
+  <% end %>
+
+  <%# Code Input Panel (for secure mode key entry) %>
+  <div data-terminal-target="codeInputPanel" class="hidden border-b border-cyan-500/20 bg-cyan-500/5">
+    <div class="max-w-7xl mx-auto px-4 py-4">
+      <div class="flex items-start gap-4">
+        <svg class="w-5 h-5 text-cyan-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+        </svg>
+        <div class="flex-1">
+          <h3 class="text-sm font-medium text-zinc-200">Secure Connection</h3>
+          <p class="text-sm text-zinc-500 mt-1">
+            Paste the connection URL from your CLI (press <kbd class="px-1 bg-zinc-800 rounded text-xs font-mono">m</kbd> to show QR code)
+          </p>
+          <div class="mt-3 flex gap-2 max-w-xl">
+            <input type="text"
+                   data-terminal-target="codeInput"
+                   data-action="keydown.enter->terminal#connectWithCode"
+                   placeholder="https://...#key=..."
+                   class="flex-1 px-3 py-2 bg-zinc-950 border border-zinc-700 rounded text-sm text-zinc-300 placeholder-zinc-600 font-mono focus:outline-none focus:border-cyan-500 transition-colors">
+            <button type="button"
+                    data-action="terminal#connectWithCode"
+                    class="px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-zinc-950 text-sm font-medium rounded transition-colors">
+              Connect
+            </button>
+            <button type="button"
+                    data-action="terminal#hideCodeInput"
+                    class="px-3 py-2 border border-zinc-700 text-zinc-400 text-sm rounded hover:border-zinc-600 transition-colors">
+              Cancel
+            </button>
+          </div>
+          <p data-terminal-target="codeError" class="text-sm text-red-400 mt-2 hidden"></p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <%# Main Content %>
+  <div class="max-w-7xl mx-auto px-4 py-6">
+    <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+
+      <%# Sidebar %>
+      <div data-terminal-target="guiContainer" class="lg:col-span-1 space-y-4">
+
+        <%# Agent List %>
+        <div data-terminal-target="agentListPanel" class="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden">
+          <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
+            <span class="text-sm font-medium text-zinc-300">Agents</span>
+            <div class="flex items-center gap-1">
+              <button type="button"
+                      data-action="terminal#showNewAgentModal"
+                      class="p-1.5 text-cyan-400 hover:bg-zinc-800 rounded transition-colors"
+                      title="New Agent">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                </svg>
+              </button>
+              <button type="button"
+                      data-action="terminal#showCloseAgentModal"
+                      data-terminal-target="closeAgentButton"
+                      class="p-1.5 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 rounded transition-colors disabled:opacity-30"
+                      title="Close Agent"
+                      disabled>
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+              <button type="button"
+                      class="p-1.5 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 rounded transition-colors"
+                      data-action="terminal#requestAgentList"
+                      title="Refresh">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div data-terminal-target="agentList" class="max-h-64 lg:max-h-96 overflow-y-auto">
+            <div class="px-4 py-8 text-center">
+              <p class="text-sm text-zinc-500">Loading agents...</p>
+            </div>
+          </div>
+        </div>
+
+        <%# Agent Actions (desktop) %>
+        <div data-terminal-target="agentActionsPanel" class="lg:block bg-zinc-900 border border-zinc-800 rounded-lg p-4 space-y-3">
+          <button type="button"
+                  data-action="terminal#showNewAgentModal"
+                  class="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-cyan-500 hover:bg-cyan-400 text-zinc-950 text-sm font-medium rounded transition-colors">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+            </svg>
+            New Agent
+          </button>
+          <button type="button"
+                  data-action="terminal#showCloseAgentModal"
+                  data-terminal-target="closeAgentButton"
+                  class="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 text-sm font-medium rounded transition-colors disabled:opacity-30"
+                  disabled>
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+            Close Agent
+          </button>
+          <button type="button"
+                  data-action="terminal#clearTunnelCache"
+                  class="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-amber-500/30 text-amber-400 hover:bg-amber-500/10 text-sm font-medium rounded transition-colors"
+                  title="Clear service worker and cookie for tunnel preview">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+            Clear Cache
+          </button>
+        </div>
+
+        <%# Hub Info %>
+        <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+          <div class="flex items-center gap-2 mb-3">
+            <svg class="w-4 h-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2" />
+            </svg>
+            <span class="text-sm font-medium text-zinc-400">Hub Info</span>
+          </div>
+          <div class="space-y-1 text-xs">
+            <% if @hub.device %>
+              <div class="text-zinc-500"><%= @hub.device.name %></div>
+              <div class="font-mono text-zinc-600 truncate"><%= @hub.device.fingerprint %></div>
+            <% end %>
+            <% if @hub.e2e_enabled? %>
+              <div class="inline-flex items-center gap-1 px-1.5 py-0.5 text-xs font-medium bg-emerald-500/10 text-emerald-400 rounded mt-2">
+                <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                  <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
+                </svg>
+                E2E Ready
+              </div>
+            <% end %>
+          </div>
+        </div>
+      </div>
+
+      <%# Terminal Panel %>
+      <div data-terminal-target="tuiContainer" class="lg:col-span-3">
+        <div class="bg-zinc-950 border border-zinc-800 rounded-lg overflow-hidden">
+          <%# Terminal header %>
+          <div class="px-4 py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900">
+            <div class="flex items-center gap-3">
+              <div class="flex items-center gap-1.5">
+                <span class="w-3 h-3 rounded-full bg-red-500/80"></span>
+                <span class="w-3 h-3 rounded-full bg-yellow-500/80"></span>
+                <span class="w-3 h-3 rounded-full bg-green-500/80"></span>
+              </div>
+              <span class="text-sm font-mono text-zinc-400" data-terminal-target="terminalTitle">Terminal</span>
+              <button type="button"
+                      data-terminal-target="ptyToggle"
+                      data-action="terminal#togglePtyView"
+                      class="hidden px-2 py-1 text-xs font-medium text-zinc-500 hover:text-zinc-300 bg-zinc-800 hover:bg-zinc-700 rounded transition-colors"
+                      title="Toggle CLI/Server view">
+                <svg class="w-3 h-3 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+                </svg>
+                <span>Toggle</span>
+              </button>
+              <button type="button"
+                      data-terminal-target="scrollToLive"
+                      data-action="terminal#scrollToBottom"
+                      class="hidden px-2 py-1 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded transition-colors"
+                      title="Return to live view">
+                <svg class="w-3 h-3 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 13l-7 7-7-7m14-8l-7 7-7-7" />
+                </svg>
+                Live
+              </button>
+            </div>
+            <div class="flex items-center gap-3">
+              <span class="text-xs text-zinc-600 hidden sm:inline">scroll: mouse wheel</span>
+              <span class="text-xs text-zinc-500" data-terminal-target="selectedAgentLabel">No agent</span>
+              <span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-cyan-500/10 text-cyan-400 rounded">
+                <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                  <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
+                </svg>
+                E2E
+              </span>
+            </div>
+          </div>
+          <%# Terminal content %>
+          <div data-terminal-target="terminal" class="h-[calc(100vh-20rem)] min-h-[300px] bg-zinc-950"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <%# Mobile Touch Controls %>
+  <div class="lg:hidden border-t border-zinc-800 bg-zinc-900/50 p-4">
+    <div class="grid grid-cols-4 gap-2 mb-3">
+      <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm font-mono rounded transition-colors" data-action="terminal#sendCtrlC">^C</button>
+      <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm rounded transition-colors" data-action="terminal#sendEnter">Enter</button>
+      <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm rounded transition-colors" data-action="terminal#sendEscape">Esc</button>
+      <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm rounded transition-colors" data-action="terminal#sendTab">Tab</button>
+    </div>
+    <div class="grid grid-cols-4 gap-2">
+      <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded transition-colors" data-action="terminal#sendArrowUp">
+        <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7" /></svg>
+      </button>
+      <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded transition-colors" data-action="terminal#sendArrowDown">
+        <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" /></svg>
+      </button>
+      <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded transition-colors" data-action="terminal#sendArrowLeft">
+        <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" /></svg>
+      </button>
+      <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded transition-colors" data-action="terminal#sendArrowRight">
+        <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" /></svg>
+      </button>
+    </div>
+  </div>
+
+  <%# New Agent Modal %>
+  <div data-controller="modal" data-terminal-target="newAgentModal" class="fixed inset-0 z-50 hidden" aria-modal="true">
+    <div class="fixed inset-0 bg-zinc-950/80 backdrop-blur-sm" data-action="modal#hide"></div>
+    <div class="fixed inset-0 flex items-center justify-center p-4 pointer-events-none">
+      <div class="bg-zinc-900 border border-zinc-800 rounded-lg shadow-2xl max-w-md w-full p-6 pointer-events-auto">
+        <h3 class="text-lg font-semibold text-zinc-100 mb-4">Create Agent</h3>
+
+        <div class="mb-4">
+          <label class="block text-sm font-medium text-zinc-400 mb-2">Initial Prompt</label>
+          <textarea data-terminal-target="agentPrompt"
+                    rows="2"
+                    placeholder="Enter prompt or leave blank for default..."
+                    class="w-full px-3 py-2 bg-zinc-950 border border-zinc-700 rounded text-sm text-zinc-300 placeholder-zinc-600 focus:outline-none focus:border-cyan-500 transition-colors"></textarea>
+        </div>
+
+        <div class="border-t border-zinc-800 pt-4 mb-4">
+          <label class="block text-sm font-medium text-zinc-400 mb-2">Reopen Existing</label>
+          <div data-terminal-target="worktreeList" class="max-h-32 overflow-y-auto bg-zinc-950 border border-zinc-700 rounded">
+            <p class="text-sm text-zinc-600 py-2 px-3">Loading worktrees...</p>
+          </div>
+        </div>
+
+        <div class="mb-4">
+          <label class="block text-sm font-medium text-zinc-400 mb-2">Or Create New</label>
+          <div class="flex gap-2">
+            <input type="text"
+                   data-terminal-target="issueOrBranch"
+                   placeholder="Issue # or branch name"
+                   class="flex-1 px-3 py-2 bg-zinc-950 border border-zinc-700 rounded text-sm text-zinc-300 placeholder-zinc-600 focus:outline-none focus:border-cyan-500 transition-colors">
+            <button type="button"
+                    data-action="terminal#submitNewAgent"
+                    class="px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-zinc-950 text-sm font-medium rounded transition-colors">
+              Create
+            </button>
+          </div>
+        </div>
+
+        <div class="flex justify-end">
+          <button type="button" data-action="modal#hide" class="px-4 py-2 text-sm text-zinc-400 hover:text-zinc-200 transition-colors">
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <%# Close Agent Modal %>
+  <div data-controller="modal" data-terminal-target="closeAgentModal" class="fixed inset-0 z-50 hidden" aria-modal="true">
+    <div class="fixed inset-0 bg-zinc-950/80 backdrop-blur-sm" data-action="modal#hide"></div>
+    <div class="fixed inset-0 flex items-center justify-center p-4 pointer-events-none">
+      <div class="bg-zinc-900 border border-zinc-800 rounded-lg shadow-2xl max-w-md w-full p-6 pointer-events-auto">
+        <h3 class="text-lg font-semibold text-zinc-100 mb-2">Close Agent</h3>
+        <p class="text-sm text-zinc-400 mb-2">Are you sure you want to close this agent?</p>
+        <p class="text-sm font-mono text-cyan-400 mb-4" data-terminal-target="closeAgentName">No agent selected</p>
+
+        <div class="flex flex-col sm:flex-row gap-3 justify-end">
+          <button type="button" data-action="modal#hide" class="px-4 py-2 text-sm text-zinc-400 hover:text-zinc-200 border border-zinc-700 rounded transition-colors">
+            Cancel
+          </button>
+          <button type="button" data-action="terminal#closeAgentKeepWorktree" class="px-4 py-2 text-sm bg-amber-500 hover:bg-amber-400 text-zinc-950 font-medium rounded transition-colors">
+            Keep Worktree
+          </button>
+          <button type="button" data-action="terminal#closeAgentDeleteWorktree" class="px-4 py-2 text-sm bg-red-500 hover:bg-red-400 text-white font-medium rounded transition-colors">
+            Delete Worktree
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

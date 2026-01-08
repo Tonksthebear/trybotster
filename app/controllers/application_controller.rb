@@ -4,4 +4,18 @@ class ApplicationController < ActionController::Base
 
   # Changes to the importmap will invalidate the etag for HTML responses
   stale_when_importmap_changes
+
+  # CSRF protection strategy:
+  # - Browser requests (session auth): raise exception on invalid token
+  # - API requests (Bearer token auth): null session (clears session, no exception)
+  #
+  # This follows the Fizzy pattern: Bearer tokens in Authorization header are
+  # inherently CSRF-safe since browsers don't auto-send them.
+  protect_from_forgery with: :exception, unless: :bearer_token_request?
+
+  private
+
+  def bearer_token_request?
+    request.headers["Authorization"]&.start_with?("Bearer ")
+  end
 end

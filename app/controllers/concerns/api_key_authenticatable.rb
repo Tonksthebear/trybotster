@@ -30,8 +30,17 @@ module ApiKeyAuthenticatable
   end
 
   def extract_api_key
-    # Support both header and query parameter
-    request.headers["X-API-Key"] || params[:api_key]
+    # Support Authorization: Bearer header (preferred, Fizzy-style)
+    # Falls back to X-API-Key header and query param for backwards compatibility
+    if (auth_header = request.headers["Authorization"])
+      auth_header.delete_prefix("Bearer ")
+    else
+      request.headers["X-API-Key"] || params[:api_key]
+    end
+  end
+
+  def api_key_present?
+    extract_api_key.present?
   end
 
   def render_unauthorized(message)

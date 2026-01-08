@@ -203,8 +203,14 @@ pub fn send_agent_list(hub: &Hub) {
 
 /// Send worktree list to browser.
 ///
-/// Collects available worktree information and sends it to the connected browser client.
-pub fn send_worktree_list(hub: &Hub) {
+/// Loads and sends available worktree information to the connected browser client.
+pub fn send_worktree_list(hub: &mut Hub) {
+    // Load worktrees fresh (they may not have been loaded yet)
+    if let Err(e) = hub.load_available_worktrees() {
+        log::warn!("Failed to load worktrees: {}", e);
+    }
+
+    // Get browser context after loading worktrees (borrow checker)
     let Some(ctx) = browser_ctx(hub) else { return };
 
     let worktrees = hub.state.available_worktrees.iter()
