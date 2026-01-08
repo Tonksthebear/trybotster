@@ -1,16 +1,59 @@
 import { Controller } from "@hotwired/stimulus";
 import * as xterm from "@xterm/xterm";
 import * as xtermFit from "@xterm/addon-fit";
-import * as naclModule from "tweetnacl";
-import * as naclUtilModule from "tweetnacl-util";
+import { x25519, ed25519 } from "@noble/curves/ed25519";
+import { randomBytes } from "@noble/ciphers/webcrypto";
 import consumer from "channels/consumer";
+import { RatchetSession, serializeEnvelope, deserializeEnvelope } from "../crypto/ratchet";
 
 // Handle various ESM export styles
 const Terminal = xterm.Terminal || xterm.default?.Terminal || xterm.default;
 const FitAddon = xtermFit.FitAddon || xtermFit.default?.FitAddon || xtermFit.default;
-const nacl = naclModule.default || naclModule;
-const naclUtil = naclUtilModule.default || naclUtilModule;
-const { encodeBase64, decodeBase64, encodeUTF8, decodeUTF8 } = naclUtil;
+
+// Base64 encoding/decoding utilities
+function encodeBase64(bytes) {
+  return btoa(String.fromCharCode(...bytes));
+}
+
+function decodeBase64(str) {
+  return new Uint8Array(atob(str).split("").map(c => c.charCodeAt(0)));
+}
+
+// UTF8 encoding/decoding utilities
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+function encodeUTF8(bytes) {
+  return textDecoder.decode(bytes);
+}
+
+function decodeUTF8(str) {
+  return textEncoder.encode(str);
+}
+
+// X25519 keypair generation (for encryption)
+function generateEncryptionKeypair() {
+  const secretKey = randomBytes(32);
+  const publicKey = x25519.getPublicKey(secretKey);
+  return { secretKey, publicKey };
+}
+
+// Ed25519 keypair generation (for signing)
+function generateSigningKeypair() {
+  const privateKey = randomBytes(32);
+  const publicKey = ed25519.getPublicKey(privateKey);
+  return { privateKey, publicKey };
+}
+
+// Sign a message with Ed25519
+function signMessage(message, privateKey) {
+  return ed25519.sign(message, privateKey);
+}
+
+// Compute raw X25519 shared secret (used to initialize Double Ratchet)
+function computeRawSharedSecret(theirPublicKey, ourSecretKey) {
+  return x25519.getSharedSecret(ourSecretKey, theirPublicKey);
+}
 
 // IndexedDB storage for browser device keypair and paired CLI keys
 const DB_NAME = "botster_device";
@@ -53,7 +96,7 @@ export default class extends Controller {
 
   connect() {
     this.subscription = null;
-    this.sharedSecret = null;
+    this.ratchet = null;  // Double Ratchet session for E2E encryption
     this.hubIdentifier = null;
     this.cliPublicKey = null;
 
@@ -162,7 +205,7 @@ export default class extends Controller {
 
     // Handle terminal input - encrypt and send
     this.terminal.onData((data) => {
-      if (this.subscription && this.sharedSecret) {
+      if (this.subscription && this.ratchet) {
         this.sendEncrypted({ type: "input", data });
       }
     });
@@ -187,21 +230,44 @@ export default class extends Controller {
     }
   }
 
-  // Load keypair from IndexedDB or create new one
+  // Load keypairs from IndexedDB or create new ones (encryption + signing)
   async loadOrCreateKeypair() {
     try {
       const stored = await this.getStoredKeypair();
       if (stored) {
+        // Load encryption keypair
         this.keypair = {
           publicKey: decodeBase64(stored.publicKey),
           secretKey: decodeBase64(stored.secretKey),
         };
+        // Load signing keypair (may need migration for old devices)
+        if (stored.signingPrivateKey && stored.signingPublicKey) {
+          this.signingKeypair = {
+            privateKey: decodeBase64(stored.signingPrivateKey),
+            publicKey: decodeBase64(stored.signingPublicKey),
+          };
+        } else {
+          // Generate signing keypair for legacy devices
+          console.log("Generating signing keypair for legacy device...");
+          this.signingKeypair = generateSigningKeypair();
+          await this.storeKeypair({
+            publicKey: stored.publicKey,
+            secretKey: stored.secretKey,
+            signingPublicKey: encodeBase64(this.signingKeypair.publicKey),
+            signingPrivateKey: encodeBase64(this.signingKeypair.privateKey),
+          });
+        }
         this.updateStatus("Device loaded. Computing shared secret...");
       } else {
-        this.keypair = nacl.box.keyPair();
+        // Create new encryption keypair
+        this.keypair = generateEncryptionKeypair();
+        // Create new signing keypair
+        this.signingKeypair = generateSigningKeypair();
         await this.storeKeypair({
           publicKey: encodeBase64(this.keypair.publicKey),
           secretKey: encodeBase64(this.keypair.secretKey),
+          signingPublicKey: encodeBase64(this.signingKeypair.publicKey),
+          signingPrivateKey: encodeBase64(this.signingKeypair.privateKey),
         });
         this.updateStatus("New device created. Registering...");
         await this.registerDevice();
@@ -209,7 +275,11 @@ export default class extends Controller {
 
       // Compute shared secret using CLI's public key from URL fragment
       // This is the key security property: we use the key directly, not from server
-      this.sharedSecret = nacl.box.before(this.cliPublicKey, this.keypair.secretKey);
+      const rawSharedSecret = computeRawSharedSecret(this.cliPublicKey, this.keypair.secretKey);
+
+      // Initialize Double Ratchet session for per-message forward secrecy
+      // Browser is NOT the initiator (CLI generates the QR code and initiates)
+      this.ratchet = new RatchetSession(rawSharedSecret, false);
 
       // Cache the CLI public key for future connections
       // This way the user doesn't need to scan QR/paste URL every time
@@ -364,11 +434,16 @@ export default class extends Controller {
           this.terminal.writeln("E2E encryption active (MITM-proof)");
           this.terminal.writeln("");
 
-          // Announce presence with public key
+          // Announce presence with signed public key
+          // The CLI will verify this signature before computing shared secret
+          // This prevents MITM attacks even if the server tries to forge presence
+          const signature = signMessage(this.keypair.publicKey, this.signingKeypair.privateKey);
           this.subscription.perform("presence", {
             event: "join",
             device_name: this.browserName(),
             public_key: encodeBase64(this.keypair.publicKey),
+            signature: encodeBase64(signature),
+            verifying_key: encodeBase64(this.signingKeypair.publicKey),
           });
 
           // Send terminal size
@@ -416,30 +491,30 @@ export default class extends Controller {
     }
   }
 
-  // Encrypt and send data to CLI
+  // Encrypt and send data to CLI using Double Ratchet
   sendEncrypted(message) {
-    const nonce = nacl.randomBytes(nacl.box.nonceLength);
-    const messageBytes = decodeUTF8(JSON.stringify(message));
-    const encrypted = nacl.box.after(messageBytes, nonce, this.sharedSecret);
+    if (!this.ratchet) {
+      console.error("Cannot send - ratchet not initialized");
+      return;
+    }
 
-    this.subscription.perform("relay", {
-      blob: encodeBase64(encrypted),
-      nonce: encodeBase64(nonce),
-    });
+    const messageBytes = decodeUTF8(JSON.stringify(message));
+    const envelope = this.ratchet.encrypt(messageBytes);
+    const serialized = serializeEnvelope(envelope);
+
+    this.subscription.perform("relay", serialized);
   }
 
-  // Decrypt received data from CLI
+  // Decrypt received data from CLI using Double Ratchet
   receiveEncrypted(data) {
+    if (!this.ratchet) {
+      console.error("Cannot receive - ratchet not initialized");
+      return;
+    }
+
     try {
-      const blob = decodeBase64(data.blob);
-      const nonce = decodeBase64(data.nonce);
-      const decrypted = nacl.box.open.after(blob, nonce, this.sharedSecret);
-
-      if (!decrypted) {
-        console.error("Decryption failed - invalid shared secret?");
-        return;
-      }
-
+      const envelope = deserializeEnvelope(data);
+      const decrypted = this.ratchet.decrypt(envelope);
       const message = JSON.parse(encodeUTF8(decrypted));
 
       if (message.type === "output") {
@@ -457,12 +532,21 @@ export default class extends Controller {
   }
 
   // Disconnect from current hub
-  disconnect() {
+  disconnectAction() {
     if (this.subscription) {
       this.subscription.unsubscribe();
       this.subscription = null;
     }
-    this.sharedSecret = null;
+    // Securely zero out key material
+    if (this.ratchet) {
+      this.ratchet.zeroize();
+      this.ratchet = null;
+    }
+    // Zero out signing keypair (in-memory only, not persistent storage)
+    if (this.signingKeypair?.privateKey) {
+      this.signingKeypair.privateKey.fill(0);
+      this.signingKeypair = null;
+    }
     this.updateStatus("Disconnected");
     this.terminal.writeln("\r\n[Disconnected]");
   }
@@ -501,7 +585,7 @@ export default class extends Controller {
   }
 
   sendKey(key) {
-    if (this.subscription && this.sharedSecret) {
+    if (this.subscription && this.ratchet) {
       this.sendEncrypted({ type: "input", data: key });
     }
   }
