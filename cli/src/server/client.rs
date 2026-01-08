@@ -63,13 +63,17 @@ impl ApiClient {
     ///
     /// # Arguments
     ///
+    /// * `hub_identifier` - Hub identifier for routing
     /// * `repo` - Repository name in "owner/repo" format
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails or the response cannot be parsed.
-    pub fn poll_messages(&self, repo: &str) -> Result<MessageResponse> {
-        let url = format!("{}/bots/messages?repo={}", self.server_url, repo);
+    pub fn poll_messages(&self, hub_identifier: &str, repo: &str) -> Result<MessageResponse> {
+        let url = format!(
+            "{}/hubs/{}/messages?repo={}",
+            self.server_url, hub_identifier, repo
+        );
 
         let response = self
             .client
@@ -89,13 +93,17 @@ impl ApiClient {
     ///
     /// # Arguments
     ///
+    /// * `hub_identifier` - Hub identifier for routing
     /// * `message_id` - ID of the message to acknowledge
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails.
-    pub fn acknowledge_message(&self, message_id: i64) -> Result<()> {
-        let url = format!("{}/bots/messages/{}", self.server_url, message_id);
+    pub fn acknowledge_message(&self, hub_identifier: &str, message_id: i64) -> Result<()> {
+        let url = format!(
+            "{}/hubs/{}/messages/{}",
+            self.server_url, hub_identifier, message_id
+        );
 
         let response = self
             .client
@@ -136,7 +144,7 @@ impl ApiClient {
         repo: &str,
         agents: Vec<AgentHeartbeatInfo>,
     ) -> Result<bool> {
-        let url = format!("{}/api/hubs/{}", self.server_url, hub_identifier);
+        let url = format!("{}/hubs/{}", self.server_url, hub_identifier);
 
         let payload = HeartbeatPayload {
             repo: repo.to_string(),
@@ -180,6 +188,7 @@ impl ApiClient {
     ///
     /// # Arguments
     ///
+    /// * `hub_identifier` - Hub identifier for routing
     /// * `repo` - Repository in "owner/repo" format
     /// * `issue_number` - Optional issue number
     /// * `invocation_url` - Optional invocation URL (preferred identifier)
@@ -190,12 +199,16 @@ impl ApiClient {
     /// Returns an error if the request fails.
     pub fn send_notification(
         &self,
+        hub_identifier: &str,
         repo: &str,
         issue_number: Option<u32>,
         invocation_url: Option<&str>,
         notification_type: &str,
     ) -> Result<()> {
-        let url = format!("{}/api/agent_notifications", self.server_url);
+        let url = format!(
+            "{}/hubs/{}/notifications",
+            self.server_url, hub_identifier
+        );
 
         let payload = NotificationPayload {
             repo: repo.to_string(),
