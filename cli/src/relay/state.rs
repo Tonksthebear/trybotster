@@ -1,6 +1,6 @@
 //! Browser communication and state management.
 //!
-//! Handles the WebSocket relay connection to browsers, including:
+//! Handles the Tailscale SSH connection to browsers, including:
 //! - Connection state tracking
 //! - Event handling and dispatch
 //! - Output streaming (TUI or GUI mode)
@@ -20,17 +20,48 @@
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-use super::connection::TerminalOutputSender;
-use super::olm::SessionEstablishmentKeys;
 use super::types::{BrowserEvent, BrowserResize};
 use crate::{AgentInfo, BrowserMode, TerminalMessage, WorktreeInfo, WorktreeManager};
+
+/// Handle for sending terminal output to the browser via SSH.
+#[derive(Clone)]
+pub struct TerminalOutputSender {
+    tx: mpsc::Sender<String>,
+}
+
+impl std::fmt::Debug for TerminalOutputSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalOutputSender").finish_non_exhaustive()
+    }
+}
+
+impl TerminalOutputSender {
+    /// Create a new terminal output sender.
+    #[must_use]
+    pub fn new(tx: mpsc::Sender<String>) -> Self {
+        Self { tx }
+    }
+
+    /// Send terminal output to browser.
+    pub async fn send(&self, output: &str) -> anyhow::Result<()> {
+        self.tx
+            .send(output.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to queue output: {}", e))
+    }
+
+    /// Check if the channel is still open.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
 
 /// Browser connection state.
 ///
 /// Consolidates all browser-related fields from Hub into a single struct.
 #[derive(Default)]
 pub struct BrowserState {
-    /// Terminal output sender for encrypted relay.
+    /// Terminal output sender for Tailscale SSH relay.
     pub sender: Option<TerminalOutputSender>,
     /// Browser event receiver.
     pub event_rx: Option<mpsc::Receiver<BrowserEvent>>,
@@ -44,8 +75,10 @@ pub struct BrowserState {
     pub agent_screen_hashes: HashMap<String, u64>,
     /// Last screen hash sent to browser.
     pub last_screen_hash: Option<u64>,
-    /// Olm session establishment keys for QR code generation.
-    pub olm_keys: Option<SessionEstablishmentKeys>,
+    /// Tailscale connection URL for QR code generation.
+    pub tailscale_connection_url: Option<String>,
+    /// CLI's tailnet hostname for browser to connect to.
+    pub tailscale_hostname: Option<String>,
 }
 
 impl std::fmt::Debug for BrowserState {
@@ -54,6 +87,7 @@ impl std::fmt::Debug for BrowserState {
             .field("connected", &self.connected)
             .field("dims", &self.dims)
             .field("mode", &self.mode)
+            .field("tailscale_hostname", &self.tailscale_hostname)
             .finish_non_exhaustive()
     }
 }
@@ -65,7 +99,11 @@ impl BrowserState {
     }
 
     /// Set connection established with sender and receiver.
-    pub fn set_connected(&mut self, sender: TerminalOutputSender, rx: mpsc::Receiver<BrowserEvent>) {
+    pub fn set_connected(
+        &mut self,
+        sender: TerminalOutputSender,
+        rx: mpsc::Receiver<BrowserEvent>,
+    ) {
         self.sender = Some(sender);
         self.event_rx = Some(rx);
         self.connected = false; // Will be true after Connected event
@@ -75,7 +113,7 @@ impl BrowserState {
     ///
     /// Sets the connected flag and default mode.
     pub fn handle_connected(&mut self, device_name: &str) {
-        log::info!("Browser connected: {device_name} - E2E encryption active");
+        log::info!("Browser connected via Tailscale SSH: {device_name}");
         self.connected = true;
         self.mode = Some(BrowserMode::Gui);
     }
@@ -132,11 +170,17 @@ impl BrowserState {
         }
         events
     }
+
+    /// Set Tailscale connection info for QR code generation.
+    pub fn set_tailscale_info(&mut self, connection_url: String, hostname: String) {
+        self.tailscale_connection_url = Some(connection_url);
+        self.tailscale_hostname = Some(hostname);
+    }
 }
 
 /// Context needed for sending browser messages.
 pub struct BrowserSendContext<'a> {
-    /// Terminal output sender for encrypted relay.
+    /// Terminal output sender for Tailscale relay.
     pub sender: &'a TerminalOutputSender,
     /// Async runtime for spawning send tasks.
     pub runtime: &'a tokio::runtime::Runtime,
@@ -152,11 +196,7 @@ impl std::fmt::Debug for BrowserSendContext<'_> {
 ///
 /// This is a helper to convert agent data into the format expected by browsers.
 #[must_use]
-pub fn build_agent_info(
-    id: &str,
-    agent: &crate::Agent,
-    hub_identifier: &str,
-) -> AgentInfo {
+pub fn build_agent_info(id: &str, agent: &crate::Agent, hub_identifier: &str) -> AgentInfo {
     AgentInfo {
         id: id.to_string(),
         repo: Some(agent.repo.clone()),
@@ -187,19 +227,13 @@ pub fn build_worktree_info(path: &str, branch: &str) -> WorktreeInfo {
 }
 
 /// Send agent list to connected browser.
-pub fn send_agent_list(
-    ctx: &BrowserSendContext,
-    agents: Vec<AgentInfo>,
-) {
+pub fn send_agent_list(ctx: &BrowserSendContext, agents: Vec<AgentInfo>) {
     let message = TerminalMessage::Agents { agents };
     send_message(ctx, &message);
 }
 
 /// Send worktree list to connected browser.
-pub fn send_worktree_list(
-    ctx: &BrowserSendContext,
-    worktrees: Vec<WorktreeInfo>,
-) {
+pub fn send_worktree_list(ctx: &BrowserSendContext, worktrees: Vec<WorktreeInfo>) {
     let repo = WorktreeManager::detect_current_repo()
         .map(|(_, name)| name)
         .ok();
@@ -424,5 +458,23 @@ mod tests {
             }
             _ => panic!("Expected Scrollback message"),
         }
+    }
+
+    #[test]
+    fn test_set_tailscale_info() {
+        let mut state = BrowserState::default();
+        state.set_tailscale_info(
+            "https://example.com/hubs/abc#key=xxx".to_string(),
+            "cli-abc.tail.local".to_string(),
+        );
+
+        assert_eq!(
+            state.tailscale_connection_url,
+            Some("https://example.com/hubs/abc#key=xxx".to_string())
+        );
+        assert_eq!(
+            state.tailscale_hostname,
+            Some("cli-abc.tail.local".to_string())
+        );
     }
 }

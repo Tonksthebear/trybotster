@@ -12,6 +12,9 @@ use std::{fs, path::PathBuf};
 pub struct Config {
     /// URL of the botster server.
     pub server_url: String,
+    /// URL of the Headscale control server for Tailscale mesh networking.
+    #[serde(default)]
+    pub headscale_url: Option<String>,
     /// New device token from device authorization flow (preferred).
     #[serde(default)]
     pub token: String,
@@ -32,6 +35,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server_url: "https://trybotster.com".to_string(),
+            headscale_url: None, // Defaults to localhost:8080 in TailscaleClient
             token: String::new(),
             api_key: String::new(),
             poll_interval: 5,
@@ -84,6 +88,11 @@ impl Config {
         // Essential config
         if let Ok(server_url) = std::env::var("BOTSTER_SERVER_URL") {
             self.server_url = server_url;
+        }
+
+        // Headscale control server URL for Tailscale mesh networking
+        if let Ok(headscale_url) = std::env::var("HEADSCALE_URL") {
+            self.headscale_url = Some(headscale_url);
         }
 
         // New token takes precedence over legacy api_key

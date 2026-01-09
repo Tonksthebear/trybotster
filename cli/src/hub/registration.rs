@@ -1,14 +1,14 @@
 //! Hub registration and connection management.
 //!
 //! This module handles device/hub registration with the Rails server
-//! and WebSocket connection setup for browser relay.
+//! and Tailscale connection setup for browser access.
 //!
 //! # Responsibilities
 //!
-//! - Device identity registration (E2E encryption keypairs)
+//! - Device identity registration
 //! - Hub registration for message routing
 //! - Tunnel connection for HTTP forwarding
-//! - Terminal relay connection for browser access
+//! - Tailscale connection for browser access
 
 // Rust guideline compliant 2025-01
 
@@ -16,29 +16,22 @@ use std::sync::Arc;
 
 use reqwest::blocking::Client;
 
+use crate::browser_connect::BrowserConnector;
 use crate::config::Config;
 use crate::device::Device;
-use crate::relay::{connection::TerminalRelay, persistence, BrowserState};
+use crate::relay::BrowserState;
 use crate::tunnel::TunnelManager;
 
 /// Register the device with the server if not already registered.
 ///
 /// This should be called after Hub creation to ensure the device identity
 /// is known to the server for browser-based key exchange.
-pub fn register_device(
-    device: &mut Device,
-    client: &Client,
-    config: &Config,
-) {
+pub fn register_device(device: &mut Device, client: &Client, config: &Config) {
     if device.device_id.is_some() {
         return;
     }
 
-    match device.register(
-        client,
-        &config.server_url,
-        config.get_api_key(),
-    ) {
+    match device.register(client, &config.server_url, config.get_api_key()) {
         Ok(id) => log::info!("Device registered with server: id={id}"),
         Err(e) => log::warn!("Device registration failed: {e} - will retry later"),
     }
@@ -89,10 +82,7 @@ pub fn register_hub_with_server(
 /// Start the tunnel connection in background.
 ///
 /// The tunnel provides HTTP forwarding for agent dev servers.
-pub fn start_tunnel(
-    tunnel_manager: &Arc<TunnelManager>,
-    runtime: &tokio::runtime::Runtime,
-) {
+pub fn start_tunnel(tunnel_manager: &Arc<TunnelManager>, runtime: &tokio::runtime::Runtime) {
     let tm = Arc::clone(tunnel_manager);
     runtime.spawn(async move {
         loop {
@@ -104,66 +94,50 @@ pub fn start_tunnel(
     });
 }
 
-/// Connect to the terminal relay for browser access.
+/// Connect to the Tailscale tailnet for browser access.
 ///
-/// This establishes an Action Cable WebSocket connection with E2E encryption
-/// for secure browser-based terminal access.
+/// This connects the CLI to the user's Headscale-managed tailnet and
+/// generates the connection URL for browser QR code scanning.
 ///
-/// # Returns
+/// # Security
 ///
-/// Returns `Ok(())` if connection succeeds and the browser state is updated,
-/// or logs a warning and continues if connection fails.
-pub fn connect_terminal_relay(
+/// - CLI joins tailnet using pre-auth key from Rails
+/// - Browser pre-auth key is placed in URL fragment (server never sees it)
+/// - All traffic E2E encrypted via WireGuard
+pub fn connect_tailscale(
     browser: &mut BrowserState,
     hub_identifier: &str,
     server_url: &str,
     api_key: &str,
+    headscale_url: Option<&str>,
     runtime: &tokio::runtime::Runtime,
 ) {
-    // Load or create Olm account (persisted for surviving restarts)
-    let mut olm_account = match persistence::load_or_create_account(hub_identifier) {
-        Ok(account) => account,
+    log::info!("Connecting to Tailscale tailnet for browser access...");
+
+    let mut connector = BrowserConnector::new(hub_identifier, server_url, api_key, headscale_url);
+
+    // Connect to tailnet in blocking fashion
+    match runtime.block_on(connector.connect_to_tailnet()) {
+        Ok(()) => {
+            log::info!("Connected to tailnet");
+        }
         Err(e) => {
-            log::error!("Failed to load/create Olm account: {e}");
+            log::warn!("Failed to connect to tailnet: {e} - browser access disabled");
             return;
         }
-    };
-
-    // Load existing session if available (browser may reconnect with saved session)
-    let existing_session = match persistence::load_session(hub_identifier) {
-        Ok(session) => session,
-        Err(e) => {
-            log::warn!("Failed to load Olm session: {e}");
-            None
-        }
-    };
-
-    if existing_session.is_some() {
-        log::info!("Loaded existing Olm session - browser can reconnect without QR scan");
     }
 
-    let keys = olm_account.session_establishment_keys();
-    log::info!("Olm session establishment keys ready: ed25519={:.8}...", keys.ed25519);
-
-    // Store keys in browser state for QR code generation
-    browser.olm_keys = Some(keys);
-
-    let relay = TerminalRelay::new_with_session(
-        olm_account,
-        existing_session,
-        hub_identifier.to_string(),
-        server_url.to_string(),
-        api_key.to_string(),
-    );
-
-    match runtime.block_on(relay.connect()) {
-        Ok((sender, rx)) => {
-            log::info!("Connected to terminal relay for E2E encrypted browser access");
-            browser.sender = Some(sender);
-            browser.event_rx = Some(rx);
+    // Get connection info for QR code
+    match runtime.block_on(connector.get_connection_info()) {
+        Ok(info) => {
+            log::info!(
+                "Tailscale connection ready: hostname={}",
+                info.hostname
+            );
+            browser.set_tailscale_info(info.connection_url, info.hostname);
         }
         Err(e) => {
-            log::warn!("Failed to connect to terminal relay: {e} - browser access disabled");
+            log::warn!("Failed to get connection info: {e}");
         }
     }
 }
@@ -171,20 +145,11 @@ pub fn connect_terminal_relay(
 /// Send shutdown notification to server.
 ///
 /// Call this when the hub is shutting down to unregister from the server.
-pub fn shutdown(
-    client: &Client,
-    server_url: &str,
-    hub_identifier: &str,
-    api_key: &str,
-) {
+pub fn shutdown(client: &Client, server_url: &str, hub_identifier: &str, api_key: &str) {
     log::info!("Sending shutdown notification to server...");
     let shutdown_url = format!("{server_url}/hubs/{hub_identifier}");
 
-    match client
-        .delete(&shutdown_url)
-        .bearer_auth(api_key)
-        .send()
-    {
+    match client.delete(&shutdown_url).bearer_auth(api_key).send() {
         Ok(response) if response.status().is_success() => {
             log::info!("Hub unregistered from server");
         }

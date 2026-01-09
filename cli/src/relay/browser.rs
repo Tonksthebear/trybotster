@@ -5,10 +5,10 @@
 //!
 //! # Architecture
 //!
-//! Browser events flow from the WebSocket relay to these handlers:
+//! Browser events flow from the Tailscale SSH connection to these handlers:
 //!
 //! ```text
-//! TerminalRelay → BrowserEvent → browser::poll_events() → Hub state changes
+//! Tailscale SSH → BrowserEvent → browser::poll_events() → Hub state changes
 //!                                                       → HubAction dispatch
 //!                                                       → Browser responses
 //! ```

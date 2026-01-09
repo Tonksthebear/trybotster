@@ -1,22 +1,35 @@
 import { Controller } from "@hotwired/stimulus";
-import consumer from "channels/consumer";
-import { initOlm, OlmSession, serializeEnvelope, deserializeEnvelope } from "crypto/olm";
+import {
+  initTailscale,
+  TailscaleSession,
+  parseKeyFromFragment,
+  getControlUrl,
+  getCliHostname,
+  ConnectionState,
+} from "tailscale/index";
 
 /**
- * Connection Controller - WebSocket + Olm E2E Encryption
+ * Connection Controller - Tailscale E2E Encrypted Mesh
  *
- * This controller manages the secure connection between browser and CLI.
+ * This controller manages the secure connection between browser and CLI
+ * via Tailscale/Headscale mesh networking.
  *
  * Architecture:
- * - Other controllers register via `registerListener()` in their `connectionOutletConnected()`
- * - Callbacks are immediately invoked if connection is already established
- * - This eliminates race conditions from event-based communication
+ * - Browser joins tailnet using pre-auth key from URL fragment
+ * - CLI is already on the tailnet (same user's namespace)
+ * - Browser opens SSH tunnel to CLI for terminal access
+ * - All traffic is E2E encrypted via WireGuard
+ *
+ * Security:
+ * - Pre-auth key is in URL fragment (#key=xxx), never sent to server
+ * - Per-user tailnet isolation at Headscale infrastructure level
+ * - WireGuard provides E2E encryption (server never sees plaintext)
  *
  * Usage in dependent controllers:
  * ```
  * connectionOutletConnected(outlet) {
  *   outlet.registerListener(this, {
- *     onConnected: (hubIdentifier) => { ... },
+ *     onConnected: (connection) => { ... },
  *     onDisconnected: () => { ... },
  *     onMessage: (message) => { ... },
  *     onError: (error) => { ... },
@@ -29,21 +42,19 @@ import { initOlm, OlmSession, serializeEnvelope, deserializeEnvelope } from "cry
  * ```
  */
 
-const DB_NAME = "botster_olm";
-const DB_VERSION = 1;
-const SESSION_STORE = "sessions";
-
 export default class extends Controller {
   static targets = ["status"];
 
   static values = {
     hubIdentifier: String,
+    cliHostname: String,
   };
 
   connect() {
-    this.subscription = null;
-    this.olmSession = null;
+    this.tailscaleSession = null;
+    this.sshConnection = null;
     this.hubIdentifier = null;
+    this.cliHostname = null;
     this.connected = false;
 
     // Don't overwrite listeners - outlet callbacks may have already registered
@@ -51,11 +62,6 @@ export default class extends Controller {
     if (!this.listeners) {
       this.listeners = new Map();
     }
-
-    // CLI's Olm keys from URL fragment (if present)
-    this.cliEd25519 = null;
-    this.cliCurve25519 = null;
-    this.cliOneTimeKey = null;
 
     // Initialize and connect
     this.initializeConnection();
@@ -73,7 +79,7 @@ export default class extends Controller {
    *
    * @param {Controller} controller - The Stimulus controller registering
    * @param {Object} callbacks - Callback functions
-   * @param {Function} callbacks.onConnected - Called with hubIdentifier when E2E established
+   * @param {Function} callbacks.onConnected - Called with connection when E2E established
    * @param {Function} callbacks.onDisconnected - Called when connection lost
    * @param {Function} callbacks.onMessage - Called with decrypted message from CLI
    * @param {Function} callbacks.onError - Called with error message
@@ -86,7 +92,7 @@ export default class extends Controller {
     this.listeners.set(controller, callbacks);
 
     // If already connected, immediately notify
-    if (this.connected && this.olmSession) {
+    if (this.connected && this.sshConnection) {
       callbacks.onConnected?.(this);
     }
   }
@@ -137,286 +143,215 @@ export default class extends Controller {
       return;
     }
 
-    this.updateStatus("Initializing encryption...");
+    // Get CLI hostname from fragment, meta tag, or API
+    this.cliHostname = getCliHostname();
+    if (!this.cliHostname && this.cliHostnameValue) {
+      this.cliHostname = this.cliHostnameValue;
+    }
+    if (!this.cliHostname) {
+      this.cliHostname = await this.fetchCliHostname();
+    }
+
+    if (!this.cliHostname) {
+      this.emitError("CLI hostname not available - hub may be offline");
+      return;
+    }
+
+    this.updateStatus("Initializing Tailscale...");
 
     try {
-      // Initialize vodozemac WASM first
-      await initOlm();
+      // Initialize tsconnect WASM
+      await initTailscale();
 
-      // Try to load saved session from IndexedDB
-      const savedSession = await this.loadSession(this.hubIdentifier);
-      if (savedSession) {
-        console.log("Loaded saved Olm session from IndexedDB");
-        this.olmSession = savedSession;
-        this.updateStatus("Connecting with saved session...");
-        this.subscribeToChannel();
-        return;
-      }
-
-      // No saved session - check URL fragment for keys
-      const keysFromUrl = this.parseUrlFragment();
-      if (keysFromUrl) {
-        console.log("Creating new Olm session from URL keys");
-        this.cliEd25519 = keysFromUrl.ed25519;
-        this.cliCurve25519 = keysFromUrl.curve25519;
-        this.cliOneTimeKey = keysFromUrl.oneTimeKey;
-
-        // Create new Olm session
-        this.olmSession = new OlmSession(
-          this.cliCurve25519,
-          this.cliOneTimeKey
+      // Get pre-auth key from URL fragment
+      const preauthKey = parseKeyFromFragment();
+      if (!preauthKey) {
+        this.emitError(
+          "No connection key found. Scan QR code from CLI to connect."
         );
-
-        // Save session to IndexedDB for reconnection
-        await this.saveSession(this.hubIdentifier, this.olmSession);
-        console.log("Saved new Olm session to IndexedDB");
-
-        this.updateStatus("Connecting...");
-        this.subscribeToChannel();
         return;
       }
 
-      // No saved session and no keys in URL
-      this.emitError("No secure key found. Scan QR code from CLI to connect.");
+      // Get Headscale control URL
+      const controlUrl = getControlUrl();
+
+      // Create Tailscale session with hub identifier for state isolation
+      this.tailscaleSession = new TailscaleSession(
+        controlUrl,
+        preauthKey,
+        this.hubIdentifier
+      );
+
+      // Set up state change handler
+      this.tailscaleSession.onStateChange = (state) => {
+        this.handleStateChange(state);
+      };
+
+      // Set up logging
+      this.tailscaleSession.onLog = (msg) => {
+        console.log(`[Connection] ${msg}`);
+      };
+
+      // Connect to tailnet
+      this.updateStatus("Joining tailnet...");
+      await this.tailscaleSession.connect();
+
+      // Open SSH tunnel to CLI
+      this.updateStatus("Connecting to CLI...");
+      await this.openSSHTunnel();
+
+      this.connected = true;
+      this.updateStatus(
+        `Connected to ${this.hubIdentifier.substring(0, 8)}...`
+      );
+
+      // Notify all registered listeners
+      this.notifyListeners("connected", this);
     } catch (error) {
       console.error("Failed to initialize connection:", error);
       this.emitError(`Connection error: ${error.message}`);
     }
   }
 
-  parseUrlFragment() {
-    const hash = window.location.hash;
-    if (!hash || hash.length < 2) {
-      return null;
-    }
-
-    const params = new URLSearchParams(hash.substring(1));
-    let ed25519 = params.get("e");
-    let curve25519 = params.get("c");
-    let oneTimeKey = params.get("o");
-
-    if (!ed25519 || !curve25519 || !oneTimeKey) {
-      return null;
-    }
-
-    // Fix base64 encoding: URLSearchParams decodes '+' as space
-    ed25519 = ed25519.replace(/ /g, "+");
-    curve25519 = curve25519.replace(/ /g, "+");
-    oneTimeKey = oneTimeKey.replace(/ /g, "+");
-
-    return { ed25519, curve25519, oneTimeKey };
-  }
-
-  // ========== IndexedDB Session Storage ==========
-
-  async openDB() {
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME, DB_VERSION);
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result);
-      request.onupgradeneeded = (event) => {
-        const db = event.target.result;
-        if (!db.objectStoreNames.contains(SESSION_STORE)) {
-          db.createObjectStore(SESSION_STORE, { keyPath: "hubIdentifier" });
+  async fetchCliHostname() {
+    try {
+      const response = await fetch(
+        `/hubs/${this.hubIdentifier}/tailscale/status`,
+        {
+          headers: { Accept: "application/json" },
         }
-      };
-    });
-  }
+      );
 
-  async saveSession(hubIdentifier, olmSession) {
-    try {
-      const db = await this.openDB();
-      const pickled = olmSession.pickle();
-
-      return new Promise((resolve, reject) => {
-        const tx = db.transaction(SESSION_STORE, "readwrite");
-        const store = tx.objectStore(SESSION_STORE);
-        const request = store.put({
-          hubIdentifier,
-          pickled,
-          savedAt: new Date().toISOString(),
-        });
-        request.onerror = () => reject(request.error);
-        request.onsuccess = () => resolve();
-      });
-    } catch (error) {
-      console.warn("Failed to save Olm session:", error);
-    }
-  }
-
-  async loadSession(hubIdentifier) {
-    try {
-      const db = await this.openDB();
-
-      const record = await new Promise((resolve, reject) => {
-        const tx = db.transaction(SESSION_STORE, "readonly");
-        const store = tx.objectStore(SESSION_STORE);
-        const request = store.get(hubIdentifier);
-        request.onerror = () => reject(request.error);
-        request.onsuccess = () => resolve(request.result);
-      });
-
-      if (record && record.pickled) {
-        return OlmSession.fromPickle(record.pickled);
+      if (!response.ok) {
+        return null;
       }
-    } catch (error) {
-      console.warn("Failed to load Olm session:", error);
-    }
-    return null;
-  }
 
-  async deleteSession(hubIdentifier) {
-    try {
-      const db = await this.openDB();
-
-      return new Promise((resolve, reject) => {
-        const tx = db.transaction(SESSION_STORE, "readwrite");
-        const store = tx.objectStore(SESSION_STORE);
-        const request = store.delete(hubIdentifier);
-        request.onerror = () => reject(request.error);
-        request.onsuccess = () => resolve();
-      });
+      const data = await response.json();
+      return data.hostname;
     } catch (error) {
-      console.warn("Failed to delete Olm session:", error);
+      console.warn("Failed to fetch CLI hostname:", error);
+      return null;
     }
   }
 
-  // ========== ActionCable Subscription ==========
-
-  subscribeToChannel() {
-    if (this.subscription) {
-      this.subscription.unsubscribe();
-    }
-
-    this.subscription = consumer.subscriptions.create(
-      {
-        channel: "TerminalChannel",
-        hub_identifier: this.hubIdentifier,
-        device_type: "browser",
-      },
-      {
-        connected: () => this.handleConnected(),
-        disconnected: () => this.handleDisconnected(),
-        rejected: () => this.handleRejected(),
-        received: (data) => this.handleReceived(data),
-      }
+  async openSSHTunnel() {
+    // Open SSH to CLI - username "root" is standard for Tailscale SSH
+    this.sshConnection = await this.tailscaleSession.openSSH(
+      this.cliHostname,
+      "root"
     );
+
+    // Set up data handler - receive terminal output from CLI
+    this.sshConnection.onData = (data) => {
+      this.handleSSHData(data);
+    };
+
+    // Set up error handler
+    this.sshConnection.onError = (msg) => {
+      console.error("[SSH Error]", msg);
+    };
+
+    // Set up close handler
+    this.sshConnection.onClose = () => {
+      this.handleSSHClose();
+    };
+
+    console.log("SSH tunnel established to CLI");
   }
 
-  handleConnected() {
-    this.connected = true;
-    this.updateStatus(`Connected to ${this.hubIdentifier.substring(0, 8)}...`);
-
-    // Send PreKey message to establish Olm session
-    this.sendPreKeyMessage();
-
-    // Notify all registered listeners
-    this.notifyListeners("connected", this);
+  handleStateChange(state) {
+    switch (state) {
+      case ConnectionState.LOADING_WASM:
+        this.updateStatus("Loading Tailscale...");
+        break;
+      case ConnectionState.CONNECTING:
+        this.updateStatus("Connecting to tailnet...");
+        break;
+      case ConnectionState.NEEDS_LOGIN:
+        this.updateStatus("Authentication required...");
+        break;
+      case ConnectionState.AUTHENTICATING:
+        this.updateStatus("Authenticating...");
+        break;
+      case ConnectionState.STARTING:
+        this.updateStatus("Starting connection...");
+        break;
+      case ConnectionState.CONNECTED:
+        this.updateStatus("Connected to tailnet");
+        break;
+      case ConnectionState.ERROR:
+        this.emitError("Tailnet connection error");
+        break;
+      case ConnectionState.DISCONNECTED:
+        this.updateStatus("Disconnected");
+        break;
+    }
   }
 
-  handleDisconnected() {
+  handleSSHData(data) {
+    // Data is raw terminal output from CLI
+    // Try to parse as JSON first (for structured messages)
+    try {
+      const text = typeof data === "string" ? data : new TextDecoder().decode(data);
+
+      // Try to parse as JSON
+      try {
+        const message = JSON.parse(text);
+        this.notifyListeners("message", message);
+      } catch {
+        // Not JSON - treat as raw terminal output
+        this.notifyListeners("message", { type: "output", data: text });
+      }
+    } catch (error) {
+      console.warn("Error handling SSH data:", error);
+    }
+  }
+
+  handleSSHClose() {
     this.connected = false;
     this.updateStatus("Disconnected");
     this.notifyListeners("disconnected");
   }
 
-  handleRejected() {
-    this.connected = false;
-    this.emitError("Connection rejected - hub may be offline");
-  }
-
-  handleReceived(data) {
-    switch (data.type) {
-      case "terminal":
-        if (data.from === "browser") return;
-        this.handleEncryptedMessage(data);
-        break;
-
-      case "presence":
-        // Could notify listeners if needed
-        break;
-
-      case "resize":
-        break;
-
-      default:
-        console.log("Unknown message type:", data.type);
-    }
-  }
-
-  sendPreKeyMessage() {
-    if (!this.olmSession) return;
-
-    const handshake = {
-      type: "handshake",
-      device_name: this.getBrowserName(),
-      browser_curve25519: this.olmSession.getCurve25519Key(),
-    };
-
-    const envelope = this.olmSession.encrypt(handshake);
-    const serialized = serializeEnvelope(envelope);
-
-    this.subscription.perform("presence", {
-      event: "join",
-      device_name: this.getBrowserName(),
-      prekey_message: serialized,
-    });
-
-    // Re-save session after PreKey to keep ratchet state in sync
-    this.saveSession(this.hubIdentifier, this.olmSession);
-
-    console.log("Sent PreKey message to establish Olm session");
-  }
-
-  handleEncryptedMessage(data) {
-    if (!this.olmSession) return;
-
-    try {
-      const envelope = deserializeEnvelope(data);
-      const message = this.olmSession.decrypt(envelope);
-
-      // Re-save session after decrypt to keep ratchet state in sync
-      this.saveSession(this.hubIdentifier, this.olmSession);
-
-      // Notify all registered listeners
-      this.notifyListeners("message", message);
-    } catch (error) {
-      console.error("Failed to decrypt message:", error);
-
-      if (error.message.includes("decrypt") || error.message.includes("session")) {
-        console.log("Session may be corrupted, deleting saved session");
-        this.deleteSession(this.hubIdentifier);
-        this.emitError("Session expired. Scan QR code to reconnect.");
-      }
-    }
-  }
-
   // ========== Public API for Outlets ==========
 
+  /**
+   * Send a JSON message to CLI via SSH.
+   */
   send(type, data) {
-    if (!this.olmSession || !this.subscription || !this.connected) {
+    if (!this.sshConnection || !this.connected) {
       console.warn("Cannot send - not connected");
       return false;
     }
 
-    const message = { type, ...data };
-    const envelope = this.olmSession.encrypt(message);
-    const serialized = serializeEnvelope(envelope);
-
-    this.subscription.perform("relay", serialized);
-
-    // Re-save session after encrypt to keep ratchet state in sync
-    this.saveSession(this.hubIdentifier, this.olmSession);
-
+    const message = JSON.stringify({ type, ...data });
+    this.sshConnection.write(message + "\n");
     return true;
   }
 
+  /**
+   * Send raw input to CLI (terminal keystrokes).
+   */
   sendInput(inputData) {
-    return this.send("input", { data: inputData });
+    if (!this.sshConnection || !this.connected) {
+      console.warn("Cannot send input - not connected");
+      return false;
+    }
+
+    this.sshConnection.write(inputData);
+    return true;
   }
 
+  /**
+   * Resize the terminal.
+   */
   sendResize(cols, rows) {
-    return this.send("resize", { cols, rows });
+    if (!this.sshConnection || !this.connected) {
+      return false;
+    }
+
+    this.sshConnection.resize(cols, rows);
+    return true;
   }
 
   requestAgents() {
@@ -436,7 +371,9 @@ export default class extends Controller {
   }
 
   async resetSession() {
-    await this.deleteSession(this.hubIdentifier);
+    if (this.tailscaleSession) {
+      await this.tailscaleSession.reset();
+    }
     this.cleanup();
     this.emitError("Session cleared. Scan QR code to reconnect.");
   }
@@ -444,13 +381,13 @@ export default class extends Controller {
   // ========== Cleanup ==========
 
   cleanup() {
-    if (this.subscription) {
-      this.subscription.unsubscribe();
-      this.subscription = null;
+    if (this.sshConnection) {
+      this.sshConnection.close();
+      this.sshConnection = null;
     }
-    if (this.olmSession) {
-      this.olmSession.free();
-      this.olmSession = null;
+    if (this.tailscaleSession) {
+      this.tailscaleSession.disconnect();
+      this.tailscaleSession = null;
     }
     this.connected = false;
     this.listeners?.clear();
@@ -473,13 +410,5 @@ export default class extends Controller {
   emitError(message) {
     this.updateStatus(message);
     this.notifyListeners("error", message);
-  }
-
-  getBrowserName() {
-    const ua = navigator.userAgent;
-    if (ua.includes("Chrome")) return "Chrome Browser";
-    if (ua.includes("Firefox")) return "Firefox Browser";
-    if (ua.includes("Safari")) return "Safari Browser";
-    return "Web Browser";
   }
 }

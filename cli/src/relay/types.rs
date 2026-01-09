@@ -1,7 +1,7 @@
 //! Data types for the terminal relay protocol.
 //!
 //! This module defines the message and event types used for communication
-//! between the CLI and browser via the WebSocket relay.
+//! between the CLI and browser via Tailscale SSH.
 //!
 //! # Message Types
 //!
@@ -9,9 +9,10 @@
 //! - [`BrowserCommand`] - Browser → CLI commands (input, actions)
 //! - [`BrowserEvent`] - Parsed browser events for Hub consumption
 //!
-//! # Wire Format
+//! # Transport
 //!
-//! All messages are encrypted using [`EncryptedEnvelope`] before transmission.
+//! Messages are sent as JSON over Tailscale SSH. Encryption is handled by
+//! WireGuard at the transport layer.
 
 // Rust guideline compliant 2025-01
 
@@ -203,15 +204,6 @@ pub enum BrowserCommand {
         /// Number of rows.
         rows: u16,
     },
-}
-
-/// Encrypted message envelope (sent via Action Cable).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncryptedEnvelope {
-    /// Base64 encrypted data.
-    pub blob: String,
-    /// Base64 nonce.
-    pub nonce: String,
 }
 
 /// Browser resize event.

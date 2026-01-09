@@ -20,6 +20,7 @@ class User < ApplicationRecord
   # Generate API token before create
   before_create :generate_api_key
   after_create :ensure_api_key
+  after_create :create_headscale_namespace
 
   # Note: No active/inactive status - all users receive @trybotster mentions
   # Filtering happens at poll time based on repo access
@@ -171,7 +172,38 @@ class User < ApplicationRecord
     end
   end
 
+  # Headscale Integration
+  # Each user gets their own isolated tailnet (namespace)
+
+  # Get the user's Headscale namespace name
+  # @return [String] Namespace name (e.g., "user-123")
+  def headscale_namespace
+    "user-#{id}"
+  end
+
+  # Create a pre-auth key for the user's tailnet
+  # @param ephemeral [Boolean] Whether nodes using this key are ephemeral
+  # @param expiration [Time] When the key expires
+  # @param tags [Array<String>] ACL tags for nodes
+  # @return [String] The pre-auth key
+  def create_tailscale_preauth_key(ephemeral: false, expiration: 1.hour.from_now, tags: [])
+    HeadscaleClient.new.create_preauth_key(
+      user: headscale_namespace,
+      ephemeral: ephemeral,
+      expiration: expiration,
+      tags: tags
+    )
+  end
+
   private
+
+  # Create the user's Headscale namespace on signup
+  def create_headscale_namespace
+    HeadscaleClient.new.create_user(headscale_namespace)
+  rescue HeadscaleClient::Error => e
+    Rails.logger.error "Failed to create Headscale namespace for user #{id}: #{e.message}"
+    # Don't fail user creation - Headscale might be unavailable
+  end
 
   def check_github_repo_access_uncached(repo_full_name)
     token = valid_github_app_token

@@ -5,9 +5,15 @@ class Hub < ApplicationRecord
   belongs_to :device, optional: true  # The CLI device running this hub
   has_many :hub_agents, dependent: :destroy
 
+  # Encrypt the Tailscale pre-auth key at rest
+  encrypts :tailscale_preauth_key
+
   validates :repo, presence: true
   validates :identifier, presence: true, uniqueness: true
   validates :last_seen_at, presence: true
+
+  # Generate Tailscale pre-auth key for CLI to join the user's tailnet
+  before_create :generate_tailscale_preauth_key
 
   scope :active, -> { where("last_seen_at > ?", 2.minutes.ago) }
   scope :for_repo, ->(repo) { where(repo: repo) }
@@ -69,6 +75,26 @@ class Hub < ApplicationRecord
     Rails.logger.warn "Failed to broadcast hub removal: #{e.message}"
   end
 
+  # Tailscale Integration
+
+  # Check if this hub is connected to the tailnet
+  def tailscale_connected?
+    tailscale_hostname.present?
+  end
+
+  # Create an ephemeral pre-auth key for browser to join the tailnet
+  # This key is returned to the CLI, which puts it in a URL fragment
+  # (server never sees it in plaintext during browser connection)
+  #
+  # @return [String] The pre-auth key for browser
+  def create_browser_preauth_key
+    user.create_tailscale_preauth_key(
+      ephemeral: true,
+      expiration: 1.hour.from_now,
+      tags: ["tag:browser"]
+    )
+  end
+
   private
 
   def normalize_agents_data(data)
@@ -77,5 +103,17 @@ class Hub < ApplicationRecord
 
   def turbo_stream_name
     "user_#{user_id}_hubs"
+  end
+
+  # Generate a long-lived pre-auth key for the CLI to join the user's tailnet
+  def generate_tailscale_preauth_key
+    self.tailscale_preauth_key = user.create_tailscale_preauth_key(
+      ephemeral: false,
+      expiration: 1.year.from_now,
+      tags: ["tag:cli", "tag:hub-#{identifier}"]
+    )
+  rescue HeadscaleClient::Error => e
+    Rails.logger.error "Failed to generate Tailscale pre-auth key for hub #{identifier}: #{e.message}"
+    # Don't fail hub creation - Headscale might be unavailable
   end
 end
