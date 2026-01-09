@@ -51,12 +51,29 @@ use std::time::Instant;
 
 use reqwest::blocking::Client;
 
+use sha2::{Digest, Sha256};
+
 use crate::app::AppMode;
 use crate::config::Config;
 use crate::device::Device;
 use crate::git::WorktreeManager;
-use crate::relay::persistence::hub_id_for_repo;
 use crate::tunnel::TunnelManager;
+
+/// Generate a stable hub_identifier from a repo path.
+///
+/// Uses SHA256 hash of the absolute path to ensure the same repo
+/// always gets the same hub_id, even across CLI restarts.
+#[must_use]
+pub fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
+    let canonical = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
+
+    let hash = Sha256::digest(canonical.to_string_lossy().as_bytes());
+
+    // Use first 16 bytes as hex (32 chars) - enough uniqueness, shorter than UUID
+    hash[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// Central orchestrator for the botster-hub application.
 ///
@@ -450,13 +467,14 @@ impl Hub {
         registration::start_tunnel(&self.tunnel_manager, &self.tokio_runtime);
     }
 
-    /// Connect to the terminal relay for browser access.
-    pub fn connect_terminal_relay(&mut self) {
-        registration::connect_terminal_relay(
+    /// Connect to Tailscale tailnet for browser access.
+    pub fn connect_tailscale(&mut self) {
+        registration::connect_tailscale(
             &mut self.browser,
             &self.hub_identifier,
             &self.config.server_url,
             self.config.get_api_key(),
+            self.config.headscale_url.as_deref(),
             &self.tokio_runtime,
         );
     }
@@ -466,7 +484,7 @@ impl Hub {
         self.register_device();
         self.register_hub_with_server();
         self.start_tunnel();
-        self.connect_terminal_relay();
+        self.connect_tailscale();
     }
 
     // === Event Loop ===

@@ -1,48 +1,31 @@
-//! Relay - Browser WebSocket adapter.
+//! Relay - Browser connectivity via Tailscale mesh.
 //!
-//! This module provides the browser relay functionality, handling WebSocket
-//! communication with connected browser clients via Action Cable. It manages:
-//!
-//! - E2E encrypted communication (vodozemac Olm)
-//! - Browser event to Hub action conversion
-//! - Terminal output streaming
+//! This module provides browser relay functionality via Tailscale/Headscale
+//! mesh networking. Browser connects to CLI via Tailscale SSH.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Browser ◄──WebSocket──► Rails Action Cable ◄──WebSocket──► Relay
-//!                                                              │
-//!                              Hub ◄─── BrowserEvent → HubAction
+//! Browser ◄──Tailscale SSH──► CLI (same tailnet, direct P2P when possible)
+//!                               │
+//!           Hub ◄─── BrowserEvent → HubAction
 //! ```
 //!
-//! # Encryption
+//! # Security
 //!
-//! All communication between the CLI and browser is E2E encrypted using
-//! vodozemac's Olm implementation - the same NCC-audited cryptography used by Matrix.
-//! The Rails server only sees encrypted blobs and cannot read the terminal content.
-//!
-//! ## Protocol (Olm)
-//!
-//! 1. CLI generates Olm account and displays QR code with session keys
-//! 2. Browser scans QR code (ed25519, curve25519, one_time_key)
-//! 3. Browser creates outbound Olm session using CLI's keys
-//! 4. Browser sends PreKey message to establish session
-//! 5. CLI creates inbound session from PreKey message
-//! 6. Both sides can now encrypt/decrypt with the session
+//! - WireGuard E2E encryption (Tailscale)
+//! - Per-user tailnet isolation at Headscale infrastructure level
+//! - Pre-auth key in URL fragment (server never sees it)
 //!
 //! # Modules
 //!
-//! - [`connection`] - WebSocket transport and Olm encryption
+//! - [`browser`] - Browser event handling
 //! - [`events`] - Browser event to Hub action conversion
-//! - [`olm`] - Olm E2E encryption (vodozemac wrapper)
 //! - [`state`] - Browser connection state management
 //! - [`types`] - Protocol message types
 
 pub mod browser;
-pub mod connection;
 pub mod events;
-pub mod olm;
-pub mod persistence;
 pub mod state;
 pub mod types;
 
@@ -53,13 +36,14 @@ pub use events::{
 pub use state::{
     build_agent_info, build_worktree_info, send_agent_list, send_agent_selected,
     send_scrollback, send_worktree_list, BrowserSendContext, BrowserState,
+    TerminalOutputSender,
 };
 
 pub use types::{
-    AgentInfo, BrowserCommand, BrowserEvent, BrowserResize, EncryptedEnvelope, TerminalMessage,
+    AgentInfo, BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage,
     WorktreeInfo,
 };
 
-pub use connection::{TerminalOutputSender, TerminalRelay};
-
-pub use olm::{OlmAccount, OlmEnvelope, OlmSession, SessionEstablishmentKeys};
+// Re-export Tailscale types from browser_connect module
+pub use crate::browser_connect::{BrowserConnectionInfo, BrowserConnector};
+pub use crate::tailscale::TailscaleClient;

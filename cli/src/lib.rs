@@ -23,6 +23,7 @@
 
 // Library modules
 pub mod agent;
+pub mod browser_connect;
 pub mod hub;
 pub mod relay;
 pub mod tui;
@@ -37,12 +38,14 @@ pub mod compat;
 pub mod config;
 pub mod constants;
 pub mod device;
+pub mod embedded_tailscale;
 pub mod git;
 pub mod notifications;
 pub mod process;
 pub mod prompt;
 pub mod render;
 pub mod server;
+pub mod tailscale;
 pub mod terminal_widget;
 pub mod tunnel;
 
@@ -58,7 +61,7 @@ pub use process::{get_parent_pid, kill_orphaned_processes};
 pub use prompt::PromptManager;
 pub use render::render_agent_terminal;
 pub use relay::{
-    AgentInfo, BrowserEvent, BrowserResize, TerminalMessage, TerminalOutputSender, TerminalRelay,
+    AgentInfo, BrowserEvent, BrowserResize, TerminalMessage, TerminalOutputSender,
     WorktreeInfo,
 };
 pub use terminal_widget::TerminalWidget;

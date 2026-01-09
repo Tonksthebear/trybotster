@@ -332,22 +332,13 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         }
 
         HubAction::ShowConnectionCode => {
-            // Generate connection URL with Olm session establishment keys
-            // Format: /hubs/{id}#e={ed25519}&c={curve25519}&o={one_time_key}
-            // Hub ID is in the path, keys are in the fragment (never sent to server)
-            hub.connection_url = if let Some(ref keys) = hub.browser.olm_keys {
-                Some(format!(
-                    "{}/hubs/{}#e={}&c={}&o={}",
-                    hub.config.server_url,
-                    hub.hub_identifier,
-                    keys.ed25519,
-                    keys.curve25519,
-                    keys.one_time_key
-                ))
-            } else {
-                log::error!("Cannot show connection code: Olm keys not initialized");
-                None
-            };
+            // Get connection URL from Tailscale connection info
+            // Format: /hubs/{id}#key={browser_preauth_key}
+            // Hub ID is in the path, key is in the fragment (never sent to server)
+            hub.connection_url = hub.browser.tailscale_connection_url.clone();
+            if hub.connection_url.is_none() {
+                log::error!("Cannot show connection code: Tailscale not connected");
+            }
             hub.mode = AppMode::ConnectionCode;
         }
 

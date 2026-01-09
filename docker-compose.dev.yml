@@ -1,0 +1,17 @@
+services:
+  headscale:
+    image: headscale/headscale:0.23
+    container_name: headscale-dev
+    restart: unless-stopped
+    ports:
+      - "8080:8080"      # HTTP API & DERP
+      - "9090:9090"      # Metrics
+      - "50443:50443"    # gRPC API
+      - "3478:3478/udp"  # STUN
+    volumes:
+      - headscale_data:/var/lib/headscale
+      - ./config/headscale:/etc/headscale:ro
+    command: serve
+
+volumes:
+  headscale_data:

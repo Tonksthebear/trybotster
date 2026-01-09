@@ -1,7 +1,0 @@
-/Users/exampleuser/Rails/trybotster/vodozemac-wasm/target/debug/deps/poly1305-da4e8aecafa409ad.d: /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/poly1305-0.8.0/src/lib.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/poly1305-0.8.0/src/backend.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/poly1305-0.8.0/src/backend/soft.rs
-
-/Users/exampleuser/Rails/trybotster/vodozemac-wasm/target/debug/deps/libpoly1305-da4e8aecafa409ad.rmeta: /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/poly1305-0.8.0/src/lib.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/poly1305-0.8.0/src/backend.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/poly1305-0.8.0/src/backend/soft.rs
-
-/Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/poly1305-0.8.0/src/lib.rs:
-/Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/poly1305-0.8.0/src/backend.rs:
-/Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/poly1305-0.8.0/src/backend/soft.rs:
