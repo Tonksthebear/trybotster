@@ -99,6 +99,7 @@ pub fn spawn_cli_pty(
         reader,
         Arc::clone(&pty.vt100_parser),
         Arc::clone(&pty.buffer),
+        Arc::clone(&pty.raw_output_queue),
         notification_tx,
     ));
 

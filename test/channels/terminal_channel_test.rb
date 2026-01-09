@@ -72,9 +72,13 @@ class TerminalChannelTest < ActionCable::Channel::TestCase
 
     stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
 
-    # Check that relay broadcasts with from: cli
+    # Check that relay broadcasts with from: cli (using Olm envelope format)
     assert_broadcasts(stream_name, 1) do
-      perform :relay, blob: "encrypted_data", nonce: "nonce_value"
+      perform :relay,
+        version: 3,
+        message_type: 1,
+        ciphertext: "encrypted_data",
+        sender_key: "cli_curve25519_key"
     end
   end
 
@@ -84,8 +88,13 @@ class TerminalChannelTest < ActionCable::Channel::TestCase
 
     stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
 
+    # Using Olm envelope format
     assert_broadcasts(stream_name, 1) do
-      perform :relay, blob: "browser_data", nonce: "browser_nonce"
+      perform :relay,
+        version: 3,
+        message_type: 1,
+        ciphertext: "browser_encrypted_data",
+        sender_key: "browser_curve25519_key"
     end
   end
 
@@ -100,14 +109,74 @@ class TerminalChannelTest < ActionCable::Channel::TestCase
     end
   end
 
-  test "resize broadcasts" do
+  # Note: resize action was removed - resize now goes through encrypted relay
+  # The browser sends BrowserCommand::Resize through the Olm-encrypted channel
+
+  # === Tests proving Olm E2E encryption relay issues ===
+
+  test "relay requires Olm envelope fields (version, ciphertext)" do
     stub_connection current_user: @user
     subscribe hub_identifier: @hub.identifier, device_type: "browser"
 
     stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
 
+    # Missing required Olm envelope fields - should NOT broadcast
+    assert_no_broadcasts(stream_name) do
+      perform :relay, blob: "old_format_data"
+    end
+  end
+
+  test "relay broadcasts Olm envelope with all required fields" do
+    stub_connection current_user: @user
+    subscribe hub_identifier: @hub.identifier, device_type: "browser"
+
+    stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
+
+    # Proper Olm v3 envelope format
     assert_broadcasts(stream_name, 1) do
-      perform :resize, cols: 80, rows: 24
+      perform :relay,
+        version: 3,
+        message_type: 1,
+        ciphertext: "base64_encrypted_data_here",
+        sender_key: "curve25519_key_here"
+    end
+  end
+
+  test "relay preserves sender_key for Olm session identification" do
+    stub_connection current_user: @user
+    subscribe hub_identifier: @hub.identifier, device_type: "cli"
+
+    stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
+
+    # The sender_key is critical for Olm - browser needs it to know which session to use
+    assert_broadcasts(stream_name, 1) do
+      perform :relay,
+        version: 3,
+        message_type: 0,  # PreKey message
+        ciphertext: "prekey_ciphertext",
+        sender_key: "my_curve25519_identity_key"
+    end
+  end
+
+  test "presence includes prekey_message for Olm session establishment" do
+    stub_connection current_user: @user
+    subscribe hub_identifier: @hub.identifier, device_type: "browser"
+
+    stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
+
+    # Browser sends PreKey message in presence to establish Olm session
+    olm_prekey = {
+      version: 3,
+      message_type: 0,
+      ciphertext: "prekey_ciphertext_base64",
+      sender_key: "browser_curve25519_key"
+    }
+
+    assert_broadcasts(stream_name, 1) do
+      perform :presence,
+        event: "join",
+        device_name: "Chrome Browser",
+        prekey_message: olm_prekey
     end
   end
 end

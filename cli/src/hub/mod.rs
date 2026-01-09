@@ -54,6 +54,8 @@ use reqwest::blocking::Client;
 use crate::app::AppMode;
 use crate::config::Config;
 use crate::device::Device;
+use crate::git::WorktreeManager;
+use crate::relay::persistence::hub_id_for_repo;
 use crate::tunnel::TunnelManager;
 
 /// Central orchestrator for the botster-hub application.
@@ -138,7 +140,22 @@ impl Hub {
 
         let state = HubState::new(config.worktree_base.clone());
         let tokio_runtime = tokio::runtime::Runtime::new()?;
-        let hub_identifier = uuid::Uuid::new_v4().to_string();
+
+        // Generate stable hub_identifier from repo path (survives restarts)
+        let hub_identifier = match WorktreeManager::detect_current_repo() {
+            Ok((repo_path, _)) => {
+                let id = hub_id_for_repo(&repo_path);
+                log::info!("Hub identifier (from repo): {}...", &id[..8]);
+                id
+            }
+            Err(_) => {
+                // Fallback to UUID if not in a repo
+                let id = uuid::Uuid::new_v4().to_string();
+                log::info!("Hub identifier (random): {}...", &id[..8]);
+                id
+            }
+        };
+
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
@@ -437,7 +454,6 @@ impl Hub {
     pub fn connect_terminal_relay(&mut self) {
         registration::connect_terminal_relay(
             &mut self.browser,
-            &self.device.secret_key,
             &self.hub_identifier,
             &self.config.server_url,
             self.config.get_api_key(),
@@ -491,7 +507,6 @@ mod tests {
             agent_timeout: 300,
             max_sessions: 10,
             worktree_base: PathBuf::from("/tmp/test-worktrees"),
-            server_assisted_pairing: false,
         }
     }
 

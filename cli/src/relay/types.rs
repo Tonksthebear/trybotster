@@ -65,6 +65,15 @@ pub enum TerminalMessage {
         /// Error description.
         message: String,
     },
+    /// Scrollback history for terminal.
+    ///
+    /// Sent when an agent is selected so the browser can populate
+    /// xterm's scrollback buffer with historical output.
+    #[serde(rename = "scrollback")]
+    Scrollback {
+        /// Lines of scrollback history (oldest first).
+        lines: Vec<String>,
+    },
 }
 
 /// Agent info for list response.
@@ -111,6 +120,14 @@ pub struct WorktreeInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum BrowserCommand {
+    /// Handshake message for session establishment/reconnection.
+    #[serde(rename = "handshake")]
+    Handshake {
+        /// Browser's device name.
+        device_name: String,
+        /// Browser's Curve25519 identity key (base64).
+        browser_curve25519: String,
+    },
     /// Terminal input from browser.
     #[serde(rename = "input")]
     Input {
@@ -178,6 +195,14 @@ pub enum BrowserCommand {
     /// Scroll to top.
     #[serde(rename = "scroll_to_top")]
     ScrollToTop,
+    /// Terminal resize.
+    #[serde(rename = "resize")]
+    Resize {
+        /// Number of columns.
+        cols: u16,
+        /// Number of rows.
+        rows: u16,
+    },
 }
 
 /// Encrypted message envelope (sent via Action Cable).
@@ -448,5 +473,45 @@ mod tests {
         let json = r#"{"type":"toggle_pty_view"}"#;
         let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
         assert!(matches!(cmd, BrowserCommand::TogglePtyView));
+    }
+
+    // ========== Scrollback Message Tests (TDD) ==========
+
+    #[test]
+    fn test_terminal_message_scrollback_serialization() {
+        let msg = TerminalMessage::Scrollback {
+            lines: vec![
+                "Line 1: some output".to_string(),
+                "Line 2: more output".to_string(),
+                "Line 3: \x1b[32mcolored\x1b[0m output".to_string(),
+            ],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"scrollback""#));
+        assert!(json.contains(r#""lines":"#));
+        assert!(json.contains("Line 1: some output"));
+        assert!(json.contains("Line 3:"));
+    }
+
+    #[test]
+    fn test_terminal_message_scrollback_empty() {
+        let msg = TerminalMessage::Scrollback { lines: vec![] };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"scrollback""#));
+        assert!(json.contains(r#""lines":[]"#));
+    }
+
+    #[test]
+    fn test_terminal_message_scrollback_deserialization() {
+        let json = r#"{"type":"scrollback","lines":["line1","line2"]}"#;
+        let parsed: TerminalMessage = serde_json::from_str(json).unwrap();
+        match parsed {
+            TerminalMessage::Scrollback { lines } => {
+                assert_eq!(lines.len(), 2);
+                assert_eq!(lines[0], "line1");
+                assert_eq!(lines[1], "line2");
+            }
+            _ => panic!("Wrong variant"),
+        }
     }
 }

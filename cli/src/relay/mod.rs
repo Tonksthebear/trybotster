@@ -3,7 +3,7 @@
 //! This module provides the browser relay functionality, handling WebSocket
 //! communication with connected browser clients via Action Cable. It manages:
 //!
-//! - E2E encrypted communication
+//! - E2E encrypted communication (vodozemac Olm)
 //! - Browser event to Hub action conversion
 //! - Terminal output streaming
 //!
@@ -18,23 +18,31 @@
 //! # Encryption
 //!
 //! All communication between the CLI and browser is E2E encrypted using
-//! Double Ratchet (Signal protocol compatible) with per-message forward secrecy.
+//! vodozemac's Olm implementation - the same NCC-audited cryptography used by Matrix.
 //! The Rails server only sees encrypted blobs and cannot read the terminal content.
+//!
+//! ## Protocol (Olm)
+//!
+//! 1. CLI generates Olm account and displays QR code with session keys
+//! 2. Browser scans QR code (ed25519, curve25519, one_time_key)
+//! 3. Browser creates outbound Olm session using CLI's keys
+//! 4. Browser sends PreKey message to establish session
+//! 5. CLI creates inbound session from PreKey message
+//! 6. Both sides can now encrypt/decrypt with the session
 //!
 //! # Modules
 //!
-//! - [`connection`] - WebSocket transport and encryption
+//! - [`connection`] - WebSocket transport and Olm encryption
 //! - [`events`] - Browser event to Hub action conversion
-//! - [`ratchet`] - Double Ratchet implementation for E2E encryption
+//! - [`olm`] - Olm E2E encryption (vodozemac wrapper)
 //! - [`state`] - Browser connection state management
 //! - [`types`] - Protocol message types
-
-// Rust guideline compliant 2025-01
 
 pub mod browser;
 pub mod connection;
 pub mod events;
-pub mod ratchet;
+pub mod olm;
+pub mod persistence;
 pub mod state;
 pub mod types;
 
@@ -44,17 +52,14 @@ pub use events::{
 };
 pub use state::{
     build_agent_info, build_worktree_info, send_agent_list, send_agent_selected,
-    send_worktree_list, BrowserSendContext, BrowserState,
+    send_scrollback, send_worktree_list, BrowserSendContext, BrowserState,
 };
 
-// Re-export types for external use
 pub use types::{
     AgentInfo, BrowserCommand, BrowserEvent, BrowserResize, EncryptedEnvelope, TerminalMessage,
     WorktreeInfo,
 };
 
-// Re-export connection types
 pub use connection::{TerminalOutputSender, TerminalRelay};
 
-// Re-export ratchet types
-pub use ratchet::{RatchetEnvelope, RatchetHeader, RatchetSession};
+pub use olm::{OlmAccount, OlmEnvelope, OlmSession, SessionEstablishmentKeys};

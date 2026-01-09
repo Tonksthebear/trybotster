@@ -2,7 +2,7 @@
 //!
 //! This module handles:
 //! - WebSocket connection to Rails Action Cable (TerminalChannel)
-//! - E2E encryption using Double Ratchet (Signal protocol compatible)
+//! - E2E encryption using vodozemac Olm (Matrix's audited crypto library)
 //! - Relaying encrypted terminal output to browser
 //! - Receiving encrypted terminal input from browser
 //!
@@ -10,24 +10,22 @@
 //!
 //! 1. CLI connects to Action Cable WebSocket
 //! 2. CLI subscribes to TerminalChannel with hub_identifier
-//! 3. Browser connects and sends presence with its public_key
-//! 4. CLI receives browser's public_key, computes shared secret
-//! 5. Double Ratchet initialized with shared secret for per-message forward secrecy
-//! 6. Server only sees encrypted blobs - zero knowledge
+//! 3. CLI displays QR code with (ed25519, curve25519, one_time_key)
+//! 4. Browser scans QR, creates outbound Olm session
+//! 5. Browser sends PreKey message in presence "join"
+//! 6. CLI creates inbound Olm session from PreKey message
+//! 7. Both sides have Olm session - server only sees encrypted blobs
 //!
 //! Rust guideline compliant 2025-01
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use crypto_box::SecretKey;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message};
 
-use super::ratchet::{RatchetEnvelope, RatchetSession};
+use super::olm::{OlmAccount, OlmEnvelope, OlmSession};
 use super::types::{BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage};
 
 /// Action Cable message format.
@@ -59,106 +57,110 @@ struct IncomingCableMessage {
 ///
 /// # Security
 ///
-/// - `ratchet` implements `ZeroizeOnDrop` - all session keys are securely erased when dropped
-/// - `secret_key` is the device's X25519 private key (also stored in OS keyring)
-///   Used only briefly to compute initial shared secret for Double Ratchet
+/// - `account` holds the Olm account with identity keys and one-time keys
+/// - `session` is created when browser sends PreKey message
+/// - All session keys are securely managed by vodozemac
 struct RelayState {
-    secret_key: SecretKey,
-    ratchet: Option<RatchetSession>,
+    account: OlmAccount,
+    session: Option<OlmSession>,
     browser_connected: bool,
+    /// Hub identifier for session persistence.
+    hub_identifier: String,
 }
 
 impl RelayState {
-    fn new(secret_key: SecretKey) -> Self {
+    /// Create state without session (for tests only).
+    #[cfg(test)]
+    fn new(account: OlmAccount) -> Self {
         Self {
-            secret_key,
-            ratchet: None,
+            account,
+            session: None,
             browser_connected: false,
+            hub_identifier: "test-hub".to_string(),
         }
     }
 
-    /// Set the peer's public key and initialize Double Ratchet
-    ///
-    /// If signature and verifying_key are provided, verifies the signature first.
-    /// This prevents MITM attacks by ensuring the public key was signed by a real device.
-    fn set_peer_public_key(
-        &mut self,
-        peer_public_key_base64: &str,
-        signature_base64: Option<&str>,
-        verifying_key_base64: Option<&str>,
-    ) -> Result<()> {
-        let peer_key_bytes = BASE64.decode(peer_public_key_base64)
-            .context("Invalid peer public key encoding")?;
+    fn new_with_session(
+        account: OlmAccount,
+        session: Option<OlmSession>,
+        hub_identifier: String,
+    ) -> Self {
+        let browser_connected = session.is_some();
+        Self {
+            account,
+            session,
+            browser_connected,
+            hub_identifier,
+        }
+    }
 
-        let peer_public_key: [u8; 32] = peer_key_bytes.clone().try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid peer public key length"))?;
+    /// Get the account's Curve25519 identity key (for envelope construction)
+    fn our_curve25519(&self) -> String {
+        self.account.curve25519_key()
+    }
 
-        // Verify signature if provided
-        match (signature_base64, verifying_key_base64) {
-            (Some(sig_b64), Some(vk_b64)) => {
-                // Decode signature
-                let sig_bytes = BASE64.decode(sig_b64)
-                    .context("Invalid signature encoding")?;
-                let signature = Signature::from_slice(&sig_bytes)
-                    .map_err(|e| anyhow::anyhow!("Invalid signature format: {}", e))?;
-
-                // Decode verifying key
-                let vk_bytes = BASE64.decode(vk_b64)
-                    .context("Invalid verifying key encoding")?;
-                let vk_array: [u8; 32] = vk_bytes.try_into()
-                    .map_err(|_| anyhow::anyhow!("Invalid verifying key length"))?;
-                let verifying_key = VerifyingKey::from_bytes(&vk_array)
-                    .map_err(|e| anyhow::anyhow!("Invalid verifying key: {}", e))?;
-
-                // Verify that the public key was signed by the browser's signing key
-                verifying_key.verify(&peer_key_bytes, &signature)
-                    .map_err(|_| anyhow::anyhow!("SECURITY: Signature verification failed - possible MITM attack!"))?;
-
-                log::info!("Signature verified - public key is authentic");
-            }
-            (None, None) => {
-                // Legacy browser without signing - allow but warn
-                log::warn!("SECURITY: Browser did not provide signature - cannot verify authenticity");
-                log::warn!("This connection is vulnerable to MITM attacks until browser is upgraded");
-            }
-            _ => {
-                // Partial signature data is suspicious
-                anyhow::bail!("SECURITY: Partial signature data provided - rejecting connection");
+    /// Persist the current session to disk for surviving restarts.
+    fn persist_session(&self) {
+        if let Some(ref session) = self.session {
+            if let Err(e) = super::persistence::save_session(&self.hub_identifier, session) {
+                log::warn!("Failed to persist Olm session: {e}");
             }
         }
+    }
 
-        // Compute raw X25519 shared secret
-        let peer_public = x25519_dalek::PublicKey::from(peer_public_key);
-        let our_secret = x25519_dalek::StaticSecret::from(self.secret_key.to_bytes());
-        let shared_secret = our_secret.diffie_hellman(&peer_public).to_bytes();
+    /// Create inbound Olm session from browser's PreKey message.
+    ///
+    /// The browser sends a PreKey message that includes:
+    /// - Their Curve25519 identity key
+    /// - The initial encrypted message
+    fn create_session_from_prekey(
+        &mut self,
+        sender_curve25519: &str,
+        prekey_message: &OlmEnvelope,
+    ) -> Result<Vec<u8>> {
+        let (session, plaintext) = self.account
+            .create_inbound_session(sender_curve25519, prekey_message)
+            .context("Failed to create inbound Olm session")?;
 
-        // Initialize Double Ratchet (CLI is always the initiator)
-        let ratchet = RatchetSession::new(&shared_secret, true)
-            .context("Failed to initialize Double Ratchet")?;
-        self.ratchet = Some(ratchet);
+        self.session = Some(session);
         self.browser_connected = true;
 
-        log::info!("Double Ratchet initialized for E2E encryption with browser");
-        Ok(())
+        // Persist session for surviving CLI restarts
+        self.persist_session();
+
+        log::info!("Olm session established for E2E encryption with browser");
+        Ok(plaintext)
     }
 
-    /// Encrypt a message for the peer using Double Ratchet
-    fn encrypt(&mut self, message: &TerminalMessage) -> Result<RatchetEnvelope> {
-        let ratchet = self.ratchet.as_mut()
-            .context("No ratchet session - browser not connected")?;
+    /// Encrypt a message for the browser using Olm
+    fn encrypt(&mut self, message: &TerminalMessage) -> Result<OlmEnvelope> {
+        // Get our key before borrowing session mutably
+        let our_key = self.our_curve25519();
+
+        let session = self.session.as_mut()
+            .context("No Olm session - browser not connected")?;
 
         let plaintext = serde_json::to_vec(message)
             .context("Failed to serialize message")?;
 
-        ratchet.encrypt(&plaintext)
+        let envelope = session.encrypt(&plaintext, &our_key);
+
+        // Persist session after encrypt (ratchet advances)
+        self.persist_session();
+
+        Ok(envelope)
     }
 
-    /// Decrypt a command from the browser using Double Ratchet
-    fn decrypt_command(&mut self, envelope: &RatchetEnvelope) -> Result<BrowserCommand> {
-        let ratchet = self.ratchet.as_mut()
-            .context("No ratchet session - browser not connected")?;
+    /// Decrypt a command from the browser using Olm
+    fn decrypt_command(&mut self, envelope: &OlmEnvelope) -> Result<BrowserCommand> {
+        let session = self.session.as_mut()
+            .context("No Olm session - browser not connected")?;
 
-        let plaintext = ratchet.decrypt(envelope)?;
+        let plaintext = session.decrypt(envelope)?;
+
+        // Persist session after decrypt (ratchet advances)
+        // (mutable borrow of session ends here naturally)
+        self.persist_session();
 
         // Log the decrypted JSON for debugging
         if let Ok(json_str) = std::str::from_utf8(&plaintext) {
@@ -173,11 +175,11 @@ impl RelayState {
 
     /// Decrypt a message (for testing - decrypts TerminalMessage sent from CLI)
     #[cfg(test)]
-    fn decrypt(&mut self, envelope: &RatchetEnvelope) -> Result<TerminalMessage> {
-        let ratchet = self.ratchet.as_mut()
-            .context("No ratchet session - browser not connected")?;
+    fn decrypt(&mut self, envelope: &OlmEnvelope) -> Result<TerminalMessage> {
+        let session = self.session.as_mut()
+            .context("No Olm session - browser not connected")?;
 
-        let plaintext = ratchet.decrypt(envelope)?;
+        let plaintext = session.decrypt(envelope)?;
 
         let message: TerminalMessage = serde_json::from_slice(&plaintext)
             .context("Failed to parse decrypted message")?;
@@ -186,7 +188,7 @@ impl RelayState {
     }
 
     fn is_ready(&self) -> bool {
-        self.browser_connected && self.ratchet.is_some()
+        self.browser_connected && self.session.is_some()
     }
 }
 
@@ -225,7 +227,8 @@ impl TerminalOutputSender {
 
 /// Terminal relay connection
 pub struct TerminalRelay {
-    secret_key: SecretKey,
+    account: OlmAccount,
+    existing_session: Option<OlmSession>,
     hub_identifier: String,
     server_url: String,
     api_key: String,
@@ -236,6 +239,7 @@ impl std::fmt::Debug for TerminalRelay {
         f.debug_struct("TerminalRelay")
             .field("hub_identifier", &self.hub_identifier)
             .field("server_url", &self.server_url)
+            .field("has_existing_session", &self.existing_session.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -243,13 +247,31 @@ impl std::fmt::Debug for TerminalRelay {
 impl TerminalRelay {
     /// Create a new terminal relay
     pub fn new(
-        secret_key: SecretKey,
+        account: OlmAccount,
         hub_identifier: String,
         server_url: String,
         api_key: String,
     ) -> Self {
         Self {
-            secret_key,
+            account,
+            existing_session: None,
+            hub_identifier,
+            server_url,
+            api_key,
+        }
+    }
+
+    /// Create a new terminal relay with an existing session (for reconnection).
+    pub fn new_with_session(
+        account: OlmAccount,
+        existing_session: Option<OlmSession>,
+        hub_identifier: String,
+        server_url: String,
+        api_key: String,
+    ) -> Self {
+        Self {
+            account,
+            existing_session,
             hub_identifier,
             server_url,
             api_key,
@@ -266,8 +288,12 @@ impl TerminalRelay {
         let ws_url = self.build_ws_url();
         let hub_identifier = self.hub_identifier.clone();
 
-        // Create shared state (consumes secret_key)
-        let state = Arc::new(RwLock::new(RelayState::new(self.secret_key)));
+        // Create shared state (consumes account, may include existing session)
+        let state = Arc::new(RwLock::new(RelayState::new_with_session(
+            self.account,
+            self.existing_session,
+            hub_identifier.clone(),
+        )));
 
         // Create channels
         let (output_tx, mut output_rx) = mpsc::channel::<String>(100);
@@ -286,12 +312,13 @@ impl TerminalRelay {
                 .parse()
                 .unwrap_or_else(|_| "http://localhost".parse().expect("localhost is a valid header value")),
         );
-        // Set Authorization header with API key (instead of query param for security)
+
+        // Set Authorization header with bearer token (Fizzy pattern)
         request.headers_mut().insert(
             "Authorization",
             format!("Bearer {}", self.api_key)
                 .parse()
-                .expect("Bearer token is a valid header value"),
+                .expect("Bearer token is valid header value"),
         );
 
         // Connect to WebSocket
@@ -373,18 +400,18 @@ impl TerminalRelay {
                     if let Ok(envelope) = state.encrypt(&message) {
                         drop(state); // Release lock before network I/O
 
-                        // Serialize RatchetEnvelope for transmission
+                        // Serialize OlmEnvelope for transmission
                         let data = serde_json::json!({
                             "action": "relay",
                             "version": envelope.version,
-                            "header": envelope.header,
+                            "message_type": envelope.message_type,
                             "ciphertext": envelope.ciphertext,
-                            "mac": envelope.mac,
+                            "sender_key": envelope.sender_key,
                         });
                         let cable_msg = CableMessage {
                             command: "message".to_string(),
                             identifier: identifier_out.clone(),
-                            data: Some(serde_json::to_string(&data).expect("RatchetEnvelope is serializable")),
+                            data: Some(serde_json::to_string(&data).expect("OlmEnvelope is serializable")),
                         };
 
                         let mut write = write_out.lock().await;
@@ -427,15 +454,19 @@ impl TerminalRelay {
                                         "terminal" => {
                                             // Only process messages from browser
                                             if message.get("from").and_then(|v| v.as_str()) == Some("browser") {
-                                                // Parse RatchetEnvelope (v2 format)
-                                                if let Ok(envelope) = serde_json::from_value::<RatchetEnvelope>(message.clone()) {
-                                                    // Need write lock for decryption (ratchet mutates state)
+                                                // Parse OlmEnvelope (v3 format)
+                                                if let Ok(envelope) = serde_json::from_value::<OlmEnvelope>(message.clone()) {
+                                                    // Need write lock for decryption (session mutates state)
                                                     let mut state = state_in.write().await;
                                                     match state.decrypt_command(&envelope) {
                                                         Ok(cmd) => {
                                                             drop(state);
                                                             // Convert BrowserCommand to BrowserEvent
                                                             let event = match cmd {
+                                                                BrowserCommand::Handshake { .. } => {
+                                                                    // Handshake is handled in presence join, skip here
+                                                                    continue;
+                                                                }
                                                                 BrowserCommand::Input { data } => BrowserEvent::Input(data),
                                                                 BrowserCommand::SetMode { mode } => BrowserEvent::SetMode { mode },
                                                                 BrowserCommand::ListAgents => BrowserEvent::ListAgents,
@@ -459,6 +490,9 @@ impl TerminalRelay {
                                                                 }
                                                                 BrowserCommand::ScrollToBottom => BrowserEvent::ScrollToBottom,
                                                                 BrowserCommand::ScrollToTop => BrowserEvent::ScrollToTop,
+                                                                BrowserCommand::Resize { cols, rows } => {
+                                                                    BrowserEvent::Resize(BrowserResize { cols, rows })
+                                                                }
                                                             };
                                                             if let Err(e) = event_tx.send(event).await {
                                                                 log::error!("Failed to forward browser event: {}", e);
@@ -477,41 +511,108 @@ impl TerminalRelay {
                                                 if let Some(event) = message.get("event").and_then(|v| v.as_str()) {
                                                     match event {
                                                         "join" => {
-                                                            // Browser joined - extract public key and signature for key exchange
-                                                            if let Some(public_key) = message.get("public_key").and_then(|v| v.as_str()) {
-                                                                let device_name = message.get("device_name")
-                                                                    .and_then(|v| v.as_str())
-                                                                    .unwrap_or("Browser")
-                                                                    .to_string();
+                                                            // Browser joined - handle session establishment or reconnection
+                                                            let prekey_message = message.get("prekey_message");
 
-                                                                // Extract optional signature and verifying key
-                                                                let signature = message.get("signature").and_then(|v| v.as_str());
-                                                                let verifying_key = message.get("verifying_key").and_then(|v| v.as_str());
+                                                            let device_name = message.get("device_name")
+                                                                .and_then(|v| v.as_str())
+                                                                .unwrap_or("Browser")
+                                                                .to_string();
 
-                                                                log::info!("Browser connected: {} - setting up E2E encryption", device_name);
+                                                            if let Some(prekey) = prekey_message {
+                                                                // Parse the envelope
+                                                                match serde_json::from_value::<OlmEnvelope>(prekey.clone()) {
+                                                                    Ok(envelope) => {
+                                                                        let sender_key = &envelope.sender_key;
+                                                                        let mut state = state_in.write().await;
 
-                                                                // Set up shared secret with signature verification
-                                                                let mut state = state_in.write().await;
-                                                                if let Err(e) = state.set_peer_public_key(public_key, signature, verifying_key) {
-                                                                    log::error!("Failed to set browser public key: {}", e);
-                                                                } else {
-                                                                    drop(state);
-                                                                    if let Err(e) = event_tx.send(BrowserEvent::Connected {
-                                                                        public_key: public_key.to_string(),
-                                                                        device_name,
-                                                                    }).await {
-                                                                        log::error!("Failed to send connected event: {}", e);
+                                                                        // Check if we already have a session (browser reconnecting)
+                                                                        if state.session.is_some() {
+                                                                            // Session exists - browser is reconnecting
+                                                                            log::info!(
+                                                                                "Browser reconnected: {} - message_type={} (0=PreKey, 1=Normal)",
+                                                                                device_name,
+                                                                                envelope.message_type
+                                                                            );
+
+                                                                            // Try to decrypt with existing session
+                                                                            match state.decrypt_command(&envelope) {
+                                                                                Ok(cmd) => {
+                                                                                    // Verify it's a handshake command
+                                                                                    match cmd {
+                                                                                        BrowserCommand::Handshake { device_name: dn, .. } => {
+                                                                                            log::info!("Reconnection successful for {}", dn);
+                                                                                            state.browser_connected = true;
+                                                                                            drop(state);
+                                                                                            if let Err(e) = event_tx.send(BrowserEvent::Connected {
+                                                                                                public_key: sender_key.to_string(),
+                                                                                                device_name: dn,
+                                                                                            }).await {
+                                                                                                log::error!("Failed to send connected event: {}", e);
+                                                                                            }
+                                                                                        }
+                                                                                        _ => {
+                                                                                            log::warn!("Expected handshake on reconnect, got {:?}", cmd);
+                                                                                            state.browser_connected = true;
+                                                                                            drop(state);
+                                                                                            if let Err(e) = event_tx.send(BrowserEvent::Connected {
+                                                                                                public_key: sender_key.to_string(),
+                                                                                                device_name,
+                                                                                            }).await {
+                                                                                                log::error!("Failed to send connected event: {}", e);
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                Err(e) => {
+                                                                                    // Session mismatch - browser has stale session
+                                                                                    log::warn!(
+                                                                                        "Reconnection decrypt failed: {} - message_type was {}",
+                                                                                        e,
+                                                                                        envelope.message_type
+                                                                                    );
+                                                                                    log::info!("Clearing CLI session - browser should rescan QR");
+                                                                                    state.session = None;
+                                                                                    state.browser_connected = false;
+                                                                                    drop(state);
+                                                                                    // Don't send Connected - browser will see decryption failures
+                                                                                }
+                                                                            }
+                                                                        } else {
+                                                                            // No session - this should be a PreKey message
+                                                                            log::info!("Browser connected: {} - establishing Olm session", device_name);
+
+                                                                            match state.create_session_from_prekey(sender_key, &envelope) {
+                                                                                Ok(_plaintext) => {
+                                                                                    drop(state);
+                                                                                    if let Err(e) = event_tx.send(BrowserEvent::Connected {
+                                                                                        public_key: sender_key.to_string(),
+                                                                                        device_name,
+                                                                                    }).await {
+                                                                                        log::error!("Failed to send connected event: {}", e);
+                                                                                    }
+                                                                                }
+                                                                                Err(e) => {
+                                                                                    log::error!("Failed to create Olm session: {}", e);
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        log::error!("Invalid message format: {}", e);
                                                                     }
                                                                 }
                                                             } else {
-                                                                log::warn!("Browser joined without public key - cannot establish E2E encryption");
+                                                                log::warn!("Browser joined without PreKey message - cannot establish E2E encryption");
                                                             }
                                                         }
                                                         "leave" => {
                                                             log::info!("Browser disconnected");
                                                             let mut state = state_in.write().await;
                                                             state.browser_connected = false;
-                                                            state.ratchet = None;
+                                                            // Keep session alive for reconnection!
+                                                            // Browser will reconnect with its saved session.
+                                                            // state.session = None;  // DON'T clear session
                                                             drop(state);
 
                                                             if let Err(e) = event_tx.send(BrowserEvent::Disconnected).await {
@@ -519,23 +620,6 @@ impl TerminalRelay {
                                                             }
                                                         }
                                                         _ => {}
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        "resize" => {
-                                            // Browser sent resize event
-                                            if message.get("from").and_then(|v| v.as_str()) == Some("browser") {
-                                                if let (Some(cols), Some(rows)) = (
-                                                    message.get("cols").and_then(serde_json::Value::as_i64),
-                                                    message.get("rows").and_then(serde_json::Value::as_i64),
-                                                ) {
-                                                    log::info!("Browser resize: {}x{}", cols, rows);
-                                                    if let Err(e) = event_tx.send(BrowserEvent::Resize(BrowserResize {
-                                                        cols: cols as u16,
-                                                        rows: rows as u16,
-                                                    })).await {
-                                                        log::error!("Failed to send resize event: {}", e);
                                                     }
                                                 }
                                             }
@@ -568,7 +652,6 @@ impl TerminalRelay {
             .replace("https://", "wss://")
             .replace("http://", "ws://");
 
-        // Action Cable endpoint (API key is sent via Authorization header, not URL)
         format!("{}/cable", base)
     }
 }
@@ -576,107 +659,151 @@ impl TerminalRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
-    use rand::{rngs::OsRng, RngCore};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
     #[test]
     fn test_relay_state_is_ready() {
-        let secret = SecretKey::generate(&mut OsRng);
-        let state = RelayState::new(secret);
+        let account = OlmAccount::new();
+        let state = RelayState::new(account);
         assert!(!state.is_ready());
     }
 
     #[test]
-    fn test_relay_state_becomes_ready_after_peer_key_legacy() {
-        // Test legacy mode (no signature)
-        let cli_secret = SecretKey::generate(&mut OsRng);
-        let browser_secret = SecretKey::generate(&mut OsRng);
-        let browser_public = browser_secret.public_key();
+    fn test_relay_state_becomes_ready_after_prekey() {
+        // CLI creates account and generates one-time key
+        let mut cli_account = OlmAccount::new();
+        cli_account.generate_one_time_keys(1);
+        let cli_identity = cli_account.curve25519_key();
+        let cli_otk = cli_account.get_one_time_key().unwrap();
 
-        let mut state = RelayState::new(cli_secret);
+        // Browser creates account and outbound session
+        let browser_account = OlmAccount::new();
+        let browser_identity = browser_account.curve25519_key();
+
+        // Browser creates outbound session to CLI
+        let mut browser_session = browser_account
+            .create_outbound_session(&cli_identity, &cli_otk)
+            .unwrap();
+
+        // Browser sends PreKey message
+        let plaintext = b"Hello CLI!";
+        let message = browser_session.encrypt(plaintext);
+        let (message_type, ciphertext) = match message {
+            vodozemac::olm::OlmMessage::PreKey(m) => (0u8, BASE64.encode(m.to_bytes())),
+            vodozemac::olm::OlmMessage::Normal(m) => (1u8, BASE64.encode(m.to_bytes())),
+        };
+        assert_eq!(message_type, 0); // First message should be PreKey
+
+        let envelope = OlmEnvelope {
+            version: OlmEnvelope::VERSION,
+            message_type,
+            ciphertext,
+            sender_key: browser_identity.clone(),
+        };
+
+        // CLI receives and creates inbound session
+        let mut state = RelayState::new(cli_account);
         assert!(!state.is_ready());
 
-        state
-            .set_peer_public_key(&BASE64.encode(browser_public.as_bytes()), None, None)
-            .unwrap();
+        let decrypted = state.create_session_from_prekey(&browser_identity, &envelope).unwrap();
+        assert_eq!(decrypted, plaintext);
         assert!(state.is_ready());
     }
 
     #[test]
-    fn test_relay_state_with_valid_signature() {
-        // Test with valid Ed25519 signature
-        let cli_secret = SecretKey::generate(&mut OsRng);
-        let browser_secret = SecretKey::generate(&mut OsRng);
-        let browser_public = browser_secret.public_key();
+    fn test_encrypt_produces_olm_envelope() {
+        // Set up a session first
+        let mut cli_account = OlmAccount::new();
+        cli_account.generate_one_time_keys(1);
+        let cli_identity = cli_account.curve25519_key();
+        let cli_otk = cli_account.get_one_time_key().unwrap();
 
-        // Generate signing keypair
-        let mut signing_secret = [0u8; 32];
-        OsRng.fill_bytes(&mut signing_secret);
-        let signing_key = SigningKey::from_bytes(&signing_secret);
-        let verifying_key = signing_key.verifying_key();
+        let browser_account = OlmAccount::new();
+        let browser_identity = browser_account.curve25519_key();
 
-        // Sign the browser's public key
-        use ed25519_dalek::Signer;
-        let signature = signing_key.sign(browser_public.as_bytes());
-
-        let mut state = RelayState::new(cli_secret);
-        state
-            .set_peer_public_key(
-                &BASE64.encode(browser_public.as_bytes()),
-                Some(&BASE64.encode(signature.to_bytes())),
-                Some(&BASE64.encode(verifying_key.as_bytes())),
-            )
-            .unwrap();
-        assert!(state.is_ready());
-    }
-
-    #[test]
-    fn test_relay_state_rejects_invalid_signature() {
-        // Test that invalid signature is rejected
-        let cli_secret = SecretKey::generate(&mut OsRng);
-        let browser_secret = SecretKey::generate(&mut OsRng);
-        let browser_public = browser_secret.public_key();
-
-        // Generate signing keypair but sign wrong data
-        let mut signing_secret = [0u8; 32];
-        OsRng.fill_bytes(&mut signing_secret);
-        let signing_key = SigningKey::from_bytes(&signing_secret);
-        let verifying_key = signing_key.verifying_key();
-
-        use ed25519_dalek::Signer;
-        let wrong_data = [0u8; 32]; // Wrong data to sign
-        let signature = signing_key.sign(&wrong_data);
-
-        let mut state = RelayState::new(cli_secret);
-        let result = state.set_peer_public_key(
-            &BASE64.encode(browser_public.as_bytes()),
-            Some(&BASE64.encode(signature.to_bytes())),
-            Some(&BASE64.encode(verifying_key.as_bytes())),
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("SECURITY"));
-    }
-
-    #[test]
-    fn test_encrypt_produces_ratchet_envelope() {
-        let cli_secret = SecretKey::generate(&mut OsRng);
-        let browser_secret = SecretKey::generate(&mut OsRng);
-        let browser_public = browser_secret.public_key();
-
-        let mut state = RelayState::new(cli_secret);
-        state
-            .set_peer_public_key(&BASE64.encode(browser_public.as_bytes()), None, None)
+        let mut browser_session = browser_account
+            .create_outbound_session(&cli_identity, &cli_otk)
             .unwrap();
 
+        let message = browser_session.encrypt(b"handshake");
+        let (message_type, ciphertext) = match message {
+            vodozemac::olm::OlmMessage::PreKey(m) => (0u8, BASE64.encode(m.to_bytes())),
+            vodozemac::olm::OlmMessage::Normal(m) => (1u8, BASE64.encode(m.to_bytes())),
+        };
+        let envelope = OlmEnvelope {
+            version: OlmEnvelope::VERSION,
+            message_type,
+            ciphertext,
+            sender_key: browser_identity.clone(),
+        };
+
+        let mut state = RelayState::new(cli_account);
+        state.create_session_from_prekey(&browser_identity, &envelope).unwrap();
+
+        // Now test encryption
         let message = TerminalMessage::Output {
             data: "Hello, browser!".to_string(),
         };
-        let envelope = state.encrypt(&message).unwrap();
+        let encrypted = state.encrypt(&message).unwrap();
 
         // Verify envelope structure
-        assert_eq!(envelope.version, 2);
-        assert!(!envelope.ciphertext.is_empty());
-        assert!(!envelope.mac.is_empty());
-        assert!(!envelope.header.dh_public_key.is_empty());
+        assert_eq!(encrypted.version, 3);
+        assert!(!encrypted.ciphertext.is_empty());
+        assert!(!encrypted.sender_key.is_empty());
+        // After session established, messages should be Normal (type 1)
+        assert_eq!(encrypted.message_type, 1);
+    }
+
+    #[test]
+    fn test_full_roundtrip() {
+        // Set up CLI side
+        let mut cli_account = OlmAccount::new();
+        cli_account.generate_one_time_keys(1);
+        let cli_identity = cli_account.curve25519_key();
+        let cli_otk = cli_account.get_one_time_key().unwrap();
+
+        // Set up browser side
+        let browser_account = OlmAccount::new();
+        let browser_identity = browser_account.curve25519_key();
+
+        let mut browser_session = browser_account
+            .create_outbound_session(&cli_identity, &cli_otk)
+            .unwrap();
+
+        // Browser sends PreKey
+        let handshake = browser_session.encrypt(b"handshake");
+        let (message_type, ciphertext) = match handshake {
+            vodozemac::olm::OlmMessage::PreKey(m) => (0u8, BASE64.encode(m.to_bytes())),
+            vodozemac::olm::OlmMessage::Normal(m) => (1u8, BASE64.encode(m.to_bytes())),
+        };
+        let prekey_envelope = OlmEnvelope {
+            version: OlmEnvelope::VERSION,
+            message_type,
+            ciphertext,
+            sender_key: browser_identity.clone(),
+        };
+
+        // CLI establishes session
+        let mut cli_state = RelayState::new(cli_account);
+        cli_state.create_session_from_prekey(&browser_identity, &prekey_envelope).unwrap();
+
+        // CLI encrypts a message
+        let message = TerminalMessage::Output {
+            data: "Hello from CLI!".to_string(),
+        };
+        let encrypted = cli_state.encrypt(&message).unwrap();
+
+        // Browser decrypts the message
+        let ciphertext_bytes = BASE64.decode(&encrypted.ciphertext).unwrap();
+        let olm_msg = vodozemac::olm::Message::try_from(ciphertext_bytes.as_slice()).unwrap();
+        let decrypted = browser_session.decrypt(&vodozemac::olm::OlmMessage::Normal(olm_msg)).unwrap();
+        let decrypted_message: TerminalMessage = serde_json::from_slice(&decrypted).unwrap();
+
+        match decrypted_message {
+            TerminalMessage::Output { data } => {
+                assert_eq!(data, "Hello from CLI!");
+            }
+            _ => panic!("Expected Output message"),
+        }
     }
 }

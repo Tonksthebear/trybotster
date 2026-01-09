@@ -1,19 +1,18 @@
 # frozen_string_literal: true
 
-# TerminalChannel relays E2E encrypted terminal data between CLI and browser.
-# The server never sees plaintext - it only forwards encrypted blobs.
+# TerminalChannel relays Olm E2E encrypted terminal data between CLI and browser.
+# The server never sees plaintext - it only forwards encrypted envelopes.
 #
 # Flow:
 #   1. Browser subscribes with hub_identifier
 #   2. CLI subscribes with hub_identifier
-#   3. Both send/receive encrypted blobs via this channel
-#   4. Server just broadcasts to all subscribers of the hub
+#   3. Browser sends PreKey message via presence to establish Olm session
+#   4. Both send/receive Olm-encrypted envelopes via relay
 class TerminalChannel < ApplicationCable::Channel
   def subscribed
     @hub_identifier = params[:hub_identifier]
     @device_type = params[:device_type] # 'cli' or 'browser'
 
-    # Verify the hub belongs to this user
     hub = current_user.hubs.find_by(identifier: @hub_identifier)
     unless hub
       reject
@@ -21,15 +20,12 @@ class TerminalChannel < ApplicationCable::Channel
     end
 
     Rails.logger.info "[TerminalChannel] Subscribed: user=#{current_user.id} hub=#{@hub_identifier} type=#{@device_type}"
-
-    # Stream for this specific hub
     stream_from terminal_stream_name
   end
 
   def unsubscribed
     Rails.logger.info "[TerminalChannel] Unsubscribed: hub=#{@hub_identifier} type=#{@device_type}"
 
-    # Notify other subscribers that this device disconnected
     ActionCable.server.broadcast(
       terminal_stream_name,
       {
@@ -41,31 +37,28 @@ class TerminalChannel < ApplicationCable::Channel
     )
   end
 
-  # Relay encrypted terminal data (output from CLI, input from browser)
-  # Server does NOT decrypt - just forwards the blob
+  # Relay Olm-encrypted terminal data
   def relay(data)
-    # Validate required fields
-    unless data["blob"].present? && data["nonce"].present?
-      Rails.logger.warn "[TerminalChannel] Invalid relay data: missing blob or nonce"
+    unless data["version"].present? && data["ciphertext"].present?
+      Rails.logger.warn "[TerminalChannel] Invalid relay: missing Olm envelope fields"
       return
     end
 
-    # Broadcast to all subscribers (CLI + browser)
-    # Each will decrypt using their shared secret
     ActionCable.server.broadcast(
       terminal_stream_name,
       {
         type: "terminal",
-        blob: data["blob"],
-        nonce: data["nonce"],
         from: @device_type,
+        version: data["version"],
+        message_type: data["message_type"],
+        ciphertext: data["ciphertext"],
+        sender_key: data["sender_key"],
         timestamp: Time.current.iso8601
       }
     )
   end
 
-  # Announce presence (browser connected, CLI ready, etc.)
-  # Browser sends public_key for E2E key exchange with CLI
+  # Announce presence - browser sends prekey_message for Olm session establishment
   def presence(data)
     ActionCable.server.broadcast(
       terminal_stream_name,
@@ -74,21 +67,7 @@ class TerminalChannel < ApplicationCable::Channel
         event: data["event"] || "join",
         device_type: @device_type,
         device_name: data["device_name"],
-        public_key: data["public_key"], # For E2E key exchange
-        timestamp: Time.current.iso8601
-      }
-    )
-  end
-
-  # Relay terminal resize events (need to be in sync)
-  def resize(data)
-    ActionCable.server.broadcast(
-      terminal_stream_name,
-      {
-        type: "resize",
-        cols: data["cols"],
-        rows: data["rows"],
-        from: @device_type,
+        prekey_message: data["prekey_message"],
         timestamp: Time.current.iso8601
       }
     )

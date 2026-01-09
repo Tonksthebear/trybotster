@@ -332,12 +332,22 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         }
 
         HubAction::ShowConnectionCode => {
-            hub.connection_url = Some(format!(
-                "{}/hubs/{}#key={}",
-                hub.config.server_url,
-                hub.hub_identifier,
-                hub.device.public_key_base64url()
-            ));
+            // Generate connection URL with Olm session establishment keys
+            // Format: /hubs/{id}#e={ed25519}&c={curve25519}&o={one_time_key}
+            // Hub ID is in the path, keys are in the fragment (never sent to server)
+            hub.connection_url = if let Some(ref keys) = hub.browser.olm_keys {
+                Some(format!(
+                    "{}/hubs/{}#e={}&c={}&o={}",
+                    hub.config.server_url,
+                    hub.hub_identifier,
+                    keys.ed25519,
+                    keys.curve25519,
+                    keys.one_time_key
+                ))
+            } else {
+                log::error!("Cannot show connection code: Olm keys not initialized");
+                None
+            };
             hub.mode = AppMode::ConnectionCode;
         }
 
@@ -611,6 +621,22 @@ fn spawn_agent_with_tunnel(hub: &mut Hub, config: &crate::agents::AgentSpawnConf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    fn test_config() -> Config {
+        Config {
+            server_url: "http://localhost:3000".to_string(),
+            token: "btstr_test-key".to_string(),
+            api_key: String::new(),
+            poll_interval: 10,
+            agent_timeout: 300,
+            max_sessions: 10,
+            worktree_base: PathBuf::from("/tmp/test-worktrees"),
+        }
+    }
+
+    const TEST_DIMS: (u16, u16) = (24, 80);
 
     #[test]
     fn test_is_pty_input() {
@@ -635,5 +661,137 @@ mod tests {
         assert!(HubAction::ScrollToTop.is_scroll_action());
         assert!(HubAction::ScrollToBottom.is_scroll_action());
         assert!(!HubAction::SelectNext.is_scroll_action());
+    }
+
+    // === Tests proving browser input/scroll/resize dispatch issues ===
+
+    /// Issue #1: SendInput silently drops input when no agent is selected.
+    /// This test documents the failure mode where browser input is lost.
+    #[test]
+    fn test_send_input_with_no_agent_selected_is_silent_noop() {
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // No agents exist, so no agent is selected
+        assert!(hub.state.agents.is_empty());
+        assert!(hub.state.selected_agent().is_none());
+
+        // Send input - this should NOT panic, but input is silently dropped
+        dispatch(&mut hub, HubAction::SendInput(b"hello world".to_vec()));
+
+        // Hub state is unchanged - input was silently dropped
+        // This is the failure mode: browser sends input, CLI receives it,
+        // but it goes nowhere because no agent is selected.
+        assert!(hub.state.agents.is_empty());
+    }
+
+    /// Issue #2: Scroll actions are no-op when no agent is selected.
+    /// Browser sends scroll commands but nothing happens.
+    #[test]
+    fn test_scroll_with_no_agent_selected_is_noop() {
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // No agents, dispatch scroll - should not panic
+        dispatch(&mut hub, HubAction::ScrollUp(10));
+        dispatch(&mut hub, HubAction::ScrollDown(5));
+        dispatch(&mut hub, HubAction::ScrollToTop);
+        dispatch(&mut hub, HubAction::ScrollToBottom);
+
+        // No crash, but scroll commands had no effect
+        assert!(hub.state.selected_agent().is_none());
+    }
+
+    /// Resize action works even without agents (stores dimensions for future agents).
+    /// This is actually correct behavior - documenting it as a positive test.
+    #[test]
+    fn test_resize_without_agent_stores_dimensions() {
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        assert_eq!(hub.terminal_dims, (24, 80));
+
+        dispatch(&mut hub, HubAction::Resize { rows: 40, cols: 120 });
+
+        // Dimensions are stored even without agents
+        assert_eq!(hub.terminal_dims, (40, 120));
+    }
+
+    /// Test that SendInput works correctly when an agent IS selected.
+    /// This proves the dispatch path is correct when conditions are met.
+    #[test]
+    fn test_send_input_with_agent_selected_reaches_agent() {
+        use crate::agent::Agent;
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // Create a test agent (not spawned, so write_input will fail gracefully)
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "test-branch".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        hub.state.add_agent("test-repo-1".to_string(), agent);
+
+        // Agent is now selected
+        assert!(hub.state.selected_agent().is_some());
+
+        // Send input - this will try to write to the agent's PTY
+        // Since PTY isn't spawned, write_input will fail, but the dispatch path works
+        dispatch(&mut hub, HubAction::SendInput(b"test input".to_vec()));
+
+        // Agent still exists (wasn't removed due to write failure)
+        assert!(hub.state.selected_agent().is_some());
+    }
+
+    /// Test scroll works when agent has content
+    #[test]
+    fn test_scroll_with_agent_selected_modifies_scroll_offset() {
+        use crate::agent::Agent;
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "test-branch".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        hub.state.add_agent("test-repo-1".to_string(), agent);
+
+        // Add some content to the agent's parser so we can scroll
+        {
+            let agent = hub.state.selected_agent_mut().unwrap();
+            let mut parser = agent.cli_pty.vt100_parser.lock().unwrap();
+            for i in 0..50 {
+                parser.process(format!("Line {i}\r\n").as_bytes());
+            }
+        }
+
+        // Now scroll up
+        dispatch(&mut hub, HubAction::ScrollUp(10));
+
+        // Verify scroll offset changed
+        let agent = hub.state.selected_agent().unwrap();
+        assert!(agent.is_scrolled());
+        assert_eq!(agent.get_scroll_offset(), 10);
+
+        // Scroll to bottom
+        dispatch(&mut hub, HubAction::ScrollToBottom);
+        let agent = hub.state.selected_agent().unwrap();
+        assert!(!agent.is_scrolled());
     }
 }

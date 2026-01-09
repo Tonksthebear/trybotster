@@ -451,6 +451,16 @@ impl Agent {
         screen::render_screen_as_ansi(parser.screen())
     }
 
+    /// Drain raw PTY output for browser streaming.
+    ///
+    /// Returns all raw bytes that have accumulated since last drain.
+    /// Used by browser GUI to stream raw output - xterm.js handles
+    /// parsing and scrollback naturally.
+    #[must_use]
+    pub fn drain_raw_output(&self) -> Vec<u8> {
+        self.cli_pty.drain_raw_output()
+    }
+
     /// Get a hash of the current screen content for change detection.
     #[must_use]
     pub fn get_screen_hash(&self) -> u64 {

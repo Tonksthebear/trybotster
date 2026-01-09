@@ -18,7 +18,7 @@ use reqwest::blocking::Client;
 
 use crate::config::Config;
 use crate::device::Device;
-use crate::relay::{connection::TerminalRelay, BrowserState};
+use crate::relay::{connection::TerminalRelay, persistence, BrowserState};
 use crate::tunnel::TunnelManager;
 
 /// Register the device with the server if not already registered.
@@ -38,7 +38,6 @@ pub fn register_device(
         client,
         &config.server_url,
         config.get_api_key(),
-        config.server_assisted_pairing,
     ) {
         Ok(id) => log::info!("Device registered with server: id={id}"),
         Err(e) => log::warn!("Device registration failed: {e} - will retry later"),
@@ -116,14 +115,42 @@ pub fn start_tunnel(
 /// or logs a warning and continues if connection fails.
 pub fn connect_terminal_relay(
     browser: &mut BrowserState,
-    secret_key: &crypto_box::SecretKey,
     hub_identifier: &str,
     server_url: &str,
     api_key: &str,
     runtime: &tokio::runtime::Runtime,
 ) {
-    let relay = TerminalRelay::new(
-        secret_key.clone(),
+    // Load or create Olm account (persisted for surviving restarts)
+    let mut olm_account = match persistence::load_or_create_account(hub_identifier) {
+        Ok(account) => account,
+        Err(e) => {
+            log::error!("Failed to load/create Olm account: {e}");
+            return;
+        }
+    };
+
+    // Load existing session if available (browser may reconnect with saved session)
+    let existing_session = match persistence::load_session(hub_identifier) {
+        Ok(session) => session,
+        Err(e) => {
+            log::warn!("Failed to load Olm session: {e}");
+            None
+        }
+    };
+
+    if existing_session.is_some() {
+        log::info!("Loaded existing Olm session - browser can reconnect without QR scan");
+    }
+
+    let keys = olm_account.session_establishment_keys();
+    log::info!("Olm session establishment keys ready: ed25519={:.8}...", keys.ed25519);
+
+    // Store keys in browser state for QR code generation
+    browser.olm_keys = Some(keys);
+
+    let relay = TerminalRelay::new_with_session(
+        olm_account,
+        existing_session,
         hub_identifier.to_string(),
         server_url.to_string(),
         api_key.to_string(),
@@ -175,9 +202,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires keyring access - run manually"]
     fn test_register_device_skips_if_already_registered() {
         // This test verifies the early return path
-        let mut device = Device::load_or_create().unwrap();
+        let mut device = Device::load_or_create().expect("Device creation failed");
         device.device_id = Some(123);
 
         // Should not panic or make network calls
@@ -190,7 +218,6 @@ mod tests {
             agent_timeout: 300,
             max_sessions: 10,
             worktree_base: std::path::PathBuf::from("/tmp"),
-            server_assisted_pairing: false,
         };
 
         register_device(&mut device, &client, &config);
