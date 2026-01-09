@@ -64,12 +64,13 @@ pub fn build_command(
 /// Spawn a CLI PTY reader thread with notification detection.
 ///
 /// Reads PTY output, processes it through the VT100 parser for terminal emulation,
-/// adds lines to the buffer for pattern detection, and detects OSC notification
-/// sequences.
+/// adds lines to the buffer for pattern detection, detects OSC notification
+/// sequences, and queues raw output for browser streaming.
 pub fn spawn_cli_reader_thread(
     reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<Parser>>,
     buffer: Arc<Mutex<VecDeque<String>>>,
+    raw_output_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     notification_tx: Sender<AgentNotification>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -110,6 +111,12 @@ pub fn spawn_cli_reader_thread(
                                 buffer_lock.pop_front();
                             }
                         }
+                    }
+
+                    // Queue raw output for browser streaming
+                    {
+                        let mut queue = raw_output_queue.lock().expect("raw_output_queue lock poisoned");
+                        queue.push_back(buf[..n].to_vec());
                     }
                 }
                 Err(e) => {

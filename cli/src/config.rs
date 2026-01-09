@@ -26,10 +26,6 @@ pub struct Config {
     pub max_sessions: usize,
     /// Base directory for creating worktrees.
     pub worktree_base: PathBuf,
-    /// If true, CLI shares its public key with the server for convenience.
-    /// If false (default), key exchange only happens via QR code (MITM-proof).
-    #[serde(default)]
-    pub server_assisted_pairing: bool,
 }
 
 impl Default for Config {
@@ -44,8 +40,6 @@ impl Default for Config {
             worktree_base: dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("botster-sessions"),
-            // Default to secure mode - public key only shared via QR code
-            server_assisted_pairing: false,
         }
     }
 }
@@ -123,13 +117,6 @@ impl Config {
             if let Ok(timeout) = agent_timeout.parse::<u64>() {
                 self.agent_timeout = timeout;
             }
-        }
-
-        // Server-assisted pairing (convenience mode)
-        // Set BOTSTER_SERVER_ASSISTED_PAIRING=true to enable
-        // WARNING: This shares your public key with the server, enabling potential MITM
-        if let Ok(val) = std::env::var("BOTSTER_SERVER_ASSISTED_PAIRING") {
-            self.server_assisted_pairing = val.eq_ignore_ascii_case("true") || val == "1";
         }
     }
 

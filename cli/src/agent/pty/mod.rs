@@ -91,10 +91,11 @@ pub const MAX_BUFFER_LINES: usize = 20000;
 /// - A VT100 parser for terminal emulation
 /// - A line buffer for pattern detection
 /// - Notification channel for OSC sequences
+/// - Raw output queue for browser streaming
 ///
 /// # Thread Safety
 ///
-/// The VT100 parser and buffer are wrapped in `Arc<Mutex<>>` to allow
+/// The VT100 parser, buffer, and raw output queue are wrapped in `Arc<Mutex<>>` to allow
 /// concurrent reads from the PTY reader thread and writes from the main thread.
 pub struct PtySession {
     /// Master PTY for resizing.
@@ -107,6 +108,9 @@ pub struct PtySession {
     pub vt100_parser: Arc<Mutex<Parser>>,
     /// Line-based buffer for pattern detection.
     pub buffer: Arc<Mutex<VecDeque<String>>>,
+    /// Raw output queue for streaming to browser (GUI mode).
+    /// Reader thread pushes raw PTY bytes here; browser output drains it.
+    pub raw_output_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     /// Channel for sending detected notifications.
     pub notification_tx: Option<Sender<AgentNotification>>,
     /// Child process handle - stored so we can kill it on drop.
@@ -142,9 +146,24 @@ impl PtySession {
             reader_thread: None,
             vt100_parser: Arc::new(Mutex::new(parser)),
             buffer: Arc::new(Mutex::new(VecDeque::new())),
+            raw_output_queue: Arc::new(Mutex::new(VecDeque::new())),
             notification_tx: None,
             child: None,
         }
+    }
+
+    /// Drain all pending raw output from the queue.
+    ///
+    /// Returns the raw PTY bytes that have accumulated since last drain.
+    /// Used by browser streaming to send raw output instead of rendered screen.
+    #[must_use]
+    pub fn drain_raw_output(&self) -> Vec<u8> {
+        let mut queue = self.raw_output_queue.lock().expect("raw_output_queue lock poisoned");
+        let mut result = Vec::new();
+        while let Some(chunk) = queue.pop_front() {
+            result.extend(chunk);
+        }
+        result
     }
 
     /// Check if a process has been spawned in this PTY session.

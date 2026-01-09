@@ -131,17 +131,16 @@ impl TunnelManager {
     /// Connects to the tunnel server and starts the message loop.
     pub async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ws_url = format!(
-            "{}/cable?api_key={}",
+            "{}/cable",
             self.server_url
                 .replace("https://", "wss://")
-                .replace("http://", "ws://"),
-            self.api_key
+                .replace("http://", "ws://")
         );
 
         self.set_status(TunnelStatus::Connecting);
         info!("[Tunnel] Connecting to {}", ws_url);
 
-        // Build request with Origin header (required by ActionCable)
+        // Build request with required headers
         let mut request = match ws_url.into_client_request() {
             Ok(req) => req,
             Err(e) => {
@@ -150,11 +149,17 @@ impl TunnelManager {
                 return Err(e.into());
             }
         };
-        // Set Origin header to match the server URL (ActionCable requires this)
-        let origin = self.server_url.clone();
+
+        // Set Origin header (required by ActionCable)
         request.headers_mut().insert(
             "Origin",
-            origin.parse().unwrap_or_else(|_| "http://localhost".parse().expect("localhost is a valid header value")),
+            self.server_url.parse().unwrap_or_else(|_| "http://localhost".parse().expect("localhost is valid")),
+        );
+
+        // Set Authorization header with bearer token (Fizzy pattern)
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", self.api_key).parse().expect("Bearer token is valid"),
         );
 
         let (ws_stream, _) = match connect_async(request).await {

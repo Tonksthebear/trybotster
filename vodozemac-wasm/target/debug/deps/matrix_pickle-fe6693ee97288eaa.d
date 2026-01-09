@@ -1,0 +1,9 @@
+/Users/exampleuser/Rails/trybotster/vodozemac-wasm/target/debug/deps/matrix_pickle-fe6693ee97288eaa.d: /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/lib.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/decode.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/encode.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/error.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/../README.md
+
+/Users/exampleuser/Rails/trybotster/vodozemac-wasm/target/debug/deps/libmatrix_pickle-fe6693ee97288eaa.rmeta: /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/lib.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/decode.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/encode.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/error.rs /Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/../README.md
+
+/Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/lib.rs:
+/Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/decode.rs:
+/Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/encode.rs:
+/Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/error.rs:
+/Users/exampleuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrix-pickle-0.2.2/src/../README.md:

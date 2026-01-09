@@ -1,29 +1,75 @@
 import { Controller } from "@hotwired/stimulus";
 
-// Generic modal controller for show/hide behavior
-// Parent controllers dispatch "modal:show" or "modal:hide" events on the modal element
-// Business logic should be handled by parent controllers via custom events
+/**
+ * Modal Controller - Generic modal dialog management
+ *
+ * Features:
+ * - Show/hide via actions or custom events
+ * - Click backdrop to close
+ * - Escape key to close
+ * - Focus management
+ *
+ * Usage:
+ *   <div data-controller="modal" class="hidden">
+ *     <div data-action="click->modal#closeFromBackdrop" class="fixed inset-0 bg-black/50">
+ *       <div data-modal-target="content" class="modal-content">
+ *         <button data-action="modal#hide">Close</button>
+ *       </div>
+ *     </div>
+ *   </div>
+ *
+ * Trigger from another controller:
+ *   this.dispatch("show", { target: modalElement })
+ *   // or dispatch custom event: modalElement.dispatchEvent(new CustomEvent("modal:show"))
+ */
 export default class extends Controller {
+  static targets = ["content"];
+
   connect() {
-    // Listen for show/hide events from parent controllers
-    this.boundShow = () => this.show();
-    this.boundHide = () => this.hide();
-    this.element.addEventListener("modal:show", this.boundShow);
-    this.element.addEventListener("modal:hide", this.boundHide);
+    this.boundHandleKeydown = this.handleKeydown.bind(this);
   }
 
   disconnect() {
-    this.element.removeEventListener("modal:show", this.boundShow);
-    this.element.removeEventListener("modal:hide", this.boundHide);
+    document.removeEventListener("keydown", this.boundHandleKeydown);
   }
 
   show() {
     this.element.classList.remove("hidden");
+    document.addEventListener("keydown", this.boundHandleKeydown);
+    document.body.classList.add("overflow-hidden");
+    this.focusFirst();
     this.dispatch("opened");
   }
 
   hide() {
     this.element.classList.add("hidden");
+    document.removeEventListener("keydown", this.boundHandleKeydown);
+    document.body.classList.remove("overflow-hidden");
     this.dispatch("closed");
+  }
+
+  // Close when clicking the backdrop (not the content)
+  closeFromBackdrop(event) {
+    // Only close if clicking directly on backdrop, not its children
+    if (event.target === event.currentTarget) {
+      this.hide();
+    }
+  }
+
+  handleKeydown(event) {
+    if (event.key === "Escape") {
+      this.hide();
+    }
+  }
+
+  focusFirst() {
+    requestAnimationFrame(() => {
+      const focusable = this.element.querySelector(
+        "input:not([type='hidden']), textarea, select, button:not([data-action*='hide'])"
+      );
+      if (focusable) {
+        focusable.focus();
+      }
+    });
   }
 }

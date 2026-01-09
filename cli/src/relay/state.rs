@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use super::connection::TerminalOutputSender;
+use super::olm::SessionEstablishmentKeys;
 use super::types::{BrowserEvent, BrowserResize};
 use crate::{AgentInfo, BrowserMode, TerminalMessage, WorktreeInfo, WorktreeManager};
 
@@ -43,6 +44,8 @@ pub struct BrowserState {
     pub agent_screen_hashes: HashMap<String, u64>,
     /// Last screen hash sent to browser.
     pub last_screen_hash: Option<u64>,
+    /// Olm session establishment keys for QR code generation.
+    pub olm_keys: Option<SessionEstablishmentKeys>,
 }
 
 impl std::fmt::Debug for BrowserState {
@@ -224,6 +227,23 @@ pub fn send_output(ctx: &BrowserSendContext, output: &str) {
     });
 }
 
+/// Build a scrollback message from buffer lines.
+///
+/// This is a pure function for testability.
+#[must_use]
+pub fn build_scrollback_message(lines: Vec<String>) -> TerminalMessage {
+    TerminalMessage::Scrollback { lines }
+}
+
+/// Send scrollback history to browser.
+///
+/// Called when an agent is selected so the browser can populate
+/// xterm's scrollback buffer with historical output.
+pub fn send_scrollback(ctx: &BrowserSendContext, lines: Vec<String>) {
+    let message = build_scrollback_message(lines);
+    send_message(ctx, &message);
+}
+
 /// Send a JSON message to browser.
 fn send_message(ctx: &BrowserSendContext, message: &TerminalMessage) {
     let Ok(json) = serde_json::to_string(message) else {
@@ -373,5 +393,36 @@ mod tests {
             Some("agent output".to_string()),
         );
         assert_eq!(output, "tui stuff");
+    }
+
+    #[test]
+    fn test_build_scrollback_message() {
+        let lines = vec![
+            "First line".to_string(),
+            "Second line".to_string(),
+            "Third line with \x1b[32mcolor\x1b[0m".to_string(),
+        ];
+        let message = build_scrollback_message(lines.clone());
+
+        match message {
+            TerminalMessage::Scrollback { lines: msg_lines } => {
+                assert_eq!(msg_lines.len(), 3);
+                assert_eq!(msg_lines[0], "First line");
+                assert_eq!(msg_lines[2], "Third line with \x1b[32mcolor\x1b[0m");
+            }
+            _ => panic!("Expected Scrollback message"),
+        }
+    }
+
+    #[test]
+    fn test_build_scrollback_message_empty() {
+        let message = build_scrollback_message(vec![]);
+
+        match message {
+            TerminalMessage::Scrollback { lines } => {
+                assert!(lines.is_empty());
+            }
+            _ => panic!("Expected Scrollback message"),
+        }
     }
 }

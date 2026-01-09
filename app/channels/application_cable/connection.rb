@@ -11,28 +11,37 @@ module ApplicationCable
     private
 
     def find_verified_user
-      # Try DeviceToken auth (for CLI) - query param for WebSocket compatibility
-      token = extract_api_token
+      # Try session auth (for browser - Fizzy pattern)
+      if env["warden"] && (user = env["warden"].user)
+        Rails.logger.info "[ActionCable] Auth via session: user=#{user.id}"
+        return user
+      end
+
+      # Try DeviceToken auth (for CLI via Authorization header)
+      token = extract_device_token
+      Rails.logger.debug "[ActionCable] Authorization header present: #{token.present?}"
+
       if token.present?
         device_token = DeviceToken.find_by(token: token)
         if device_token
           device_token.touch_usage!(ip: request.remote_ip)
+          Rails.logger.info "[ActionCable] Auth via DeviceToken: user=#{device_token.user_id}"
           return device_token.user
+        else
+          Rails.logger.warn "[ActionCable] DeviceToken not found for provided token"
         end
       end
 
-      # Try session auth (for browser)
-      if env["warden"] && (user = env["warden"].user)
-        return user
-      end
-
+      Rails.logger.warn "[ActionCable] No valid auth - rejecting connection"
       reject_unauthorized_connection
     end
 
-    def extract_api_token
-      # Only accept Authorization header (not query param - exposes key in logs/history)
-      auth_header = request.headers["Authorization"]
-      auth_header&.delete_prefix("Bearer ")
+    def extract_device_token
+      # Bearer token in Authorization header (Fizzy pattern)
+      auth_header = request.headers["HTTP_AUTHORIZATION"] || request.headers["Authorization"]
+      return nil unless auth_header.present?
+
+      auth_header.delete_prefix("Bearer ")
     end
   end
 end

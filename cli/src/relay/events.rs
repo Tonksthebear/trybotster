@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::hub::HubAction;
 use crate::BrowserMode;
-use super::types::{BrowserCommand, BrowserEvent};
+use super::types::{BrowserCommand, BrowserEvent, BrowserResize};
 
 /// Convert a BrowserEvent to a HubAction.
 ///
@@ -159,6 +159,13 @@ fn parse_issue_or_branch(value: Option<&String>) -> (Option<u32>, Option<String>
 #[must_use]
 pub fn command_to_event(cmd: &BrowserCommand) -> BrowserEvent {
     match cmd {
+        BrowserCommand::Handshake { device_name, browser_curve25519 } => {
+            // Handshake is handled specially in connection code, but map it here for completeness
+            BrowserEvent::Connected {
+                public_key: browser_curve25519.clone(),
+                device_name: device_name.clone(),
+            }
+        }
         BrowserCommand::Input { data } => BrowserEvent::Input(data.clone()),
         BrowserCommand::SetMode { mode } => BrowserEvent::SetMode { mode: mode.clone() },
         BrowserCommand::ListAgents => BrowserEvent::ListAgents,
@@ -191,6 +198,10 @@ pub fn command_to_event(cmd: &BrowserCommand) -> BrowserEvent {
         },
         BrowserCommand::ScrollToBottom => BrowserEvent::ScrollToBottom,
         BrowserCommand::ScrollToTop => BrowserEvent::ScrollToTop,
+        BrowserCommand::Resize { cols, rows } => BrowserEvent::Resize(BrowserResize {
+            cols: *cols,
+            rows: *rows,
+        }),
     }
 }
 

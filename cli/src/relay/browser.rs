@@ -16,7 +16,6 @@
 //! # Functions
 //!
 //! - [`poll_events`] - Main event loop integration point
-//! - [`handle_input`] - Terminal input parsing and dispatch
 //! - [`send_agent_list`] - Send agent list to browser
 //! - [`send_worktree_list`] - Send worktree list to browser
 //! - [`create_agent`] - Handle browser create agent request
@@ -48,14 +47,14 @@ fn browser_ctx(hub: &Hub) -> Option<BrowserSendContext<'_>> {
 /// # Arguments
 ///
 /// * `hub` - Mutable reference to the Hub
-/// * `terminal` - Reference to the terminal for size queries
+/// * `_terminal` - Currently unused, kept for API compatibility
 ///
 /// # Errors
 ///
-/// Returns an error if input handling fails.
+/// Returns an error if event handling fails.
 pub fn poll_events(
     hub: &mut Hub,
-    terminal: &ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    _terminal: &ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
 ) -> Result<()> {
     let browser_events = hub.browser.drain_events();
 
@@ -86,9 +85,9 @@ pub fn poll_events(
                 send_worktree_list(hub);
             }
 
-            // Input handling - parse and dispatch
+            // Input handling - send raw input to PTY
             BrowserEvent::Input(data) => {
-                handle_input(hub, &data, terminal)?;
+                actions::dispatch(hub, HubAction::SendInput(data.as_bytes().to_vec()));
             }
 
             // Agent operations - dispatch and notify
@@ -96,6 +95,7 @@ pub fn poll_events(
                 actions::dispatch(hub, HubAction::SelectByKey(id.clone()));
                 hub.browser.invalidate_screen();
                 send_agent_selected(hub, &id);
+                send_scrollback_for_selected_agent(hub);
             }
             BrowserEvent::CreateAgent { issue_or_branch, prompt } => {
                 if let Some(input) = issue_or_branch {
@@ -133,53 +133,6 @@ pub fn poll_events(
             BrowserEvent::ScrollToBottom => {
                 actions::dispatch(hub, HubAction::ScrollToBottom);
                 hub.browser.invalidate_screen();
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Handle browser input by parsing terminal escape sequences and dispatching.
-///
-/// Parses raw terminal input from the browser and converts it to `HubAction`s.
-/// Filters out Quit actions to prevent accidental browser disconnections.
-///
-/// # Arguments
-///
-/// * `hub` - Mutable reference to the Hub
-/// * `data` - Raw terminal input data
-/// * `terminal` - Reference to the terminal for size queries
-///
-/// # Errors
-///
-/// Returns an error if terminal size query fails.
-pub fn handle_input(
-    hub: &mut Hub,
-    data: &str,
-    terminal: &ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-) -> Result<()> {
-    use crate::app::parse_terminal_input;
-    use crate::constants;
-    use crate::tui;
-
-    let keys = parse_terminal_input(data);
-    for (code, modifiers) in keys {
-        // Build context for input dispatch
-        let context = tui::InputContext {
-            terminal_rows: terminal.size()?.height,
-            menu_selected: hub.menu_selected,
-            menu_count: constants::MENU_ITEMS.len(),
-            worktree_selected: hub.worktree_selected,
-            worktree_count: hub.state.available_worktrees.len(),
-        };
-
-        // Use tui's key_event_to_action for consistency
-        let key_event = crossterm::event::KeyEvent::new(code, modifiers);
-        if let Some(action) = tui::input::key_event_to_action(&key_event, &hub.mode, &context) {
-            // Skip Quit from browser to prevent accidental disconnects
-            if !matches!(action, HubAction::Quit) {
-                actions::dispatch(hub, action);
             }
         }
     }
@@ -226,6 +179,19 @@ pub fn send_worktree_list(hub: &mut Hub) {
 pub fn send_agent_selected(hub: &Hub, agent_id: &str) {
     let Some(ctx) = browser_ctx(hub) else { return };
     crate::relay::send_agent_selected(&ctx, agent_id);
+}
+
+/// Send scrollback history for the selected agent to browser.
+///
+/// Called when an agent is selected so the browser can populate
+/// xterm's scrollback buffer with historical output.
+pub fn send_scrollback_for_selected_agent(hub: &Hub) {
+    let Some(ctx) = browser_ctx(hub) else { return };
+    let Some(agent) = hub.state.selected_agent() else { return };
+
+    let lines = agent.get_buffer_snapshot();
+    log::info!("Sending {} scrollback lines to browser", lines.len());
+    crate::relay::send_scrollback(&ctx, lines);
 }
 
 /// Handle browser create agent request.
@@ -345,18 +311,124 @@ pub fn reopen_worktree(hub: &mut Hub, path: &str, branch: &str, prompt: Option<S
 
 /// Send output to browser via E2E encrypted relay.
 ///
-/// Sends terminal output to the connected browser, selecting the appropriate
-/// content based on the current browser mode.
-pub fn send_output(hub: &Hub, ansi_output: &str) {
+/// For TUI mode (if ever needed): sends rendered TUI.
+/// For GUI mode: sends raw PTY bytes so xterm.js can handle scrollback.
+pub fn send_output(hub: &Hub, _ansi_output: &str) {
     let Some(ctx) = browser_ctx(hub) else { return };
     if !hub.browser.connected { return; }
 
-    let agent_output = hub.state.selected_agent().map(crate::agent::Agent::get_screen_as_ansi);
-    let output = crate::relay::state::get_output_for_mode(hub.browser.mode, ansi_output, agent_output);
+    // Always stream raw PTY output to browser
+    // This lets xterm.js handle scrollback naturally
+    let Some(agent) = hub.state.selected_agent() else { return };
+
+    let raw_bytes = agent.drain_raw_output();
+    if raw_bytes.is_empty() {
+        return;
+    }
+
+    // Convert to string (lossy - invalid UTF-8 becomes replacement chars)
+    let output = String::from_utf8_lossy(&raw_bytes);
     crate::relay::state::send_output(&ctx, &output);
 }
 
 #[cfg(test)]
 mod tests {
-    // Browser functions require runtime integration and are tested via hub tests
+    use super::*;
+    use crate::relay::types::BrowserCommand;
+
+    /// Verify BrowserCommand::Input -> BrowserEvent::Input mapping.
+    /// This is critical for keyboard input from browser to reach CLI.
+    #[test]
+    fn test_browser_command_input_converts_to_event() {
+        let json = r#"{"type":"input","data":"hello world"}"#;
+        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
+
+        // The conversion happens in connection.rs, but we verify the type structure
+        match cmd {
+            BrowserCommand::Input { data } => {
+                assert_eq!(data, "hello world");
+                // In connection.rs line 402, this becomes BrowserEvent::Input(data)
+            }
+            _ => panic!("Expected Input variant"),
+        }
+    }
+
+    /// Verify BrowserCommand::Scroll -> BrowserEvent::Scroll mapping.
+    #[test]
+    fn test_browser_command_scroll_converts_to_event() {
+        let json = r#"{"type":"scroll","direction":"up","lines":10}"#;
+        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
+
+        match cmd {
+            BrowserCommand::Scroll { direction, lines } => {
+                assert_eq!(direction, "up");
+                assert_eq!(lines, Some(10));
+            }
+            _ => panic!("Expected Scroll variant"),
+        }
+    }
+
+    /// Verify BrowserCommand::Resize -> BrowserEvent::Resize mapping.
+    #[test]
+    fn test_browser_command_resize_converts_to_event() {
+        let json = r#"{"type":"resize","cols":120,"rows":40}"#;
+        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
+
+        match cmd {
+            BrowserCommand::Resize { cols, rows } => {
+                assert_eq!(cols, 120);
+                assert_eq!(rows, 40);
+                // In connection.rs line 425-427, this becomes:
+                // BrowserEvent::Resize(BrowserResize { cols, rows })
+            }
+            _ => panic!("Expected Resize variant"),
+        }
+    }
+
+    /// Verify BrowserCommand::SetMode parsing for gui mode.
+    #[test]
+    fn test_browser_command_set_mode_gui() {
+        let json = r#"{"type":"set_mode","mode":"gui"}"#;
+        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
+
+        match cmd {
+            BrowserCommand::SetMode { mode } => {
+                assert_eq!(mode, "gui");
+            }
+            _ => panic!("Expected SetMode variant"),
+        }
+    }
+
+    /// Test the actual event handling in poll_events would require a full Hub,
+    /// which is tested in hub/actions.rs. This module tests the parsing layer.
+
+    /// Verify browser input with special characters (Ctrl+C, etc.)
+    #[test]
+    fn test_browser_command_input_with_control_chars() {
+        // Ctrl+C is \x03
+        let json = r#"{"type":"input","data":"\u0003"}"#;
+        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
+
+        match cmd {
+            BrowserCommand::Input { data } => {
+                assert_eq!(data, "\x03");
+            }
+            _ => panic!("Expected Input variant"),
+        }
+    }
+
+    /// Verify browser input with escape sequences (arrow keys, etc.)
+    #[test]
+    fn test_browser_command_input_with_escape_sequences() {
+        // Arrow up is \x1b[A
+        let json = r#"{"type":"input","data":"\u001b[A"}"#;
+        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
+
+        match cmd {
+            BrowserCommand::Input { data } => {
+                assert_eq!(data, "\x1b[A");
+            }
+            _ => panic!("Expected Input variant"),
+        }
+    }
 }

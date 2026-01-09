@@ -48,8 +48,9 @@ pub fn render_screen_as_ansi(screen: &vt100::Screen) -> String {
     // Hide cursor during update to prevent flicker
     output.push_str("\x1b[?25l");
 
-    // Reset attributes, clear screen and scrollback, move to home
-    output.push_str("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
+    // Reset attributes, clear visible screen, move to home
+    // Note: Do NOT use \x1b[3J here - it clears scrollback buffer
+    output.push_str("\x1b[0m\x1b[2J\x1b[H");
 
     for row in 0..rows {
         let _ = write!(output, "\x1b[{};1H", row + 1);
