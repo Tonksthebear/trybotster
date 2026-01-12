@@ -75,6 +75,17 @@ pub enum TerminalMessage {
         /// Lines of scrollback history (oldest first).
         lines: Vec<String>,
     },
+    /// Invite bundle for sharing hub connection.
+    ///
+    /// Contains a fresh PreKeyBundle that can be shared via URL fragment.
+    /// Server never sees this - stays in `#bundle=...` URL fragment.
+    #[serde(rename = "invite_bundle")]
+    InviteBundle {
+        /// Base64-encoded PreKeyBundle JSON.
+        bundle: String,
+        /// Shareable URL with bundle in fragment.
+        url: String,
+    },
 }
 
 /// Agent info for list response.
@@ -206,6 +217,9 @@ pub enum BrowserCommand {
         /// Number of rows.
         rows: u16,
     },
+    /// Request a fresh invite bundle for sharing hub connection.
+    #[serde(rename = "generate_invite")]
+    GenerateInvite,
 }
 
 /// Browser resize event.
@@ -286,6 +300,9 @@ pub enum BrowserEvent {
     ScrollToBottom,
     /// Scroll to top.
     ScrollToTop,
+    /// Request invite bundle for sharing.
+    /// Handled directly in relay, not forwarded to Hub.
+    GenerateInvite,
 }
 
 #[cfg(test)]

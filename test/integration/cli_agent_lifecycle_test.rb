@@ -44,23 +44,6 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
     wait_for_agent_registration(@hub, timeout: 10)
 
     @hub.reload
-    unless @hub.hub_agents.exists?
-      # Debug: dump all available info
-      puts "\n=== DEBUG: CLI LOG FILE (#{cli.log_file_path}) ==="
-      if File.exist?(cli.log_file_path.to_s)
-        puts File.read(cli.log_file_path).last(5000)
-      else
-        puts "Log file does not exist"
-        # Check if there are any files in the temp dir
-        puts "Temp dir contents: #{Dir.entries(cli.temp_dir).join(', ')}"
-      end
-      puts "\n=== DEBUG: CLI STDOUT BUFFER ==="
-      puts cli.recent_output(lines: 50)
-      puts "\n=== DEBUG: WORKTREE BASE ==="
-      puts "Worktree base: #{@worktree_base}"
-      puts "Contents: #{Dir.exist?(@worktree_base) ? Dir.entries(@worktree_base).join(', ') : 'does not exist'}"
-    end
-
     assert @hub.hub_agents.exists?, "Agent should be registered with hub.\nCLI logs:\n#{cli.log_contents(lines: 50)}"
 
     agent = @hub.hub_agents.first

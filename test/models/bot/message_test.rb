@@ -170,4 +170,86 @@ class Bot::MessageTest < ActiveSupport::TestCase
     assert_equal "failed", message.status
     assert_equal "Something went wrong", message.payload["error"]
   end
+
+  # Race condition tests
+  test "claiming already claimed message raises AlreadyClaimedError" do
+    message = Bot::Message.create!(
+      event_type: "github_mention",
+      payload: { repo: "test/repo", issue_number: 1 }
+    )
+
+    # First claim succeeds
+    message.claim!(1)
+    assert message.claimed?
+
+    # Second claim should raise error
+    error = assert_raises(Bot::Message::AlreadyClaimedError) do
+      message.claim!(2)
+    end
+    assert_match(/already claimed/, error.message)
+
+    # Original claim should be preserved
+    message.reload
+    assert_equal 1, message.claimed_by_user_id
+  end
+
+  test "concurrent claim attempts only allow one to succeed" do
+    message = Bot::Message.create!(
+      event_type: "github_mention",
+      payload: { repo: "test/repo", issue_number: 1 }
+    )
+
+    success_count = 0
+    error_count = 0
+    claimed_by = nil
+    mutex = Mutex.new
+
+    # Simulate concurrent claims from 5 different users
+    threads = (1..5).map do |user_id|
+      Thread.new do
+        begin
+          # Small random delay to increase chance of actual concurrency
+          sleep(rand * 0.01)
+          message.reload # Get fresh state
+          message.claim!(user_id)
+          mutex.synchronize do
+            success_count += 1
+            claimed_by = user_id
+          end
+        rescue Bot::Message::AlreadyClaimedError
+          mutex.synchronize { error_count += 1 }
+        end
+      end
+    end
+
+    threads.each(&:join)
+
+    # Exactly one should succeed, others should fail
+    assert_equal 1, success_count, "Only one claim should succeed"
+    assert_equal 4, error_count, "Four claims should fail"
+
+    # Message should be claimed by exactly one user
+    message.reload
+    assert message.claimed?
+    assert_not_nil claimed_by
+    assert_equal claimed_by, message.claimed_by_user_id
+  end
+
+  test "for_delivery scope excludes claimed messages" do
+    # Create two messages
+    pending_message = Bot::Message.create!(
+      event_type: "github_mention",
+      payload: { repo: "test/repo", issue_number: 1 }
+    )
+    claimed_message = Bot::Message.create!(
+      event_type: "github_mention",
+      payload: { repo: "test/repo", issue_number: 2 }
+    )
+    claimed_message.claim!(1)
+
+    # for_delivery should only include unclaimed pending messages
+    deliverable = Bot::Message.for_delivery
+    assert_includes deliverable, pending_message
+    refute_includes deliverable, claimed_message
+  end
 end

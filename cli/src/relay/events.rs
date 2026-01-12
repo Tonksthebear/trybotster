@@ -122,7 +122,8 @@ pub fn browser_event_to_hub_action(
         | BrowserEvent::ListAgents
         | BrowserEvent::ListWorktrees
         | BrowserEvent::ReopenWorktree { .. }
-        | BrowserEvent::SetMode { .. } => None,
+        | BrowserEvent::SetMode { .. }
+        | BrowserEvent::GenerateInvite => None,
     }
 }
 
@@ -203,6 +204,7 @@ pub fn command_to_event(cmd: &BrowserCommand) -> BrowserEvent {
             cols: *cols,
             rows: *rows,
         }),
+        BrowserCommand::GenerateInvite => BrowserEvent::GenerateInvite,
     }
 }
 

@@ -56,6 +56,18 @@ pub fn poll_events(
     hub: &mut Hub,
     _terminal: &ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
 ) -> Result<()> {
+    poll_events_headless(hub)
+}
+
+/// Poll and handle browser events in headless mode.
+///
+/// Same as `poll_events` but doesn't require a terminal reference.
+/// Used by headless mode where no TUI is available.
+///
+/// # Errors
+///
+/// Returns an error if event handling fails.
+pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
     let browser_events = hub.browser.drain_events();
 
     for event in browser_events {
@@ -133,6 +145,11 @@ pub fn poll_events(
             BrowserEvent::ScrollToBottom => {
                 actions::dispatch(hub, HubAction::ScrollToBottom);
                 hub.browser.invalidate_screen();
+            }
+            // GenerateInvite is handled directly in relay connection.rs
+            // Should never reach Hub, but match must be exhaustive
+            BrowserEvent::GenerateInvite => {
+                log::warn!("GenerateInvite reached Hub - should be handled in relay");
             }
         }
     }
