@@ -31,6 +31,7 @@ Rails.application.routes.draw do
       resources :messages, only: [ :index, :update ]
       resources :notifications, only: [ :create ]
       resource :connection, only: [ :show ]
+      resource :bundle, only: [ :show ]
 
       # Tailscale integration (DEPRECATED - moved to deprecated/ folder)
       # namespace :tailscale do
@@ -57,4 +58,12 @@ Rails.application.routes.draw do
 
   # Health check for load balancers and uptime monitors
   get "up" => "rails/health#show", as: :rails_health_check
+
+  # Test-only routes (system tests need direct sign-in for OAuth apps)
+  if Rails.env.test?
+    namespace :test do
+      get "sessions/new", to: "sessions#new"
+      post "sessions", to: "sessions#create"
+    end
+  end
 end

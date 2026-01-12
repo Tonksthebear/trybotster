@@ -32,6 +32,12 @@ static SHUTDOWN_FLAG: std::sync::LazyLock<Arc<AtomicBool>> =
 fn ensure_authenticated() -> Result<()> {
     use botster_hub::auth;
 
+    // Skip auth validation in test mode (BOTSTER_ENV=test)
+    if botster_hub::env::is_test_mode() {
+        log::info!("Skipping authentication (BOTSTER_ENV=test)");
+        return Ok(());
+    }
+
     let mut config = Config::load()?;
     let using_env_var =
         std::env::var("BOTSTER_TOKEN").is_ok() || std::env::var("BOTSTER_API_KEY").is_ok();
@@ -68,10 +74,52 @@ fn ensure_authenticated() -> Result<()> {
 }
 
 /// Runs the hub in headless mode (no TUI).
-#[expect(clippy::unnecessary_wraps, reason = "Will return errors when fully implemented")]
+///
+/// This mode is useful for:
+/// - Integration testing (system tests spawn CLI headless)
+/// - Running as a background daemon
+/// - CI/CD environments without a terminal
 fn run_headless() -> Result<()> {
     println!("Starting Botster Hub v{} in headless mode...", VERSION);
-    println!("Headless mode not yet implemented");
+
+    // Ensure we have a valid authentication token
+    ensure_authenticated()?;
+
+    // Set up signal handlers
+    use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGHUP};
+    use signal_hook::flag;
+    flag::register(SIGINT, Arc::clone(&SHUTDOWN_FLAG))?;
+    flag::register(SIGTERM, Arc::clone(&SHUTDOWN_FLAG))?;
+    flag::register(SIGHUP, Arc::clone(&SHUTDOWN_FLAG))?;
+
+    // Create Hub with default terminal size (not used in headless)
+    let config = Config::load()?;
+    let mut hub = Hub::new(config, (24, 80))?;
+
+    println!("Setting up connections...");
+    hub.setup();
+
+    println!("Hub ready. Waiting for connections...");
+    log::info!("Botster Hub v{} started in headless mode", VERSION);
+
+    // In headless mode, run a simplified event loop
+    // - Poll for messages and send heartbeats via tick()
+    // - Drain browser events (full handling requires TUI context)
+    while !SHUTDOWN_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+        // Poll for messages and send heartbeats
+        hub.tick();
+
+        // Drain browser events to prevent channel backup
+        // Note: Full event handling (resize, keyboard) requires TUI context
+        let _events = hub.browser.drain_events();
+
+        // Sleep to avoid busy-looping (100ms = 10 ticks/sec is plenty for headless)
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    println!("Shutting down...");
+    hub.shutdown();
+
     Ok(())
 }
 
@@ -89,7 +137,23 @@ fn run_with_hub() -> Result<()> {
     flag::register(SIGTERM, Arc::clone(&SHUTDOWN_FLAG))?;
     flag::register(SIGHUP, Arc::clone(&SHUTDOWN_FLAG))?;
 
-    // Setup terminal
+    // Get terminal size BEFORE entering raw mode (in case of errors)
+    let (rows, cols) = crossterm::terminal::size()?;
+    let terminal_cols = (cols * 70 / 100).saturating_sub(2);
+    let terminal_rows = rows.saturating_sub(2);
+
+    // Create Hub BEFORE entering raw mode so errors are visible
+    println!("Initializing hub...");
+    let config = Config::load()?;
+    let mut hub = Hub::new(config, (terminal_rows, terminal_cols))?;
+
+    // Perform setup BEFORE entering raw mode so errors are visible
+    println!("Setting up connections...");
+    hub.setup();
+
+    println!("Starting TUI...");
+
+    // NOW setup terminal (after all initialization that could fail)
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -97,16 +161,6 @@ fn run_with_hub() -> Result<()> {
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
-    // Get initial terminal size
-    let terminal_size = terminal.size()?;
-    let terminal_cols = (terminal_size.width * 70 / 100).saturating_sub(2);
-    let terminal_rows = terminal_size.height.saturating_sub(2);
-
-    // Create Hub and perform setup
-    let config = Config::load()?;
-    let mut hub = Hub::new(config, (terminal_rows, terminal_cols))?;
-    hub.setup();
 
     log::info!("Botster Hub v{} started with Hub architecture", VERSION);
 
@@ -181,12 +235,26 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// Get the connection URL for a running hub (for testing/automation)
+    GetConnectionUrl {
+        /// Hub identifier
+        #[arg(long)]
+        hub: String,
+    },
 }
 
 fn main() -> Result<()> {
     // Set up file logging so TUI doesn't interfere with log output
-    let log_file = std::fs::File::create("/tmp/botster-hub.log")
-        .expect("Failed to create log file");
+    // Use BOTSTER_LOG_FILE or BOTSTER_CONFIG_DIR/botster-hub.log or fallback
+    let log_path = if let Ok(path) = std::env::var("BOTSTER_LOG_FILE") {
+        std::path::PathBuf::from(path)
+    } else if let Ok(config_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
+        std::path::PathBuf::from(config_dir).join("botster-hub.log")
+    } else {
+        std::path::PathBuf::from("/tmp/botster-hub.log")
+    };
+    let log_file = std::fs::File::create(&log_path)
+        .unwrap_or_else(|_| panic!("Failed to create log file at {:?}", log_path));
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .format_timestamp_secs()
@@ -257,6 +325,18 @@ fn main() -> Result<()> {
                 commands::update::check()?;
             } else {
                 commands::update::install()?;
+            }
+        }
+        Commands::GetConnectionUrl { hub } => {
+            use botster_hub::relay::read_connection_url;
+            match read_connection_url(&hub)? {
+                Some(url) => {
+                    println!("{}", url);
+                }
+                None => {
+                    eprintln!("No connection URL found for hub '{}'. Is the CLI running?", hub);
+                    std::process::exit(1);
+                }
             }
         }
     }

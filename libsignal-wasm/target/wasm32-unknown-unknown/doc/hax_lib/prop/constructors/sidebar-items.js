@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["and","eq","exists","forall","from_bool","implies","ne","not","or"]};

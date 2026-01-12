@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["Int"],"trait":["Abstraction","Concretization","ToInt"]};

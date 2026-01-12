@@ -39,6 +39,7 @@ pub mod config;
 pub mod constants;
 pub mod device;
 pub mod embedded_tailscale;
+pub mod env;
 pub mod git;
 pub mod notifications;
 pub mod process;

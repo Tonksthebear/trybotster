@@ -1,31 +1,60 @@
-//! Relay - Browser connectivity via Tailscale mesh.
+//! Relay - Browser WebSocket adapter.
 //!
-//! This module provides browser relay functionality via Tailscale/Headscale
-//! mesh networking. Browser connects to CLI via Tailscale SSH.
+//! This module provides the browser relay functionality, handling WebSocket
+//! communication with connected browser clients via Action Cable. It manages:
+//!
+//! - E2E encrypted communication (Signal Protocol)
+//! - Browser event to Hub action conversion
+//! - Terminal output streaming
 //!
 //! # Architecture
 //!
 //! ```text
-//! Browser ◄──Tailscale SSH──► CLI (same tailnet, direct P2P when possible)
-//!                               │
-//!           Hub ◄─── BrowserEvent → HubAction
+//! Browser ◄──WebSocket──► Rails Action Cable ◄──WebSocket──► Relay
+//!                                                              │
+//!                              Hub ◄─── BrowserEvent → HubAction
 //! ```
 //!
-//! # Security
+//! # Encryption
 //!
-//! - WireGuard E2E encryption (Tailscale)
-//! - Per-user tailnet isolation at Headscale infrastructure level
-//! - Pre-auth key in URL fragment (server never sees it)
+//! All communication between the CLI and browser is E2E encrypted using
+//! the Signal Protocol (X3DH + Double Ratchet), the same battle-tested
+//! cryptography used by Signal, WhatsApp, and other secure messengers.
+//! The Rails server only sees encrypted blobs and cannot read the terminal content.
+//!
+//! ## Protocol (Signal)
+//!
+//! 1. CLI generates identity keys and PreKeyBundle
+//! 2. CLI displays QR code with PreKeyBundle
+//! 3. Browser scans QR code and calls process_prekey_bundle()
+//! 4. Browser sends PreKeySignalMessage to establish session
+//! 5. CLI decrypts and creates Double Ratchet session
+//! 6. Both sides can now encrypt/decrypt with forward secrecy
+//!
+//! ## Group Messaging (SenderKey)
+//!
+//! For CLI → multiple browsers broadcast:
+//! 1. CLI creates SenderKeyDistributionMessage
+//! 2. CLI sends distribution to each browser via individual session
+//! 3. CLI uses group_encrypt for broadcasts (efficient)
+//! 4. Browsers use group_decrypt to receive
 //!
 //! # Modules
 //!
-//! - [`browser`] - Browser event handling
+//! - [`connection`] - WebSocket transport and Signal encryption
 //! - [`events`] - Browser event to Hub action conversion
+//! - [`signal`] - Signal Protocol E2E encryption
+//! - [`signal_stores`] - Signal Protocol store implementations
+//! - [`persistence`] - Encrypted storage for Signal state
 //! - [`state`] - Browser connection state management
 //! - [`types`] - Protocol message types
 
 pub mod browser;
+pub mod connection;
 pub mod events;
+pub mod persistence;
+pub mod signal;
+pub mod signal_stores;
 pub mod state;
 pub mod types;
 
@@ -36,7 +65,6 @@ pub use events::{
 pub use state::{
     build_agent_info, build_worktree_info, send_agent_list, send_agent_selected,
     send_scrollback, send_worktree_list, BrowserSendContext, BrowserState,
-    TerminalOutputSender,
 };
 
 pub use types::{
@@ -44,6 +72,8 @@ pub use types::{
     WorktreeInfo,
 };
 
-// Re-export Tailscale types from browser_connect module
-pub use crate::browser_connect::{BrowserConnectionInfo, BrowserConnector};
-pub use crate::tailscale::TailscaleClient;
+pub use connection::{TerminalOutputSender, TerminalRelay};
+
+pub use signal::{PreKeyBundleData, SignalEnvelope, SignalProtocolManager, SIGNAL_PROTOCOL_VERSION};
+
+pub use persistence::{read_connection_url, write_connection_url, delete_connection_url};

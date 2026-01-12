@@ -11,6 +11,10 @@ class TunnelChannel < ApplicationCable::Channel
 
     # Stream for this hub identifier - hub record will be created by heartbeat
     stream_from "tunnel_hub_#{@user_id}_#{@hub_identifier}"
+  rescue => e
+    Rails.logger.error "[TunnelChannel] Error in subscribed: #{e.class} - #{e.message}"
+    Rails.logger.error e.backtrace.first(5).join("\n")
+    reject
   end
 
   def unsubscribed
@@ -22,8 +26,6 @@ class TunnelChannel < ApplicationCable::Channel
   # CLI registers an agent's tunnel port
   # Note: Agent may not exist yet if this arrives before heartbeat, so we create it
   def register_agent_tunnel(data)
-    Rails.logger.info "[TunnelChannel] register_agent_tunnel: #{data.inspect}"
-
     hub = current_user.hubs.find_by(identifier: @hub_identifier)
     unless hub
       Rails.logger.warn "[TunnelChannel] Hub not found: #{@hub_identifier}"

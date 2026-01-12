@@ -37,11 +37,14 @@ module ApplicationCable
     end
 
     def extract_device_token
-      # Bearer token in Authorization header (Fizzy pattern)
+      # First try Bearer token in Authorization header (Fizzy pattern)
       auth_header = request.headers["HTTP_AUTHORIZATION"] || request.headers["Authorization"]
-      return nil unless auth_header.present?
+      if auth_header.present?
+        return auth_header.delete_prefix("Bearer ")
+      end
 
-      auth_header.delete_prefix("Bearer ")
+      # Fallback to query param (useful for WebSocket connections where headers may be stripped)
+      request.params[:api_key]
     end
   end
 end
