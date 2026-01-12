@@ -410,16 +410,16 @@ fn render_close_confirm_modal(f: &mut Frame) {
 fn render_connection_code_modal(f: &mut Frame, connection_url: Option<&str>) {
     use crate::tui::generate_qr_code_lines;
 
-    // Use most of the terminal for the QR code modal
-    let area = centered_rect(90, 90, f.area());
+    // Use full terminal for the QR code modal (QR codes with Kyber keys are large)
+    let area = centered_rect(98, 98, f.area());
     f.render_widget(Clear, area);
 
     // Use the pre-generated connection URL
     let secure_url = connection_url.unwrap_or("Error: No connection URL generated");
 
-    // Calculate available space for QR code
-    let header_lines = 6u16;
-    let footer_lines = 7u16;
+    // Calculate available space for QR code (minimal overhead)
+    let header_lines = 2u16; // Title + instruction
+    let footer_lines = 2u16; // Copy hint + close hint
     let border_overhead = 2u16;
     let available_height = area
         .height
@@ -427,18 +427,12 @@ fn render_connection_code_modal(f: &mut Frame, connection_url: Option<&str>) {
     let available_width = area.width.saturating_sub(2);
 
     let qr_lines = generate_qr_code_lines(secure_url, available_width, available_height);
+    let qr_fits = !qr_lines.iter().any(|l| l.contains("too large"));
 
     let mut text_lines = vec![
-        Line::from("Secure E2E Connection"),
-        Line::from(""),
         Line::from(Span::styled(
-            "Scan QR code to connect securely",
+            "Scan QR to connect securely",
             Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "⚠ Key exchange bypasses server (MITM-proof)",
-            Style::default().fg(ratatui::style::Color::Green),
         )),
         Line::from(""),
     ];
@@ -449,19 +443,18 @@ fn render_connection_code_modal(f: &mut Frame, connection_url: Option<&str>) {
     }
 
     text_lines.push(Line::from(""));
-    text_lines.push(Line::from(Span::styled(
-        "Press 'c' to copy URL to clipboard",
-        Style::default().fg(ratatui::style::Color::Yellow),
-    )));
-    // Show URL
-    text_lines.push(Line::from(Span::styled(
-        secure_url,
-        Style::default()
-            .fg(ratatui::style::Color::Cyan)
-            .add_modifier(Modifier::UNDERLINED),
-    )));
-    text_lines.push(Line::from(""));
-    text_lines.push(Line::from("Press Esc, q, or Enter to close"));
+    if qr_fits {
+        text_lines.push(Line::from(Span::styled(
+            "[c] copy URL  [Esc/q/Enter] close",
+            Style::default().fg(ratatui::style::Color::DarkGray),
+        )));
+    } else {
+        // If QR doesn't fit, show more helpful message
+        text_lines.push(Line::from(Span::styled(
+            "[c] copy URL to clipboard  [Esc] close",
+            Style::default().fg(ratatui::style::Color::Yellow),
+        )));
+    }
 
     let code_widget = Paragraph::new(text_lines)
         .block(

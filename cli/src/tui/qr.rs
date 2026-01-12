@@ -115,16 +115,18 @@ pub fn generate_qr_code_lines(data: &str, max_width: u16, max_height: u16) -> Ve
         }
     }
 
-    // If nothing fits, return error message
+    // If nothing fits, return error message with actual dimensions
     log::warn!(
-        "QR code too large for terminal (max: {}x{})",
+        "QR code too large for terminal (available: {}x{}, need ~70x35)",
         max_width,
         max_height
     );
     vec![
-        "QR code too large for terminal".to_string(),
-        "Please resize your terminal window".to_string(),
-        "(need at least 60x30 characters)".to_string(),
+        "Terminal too small for QR code".to_string(),
+        format!("Available: {}x{} chars", max_width, max_height),
+        "Need: ~70 wide x 35 tall".to_string(),
+        "".to_string(),
+        "Press [c] to copy URL instead".to_string(),
     ]
 }
 
