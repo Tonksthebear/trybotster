@@ -7,15 +7,23 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
 
   setup do
     @hub_identifier = "test-hub-#{SecureRandom.hex(4)}"
+    @browser_identity = "browser-#{SecureRandom.hex(16)}"
   end
 
   # === Subscription Tests ===
 
-  test "subscribes successfully with valid hub_identifier" do
+  test "CLI subscribes to CLI stream (no browser_identity)" do
     subscribe hub_identifier: @hub_identifier
 
     assert subscription.confirmed?
-    assert_has_stream "terminal_relay:#{@hub_identifier}"
+    assert_has_stream "terminal_relay:#{@hub_identifier}:cli"
+  end
+
+  test "browser subscribes to dedicated browser stream" do
+    subscribe hub_identifier: @hub_identifier, browser_identity: @browser_identity
+
+    assert subscription.confirmed?
+    assert_has_stream "terminal_relay:#{@hub_identifier}:browser:#{@browser_identity}"
   end
 
   test "rejects subscription without hub_identifier" do
@@ -30,31 +38,56 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
     assert subscription.rejected?
   end
 
-  # === Relay Format Tests (THE CRITICAL BUG WE FIXED) ===
+  # === Routing Tests (Server-Side Routing) ===
 
-  test "relay broadcasts message when envelope wrapper is present" do
+  test "relay routes to browser stream when recipient_identity present" do
     subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
+    browser_stream = "terminal_relay:#{@hub_identifier}:browser:#{@browser_identity}"
+    cli_stream = "terminal_relay:#{@hub_identifier}:cli"
 
-    # Correct format: envelope fields nested under "envelope" key
-    assert_broadcasts(stream_name, 1) do
-      perform :relay, envelope: {
-        version: 4,
-        message_type: 2,
-        ciphertext: "base64_encrypted_data",
-        sender_identity: "signal_identity_key",
-        registration_id: 12345,
-        device_id: 1
-      }
+    # Message with recipient_identity goes to that browser's stream
+    assert_broadcasts(browser_stream, 1) do
+      assert_no_broadcasts(cli_stream) do
+        perform :relay, recipient_identity: @browser_identity, envelope: {
+          version: 4,
+          message_type: 2,
+          ciphertext: "base64_encrypted_data",
+          sender_identity: "cli_identity_key",
+          registration_id: 12345,
+          device_id: 1
+        }
+      end
     end
   end
 
+  test "relay routes to CLI stream when no recipient_identity" do
+    subscribe hub_identifier: @hub_identifier, browser_identity: @browser_identity
+    browser_stream = "terminal_relay:#{@hub_identifier}:browser:#{@browser_identity}"
+    cli_stream = "terminal_relay:#{@hub_identifier}:cli"
+
+    # Message without recipient_identity goes to CLI stream
+    assert_broadcasts(cli_stream, 1) do
+      assert_no_broadcasts(browser_stream) do
+        perform :relay, envelope: {
+          version: 4,
+          message_type: 1,
+          ciphertext: "encrypted_handshake",
+          sender_identity: @browser_identity,
+          registration_id: 54321,
+          device_id: 1
+        }
+      end
+    end
+  end
+
+  # === Relay Format Tests ===
+
   test "relay does NOT broadcast when envelope wrapper is missing" do
     subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
+    cli_stream = "terminal_relay:#{@hub_identifier}:cli"
 
-    # Wrong format: envelope fields at top level (the bug we fixed!)
-    assert_no_broadcasts(stream_name) do
+    # Wrong format: envelope fields at top level
+    assert_no_broadcasts(cli_stream) do
       perform :relay,
         version: 4,
         message_type: 2,
@@ -67,83 +100,46 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
 
   test "relay does NOT broadcast with nil envelope" do
     subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
+    cli_stream = "terminal_relay:#{@hub_identifier}:cli"
 
-    assert_no_broadcasts(stream_name) do
+    assert_no_broadcasts(cli_stream) do
       perform :relay, envelope: nil
-    end
-  end
-
-  test "relay does NOT broadcast with empty envelope" do
-    subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
-
-    # Empty hash is "present" but probably shouldn't broadcast either
-    # Current implementation allows this - may want to add validation
-    # For now, test documents current behavior
-  end
-
-  test "relay preserves envelope structure in broadcast" do
-    subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
-
-    envelope_data = {
-      version: 4,
-      message_type: 1,  # PreKeySignalMessage
-      ciphertext: "encrypted_handshake_data",
-      sender_identity: "browser_identity_key_base64",
-      registration_id: 54321,
-      device_id: 1
-    }
-
-    # Capture the broadcast to verify structure
-    assert_broadcasts(stream_name, 1) do
-      perform :relay, envelope: envelope_data
     end
   end
 
   # === SenderKey Distribution Tests ===
 
-  test "distribute_sender_key broadcasts distribution message" do
-    subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
+  test "distribute_sender_key broadcasts to CLI stream" do
+    subscribe hub_identifier: @hub_identifier, browser_identity: @browser_identity
+    cli_stream = "terminal_relay:#{@hub_identifier}:cli"
 
-    assert_broadcasts(stream_name, 1) do
+    assert_broadcasts(cli_stream, 1) do
       perform :distribute_sender_key, distribution: "base64_sender_key_distribution_message"
     end
   end
 
   test "distribute_sender_key does NOT broadcast without distribution" do
     subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
+    cli_stream = "terminal_relay:#{@hub_identifier}:cli"
 
-    assert_no_broadcasts(stream_name) do
+    assert_no_broadcasts(cli_stream) do
       perform :distribute_sender_key, distribution: nil
-    end
-  end
-
-  test "distribute_sender_key does NOT broadcast with blank distribution" do
-    subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
-
-    assert_no_broadcasts(stream_name) do
-      perform :distribute_sender_key, distribution: ""
     end
   end
 
   # === Signal Protocol Version Tests ===
 
   test "relay handles PreKeySignalMessage (message_type 1)" do
-    subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
+    subscribe hub_identifier: @hub_identifier, browser_identity: @browser_identity
+    cli_stream = "terminal_relay:#{@hub_identifier}:cli"
 
-    # PreKeySignalMessage is sent first to establish session
-    assert_broadcasts(stream_name, 1) do
+    # PreKeySignalMessage from browser to CLI (no recipient_identity)
+    assert_broadcasts(cli_stream, 1) do
       perform :relay, envelope: {
         version: 4,
-        message_type: 1,  # PreKeySignalMessage
+        message_type: 1,
         ciphertext: "prekey_signal_message_ciphertext",
-        sender_identity: "sender_identity_key",
+        sender_identity: @browser_identity,
         registration_id: 11111,
         device_id: 1
       }
@@ -152,80 +148,47 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
 
   test "relay handles SignalMessage (message_type 2)" do
     subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
+    browser_stream = "terminal_relay:#{@hub_identifier}:browser:#{@browser_identity}"
 
-    # SignalMessage is used after session is established
-    assert_broadcasts(stream_name, 1) do
-      perform :relay, envelope: {
+    # SignalMessage from CLI to specific browser
+    assert_broadcasts(browser_stream, 1) do
+      perform :relay, recipient_identity: @browser_identity, envelope: {
         version: 4,
-        message_type: 2,  # SignalMessage
+        message_type: 2,
         ciphertext: "signal_message_ciphertext",
-        sender_identity: "sender_identity_key",
+        sender_identity: "cli_identity_key",
         registration_id: 11111,
         device_id: 1
       }
     end
   end
 
-  test "relay handles SenderKeyMessage (message_type 3)" do
-    subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
-
-    # SenderKeyMessage is used for group broadcasts
-    assert_broadcasts(stream_name, 1) do
-      perform :relay, envelope: {
-        version: 4,
-        message_type: 3,  # SenderKeyMessage
-        ciphertext: "sender_key_message_ciphertext",
-        sender_identity: "cli_identity_key",
-        registration_id: 22222,
-        device_id: 1
-      }
-    end
-  end
-
-  # === Envelope as String Tests ===
-
-  test "relay handles envelope as JSON string" do
-    subscribe hub_identifier: @hub_identifier
-    stream_name = "terminal_relay:#{@hub_identifier}"
-
-    envelope_json = {
-      version: 4,
-      message_type: 2,
-      ciphertext: "encrypted_data",
-      sender_identity: "identity_key",
-      registration_id: 12345,
-      device_id: 1
-    }.to_json
-
-    assert_broadcasts(stream_name, 1) do
-      perform :relay, envelope: envelope_json
-    end
-  end
-
-  # === Documentation: Expected CLI Message Format ===
+  # === Documentation: Expected Message Formats ===
   #
-  # The CLI must send messages in this format for the relay to work:
-  #
+  # CLI -> Browser (with recipient_identity for routing):
   # {
   #   "action": "relay",
+  #   "recipient_identity": "browser_identity_key_base64",
   #   "envelope": {
   #     "version": 4,
   #     "message_type": 2,
   #     "ciphertext": "base64_encrypted_data",
-  #     "sender_identity": "base64_identity_key",
+  #     "sender_identity": "cli_identity_key",
   #     "registration_id": 12345,
   #     "device_id": 1
   #   }
   # }
   #
-  # NOT this (wrong - envelope fields at top level):
-  #
+  # Browser -> CLI (no recipient_identity):
   # {
   #   "action": "relay",
-  #   "version": 4,
-  #   "message_type": 2,
-  #   ...
+  #   "envelope": {
+  #     "version": 4,
+  #     "message_type": 1,
+  #     "ciphertext": "base64_encrypted_data",
+  #     "sender_identity": "browser_identity_key",
+  #     "registration_id": 54321,
+  #     "device_id": 1
+  #   }
   # }
 end

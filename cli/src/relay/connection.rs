@@ -27,9 +27,12 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message};
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
 use super::signal::{SignalEnvelope, SignalProtocolManager};
 use super::types::{BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage};
@@ -234,8 +237,9 @@ impl TerminalRelay {
             connected: Arc::clone(&connected),
         };
 
-        // Track browser identity for encryption
-        let mut browser_identity: Option<String> = None;
+        // Track browser identities for multi-session encryption
+        // Each connected browser has its own Signal session
+        let mut browser_identities: HashSet<String> = HashSet::new();
 
         // Spawn single task that handles all I/O using select!
         // This avoids Send requirements since everything runs on one task
@@ -244,27 +248,31 @@ impl TerminalRelay {
             loop {
                 tokio::select! {
                     // Handle outgoing messages (CLI -> browser)
+                    // Broadcast to ALL connected browsers
                     Some(output) = output_rx.recv() => {
-                        if *connected_clone.read().await {
-                            if let Some(ref identity) = browser_identity {
-                                let message = if let Ok(parsed) = serde_json::from_str::<TerminalMessage>(&output) {
-                                    parsed
-                                } else {
-                                    TerminalMessage::Output { data: output }
-                                };
+                        if *connected_clone.read().await && !browser_identities.is_empty() {
+                            let message = if let Ok(parsed) = serde_json::from_str::<TerminalMessage>(&output) {
+                                parsed
+                            } else {
+                                TerminalMessage::Output { data: output }
+                            };
 
-                                let plaintext = match serde_json::to_vec(&message) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        log::error!("Failed to serialize message: {}", e);
-                                        continue;
-                                    }
-                                };
+                            let plaintext = match serde_json::to_vec(&message) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    log::error!("Failed to serialize message: {}", e);
+                                    continue;
+                                }
+                            };
 
+                            // Encrypt and send to EACH connected browser
+                            for identity in &browser_identities {
                                 match self.signal_manager.encrypt(&plaintext, identity).await {
                                     Ok(envelope) => {
+                                        // recipient_identity at top level for server-side routing
                                         let data = serde_json::json!({
                                             "action": "relay",
+                                            "recipient_identity": identity,
                                             "envelope": {
                                                 "version": envelope.version,
                                                 "message_type": envelope.message_type,
@@ -283,12 +291,12 @@ impl TerminalRelay {
                                         if let Err(e) = write.send(Message::Text(
                                             serde_json::to_string(&cable_msg).expect("serializable")
                                         )).await {
-                                            log::error!("Failed to send output: {}", e);
-                                            break;
+                                            log::error!("Failed to send output to {}: {}", identity, e);
+                                            // Don't break - continue sending to other browsers
                                         }
                                     }
                                     Err(e) => {
-                                        log::error!("Encryption failed: {}", e);
+                                        log::error!("Encryption failed for {}: {}", identity, e);
                                     }
                                 }
                             }
@@ -343,11 +351,12 @@ impl TerminalRelay {
                                                         log::warn!("Failed to persist: {}", e);
                                                     }
 
-                                                    // Track browser identity for responses
-                                                    if browser_identity.is_none() {
-                                                        browser_identity = Some(envelope.sender_identity.clone());
+                                                    // Track browser identity for multi-session
+                                                    // Add each new browser to the set
+                                                    let is_new = browser_identities.insert(envelope.sender_identity.clone());
+                                                    if is_new {
+                                                        log::info!("Browser connected: {} (total: {})", envelope.sender_identity, browser_identities.len());
                                                         *connected_clone.write().await = true;
-                                                        log::info!("Browser connected: {}", envelope.sender_identity);
                                                     }
 
                                                     // Parse decrypted message
@@ -369,6 +378,7 @@ impl TerminalRelay {
                                                                         Ok(ack_envelope) => {
                                                                             let ack_data = serde_json::json!({
                                                                                 "action": "relay",
+                                                                                "recipient_identity": &envelope.sender_identity,
                                                                                 "envelope": {
                                                                                     "version": ack_envelope.version,
                                                                                     "message_type": ack_envelope.message_type,
@@ -402,6 +412,100 @@ impl TerminalRelay {
                                                                         device_name,
                                                                     }).await {
                                                                         log::error!("Failed to send event: {}", e);
+                                                                    }
+                                                                    continue;
+                                                                }
+                                                                BrowserCommand::GenerateInvite => {
+                                                                    log::info!("Browser requested invite bundle");
+
+                                                                    // Generate fresh PreKeyBundle for sharing
+                                                                    // Use a higher prekey ID than the initial QR (which uses 1)
+                                                                    match self.signal_manager.build_prekey_bundle_data(2).await {
+                                                                        Ok(bundle) => {
+                                                                            // Encode bundle for URL fragment
+                                                                            let bundle_json = serde_json::to_string(&bundle)
+                                                                                .expect("PreKeyBundle serializable");
+                                                                            let bundle_encoded = URL_SAFE_NO_PAD.encode(bundle_json.as_bytes());
+
+                                                                            // Build shareable URL (fragment never sent to server)
+                                                                            let invite_url = format!(
+                                                                                "{}/hubs/{}#bundle={}",
+                                                                                self.server_url, hub_identifier, bundle_encoded
+                                                                            );
+
+                                                                            // Send invite_bundle response
+                                                                            let response = TerminalMessage::InviteBundle {
+                                                                                bundle: bundle_encoded,
+                                                                                url: invite_url,
+                                                                            };
+                                                                            let response_bytes = serde_json::to_vec(&response)
+                                                                                .expect("InviteBundle serializable");
+
+                                                                            match self.signal_manager.encrypt(&response_bytes, &envelope.sender_identity).await {
+                                                                                Ok(invite_envelope) => {
+                                                                                    let invite_data = serde_json::json!({
+                                                                                        "action": "relay",
+                                                                                        "recipient_identity": &envelope.sender_identity,
+                                                                                        "envelope": {
+                                                                                            "version": invite_envelope.version,
+                                                                                            "message_type": invite_envelope.message_type,
+                                                                                            "ciphertext": invite_envelope.ciphertext,
+                                                                                            "sender_identity": invite_envelope.sender_identity,
+                                                                                            "registration_id": invite_envelope.registration_id,
+                                                                                            "device_id": invite_envelope.device_id,
+                                                                                        }
+                                                                                    });
+                                                                                    let invite_cable = CableMessage {
+                                                                                        command: "message".to_string(),
+                                                                                        identifier: identifier_json.clone(),
+                                                                                        data: Some(serde_json::to_string(&invite_data).expect("serializable")),
+                                                                                    };
+
+                                                                                    if let Err(e) = write.send(Message::Text(
+                                                                                        serde_json::to_string(&invite_cable).expect("serializable")
+                                                                                    )).await {
+                                                                                        log::error!("Failed to send invite_bundle: {}", e);
+                                                                                    } else {
+                                                                                        log::info!("Sent invite_bundle to browser");
+                                                                                    }
+                                                                                }
+                                                                                Err(e) => {
+                                                                                    log::error!("Failed to encrypt invite_bundle: {}", e);
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        Err(e) => {
+                                                                            log::error!("Failed to generate invite bundle: {}", e);
+                                                                            // Send error response to browser
+                                                                            let error_msg = TerminalMessage::Error {
+                                                                                message: format!("Failed to generate invite: {}", e),
+                                                                            };
+                                                                            let error_bytes = serde_json::to_vec(&error_msg)
+                                                                                .expect("Error serializable");
+
+                                                                            if let Ok(error_envelope) = self.signal_manager.encrypt(&error_bytes, &envelope.sender_identity).await {
+                                                                                let error_data = serde_json::json!({
+                                                                                    "action": "relay",
+                                                                                    "recipient_identity": &envelope.sender_identity,
+                                                                                    "envelope": {
+                                                                                        "version": error_envelope.version,
+                                                                                        "message_type": error_envelope.message_type,
+                                                                                        "ciphertext": error_envelope.ciphertext,
+                                                                                        "sender_identity": error_envelope.sender_identity,
+                                                                                        "registration_id": error_envelope.registration_id,
+                                                                                        "device_id": error_envelope.device_id,
+                                                                                    }
+                                                                                });
+                                                                                let error_cable = CableMessage {
+                                                                                    command: "message".to_string(),
+                                                                                    identifier: identifier_json.clone(),
+                                                                                    data: Some(serde_json::to_string(&error_data).expect("serializable")),
+                                                                                };
+                                                                                let _ = write.send(Message::Text(
+                                                                                    serde_json::to_string(&error_cable).expect("serializable")
+                                                                                )).await;
+                                                                            }
+                                                                        }
                                                                     }
                                                                     continue;
                                                                 }

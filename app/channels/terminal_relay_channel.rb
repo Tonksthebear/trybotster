@@ -7,10 +7,14 @@
 # it only forwards encrypted blobs.
 #
 # Architecture:
-# - Browser subscribes with hub_identifier
-# - CLI subscribes with hub_identifier (via separate WebSocket)
-# - Messages are relayed between them unchanged
+# - CLI subscribes with hub_identifier (no browser_identity)
+# - Each browser subscribes with hub_identifier + browser_identity
+# - Server routes messages to appropriate streams based on recipient_identity
 # - All encryption/decryption happens at endpoints
+#
+# Streams:
+# - CLI:     terminal_relay:{hub}:cli
+# - Browser: terminal_relay:{hub}:browser:{identity}
 #
 # Security:
 # - Server never sees plaintext terminal content
@@ -19,6 +23,7 @@
 class TerminalRelayChannel < ApplicationCable::Channel
   def subscribed
     @hub_identifier = params[:hub_identifier]
+    @browser_identity = params[:browser_identity]
 
     unless @hub_identifier.present?
       Rails.logger.warn "[TerminalRelay] Missing hub_identifier"
@@ -26,20 +31,29 @@ class TerminalRelayChannel < ApplicationCable::Channel
       return
     end
 
-    # Stream for this hub - both CLI and browsers subscribe to same stream
-    stream_from stream_name
+    # Subscribe to appropriate stream based on client type
+    stream_from my_stream_name
 
-    Rails.logger.info "[TerminalRelay] Subscribed: hub=#{@hub_identifier}"
+    if @browser_identity.present?
+      Rails.logger.info "[TerminalRelay] Browser subscribed: hub=#{@hub_identifier} identity=#{@browser_identity[0..8]}..."
+    else
+      Rails.logger.info "[TerminalRelay] CLI subscribed: hub=#{@hub_identifier}"
+    end
   end
 
   def unsubscribed
-    Rails.logger.info "[TerminalRelay] Unsubscribed: hub=#{@hub_identifier}"
+    if @browser_identity.present?
+      Rails.logger.info "[TerminalRelay] Browser unsubscribed: hub=#{@hub_identifier}"
+    else
+      Rails.logger.info "[TerminalRelay] CLI unsubscribed: hub=#{@hub_identifier}"
+    end
   end
 
-  # Relay encrypted message from browser to CLI (or CLI to browser)
+  # Relay encrypted message to appropriate recipient
   #
   # @param data [Hash] Contains encrypted SignalEnvelope
   # @option data [String] :envelope The encrypted SignalEnvelope JSON
+  # @option data [String] :recipient_identity Target browser (CLI->browser only)
   def relay(data)
     envelope = data["envelope"]
 
@@ -48,11 +62,18 @@ class TerminalRelayChannel < ApplicationCable::Channel
       return
     end
 
-    # Broadcast to all subscribers (CLI + other browsers)
-    # Each endpoint decrypts what's meant for them
-    ActionCable.server.broadcast(stream_name, { envelope: envelope })
+    recipient_identity = data["recipient_identity"]
 
-    Rails.logger.debug "[TerminalRelay] Relayed message for hub=#{@hub_identifier}"
+    if recipient_identity.present?
+      # CLI -> specific browser: route to that browser's stream
+      target_stream = browser_stream_name(recipient_identity)
+      ActionCable.server.broadcast(target_stream, { envelope: envelope })
+      Rails.logger.debug "[TerminalRelay] Routed to browser: #{recipient_identity[0..8]}..."
+    else
+      # Browser -> CLI: route to CLI stream
+      ActionCable.server.broadcast(cli_stream_name, { envelope: envelope })
+      Rails.logger.debug "[TerminalRelay] Routed to CLI"
+    end
   end
 
   # Relay SenderKey distribution (for group messaging)
@@ -67,14 +88,29 @@ class TerminalRelayChannel < ApplicationCable::Channel
       return
     end
 
-    ActionCable.server.broadcast(stream_name, { sender_key_distribution: distribution })
+    # SenderKey distribution goes to all browsers (broadcast pattern)
+    # TODO: When implementing SenderKey, need a browser broadcast stream
+    ActionCable.server.broadcast(cli_stream_name, { sender_key_distribution: distribution })
 
     Rails.logger.debug "[TerminalRelay] Distributed SenderKey for hub=#{@hub_identifier}"
   end
 
   private
 
-  def stream_name
-    "terminal_relay:#{@hub_identifier}"
+  # Stream this client subscribes to
+  def my_stream_name
+    if @browser_identity.present?
+      browser_stream_name(@browser_identity)
+    else
+      cli_stream_name
+    end
+  end
+
+  def cli_stream_name
+    "terminal_relay:#{@hub_identifier}:cli"
+  end
+
+  def browser_stream_name(identity)
+    "terminal_relay:#{@hub_identifier}:browser:#{identity}"
   end
 end

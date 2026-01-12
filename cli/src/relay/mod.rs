@@ -77,3 +77,5 @@ pub use connection::{TerminalOutputSender, TerminalRelay};
 pub use signal::{PreKeyBundleData, SignalEnvelope, SignalProtocolManager, SIGNAL_PROTOCOL_VERSION};
 
 pub use persistence::{read_connection_url, write_connection_url, delete_connection_url};
+
+pub use browser::poll_events_headless;

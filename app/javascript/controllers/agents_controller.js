@@ -143,8 +143,8 @@ export default class extends Controller {
 
   // Handle agent selection from CLI
   handleAgentSelected(message) {
-    this.selectedAgentId = message.agent_id;
-    this.updateSelectedLabel(message.agent_name || message.agent_id);
+    this.selectedAgentId = message.id;
+    this.updateSelectedLabel(message.name || message.id);
     this.updateAgentList(this.agents); // Re-render to show selection
   }
 

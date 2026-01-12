@@ -104,14 +104,15 @@ fn run_headless() -> Result<()> {
 
     // In headless mode, run a simplified event loop
     // - Poll for messages and send heartbeats via tick()
-    // - Drain browser events (full handling requires TUI context)
+    // - Process browser events (ListAgents, Input, etc.)
     while !SHUTDOWN_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
         // Poll for messages and send heartbeats
         hub.tick();
 
-        // Drain browser events to prevent channel backup
-        // Note: Full event handling (resize, keyboard) requires TUI context
-        let _events = hub.browser.drain_events();
+        // Process browser events (handles ListAgents, Input, Resize, etc.)
+        if let Err(e) = botster_hub::relay::poll_events_headless(&mut hub) {
+            log::error!("Failed to process browser events: {}", e);
+        }
 
         // Sleep to avoid busy-looping (100ms = 10 ticks/sec is plenty for headless)
         std::thread::sleep(std::time::Duration::from_millis(100));

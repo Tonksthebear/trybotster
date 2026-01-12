@@ -113,6 +113,8 @@ export default class extends Controller {
     "securityIcon",
     "securityText",
     "terminalBadge",
+    "shareBtn",
+    "shareStatus",
   ];
 
   static values = {
@@ -344,6 +346,7 @@ export default class extends Controller {
         {
           channel: "TerminalRelayChannel",
           hub_identifier: this.hubIdentifier,
+          browser_identity: this.ourIdentityKey,
         },
         {
           connected: () => {
@@ -421,21 +424,8 @@ export default class extends Controller {
 
     try {
       // Data from server is an encrypted SignalEnvelope
+      // Server routes messages to our dedicated stream, so all messages here are for us
       if (data.envelope) {
-        // Parse envelope to check sender
-        const envelope =
-          typeof data.envelope === "string"
-            ? JSON.parse(data.envelope)
-            : data.envelope;
-
-        // Skip our own messages (Action Cable broadcasts to all including sender)
-        if (
-          this.ourIdentityKey &&
-          envelope.sender_identity === this.ourIdentityKey
-        ) {
-          return;
-        }
-
         const decrypted = await this.signalSession.decrypt(data.envelope);
         this.handleDecryptedMessage(decrypted);
       } else if (data.sender_key_distribution) {
@@ -493,6 +483,13 @@ export default class extends Controller {
 
       // Notify all registered listeners
       this.notifyListeners("connected", this);
+      return;
+    }
+
+    // Handle invite bundle response
+    if (message.type === "invite_bundle") {
+      console.log("[Connection] Received invite bundle from CLI");
+      this.handleInviteBundle(message);
       return;
     }
 
@@ -572,7 +569,7 @@ export default class extends Controller {
   }
 
   selectAgent(agentId) {
-    return this.send("select_agent", { agent_id: agentId });
+    return this.send("select_agent", { id: agentId });
   }
 
   isConnected() {
@@ -601,6 +598,105 @@ export default class extends Controller {
       ConnectionError.SESSION_CREATE_FAILED,
       "Session cleared. Scan QR code to reconnect."
     );
+  }
+
+  // ========== Share Hub ==========
+
+  /**
+   * Request an invite bundle from CLI for sharing hub connection.
+   * Triggered by Share Hub button click.
+   */
+  async requestInviteBundle() {
+    if (!this.connected || !this.signalSession) {
+      console.warn("[Connection] Cannot request invite - not connected");
+      this.updateShareStatus("Not connected", "error");
+      return;
+    }
+
+    console.log("[Connection] Requesting invite bundle from CLI");
+    this.updateShareStatus("Generating...", "loading");
+
+    const success = await this.send("generate_invite");
+    if (!success) {
+      this.updateShareStatus("Failed to request", "error");
+    }
+    // Response will be handled by handleInviteBundle()
+  }
+
+  /**
+   * Handle invite bundle response from CLI.
+   * Copies URL to clipboard and/or uses native share.
+   */
+  async handleInviteBundle(message) {
+    const { url, bundle } = message;
+
+    if (!url) {
+      console.error("[Connection] Invite bundle missing URL");
+      this.updateShareStatus("Invalid response", "error");
+      return;
+    }
+
+    console.log("[Connection] Received invite URL:", url.substring(0, 50) + "...");
+
+    // Try native share first (mobile), fall back to clipboard
+    if (navigator.share && /iPhone|iPad|Android/i.test(navigator.userAgent)) {
+      try {
+        await navigator.share({
+          title: "Join Hub",
+          text: "Connect to my Botster hub",
+          url: url,
+        });
+        this.updateShareStatus("Shared!", "success");
+        return;
+      } catch (err) {
+        // User cancelled or share failed, fall back to clipboard
+        if (err.name !== "AbortError") {
+          console.warn("[Connection] Native share failed:", err);
+        }
+      }
+    }
+
+    // Copy to clipboard
+    try {
+      await navigator.clipboard.writeText(url);
+      this.updateShareStatus("Copied to clipboard!", "success");
+      console.log("[Connection] Invite URL copied to clipboard");
+    } catch (err) {
+      console.error("[Connection] Failed to copy to clipboard:", err);
+      // Show URL in a prompt as fallback
+      prompt("Copy this link to share:", url);
+      this.updateShareStatus("Copy the link above", "info");
+    }
+  }
+
+  /**
+   * Update share button status display.
+   */
+  updateShareStatus(text, state) {
+    if (this.hasShareStatusTarget) {
+      this.shareStatusTarget.textContent = text;
+
+      // Clear after delay (except for loading state)
+      if (state !== "loading") {
+        setTimeout(() => {
+          if (this.hasShareStatusTarget) {
+            this.shareStatusTarget.textContent = "";
+          }
+        }, 3000);
+      }
+    }
+
+    // Update button state
+    if (this.hasShareBtnTarget) {
+      const btn = this.shareBtnTarget;
+      btn.disabled = state === "loading";
+
+      if (state === "loading") {
+        btn.classList.add("opacity-50", "cursor-wait");
+      } else {
+        btn.classList.remove("opacity-50", "cursor-wait");
+      }
+    }
   }
 
   // ========== State Management ==========
