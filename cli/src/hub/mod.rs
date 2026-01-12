@@ -158,18 +158,23 @@ impl Hub {
         let state = HubState::new(config.worktree_base.clone());
         let tokio_runtime = tokio::runtime::Runtime::new()?;
 
-        // Generate stable hub_identifier from repo path (survives restarts)
-        let hub_identifier = match WorktreeManager::detect_current_repo() {
-            Ok((repo_path, _)) => {
-                let id = hub_id_for_repo(&repo_path);
-                log::info!("Hub identifier (from repo): {}...", &id[..8]);
-                id
-            }
-            Err(_) => {
-                // Fallback to UUID if not in a repo
-                let id = uuid::Uuid::new_v4().to_string();
-                log::info!("Hub identifier (random): {}...", &id[..8]);
-                id
+        // Generate stable hub_identifier: env var (for testing) > repo path > UUID
+        let hub_identifier = if let Ok(id) = std::env::var("BOTSTER_HUB_ID") {
+            log::info!("Hub identifier (from env): {}...", &id[..id.len().min(8)]);
+            id
+        } else {
+            match WorktreeManager::detect_current_repo() {
+                Ok((repo_path, _)) => {
+                    let id = hub_id_for_repo(&repo_path);
+                    log::info!("Hub identifier (from repo): {}...", &id[..8]);
+                    id
+                }
+                Err(_) => {
+                    // Fallback to UUID if not in a repo
+                    let id = uuid::Uuid::new_v4().to_string();
+                    log::info!("Hub identifier (random): {}...", &id[..8]);
+                    id
+                }
             }
         };
 
@@ -188,6 +193,9 @@ impl Hub {
             config.server_url.clone(),
         ));
 
+        // Initialize timestamps to past to trigger immediate poll/heartbeat on first tick
+        let past = Instant::now() - std::time::Duration::from_secs(3600);
+
         Ok(Self {
             state,
             config,
@@ -198,8 +206,8 @@ impl Hub {
             tokio_runtime,
             quit: false,
             polling_enabled: true,
-            last_poll: Instant::now(),
-            last_heartbeat: Instant::now(),
+            last_poll: past,
+            last_heartbeat: past,
             terminal_dims,
             mode: AppMode::Normal,
             menu_selected: 0,
@@ -347,11 +355,21 @@ impl Hub {
         }
         self.last_poll = Instant::now();
 
-        let (repo_path, repo_name) = match crate::git::WorktreeManager::detect_current_repo() {
-            Ok(result) => result,
-            Err(e) => {
-                log::warn!("Not in a git repository, skipping poll: {e}");
-                return;
+        // Detect repo: env var > git detection > test fallback
+        let (repo_path, repo_name) = if let Ok(repo) = std::env::var("BOTSTER_REPO") {
+            // Explicit repo override (used in tests and special cases)
+            (std::path::PathBuf::from("."), repo)
+        } else {
+            match crate::git::WorktreeManager::detect_current_repo() {
+                Ok(result) => result,
+                Err(_) if crate::env::is_test_mode() => {
+                    // Test mode fallback - use dummy repo
+                    (std::path::PathBuf::from("."), "test/repo".to_string())
+                }
+                Err(e) => {
+                    log::warn!("Not in a git repository, skipping poll: {e}");
+                    return;
+                }
             }
         };
 
@@ -360,16 +378,18 @@ impl Hub {
             return;
         }
 
+        log::info!("Polled {} messages for repo={}", messages.len(), repo_name);
+
         let context = MessageContext {
             repo_path,
-            repo_name,
+            repo_name: repo_name.clone(),
             worktree_base: self.config.worktree_base.clone(),
             max_sessions: self.config.max_sessions,
             current_agent_count: self.state.agent_count(),
         };
 
-        for msg in messages {
-            let parsed = ParsedMessage::from_message_data(&msg);
+        for msg in &messages {
+            let parsed = ParsedMessage::from_message_data(msg);
 
             // Try to notify existing agent first
             if self.try_notify_existing_agent(&parsed, &context.repo_name) {
@@ -392,11 +412,17 @@ impl Hub {
     /// Try to send a notification to an existing agent for this issue.
     ///
     /// Returns true if an agent was found and notified, false otherwise.
+    /// Does NOT apply to cleanup messages - those need to go through the action dispatch.
     fn try_notify_existing_agent(
         &mut self,
         parsed: &crate::server::messages::ParsedMessage,
         default_repo: &str,
     ) -> bool {
+        // Cleanup messages should not be treated as notifications
+        if parsed.is_cleanup() {
+            return false;
+        }
+
         let Some(issue_number) = parsed.issue_number else {
             return false;
         };
@@ -467,14 +493,13 @@ impl Hub {
         registration::start_tunnel(&self.tunnel_manager, &self.tokio_runtime);
     }
 
-    /// Connect to Tailscale tailnet for browser access.
-    pub fn connect_tailscale(&mut self) {
-        registration::connect_tailscale(
+    /// Connect to terminal relay for browser access (Signal E2E encryption).
+    pub fn connect_terminal_relay(&mut self) {
+        registration::connect_terminal_relay(
             &mut self.browser,
             &self.hub_identifier,
             &self.config.server_url,
             self.config.get_api_key(),
-            self.config.headscale_url.as_deref(),
             &self.tokio_runtime,
         );
     }
@@ -484,7 +509,7 @@ impl Hub {
         self.register_device();
         self.register_hub_with_server();
         self.start_tunnel();
-        self.connect_tailscale();
+        self.connect_terminal_relay();
     }
 
     // === Event Loop ===
@@ -519,6 +544,7 @@ mod tests {
     fn test_config() -> Config {
         Config {
             server_url: "http://localhost:3000".to_string(),
+            headscale_url: None,
             token: "btstr_test-key".to_string(),
             api_key: String::new(),
             poll_interval: 10,

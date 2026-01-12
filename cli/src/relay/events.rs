@@ -159,10 +159,11 @@ fn parse_issue_or_branch(value: Option<&String>) -> (Option<u32>, Option<String>
 #[must_use]
 pub fn command_to_event(cmd: &BrowserCommand) -> BrowserEvent {
     match cmd {
-        BrowserCommand::Handshake { device_name, browser_curve25519 } => {
-            // Handshake is handled specially in connection code, but map it here for completeness
+        BrowserCommand::Handshake { device_name, .. } => {
+            // Handshake is handled specially in connection code where the
+            // identity key is extracted from the Signal envelope.
             BrowserEvent::Connected {
-                public_key: browser_curve25519.clone(),
+                public_key: String::new(), // Filled from envelope in connection handler
                 device_name: device_name.clone(),
             }
         }

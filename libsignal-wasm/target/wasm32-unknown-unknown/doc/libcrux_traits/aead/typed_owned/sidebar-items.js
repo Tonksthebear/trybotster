@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"macro":["impl_aead_typed_owned"],"struct":["Key","Nonce","Tag"],"trait":["Aead"]};

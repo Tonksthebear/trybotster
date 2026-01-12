@@ -1,602 +1,442 @@
-//! Signal Protocol store implementation with encrypted persistence.
+//! Signal Protocol store implementations.
 //!
-//! This module implements the `SessionStorage` trait from libsignal-rust with
-//! encrypted file storage. All sensitive data (identity keys, session state,
-//! pre-keys) is encrypted using AES-256-GCM before writing to disk.
+//! This module provides in-memory stores for all Signal Protocol state,
+//! with encrypted persistence to disk using AES-256-GCM + OS keyring.
 //!
-//! # Storage Layout
+//! # Store Traits Implemented
 //!
-//! ```text
-//! ~/.botster_hub/signal/{hub_id}/
-//! ├── identity.enc           # Our identity keypair
-//! ├── trusted_identities/    # Known peer identity keys
-//! │   └── {address}.enc
-//! ├── sessions/              # Session records per peer
-//! │   └── {address}.enc
-//! ├── pre_keys/              # One-time pre-keys
-//! │   └── {id}.enc
-//! └── signed_pre_keys/       # Signed pre-keys
-//!     └── {id}.enc
-//! ```
+//! - `IdentityKeyStore` - Our identity + known peer identities
+//! - `SessionStore` - Per-peer Double Ratchet sessions
+//! - `PreKeyStore` - One-time PreKeys (consumed on use)
+//! - `SignedPreKeyStore` - Signed PreKeys (rotated periodically)
+//! - `KyberPreKeyStore` - Post-quantum Kyber keys
+//! - `SenderKeyStore` - Group messaging keys
 //!
-//! # Security
-//!
-//! - Encryption key is stored in OS keyring (or file in test mode)
-//! - AES-256-GCM provides authenticated encryption
-//! - Each file has a unique 12-byte nonce
+//! Rust guideline compliant 2025-01
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
-use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use keyring::Entry;
-use libsignal_rust::{
-    curve::{self, KeyPair},
-    session_builder::SessionStorage,
-    session_record::SessionRecord,
-};
-use rand::{rngs::OsRng, RngCore};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use libsignal_protocol::{
+    Direction, GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair, KyberPreKeyId,
+    KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress,
+    PublicKey, SenderKeyRecord, SenderKeyStore, SessionRecord, SessionStore, SignedPreKeyId,
+    SignedPreKeyRecord, SignedPreKeyStore, SignalProtocolError,
+};
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
-/// Keyring service name for Signal encryption keys.
-const KEYRING_SERVICE: &str = "botster-signal";
+use super::persistence::SignalStoreState;
 
-/// Check if keyring should be skipped (for testing).
-fn should_skip_keyring() -> bool {
-    #[cfg(test)]
-    {
-        return true;
-    }
-
-    #[cfg(not(test))]
-    {
-        if std::env::var("BOTSTER_SKIP_KEYRING")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        std::env::var("BOTSTER_CONFIG_DIR").is_ok()
-    }
+/// Unified Signal Protocol store with all key material.
+///
+/// Uses in-memory storage with encrypted disk persistence.
+/// Cloneable - clones share the underlying data via Arc.
+#[derive(Clone)]
+pub struct SignalProtocolStore {
+    // Note: IdentityKeyPair doesn't implement Debug, so we can't derive Debug.
+    // Use manual Debug impl below.
+    /// Our identity key pair.
+    identity_key_pair: IdentityKeyPair,
+    /// Registration ID (random 14-bit value).
+    registration_id: u32,
+    /// Known peer identities (address -> identity key).
+    identities: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    /// Sessions (address -> session record bytes).
+    sessions: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    /// One-time PreKeys (id -> record bytes).
+    pre_keys: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
+    /// Signed PreKeys (id -> record bytes).
+    signed_pre_keys: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
+    /// Kyber PreKeys (id -> record bytes).
+    kyber_pre_keys: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
+    /// Sender keys for groups ((address, distribution_id) -> record bytes).
+    sender_keys: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    /// Track which PreKeys have been used.
+    used_pre_keys: Arc<RwLock<Vec<u32>>>,
 }
 
-/// Stored identity information (encrypted at rest).
-#[derive(Debug, Serialize, Deserialize)]
-struct StoredIdentity {
-    /// Private key bytes (32 bytes).
-    priv_key: Vec<u8>,
-    /// Public key bytes (33 bytes with version prefix).
-    pub_key: Vec<u8>,
-}
-
-/// Persistent Signal Protocol storage with encryption.
-pub struct SignalStore {
-    /// Hub identifier (used for namespace isolation).
-    hub_id: String,
-    /// Base directory for storage.
-    base_dir: PathBuf,
-    /// Encryption key (loaded from keyring).
-    encryption_key: [u8; 32],
-    /// In-memory session cache.
-    sessions: Arc<RwLock<HashMap<String, SessionRecord>>>,
-    /// In-memory pre-key cache.
-    pre_keys: Arc<RwLock<HashMap<u32, KeyPair>>>,
-    /// In-memory signed pre-key cache.
-    signed_pre_keys: Arc<RwLock<HashMap<u32, KeyPair>>>,
-    /// In-memory trusted identities cache.
-    trusted_identities: Arc<RwLock<HashMap<String, Vec<u8>>>>,
-    /// Our identity keypair (cached).
-    identity: Arc<RwLock<Option<KeyPair>>>,
-}
-
-impl std::fmt::Debug for SignalStore {
+impl std::fmt::Debug for SignalProtocolStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SignalStore")
-            .field("hub_id", &self.hub_id)
-            .field("base_dir", &self.base_dir)
+        f.debug_struct("SignalProtocolStore")
+            .field("registration_id", &self.registration_id)
             .finish_non_exhaustive()
     }
 }
 
-impl SignalStore {
-    /// Create or load a Signal store for a hub.
-    ///
-    /// This loads the encryption key from the OS keyring (or generates a new one)
-    /// and sets up the directory structure for encrypted storage.
-    pub fn new(hub_id: &str) -> Result<Self> {
-        let base_dir = Self::get_base_dir(hub_id)?;
-        let encryption_key = Self::get_or_create_encryption_key(hub_id)?;
+impl SignalProtocolStore {
+    /// Create a new store with fresh identity.
+    pub async fn new() -> Result<Self> {
+        let identity_key_pair = IdentityKeyPair::generate(&mut rand::rng());
+        // Registration ID is a 14-bit random value
+        let registration_id = rand::random::<u32>() & 0x3FFF;
 
-        let store = Self {
-            hub_id: hub_id.to_string(),
-            base_dir,
-            encryption_key,
+        Ok(Self {
+            identity_key_pair,
+            registration_id,
+            identities: Arc::new(RwLock::new(HashMap::new())),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             pre_keys: Arc::new(RwLock::new(HashMap::new())),
             signed_pre_keys: Arc::new(RwLock::new(HashMap::new())),
-            trusted_identities: Arc::new(RwLock::new(HashMap::new())),
-            identity: Arc::new(RwLock::new(None)),
+            kyber_pre_keys: Arc::new(RwLock::new(HashMap::new())),
+            sender_keys: Arc::new(RwLock::new(HashMap::new())),
+            used_pre_keys: Arc::new(RwLock::new(Vec::new())),
+        })
+    }
+
+    /// Load store from encrypted disk storage.
+    pub async fn load(hub_id: &str) -> Result<Self> {
+        let state = super::persistence::load_signal_store(hub_id)?;
+
+        let identity_key_pair = IdentityKeyPair::try_from(state.identity_key_pair.as_slice())
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize identity: {e}"))?;
+
+        Ok(Self {
+            identity_key_pair,
+            registration_id: state.registration_id,
+            identities: Arc::new(RwLock::new(state.identities)),
+            sessions: Arc::new(RwLock::new(state.sessions)),
+            pre_keys: Arc::new(RwLock::new(state.pre_keys)),
+            signed_pre_keys: Arc::new(RwLock::new(state.signed_pre_keys)),
+            kyber_pre_keys: Arc::new(RwLock::new(state.kyber_pre_keys)),
+            sender_keys: Arc::new(RwLock::new(state.sender_keys)),
+            used_pre_keys: Arc::new(RwLock::new(state.used_pre_keys)),
+        })
+    }
+
+    /// Persist store to encrypted disk storage.
+    pub async fn persist(&self, hub_id: &str) -> Result<()> {
+        let state = SignalStoreState {
+            identity_key_pair: self.identity_key_pair.serialize().to_vec(),
+            registration_id: self.registration_id,
+            identities: self.identities.read().await.clone(),
+            sessions: self.sessions.read().await.clone(),
+            pre_keys: self.pre_keys.read().await.clone(),
+            signed_pre_keys: self.signed_pre_keys.read().await.clone(),
+            kyber_pre_keys: self.kyber_pre_keys.read().await.clone(),
+            sender_keys: self.sender_keys.read().await.clone(),
+            used_pre_keys: self.used_pre_keys.read().await.clone(),
         };
 
-        // Load existing data from disk
-        store.load_from_disk()?;
-
-        Ok(store)
-    }
-
-    /// Get the base directory for Signal storage.
-    fn get_base_dir(hub_id: &str) -> Result<PathBuf> {
-        let config_dir = if let Ok(custom_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
-            PathBuf::from(custom_dir)
-        } else {
-            dirs::config_dir()
-                .context("Could not determine config directory")?
-                .join("botster_hub")
-        };
-
-        let base_dir = config_dir.join("signal").join(hub_id);
-        fs::create_dir_all(&base_dir).context("Failed to create signal storage directory")?;
-        fs::create_dir_all(base_dir.join("sessions"))?;
-        fs::create_dir_all(base_dir.join("pre_keys"))?;
-        fs::create_dir_all(base_dir.join("signed_pre_keys"))?;
-        fs::create_dir_all(base_dir.join("trusted_identities"))?;
-
-        Ok(base_dir)
-    }
-
-    /// Get or create the encryption key for this hub.
-    fn get_or_create_encryption_key(hub_id: &str) -> Result<[u8; 32]> {
-        if should_skip_keyring() {
-            // Test mode: use file-based key storage
-            let key_path = Self::get_base_dir(hub_id)?.join("encryption.key");
-            if key_path.exists() {
-                let key_b64 = fs::read_to_string(&key_path)?;
-                let key_bytes = BASE64.decode(key_b64.trim())?;
-                let key: [u8; 32] = key_bytes
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
-                return Ok(key);
-            } else {
-                let mut key = [0u8; 32];
-                OsRng.fill_bytes(&mut key);
-                let key_b64 = BASE64.encode(key);
-                fs::write(&key_path, &key_b64)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
-                }
-                return Ok(key);
-            }
-        }
-
-        // Production: use OS keyring
-        let entry_name = format!("signal-{}", hub_id);
-        let entry = Entry::new(KEYRING_SERVICE, &entry_name)
-            .map_err(|e| anyhow::anyhow!("Failed to create keyring entry: {:?}", e))?;
-
-        match entry.get_password() {
-            Ok(key_b64) => {
-                let key_bytes = BASE64
-                    .decode(&key_b64)
-                    .context("Invalid key encoding in keyring")?;
-                let key: [u8; 32] = key_bytes
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Invalid key length in keyring"))?;
-                Ok(key)
-            }
-            Err(_) => {
-                // Generate new key
-                let mut key = [0u8; 32];
-                OsRng.fill_bytes(&mut key);
-                let key_b64 = BASE64.encode(key);
-                entry
-                    .set_password(&key_b64)
-                    .map_err(|e| anyhow::anyhow!("Failed to store key in keyring: {:?}", e))?;
-                log::info!("Generated new Signal encryption key for hub {}", hub_id);
-                Ok(key)
-            }
-        }
-    }
-
-    /// Load existing data from disk into memory.
-    fn load_from_disk(&self) -> Result<()> {
-        // Load identity
-        let identity_path = self.base_dir.join("identity.enc");
-        if identity_path.exists() {
-            if let Ok(data) = self.read_encrypted_file(&identity_path) {
-                if let Ok(stored) = serde_json::from_slice::<StoredIdentity>(&data) {
-                    let keypair = KeyPair {
-                        priv_key: stored.priv_key,
-                        pub_key: stored.pub_key,
-                    };
-                    let mut identity = self.identity.blocking_write();
-                    *identity = Some(keypair);
-                }
-            }
-        }
-
-        // Load sessions
-        let sessions_dir = self.base_dir.join("sessions");
-        if sessions_dir.exists() {
-            for entry in fs::read_dir(&sessions_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().map(|e| e == "enc").unwrap_or(false) {
-                    if let Some(stem) = path.file_stem() {
-                        let address = stem.to_string_lossy().to_string();
-                        if let Ok(data) = self.read_encrypted_file(&path) {
-                            if let Ok(record) = serde_json::from_slice::<SessionRecord>(&data) {
-                                let mut sessions = self.sessions.blocking_write();
-                                sessions.insert(address, record);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Load pre-keys
-        let pre_keys_dir = self.base_dir.join("pre_keys");
-        if pre_keys_dir.exists() {
-            for entry in fs::read_dir(&pre_keys_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().map(|e| e == "enc").unwrap_or(false) {
-                    if let Some(stem) = path.file_stem() {
-                        if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
-                            if let Ok(data) = self.read_encrypted_file(&path) {
-                                if let Ok(keypair) = serde_json::from_slice::<KeyPair>(&data) {
-                                    let mut pre_keys = self.pre_keys.blocking_write();
-                                    pre_keys.insert(id, keypair);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Load signed pre-keys
-        let signed_pre_keys_dir = self.base_dir.join("signed_pre_keys");
-        if signed_pre_keys_dir.exists() {
-            for entry in fs::read_dir(&signed_pre_keys_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().map(|e| e == "enc").unwrap_or(false) {
-                    if let Some(stem) = path.file_stem() {
-                        if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
-                            if let Ok(data) = self.read_encrypted_file(&path) {
-                                if let Ok(keypair) = serde_json::from_slice::<KeyPair>(&data) {
-                                    let mut signed_pre_keys = self.signed_pre_keys.blocking_write();
-                                    signed_pre_keys.insert(id, keypair);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Load trusted identities
-        let trusted_dir = self.base_dir.join("trusted_identities");
-        if trusted_dir.exists() {
-            for entry in fs::read_dir(&trusted_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().map(|e| e == "enc").unwrap_or(false) {
-                    if let Some(stem) = path.file_stem() {
-                        let address = stem.to_string_lossy().to_string();
-                        if let Ok(data) = self.read_encrypted_file(&path) {
-                            let mut trusted = self.trusted_identities.blocking_write();
-                            trusted.insert(address, data);
-                        }
-                    }
-                }
-            }
-        }
-
+        super::persistence::save_signal_store(hub_id, &state)?;
         Ok(())
     }
 
-    /// Read and decrypt a file.
-    fn read_encrypted_file(&self, path: &PathBuf) -> Result<Vec<u8>> {
-        let contents = fs::read(path)?;
-        if contents.len() < 12 {
-            anyhow::bail!("File too short for nonce");
-        }
-
-        let (nonce_bytes, ciphertext) = contents.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
-        let cipher = Aes256Gcm::new_from_slice(&self.encryption_key)
-            .map_err(|e| anyhow::anyhow!("Failed to create cipher: {}", e))?;
-
-        cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))
+    /// Get identity key pair.
+    pub async fn get_identity_key_pair(&self) -> std::result::Result<IdentityKeyPair, SignalProtocolError> {
+        Ok(self.identity_key_pair.clone())
     }
 
-    /// Encrypt and write a file.
-    fn write_encrypted_file(&self, path: &PathBuf, data: &[u8]) -> Result<()> {
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        let cipher = Aes256Gcm::new_from_slice(&self.encryption_key)
-            .map_err(|e| anyhow::anyhow!("Failed to create cipher: {}", e))?;
-
-        let ciphertext = cipher
-            .encrypt(nonce, data)
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
-
-        let mut contents = nonce_bytes.to_vec();
-        contents.extend(ciphertext);
-
-        fs::write(path, &contents)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        }
-
-        Ok(())
+    /// Get local registration ID.
+    pub async fn get_local_registration_id(&self) -> std::result::Result<u32, SignalProtocolError> {
+        Ok(self.registration_id)
     }
 
-    /// Generate or get our identity keypair.
-    pub async fn get_or_create_identity(&self) -> KeyPair {
-        {
-            let identity = self.identity.read().await;
-            if let Some(ref keypair) = *identity {
-                return keypair.clone();
-            }
-        }
-
-        // Generate new identity
-        let keypair = curve::generate_signing_key_pair();
-
-        // Store it
-        let mut identity = self.identity.write().await;
-        *identity = Some(keypair.clone());
-
-        // Persist to disk
-        let stored = StoredIdentity {
-            priv_key: keypair.priv_key.clone(),
-            pub_key: keypair.pub_key.clone(),
-        };
-        let data = serde_json::to_vec(&stored).unwrap_or_default();
-        let path = self.base_dir.join("identity.enc");
-        if let Err(e) = self.write_encrypted_file(&path, &data) {
-            log::error!("Failed to persist identity: {}", e);
-        }
-
-        keypair
+    /// Get an available PreKey ID (any that hasn't been consumed).
+    ///
+    /// Returns None if all PreKeys have been consumed.
+    pub async fn get_available_prekey_id(&self) -> Option<u32> {
+        let pre_keys = self.pre_keys.read().await;
+        pre_keys.keys().next().copied()
     }
 
-    /// Store a pre-key.
-    pub async fn store_pre_key(&self, id: u32, keypair: KeyPair) -> Result<()> {
-        {
-            let mut pre_keys = self.pre_keys.write().await;
-            pre_keys.insert(id, keypair.clone());
-        }
-
-        let data = serde_json::to_vec(&keypair)?;
-        let path = self.base_dir.join("pre_keys").join(format!("{}.enc", id));
-        self.write_encrypted_file(&path, &data)
+    /// Get count of remaining PreKeys.
+    pub async fn prekey_count(&self) -> usize {
+        self.pre_keys.read().await.len()
     }
 
-    /// Store a signed pre-key.
-    pub async fn store_signed_pre_key(&self, id: u32, keypair: KeyPair) -> Result<()> {
-        {
-            let mut signed_pre_keys = self.signed_pre_keys.write().await;
-            signed_pre_keys.insert(id, keypair.clone());
-        }
-
-        let data = serde_json::to_vec(&keypair)?;
-        let path = self
-            .base_dir
-            .join("signed_pre_keys")
-            .join(format!("{}.enc", id));
-        self.write_encrypted_file(&path, &data)
+    /// Create address key for HashMap.
+    fn address_key(address: &ProtocolAddress) -> String {
+        format!("{}:{}", address.name(), address.device_id())
     }
 
-    /// Mark an identity as trusted.
-    pub async fn trust_identity(&self, address: &str, identity_key: &[u8]) -> Result<()> {
-        {
-            let mut trusted = self.trusted_identities.write().await;
-            trusted.insert(address.to_string(), identity_key.to_vec());
-        }
-
-        let path = self
-            .base_dir
-            .join("trusted_identities")
-            .join(format!("{}.enc", Self::sanitize_filename(address)));
-        self.write_encrypted_file(&path, identity_key)
-    }
-
-    /// Remove a pre-key after use (one-time keys).
-    pub async fn remove_pre_key(&self, id: u32) -> Result<()> {
-        {
-            let mut pre_keys = self.pre_keys.write().await;
-            pre_keys.remove(&id);
-        }
-
-        let path = self.base_dir.join("pre_keys").join(format!("{}.enc", id));
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
-    }
-
-    /// Sanitize a string for use as a filename.
-    fn sanitize_filename(s: &str) -> String {
-        s.chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
+    /// Create sender key map key.
+    fn sender_key_key(sender: &ProtocolAddress, distribution_id: Uuid) -> String {
+        format!("{}:{}:{}", sender.name(), sender.device_id(), distribution_id)
     }
 }
 
-impl SessionStorage for SignalStore {
-    fn is_trusted_identity(
+// ============================================================================
+// IdentityKeyStore Implementation
+// ============================================================================
+
+#[async_trait(?Send)]
+impl libsignal_protocol::IdentityKeyStore for SignalProtocolStore {
+    async fn get_identity_key_pair(&self) -> std::result::Result<IdentityKeyPair, SignalProtocolError> {
+        Ok(self.identity_key_pair.clone())
+    }
+
+    async fn get_local_registration_id(&self) -> std::result::Result<u32, SignalProtocolError> {
+        Ok(self.registration_id)
+    }
+
+    async fn save_identity(
+        &mut self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> std::result::Result<IdentityChange, SignalProtocolError> {
+        let key = Self::address_key(address);
+        let mut identities = self.identities.write().await;
+
+        let existing = identities.get(&key).cloned();
+        let new_bytes = identity.serialize().to_vec();
+
+        let change = match existing {
+            Some(old) if old != new_bytes => IdentityChange::ReplacedExisting,
+            _ => IdentityChange::NewOrUnchanged,
+        };
+        identities.insert(key, new_bytes);
+
+        Ok(change)
+    }
+
+    async fn is_trusted_identity(
         &self,
-        address: &str,
-        identity_key: &[u8],
-    ) -> impl std::future::Future<Output = bool> + Send {
-        let trusted = self.trusted_identities.clone();
-        let address = address.to_string();
-        let identity_key = identity_key.to_vec();
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+        _direction: Direction,
+    ) -> std::result::Result<bool, SignalProtocolError> {
+        let key = Self::address_key(address);
+        let identities = self.identities.read().await;
 
-        async move {
-            let trusted = trusted.read().await;
-
-            // If we've never seen this identity, it's trusted (TOFU)
-            match trusted.get(&address) {
-                Some(stored_key) => stored_key == &identity_key,
-                None => true, // Trust on first use
+        match identities.get(&key) {
+            Some(known) => {
+                // Trust if it matches what we have
+                Ok(*known == identity.serialize().to_vec())
+            }
+            None => {
+                // Trust on first use (TOFU)
+                Ok(true)
             }
         }
     }
 
-    fn load_session(
+    async fn get_identity(
         &self,
-        address: &str,
-    ) -> impl std::future::Future<Output = Option<SessionRecord>> + Send {
-        let sessions = self.sessions.clone();
-        let address = address.to_string();
+        address: &ProtocolAddress,
+    ) -> std::result::Result<Option<IdentityKey>, SignalProtocolError> {
+        let key = Self::address_key(address);
+        let identities = self.identities.read().await;
 
-        async move {
-            let sessions = sessions.read().await;
-            sessions.get(&address).cloned()
+        match identities.get(&key) {
+            Some(bytes) => {
+                let identity = IdentityKey::try_from(bytes.as_slice())
+                    .map_err(|e| SignalProtocolError::InvalidArgument(format!("Invalid identity: {e}")))?;
+                Ok(Some(identity))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+// ============================================================================
+// SessionStore Implementation
+// ============================================================================
+
+#[async_trait(?Send)]
+impl SessionStore for SignalProtocolStore {
+    async fn load_session(
+        &self,
+        address: &ProtocolAddress,
+    ) -> std::result::Result<Option<SessionRecord>, SignalProtocolError> {
+        let key = Self::address_key(address);
+        let sessions = self.sessions.read().await;
+
+        match sessions.get(&key) {
+            Some(bytes) => {
+                let record = SessionRecord::deserialize(bytes)
+                    .map_err(|e| SignalProtocolError::InvalidArgument(format!("Invalid session: {e}")))?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
         }
     }
 
-    fn store_session(
+    async fn store_session(
+        &mut self,
+        address: &ProtocolAddress,
+        record: &SessionRecord,
+    ) -> std::result::Result<(), SignalProtocolError> {
+        let key = Self::address_key(address);
+        let bytes = record.serialize()
+            .map_err(|e| SignalProtocolError::InvalidArgument(format!("Failed to serialize session: {e}")))?;
+
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(key, bytes);
+        Ok(())
+    }
+}
+
+// ============================================================================
+// PreKeyStore Implementation
+// ============================================================================
+
+#[async_trait(?Send)]
+impl PreKeyStore for SignalProtocolStore {
+    async fn get_pre_key(
         &self,
-        address: &str,
-        record: SessionRecord,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        let sessions = self.sessions.clone();
-        let base_dir = self.base_dir.clone();
-        let encryption_key = self.encryption_key;
-        let address = address.to_string();
+        id: PreKeyId,
+    ) -> std::result::Result<PreKeyRecord, SignalProtocolError> {
+        let pre_keys = self.pre_keys.read().await;
+        let id_u32: u32 = id.into();
 
-        async move {
-            // Store in memory
-            {
-                let mut sessions = sessions.write().await;
-                sessions.insert(address.clone(), record.clone());
-            }
-
-            // Persist to disk
-            if let Ok(data) = serde_json::to_vec(&record) {
-                let path = base_dir
-                    .join("sessions")
-                    .join(format!("{}.enc", Self::sanitize_filename(&address)));
-
-                // Encrypt and write
-                let mut nonce_bytes = [0u8; 12];
-                OsRng.fill_bytes(&mut nonce_bytes);
-                let nonce = Nonce::from_slice(&nonce_bytes);
-
-                if let Ok(cipher) = Aes256Gcm::new_from_slice(&encryption_key) {
-                    if let Ok(ciphertext) = cipher.encrypt(nonce, data.as_slice()) {
-                        let mut contents = nonce_bytes.to_vec();
-                        contents.extend(ciphertext);
-
-                        if let Err(e) = fs::write(&path, &contents) {
-                            log::error!("Failed to persist session: {}", e);
-                        }
-                    }
-                }
-            }
+        match pre_keys.get(&id_u32) {
+            Some(bytes) => PreKeyRecord::deserialize(bytes)
+                .map_err(|e| SignalProtocolError::InvalidArgument(format!("Invalid PreKey: {e}"))),
+            None => Err(SignalProtocolError::InvalidPreKeyId),
         }
     }
 
-    fn load_pre_key(
-        &self,
-        pre_key_id: u32,
-    ) -> impl std::future::Future<Output = Option<KeyPair>> + Send {
-        let pre_keys = self.pre_keys.clone();
+    async fn save_pre_key(
+        &mut self,
+        id: PreKeyId,
+        record: &PreKeyRecord,
+    ) -> std::result::Result<(), SignalProtocolError> {
+        let id_u32: u32 = id.into();
+        let bytes = record.serialize()
+            .map_err(|e| SignalProtocolError::InvalidArgument(format!("Failed to serialize PreKey: {e}")))?;
 
-        async move {
-            let pre_keys = pre_keys.read().await;
-            pre_keys.get(&pre_key_id).cloned()
+        let mut pre_keys = self.pre_keys.write().await;
+        pre_keys.insert(id_u32, bytes);
+        Ok(())
+    }
+
+    async fn remove_pre_key(&mut self, id: PreKeyId) -> std::result::Result<(), SignalProtocolError> {
+        let id_u32: u32 = id.into();
+
+        let mut pre_keys = self.pre_keys.write().await;
+        pre_keys.remove(&id_u32);
+
+        // Track that this PreKey was used
+        let mut used = self.used_pre_keys.write().await;
+        if !used.contains(&id_u32) {
+            used.push(id_u32);
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// SignedPreKeyStore Implementation
+// ============================================================================
+
+#[async_trait(?Send)]
+impl SignedPreKeyStore for SignalProtocolStore {
+    async fn get_signed_pre_key(
+        &self,
+        id: SignedPreKeyId,
+    ) -> std::result::Result<SignedPreKeyRecord, SignalProtocolError> {
+        let signed_pre_keys = self.signed_pre_keys.read().await;
+        let id_u32: u32 = id.into();
+
+        match signed_pre_keys.get(&id_u32) {
+            Some(bytes) => SignedPreKeyRecord::deserialize(bytes)
+                .map_err(|e| SignalProtocolError::InvalidArgument(format!("Invalid SignedPreKey: {e}"))),
+            None => Err(SignalProtocolError::InvalidSignedPreKeyId),
         }
     }
 
-    fn load_signed_pre_key(
-        &self,
-        signed_pre_key_id: u32,
-    ) -> impl std::future::Future<Output = Option<KeyPair>> + Send {
-        let signed_pre_keys = self.signed_pre_keys.clone();
+    async fn save_signed_pre_key(
+        &mut self,
+        id: SignedPreKeyId,
+        record: &SignedPreKeyRecord,
+    ) -> std::result::Result<(), SignalProtocolError> {
+        let id_u32: u32 = id.into();
+        let bytes = record.serialize()
+            .map_err(|e| SignalProtocolError::InvalidArgument(format!("Failed to serialize SignedPreKey: {e}")))?;
 
-        async move {
-            let signed_pre_keys = signed_pre_keys.read().await;
-            signed_pre_keys.get(&signed_pre_key_id).cloned()
+        let mut signed_pre_keys = self.signed_pre_keys.write().await;
+        signed_pre_keys.insert(id_u32, bytes);
+        Ok(())
+    }
+}
+
+// ============================================================================
+// KyberPreKeyStore Implementation
+// ============================================================================
+
+#[async_trait(?Send)]
+impl KyberPreKeyStore for SignalProtocolStore {
+    async fn get_kyber_pre_key(
+        &self,
+        id: KyberPreKeyId,
+    ) -> std::result::Result<KyberPreKeyRecord, SignalProtocolError> {
+        let kyber_pre_keys = self.kyber_pre_keys.read().await;
+        let id_u32: u32 = id.into();
+
+        match kyber_pre_keys.get(&id_u32) {
+            Some(bytes) => KyberPreKeyRecord::deserialize(bytes)
+                .map_err(|e| SignalProtocolError::InvalidArgument(format!("Invalid KyberPreKey: {e}"))),
+            None => Err(SignalProtocolError::InvalidKyberPreKeyId),
         }
     }
 
-    fn get_our_identity(&self) -> impl std::future::Future<Output = KeyPair> + Send {
-        let identity = self.identity.clone();
-        let base_dir = self.base_dir.clone();
-        let encryption_key = self.encryption_key;
+    async fn save_kyber_pre_key(
+        &mut self,
+        id: KyberPreKeyId,
+        record: &KyberPreKeyRecord,
+    ) -> std::result::Result<(), SignalProtocolError> {
+        let id_u32: u32 = id.into();
+        let bytes = record.serialize()
+            .map_err(|e| SignalProtocolError::InvalidArgument(format!("Failed to serialize KyberPreKey: {e}")))?;
 
-        async move {
-            // Check cache first
-            {
-                let identity = identity.read().await;
-                if let Some(ref keypair) = *identity {
-                    return keypair.clone();
-                }
+        let mut kyber_pre_keys = self.kyber_pre_keys.write().await;
+        kyber_pre_keys.insert(id_u32, bytes);
+        Ok(())
+    }
+
+    async fn mark_kyber_pre_key_used(
+        &mut self,
+        kyber_prekey_id: KyberPreKeyId,
+        _ec_prekey_id: SignedPreKeyId,
+        _base_key: &PublicKey,
+    ) -> std::result::Result<(), SignalProtocolError> {
+        // For now, we don't remove Kyber keys after use (they can be reused as last-resort)
+        // In a more complete implementation, you might want to track usage
+        log::debug!("KyberPreKey {} marked as used", u32::from(kyber_prekey_id));
+        Ok(())
+    }
+}
+
+// ============================================================================
+// SenderKeyStore Implementation
+// ============================================================================
+
+#[async_trait(?Send)]
+impl SenderKeyStore for SignalProtocolStore {
+    async fn store_sender_key(
+        &mut self,
+        sender: &ProtocolAddress,
+        distribution_id: Uuid,
+        record: &SenderKeyRecord,
+    ) -> std::result::Result<(), SignalProtocolError> {
+        let key = Self::sender_key_key(sender, distribution_id);
+        let bytes = record.serialize()
+            .map_err(|e| SignalProtocolError::InvalidArgument(format!("Failed to serialize SenderKey: {e}")))?;
+
+        let mut sender_keys = self.sender_keys.write().await;
+        sender_keys.insert(key, bytes);
+        Ok(())
+    }
+
+    async fn load_sender_key(
+        &mut self,
+        sender: &ProtocolAddress,
+        distribution_id: Uuid,
+    ) -> std::result::Result<Option<SenderKeyRecord>, SignalProtocolError> {
+        let key = Self::sender_key_key(sender, distribution_id);
+        let sender_keys = self.sender_keys.read().await;
+
+        match sender_keys.get(&key) {
+            Some(bytes) => {
+                let record = SenderKeyRecord::deserialize(bytes)
+                    .map_err(|e| SignalProtocolError::InvalidArgument(format!("Invalid SenderKey: {e}")))?;
+                Ok(Some(record))
             }
-
-            // Generate new identity
-            let keypair = curve::generate_signing_key_pair();
-
-            // Store in cache
-            {
-                let mut identity_write = identity.write().await;
-                *identity_write = Some(keypair.clone());
-            }
-
-            // Persist to disk
-            let stored = StoredIdentity {
-                priv_key: keypair.priv_key.clone(),
-                pub_key: keypair.pub_key.clone(),
-            };
-            if let Ok(data) = serde_json::to_vec(&stored) {
-                let path = base_dir.join("identity.enc");
-
-                let mut nonce_bytes = [0u8; 12];
-                OsRng.fill_bytes(&mut nonce_bytes);
-                let nonce = Nonce::from_slice(&nonce_bytes);
-
-                if let Ok(cipher) = Aes256Gcm::new_from_slice(&encryption_key) {
-                    if let Ok(ciphertext) = cipher.encrypt(nonce, data.as_slice()) {
-                        let mut contents = nonce_bytes.to_vec();
-                        contents.extend(ciphertext);
-
-                        if let Err(e) = fs::write(&path, &contents) {
-                            log::error!("Failed to persist identity: {}", e);
-                        }
-                    }
-                }
-            }
-
-            keypair
+            None => Ok(None),
         }
     }
 }
@@ -604,92 +444,37 @@ impl SessionStorage for SignalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
-    fn setup_test_store() -> SignalStore {
-        let temp_dir = tempdir().unwrap();
-        std::env::set_var("BOTSTER_CONFIG_DIR", temp_dir.path().to_str().unwrap());
-        SignalStore::new("test-hub").unwrap()
+    #[tokio::test]
+    async fn test_store_creation() {
+        let store = SignalProtocolStore::new().await.unwrap();
+        let identity = store.get_identity_key_pair().await.unwrap();
+        assert!(!identity.public_key().serialize().is_empty());
     }
 
     #[tokio::test]
-    async fn test_identity_generation_and_persistence() {
-        let store = setup_test_store();
-
-        // Get identity (should generate new one)
-        let identity1 = store.get_our_identity().await;
-        assert_eq!(identity1.priv_key.len(), 32);
-        assert_eq!(identity1.pub_key.len(), 33); // 32 + version byte
-
-        // Get identity again (should return same one)
-        let identity2 = store.get_our_identity().await;
-        assert_eq!(identity1.priv_key, identity2.priv_key);
-        assert_eq!(identity1.pub_key, identity2.pub_key);
+    async fn test_registration_id() {
+        let store = SignalProtocolStore::new().await.unwrap();
+        let reg_id = store.get_local_registration_id().await.unwrap();
+        // Should be 14-bit value
+        assert!(reg_id < 0x4000);
     }
 
     #[tokio::test]
-    async fn test_trusted_identity() {
-        let store = setup_test_store();
+    async fn test_prekey_storage() {
+        use libsignal_protocol::KeyPair;
 
-        let address = "browser-device-123";
-        let identity_key = vec![5u8; 33]; // Fake identity key
+        let mut store = SignalProtocolStore::new().await.unwrap();
 
-        // First use should be trusted (TOFU)
-        assert!(store.is_trusted_identity(address, &identity_key).await);
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        let record = PreKeyRecord::new(PreKeyId::from(42), &key_pair);
 
-        // Store the identity
-        store.trust_identity(address, &identity_key).await.unwrap();
+        store.save_pre_key(PreKeyId::from(42), &record).await.unwrap();
 
-        // Same identity should still be trusted
-        assert!(store.is_trusted_identity(address, &identity_key).await);
-
-        // Different identity should not be trusted
-        let different_key = vec![6u8; 33];
-        assert!(!store.is_trusted_identity(address, &different_key).await);
-    }
-
-    #[tokio::test]
-    async fn test_pre_key_storage() {
-        let store = setup_test_store();
-
-        let keypair = curve::generate_key_pair();
-        let pre_key_id = 42u32;
-
-        // Store pre-key
-        store.store_pre_key(pre_key_id, keypair.clone()).await.unwrap();
-
-        // Load pre-key
-        let loaded = store.load_pre_key(pre_key_id).await;
-        assert!(loaded.is_some());
-        let loaded = loaded.unwrap();
-        assert_eq!(loaded.priv_key, keypair.priv_key);
-        assert_eq!(loaded.pub_key, keypair.pub_key);
-
-        // Remove pre-key
-        store.remove_pre_key(pre_key_id).await.unwrap();
-
-        // Should be gone
-        assert!(store.load_pre_key(pre_key_id).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_signed_pre_key_storage() {
-        let store = setup_test_store();
-
-        let keypair = curve::generate_key_pair();
-        let signed_pre_key_id = 1u32;
-
-        // Store signed pre-key
-        store
-            .store_signed_pre_key(signed_pre_key_id, keypair.clone())
-            .await
-            .unwrap();
-
-        // Load signed pre-key
-        let loaded = store.load_signed_pre_key(signed_pre_key_id).await;
-        assert!(loaded.is_some());
-        let loaded = loaded.unwrap();
-        assert_eq!(loaded.priv_key, keypair.priv_key);
-        assert_eq!(loaded.pub_key, keypair.pub_key);
+        let loaded = store.get_pre_key(PreKeyId::from(42)).await.unwrap();
+        assert_eq!(
+            loaded.public_key().unwrap().serialize(),
+            record.public_key().unwrap().serialize()
+        );
     }
 }

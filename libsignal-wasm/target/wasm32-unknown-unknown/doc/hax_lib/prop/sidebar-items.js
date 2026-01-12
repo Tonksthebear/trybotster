@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["exists","forall","implies"],"mod":["constructors"],"struct":["Prop"],"trait":["ToProp"]};

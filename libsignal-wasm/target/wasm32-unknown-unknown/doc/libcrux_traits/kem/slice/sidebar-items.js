@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DecapsError","EncapsError","KeyGenError"],"macro":["impl_trait"],"trait":["Kem"]};

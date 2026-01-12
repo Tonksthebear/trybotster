@@ -3,6 +3,9 @@ require_relative "../config/environment"
 require "rails/test_help"
 require "webmock/minitest"
 
+# Load support files
+Dir[Rails.root.join("test/support/**/*.rb")].each { |f| require f }
+
 # Allow localhost connections for ActionCable tests
 WebMock.disable_net_connect!(allow_localhost: true)
 

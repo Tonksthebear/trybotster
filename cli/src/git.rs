@@ -241,6 +241,11 @@ impl WorktreeManager {
     }
 
     /// Detects the current git repository
+    ///
+    /// Repo name is determined from (in order):
+    /// 1. BOTSTER_REPO env var (for tests and explicit override)
+    /// 2. Origin remote URL
+    /// 3. Directory name
     pub fn detect_current_repo() -> Result<(PathBuf, String)> {
         let current_dir = std::env::current_dir().context("Failed to get current directory")?;
 
@@ -253,8 +258,11 @@ impl WorktreeManager {
             .context("Failed to get repo path")?
             .to_path_buf();
 
-        // Get the repo name from the remote URL or directory name
-        let repo_name = if let Ok(remote) = repo.find_remote("origin") {
+        // Get the repo name: env var > origin remote > directory name
+        let repo_name = if let Ok(env_repo) = std::env::var("BOTSTER_REPO") {
+            // Explicit override (used in tests)
+            env_repo
+        } else if let Ok(remote) = repo.find_remote("origin") {
             if let Some(url) = remote.url() {
                 // Extract owner/repo from URL like "https://github.com/owner/repo.git"
                 url.trim_end_matches(".git")

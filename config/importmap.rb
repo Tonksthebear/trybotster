@@ -11,5 +11,5 @@ pin_all_from "app/javascript/channels", under: "channels"
 pin "@xterm/xterm", to: "https://esm.sh/@xterm/xterm@5.5.0"
 pin "@xterm/addon-fit", to: "https://esm.sh/@xterm/addon-fit@0.10.0"
 
-# Tailscale integration (tsconnect WASM)
-pin_all_from "app/javascript/tailscale", under: "tailscale"
+# Signal Protocol WASM for E2E encryption
+pin "signal", to: "signal/index.js"

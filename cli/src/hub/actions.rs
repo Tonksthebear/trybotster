@@ -270,13 +270,26 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         HubAction::SpawnAgent {
             issue_number,
             branch_name,
-            worktree_path,
+            worktree_path: _, // Ignored - we create the worktree ourselves
             repo_path,
             repo_name,
             prompt,
             message_id,
             invocation_url,
         } => {
+            log::debug!("SpawnAgent: branch={}, issue={:?}", branch_name, issue_number);
+            // Create the worktree first (the path in the action is just computed, not created)
+            let worktree_path = match hub.state.git_manager.create_worktree_with_branch(&branch_name) {
+                Ok(path) => {
+                    log::info!("Worktree created at {:?}", path);
+                    path
+                }
+                Err(e) => {
+                    log::error!("Failed to create worktree for {}: {}", branch_name, e);
+                    return;
+                }
+            };
+
             let config = crate::agents::AgentSpawnConfig {
                 issue_number,
                 branch_name,
@@ -307,6 +320,7 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         }
 
         HubAction::CloseAgent { session_key, delete_worktree } => {
+            log::debug!("CloseAgent: session_key={}", session_key);
             if let Err(e) = lifecycle::close_agent(&mut hub.state, &session_key, delete_worktree) {
                 log::error!("Failed to close agent {}: {}", session_key, e);
             }
@@ -332,13 +346,30 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         }
 
         HubAction::ShowConnectionCode => {
-            // Get connection URL from Tailscale connection info
-            // Format: /hubs/{id}#key={browser_preauth_key}
-            // Hub ID is in the path, key is in the fragment (never sent to server)
-            hub.connection_url = hub.browser.tailscale_connection_url.clone();
-            if hub.connection_url.is_none() {
-                log::error!("Cannot show connection code: Tailscale not connected");
-            }
+            // Generate connection URL with Signal PreKeyBundle
+            // Format: /hubs/{id}#bundle={base64_json_bundle}
+            // Hub ID is in the path, bundle is in the fragment (never sent to server)
+            hub.connection_url = if let Some(ref bundle) = hub.browser.signal_bundle {
+                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+                match serde_json::to_string(bundle) {
+                    Ok(json) => {
+                        let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
+                        Some(format!(
+                            "{}/hubs/{}#bundle={}",
+                            hub.config.server_url,
+                            hub.hub_identifier,
+                            encoded
+                        ))
+                    }
+                    Err(e) => {
+                        log::error!("Cannot serialize PreKeyBundle: {e}");
+                        None
+                    }
+                }
+            } else {
+                log::error!("Cannot show connection code: Signal bundle not initialized");
+                None
+            };
             hub.mode = AppMode::ConnectionCode;
         }
 
@@ -618,6 +649,7 @@ mod tests {
     fn test_config() -> Config {
         Config {
             server_url: "http://localhost:3000".to_string(),
+            headscale_url: None,
             token: "btstr_test-key".to_string(),
             api_key: String::new(),
             poll_interval: 10,

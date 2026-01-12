@@ -130,11 +130,13 @@ impl TunnelManager {
 
     /// Connects to the tunnel server and starts the message loop.
     pub async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Include api_key in URL as fallback (some proxies strip Authorization headers on WebSocket upgrade)
         let ws_url = format!(
-            "{}/cable",
+            "{}/cable?api_key={}",
             self.server_url
                 .replace("https://", "wss://")
-                .replace("http://", "ws://")
+                .replace("http://", "ws://"),
+            self.api_key
         );
 
         self.set_status(TunnelStatus::Connecting);

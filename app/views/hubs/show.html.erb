@@ -19,6 +19,8 @@
 <div class="min-h-[calc(100vh-8rem)]"
      data-controller="connection terminal-display agents"
      data-connection-hub-identifier-value="<%= @hub.identifier %>"
+     data-connection-wasm-js-path-value="/wasm/libsignal_wasm.js"
+     data-connection-wasm-bg-path-value="/wasm/libsignal_wasm_bg.wasm"
      data-terminal-display-connection-outlet="[data-controller~='connection']"
      data-agents-connection-outlet="[data-controller~='connection']"
      data-agents-modal-outlet="#new-agent-modal">
@@ -41,16 +43,23 @@
           </div>
         </div>
 
-        <%# Connection status %>
+        <%# Connection status - multi-step indicator %>
         <div class="flex items-center gap-3">
-          <div data-connection-target="status" class="text-sm font-mono text-zinc-500">
-            <span class="inline-flex items-center gap-2">
-              <span class="w-2 h-2 rounded-full bg-zinc-600"></span>
-              Initializing...
-            </span>
+          <div data-connection-target="statusContainer" class="flex flex-col items-end gap-0.5">
+            <div data-connection-target="status" class="text-sm font-medium text-zinc-400 flex items-center gap-2">
+              <span data-connection-target="statusIcon" class="flex-shrink-0">
+                <svg class="w-4 h-4 animate-spin text-zinc-500" fill="none" viewBox="0 0 24 24">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+              </span>
+              <span data-connection-target="statusText">Initializing...</span>
+            </div>
+            <div data-connection-target="statusDetail" class="text-xs text-zinc-600 font-mono"></div>
           </div>
           <button type="button"
                   data-action="connection#disconnectAction"
+                  data-connection-target="disconnectBtn"
                   class="hidden px-3 py-1.5 text-sm font-medium text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-600 rounded transition-colors">
             Disconnect
           </button>
@@ -59,15 +68,17 @@
     </div>
   </div>
 
-  <%# Security Banner %>
-  <div class="border-b border-emerald-500/20 bg-emerald-500/5">
+  <%# Security Banner - updates based on connection state %>
+  <div data-connection-target="securityBanner" class="border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300">
     <div class="max-w-7xl mx-auto px-4 py-3">
       <div class="flex items-center gap-3">
-        <svg class="w-4 h-4 text-emerald-400 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
-          <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
-        </svg>
-        <p class="text-sm text-emerald-200/80">
-          <strong class="text-emerald-300">Tailscale E2E Encryption</strong> &mdash; WireGuard mesh network, MITM-proof
+        <span data-connection-target="securityIcon" class="flex-shrink-0">
+          <svg class="w-4 h-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+          </svg>
+        </span>
+        <p class="text-sm" data-connection-target="securityText">
+          <span class="text-zinc-400">Establishing secure connection...</span>
         </p>
       </div>
     </div>
@@ -181,11 +192,11 @@
             <div class="flex items-center gap-3">
               <span class="text-xs text-zinc-600 hidden sm:inline">scroll: mouse wheel</span>
               <span class="text-xs text-zinc-500" data-agents-target="selectedLabel">No agent</span>
-              <span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-emerald-500/10 text-emerald-400 rounded">
-                <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
-                  <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
+              <span data-connection-target="terminalBadge" class="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-zinc-700/50 text-zinc-500 rounded">
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
                 </svg>
-                Tailscale
+                <span>Connecting...</span>
               </span>
             </div>
           </div>

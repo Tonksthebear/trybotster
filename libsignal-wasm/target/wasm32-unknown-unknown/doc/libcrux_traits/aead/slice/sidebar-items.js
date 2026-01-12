@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DecryptError","EncryptError","KeyGenError"],"macro":["impl_aead_slice_trait"],"trait":["Aead"]};

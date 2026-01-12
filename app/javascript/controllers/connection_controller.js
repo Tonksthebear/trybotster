@@ -1,64 +1,137 @@
 import { Controller } from "@hotwired/stimulus";
+import consumer from "channels/consumer";
 import {
-  initTailscale,
-  TailscaleSession,
-  parseKeyFromFragment,
-  getControlUrl,
-  getCliHostname,
+  initSignal,
+  SignalSession,
+  parseBundleFromFragment,
+  getHubIdFromPath,
   ConnectionState,
-} from "tailscale/index";
+  ConnectionError,
+} from "signal";
 
 /**
- * Connection Controller - Tailscale E2E Encrypted Mesh
+ * Connection Controller - Signal Protocol E2E Encryption
  *
  * This controller manages the secure connection between browser and CLI
- * via Tailscale/Headscale mesh networking.
+ * via Action Cable with Signal Protocol E2E encryption.
  *
- * Architecture:
- * - Browser joins tailnet using pre-auth key from URL fragment
- * - CLI is already on the tailnet (same user's namespace)
- * - Browser opens SSH tunnel to CLI for terminal access
- * - All traffic is E2E encrypted via WireGuard
+ * Connection Flow:
+ * 1. LOADING_WASM - Loading Signal Protocol WASM module
+ * 2. CREATING_SESSION - Setting up encryption from QR bundle
+ * 3. SUBSCRIBING - Connecting to Action Cable channel
+ * 4. CHANNEL_CONNECTED - Action Cable confirmed (CLI is reachable)
+ * 5. HANDSHAKE_SENT - Sent encrypted handshake, waiting for CLI ACK
+ * 6. CONNECTED - CLI acknowledged, E2E encryption active
  *
- * Security:
- * - Pre-auth key is in URL fragment (#key=xxx), never sent to server
- * - Per-user tailnet isolation at Headscale infrastructure level
- * - WireGuard provides E2E encryption (server never sees plaintext)
- *
- * Usage in dependent controllers:
- * ```
- * connectionOutletConnected(outlet) {
- *   outlet.registerListener(this, {
- *     onConnected: (connection) => { ... },
- *     onDisconnected: () => { ... },
- *     onMessage: (message) => { ... },
- *     onError: (error) => { ... },
- *   });
- * }
- *
- * connectionOutletDisconnected(outlet) {
- *   outlet.unregisterListener(this);
- * }
- * ```
+ * Each step shows clear status. Failures show specific reasons.
  */
 
+// Handshake timeout in milliseconds
+const HANDSHAKE_TIMEOUT_MS = 8000;
+
+// SVG icons for status display
+const ICONS = {
+  spinner: `<svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+  </svg>`,
+  check: `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+  </svg>`,
+  error: `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+  </svg>`,
+  disconnected: `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 5.636a9 9 0 010 12.728m-2.829-2.829a5 5 0 000-7.07m-4.243 4.243a1 1 0 11-1.414-1.414 1 1 0 011.414 1.414z"></path>
+  </svg>`,
+  lock: `<svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+    <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"></path>
+  </svg>`,
+};
+
+// Status display configuration per state
+const STATUS_CONFIG = {
+  disconnected: {
+    text: "Disconnected",
+    icon: ICONS.disconnected,
+    iconClass: "text-zinc-500",
+    textClass: "text-zinc-500",
+  },
+  loading_wasm: {
+    text: "Loading encryption",
+    icon: ICONS.spinner,
+    iconClass: "text-cyan-400",
+    textClass: "text-zinc-400",
+  },
+  creating_session: {
+    text: "Setting up encryption",
+    icon: ICONS.spinner,
+    iconClass: "text-cyan-400",
+    textClass: "text-zinc-400",
+  },
+  subscribing: {
+    text: "Connecting to server",
+    icon: ICONS.spinner,
+    iconClass: "text-cyan-400",
+    textClass: "text-zinc-400",
+  },
+  channel_connected: {
+    text: "CLI reachable",
+    icon: ICONS.spinner,
+    iconClass: "text-amber-400",
+    textClass: "text-amber-400",
+  },
+  handshake_sent: {
+    text: "Handshake sent",
+    icon: ICONS.spinner,
+    iconClass: "text-amber-400",
+    textClass: "text-amber-400",
+  },
+  connected: {
+    text: "Connected",
+    icon: ICONS.lock,
+    iconClass: "text-emerald-400",
+    textClass: "text-emerald-400",
+  },
+  error: {
+    text: "Connection failed",
+    icon: ICONS.error,
+    iconClass: "text-red-400",
+    textClass: "text-red-400",
+  },
+};
+
 export default class extends Controller {
-  static targets = ["status"];
+  static targets = [
+    "status",
+    "statusContainer",
+    "statusIcon",
+    "statusText",
+    "statusDetail",
+    "disconnectBtn",
+    "securityBanner",
+    "securityIcon",
+    "securityText",
+    "terminalBadge",
+  ];
 
   static values = {
     hubIdentifier: String,
-    cliHostname: String,
+    wasmJsPath: String,
+    wasmBgPath: String,
   };
 
   connect() {
-    this.tailscaleSession = null;
-    this.sshConnection = null;
+    this.signalSession = null;
+    this.subscription = null;
     this.hubIdentifier = null;
-    this.cliHostname = null;
+    this.ourIdentityKey = null;
     this.connected = false;
+    this.state = ConnectionState.DISCONNECTED;
+    this.errorReason = null;
+    this.handshakeTimer = null;
 
     // Don't overwrite listeners - outlet callbacks may have already registered
-    // (Stimulus can call outlet callbacks before connect())
     if (!this.listeners) {
       this.listeners = new Map();
     }
@@ -76,31 +149,24 @@ export default class extends Controller {
   /**
    * Register a controller to receive connection callbacks.
    * If already connected, onConnected is called immediately.
-   *
-   * @param {Controller} controller - The Stimulus controller registering
-   * @param {Object} callbacks - Callback functions
-   * @param {Function} callbacks.onConnected - Called with connection when E2E established
-   * @param {Function} callbacks.onDisconnected - Called when connection lost
-   * @param {Function} callbacks.onMessage - Called with decrypted message from CLI
-   * @param {Function} callbacks.onError - Called with error message
    */
   registerListener(controller, callbacks) {
-    // Lazy init in case outlet callback fires before connect()
     if (!this.listeners) {
       this.listeners = new Map();
     }
     this.listeners.set(controller, callbacks);
 
     // If already connected, immediately notify
-    if (this.connected && this.sshConnection) {
+    if (this.connected && this.signalSession) {
       callbacks.onConnected?.(this);
     }
+
+    // Notify of current state
+    callbacks.onStateChange?.(this.state, this.errorReason);
   }
 
   /**
    * Unregister a controller from receiving callbacks.
-   *
-   * @param {Controller} controller - The controller to unregister
    */
   unregisterListener(controller) {
     this.listeners?.delete(controller);
@@ -123,6 +189,9 @@ export default class extends Controller {
         case "error":
           callbacks.onError?.(data);
           break;
+        case "stateChange":
+          callbacks.onStateChange?.(data.state, data.reason);
+          break;
       }
     }
   }
@@ -130,232 +199,376 @@ export default class extends Controller {
   // ========== Connection Logic ==========
 
   async initializeConnection() {
-    // Extract hub ID from URL path: /hubs/{hub_id}
-    const pathMatch = window.location.pathname.match(/\/hubs\/([^\/]+)/);
-    if (pathMatch) {
-      this.hubIdentifier = pathMatch[1];
-    } else if (this.hubIdentifierValue) {
+    // Get hub ID from URL path
+    this.hubIdentifier = getHubIdFromPath();
+    if (!this.hubIdentifier && this.hubIdentifierValue) {
       this.hubIdentifier = this.hubIdentifierValue;
     }
 
     if (!this.hubIdentifier) {
-      this.emitError("Hub ID not found in URL");
+      this.setError(ConnectionError.NO_BUNDLE, "Hub ID not found in URL");
       return;
     }
-
-    // Get CLI hostname from fragment, meta tag, or API
-    this.cliHostname = getCliHostname();
-    if (!this.cliHostname && this.cliHostnameValue) {
-      this.cliHostname = this.cliHostnameValue;
-    }
-    if (!this.cliHostname) {
-      this.cliHostname = await this.fetchCliHostname();
-    }
-
-    if (!this.cliHostname) {
-      this.emitError("CLI hostname not available - hub may be offline");
-      return;
-    }
-
-    this.updateStatus("Initializing Tailscale...");
 
     try {
-      // Initialize tsconnect WASM
-      await initTailscale();
+      // Step 1: Load Signal WASM
+      this.setState(ConnectionState.LOADING_WASM);
+      this.updateStatus("Loading encryption...", "Initializing Signal Protocol");
 
-      // Get pre-auth key from URL fragment
-      const preauthKey = parseKeyFromFragment();
-      if (!preauthKey) {
-        this.emitError(
-          "No connection key found. Scan QR code from CLI to connect."
+      try {
+        await initSignal(this.wasmJsPathValue, this.wasmBgPathValue);
+      } catch (wasmError) {
+        this.setError(
+          ConnectionError.WASM_LOAD_FAILED,
+          `Failed to load encryption: ${wasmError.message}`
         );
         return;
       }
 
-      // Get Headscale control URL
-      const controlUrl = getControlUrl();
+      // Step 2: Set up Signal session
+      this.setState(ConnectionState.CREATING_SESSION);
+      this.updateStatus("Setting up encryption...", "Processing security keys");
 
-      // Create Tailscale session with hub identifier for state isolation
-      this.tailscaleSession = new TailscaleSession(
-        controlUrl,
-        preauthKey,
-        this.hubIdentifier
-      );
+      try {
+        await this.setupSignalSession();
+      } catch (sessionError) {
+        this.setError(
+          ConnectionError.SESSION_CREATE_FAILED,
+          `Encryption setup failed: ${sessionError.message}`
+        );
+        return;
+      }
 
-      // Set up state change handler
-      this.tailscaleSession.onStateChange = (state) => {
-        this.handleStateChange(state);
-      };
+      if (!this.signalSession) {
+        this.setError(
+          ConnectionError.NO_BUNDLE,
+          "No encryption bundle. Scan QR code to connect."
+        );
+        return;
+      }
 
-      // Set up logging
-      this.tailscaleSession.onLog = (msg) => {
-        console.log(`[Connection] ${msg}`);
-      };
+      // Get our identity key to filter out our own messages
+      this.ourIdentityKey = await this.signalSession.getIdentityKey();
 
-      // Connect to tailnet
-      this.updateStatus("Joining tailnet...");
-      await this.tailscaleSession.connect();
+      // Step 3: Subscribe to Action Cable channel
+      this.setState(ConnectionState.SUBSCRIBING);
+      this.updateStatus("Connecting to server...", "Establishing secure channel");
 
-      // Open SSH tunnel to CLI
-      this.updateStatus("Connecting to CLI...");
-      await this.openSSHTunnel();
+      try {
+        await this.subscribeToChannel();
+      } catch (subError) {
+        this.setError(
+          ConnectionError.SUBSCRIBE_REJECTED,
+          `Connection rejected: ${subError.message}`
+        );
+        return;
+      }
 
-      this.connected = true;
-      this.updateStatus(
-        `Connected to ${this.hubIdentifier.substring(0, 8)}...`
-      );
+      // Step 4: Channel connected - CLI is reachable
+      this.setState(ConnectionState.CHANNEL_CONNECTED);
+      this.updateStatus("CLI reachable", "Sending encrypted handshake...");
 
-      // Notify all registered listeners
-      this.notifyListeners("connected", this);
+      // Step 5: Send handshake and wait for ACK
+      this.setState(ConnectionState.HANDSHAKE_SENT);
+      await this.sendHandshakeWithTimeout();
+
+      // Note: Connection completes when we receive handshake_ack in handleDecryptedMessage
     } catch (error) {
-      console.error("Failed to initialize connection:", error);
-      this.emitError(`Connection error: ${error.message}`);
+      console.error("[Connection] Failed to initialize:", error);
+      this.setError(
+        ConnectionError.WEBSOCKET_ERROR,
+        `Connection error: ${error.message}`
+      );
     }
   }
 
-  async fetchCliHostname() {
-    try {
-      const response = await fetch(
-        `/hubs/${this.hubIdentifier}/tailscale/status`,
-        {
-          headers: { Accept: "application/json" },
-        }
+  async setupSignalSession() {
+    // Check for bundle in URL fragment (fresh QR code scan)
+    const urlBundle = parseBundleFromFragment();
+
+    if (urlBundle) {
+      // Fresh bundle from QR code - always use it (replaces any cached session)
+      console.log("[Connection] Creating new session from URL bundle");
+      this.signalSession = await SignalSession.create(
+        urlBundle,
+        this.hubIdentifier
       );
-
-      if (!response.ok) {
-        return null;
+      // Clear fragment after successful session creation (clean URL)
+      if (window.history.replaceState) {
+        window.history.replaceState(
+          null,
+          "",
+          window.location.pathname + window.location.search
+        );
       }
+    } else {
+      // No URL bundle - try to restore from IndexedDB
+      this.signalSession = await SignalSession.load(this.hubIdentifier);
 
-      const data = await response.json();
-      return data.hostname;
+      if (!this.signalSession) {
+        // No cached session either - try server as last resort
+        const serverBundle = await this.fetchPreKeyBundle();
+        if (serverBundle) {
+          this.signalSession = await SignalSession.create(
+            serverBundle,
+            this.hubIdentifier
+          );
+        }
+      } else {
+        console.log(
+          "[Connection] Restored cached session for hub:",
+          this.hubIdentifier
+        );
+      }
+    }
+  }
+
+  async fetchPreKeyBundle() {
+    try {
+      const response = await fetch(`/hubs/${this.hubIdentifier}/bundle`, {
+        headers: { Accept: "application/json" },
+      });
+
+      if (!response.ok) return null;
+
+      return await response.json();
     } catch (error) {
-      console.warn("Failed to fetch CLI hostname:", error);
+      console.warn("[Connection] Failed to fetch bundle:", error);
       return null;
     }
   }
 
-  async openSSHTunnel() {
-    // Open SSH to CLI - username "root" is standard for Tailscale SSH
-    this.sshConnection = await this.tailscaleSession.openSSH(
-      this.cliHostname,
-      "root"
-    );
-
-    // Set up data handler - receive terminal output from CLI
-    this.sshConnection.onData = (data) => {
-      this.handleSSHData(data);
-    };
-
-    // Set up error handler
-    this.sshConnection.onError = (msg) => {
-      console.error("[SSH Error]", msg);
-    };
-
-    // Set up close handler
-    this.sshConnection.onClose = () => {
-      this.handleSSHClose();
-    };
-
-    console.log("SSH tunnel established to CLI");
+  subscribeToChannel() {
+    return new Promise((resolve, reject) => {
+      this.subscription = consumer.subscriptions.create(
+        {
+          channel: "TerminalRelayChannel",
+          hub_identifier: this.hubIdentifier,
+        },
+        {
+          connected: () => {
+            console.log("[Connection] Action Cable connected");
+            resolve();
+          },
+          disconnected: () => {
+            console.log("[Connection] Action Cable disconnected");
+            this.handleDisconnect();
+          },
+          rejected: () => {
+            console.error("[Connection] Action Cable subscription rejected");
+            reject(new Error("Subscription rejected - hub may be offline"));
+          },
+          received: async (data) => {
+            await this.handleReceived(data);
+          },
+        }
+      );
+    });
   }
 
-  handleStateChange(state) {
-    switch (state) {
-      case ConnectionState.LOADING_WASM:
-        this.updateStatus("Loading Tailscale...");
-        break;
-      case ConnectionState.CONNECTING:
-        this.updateStatus("Connecting to tailnet...");
-        break;
-      case ConnectionState.NEEDS_LOGIN:
-        this.updateStatus("Authentication required...");
-        break;
-      case ConnectionState.AUTHENTICATING:
-        this.updateStatus("Authenticating...");
-        break;
-      case ConnectionState.STARTING:
-        this.updateStatus("Starting connection...");
-        break;
-      case ConnectionState.CONNECTED:
-        this.updateStatus("Connected to tailnet");
-        break;
-      case ConnectionState.ERROR:
-        this.emitError("Tailnet connection error");
-        break;
-      case ConnectionState.DISCONNECTED:
-        this.updateStatus("Disconnected");
-        break;
+  async sendHandshakeWithTimeout() {
+    // Send encrypted handshake
+    const handshake = {
+      type: "connected",
+      device_name: this.getDeviceName(),
+      timestamp: Date.now(),
+    };
+
+    console.log("[Connection] Sending handshake:", handshake);
+    const sent = await this.sendEncrypted(handshake);
+
+    if (!sent) {
+      this.setError(
+        ConnectionError.HANDSHAKE_FAILED,
+        "Failed to send handshake"
+      );
+      return;
     }
+
+    this.updateStatus("Handshake sent", "Waiting for CLI acknowledgment...");
+
+    // Start timeout for handshake ACK
+    this.handshakeTimer = setTimeout(() => {
+      if (this.state === ConnectionState.HANDSHAKE_SENT) {
+        console.warn("[Connection] Handshake timeout - no ACK from CLI");
+        this.setError(
+          ConnectionError.HANDSHAKE_TIMEOUT,
+          "CLI did not respond. Session may be expired - scan QR code again."
+        );
+        // Clear potentially stale session
+        this.signalSession?.clear();
+        this.signalSession = null;
+      }
+    }, HANDSHAKE_TIMEOUT_MS);
   }
 
-  handleSSHData(data) {
-    // Data is raw terminal output from CLI
-    // Try to parse as JSON first (for structured messages)
-    try {
-      const text = typeof data === "string" ? data : new TextDecoder().decode(data);
+  getDeviceName() {
+    const ua = navigator.userAgent;
+    if (ua.includes("iPhone")) return "iPhone";
+    if (ua.includes("iPad")) return "iPad";
+    if (ua.includes("Android")) return "Android";
+    if (ua.includes("Mac")) return "Mac Browser";
+    if (ua.includes("Windows")) return "Windows Browser";
+    if (ua.includes("Linux")) return "Linux Browser";
+    return "Browser";
+  }
 
-      // Try to parse as JSON
-      try {
-        const message = JSON.parse(text);
-        this.notifyListeners("message", message);
-      } catch {
-        // Not JSON - treat as raw terminal output
-        this.notifyListeners("message", { type: "output", data: text });
+  async handleReceived(data) {
+    // Skip if session is not ready
+    if (!this.signalSession) {
+      return;
+    }
+
+    try {
+      // Data from server is an encrypted SignalEnvelope
+      if (data.envelope) {
+        // Parse envelope to check sender
+        const envelope =
+          typeof data.envelope === "string"
+            ? JSON.parse(data.envelope)
+            : data.envelope;
+
+        // Skip our own messages (Action Cable broadcasts to all including sender)
+        if (
+          this.ourIdentityKey &&
+          envelope.sender_identity === this.ourIdentityKey
+        ) {
+          return;
+        }
+
+        const decrypted = await this.signalSession.decrypt(data.envelope);
+        this.handleDecryptedMessage(decrypted);
+      } else if (data.sender_key_distribution) {
+        // Handle SenderKey distribution for group messaging
+        await this.signalSession.processSenderKeyDistribution(
+          data.sender_key_distribution
+        );
+        console.log("[Connection] Processed SenderKey distribution");
+      } else if (data.error) {
+        this.setError(ConnectionError.WEBSOCKET_ERROR, data.error);
       }
     } catch (error) {
-      console.warn("Error handling SSH data:", error);
+      console.error("[Connection] Failed to handle received data:", error);
+
+      // Check if this is a session/crypto error (stale session)
+      const errorMsg = error.message || error.toString();
+      if (
+        errorMsg.includes("decrypt") ||
+        errorMsg.includes("prekey") ||
+        errorMsg.includes("session") ||
+        errorMsg.includes("invalid") ||
+        errorMsg.includes("MAC")
+      ) {
+        console.warn(
+          "[Connection] Session appears stale, clearing cached session"
+        );
+        await this.signalSession?.clear();
+        this.signalSession = null;
+        this.setError(
+          ConnectionError.DECRYPT_FAILED,
+          "Session expired. Please scan QR code again."
+        );
+      }
     }
   }
 
-  handleSSHClose() {
+  handleDecryptedMessage(message) {
+    // Handle handshake acknowledgment
+    if (message.type === "handshake_ack") {
+      console.log("[Connection] Received handshake ACK from CLI");
+
+      // Clear timeout
+      if (this.handshakeTimer) {
+        clearTimeout(this.handshakeTimer);
+        this.handshakeTimer = null;
+      }
+
+      // Complete connection
+      this.connected = true;
+      this.setState(ConnectionState.CONNECTED);
+      this.updateStatus(
+        "Connected",
+        `E2E encrypted to ${this.hubIdentifier.substring(0, 8)}...`
+      );
+
+      // Notify all registered listeners
+      this.notifyListeners("connected", this);
+      return;
+    }
+
+    // Route other messages to listeners
+    if (typeof message === "object" && message.type) {
+      switch (message.type) {
+        case "output":
+        case "agents":
+        case "worktrees":
+        case "agent_selected":
+        case "scrollback":
+          this.notifyListeners("message", message);
+          break;
+        default:
+          this.notifyListeners("message", message);
+      }
+    } else {
+      // Raw output
+      this.notifyListeners("message", { type: "output", data: message });
+    }
+  }
+
+  handleDisconnect() {
     this.connected = false;
-    this.updateStatus("Disconnected");
+    this.setState(ConnectionState.DISCONNECTED);
+    this.updateStatus("Disconnected", "Connection lost");
     this.notifyListeners("disconnected");
   }
 
   // ========== Public API for Outlets ==========
 
   /**
-   * Send a JSON message to CLI via SSH.
+   * Send a JSON message to CLI (encrypted).
    */
-  send(type, data) {
-    if (!this.sshConnection || !this.connected) {
-      console.warn("Cannot send - not connected");
+  async send(type, data = {}) {
+    if (!this.subscription || !this.connected || !this.signalSession) {
+      console.warn("[Connection] Cannot send - not connected");
       return false;
     }
 
-    const message = JSON.stringify({ type, ...data });
-    this.sshConnection.write(message + "\n");
-    return true;
+    const message = { type, ...data };
+    console.log("[Connection] Sending message:", type);
+    return await this.sendEncrypted(message);
+  }
+
+  /**
+   * Send encrypted message via Action Cable.
+   */
+  async sendEncrypted(message) {
+    try {
+      const envelope = await this.signalSession.encrypt(message);
+      console.log("[Connection] Encrypted envelope, sending via relay");
+      this.subscription.perform("relay", { envelope });
+      return true;
+    } catch (error) {
+      console.error("[Connection] Encryption failed:", error);
+      return false;
+    }
   }
 
   /**
    * Send raw input to CLI (terminal keystrokes).
    */
-  sendInput(inputData) {
-    if (!this.sshConnection || !this.connected) {
-      console.warn("Cannot send input - not connected");
-      return false;
-    }
-
-    this.sshConnection.write(inputData);
-    return true;
+  async sendInput(inputData) {
+    return await this.send("input", { data: inputData });
   }
 
   /**
    * Resize the terminal.
    */
-  sendResize(cols, rows) {
-    if (!this.sshConnection || !this.connected) {
-      return false;
-    }
-
-    this.sshConnection.resize(cols, rows);
-    return true;
+  async sendResize(cols, rows) {
+    return await this.send("resize", { cols, rows });
   }
 
   requestAgents() {
-    return this.send("list_agents", {});
+    return this.send("list_agents");
   }
 
   selectAgent(agentId) {
@@ -370,24 +583,56 @@ export default class extends Controller {
     return this.hubIdentifier;
   }
 
+  getState() {
+    return this.state;
+  }
+
+  getErrorReason() {
+    return this.errorReason;
+  }
+
   async resetSession() {
-    if (this.tailscaleSession) {
-      await this.tailscaleSession.reset();
+    if (this.signalSession) {
+      await this.signalSession.clear();
+      this.signalSession = null;
     }
     this.cleanup();
-    this.emitError("Session cleared. Scan QR code to reconnect.");
+    this.setError(
+      ConnectionError.SESSION_CREATE_FAILED,
+      "Session cleared. Scan QR code to reconnect."
+    );
+  }
+
+  // ========== State Management ==========
+
+  setState(state) {
+    const prevState = this.state;
+    this.state = state;
+    if (state !== ConnectionState.ERROR) {
+      this.errorReason = null;
+    }
+    console.log(`[Connection] State: ${prevState} -> ${state}`);
+    this.notifyListeners("stateChange", { state, reason: this.errorReason });
+  }
+
+  setError(reason, message) {
+    this.errorReason = reason;
+    this.setState(ConnectionState.ERROR);
+    this.updateStatus("Connection failed", message);
+    console.error(`[Connection] Error (${reason}): ${message}`);
+    this.notifyListeners("error", { reason, message });
   }
 
   // ========== Cleanup ==========
 
   cleanup() {
-    if (this.sshConnection) {
-      this.sshConnection.close();
-      this.sshConnection = null;
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer);
+      this.handshakeTimer = null;
     }
-    if (this.tailscaleSession) {
-      this.tailscaleSession.disconnect();
-      this.tailscaleSession = null;
+    if (this.subscription) {
+      this.subscription.unsubscribe();
+      this.subscription = null;
     }
     this.connected = false;
     this.listeners?.clear();
@@ -395,20 +640,177 @@ export default class extends Controller {
 
   disconnectAction() {
     this.cleanup();
-    this.updateStatus("Disconnected");
+    this.updateStatus("Disconnected", "");
     this.notifyListeners("disconnected");
   }
 
   // ========== Helpers ==========
 
-  updateStatus(text) {
-    if (this.hasStatusTarget) {
-      this.statusTarget.textContent = text;
+  updateStatus(text, detail = "") {
+    // Update based on current state
+    const config = STATUS_CONFIG[this.state] || STATUS_CONFIG.disconnected;
+
+    if (this.hasStatusIconTarget) {
+      this.statusIconTarget.innerHTML = config.icon;
+      // Apply color class to icon
+      this.statusIconTarget.className = `flex-shrink-0 ${config.iconClass}`;
+    }
+
+    if (this.hasStatusTextTarget) {
+      this.statusTextTarget.textContent = text || config.text;
+      this.statusTextTarget.className = config.textClass;
+    }
+
+    if (this.hasStatusDetailTarget) {
+      this.statusDetailTarget.textContent = detail;
+      // Show detail in appropriate color
+      if (this.state === ConnectionState.ERROR) {
+        this.statusDetailTarget.className = "text-xs text-red-400/80 font-mono max-w-xs text-right";
+      } else if (this.state === ConnectionState.CONNECTED) {
+        this.statusDetailTarget.className = "text-xs text-emerald-400/60 font-mono";
+      } else {
+        this.statusDetailTarget.className = "text-xs text-zinc-500 font-mono";
+      }
+    }
+
+    // Show/hide disconnect button
+    if (this.hasDisconnectBtnTarget) {
+      if (this.state === ConnectionState.CONNECTED) {
+        this.disconnectBtnTarget.classList.remove("hidden");
+      } else {
+        this.disconnectBtnTarget.classList.add("hidden");
+      }
+    }
+
+    // Update security banner
+    this.updateSecurityBanner();
+  }
+
+  updateSecurityBanner() {
+    if (!this.hasSecurityBannerTarget) return;
+
+    const lockIcon = `<svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+      <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
+    </svg>`;
+    const unlockIcon = `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+    </svg>`;
+    const errorIcon = `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+    </svg>`;
+
+    switch (this.state) {
+      case ConnectionState.CONNECTED:
+        this.securityBannerTarget.className =
+          "border-b border-emerald-500/20 bg-emerald-500/5 transition-colors duration-300";
+        if (this.hasSecurityIconTarget) {
+          this.securityIconTarget.innerHTML = lockIcon;
+          this.securityIconTarget.className = "flex-shrink-0 text-emerald-400";
+        }
+        if (this.hasSecurityTextTarget) {
+          this.securityTextTarget.innerHTML = `
+            <strong class="text-emerald-300">Signal Protocol E2E Encryption</strong>
+            <span class="text-emerald-200/80">&mdash; Double Ratchet + Post-Quantum (Kyber)</span>
+          `;
+        }
+        break;
+
+      case ConnectionState.ERROR:
+        this.securityBannerTarget.className =
+          "border-b border-red-500/20 bg-red-500/5 transition-colors duration-300";
+        if (this.hasSecurityIconTarget) {
+          this.securityIconTarget.innerHTML = errorIcon;
+          this.securityIconTarget.className = "flex-shrink-0 text-red-400";
+        }
+        if (this.hasSecurityTextTarget) {
+          this.securityTextTarget.innerHTML = `
+            <strong class="text-red-300">Connection Failed</strong>
+            <span class="text-red-200/80">&mdash; ${this.errorReason || "Unable to establish secure connection"}</span>
+          `;
+        }
+        break;
+
+      case ConnectionState.CHANNEL_CONNECTED:
+      case ConnectionState.HANDSHAKE_SENT:
+        this.securityBannerTarget.className =
+          "border-b border-amber-500/20 bg-amber-500/5 transition-colors duration-300";
+        if (this.hasSecurityIconTarget) {
+          this.securityIconTarget.innerHTML = unlockIcon;
+          this.securityIconTarget.className = "flex-shrink-0 text-amber-400";
+        }
+        if (this.hasSecurityTextTarget) {
+          this.securityTextTarget.innerHTML = `
+            <strong class="text-amber-300">Establishing E2E Encryption</strong>
+            <span class="text-amber-200/80">&mdash; Waiting for CLI acknowledgment...</span>
+          `;
+        }
+        break;
+
+      default:
+        this.securityBannerTarget.className =
+          "border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300";
+        if (this.hasSecurityIconTarget) {
+          this.securityIconTarget.innerHTML = unlockIcon;
+          this.securityIconTarget.className = "flex-shrink-0 text-zinc-500";
+        }
+        if (this.hasSecurityTextTarget) {
+          this.securityTextTarget.innerHTML = `
+            <span class="text-zinc-400">Establishing secure connection...</span>
+          `;
+        }
+        break;
+    }
+
+    // Update terminal badge
+    this.updateTerminalBadge();
+  }
+
+  updateTerminalBadge() {
+    if (!this.hasTerminalBadgeTarget) return;
+
+    const lockIcon = `<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+      <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
+    </svg>`;
+    const unlockIcon = `<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+    </svg>`;
+
+    switch (this.state) {
+      case ConnectionState.CONNECTED:
+        this.terminalBadgeTarget.className =
+          "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-emerald-500/10 text-emerald-400 rounded";
+        this.terminalBadgeTarget.innerHTML = `${lockIcon}<span>E2E Encrypted</span>`;
+        break;
+
+      case ConnectionState.ERROR:
+        this.terminalBadgeTarget.className =
+          "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-red-500/10 text-red-400 rounded";
+        this.terminalBadgeTarget.innerHTML = `${unlockIcon}<span>Not Connected</span>`;
+        break;
+
+      case ConnectionState.CHANNEL_CONNECTED:
+      case ConnectionState.HANDSHAKE_SENT:
+        this.terminalBadgeTarget.className =
+          "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-amber-500/10 text-amber-400 rounded";
+        this.terminalBadgeTarget.innerHTML = `${unlockIcon}<span>Handshaking...</span>`;
+        break;
+
+      default:
+        this.terminalBadgeTarget.className =
+          "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-zinc-700/50 text-zinc-500 rounded";
+        this.terminalBadgeTarget.innerHTML = `${unlockIcon}<span>Connecting...</span>`;
+        break;
     }
   }
 
+  // Update status display for state change
+  updateStatusForState() {
+    const config = STATUS_CONFIG[this.state] || STATUS_CONFIG.disconnected;
+    this.updateStatus(config.text, "");
+  }
+
+  // Legacy method for backwards compatibility
   emitError(message) {
-    this.updateStatus(message);
-    this.notifyListeners("error", message);
+    this.setError(ConnectionError.WEBSOCKET_ERROR, message);
   }
 }

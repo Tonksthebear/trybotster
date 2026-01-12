@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use keyring::Entry;
-use rand::{rngs::OsRng, RngCore};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -29,8 +29,7 @@ const KEYRING_SIGNING_SUFFIX: &str = "signing";
 ///
 /// Keyring is skipped when:
 /// - Compiled with `cfg(test)` (unit tests via `cargo test --lib`)
-/// - `BOTSTER_SKIP_KEYRING=1` is set (explicit override)
-/// - `BOTSTER_CONFIG_DIR` is set (integration tests use this)
+/// - `BOTSTER_ENV=test` is set (integration/system tests)
 ///
 /// This avoids macOS keychain prompts during test runs.
 fn should_skip_keyring() -> bool {
@@ -42,16 +41,7 @@ fn should_skip_keyring() -> bool {
 
     #[cfg(not(test))]
     {
-        // Explicit override
-        if std::env::var("BOTSTER_SKIP_KEYRING")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false)
-        {
-            return true;
-        }
-
-        // Auto-detect test mode: integration tests set BOTSTER_CONFIG_DIR
-        std::env::var("BOTSTER_CONFIG_DIR").is_ok()
+        crate::env::is_test_mode()
     }
 }
 
@@ -245,7 +235,7 @@ impl Device {
     fn create_new(path: &PathBuf) -> Result<Self> {
         // Generate Ed25519 keypair for signing/identity
         let mut signing_secret = [0u8; 32];
-        OsRng.fill_bytes(&mut signing_secret);
+        rand::rng().fill_bytes(&mut signing_secret);
         let signing_key = SigningKey::from_bytes(&signing_secret);
         let verifying_key = signing_key.verifying_key();
 
@@ -425,7 +415,7 @@ mod tests {
     #[test]
     fn test_fingerprint_format() {
         let mut secret_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut secret_bytes);
+        rand::rng().fill_bytes(&mut secret_bytes);
         let signing_key = SigningKey::from_bytes(&secret_bytes);
         let verifying_key = signing_key.verifying_key();
         let fingerprint = Device::compute_fingerprint(&verifying_key);

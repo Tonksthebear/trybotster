@@ -98,7 +98,7 @@ export default class extends Controller {
     });
 
     // Show initial message
-    this.terminal.writeln("Secure Terminal (Olm E2E Encryption)");
+    this.terminal.writeln("Secure Terminal (Signal Protocol E2E Encryption)");
     this.terminal.writeln("Connecting...");
     this.terminal.writeln("");
   }

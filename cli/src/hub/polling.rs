@@ -54,9 +54,12 @@ pub struct PollingState {
 
 impl Default for PollingState {
     fn default() -> Self {
+        // Initialize timestamps far in the past to trigger immediate poll/heartbeat
+        // on first tick. This ensures the CLI starts working immediately.
+        let past = Instant::now() - Duration::from_secs(3600);
         Self {
-            last_poll: Instant::now(),
-            last_heartbeat: Instant::now(),
+            last_poll: past,
+            last_heartbeat: past,
         }
     }
 }
@@ -295,9 +298,9 @@ pub fn send_heartbeat_if_due(hub: &mut Hub) {
         return;
     }
 
-    // Check heartbeat interval (30 seconds)
-    const HEARTBEAT_INTERVAL: u64 = 30;
-    if hub.last_heartbeat.elapsed() < Duration::from_secs(HEARTBEAT_INTERVAL) {
+    // Check heartbeat interval (shorter in test mode for faster tests)
+    let heartbeat_interval = if crate::env::is_test_mode() { 2 } else { 30 };
+    if hub.last_heartbeat.elapsed() < Duration::from_secs(heartbeat_interval) {
         return;
     }
     hub.last_heartbeat = Instant::now();
@@ -396,8 +399,9 @@ mod tests {
     #[test]
     fn test_polling_state_default() {
         let state = PollingState::default();
-        // Should not poll immediately after creation
-        assert!(!state.should_poll(1));
+        // Should poll immediately after creation (timestamps initialized to past)
+        assert!(state.should_poll(1));
+        assert!(state.should_heartbeat());
     }
 
     #[test]

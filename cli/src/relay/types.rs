@@ -122,12 +122,14 @@ pub struct WorktreeInfo {
 #[serde(tag = "type")]
 pub enum BrowserCommand {
     /// Handshake message for session establishment/reconnection.
-    #[serde(rename = "handshake")]
+    /// Browser sends this after establishing Signal session.
+    #[serde(rename = "connected")]
     Handshake {
         /// Browser's device name.
         device_name: String,
-        /// Browser's Curve25519 identity key (base64).
-        browser_curve25519: String,
+        /// Timestamp of connection (optional).
+        #[serde(default)]
+        timestamp: Option<u64>,
     },
     /// Terminal input from browser.
     #[serde(rename = "input")]
