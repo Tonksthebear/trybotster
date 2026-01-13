@@ -561,4 +561,83 @@ mod tests {
         assert!(!bundle.signed_prekey.is_empty());
         assert!(!bundle.kyber_prekey.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_prekey_bundle_url_size() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let manager = SignalProtocolManager::new("test-hub-size").await.unwrap();
+        let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
+
+        let json = serde_json::to_string(&bundle).unwrap();
+        let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
+        let url = format!("https://example.com/hubs/abc123#{}", encoded);
+
+        println!("Bundle JSON size: {} chars", json.len());
+        println!("Bundle base64 size: {} chars", encoded.len());
+        println!("Full URL size: {} chars", url.len());
+        println!("Kyber key size: {} chars", bundle.kyber_prekey.len());
+
+        // DOCUMENTED LIMITATION: Post-quantum Kyber keys (~2092 chars) make the URL
+        // too long for QR codes (max ~2900 chars). Full URL is ~3500+ chars.
+        // The UI handles this by showing "URL too long for QR code" and offering
+        // the copy URL option instead.
+        assert!(
+            url.len() > 2900,
+            "With Kyber keys, URL should exceed QR capacity - if this fails, QR codes might work now!"
+        );
+
+        // Verify Kyber is the main contributor
+        assert!(bundle.kyber_prekey.len() > 2000, "Kyber key should be the largest component");
+    }
+
+    #[tokio::test]
+    async fn test_qr_size_options() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let manager = SignalProtocolManager::new("test-hub-qr-options").await.unwrap();
+        let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
+        let json = serde_json::to_string(&bundle).unwrap();
+
+        println!("\n=== QR Code Size Analysis ===\n");
+
+        // Current approach (JSON + base64)
+        let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
+        println!("Current (JSON + base64): {} chars", encoded.len());
+        println!("QR max capacity:         ~2900 chars");
+        println!("Overflow:                {} chars\n", encoded.len() as i32 - 2900);
+
+        // Size breakdown
+        println!("=== Component Sizes (base64) ===");
+        println!("Kyber prekey:       {} chars (the problem)", bundle.kyber_prekey.len());
+        println!("Kyber signature:    {} chars", bundle.kyber_prekey_signature.len());
+        println!("Identity key:       {} chars", bundle.identity_key.len());
+        println!("Signed prekey:      {} chars", bundle.signed_prekey.len());
+        println!("Signed prekey sig:  {} chars", bundle.signed_prekey_signature.len());
+        if let Some(ref pk) = bundle.prekey {
+            println!("One-time prekey:    {} chars", pk.len());
+        }
+
+        // Raw byte sizes (pre-base64)
+        println!("\n=== Raw Byte Sizes ===");
+        println!("Kyber1024 public key:  1568 bytes → {} base64 chars", (1568 * 4 + 2) / 3);
+        println!("X25519 public key:     32 bytes → 43 base64 chars");
+        println!("Ed25519 signature:     64 bytes → 86 base64 chars");
+
+        println!("\n=== Viable Options (keeping Kyber) ===");
+        println!("1. Server relay: QR has short URL, browser fetches bundle from server");
+        println!("   - QR: https://botster.dev/c/abc123 (~35 chars)");
+        println!("   - Server stores bundle ephemerally (5 min TTL)");
+        println!("   - Tradeoff: requires server, but bundle stays E2E encrypted");
+        println!("");
+        println!("2. Animated QR sequence: Display 2 QR codes alternating");
+        println!("   - Split bundle across 2 QRs (~1770 chars each)");
+        println!("   - App scans both and reassembles");
+        println!("   - Tradeoff: worse UX, needs custom scanner logic");
+
+        // Note: compression doesn't help - crypto keys are high-entropy random data
+        // that actually gets LARGER when you try to compress it
+
+        assert!(encoded.len() > 2900, "Confirming Kyber bundle exceeds QR capacity");
+    }
 }

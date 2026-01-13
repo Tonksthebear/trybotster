@@ -245,6 +245,15 @@ impl Agent {
         self.server_pty.is_some()
     }
 
+    /// Get the current PTY size (rows, cols).
+    ///
+    /// Returns the dimensions of the CLI PTY's vt100 parser screen.
+    #[must_use]
+    pub fn get_pty_size(&self) -> (u16, u16) {
+        let parser = self.cli_pty.vt100_parser.lock().expect("parser lock poisoned");
+        parser.screen().size()
+    }
+
     /// Check if the dev server is running.
     #[must_use]
     pub fn is_server_running(&self) -> bool {

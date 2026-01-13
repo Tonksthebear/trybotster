@@ -329,6 +329,24 @@ pub fn handle_connection_code_key(code: KeyCode) -> InputAction {
     }
 }
 
+/// Handle key presses in Error mode.
+///
+/// Any of Esc, Enter, or 'q' dismisses the error.
+///
+/// # Arguments
+///
+/// * `code` - The key code pressed
+///
+/// # Returns
+///
+/// The action to take in response to the key press.
+pub fn handle_error_mode_key(code: KeyCode) -> InputAction {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => InputAction::CloseModal,
+        _ => InputAction::None,
+    }
+}
+
 /// Parses raw terminal input bytes into KeyCode and KeyModifiers.
 ///
 /// This is used to convert browser input (which comes as raw escape sequences)
@@ -482,6 +500,7 @@ pub fn dispatch_key_event(
         AppMode::NewAgentPrompt => handle_prompt_input_key(code),
         AppMode::CloseAgentConfirm => handle_close_confirm_key(code),
         AppMode::ConnectionCode => handle_connection_code_key(code),
+        AppMode::Error => handle_error_mode_key(code),
     }
 }
 

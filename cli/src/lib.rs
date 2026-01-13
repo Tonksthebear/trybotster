@@ -24,6 +24,7 @@
 // Library modules
 pub mod agent;
 pub mod browser_connect;
+pub mod client;
 pub mod hub;
 pub mod relay;
 pub mod tui;
@@ -71,3 +72,9 @@ pub use tunnel::{allocate_tunnel_port, TunnelManager, TunnelStatus};
 // Re-export Hub types
 pub use hub::{Hub, HubAction, HubState};
 pub use agents::AgentSpawnConfig;
+
+// Re-export Client types
+pub use client::{
+    BrowserClient, Client, ClientId, ClientRegistry, ClientState, CreateAgentRequest,
+    DeleteAgentRequest, Response, TuiClient,
+};

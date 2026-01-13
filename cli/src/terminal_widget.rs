@@ -27,7 +27,8 @@ impl Default for CursorConfig {
         Self {
             show: true,
             symbol: "█".to_string(),
-            style: Style::default().fg(Color::White),
+            // Use REVERSED to invert terminal colors instead of hardcoding
+            style: Style::default().add_modifier(Modifier::REVERSED),
         }
     }
 }
