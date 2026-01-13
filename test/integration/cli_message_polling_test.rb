@@ -5,9 +5,9 @@ require_relative "cli_integration_test_case"
 # Tests CLI message polling against real Rails server.
 #
 # Verifies the CLI correctly:
-# - Polls for pending messages (GET /hubs/:identifier/messages)
+# - Polls for pending messages (GET /hubs/:hub_id/messages)
 # - Claims messages during polling (status pending → sent)
-# - Acknowledges processed messages (PATCH /hubs/:identifier/messages/:id)
+# - Acknowledges processed messages (PATCH /hubs/:hub_id/messages/:id)
 # - Updates heartbeat timestamps
 #
 # These tests spawn real CLI binary and verify database state changes.

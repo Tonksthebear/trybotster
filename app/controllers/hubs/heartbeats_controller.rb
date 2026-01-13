@@ -8,7 +8,7 @@ module Hubs
     before_action :authenticate_hub_request!
     before_action :set_hub
 
-    # PATCH /hubs/:identifier/heartbeat
+    # PATCH /hubs/:id/heartbeat
     def update
       @hub.touch(:last_seen_at)
 
@@ -30,7 +30,7 @@ module Hubs
     end
 
     def set_hub
-      @hub = current_hub_user.hubs.find_by(identifier: params[:hub_identifier])
+      @hub = current_hub_user.hubs.find_by(id: params[:hub_id])
       render json: { error: "Hub not found" }, status: :not_found unless @hub
     end
   end

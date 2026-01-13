@@ -18,6 +18,10 @@
 
 use super::{AgentInfo, Client, ClientId, ClientState, Response, WorktreeInfo};
 
+/// Maximum size of the output buffer in bytes (4MB).
+/// If browser isn't draining fast enough, excess data is dropped from the front.
+const MAX_OUTPUT_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
 /// Browser connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -108,6 +112,13 @@ impl Client for BrowserClient {
         // Buffer output data for later draining.
         // Hub.drain_browser_outputs() will send this via relay to this browser.
         self.output_buffer.extend_from_slice(data);
+
+        // Enforce buffer size limit to prevent memory leaks
+        if self.output_buffer.len() > MAX_OUTPUT_BUFFER_SIZE {
+            // Drop oldest data - keep most recent MAX_OUTPUT_BUFFER_SIZE bytes
+            let excess = self.output_buffer.len() - MAX_OUTPUT_BUFFER_SIZE;
+            self.output_buffer.drain(..excess);
+        }
     }
 
     fn receive_scrollback(&mut self, _lines: Vec<String>) {

@@ -14,7 +14,7 @@ module Hubs
     before_action :set_hub
     before_action :check_server_assisted_pairing
 
-    # GET /hubs/:identifier/connection
+    # GET /hubs/:id/connection
     # Returns device public key for Diffie-Hellman key exchange
     # ONLY if user has opted into server-assisted pairing
     def show
@@ -39,7 +39,7 @@ module Hubs
     private
 
     def set_hub
-      @hub = current_user.hubs.find_by(identifier: params[:hub_identifier])
+      @hub = current_user.hubs.find_by(id: params[:hub_id])
       render json: { error: "Hub not found" }, status: :not_found unless @hub
     end
 
@@ -55,7 +55,7 @@ module Hubs
         message: "For security, key exchange requires scanning the QR code displayed on your CLI. " \
                  "The key is transmitted via URL fragment which never reaches the server (MITM-proof). " \
                  "To enable server-assisted pairing (less secure), update your settings.",
-        secure_connect_url: @hub ? "/hubs/#{@hub.identifier}" : "/hubs",
+        secure_connect_url: @hub ? "/hubs/#{@hub.id}" : "/hubs",
         enable_convenience_url: "/settings",
         device: device_info
       }, status: :forbidden

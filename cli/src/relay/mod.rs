@@ -76,7 +76,7 @@ pub use types::{
 
 pub use connection::{TerminalOutputSender, TerminalRelay};
 
-pub use signal::{PreKeyBundleData, SignalEnvelope, SignalProtocolManager, SIGNAL_PROTOCOL_VERSION};
+pub use signal::{PreKeyBundleData, SignalEnvelope, SignalProtocolManager, SIGNAL_PROTOCOL_VERSION, binary_format};
 
 pub use persistence::{read_connection_url, write_connection_url, delete_connection_url};
 

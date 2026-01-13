@@ -6,6 +6,8 @@ require "minitest/mock"
 
 module Github
   class WebhooksControllerTest < ActionDispatch::IntegrationTest
+    include GithubTestHelper
+
     # Load fixtures needed for webhook tests
     fixtures :"bot/messages", :users
 
@@ -244,16 +246,17 @@ module Github
 
       body, signature = sign_webhook_payload(payload)
 
-      # This will attempt to fetch the PR from GitHub API
-      # For this test, we expect it to fail gracefully and create a PR message anyway
-      assert_difference "Bot::Message.count", 1 do
-        post "/github/webhooks",
-          params: body,
-          headers: {
-            "Content-Type" => "application/json",
-            "X-GitHub-Event" => "issue_comment",
-            "X-Hub-Signature-256" => signature
-          }
+      # Stub GitHub API calls since LinkedIssueResolver tries to fetch installations
+      with_stubbed_github do
+        assert_difference "Bot::Message.count", 1 do
+          post "/github/webhooks",
+            params: body,
+            headers: {
+              "Content-Type" => "application/json",
+              "X-GitHub-Event" => "issue_comment",
+              "X-Hub-Signature-256" => signature
+            }
+        end
       end
 
       message = Bot::Message.last

@@ -5,71 +5,102 @@ require "test_helper"
 # Tests for hub lifecycle endpoints.
 #
 # The CLI uses these endpoints to:
-# 1. Register/update hub on startup (PUT /hubs/:identifier)
-# 2. Heartbeat to keep hub alive (PATCH /hubs/:identifier/heartbeat)
-# 3. Unregister hub on shutdown (DELETE /hubs/:identifier)
+# 1. Register hub on startup (POST /hubs)
+# 2. Update hub / send heartbeat (PUT /hubs/:id)
+# 3. Heartbeat to keep hub alive (PATCH /hubs/:id/heartbeat)
+# 4. Unregister hub on shutdown (DELETE /hubs/:id)
 #
 # These tests verify the API contract the CLI expects.
 class HubsControllerTest < ActionDispatch::IntegrationTest
   include ApiTestHelper
 
   # ==========================================================================
-  # PUT /hubs/:identifier - Register/Update Hub
+  # POST /hubs - Register Hub
   # ==========================================================================
 
-  test "PUT /hubs/:identifier returns 401 without authentication" do
-    put hub_url("new-hub-123"),
+  test "POST /hubs returns 401 without authentication" do
+    post hubs_url,
+      params: { identifier: "new-hub-123", repo: "owner/repo" }.to_json,
+      headers: json_headers
+
+    assert_response :unauthorized
+  end
+
+  test "POST /hubs creates new hub and returns id" do
+    identifier = "new-hub-#{SecureRandom.hex(8)}"
+
+    assert_difference -> { Hub.count }, 1 do
+      post hubs_url,
+        params: { identifier: identifier, repo: "owner/repo" }.to_json,
+        headers: auth_headers_for(:jason)
+    end
+
+    assert_response :created
+    json = assert_json_keys(:id, :identifier)
+
+    assert_kind_of Integer, json["id"]
+    assert_equal identifier, json["identifier"]
+
+    hub = Hub.find(json["id"])
+    assert_equal identifier, hub.identifier
+    assert_equal "owner/repo", hub.repo
+    assert_equal users(:jason), hub.user
+  end
+
+  test "POST /hubs finds existing hub by identifier and returns 200" do
+    hub = hubs(:active_hub)
+    original_id = hub.id
+
+    assert_no_difference -> { Hub.count } do
+      post hubs_url,
+        params: { identifier: hub.identifier, repo: "updated/repo" }.to_json,
+        headers: auth_headers_for(:jason)
+    end
+
+    assert_response :ok  # 200 for existing, 201 for new
+    json = assert_json_keys(:id, :identifier)
+
+    assert_equal original_id, json["id"]
+
+    hub.reload
+    assert_equal "updated/repo", hub.repo
+  end
+
+  # ==========================================================================
+  # PUT /hubs/:id - Update Hub
+  # ==========================================================================
+
+  test "PUT /hubs/:id returns 401 without authentication" do
+    hub = hubs(:active_hub)
+
+    put hub_url(hub),
       params: { repo: "owner/repo" }.to_json,
       headers: json_headers
 
     assert_response :unauthorized
   end
 
-  test "PUT /hubs/:identifier creates new hub" do
-    identifier = "new-hub-#{SecureRandom.hex(8)}"
-
-    assert_difference -> { Hub.count }, 1 do
-      put hub_url(identifier),
-        params: { repo: "owner/repo" }.to_json,
-        headers: auth_headers_for(:jason)
-    end
-
-    assert_response :ok
-    json = assert_json_keys(:success, :hub_id)
-
-    assert_equal true, json["success"]
-    assert_kind_of Integer, json["hub_id"]
-
-    hub = Hub.find(json["hub_id"])
-    assert_equal identifier, hub.identifier
-    assert_equal "owner/repo", hub.repo
-    assert_equal users(:jason), hub.user
-  end
-
-  test "PUT /hubs/:identifier updates existing hub" do
+  test "PUT /hubs/:id updates existing hub" do
     hub = hubs(:active_hub)
-    original_id = hub.id
 
-    assert_no_difference -> { Hub.count } do
-      put hub_url(hub.identifier),
-        params: { repo: "updated/repo" }.to_json,
-        headers: auth_headers_for(:jason)
-    end
+    put hub_url(hub),
+      params: { repo: "updated/repo" }.to_json,
+      headers: auth_headers_for(:jason)
 
     assert_response :ok
     json = assert_json_keys(:success, :hub_id)
 
-    assert_equal original_id, json["hub_id"]
+    assert_equal hub.id, json["hub_id"]
 
     hub.reload
     assert_equal "updated/repo", hub.repo
   end
 
-  test "PUT /hubs/:identifier updates last_seen_at" do
+  test "PUT /hubs/:id updates last_seen_at" do
     hub = hubs(:stale_hub)
     old_last_seen = hub.last_seen_at
 
-    put hub_url(hub.identifier),
+    put hub_url(hub),
       params: { repo: hub.repo }.to_json,
       headers: auth_headers_for(:jason)
 
@@ -79,10 +110,10 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_operator hub.last_seen_at, :>, old_last_seen
   end
 
-  test "PUT /hubs/:identifier syncs agents" do
+  test "PUT /hubs/:id syncs agents" do
     hub = hubs(:active_hub)
 
-    put hub_url(hub.identifier),
+    put hub_url(hub),
       params: {
         repo: hub.repo,
         agents: [
@@ -98,27 +129,29 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_equal 2, hub.hub_agents.count
   end
 
-  test "PUT /hubs/:identifier associates device when device_id provided" do
+  test "PUT /hubs/:id associates device when device_id provided" do
     device = users(:jason).devices.create!(
       device_type: "cli",
       name: "My CLI",
       fingerprint: "hub:test:#{SecureRandom.hex(6)}"
     )
 
-    identifier = "hub-with-device-#{SecureRandom.hex(4)}"
+    hub = hubs(:active_hub)
 
-    put hub_url(identifier),
+    put hub_url(hub),
       params: { repo: "owner/repo", device_id: device.id }.to_json,
       headers: auth_headers_for(:jason)
 
     assert_response :ok
 
-    hub = Hub.find_by(identifier: identifier)
+    hub.reload
     assert_equal device, hub.device
   end
 
-  test "PUT /hubs/:identifier returns e2e_enabled status" do
-    put hub_url("hub-e2e-test"),
+  test "PUT /hubs/:id returns e2e_enabled status" do
+    hub = hubs(:active_hub)
+
+    put hub_url(hub),
       params: { repo: "owner/repo" }.to_json,
       headers: auth_headers_for(:jason)
 
@@ -128,24 +161,38 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert json.key?("e2e_enabled")
   end
 
+  test "PUT /hubs/:id returns 404 for other user's hub" do
+    other_hub = users(:one).hubs.create!(
+      identifier: "other-user-hub-#{SecureRandom.hex(4)}",
+      repo: "other/repo",
+      last_seen_at: Time.current
+    )
+
+    put hub_url(other_hub),
+      params: { repo: "hacked/repo" }.to_json,
+      headers: auth_headers_for(:jason)
+
+    assert_response :not_found
+  end
+
   # ==========================================================================
-  # PATCH /hubs/:identifier/heartbeat - Heartbeat
+  # PATCH /hubs/:hub_id/heartbeat - Heartbeat
   # ==========================================================================
 
-  test "PATCH /hubs/:identifier/heartbeat returns 401 without authentication" do
+  test "PATCH /hubs/:hub_id/heartbeat returns 401 without authentication" do
     hub = hubs(:active_hub)
 
-    patch hub_heartbeat_url(hub.identifier),
+    patch hub_heartbeat_url(hub),
       headers: json_headers
 
     assert_response :unauthorized
   end
 
-  test "PATCH /hubs/:identifier/heartbeat updates last_seen_at" do
+  test "PATCH /hubs/:hub_id/heartbeat updates last_seen_at" do
     hub = hubs(:stale_hub)
     old_last_seen = hub.last_seen_at
 
-    patch hub_heartbeat_url(hub.identifier),
+    patch hub_heartbeat_url(hub),
       headers: auth_headers_for(:jason)
 
     assert_response :ok
@@ -157,47 +204,46 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_operator hub.last_seen_at, :>, old_last_seen
   end
 
-  test "PATCH /hubs/:identifier/heartbeat returns 404 for unknown hub" do
-    patch hub_heartbeat_url("nonexistent-hub"),
+  test "PATCH /hubs/:hub_id/heartbeat returns 404 for unknown hub" do
+    patch hub_heartbeat_url(hub_id: 999999),
       headers: auth_headers_for(:jason)
 
     assert_response :not_found
     assert_json_error("Hub not found")
   end
 
-  test "PATCH /hubs/:identifier/heartbeat returns 404 for other user's hub" do
-    # Create hub for user :one
+  test "PATCH /hubs/:hub_id/heartbeat returns 404 for other user's hub" do
     other_hub = users(:one).hubs.create!(
       identifier: "other-user-hub-#{SecureRandom.hex(4)}",
       repo: "other/repo",
       last_seen_at: Time.current
     )
 
-    # Try to heartbeat with jason's token
-    patch hub_heartbeat_url(other_hub.identifier),
+    patch hub_heartbeat_url(other_hub),
       headers: auth_headers_for(:jason)
 
     assert_response :not_found
   end
 
   # ==========================================================================
-  # DELETE /hubs/:identifier - Unregister Hub
+  # DELETE /hubs/:id - Unregister Hub
   # ==========================================================================
 
-  test "DELETE /hubs/:identifier returns 401 without authentication" do
+  test "DELETE /hubs/:id returns 401 without authentication" do
     hub = hubs(:active_hub)
 
-    delete hub_url(hub.identifier),
+    delete hub_url(hub),
       headers: json_headers
 
     assert_response :unauthorized
   end
 
-  test "DELETE /hubs/:identifier removes hub" do
+  test "DELETE /hubs/:id marks hub as dead but preserves record" do
     hub = hubs(:active_hub)
+    assert hub.alive?
 
-    assert_difference -> { Hub.count }, -1 do
-      delete hub_url(hub.identifier),
+    assert_no_difference -> { Hub.count } do
+      delete hub_url(hub),
         headers: auth_headers_for(:jason)
     end
 
@@ -205,11 +251,14 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     json = assert_json_keys(:success)
 
     assert_equal true, json["success"]
-    assert_nil Hub.find_by(id: hub.id)
+
+    hub.reload
+    assert_not hub.alive?, "Hub should be marked as dead"
+    assert hub.persisted?, "Hub record should be preserved for reconnection"
   end
 
-  test "DELETE /hubs/:identifier is idempotent for nonexistent hub" do
-    delete hub_url("already-gone-hub"),
+  test "DELETE /hubs/:id is idempotent for nonexistent hub" do
+    delete hub_url(id: 999999),
       headers: auth_headers_for(:jason)
 
     assert_response :ok
@@ -218,7 +267,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_equal true, json["success"]
   end
 
-  test "DELETE /hubs/:identifier cannot delete other user's hub" do
+  test "DELETE /hubs/:id cannot delete other user's hub" do
     other_hub = users(:one).hubs.create!(
       identifier: "other-hub-#{SecureRandom.hex(4)}",
       repo: "other/repo",
@@ -226,7 +275,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     )
 
     assert_no_difference -> { Hub.count } do
-      delete hub_url(other_hub.identifier),
+      delete hub_url(other_hub),
         headers: auth_headers_for(:jason)
     end
 

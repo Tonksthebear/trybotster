@@ -96,8 +96,10 @@ pub struct Hub {
     // === Runtime ===
     /// HTTP tunnel manager for dev server forwarding.
     pub tunnel_manager: Arc<TunnelManager>,
-    /// Unique identifier for this hub session.
+    /// Local identifier for this hub session (used for config directories).
     pub hub_identifier: String,
+    /// Server-assigned ID for server communication (set after registration).
+    pub botster_id: Option<String>,
     /// Async runtime for relay and tunnel operations.
     pub tokio_runtime: tokio::runtime::Runtime,
 
@@ -128,6 +130,8 @@ pub struct Hub {
     pub connection_url: Option<String>,
     /// Error message to display in Error mode.
     pub error_message: Option<String>,
+    /// Whether the QR image has been displayed (to avoid re-rendering every frame).
+    pub qr_image_displayed: bool,
 
     // === Browser Relay ===
     /// Browser connection state and communication.
@@ -212,6 +216,7 @@ impl Hub {
             device,
             tunnel_manager,
             hub_identifier,
+            botster_id: None,
             tokio_runtime,
             quit: false,
             polling_enabled: true,
@@ -224,6 +229,7 @@ impl Hub {
             worktree_selected: 0,
             connection_url: None,
             error_message: None,
+            qr_image_displayed: false,
             browser: crate::relay::BrowserState::default(),
             clients: {
                 let mut registry = ClientRegistry::new();
@@ -237,6 +243,15 @@ impl Hub {
     #[must_use]
     pub fn terminal_dims(&self) -> (u16, u16) {
         self.terminal_dims
+    }
+
+    /// Get the hub ID to use for server communication.
+    ///
+    /// Returns the server-assigned `botster_id` if available (after registration),
+    /// otherwise falls back to local `hub_identifier`.
+    #[must_use]
+    pub fn server_hub_id(&self) -> &str {
+        self.botster_id.as_deref().unwrap_or(&self.hub_identifier)
     }
 
     /// Set terminal dimensions.
@@ -435,7 +450,7 @@ impl Hub {
             server_url: &self.config.server_url,
             api_key: self.config.get_api_key(),
             poll_interval: self.config.poll_interval,
-            hub_identifier: &self.hub_identifier,
+            server_hub_id: self.server_hub_id(),
         }
     }
 
@@ -578,14 +593,20 @@ impl Hub {
         registration::register_device(&mut self.device, &self.client, &self.config);
     }
 
-    /// Register the hub with the server before connecting to channels.
-    pub fn register_hub_with_server(&self) {
-        registration::register_hub_with_server(
+    /// Register the hub with the server and store the server-assigned ID.
+    ///
+    /// The server-assigned `botster_id` is used for all URLs and WebSocket subscriptions
+    /// to guarantee uniqueness (no collision between different CLI instances).
+    /// The local `hub_identifier` is kept for config directories.
+    pub fn register_hub_with_server(&mut self) {
+        let botster_id = registration::register_hub_with_server(
             &self.hub_identifier,
             &self.config.server_url,
             self.config.get_api_key(),
             self.device.device_id,
         );
+        // Store server-assigned ID (used for all server communication)
+        self.botster_id = Some(botster_id);
     }
 
     /// Start the tunnel connection in background.
@@ -595,11 +616,18 @@ impl Hub {
 
     /// Connect to terminal relay for browser access (Signal E2E encryption).
     pub fn connect_terminal_relay(&mut self) {
+        // Extract values before mutable borrow of browser
+        let server_id = self.server_hub_id().to_string();
+        let local_id = self.hub_identifier.clone();
+        let server_url = self.config.server_url.clone();
+        let api_key = self.config.get_api_key().to_string();
+
         registration::connect_terminal_relay(
             &mut self.browser,
-            &self.hub_identifier,
-            &self.config.server_url,
-            self.config.get_api_key(),
+            &server_id,
+            &local_id,
+            &server_url,
+            &api_key,
             &self.tokio_runtime,
         );
     }
@@ -630,7 +658,7 @@ impl Hub {
         registration::shutdown(
             &self.client,
             &self.config.server_url,
-            &self.hub_identifier,
+            self.server_hub_id(),
             self.config.get_api_key(),
         );
     }

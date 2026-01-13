@@ -102,11 +102,12 @@ module CliTestHelper
     def connection_url
       return @cached_url if @cached_url
 
-      # Must use same config dir as the running CLI to find the URL file
-      env_prefix = "BOTSTER_CONFIG_DIR=#{@temp_dir}"
-      result = `#{env_prefix} #{CLI_BINARY} get-connection-url --hub #{@hub.identifier} 2>/dev/null`.strip
-      @cached_url = result if $?.success? && result.present?
-      @cached_url
+      # Read directly from the file written by the CLI
+      url_path = File.join(@temp_dir, "hubs", @hub.identifier, "connection_url.txt")
+      return nil unless File.exist?(url_path)
+
+      @cached_url = File.read(url_path).strip
+      @cached_url.present? ? @cached_url : nil
     end
 
     def add_output(line)

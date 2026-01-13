@@ -7,7 +7,7 @@ module Hubs
     before_action :authenticate_with_api_key!
     before_action :set_hub
 
-    # GET /hubs/:identifier/messages
+    # GET /hubs/:id/messages
     # Returns pending, unclaimed messages for this hub's repo
     def index
       # Get all pending, unclaimed messages for this hub's repo
@@ -56,7 +56,7 @@ module Hubs
       }
     end
 
-    # PATCH/PUT /hubs/:identifier/messages/:id
+    # PATCH/PUT /hubs/:id/messages/:id
     # Acknowledges a message
     def update
       message = Bot::Message.find_by!(id: params[:id], claimed_by_user_id: current_api_user.id)
@@ -74,7 +74,7 @@ module Hubs
     private
 
     def set_hub
-      @hub = current_api_user.hubs.find_by!(identifier: params[:hub_identifier])
+      @hub = current_api_user.hubs.find_by!(id: params[:hub_id])
     rescue ActiveRecord::RecordNotFound
       render json: { error: "Hub not found" }, status: :not_found
     end

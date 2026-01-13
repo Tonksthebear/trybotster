@@ -13,9 +13,9 @@ class Hub < ApplicationRecord
   validates :identifier, presence: true, uniqueness: true
   validates :last_seen_at, presence: true
 
-  scope :active, -> { where("last_seen_at > ?", 2.minutes.ago) }
+  scope :active, -> { where(alive: true).where("last_seen_at > ?", 2.minutes.ago) }
   scope :for_repo, ->(repo) { where(repo: repo) }
-  scope :stale, -> { where("last_seen_at <= ?", 2.minutes.ago) }
+  scope :stale, -> { where(alive: false).or(where("last_seen_at <= ?", 2.minutes.ago)) }
   scope :with_device, -> { where.not(device_id: nil) }
 
   # Check if this hub supports E2E encrypted terminal access
@@ -23,9 +23,9 @@ class Hub < ApplicationRecord
     device.present?
   end
 
-  # Check if this hub is active (seen within 2 minutes)
+  # Check if this hub is active (alive flag set and seen within 2 minutes)
   def active?
-    last_seen_at > 2.minutes.ago
+    alive? && last_seen_at > 2.minutes.ago
   end
 
   # Synchronize hub_agents with data from CLI heartbeat.

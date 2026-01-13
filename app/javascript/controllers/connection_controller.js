@@ -118,7 +118,7 @@ export default class extends Controller {
   ];
 
   static values = {
-    hubIdentifier: String,
+    hubId: String,
     wasmJsPath: String,
     wasmBgPath: String,
   };
@@ -126,7 +126,7 @@ export default class extends Controller {
   connect() {
     this.signalSession = null;
     this.subscription = null;
-    this.hubIdentifier = null;
+    this.hubId = null;
     this.ourIdentityKey = null;
     this.connected = false;
     this.state = ConnectionState.DISCONNECTED;
@@ -202,12 +202,12 @@ export default class extends Controller {
 
   async initializeConnection() {
     // Get hub ID from URL path
-    this.hubIdentifier = getHubIdFromPath();
-    if (!this.hubIdentifier && this.hubIdentifierValue) {
-      this.hubIdentifier = this.hubIdentifierValue;
+    this.hubId = getHubIdFromPath();
+    if (!this.hubId && this.hubIdValue) {
+      this.hubId = this.hubIdValue;
     }
 
-    if (!this.hubIdentifier) {
+    if (!this.hubId) {
       this.setError(ConnectionError.NO_BUNDLE, "Hub ID not found in URL");
       return;
     }
@@ -293,7 +293,7 @@ export default class extends Controller {
       console.log("[Connection] Creating new session from URL bundle");
       this.signalSession = await SignalSession.create(
         urlBundle,
-        this.hubIdentifier
+        this.hubId
       );
       // Clear fragment after successful session creation (clean URL)
       if (window.history.replaceState) {
@@ -305,7 +305,7 @@ export default class extends Controller {
       }
     } else {
       // No URL bundle - try to restore from IndexedDB
-      this.signalSession = await SignalSession.load(this.hubIdentifier);
+      this.signalSession = await SignalSession.load(this.hubId);
 
       if (!this.signalSession) {
         // No cached session either - try server as last resort
@@ -313,13 +313,13 @@ export default class extends Controller {
         if (serverBundle) {
           this.signalSession = await SignalSession.create(
             serverBundle,
-            this.hubIdentifier
+            this.hubId
           );
         }
       } else {
         console.log(
           "[Connection] Restored cached session for hub:",
-          this.hubIdentifier
+          this.hubId
         );
       }
     }
@@ -327,7 +327,7 @@ export default class extends Controller {
 
   async fetchPreKeyBundle() {
     try {
-      const response = await fetch(`/hubs/${this.hubIdentifier}/bundle`, {
+      const response = await fetch(`/hubs/${this.hubId}/bundle`, {
         headers: { Accept: "application/json" },
       });
 
@@ -345,7 +345,7 @@ export default class extends Controller {
       this.subscription = consumer.subscriptions.create(
         {
           channel: "TerminalRelayChannel",
-          hub_identifier: this.hubIdentifier,
+          hub_id: this.hubId,
           browser_identity: this.ourIdentityKey,
         },
         {
@@ -478,7 +478,7 @@ export default class extends Controller {
       this.setState(ConnectionState.CONNECTED);
       this.updateStatus(
         "Connected",
-        `E2E encrypted to ${this.hubIdentifier.substring(0, 8)}...`
+        `E2E encrypted to ${this.hubId.substring(0, 8)}...`
       );
 
       // Notify all registered listeners
@@ -576,8 +576,8 @@ export default class extends Controller {
     return this.connected;
   }
 
-  getHubIdentifier() {
-    return this.hubIdentifier;
+  getHubId() {
+    return this.hubId;
   }
 
   getState() {

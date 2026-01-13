@@ -60,6 +60,7 @@ libsignal-protocol = { git = "https://github.com/signalapp/libsignal", branch = 
 async-trait = "0.1"
 rand = "0.9"
 base64 = "0.22"
+data-encoding = "2.6"  # Base32 encoding for QR-friendly URLs
 
 # Security hardening
 keyring = { version = "3", features = ["apple-native"] }  # OS keychain for secret key storage
@@ -71,8 +72,11 @@ aes-gcm = "0.10"               # AES-GCM for encrypting Signal state at rest
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 
-# QR code generation for browser connection
-qrcode = "0.14"
+# QR code generation for browser connection (qrcodegen supports alphanumeric mode for smaller QR)
+qrcodegen = "1.8"
+
+# Image generation for QR code rendering (Kitty graphics protocol)
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Clipboard support for copying URLs
 arboard = "3.4"

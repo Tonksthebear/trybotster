@@ -32,7 +32,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use data_encoding::BASE32_NOPAD;
 
 use super::signal::{SignalEnvelope, SignalProtocolManager};
 use super::state::IdentifiedBrowserEvent;
@@ -48,11 +48,13 @@ struct CableMessage {
 }
 
 /// Action Cable subscription identifier.
+///
+/// CLI subscribes without browser_identity → gets CLI stream.
+/// Rails uses hub_id for routing.
 #[derive(Debug, Serialize, Deserialize)]
 struct ChannelIdentifier {
     channel: String,
-    hub_identifier: String,
-    device_type: String,
+    hub_id: String,
 }
 
 /// Incoming Action Cable message.
@@ -237,11 +239,10 @@ impl TerminalRelay {
             Err(_) => anyhow::bail!("Timeout waiting for Action Cable welcome"),
         }
 
-        // Build channel identifier
+        // Build channel identifier - hub_identifier is the server-assigned ID
         let identifier = ChannelIdentifier {
             channel: "TerminalRelayChannel".to_string(),
-            hub_identifier: hub_identifier.clone(),
-            device_type: "cli".to_string(),
+            hub_id: hub_identifier.clone(),
         };
         let identifier_json = serde_json::to_string(&identifier)?;
 
@@ -472,15 +473,17 @@ impl TerminalRelay {
                                                                     // Use a higher prekey ID than the initial QR (which uses 1)
                                                                     match self.signal_manager.build_prekey_bundle_data(2).await {
                                                                         Ok(bundle) => {
-                                                                            // Encode bundle for URL fragment
-                                                                            let bundle_json = serde_json::to_string(&bundle)
-                                                                                .expect("PreKeyBundle serializable");
-                                                                            let bundle_encoded = URL_SAFE_NO_PAD.encode(bundle_json.as_bytes());
+                                                                            // Encode bundle as binary + Base32 for QR-friendly URLs
+                                                                            let bundle_bytes = bundle.to_binary()
+                                                                                .expect("PreKeyBundle binary serializable");
+                                                                            let bundle_encoded = BASE32_NOPAD.encode(&bundle_bytes);
 
-                                                                            // Build shareable URL (fragment never sent to server)
+                                                                            // Build shareable URL (mixed-mode: byte for URL, alphanumeric for bundle)
                                                                             let invite_url = format!(
-                                                                                "{}/hubs/{}#bundle={}",
-                                                                                self.server_url, hub_identifier, bundle_encoded
+                                                                                "{}/hubs/{}#{}",
+                                                                                self.server_url,
+                                                                                hub_identifier,
+                                                                                bundle_encoded
                                                                             );
 
                                                                             // Send invite_bundle response

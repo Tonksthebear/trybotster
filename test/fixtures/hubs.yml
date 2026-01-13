@@ -6,6 +6,7 @@ active_hub:
   repo: "botster/trybotster"
   identifier: "hub-active-123"
   last_seen_at: <%= 30.seconds.ago %>
+  alive: true
 
 stale_hub:
   user: jason
@@ -13,9 +14,11 @@ stale_hub:
   repo: "botster/old-repo"
   identifier: "hub-stale-456"
   last_seen_at: <%= 5.minutes.ago %>
+  alive: false
 
 hub_without_device:
   user: jason
   repo: "botster/no-device"
   identifier: "hub-no-device-789"
   last_seen_at: <%= 1.minute.ago %>
+  alive: true

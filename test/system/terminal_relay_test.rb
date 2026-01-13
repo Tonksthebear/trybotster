@@ -24,7 +24,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     connection_url = @cli.connection_url
 
     assert connection_url.present?, "CLI should generate connection URL"
-    assert connection_url.include?("#bundle="), "URL should contain PreKeyBundle"
+    assert connection_url.include?("#"), "URL should contain PreKeyBundle in fragment"
 
     sign_in_as(@user)
     visit connection_url
@@ -39,9 +39,42 @@ class TerminalRelayTest < ApplicationSystemTestCase
     end
   end
 
+  test "CLI connection URL matches Rails hubs#show route" do
+    @cli = start_cli(@hub, timeout: 20)
+    connection_url = @cli.connection_url
+
+    assert connection_url.present?, "CLI should generate connection URL"
+
+    # Parse URL and validate format
+    uri = URI.parse(connection_url)
+
+    # Path must match /hubs/:id (Rails resourceful route using numeric ID)
+    # This prevents accidental path changes that would 404
+    expected_path = "/hubs/#{@hub.id}"
+    assert_equal expected_path, uri.path,
+      "CLI URL path must match Rails hubs#show route. " \
+      "Got '#{uri.path}', expected '#{expected_path}'. " \
+      "If you need a shorter path for QR codes, add a Rails route alias."
+
+    # Fragment should contain raw Base32-encoded PreKeyBundle (no prefix for QR efficiency)
+    assert uri.fragment.present?, "URL must have fragment with PreKeyBundle"
+    assert uri.fragment.match?(/\A[A-Z2-7]+\z/),
+      "Fragment should be raw Base32 encoded (uppercase A-Z, 2-7). Got: #{uri.fragment[0..50]}..."
+    assert uri.fragment.length > 2800,
+      "Bundle should be ~2900 chars for Kyber keys. Got: #{uri.fragment.length}"
+
+    # Verify the URL actually resolves (doesn't 404)
+    sign_in_as(@user)
+    visit connection_url
+
+    # If we get here without routing error, the path is valid
+    # Don't need full handshake - just verify page loads
+    assert_selector "[data-connection-target='status']", wait: 10
+  end
+
   test "connection fails gracefully without CLI" do
     sign_in_as(@user)
-    visit hub_path(@hub.identifier)
+    visit hub_path(@hub)
 
     assert_text(/connection failed|no bundle|scan qr/i, wait: 10)
   end
@@ -77,7 +110,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     # Get invite URL from clipboard
     invite_url = page.evaluate_script("navigator.clipboard.readText()")
     assert invite_url.present?, "Invite URL should be in clipboard"
-    assert invite_url.include?("#bundle="), "Invite URL should contain bundle fragment"
+    assert invite_url.include?("#"), "Invite URL should contain bundle fragment"
     assert invite_url != connection_url, "Invite URL should have fresh bundle"
 
     # Second browser (new window) uses invite
@@ -210,13 +243,13 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
   test "each CLI instance has unique keys" do
     @cli = start_cli(@hub, timeout: 20)
-    first_bundle = @cli.connection_url.split("#bundle=").last
+    first_bundle = @cli.connection_url.split("#").last
 
     stop_cli(@cli)
     sleep 1
 
     @cli = start_cli(@hub, timeout: 20)
-    second_bundle = @cli.connection_url.split("#bundle=").last
+    second_bundle = @cli.connection_url.split("#").last
 
     refute_equal first_bundle, second_bundle, "New CLI should have different keys"
   end
@@ -234,7 +267,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
 
     # Visit without new bundle - cached session won't work
-    visit hub_path(@hub.identifier)
+    visit hub_path(@hub)
     assert_text(/connection failed|no bundle|scan qr/i, wait: 15)
 
     # New bundle works

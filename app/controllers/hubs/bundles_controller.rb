@@ -9,7 +9,7 @@ module Hubs
     before_action :authenticate_user!
     before_action :set_hub
 
-    # GET /hubs/:hub_identifier/bundle
+    # GET /hubs/:hub_id/bundle
     def show
       # For now, bundles are only available via QR code URL fragment.
       # The CLI generates a fresh PreKeyBundle and embeds it in the QR code.
@@ -21,7 +21,7 @@ module Hubs
     private
 
     def set_hub
-      @hub = current_user.hubs.find_by(identifier: params[:hub_identifier])
+      @hub = current_user.hubs.find_by(id: params[:hub_id])
       render json: { error: "Hub not found" }, status: :not_found unless @hub
     end
   end

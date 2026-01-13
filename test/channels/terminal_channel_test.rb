@@ -2,181 +2,107 @@
 
 require "test_helper"
 
+# Tests for TerminalRelayChannel E2E encryption relay.
+#
+# This channel is a pure relay - it doesn't validate hub ownership.
+# It just routes encrypted messages between CLI and browser endpoints.
 class TerminalChannelTest < ActionCable::Channel::TestCase
+  tests TerminalRelayChannel
+
   setup do
-    @user = users(:one)
-    @hub = Hub.create!(
-      user: @user,
-      identifier: "test-hub-#{SecureRandom.hex(4)}",
-      repo: "test/repo",
-      last_seen_at: Time.current
-    )
+    @hub_id = 12345
+    @browser_identity = "browser-#{SecureRandom.hex(16)}"
   end
 
-  teardown do
-    @hub&.destroy
-  end
+  # === Subscription Tests ===
 
-  test "CLI with device token can subscribe to terminal channel" do
-    # Create a device token
-    device_token = @user.device_tokens.create!(name: "Test CLI")
-
-    # Stub the connection with the user (simulating successful auth)
-    stub_connection current_user: @user
-
-    # Subscribe to the channel
-    subscribe hub_identifier: @hub.identifier, device_type: "cli"
+  test "CLI subscribes to CLI stream (no browser_identity)" do
+    subscribe hub_id: @hub_id
 
     assert subscription.confirmed?
-    assert_has_stream "terminal_#{@user.id}_#{@hub.identifier}"
+    assert_has_stream "terminal_relay:#{@hub_id}:cli"
   end
 
-  test "browser can subscribe to terminal channel" do
-    stub_connection current_user: @user
-
-    subscribe hub_identifier: @hub.identifier, device_type: "browser"
+  test "browser subscribes to dedicated browser stream" do
+    subscribe hub_id: @hub_id, browser_identity: @browser_identity
 
     assert subscription.confirmed?
-    assert_has_stream "terminal_#{@user.id}_#{@hub.identifier}"
+    assert_has_stream "terminal_relay:#{@hub_id}:browser:#{@browser_identity}"
   end
 
-  test "rejects subscription for hub belonging to different user" do
-    other_user = users(:two)
-    other_hub = Hub.create!(
-      user: other_user,
-      identifier: "other-hub-#{SecureRandom.hex(4)}",
-      repo: "other/repo",
-      last_seen_at: Time.current
-    )
-
-    stub_connection current_user: @user
-
-    subscribe hub_identifier: other_hub.identifier, device_type: "cli"
-
-    assert subscription.rejected?
-
-    other_hub.destroy
-  end
-
-  test "rejects subscription for non-existent hub" do
-    stub_connection current_user: @user
-
-    subscribe hub_identifier: "non-existent-hub", device_type: "cli"
+  test "rejects subscription without hub_id" do
+    subscribe
 
     assert subscription.rejected?
   end
 
-  test "relay broadcasts terminal message with correct from field" do
-    stub_connection current_user: @user
-    subscribe hub_identifier: @hub.identifier, device_type: "cli"
+  test "rejects subscription with blank hub_id" do
+    subscribe hub_id: ""
 
-    stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
+    assert subscription.rejected?
+  end
 
-    # Check that relay broadcasts with from: cli (using Olm envelope format)
-    assert_broadcasts(stream_name, 1) do
-      perform :relay,
-        version: 3,
+  # === Relay Routing Tests ===
+
+  test "CLI relay with recipient_identity routes to browser stream" do
+    subscribe hub_id: @hub_id  # Subscribe as CLI
+
+    browser_stream = "terminal_relay:#{@hub_id}:browser:#{@browser_identity}"
+
+    # CLI sends to specific browser
+    assert_broadcasts(browser_stream, 1) do
+      perform :relay, recipient_identity: @browser_identity, envelope: {
+        version: 4,
+        message_type: 2,
+        ciphertext: "encrypted_data"
+      }
+    end
+  end
+
+  test "browser relay without recipient_identity routes to CLI stream" do
+    subscribe hub_id: @hub_id, browser_identity: @browser_identity
+
+    cli_stream = "terminal_relay:#{@hub_id}:cli"
+
+    # Browser sends to CLI (no recipient_identity needed)
+    assert_broadcasts(cli_stream, 1) do
+      perform :relay, envelope: {
+        version: 4,
         message_type: 1,
-        ciphertext: "encrypted_data",
-        sender_key: "cli_curve25519_key"
+        ciphertext: "encrypted_handshake"
+      }
     end
   end
 
-  test "browser relay broadcasts terminal message" do
-    stub_connection current_user: @user
-    subscribe hub_identifier: @hub.identifier, device_type: "browser"
+  test "relay does NOT broadcast when envelope is missing" do
+    subscribe hub_id: @hub_id
+    cli_stream = "terminal_relay:#{@hub_id}:cli"
 
-    stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
-
-    # Using Olm envelope format
-    assert_broadcasts(stream_name, 1) do
-      perform :relay,
-        version: 3,
-        message_type: 1,
-        ciphertext: "browser_encrypted_data",
-        sender_key: "browser_curve25519_key"
+    # Missing envelope field
+    assert_no_broadcasts(cli_stream) do
+      perform :relay, recipient_identity: @browser_identity
     end
   end
 
-  test "presence broadcasts device type and public key" do
-    stub_connection current_user: @user
-    subscribe hub_identifier: @hub.identifier, device_type: "browser"
+  # === SenderKey Distribution Tests ===
 
-    stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
+  test "distribute_sender_key broadcasts to CLI stream" do
+    subscribe hub_id: @hub_id, browser_identity: @browser_identity
 
-    assert_broadcasts(stream_name, 1) do
-      perform :presence, event: "join", device_name: "Test Browser", public_key: "test_public_key"
+    cli_stream = "terminal_relay:#{@hub_id}:cli"
+
+    assert_broadcasts(cli_stream, 1) do
+      perform :distribute_sender_key, distribution: "base64_sender_key_distribution_message"
     end
   end
 
-  # Note: resize action was removed - resize now goes through encrypted relay
-  # The browser sends BrowserCommand::Resize through the Olm-encrypted channel
+  test "distribute_sender_key does NOT broadcast without distribution" do
+    subscribe hub_id: @hub_id
 
-  # === Tests proving Olm E2E encryption relay issues ===
+    cli_stream = "terminal_relay:#{@hub_id}:cli"
 
-  test "relay requires Olm envelope fields (version, ciphertext)" do
-    stub_connection current_user: @user
-    subscribe hub_identifier: @hub.identifier, device_type: "browser"
-
-    stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
-
-    # Missing required Olm envelope fields - should NOT broadcast
-    assert_no_broadcasts(stream_name) do
-      perform :relay, blob: "old_format_data"
-    end
-  end
-
-  test "relay broadcasts Olm envelope with all required fields" do
-    stub_connection current_user: @user
-    subscribe hub_identifier: @hub.identifier, device_type: "browser"
-
-    stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
-
-    # Proper Olm v3 envelope format
-    assert_broadcasts(stream_name, 1) do
-      perform :relay,
-        version: 3,
-        message_type: 1,
-        ciphertext: "base64_encrypted_data_here",
-        sender_key: "curve25519_key_here"
-    end
-  end
-
-  test "relay preserves sender_key for Olm session identification" do
-    stub_connection current_user: @user
-    subscribe hub_identifier: @hub.identifier, device_type: "cli"
-
-    stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
-
-    # The sender_key is critical for Olm - browser needs it to know which session to use
-    assert_broadcasts(stream_name, 1) do
-      perform :relay,
-        version: 3,
-        message_type: 0,  # PreKey message
-        ciphertext: "prekey_ciphertext",
-        sender_key: "my_curve25519_identity_key"
-    end
-  end
-
-  test "presence includes prekey_message for Olm session establishment" do
-    stub_connection current_user: @user
-    subscribe hub_identifier: @hub.identifier, device_type: "browser"
-
-    stream_name = "terminal_#{@user.id}_#{@hub.identifier}"
-
-    # Browser sends PreKey message in presence to establish Olm session
-    olm_prekey = {
-      version: 3,
-      message_type: 0,
-      ciphertext: "prekey_ciphertext_base64",
-      sender_key: "browser_curve25519_key"
-    }
-
-    assert_broadcasts(stream_name, 1) do
-      perform :presence,
-        event: "join",
-        device_name: "Chrome Browser",
-        prekey_message: olm_prekey
+    assert_no_broadcasts(cli_stream) do
+      perform :distribute_sender_key, distribution: nil
     end
   end
 end

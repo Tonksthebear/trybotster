@@ -90,6 +90,16 @@ impl SignalProtocolStore {
     pub async fn load(hub_id: &str) -> Result<Self> {
         let state = super::persistence::load_signal_store(hub_id)?;
 
+        log::info!(
+            "Loaded Signal store: {} sessions, {} identities, {} prekeys",
+            state.sessions.len(),
+            state.identities.len(),
+            state.pre_keys.len()
+        );
+        for key in state.sessions.keys() {
+            log::debug!("  Restored session: {}", key);
+        }
+
         let identity_key_pair = IdentityKeyPair::try_from(state.identity_key_pair.as_slice())
             .map_err(|e| anyhow::anyhow!("Failed to deserialize identity: {e}"))?;
 
@@ -108,11 +118,23 @@ impl SignalProtocolStore {
 
     /// Persist store to encrypted disk storage.
     pub async fn persist(&self, hub_id: &str) -> Result<()> {
+        let sessions = self.sessions.read().await.clone();
+        let identities = self.identities.read().await.clone();
+
+        log::debug!(
+            "Persisting Signal store: {} sessions, {} identities",
+            sessions.len(),
+            identities.len()
+        );
+        for key in sessions.keys() {
+            log::debug!("  Session: {}", key);
+        }
+
         let state = SignalStoreState {
             identity_key_pair: self.identity_key_pair.serialize().to_vec(),
             registration_id: self.registration_id,
-            identities: self.identities.read().await.clone(),
-            sessions: self.sessions.read().await.clone(),
+            identities,
+            sessions,
             pre_keys: self.pre_keys.read().await.clone(),
             signed_pre_keys: self.signed_pre_keys.read().await.clone(),
             kyber_pre_keys: self.kyber_pre_keys.read().await.clone(),
