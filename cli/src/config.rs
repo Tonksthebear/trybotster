@@ -1,11 +1,20 @@
 //! Configuration loading and persistence.
 //!
-//! Handles reading and writing the botster-hub configuration file,
-//! which stores server URL, API tokens, and other settings.
+//! Handles reading and writing the botster-hub configuration file.
+//! Sensitive tokens are stored in OS keyring, not in the config file.
 
+use crate::env::is_test_mode;
 use anyhow::{Context, Result};
+use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+/// Keyring service name (shared with device.rs)
+const KEYRING_SERVICE: &str = "botster";
+/// Keyring entry name for API token
+const KEYRING_TOKEN_ENTRY: &str = "api-token";
 
 /// Configuration for the botster-hub CLI.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -15,11 +24,11 @@ pub struct Config {
     /// URL of the Headscale control server for Tailscale mesh networking.
     #[serde(default)]
     pub headscale_url: Option<String>,
-    /// New device token from device authorization flow (preferred).
-    #[serde(default)]
+    /// API token - NOT serialized to disk (stored in keyring)
+    #[serde(skip)]
     pub token: String,
-    /// Legacy API key (deprecated, kept for backward compatibility).
-    #[serde(default)]
+    /// Legacy API key - NOT serialized to disk
+    #[serde(skip)]
     pub api_key: String,
     /// Interval in seconds between server polls.
     pub poll_interval: u64,
@@ -35,7 +44,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server_url: "https://trybotster.com".to_string(),
-            headscale_url: None, // Defaults to localhost:8080 in TailscaleClient
+            headscale_url: None,
             token: String::new(),
             api_key: String::new(),
             poll_interval: 5,
@@ -51,7 +60,6 @@ impl Default for Config {
 impl Config {
     /// Returns the configuration directory path, creating it if necessary.
     pub fn config_dir() -> Result<PathBuf> {
-        // Allow tests to override the config directory
         let dir = if let Ok(test_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
             PathBuf::from(test_dir)
         } else {
@@ -64,12 +72,17 @@ impl Config {
     }
 
     /// Loads configuration from file, with environment variable overrides.
+    /// Token is loaded from keyring (or env var).
     pub fn load() -> Result<Self> {
-        // Priority: Environment variables > config file > defaults
         let mut config = Self::load_from_file().unwrap_or_else(|_| Self::default());
-
-        // Override with environment variables if present
         config.apply_env_overrides();
+
+        // Load token from keyring if not set via env var
+        if config.token.is_empty() {
+            if let Ok(token) = Self::load_token_from_keyring() {
+                config.token = token;
+            }
+        }
 
         Ok(config)
     }
@@ -85,22 +98,20 @@ impl Config {
     }
 
     fn apply_env_overrides(&mut self) {
-        // Essential config
         if let Ok(server_url) = std::env::var("BOTSTER_SERVER_URL") {
             self.server_url = server_url;
         }
 
-        // Headscale control server URL for Tailscale mesh networking
         if let Ok(headscale_url) = std::env::var("HEADSCALE_URL") {
             self.headscale_url = Some(headscale_url);
         }
 
-        // New token takes precedence over legacy api_key
+        // Token from env var (for CI/CD)
         if let Ok(token) = std::env::var("BOTSTER_TOKEN") {
             self.token = token;
         }
 
-        // Legacy api_key support
+        // Legacy env var support
         if let Ok(api_key) = std::env::var("BOTSTER_API_KEY") {
             self.api_key = api_key;
         }
@@ -109,7 +120,6 @@ impl Config {
             self.worktree_base = PathBuf::from(worktree_base);
         }
 
-        // Optional config
         if let Ok(poll_interval) = std::env::var("BOTSTER_POLL_INTERVAL") {
             if let Ok(interval) = poll_interval.parse::<u64>() {
                 self.poll_interval = interval;
@@ -130,9 +140,15 @@ impl Config {
     }
 
     /// Persists the current configuration to disk.
+    /// Note: Token is NOT saved here (use save_token for that).
     pub fn save(&self) -> Result<()> {
         let config_path = Self::config_dir()?.join("config.json");
         fs::write(&config_path, serde_json::to_string_pretty(self)?)?;
+
+        // Set restrictive permissions (owner read/write only)
+        #[cfg(unix)]
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+
         Ok(())
     }
 
@@ -148,16 +164,13 @@ impl Config {
 
     /// Check if we have a valid authentication token.
     /// Only returns true if the token has the expected `btstr_` prefix.
-    /// This ensures legacy api_key values trigger re-authentication.
     pub fn has_token(&self) -> bool {
         const TOKEN_PREFIX: &str = "btstr_";
 
-        // New token format takes precedence
         if !self.token.is_empty() {
             return self.token.starts_with(TOKEN_PREFIX);
         }
 
-        // Legacy api_key - only valid if it happens to have btstr_ prefix (unlikely)
         if !self.api_key.is_empty() {
             return self.api_key.starts_with(TOKEN_PREFIX);
         }
@@ -165,16 +178,83 @@ impl Config {
         false
     }
 
-    /// Save a new device token to the config file.
+    /// Save a new device token to the keyring.
     pub fn save_token(&mut self, token: &str) -> Result<()> {
         self.token = token.to_string();
-        self.save()
+        Self::save_token_to_keyring(token)?;
+        Ok(())
     }
 
-    /// Clear the token (for logout).
+    /// Clear the token from keyring.
     pub fn clear_token(&mut self) -> Result<()> {
         self.token.clear();
-        self.save()
+        Self::delete_token_from_keyring()?;
+        Ok(())
+    }
+
+    // ========== Keyring Operations ==========
+
+    /// Load token from OS keyring (or file in test mode).
+    fn load_token_from_keyring() -> Result<String> {
+        if is_test_mode() || cfg!(test) {
+            // Test mode: use file storage
+            let token_path = Self::config_dir()?.join("token");
+            if token_path.exists() {
+                return Ok(fs::read_to_string(&token_path)?.trim().to_string());
+            }
+            anyhow::bail!("Token file not found");
+        }
+
+        // Production: use OS keyring
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_ENTRY)
+            .map_err(|e| anyhow::anyhow!("Failed to create keyring entry: {:?}", e))?;
+
+        entry
+            .get_password()
+            .map_err(|e| anyhow::anyhow!("Token not found in keyring: {:?}", e))
+    }
+
+    /// Save token to OS keyring (or file in test mode).
+    fn save_token_to_keyring(token: &str) -> Result<()> {
+        if is_test_mode() || cfg!(test) {
+            // Test mode: use file storage
+            let token_path = Self::config_dir()?.join("token");
+            fs::write(&token_path, token)?;
+            #[cfg(unix)]
+            fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600))?;
+            log::debug!("Saved token to file (test mode)");
+            return Ok(());
+        }
+
+        // Production: use OS keyring
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_ENTRY)
+            .map_err(|e| anyhow::anyhow!("Failed to create keyring entry: {:?}", e))?;
+
+        entry
+            .set_password(token)
+            .map_err(|e| anyhow::anyhow!("Failed to store token in keyring: {:?}", e))?;
+
+        log::info!("Stored API token in OS keyring");
+        Ok(())
+    }
+
+    /// Delete token from OS keyring (or file in test mode).
+    fn delete_token_from_keyring() -> Result<()> {
+        if is_test_mode() || cfg!(test) {
+            let token_path = Self::config_dir()?.join("token");
+            if token_path.exists() {
+                fs::remove_file(&token_path)?;
+            }
+            return Ok(());
+        }
+
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_ENTRY)
+            .map_err(|e| anyhow::anyhow!("Failed to create keyring entry: {:?}", e))?;
+
+        // Ignore errors if entry doesn't exist
+        let _ = entry.delete_credential();
+        log::info!("Deleted API token from OS keyring");
+        Ok(())
     }
 }
 
@@ -192,11 +272,14 @@ mod tests {
     }
 
     #[test]
-    fn test_config_serialization() {
-        let config = Config::default();
+    fn test_config_serialization_excludes_token() {
+        let mut config = Config::default();
+        config.token = "secret_token".to_string();
         let json = serde_json::to_string(&config).unwrap();
-        let deserialized: Config = serde_json::from_str(&json).unwrap();
-        assert_eq!(config.server_url, deserialized.server_url);
+
+        // Token should NOT be in the JSON
+        assert!(!json.contains("secret_token"));
+        assert!(!json.contains("token"));
     }
 
     #[test]
@@ -219,20 +302,16 @@ mod tests {
         let mut config = Config::default();
         assert!(!config.has_token());
 
-        // Token must have btstr_ prefix to be valid
         config.token = "btstr_token123".to_string();
         assert!(config.has_token());
 
-        // Token without prefix is not valid
         config.token = "invalid_token".to_string();
         assert!(!config.has_token());
 
-        // Legacy api_key without prefix is not valid
         config.token.clear();
         config.api_key = "legacy_key".to_string();
         assert!(!config.has_token());
 
-        // api_key with btstr_ prefix would be valid (edge case)
         config.api_key = "btstr_legacy_key".to_string();
         assert!(config.has_token());
     }

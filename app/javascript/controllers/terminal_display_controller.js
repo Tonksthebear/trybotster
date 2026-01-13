@@ -105,9 +105,10 @@ export default class extends Controller {
 
   // Handle connection established
   handleConnected(outlet) {
-    this.connection = outlet
-    this.terminal.writeln(`[Connected to hub: ${outlet.hubIdentifier.substring(0, 8)}...]`);
-    this.terminal.writeln("[Olm E2E encryption active]");
+    this.connection = outlet;
+    const hubId = outlet.getHubId();
+    this.terminal.writeln(`[Connected to hub: ${hubId.substring(0, 8)}...]`);
+    this.terminal.writeln("[Signal E2E encryption active]");
     this.terminal.writeln("");
     // Set GUI mode to receive raw agent PTY output (not TUI)
     this.connection.send("set_mode", { mode: "gui" });

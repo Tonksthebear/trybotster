@@ -7,25 +7,25 @@ class ApplicationCable::ConnectionTest < ActionCable::Connection::TestCase
     @user = users(:one)
   end
 
-  test "connects with valid device token" do
+  test "connects with valid device token via Authorization header" do
     # Create a device token for the user
     device_token = @user.device_tokens.create!(name: "Test CLI")
 
-    # Connect with the device token
-    connect params: { api_key: device_token.token }
+    # Connect with the device token in Authorization header
+    connect headers: { "Authorization" => "Bearer #{device_token.token}" }
 
     assert_equal @user, connection.current_user
   end
 
   test "rejects connection with invalid token" do
     assert_reject_connection do
-      connect params: { api_key: "invalid_token" }
+      connect headers: { "Authorization" => "Bearer invalid_token" }
     end
   end
 
   test "rejects connection with empty token" do
     assert_reject_connection do
-      connect params: { api_key: "" }
+      connect headers: { "Authorization" => "Bearer " }
     end
   end
 
@@ -41,7 +41,7 @@ class ApplicationCable::ConnectionTest < ActionCable::Connection::TestCase
     # Verify it has the btstr_ prefix
     assert device_token.token.start_with?("btstr_"), "Token should have btstr_ prefix"
 
-    connect params: { api_key: device_token.token }
+    connect headers: { "Authorization" => "Bearer #{device_token.token}" }
 
     assert_equal @user, connection.current_user
   end
@@ -50,7 +50,7 @@ class ApplicationCable::ConnectionTest < ActionCable::Connection::TestCase
     other_user = users(:two)
     other_token = other_user.device_tokens.create!(name: "Other CLI")
 
-    connect params: { api_key: other_token.token }
+    connect headers: { "Authorization" => "Bearer #{other_token.token}" }
 
     assert_equal other_user, connection.current_user
     assert_not_equal @user, connection.current_user

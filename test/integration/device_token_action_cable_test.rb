@@ -94,16 +94,16 @@ class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
   end
 
   test "websocket url format is correct" do
-    # The CLI builds: {base}/cable?api_key={token}
+    # The CLI builds: {base}/cable with Authorization: Bearer header
+    # NO query params for security (tokens visible in logs/history)
     server_url = "https://dev.trybotster.com"
-    token = "btstr_test_token_123"
 
     ws_url = server_url
       .gsub("https://", "wss://")
       .gsub("http://", "ws://")
 
-    expected_url = "wss://dev.trybotster.com/cable?api_key=btstr_test_token_123"
-    actual_url = "#{ws_url}/cable?api_key=#{token}"
+    expected_url = "wss://dev.trybotster.com/cable"
+    actual_url = "#{ws_url}/cable"
 
     assert_equal expected_url, actual_url
   end

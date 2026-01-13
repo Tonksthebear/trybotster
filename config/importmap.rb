@@ -13,3 +13,4 @@ pin "@xterm/addon-fit", to: "https://esm.sh/@xterm/addon-fit@0.10.0"
 
 # Signal Protocol WASM for E2E encryption
 pin "signal", to: "signal/index.js"
+pin_all_from "app/javascript/workers", under: "workers"
