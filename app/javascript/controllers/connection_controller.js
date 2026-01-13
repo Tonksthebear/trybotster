@@ -119,8 +119,9 @@ export default class extends Controller {
 
   static values = {
     hubId: String,
-    wasmJsPath: String,
-    wasmBgPath: String,
+    workerUrl: String,
+    wasmJsUrl: String,
+    wasmBinaryUrl: String,
   };
 
   connect() {
@@ -218,7 +219,7 @@ export default class extends Controller {
       this.updateStatus("Loading encryption...", "Initializing Signal Protocol");
 
       try {
-        await initSignal(this.wasmJsPathValue, this.wasmBgPathValue);
+        await initSignal(this.workerUrlValue, this.wasmJsUrlValue, this.wasmBinaryUrlValue);
       } catch (wasmError) {
         this.setError(
           ConnectionError.WASM_LOAD_FAILED,
@@ -307,36 +308,13 @@ export default class extends Controller {
       // No URL bundle - try to restore from IndexedDB
       this.signalSession = await SignalSession.load(this.hubId);
 
-      if (!this.signalSession) {
-        // No cached session either - try server as last resort
-        const serverBundle = await this.fetchPreKeyBundle();
-        if (serverBundle) {
-          this.signalSession = await SignalSession.create(
-            serverBundle,
-            this.hubId
-          );
-        }
-      } else {
+      if (this.signalSession) {
         console.log(
           "[Connection] Restored cached session for hub:",
           this.hubId
         );
       }
-    }
-  }
-
-  async fetchPreKeyBundle() {
-    try {
-      const response = await fetch(`/hubs/${this.hubId}/bundle`, {
-        headers: { Accept: "application/json" },
-      });
-
-      if (!response.ok) return null;
-
-      return await response.json();
-    } catch (error) {
-      console.warn("[Connection] Failed to fetch bundle:", error);
-      return null;
+      // If no cached session, user needs to scan QR code
     }
   }
 

@@ -9,5 +9,8 @@ Rails.application.config.assets.version = "1.0"
 # Add WASM files to asset pipeline for libsignal
 Rails.application.config.assets.paths << Rails.root.join("app/assets/wasm")
 
+# Add Web Workers to asset pipeline
+Rails.application.config.assets.paths << Rails.root.join("app/javascript/workers")
+
 # Register WASM MIME type
 Mime::Type.register "application/wasm", :wasm
