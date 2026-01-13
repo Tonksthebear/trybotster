@@ -35,6 +35,7 @@ use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, t
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
 use super::signal::{SignalEnvelope, SignalProtocolManager};
+use super::state::IdentifiedBrowserEvent;
 use super::types::{BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage};
 
 /// Action Cable message format.
@@ -62,12 +63,24 @@ struct IncomingCableMessage {
     message: Option<serde_json::Value>,
 }
 
+/// Output message for relay task.
+#[derive(Debug)]
+enum OutputMessage {
+    /// Broadcast to all connected browsers.
+    Broadcast(String),
+    /// Send to a specific browser by identity.
+    Targeted {
+        identity: String,
+        data: String,
+    },
+}
+
 /// Handle for sending terminal output to the browser.
 ///
 /// This is a simple channel sender that queues output for the relay task.
 #[derive(Clone)]
 pub struct TerminalOutputSender {
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<OutputMessage>,
     connected: Arc<RwLock<bool>>,
 }
 
@@ -78,15 +91,32 @@ impl std::fmt::Debug for TerminalOutputSender {
 }
 
 impl TerminalOutputSender {
-    /// Send terminal output to browser (will be encrypted by relay task).
+    /// Send terminal output to all browsers (will be encrypted by relay task).
     pub async fn send(&self, output: &str) -> Result<()> {
         // Only send if browser is connected
         if !*self.connected.read().await {
             return Ok(()); // Silently drop if no browser connected
         }
 
-        self.tx.send(output.to_string()).await
+        self.tx.send(OutputMessage::Broadcast(output.to_string())).await
             .map_err(|e| anyhow::anyhow!("Failed to queue output: {}", e))
+    }
+
+    /// Send terminal output to a specific browser by identity.
+    ///
+    /// This enables per-client output routing: each browser only receives
+    /// output from agents it's viewing.
+    pub async fn send_to(&self, identity: &str, output: &str) -> Result<()> {
+        // Only send if browser is connected
+        if !*self.connected.read().await {
+            return Ok(()); // Silently drop if no browser connected
+        }
+
+        self.tx.send(OutputMessage::Targeted {
+            identity: identity.to_string(),
+            data: output.to_string(),
+        }).await
+            .map_err(|e| anyhow::anyhow!("Failed to queue targeted output: {}", e))
     }
 
     /// Check if browser is connected and ready for encrypted communication.
@@ -132,12 +162,12 @@ impl TerminalRelay {
     ///
     /// Returns:
     /// - `TerminalOutputSender` - for sending terminal output to browser
-    /// - `mpsc::Receiver<BrowserEvent>` - for receiving events from browser
+    /// - `mpsc::Receiver<IdentifiedBrowserEvent>` - for receiving events from browser with identity
     ///
     /// The relay runs on the current task using select! to multiplex I/O.
     /// This is required because Signal Protocol futures are not Send.
-    pub async fn connect(self) -> Result<(TerminalOutputSender, mpsc::Receiver<BrowserEvent>)> {
-        let (event_tx, event_rx) = mpsc::channel::<BrowserEvent>(100);
+    pub async fn connect(self) -> Result<(TerminalOutputSender, mpsc::Receiver<IdentifiedBrowserEvent>)> {
+        let (event_tx, event_rx) = mpsc::channel::<IdentifiedBrowserEvent>(100);
         let sender = self.connect_with_event_channel(event_tx).await?;
         Ok((sender, event_rx))
     }
@@ -148,10 +178,10 @@ impl TerminalRelay {
     /// separately (e.g., for cross-thread communication).
     ///
     /// Returns `TerminalOutputSender` for sending terminal output to browser.
-    /// Events are sent to the provided `event_tx` channel.
+    /// Events are sent to the provided `event_tx` channel with browser identity attached.
     pub async fn connect_with_event_channel(
         mut self,
-        event_tx: mpsc::Sender<BrowserEvent>,
+        event_tx: mpsc::Sender<IdentifiedBrowserEvent>,
     ) -> Result<TerminalOutputSender> {
         let ws_url = self.build_ws_url();
         let hub_identifier = self.hub_identifier.clone();
@@ -226,7 +256,7 @@ impl TerminalRelay {
         log::info!("Sent subscribe to TerminalRelayChannel for hub {}", hub_identifier);
 
         // Create channel for terminal output
-        let (output_tx, mut output_rx) = mpsc::channel::<String>(100);
+        let (output_tx, mut output_rx) = mpsc::channel::<OutputMessage>(100);
 
         // Shared connection state
         let connected = Arc::new(RwLock::new(false));
@@ -248,9 +278,25 @@ impl TerminalRelay {
             loop {
                 tokio::select! {
                     // Handle outgoing messages (CLI -> browser)
-                    // Broadcast to ALL connected browsers
-                    Some(output) = output_rx.recv() => {
+                    Some(output_msg) = output_rx.recv() => {
                         if *connected_clone.read().await && !browser_identities.is_empty() {
+                            // Determine targets and output based on message type
+                            let (output, targets): (String, Vec<&String>) = match &output_msg {
+                                OutputMessage::Broadcast(data) => {
+                                    // Broadcast to all connected browsers
+                                    (data.clone(), browser_identities.iter().collect())
+                                }
+                                OutputMessage::Targeted { identity, data } => {
+                                    // Send to specific browser only (if connected)
+                                    if browser_identities.contains(identity) {
+                                        (data.clone(), vec![identity])
+                                    } else {
+                                        log::warn!("Targeted send to unknown identity: {}", identity);
+                                        continue;
+                                    }
+                                }
+                            };
+
                             let message = if let Ok(parsed) = serde_json::from_str::<TerminalMessage>(&output) {
                                 parsed
                             } else {
@@ -265,8 +311,8 @@ impl TerminalRelay {
                                 }
                             };
 
-                            // Encrypt and send to EACH connected browser
-                            for identity in &browser_identities {
+                            // Encrypt and send to target browser(s)
+                            for identity in targets {
                                 match self.signal_manager.encrypt(&plaintext, identity).await {
                                     Ok(envelope) => {
                                         // recipient_identity at top level for server-side routing
@@ -407,10 +453,14 @@ impl TerminalRelay {
                                                                         }
                                                                     }
 
-                                                                    if let Err(e) = event_tx.send(BrowserEvent::Connected {
-                                                                        public_key: envelope.sender_identity.clone(),
-                                                                        device_name,
-                                                                    }).await {
+                                                                    let browser_identity = envelope.sender_identity.clone();
+                                                                    if let Err(e) = event_tx.send((
+                                                                        BrowserEvent::Connected {
+                                                                            public_key: browser_identity.clone(),
+                                                                            device_name,
+                                                                        },
+                                                                        browser_identity,
+                                                                    )).await {
                                                                         log::error!("Failed to send event: {}", e);
                                                                     }
                                                                     continue;
@@ -536,7 +586,8 @@ impl TerminalRelay {
                                                                     BrowserEvent::Resize(BrowserResize { cols, rows })
                                                                 }
                                                             };
-                                                            if let Err(e) = event_tx.send(event).await {
+                                                            // Send event with browser identity for client-scoped routing
+                                                            if let Err(e) = event_tx.send((event, envelope.sender_identity.clone())).await {
                                                                 log::error!("Failed to forward event: {}", e);
                                                             }
                                                         }

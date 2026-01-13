@@ -47,7 +47,12 @@ pub fn render(
     // Collect all state needed for rendering
     let agent_keys_ordered = hub.state.agent_keys_ordered.clone();
     let agents = &hub.state.agents;
-    let selected = hub.state.selected;
+    // TuiClient is the source of truth for TUI selection
+    let selected_key = hub.get_tui_selected_agent_key();
+    let selected = selected_key
+        .as_ref()
+        .and_then(|key| agent_keys_ordered.iter().position(|k| k == key))
+        .unwrap_or(0);
     let seconds_since_poll = hub.last_poll.elapsed().as_secs();
     let poll_interval = hub.config.poll_interval;
     let mode = hub.mode;
@@ -61,6 +66,8 @@ pub fn render(
     let vpn_status: Option<VpnStatus> = None;
     // E2E encryption: connection URL for QR code display
     let connection_url = hub.connection_url.clone();
+    // Error message for Error mode
+    let error_message = hub.error_message.clone();
 
     // Build menu context from current state
     let selected_agent = agent_keys_ordered
@@ -186,6 +193,9 @@ pub fn render(
             AppMode::ConnectionCode => {
                 render_connection_code_modal(f, connection_url.as_deref());
             }
+            AppMode::Error => {
+                render_error_modal(f, error_message.as_deref());
+            }
             AppMode::Normal => {}
         }
     };
@@ -248,11 +258,11 @@ fn render_menu_modal(
 
     for item in menu_items {
         if item.is_header {
-            // Section headers are dimmed and not selectable
+            // Section headers are dimmed and not selectable (use terminal default with DIM modifier)
             lines.push(Line::from(Span::styled(
                 item.label.clone(),
                 Style::default()
-                    .fg(ratatui::style::Color::DarkGray)
+                    .add_modifier(Modifier::DIM)
                     .add_modifier(Modifier::BOLD),
             )));
         } else {
@@ -260,13 +270,13 @@ fn render_menu_modal(
             let is_selected = selectable_idx == menu_selected;
             let cursor = if is_selected { ">" } else { " " };
             let style = if is_selected {
+                // Use REVERSED modifier to invert terminal colors instead of hardcoding
                 Style::default()
-                    .fg(ratatui::style::Color::Black)
-                    .bg(ratatui::style::Color::Cyan)
+                    .add_modifier(Modifier::REVERSED)
                     .add_modifier(Modifier::BOLD)
             } else {
-                // Explicit white foreground for xterm.js compatibility
-                Style::default().fg(ratatui::style::Color::White)
+                // Use terminal default colors
+                Style::default()
             };
             lines.push(Line::from(Span::styled(
                 format!("{} {}", cursor, item.label),
@@ -408,26 +418,43 @@ fn render_close_confirm_modal(f: &mut Frame) {
 }
 
 fn render_connection_code_modal(f: &mut Frame, connection_url: Option<&str>) {
-    use crate::tui::generate_qr_code_lines;
-
-    // Use full terminal for the QR code modal (QR codes with Kyber keys are large)
-    let area = centered_rect(98, 98, f.area());
-    f.render_widget(Clear, area);
+    use crate::tui::qr::generate_qr_code_lines;
 
     // Use the pre-generated connection URL
     let secure_url = connection_url.unwrap_or("Error: No connection URL generated");
 
-    // Calculate available space for QR code (minimal overhead)
-    let header_lines = 2u16; // Title + instruction
-    let footer_lines = 2u16; // Copy hint + close hint
+    // Content overhead for the modal
+    let header_lines = 2u16; // Title + blank line
+    let footer_lines = 2u16; // Blank line + help text
     let border_overhead = 2u16;
-    let available_height = area
-        .height
-        .saturating_sub(header_lines + footer_lines + border_overhead);
-    let available_width = area.width.saturating_sub(2);
+    let content_overhead = header_lines + footer_lines + border_overhead;
 
-    let qr_lines = generate_qr_code_lines(secure_url, available_width, available_height);
-    let qr_fits = !qr_lines.iter().any(|l| l.contains("too large"));
+    // Start with menu-sized modal (50% width), expand if needed for QR
+    let terminal = f.area();
+    let base_width = (terminal.width * 50) / 100;
+    let base_height = (terminal.height * 50) / 100;
+
+    // Try generating QR at base size first
+    let base_qr_width = base_width.saturating_sub(2);
+    let base_qr_height = base_height.saturating_sub(content_overhead);
+    let qr_lines = generate_qr_code_lines(secure_url, base_qr_width, base_qr_height);
+    let qr_fits_base = !qr_lines.iter().any(|l| l.contains("Terminal"));
+
+    // If QR doesn't fit at base size, try full terminal
+    let (area, qr_lines, qr_fits) = if qr_fits_base {
+        (centered_rect(50, 50, terminal), qr_lines, true)
+    } else {
+        // Try with nearly full terminal
+        let full_width = (terminal.width * 95) / 100;
+        let full_height = (terminal.height * 95) / 100;
+        let full_qr_width = full_width.saturating_sub(2);
+        let full_qr_height = full_height.saturating_sub(content_overhead);
+        let full_qr_lines = generate_qr_code_lines(secure_url, full_qr_width, full_qr_height);
+        let fits = !full_qr_lines.iter().any(|l| l.contains("Terminal"));
+        (centered_rect(95, 95, terminal), full_qr_lines, fits)
+    };
+
+    f.render_widget(Clear, area);
 
     let mut text_lines = vec![
         Line::from(Span::styled(
@@ -444,15 +471,16 @@ fn render_connection_code_modal(f: &mut Frame, connection_url: Option<&str>) {
 
     text_lines.push(Line::from(""));
     if qr_fits {
+        // Use DIM modifier for help text instead of hardcoded color
         text_lines.push(Line::from(Span::styled(
             "[c] copy URL  [Esc/q/Enter] close",
-            Style::default().fg(ratatui::style::Color::DarkGray),
+            Style::default().add_modifier(Modifier::DIM),
         )));
     } else {
-        // If QR doesn't fit, show more helpful message
+        // If QR doesn't fit, emphasize the copy option with BOLD
         text_lines.push(Line::from(Span::styled(
             "[c] copy URL to clipboard  [Esc] close",
-            Style::default().fg(ratatui::style::Color::Yellow),
+            Style::default().add_modifier(Modifier::BOLD),
         )));
     }
 
@@ -465,4 +493,38 @@ fn render_connection_code_modal(f: &mut Frame, connection_url: Option<&str>) {
         .alignment(Alignment::Center);
 
     f.render_widget(code_widget, area);
+}
+
+/// Render an error modal.
+fn render_error_modal(f: &mut Frame, error_message: Option<&str>) {
+    let area = centered_rect(60, 30, f.area());
+    f.render_widget(Clear, area);
+
+    let message = error_message.unwrap_or("An error occurred");
+
+    let text_lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Error",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(message),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[Esc/Enter] dismiss",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    ];
+
+    let error_widget = Paragraph::new(text_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Error "),
+        )
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(error_widget, area);
 }

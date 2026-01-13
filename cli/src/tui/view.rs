@@ -28,8 +28,8 @@ pub struct ViewState {
     pub agent_count: usize,
     /// Ordered list of agent session keys.
     pub agent_keys: Vec<String>,
-    /// Currently selected agent index.
-    pub selected: usize,
+    /// Currently selected agent key (from TUI client).
+    pub selected_agent_key: Option<String>,
     /// Current application mode.
     pub mode: AppMode,
     /// Whether server polling is enabled.
@@ -50,6 +50,8 @@ pub struct ViewState {
     pub tunnel_status: TunnelStatus,
     /// Connection URL for QR code display.
     pub connection_url: Option<String>,
+    /// Error message for Error mode.
+    pub error_message: Option<String>,
 }
 
 impl ViewState {
@@ -58,13 +60,13 @@ impl ViewState {
     /// # Arguments
     ///
     /// * `hub_state` - Reference to the Hub's state
-    /// * `context` - Additional view context from the application
+    /// * `context` - Additional view context from the application (includes TUI selection)
     #[must_use]
     pub fn from_hub(hub_state: &HubState, context: ViewContext) -> Self {
         Self {
             agent_count: hub_state.agent_count(),
             agent_keys: hub_state.agent_keys_ordered.clone(),
-            selected: hub_state.selected,
+            selected_agent_key: context.selected_key,
             mode: context.mode,
             polling_enabled: context.polling_enabled,
             seconds_since_poll: context.seconds_since_poll,
@@ -75,13 +77,14 @@ impl ViewState {
             input_buffer: context.input_buffer,
             tunnel_status: context.tunnel_status,
             connection_url: context.connection_url,
+            error_message: context.error_message,
         }
     }
 
     /// Get the session key of the currently selected agent.
     #[must_use]
     pub fn selected_key(&self) -> Option<&str> {
-        self.agent_keys.get(self.selected).map(String::as_str)
+        self.selected_agent_key.as_deref()
     }
 
     /// Check if there are any active agents.
@@ -100,9 +103,11 @@ impl ViewState {
 /// Additional context needed for view rendering.
 ///
 /// This contains state that lives outside HubState but is needed
-/// for rendering.
+/// for rendering. Selection is provided by the TUI client.
 #[derive(Debug, Clone)]
 pub struct ViewContext {
+    /// Currently selected agent key (from TUI client).
+    pub selected_key: Option<String>,
     /// Current application mode.
     pub mode: AppMode,
     /// Whether polling is enabled.
@@ -121,11 +126,14 @@ pub struct ViewContext {
     pub tunnel_status: TunnelStatus,
     /// Connection URL for QR code.
     pub connection_url: Option<String>,
+    /// Error message for Error mode.
+    pub error_message: Option<String>,
 }
 
 impl Default for ViewContext {
     fn default() -> Self {
         Self {
+            selected_key: None,
             mode: AppMode::Normal,
             polling_enabled: true,
             seconds_since_poll: 0,
@@ -135,6 +143,7 @@ impl Default for ViewContext {
             input_buffer: String::new(),
             tunnel_status: TunnelStatus::Disconnected,
             connection_url: None,
+            error_message: None,
         }
     }
 }
@@ -230,7 +239,11 @@ mod tests {
         let mut hub_state = HubState::new(PathBuf::from("/tmp/worktrees"));
         hub_state.agent_keys_ordered.push("test-key".to_string());
 
-        let context = ViewContext::default();
+        // Selection comes from ViewContext (TUI client's selection)
+        let context = ViewContext {
+            selected_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
         let view_state = ViewState::from_hub(&hub_state, context);
 
         assert_eq!(view_state.selected_key(), Some("test-key"));

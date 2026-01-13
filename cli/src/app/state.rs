@@ -78,6 +78,14 @@ pub enum AppMode {
     /// Key bindings:
     /// - `Esc/q/Enter`: Close, return to Normal
     ConnectionCode,
+
+    /// Displaying an error message to the user.
+    ///
+    /// Shows a modal with the error message. The actual message text
+    /// is stored in `Hub.error_message`.
+    /// Key bindings:
+    /// - `Esc/q/Enter`: Dismiss error, return to Normal
+    Error,
 }
 
 impl AppMode {
@@ -104,6 +112,7 @@ impl AppMode {
             AppMode::NewAgentPrompt => "Enter Prompt",
             AppMode::CloseAgentConfirm => "Confirm Close",
             AppMode::ConnectionCode => "Connection Code",
+            AppMode::Error => "Error",
         }
     }
 }
@@ -145,6 +154,7 @@ mod tests {
         assert!(AppMode::NewAgentPrompt.is_modal());
         assert!(AppMode::CloseAgentConfirm.is_modal());
         assert!(AppMode::ConnectionCode.is_modal());
+        assert!(AppMode::Error.is_modal());
     }
 
     #[test]
@@ -156,6 +166,7 @@ mod tests {
         assert!(AppMode::NewAgentPrompt.accepts_text_input());
         assert!(!AppMode::CloseAgentConfirm.accepts_text_input());
         assert!(!AppMode::ConnectionCode.accepts_text_input());
+        assert!(!AppMode::Error.accepts_text_input());
     }
 
     #[test]

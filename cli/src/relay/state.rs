@@ -25,6 +25,11 @@ use super::signal::PreKeyBundleData;
 use super::types::{BrowserEvent, BrowserResize};
 use crate::{AgentInfo, BrowserMode, TerminalMessage, WorktreeInfo, WorktreeManager};
 
+/// Browser event with identity attached.
+///
+/// Tuple of (event, browser_identity) for client-scoped action routing.
+pub type IdentifiedBrowserEvent = (BrowserEvent, String);
+
 /// Browser connection state.
 ///
 /// Consolidates all browser-related fields from Hub into a single struct.
@@ -32,8 +37,8 @@ use crate::{AgentInfo, BrowserMode, TerminalMessage, WorktreeInfo, WorktreeManag
 pub struct BrowserState {
     /// Terminal output sender for encrypted relay.
     pub sender: Option<TerminalOutputSender>,
-    /// Browser event receiver.
-    pub event_rx: Option<mpsc::Receiver<BrowserEvent>>,
+    /// Browser event receiver (events include browser identity).
+    pub event_rx: Option<mpsc::Receiver<IdentifiedBrowserEvent>>,
     /// Whether a browser is currently connected.
     pub connected: bool,
     /// Browser terminal dimensions.
@@ -65,7 +70,7 @@ impl BrowserState {
     }
 
     /// Set connection established with sender and receiver.
-    pub fn set_connected(&mut self, sender: TerminalOutputSender, rx: mpsc::Receiver<BrowserEvent>) {
+    pub fn set_connected(&mut self, sender: TerminalOutputSender, rx: mpsc::Receiver<IdentifiedBrowserEvent>) {
         self.sender = Some(sender);
         self.event_rx = Some(rx);
         self.connected = false; // Will be true after Connected event
@@ -121,7 +126,9 @@ impl BrowserState {
     }
 
     /// Drain pending events from receiver.
-    pub fn drain_events(&mut self) -> Vec<BrowserEvent> {
+    ///
+    /// Returns events with their browser identity attached for client-scoped routing.
+    pub fn drain_events(&mut self) -> Vec<IdentifiedBrowserEvent> {
         let Some(ref mut rx) = self.event_rx else {
             return Vec::new();
         };
@@ -244,7 +251,7 @@ pub fn send_scrollback(ctx: &BrowserSendContext, lines: Vec<String>) {
     send_message(ctx, &message);
 }
 
-/// Send a JSON message to browser.
+/// Send a JSON message to all browsers (broadcast).
 fn send_message(ctx: &BrowserSendContext, message: &TerminalMessage) {
     let Ok(json) = serde_json::to_string(message) else {
         return;
@@ -254,6 +261,59 @@ fn send_message(ctx: &BrowserSendContext, message: &TerminalMessage) {
     ctx.runtime.spawn(async move {
         let _ = sender.send(&json).await;
     });
+}
+
+/// Send a JSON message to a specific browser (targeted).
+fn send_message_to(ctx: &BrowserSendContext, identity: &str, message: &TerminalMessage) {
+    let Ok(json) = serde_json::to_string(message) else {
+        return;
+    };
+
+    let sender = ctx.sender.clone();
+    let identity = identity.to_string();
+    ctx.runtime.spawn(async move {
+        let _ = sender.send_to(&identity, &json).await;
+    });
+}
+
+// === Targeted send functions (per-client routing) ===
+
+/// Send agent list to a specific browser.
+pub fn send_agent_list_to(
+    ctx: &BrowserSendContext,
+    identity: &str,
+    agents: Vec<AgentInfo>,
+) {
+    let message = TerminalMessage::Agents { agents };
+    send_message_to(ctx, identity, &message);
+}
+
+/// Send worktree list to a specific browser.
+pub fn send_worktree_list_to(
+    ctx: &BrowserSendContext,
+    identity: &str,
+    worktrees: Vec<WorktreeInfo>,
+) {
+    let repo = WorktreeManager::detect_current_repo()
+        .map(|(_, name)| name)
+        .ok();
+
+    let message = TerminalMessage::Worktrees { worktrees, repo };
+    send_message_to(ctx, identity, &message);
+}
+
+/// Send agent selection notification to a specific browser.
+pub fn send_agent_selected_to(ctx: &BrowserSendContext, identity: &str, agent_id: &str) {
+    let message = TerminalMessage::AgentSelected {
+        id: agent_id.to_string(),
+    };
+    send_message_to(ctx, identity, &message);
+}
+
+/// Send scrollback history to a specific browser.
+pub fn send_scrollback_to(ctx: &BrowserSendContext, identity: &str, lines: Vec<String>) {
+    let message = build_scrollback_message(lines);
+    send_message_to(ctx, identity, &message);
 }
 
 /// Calculate agent dimensions based on browser mode.

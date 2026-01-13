@@ -59,12 +59,14 @@ pub mod state;
 pub mod types;
 
 pub use events::{
-    browser_event_to_hub_action, check_browser_resize, command_to_event, BrowserEventContext,
+    browser_event_to_client_action, check_browser_resize, command_to_event, BrowserEventContext,
     BrowserEventResult, BrowserResponse, ResizeAction,
 };
 pub use state::{
-    build_agent_info, build_worktree_info, send_agent_list, send_agent_selected,
-    send_scrollback, send_worktree_list, BrowserSendContext, BrowserState,
+    build_agent_info, build_worktree_info, send_agent_list, send_agent_list_to,
+    send_agent_selected, send_agent_selected_to, send_scrollback, send_scrollback_to,
+    send_worktree_list, send_worktree_list_to, BrowserSendContext, BrowserState,
+    IdentifiedBrowserEvent,
 };
 
 pub use types::{
@@ -78,4 +80,4 @@ pub use signal::{PreKeyBundleData, SignalEnvelope, SignalProtocolManager, SIGNAL
 
 pub use persistence::{read_connection_url, write_connection_url, delete_connection_url};
 
-pub use browser::poll_events_headless;
+pub use browser::{drain_and_route_pty_output, poll_events_headless};

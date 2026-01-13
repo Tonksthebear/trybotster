@@ -31,6 +31,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::app::AppMode;
+use crate::client::ClientId;
 use crate::hub::HubAction;
 
 /// Convert a crossterm Event to a HubAction.
@@ -51,7 +52,9 @@ pub fn event_to_hub_action(
     match event {
         Event::Key(key) => key_event_to_action(key, mode, context),
         Event::Mouse(mouse) => mouse_event_to_action(*mouse, *mode),
-        Event::Resize(cols, rows) => Some(HubAction::Resize {
+        // Use client-scoped resize action for TUI
+        Event::Resize(cols, rows) => Some(HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
             rows: *rows,
             cols: *cols,
         }),
@@ -97,6 +100,7 @@ pub fn key_event_to_action(
         AppMode::NewAgentCreateWorktree | AppMode::NewAgentPrompt => text_input_key(key),
         AppMode::CloseAgentConfirm => close_confirm_key(key),
         AppMode::ConnectionCode => connection_code_key(key),
+        AppMode::Error => error_mode_key(key),
     }
 }
 
@@ -137,27 +141,75 @@ fn normal_mode_key(key: &KeyEvent, context: &InputContext) -> Option<HubAction> 
             Some(HubAction::ScrollToBottom)
         }
 
-        // Forward everything else to PTY
+        // Forward everything else to PTY (using client-scoped action for TUI)
         KeyCode::Char(c) if ctrl => {
             // Send control character (Ctrl+A = 1, Ctrl+C = 3, etc.)
             let ctrl_byte = (c.to_ascii_uppercase() as u8).wrapping_sub(b'@');
-            Some(HubAction::SendInput(vec![ctrl_byte]))
+            Some(HubAction::SendInputForClient {
+                client_id: ClientId::Tui,
+                data: vec![ctrl_byte],
+            })
         }
-        KeyCode::Char(c) => Some(HubAction::SendInput(c.to_string().into_bytes())),
-        KeyCode::Enter => Some(HubAction::SendInput(vec![b'\r'])),
-        KeyCode::Backspace => Some(HubAction::SendInput(vec![0x7f])),
-        KeyCode::Tab => Some(HubAction::SendInput(vec![b'\t'])),
-        KeyCode::Esc => Some(HubAction::SendInput(vec![0x1b])),
-        KeyCode::Up => Some(HubAction::SendInput(vec![0x1b, b'[', b'A'])),
-        KeyCode::Down => Some(HubAction::SendInput(vec![0x1b, b'[', b'B'])),
-        KeyCode::Right => Some(HubAction::SendInput(vec![0x1b, b'[', b'C'])),
-        KeyCode::Left => Some(HubAction::SendInput(vec![0x1b, b'[', b'D'])),
-        KeyCode::Home => Some(HubAction::SendInput(vec![0x1b, b'[', b'H'])),
-        KeyCode::End => Some(HubAction::SendInput(vec![0x1b, b'[', b'F'])),
-        KeyCode::PageUp => Some(HubAction::SendInput(vec![0x1b, b'[', b'5', b'~'])),
-        KeyCode::PageDown => Some(HubAction::SendInput(vec![0x1b, b'[', b'6', b'~'])),
-        KeyCode::Delete => Some(HubAction::SendInput(vec![0x1b, b'[', b'3', b'~'])),
-        KeyCode::Insert => Some(HubAction::SendInput(vec![0x1b, b'[', b'2', b'~'])),
+        KeyCode::Char(c) => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: c.to_string().into_bytes(),
+        }),
+        KeyCode::Enter => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![b'\r'],
+        }),
+        KeyCode::Backspace => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x7f],
+        }),
+        KeyCode::Tab => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![b'\t'],
+        }),
+        KeyCode::Esc => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x1b],
+        }),
+        KeyCode::Up => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x1b, b'[', b'A'],
+        }),
+        KeyCode::Down => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x1b, b'[', b'B'],
+        }),
+        KeyCode::Right => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x1b, b'[', b'C'],
+        }),
+        KeyCode::Left => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x1b, b'[', b'D'],
+        }),
+        KeyCode::Home => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x1b, b'[', b'H'],
+        }),
+        KeyCode::End => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x1b, b'[', b'F'],
+        }),
+        KeyCode::PageUp => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x1b, b'[', b'5', b'~'],
+        }),
+        KeyCode::PageDown => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x1b, b'[', b'6', b'~'],
+        }),
+        KeyCode::Delete => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x1b, b'[', b'3', b'~'],
+        }),
+        KeyCode::Insert => Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![0x1b, b'[', b'2', b'~'],
+        }),
 
         _ => None,
     }
@@ -219,6 +271,15 @@ fn connection_code_key(key: &KeyEvent) -> Option<HubAction> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => Some(HubAction::CloseModal),
         KeyCode::Char('c') => Some(HubAction::CopyConnectionUrl),
+        _ => None,
+    }
+}
+
+/// Key handling for error display mode.
+fn error_mode_key(key: &KeyEvent) -> Option<HubAction> {
+    match key.code {
+        // Any of these keys dismiss the error
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => Some(HubAction::CloseModal),
         _ => None,
     }
 }
@@ -301,31 +362,45 @@ mod tests {
 
     #[test]
     fn test_plain_keys_forward_to_pty() {
+        use crate::client::ClientId;
         let context = default_context();
 
-        // Plain 'q' should forward to PTY, not quit
+        // Plain 'q' should forward to PTY (client-scoped), not quit
         let action = key_event_to_action(&make_key(KeyCode::Char('q')), &AppMode::Normal, &context);
-        assert_eq!(action, Some(HubAction::SendInput(vec![b'q'])));
+        assert_eq!(action, Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![b'q'],
+        }));
 
-        // Plain 'j' should forward to PTY, not navigate
+        // Plain 'j' should forward to PTY (client-scoped), not navigate
         let action = key_event_to_action(&make_key(KeyCode::Char('j')), &AppMode::Normal, &context);
-        assert_eq!(action, Some(HubAction::SendInput(vec![b'j'])));
+        assert_eq!(action, Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![b'j'],
+        }));
 
-        // Number keys should forward to PTY
+        // Number keys should forward to PTY (client-scoped)
         let action = key_event_to_action(&make_key(KeyCode::Char('3')), &AppMode::Normal, &context);
-        assert_eq!(action, Some(HubAction::SendInput(vec![b'3'])));
+        assert_eq!(action, Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![b'3'],
+        }));
     }
 
     #[test]
     fn test_ctrl_c_forwards_to_pty() {
+        use crate::client::ClientId;
         let context = default_context();
-        // Ctrl+C should forward as control character (0x03)
+        // Ctrl+C should forward as control character (0x03) via client-scoped action
         let action = key_event_to_action(
             &make_key_ctrl(KeyCode::Char('c')),
             &AppMode::Normal,
             &context,
         );
-        assert_eq!(action, Some(HubAction::SendInput(vec![3])));
+        assert_eq!(action, Some(HubAction::SendInputForClient {
+            client_id: ClientId::Tui,
+            data: vec![3],
+        }));
     }
 
     #[test]
@@ -400,9 +475,75 @@ mod tests {
 
     #[test]
     fn test_resize_event() {
+        use crate::client::ClientId;
         let event = Event::Resize(120, 40);
         let context = default_context();
         let action = event_to_hub_action(&event, &AppMode::Normal, &context);
-        assert_eq!(action, Some(HubAction::Resize { rows: 40, cols: 120 }));
+        assert_eq!(action, Some(HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            cols: 120,
+            rows: 40,
+        }));
+    }
+
+    // === Phase 2B: TUI input should create client-scoped actions ===
+    //
+    // TUI input events should produce actions that include ClientId::Tui,
+    // enabling proper client isolation in multi-client scenarios.
+
+    #[test]
+    fn test_tui_send_input_uses_client_scoped_action() {
+        use crate::client::ClientId;
+        let context = default_context();
+
+        // Plain key 'a' should produce SendInputForClient with ClientId::Tui
+        let action = key_event_to_action(&make_key(KeyCode::Char('a')), &AppMode::Normal, &context);
+        assert_eq!(
+            action,
+            Some(HubAction::SendInputForClient {
+                client_id: ClientId::Tui,
+                data: vec![b'a'],
+            }),
+            "TUI input should produce SendInputForClient with ClientId::Tui"
+        );
+    }
+
+    #[test]
+    fn test_tui_ctrl_char_uses_client_scoped_action() {
+        use crate::client::ClientId;
+        let context = default_context();
+
+        // Ctrl+C (0x03) should produce SendInputForClient with ClientId::Tui
+        let action = key_event_to_action(
+            &make_key_ctrl(KeyCode::Char('c')),
+            &AppMode::Normal,
+            &context,
+        );
+        assert_eq!(
+            action,
+            Some(HubAction::SendInputForClient {
+                client_id: ClientId::Tui,
+                data: vec![3],
+            }),
+            "TUI Ctrl+C should produce SendInputForClient with ClientId::Tui"
+        );
+    }
+
+    #[test]
+    fn test_tui_resize_uses_client_scoped_action() {
+        use crate::client::ClientId;
+        let context = default_context();
+
+        let event = Event::Resize(120, 40);
+        let action = event_to_hub_action(&event, &AppMode::Normal, &context);
+        assert_eq!(
+            action,
+            Some(HubAction::ResizeForClient {
+                client_id: ClientId::Tui,
+                cols: 120,
+                rows: 40,
+            }),
+            "TUI resize should produce ResizeForClient with ClientId::Tui"
+        );
     }
 }

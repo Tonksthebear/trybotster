@@ -40,7 +40,7 @@ pub mod registration;
 pub mod run;
 pub mod state;
 
-pub use actions::HubAction;
+pub use actions::{HubAction, ScrollDirection};
 pub use crate::agents::AgentSpawnConfig;
 pub use lifecycle::{close_agent, spawn_agent, SpawnResult};
 pub use menu::{build_menu, MenuAction, MenuContext, MenuItem};
@@ -54,9 +54,11 @@ use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 
 use crate::app::AppMode;
+use crate::client::{ClientId, ClientRegistry, Response, TuiClient};
 use crate::config::Config;
 use crate::device::Device;
 use crate::git::WorktreeManager;
+use crate::relay::AgentInfo;
 use crate::tunnel::TunnelManager;
 
 /// Generate a stable hub_identifier from a repo path.
@@ -124,10 +126,17 @@ pub struct Hub {
     pub worktree_selected: usize,
     /// Current connection URL for clipboard copying.
     pub connection_url: Option<String>,
+    /// Error message to display in Error mode.
+    pub error_message: Option<String>,
 
     // === Browser Relay ===
     /// Browser connection state and communication.
     pub browser: crate::relay::BrowserState,
+
+    // === Client Registry ===
+    /// Registry of all connected clients (TUI, browsers).
+    /// Each client can independently select and view different agents.
+    pub clients: ClientRegistry,
 }
 
 impl std::fmt::Debug for Hub {
@@ -214,7 +223,13 @@ impl Hub {
             input_buffer: String::new(),
             worktree_selected: 0,
             connection_url: None,
+            error_message: None,
             browser: crate::relay::BrowserState::default(),
+            clients: {
+                let mut registry = ClientRegistry::new();
+                registry.register(Box::new(TuiClient::new()));
+                registry
+            },
         })
     }
 
@@ -229,22 +244,107 @@ impl Hub {
         self.terminal_dims = (rows, cols);
     }
 
+    /// Show an error message to the user.
+    ///
+    /// Sets the error message and switches to Error mode.
+    /// The user can dismiss the error with Esc/Enter/q.
+    pub fn show_error(&mut self, message: impl Into<String>) {
+        self.error_message = Some(message.into());
+        self.mode = AppMode::Error;
+    }
+
+    /// Clear the error message and return to Normal mode.
+    pub fn clear_error(&mut self) {
+        self.error_message = None;
+        self.mode = AppMode::Normal;
+    }
+
     /// Get the number of active agents.
     #[must_use]
     pub fn agent_count(&self) -> usize {
         self.state.agent_count()
     }
 
-    /// Get the currently selected agent.
+    /// Get the currently selected agent for TUI.
+    ///
+    /// This uses `TuiClient.state().selected_agent` as the source of truth,
+    /// NOT `HubState.selected`. This is part of the client abstraction.
     #[must_use]
     pub fn selected_agent(&self) -> Option<&crate::agent::Agent> {
-        self.state.selected_agent()
+        self.get_tui_selected_agent_key()
+            .and_then(|key| self.state.agents.get(&key))
     }
 
-    /// Get a mutable reference to the currently selected agent.
+    /// Get a mutable reference to the currently selected agent for TUI.
     #[must_use]
     pub fn selected_agent_mut(&mut self) -> Option<&mut crate::agent::Agent> {
-        self.state.selected_agent_mut()
+        let key = self.get_tui_selected_agent_key()?;
+        self.state.agents.get_mut(&key)
+    }
+
+    /// Get the selected agent key from TuiClient.
+    ///
+    /// TuiClient is the single source of truth for TUI's selection.
+    /// This replaces the old `hub.state.selected` index-based approach.
+    #[must_use]
+    pub fn get_tui_selected_agent_key(&self) -> Option<String> {
+        self.clients
+            .get(&ClientId::Tui)
+            .and_then(|client| client.state().selected_agent.clone())
+    }
+
+    /// Get the next agent key for a client's navigation.
+    ///
+    /// Returns the next agent in the ordered list, wrapping around.
+    /// If no agent is selected, returns the first agent.
+    #[must_use]
+    pub fn get_next_agent_key(&self, client_id: &ClientId) -> Option<String> {
+        if self.state.agent_keys_ordered.is_empty() {
+            return None;
+        }
+
+        let current = self.clients.get(client_id)
+            .and_then(|c| c.state().selected_agent.as_ref());
+
+        match current {
+            Some(key) => {
+                let idx = self.state.agent_keys_ordered.iter()
+                    .position(|k| k == key)
+                    .unwrap_or(0);
+                let next_idx = (idx + 1) % self.state.agent_keys_ordered.len();
+                Some(self.state.agent_keys_ordered[next_idx].clone())
+            }
+            None => Some(self.state.agent_keys_ordered[0].clone()),
+        }
+    }
+
+    /// Get the previous agent key for a client's navigation.
+    ///
+    /// Returns the previous agent in the ordered list, wrapping around.
+    /// If no agent is selected, returns the last agent.
+    #[must_use]
+    pub fn get_previous_agent_key(&self, client_id: &ClientId) -> Option<String> {
+        if self.state.agent_keys_ordered.is_empty() {
+            return None;
+        }
+
+        let current = self.clients.get(client_id)
+            .and_then(|c| c.state().selected_agent.as_ref());
+
+        match current {
+            Some(key) => {
+                let idx = self.state.agent_keys_ordered.iter()
+                    .position(|k| k == key)
+                    .unwrap_or(0);
+                let prev_idx = if idx == 0 {
+                    self.state.agent_keys_ordered.len() - 1
+                } else {
+                    idx - 1
+                };
+                Some(self.state.agent_keys_ordered[prev_idx].clone())
+            }
+            None => Some(self.state.agent_keys_ordered.last()?.clone()),
+        }
     }
 
     /// Check if the hub should quit.
@@ -534,6 +634,163 @@ impl Hub {
             self.config.get_api_key(),
         );
     }
+
+    // === Client Communication Helpers ===
+
+    /// Build the agent list for sending to clients.
+    fn build_agent_list(&self) -> Vec<AgentInfo> {
+        self.state
+            .agents
+            .iter()
+            .map(|(key, agent)| AgentInfo {
+                id: key.clone(),
+                repo: Some(agent.repo.clone()),
+                issue_number: agent.issue_number.map(u64::from),
+                branch_name: Some(agent.branch_name.clone()),
+                name: None, // Agent doesn't have a separate name field
+                status: Some(format!("{:?}", agent.status)),
+                tunnel_port: agent.tunnel_port,
+                server_running: Some(agent.server_pty.is_some()),
+                has_server_pty: Some(agent.server_pty.is_some()),
+                active_pty_view: None, // Not tracked at Agent level
+                scroll_offset: None,   // Not tracked at Agent level
+                hub_identifier: Some(self.hub_identifier.clone()),
+            })
+            .collect()
+    }
+
+    /// Send agent list to a specific client.
+    pub fn send_agent_list_to(&mut self, client_id: &ClientId) {
+        let agents = self.build_agent_list();
+        if let Some(client) = self.clients.get_mut(client_id) {
+            client.receive_agent_list(agents);
+        }
+    }
+
+    /// Send worktree list to a specific client.
+    pub fn send_worktree_list_to(&mut self, client_id: &ClientId) {
+        // available_worktrees is Vec<(path: String, branch: String)>
+        let worktrees = self
+            .state
+            .available_worktrees
+            .iter()
+            .map(|(path, branch)| crate::relay::WorktreeInfo {
+                path: path.clone(),
+                branch: branch.clone(),
+                issue_number: None, // Not tracked in tuple format
+            })
+            .collect();
+
+        if let Some(client) = self.clients.get_mut(client_id) {
+            client.receive_worktree_list(worktrees);
+        }
+    }
+
+    /// Send error response to a specific client.
+    pub fn send_error_to(&mut self, client_id: &ClientId, message: String) {
+        if let Some(client) = self.clients.get_mut(client_id) {
+            client.receive_response(Response::Error { message });
+        }
+    }
+
+    /// Broadcast agent list to all connected clients.
+    pub fn broadcast_agent_list(&mut self) {
+        let agents = self.build_agent_list();
+        for (_client_id, client) in self.clients.iter_mut() {
+            client.receive_agent_list(agents.clone());
+        }
+    }
+
+    /// Broadcast PTY output to all clients viewing a specific agent.
+    ///
+    /// Uses the viewer index for O(1) routing - only clients that have
+    /// selected this agent will receive the output.
+    ///
+    /// For browser clients, output is buffered in BrowserClient. Call
+    /// `drain_and_send_browser_outputs()` from the event loop to send
+    /// buffered output to each browser via relay with per-client targeting.
+    ///
+    /// For TUI, output is a no-op since TUI reads directly from the agent's PTY.
+    pub fn broadcast_pty_output(&mut self, agent_key: &str, data: &[u8]) {
+        // Get viewer IDs first to avoid borrow issues
+        let viewer_ids: Vec<ClientId> = self.clients.viewers_of(agent_key).cloned().collect();
+
+        // Update client state (for TUI this is no-op, for BrowserClient this buffers)
+        for client_id in viewer_ids {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.receive_output(data);
+            }
+        }
+
+        // Note: Browser output is buffered above in BrowserClient.receive_output().
+        // The event loop calls drain_and_send_browser_outputs() to send per-client.
+        // This removes the old broadcast-to-all workaround (Phase 5 complete).
+    }
+
+    /// Flush all client output buffers.
+    ///
+    /// Call this at the end of each event loop iteration to ensure
+    /// batched output is sent to browsers.
+    pub fn flush_all_clients(&mut self) {
+        self.clients.flush_all();
+    }
+
+    /// Drain buffered output from all browser clients.
+    ///
+    /// Returns a vector of (identity, data) tuples for relay sending.
+    /// Only includes browsers with buffered output. TUI is excluded.
+    ///
+    /// This method is used to collect per-client output for targeted relay
+    /// sending, enabling proper client isolation (each browser only receives
+    /// output from agents it's viewing).
+    pub fn drain_browser_outputs(&mut self) -> Vec<(String, Vec<u8>)> {
+        let mut outputs = Vec::new();
+
+        for (client_id, client) in self.clients.iter_mut() {
+            // Only process browser clients
+            if let ClientId::Browser(identity) = client_id {
+                // Drain any buffered output
+                if let Some(data) = client.drain_buffered_output() {
+                    outputs.push((identity.clone(), data));
+                }
+            }
+        }
+
+        outputs
+    }
+
+    /// Drain and send browser outputs via relay with per-client targeting.
+    ///
+    /// This method:
+    /// 1. Drains buffered output from each BrowserClient
+    /// 2. Sends each client's output via relay to that specific browser
+    ///
+    /// This enables proper client isolation - each browser only receives
+    /// output from agents it's viewing, not from all agents.
+    ///
+    /// Call this from the event loop to route PTY output to browsers.
+    pub fn drain_and_send_browser_outputs(&mut self) {
+        let outputs = self.drain_browser_outputs();
+
+        if outputs.is_empty() {
+            return;
+        }
+
+        let Some(ref sender) = self.browser.sender else {
+            return;
+        };
+
+        for (identity, data) in outputs {
+            let output = String::from_utf8_lossy(&data).to_string();
+            let sender = sender.clone();
+            let identity_clone = identity.clone();
+            self.tokio_runtime.spawn(async move {
+                if let Err(e) = sender.send_to(&identity_clone, &output).await {
+                    log::error!("Failed to send output to {}: {}", identity_clone, e);
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -625,5 +882,310 @@ mod tests {
 
         hub.handle_action(HubAction::Resize { rows: 50, cols: 150 });
         assert_eq!(hub.terminal_dims(), (50, 150));
+    }
+
+    // === Phase 2A: TuiClient is source of truth for TUI selection ===
+    //
+    // These tests verify that:
+    // 1. TuiClient owns TUI's selected_agent state
+    // 2. HubState.selected is NOT used for TUI selection
+    // 3. SelectAgentForClient updates TuiClient, not HubState
+
+    #[test]
+    fn test_tui_selection_comes_from_tui_client() {
+        use crate::client::ClientId;
+
+        let config = test_config();
+        let hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // TUI client should be registered
+        let tui_client = hub.clients.get(&ClientId::Tui);
+        assert!(tui_client.is_some(), "TuiClient should be registered");
+
+        // Initial selection should be None (no agents)
+        let tui_selection = tui_client.unwrap().state().selected_agent.clone();
+        assert!(tui_selection.is_none(), "TuiClient should have no selection initially");
+    }
+
+    #[test]
+    fn test_select_agent_for_client_updates_tui_client() {
+        use crate::client::ClientId;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // Add a test agent directly to state
+        let agent = crate::agent::Agent::new(
+            Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(42),
+            "botster-issue-42".to_string(),
+            PathBuf::from("/tmp/test"),
+        );
+        let agent_key = "test-repo-42".to_string();
+        hub.state.add_agent(agent_key.clone(), agent);
+
+        // Use SelectAgentForClient action (client-scoped)
+        hub.handle_action(HubAction::SelectAgentForClient {
+            client_id: ClientId::Tui,
+            agent_key: agent_key.clone(),
+        });
+
+        // TuiClient should now have the agent selected
+        let tui_client = hub.clients.get(&ClientId::Tui).unwrap();
+        let tui_selection = tui_client.state().selected_agent.clone();
+        assert_eq!(
+            tui_selection,
+            Some(agent_key.clone()),
+            "TuiClient.selected_agent should be updated by SelectAgentForClient"
+        );
+    }
+
+    #[test]
+    fn test_tui_and_browser_can_have_different_selections() {
+        use crate::client::{BrowserClient, ClientId};
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // Add two test agents
+        for i in 1..=2 {
+            let agent = crate::agent::Agent::new(
+                Uuid::new_v4(),
+                "test/repo".to_string(),
+                Some(i),
+                format!("botster-issue-{}", i),
+                PathBuf::from("/tmp/test"),
+            );
+            hub.state.add_agent(format!("test-repo-{}", i), agent);
+        }
+
+        // Register a browser client
+        let browser_client = BrowserClient::new("browser-test-123".to_string());
+        hub.clients.register(Box::new(browser_client));
+
+        // TUI selects agent 1
+        hub.handle_action(HubAction::SelectAgentForClient {
+            client_id: ClientId::Tui,
+            agent_key: "test-repo-1".to_string(),
+        });
+
+        // Browser selects agent 2
+        hub.handle_action(HubAction::SelectAgentForClient {
+            client_id: ClientId::browser("browser-test-123"),
+            agent_key: "test-repo-2".to_string(),
+        });
+
+        // Verify they have different selections
+        let tui_selection = hub.clients.get(&ClientId::Tui)
+            .unwrap()
+            .state()
+            .selected_agent
+            .clone();
+        let browser_selection = hub.clients.get(&ClientId::browser("browser-test-123"))
+            .unwrap()
+            .state()
+            .selected_agent
+            .clone();
+
+        assert_eq!(tui_selection, Some("test-repo-1".to_string()));
+        assert_eq!(browser_selection, Some("test-repo-2".to_string()));
+        assert_ne!(tui_selection, browser_selection, "TUI and browser should have independent selections");
+    }
+
+    #[test]
+    fn test_get_tui_selected_agent_uses_client_not_hub_state() {
+        use crate::client::ClientId;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // Add two test agents
+        for i in 1..=2 {
+            let agent = crate::agent::Agent::new(
+                Uuid::new_v4(),
+                "test/repo".to_string(),
+                Some(i),
+                format!("botster-issue-{}", i),
+                PathBuf::from("/tmp/test"),
+            );
+            hub.state.add_agent(format!("test-repo-{}", i), agent);
+        }
+
+        // Use SelectAgentForClient to select agent 2 via TuiClient
+        hub.handle_action(HubAction::SelectAgentForClient {
+            client_id: ClientId::Tui,
+            agent_key: "test-repo-2".to_string(),
+        });
+
+        // The helper method should return the agent based on TuiClient selection
+        let selected_key = hub.get_tui_selected_agent_key();
+        assert_eq!(
+            selected_key,
+            Some("test-repo-2".to_string()),
+            "get_tui_selected_agent_key should return TuiClient's selection"
+        );
+    }
+
+    // === Phase 3B: Hub drains browser output buffers ===
+    //
+    // These tests verify that:
+    // 1. Hub can drain buffered output from BrowserClients
+    // 2. Drained output is returned with browser identity for relay routing
+    // 3. TUI client has no buffered output (returns None)
+
+    #[test]
+    fn test_hub_drain_browser_outputs_returns_buffered_data() {
+        use crate::client::{BrowserClient, ClientId};
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // Add a test agent
+        let agent = crate::agent::Agent::new(
+            Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(42),
+            "botster-issue-42".to_string(),
+            PathBuf::from("/tmp/test"),
+        );
+        let agent_key = "test-repo-42".to_string();
+        hub.state.add_agent(agent_key.clone(), agent);
+
+        // Register a browser client and select the agent
+        let browser_id = "browser-test-drain".to_string();
+        let browser_client = BrowserClient::new(browser_id.clone());
+        hub.clients.register(Box::new(browser_client));
+
+        hub.handle_action(HubAction::SelectAgentForClient {
+            client_id: ClientId::Browser(browser_id.clone()),
+            agent_key: agent_key.clone(),
+        });
+
+        // Simulate PTY output via broadcast (this buffers in BrowserClient)
+        hub.broadcast_pty_output(&agent_key, b"Hello from PTY!");
+
+        // Drain browser outputs - should get the buffered data with identity
+        let outputs = hub.drain_browser_outputs();
+
+        assert_eq!(outputs.len(), 1, "Should have one browser's output");
+        let (identity, data) = &outputs[0];
+        assert_eq!(identity, &browser_id, "Identity should match browser");
+        assert_eq!(data, b"Hello from PTY!", "Data should match what was buffered");
+
+        // Second drain should return empty (buffer was cleared)
+        let outputs_after = hub.drain_browser_outputs();
+        assert!(outputs_after.is_empty(), "Should be empty after drain");
+    }
+
+    #[test]
+    fn test_hub_drain_multiple_browsers() {
+        use crate::client::{BrowserClient, ClientId};
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // Add two test agents
+        for i in 1..=2 {
+            let agent = crate::agent::Agent::new(
+                Uuid::new_v4(),
+                "test/repo".to_string(),
+                Some(i),
+                format!("botster-issue-{}", i),
+                PathBuf::from("/tmp/test"),
+            );
+            hub.state.add_agent(format!("test-repo-{}", i), agent);
+        }
+
+        // Register two browser clients viewing different agents
+        let browser1 = BrowserClient::new("browser-1".to_string());
+        let browser2 = BrowserClient::new("browser-2".to_string());
+        hub.clients.register(Box::new(browser1));
+        hub.clients.register(Box::new(browser2));
+
+        hub.handle_action(HubAction::SelectAgentForClient {
+            client_id: ClientId::Browser("browser-1".to_string()),
+            agent_key: "test-repo-1".to_string(),
+        });
+        hub.handle_action(HubAction::SelectAgentForClient {
+            client_id: ClientId::Browser("browser-2".to_string()),
+            agent_key: "test-repo-2".to_string(),
+        });
+
+        // Send different output to each agent
+        hub.broadcast_pty_output("test-repo-1", b"Output for agent 1");
+        hub.broadcast_pty_output("test-repo-2", b"Output for agent 2");
+
+        // Drain outputs - should get both browsers' data
+        let outputs = hub.drain_browser_outputs();
+
+        assert_eq!(outputs.len(), 2, "Should have two browsers' output");
+
+        // Check both outputs are present (order may vary)
+        let output_map: std::collections::HashMap<_, _> = outputs.into_iter().collect();
+        assert_eq!(
+            output_map.get("browser-1"),
+            Some(&b"Output for agent 1".to_vec()),
+            "Browser 1 should have agent 1's output"
+        );
+        assert_eq!(
+            output_map.get("browser-2"),
+            Some(&b"Output for agent 2".to_vec()),
+            "Browser 2 should have agent 2's output"
+        );
+    }
+
+    #[test]
+    fn test_hub_drain_does_not_include_tui() {
+        use crate::client::{BrowserClient, ClientId};
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // Add a test agent
+        let agent = crate::agent::Agent::new(
+            Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(42),
+            "botster-issue-42".to_string(),
+            PathBuf::from("/tmp/test"),
+        );
+        let agent_key = "test-repo-42".to_string();
+        hub.state.add_agent(agent_key.clone(), agent);
+
+        // Select with TUI (TUI client is already registered)
+        hub.handle_action(HubAction::SelectAgentForClient {
+            client_id: ClientId::Tui,
+            agent_key: agent_key.clone(),
+        });
+
+        // Register a browser client viewing the same agent
+        let browser_client = BrowserClient::new("browser-only".to_string());
+        hub.clients.register(Box::new(browser_client));
+        hub.handle_action(HubAction::SelectAgentForClient {
+            client_id: ClientId::Browser("browser-only".to_string()),
+            agent_key: agent_key.clone(),
+        });
+
+        // Both TUI and browser are viewing - send output
+        hub.broadcast_pty_output(&agent_key, b"Shared output");
+
+        // Drain outputs - should only get browser's data, not TUI
+        let outputs = hub.drain_browser_outputs();
+
+        assert_eq!(outputs.len(), 1, "Should only have browser output, not TUI");
+        assert_eq!(outputs[0].0, "browser-only");
     }
 }

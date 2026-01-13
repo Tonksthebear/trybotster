@@ -105,6 +105,7 @@ fn run_headless() -> Result<()> {
     // In headless mode, run a simplified event loop
     // - Poll for messages and send heartbeats via tick()
     // - Process browser events (ListAgents, Input, etc.)
+    // - Route PTY output to viewing clients
     while !SHUTDOWN_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
         // Poll for messages and send heartbeats
         hub.tick();
@@ -113,6 +114,12 @@ fn run_headless() -> Result<()> {
         if let Err(e) = botster_hub::relay::poll_events_headless(&mut hub) {
             log::error!("Failed to process browser events: {}", e);
         }
+
+        // Drain PTY output from all agents and route to viewing clients
+        botster_hub::relay::drain_and_route_pty_output(&mut hub);
+
+        // Flush client output buffers
+        hub.flush_all_clients();
 
         // Sleep to avoid busy-looping (100ms = 10 ticks/sec is plenty for headless)
         std::thread::sleep(std::time::Duration::from_millis(100));

@@ -85,7 +85,6 @@ pub fn render_agent_terminal(agent: &Agent, area: Rect, buf: &mut Buffer) -> Str
 mod tests {
     use super::*;
     use crate::agent::PtySession;
-    use ratatui::buffer::Buffer;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;

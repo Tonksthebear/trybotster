@@ -2,17 +2,22 @@
 //!
 //! This module contains the core state types for the Hub, including
 //! agent management and worktree tracking.
+//!
+//! # Selection Model
+//!
+//! Agent selection is now per-client, managed by the client abstraction layer.
+//! See `crate::client` for the `TuiClient` and `BrowserClient` implementations.
+//! This module only manages the agent registry itself.
 
 use std::collections::HashMap;
 
 use crate::agent::Agent;
 use crate::git::WorktreeManager;
 
-/// Core hub state - manages active agents and selection.
+/// Core hub state - manages active agents.
 ///
 /// This struct holds the minimal state needed for agent management,
-/// delegating TUI concerns to separate modules. The Hub owns this
-/// state and provides query methods for adapters (TUI, Relay) to access it.
+/// delegating selection to the client abstraction layer.
 ///
 /// # Example
 ///
@@ -22,13 +27,9 @@ use crate::git::WorktreeManager;
 /// // Add an agent
 /// state.add_agent(session_key, agent);
 ///
-/// // Navigate
-/// state.select_next();
-/// state.select_previous();
-///
-/// // Query
-/// if let Some(agent) = state.selected_agent() {
-///     println!("Selected: {}", agent.session_key());
+/// // Query agents
+/// for (key, agent) in state.agents_ordered() {
+///     println!("Agent: {}", key);
 /// }
 /// ```
 pub struct HubState {
@@ -42,12 +43,6 @@ pub struct HubState {
     ///
     /// This maintains insertion order for consistent UI display.
     pub agent_keys_ordered: Vec<String>,
-
-    /// Currently selected agent index.
-    ///
-    /// Index into `agent_keys_ordered`. Will be clamped to valid range
-    /// when agents are added or removed.
-    pub selected: usize,
 
     /// Available worktrees for spawning new agents.
     ///
@@ -63,7 +58,6 @@ impl std::fmt::Debug for HubState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HubState")
             .field("agents", &self.agents.len())
-            .field("selected", &self.selected)
             .field("available_worktrees", &self.available_worktrees.len())
             .finish_non_exhaustive()
     }
@@ -75,7 +69,6 @@ impl HubState {
         Self {
             agents: HashMap::new(),
             agent_keys_ordered: Vec::new(),
-            selected: 0,
             available_worktrees: Vec::new(),
             git_manager: WorktreeManager::new(worktree_base),
         }
@@ -102,82 +95,10 @@ impl HubState {
     /// Removes an agent from the hub state.
     ///
     /// Returns the removed agent if it existed.
+    /// Note: Client selection updates are handled by the client abstraction layer.
     pub fn remove_agent(&mut self, session_key: &str) -> Option<Agent> {
         self.agent_keys_ordered.retain(|k| k != session_key);
-        let agent = self.agents.remove(session_key);
-
-        // Clamp selection to valid range
-        if self.agent_keys_ordered.is_empty() {
-            self.selected = 0;
-        } else {
-            self.selected = self.selected.min(self.agent_keys_ordered.len() - 1);
-        }
-
-        agent
-    }
-
-    /// Returns the currently selected agent, if any.
-    pub fn selected_agent(&self) -> Option<&Agent> {
-        self.agent_keys_ordered
-            .get(self.selected)
-            .and_then(|key| self.agents.get(key))
-    }
-
-    /// Returns a mutable reference to the currently selected agent, if any.
-    pub fn selected_agent_mut(&mut self) -> Option<&mut Agent> {
-        let key = self.agent_keys_ordered.get(self.selected)?.clone();
-        self.agents.get_mut(&key)
-    }
-
-    /// Returns the session key of the currently selected agent, if any.
-    pub fn selected_session_key(&self) -> Option<&str> {
-        self.agent_keys_ordered.get(self.selected).map(String::as_str)
-    }
-
-    /// Selects the next agent (wraps around).
-    pub fn select_next(&mut self) {
-        if !self.agent_keys_ordered.is_empty() {
-            self.selected = (self.selected + 1) % self.agent_keys_ordered.len();
-        }
-    }
-
-    /// Selects the previous agent (wraps around).
-    pub fn select_previous(&mut self) {
-        if !self.agent_keys_ordered.is_empty() {
-            self.selected = if self.selected == 0 {
-                self.agent_keys_ordered.len() - 1
-            } else {
-                self.selected - 1
-            };
-        }
-    }
-
-    /// Selects an agent by index (1-based, for keyboard shortcuts).
-    ///
-    /// Returns true if the selection was valid.
-    pub fn select_by_index(&mut self, index: usize) -> bool {
-        if index > 0 && index <= self.agent_keys_ordered.len() {
-            self.selected = index - 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Selects an agent by session key.
-    ///
-    /// Returns true if the agent was found and selected.
-    pub fn select_by_key(&mut self, session_key: &str) -> bool {
-        if let Some(idx) = self
-            .agent_keys_ordered
-            .iter()
-            .position(|k| k == session_key)
-        {
-            self.selected = idx;
-            true
-        } else {
-            false
-        }
+        self.agents.remove(session_key)
     }
 
     /// Returns an iterator over all agents in display order.
@@ -282,7 +203,6 @@ mod tests {
         let state = HubState::new(PathBuf::from("/tmp/worktrees"));
         assert!(state.is_empty());
         assert_eq!(state.agent_count(), 0);
-        assert_eq!(state.selected, 0);
     }
 
     #[test]
@@ -301,81 +221,17 @@ mod tests {
     }
 
     #[test]
-    fn test_selection_navigation() {
+    fn test_agents_ordered() {
         let mut state = HubState::new(PathBuf::from("/tmp/worktrees"));
 
-        // Add three agents
+        // Add agents in order
         for i in 1..=3 {
             let agent = create_test_agent("owner/repo", Some(i), &format!("botster-issue-{i}"));
             state.add_agent(format!("owner-repo-{i}"), agent);
         }
 
-        assert_eq!(state.selected, 0);
-
-        state.select_next();
-        assert_eq!(state.selected, 1);
-
-        state.select_next();
-        assert_eq!(state.selected, 2);
-
-        // Wrap around
-        state.select_next();
-        assert_eq!(state.selected, 0);
-
-        // Wrap backwards
-        state.select_previous();
-        assert_eq!(state.selected, 2);
-    }
-
-    #[test]
-    fn test_select_by_index() {
-        let mut state = HubState::new(PathBuf::from("/tmp/worktrees"));
-
-        for i in 1..=3 {
-            let agent = create_test_agent("owner/repo", Some(i), &format!("botster-issue-{i}"));
-            state.add_agent(format!("owner-repo-{i}"), agent);
-        }
-
-        // 1-based indexing
-        assert!(state.select_by_index(2));
-        assert_eq!(state.selected, 1);
-
-        // Out of bounds
-        assert!(!state.select_by_index(0));
-        assert!(!state.select_by_index(5));
-    }
-
-    #[test]
-    fn test_select_by_key() {
-        let mut state = HubState::new(PathBuf::from("/tmp/worktrees"));
-
-        for i in 1..=3 {
-            let agent = create_test_agent("owner/repo", Some(i), &format!("botster-issue-{i}"));
-            state.add_agent(format!("owner-repo-{i}"), agent);
-        }
-
-        assert!(state.select_by_key("owner-repo-2"));
-        assert_eq!(state.selected, 1);
-
-        assert!(!state.select_by_key("nonexistent"));
-    }
-
-    #[test]
-    fn test_selection_clamps_on_remove() {
-        let mut state = HubState::new(PathBuf::from("/tmp/worktrees"));
-
-        for i in 1..=3 {
-            let agent = create_test_agent("owner/repo", Some(i), &format!("botster-issue-{i}"));
-            state.add_agent(format!("owner-repo-{i}"), agent);
-        }
-
-        // Select last agent
-        state.selected = 2;
-
-        // Remove it
-        state.remove_agent("owner-repo-3");
-
-        // Selection should clamp
-        assert_eq!(state.selected, 1);
+        // Verify iteration order matches insertion order
+        let keys: Vec<_> = state.agents_ordered().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec!["owner-repo-1", "owner-repo-2", "owner-repo-3"]);
     }
 }
