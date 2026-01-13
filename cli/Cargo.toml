@@ -43,6 +43,7 @@ mimalloc = "0.1"
 # Error handling & utilities
 anyhow = "1.0"
 log = "0.4"
+scopeguard = "1.2"  # RAII guards for cleanup
 env_logger = "0.11"
 ctrlc = { version = "3.4", features = ["termination"] }
 signal-hook = "0.3"
