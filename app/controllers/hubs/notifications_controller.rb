@@ -9,7 +9,7 @@ module Hubs
     before_action :authenticate_with_api_key!
     before_action :set_hub
 
-    # POST /hubs/:identifier/notifications
+    # POST /hubs/:id/notifications
     # CLI sends notification when terminal bell/alert is detected
     def create
       notification_type = params[:notification_type]
@@ -66,7 +66,7 @@ module Hubs
     private
 
     def set_hub
-      @hub = current_api_user.hubs.find_by!(identifier: params[:hub_identifier])
+      @hub = current_api_user.hubs.find_by!(id: params[:hub_id])
     rescue ActiveRecord::RecordNotFound
       render json: { error: "Hub not found" }, status: :not_found
     end

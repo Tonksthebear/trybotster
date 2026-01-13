@@ -5,8 +5,8 @@ require_relative "cli_integration_test_case"
 # Tests CLI hub registration against real Rails server.
 #
 # Verifies the CLI correctly:
-# - Registers hub on startup (PUT /hubs/:identifier)
-# - Sends heartbeats (PATCH /hubs/:identifier/heartbeat)
+# - Registers hub on startup (POST /hubs, then PUT /hubs/:id)
+# - Sends heartbeats (PATCH /hubs/:hub_id/heartbeat)
 # - Updates hub state in database
 #
 # These tests spawn real CLI binary and verify database state changes.
@@ -35,13 +35,16 @@ class CliHubRegistrationTest < CliIntegrationTestCase
     connection_url = cli.connection_url
     assert connection_url.present?, "Connection URL should be available"
 
-    # URL should contain the bundle fragment with base64-encoded PreKeyBundle
-    assert_match %r{#bundle=}, connection_url, "URL should contain bundle fragment"
+    # URL format: /hubs/{id}#{base32_bundle}
+    # Fragment contains raw Base32-encoded PreKeyBundle (no prefix for QR efficiency)
+    uri = URI.parse(connection_url)
+    assert uri.fragment.present?, "URL should have fragment with PreKeyBundle"
 
-    # Bundle should be base64-encoded data (alphanumeric, +, /, =)
-    bundle_match = connection_url.match(%r{#bundle=([A-Za-z0-9+/=]+)})
-    assert bundle_match, "Bundle should be valid base64"
-    assert bundle_match[1].length > 100, "Bundle should contain substantial data (PreKeyBundle)"
+    # Bundle should be Base32-encoded data (uppercase A-Z, 2-7)
+    assert uri.fragment.match?(/\A[A-Z2-7]+\z/),
+      "Fragment should be raw Base32 encoded. Got: #{uri.fragment[0..50]}..."
+    assert uri.fragment.length > 2800,
+      "Bundle should be ~2900 chars for Kyber keys. Got: #{uri.fragment.length}"
   end
 
   test "CLI updates hub repo on registration" do

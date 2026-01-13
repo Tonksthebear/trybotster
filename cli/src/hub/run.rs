@@ -82,7 +82,12 @@ pub fn run_event_loop(
         handle_browser_resize_action(hub, browser_dims.as_ref(), terminal);
 
         // 4. Render using tui::render()
-        let (_ansi_output, _rows, _cols) = tui::render(terminal, hub, browser_dims.clone())?;
+        let (_ansi_output, _rows, _cols, qr_image_written) = tui::render(terminal, hub, browser_dims.clone())?;
+
+        // Track QR image display to prevent re-rendering every frame
+        if qr_image_written {
+            hub.qr_image_displayed = true;
+        }
 
         // 5. Poll and handle browser events
         browser::poll_events(hub, terminal)?;

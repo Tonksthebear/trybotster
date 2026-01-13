@@ -17,6 +17,11 @@ use vt100::Parser;
 use super::notification::{detect_notifications, AgentNotification};
 use super::pty::MAX_BUFFER_LINES;
 
+/// Maximum number of raw output chunks to queue for browser streaming.
+/// Each chunk is at most 4096 bytes, so 1000 chunks = ~4MB max.
+/// If the browser isn't draining fast enough, oldest chunks are dropped.
+const MAX_RAW_OUTPUT_QUEUE_SIZE: usize = 1000;
+
 /// Configuration for spawning a PTY process.
 #[derive(Debug)]
 pub struct PtySpawnConfig<'a> {
@@ -113,10 +118,14 @@ pub fn spawn_cli_reader_thread(
                         }
                     }
 
-                    // Queue raw output for browser streaming
+                    // Queue raw output for browser streaming (bounded to prevent memory leaks)
                     {
                         let mut queue = raw_output_queue.lock().expect("raw_output_queue lock poisoned");
                         queue.push_back(buf[..n].to_vec());
+                        // Drop oldest chunks if queue exceeds limit
+                        while queue.len() > MAX_RAW_OUTPUT_QUEUE_SIZE {
+                            queue.pop_front();
+                        }
                     }
                 }
                 Err(e) => {

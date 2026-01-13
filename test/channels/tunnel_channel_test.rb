@@ -29,38 +29,38 @@ class TunnelChannelTest < ActionCable::Channel::TestCase
   test "subscribes to hub tunnel stream" do
     stub_connection current_user: @user
 
-    subscribe hub_id: @hub.identifier
+    subscribe hub_id: @hub.id
 
     assert subscription.confirmed?
-    # Stream name format: tunnel_hub_{user_id}_{identifier}
-    assert_has_stream "tunnel_hub_#{@user.id}_#{@hub.identifier}"
+    # Stream name format: tunnel_hub_{user_id}_{hub_id}
+    assert_has_stream "tunnel_hub_#{@user.id}_#{@hub.id}"
   end
 
-  test "accepts subscription for non-existent hub identifier" do
+  test "accepts subscription for non-existent hub id" do
     # Subscriptions are allowed even before hub exists (hub created by heartbeat)
     stub_connection current_user: @user
-    fake_identifier = "future-hub-#{SecureRandom.uuid}"
+    fake_hub_id = 999999
 
-    subscribe hub_id: fake_identifier
+    subscribe hub_id: fake_hub_id
 
     assert subscription.confirmed?
-    assert_has_stream "tunnel_hub_#{@user.id}_#{fake_identifier}"
+    assert_has_stream "tunnel_hub_#{@user.id}_#{fake_hub_id}"
   end
 
-  test "different users can subscribe to same hub identifier" do
-    # Each user gets their own stream based on user_id + identifier
+  test "different users can subscribe to same hub id" do
+    # Each user gets their own stream based on user_id + hub_id
     stub_connection current_user: @other_user
 
-    subscribe hub_id: @hub.identifier
+    subscribe hub_id: @hub.id
 
     assert subscription.confirmed?
     # Other user gets a different stream
-    assert_has_stream "tunnel_hub_#{@other_user.id}_#{@hub.identifier}"
+    assert_has_stream "tunnel_hub_#{@other_user.id}_#{@hub.id}"
   end
 
   test "register_agent_tunnel updates agent" do
     stub_connection current_user: @user
-    subscribe hub_id: @hub.identifier
+    subscribe hub_id: @hub.id
 
     assert_not @hub_agent.tunnel_connected?
     assert_nil @hub_agent.tunnel_port
@@ -77,7 +77,7 @@ class TunnelChannelTest < ActionCable::Channel::TestCase
   test "register_agent_tunnel creates non-existent agent" do
     # This tests the race condition fix: tunnel registration can arrive before heartbeat
     stub_connection current_user: @user
-    subscribe hub_id: @hub.identifier
+    subscribe hub_id: @hub.id
 
     new_session_key = "owner-repo-new-agent"
     assert_nil @hub.hub_agents.find_by(session_key: new_session_key)
@@ -94,19 +94,19 @@ class TunnelChannelTest < ActionCable::Channel::TestCase
 
   test "register_agent_tunnel ignores registration when hub does not exist" do
     stub_connection current_user: @user
-    fake_hub_id = "non-existent-hub-#{SecureRandom.uuid}"
+    fake_hub_id = 999999
     subscribe hub_id: fake_hub_id
 
     # Should not raise an error but also should not create anything
     perform :register_agent_tunnel, { session_key: "some-agent", port: 4001 }
 
     # No hub should be created (we don't have enough info to create one)
-    assert_nil Hub.find_by(identifier: fake_hub_id)
+    assert_nil Hub.find_by(id: fake_hub_id)
   end
 
   test "register_agent_tunnel updates existing tunnel info" do
     stub_connection current_user: @user
-    subscribe hub_id: @hub.identifier
+    subscribe hub_id: @hub.id
 
     @hub_agent.update!(tunnel_port: 4001, tunnel_status: "connected")
 
@@ -119,7 +119,7 @@ class TunnelChannelTest < ActionCable::Channel::TestCase
 
   test "http_response fulfills the response store" do
     stub_connection current_user: @user
-    subscribe hub_id: @hub.identifier
+    subscribe hub_id: @hub.id
 
     request_id = SecureRandom.uuid
     response_data = {
@@ -153,7 +153,7 @@ class TunnelChannelTest < ActionCable::Channel::TestCase
 
   test "unsubscribed marks all agents as disconnected" do
     stub_connection current_user: @user
-    subscribe hub_id: @hub.identifier
+    subscribe hub_id: @hub.id
 
     # Set up multiple connected agents
     @hub_agent.update!(tunnel_status: "connected")
@@ -180,7 +180,7 @@ class TunnelChannelTest < ActionCable::Channel::TestCase
 
   test "unsubscribed only affects connected agents" do
     stub_connection current_user: @user
-    subscribe hub_id: @hub.identifier
+    subscribe hub_id: @hub.id
 
     # One connected, one already disconnected
     @hub_agent.update!(tunnel_status: "connected")

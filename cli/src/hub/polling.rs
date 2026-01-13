@@ -39,8 +39,8 @@ pub struct PollingConfig<'a> {
     pub api_key: &'a str,
     /// Poll interval in seconds.
     pub poll_interval: u64,
-    /// Hub identifier for heartbeats.
-    pub hub_identifier: &'a str,
+    /// Hub ID for server communication (botster_id or fallback identifier).
+    pub server_hub_id: &'a str,
 }
 
 /// Timing state for polling operations.
@@ -101,7 +101,7 @@ pub struct MessageResponse {
 pub fn poll_messages(config: &PollingConfig, repo_name: &str) -> Vec<MessageData> {
     let url = format!(
         "{}/hubs/{}/messages?repo={}",
-        config.server_url, config.hub_identifier, repo_name
+        config.server_url, config.server_hub_id, repo_name
     );
 
     let response = match config
@@ -142,7 +142,7 @@ pub fn poll_messages(config: &PollingConfig, repo_name: &str) -> Vec<MessageData
 pub fn acknowledge_message(config: &PollingConfig, message_id: i64) {
     let url = format!(
         "{}/hubs/{}/messages/{message_id}",
-        config.server_url, config.hub_identifier
+        config.server_url, config.server_hub_id
     );
 
     match config
@@ -195,7 +195,7 @@ pub fn send_heartbeat(
         })
         .collect();
 
-    let url = format!("{}/hubs/{}", config.server_url, config.hub_identifier);
+    let url = format!("{}/hubs/{}", config.server_url, config.server_hub_id);
     let payload = serde_json::json!({
         "repo": repo_name,
         "agents": agents_list,
@@ -241,7 +241,7 @@ pub struct AgentNotificationPayload<'a> {
 pub fn send_agent_notification(config: &PollingConfig, payload: &AgentNotificationPayload) -> Result<()> {
     let url = format!(
         "{}/hubs/{}/notifications",
-        config.server_url, config.hub_identifier
+        config.server_url, config.server_hub_id
     );
 
     let json_payload = serde_json::json!({
@@ -330,7 +330,7 @@ pub fn send_heartbeat_if_due(hub: &mut Hub) {
         server_url: &hub.config.server_url,
         api_key: hub.config.get_api_key(),
         poll_interval: hub.config.poll_interval,
-        hub_identifier: &hub.hub_identifier,
+        server_hub_id: hub.server_hub_id(),
     };
 
     send_heartbeat(&config, &repo_name, &agents, hub.device.device_id);
@@ -368,7 +368,7 @@ pub fn poll_and_send_agent_notifications(hub: &mut Hub) {
         server_url: &hub.config.server_url,
         api_key: hub.config.get_api_key(),
         poll_interval: hub.config.poll_interval,
-        hub_identifier: &hub.hub_identifier,
+        server_hub_id: hub.server_hub_id(),
     };
 
     for notif in notifications {

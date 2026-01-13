@@ -57,7 +57,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_response :success
 
     # Should have link to hub show page
-    assert_select "a[href=?]", hub_path(@active_hub.identifier)
+    assert_select "a[href=?]", hub_path(@active_hub)
   end
 
   test "index shows empty state when no hubs" do
@@ -74,25 +74,25 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
   # === Show Tests ===
 
   test "show requires authentication" do
-    get hub_path(@active_hub.identifier)
+    get hub_path(@active_hub)
     assert_redirected_to root_path
   end
 
   test "show displays terminal for hub" do
     sign_in @user
-    get hub_path(@active_hub.identifier)
+    get hub_path(@active_hub)
     assert_response :success
 
-    # Should have terminal controller attached
-    assert_select "[data-controller='terminal']"
+    # Should have connection controller attached (with other controllers like terminal-display, agents)
+    assert_select "[data-controller~='connection']"
 
-    # Should pass hub identifier to terminal controller
-    assert_select "[data-terminal-hub-identifier-value=?]", @active_hub.identifier
+    # Should pass hub ID to connection controller
+    assert_select "[data-connection-hub-id-value=?]", @active_hub.id.to_s
   end
 
   test "show displays hub info" do
     sign_in @user
-    get hub_path(@active_hub.identifier)
+    get hub_path(@active_hub)
     assert_response :success
 
     # Should show hub identifier in header
@@ -104,7 +104,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
   test "show has back link to index" do
     sign_in @user
-    get hub_path(@active_hub.identifier)
+    get hub_path(@active_hub)
     assert_response :success
 
     assert_select "a[href=?]", hubs_path
@@ -128,7 +128,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     )
 
     sign_in @user
-    get hub_path(other_hub.identifier)
+    get hub_path(other_hub)
 
     assert_redirected_to hubs_path
     assert_equal "Hub not found", flash[:alert]
@@ -136,19 +136,20 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
   test "show displays E2E badge for hub with device" do
     sign_in @user
-    get hub_path(@active_hub.identifier)
+    get hub_path(@active_hub)
     assert_response :success
 
     # Hub has a device, should show E2E badge
     assert_select ".text-emerald-400", text: /E2E/
   end
 
-  test "show displays security mode banner" do
+  test "show displays security banner placeholder" do
     sign_in @user
-    get hub_path(@active_hub.identifier)
+    get hub_path(@active_hub)
     assert_response :success
 
-    # Should show either secure mode or convenience mode banner
-    assert_match /Secure Mode|Convenience Mode/, response.body
+    # Security banner exists with initial loading state (JavaScript updates it after E2E connection)
+    assert_select "[data-connection-target='securityBanner']"
+    assert_match /secure connection/i, response.body
   end
 end

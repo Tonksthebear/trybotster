@@ -92,6 +92,261 @@ pub struct PreKeyBundleData {
     pub kyber_prekey_signature: String,
 }
 
+/// Binary format constants for PreKeyBundleData.
+///
+/// Total size: 1813 bytes (fits in QR alphanumeric mode with Base32).
+///
+/// # Browser-side Decoding
+///
+/// The browser receives an uppercase URL like:
+/// ```text
+/// HTTPS://BOTSTER.DEV/H/123#GEZDGNBVGY3TQOJQ...
+/// ```
+///
+/// To decode in JavaScript:
+/// ```javascript
+/// // 1. Get fragment (without #)
+/// const fragment = window.location.hash.slice(1);
+///
+/// // 2. Decode Base32 to bytes
+/// const bytes = base32Decode(fragment); // Use a Base32 library (no padding)
+///
+/// // 3. Parse binary format using these offsets:
+/// const bundle = {
+///     version: bytes[0],
+///     registration_id: new DataView(bytes.buffer).getUint32(1, true), // little-endian
+///     identity_key: bytes.slice(5, 38),
+///     signed_prekey_id: new DataView(bytes.buffer).getUint32(38, true),
+///     signed_prekey: bytes.slice(42, 75),
+///     signed_prekey_signature: bytes.slice(75, 139),
+///     prekey_id: new DataView(bytes.buffer).getUint32(139, true),
+///     prekey: bytes.slice(143, 176),
+///     kyber_prekey_id: new DataView(bytes.buffer).getUint32(176, true),
+///     kyber_prekey: bytes.slice(180, 1749),
+///     kyber_prekey_signature: bytes.slice(1749, 1813),
+/// };
+/// ```
+///
+/// Recommended Base32 library: `hi-base32` (npm) or manual decode.
+pub mod binary_format {
+    //! Binary format constants for PreKeyBundle serialization.
+    //!
+    //! These define byte offsets and sizes for the compact binary format
+    //! used in QR codes. Total size: 1813 bytes.
+
+    /// Byte offset: format version (1 byte).
+    pub const VERSION_OFFSET: usize = 0;
+    /// Byte offset: registration ID (4 bytes LE).
+    pub const REGISTRATION_ID_OFFSET: usize = 1;
+    /// Byte offset: identity key (33 bytes).
+    pub const IDENTITY_KEY_OFFSET: usize = 5;
+    /// Byte offset: signed prekey ID (4 bytes LE).
+    pub const SIGNED_PREKEY_ID_OFFSET: usize = 38;
+    /// Byte offset: signed prekey (33 bytes).
+    pub const SIGNED_PREKEY_OFFSET: usize = 42;
+    /// Byte offset: signed prekey signature (64 bytes).
+    pub const SIGNED_PREKEY_SIG_OFFSET: usize = 75;
+    /// Byte offset: one-time prekey ID (4 bytes LE).
+    pub const PREKEY_ID_OFFSET: usize = 139;
+    /// Byte offset: one-time prekey (33 bytes).
+    pub const PREKEY_OFFSET: usize = 143;
+    /// Byte offset: Kyber prekey ID (4 bytes LE).
+    pub const KYBER_PREKEY_ID_OFFSET: usize = 176;
+    /// Byte offset: Kyber prekey (1569 bytes).
+    pub const KYBER_PREKEY_OFFSET: usize = 180;
+    /// Byte offset: Kyber prekey signature (64 bytes). Equals 180 + 1569.
+    pub const KYBER_PREKEY_SIG_OFFSET: usize = 1749;
+    /// Total binary bundle size in bytes. Equals 1749 + 64.
+    pub const TOTAL_SIZE: usize = 1813;
+
+    /// Size of identity key in bytes.
+    pub const IDENTITY_KEY_SIZE: usize = 33;
+    /// Size of signed prekey in bytes.
+    pub const SIGNED_PREKEY_SIZE: usize = 33;
+    /// Size of signed prekey signature in bytes.
+    pub const SIGNED_PREKEY_SIG_SIZE: usize = 64;
+    /// Size of one-time prekey in bytes.
+    pub const PREKEY_SIZE: usize = 33;
+    /// Size of Kyber1024 public key in bytes (includes type byte).
+    pub const KYBER_PREKEY_SIZE: usize = 1569;
+    /// Size of Kyber prekey signature in bytes.
+    pub const KYBER_PREKEY_SIG_SIZE: usize = 64;
+}
+
+impl PreKeyBundleData {
+    /// Serialize to compact binary format for QR codes.
+    ///
+    /// Binary format (1812 bytes total):
+    /// - version: 1 byte
+    /// - registration_id: 4 bytes (LE)
+    /// - identity_key: 33 bytes
+    /// - signed_prekey_id: 4 bytes (LE)
+    /// - signed_prekey: 33 bytes
+    /// - signed_prekey_signature: 64 bytes
+    /// - prekey_id: 4 bytes (LE, 0 if none)
+    /// - prekey: 33 bytes (zeros if none)
+    /// - kyber_prekey_id: 4 bytes (LE)
+    /// - kyber_prekey: 1568 bytes
+    /// - kyber_prekey_signature: 64 bytes
+    ///
+    /// Note: hub_id and device_id are NOT included - they come from URL path.
+    pub fn to_binary(&self) -> Result<Vec<u8>> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use binary_format::*;
+
+        let mut buf = vec![0u8; TOTAL_SIZE];
+
+        // Version
+        buf[VERSION_OFFSET] = self.version;
+
+        // Registration ID (little-endian)
+        buf[REGISTRATION_ID_OFFSET..REGISTRATION_ID_OFFSET + 4]
+            .copy_from_slice(&self.registration_id.to_le_bytes());
+
+        // Identity key (decode from base64)
+        let identity_key = STANDARD.decode(&self.identity_key)
+            .map_err(|e| anyhow::anyhow!("Invalid identity_key base64: {e}"))?;
+        if identity_key.len() != IDENTITY_KEY_SIZE {
+            return Err(anyhow::anyhow!("identity_key wrong size: {} != {}", identity_key.len(), IDENTITY_KEY_SIZE));
+        }
+        buf[IDENTITY_KEY_OFFSET..IDENTITY_KEY_OFFSET + IDENTITY_KEY_SIZE]
+            .copy_from_slice(&identity_key);
+
+        // Signed PreKey ID
+        buf[SIGNED_PREKEY_ID_OFFSET..SIGNED_PREKEY_ID_OFFSET + 4]
+            .copy_from_slice(&self.signed_prekey_id.to_le_bytes());
+
+        // Signed PreKey
+        let signed_prekey = STANDARD.decode(&self.signed_prekey)
+            .map_err(|e| anyhow::anyhow!("Invalid signed_prekey base64: {e}"))?;
+        if signed_prekey.len() != SIGNED_PREKEY_SIZE {
+            return Err(anyhow::anyhow!("signed_prekey wrong size: {} != {}", signed_prekey.len(), SIGNED_PREKEY_SIZE));
+        }
+        buf[SIGNED_PREKEY_OFFSET..SIGNED_PREKEY_OFFSET + SIGNED_PREKEY_SIZE]
+            .copy_from_slice(&signed_prekey);
+
+        // Signed PreKey signature
+        let signed_prekey_sig = STANDARD.decode(&self.signed_prekey_signature)
+            .map_err(|e| anyhow::anyhow!("Invalid signed_prekey_signature base64: {e}"))?;
+        if signed_prekey_sig.len() != SIGNED_PREKEY_SIG_SIZE {
+            return Err(anyhow::anyhow!("signed_prekey_signature wrong size: {} != {}", signed_prekey_sig.len(), SIGNED_PREKEY_SIG_SIZE));
+        }
+        buf[SIGNED_PREKEY_SIG_OFFSET..SIGNED_PREKEY_SIG_OFFSET + SIGNED_PREKEY_SIG_SIZE]
+            .copy_from_slice(&signed_prekey_sig);
+
+        // PreKey ID and PreKey (optional)
+        if let (Some(id), Some(ref pk)) = (self.prekey_id, &self.prekey) {
+            buf[PREKEY_ID_OFFSET..PREKEY_ID_OFFSET + 4]
+                .copy_from_slice(&id.to_le_bytes());
+            let prekey = STANDARD.decode(pk)
+                .map_err(|e| anyhow::anyhow!("Invalid prekey base64: {e}"))?;
+            if prekey.len() != PREKEY_SIZE {
+                return Err(anyhow::anyhow!("prekey wrong size: {} != {}", prekey.len(), PREKEY_SIZE));
+            }
+            buf[PREKEY_OFFSET..PREKEY_OFFSET + PREKEY_SIZE]
+                .copy_from_slice(&prekey);
+        }
+        // else: already zeros
+
+        // Kyber PreKey ID
+        buf[KYBER_PREKEY_ID_OFFSET..KYBER_PREKEY_ID_OFFSET + 4]
+            .copy_from_slice(&self.kyber_prekey_id.to_le_bytes());
+
+        // Kyber PreKey
+        let kyber_prekey = STANDARD.decode(&self.kyber_prekey)
+            .map_err(|e| anyhow::anyhow!("Invalid kyber_prekey base64: {e}"))?;
+        if kyber_prekey.len() != KYBER_PREKEY_SIZE {
+            return Err(anyhow::anyhow!("kyber_prekey wrong size: {} != {}", kyber_prekey.len(), KYBER_PREKEY_SIZE));
+        }
+        buf[KYBER_PREKEY_OFFSET..KYBER_PREKEY_OFFSET + KYBER_PREKEY_SIZE]
+            .copy_from_slice(&kyber_prekey);
+
+        // Kyber PreKey signature
+        let kyber_prekey_sig = STANDARD.decode(&self.kyber_prekey_signature)
+            .map_err(|e| anyhow::anyhow!("Invalid kyber_prekey_signature base64: {e}"))?;
+        if kyber_prekey_sig.len() != KYBER_PREKEY_SIG_SIZE {
+            return Err(anyhow::anyhow!("kyber_prekey_signature wrong size: {} != {}", kyber_prekey_sig.len(), KYBER_PREKEY_SIG_SIZE));
+        }
+        buf[KYBER_PREKEY_SIG_OFFSET..KYBER_PREKEY_SIG_OFFSET + KYBER_PREKEY_SIG_SIZE]
+            .copy_from_slice(&kyber_prekey_sig);
+
+        Ok(buf)
+    }
+
+    /// Deserialize from compact binary format.
+    ///
+    /// Note: hub_id is set to empty string (comes from URL path).
+    /// device_id is set to CLI_DEVICE_ID (always 1).
+    pub fn from_binary(bytes: &[u8]) -> Result<Self> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use binary_format::*;
+
+        if bytes.len() != TOTAL_SIZE {
+            return Err(anyhow::anyhow!("Binary bundle wrong size: {} != {}", bytes.len(), TOTAL_SIZE));
+        }
+
+        let version = bytes[VERSION_OFFSET];
+
+        let registration_id = u32::from_le_bytes(
+            bytes[REGISTRATION_ID_OFFSET..REGISTRATION_ID_OFFSET + 4].try_into().unwrap()
+        );
+
+        let identity_key = STANDARD.encode(
+            &bytes[IDENTITY_KEY_OFFSET..IDENTITY_KEY_OFFSET + IDENTITY_KEY_SIZE]
+        );
+
+        let signed_prekey_id = u32::from_le_bytes(
+            bytes[SIGNED_PREKEY_ID_OFFSET..SIGNED_PREKEY_ID_OFFSET + 4].try_into().unwrap()
+        );
+
+        let signed_prekey = STANDARD.encode(
+            &bytes[SIGNED_PREKEY_OFFSET..SIGNED_PREKEY_OFFSET + SIGNED_PREKEY_SIZE]
+        );
+
+        let signed_prekey_signature = STANDARD.encode(
+            &bytes[SIGNED_PREKEY_SIG_OFFSET..SIGNED_PREKEY_SIG_OFFSET + SIGNED_PREKEY_SIG_SIZE]
+        );
+
+        let prekey_id_raw = u32::from_le_bytes(
+            bytes[PREKEY_ID_OFFSET..PREKEY_ID_OFFSET + 4].try_into().unwrap()
+        );
+        let prekey_bytes = &bytes[PREKEY_OFFSET..PREKEY_OFFSET + PREKEY_SIZE];
+        let (prekey_id, prekey) = if prekey_id_raw == 0 && prekey_bytes.iter().all(|&b| b == 0) {
+            (None, None)
+        } else {
+            (Some(prekey_id_raw), Some(STANDARD.encode(prekey_bytes)))
+        };
+
+        let kyber_prekey_id = u32::from_le_bytes(
+            bytes[KYBER_PREKEY_ID_OFFSET..KYBER_PREKEY_ID_OFFSET + 4].try_into().unwrap()
+        );
+
+        let kyber_prekey = STANDARD.encode(
+            &bytes[KYBER_PREKEY_OFFSET..KYBER_PREKEY_OFFSET + KYBER_PREKEY_SIZE]
+        );
+
+        let kyber_prekey_signature = STANDARD.encode(
+            &bytes[KYBER_PREKEY_SIG_OFFSET..KYBER_PREKEY_SIG_OFFSET + KYBER_PREKEY_SIG_SIZE]
+        );
+
+        Ok(Self {
+            version,
+            hub_id: String::new(), // Comes from URL path
+            registration_id,
+            device_id: CLI_DEVICE_ID,
+            identity_key,
+            signed_prekey_id,
+            signed_prekey,
+            signed_prekey_signature,
+            prekey_id,
+            prekey,
+            kyber_prekey_id,
+            kyber_prekey,
+            kyber_prekey_signature,
+        })
+    }
+}
+
 /// Encrypted Signal message envelope (protocol v4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalEnvelope {
@@ -405,6 +660,13 @@ impl SignalProtocolManager {
     pub async fn decrypt(&mut self, envelope: &SignalEnvelope) -> Result<Vec<u8>> {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
+        log::debug!(
+            "Decrypting message: type={}, sender={}, device={}",
+            envelope.message_type,
+            &envelope.sender_identity[..envelope.sender_identity.len().min(16)],
+            envelope.device_id
+        );
+
         let ciphertext = BASE64.decode(&envelope.ciphertext)
             .context("Invalid base64 ciphertext")?;
 
@@ -639,5 +901,106 @@ mod tests {
         // that actually gets LARGER when you try to compress it
 
         assert!(encoded.len() > 2900, "Confirming Kyber bundle exceeds QR capacity");
+    }
+
+    // ============ TDD: Binary Bundle Format ============
+    // These tests define the expected behavior before implementation
+
+    #[tokio::test]
+    async fn test_binary_bundle_round_trip() {
+        let manager = SignalProtocolManager::new("test-hub-binary").await.unwrap();
+        let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
+
+        // Serialize to binary
+        let bytes = bundle.to_binary().expect("serialization should succeed");
+
+        // Deserialize back
+        let restored = PreKeyBundleData::from_binary(&bytes).expect("deserialization should succeed");
+
+        // All fields should match (except hub_id which is not in binary format)
+        assert_eq!(bundle.version, restored.version);
+        assert_eq!(bundle.registration_id, restored.registration_id);
+        assert_eq!(bundle.device_id, restored.device_id);
+        assert_eq!(bundle.identity_key, restored.identity_key);
+        assert_eq!(bundle.signed_prekey_id, restored.signed_prekey_id);
+        assert_eq!(bundle.signed_prekey, restored.signed_prekey);
+        assert_eq!(bundle.signed_prekey_signature, restored.signed_prekey_signature);
+        assert_eq!(bundle.prekey_id, restored.prekey_id);
+        assert_eq!(bundle.prekey, restored.prekey);
+        assert_eq!(bundle.kyber_prekey_id, restored.kyber_prekey_id);
+        assert_eq!(bundle.kyber_prekey, restored.kyber_prekey);
+        assert_eq!(bundle.kyber_prekey_signature, restored.kyber_prekey_signature);
+    }
+
+    #[tokio::test]
+    async fn test_binary_bundle_size() {
+        let manager = SignalProtocolManager::new("test-hub-binary-size").await.unwrap();
+        let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
+
+        let bytes = bundle.to_binary().expect("serialization should succeed");
+
+        // Expected size: 1813 bytes
+        // version(1) + reg_id(4) + identity(33) + spk_id(4) + spk(33) + spk_sig(64)
+        // + pk_id(4) + pk(33) + kpk_id(4) + kpk(1569) + kpk_sig(64) = 1813
+        println!("Binary bundle size: {} bytes", bytes.len());
+        assert_eq!(bytes.len(), 1813, "Binary bundle should be exactly 1813 bytes");
+    }
+
+    #[tokio::test]
+    async fn test_binary_bundle_fits_in_qr_with_base32() {
+        use data_encoding::BASE32_NOPAD;
+
+        let manager = SignalProtocolManager::new("test-hub-qr-fit").await.unwrap();
+        let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
+
+        let bytes = bundle.to_binary().expect("serialization should succeed");
+        let base32 = BASE32_NOPAD.encode(&bytes);
+
+        // Base32 should be all uppercase (for QR alphanumeric mode)
+        assert!(base32.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+            "Base32 should be uppercase alphanumeric");
+
+        // Full URL with hub ID
+        let url = format!("HTTPS://BOTSTER.DEV/H/123#{}", base32);
+
+        println!("Binary size:  {} bytes", bytes.len());
+        println!("Base32 size:  {} chars", base32.len());
+        println!("Full URL:     {} chars", url.len());
+        println!("QR capacity:  4296 chars (alphanumeric mode)");
+        println!("Headroom:     {} chars", 4296 - url.len() as i32);
+
+        // Must fit in QR alphanumeric capacity (4296 chars for version 40-L)
+        assert!(url.len() < 4296, "URL should fit in QR alphanumeric mode");
+
+        // Should be well under the limit
+        assert!(url.len() < 3000, "URL should be under 3000 chars");
+    }
+
+    #[test]
+    fn test_binary_format_is_deterministic() {
+        // Same input should produce same output
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        // Create a bundle with known values
+        let bundle = PreKeyBundleData {
+            version: 4,
+            hub_id: "ignored".to_string(), // Not in binary format
+            registration_id: 12345,
+            device_id: 1,
+            identity_key: STANDARD.encode(&[1u8; 33]),
+            signed_prekey_id: 1,
+            signed_prekey: STANDARD.encode(&[2u8; 33]),
+            signed_prekey_signature: STANDARD.encode(&[3u8; 64]),
+            prekey_id: Some(1),
+            prekey: Some(STANDARD.encode(&[4u8; 33])),
+            kyber_prekey_id: 1,
+            kyber_prekey: STANDARD.encode(&[5u8; 1569]),
+            kyber_prekey_signature: STANDARD.encode(&[6u8; 64]),
+        };
+
+        let bytes1 = bundle.to_binary().unwrap();
+        let bytes2 = bundle.to_binary().unwrap();
+
+        assert_eq!(bytes1, bytes2, "Binary serialization should be deterministic");
     }
 }

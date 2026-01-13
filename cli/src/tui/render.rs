@@ -26,7 +26,7 @@ use crate::{Agent, BrowserDimensions, PtyView, VpnStatus};
 
 /// Render the TUI and return ANSI output for browser streaming.
 ///
-/// Returns `(ansi_string, rows, cols)` for sending to connected browsers.
+/// Returns `(ansi_string, rows, cols, qr_image_written)` for sending to connected browsers.
 /// If `browser_dims` is provided, renders at those dimensions for proper layout.
 ///
 /// # Arguments
@@ -37,13 +37,14 @@ use crate::{Agent, BrowserDimensions, PtyView, VpnStatus};
 ///
 /// # Returns
 ///
-/// A tuple of (ANSI output string, rows, cols) for browser streaming.
+/// A tuple of (ANSI output string, rows, cols, qr_image_written) for browser streaming.
 /// If no browser is connected, returns empty string with 0 dimensions.
+/// The `qr_image_written` flag indicates if a QR image was written to stdout (for tracking).
 pub fn render(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     hub: &Hub,
     browser_dims: Option<BrowserDimensions>,
-) -> Result<(String, u16, u16)> {
+) -> Result<(String, u16, u16, bool)> {
     // Collect all state needed for rendering
     let agent_keys_ordered = hub.state.agent_keys_ordered.clone();
     let agents = &hub.state.agents;
@@ -174,34 +175,68 @@ pub fn render(
         }
 
         // Render modal overlays based on mode
-        match mode {
+        // Returns QrImageState if connection code modal needs Kitty image rendering
+        let qr_state: Option<QrImageState> = match mode {
             AppMode::Menu => {
                 render_menu_modal(f, &menu_items, menu_selected);
+                None
             }
             AppMode::NewAgentSelectWorktree => {
                 render_worktree_select_modal(f, &available_worktrees, worktree_selected);
+                None
             }
             AppMode::NewAgentCreateWorktree => {
                 render_create_worktree_modal(f, &input_buffer);
+                None
             }
             AppMode::NewAgentPrompt => {
                 render_prompt_modal(f, &input_buffer);
+                None
             }
             AppMode::CloseAgentConfirm => {
                 render_close_confirm_modal(f);
+                None
             }
             AppMode::ConnectionCode => {
-                render_connection_code_modal(f, connection_url.as_deref());
+                render_connection_code_modal(f, connection_url.as_deref())
             }
             AppMode::Error => {
                 render_error_modal(f, error_message.as_deref());
+                None
             }
-            AppMode::Normal => {}
-        }
+            AppMode::Normal => None,
+        };
+        qr_state
     };
 
+    // Capture QR image state from render
+    let mut captured_qr_state: Option<QrImageState> = None;
+
     // Always render to real terminal for local display
-    terminal.draw(|f| render_ui(f, agents))?;
+    terminal.draw(|f| {
+        captured_qr_state = render_ui(f, agents);
+    })?;
+
+    // Track whether we wrote a QR image (for preventing re-rendering)
+    let mut qr_image_written = false;
+
+    // If Kitty image needs to be rendered, write it after the frame
+    // IMPORTANT: Only write if not already displayed to prevent memory leak.
+    // Writing 60 images/second causes 150GB+ memory usage in terminal emulators.
+    if let Some(qr_state) = captured_qr_state {
+        if let Some(escape_seq) = qr_state.kitty_escape {
+            if !hub.qr_image_displayed {
+                use std::io::Write;
+                // Position cursor and write image
+                let cursor_pos = format!("\x1b[{};{}H", qr_state.row + 1, qr_state.col + 1);
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(cursor_pos.as_bytes());
+                let _ = stdout.write_all(escape_seq.as_bytes());
+                let _ = stdout.flush();
+                qr_image_written = true;
+            }
+        }
+    }
 
     // For browser streaming, render to browser-sized buffer if dimensions provided
     let (ansi_output, out_rows, out_cols) = if let Some(dims) = browser_dims {
@@ -240,7 +275,7 @@ pub fn render(
         (String::new(), 0, 0)
     };
 
-    Ok((ansi_output, out_rows, out_cols))
+    Ok((ansi_output, out_rows, out_cols, qr_image_written))
 }
 
 // === Modal Rendering Helpers ===
@@ -417,82 +452,133 @@ fn render_close_confirm_modal(f: &mut Frame) {
     f.render_widget(confirm_widget, area);
 }
 
-fn render_connection_code_modal(f: &mut Frame, connection_url: Option<&str>) {
-    use crate::tui::qr::generate_qr_code_lines;
+/// State for QR image rendering via Kitty graphics protocol.
+/// This is returned from render and should be written to stdout after the frame.
+#[derive(Default, Debug)]
+pub struct QrImageState {
+    /// If set, this escape sequence should be written to stdout after the frame.
+    pub kitty_escape: Option<String>,
+    /// Row position where the image should be displayed.
+    pub row: u16,
+    /// Column position where the image should be displayed.
+    pub col: u16,
+}
 
-    // Use the pre-generated connection URL
+fn render_connection_code_modal(f: &mut Frame, connection_url: Option<&str>) -> Option<QrImageState> {
+    use crate::tui::qr::{generate_qr_code_lines, generate_qr_kitty_image, QrRenderResult};
+    use ratatui::layout::Rect;
+
+    let terminal = f.area();
     let secure_url = connection_url.unwrap_or("Error: No connection URL generated");
 
-    // Content overhead for the modal
-    let header_lines = 2u16; // Title + blank line
-    let footer_lines = 2u16; // Blank line + help text
-    let border_overhead = 2u16;
-    let content_overhead = header_lines + footer_lines + border_overhead;
+    // Try Kitty graphics first (module_size=4 gives good balance of size/quality)
+    if let Some(QrRenderResult::KittyImage { escape_sequence, width_cells, height_cells }) =
+        generate_qr_kitty_image(secure_url, 4)
+    {
+        // Kitty image mode: render a compact modal sized to QR + text
+        let header = "Scan QR to connect securely";
+        let footer = "[c] copy URL  [Esc/q/Enter] close";
 
-    // Start with menu-sized modal (50% width), expand if needed for QR
-    let terminal = f.area();
-    let base_width = (terminal.width * 50) / 100;
-    let base_height = (terminal.height * 50) / 100;
+        // Modal sized to fit QR image + header/footer
+        let content_width = width_cells.max(header.len() as u16).max(footer.len() as u16);
+        let modal_width = content_width + 4; // +4 for borders and padding
+        let modal_height = height_cells + 6; // header, blank, image rows, blank, footer, borders
 
-    // Try generating QR at base size first
-    let base_qr_width = base_width.saturating_sub(2);
-    let base_qr_height = base_height.saturating_sub(content_overhead);
-    let qr_lines = generate_qr_code_lines(secure_url, base_qr_width, base_qr_height);
-    let qr_fits_base = !qr_lines.iter().any(|l| l.contains("Terminal"));
+        // Center the modal
+        let x = terminal.x + (terminal.width.saturating_sub(modal_width)) / 2;
+        let y = terminal.y + (terminal.height.saturating_sub(modal_height)) / 2;
+        let area = Rect::new(x, y, modal_width.min(terminal.width), modal_height.min(terminal.height));
 
-    // If QR doesn't fit at base size, try full terminal
-    let (area, qr_lines, qr_fits) = if qr_fits_base {
-        (centered_rect(50, 50, terminal), qr_lines, true)
+        f.render_widget(Clear, area);
+
+        // Build text with placeholder for image
+        let mut text_lines = vec![
+            Line::from(Span::styled(header, Style::default().add_modifier(Modifier::BOLD))),
+            Line::from(""),
+        ];
+
+        // Add empty lines where image will go
+        for _ in 0..height_cells {
+            text_lines.push(Line::from(""));
+        }
+
+        text_lines.push(Line::from(""));
+        text_lines.push(Line::from(Span::styled(footer, Style::default().add_modifier(Modifier::DIM))));
+
+        let code_widget = Paragraph::new(text_lines)
+            .block(Block::default().borders(Borders::ALL).title(" Secure Connection "))
+            .alignment(Alignment::Center);
+
+        f.render_widget(code_widget, area);
+
+        // Return image state - caller will write escape sequence after frame
+        // Center image within modal
+        let img_x = x + (modal_width.saturating_sub(width_cells)) / 2;
+        let img_y = y + 3; // After border + header + blank line
+
+        return Some(QrImageState {
+            kitty_escape: Some(escape_sequence),
+            row: img_y,
+            col: img_x,
+        });
+    }
+
+    // Fallback: text-based QR using Unicode half-blocks
+    let max_qr_width = terminal.width.saturating_sub(4);
+    let max_qr_height = terminal.height.saturating_sub(8);
+    let qr_lines = generate_qr_code_lines(secure_url, max_qr_width, max_qr_height);
+    let qr_fits = !qr_lines.iter().any(|l| l.contains("Terminal"));
+
+    let qr_width = qr_lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let qr_height = qr_lines.len() as u16;
+
+    let header = "Scan QR to connect securely";
+    let footer = if qr_fits {
+        "[c] copy URL  [Esc/q/Enter] close"
     } else {
-        // Try with nearly full terminal
-        let full_width = (terminal.width * 95) / 100;
-        let full_height = (terminal.height * 95) / 100;
-        let full_qr_width = full_width.saturating_sub(2);
-        let full_qr_height = full_height.saturating_sub(content_overhead);
-        let full_qr_lines = generate_qr_code_lines(secure_url, full_qr_width, full_qr_height);
-        let fits = !full_qr_lines.iter().any(|l| l.contains("Terminal"));
-        (centered_rect(95, 95, terminal), full_qr_lines, fits)
+        "Terminal graphics not supported. [c] copy URL  [Esc] close"
     };
+
+    let content_width = qr_width.max(header.len() as u16).max(footer.len() as u16);
+    let modal_width = content_width + 4;
+    let modal_height = qr_height + 6;
+
+    let x = terminal.x + (terminal.width.saturating_sub(modal_width)) / 2;
+    let y = terminal.y + (terminal.height.saturating_sub(modal_height)) / 2;
+    let area = Rect::new(x, y, modal_width.min(terminal.width), modal_height.min(terminal.height));
 
     f.render_widget(Clear, area);
 
     let mut text_lines = vec![
-        Line::from(Span::styled(
-            "Scan QR to connect securely",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled(header, Style::default().add_modifier(Modifier::BOLD))),
         Line::from(""),
     ];
 
-    // Add QR code lines
-    for qr_line in qr_lines {
-        text_lines.push(Line::from(qr_line));
+    for qr_line in &qr_lines {
+        text_lines.push(Line::from(qr_line.clone()));
+    }
+
+    if !qr_fits {
+        text_lines.push(Line::from(format!(
+            "(Terminal: {}x{}, need {}x{})",
+            terminal.width, terminal.height, qr_width + 4, qr_height + 6
+        )));
     }
 
     text_lines.push(Line::from(""));
-    if qr_fits {
-        // Use DIM modifier for help text instead of hardcoded color
-        text_lines.push(Line::from(Span::styled(
-            "[c] copy URL  [Esc/q/Enter] close",
-            Style::default().add_modifier(Modifier::DIM),
-        )));
-    } else {
-        // If QR doesn't fit, emphasize the copy option with BOLD
-        text_lines.push(Line::from(Span::styled(
-            "[c] copy URL to clipboard  [Esc] close",
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-    }
+    text_lines.push(Line::from(Span::styled(
+        footer,
+        if qr_fits { Style::default().add_modifier(Modifier::DIM) }
+        else { Style::default().add_modifier(Modifier::BOLD) },
+    )));
 
     let code_widget = Paragraph::new(text_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Secure Connection "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(" Secure Connection "))
         .alignment(Alignment::Center);
 
     f.render_widget(code_widget, area);
+
+    None
 }
 
 /// Render an error modal.

@@ -14,7 +14,7 @@
     <% if @hubs.any? %>
       <div class="space-y-3">
         <% @hubs.each do |hub| %>
-          <%= link_to hub_path(hub.identifier), class: "block bg-zinc-900 border border-zinc-800 hover:border-zinc-700 rounded-lg p-4 transition-colors group" do %>
+          <%= link_to hub_path(hub), class: "block bg-zinc-900 border border-zinc-800 hover:border-zinc-700 rounded-lg p-4 transition-colors group" do %>
             <div class="flex items-start justify-between">
               <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-3 mb-2">

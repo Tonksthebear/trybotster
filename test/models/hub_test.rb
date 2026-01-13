@@ -83,42 +83,62 @@ class HubTest < ActiveSupport::TestCase
     assert_includes duplicate.errors[:identifier], "has already been taken"
   end
 
-  test "active scope returns hubs seen within 2 minutes" do
+  test "active scope returns hubs that are alive and seen within 2 minutes" do
     active_hub = Hub.create!(
       user: @user,
       repo: "owner/active",
       identifier: SecureRandom.uuid,
-      last_seen_at: 1.minute.ago
+      last_seen_at: 1.minute.ago,
+      alive: true
     )
     stale_hub = Hub.create!(
       user: @user,
       repo: "owner/stale",
       identifier: SecureRandom.uuid,
-      last_seen_at: 5.minutes.ago
+      last_seen_at: 5.minutes.ago,
+      alive: true
+    )
+    dead_hub = Hub.create!(
+      user: @user,
+      repo: "owner/dead",
+      identifier: SecureRandom.uuid,
+      last_seen_at: 1.minute.ago,
+      alive: false
     )
 
     active_hubs = Hub.active
     assert_includes active_hubs, active_hub
     assert_not_includes active_hubs, stale_hub
+    assert_not_includes active_hubs, dead_hub
   end
 
-  test "stale scope returns hubs not seen within 2 minutes" do
+  test "stale scope returns hubs that are dead or not seen within 2 minutes" do
     active_hub = Hub.create!(
       user: @user,
       repo: "owner/active",
       identifier: SecureRandom.uuid,
-      last_seen_at: 1.minute.ago
+      last_seen_at: 1.minute.ago,
+      alive: true
     )
     stale_hub = Hub.create!(
       user: @user,
       repo: "owner/stale",
       identifier: SecureRandom.uuid,
-      last_seen_at: 5.minutes.ago
+      last_seen_at: 5.minutes.ago,
+      alive: true
+    )
+    dead_hub = Hub.create!(
+      user: @user,
+      repo: "owner/dead",
+      identifier: SecureRandom.uuid,
+      last_seen_at: 1.minute.ago,
+      alive: false
     )
 
     stale_hubs = Hub.stale
     assert_not_includes stale_hubs, active_hub
     assert_includes stale_hubs, stale_hub
+    assert_includes stale_hubs, dead_hub
   end
 
   test "for_repo scope filters by repo" do
@@ -140,12 +160,13 @@ class HubTest < ActiveSupport::TestCase
     assert_not_includes result, hub2
   end
 
-  test "active? returns true for hub seen within 2 minutes" do
+  test "active? returns true for alive hub seen within 2 minutes" do
     hub = Hub.new(
       user: @user,
       repo: "owner/repo",
       identifier: SecureRandom.uuid,
-      last_seen_at: 1.minute.ago
+      last_seen_at: 1.minute.ago,
+      alive: true
     )
     assert hub.active?
   end
@@ -155,17 +176,30 @@ class HubTest < ActiveSupport::TestCase
       user: @user,
       repo: "owner/repo",
       identifier: SecureRandom.uuid,
-      last_seen_at: 5.minutes.ago
+      last_seen_at: 5.minutes.ago,
+      alive: true
     )
     assert_not hub.active?
   end
 
-  test "active? returns true for hub seen just now" do
+  test "active? returns false for dead hub even if recently seen" do
     hub = Hub.new(
       user: @user,
       repo: "owner/repo",
       identifier: SecureRandom.uuid,
-      last_seen_at: Time.current
+      last_seen_at: 1.minute.ago,
+      alive: false
+    )
+    assert_not hub.active?
+  end
+
+  test "active? returns true for alive hub seen just now" do
+    hub = Hub.new(
+      user: @user,
+      repo: "owner/repo",
+      identifier: SecureRandom.uuid,
+      last_seen_at: Time.current,
+      alive: true
     )
     assert hub.active?
   end
@@ -175,7 +209,8 @@ class HubTest < ActiveSupport::TestCase
       user: @user,
       repo: "owner/repo",
       identifier: SecureRandom.uuid,
-      last_seen_at: 2.minutes.ago
+      last_seen_at: 2.minutes.ago,
+      alive: true
     )
     assert_not hub.active?
   end

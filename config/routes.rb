@@ -18,8 +18,10 @@ Rails.application.routes.draw do
     resources :hubs, only: [ :new, :create ]
   end
 
-  # Hubs - the central resource
-  resources :hubs, param: :identifier, only: [ :index, :show, :update, :destroy ] do
+  # Hubs - the central resource (uses Rails ID, not local identifier)
+  # POST /hubs - CLI registration (returns Rails ID)
+  # PUT /hubs/:id - CLI heartbeat (updates existing hub)
+  resources :hubs, only: [ :index, :show, :create, :update, :destroy ] do
     collection do
       scope module: :hubs do
         resources :codes, only: [ :create, :show ]

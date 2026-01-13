@@ -4,8 +4,8 @@ class HubsController < ApplicationController
   include ApiKeyAuthenticatable
 
   before_action :authenticate_user!, only: [ :index, :show ]
-  before_action :authenticate_hub_request!, only: [ :update, :destroy ]
-  before_action :set_hub, only: [ :show, :destroy ]
+  before_action :authenticate_hub_request!, only: [ :create, :update, :destroy ]
+  before_action :set_hub, only: [ :show, :update, :destroy ]
 
   # GET /hubs
   # Dashboard showing list of hubs with health status
@@ -13,9 +13,9 @@ class HubsController < ApplicationController
     @hubs = current_user.hubs.active.includes(:device, :hub_agents)
   end
 
-  # GET /hubs/:identifier
+  # GET /hubs/:id
   # Terminal view for a specific hub
-  # URL fragment contains E2E key: /hubs/:identifier#key=...
+  # URL fragment contains E2E key: /hubs/:id#<bundle>
   def show
     unless @hub
       redirect_to hubs_path, alert: "Hub not found"
@@ -25,35 +25,64 @@ class HubsController < ApplicationController
     @browser_device = current_user.devices.browser_devices.order(last_seen_at: :desc).first
   end
 
-  # PUT /hubs/:identifier
-  # Upsert: create or update hub by identifier (CLI heartbeat)
-  def update
+  # POST /hubs
+  # CLI registration: creates or finds hub and returns Rails ID
+  # Called once at CLI startup before QR code generation
+  def create
     hub = current_hub_user.hubs.find_or_initialize_by(identifier: params[:identifier])
+    is_new = hub.new_record?
     hub.repo = params[:repo]
     hub.last_seen_at = Time.current
+    hub.alive = true
 
-    # Associate with device if device_id provided
     if params[:device_id].present?
       device = current_hub_user.devices.find_by(id: params[:device_id])
       hub.device = device if device
     end
 
     if hub.save
-      hub.sync_agents(params[:agents] || [])
-      hub.broadcast_update!
-
-      render json: { success: true, hub_id: hub.id, e2e_enabled: hub.e2e_enabled? }
+      status = is_new ? :created : :ok
+      render json: { id: hub.id, identifier: hub.identifier }, status: status
     else
       render json: { error: hub.errors.full_messages.join(", ") }, status: :unprocessable_entity
     end
   end
 
-  # DELETE /hubs/:identifier
+  # PUT /hubs/:id
+  # CLI heartbeat: updates existing hub by Rails ID
+  def update
+    unless @hub
+      render json: { error: "Hub not found" }, status: :not_found
+      return
+    end
+
+    @hub.repo = params[:repo] if params[:repo].present?
+    @hub.last_seen_at = Time.current
+    @hub.alive = true
+
+    if params[:device_id].present?
+      device = current_hub_user.devices.find_by(id: params[:device_id])
+      @hub.device = device if device
+    end
+
+    if @hub.save
+      @hub.sync_agents(params[:agents] || [])
+      @hub.broadcast_update!
+
+      render json: { success: true, hub_id: @hub.id, e2e_enabled: @hub.e2e_enabled? }
+    else
+      render json: { error: @hub.errors.full_messages.join(", ") }, status: :unprocessable_entity
+    end
+  end
+
+  # DELETE /hubs/:id
   # Called when CLI shuts down gracefully
+  # Sets alive=false to mark offline while preserving hub ID for reconnection.
+  # Browser sessions are tied to hub ID, so destroying breaks reconnection.
   def destroy
     if @hub
       @hub.broadcast_removal!
-      @hub.destroy
+      @hub.update!(alive: false)
       render json: { success: true }
     else
       render json: { success: true } # Idempotent - already gone is fine
@@ -77,6 +106,6 @@ class HubsController < ApplicationController
   end
 
   def set_hub
-    @hub = current_hub_user.hubs.find_by(identifier: params[:identifier])
+    @hub = current_hub_user.hubs.find_by(id: params[:id])
   end
 end

@@ -6,7 +6,7 @@
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Tailscale version to embed.

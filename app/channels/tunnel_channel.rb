@@ -2,15 +2,14 @@
 
 class TunnelChannel < ApplicationCable::Channel
   def subscribed
-    # Store the hub identifier for later use
-    # We stream based on identifier, not DB id, so the hub doesn't need to exist yet
-    @hub_identifier = params[:hub_id]
+    # Store the hub ID for later use
+    @hub_id = params[:hub_id]
     @user_id = current_user.id
 
-    Rails.logger.info "[TunnelChannel] Subscribed: user=#{@user_id} hub=#{@hub_identifier}"
+    Rails.logger.info "[TunnelChannel] Subscribed: user=#{@user_id} hub=#{@hub_id}"
 
-    # Stream for this hub identifier - hub record will be created by heartbeat
-    stream_from "tunnel_hub_#{@user_id}_#{@hub_identifier}"
+    # Stream for this hub - uses Rails ID for consistency
+    stream_from "tunnel_hub_#{@user_id}_#{@hub_id}"
   rescue => e
     Rails.logger.error "[TunnelChannel] Error in subscribed: #{e.class} - #{e.message}"
     Rails.logger.error e.backtrace.first(5).join("\n")
@@ -19,16 +18,16 @@ class TunnelChannel < ApplicationCable::Channel
 
   def unsubscribed
     # Mark all agents' tunnels as disconnected
-    hub = current_user.hubs.find_by(identifier: @hub_identifier)
+    hub = current_user.hubs.find_by(id: @hub_id)
     hub&.hub_agents&.tunnel_connected&.update_all(tunnel_status: "disconnected")
   end
 
   # CLI registers an agent's tunnel port
   # Note: Agent may not exist yet if this arrives before heartbeat, so we create it
   def register_agent_tunnel(data)
-    hub = current_user.hubs.find_by(identifier: @hub_identifier)
+    hub = current_user.hubs.find_by(id: @hub_id)
     unless hub
-      Rails.logger.warn "[TunnelChannel] Hub not found: #{@hub_identifier}"
+      Rails.logger.warn "[TunnelChannel] Hub not found: #{@hub_id}"
       return
     end
 

@@ -51,10 +51,116 @@ export async function initSignal(wasmJsPath, wasmBgPath) {
 }
 
 /**
- * Parse PreKeyBundle from URL fragment.
- * Expected format: #bundle=<base64_json>
+ * Decode Base32 (RFC 4648) to Uint8Array.
+ * Used for QR code URLs which use Base32 for alphanumeric mode efficiency.
+ */
+function base32Decode(base32) {
+  base32 = base32.toUpperCase().replace(/=+$/, "").replace(/[^A-Z2-7]/g, "");
+
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = "";
+  for (const c of base32) {
+    const i = alphabet.indexOf(c);
+    if (i < 0) throw new Error(`Invalid Base32 character: ${c}`);
+    bits += i.toString(2).padStart(5, "0");
+  }
+
+  // Trim any incomplete byte at the end
+  const byteCount = Math.floor(bits.length / 8);
+  const bytes = new Uint8Array(byteCount);
+  for (let i = 0; i < byteCount; i++) {
+    bytes[i] = parseInt(bits.slice(i * 8, i * 8 + 8), 2);
+  }
+  return bytes;
+}
+
+/**
+ * Convert Uint8Array to Base64 string.
+ */
+function bytesToBase64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+/**
+ * Read little-endian u32 from byte array.
+ */
+function readU32LE(bytes, offset) {
+  return (
+    bytes[offset] |
+    (bytes[offset + 1] << 8) |
+    (bytes[offset + 2] << 16) |
+    (bytes[offset + 3] << 24)
+  ) >>> 0;
+}
+
+/**
+ * Parse binary PreKeyBundle format from CLI.
  *
- * Handles both URL-safe base64 (-/_) and standard base64 (+/).
+ * Binary format (1813 bytes total):
+ * - version: 1 byte
+ * - registration_id: 4 bytes (LE)
+ * - identity_key: 33 bytes
+ * - signed_prekey_id: 4 bytes (LE)
+ * - signed_prekey: 33 bytes
+ * - signed_prekey_signature: 64 bytes
+ * - prekey_id: 4 bytes (LE)
+ * - prekey: 33 bytes
+ * - kyber_prekey_id: 4 bytes (LE)
+ * - kyber_prekey: 1569 bytes
+ * - kyber_prekey_signature: 64 bytes
+ */
+function parseBinaryBundle(bytes) {
+  // Offsets matching Rust binary_format module
+  const VERSION_OFFSET = 0;
+  const REGISTRATION_ID_OFFSET = 1;
+  const IDENTITY_KEY_OFFSET = 5;
+  const SIGNED_PREKEY_ID_OFFSET = 38;
+  const SIGNED_PREKEY_OFFSET = 42;
+  const SIGNED_PREKEY_SIG_OFFSET = 75;
+  const PREKEY_ID_OFFSET = 139;
+  const PREKEY_OFFSET = 143;
+  const KYBER_PREKEY_ID_OFFSET = 176;
+  const KYBER_PREKEY_OFFSET = 180;
+  const KYBER_PREKEY_SIG_OFFSET = 1749;
+  const TOTAL_SIZE = 1813;
+
+  if (bytes.length !== TOTAL_SIZE) {
+    throw new Error(`Invalid bundle size: ${bytes.length}, expected ${TOTAL_SIZE}`);
+  }
+
+  const bundle = {
+    version: bytes[VERSION_OFFSET],
+    registration_id: readU32LE(bytes, REGISTRATION_ID_OFFSET),
+    identity_key: bytesToBase64(bytes.slice(IDENTITY_KEY_OFFSET, IDENTITY_KEY_OFFSET + 33)),
+    signed_prekey_id: readU32LE(bytes, SIGNED_PREKEY_ID_OFFSET),
+    signed_prekey: bytesToBase64(bytes.slice(SIGNED_PREKEY_OFFSET, SIGNED_PREKEY_OFFSET + 33)),
+    signed_prekey_signature: bytesToBase64(bytes.slice(SIGNED_PREKEY_SIG_OFFSET, SIGNED_PREKEY_SIG_OFFSET + 64)),
+    prekey_id: readU32LE(bytes, PREKEY_ID_OFFSET),
+    prekey: bytesToBase64(bytes.slice(PREKEY_OFFSET, PREKEY_OFFSET + 33)),
+    kyber_prekey_id: readU32LE(bytes, KYBER_PREKEY_ID_OFFSET),
+    kyber_prekey: bytesToBase64(bytes.slice(KYBER_PREKEY_OFFSET, KYBER_PREKEY_OFFSET + 1569)),
+    kyber_prekey_signature: bytesToBase64(bytes.slice(KYBER_PREKEY_SIG_OFFSET, KYBER_PREKEY_SIG_OFFSET + 64)),
+  };
+
+  // If prekey_id is 0, there's no prekey
+  if (bundle.prekey_id === 0) {
+    bundle.prekey_id = null;
+    bundle.prekey = null;
+  }
+
+  return bundle;
+}
+
+/**
+ * Parse PreKeyBundle from URL fragment.
+ * Expected format: #bundle=<base32_binary>
+ *
+ * The bundle is Base32-encoded binary (not JSON) for QR code efficiency.
+ * Base32 uses only A-Z and 2-7, enabling QR alphanumeric mode.
  */
 export function parseBundleFromFragment() {
   const hash = window.location.hash;
@@ -65,26 +171,33 @@ export function parseBundleFromFragment() {
     return null;
   }
 
-  const match = hash.match(/bundle=([^&]+)/);
-  if (!match) {
-    console.log("[Signal] No bundle= found in hash");
+  // Fragment is raw Base32 data (no prefix) for QR alphanumeric mode efficiency
+  // Strip leading # if present
+  const base32Data = hash.startsWith("#") ? hash.slice(1) : hash;
+  if (!base32Data || base32Data.length < 100) {
+    console.log("[Signal] No valid bundle in hash");
     return null;
   }
 
-  console.log("[Signal] Found bundle, length:", match[1].length);
+  console.log("[Signal] Found bundle, Base32 length:", base32Data.length);
 
   try {
-    // Convert URL-safe base64 to standard base64 (handles both formats)
-    let base64 = match[1].replace(/-/g, "+").replace(/_/g, "/");
+    // Decode Base32 to binary
+    const bytes = base32Decode(base32Data);
+    console.log("[Signal] Decoded to", bytes.length, "bytes");
 
-    // Add padding if needed
-    const padding = base64.length % 4;
-    if (padding === 2) base64 += "==";
-    else if (padding === 3) base64 += "=";
+    // Parse binary format
+    const bundle = parseBinaryBundle(bytes);
 
-    const decoded = atob(base64);
-    const bundle = JSON.parse(decoded);
-    console.log("[Signal] Successfully parsed bundle for hub:", bundle.hub_id);
+    // Add fields not in binary format (they come from URL path)
+    // hub_id from URL: /hubs/{hub_id}
+    const hubMatch = window.location.pathname.match(/\/hubs\/([^\/]+)/);
+    bundle.hub_id = hubMatch ? hubMatch[1] : "";
+
+    // device_id: CLI is always device 1
+    bundle.device_id = 1;
+
+    console.log("[Signal] Successfully parsed binary bundle, version:", bundle.version, "hub:", bundle.hub_id);
     return bundle;
   } catch (error) {
     console.error("[Signal] Failed to parse bundle from fragment:", error);

@@ -95,6 +95,8 @@ module GithubTestHelper
     # Save original methods
     original_get_installation = Github::App.method(:get_installation_for_repo)
     original_installation_client = Github::App.method(:installation_client)
+    original_get_installation_token = Github::App.method(:get_installation_token)
+    original_client = Github::App.method(:client)
 
     # Create mock response for get_installation_for_repo
     installation_response = {
@@ -104,13 +106,26 @@ module GithubTestHelper
       account_type: "Organization"
     }
 
-    # Create mock client for installation_client
+    # Create mock response for get_installation_token
+    token_response = {
+      success: true,
+      token: "ghs_stubbed_token_123"
+    }
+
+    # Create mock client for installation_client and client
     mock_comment = sawyer_resource(
       html_url: comment_url,
       id: 123,
       body: "test comment"
     )
-    mock_client = mock_octokit_client(add_comment: mock_comment)
+    mock_pr = sawyer_resource(
+      body: "",  # Empty body = no linked issues
+      number: 100
+    )
+    mock_client = mock_octokit_client(
+      add_comment: mock_comment,
+      pull_request: mock_pr
+    )
 
     # Replace with stubs
     Github::App.define_singleton_method(:get_installation_for_repo) do |*_args|
@@ -121,10 +136,20 @@ module GithubTestHelper
       mock_client
     end
 
+    Github::App.define_singleton_method(:get_installation_token) do |*_args|
+      token_response
+    end
+
+    Github::App.define_singleton_method(:client) do |*_args|
+      mock_client
+    end
+
     yield
   ensure
     # Restore original methods
     Github::App.define_singleton_method(:get_installation_for_repo, original_get_installation)
     Github::App.define_singleton_method(:installation_client, original_installation_client)
+    Github::App.define_singleton_method(:get_installation_token, original_get_installation_token)
+    Github::App.define_singleton_method(:client, original_client)
   end
 end

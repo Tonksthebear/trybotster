@@ -44,16 +44,22 @@ pub fn register_device(
     }
 }
 
-/// Register the hub with the server before connecting to channels.
+/// Register the hub with the server and get the Rails-assigned ID.
 ///
-/// This creates the Hub record on the server so that the terminal
-/// relay channel can find it when the CLI subscribes.
+/// This creates the Hub record on the server and returns the database ID
+/// which should be used for all subsequent URLs and WebSocket subscriptions
+/// to guarantee uniqueness.
+///
+/// # Returns
+///
+/// The Rails-assigned hub ID as a string, or the local identifier if
+/// registration fails (for offline/degraded mode).
 pub fn register_hub_with_server(
-    hub_identifier: &str,
+    local_identifier: &str,
     server_url: &str,
     api_key: &str,
     device_id: Option<i64>,
-) {
+) -> String {
     // Detect repo: env var > git detection > test fallback > error
     let repo_name = std::env::var("BOTSTER_REPO").ok()
         .or_else(|| {
@@ -70,32 +76,49 @@ pub fn register_hub_with_server(
             }
         });
 
-    let url = format!("{server_url}/hubs/{hub_identifier}");
+    // POST /hubs to register and get server-assigned ID
+    let url = format!("{server_url}/hubs");
     let payload = serde_json::json!({
+        "identifier": local_identifier,
         "repo": repo_name,
-        "agents": [],
         "device_id": device_id,
     });
 
-    log::info!("Registering hub with server before channel connections...");
+    log::info!("Registering hub with server to get Botster ID...");
     match reqwest::blocking::Client::new()
-        .put(&url)
+        .post(&url)
         .header("Content-Type", "application/json")
-        .header("X-Hub-Identifier", hub_identifier)
         .bearer_auth(api_key)
         .json(&payload)
         .send()
     {
         Ok(response) if response.status().is_success() => {
-            log::info!("Hub registered successfully");
+            // Parse response to get server-assigned ID
+            match response.json::<serde_json::Value>() {
+                Ok(json) => {
+                    if let Some(id) = json.get("id").and_then(|v| v.as_i64()) {
+                        let botster_id = id.to_string();
+                        log::info!("Hub registered with Botster ID: {botster_id}");
+                        return botster_id;
+                    }
+                    log::warn!("Response missing 'id' field, using local identifier");
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse registration response: {e}");
+                }
+            }
         }
         Ok(response) => {
             log::warn!("Hub registration returned status: {}", response.status());
         }
         Err(e) => {
-            log::warn!("Failed to register hub: {e} - channels may not work");
+            log::warn!("Failed to register hub: {e} - using local identifier");
         }
     }
+
+    // Fallback to local identifier if registration fails
+    log::info!("Using local identifier as fallback: {local_identifier}");
+    local_identifier.to_string()
 }
 
 /// Start the tunnel connection in background.
@@ -130,7 +153,8 @@ pub fn start_tunnel(
 /// or logs a warning and continues if connection fails.
 pub fn connect_terminal_relay(
     browser: &mut BrowserState,
-    hub_identifier: &str,
+    server_hub_id: &str,
+    local_identifier: &str,
     server_url: &str,
     api_key: &str,
     _runtime: &tokio::runtime::Runtime,
@@ -138,7 +162,8 @@ pub fn connect_terminal_relay(
     use std::sync::mpsc as std_mpsc;
     use tokio::sync::mpsc;
 
-    let hub_id = hub_identifier.to_string();
+    let server_id = server_hub_id.to_string();
+    let local_id = local_identifier.to_string();
     let server = server_url.to_string();
     let key = api_key.to_string();
 
@@ -157,8 +182,8 @@ pub fn connect_terminal_relay(
         let local = tokio::task::LocalSet::new();
 
         local.block_on(&rt, async {
-            // Load or create Signal Protocol manager
-            let signal_manager = match SignalProtocolManager::load_or_create(&hub_id).await {
+            // Load or create Signal Protocol manager (uses local identifier for config)
+            let signal_manager = match SignalProtocolManager::load_or_create(&local_id).await {
                 Ok(manager) => manager,
                 Err(e) => {
                     log::error!("Failed to load/create Signal Protocol manager: {e}");
@@ -185,9 +210,10 @@ pub fn connect_terminal_relay(
             // Send bundle back to main thread
             let _ = bundle_tx.send(Some(bundle));
 
+            // Terminal relay uses server ID for channel subscription
             let relay = TerminalRelay::new(
                 signal_manager,
-                hub_id.clone(),
+                server_id.clone(),
                 server,
                 key,
             );
@@ -215,17 +241,21 @@ pub fn connect_terminal_relay(
     match bundle_rx.recv_timeout(std::time::Duration::from_secs(10)) {
         Ok(Some(bundle)) => {
             // Build connection URL and write to file for external access (testing/automation)
-            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+            use data_encoding::BASE32_NOPAD;
             use crate::relay::write_connection_url;
 
-            if let Ok(json) = serde_json::to_string(&bundle) {
-                let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
+            if let Ok(bytes) = bundle.to_binary() {
+                let encoded = BASE32_NOPAD.encode(&bytes);
+                // Mixed-mode QR: byte for URL, alphanumeric for Base32 bundle
+                // URL uses server ID, file uses local identifier for config path
                 let connection_url = format!(
-                    "{}/hubs/{}#bundle={}",
-                    server_url, hub_identifier, encoded
+                    "{}/hubs/{}#{}",
+                    server_url,
+                    server_hub_id,
+                    encoded
                 );
 
-                if let Err(e) = write_connection_url(hub_identifier, &connection_url) {
+                if let Err(e) = write_connection_url(local_identifier, &connection_url) {
                     log::warn!("Failed to write connection URL: {e}");
                 } else {
                     log::info!("Connection URL available for external access");

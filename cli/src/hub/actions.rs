@@ -468,6 +468,13 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         }
 
         HubAction::CloseModal => {
+            // If closing ConnectionCode modal, delete any Kitty graphics images
+            if hub.mode == AppMode::ConnectionCode {
+                use crate::tui::qr::kitty_delete_images;
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(kitty_delete_images().as_bytes());
+                let _ = std::io::stdout().flush();
+            }
             hub.mode = AppMode::Normal;
             hub.input_buffer.clear();
             hub.error_message = None; // Clear error message if in Error mode
@@ -475,22 +482,30 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
 
         HubAction::ShowConnectionCode => {
             // Generate connection URL with Signal PreKeyBundle
-            // Format: /hubs/{id}#bundle={base64_json_bundle}
-            // Hub ID is in the path, bundle is in the fragment (never sent to server)
+            // Format: /hubs/{id}#{base32_binary_bundle}
+            // - All uppercase for QR alphanumeric mode (4296 char capacity vs 2953 byte mode)
+            // - Binary format (1813 bytes) + Base32 = ~2900 chars (fits easily)
+            // - Hub ID in path, bundle in fragment (never sent to server)
             hub.connection_url = if let Some(ref bundle) = hub.browser.signal_bundle {
-                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-                match serde_json::to_string(bundle) {
-                    Ok(json) => {
-                        let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
-                        Some(format!(
-                            "{}/hubs/{}#bundle={}",
+                use data_encoding::BASE32_NOPAD;
+                match bundle.to_binary() {
+                    Ok(bytes) => {
+                        let encoded = BASE32_NOPAD.encode(&bytes);
+                        // URL uses mixed-mode QR encoding:
+                        // - URL portion (up to #): byte mode (any case allowed)
+                        // - Bundle (after #): alphanumeric mode (must be uppercase Base32)
+                        // Rails ID is numeric, uppercase is no-op but harmless
+                        let url = format!(
+                            "{}/hubs/{}#{}",
                             hub.config.server_url,
-                            hub.hub_identifier,
+                            hub.server_hub_id(),
                             encoded
-                        ))
+                        );
+                        log::debug!("Connection URL: {} chars (QR alphanumeric capacity: 4296)", url.len());
+                        Some(url)
                     }
                     Err(e) => {
-                        log::error!("Cannot serialize PreKeyBundle: {e}");
+                        log::error!("Cannot serialize PreKeyBundle to binary: {e}");
                         None
                     }
                 }
@@ -498,6 +513,8 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
                 log::error!("Cannot show connection code: Signal bundle not initialized");
                 None
             };
+            // Reset QR image flag so it renders fresh when modal opens
+            hub.qr_image_displayed = false;
             hub.mode = AppMode::ConnectionCode;
         }
 
@@ -3238,5 +3255,68 @@ mod tests {
 
         assert_eq!(hub.mode, AppMode::Normal);
         assert!(hub.error_message.is_none());
+    }
+
+    /// TEST: Connection code modal can be closed after resize event.
+    ///
+    /// Regression test for: resizing while connection info is displayed
+    /// prevents Escape from closing the modal.
+    #[test]
+    fn test_connection_code_close_after_resize() {
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // Open connection code modal
+        dispatch(&mut hub, HubAction::ShowConnectionCode);
+        assert_eq!(hub.mode, AppMode::ConnectionCode);
+
+        // Simulate a resize event (as would happen when user resizes terminal)
+        dispatch(&mut hub, HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            rows: 100,
+            cols: 200,
+        });
+
+        // Mode should still be ConnectionCode after resize
+        assert_eq!(
+            hub.mode, AppMode::ConnectionCode,
+            "Resize should not change mode from ConnectionCode"
+        );
+
+        // Close modal (simulates pressing Escape)
+        dispatch(&mut hub, HubAction::CloseModal);
+
+        // Should return to Normal mode
+        assert_eq!(
+            hub.mode, AppMode::Normal,
+            "CloseModal should return to Normal mode even after resize"
+        );
+    }
+
+    /// TEST: Connection code modal survives multiple resize events.
+    #[test]
+    fn test_connection_code_survives_multiple_resizes() {
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        // Open connection code modal
+        dispatch(&mut hub, HubAction::ShowConnectionCode);
+        assert_eq!(hub.mode, AppMode::ConnectionCode);
+
+        // Multiple rapid resize events
+        for i in 0..5 {
+            dispatch(&mut hub, HubAction::ResizeForClient {
+                client_id: ClientId::Tui,
+                rows: 50 + i * 10,
+                cols: 150 + i * 10,
+            });
+        }
+
+        // Mode should still be ConnectionCode
+        assert_eq!(hub.mode, AppMode::ConnectionCode);
+
+        // Close should work
+        dispatch(&mut hub, HubAction::CloseModal);
+        assert_eq!(hub.mode, AppMode::Normal);
     }
 }
