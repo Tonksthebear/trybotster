@@ -211,6 +211,7 @@ pub fn connect_terminal_relay(
             let _ = bundle_tx.send(Some(bundle));
 
             // Terminal relay uses server ID for channel subscription
+            // Relay handles reconnection internally with exponential backoff
             let relay = TerminalRelay::new(
                 signal_manager,
                 server_id.clone(),
@@ -219,18 +220,18 @@ pub fn connect_terminal_relay(
             );
 
             match relay.connect_with_event_channel(event_tx).await {
-                Ok(sender) => {
-                    log::info!("Connected to terminal relay for E2E encrypted browser access");
+                Ok((sender, _shutdown_rx)) => {
+                    log::info!("Terminal relay started with auto-reconnection");
                     let _ = sender_tx.send(Some(sender));
 
-                    // Keep the LocalSet running forever to process messages
-                    // The spawned tasks inside connect_with_event_channel will handle messages
+                    // Keep the LocalSet running forever
+                    // The relay task handles reconnection internally
                     loop {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
                     }
                 }
                 Err(e) => {
-                    log::warn!("Failed to connect to terminal relay: {e} - browser access disabled");
+                    log::warn!("Failed to start terminal relay: {e} - browser access disabled");
                     let _ = sender_tx.send(None);
                 }
             }

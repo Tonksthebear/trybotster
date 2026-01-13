@@ -5,6 +5,7 @@
 //! - E2E encryption using Signal Protocol (X3DH + Double Ratchet)
 //! - Relaying encrypted terminal output to browser
 //! - Receiving encrypted terminal input from browser
+//! - Automatic reconnection with exponential backoff
 //!
 //! # Protocol
 //!
@@ -29,7 +30,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message};
 
 use data_encoding::BASE32_NOPAD;
@@ -37,6 +39,10 @@ use data_encoding::BASE32_NOPAD;
 use super::signal::{SignalEnvelope, SignalProtocolManager};
 use super::state::IdentifiedBrowserEvent;
 use super::types::{BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage};
+
+/// Reconnection backoff configuration.
+const INITIAL_BACKOFF_SECS: u64 = 1;
+const MAX_BACKOFF_SECS: u64 = 30;
 
 /// Action Cable message format.
 #[derive(Debug, Serialize, Deserialize)]
@@ -165,13 +171,14 @@ impl TerminalRelay {
     /// Returns:
     /// - `TerminalOutputSender` - for sending terminal output to browser
     /// - `mpsc::Receiver<IdentifiedBrowserEvent>` - for receiving events from browser with identity
+    /// - `oneshot::Receiver<()>` - signals when the relay task exits permanently
     ///
-    /// The relay runs on the current task using select! to multiplex I/O.
-    /// This is required because Signal Protocol futures are not Send.
-    pub async fn connect(self) -> Result<(TerminalOutputSender, mpsc::Receiver<IdentifiedBrowserEvent>)> {
+    /// The relay automatically reconnects on WebSocket disconnection with exponential backoff.
+    /// The shutdown receiver only fires when the entire relay task exits (rare).
+    pub async fn connect(self) -> Result<(TerminalOutputSender, mpsc::Receiver<IdentifiedBrowserEvent>, oneshot::Receiver<()>)> {
         let (event_tx, event_rx) = mpsc::channel::<IdentifiedBrowserEvent>(100);
-        let sender = self.connect_with_event_channel(event_tx).await?;
-        Ok((sender, event_rx))
+        let (sender, shutdown_rx) = self.connect_with_event_channel(event_tx).await?;
+        Ok((sender, event_rx, shutdown_rx))
     }
 
     /// Connect to Action Cable with an external event channel.
@@ -179,16 +186,126 @@ impl TerminalRelay {
     /// This variant is used when the caller needs to manage the event channel
     /// separately (e.g., for cross-thread communication).
     ///
-    /// Returns `TerminalOutputSender` for sending terminal output to browser.
+    /// Returns:
+    /// - `TerminalOutputSender` for sending terminal output to browser
+    /// - `oneshot::Receiver<()>` that fires when the relay task exits permanently
+    ///
     /// Events are sent to the provided `event_tx` channel with browser identity attached.
+    /// The relay automatically reconnects on WebSocket disconnection with exponential backoff.
     pub async fn connect_with_event_channel(
-        mut self,
+        self,
         event_tx: mpsc::Sender<IdentifiedBrowserEvent>,
-    ) -> Result<TerminalOutputSender> {
-        let ws_url = self.build_ws_url();
-        let hub_identifier = self.hub_identifier.clone();
+    ) -> Result<(TerminalOutputSender, oneshot::Receiver<()>)> {
+        // Create channel for terminal output (lives across reconnections)
+        let (output_tx, output_rx) = mpsc::channel::<OutputMessage>(100);
 
-        log::info!("Connecting to Action Cable: {}", ws_url);
+        // Shared connection state
+        let connected = Arc::new(RwLock::new(false));
+
+        // Create output sender handle
+        let output_sender = TerminalOutputSender {
+            tx: output_tx,
+            connected: Arc::clone(&connected),
+        };
+
+        // Shutdown signal - fires when relay task exits permanently
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        // Spawn reconnection task
+        let hub_identifier = self.hub_identifier.clone();
+        let server_url = self.server_url.clone();
+        let api_key = self.api_key.clone();
+        let signal_manager = self.signal_manager;
+
+        tokio::task::spawn_local(async move {
+            // Ensure shutdown signal is sent when task exits
+            let _shutdown_guard = scopeguard::guard(shutdown_tx, |tx| {
+                let _ = tx.send(());
+            });
+
+            Self::run_with_reconnection(
+                signal_manager,
+                hub_identifier,
+                server_url,
+                api_key,
+                output_rx,
+                connected,
+                event_tx,
+            ).await;
+        });
+
+        Ok((output_sender, shutdown_rx))
+    }
+
+    /// Run the relay with automatic reconnection on WebSocket failure.
+    async fn run_with_reconnection(
+        mut signal_manager: SignalProtocolManager,
+        hub_identifier: String,
+        server_url: String,
+        api_key: String,
+        mut output_rx: mpsc::Receiver<OutputMessage>,
+        connected: Arc<RwLock<bool>>,
+        event_tx: mpsc::Sender<IdentifiedBrowserEvent>,
+    ) {
+        let mut backoff_secs = INITIAL_BACKOFF_SECS;
+        let mut browser_identities: HashSet<String> = HashSet::new();
+
+        loop {
+            // Attempt to connect
+            match Self::connect_websocket(&server_url, &api_key, &hub_identifier).await {
+                Ok((mut write, mut read, identifier_json)) => {
+                    log::info!("WebSocket connected to terminal relay");
+                    backoff_secs = INITIAL_BACKOFF_SECS; // Reset backoff on success
+
+                    // Run message loop until WebSocket dies
+                    Self::run_message_loop(
+                        &mut signal_manager,
+                        &hub_identifier,
+                        &server_url,
+                        &mut write,
+                        &mut read,
+                        &identifier_json,
+                        &mut output_rx,
+                        &connected,
+                        &event_tx,
+                        &mut browser_identities,
+                    ).await;
+
+                    // Mark disconnected
+                    *connected.write().await = false;
+                    log::warn!("WebSocket disconnected from terminal relay");
+                }
+                Err(e) => {
+                    log::warn!("Failed to connect to terminal relay: {e}");
+                }
+            }
+
+            // Exponential backoff with jitter before reconnecting
+            let jitter_ms = rand::random::<u64>() % 1000;
+            let wait = Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms);
+            log::info!("Reconnecting to terminal relay in {:.1}s...", wait.as_secs_f32());
+            tokio::time::sleep(wait).await;
+
+            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+        }
+    }
+
+    /// Connect to WebSocket and subscribe to channel.
+    async fn connect_websocket(
+        server_url: &str,
+        api_key: &str,
+        hub_identifier: &str,
+    ) -> Result<(
+        futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
+        String,
+    )> {
+        let ws_url = format!(
+            "{}/cable",
+            server_url.replace("https://", "wss://").replace("http://", "ws://")
+        );
+
+        log::debug!("Connecting to Action Cable: {}", ws_url);
 
         // Build request with required headers
         let mut request = ws_url
@@ -196,13 +313,13 @@ impl TerminalRelay {
             .context("Failed to build WebSocket request")?;
         request.headers_mut().insert(
             "Origin",
-            self.server_url
+            server_url
                 .parse()
                 .unwrap_or_else(|_| "http://localhost".parse().expect("localhost is valid")),
         );
         request.headers_mut().insert(
             "Authorization",
-            format!("Bearer {}", self.api_key)
+            format!("Bearer {}", api_key)
                 .parse()
                 .expect("Bearer token is valid"),
         );
@@ -217,7 +334,7 @@ impl TerminalRelay {
         // Wait for Action Cable "welcome" message
         log::debug!("Waiting for Action Cable welcome message...");
         let welcome_timeout = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            Duration::from_secs(10),
             async {
                 while let Some(msg) = read.next().await {
                     if let Ok(Message::Text(text)) = msg {
@@ -239,10 +356,10 @@ impl TerminalRelay {
             Err(_) => anyhow::bail!("Timeout waiting for Action Cable welcome"),
         }
 
-        // Build channel identifier - hub_identifier is the server-assigned ID
+        // Build channel identifier
         let identifier = ChannelIdentifier {
             channel: "TerminalRelayChannel".to_string(),
-            hub_id: hub_identifier.clone(),
+            hub_id: hub_identifier.to_string(),
         };
         let identifier_json = serde_json::to_string(&identifier)?;
 
@@ -254,393 +371,389 @@ impl TerminalRelay {
         };
         write.send(Message::Text(serde_json::to_string(&subscribe)?)).await?;
 
-        log::info!("Sent subscribe to TerminalRelayChannel for hub {}", hub_identifier);
+        log::info!("Subscribed to TerminalRelayChannel for hub {}", hub_identifier);
 
-        // Create channel for terminal output
-        let (output_tx, mut output_rx) = mpsc::channel::<OutputMessage>(100);
-
-        // Shared connection state
-        let connected = Arc::new(RwLock::new(false));
-
-        // Create output sender handle
-        let output_sender = TerminalOutputSender {
-            tx: output_tx,
-            connected: Arc::clone(&connected),
-        };
-
-        // Track browser identities for multi-session encryption
-        // Each connected browser has its own Signal session
-        let mut browser_identities: HashSet<String> = HashSet::new();
-
-        // Spawn single task that handles all I/O using select!
-        // This avoids Send requirements since everything runs on one task
-        let connected_clone = Arc::clone(&connected);
-        tokio::task::spawn_local(async move {
-            loop {
-                tokio::select! {
-                    // Handle outgoing messages (CLI -> browser)
-                    Some(output_msg) = output_rx.recv() => {
-                        if *connected_clone.read().await && !browser_identities.is_empty() {
-                            // Determine targets and output based on message type
-                            let (output, targets): (String, Vec<&String>) = match &output_msg {
-                                OutputMessage::Broadcast(data) => {
-                                    // Broadcast to all connected browsers
-                                    (data.clone(), browser_identities.iter().collect())
-                                }
-                                OutputMessage::Targeted { identity, data } => {
-                                    // Send to specific browser only (if connected)
-                                    if browser_identities.contains(identity) {
-                                        (data.clone(), vec![identity])
-                                    } else {
-                                        log::warn!("Targeted send to unknown identity: {}", identity);
-                                        continue;
-                                    }
-                                }
-                            };
-
-                            let message = if let Ok(parsed) = serde_json::from_str::<TerminalMessage>(&output) {
-                                parsed
-                            } else {
-                                TerminalMessage::Output { data: output }
-                            };
-
-                            let plaintext = match serde_json::to_vec(&message) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    log::error!("Failed to serialize message: {}", e);
-                                    continue;
-                                }
-                            };
-
-                            // Encrypt and send to target browser(s)
-                            for identity in targets {
-                                match self.signal_manager.encrypt(&plaintext, identity).await {
-                                    Ok(envelope) => {
-                                        // recipient_identity at top level for server-side routing
-                                        let data = serde_json::json!({
-                                            "action": "relay",
-                                            "recipient_identity": identity,
-                                            "envelope": {
-                                                "version": envelope.version,
-                                                "message_type": envelope.message_type,
-                                                "ciphertext": envelope.ciphertext,
-                                                "sender_identity": envelope.sender_identity,
-                                                "registration_id": envelope.registration_id,
-                                                "device_id": envelope.device_id,
-                                            }
-                                        });
-                                        let cable_msg = CableMessage {
-                                            command: "message".to_string(),
-                                            identifier: identifier_json.clone(),
-                                            data: Some(serde_json::to_string(&data).expect("serializable")),
-                                        };
-
-                                        if let Err(e) = write.send(Message::Text(
-                                            serde_json::to_string(&cable_msg).expect("serializable")
-                                        )).await {
-                                            log::error!("Failed to send output to {}: {}", identity, e);
-                                            // Don't break - continue sending to other browsers
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!("Encryption failed for {}: {}", identity, e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Handle incoming messages (browser -> CLI)
-                    Some(msg) = read.next() => {
-                        match msg {
-                            Ok(Message::Text(text)) => {
-                                if let Ok(cable_msg) = serde_json::from_str::<IncomingCableMessage>(&text) {
-                                    // Handle different message types
-                                    if let Some(ref msg_type) = cable_msg.msg_type {
-                                        match msg_type.as_str() {
-                                            "welcome" => log::info!("Action Cable welcome received"),
-                                            "confirm_subscription" => log::info!("TerminalChannel subscription confirmed"),
-                                            "ping" => {} // Ignore
-                                            _ => {}
-                                        }
-                                    }
-
-                                    // Handle broadcast messages (encrypted envelopes from browser)
-                                    if let Some(message) = cable_msg.message {
-                                        // Browser sends { envelope: SignalEnvelope } via relay action
-                                        if let Some(envelope_json) = message.get("envelope") {
-                                            // Parse the envelope string (it's JSON-encoded)
-                                            let envelope: SignalEnvelope = match envelope_json {
-                                                serde_json::Value::String(s) => {
-                                                    match serde_json::from_str(s) {
-                                                        Ok(e) => e,
-                                                        Err(e) => {
-                                                            log::warn!("Failed to parse envelope string: {}", e);
-                                                            continue;
-                                                        }
-                                                    }
-                                                }
-                                                _ => {
-                                                    match serde_json::from_value(envelope_json.clone()) {
-                                                        Ok(e) => e,
-                                                        Err(e) => {
-                                                            log::warn!("Failed to parse envelope: {}", e);
-                                                            continue;
-                                                        }
-                                                    }
-                                                }
-                                            };
-
-                                            // Decrypt the envelope
-                                            match self.signal_manager.decrypt(&envelope).await {
-                                                Ok(plaintext) => {
-                                                    if let Err(e) = self.signal_manager.persist().await {
-                                                        log::warn!("Failed to persist: {}", e);
-                                                    }
-
-                                                    // Track browser identity for multi-session
-                                                    // Add each new browser to the set
-                                                    let is_new = browser_identities.insert(envelope.sender_identity.clone());
-                                                    if is_new {
-                                                        log::info!("Browser connected: {} (total: {})", envelope.sender_identity, browser_identities.len());
-                                                        *connected_clone.write().await = true;
-                                                    }
-
-                                                    // Parse decrypted message
-                                                    match serde_json::from_slice::<BrowserCommand>(&plaintext) {
-                                                        Ok(cmd) => {
-                                                            let event = match cmd {
-                                                                BrowserCommand::Handshake { device_name, .. } => {
-                                                                    log::info!("Browser handshake from: {}", device_name);
-
-                                                                    // Send handshake_ack back to browser
-                                                                    let ack = serde_json::json!({
-                                                                        "type": "handshake_ack",
-                                                                        "cli_version": env!("CARGO_PKG_VERSION"),
-                                                                        "hub_id": hub_identifier,
-                                                                    });
-                                                                    let ack_bytes = serde_json::to_vec(&ack).expect("serializable");
-
-                                                                    match self.signal_manager.encrypt(&ack_bytes, &envelope.sender_identity).await {
-                                                                        Ok(ack_envelope) => {
-                                                                            let ack_data = serde_json::json!({
-                                                                                "action": "relay",
-                                                                                "recipient_identity": &envelope.sender_identity,
-                                                                                "envelope": {
-                                                                                    "version": ack_envelope.version,
-                                                                                    "message_type": ack_envelope.message_type,
-                                                                                    "ciphertext": ack_envelope.ciphertext,
-                                                                                    "sender_identity": ack_envelope.sender_identity,
-                                                                                    "registration_id": ack_envelope.registration_id,
-                                                                                    "device_id": ack_envelope.device_id,
-                                                                                }
-                                                                            });
-                                                                            let ack_cable = CableMessage {
-                                                                                command: "message".to_string(),
-                                                                                identifier: identifier_json.clone(),
-                                                                                data: Some(serde_json::to_string(&ack_data).expect("serializable")),
-                                                                            };
-
-                                                                            if let Err(e) = write.send(Message::Text(
-                                                                                serde_json::to_string(&ack_cable).expect("serializable")
-                                                                            )).await {
-                                                                                log::error!("Failed to send handshake_ack: {}", e);
-                                                                            } else {
-                                                                                log::info!("Sent handshake_ack to browser");
-                                                                            }
-                                                                        }
-                                                                        Err(e) => {
-                                                                            log::error!("Failed to encrypt handshake_ack: {}", e);
-                                                                        }
-                                                                    }
-
-                                                                    let browser_identity = envelope.sender_identity.clone();
-                                                                    if let Err(e) = event_tx.send((
-                                                                        BrowserEvent::Connected {
-                                                                            public_key: browser_identity.clone(),
-                                                                            device_name,
-                                                                        },
-                                                                        browser_identity,
-                                                                    )).await {
-                                                                        log::error!("Failed to send event: {}", e);
-                                                                    }
-                                                                    continue;
-                                                                }
-                                                                BrowserCommand::GenerateInvite => {
-                                                                    log::info!("Browser requested invite bundle");
-
-                                                                    // Generate fresh PreKeyBundle for sharing
-                                                                    // Use a higher prekey ID than the initial QR (which uses 1)
-                                                                    match self.signal_manager.build_prekey_bundle_data(2).await {
-                                                                        Ok(bundle) => {
-                                                                            // Encode bundle as binary + Base32 for QR-friendly URLs
-                                                                            let bundle_bytes = bundle.to_binary()
-                                                                                .expect("PreKeyBundle binary serializable");
-                                                                            let bundle_encoded = BASE32_NOPAD.encode(&bundle_bytes);
-
-                                                                            // Build shareable URL (mixed-mode: byte for URL, alphanumeric for bundle)
-                                                                            let invite_url = format!(
-                                                                                "{}/hubs/{}#{}",
-                                                                                self.server_url,
-                                                                                hub_identifier,
-                                                                                bundle_encoded
-                                                                            );
-
-                                                                            // Send invite_bundle response
-                                                                            let response = TerminalMessage::InviteBundle {
-                                                                                bundle: bundle_encoded,
-                                                                                url: invite_url,
-                                                                            };
-                                                                            let response_bytes = serde_json::to_vec(&response)
-                                                                                .expect("InviteBundle serializable");
-
-                                                                            match self.signal_manager.encrypt(&response_bytes, &envelope.sender_identity).await {
-                                                                                Ok(invite_envelope) => {
-                                                                                    let invite_data = serde_json::json!({
-                                                                                        "action": "relay",
-                                                                                        "recipient_identity": &envelope.sender_identity,
-                                                                                        "envelope": {
-                                                                                            "version": invite_envelope.version,
-                                                                                            "message_type": invite_envelope.message_type,
-                                                                                            "ciphertext": invite_envelope.ciphertext,
-                                                                                            "sender_identity": invite_envelope.sender_identity,
-                                                                                            "registration_id": invite_envelope.registration_id,
-                                                                                            "device_id": invite_envelope.device_id,
-                                                                                        }
-                                                                                    });
-                                                                                    let invite_cable = CableMessage {
-                                                                                        command: "message".to_string(),
-                                                                                        identifier: identifier_json.clone(),
-                                                                                        data: Some(serde_json::to_string(&invite_data).expect("serializable")),
-                                                                                    };
-
-                                                                                    if let Err(e) = write.send(Message::Text(
-                                                                                        serde_json::to_string(&invite_cable).expect("serializable")
-                                                                                    )).await {
-                                                                                        log::error!("Failed to send invite_bundle: {}", e);
-                                                                                    } else {
-                                                                                        log::info!("Sent invite_bundle to browser");
-                                                                                    }
-                                                                                }
-                                                                                Err(e) => {
-                                                                                    log::error!("Failed to encrypt invite_bundle: {}", e);
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                        Err(e) => {
-                                                                            log::error!("Failed to generate invite bundle: {}", e);
-                                                                            // Send error response to browser
-                                                                            let error_msg = TerminalMessage::Error {
-                                                                                message: format!("Failed to generate invite: {}", e),
-                                                                            };
-                                                                            let error_bytes = serde_json::to_vec(&error_msg)
-                                                                                .expect("Error serializable");
-
-                                                                            if let Ok(error_envelope) = self.signal_manager.encrypt(&error_bytes, &envelope.sender_identity).await {
-                                                                                let error_data = serde_json::json!({
-                                                                                    "action": "relay",
-                                                                                    "recipient_identity": &envelope.sender_identity,
-                                                                                    "envelope": {
-                                                                                        "version": error_envelope.version,
-                                                                                        "message_type": error_envelope.message_type,
-                                                                                        "ciphertext": error_envelope.ciphertext,
-                                                                                        "sender_identity": error_envelope.sender_identity,
-                                                                                        "registration_id": error_envelope.registration_id,
-                                                                                        "device_id": error_envelope.device_id,
-                                                                                    }
-                                                                                });
-                                                                                let error_cable = CableMessage {
-                                                                                    command: "message".to_string(),
-                                                                                    identifier: identifier_json.clone(),
-                                                                                    data: Some(serde_json::to_string(&error_data).expect("serializable")),
-                                                                                };
-                                                                                let _ = write.send(Message::Text(
-                                                                                    serde_json::to_string(&error_cable).expect("serializable")
-                                                                                )).await;
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                    continue;
-                                                                }
-                                                                BrowserCommand::Input { data } => BrowserEvent::Input(data),
-                                                                BrowserCommand::SetMode { mode } => BrowserEvent::SetMode { mode },
-                                                                BrowserCommand::ListAgents => BrowserEvent::ListAgents,
-                                                                BrowserCommand::ListWorktrees => BrowserEvent::ListWorktrees,
-                                                                BrowserCommand::SelectAgent { id } => BrowserEvent::SelectAgent { id },
-                                                                BrowserCommand::CreateAgent { issue_or_branch, prompt } => {
-                                                                    BrowserEvent::CreateAgent { issue_or_branch, prompt }
-                                                                }
-                                                                BrowserCommand::ReopenWorktree { path, branch, prompt } => {
-                                                                    BrowserEvent::ReopenWorktree { path, branch, prompt }
-                                                                }
-                                                                BrowserCommand::DeleteAgent { id, delete_worktree } => {
-                                                                    BrowserEvent::DeleteAgent {
-                                                                        id,
-                                                                        delete_worktree: delete_worktree.unwrap_or(false),
-                                                                    }
-                                                                }
-                                                                BrowserCommand::TogglePtyView => BrowserEvent::TogglePtyView,
-                                                                BrowserCommand::Scroll { direction, lines } => {
-                                                                    BrowserEvent::Scroll { direction, lines: lines.unwrap_or(3) }
-                                                                }
-                                                                BrowserCommand::ScrollToBottom => BrowserEvent::ScrollToBottom,
-                                                                BrowserCommand::ScrollToTop => BrowserEvent::ScrollToTop,
-                                                                BrowserCommand::Resize { cols, rows } => {
-                                                                    BrowserEvent::Resize(BrowserResize { cols, rows })
-                                                                }
-                                                            };
-                                                            // Send event with browser identity for client-scoped routing
-                                                            if let Err(e) = event_tx.send((event, envelope.sender_identity.clone())).await {
-                                                                log::error!("Failed to forward event: {}", e);
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            // Try parsing as raw string (legacy)
-                                                            if let Ok(text) = String::from_utf8(plaintext.clone()) {
-                                                                log::debug!("Received text message: {}", text);
-                                                            } else {
-                                                                log::warn!("Failed to parse command: {}", e);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => log::warn!("Decryption failed: {}", e),
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(Message::Ping(data)) => {
-                                // Respond to WebSocket ping with pong
-                                if let Err(e) = write.send(Message::Pong(data)).await {
-                                    log::warn!("Failed to send pong: {}", e);
-                                }
-                            }
-                            Ok(Message::Close(_)) => {
-                                log::info!("Action Cable WebSocket closed");
-                                break;
-                            }
-                            Err(e) => {
-                                log::error!("WebSocket error: {}", e);
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    else => break,
-                }
-            }
-        });
-
-        Ok(output_sender)
+        Ok((write, read, identifier_json))
     }
 
-    /// Build WebSocket URL for Action Cable.
-    fn build_ws_url(&self) -> String {
-        let base = self.server_url
-            .replace("https://", "wss://")
-            .replace("http://", "ws://");
-        format!("{}/cable", base)
+    /// Run the message loop until WebSocket disconnects.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_message_loop(
+        signal_manager: &mut SignalProtocolManager,
+        hub_identifier: &str,
+        server_url: &str,
+        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        read: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
+        identifier_json: &str,
+        output_rx: &mut mpsc::Receiver<OutputMessage>,
+        connected: &Arc<RwLock<bool>>,
+        event_tx: &mpsc::Sender<IdentifiedBrowserEvent>,
+        browser_identities: &mut HashSet<String>,
+    ) {
+        loop {
+            tokio::select! {
+                // Handle outgoing messages (CLI -> browser)
+                Some(output_msg) = output_rx.recv() => {
+                    if *connected.read().await && !browser_identities.is_empty() {
+                        Self::handle_output(
+                            signal_manager,
+                            write,
+                            identifier_json,
+                            output_msg,
+                            browser_identities,
+                        ).await;
+                    }
+                }
+
+                // Handle incoming messages (browser -> CLI)
+                Some(msg) = read.next() => {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            Self::handle_incoming_text(
+                                signal_manager,
+                                hub_identifier,
+                                server_url,
+                                write,
+                                identifier_json,
+                                &text,
+                                connected,
+                                event_tx,
+                                browser_identities,
+                            ).await;
+                        }
+                        Ok(Message::Ping(data)) => {
+                            if let Err(e) = write.send(Message::Pong(data)).await {
+                                log::warn!("Failed to send pong: {}", e);
+                            }
+                        }
+                        Ok(Message::Close(_)) => {
+                            log::info!("Action Cable WebSocket closed by server");
+                            break;
+                        }
+                        Err(e) => {
+                            log::error!("WebSocket error: {}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                else => break,
+            }
+        }
+    }
+
+    /// Handle outgoing message to browser(s).
+    async fn handle_output(
+        signal_manager: &mut SignalProtocolManager,
+        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        identifier_json: &str,
+        output_msg: OutputMessage,
+        browser_identities: &HashSet<String>,
+    ) {
+        let (output, targets): (String, Vec<&String>) = match &output_msg {
+            OutputMessage::Broadcast(data) => {
+                (data.clone(), browser_identities.iter().collect())
+            }
+            OutputMessage::Targeted { identity, data } => {
+                if browser_identities.contains(identity) {
+                    (data.clone(), vec![identity])
+                } else {
+                    log::warn!("Targeted send to unknown identity: {}", identity);
+                    return;
+                }
+            }
+        };
+
+        let message = if let Ok(parsed) = serde_json::from_str::<TerminalMessage>(&output) {
+            parsed
+        } else {
+            TerminalMessage::Output { data: output }
+        };
+
+        let plaintext = match serde_json::to_vec(&message) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("Failed to serialize message: {}", e);
+                return;
+            }
+        };
+
+        for identity in targets {
+            match signal_manager.encrypt(&plaintext, identity).await {
+                Ok(envelope) => {
+                    let data = serde_json::json!({
+                        "action": "relay",
+                        "recipient_identity": identity,
+                        "envelope": {
+                            "version": envelope.version,
+                            "message_type": envelope.message_type,
+                            "ciphertext": envelope.ciphertext,
+                            "sender_identity": envelope.sender_identity,
+                            "registration_id": envelope.registration_id,
+                            "device_id": envelope.device_id,
+                        }
+                    });
+                    let cable_msg = CableMessage {
+                        command: "message".to_string(),
+                        identifier: identifier_json.to_string(),
+                        data: Some(serde_json::to_string(&data).expect("serializable")),
+                    };
+
+                    if let Err(e) = write.send(Message::Text(
+                        serde_json::to_string(&cable_msg).expect("serializable")
+                    )).await {
+                        log::error!("Failed to send output to {}: {}", identity, e);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Encryption failed for {}: {}", identity, e);
+                }
+            }
+        }
+    }
+
+    /// Handle incoming text message from Action Cable.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_incoming_text(
+        signal_manager: &mut SignalProtocolManager,
+        hub_identifier: &str,
+        server_url: &str,
+        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        identifier_json: &str,
+        text: &str,
+        connected: &Arc<RwLock<bool>>,
+        event_tx: &mpsc::Sender<IdentifiedBrowserEvent>,
+        browser_identities: &mut HashSet<String>,
+    ) {
+        let Ok(cable_msg) = serde_json::from_str::<IncomingCableMessage>(text) else {
+            return;
+        };
+
+        // Handle different message types
+        if let Some(ref msg_type) = cable_msg.msg_type {
+            match msg_type.as_str() {
+                "welcome" => log::info!("Action Cable welcome received"),
+                "confirm_subscription" => log::info!("TerminalChannel subscription confirmed"),
+                "ping" => {} // Ignore
+                _ => {}
+            }
+        }
+
+        // Handle broadcast messages (encrypted envelopes from browser)
+        let Some(message) = cable_msg.message else {
+            return;
+        };
+
+        let Some(envelope_json) = message.get("envelope") else {
+            return;
+        };
+
+        // Parse the envelope
+        let envelope: SignalEnvelope = match envelope_json {
+            serde_json::Value::String(s) => {
+                match serde_json::from_str(s) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::warn!("Failed to parse envelope string: {}", e);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                match serde_json::from_value(envelope_json.clone()) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::warn!("Failed to parse envelope: {}", e);
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Decrypt the envelope
+        let plaintext = match signal_manager.decrypt(&envelope).await {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Decryption failed: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = signal_manager.persist().await {
+            log::warn!("Failed to persist: {}", e);
+        }
+
+        // Track browser identity
+        let is_new = browser_identities.insert(envelope.sender_identity.clone());
+        if is_new {
+            log::info!("Browser connected: {} (total: {})", envelope.sender_identity, browser_identities.len());
+            *connected.write().await = true;
+        }
+
+        // Parse and handle command
+        let cmd: BrowserCommand = match serde_json::from_slice(&plaintext) {
+            Ok(c) => c,
+            Err(e) => {
+                if let Ok(text) = String::from_utf8(plaintext.clone()) {
+                    log::debug!("Received text message: {}", text);
+                } else {
+                    log::warn!("Failed to parse command: {}", e);
+                }
+                return;
+            }
+        };
+
+        Self::handle_browser_command(
+            signal_manager,
+            hub_identifier,
+            server_url,
+            write,
+            identifier_json,
+            cmd,
+            &envelope.sender_identity,
+            event_tx,
+        ).await;
+    }
+
+    /// Handle a parsed browser command.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_browser_command(
+        signal_manager: &mut SignalProtocolManager,
+        hub_identifier: &str,
+        server_url: &str,
+        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        identifier_json: &str,
+        cmd: BrowserCommand,
+        sender_identity: &str,
+        event_tx: &mpsc::Sender<IdentifiedBrowserEvent>,
+    ) {
+        let event = match cmd {
+            BrowserCommand::Handshake { device_name, .. } => {
+                log::info!("Browser handshake from: {}", device_name);
+
+                // Send handshake_ack back to browser
+                let ack = serde_json::json!({
+                    "type": "handshake_ack",
+                    "cli_version": env!("CARGO_PKG_VERSION"),
+                    "hub_id": hub_identifier,
+                });
+                Self::send_encrypted(signal_manager, write, identifier_json, sender_identity, &ack).await;
+
+                if let Err(e) = event_tx.send((
+                    BrowserEvent::Connected {
+                        public_key: sender_identity.to_string(),
+                        device_name,
+                    },
+                    sender_identity.to_string(),
+                )).await {
+                    log::error!("Failed to send event: {}", e);
+                }
+                return;
+            }
+            BrowserCommand::GenerateInvite => {
+                log::info!("Browser requested invite bundle");
+
+                match signal_manager.build_prekey_bundle_data(2).await {
+                    Ok(bundle) => {
+                        let bundle_bytes = bundle.to_binary().expect("PreKeyBundle binary serializable");
+                        let bundle_encoded = BASE32_NOPAD.encode(&bundle_bytes);
+                        let invite_url = format!("{}/hubs/{}#{}", server_url, hub_identifier, bundle_encoded);
+
+                        let response = TerminalMessage::InviteBundle {
+                            bundle: bundle_encoded,
+                            url: invite_url,
+                        };
+                        Self::send_encrypted(signal_manager, write, identifier_json, sender_identity, &response).await;
+                    }
+                    Err(e) => {
+                        log::error!("Failed to generate invite bundle: {}", e);
+                        let error_msg = TerminalMessage::Error {
+                            message: format!("Failed to generate invite: {}", e),
+                        };
+                        Self::send_encrypted(signal_manager, write, identifier_json, sender_identity, &error_msg).await;
+                    }
+                }
+                return;
+            }
+            BrowserCommand::Input { data } => BrowserEvent::Input(data),
+            BrowserCommand::SetMode { mode } => BrowserEvent::SetMode { mode },
+            BrowserCommand::ListAgents => BrowserEvent::ListAgents,
+            BrowserCommand::ListWorktrees => BrowserEvent::ListWorktrees,
+            BrowserCommand::SelectAgent { id } => BrowserEvent::SelectAgent { id },
+            BrowserCommand::CreateAgent { issue_or_branch, prompt } => {
+                BrowserEvent::CreateAgent { issue_or_branch, prompt }
+            }
+            BrowserCommand::ReopenWorktree { path, branch, prompt } => {
+                BrowserEvent::ReopenWorktree { path, branch, prompt }
+            }
+            BrowserCommand::DeleteAgent { id, delete_worktree } => {
+                BrowserEvent::DeleteAgent {
+                    id,
+                    delete_worktree: delete_worktree.unwrap_or(false),
+                }
+            }
+            BrowserCommand::TogglePtyView => BrowserEvent::TogglePtyView,
+            BrowserCommand::Scroll { direction, lines } => {
+                BrowserEvent::Scroll { direction, lines: lines.unwrap_or(3) }
+            }
+            BrowserCommand::ScrollToBottom => BrowserEvent::ScrollToBottom,
+            BrowserCommand::ScrollToTop => BrowserEvent::ScrollToTop,
+            BrowserCommand::Resize { cols, rows } => {
+                BrowserEvent::Resize(BrowserResize { cols, rows })
+            }
+        };
+
+        if let Err(e) = event_tx.send((event, sender_identity.to_string())).await {
+            log::error!("Failed to forward event: {}", e);
+        }
+    }
+
+    /// Send an encrypted message to a browser.
+    async fn send_encrypted<T: Serialize>(
+        signal_manager: &mut SignalProtocolManager,
+        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        identifier_json: &str,
+        recipient_identity: &str,
+        message: &T,
+    ) {
+        let bytes = match serde_json::to_vec(message) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("Failed to serialize message: {}", e);
+                return;
+            }
+        };
+
+        match signal_manager.encrypt(&bytes, recipient_identity).await {
+            Ok(envelope) => {
+                let data = serde_json::json!({
+                    "action": "relay",
+                    "recipient_identity": recipient_identity,
+                    "envelope": {
+                        "version": envelope.version,
+                        "message_type": envelope.message_type,
+                        "ciphertext": envelope.ciphertext,
+                        "sender_identity": envelope.sender_identity,
+                        "registration_id": envelope.registration_id,
+                        "device_id": envelope.device_id,
+                    }
+                });
+                let cable_msg = CableMessage {
+                    command: "message".to_string(),
+                    identifier: identifier_json.to_string(),
+                    data: Some(serde_json::to_string(&data).expect("serializable")),
+                };
+
+                if let Err(e) = write.send(Message::Text(
+                    serde_json::to_string(&cable_msg).expect("serializable")
+                )).await {
+                    log::error!("Failed to send encrypted message: {}", e);
+                }
+            }
+            Err(e) => {
+                log::error!("Encryption failed: {}", e);
+            }
+        }
     }
 }
