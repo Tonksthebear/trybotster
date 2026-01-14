@@ -418,21 +418,104 @@ trybotster/
 
 ## 🔒 Security
 
-### Webhook Verification
+### End-to-End Encrypted Terminal Streaming
 
-GitHub webhooks are verified using HMAC-SHA256 signatures.
+When you view agents through the Web GUI, terminal content is **end-to-end encrypted** using the Signal Protocol. The server acts as a pure relay and **cannot decrypt your terminal output**.
 
-### API Authentication
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Security Architecture                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   ┌──────────────┐                                    ┌──────────────┐      │
+│   │   Browser    │                                    │     CLI      │      │
+│   │              │                                    │              │      │
+│   │  ┌────────┐  │      1. QR Code Scan (Visual)      │  ┌────────┐  │      │
+│   │  │ Signal │  │◄──────────────────────────────────►│  │ Signal │  │      │
+│   │  │Protocol│  │      (Keys exchanged locally)      │  │Protocol│  │      │
+│   │  └────────┘  │                                    │  └────────┘  │      │
+│   │      │       │                                    │      │       │      │
+│   │      │       │   2. Encrypted Terminal Data       │      │       │      │
+│   │      ▼       │         (ciphertext only)          │      ▼       │      │
+│   │  [Decrypt]   │◄──────────────────────────────────►│  [Encrypt]   │      │
+│   │      │       │                │                   │      ▲       │      │
+│   │      ▼       │                │                   │      │       │      │
+│   │  Terminal    │                │                   │  PTY Output  │      │
+│   │   Display    │                │                   │              │      │
+│   └──────────────┘                │                   └──────────────┘      │
+│                                   │                                          │
+│                    ┌──────────────▼──────────────┐                          │
+│                    │      Rails Server           │                          │
+│                    │      (Pure Relay)           │                          │
+│                    │                             │                          │
+│                    │  ✓ Sees: connection timing  │                          │
+│                    │  ✓ Sees: message sizes      │                          │
+│                    │  ✗ Cannot see: plaintext    │                          │
+│                    │  ✗ Cannot see: keystrokes   │                          │
+│                    │  ✗ Cannot decrypt anything  │                          │
+│                    └─────────────────────────────┘                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-Daemon authenticates to Rails using `X-API-Key` header.
+**Cryptographic Details:**
 
-### Repository Access
+| Component | Algorithm | Purpose |
+|-----------|-----------|---------|
+| Key Exchange | X3DH (Extended Triple Diffie-Hellman) | Initial session establishment |
+| Message Encryption | Double Ratchet + AES-256-GCM | Forward secrecy per message |
+| Post-Quantum | Kyber1024 | Resistance to future quantum attacks |
+| Signing | Ed25519 | Identity verification |
 
-Users must have GitHub access to a repository to receive messages for it. The Rails server verifies access via GitHub API before delivering messages.
+**How Pairing Works:**
 
-### Bot Attribution
+1. CLI displays QR code containing its public keys
+2. You scan QR with your browser (visual channel - hard to MITM)
+3. Browser and CLI perform X3DH key exchange
+4. All subsequent messages encrypted with Double Ratchet
+5. Server only sees encrypted blobs it cannot decrypt
 
-All GitHub actions show as `@trybotster[bot]` using GitHub App installation tokens.
+### Browser Security
+
+- **Web Worker Isolation**: All cryptographic operations run in a Web Worker. Even if XSS compromises the main page, session keys remain isolated in the worker thread.
+- **Non-Extractable Keys**: Browser encryption keys are marked non-extractable via Web Crypto API.
+- **Session Encryption**: IndexedDB sessions encrypted with AES-256-GCM using keys derived from non-extractable CryptoKey.
+
+### CLI Token Security
+
+- **OS Keyring Storage**: API tokens stored in macOS Keychain or Linux Secret Service, not plaintext config files.
+- **No Query Parameters**: Authentication via `Authorization: Bearer` header only. Tokens never appear in URLs or server logs.
+
+### Server-Side Security
+
+**Webhook Verification:** GitHub webhooks verified using HMAC-SHA256 signatures.
+
+**API Authentication:** CLI authenticates using device tokens with `btstr_` prefix, validated per-request.
+
+**Repository Access:** Users must have GitHub access to a repository to receive messages for it. Rails verifies access via GitHub API before delivering messages.
+
+**Bot Attribution:** All GitHub actions show as `@trybotster[bot]` using GitHub App installation tokens.
+
+### Trust Model
+
+**You trust:**
+- The CLI binary you run (verify source/build)
+- Browser JavaScript served by trybotster.com
+- That you scanned the correct QR code
+
+**You don't need to trust:**
+- The server with your terminal content (E2E encrypted)
+- Network infrastructure (encrypted in transit)
+
+**The server knows:**
+- When you connect and disconnect
+- How much data flows (message sizes)
+- Which hub you're connected to
+
+**The server cannot know:**
+- What commands you run
+- What output appears in your terminal
+- Your keystrokes
 
 ## 🧪 Testing
 
