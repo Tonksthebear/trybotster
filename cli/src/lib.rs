@@ -23,7 +23,6 @@
 
 // Library modules
 pub mod agent;
-pub mod browser_connect;
 pub mod client;
 pub mod hub;
 pub mod relay;
@@ -39,7 +38,6 @@ pub mod compat;
 pub mod config;
 pub mod constants;
 pub mod device;
-pub mod embedded_tailscale;
 pub mod env;
 pub mod git;
 pub mod notifications;
@@ -47,7 +45,6 @@ pub mod process;
 pub mod prompt;
 pub mod render;
 pub mod server;
-pub mod tailscale;
 pub mod terminal_widget;
 pub mod tunnel;
 

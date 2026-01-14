@@ -1,14 +1,10 @@
 <% content_for :head do %>
   <%= stylesheet_link_tag "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" %>
-  <%= tag.meta name: "headscale-url", content: Rails.application.config.headscale_url || "http://localhost:8080" %>
-  <% if @hub.tailscale_hostname.present? %>
-    <%= tag.meta name: "cli-hostname", content: @hub.tailscale_hostname %>
-  <% end %>
 <% end %>
 
 <%#
   Multi-controller architecture:
-  - connection: Tailscale mesh + WireGuard E2E encryption
+  - connection: Signal Protocol E2E encryption via ActionCable
   - terminal-display: xterm.js rendering
   - agents: Agent list and management
 

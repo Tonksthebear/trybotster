@@ -829,7 +829,6 @@ mod tests {
     fn test_config() -> Config {
         Config {
             server_url: "http://localhost:3000".to_string(),
-            headscale_url: None,
             token: "btstr_test-key".to_string(),
             api_key: String::new(),
             poll_interval: 10,

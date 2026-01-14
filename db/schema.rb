@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_01_13_180126) do
+ActiveRecord::Schema[8.1].define(version: 2026_01_14_015447) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "vector"
@@ -163,8 +163,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_01_13_180126) do
     t.string "identifier", null: false
     t.datetime "last_seen_at", null: false
     t.string "repo", null: false
-    t.string "tailscale_hostname"
-    t.string "tailscale_preauth_key"
     t.datetime "updated_at", null: false
     t.bigint "user_id", null: false
     t.index ["device_id"], name: "index_hubs_on_device_id"
@@ -268,19 +266,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_01_13_180126) do
     t.index ["team_id"], name: "index_users_on_team_id"
   end
 
-  create_table "webrtc_sessions", force: :cascade do |t|
-    t.jsonb "answer"
-    t.datetime "created_at", null: false
-    t.datetime "expires_at", null: false
-    t.jsonb "offer", null: false
-    t.string "status", default: "pending", null: false
-    t.datetime "updated_at", null: false
-    t.bigint "user_id", null: false
-    t.index ["expires_at"], name: "index_webrtc_sessions_on_expires_at"
-    t.index ["status"], name: "index_webrtc_sessions_on_status"
-    t.index ["user_id"], name: "index_webrtc_sessions_on_user_id"
-  end
-
   add_foreign_key "action_mcp_session_messages", "action_mcp_sessions", column: "session_id", name: "fk_action_mcp_session_messages_session_id", on_update: :cascade, on_delete: :cascade
   add_foreign_key "action_mcp_session_resources", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_session_subscriptions", "action_mcp_sessions", column: "session_id", on_delete: :cascade
@@ -297,5 +282,4 @@ ActiveRecord::Schema[8.1].define(version: 2026_01_13_180126) do
   add_foreign_key "memory_tags", "memories"
   add_foreign_key "memory_tags", "tags"
   add_foreign_key "users", "teams"
-  add_foreign_key "webrtc_sessions", "users"
 end

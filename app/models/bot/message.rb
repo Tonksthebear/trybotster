@@ -1,7 +1,7 @@
 class Bot::Message < ApplicationRecord
   # Validations
   validates :event_type, presence: true, inclusion: {
-    in: %w[github_mention manual_trigger system_notification agent_cleanup webrtc_offer],
+    in: %w[github_mention manual_trigger system_notification agent_cleanup],
     message: "%{value} is not a valid event type"
   }
   validates :payload, presence: true

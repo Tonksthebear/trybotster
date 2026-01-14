@@ -334,7 +334,6 @@ mod tests {
         let client = Client::new();
         let config = Config {
             server_url: "http://localhost:3000".to_string(),
-            headscale_url: None,
             token: "test".to_string(),
             api_key: String::new(),
             poll_interval: 10,
