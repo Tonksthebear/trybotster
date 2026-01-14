@@ -1131,6 +1131,17 @@ fn spawn_agent_sync(
                 client.receive_response(Response::agent_created(&result.session_key));
             }
 
+            // Send agent_created to browser clients via relay
+            if let ClientId::Browser(ref identity) = client_id {
+                if let Some(ref sender) = hub.browser.sender {
+                    let ctx = crate::relay::BrowserSendContext {
+                        sender,
+                        runtime: &hub.tokio_runtime,
+                    };
+                    crate::relay::send_agent_created_to(&ctx, identity, &result.session_key);
+                }
+            }
+
             hub.broadcast_agent_list();
             let session_key = result.session_key;
             handle_select_agent_for_client(hub, client_id, session_key);

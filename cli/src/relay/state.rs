@@ -364,6 +364,14 @@ pub fn send_scrollback_to(ctx: &BrowserSendContext, identity: &str, lines: Vec<S
     send_message_to(ctx, identity, &message);
 }
 
+/// Send agent created confirmation to a specific browser.
+pub fn send_agent_created_to(ctx: &BrowserSendContext, identity: &str, agent_id: &str) {
+    let message = TerminalMessage::AgentCreated {
+        id: agent_id.to_string(),
+    };
+    send_message_to(ctx, identity, &message);
+}
+
 /// Calculate agent dimensions based on browser mode.
 pub fn calculate_agent_dims(dims: &BrowserResize, mode: BrowserMode) -> (u16, u16) {
     match mode {

@@ -13,12 +13,16 @@ import { Controller } from "@hotwired/stimulus";
  */
 export default class extends Controller {
   static targets = [
-    "list",           // Container for agent list
-    "selectedLabel",  // Label showing selected agent
-    "emptyState",     // Message when no agents
-    "creatingState",  // Loading indicator for agent creation
-    "worktreeList",   // Container for worktree list in modal
-    "newBranchInput", // Input for new branch/issue number
+    "list",                  // Container for agent list
+    "selectedLabel",         // Label showing selected agent
+    "emptyState",            // Message when no agents
+    "creatingState",         // Loading indicator for agent creation
+    "worktreeList",          // Container for worktree list in modal
+    "newBranchInput",        // Input for new branch/issue number
+    "step1",                 // Step 1: worktree selection
+    "step2",                 // Step 2: prompt input
+    "selectedWorktreeLabel", // Label showing selected worktree in step 2
+    "promptInput",           // Textarea for initial prompt
   ];
 
   static outlets = ["connection", "modal"];
@@ -28,6 +32,9 @@ export default class extends Controller {
     this.worktrees = [];
     this.selectedAgentId = null;
     this.connection = null; // Set when connection is ready
+
+    // Two-step modal state
+    this.pendingSelection = null; // { type: 'existing' | 'new', path?, branch?, issueOrBranch? }
   }
 
   disconnect() {
@@ -305,14 +312,11 @@ export default class extends Controller {
         : worktree.branch;
 
       item.innerHTML = `
-        <div class="flex items-center justify-between">
-          <div class="flex items-center gap-2">
-            <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path>
-            </svg>
-            <span class="font-mono text-sm">${this.escapeHtml(issueLabel)}</span>
-          </div>
-          <span class="text-xs text-emerald-400">instant</span>
+        <div class="flex items-center gap-2">
+          <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path>
+          </svg>
+          <span class="font-mono text-sm">${this.escapeHtml(issueLabel)}</span>
         </div>
         <div class="text-xs text-zinc-500 mt-1 truncate">${this.escapeHtml(worktree.path)}</div>
       `;
@@ -360,21 +364,124 @@ export default class extends Controller {
     this.connection.selectAgent(agentId);
   }
 
-  // Action: Select existing worktree (fast path - no git clone)
+  // Action: Select existing worktree - go to step 2 for prompt
   selectWorktree(event) {
     const path = event.currentTarget.dataset.worktreePath;
     const branch = event.currentTarget.dataset.worktreeBranch;
 
-    if (!path || !branch || !this.connection) return;
+    if (!path || !branch) return;
 
-    // Use reopen_worktree command for instant agent creation
-    this.connection.send("reopen_worktree", {
+    // Store selection and go to step 2
+    this.pendingSelection = {
+      type: "existing",
       path: path,
       branch: branch,
-    });
+    };
 
+    this.goToStep2(branch);
+  }
+
+  // Action: Select new branch/issue - go to step 2 for prompt
+  selectNewBranch(event) {
+    // Prevent form submission if triggered by Enter key
+    if (event.type === "keydown") {
+      event.preventDefault();
+    }
+
+    if (!this.hasNewBranchInputTarget) return;
+
+    const value = this.newBranchInputTarget.value?.trim();
+    if (!value) return;
+
+    // Store selection and go to step 2
+    this.pendingSelection = {
+      type: "new",
+      issueOrBranch: value,
+    };
+
+    this.goToStep2(value);
+  }
+
+  // Navigate to step 2 (prompt input)
+  goToStep2(label) {
+    if (this.hasStep1Target && this.hasStep2Target) {
+      this.step1Target.classList.add("hidden");
+      this.step2Target.classList.remove("hidden");
+    }
+
+    if (this.hasSelectedWorktreeLabelTarget) {
+      this.selectedWorktreeLabelTarget.textContent = label;
+    }
+
+    // Focus the prompt input
+    if (this.hasPromptInputTarget) {
+      this.promptInputTarget.focus();
+    }
+  }
+
+  // Action: Go back to step 1
+  goBackToStep1() {
+    if (this.hasStep1Target && this.hasStep2Target) {
+      this.step2Target.classList.add("hidden");
+      this.step1Target.classList.remove("hidden");
+    }
+
+    // Clear prompt but keep selection
+    if (this.hasPromptInputTarget) {
+      this.promptInputTarget.value = "";
+    }
+  }
+
+  // Action: Submit agent with prompt
+  submitAgent() {
+    if (!this.pendingSelection) {
+      console.warn("[Agents] No pending selection");
+      return;
+    }
+    if (!this.connection) {
+      console.warn("[Agents] No connection");
+      return;
+    }
+
+    const prompt = this.hasPromptInputTarget ? this.promptInputTarget.value?.trim() : "";
+
+    if (this.pendingSelection.type === "existing") {
+      // Reopen existing worktree with optional prompt
+      this.connection.send("reopen_worktree", {
+        path: this.pendingSelection.path,
+        branch: this.pendingSelection.branch,
+        prompt: prompt || null,
+      });
+    } else {
+      // Create new agent with optional prompt
+      this.connection.send("create_agent", {
+        issue_or_branch: this.pendingSelection.issueOrBranch,
+        prompt: prompt || null,
+      });
+    }
+
+    // Reset and close modal
+    this.resetModalState();
     if (this.hasModalOutlet) {
       this.modalOutlet.hide();
+    }
+  }
+
+  // Reset modal state
+  resetModalState() {
+    this.pendingSelection = null;
+
+    if (this.hasNewBranchInputTarget) {
+      this.newBranchInputTarget.value = "";
+    }
+    if (this.hasPromptInputTarget) {
+      this.promptInputTarget.value = "";
+    }
+
+    // Reset to step 1
+    if (this.hasStep1Target && this.hasStep2Target) {
+      this.step2Target.classList.add("hidden");
+      this.step1Target.classList.remove("hidden");
     }
   }
 
@@ -387,6 +494,9 @@ export default class extends Controller {
 
   // Action: Open the new agent modal
   createAgent() {
+    // Reset modal state first
+    this.resetModalState();
+
     // Refresh worktree list when opening modal
     if (this.connection) {
       this.connection.send("list_worktrees");
@@ -396,22 +506,6 @@ export default class extends Controller {
 
     if (this.hasModalOutlet) {
       this.modalOutlet.show();
-    }
-  }
-
-  // Action: Submit new agent form (creates new worktree - slower)
-  submitNewAgent(event) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const input = form.querySelector("input[name='issue_or_branch']");
-    const value = input?.value?.trim();
-
-    if (value && this.connection) {
-      this.connection.send("create_agent", { issue_or_branch: value });
-      input.value = "";
-      if (this.hasModalOutlet) {
-        this.modalOutlet.hide();
-      }
     }
   }
 

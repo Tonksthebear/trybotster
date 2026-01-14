@@ -862,6 +862,17 @@ impl Hub {
                             client.receive_response(Response::agent_created(&result.session_key));
                         }
 
+                        // Send agent_created to browser clients via relay
+                        if let ClientId::Browser(ref identity) = pending.client_id {
+                            if let Some(ref sender) = self.browser.sender {
+                                let ctx = crate::relay::BrowserSendContext {
+                                    sender,
+                                    runtime: &self.tokio_runtime,
+                                };
+                                crate::relay::send_agent_created_to(&ctx, identity, &result.session_key);
+                            }
+                        }
+
                         // Broadcast updated agent list to all clients
                         self.broadcast_agent_list();
 
