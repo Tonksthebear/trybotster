@@ -249,7 +249,7 @@ increment() {
 <%# Pass asset URLs via values - Rails handles fingerprinting %>
 <div data-controller="signal"
      data-signal-wasm-url-value="<%= asset_path('libsignal_wasm_bg.wasm') %>"
-     data-signal-worker-url-value="<%= asset_path('signal_worker.js') %>">
+     data-signal-worker-url-value="<%= asset_path('workers/signal.js') %>">
 </div>
 ```
 
@@ -264,7 +264,7 @@ export default class extends Controller {
   };
 
   connect() {
-    // URLs are fingerprinted: /assets/signal_worker-a1b2c3d4.js
+    // URLs are fingerprinted: /assets/workers/signal-a1b2c3d4.js
     this.worker = new Worker(this.workerUrlValue, { type: "module" });
   }
 }
@@ -275,13 +275,8 @@ export default class extends Controller {
 ```ruby
 # WASM files - app/assets/wasm/
 Rails.application.config.assets.paths << Rails.root.join("app/assets/wasm")
-
-# Web Workers - app/javascript/workers/
-Rails.application.config.assets.paths << Rails.root.join("app/javascript/workers")
 ```
 
-This pattern is required for:
-- **Web Workers** - Must be loaded via URL, can't use importmaps
 - **WASM files** - Need direct URL for `WebAssembly.instantiate()`
 
 ---
