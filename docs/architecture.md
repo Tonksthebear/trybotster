@@ -25,6 +25,7 @@ GitHub @mention → Rails server → Message queue → Rust CLI polls
 **Key principle:** The server is a **pure relay** for terminal communication. It **cannot decrypt** any terminal content due to E2E encryption.
 
 **Responsibilities:**
+
 - GitHub OAuth authentication
 - GitHub webhook processing (creates `Bot::Message` records)
 - User/Hub/Device record management
@@ -32,6 +33,7 @@ GitHub @mention → Rails server → Message queue → Rust CLI polls
 - HTTP polling endpoint for CLI messages
 
 **Does NOT:**
+
 - Store encryption keys or bundles
 - Decrypt any terminal content
 - Have access to agent conversations
@@ -43,6 +45,7 @@ GitHub @mention → Rails server → Message queue → Rust CLI polls
 **Location:** `cli/` directory
 
 **Responsibilities:**
+
 - Polls Rails for messages
 - Creates/manages git worktrees per issue
 - Spawns Claude in PTY with full terminal emulation
@@ -51,6 +54,7 @@ GitHub @mention → Rails server → Message queue → Rust CLI polls
 - Session persistence to OS keyring
 
 **Key files:**
+
 - `cli/src/hub/` - Hub lifecycle, registration, polling
 - `cli/src/agent/` - PTY spawning and management
 - `cli/src/relay/` - WebSocket relay with Signal encryption
@@ -63,14 +67,16 @@ GitHub @mention → Rails server → Message queue → Rust CLI polls
 **Key principle:** All terminal data is E2E encrypted. Browser decrypts locally using Signal Protocol WASM running in an isolated Web Worker.
 
 **Responsibilities:**
+
 - Signal Protocol session management (WASM in Web Worker)
 - Action Cable subscription for relay
 - Terminal rendering (xterm.js)
 - IndexedDB session persistence (encrypted)
 
 **Security architecture:**
+
 ```
-Main Thread                          Web Worker (signal_worker.js)
+Main Thread                          Web Worker (workers/signal.js)
 -----------                          ----------------------------
 connection_controller.js  <---->     - Non-extractable CryptoKey
   "encrypt this"          postMessage  - Signal sessions (decrypted state)
@@ -81,8 +87,9 @@ connection_controller.js  <---->     - Non-extractable CryptoKey
 The main thread never sees session state - only encrypted envelopes and decrypted messages.
 
 **Key files:**
+
 - `app/javascript/signal/index.js` - Worker proxy (thin wrapper)
-- `app/javascript/workers/signal_worker.js` - Crypto isolation (all sensitive ops)
+- `app/javascript/workers/signal.js` - Crypto isolation (all sensitive ops)
 - `app/assets/wasm/` - Custom libsignal WASM bindings
 - `app/javascript/controllers/connection_controller.js` - Connection state machine
 
@@ -93,6 +100,7 @@ The main thread never sees session state - only encrypted envelopes and decrypte
 ### Why Signal Protocol?
 
 We use [libsignal](https://github.com/signalapp/libsignal) for E2E encryption because:
+
 - Double Ratchet provides forward secrecy
 - Post-quantum security via PQXDH (ML-KEM/Kyber)
 - Battle-tested by Signal Messenger
@@ -107,6 +115,7 @@ See `docs/signal-e2e-encryption.md` for compilation details.
 **WASM source:** `libsignal-wasm/` (if exists) or built from libsignal repo
 
 **Browser bindings:**
+
 - `app/javascript/wasm/libsignal_wasm.js` - WASM glue code
 - `public/wasm/libsignal_wasm_bg.wasm` - WASM binary
 
@@ -125,6 +134,7 @@ See `docs/signal-e2e-encryption.md` for compilation details.
 ### Bundle Format
 
 The PreKeyBundle is binary (1813 bytes) for QR code efficiency:
+
 - Base32 encoding enables QR alphanumeric mode (smaller QR)
 - Bundle in URL fragment (never sent to server)
 
@@ -145,6 +155,7 @@ See `parseBinaryBundle()` in `app/javascript/signal/index.js` for format.
 **Purpose:** Relay encrypted messages between browser and CLI.
 
 **Streams:**
+
 - CLI subscribes to: `terminal_relay:{hub_id}:cli`
 - Browser subscribes to: `terminal_relay:{hub_id}:browser:{identity}`
 
@@ -163,6 +174,7 @@ HTTP tunnel for agent dev servers (separate from terminal encryption).
 Represents a running CLI instance.
 
 **Key fields:**
+
 - `id` - Server-assigned ID (used in URLs and subscriptions)
 - `identifier` - Local CLI identifier (for config persistence)
 - `alive` - Explicit online/offline flag
@@ -170,6 +182,7 @@ Represents a running CLI instance.
 - `user_id` - Owner
 
 **Lifecycle:**
+
 - CLI registers on startup → gets/reuses server ID
 - CLI sends heartbeats (PUT /hubs/:id) every 30s
 - CLI shutdown sets `alive: false` (record preserved for reconnection)
@@ -180,6 +193,7 @@ Represents a running CLI instance.
 Browser device identity for E2E encryption.
 
 **Key fields:**
+
 - `identity_public_key` - Ed25519 public key
 - `device_type` - "browser" or "cli"
 
@@ -225,11 +239,12 @@ Queued messages from GitHub webhooks for CLI to poll.
 
 ### Browser Security
 
-All sensitive cryptographic operations run in an isolated **Web Worker** (`signal_worker.js`). This provides defense-in-depth against XSS:
+All sensitive cryptographic operations run in an isolated **Web Worker** (`workers/signal.js`). This provides defense-in-depth against XSS:
 
 **Layer 1: Web Worker Isolation**
 
 The Web Worker has its own global scope, separate from the main thread. Inside the worker:
+
 - Non-extractable AES-256-GCM `CryptoKey` for session encryption
 - Decrypted Signal session state (pickled sessions)
 - WASM module instance
@@ -243,6 +258,7 @@ Even within the worker, the wrapping key is non-extractable. `crypto.subtle.expo
 **Layer 3: Narrow API**
 
 The worker exposes only these operations via `postMessage`:
+
 - `createSession(bundle, hubId)` - returns identity key only
 - `encrypt(hubId, message)` - returns ciphertext only
 - `decrypt(hubId, envelope)` - returns plaintext only
@@ -251,9 +267,11 @@ The worker exposes only these operations via `postMessage`:
 Session state never leaves the worker.
 
 **What XSS Can Do:**
+
 - Use the session while the tab is open (send/receive messages)
 
 **What XSS Cannot Do:**
+
 - Export the CryptoKey
 - Read decrypted session state
 - Steal the session for use elsewhere (on attacker's machine)
@@ -289,11 +307,12 @@ We use server IDs in URLs to guarantee uniqueness across users. The CLI register
 
 ### Why Base32 for QR Codes?
 
-QR codes have multiple encoding modes. Alphanumeric mode (A-Z, 0-9, space, $%*+-./:) is ~40% more efficient than binary mode. Base32 (A-Z, 2-7) fits alphanumeric mode perfectly.
+QR codes have multiple encoding modes. Alphanumeric mode (A-Z, 0-9, space, $%\*+-./:) is ~40% more efficient than binary mode. Base32 (A-Z, 2-7) fits alphanumeric mode perfectly.
 
 ### Why Not Store Bundles Server-Side?
 
 E2E trust model: the server should never see encryption key material. Bundles only exist in:
+
 1. QR code URL fragment (never sent to server)
 2. Client memory during session creation
 
@@ -333,7 +352,7 @@ app/
 │   ├── signal/
 │   │   └── index.js   # Worker proxy (main thread)
 │   ├── workers/
-│   │   └── signal_worker.js  # Crypto isolation (Web Worker)
+│   │   └── signal.js  # Crypto isolation (Web Worker)
 │   └── controllers/
 │       └── connection_controller.js  # Connection state machine
 └── models/

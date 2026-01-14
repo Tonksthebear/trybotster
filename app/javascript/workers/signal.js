@@ -89,7 +89,7 @@ async function handleInit(wasmJsUrl, wasmBinaryUrl) {
 
   // Import WASM JS glue code and initialize with binary
   const module = await import(wasmJsUrl);
-  await module.default(wasmBinaryUrl);
+  await module.default({ module_or_path: wasmBinaryUrl });
   wasmModule = module;
 
   console.log("[SignalWorker] WASM initialized:", module.ping());

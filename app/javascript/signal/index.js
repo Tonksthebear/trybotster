@@ -24,7 +24,7 @@ let nextRequestId = 1;
 /**
  * Initialize the Signal worker with WASM module.
  *
- * @param {string} workerUrl - URL to signal_worker.js (from asset_path)
+ * @param {string} workerUrl - URL to workers/signal.js (from asset_path)
  * @param {string} wasmJsUrl - URL to libsignal_wasm.js (from asset_path)
  * @param {string} wasmBinaryUrl - URL to libsignal_wasm_bg.wasm (from asset_path)
  */
@@ -93,7 +93,10 @@ function sendToWorker(action, params = {}) {
  * Used for QR code URLs which use Base32 for alphanumeric mode efficiency.
  */
 function base32Decode(base32) {
-  base32 = base32.toUpperCase().replace(/=+$/, "").replace(/[^A-Z2-7]/g, "");
+  base32 = base32
+    .toUpperCase()
+    .replace(/=+$/, "")
+    .replace(/[^A-Z2-7]/g, "");
 
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
   let bits = "";
@@ -127,11 +130,12 @@ function bytesToBase64(bytes) {
  */
 function readU32LE(bytes, offset) {
   return (
-    bytes[offset] |
-    (bytes[offset + 1] << 8) |
-    (bytes[offset + 2] << 16) |
-    (bytes[offset + 3] << 24)
-  ) >>> 0;
+    (bytes[offset] |
+      (bytes[offset + 1] << 8) |
+      (bytes[offset + 2] << 16) |
+      (bytes[offset + 3] << 24)) >>>
+    0
+  );
 }
 
 /**
@@ -165,21 +169,33 @@ function parseBinaryBundle(bytes) {
   const TOTAL_SIZE = 1813;
 
   if (bytes.length !== TOTAL_SIZE) {
-    throw new Error(`Invalid bundle size: ${bytes.length}, expected ${TOTAL_SIZE}`);
+    throw new Error(
+      `Invalid bundle size: ${bytes.length}, expected ${TOTAL_SIZE}`,
+    );
   }
 
   const bundle = {
     version: bytes[VERSION_OFFSET],
     registration_id: readU32LE(bytes, REGISTRATION_ID_OFFSET),
-    identity_key: bytesToBase64(bytes.slice(IDENTITY_KEY_OFFSET, IDENTITY_KEY_OFFSET + 33)),
+    identity_key: bytesToBase64(
+      bytes.slice(IDENTITY_KEY_OFFSET, IDENTITY_KEY_OFFSET + 33),
+    ),
     signed_prekey_id: readU32LE(bytes, SIGNED_PREKEY_ID_OFFSET),
-    signed_prekey: bytesToBase64(bytes.slice(SIGNED_PREKEY_OFFSET, SIGNED_PREKEY_OFFSET + 33)),
-    signed_prekey_signature: bytesToBase64(bytes.slice(SIGNED_PREKEY_SIG_OFFSET, SIGNED_PREKEY_SIG_OFFSET + 64)),
+    signed_prekey: bytesToBase64(
+      bytes.slice(SIGNED_PREKEY_OFFSET, SIGNED_PREKEY_OFFSET + 33),
+    ),
+    signed_prekey_signature: bytesToBase64(
+      bytes.slice(SIGNED_PREKEY_SIG_OFFSET, SIGNED_PREKEY_SIG_OFFSET + 64),
+    ),
     prekey_id: readU32LE(bytes, PREKEY_ID_OFFSET),
     prekey: bytesToBase64(bytes.slice(PREKEY_OFFSET, PREKEY_OFFSET + 33)),
     kyber_prekey_id: readU32LE(bytes, KYBER_PREKEY_ID_OFFSET),
-    kyber_prekey: bytesToBase64(bytes.slice(KYBER_PREKEY_OFFSET, KYBER_PREKEY_OFFSET + 1569)),
-    kyber_prekey_signature: bytesToBase64(bytes.slice(KYBER_PREKEY_SIG_OFFSET, KYBER_PREKEY_SIG_OFFSET + 64)),
+    kyber_prekey: bytesToBase64(
+      bytes.slice(KYBER_PREKEY_OFFSET, KYBER_PREKEY_OFFSET + 1569),
+    ),
+    kyber_prekey_signature: bytesToBase64(
+      bytes.slice(KYBER_PREKEY_SIG_OFFSET, KYBER_PREKEY_SIG_OFFSET + 64),
+    ),
   };
 
   if (bundle.prekey_id === 0) {
@@ -221,7 +237,12 @@ export function parseBundleFromFragment() {
     bundle.hub_id = hubMatch ? hubMatch[1] : "";
     bundle.device_id = 1;
 
-    console.log("[Signal] Successfully parsed binary bundle, version:", bundle.version, "hub:", bundle.hub_id);
+    console.log(
+      "[Signal] Successfully parsed binary bundle, version:",
+      bundle.version,
+      "hub:",
+      bundle.hub_id,
+    );
     return bundle;
   } catch (error) {
     console.error("[Signal] Failed to parse bundle from fragment:", error);

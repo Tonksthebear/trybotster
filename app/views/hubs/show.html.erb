@@ -19,7 +19,7 @@
 <div class="min-h-[calc(100vh-8rem)]"
      data-controller="connection terminal-display agents"
      data-connection-hub-id-value="<%= @hub.id %>"
-     data-connection-worker-url-value="<%= asset_path('workers/signal_worker.js') %>"
+     data-connection-worker-url-value="<%= asset_path('workers/signal.js') %>"
      data-connection-wasm-js-url-value="<%= asset_path('libsignal_wasm.js') %>"
      data-connection-wasm-binary-url-value="<%= asset_path('libsignal_wasm_bg.wasm') %>"
      data-terminal-display-connection-outlet="[data-controller~='connection']"
