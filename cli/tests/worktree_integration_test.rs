@@ -70,7 +70,8 @@ fn test_agent_spawns_with_echo_command() {
     );
 
     // Spawn with echo command (simple, won't fail)
-    let result = agent.spawn("echo test", "", vec![], std::collections::HashMap::new());
+    let empty_env = std::collections::HashMap::new();
+    let result = agent.spawn("echo test", "", vec![], &empty_env);
 
     // Should succeed in spawning
     assert!(result.is_ok());

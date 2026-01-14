@@ -69,6 +69,8 @@ pub fn render(
     let connection_url = hub.connection_url.clone();
     // Error message for Error mode
     let error_message = hub.error_message.clone();
+    // TUI creation progress for display
+    let creating_agent = hub.creating_agent.clone();
 
     // Build menu context from current state
     let selected_agent = agent_keys_ordered
@@ -90,7 +92,26 @@ pub fn render(
             .split(f.area());
 
         // Render agent list
-        let items: Vec<ListItem> = agent_keys_ordered
+        let mut items: Vec<ListItem> = Vec::new();
+
+        // Add creating indicator at top if agent creation is in progress
+        if let Some((ref identifier, ref stage)) = creating_agent {
+            use crate::relay::AgentCreationStage;
+            let stage_label = match stage {
+                AgentCreationStage::CreatingWorktree => "Creating worktree...",
+                AgentCreationStage::CopyingConfig => "Copying config...",
+                AgentCreationStage::SpawningAgent => "Starting agent...",
+                AgentCreationStage::Ready => "Ready",
+            };
+            let creating_text = format!("⟳ {} ({})", identifier, stage_label);
+            items.push(
+                ListItem::new(creating_text)
+                    .style(Style::default().fg(ratatui::style::Color::Cyan))
+            );
+        }
+
+        // Add existing agents
+        items.extend(agent_keys_ordered
             .iter()
             .filter_map(|key| agents.get(key))
             .map(|agent| {
@@ -113,12 +134,13 @@ pub fn render(
                 };
 
                 ListItem::new(format!("{}{}", base_text, server_info))
-            })
-            .collect();
+            }));
 
         let mut state = ListState::default();
+        // Offset selection by 1 if creating indicator is shown
+        let creating_offset = if creating_agent.is_some() { 1 } else { 0 };
         state.select(Some(
-            selected.min(agent_keys_ordered.len().saturating_sub(1)),
+            (selected + creating_offset).min(items.len().saturating_sub(1)),
         ));
 
         // Add polling indicator

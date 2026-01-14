@@ -48,6 +48,27 @@ pub enum TerminalMessage {
         /// Selected agent's session key.
         id: String,
     },
+    /// Agent creation started notification.
+    ///
+    /// Sent immediately when agent creation begins, before blocking operations.
+    /// Allows browser to show loading state.
+    #[serde(rename = "agent_creating")]
+    AgentCreating {
+        /// The branch or issue identifier being created.
+        identifier: String,
+    },
+    /// Agent creation progress update.
+    ///
+    /// Sent during agent creation to show progress through stages.
+    #[serde(rename = "agent_creating_progress")]
+    AgentCreatingProgress {
+        /// The branch or issue identifier being created.
+        identifier: String,
+        /// Current stage of creation.
+        stage: AgentCreationStage,
+        /// Human-readable message for this stage.
+        message: String,
+    },
     /// Agent created confirmation.
     #[serde(rename = "agent_created")]
     AgentCreated {
@@ -126,6 +147,44 @@ pub struct WorktreeInfo {
     pub branch: String,
     /// Associated issue number, if any.
     pub issue_number: Option<u64>,
+}
+
+/// Stages of agent creation for progress reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCreationStage {
+    /// Creating the git worktree (slowest step).
+    CreatingWorktree,
+    /// Copying .botster_copy configuration files.
+    CopyingConfig,
+    /// Spawning the agent PTY process.
+    SpawningAgent,
+    /// Agent is ready.
+    Ready,
+}
+
+impl AgentCreationStage {
+    /// Get a human-readable description for this stage.
+    #[must_use]
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::CreatingWorktree => "Creating git worktree...",
+            Self::CopyingConfig => "Copying configuration files...",
+            Self::SpawningAgent => "Starting agent...",
+            Self::Ready => "Agent ready",
+        }
+    }
+
+    /// Get a short label for this stage.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CreatingWorktree => "Worktree",
+            Self::CopyingConfig => "Config",
+            Self::SpawningAgent => "Starting",
+            Self::Ready => "Ready",
+        }
+    }
 }
 
 /// Browser command types (browser -> CLI).

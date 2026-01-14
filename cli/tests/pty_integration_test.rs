@@ -46,18 +46,52 @@ fn count_botster_processes() -> usize {
 }
 
 
-/// Spawn a thread to drain PTY output (prevents blocking on full buffer)
-fn spawn_output_drain(mut reader: Box<dyn std::io::Read + Send>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
+/// Spawn a thread to capture PTY output (prevents blocking on full buffer)
+/// Returns a handle and a receiver for the captured output
+fn spawn_output_capture(
+    mut reader: Box<dyn std::io::Read + Send>,
+) -> (thread::JoinHandle<()>, std::sync::mpsc::Receiver<String>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        let mut output = String::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break, // EOF
-                Ok(_) => continue, // Discard output
+                Ok(n) => {
+                    output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
                 Err(_) => break,
             }
         }
-    })
+        let _ = tx.send(output);
+    });
+    (handle, rx)
+}
+
+/// Safely send input to PTY, returning error if process exited unexpectedly.
+fn safe_pty_write(
+    writer: &mut Box<dyn std::io::Write + Send>,
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    data: &[u8],
+) -> Result<(), String> {
+    // Check if process is still running before sending input
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            return Err(format!("CLI exited unexpectedly with status: {:?}", status));
+        }
+        Ok(None) => {
+            // Process still running, continue
+        }
+        Err(e) => {
+            return Err(format!("Failed to check process status: {}", e));
+        }
+    }
+
+    // Try to write
+    writer.write_all(data).map_err(|e| format!("PTY write failed: {}", e))?;
+    writer.flush().map_err(|e| format!("PTY flush failed: {}", e))?;
+    Ok(())
 }
 
 #[test]
@@ -82,10 +116,8 @@ fn test_ctrl_q_exits_cleanly() {
     let mut cmd = CommandBuilder::new(get_binary_path());
     cmd.arg("start");
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    cmd.env("BOTSTER_API_KEY", "test-key-for-pty-test");
-    cmd.env("BOTSTER_SERVER_URL", "http://localhost:9999");
-    // Prevent actual network connections
-    cmd.env("BOTSTER_OFFLINE_MODE", "true");
+    // Use test mode to skip authentication and network connections
+    cmd.env("BOTSTER_ENV", "test");
 
     let mut child = pair
         .slave
@@ -94,16 +126,19 @@ fn test_ctrl_q_exits_cleanly() {
 
     let mut writer = pair.master.take_writer().expect("Failed to get PTY writer");
 
-    // Drain output to prevent CLI from blocking on writes
+    // Capture output to see errors if CLI fails
     let reader = pair.master.try_clone_reader().expect("Failed to get PTY reader");
-    let _drain_handle = spawn_output_drain(reader);
+    let (_capture_handle, output_rx) = spawn_output_capture(reader);
 
     // Give the TUI time to initialize
     thread::sleep(Duration::from_millis(800));
 
     // Send Ctrl+Q (ASCII 0x11)
-    writer.write_all(&[0x11]).expect("Failed to send Ctrl+Q");
-    writer.flush().expect("Failed to flush");
+    if let Err(e) = safe_pty_write(&mut writer, &mut child, &[0x11]) {
+        // Get captured output to show in error message
+        let output = output_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
+        panic!("Failed to send input to CLI: {}\nCLI output:\n{}", e, output);
+    }
 
     // Wait for process to exit (should be quick)
     let start = Instant::now();
@@ -157,21 +192,26 @@ fn test_sigint_triggers_graceful_shutdown() {
     let mut cmd = CommandBuilder::new(get_binary_path());
     cmd.arg("start");
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    cmd.env("BOTSTER_API_KEY", "test-key-for-pty-test");
-    cmd.env("BOTSTER_SERVER_URL", "http://localhost:9999");
-    cmd.env("BOTSTER_OFFLINE_MODE", "true");
+    // Use test mode to skip authentication and network connections
+    cmd.env("BOTSTER_ENV", "test");
 
     let mut child = pair
         .slave
         .spawn_command(cmd)
         .expect("Failed to spawn CLI in PTY");
 
-    // Drain output to prevent CLI from blocking on writes
+    // Capture output to see errors if CLI fails
     let reader = pair.master.try_clone_reader().expect("Failed to get PTY reader");
-    let _drain_handle = spawn_output_drain(reader);
+    let (_capture_handle, output_rx) = spawn_output_capture(reader);
 
     // Give the TUI time to initialize
     thread::sleep(Duration::from_millis(800));
+
+    // Check if process is still running before sending signal
+    if let Ok(Some(status)) = child.try_wait() {
+        let output = output_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
+        panic!("CLI exited before test could run with status: {:?}\nCLI output:\n{}", status, output);
+    }
 
     // Get the process ID and send SIGINT
     let pid = child.process_id().expect("Failed to get PID");
@@ -226,21 +266,26 @@ fn test_sigterm_triggers_graceful_shutdown() {
     let mut cmd = CommandBuilder::new(get_binary_path());
     cmd.arg("start");
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    cmd.env("BOTSTER_API_KEY", "test-key-for-pty-test");
-    cmd.env("BOTSTER_SERVER_URL", "http://localhost:9999");
-    cmd.env("BOTSTER_OFFLINE_MODE", "true");
+    // Use test mode to skip authentication and network connections
+    cmd.env("BOTSTER_ENV", "test");
 
     let mut child = pair
         .slave
         .spawn_command(cmd)
         .expect("Failed to spawn CLI in PTY");
 
-    // Drain output to prevent CLI from blocking on writes
+    // Capture output to see errors if CLI fails
     let reader = pair.master.try_clone_reader().expect("Failed to get PTY reader");
-    let _drain_handle = spawn_output_drain(reader);
+    let (_capture_handle, output_rx) = spawn_output_capture(reader);
 
     // Give the TUI time to initialize
     thread::sleep(Duration::from_millis(800));
+
+    // Check if process is still running before sending signal
+    if let Ok(Some(status)) = child.try_wait() {
+        let output = output_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
+        panic!("CLI exited before test could run with status: {:?}\nCLI output:\n{}", status, output);
+    }
 
     // Send SIGTERM
     let pid = child.process_id().expect("Failed to get PID");
@@ -296,17 +341,25 @@ fn test_pty_close_triggers_cleanup() {
     let mut cmd = CommandBuilder::new(get_binary_path());
     cmd.arg("start");
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    cmd.env("BOTSTER_API_KEY", "test-key-for-pty-test");
-    cmd.env("BOTSTER_SERVER_URL", "http://localhost:9999");
-    cmd.env("BOTSTER_OFFLINE_MODE", "true");
+    // Use test mode to skip authentication and network connections
+    cmd.env("BOTSTER_ENV", "test");
 
     let mut child = pair
         .slave
         .spawn_command(cmd)
         .expect("Failed to spawn CLI in PTY");
 
+    // Note: We intentionally don't capture output here because the test requires
+    // dropping the PTY master cleanly. Any cloned readers would keep FDs open
+    // and potentially interfere with PTY closure semantics.
+
     // Give the TUI time to initialize
     thread::sleep(Duration::from_millis(800));
+
+    // Check if process is still running before closing PTY
+    if let Ok(Some(status)) = child.try_wait() {
+        panic!("CLI exited before test could run with status: {:?}", status);
+    }
 
     // Drop the master PTY - this closes the terminal, sending SIGHUP
     drop(pair.master);
@@ -362,9 +415,8 @@ fn test_input_is_responsive() {
     let mut cmd = CommandBuilder::new(get_binary_path());
     cmd.arg("start");
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    cmd.env("BOTSTER_API_KEY", "test-key-for-pty-test");
-    cmd.env("BOTSTER_SERVER_URL", "http://localhost:9999");
-    cmd.env("BOTSTER_OFFLINE_MODE", "true");
+    // Use test mode to skip authentication and network connections
+    cmd.env("BOTSTER_ENV", "test");
 
     let mut child = pair
         .slave
@@ -373,9 +425,9 @@ fn test_input_is_responsive() {
 
     let mut writer = pair.master.take_writer().expect("Failed to get PTY writer");
 
-    // Drain output to prevent CLI from blocking on writes
+    // Capture output to see errors if CLI fails
     let reader = pair.master.try_clone_reader().expect("Failed to get PTY reader");
-    let _drain_handle = spawn_output_drain(reader);
+    let (_capture_handle, output_rx) = spawn_output_capture(reader);
 
     // Give the TUI time to initialize
     thread::sleep(Duration::from_millis(800));
@@ -384,8 +436,10 @@ fn test_input_is_responsive() {
     let input_start = Instant::now();
 
     // Send Ctrl+Q
-    writer.write_all(&[0x11]).expect("Failed to send Ctrl+Q");
-    writer.flush().expect("Failed to flush");
+    if let Err(e) = safe_pty_write(&mut writer, &mut child, &[0x11]) {
+        let output = output_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
+        panic!("Failed to send input to CLI: {}\nCLI output:\n{}", e, output);
+    }
 
     // The CLI should respond within 500ms if input handling is working
     let response_timeout = Duration::from_millis(500);
@@ -458,9 +512,8 @@ fn test_no_orphan_processes_after_exit() {
     let mut cmd = CommandBuilder::new(get_binary_path());
     cmd.arg("start");
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    cmd.env("BOTSTER_API_KEY", "test-key-for-pty-test");
-    cmd.env("BOTSTER_SERVER_URL", "http://localhost:9999");
-    cmd.env("BOTSTER_OFFLINE_MODE", "true");
+    // Use test mode to skip authentication and network connections
+    cmd.env("BOTSTER_ENV", "test");
 
     let mut child = pair
         .slave
@@ -469,16 +522,18 @@ fn test_no_orphan_processes_after_exit() {
 
     let mut writer = pair.master.take_writer().expect("Failed to get PTY writer");
 
-    // Drain output to prevent CLI from blocking on writes
+    // Capture output to see errors if CLI fails
     let reader = pair.master.try_clone_reader().expect("Failed to get PTY reader");
-    let _drain_handle = spawn_output_drain(reader);
+    let (_capture_handle, output_rx) = spawn_output_capture(reader);
 
     // Give the TUI time to initialize
     thread::sleep(Duration::from_millis(800));
 
     // Exit cleanly with Ctrl+Q
-    writer.write_all(&[0x11]).expect("Failed to send Ctrl+Q");
-    writer.flush().expect("Failed to flush");
+    if let Err(e) = safe_pty_write(&mut writer, &mut child, &[0x11]) {
+        let output = output_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
+        panic!("Failed to send input to CLI: {}\nCLI output:\n{}", e, output);
+    }
 
     // Wait for exit
     let start = Instant::now();
