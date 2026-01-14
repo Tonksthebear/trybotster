@@ -16,7 +16,7 @@
     <% if flash[:alert] %>
       <div class="bg-red-500/10 border border-red-500/20 rounded-lg p-4 mb-6">
         <div class="flex items-center gap-3">
-          <svg class="w-5 h-5 text-red-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg class="w-5 h-5 text-red-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
           <p class="text-sm text-red-300"><%= flash[:alert] %></p>
@@ -37,7 +37,7 @@
                  autofocus
                  autocomplete="off"
                  placeholder="XXXX-XXXX"
-                 class="w-full px-4 py-4 bg-zinc-950 border border-zinc-700 rounded-lg text-zinc-100 placeholder-zinc-600 font-mono text-2xl text-center tracking-widest uppercase focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-colors">
+                 class="w-full px-4 py-4 bg-zinc-950 border border-zinc-700 rounded-lg text-zinc-100 placeholder-zinc-600 font-mono text-2xl text-center tracking-widest uppercase focus:outline-hidden focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-colors">
           <p class="mt-3 text-xs text-zinc-500">
             Run <code class="px-1.5 py-0.5 bg-zinc-800 rounded font-mono text-cyan-400">botster</code> in your terminal to get the code
           </p>

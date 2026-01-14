@@ -729,7 +729,7 @@ export default class extends Controller {
     if (this.hasStatusIconTarget) {
       this.statusIconTarget.innerHTML = config.icon;
       // Apply color class to icon
-      this.statusIconTarget.className = `flex-shrink-0 ${config.iconClass}`;
+      this.statusIconTarget.className = `shrink-0 ${config.iconClass}`;
     }
 
     if (this.hasStatusTextTarget) {
@@ -781,7 +781,7 @@ export default class extends Controller {
           "border-b border-emerald-500/20 bg-emerald-500/5 transition-colors duration-300";
         if (this.hasSecurityIconTarget) {
           this.securityIconTarget.innerHTML = lockIcon;
-          this.securityIconTarget.className = "flex-shrink-0 text-emerald-400";
+          this.securityIconTarget.className = "shrink-0 text-emerald-400";
         }
         if (this.hasSecurityTextTarget) {
           this.securityTextTarget.innerHTML = `
@@ -796,7 +796,7 @@ export default class extends Controller {
           "border-b border-red-500/20 bg-red-500/5 transition-colors duration-300";
         if (this.hasSecurityIconTarget) {
           this.securityIconTarget.innerHTML = errorIcon;
-          this.securityIconTarget.className = "flex-shrink-0 text-red-400";
+          this.securityIconTarget.className = "shrink-0 text-red-400";
         }
         if (this.hasSecurityTextTarget) {
           this.securityTextTarget.innerHTML = `
@@ -812,7 +812,7 @@ export default class extends Controller {
           "border-b border-amber-500/20 bg-amber-500/5 transition-colors duration-300";
         if (this.hasSecurityIconTarget) {
           this.securityIconTarget.innerHTML = unlockIcon;
-          this.securityIconTarget.className = "flex-shrink-0 text-amber-400";
+          this.securityIconTarget.className = "shrink-0 text-amber-400";
         }
         if (this.hasSecurityTextTarget) {
           this.securityTextTarget.innerHTML = `
@@ -827,7 +827,7 @@ export default class extends Controller {
           "border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300";
         if (this.hasSecurityIconTarget) {
           this.securityIconTarget.innerHTML = unlockIcon;
-          this.securityIconTarget.className = "flex-shrink-0 text-zinc-500";
+          this.securityIconTarget.className = "shrink-0 text-zinc-500";
         }
         if (this.hasSecurityTextTarget) {
           this.securityTextTarget.innerHTML = `

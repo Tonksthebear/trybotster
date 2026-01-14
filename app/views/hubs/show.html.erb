@@ -44,7 +44,7 @@
         <div class="flex items-center gap-3">
           <div data-connection-target="statusContainer" class="flex flex-col items-end gap-0.5">
             <div data-connection-target="status" class="text-sm font-medium text-zinc-400 flex items-center gap-2">
-              <span data-connection-target="statusIcon" class="flex-shrink-0">
+              <span data-connection-target="statusIcon" class="shrink-0">
                 <svg class="w-4 h-4 animate-spin text-zinc-500" fill="none" viewBox="0 0 24 24">
                   <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                   <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
@@ -69,7 +69,7 @@
   <div data-connection-target="securityBanner" class="border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300">
     <div class="max-w-7xl mx-auto px-4 py-3">
       <div class="flex items-center gap-3">
-        <span data-connection-target="securityIcon" class="flex-shrink-0">
+        <span data-connection-target="securityIcon" class="shrink-0">
           <svg class="w-4 h-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
           </svg>
@@ -247,14 +247,14 @@
   <div id="new-agent-modal"
        data-controller="modal"
        class="hidden fixed inset-0 z-50">
-    <div data-action="click->modal#closeFromBackdrop"
+    <div data-action="modal#closeFromBackdrop"
          class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
       <div data-modal-target="content"
            class="bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl w-full max-w-md max-h-[80vh] flex flex-col">
 
         <%# Step 1: Worktree Selection %>
         <div data-agents-target="step1" class="flex flex-col flex-1 min-h-0">
-          <div class="px-6 py-4 border-b border-zinc-800 flex-shrink-0">
+          <div class="px-6 py-4 border-b border-zinc-800 shrink-0">
             <div class="flex items-center gap-2 mb-1">
               <span class="w-6 h-6 rounded-full bg-cyan-500 text-zinc-950 text-xs font-bold flex items-center justify-center">1</span>
               <h3 class="text-lg font-semibold text-zinc-100">Select Worktree</h3>
@@ -281,7 +281,7 @@
                 <input type="text"
                        data-agents-target="newBranchInput"
                        placeholder="Issue # or branch name"
-                       class="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-zinc-100 placeholder-zinc-500 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
+                       class="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-zinc-100 placeholder-zinc-500 text-sm focus:outline-hidden focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
                        autocomplete="off"
                        data-action="keydown.enter->agents#selectNewBranch">
                 <button type="button"
@@ -293,7 +293,7 @@
             </div>
           </div>
 
-          <div class="px-4 py-3 border-t border-zinc-800 flex-shrink-0">
+          <div class="px-4 py-3 border-t border-zinc-800 shrink-0">
             <button type="button"
                     data-action="modal#hide"
                     class="w-full px-4 py-2 text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition-colors">
@@ -304,7 +304,7 @@
 
         <%# Step 2: Prompt Input %>
         <div data-agents-target="step2" class="hidden flex flex-col flex-1 min-h-0">
-          <div class="px-6 py-4 border-b border-zinc-800 flex-shrink-0">
+          <div class="px-6 py-4 border-b border-zinc-800 shrink-0">
             <div class="flex items-center gap-2 mb-1">
               <span class="w-6 h-6 rounded-full bg-cyan-500 text-zinc-950 text-xs font-bold flex items-center justify-center">2</span>
               <h3 class="text-lg font-semibold text-zinc-100">Initial Prompt</h3>
@@ -316,7 +316,7 @@
             <%# Selection Summary %>
             <div class="mb-4 p-3 bg-zinc-800/50 border border-zinc-700 rounded-lg">
               <div class="flex items-center gap-2 text-sm">
-                <svg class="w-4 h-4 text-emerald-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <svg class="w-4 h-4 text-emerald-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path>
                 </svg>
                 <span class="text-zinc-400">Worktree:</span>
@@ -329,11 +329,11 @@
             <textarea data-agents-target="promptInput"
                       rows="4"
                       placeholder="Describe what you want the agent to work on... (leave blank for interactive session)"
-                      class="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-zinc-100 placeholder-zinc-500 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent resize-none"></textarea>
+                      class="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-zinc-100 placeholder-zinc-500 text-sm focus:outline-hidden focus:ring-2 focus:ring-cyan-500 focus:border-transparent resize-none"></textarea>
             <p class="text-xs text-zinc-500 mt-2">Leave blank to start an interactive session where you can guide the agent</p>
           </div>
 
-          <div class="px-4 py-3 border-t border-zinc-800 flex-shrink-0 flex gap-2">
+          <div class="px-4 py-3 border-t border-zinc-800 shrink-0 flex gap-2">
             <button type="button"
                     data-action="agents#goBackToStep1"
                     class="flex-1 px-4 py-2 text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition-colors">

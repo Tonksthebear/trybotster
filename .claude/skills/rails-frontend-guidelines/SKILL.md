@@ -144,6 +144,7 @@ end
 
 ## Resources
 
+- [Tailwind Guide](resources/tailwind-guide.md) - v4 utilities, breaking changes, best practices
 - [Turbo Guide](resources/turbo-guide.md) - Frames, Streams, Drive
 - [Stimulus Guide](resources/stimulus-guide.md) - Controllers, targets, values
 - [Complete Examples](resources/complete-examples.md) - Full working patterns
