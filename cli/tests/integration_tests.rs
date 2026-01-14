@@ -107,13 +107,12 @@ fn test_pty_view_switch_preserves_scroll() {
 
     let (mut agent, _temp_dir) = create_test_agent();
 
-    // Set up both PTYs
-    agent.cli_pty = Some(PtySession::new(24, 80));
+    // cli_pty is already initialized in Agent::new(), just set up server_pty
     agent.server_pty = Some(PtySession::new(24, 80));
 
     // Add content to both
     {
-        let mut p = agent.cli_pty.as_ref().unwrap().vt100_parser.lock().unwrap();
+        let mut p = agent.cli_pty.vt100_parser.lock().unwrap();
         for i in 0..50 {
             p.process(format!("CLI Line {}\r\n", i).as_bytes());
         }
@@ -290,12 +289,9 @@ fn test_concurrent_scroll_and_render() {
 /// Run with: cargo test --test integration_tests -- --test-threads=1 test_main_render_loop
 #[test]
 fn test_main_render_loop_pattern() {
-    use botster_hub::agent::PtySession;
-
     let (mut agent, _temp_dir) = create_test_agent();
 
-    // Set up PTY like main.rs does
-    agent.cli_pty = Some(PtySession::new(24, 80));
+    // cli_pty is already initialized in Agent::new()
 
     // Add content to the parser
     {
@@ -471,7 +467,7 @@ fn test_spawn_real_pty_with_init_script() {
             "bash",
             "",
             vec![format!("source {}", init_script.display())],
-            env_vars,
+            &env_vars,
         ).expect("Failed to spawn PTY");
 
         // Wait for output to be generated
@@ -542,11 +538,12 @@ fn test_spawn_server_pty() {
         );
 
         // First set up the CLI PTY (as would happen in normal operation)
+        let empty_env = HashMap::new();
         agent.spawn(
             "bash",
             "",
             vec!["echo 'CLI PTY started'".to_string()],
-            HashMap::new(),
+            &empty_env,
         ).expect("Failed to spawn CLI PTY");
 
         // Now spawn the server PTY
@@ -556,7 +553,7 @@ fn test_spawn_server_pty() {
 
         agent.spawn_server_pty(
             &server_script.display().to_string(),
-            server_env,
+            &server_env,
         ).expect("Failed to spawn server PTY");
 
         assert!(agent.has_server_pty(), "Server PTY should be available");
@@ -614,18 +611,19 @@ fn test_real_pty_view_switching() {
         );
 
         // Spawn CLI PTY
+        let empty_env = HashMap::new();
         agent.spawn(
             "bash",
             "",
             vec!["for i in $(seq 1 50); do echo \"CLI Line $i\"; done".to_string()],
-            HashMap::new(),
+            &empty_env,
         ).expect("Failed to spawn CLI PTY");
 
         // Spawn server PTY
         let server_script = fixture_path("test_botster_server.sh");
         agent.spawn_server_pty(
             &server_script.display().to_string(),
-            HashMap::new(),
+            &empty_env,
         ).expect("Failed to spawn server PTY");
 
         // Wait for output
@@ -720,7 +718,7 @@ fn test_render_agent_terminal_with_real_pty() {
             "bash",
             "",
             vec![format!("source {}", init_script.display())],
-            env_vars,
+            &env_vars,
         ).expect("Failed to spawn PTY");
 
         // Wait for the script to generate output (100 lines)
@@ -771,11 +769,12 @@ fn test_rapid_scroll_real_pty_no_deadlock() {
         );
 
         // Spawn PTY with content
+        let empty_env = HashMap::new();
         agent.spawn(
             "bash",
             "",
             vec!["for i in $(seq 1 200); do echo \"Line $i: Lorem ipsum dolor sit amet\"; done".to_string()],
-            HashMap::new(),
+            &empty_env,
         ).expect("Failed to spawn PTY");
 
         // Wait for content

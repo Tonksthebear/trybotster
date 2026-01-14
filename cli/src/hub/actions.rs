@@ -675,9 +675,19 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
 }
 
 /// Build menu context from current hub state.
+///
+/// IMPORTANT: This must use the same selection logic as render.rs to ensure
+/// the displayed menu matches the navigation bounds. If TUI has no explicit
+/// selection, we fall back to the first agent (index 0) for consistency.
 fn build_menu_context(hub: &Hub) -> super::MenuContext {
-    // Uses TUI client's selection via hub.selected_agent()
-    let selected_agent = hub.selected_agent();
+    // Use same fallback logic as render.rs: if no TUI selection, use first agent
+    let selected_agent = hub.get_tui_selected_agent_key()
+        .and_then(|key| hub.state.agents.get(&key))
+        .or_else(|| {
+            // Fallback: use first agent if any exist (matches render.rs behavior)
+            hub.state.agent_keys_ordered.first()
+                .and_then(|key| hub.state.agents.get(key))
+        });
 
     super::MenuContext {
         has_agent: selected_agent.is_some(),
@@ -786,6 +796,9 @@ fn spawn_agent_from_worktree(hub: &mut Hub) -> anyhow::Result<()> {
 }
 
 /// Create a new worktree and spawn an agent on it.
+///
+/// Routes through the async `handle_create_agent_for_client` path to avoid
+/// blocking the TUI during git operations.
 fn create_and_spawn_agent(hub: &mut Hub) -> anyhow::Result<()> {
     let branch_name = hub.input_buffer.trim();
 
@@ -793,32 +806,15 @@ fn create_and_spawn_agent(hub: &mut Hub) -> anyhow::Result<()> {
         anyhow::bail!("Branch name cannot be empty");
     }
 
-    let (issue_number, actual_branch_name) = if let Ok(num) = branch_name.parse::<u32>() {
-        (Some(num), format!("botster-issue-{num}"))
-    } else {
-        (None, branch_name.to_string())
+    // Route through the async client path (same as browser)
+    // This spawns git operations to background thread
+    let request = crate::client::CreateAgentRequest {
+        issue_or_branch: branch_name.to_string(),
+        prompt: None,
+        from_worktree: None,
     };
 
-    let (repo_path, repo_name) = crate::git::WorktreeManager::detect_current_repo()?;
-    let worktree_path = hub.state.git_manager.create_worktree_with_branch(&actual_branch_name)?;
-
-    let prompt = issue_number.map_or_else(
-        || format!("Work on {actual_branch_name}"),
-        |n| format!("Work on issue #{n}"),
-    );
-
-    let config = crate::agents::AgentSpawnConfig {
-        issue_number,
-        branch_name: actual_branch_name,
-        worktree_path,
-        repo_path,
-        repo_name,
-        prompt,
-        message_id: None,
-        invocation_url: None,
-    };
-    spawn_agent_with_tunnel(hub, &config)?;
-
+    handle_create_agent_for_client(hub, ClientId::Tui, request);
     Ok(())
 }
 
@@ -951,7 +947,22 @@ fn handle_resize_for_client(hub: &mut Hub, client_id: ClientId, cols: u16, rows:
 }
 
 /// Handle creating an agent for a specific client.
+///
+/// This spawns the heavy git/file operations to a background thread to avoid
+/// blocking the main event loop. The main loop polls for completion and finishes
+/// the spawn (PTY creation) on the main thread.
 fn handle_create_agent_for_client(hub: &mut Hub, client_id: ClientId, request: CreateAgentRequest) {
+    // Send immediate "creating" notification to browser clients
+    if let ClientId::Browser(ref identity) = client_id {
+        if let Some(ref sender) = hub.browser.sender {
+            let ctx = crate::relay::BrowserSendContext {
+                sender,
+                runtime: &hub.tokio_runtime,
+            };
+            crate::relay::send_agent_creating_to(&ctx, identity, &request.issue_or_branch);
+        }
+    }
+
     // Parse issue number or branch name
     let (issue_number, actual_branch_name) = if let Ok(num) = request.issue_or_branch.parse::<u32>() {
         (Some(num), format!("botster-issue-{num}"))
@@ -959,20 +970,13 @@ fn handle_create_agent_for_client(hub: &mut Hub, client_id: ClientId, request: C
         (None, request.issue_or_branch.clone())
     };
 
-    // Create worktree or use existing
-    let worktree_path = if let Some(path) = request.from_worktree {
-        path
-    } else {
-        match hub.state.git_manager.create_worktree_with_branch(&actual_branch_name) {
-            Ok(path) => path,
-            Err(e) => {
-                hub.send_error_to(&client_id, format!("Failed to create worktree: {}", e));
-                return;
-            }
-        }
-    };
+    // If worktree already provided, spawn agent synchronously (fast path)
+    if let Some(worktree_path) = request.from_worktree {
+        spawn_agent_sync(hub, client_id, issue_number, actual_branch_name, worktree_path, request.prompt);
+        return;
+    }
 
-    // Get repo info
+    // Get repo info before spawning (needed for config)
     let (repo_path, repo_name) = match crate::git::WorktreeManager::detect_current_repo() {
         Ok(info) => info,
         Err(e) => {
@@ -981,16 +985,124 @@ fn handle_create_agent_for_client(hub: &mut Hub, client_id: ClientId, request: C
         }
     };
 
+    // Clone what we need for the background thread
+    let worktree_base = hub.config.worktree_base.clone();
+    let branch_name = actual_branch_name.clone();
+    let result_tx = hub.pending_agent_tx.clone();
+    let progress_tx = hub.progress_tx.clone();
+    let identifier = request.issue_or_branch.clone();
     let prompt = request.prompt.unwrap_or_else(|| {
         issue_number.map_or_else(
-            || format!("Work on {actual_branch_name}"),
+            || format!("Work on {branch_name}"),
+            |n| format!("Work on issue #{n}"),
+        )
+    });
+
+    // Spawn heavy git/file operations to background thread
+    log::info!("Spawning background agent creation for branch: {}", branch_name);
+
+    std::thread::spawn(move || {
+        use crate::relay::AgentCreationStage;
+
+        // Helper to send progress updates
+        let send_progress = |stage: AgentCreationStage| {
+            let _ = progress_tx.send(super::AgentProgressEvent {
+                client_id: client_id.clone(),
+                identifier: identifier.clone(),
+                stage,
+            });
+        };
+
+        // Stage 1: Creating worktree
+        send_progress(AgentCreationStage::CreatingWorktree);
+
+        // Create worktree manager for this thread
+        let git_manager = crate::git::WorktreeManager::new(worktree_base);
+
+        // SLOW: Create git worktree
+        let worktree_path = match git_manager.create_worktree_with_branch(&branch_name) {
+            Ok(path) => path,
+            Err(e) => {
+                let _ = result_tx.send(super::PendingAgentResult {
+                    client_id,
+                    result: Err(format!("Failed to create worktree: {}", e)),
+                    config: crate::agents::AgentSpawnConfig {
+                        issue_number,
+                        branch_name,
+                        worktree_path: PathBuf::new(),
+                        repo_path,
+                        repo_name,
+                        prompt,
+                        message_id: None,
+                        invocation_url: None,
+                    },
+                });
+                return;
+            }
+        };
+
+        // Stage 2: Copying config files (done inside create_worktree_with_branch)
+        send_progress(AgentCreationStage::CopyingConfig);
+
+        // Build config for spawn (will be completed on main thread)
+        let config = crate::agents::AgentSpawnConfig {
+            issue_number,
+            branch_name,
+            worktree_path: worktree_path.clone(),
+            repo_path,
+            repo_name,
+            prompt,
+            message_id: None,
+            invocation_url: None,
+        };
+
+        log::info!("Background worktree creation complete: {:?}", worktree_path);
+
+        // Stage 3: Spawning agent (main thread will handle this, but signal we're ready)
+        send_progress(AgentCreationStage::SpawningAgent);
+
+        // Send config back to main thread for PTY spawn
+        // The main thread will call spawn_agent() which is fast
+        let _ = result_tx.send(super::PendingAgentResult {
+            client_id,
+            result: Ok(super::SpawnResult {
+                // Placeholder - actual spawn happens on main thread
+                session_key: String::new(),
+                tunnel_port: None,
+                has_server_pty: false,
+            }),
+            config,
+        });
+    });
+}
+
+/// Synchronous agent spawn (fast path when worktree already exists).
+fn spawn_agent_sync(
+    hub: &mut Hub,
+    client_id: ClientId,
+    issue_number: Option<u32>,
+    branch_name: String,
+    worktree_path: std::path::PathBuf,
+    prompt: Option<String>,
+) {
+    let (repo_path, repo_name) = match crate::git::WorktreeManager::detect_current_repo() {
+        Ok(info) => info,
+        Err(e) => {
+            hub.send_error_to(&client_id, format!("Failed to detect repo: {}", e));
+            return;
+        }
+    };
+
+    let prompt = prompt.unwrap_or_else(|| {
+        issue_number.map_or_else(
+            || format!("Work on {branch_name}"),
             |n| format!("Work on issue #{n}"),
         )
     });
 
     let config = crate::agents::AgentSpawnConfig {
         issue_number,
-        branch_name: actual_branch_name,
+        branch_name,
         worktree_path,
         repo_path,
         repo_name,
@@ -1007,7 +1119,6 @@ fn handle_create_agent_for_client(hub: &mut Hub, client_id: ClientId, request: C
         Ok(result) => {
             log::info!("Client {} created agent: {}", client_id, result.session_key);
 
-            // Register tunnel if port assigned
             if let Some(port) = result.tunnel_port {
                 let tm = Arc::clone(&hub.tunnel_manager);
                 let key = result.session_key.clone();
@@ -1016,17 +1127,11 @@ fn handle_create_agent_for_client(hub: &mut Hub, client_id: ClientId, request: C
                 });
             }
 
-            // Send response to requesting client
             if let Some(client) = hub.clients.get_mut(&client_id) {
                 client.receive_response(Response::agent_created(&result.session_key));
             }
 
-            // Broadcast updated agent list to all clients
             hub.broadcast_agent_list();
-
-            // Auto-select the new agent for the requesting client.
-            // This ensures the agent gets resized to client dims (even if resize
-            // arrived after create_agent due to async message ordering).
             let session_key = result.session_key;
             handle_select_agent_for_client(hub, client_id, session_key);
         }

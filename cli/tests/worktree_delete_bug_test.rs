@@ -62,7 +62,8 @@ fn test_delete_worktree_by_path_from_main_repo() {
     setup_test_repo(&main_repo);
 
     // Save original cwd and change to main repo (this simulates the bug scenario)
-    let original_cwd = env::current_dir().unwrap();
+    // Use ok() to handle case where cwd was deleted by another test
+    let original_cwd = env::current_dir().ok();
     env::set_current_dir(&main_repo).expect("Failed to change directory to main repo");
 
     let manager = WorktreeManager::new(base_dir.clone());
@@ -99,7 +100,16 @@ fn test_delete_worktree_by_path_from_main_repo() {
     let result = manager.delete_worktree_by_path(&worktree_path, branch_name);
 
     // Restore original directory before asserting
-    env::set_current_dir(&original_cwd).expect("Failed to restore directory");
+    // Handle case where original was deleted by another test
+    if let Some(ref cwd) = original_cwd {
+        if cwd.exists() {
+            env::set_current_dir(cwd).expect("Failed to restore directory");
+        } else {
+            env::set_current_dir(env::temp_dir()).expect("Failed to restore to temp");
+        }
+    } else {
+        env::set_current_dir(env::temp_dir()).expect("Failed to restore to temp");
+    }
 
     // The bug manifests as:
     // "Failed to remove worktree: fatal: '/path/to/main_repo' is a main working tree"
@@ -146,7 +156,8 @@ fn test_delete_worktree_by_path_with_different_cwd() {
     setup_test_repo(&main_repo);
 
     // Change to /tmp (completely unrelated directory)
-    let original_cwd = env::current_dir().unwrap();
+    // Use ok() to handle case where cwd was deleted by another test
+    let original_cwd = env::current_dir().ok();
     env::set_current_dir("/tmp").expect("Failed to change to /tmp");
 
     let manager = WorktreeManager::new(base_dir.clone());
@@ -173,8 +184,16 @@ fn test_delete_worktree_by_path_with_different_cwd() {
     // because detect_current_repo() can't find a repo in /tmp
     let result = manager.delete_worktree_by_path(&worktree_path, branch_name);
 
-    // Restore directory
-    env::set_current_dir(&original_cwd).expect("Failed to restore directory");
+    // Restore directory - handle case where original was deleted by another test
+    if let Some(ref cwd) = original_cwd {
+        if cwd.exists() {
+            env::set_current_dir(cwd).expect("Failed to restore directory");
+        } else {
+            env::set_current_dir(env::temp_dir()).expect("Failed to restore to temp");
+        }
+    } else {
+        env::set_current_dir(env::temp_dir()).expect("Failed to restore to temp");
+    }
 
     assert!(
         result.is_ok(),
@@ -220,7 +239,8 @@ fn test_delete_worktree_by_path_finds_correct_main_repo() {
     assert!(output.status.success());
 
     // Change cwd to repo1 (wrong repo)
-    let original_cwd = env::current_dir().unwrap();
+    // Use ok() to handle case where cwd was deleted by another test
+    let original_cwd = env::current_dir().ok();
     env::set_current_dir(&repo1).expect("Failed to change to repo1");
 
     let manager = WorktreeManager::new(base_dir.clone());
@@ -228,8 +248,16 @@ fn test_delete_worktree_by_path_finds_correct_main_repo() {
     // Delete worktree - should use repo2, NOT repo1 (current directory)
     let result = manager.delete_worktree_by_path(&worktree_path, branch_name);
 
-    // Restore directory
-    env::set_current_dir(&original_cwd).expect("Failed to restore directory");
+    // Restore directory - handle case where original was deleted by another test
+    if let Some(ref cwd) = original_cwd {
+        if cwd.exists() {
+            env::set_current_dir(cwd).expect("Failed to restore directory");
+        } else {
+            env::set_current_dir(env::temp_dir()).expect("Failed to restore to temp");
+        }
+    } else {
+        env::set_current_dir(env::temp_dir()).expect("Failed to restore to temp");
+    }
 
     assert!(
         result.is_ok(),

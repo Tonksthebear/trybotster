@@ -478,6 +478,8 @@ export default class extends Controller {
         case "agents":
         case "worktrees":
         case "agent_selected":
+        case "agent_creating":
+        case "agent_created":
         case "scrollback":
           this.notifyListeners("message", message);
           break;

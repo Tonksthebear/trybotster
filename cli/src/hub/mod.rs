@@ -39,6 +39,7 @@ pub mod polling;
 pub mod registration;
 pub mod run;
 pub mod state;
+pub mod workers;
 
 pub use actions::{HubAction, ScrollDirection};
 pub use crate::agents::AgentSpawnConfig;
@@ -47,6 +48,7 @@ pub use menu::{build_menu, MenuAction, MenuContext, MenuItem};
 pub use state::HubState;
 
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
 use std::time::Instant;
 
 use reqwest::blocking::Client;
@@ -60,6 +62,32 @@ use crate::device::Device;
 use crate::git::WorktreeManager;
 use crate::relay::AgentInfo;
 use crate::tunnel::TunnelManager;
+
+/// Progress event during agent creation.
+///
+/// Sent from background thread to main loop to report creation progress.
+#[derive(Debug, Clone)]
+pub struct AgentProgressEvent {
+    /// The client that requested the agent creation.
+    pub client_id: ClientId,
+    /// The branch or issue identifier being created.
+    pub identifier: String,
+    /// Current creation stage.
+    pub stage: crate::relay::AgentCreationStage,
+}
+
+/// Result of a background agent creation task.
+///
+/// Sent from the background thread to the main loop when agent creation completes.
+#[derive(Debug)]
+pub struct PendingAgentResult {
+    /// The client that requested the agent creation.
+    pub client_id: ClientId,
+    /// The result of the spawn operation.
+    pub result: Result<SpawnResult, String>,
+    /// The spawn config used (for error reporting).
+    pub config: AgentSpawnConfig,
+}
 
 /// Generate a stable hub_identifier from a repo path.
 ///
@@ -141,6 +169,31 @@ pub struct Hub {
     /// Registry of all connected clients (TUI, browsers).
     /// Each client can independently select and view different agents.
     pub clients: ClientRegistry,
+
+    // === Background Task Channels ===
+    /// Sender for pending agent creation results (cloned for each background task).
+    pub pending_agent_tx: std_mpsc::Sender<PendingAgentResult>,
+    /// Receiver for pending agent creation results (polled in main loop).
+    pub pending_agent_rx: std_mpsc::Receiver<PendingAgentResult>,
+    /// Sender for agent creation progress updates (cloned for each background task).
+    pub progress_tx: std_mpsc::Sender<AgentProgressEvent>,
+    /// Receiver for agent creation progress updates (polled in main loop).
+    pub progress_rx: std_mpsc::Receiver<AgentProgressEvent>,
+
+    // === TUI Creation Progress ===
+    /// Current agent creation in progress for TUI display (identifier, stage).
+    /// Cleared when agent is created or creation fails.
+    pub creating_agent: Option<(String, crate::relay::AgentCreationStage)>,
+
+    // === Background Workers ===
+    /// Background worker for message polling (non-blocking).
+    pub polling_worker: Option<workers::PollingWorker>,
+    /// Background worker for heartbeat sending (non-blocking).
+    pub heartbeat_worker: Option<workers::HeartbeatWorker>,
+    /// Background worker for notification sending (non-blocking).
+    pub notification_worker: Option<workers::NotificationWorker>,
+    /// Last agent count sent to heartbeat worker (for change detection).
+    last_heartbeat_agent_count: usize,
 }
 
 impl std::fmt::Debug for Hub {
@@ -209,6 +262,11 @@ impl Hub {
         // Initialize timestamps to past to trigger immediate poll/heartbeat on first tick
         let past = Instant::now() - std::time::Duration::from_secs(3600);
 
+        // Create channel for background agent creation results
+        let (pending_agent_tx, pending_agent_rx) = std_mpsc::channel();
+        // Create channel for progress updates during agent creation
+        let (progress_tx, progress_rx) = std_mpsc::channel();
+
         Ok(Self {
             state,
             config,
@@ -236,7 +294,72 @@ impl Hub {
                 registry.register(Box::new(TuiClient::new()));
                 registry
             },
+            pending_agent_tx,
+            pending_agent_rx,
+            progress_tx,
+            progress_rx,
+            creating_agent: None,
+            // Workers are started later via start_background_workers() after registration
+            polling_worker: None,
+            heartbeat_worker: None,
+            notification_worker: None,
+            last_heartbeat_agent_count: 0,
         })
+    }
+
+    /// Start background workers for non-blocking network I/O.
+    ///
+    /// Call this after hub registration completes and `botster_id` is set.
+    /// Workers handle polling, heartbeat, and notifications in background threads.
+    pub fn start_background_workers(&mut self) {
+        // Detect repo for workers
+        let repo_name = match WorktreeManager::detect_current_repo() {
+            Ok((_, name)) => name,
+            Err(e) => {
+                log::warn!("Cannot start background workers: not in a git repo: {e}");
+                return;
+            }
+        };
+
+        let worker_config = workers::WorkerConfig {
+            server_url: self.config.server_url.clone(),
+            api_key: self.config.get_api_key().to_string(),
+            server_hub_id: self.server_hub_id().to_string(),
+            poll_interval: self.config.poll_interval,
+            repo_name,
+            device_id: self.device.device_id,
+        };
+
+        // Start polling worker
+        if self.polling_worker.is_none() {
+            log::info!("Starting background polling worker");
+            self.polling_worker = Some(workers::PollingWorker::new(worker_config.clone()));
+        }
+
+        // Start heartbeat worker
+        if self.heartbeat_worker.is_none() {
+            log::info!("Starting background heartbeat worker");
+            self.heartbeat_worker = Some(workers::HeartbeatWorker::new(worker_config.clone()));
+        }
+
+        // Start notification worker
+        if self.notification_worker.is_none() {
+            log::info!("Starting background notification worker");
+            self.notification_worker = Some(workers::NotificationWorker::new(worker_config));
+        }
+    }
+
+    /// Shutdown all background workers gracefully.
+    pub fn shutdown_background_workers(&mut self) {
+        if let Some(worker) = self.polling_worker.take() {
+            worker.shutdown();
+        }
+        if let Some(worker) = self.heartbeat_worker.take() {
+            worker.shutdown();
+        }
+        if let Some(worker) = self.notification_worker.take() {
+            worker.shutdown();
+        }
     }
 
     /// Get the current terminal dimensions.
@@ -429,16 +552,359 @@ impl Hub {
     /// Perform periodic tasks (polling, heartbeat, notifications).
     ///
     /// Call this from your event loop to handle time-based operations.
-    /// This method is non-blocking and respects configured intervals.
+    /// This method is **non-blocking** when background workers are running.
+    ///
+    /// # Worker-based flow (non-blocking)
+    ///
+    /// When workers are active (after `setup()`):
+    /// - `poll_worker_messages()` - non-blocking try_recv from PollingWorker
+    /// - `update_heartbeat_agents()` - non-blocking send to HeartbeatWorker
+    /// - `poll_agent_notifications_async()` - non-blocking send to NotificationWorker
+    ///
+    /// # Fallback flow (blocking)
+    ///
+    /// When workers aren't available (offline mode, testing):
+    /// - Falls back to blocking HTTP calls on main thread
     pub fn tick(&mut self) {
-        // Poll server for new messages
-        self.poll_messages();
+        // Process completed background agent creations (always non-blocking)
+        self.poll_pending_agents();
 
-        // Send heartbeat to register hub
-        self.send_heartbeat();
+        // Process progress events from background agent creations
+        self.poll_progress_events();
 
-        // Poll agents for terminal notifications
-        self.poll_agent_notifications();
+        // Use background workers if available (non-blocking)
+        if self.polling_worker.is_some() {
+            self.poll_worker_messages();
+            self.update_heartbeat_agents();
+            self.poll_agent_notifications_async();
+        } else {
+            // Fallback to blocking calls (offline mode, testing, or before setup)
+            self.poll_messages();
+            self.send_heartbeat();
+            self.poll_agent_notifications();
+        }
+    }
+
+    /// Poll for messages from background worker (non-blocking).
+    ///
+    /// Checks the polling worker's result channel for new messages
+    /// and processes them without blocking the main thread.
+    fn poll_worker_messages(&mut self) {
+        // Collect all available results first (to release borrow)
+        let results: Vec<workers::PollingResult> = {
+            let Some(ref worker) = self.polling_worker else {
+                return;
+            };
+
+            let mut results = Vec::new();
+            while let Some(result) = worker.try_recv() {
+                results.push(result);
+            }
+            results
+        };
+
+        // Now process each result (borrow released)
+        for result in results {
+            match result {
+                workers::PollingResult::Messages(messages) => {
+                    if !messages.is_empty() {
+                        self.process_polled_messages(messages);
+                    }
+                }
+                workers::PollingResult::Skipped => {
+                    // Offline mode or similar - nothing to do
+                }
+                workers::PollingResult::Error(e) => {
+                    log::debug!("Background poll error (will retry): {e}");
+                }
+            }
+        }
+    }
+
+    /// Process messages received from background polling.
+    ///
+    /// Converts messages to actions and dispatches them.
+    /// Acknowledgments are queued back to the worker thread.
+    fn process_polled_messages(&mut self, messages: Vec<crate::server::types::MessageData>) {
+        use crate::server::messages::{message_to_hub_action, MessageContext, ParsedMessage};
+
+        // Detect repo for context
+        let (repo_path, repo_name) = if let Ok(repo) = std::env::var("BOTSTER_REPO") {
+            (std::path::PathBuf::from("."), repo)
+        } else {
+            match crate::git::WorktreeManager::detect_current_repo() {
+                Ok(result) => result,
+                Err(_) if crate::env::is_test_mode() => {
+                    (std::path::PathBuf::from("."), "test/repo".to_string())
+                }
+                Err(e) => {
+                    log::warn!("Not in a git repository, skipping message processing: {e}");
+                    return;
+                }
+            }
+        };
+
+        log::info!("Processing {} messages from background poll", messages.len());
+
+        let context = MessageContext {
+            repo_path,
+            repo_name: repo_name.clone(),
+            worktree_base: self.config.worktree_base.clone(),
+            max_sessions: self.config.max_sessions,
+            current_agent_count: self.state.agent_count(),
+        };
+
+        for msg in &messages {
+            let parsed = ParsedMessage::from_message_data(msg);
+
+            // Try to notify existing agent first
+            if self.try_notify_existing_agent(&parsed, &context.repo_name) {
+                self.acknowledge_message_async(msg.id);
+                continue;
+            }
+
+            // Convert to action and dispatch
+            match message_to_hub_action(&parsed, &context) {
+                Ok(Some(action)) => {
+                    self.handle_action(action);
+                    self.acknowledge_message_async(msg.id);
+                }
+                Ok(None) => self.acknowledge_message_async(msg.id),
+                Err(e) => {
+                    // IMPORTANT: Acknowledge even on error to prevent infinite redelivery.
+                    // The message is malformed or we can't handle it - retrying won't help.
+                    log::error!("Failed to process message {}: {e} (acknowledging to prevent redelivery)", msg.id);
+                    self.acknowledge_message_async(msg.id);
+                }
+            }
+        }
+    }
+
+    /// Queue message acknowledgment to background worker (non-blocking).
+    fn acknowledge_message_async(&self, message_id: i64) {
+        if let Some(ref worker) = self.polling_worker {
+            worker.acknowledge(message_id);
+        } else {
+            // Fallback to blocking ack
+            self.acknowledge_message(message_id);
+        }
+    }
+
+    /// Update heartbeat worker with current agent list (non-blocking).
+    ///
+    /// Only sends updates when the agent count changes to avoid
+    /// sending redundant data every tick (60 FPS would be wasteful).
+    ///
+    /// The heartbeat worker maintains its own 30-second timer, so we just
+    /// need to keep it updated with the current agent list.
+    fn update_heartbeat_agents(&mut self) {
+        let Some(ref worker) = self.heartbeat_worker else {
+            return;
+        };
+
+        // Only send if agent count changed (simple change detection)
+        let current_count = self.state.agents.len();
+        if current_count == self.last_heartbeat_agent_count {
+            return;
+        }
+        self.last_heartbeat_agent_count = current_count;
+
+        // Build agent data for heartbeat
+        let agents: Vec<workers::HeartbeatAgentData> = self
+            .state
+            .agents
+            .values()
+            .map(|agent| workers::HeartbeatAgentData {
+                session_key: agent.session_key(),
+                last_invocation_url: agent.last_invocation_url.clone(),
+            })
+            .collect();
+
+        log::debug!("Heartbeat agent list updated: {} agents", agents.len());
+        worker.update_agents(agents);
+    }
+
+    /// Poll agents for notifications and send via background worker (non-blocking).
+    ///
+    /// Collects notifications from all agents and queues them to the
+    /// notification worker for background sending to Rails.
+    fn poll_agent_notifications_async(&self) {
+        use crate::agent::AgentNotification;
+
+        let Some(ref worker) = self.notification_worker else {
+            return;
+        };
+
+        // Collect and send notifications from all agents
+        for agent in self.state.agents.values() {
+            for notification in agent.poll_notifications() {
+                // Only send if we have issue context (otherwise there's nowhere to post)
+                if agent.issue_number.is_none() && agent.last_invocation_url.is_none() {
+                    continue;
+                }
+
+                let notification_type = match &notification {
+                    AgentNotification::Osc9(_) | AgentNotification::Osc777 { .. } => "question_asked",
+                };
+
+                log::info!(
+                    "Agent {} sent notification: {} (url: {:?})",
+                    agent.session_key(), notification_type, agent.last_invocation_url
+                );
+
+                let request = workers::NotificationRequest {
+                    repo: agent.repo.clone(),
+                    issue_number: agent.issue_number,
+                    invocation_url: agent.last_invocation_url.clone(),
+                    notification_type: notification_type.to_string(),
+                };
+
+                worker.send(request);
+            }
+        }
+    }
+
+    /// Poll for completed background agent creation tasks.
+    ///
+    /// Non-blocking check for results from spawn_blocking tasks.
+    /// Processes all completed creations and sends appropriate responses to clients.
+    pub fn poll_pending_agents(&mut self) {
+        // Process all pending results (non-blocking)
+        while let Ok(pending) = self.pending_agent_rx.try_recv() {
+            self.handle_pending_agent_result(pending);
+        }
+    }
+
+    /// Poll for progress events from background agent creation.
+    ///
+    /// Non-blocking check for progress updates. Sends progress to the requesting
+    /// client (browser or TUI).
+    pub fn poll_progress_events(&mut self) {
+        while let Ok(event) = self.progress_rx.try_recv() {
+            self.handle_progress_event(event);
+        }
+    }
+
+    /// Handle a progress event from background agent creation.
+    fn handle_progress_event(&mut self, event: AgentProgressEvent) {
+        log::debug!(
+            "Progress: {} -> {:?} for client {:?}",
+            event.identifier,
+            event.stage,
+            event.client_id
+        );
+
+        // Send progress to browser clients via relay
+        if let ClientId::Browser(ref identity) = event.client_id {
+            if let Some(ref sender) = self.browser.sender {
+                let ctx = crate::relay::BrowserSendContext {
+                    sender,
+                    runtime: &self.tokio_runtime,
+                };
+                crate::relay::send_agent_progress_to(
+                    &ctx,
+                    identity,
+                    &event.identifier,
+                    event.stage,
+                );
+            }
+        }
+
+        // Track TUI creation progress for display
+        if event.client_id.is_tui() {
+            self.creating_agent = Some((event.identifier.clone(), event.stage));
+        }
+    }
+
+    /// Handle a completed agent creation from background thread.
+    ///
+    /// The background thread has completed the slow git/file operations.
+    /// Now we do the fast PTY spawn on the main thread (needs &mut state).
+    fn handle_pending_agent_result(&mut self, pending: PendingAgentResult) {
+        // Clear TUI creating indicator on completion (success or failure)
+        if pending.client_id.is_tui() {
+            self.creating_agent = None;
+        }
+
+        match pending.result {
+            Ok(_) => {
+                // Background work succeeded - now spawn the agent (fast, needs &mut state)
+                log::info!(
+                    "Background worktree ready for {:?}, spawning agent...",
+                    pending.client_id
+                );
+
+                // Get client dims for PTY
+                let dims = self.clients.get(&pending.client_id)
+                    .and_then(|c| c.state().dims)
+                    .unwrap_or(self.terminal_dims);
+
+                // Spawn agent (fast - just PTY creation)
+                match lifecycle::spawn_agent(&mut self.state, &pending.config, dims) {
+                    Ok(result) => {
+                        log::info!(
+                            "Agent spawned: {} for client {:?}",
+                            result.session_key,
+                            pending.client_id
+                        );
+
+                        // Register tunnel if port assigned
+                        if let Some(port) = result.tunnel_port {
+                            let tm = Arc::clone(&self.tunnel_manager);
+                            let key = result.session_key.clone();
+                            self.tokio_runtime.spawn(async move {
+                                tm.register_agent(key, port).await;
+                            });
+                        }
+
+                        // Send response to requesting client
+                        if let Some(client) = self.clients.get_mut(&pending.client_id) {
+                            client.receive_response(Response::agent_created(&result.session_key));
+                        }
+
+                        // Broadcast updated agent list to all clients
+                        self.broadcast_agent_list();
+
+                        // Auto-select the new agent for the requesting client
+                        let session_key = result.session_key.clone();
+                        actions::dispatch(
+                            self,
+                            HubAction::SelectAgentForClient {
+                                client_id: pending.client_id.clone(),
+                                agent_key: session_key.clone(),
+                            },
+                        );
+
+                        // Also auto-select for TUI if it has no selection
+                        // (ensures TUI state matches what's visually displayed)
+                        if pending.client_id != ClientId::Tui {
+                            let tui_has_selection = self.get_tui_selected_agent_key().is_some();
+                            if !tui_has_selection {
+                                actions::dispatch(
+                                    self,
+                                    HubAction::SelectAgentForClient {
+                                        client_id: ClientId::Tui,
+                                        agent_key: session_key,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to spawn agent: {}", e);
+                        self.send_error_to(&pending.client_id, format!("Failed to spawn agent: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "Background agent creation failed for {:?}: {}",
+                    pending.client_id,
+                    e
+                );
+                self.send_error_to(&pending.client_id, format!("Failed to create agent: {}", e));
+            }
+        }
     }
 
     // === Server Communication ===
@@ -638,6 +1104,10 @@ impl Hub {
         self.register_hub_with_server();
         self.start_tunnel();
         self.connect_terminal_relay();
+
+        // Start background workers for non-blocking network I/O
+        // Must be called after register_hub_with_server() sets botster_id
+        self.start_background_workers();
     }
 
     // === Event Loop ===
@@ -653,8 +1123,12 @@ impl Hub {
         run::run_event_loop(self, terminal, shutdown_flag)
     }
 
-    /// Send shutdown notification to server.
-    pub fn shutdown(&self) {
+    /// Send shutdown notification to server and cleanup resources.
+    pub fn shutdown(&mut self) {
+        // Shutdown background workers first (allows pending notifications to drain)
+        self.shutdown_background_workers();
+
+        // Notify server of shutdown
         registration::shutdown(
             &self.client,
             &self.config.server_url,

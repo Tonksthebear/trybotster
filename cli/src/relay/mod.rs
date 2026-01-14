@@ -63,15 +63,16 @@ pub use events::{
     BrowserEventResult, BrowserResponse, ResizeAction,
 };
 pub use state::{
-    build_agent_info, build_worktree_info, send_agent_list, send_agent_list_to,
+    build_agent_info, build_worktree_info, send_agent_creating, send_agent_creating_to,
+    send_agent_list, send_agent_list_to, send_agent_progress, send_agent_progress_to,
     send_agent_selected, send_agent_selected_to, send_scrollback, send_scrollback_to,
     send_worktree_list, send_worktree_list_to, BrowserSendContext, BrowserState,
     IdentifiedBrowserEvent,
 };
 
 pub use types::{
-    AgentInfo, BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage,
-    WorktreeInfo,
+    AgentCreationStage, AgentInfo, BrowserCommand, BrowserEvent, BrowserResize,
+    TerminalMessage, WorktreeInfo,
 };
 
 pub use connection::{TerminalOutputSender, TerminalRelay};

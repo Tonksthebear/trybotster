@@ -1,24 +1,30 @@
 // Comprehensive tests for environment variable handling
-// Run with: cargo test --test environment_variables_test -- --test-threads=1
-//
-// IMPORTANT: Run with --test-threads=1 to avoid env var contamination between tests
 //
 // Tests use BOTSTER_CONFIG_DIR to isolate from real user config at ~/.botster_hub
+// Tests are serialized via ENV_LOCK mutex to prevent env var contamination.
 
 use botster_hub::Config;
 use std::env;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tempfile::TempDir;
+
+// Global lock to prevent env var pollution between tests (run serially)
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Helper to set environment variables for a test and clean them up after.
 /// Also sets BOTSTER_CONFIG_DIR to a temp directory to isolate from real config.
 struct EnvGuard {
     keys: Vec<String>,
     _temp_dir: TempDir, // Keep temp dir alive for duration of test
+    _guard: std::sync::MutexGuard<'static, ()>, // Serialize test execution
 }
 
 impl EnvGuard {
     fn new() -> Self {
+        // Acquire lock to serialize tests (prevents env var race conditions)
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         // Create a temp directory for config isolation
         let temp_dir = TempDir::new().expect("Failed to create temp dir for test");
 
@@ -28,14 +34,21 @@ impl EnvGuard {
         // Clear all known botster env vars when creating a new guard
         env::remove_var("BOTSTER_SERVER_URL");
         env::remove_var("BOTSTER_API_KEY");
+        env::remove_var("BOTSTER_TOKEN");
         env::remove_var("BOTSTER_WORKTREE_BASE");
         env::remove_var("BOTSTER_POLL_INTERVAL");
         env::remove_var("BOTSTER_MAX_SESSIONS");
         env::remove_var("BOTSTER_AGENT_TIMEOUT");
 
+        // Clear any token from keyring to ensure test isolation
+        if let Ok(mut config) = Config::load() {
+            let _ = config.clear_token();
+        }
+
         Self {
             keys: vec!["BOTSTER_CONFIG_DIR".to_string()],
             _temp_dir: temp_dir,
+            _guard: guard,
         }
     }
 
@@ -381,7 +394,7 @@ fn test_config_save_and_load_preserves_values() {
     // Create a config with custom values
     let mut config = Config::default();
     config.server_url = "https://saved.example.com".to_string();
-    config.api_key = "saved_key".to_string();
+    // Note: api_key and token are #[serde(skip)] - stored in keyring, not file
     config.poll_interval = 42;
     config.max_sessions = 77;
     config.agent_timeout = 1234;
@@ -394,7 +407,8 @@ fn test_config_save_and_load_preserves_values() {
     let loaded: Config = serde_json::from_str(&json).unwrap();
 
     assert_eq!(loaded.server_url, "https://saved.example.com");
-    assert_eq!(loaded.api_key, "saved_key");
+    // api_key is not serialized (uses keyring)
+    assert_eq!(loaded.api_key, ""); // Skipped field defaults to empty
     assert_eq!(loaded.poll_interval, 42);
     assert_eq!(loaded.max_sessions, 77);
     assert_eq!(loaded.agent_timeout, 1234);
@@ -407,8 +421,10 @@ fn test_config_serialization_format() {
     let json = serde_json::to_string_pretty(&config).unwrap();
 
     // Verify JSON contains expected fields
+    // Note: api_key and token are NOT serialized (they use keyring via #[serde(skip)])
     assert!(json.contains("server_url"));
-    assert!(json.contains("api_key"));
+    assert!(!json.contains("api_key"), "api_key should not be serialized");
+    assert!(!json.contains("token"), "token should not be serialized");
     assert!(json.contains("poll_interval"));
     assert!(json.contains("agent_timeout"));
     assert!(json.contains("max_sessions"));

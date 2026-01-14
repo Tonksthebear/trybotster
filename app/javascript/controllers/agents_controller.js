@@ -6,6 +6,7 @@ import { Controller } from "@hotwired/stimulus";
  * This controller handles agent-related UI:
  * - Displays list of agents from CLI
  * - Handles agent selection
+ * - Shows available worktrees for fast agent creation
  * - Requests agent creation/closure
  *
  * Uses connection controller's registerListener API for reliable event handling.
@@ -15,12 +16,16 @@ export default class extends Controller {
     "list",           // Container for agent list
     "selectedLabel",  // Label showing selected agent
     "emptyState",     // Message when no agents
+    "creatingState",  // Loading indicator for agent creation
+    "worktreeList",   // Container for worktree list in modal
+    "newBranchInput", // Input for new branch/issue number
   ];
 
   static outlets = ["connection", "modal"];
 
   connect() {
     this.agents = [];
+    this.worktrees = [];
     this.selectedAgentId = null;
     this.connection = null; // Set when connection is ready
   }
@@ -56,6 +61,7 @@ export default class extends Controller {
   handleDisconnected() {
     this.connection = null;
     this.agents = [];
+    this.worktrees = [];
     this.selectedAgentId = null;
     this.updateAgentList([]);
     this.updateSelectedLabel(null);
@@ -66,14 +72,29 @@ export default class extends Controller {
     switch (message.type) {
       case "agents":
       case "agent_list":
+        this.hideCreatingState();
         this.updateAgentList(message.agents || []);
+        break;
+
+      case "worktrees":
+        this.worktrees = message.worktrees || [];
+        this.updateWorktreeList();
         break;
 
       case "agent_selected":
         this.handleAgentSelected(message);
         break;
 
+      case "agent_creating":
+        this.showCreatingState(message.identifier);
+        break;
+
+      case "agent_creating_progress":
+        this.updateCreatingProgress(message);
+        break;
+
       case "agent_created":
+        this.hideCreatingState();
         this.requestAgentList();
         break;
 
@@ -86,6 +107,120 @@ export default class extends Controller {
   // Handle connection errors
   handleError(error) {
     console.error("[Agents] Connection error:", error);
+  }
+
+  // Show creating state (loading indicator)
+  showCreatingState(identifier, stage = null) {
+    this.creatingIdentifier = identifier;
+    this.creatingStage = stage;
+
+    const stageInfo = this.getStageInfo(stage);
+
+    if (this.hasCreatingStateTarget) {
+      // Update text if element exists
+      const label = this.creatingStateTarget.querySelector("[data-creating-label]");
+      if (label) {
+        label.textContent = stageInfo.message;
+      }
+      this.creatingStateTarget.classList.remove("hidden");
+    } else if (this.hasListTarget) {
+      // Inject creating state into list if no dedicated target
+      const existingCreating = this.listTarget.querySelector("[data-creating-indicator]");
+      if (existingCreating) {
+        // Update existing indicator
+        const statusText = existingCreating.querySelector("[data-creating-status]");
+        const progressBar = existingCreating.querySelector("[data-progress-bar]");
+        if (statusText) {
+          statusText.textContent = stageInfo.message;
+        }
+        if (progressBar) {
+          progressBar.style.width = `${stageInfo.progress}%`;
+        }
+      } else {
+        // Create new indicator
+        const creating = document.createElement("div");
+        creating.dataset.creatingIndicator = "true";
+        creating.className = "px-3 py-3 bg-cyan-500/10 border border-cyan-500/20 rounded-lg";
+        creating.innerHTML = `
+          <div class="flex items-center gap-3">
+            <svg class="w-4 h-4 text-cyan-400 animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <div class="flex-1 min-w-0">
+              <div class="text-sm text-cyan-400 font-medium" data-creating-status>${this.escapeHtml(stageInfo.message)}</div>
+              <div class="text-xs text-cyan-400/70 font-mono truncate">${this.escapeHtml(identifier)}</div>
+            </div>
+          </div>
+          <div class="mt-2 bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+            <div class="h-full bg-cyan-400 transition-all duration-500" data-progress-bar style="width: ${stageInfo.progress}%"></div>
+          </div>
+        `;
+        this.listTarget.prepend(creating);
+      }
+    }
+
+    // Also hide modal if open
+    if (this.hasModalOutlet) {
+      this.modalOutlet.hide();
+    }
+  }
+
+  // Update creating progress state
+  updateCreatingProgress(message) {
+    // Only update if same identifier
+    if (message.identifier !== this.creatingIdentifier) {
+      this.creatingIdentifier = message.identifier;
+    }
+
+    this.creatingStage = message.stage;
+
+    const stageInfo = this.getStageInfo(message.stage);
+
+    if (this.hasListTarget) {
+      const indicator = this.listTarget.querySelector("[data-creating-indicator]");
+      if (indicator) {
+        const statusText = indicator.querySelector("[data-creating-status]");
+        const progressBar = indicator.querySelector("[data-progress-bar]");
+        if (statusText) {
+          statusText.textContent = message.message || stageInfo.message;
+        }
+        if (progressBar) {
+          progressBar.style.width = `${stageInfo.progress}%`;
+        }
+      } else {
+        // Create indicator if it doesn't exist
+        this.showCreatingState(message.identifier, message.stage);
+      }
+    }
+  }
+
+  // Get stage display info
+  getStageInfo(stage) {
+    const stages = {
+      creating_worktree: { message: "Creating git worktree...", progress: 25 },
+      copying_config: { message: "Copying configuration files...", progress: 50 },
+      spawning_agent: { message: "Starting agent...", progress: 75 },
+      ready: { message: "Agent ready", progress: 100 },
+    };
+    return stages[stage] || { message: "Creating agent...", progress: 10 };
+  }
+
+  // Hide creating state
+  hideCreatingState() {
+    this.creatingIdentifier = null;
+
+    if (this.hasCreatingStateTarget) {
+      this.creatingStateTarget.classList.add("hidden");
+    }
+
+    // Also remove any injected indicator
+    if (this.hasListTarget) {
+      const indicator = this.listTarget.querySelector("[data-creating-indicator]");
+      if (indicator) {
+        indicator.remove();
+      }
+    }
   }
 
   // Update the agent list UI
@@ -141,6 +276,51 @@ export default class extends Controller {
     });
   }
 
+  // Update worktree list in modal
+  updateWorktreeList() {
+    if (!this.hasWorktreeListTarget) return;
+
+    this.worktreeListTarget.innerHTML = "";
+
+    if (this.worktrees.length === 0) {
+      this.worktreeListTarget.innerHTML = `
+        <div class="text-center py-4 text-zinc-500 text-sm">
+          No existing worktrees
+        </div>
+      `;
+      return;
+    }
+
+    // Render worktree list
+    this.worktrees.forEach((worktree) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "w-full text-left px-3 py-2 rounded-lg hover:bg-zinc-700 text-zinc-300 transition-colors";
+      item.dataset.action = "agents#selectWorktree";
+      item.dataset.worktreePath = worktree.path;
+      item.dataset.worktreeBranch = worktree.branch;
+
+      const issueLabel = worktree.issue_number
+        ? `Issue #${worktree.issue_number}`
+        : worktree.branch;
+
+      item.innerHTML = `
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path>
+            </svg>
+            <span class="font-mono text-sm">${this.escapeHtml(issueLabel)}</span>
+          </div>
+          <span class="text-xs text-emerald-400">instant</span>
+        </div>
+        <div class="text-xs text-zinc-500 mt-1 truncate">${this.escapeHtml(worktree.path)}</div>
+      `;
+
+      this.worktreeListTarget.appendChild(item);
+    });
+  }
+
   // Handle agent selection from CLI
   handleAgentSelected(message) {
     this.selectedAgentId = message.id;
@@ -180,6 +360,24 @@ export default class extends Controller {
     this.connection.selectAgent(agentId);
   }
 
+  // Action: Select existing worktree (fast path - no git clone)
+  selectWorktree(event) {
+    const path = event.currentTarget.dataset.worktreePath;
+    const branch = event.currentTarget.dataset.worktreeBranch;
+
+    if (!path || !branch || !this.connection) return;
+
+    // Use reopen_worktree command for instant agent creation
+    this.connection.send("reopen_worktree", {
+      path: path,
+      branch: branch,
+    });
+
+    if (this.hasModalOutlet) {
+      this.modalOutlet.hide();
+    }
+  }
+
   // Action: Request agent list refresh
   requestAgentList() {
     if (this.connection) {
@@ -189,12 +387,19 @@ export default class extends Controller {
 
   // Action: Open the new agent modal
   createAgent() {
+    // Refresh worktree list when opening modal
+    if (this.connection) {
+      this.connection.send("list_worktrees");
+    }
+    // Update UI with current worktrees
+    this.updateWorktreeList();
+
     if (this.hasModalOutlet) {
       this.modalOutlet.show();
     }
   }
 
-  // Action: Submit new agent form
+  // Action: Submit new agent form (creates new worktree - slower)
   submitNewAgent(event) {
     event.preventDefault();
     const form = event.currentTarget;

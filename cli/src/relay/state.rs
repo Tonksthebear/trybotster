@@ -223,6 +223,54 @@ pub fn send_agent_selected(ctx: &BrowserSendContext, agent_id: &str) {
     send_message(ctx, &message);
 }
 
+/// Send agent creating notification to browser.
+///
+/// Sent immediately when agent creation begins, before blocking operations.
+/// Allows browser to show loading state.
+pub fn send_agent_creating(ctx: &BrowserSendContext, identifier: &str) {
+    let message = TerminalMessage::AgentCreating {
+        identifier: identifier.to_string(),
+    };
+    send_message(ctx, &message);
+}
+
+/// Send agent creating notification to a specific browser.
+pub fn send_agent_creating_to(ctx: &BrowserSendContext, identity: &str, identifier: &str) {
+    let message = TerminalMessage::AgentCreating {
+        identifier: identifier.to_string(),
+    };
+    send_message_to(ctx, identity, &message);
+}
+
+/// Send agent creation progress update to all browsers.
+pub fn send_agent_progress(
+    ctx: &BrowserSendContext,
+    identifier: &str,
+    stage: super::types::AgentCreationStage,
+) {
+    let message = TerminalMessage::AgentCreatingProgress {
+        identifier: identifier.to_string(),
+        stage,
+        message: stage.description().to_string(),
+    };
+    send_message(ctx, &message);
+}
+
+/// Send agent creation progress update to a specific browser.
+pub fn send_agent_progress_to(
+    ctx: &BrowserSendContext,
+    identity: &str,
+    identifier: &str,
+    stage: super::types::AgentCreationStage,
+) {
+    let message = TerminalMessage::AgentCreatingProgress {
+        identifier: identifier.to_string(),
+        stage,
+        message: stage.description().to_string(),
+    };
+    send_message_to(ctx, identity, &message);
+}
+
 /// Send terminal output to browser.
 pub fn send_output(ctx: &BrowserSendContext, output: &str) {
     let sender = ctx.sender.clone();
