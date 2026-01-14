@@ -33,13 +33,6 @@ Rails.application.routes.draw do
       resources :messages, only: [ :index, :update ]
       resources :notifications, only: [ :create ]
       resource :connection, only: [ :show ]
-
-      # Tailscale integration (DEPRECATED - moved to deprecated/ folder)
-      # namespace :tailscale do
-      #   post "browser_key", to: "/hubs/tailscale#browser_key"
-      #   patch "hostname", to: "/hubs/tailscale#update_hostname"
-      #   get "status", to: "/hubs/tailscale#status"
-      # end
     end
   end
 

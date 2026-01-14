@@ -5,10 +5,6 @@ class Hub < ApplicationRecord
   belongs_to :device, optional: true  # The CLI device running this hub
   has_many :hub_agents, dependent: :destroy
 
-  # DEPRECATED - Tailscale integration (moved to deprecated/ folder)
-  # encrypts :tailscale_preauth_key
-  # before_create :generate_tailscale_preauth_key
-
   validates :repo, presence: true
   validates :identifier, presence: true, uniqueness: true
   validates :last_seen_at, presence: true
@@ -73,19 +69,6 @@ class Hub < ApplicationRecord
     Rails.logger.warn "Failed to broadcast hub removal: #{e.message}"
   end
 
-  # DEPRECATED - Tailscale Integration (moved to deprecated/ folder)
-  # def tailscale_connected?
-  #   tailscale_hostname.present?
-  # end
-  #
-  # def create_browser_preauth_key
-  #   user.create_tailscale_preauth_key(
-  #     ephemeral: true,
-  #     expiration: 1.hour.from_now,
-  #     tags: ["tag:browser"]
-  #   )
-  # end
-
   private
 
   def normalize_agents_data(data)
@@ -95,15 +78,4 @@ class Hub < ApplicationRecord
   def turbo_stream_name
     "user_#{user_id}_hubs"
   end
-
-  # DEPRECATED - Tailscale pre-auth key generation
-  # def generate_tailscale_preauth_key
-  #   self.tailscale_preauth_key = user.create_tailscale_preauth_key(
-  #     ephemeral: false,
-  #     expiration: 1.year.from_now,
-  #     tags: ["tag:cli", "tag:hub-#{identifier}"]
-  #   )
-  # rescue HeadscaleClient::Error => e
-  #   Rails.logger.error "Failed to generate Tailscale pre-auth key for hub #{identifier}: #{e.message}"
-  # end
 end

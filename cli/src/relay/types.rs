@@ -1,7 +1,7 @@
 //! Data types for the terminal relay protocol.
 //!
 //! This module defines the message and event types used for communication
-//! between the CLI and browser via Tailscale SSH.
+//! between the CLI and browser via Signal Protocol E2E encryption.
 //!
 //! # Message Types
 //!
@@ -11,8 +11,8 @@
 //!
 //! # Transport
 //!
-//! Messages are sent as JSON over Tailscale SSH. Encryption is handled by
-//! WireGuard at the transport layer.
+//! Messages are sent as JSON over ActionCable WebSocket. E2E encryption is
+//! handled by Signal Protocol (X3DH + Double Ratchet).
 
 // Rust guideline compliant 2025-01
 

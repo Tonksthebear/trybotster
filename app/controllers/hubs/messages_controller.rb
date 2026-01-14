@@ -11,13 +11,8 @@ module Hubs
     # Returns pending, unclaimed messages for this hub's repo
     def index
       # Get all pending, unclaimed messages for this hub's repo
-      # Also include webrtc_offer messages for this user (they don't have a repo)
       messages = Bot::Message.for_delivery
-        .where(
-          "(payload->>'repo' = ?) OR (event_type = 'webrtc_offer' AND payload->>'user_id' = ?)",
-          @hub.repo,
-          current_api_user.id.to_s
-        )
+        .where("payload->>'repo' = ?", @hub.repo)
         .limit(50)
 
       # Filter messages by repo access authorization

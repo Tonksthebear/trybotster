@@ -20,7 +20,6 @@ class User < ApplicationRecord
   # Generate API token before create
   before_create :generate_api_key
   after_create :ensure_api_key
-  # after_create :create_headscale_namespace  # DEPRECATED - Headscale experiment moved to deprecated/
 
   # Note: No active/inactive status - all users receive @trybotster mentions
   # Filtering happens at poll time based on repo access
@@ -175,30 +174,7 @@ class User < ApplicationRecord
     end
   end
 
-  # DEPRECATED - Headscale Integration (moved to deprecated/ folder)
-  # Each user gets their own isolated tailnet (namespace)
-  #
-  # def headscale_namespace
-  #   "user-#{id}"
-  # end
-  #
-  # def create_tailscale_preauth_key(ephemeral: false, expiration: 1.hour.from_now, tags: [])
-  #   HeadscaleClient.new.create_preauth_key(
-  #     user: headscale_namespace,
-  #     ephemeral: ephemeral,
-  #     expiration: expiration,
-  #     tags: tags
-  #   )
-  # end
-
   private
-
-  # DEPRECATED - Headscale namespace creation
-  # def create_headscale_namespace
-  #   HeadscaleClient.new.create_user(headscale_namespace)
-  # rescue HeadscaleClient::Error => e
-  #   Rails.logger.error "Failed to create Headscale namespace for user #{id}: #{e.message}"
-  # end
 
   def check_github_repo_access_uncached(repo_full_name)
     token = valid_github_app_token

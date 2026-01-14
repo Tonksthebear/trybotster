@@ -21,9 +21,6 @@ const KEYRING_TOKEN_ENTRY: &str = "api-token";
 pub struct Config {
     /// URL of the botster server.
     pub server_url: String,
-    /// URL of the Headscale control server for Tailscale mesh networking.
-    #[serde(default)]
-    pub headscale_url: Option<String>,
     /// API token - NOT serialized to disk (stored in keyring)
     #[serde(skip)]
     pub token: String,
@@ -44,7 +41,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server_url: "https://trybotster.com".to_string(),
-            headscale_url: None,
             token: String::new(),
             api_key: String::new(),
             poll_interval: 5,
@@ -100,10 +96,6 @@ impl Config {
     fn apply_env_overrides(&mut self) {
         if let Ok(server_url) = std::env::var("BOTSTER_SERVER_URL") {
             self.server_url = server_url;
-        }
-
-        if let Ok(headscale_url) = std::env::var("HEADSCALE_URL") {
-            self.headscale_url = Some(headscale_url);
         }
 
         // Token from env var (for CI/CD)
