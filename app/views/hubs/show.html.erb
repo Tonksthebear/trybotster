@@ -243,7 +243,7 @@
     </div>
   </div>
 
-  <%# New Agent Modal %>
+  <%# New Agent Modal - Two Step Flow %>
   <div id="new-agent-modal"
        data-controller="modal"
        class="hidden fixed inset-0 z-50">
@@ -251,55 +251,102 @@
          class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
       <div data-modal-target="content"
            class="bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl w-full max-w-md max-h-[80vh] flex flex-col">
-        <div class="px-6 py-4 border-b border-zinc-800 flex-shrink-0">
-          <h3 class="text-lg font-semibold text-zinc-100">New Agent</h3>
-          <p class="text-sm text-zinc-500 mt-1">Select an existing worktree or create a new one</p>
-        </div>
 
-        <div class="flex-1 overflow-y-auto">
-          <%# Existing Worktrees Section %>
-          <div class="p-4 border-b border-zinc-800">
-            <div class="flex items-center justify-between mb-3">
-              <h4 class="text-sm font-medium text-zinc-300">Existing Worktrees</h4>
-              <span class="text-xs text-emerald-400">instant start</span>
+        <%# Step 1: Worktree Selection %>
+        <div data-agents-target="step1" class="flex flex-col flex-1 min-h-0">
+          <div class="px-6 py-4 border-b border-zinc-800 flex-shrink-0">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="w-6 h-6 rounded-full bg-cyan-500 text-zinc-950 text-xs font-bold flex items-center justify-center">1</span>
+              <h3 class="text-lg font-semibold text-zinc-100">Select Worktree</h3>
             </div>
-            <div data-agents-target="worktreeList"
-                 class="space-y-2 max-h-48 overflow-y-auto">
-              <div class="text-center py-4 text-zinc-500 text-sm">
-                Loading worktrees...
+            <p class="text-sm text-zinc-500 ml-8">Choose an existing worktree or create a new one</p>
+          </div>
+
+          <div class="flex-1 overflow-y-auto">
+            <%# Existing Worktrees Section %>
+            <div class="p-4 border-b border-zinc-800">
+              <h4 class="text-sm font-medium text-zinc-300 mb-3">Existing Worktrees</h4>
+              <div data-agents-target="worktreeList"
+                   class="space-y-2 max-h-48 overflow-y-auto">
+                <div class="text-center py-4 text-zinc-500 text-sm">
+                  Loading worktrees...
+                </div>
+              </div>
+            </div>
+
+            <%# Create New Section %>
+            <div class="p-4">
+              <h4 class="text-sm font-medium text-zinc-300 mb-3">Create New</h4>
+              <div class="flex gap-2">
+                <input type="text"
+                       data-agents-target="newBranchInput"
+                       placeholder="Issue # or branch name"
+                       class="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-zinc-100 placeholder-zinc-500 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
+                       autocomplete="off"
+                       data-action="keydown.enter->agents#selectNewBranch">
+                <button type="button"
+                        data-action="agents#selectNewBranch"
+                        class="px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-zinc-950 text-sm font-medium rounded-lg transition-colors whitespace-nowrap">
+                  Next
+                </button>
               </div>
             </div>
           </div>
 
-          <%# Create New Section %>
-          <form data-action="submit->agents#submitNewAgent" class="p-4">
-            <div class="flex items-center justify-between mb-3">
-              <h4 class="text-sm font-medium text-zinc-300">Create New</h4>
-              <span class="text-xs text-amber-400">~10 seconds</span>
-            </div>
-            <div class="flex gap-2">
-              <input type="text"
-                     name="issue_or_branch"
-                     id="issue_or_branch"
-                     data-agents-target="newBranchInput"
-                     placeholder="Issue # or branch name"
-                     class="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-zinc-100 placeholder-zinc-500 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                     autocomplete="off">
-              <button type="submit"
-                      class="px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-zinc-950 text-sm font-medium rounded-lg transition-colors whitespace-nowrap">
-                Create
-              </button>
-            </div>
-          </form>
+          <div class="px-4 py-3 border-t border-zinc-800 flex-shrink-0">
+            <button type="button"
+                    data-action="modal#hide"
+                    class="w-full px-4 py-2 text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition-colors">
+              Cancel
+            </button>
+          </div>
         </div>
 
-        <div class="px-4 py-3 border-t border-zinc-800 flex-shrink-0">
-          <button type="button"
-                  data-action="modal#hide"
-                  class="w-full px-4 py-2 text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition-colors">
-            Cancel
-          </button>
+        <%# Step 2: Prompt Input %>
+        <div data-agents-target="step2" class="hidden flex flex-col flex-1 min-h-0">
+          <div class="px-6 py-4 border-b border-zinc-800 flex-shrink-0">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="w-6 h-6 rounded-full bg-cyan-500 text-zinc-950 text-xs font-bold flex items-center justify-center">2</span>
+              <h3 class="text-lg font-semibold text-zinc-100">Initial Prompt</h3>
+            </div>
+            <p class="text-sm text-zinc-500 ml-8">What should the agent work on? (optional)</p>
+          </div>
+
+          <div class="flex-1 overflow-y-auto p-4">
+            <%# Selection Summary %>
+            <div class="mb-4 p-3 bg-zinc-800/50 border border-zinc-700 rounded-lg">
+              <div class="flex items-center gap-2 text-sm">
+                <svg class="w-4 h-4 text-emerald-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path>
+                </svg>
+                <span class="text-zinc-400">Worktree:</span>
+                <span data-agents-target="selectedWorktreeLabel" class="text-zinc-200 font-mono truncate"></span>
+              </div>
+            </div>
+
+            <%# Prompt Input %>
+            <label class="block text-sm font-medium text-zinc-300 mb-2">Task Description</label>
+            <textarea data-agents-target="promptInput"
+                      rows="4"
+                      placeholder="Describe what you want the agent to work on... (leave blank for interactive session)"
+                      class="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-zinc-100 placeholder-zinc-500 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent resize-none"></textarea>
+            <p class="text-xs text-zinc-500 mt-2">Leave blank to start an interactive session where you can guide the agent</p>
+          </div>
+
+          <div class="px-4 py-3 border-t border-zinc-800 flex-shrink-0 flex gap-2">
+            <button type="button"
+                    data-action="agents#goBackToStep1"
+                    class="flex-1 px-4 py-2 text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition-colors">
+              Back
+            </button>
+            <button type="button"
+                    data-action="agents#submitAgent"
+                    class="flex-1 px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-zinc-950 text-sm font-medium rounded-lg transition-colors">
+              Start Agent
+            </button>
+          </div>
         </div>
+
       </div>
     </div>
   </div>
