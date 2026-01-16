@@ -1,6 +1,7 @@
 <% content_for :head do %>
   <%= stylesheet_link_tag "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" %>
 <% end %>
+<% content_for :no_footer, true %>
 
 <%#
   Multi-controller architecture:
@@ -12,7 +13,7 @@
   - Events: connection:connected, connection:message, connection:disconnected
   - Outlets: terminal-display and agents use connection outlet
 %>
-<div class="min-h-[calc(100vh-8rem)]"
+<div class="h-[calc(100dvh-3.5rem-1px)] flex flex-col overflow-hidden"
      data-controller="connection terminal-display agents"
      data-connection-hub-id-value="<%= @hub.id %>"
      data-connection-worker-url-value="<%= asset_path('workers/signal.js') %>"
@@ -22,7 +23,7 @@
      data-agents-connection-outlet="[data-controller~='connection']">
 
   <%# Header %>
-  <div class="border-b border-zinc-800 bg-zinc-900/50">
+  <div class="shrink-0 border-b border-zinc-800 bg-zinc-900/50">
     <div class="max-w-7xl mx-auto px-4 py-4">
       <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div class="flex items-center gap-4">
@@ -65,7 +66,7 @@
   </div>
 
   <%# Security Banner - updates based on connection state %>
-  <div data-connection-target="securityBanner" class="border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300">
+  <div data-connection-target="securityBanner" class="shrink-0 border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300">
     <div class="max-w-7xl mx-auto px-4 py-3">
       <div class="flex items-center gap-3">
         <span data-connection-target="securityIcon" class="shrink-0">
@@ -81,11 +82,11 @@
   </div>
 
   <%# Main Content %>
-  <div class="max-w-7xl mx-auto px-4 py-6">
-    <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+  <div class="flex-1 min-h-0 max-w-7xl mx-auto px-4 py-4 w-full">
+    <div class="h-full grid grid-cols-1 lg:grid-cols-4 gap-4">
 
       <%# Sidebar %>
-      <div class="lg:col-span-1 space-y-4">
+      <div class="lg:col-span-1 space-y-4 overflow-y-auto">
 
         <%# Agent List %>
         <div class="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden">
@@ -199,10 +200,10 @@
       </div>
 
       <%# Terminal Panel %>
-      <div class="lg:col-span-3">
-        <div class="bg-zinc-950 border border-zinc-800 rounded-lg overflow-hidden">
+      <div class="lg:col-span-3 flex flex-col min-h-0">
+        <div class="flex-1 flex flex-col min-h-0 bg-zinc-950 border border-zinc-800 rounded-lg overflow-hidden">
           <%# Terminal header %>
-          <div class="px-4 py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900">
+          <div class="shrink-0 px-4 py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900">
             <div class="flex items-center gap-3">
               <div class="flex items-center gap-1.5">
                 <span class="w-3 h-3 rounded-full bg-red-500/80"></span>
@@ -223,14 +224,14 @@
             </div>
           </div>
           <%# Terminal content - target for terminal-display controller %>
-          <div data-terminal-display-target="container" class="h-[calc(100vh-20rem)] min-h-[300px] bg-zinc-950"></div>
+          <div data-terminal-display-target="container" class="flex-1 min-h-0 bg-zinc-950"></div>
         </div>
       </div>
     </div>
   </div>
 
   <%# Mobile Touch Controls %>
-  <div class="lg:hidden border-t border-zinc-800 bg-zinc-900/50 p-4">
+  <div class="shrink-0 lg:hidden border-t border-zinc-800 bg-zinc-900/50 p-4">
     <div class="grid grid-cols-4 gap-2 mb-3">
       <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm font-mono rounded transition-colors" data-action="terminal-display#sendCtrlC">^C</button>
       <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm rounded transition-colors" data-action="terminal-display#sendEnter">Enter</button>
@@ -260,7 +261,7 @@
       <%# Header %>
       <div class="px-5 py-4 border-b border-zinc-800 bg-zinc-950/50">
         <div class="flex items-center gap-3">
-          <span class="w-7 h-7 rounded-md bg-primary-500/20 text-primary-400 text-xs font-bold flex items-center justify-center border border-primary-500/30">1</span>
+          <span class="size-7 rounded-md bg-primary-500/20 text-primary-400 text-xs font-bold flex items-center justify-center border border-primary-500/30">1</span>
           <div>
             <h3 class="text-base font-semibold text-zinc-100">Select Worktree</h3>
             <p class="text-xs text-zinc-500 mt-0.5">Choose existing or create new</p>
@@ -305,7 +306,7 @@
             <input type="text"
                    data-agents-target="newBranchInput"
                    placeholder="Issue # or branch name"
-                   class="flex-1 px-3 py-2.5 bg-zinc-950 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 text-sm font-mono focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/50 transition-colors"
+                   class="flex-1 px-3 py-2.5 bg-zinc-950 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 text-sm font-mono focus:outline-hidden focus:border-primary-500 focus:ring-1 focus:ring-primary-500/50 transition-colors"
                    autocomplete="off"
                    data-action="keydown.enter->agents#selectNewBranch">
             <%= render Elements::ButtonComponent.new("Next", data: { action: "agents#selectNewBranch" }) %>
@@ -330,7 +331,7 @@
       <%# Header %>
       <div class="px-5 py-4 border-b border-zinc-800 bg-zinc-950/50">
         <div class="flex items-center gap-3">
-          <span class="w-7 h-7 rounded-md bg-primary-500/20 text-primary-400 text-xs font-bold flex items-center justify-center border border-primary-500/30">2</span>
+          <span class="size-7 rounded-md bg-primary-500/20 text-primary-400 text-xs font-bold flex items-center justify-center border border-primary-500/30">2</span>
           <div>
             <h3 class="text-base font-semibold text-zinc-100">Initial Prompt</h3>
             <p class="text-xs text-zinc-500 mt-0.5">What should the agent work on?</p>
@@ -361,7 +362,7 @@
         <textarea data-agents-target="promptInput"
                   rows="4"
                   placeholder="Describe the task..."
-                  class="w-full px-3 py-2.5 bg-zinc-950 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 text-sm focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/50 transition-colors resize-none"></textarea>
+                  class="w-full px-3 py-2.5 bg-zinc-950 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 text-sm focus:outline-hidden focus:border-primary-500 focus:ring-1 focus:ring-primary-500/50 transition-colors resize-none"></textarea>
         <p class="text-xs text-zinc-600 mt-2">Leave blank for interactive session</p>
       </div>
 

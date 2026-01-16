@@ -24,58 +24,80 @@
     <%= javascript_importmap_tags %>
   </head>
 
-  <body class="bg-zinc-950 text-zinc-100 min-h-dvh font-sans antialiased">
-    <%# Navigation %>
-    <nav class="border-b border-zinc-800 bg-zinc-900/80 backdrop-blur-sm sticky top-0 z-40">
-      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div class="flex justify-between h-14">
-          <div class="flex items-center gap-8">
-            <%= link_to root_path, class: "flex items-center gap-2 text-primary-400 hover:text-primary-300 transition-colors" do %>
-              <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-              </svg>
-              <span class="font-mono font-bold text-lg tracking-tight">botster</span>
-            <% end %>
+  <body class="bg-zinc-950 text-zinc-100 min-h-dvh font-sans antialiased flex flex-col">
+    <%= render Elements::StackedLayoutComponent.new(style: :border) do |layout| %>
+      <% layout.with_navbar do %>
+        <%# Logo & Nav Links %>
+        <div class="flex items-center gap-8">
+          <%= link_to root_path, class: "flex items-center gap-2 text-primary-400 hover:text-primary-300 transition-colors" do %>
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+            <span class="font-mono font-bold text-lg tracking-tight">botster</span>
+          <% end %>
 
-            <% if user_signed_in? %>
-              <div class="hidden sm:flex items-center gap-1">
-                <%= link_to hubs_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path == hubs_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
-                  Hubs
-                <% end %>
-                <%= link_to settings_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path == settings_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
-                  Settings
-                <% end %>
-              </div>
-            <% end %>
-          </div>
+          <% if user_signed_in? %>
+            <div class="hidden sm:flex items-center gap-1">
+              <%= link_to hubs_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path == hubs_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
+                Hubs
+              <% end %>
+              <%= link_to settings_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path == settings_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
+                Settings
+              <% end %>
+            </div>
+          <% end %>
+        </div>
 
-          <div class="flex items-center gap-4">
-            <% if user_signed_in? %>
-              <span class="hidden sm:block text-sm text-zinc-500 font-mono">
+        <%# User Info & Logout (desktop) %>
+        <div class="hidden sm:flex items-center gap-4">
+          <% if user_signed_in? %>
+            <span class="text-sm text-zinc-500 font-mono">
+              <%= current_user.username || current_user.email %>
+            </span>
+            <%= link_to destroy_user_session_path,
+                        data: { turbo_method: :delete },
+                        class: "text-sm text-zinc-400 hover:text-zinc-200 transition-colors" do %>
+              Logout
+            <% end %>
+          <% end %>
+        </div>
+      <% end %>
+
+      <% layout.with_mobile_menu do %>
+        <div class="space-y-1 px-4 py-3 border-t border-zinc-800">
+          <% if user_signed_in? %>
+            <%= link_to hubs_path, class: "block px-3 py-2 rounded text-base font-medium transition-colors #{request.path == hubs_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100'}" do %>
+              Hubs
+            <% end %>
+            <%= link_to settings_path, class: "block px-3 py-2 rounded text-base font-medium transition-colors #{request.path == settings_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100'}" do %>
+              Settings
+            <% end %>
+            <div class="border-t border-zinc-800 mt-3 pt-3">
+              <div class="px-3 py-2 text-sm text-zinc-500 font-mono">
                 <%= current_user.username || current_user.email %>
-              </span>
+              </div>
               <%= link_to destroy_user_session_path,
                           data: { turbo_method: :delete },
-                          class: "text-sm text-zinc-400 hover:text-zinc-200 transition-colors" do %>
+                          class: "block px-3 py-2 rounded text-base font-medium text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition-colors" do %>
                 Logout
               <% end %>
-            <% end %>
-          </div>
+            </div>
+          <% end %>
         </div>
-      </div>
-    </nav>
+      <% end %>
 
-    <main class="flex-1">
       <%= yield %>
-    </main>
+    <% end %>
 
-    <%# Footer %>
-    <footer class="border-t border-zinc-800 mt-auto py-6">
-      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <p class="text-center text-xs text-zinc-600 font-mono">
-          botster &middot; autonomous agents for github
-        </p>
-      </div>
-    </footer>
+    <% unless content_for?(:no_footer) %>
+      <%# Footer %>
+      <footer class="border-t border-zinc-800 mt-auto py-6">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <p class="text-center text-xs text-zinc-600 font-mono">
+            botster &middot; autonomous agents for github
+          </p>
+        </div>
+      </footer>
+    <% end %>
   </body>
 </html>
