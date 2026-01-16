@@ -1,19 +1,18 @@
 <% content_for :head do %>
   <%= stylesheet_link_tag "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" %>
 <% end %>
-<% content_for :no_footer, true %>
 
 <%#
   Multi-controller architecture:
   - connection: Signal Protocol E2E encryption via ActionCable
   - terminal-display: xterm.js rendering
-  - agents: Agent list and management
+  - agents: Agent list and management (now in sidebar)
 
   Communication:
   - Events: connection:connected, connection:message, connection:disconnected
   - Outlets: terminal-display and agents use connection outlet
 %>
-<div class="h-[calc(100dvh-3.5rem-1px)] flex flex-col overflow-hidden"
+<div class="h-full flex flex-col overflow-hidden"
      data-controller="connection terminal-display agents"
      data-connection-hub-id-value="<%= @hub.id %>"
      data-connection-worker-url-value="<%= asset_path('workers/signal.js') %>"
@@ -22,30 +21,25 @@
      data-terminal-display-connection-outlet="[data-controller~='connection']"
      data-agents-connection-outlet="[data-controller~='connection']">
 
-  <%# Header %>
+  <%# Header with connection status %>
   <div class="shrink-0 border-b border-zinc-800 bg-zinc-900/50">
-    <div class="max-w-7xl mx-auto px-4 py-4">
-      <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div class="flex items-center gap-4">
-          <%= link_to hubs_path, class: "text-zinc-500 hover:text-zinc-300 transition-colors" do %>
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-            </svg>
-          <% end %>
-          <div>
-            <h1 class="text-xl font-bold text-zinc-100 font-mono"><%= @hub.identifier.truncate(24) %></h1>
-            <p class="text-sm text-zinc-500 mt-0.5">
-              <%= @hub.repo || "No repository" %> &mdash; <%= @hub.hub_agents.count %> agents
+    <div class="px-4 py-3">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-4 min-w-0">
+          <div class="min-w-0">
+            <h1 class="text-lg font-bold text-zinc-100 font-mono truncate"><%= @hub.identifier.truncate(24) %></h1>
+            <p class="text-xs text-zinc-500 truncate">
+              <%= @hub.repo || "No repository" %>
             </p>
           </div>
         </div>
 
-        <%# Connection status - multi-step indicator %>
-        <div class="flex items-center gap-3">
+        <%# Connection status %>
+        <div class="flex items-center gap-3 shrink-0">
           <div data-connection-target="statusContainer" class="flex flex-col items-end gap-0.5">
             <div data-connection-target="status" class="text-sm font-medium text-zinc-400 flex items-center gap-2">
               <span data-connection-target="statusIcon" class="shrink-0">
-                <svg class="w-4 h-4 animate-spin text-zinc-500" fill="none" viewBox="0 0 24 24">
+                <svg class="size-4 animate-spin text-zinc-500" fill="none" viewBox="0 0 24 24">
                   <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                   <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                 </svg>
@@ -65,12 +59,12 @@
     </div>
   </div>
 
-  <%# Security Banner - updates based on connection state %>
+  <%# Security Banner %>
   <div data-connection-target="securityBanner" class="shrink-0 border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300">
-    <div class="max-w-7xl mx-auto px-4 py-3">
+    <div class="px-4 py-2">
       <div class="flex items-center gap-3">
         <span data-connection-target="securityIcon" class="shrink-0">
-          <svg class="w-4 h-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg class="size-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
           </svg>
         </span>
@@ -81,152 +75,32 @@
     </div>
   </div>
 
-  <%# Main Content %>
-  <div class="flex-1 min-h-0 max-w-7xl mx-auto px-4 py-4 w-full">
-    <div class="h-full grid grid-cols-1 lg:grid-cols-4 gap-4">
-
-      <%# Sidebar %>
-      <div class="lg:col-span-1 space-y-4 overflow-y-auto">
-
-        <%# Agent List %>
-        <div class="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden">
-          <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
-            <span class="text-sm font-medium text-zinc-300">Agents</span>
-            <div class="flex items-center gap-1">
-              <%= render Elements::ButtonComponent.new(
-                variant: :ghost, shape: :circular,
-                data: { action: "agents#createAgent" },
-                command: "show-modal", commandfor: "new-agent-modal",
-                title: "New Agent"
-              ) do %>
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-                </svg>
-              <% end %>
-              <%= render Elements::ButtonComponent.new(
-                color: :neutral, variant: :ghost, shape: :circular,
-                data: { action: "agents#closeAgent" },
-                disabled: true, title: "Close Agent"
-              ) do %>
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              <% end %>
-              <%= render Elements::ButtonComponent.new(
-                color: :neutral, variant: :ghost, shape: :circular,
-                data: { action: "agents#requestAgentList" },
-                title: "Refresh"
-              ) do %>
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-              <% end %>
-            </div>
+  <%# Terminal Panel - fills remaining space %>
+  <div class="flex-1 min-h-0 flex flex-col">
+    <div class="flex-1 flex flex-col min-h-0 bg-zinc-950 overflow-hidden">
+      <%# Terminal header %>
+      <div class="shrink-0 px-4 py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900">
+        <div class="flex items-center gap-3">
+          <div class="flex items-center gap-1.5">
+            <span class="size-3 rounded-full bg-red-500/80"></span>
+            <span class="size-3 rounded-full bg-yellow-500/80"></span>
+            <span class="size-3 rounded-full bg-green-500/80"></span>
           </div>
-          <div data-agents-target="list" class="max-h-64 lg:max-h-96 overflow-y-auto">
-            <div class="px-4 py-8 text-center">
-              <p class="text-sm text-zinc-500">Loading agents...</p>
-            </div>
-          </div>
+          <span class="text-sm font-mono text-zinc-400">Terminal</span>
         </div>
-
-        <%# Agent Actions %>
-        <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 space-y-3">
-          <%= render Elements::ButtonComponent.new(
-            class: "w-full flex items-center justify-center gap-2",
-            data: { action: "agents#createAgent" },
-            command: "show-modal", commandfor: "new-agent-modal"
-          ) do %>
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+        <div class="flex items-center gap-3">
+          <span class="text-xs text-zinc-600 hidden sm:inline">scroll: mouse wheel</span>
+          <span class="text-xs text-zinc-500" data-agents-target="selectedLabel">No agent</span>
+          <span data-connection-target="terminalBadge" class="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-zinc-700/50 text-zinc-500 rounded">
+            <svg class="size-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
             </svg>
-            New Agent
-          <% end %>
-          <%= render Elements::ButtonComponent.new(
-            color: :neutral,
-            class: "w-full flex items-center justify-center gap-2",
-            data: { action: "agents#closeAgent" },
-            disabled: true
-          ) do %>
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-            Close Agent
-          <% end %>
-        </div>
-
-        <%# Hub Info %>
-        <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
-          <div class="flex items-center gap-2 mb-3">
-            <svg class="w-4 h-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2" />
-            </svg>
-            <span class="text-sm font-medium text-zinc-400">Hub Info</span>
-          </div>
-          <div class="space-y-1 text-xs">
-            <% if @hub.device %>
-              <div class="text-zinc-500"><%= @hub.device.name %></div>
-              <div class="font-mono text-zinc-600 truncate"><%= @hub.device.fingerprint %></div>
-            <% end %>
-            <% if @hub.e2e_enabled? %>
-              <div class="inline-flex items-center gap-1 px-1.5 py-0.5 text-xs font-medium bg-success-500/10 text-success-400 rounded mt-2">
-                <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
-                  <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
-                </svg>
-                E2E Ready
-              </div>
-            <% end %>
-          </div>
-
-          <%# Share Hub Button - generates invite link %>
-          <div class="mt-4 pt-3 border-t border-zinc-800">
-            <%= render Elements::ButtonComponent.new(
-              color: :neutral,
-              class: "w-full flex items-center justify-center gap-2",
-              data: {
-                action: "connection#requestInviteBundle",
-                connection_target: "shareBtn"
-              }
-            ) do %>
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
-              </svg>
-              Share Hub
-            <% end %>
-            <p class="text-xs text-zinc-600 mt-2 text-center" data-connection-target="shareStatus"></p>
-            <p class="text-xs text-zinc-600 mt-1 text-center">Connect another device without QR</p>
-          </div>
+            <span>Connecting...</span>
+          </span>
         </div>
       </div>
-
-      <%# Terminal Panel %>
-      <div class="lg:col-span-3 flex flex-col min-h-0">
-        <div class="flex-1 flex flex-col min-h-0 bg-zinc-950 border border-zinc-800 rounded-lg overflow-hidden">
-          <%# Terminal header %>
-          <div class="shrink-0 px-4 py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900">
-            <div class="flex items-center gap-3">
-              <div class="flex items-center gap-1.5">
-                <span class="w-3 h-3 rounded-full bg-red-500/80"></span>
-                <span class="w-3 h-3 rounded-full bg-yellow-500/80"></span>
-                <span class="w-3 h-3 rounded-full bg-green-500/80"></span>
-              </div>
-              <span class="text-sm font-mono text-zinc-400">Terminal</span>
-            </div>
-            <div class="flex items-center gap-3">
-              <span class="text-xs text-zinc-600 hidden sm:inline">scroll: mouse wheel</span>
-              <span class="text-xs text-zinc-500" data-agents-target="selectedLabel">No agent</span>
-              <span data-connection-target="terminalBadge" class="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-zinc-700/50 text-zinc-500 rounded">
-                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
-                </svg>
-                <span>Connecting...</span>
-              </span>
-            </div>
-          </div>
-          <%# Terminal content - target for terminal-display controller %>
-          <div data-terminal-display-target="container" class="flex-1 min-h-0 bg-zinc-950"></div>
-        </div>
-      </div>
+      <%# Terminal content %>
+      <div data-terminal-display-target="container" class="flex-1 min-h-0 bg-zinc-950"></div>
     </div>
   </div>
 
@@ -240,16 +114,16 @@
     </div>
     <div class="grid grid-cols-4 gap-2">
       <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded transition-colors" data-action="terminal-display#sendArrowUp">
-        <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7" /></svg>
+        <svg class="size-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7" /></svg>
       </button>
       <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded transition-colors" data-action="terminal-display#sendArrowDown">
-        <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" /></svg>
+        <svg class="size-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded transition-colors" data-action="terminal-display#sendArrowLeft">
-        <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" /></svg>
+        <svg class="size-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" /></svg>
       </button>
       <button type="button" class="px-3 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded transition-colors" data-action="terminal-display#sendArrowRight">
-        <svg class="w-4 h-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" /></svg>
+        <svg class="size-4 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" /></svg>
       </button>
     </div>
   </div>
@@ -273,7 +147,7 @@
         <%# Existing Worktrees Section %>
         <div class="p-5">
           <div class="flex items-center gap-2 mb-3">
-            <svg class="w-4 h-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg class="size-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path>
             </svg>
             <h4 class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Existing</h4>
@@ -297,7 +171,7 @@
         <%# Create New Section %>
         <div class="p-5">
           <div class="flex items-center gap-2 mb-3">
-            <svg class="w-4 h-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg class="size-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
             </svg>
             <h4 class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Create New</h4>
@@ -342,7 +216,7 @@
       <div class="flex-1 overflow-y-auto p-5">
         <%# Selection Summary %>
         <div class="mb-4 px-3 py-2.5 bg-zinc-950 border border-zinc-800 rounded flex items-center gap-3">
-          <svg class="w-4 h-4 text-success-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg class="size-4 text-success-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
           </svg>
           <div class="min-w-0 flex-1">
@@ -353,7 +227,7 @@
 
         <%# Prompt Input %>
         <div class="flex items-center gap-2 mb-2">
-          <svg class="w-4 h-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg class="size-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
           </svg>
           <label class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Task</label>

@@ -18,37 +18,34 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to root_path
   end
 
-  test "index shows list of active hubs" do
+  test "index shows list of active hubs in sidebar" do
     sign_in @user
     get hubs_path
     assert_response :success
 
-    # Should show active hub
-    assert_select "h2", text: /hub-active-123/
-
-    # Should not show stale hubs (they're filtered by active scope)
-    assert_select "h2", text: /hub-stale-456/, count: 0
-  end
-
-  test "index displays hub health indicators" do
-    sign_in @user
-    get hubs_path
-    assert_response :success
-
-    # Active hub should have success indicator (animate-pulse class)
-    assert_select ".bg-success-500.animate-pulse"
-  end
-
-  test "index displays hub metadata" do
-    sign_in @user
-    get hubs_path
-    assert_response :success
-
-    # Should show repo name
+    # Hubs are shown in sidebar - check for repo name in sidebar hub list
     assert_match /botster\/trybotster/, response.body
 
-    # Should show agent count
-    assert_match /2 agents/, response.body
+    # Main content shows "Select a Hub" message
+    assert_select "h2", text: /Select a Hub/
+  end
+
+  test "index displays hub health indicators in sidebar" do
+    sign_in @user
+    get hubs_path
+    assert_response :success
+
+    # Active hub should have success indicator in sidebar
+    assert_select ".bg-success-500"
+  end
+
+  test "index displays hub repo in sidebar" do
+    sign_in @user
+    get hubs_path
+    assert_response :success
+
+    # Should show repo name in sidebar
+    assert_match /botster\/trybotster/, response.body
   end
 
   test "index links to hub show page" do
@@ -67,7 +64,8 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     get hubs_path
     assert_response :success
 
-    assert_match /No active hubs/, response.body
+    # Main content shows empty state
+    assert_match /No Active Hubs/, response.body
     assert_match /botster-hub/, response.body
   end
 
@@ -102,12 +100,13 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_match /botster\/trybotster/, response.body
   end
 
-  test "show has back link to index" do
+  test "show has sidebar with hubs list" do
     sign_in @user
     get hub_path(@active_hub)
     assert_response :success
 
-    assert_select "a[href=?]", hubs_path
+    # Sidebar contains link to hubs (the current hub should be highlighted)
+    assert_select "[data-sidebar-hubs-target='list'] a[href=?]", hub_path(@active_hub)
   end
 
   test "show redirects to index for non-existent hub" do
@@ -134,13 +133,13 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "Hub not found", flash[:alert]
   end
 
-  test "show displays E2E badge for hub with device" do
+  test "show displays terminal badge for E2E connection status" do
     sign_in @user
     get hub_path(@active_hub)
     assert_response :success
 
-    # Hub has a device, should show E2E badge (uses semantic success color)
-    assert_select ".text-success-400", text: /E2E/
+    # Terminal has a badge showing E2E connection status (initially shows "Connecting...")
+    assert_select "[data-connection-target='terminalBadge']"
   end
 
   test "show displays security banner placeholder" do

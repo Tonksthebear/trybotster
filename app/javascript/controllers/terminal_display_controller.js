@@ -2,255 +2,345 @@ import { Controller } from "@hotwired/stimulus";
 import * as xterm from "@xterm/xterm";
 import * as xtermFit from "@xterm/addon-fit";
 
-// Handle various ESM export styles
 const Terminal = xterm.Terminal || xterm.default?.Terminal || xterm.default;
 const FitAddon = xtermFit.FitAddon || xtermFit.default?.FitAddon || xtermFit.default;
 
 /**
- * Terminal Display Controller - xterm.js rendering
+ * Terminal Display Controller
  *
- * This controller handles terminal display only:
- * - Initializes and renders xterm.js
- * - Receives messages via connection controller callbacks
- * - Sends keyboard input via connection outlet
- * - Handles terminal resize
- *
- * Uses connection controller's registerListener API for reliable event handling.
+ * Handles xterm.js rendering with custom touch scrolling for mobile.
+ * xterm.js lacks proper touch support, so we overlay a transparent div
+ * to capture touch events. See: https://github.com/xtermjs/xterm.js/issues/5377
  */
 export default class extends Controller {
   static targets = ["container"];
-
   static outlets = ["connection"];
 
+  // Private fields
+  #terminal = null;
+  #fitAddon = null;
+  #connection = null;
+  #touchOverlay = null;
+  #keyboardHandler = null;
+  #boundHandleResize = null;
+  #momentumAnimationId = null;
+
   connect() {
-    this.terminal = null;
-    this.fitAddon = null;
-    this.connection = null; // Set when connection is ready
-
-    // Initialize terminal immediately
-    this.initTerminal();
-
-    // Handle window resize
-    this.boundHandleResize = this.handleResize.bind(this);
-    window.addEventListener("resize", this.boundHandleResize);
+    this.#boundHandleResize = this.#handleResize.bind(this);
+    window.addEventListener("resize", this.#boundHandleResize);
+    this.#initTerminal();
   }
 
   disconnect() {
-    window.removeEventListener("resize", this.boundHandleResize);
+    window.removeEventListener("resize", this.#boundHandleResize);
 
-    if (this.terminal) {
-      this.terminal.dispose();
-      this.terminal = null;
+    this.#touchOverlay?.remove();
+    this.#touchOverlay = null;
+
+    if (this.#momentumAnimationId) {
+      cancelAnimationFrame(this.#momentumAnimationId);
+      this.#momentumAnimationId = null;
     }
+
+    if (this.#keyboardHandler) {
+      window.visualViewport?.removeEventListener("resize", this.#keyboardHandler);
+      window.visualViewport?.removeEventListener("scroll", this.#keyboardHandler);
+      this.#keyboardHandler = null;
+    }
+
+    this.#terminal?.dispose();
+    this.#terminal = null;
   }
 
-  // Called by Stimulus when connection outlet becomes available
+  // Stimulus outlet callbacks
   connectionOutletConnected(outlet) {
     outlet.registerListener(this, {
-      onConnected: (outlet) => this.handleConnected(outlet),
-      onDisconnected: () => this.handleDisconnected(),
-      onMessage: (message) => this.handleMessage(message),
-      onError: (error) => this.handleError(error),
+      onConnected: (o) => this.#handleConnected(o),
+      onDisconnected: () => this.#handleDisconnected(),
+      onMessage: (msg) => this.#handleMessage(msg),
+      onError: (err) => this.#handleError(err),
     });
   }
 
-  // Called by Stimulus when connection outlet is removed
   connectionOutletDisconnected(outlet) {
     outlet.unregisterListener(this);
-    this.connection = null;
+    this.#connection = null;
   }
 
-  initTerminal() {
-    this.terminal = new Terminal({
+  // Public actions for touch control buttons
+  sendCtrlC() { this.#sendInput("\x03"); }
+  sendEnter() { this.#sendInput("\r"); }
+  sendEscape() { this.#sendInput("\x1b"); }
+  sendTab() { this.#sendInput("\t"); }
+  sendArrowUp() { this.#sendInput("\x1b[A"); }
+  sendArrowDown() { this.#sendInput("\x1b[B"); }
+  sendArrowLeft() { this.#sendInput("\x1b[D"); }
+  sendArrowRight() { this.#sendInput("\x1b[C"); }
+
+  // Public API
+  clear() { this.#terminal?.clear(); }
+  writeln(text) { this.#terminal?.writeln(text); }
+  focus() { this.#terminal?.focus(); }
+
+  getDimensions() {
+    return this.#terminal
+      ? { cols: this.#terminal.cols, rows: this.#terminal.rows }
+      : { cols: 80, rows: 24 };
+  }
+
+  // Terminal initialization
+  #initTerminal() {
+    this.#terminal = new Terminal({
       cursorBlink: true,
       fontFamily: "'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
       fontSize: 14,
+      scrollback: 10000,
       theme: {
-        background: "#1a1a1a",
+        background: "#09090b",
         foreground: "#d4d4d4",
         cursor: "#ffffff",
         selectionBackground: "#3a3a3a",
       },
-      allowProposedApi: true,
-      scrollback: 10000,
     });
 
-    this.fitAddon = new FitAddon();
-    this.terminal.loadAddon(this.fitAddon);
+    this.#fitAddon = new FitAddon();
+    this.#terminal.loadAddon(this.#fitAddon);
 
-    // Open terminal in container
     const container = this.hasContainerTarget ? this.containerTarget : this.element;
-    this.terminal.open(container);
+    this.#terminal.open(container);
 
-    // Fit to container
-    requestAnimationFrame(() => {
-      this.fitAddon.fit();
-    });
+    requestAnimationFrame(() => this.#fitAddon.fit());
 
-    // Handle terminal input
-    this.terminal.onData((data) => {
-      this.sendInput(data);
-    });
+    this.#terminal.onData((data) => this.#sendInput(data));
+    container.addEventListener("click", () => this.focus());
 
-    // Click to focus
-    container.addEventListener("click", () => {
-      this.focus();
-    });
+    this.#setupTouchScroll();
+    this.#setupKeyboardHandler();
 
-    // Show initial message
-    this.terminal.writeln("Secure Terminal (Signal Protocol E2E Encryption)");
-    this.terminal.writeln("Connecting...");
-    this.terminal.writeln("");
+    this.#terminal.writeln("Secure Terminal (Signal Protocol E2E Encryption)");
+    this.#terminal.writeln("Connecting...");
+    this.#terminal.writeln("");
   }
 
-  // Handle connection established
-  handleConnected(outlet) {
-    this.connection = outlet;
+  // Touch scrolling with momentum
+  #setupTouchScroll() {
+    const xtermEl = this.#terminal?.element;
+    if (!xtermEl) return;
+
+    const overlay = document.createElement("div");
+    overlay.style.cssText = `
+      position: absolute;
+      inset: 0;
+      touch-action: none;
+      z-index: 10;
+    `;
+    xtermEl.style.position = "relative";
+    xtermEl.appendChild(overlay);
+    this.#touchOverlay = overlay;
+
+    const SENSITIVITY = 15;
+    const FRICTION = 0.92;
+    const TAP_THRESHOLD = 10;
+    const MAX_VELOCITY_SAMPLES = 5;
+
+    let startY = 0;
+    let lastY = 0;
+    let lastTime = 0;
+    let isScrolling = false;
+    const velocityHistory = [];
+
+    overlay.addEventListener("touchstart", (e) => {
+      if (e.touches.length !== 1) return;
+
+      cancelAnimationFrame(this.#momentumAnimationId);
+      velocityHistory.length = 0;
+      startY = lastY = e.touches[0].clientY;
+      lastTime = performance.now();
+      isScrolling = false;
+    });
+
+    overlay.addEventListener("touchmove", (e) => {
+      if (e.touches.length !== 1) return;
+
+      const now = performance.now();
+      const deltaTime = Math.max(now - lastTime, 1);
+      const deltaY = e.touches[0].clientY - lastY;
+      const totalDelta = Math.abs(e.touches[0].clientY - startY);
+
+      lastY = e.touches[0].clientY;
+      lastTime = now;
+
+      if (totalDelta > TAP_THRESHOLD) {
+        isScrolling = true;
+      }
+
+      if (isScrolling) {
+        const lines = Math.round(-deltaY / SENSITIVITY);
+        if (lines !== 0) {
+          this.#terminal.scrollLines(lines);
+        }
+
+        velocityHistory.push({ v: -deltaY / SENSITIVITY / deltaTime, t: now });
+        while (velocityHistory.length > MAX_VELOCITY_SAMPLES) {
+          velocityHistory.shift();
+        }
+
+        e.preventDefault();
+      }
+    });
+
+    overlay.addEventListener("touchend", (e) => {
+      if (!isScrolling) {
+        // Pass tap through to terminal for focus/keyboard
+        overlay.style.pointerEvents = "none";
+        const touch = e.changedTouches[0];
+        const target = document.elementFromPoint(touch.clientX, touch.clientY);
+        target?.focus?.();
+        target?.click?.();
+        requestAnimationFrame(() => overlay.style.pointerEvents = "auto");
+        return;
+      }
+
+      // Calculate weighted velocity from recent samples
+      let velocity = 0;
+      if (velocityHistory.length > 0) {
+        const now = performance.now();
+        let totalWeight = 0;
+        let weightedSum = 0;
+
+        for (const { v, t } of velocityHistory) {
+          const weight = Math.max(0, 1 - (now - t) / 150);
+          weightedSum += v * weight;
+          totalWeight += weight;
+        }
+
+        velocity = totalWeight > 0 ? weightedSum / totalWeight : 0;
+      }
+
+      // Momentum animation
+      if (Math.abs(velocity) > 0.01) {
+        const animate = () => {
+          if (Math.abs(velocity) < 0.005) {
+            this.#momentumAnimationId = null;
+            return;
+          }
+
+          const lines = Math.round(velocity * 16);
+          if (lines !== 0) {
+            this.#terminal.scrollLines(lines);
+          }
+
+          velocity *= FRICTION;
+          this.#momentumAnimationId = requestAnimationFrame(animate);
+        };
+        animate();
+      }
+    });
+  }
+
+  // iOS keyboard viewport adjustment
+  #setupKeyboardHandler() {
+    if (!window.visualViewport) return;
+
+    const container = this.hasContainerTarget ? this.containerTarget : this.element;
+    let isKeyboardOpen = false;
+
+    this.#keyboardHandler = () => {
+      const vh = window.visualViewport.height;
+      const offset = window.visualViewport.offsetTop;
+      const rect = container.getBoundingClientRect();
+      const availableHeight = vh - (rect.top + window.scrollY - offset);
+
+      if (availableHeight < rect.height && availableHeight > 100) {
+        container.style.maxHeight = `${availableHeight - 10}px`;
+        isKeyboardOpen = true;
+        requestAnimationFrame(() => {
+          this.#fitAddon?.fit();
+          this.#terminal?.scrollToBottom();
+        });
+      } else if (isKeyboardOpen) {
+        container.style.maxHeight = "";
+        isKeyboardOpen = false;
+        requestAnimationFrame(() => this.#fitAddon?.fit());
+      }
+    };
+
+    window.visualViewport.addEventListener("resize", this.#keyboardHandler);
+    window.visualViewport.addEventListener("scroll", this.#keyboardHandler);
+  }
+
+  // Connection handlers
+  #handleConnected(outlet) {
+    this.#connection = outlet;
     const hubId = outlet.getHubId();
-    this.terminal.writeln(`[Connected to hub: ${hubId.substring(0, 8)}...]`);
-    this.terminal.writeln("[Signal E2E encryption active]");
-    this.terminal.writeln("");
-    // Set GUI mode to receive raw agent PTY output (not TUI)
-    this.connection.send("set_mode", { mode: "gui" });
-    this.sendResize();
-    // Focus terminal so it can receive keyboard input
+    this.#terminal.writeln(`[Connected to hub: ${hubId.substring(0, 8)}...]`);
+    this.#terminal.writeln("[Signal E2E encryption active]");
+    this.#terminal.writeln("");
+    this.#connection.send("set_mode", { mode: "gui" });
+    this.#sendResize();
     this.focus();
   }
 
-  // Handle connection lost
-  handleDisconnected() {
-    this.terminal.writeln("\r\n[Disconnected]");
-    this.connection = null;
+  #handleDisconnected() {
+    this.#terminal?.writeln("\r\n[Disconnected]");
+    this.#connection = null;
   }
 
-  // Handle decrypted messages from CLI
-  handleMessage(message) {
+  #handleMessage(message) {
     switch (message.type) {
       case "output":
-        this.writeOutput(message.data);
+        this.#terminal?.write(message.data);
         break;
-
       case "clear":
-        this.terminal.clear();
-        break;
-
       case "agent_selected":
-        this.terminal.clear();
+        this.#terminal?.clear();
         break;
-
       case "scrollback":
-        // Write scrollback history to terminal
-        // These lines will scroll up into history as new output arrives
-        this.writeScrollback(message.lines);
+        this.#writeScrollback(message.data, message.compressed);
         break;
     }
   }
 
-  // Write scrollback history lines to terminal
-  writeScrollback(lines) {
-    if (!this.terminal || !lines || lines.length === 0) {
-      return;
-    }
-
-    // Write each line - they'll be in the scrollback buffer
-    for (const line of lines) {
-      this.terminal.writeln(line);
-    }
+  #handleError(error) {
+    this.#terminal?.writeln(`\r\n[Error: ${error}]`);
   }
 
-  // Handle connection errors
-  handleError(error) {
-    this.terminal.writeln(`\r\n[Error: ${error}]`);
-  }
+  // Scrollback decompression
+  async #writeScrollback(data, compressed) {
+    if (!this.#terminal || !data) return;
 
-  // Write output to terminal
-  writeOutput(data) {
-    if (this.terminal && data) {
-      this.terminal.write(data);
+    try {
+      const text = compressed ? await this.#decompress(data) : data;
+      this.#terminal.write(text);
+    } catch (error) {
+      console.error("Failed to decompress scrollback:", error);
+      this.#terminal.write(data);
     }
   }
 
-  // Send input to CLI via connection outlet
-  sendInput(data) {
-    if (this.connection) {
-      this.connection.sendInput(data);
+  async #decompress(base64Data) {
+    const binaryString = atob(base64Data);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return new Response(stream).text();
+  }
+
+  // I/O helpers
+  #sendInput(data) {
+    this.#connection?.sendInput(data);
+  }
+
+  #sendResize() {
+    if (this.#connection && this.#terminal) {
+      this.#connection.sendResize(this.#terminal.cols, this.#terminal.rows);
     }
   }
 
-  // Handle window resize
-  handleResize() {
-    if (this.fitAddon) {
-      this.fitAddon.fit();
-      this.sendResize();
-    }
-  }
-
-  // Send resize to CLI
-  sendResize() {
-    if (this.connection && this.terminal) {
-      this.connection.sendResize(this.terminal.cols, this.terminal.rows);
-    }
-  }
-
-  // Public: Clear terminal
-  clear() {
-    if (this.terminal) {
-      this.terminal.clear();
-    }
-  }
-
-  // Public: Write line
-  writeln(text) {
-    if (this.terminal) {
-      this.terminal.writeln(text);
-    }
-  }
-
-  // Public: Focus terminal
-  focus() {
-    if (this.terminal) {
-      this.terminal.focus();
-    }
-  }
-
-  // Public: Get terminal dimensions
-  getDimensions() {
-    if (this.terminal) {
-      return { cols: this.terminal.cols, rows: this.terminal.rows };
-    }
-    return { cols: 80, rows: 24 };
-  }
-
-  // Mobile touch control actions
-  sendCtrlC() {
-    this.sendInput("\x03");
-  }
-
-  sendEnter() {
-    this.sendInput("\r");
-  }
-
-  sendEscape() {
-    this.sendInput("\x1b");
-  }
-
-  sendTab() {
-    this.sendInput("\t");
-  }
-
-  sendArrowUp() {
-    this.sendInput("\x1b[A");
-  }
-
-  sendArrowDown() {
-    this.sendInput("\x1b[B");
-  }
-
-  sendArrowLeft() {
-    this.sendInput("\x1b[D");
-  }
-
-  sendArrowRight() {
-    this.sendInput("\x1b[C");
+  #handleResize() {
+    this.#fitAddon?.fit();
+    this.#sendResize();
   }
 }

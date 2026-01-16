@@ -1,0 +1,97 @@
+<div class="flex h-full min-h-svh flex-col bg-zinc-900 border-r border-zinc-800">
+  <%# Logo %>
+  <div class="shrink-0 flex items-center gap-2 px-4 py-4 border-b border-zinc-800">
+    <%= link_to root_path, class: "flex items-center gap-2 text-primary-400 hover:text-primary-300 transition-colors" do %>
+      <svg class="size-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+      </svg>
+      <span class="font-mono font-bold text-lg tracking-tight">botster</span>
+    <% end %>
+  </div>
+
+  <%# Scrollable content %>
+  <div class="flex-1 flex flex-col min-h-0 overflow-hidden">
+    <%# Hubs Section %>
+    <div class="flex flex-col min-h-0" data-controller="sidebar-hubs">
+      <div class="shrink-0 flex items-center justify-between px-4 py-3">
+        <h2 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Hubs</h2>
+        <%= link_to new_users_hub_path, class: "p-1 text-zinc-500 hover:text-primary-400 transition-colors", title: "Connect Hub" do %>
+          <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+          </svg>
+        <% end %>
+      </div>
+      <div class="flex-1 overflow-y-auto px-2 pb-2" data-sidebar-hubs-target="list">
+        <% if defined?(@sidebar_hubs) && @sidebar_hubs.any? %>
+          <% @sidebar_hubs.each do |hub| %>
+            <%= link_to hub_path(hub),
+                class: "flex items-center gap-2 px-2 py-1.5 rounded text-sm transition-colors #{@hub&.id == hub.id ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'}",
+                data: { turbo_frame: "_top" } do %>
+              <span class="shrink-0 size-2 rounded-full <%= hub.active? ? 'bg-success-500' : 'bg-zinc-600' %>"></span>
+              <span class="truncate font-mono text-xs"><%= hub.repo.presence || hub.identifier.truncate(20) %></span>
+            <% end %>
+          <% end %>
+        <% else %>
+          <p class="px-2 py-4 text-center text-xs text-zinc-600">No hubs connected</p>
+        <% end %>
+      </div>
+    </div>
+
+    <%# Agents Section - only shown when hub is selected %>
+    <% if defined?(@hub) && @hub %>
+      <div class="flex flex-col min-h-0 border-t border-zinc-800" data-controller="sidebar-agents" data-sidebar-agents-hub-id-value="<%= @hub.id %>">
+        <div class="shrink-0 flex items-center justify-between px-4 py-3">
+          <h2 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Agents</h2>
+          <button type="button"
+                  class="p-1 text-zinc-500 hover:text-primary-400 transition-colors"
+                  title="New Agent"
+                  command="show-modal"
+                  commandfor="new-agent-modal">
+            <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+            </svg>
+          </button>
+        </div>
+        <div class="flex-1 overflow-y-auto px-2 pb-2" data-sidebar-agents-target="list">
+          <p class="px-2 py-4 text-center text-xs text-zinc-600">
+            <span data-sidebar-agents-target="status">Connecting...</span>
+          </p>
+        </div>
+      </div>
+    <% end %>
+  </div>
+
+  <%# Bottom section - Settings & User %>
+  <div class="shrink-0 border-t border-zinc-800">
+    <%# Settings %>
+    <%= link_to settings_path,
+        class: "flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
+      <svg class="size-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+      </svg>
+      <span>Settings</span>
+    <% end %>
+
+    <%# User dropdown %>
+    <% if user_signed_in? %>
+      <%= render Elements::DropdownComponent.new(anchor: "top start", class: "block") do |dropdown| %>
+        <% dropdown.with_button class: "w-full flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
+          <div class="size-8 rounded-full bg-zinc-800 flex items-center justify-center text-xs font-medium text-zinc-300">
+            <%= current_user.username&.first&.upcase || "?" %>
+          </div>
+          <span class="flex-1 text-left truncate font-mono text-xs"><%= current_user.username || "User" %></span>
+          <svg class="size-4 text-zinc-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l4-4 4 4m0 6l-4 4-4-4" />
+          </svg>
+        <% end %>
+
+        <%= link_to destroy_user_session_path,
+            data: { turbo_method: :delete },
+            class: "block px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-700 transition-colors" do %>
+          Logout
+        <% end %>
+      <% end %>
+    <% end %>
+  </div>
+</div>

@@ -1,4 +1,7 @@
 @theme {
+  /* Layout */
+  --sidebar-width: 16rem;
+
   /* Base colors for contrast */
   --color-white: #fff;
   --color-black: #000;

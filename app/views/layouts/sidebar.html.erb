@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html class="dark">
+  <head>
+    <title><%= content_for(:title) || "Botster" %></title>
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="application-name" content="Botster">
+    <meta name="mobile-web-app-capable" content="yes">
+    <%= csrf_meta_tags %>
+    <%= csp_meta_tag %>
+
+    <%= yield :head %>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <link rel="icon" href="/icon.png" type="image/png">
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/icon.png">
+
+    <%= stylesheet_link_tag :app, "data-turbo-track": "reload" %>
+    <%= javascript_importmap_tags %>
+  </head>
+
+  <body class="bg-zinc-950 text-zinc-100 h-dvh font-sans antialiased flex flex-col">
+    <%= render Elements::SidebarComponent.new(class: "flex-1 min-h-0 flex flex-col overflow-y-auto") do |layout| %>
+      <% layout.with_sidebar do %>
+        <%= render "layouts/sidebar_content" %>
+      <% end %>
+
+      <% layout.with_header do %>
+        <%# Mobile header content - logo %>
+        <%= link_to root_path, class: "flex items-center gap-2 text-primary-400" do %>
+          <svg class="size-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+          </svg>
+          <span class="font-mono font-bold tracking-tight">botster</span>
+        <% end %>
+      <% end %>
+
+      <%= yield %>
+    <% end %>
+  </body>
+</html>

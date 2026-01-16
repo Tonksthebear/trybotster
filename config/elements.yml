@@ -67,7 +67,7 @@ btn:
 
 sidebar:
   container: "lg:pl-(--sidebar-width)"
-  header: "sticky top-0 z-40 flex items-center gap-x-6 px-4 py-4 sm:px-6 lg:hidden lg:pl-(--sidebar-width)"
+  header: "sticky top-0 z-40 flex items-center gap-x-4 px-4 py-3 bg-zinc-900 border-b border-zinc-800 lg:hidden"
 
 stacked:
   mobile_button: "relative inline-flex items-center justify-center rounded-md p-2 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 focus:outline-2 focus:outline-offset-2 focus:outline-primary-500"
