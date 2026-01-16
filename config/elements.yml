@@ -2,7 +2,7 @@ dialog:
   main: "fixed inset-0 size-auto max-h-none max-w-none overflow-y-auto bg-transparent backdrop:bg-transparent"
   backdrop: "fixed inset-0 bg-black/80 backdrop-blur-sm transition-opacity data-closed:opacity-0 data-enter:duration-200 data-enter:ease-out data-leave:duration-150 data-leave:ease-in"
   container:
-    base: "flex min-h-full p-4 focus:outline-none items-end sm:p-0"
+    base: "flex min-h-full p-4 focus:outline-hidden items-end sm:p-0"
     centered: "justify-center text-center sm:items-center"
     bottom: "justify-center text-center sm:items-end group-data-[transition]/dialog:overflow-hidden"
   panel:
@@ -70,17 +70,17 @@ sidebar:
   header: "sticky top-0 z-40 flex items-center gap-x-6 px-4 py-4 sm:px-6 lg:hidden lg:pl-(--sidebar-width)"
 
 stacked:
-  mobile_button: "relative inline-flex items-center justify-center rounded-md p-2 focus:outline-2 focus:outline-offset-2"
+  mobile_button: "relative inline-flex items-center justify-center rounded-md p-2 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 focus:outline-2 focus:outline-offset-2 focus:outline-primary-500"
   border:
-    nav: "border-b border-gray-200 bg-white dark:border-white/10 dark:bg-gray-900"
+    nav: "border-b border-zinc-800 bg-zinc-900/80 backdrop-blur-sm sticky top-0 z-40"
     container: "mx-auto max-w-7xl px-4 sm:px-6 lg:px-8"
-    inner: "flex h-16 justify-between"
-    main: ""
+    inner: "flex h-14 justify-between"
+    main: "flex-1"
   overlap:
-    zone: "relative bg-gray-800 pb-32 dark:bg-gray-800/50"
-    nav: "bg-gray-800 dark:bg-transparent"
+    zone: "relative bg-zinc-900 pb-32"
+    nav: "bg-transparent"
     container: "mx-auto max-w-7xl sm:px-6 lg:px-8"
-    inner: "flex h-16 items-center justify-between border-b border-white/10 px-4 sm:px-0"
+    inner: "flex h-16 items-center justify-between border-b border-zinc-800 px-4 sm:px-0"
     main: "relative -mt-32"
 
 dropdown:
