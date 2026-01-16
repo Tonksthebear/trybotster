@@ -1,18 +1,18 @@
 <div id="hub_agent_<%= hub_agent.id %>" class="ml-2 flex items-center gap-2">
   <span class="font-mono"><%= hub_agent.session_key %></span>
   <% if hub_agent.last_invocation_url.present? %>
-    <%= link_to "view", hub_agent.last_invocation_url, target: "_blank", class: "text-blue-500 hover:underline" %>
+    <%= link_to "view", hub_agent.last_invocation_url, target: "_blank", class: "text-primary-500 hover:underline" %>
   <% end %>
   <% if hub_agent.tunnel_connected? %>
     <%= link_to tunnel_root_path(hub_id: hub_agent.hub_id, agent_id: hub_agent.id),
         target: "_blank",
-        class: "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200 hover:bg-green-200 dark:hover:bg-green-800" do %>
-      <span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>
+        class: "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full bg-success-100 text-success-800 dark:bg-success-900 dark:text-success-200 hover:bg-success-200 dark:hover:bg-success-800" do %>
+      <span class="w-1.5 h-1.5 rounded-full bg-success-500"></span>
       Preview
     <% end %>
   <% elsif hub_agent.tunnel_port.present? %>
-    <span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
-      <span class="w-1.5 h-1.5 rounded-full bg-yellow-500"></span>
+    <span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full bg-warning-100 text-warning-800 dark:bg-warning-900 dark:text-warning-200">
+      <span class="w-1.5 h-1.5 rounded-full bg-warning-500"></span>
       Port <%= hub_agent.tunnel_port %>
     </span>
   <% end %>

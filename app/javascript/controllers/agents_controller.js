@@ -25,7 +25,7 @@ export default class extends Controller {
     "promptInput",           // Textarea for initial prompt
   ];
 
-  static outlets = ["connection", "modal"];
+  static outlets = ["connection"];
 
   connect() {
     this.agents = [];
@@ -167,9 +167,10 @@ export default class extends Controller {
       }
     }
 
-    // Also hide modal if open
-    if (this.hasModalOutlet) {
-      this.modalOutlet.hide();
+    // Also close dialog if open
+    const dialog = document.getElementById('new-agent-modal');
+    if (dialog?.open) {
+      dialog.close();
     }
   }
 
@@ -460,11 +461,8 @@ export default class extends Controller {
       });
     }
 
-    // Reset and close modal
+    // Reset state - dialog closes via native command attribute on button
     this.resetModalState();
-    if (this.hasModalOutlet) {
-      this.modalOutlet.hide();
-    }
   }
 
   // Reset modal state
@@ -492,7 +490,7 @@ export default class extends Controller {
     }
   }
 
-  // Action: Open the new agent modal
+  // Action: Prepare for new agent creation (called alongside command="show-modal")
   createAgent() {
     // Reset modal state first
     this.resetModalState();
@@ -503,10 +501,7 @@ export default class extends Controller {
     }
     // Update UI with current worktrees
     this.updateWorktreeList();
-
-    if (this.hasModalOutlet) {
-      this.modalOutlet.show();
-    }
+    // Dialog opens via native command="show-modal" attribute on button
   }
 
   // Action: Close selected agent
