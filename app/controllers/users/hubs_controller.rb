@@ -4,6 +4,8 @@ module Users
   # Handles browser-side authorization flow: user "adds a hub to their account"
   # by entering and approving a device code from the CLI.
   class HubsController < ApplicationController
+    layout "application"
+
     before_action :authenticate_user!
 
     # GET /users/hubs/new

@@ -13,8 +13,7 @@ import { Controller } from "@hotwired/stimulus";
  */
 export default class extends Controller {
   static targets = [
-    "list",                  // Container for agent list
-    "selectedLabel",         // Label showing selected agent
+    "selectedLabel",         // Label showing selected agent (desktop terminal header)
     "emptyState",            // Message when no agents
     "creatingState",         // Loading indicator for agent creation
     "worktreeList",          // Container for worktree list in modal
@@ -23,9 +22,21 @@ export default class extends Controller {
     "step2",                 // Step 2: prompt input
     "selectedWorktreeLabel", // Label showing selected worktree in step 2
     "promptInput",           // Textarea for initial prompt
+    "mobileAgentLabel",      // Mobile header agent/hub label
+    "mobileAgentInfo",       // Mobile dropdown agent info section
+    "mobileAgentName",       // Mobile dropdown agent name
+    "mobileDeleteBtn",       // Mobile dropdown delete button
   ];
 
   static outlets = ["connection"];
+
+  static values = {
+    sidebarListClass: { type: String, default: "sidebar-agents-list" },
+    hubName: { type: String, default: "" }
+  };
+
+  // Private field for cached sidebar list elements (there can be multiple - mobile + desktop)
+  #sidebarListElements = null;
 
   connect() {
     this.agents = [];
@@ -38,7 +49,20 @@ export default class extends Controller {
   }
 
   disconnect() {
-    // Cleanup if needed
+    // Clear reference to external elements
+    this.#sidebarListElements = null;
+  }
+
+  // Lazy getter for sidebar list elements (outside this controller's scope)
+  // Returns array of elements - there can be multiple (mobile + desktop sidebars)
+  get sidebarListElements() {
+    if (!this.#sidebarListElements) {
+      this.#sidebarListElements = Array.from(
+        document.querySelectorAll(`.${this.sidebarListClassValue}`)
+      );
+      console.log("[Agents] Looking for sidebar lists:", this.sidebarListClassValue, "found:", this.#sidebarListElements.length);
+    }
+    return this.#sidebarListElements;
   }
 
   // Called by Stimulus when connection outlet becomes available
@@ -59,9 +83,10 @@ export default class extends Controller {
 
   // Handle connection established
   handleConnected(outlet) {
-    // Request agent list when connected
     this.connection = outlet;
+    // Request agent list and worktrees when connected
     this.requestAgentList();
+    this.requestWorktrees();
   }
 
   // Handle connection lost
@@ -72,14 +97,18 @@ export default class extends Controller {
     this.selectedAgentId = null;
     this.updateAgentList([]);
     this.updateSelectedLabel(null);
+    this.updateMobileAgentUI(null);
   }
 
   // Handle decrypted messages from CLI
   handleMessage(message) {
+    console.log("[Agents] Received message:", message.type, message);
+
     switch (message.type) {
       case "agents":
       case "agent_list":
         this.hideCreatingState();
+        console.log("[Agents] Updating agent list with:", message.agents);
         this.updateAgentList(message.agents || []);
         break;
 
@@ -130,41 +159,42 @@ export default class extends Controller {
         label.textContent = stageInfo.message;
       }
       this.creatingStateTarget.classList.remove("hidden");
-    } else if (this.hasListTarget) {
-      // Inject creating state into list if no dedicated target
-      const existingCreating = this.listTarget.querySelector("[data-creating-indicator]");
-      if (existingCreating) {
-        // Update existing indicator
-        const statusText = existingCreating.querySelector("[data-creating-status]");
-        const progressBar = existingCreating.querySelector("[data-progress-bar]");
-        if (statusText) {
-          statusText.textContent = stageInfo.message;
-        }
-        if (progressBar) {
-          progressBar.style.width = `${stageInfo.progress}%`;
-        }
-      } else {
-        // Create new indicator
-        const creating = document.createElement("div");
-        creating.dataset.creatingIndicator = "true";
-        creating.className = "px-3 py-3 bg-cyan-500/10 border border-cyan-500/20 rounded-lg";
-        creating.innerHTML = `
-          <div class="flex items-center gap-3">
-            <svg class="w-4 h-4 text-cyan-400 animate-spin shrink-0" fill="none" viewBox="0 0 24 24">
-              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-            </svg>
-            <div class="flex-1 min-w-0">
-              <div class="text-sm text-cyan-400 font-medium" data-creating-status>${this.escapeHtml(stageInfo.message)}</div>
-              <div class="text-xs text-cyan-400/70 font-mono truncate">${this.escapeHtml(identifier)}</div>
+    } else {
+      // Inject creating state into all sidebar lists
+      this.sidebarListElements.forEach((listElement) => {
+        const existingCreating = listElement.querySelector("[data-creating-indicator]");
+        if (existingCreating) {
+          // Update existing indicator
+          const statusText = existingCreating.querySelector("[data-creating-status]");
+          const progressBar = existingCreating.querySelector("[data-progress-bar]");
+          if (statusText) {
+            statusText.textContent = stageInfo.message;
+          }
+          if (progressBar) {
+            progressBar.style.width = `${stageInfo.progress}%`;
+          }
+        } else {
+          // Create new indicator
+          const creating = document.createElement("div");
+          creating.dataset.creatingIndicator = "true";
+          creating.className = "px-2 py-2 bg-cyan-500/10 border border-cyan-500/20 rounded";
+          creating.innerHTML = `
+            <div class="flex items-center gap-2">
+              <svg class="size-3 text-cyan-400 animate-spin shrink-0" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <div class="flex-1 min-w-0">
+                <div class="text-xs text-cyan-400 font-medium truncate" data-creating-status>${this.escapeHtml(stageInfo.message)}</div>
+              </div>
             </div>
-          </div>
-          <div class="mt-2 bg-zinc-800 rounded-full h-1.5 overflow-hidden">
-            <div class="h-full bg-cyan-400 transition-all duration-500" data-progress-bar style="width: ${stageInfo.progress}%"></div>
-          </div>
-        `;
-        this.listTarget.prepend(creating);
-      }
+            <div class="mt-1.5 bg-zinc-800 rounded-full h-1 overflow-hidden">
+              <div class="h-full bg-cyan-400 transition-all duration-500" data-progress-bar style="width: ${stageInfo.progress}%"></div>
+            </div>
+          `;
+          listElement.prepend(creating);
+        }
+      });
     }
 
     // Also close dialog if open
@@ -185,9 +215,14 @@ export default class extends Controller {
 
     const stageInfo = this.getStageInfo(message.stage);
 
-    if (this.hasListTarget) {
-      const indicator = this.listTarget.querySelector("[data-creating-indicator]");
+    const lists = this.sidebarListElements;
+    if (lists.length === 0) return;
+
+    let foundIndicator = false;
+    lists.forEach((listElement) => {
+      const indicator = listElement.querySelector("[data-creating-indicator]");
       if (indicator) {
+        foundIndicator = true;
         const statusText = indicator.querySelector("[data-creating-status]");
         const progressBar = indicator.querySelector("[data-progress-bar]");
         if (statusText) {
@@ -196,10 +231,12 @@ export default class extends Controller {
         if (progressBar) {
           progressBar.style.width = `${stageInfo.progress}%`;
         }
-      } else {
-        // Create indicator if it doesn't exist
-        this.showCreatingState(message.identifier, message.stage);
       }
+    });
+
+    // Create indicator if it doesn't exist in any list
+    if (!foundIndicator) {
+      this.showCreatingState(message.identifier, message.stage);
     }
   }
 
@@ -222,65 +259,81 @@ export default class extends Controller {
       this.creatingStateTarget.classList.add("hidden");
     }
 
-    // Also remove any injected indicator
-    if (this.hasListTarget) {
-      const indicator = this.listTarget.querySelector("[data-creating-indicator]");
+    // Also remove any injected indicator from all sidebar lists
+    this.sidebarListElements.forEach((listElement) => {
+      const indicator = listElement.querySelector("[data-creating-indicator]");
       if (indicator) {
         indicator.remove();
       }
-    }
+    });
   }
 
-  // Update the agent list UI
+  // Update the agent list UI (renders to all sidebar elements)
   updateAgentList(agents) {
     this.agents = agents;
 
-    if (!this.hasListTarget) return;
+    const lists = this.sidebarListElements;
+    if (lists.length === 0) return;
 
-    // Clear existing list
-    this.listTarget.innerHTML = "";
+    // Update each sidebar list (mobile + desktop)
+    lists.forEach((listElement) => {
+      // Clear existing list
+      listElement.innerHTML = "";
 
-    if (agents.length === 0) {
-      if (this.hasEmptyStateTarget) {
-        this.emptyStateTarget.classList.remove("hidden");
+      if (agents.length === 0) {
+        if (this.hasEmptyStateTarget) {
+          this.emptyStateTarget.classList.remove("hidden");
+        }
+        listElement.innerHTML = `
+          <p class="px-2 py-4 text-center text-xs text-zinc-600">No agents running</p>
+        `;
+        return;
       }
-      this.listTarget.innerHTML = `
-        <div class="text-center py-8 text-zinc-500">
-          <p>No agents running</p>
-          <p class="text-sm mt-1">Create one to get started</p>
-        </div>
-      `;
-      return;
-    }
 
-    if (this.hasEmptyStateTarget) {
-      this.emptyStateTarget.classList.add("hidden");
-    }
+      if (this.hasEmptyStateTarget) {
+        this.emptyStateTarget.classList.add("hidden");
+      }
 
-    // Render agent list
-    agents.forEach((agent) => {
-      const isSelected = agent.id === this.selectedAgentId;
-      const item = document.createElement("button");
-      item.className = `w-full text-left px-3 py-2 rounded-lg transition-colors ${
-        isSelected
-          ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-          : "hover:bg-zinc-800 text-zinc-300"
-      }`;
-      item.dataset.action = "agents#selectAgent";
-      item.dataset.agentId = agent.id;
+      // Render agent list
+      agents.forEach((agent) => {
+        const isSelected = agent.id === this.selectedAgentId;
 
-      item.innerHTML = `
-        <div class="flex items-center justify-between">
-          <div class="flex items-center gap-2">
-            <span class="w-2 h-2 rounded-full ${this.getStatusColor(agent.status)}"></span>
-            <span class="font-mono text-sm truncate">${this.escapeHtml(agent.name || agent.id)}</span>
-          </div>
-          <span class="text-xs text-zinc-500">${agent.status || "unknown"}</span>
-        </div>
-        ${agent.issue ? `<div class="text-xs text-zinc-500 mt-1 truncate">${this.escapeHtml(agent.issue)}</div>` : ""}
-      `;
+        // Container with flex layout for agent name and delete button
+        const item = document.createElement("div");
+        item.className = `group flex items-center gap-1 rounded transition-colors ${
+          isSelected
+            ? "bg-primary-500/20"
+            : "hover:bg-zinc-800/50"
+        }`;
 
-      this.listTarget.appendChild(item);
+        // Agent button (main clickable area)
+        const agentBtn = document.createElement("button");
+        agentBtn.type = "button";
+        agentBtn.setAttribute("command", "close");
+        agentBtn.setAttribute("commandfor", "sidebar");
+        agentBtn.className = `flex-1 text-left px-2 py-1.5 min-w-0 ${
+          isSelected
+            ? "text-primary-400 font-medium"
+            : "text-zinc-400 hover:text-zinc-200"
+        }`;
+        agentBtn.innerHTML = `<span class="truncate font-mono text-xs block">${this.escapeHtml(agent.name || agent.id)}</span>`;
+        agentBtn.addEventListener("click", () => this.#handleAgentClick(agent.id));
+
+        // Delete button (visible on hover)
+        const deleteBtn = document.createElement("button");
+        deleteBtn.type = "button";
+        deleteBtn.className = "shrink-0 p-1.5 text-zinc-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity";
+        deleteBtn.title = "Delete agent";
+        deleteBtn.innerHTML = `<svg class="size-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+        </svg>`;
+        deleteBtn.dataset.agentId = agent.id;
+        deleteBtn.addEventListener("click", (e) => this.deleteAgent(e));
+
+        item.appendChild(agentBtn);
+        item.appendChild(deleteBtn);
+        listElement.appendChild(item);
+      });
     });
   }
 
@@ -329,8 +382,43 @@ export default class extends Controller {
   // Handle agent selection from CLI
   handleAgentSelected(message) {
     this.selectedAgentId = message.id;
-    this.updateSelectedLabel(message.name || message.id);
+    const displayName = message.name || message.id;
+    this.updateSelectedLabel(displayName);
+    this.updateMobileAgentUI(displayName);
     this.updateAgentList(this.agents); // Re-render to show selection
+  }
+
+  // Update mobile header agent UI
+  updateMobileAgentUI(agentName) {
+    // Update the dropdown trigger label
+    if (this.hasMobileAgentLabelTarget) {
+      this.mobileAgentLabelTarget.textContent = agentName || this.hubNameValue || "No agent";
+    }
+
+    // Show/hide agent info section
+    if (this.hasMobileAgentInfoTarget) {
+      if (agentName) {
+        this.mobileAgentInfoTarget.classList.remove("hidden");
+      } else {
+        this.mobileAgentInfoTarget.classList.add("hidden");
+      }
+    }
+
+    // Update agent name in dropdown
+    if (this.hasMobileAgentNameTarget) {
+      this.mobileAgentNameTarget.textContent = agentName || "";
+    }
+
+    // Show/hide delete button
+    if (this.hasMobileDeleteBtnTarget) {
+      if (agentName && this.selectedAgentId) {
+        this.mobileDeleteBtnTarget.classList.remove("hidden");
+        this.mobileDeleteBtnTarget.classList.add("flex");
+      } else {
+        this.mobileDeleteBtnTarget.classList.add("hidden");
+        this.mobileDeleteBtnTarget.classList.remove("flex");
+      }
+    }
   }
 
   // Handle agent closed
@@ -358,10 +446,15 @@ export default class extends Controller {
   }
 
   // Action: Select an agent
+  // Action: Select an agent (for elements within controller scope)
   selectAgent(event) {
     const agentId = event.currentTarget.dataset.agentId;
-    if (!agentId || !this.connection) return;
+    this.#handleAgentClick(agentId);
+  }
 
+  // Private: Handle agent selection (used by both action and direct click)
+  #handleAgentClick(agentId) {
+    if (!agentId || !this.connection) return;
     this.connection.selectAgent(agentId);
   }
 
@@ -490,42 +583,61 @@ export default class extends Controller {
     }
   }
 
+  // Action: Request worktree list refresh
+  requestWorktrees() {
+    if (this.connection) {
+      this.connection.requestWorktrees();
+    }
+  }
+
   // Action: Prepare for new agent creation (called alongside command="show-modal")
   createAgent() {
     // Reset modal state first
     this.resetModalState();
 
     // Refresh worktree list when opening modal
-    if (this.connection) {
-      this.connection.send("list_worktrees");
-    }
+    this.requestWorktrees();
     // Update UI with current worktrees
     this.updateWorktreeList();
     // Dialog opens via native command="show-modal" attribute on button
   }
 
-  // Action: Close selected agent
-  closeAgent() {
-    if (!this.selectedAgentId) return;
-    this.dispatch("close-requested", {
-      detail: { agentId: this.selectedAgentId }
-    });
+  // Action: Delete an agent with confirmation
+  deleteAgent(event) {
+    event.stopPropagation(); // Don't trigger agent selection
+    const agentId = event.currentTarget.dataset.agentId;
+    if (!agentId) return;
+
+    const agent = this.agents.find(a => a.id === agentId);
+    const agentName = agent?.name || agent?.id || "this agent";
+
+    // Show confirmation
+    if (confirm(`Delete ${agentName}?\n\nThis will stop the agent process.`)) {
+      this.#performDelete(agentId, false);
+    }
   }
 
-  // Helper: Get status indicator color
-  getStatusColor(status) {
-    switch (status) {
-      case "running":
-      case "active":
-        return "bg-emerald-500";
-      case "idle":
-      case "waiting":
-        return "bg-yellow-500";
-      case "error":
-      case "failed":
-        return "bg-red-500";
-      default:
-        return "bg-zinc-500";
+  // Action: Delete selected agent (for mobile dropdown)
+  deleteSelectedAgent() {
+    if (!this.selectedAgentId) return;
+
+    const agent = this.agents.find(a => a.id === this.selectedAgentId);
+    const agentName = agent?.name || agent?.id || "this agent";
+
+    if (confirm(`Delete ${agentName}?\n\nThis will stop the agent process.`)) {
+      this.#performDelete(this.selectedAgentId, false);
+    }
+  }
+
+  // Private: Perform the delete
+  #performDelete(agentId, deleteWorktree = false) {
+    if (!this.connection) return;
+    this.connection.deleteAgent(agentId, deleteWorktree);
+
+    // Clear selection if deleting selected agent
+    if (this.selectedAgentId === agentId) {
+      this.selectedAgentId = null;
+      this.updateSelectedLabel(null);
     }
   }
 

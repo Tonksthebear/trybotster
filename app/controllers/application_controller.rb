@@ -13,7 +13,19 @@ class ApplicationController < ActionController::Base
   # inherently CSRF-safe since browsers don't auto-send them.
   protect_from_forgery with: :exception, unless: :bearer_token_request?
 
+  layout :choose_layout
+
+  before_action :set_sidebar_hubs, if: :user_signed_in?
+
   private
+
+  def choose_layout
+    user_signed_in? ? "sidebar" : "application"
+  end
+
+  def set_sidebar_hubs
+    @sidebar_hubs = current_user.hubs.includes(:device).order(last_seen_at: :desc)
+  end
 
   def bearer_token_request?
     request.headers["Authorization"]&.start_with?("Bearer ")

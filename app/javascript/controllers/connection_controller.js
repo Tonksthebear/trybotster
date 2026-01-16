@@ -108,6 +108,8 @@ export default class extends Controller {
     "statusIcon",
     "statusText",
     "statusDetail",
+    "statusIconMobile",
+    "statusTextMobile",
     "disconnectBtn",
     "securityBanner",
     "securityIcon",
@@ -123,6 +125,8 @@ export default class extends Controller {
     wasmJsUrl: String,
     wasmBinaryUrl: String,
   };
+
+  static classes = ["securityBannerBase"];
 
   connect() {
     this.signalSession = null;
@@ -374,11 +378,11 @@ export default class extends Controller {
         console.warn("[Connection] Handshake timeout - no ACK from CLI");
         this.setError(
           ConnectionError.HANDSHAKE_TIMEOUT,
-          "CLI did not respond. Session may be expired - scan QR code again."
+          "CLI did not respond. Try refreshing the page."
         );
-        // Clear potentially stale session
-        this.signalSession?.clear();
-        this.signalSession = null;
+        // DON'T clear session on timeout - this is likely a transient network issue,
+        // not a session problem. Clearing would force unnecessary QR re-scan.
+        // User can refresh to retry with existing session.
       }
     }, HANDSHAKE_TIMEOUT_MS);
   }
@@ -418,7 +422,14 @@ export default class extends Controller {
     } catch (error) {
       console.error("[Connection] Failed to handle received data:", error);
 
-      // Check if this is a session/crypto error (stale session)
+      // Check if this is a session/crypto error
+      // DON'T automatically clear the session - this is too aggressive and forces
+      // unnecessary QR re-scans. Most crypto errors are transient (network issues,
+      // timing problems) and will resolve on retry.
+      //
+      // The session should only be cleared if:
+      // 1. User explicitly requests it (via resetSession())
+      // 2. CLI confirms identity has changed (future: implement identity verification)
       const errorMsg = error.message || error.toString();
       if (
         errorMsg.includes("decrypt") ||
@@ -428,14 +439,14 @@ export default class extends Controller {
         errorMsg.includes("MAC")
       ) {
         console.warn(
-          "[Connection] Session appears stale, clearing cached session"
+          "[Connection] Crypto error (keeping session for retry):",
+          errorMsg
         );
-        await this.signalSession?.clear();
-        this.signalSession = null;
         this.setError(
           ConnectionError.DECRYPT_FAILED,
-          "Session expired. Please scan QR code again."
+          "Decryption failed. Try refreshing the page."
         );
+        // Session is preserved - user can refresh to retry
       }
     }
   }
@@ -548,8 +559,16 @@ export default class extends Controller {
     return this.send("list_agents");
   }
 
+  requestWorktrees() {
+    return this.send("list_worktrees");
+  }
+
   selectAgent(agentId) {
     return this.send("select_agent", { id: agentId });
+  }
+
+  deleteAgent(agentId, deleteWorktree = false) {
+    return this.send("delete_agent", { id: agentId, delete_worktree: deleteWorktree });
   }
 
   isConnected() {
@@ -749,6 +768,21 @@ export default class extends Controller {
       }
     }
 
+    // Update mobile status (compact)
+    if (this.hasStatusIconMobileTarget) {
+      // Use smaller icon for mobile
+      const mobileIcon = config.icon.replace(/size-4/g, "size-3");
+      this.statusIconMobileTarget.innerHTML = mobileIcon;
+      this.statusIconMobileTarget.className = `shrink-0 ${config.iconClass}`;
+    }
+
+    if (this.hasStatusTextMobileTarget) {
+      // Shorter text for mobile
+      const shortText = (text || config.text).replace("Initializing...", "Init...").replace("Connecting...", "...").replace("Connected", "Live");
+      this.statusTextMobileTarget.textContent = shortText;
+      this.statusTextMobileTarget.className = `text-xs shrink-0 ${config.textClass}`;
+    }
+
     // Show/hide disconnect button
     if (this.hasDisconnectBtnTarget) {
       if (this.state === ConnectionState.CONNECTED) {
@@ -775,10 +809,13 @@ export default class extends Controller {
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
     </svg>`;
 
+    // Use Stimulus classes API for base classes (responsive hiding)
+    const baseClasses = this.hasSecurityBannerBaseClass ? this.securityBannerBaseClass : "";
+
     switch (this.state) {
       case ConnectionState.CONNECTED:
         this.securityBannerTarget.className =
-          "border-b border-emerald-500/20 bg-emerald-500/5 transition-colors duration-300";
+          `${baseClasses} border-b border-emerald-500/20 bg-emerald-500/5 transition-colors duration-300`;
         if (this.hasSecurityIconTarget) {
           this.securityIconTarget.innerHTML = lockIcon;
           this.securityIconTarget.className = "shrink-0 text-emerald-400";
@@ -793,7 +830,7 @@ export default class extends Controller {
 
       case ConnectionState.ERROR:
         this.securityBannerTarget.className =
-          "border-b border-red-500/20 bg-red-500/5 transition-colors duration-300";
+          `${baseClasses} border-b border-red-500/20 bg-red-500/5 transition-colors duration-300`;
         if (this.hasSecurityIconTarget) {
           this.securityIconTarget.innerHTML = errorIcon;
           this.securityIconTarget.className = "shrink-0 text-red-400";
@@ -809,7 +846,7 @@ export default class extends Controller {
       case ConnectionState.CHANNEL_CONNECTED:
       case ConnectionState.HANDSHAKE_SENT:
         this.securityBannerTarget.className =
-          "border-b border-amber-500/20 bg-amber-500/5 transition-colors duration-300";
+          `${baseClasses} border-b border-amber-500/20 bg-amber-500/5 transition-colors duration-300`;
         if (this.hasSecurityIconTarget) {
           this.securityIconTarget.innerHTML = unlockIcon;
           this.securityIconTarget.className = "shrink-0 text-amber-400";
@@ -824,7 +861,7 @@ export default class extends Controller {
 
       default:
         this.securityBannerTarget.className =
-          "border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300";
+          `${baseClasses} border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300`;
         if (this.hasSecurityIconTarget) {
           this.securityIconTarget.innerHTML = unlockIcon;
           this.securityIconTarget.className = "shrink-0 text-zinc-500";
