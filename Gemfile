@@ -85,3 +85,7 @@ group :test do
 end
 gem "neighbor"
 gem "ruby-openai"
+
+# UI Components
+gem "view_component"
+gem "classy-yaml"

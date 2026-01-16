@@ -35,8 +35,8 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     get hubs_path
     assert_response :success
 
-    # Active hub should have green indicator (animate-pulse class)
-    assert_select ".bg-emerald-500.animate-pulse"
+    # Active hub should have success indicator (animate-pulse class)
+    assert_select ".bg-success-500.animate-pulse"
   end
 
   test "index displays hub metadata" do
@@ -139,8 +139,8 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     get hub_path(@active_hub)
     assert_response :success
 
-    # Hub has a device, should show E2E badge
-    assert_select ".text-emerald-400", text: /E2E/
+    # Hub has a device, should show E2E badge (uses semantic success color)
+    assert_select ".text-success-400", text: /E2E/
   end
 
   test "show displays security banner placeholder" do

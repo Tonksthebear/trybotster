@@ -1,0 +1,42 @@
+<div class="min-h-full">
+  <% if overlap? %>
+    <div class="<%= yass(stacked: { overlap: :zone }) %>">
+  <% end %>
+
+  <nav class="<%= yass(stacked: { style => :nav }) %>">
+    <div class="<%= yass(stacked: { style => :container }) %>">
+      <div class="<%= yass(stacked: { style => :inner }) %>">
+        <%= navbar %>
+
+        <div class="flex items-center sm:hidden">
+          <button type="button" command="--toggle" commandfor="stacked-mobile-menu" class="<%= yass(stacked: :mobile_button) %> <%= mobile_menu_button_classes %>">
+            <span class="sr-only">Open main menu</span>
+            <span class="peer/mobile-btn"><%= mobile_menu_button_content %></span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" class="size-6 peer-has-[*]/mobile-btn:hidden in-aria-expanded:hidden">
+              <path d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" class="size-6 peer-has-[*]/mobile-btn:hidden not-in-aria-expanded:hidden">
+              <path d="M6 18 18 6M6 6l12 12" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <el-disclosure id="stacked-mobile-menu" hidden class="sm:hidden">
+      <%= mobile_menu %>
+    </el-disclosure>
+  </nav>
+
+  <% if header? %>
+    <%= header %>
+  <% end %>
+
+  <% if overlap? %>
+    </div>
+  <% end %>
+
+  <main class="<%= yass(stacked: { style => :main }) %>">
+    <%= content %>
+  </main>
+</div>

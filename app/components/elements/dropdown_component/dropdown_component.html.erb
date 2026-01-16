@@ -1,0 +1,7 @@
+<%= content_tag "el-dropdown", **@options do %>
+  <%= button %>
+
+  <%= tag.el_menu anchor: anchor, popover: true, class: menu_classes do %>
+    <%= content %>
+  <% end %>
+<% end %>

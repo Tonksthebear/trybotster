@@ -1,0 +1,22 @@
+<%= render MobileComponent.new do %>
+  <%= mobile_sidebar || sidebar %>
+<% end %>
+
+<%= render DesktopComponent.new do %>
+  <%= desktop_sidebar || sidebar %>
+<% end %>
+
+<!-- Sticky header -->
+<%= tag.div class: { sidebar: :header, add: @header_classes } do %>
+  <button type="button" command="show-modal" commandfor="sidebar" class="-m-2.5 p-2.5 lg:hidden <%= @mobile_menu_classes %>">
+    <span class="sr-only">Open sidebar</span>
+    <div class="content peer/mobile"><%= @mobile_menu_content %></div>
+    <svg viewBox="0 0 20 20" fill="currentColor" data-slot="icon" aria-hidden="true" class="size-5 hidden peer-empty/mobile:block">
+      <path d="M2 4.75A.75.75 0 0 1 2.75 4h14.5a.75.75 0 0 1 0 1.5H2.75A.75.75 0 0 1 2 4.75ZM2 10a.75.75 0 0 1 .75-.75h14.5a.75.75 0 0 1 0 1.5H2.75A.75.75 0 0 1 2 10Zm0 5.25a.75.75 0 0 1 .75-.75h14.5a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1-.75-.75Z" clip-rule="evenodd" fill-rule="evenodd" />
+    </svg>
+  </button>
+  <%= header %>
+<% end %>
+<%= content_tag :main, **@options do %>
+  <%= content %>
+<% end %>
