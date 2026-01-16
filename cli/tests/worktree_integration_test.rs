@@ -79,9 +79,8 @@ fn test_agent_spawns_with_echo_command() {
     // Give it a moment to run
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // Buffer should have spawn messages
-    let snapshot = agent.get_buffer_snapshot();
-    assert!(snapshot.iter().any(|line| line.contains("Spawning agent")));
+    // Verify PTY is spawned and has a master
+    assert!(agent.cli_pty.is_spawned());
 }
 
 #[test]

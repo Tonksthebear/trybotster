@@ -76,7 +76,7 @@ pub fn spawn_server_pty(
     server_pty.reader_thread = Some(spawn::spawn_server_reader_thread(
         reader,
         Arc::clone(&server_pty.vt100_parser),
-        Arc::clone(&server_pty.buffer),
+        Arc::clone(&server_pty.scrollback_buffer),
     ));
 
     server_pty.master_pty = Some(pair.master);

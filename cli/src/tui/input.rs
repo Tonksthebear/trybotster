@@ -271,6 +271,7 @@ fn connection_code_key(key: &KeyEvent) -> Option<HubAction> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => Some(HubAction::CloseModal),
         KeyCode::Char('c') => Some(HubAction::CopyConnectionUrl),
+        KeyCode::Char('r') => Some(HubAction::RegenerateConnectionCode),
         _ => None,
     }
 }
@@ -544,6 +545,53 @@ mod tests {
                 rows: 40,
             }),
             "TUI resize should produce ResizeForClient with ClientId::Tui"
+        );
+    }
+
+    // === Connection Code Modal Tests ===
+
+    #[test]
+    fn test_connection_code_r_regenerates() {
+        let context = default_context();
+        let action = key_event_to_action(
+            &make_key(KeyCode::Char('r')),
+            &AppMode::ConnectionCode,
+            &context,
+        );
+        assert_eq!(
+            action,
+            Some(HubAction::RegenerateConnectionCode),
+            "Pressing 'r' in ConnectionCode mode should regenerate the QR code"
+        );
+    }
+
+    #[test]
+    fn test_connection_code_c_copies_url() {
+        let context = default_context();
+        let action = key_event_to_action(
+            &make_key(KeyCode::Char('c')),
+            &AppMode::ConnectionCode,
+            &context,
+        );
+        assert_eq!(
+            action,
+            Some(HubAction::CopyConnectionUrl),
+            "Pressing 'c' in ConnectionCode mode should copy URL"
+        );
+    }
+
+    #[test]
+    fn test_connection_code_escape_closes() {
+        let context = default_context();
+        let action = key_event_to_action(
+            &make_key(KeyCode::Esc),
+            &AppMode::ConnectionCode,
+            &context,
+        );
+        assert_eq!(
+            action,
+            Some(HubAction::CloseModal),
+            "Pressing Esc in ConnectionCode mode should close modal"
         );
     }
 }

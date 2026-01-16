@@ -10,7 +10,7 @@
 //! ├── master_pty: MasterPty (for resizing)
 //! ├── writer: Write (for input)
 //! ├── vt100_parser: Parser (terminal emulation)
-//! └── buffer: VecDeque<String> (line-based history)
+//! └── scrollback_buffer: VecDeque<u8> (raw byte history)
 //! ```
 //!
 //! # Usage
@@ -77,26 +77,26 @@ pub fn resize_with_clear(pty: &PtySession, rows: u16, cols: u16, label: &str) {
     pty.resize(rows, cols);
 }
 
-/// Maximum lines to keep in scrollback buffer.
+/// Maximum bytes to keep in scrollback buffer.
 ///
-/// 20K lines balances memory usage (~2-4MB per agent) with sufficient
-/// history for debugging. Based on typical agent session output
-/// rates of ~100 lines/minute, this provides ~3 hours of scrollback.
-pub const MAX_BUFFER_LINES: usize = 20000;
+/// 4MB balances memory usage with sufficient history for debugging.
+/// Based on typical agent session output rates, this provides
+/// several hours of scrollback.
+pub const MAX_SCROLLBACK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Encapsulates all state for a single PTY session.
 ///
 /// Each PTY session manages:
 /// - A pseudo-terminal for process I/O
 /// - A VT100 parser for terminal emulation
-/// - A line buffer for pattern detection
+/// - A raw byte scrollback buffer for history replay
 /// - Notification channel for OSC sequences
 /// - Raw output queue for browser streaming
 ///
 /// # Thread Safety
 ///
-/// The VT100 parser, buffer, and raw output queue are wrapped in `Arc<Mutex<>>` to allow
-/// concurrent reads from the PTY reader thread and writes from the main thread.
+/// The VT100 parser, scrollback buffer, and raw output queue are wrapped in `Arc<Mutex<>>`
+/// to allow concurrent reads from the PTY reader thread and writes from the main thread.
 pub struct PtySession {
     /// Master PTY for resizing.
     pub master_pty: Option<Box<dyn MasterPty + Send>>,
@@ -106,8 +106,9 @@ pub struct PtySession {
     pub reader_thread: Option<thread::JoinHandle<()>>,
     /// VT100 terminal emulator with scrollback.
     pub vt100_parser: Arc<Mutex<Parser>>,
-    /// Line-based buffer for pattern detection.
-    pub buffer: Arc<Mutex<VecDeque<String>>>,
+    /// Raw byte scrollback buffer for history replay.
+    /// Stores raw PTY output so xterm.js can interpret escape sequences correctly.
+    pub scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
     /// Raw output queue for streaming to browser (GUI mode).
     /// Reader thread pushes raw PTY bytes here; browser output drains it.
     pub raw_output_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -139,13 +140,14 @@ impl PtySession {
     /// * `cols` - Terminal width in columns
     #[must_use]
     pub fn new(rows: u16, cols: u16) -> Self {
-        let parser = Parser::new(rows, cols, MAX_BUFFER_LINES);
+        // Use a reasonable scrollback for the vt100 parser (current screen state)
+        let parser = Parser::new(rows, cols, 1000);
         Self {
             master_pty: None,
             writer: None,
             reader_thread: None,
             vt100_parser: Arc::new(Mutex::new(parser)),
-            buffer: Arc::new(Mutex::new(VecDeque::new())),
+            scrollback_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_SCROLLBACK_BYTES))),
             raw_output_queue: Arc::new(Mutex::new(VecDeque::new())),
             notification_tx: None,
             child: None,
@@ -238,25 +240,29 @@ impl PtySession {
         self.write_input(input.as_bytes())
     }
 
-    /// Add a line to the buffer for pattern detection.
+    /// Add raw bytes to the scrollback buffer.
     ///
-    /// Lines exceeding `MAX_BUFFER_LINES` are dropped from the front.
-    pub fn add_to_buffer(&self, line: &str) {
-        let mut buffer = self.buffer.lock().expect("buffer lock poisoned");
-        buffer.push_back(line.to_string());
-        if buffer.len() > MAX_BUFFER_LINES {
+    /// Bytes exceeding `MAX_SCROLLBACK_BYTES` are dropped from the front.
+    pub fn add_to_scrollback(&self, data: &[u8]) {
+        let mut buffer = self.scrollback_buffer.lock().expect("scrollback_buffer lock poisoned");
+
+        // Add new bytes
+        buffer.extend(data.iter().copied());
+
+        // Trim from front if over limit
+        while buffer.len() > MAX_SCROLLBACK_BYTES {
             buffer.pop_front();
         }
     }
 
-    /// Get a snapshot of the buffer contents.
+    /// Get a snapshot of the scrollback buffer as raw bytes.
     #[must_use]
-    pub fn get_buffer_snapshot(&self) -> Vec<String> {
-        self.buffer
+    pub fn get_scrollback_snapshot(&self) -> Vec<u8> {
+        self.scrollback_buffer
             .lock()
-            .expect("buffer lock poisoned")
+            .expect("scrollback_buffer lock poisoned")
             .iter()
-            .cloned()
+            .copied()
             .collect()
     }
 
@@ -324,28 +330,28 @@ mod tests {
     }
 
     #[test]
-    fn test_pty_session_buffer() {
+    fn test_pty_session_scrollback() {
         let session = PtySession::new(24, 80);
 
-        session.add_to_buffer("test line 1");
-        session.add_to_buffer("test line 2");
+        session.add_to_scrollback(b"test line 1\n");
+        session.add_to_scrollback(b"test line 2\n");
 
-        let snapshot = session.get_buffer_snapshot();
-        assert_eq!(snapshot.len(), 2);
-        assert_eq!(snapshot[0], "test line 1");
+        let snapshot = session.get_scrollback_snapshot();
+        assert_eq!(snapshot, b"test line 1\ntest line 2\n");
     }
 
     #[test]
-    fn test_pty_session_buffer_limit() {
+    fn test_pty_session_scrollback_limit() {
         let session = PtySession::new(24, 80);
 
-        // Add more lines than MAX_BUFFER_LINES
-        for i in 0..MAX_BUFFER_LINES + 100 {
-            session.add_to_buffer(&format!("line {i}"));
+        // Add more bytes than MAX_SCROLLBACK_BYTES
+        let chunk = vec![b'x'; 1024]; // 1KB chunks
+        let num_chunks = MAX_SCROLLBACK_BYTES / 1024 + 100;
+        for _ in 0..num_chunks {
+            session.add_to_scrollback(&chunk);
         }
 
-        let snapshot = session.get_buffer_snapshot();
-        assert_eq!(snapshot.len(), MAX_BUFFER_LINES);
-        assert_eq!(snapshot[0], "line 100");
+        let snapshot = session.get_scrollback_snapshot();
+        assert!(snapshot.len() <= MAX_SCROLLBACK_BYTES);
     }
 }

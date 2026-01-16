@@ -137,6 +137,9 @@ pub enum HubAction {
     /// Show the connection QR code.
     ShowConnectionCode,
 
+    /// Regenerate the connection QR code with a fresh PreKey.
+    RegenerateConnectionCode,
+
     /// Copy connection URL to clipboard.
     CopyConnectionUrl,
 
@@ -528,6 +531,23 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
                     }
                     Err(e) => log::warn!("Could not access clipboard: {}", e),
                 }
+            }
+        }
+
+        HubAction::RegenerateConnectionCode => {
+            // Request a new PreKeyBundle from the relay
+            if let Some(ref sender) = hub.browser.sender {
+                let sender = sender.clone();
+                hub.tokio_runtime.spawn(async move {
+                    if let Err(e) = sender.request_bundle_regeneration().await {
+                        log::error!("Failed to request bundle regeneration: {}", e);
+                    }
+                });
+                log::info!("Requested bundle regeneration");
+                // Reset QR image flag so it renders fresh when new bundle arrives
+                hub.qr_image_displayed = false;
+            } else {
+                log::warn!("Cannot regenerate bundle: relay not connected");
             }
         }
 

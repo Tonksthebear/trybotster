@@ -30,7 +30,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message};
 
@@ -43,6 +43,20 @@ use super::types::{BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage}
 /// Reconnection backoff configuration.
 const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 30;
+
+/// Connection health check configuration.
+///
+/// ActionCable sends pings every 3 seconds. If we don't receive any server
+/// activity (pings, messages, or subscription confirmations) for this duration,
+/// we assume the connection is dead and trigger a reconnect.
+///
+/// This catches silent connection failures (half-open TCP, NAT timeout, load
+/// balancer disconnect) that would otherwise leave the CLI thinking it's
+/// connected while the WebSocket is actually dead.
+const CONNECTION_STALE_TIMEOUT_SECS: u64 = 15;
+
+/// How often to check connection health.
+const HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
 
 /// Action Cable message format.
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,6 +95,9 @@ enum OutputMessage {
         identity: String,
         data: String,
     },
+    /// Request to regenerate the PreKeyBundle with a fresh PreKey.
+    /// Response will be sent via the event channel as BrowserEvent::BundleRegenerated.
+    RegenerateBundle,
 }
 
 /// Handle for sending terminal output to the browser.
@@ -130,6 +147,13 @@ impl TerminalOutputSender {
     /// Check if browser is connected and ready for encrypted communication.
     pub async fn is_ready(&self) -> bool {
         *self.connected.read().await
+    }
+
+    /// Request regeneration of the PreKeyBundle with a fresh PreKey.
+    /// The new bundle will be sent back via the event channel as BrowserEvent::BundleRegenerated.
+    pub async fn request_bundle_regeneration(&self) -> Result<()> {
+        self.tx.send(OutputMessage::RegenerateBundle).await
+            .map_err(|e| anyhow::anyhow!("Failed to request bundle regeneration: {}", e))
     }
 }
 
@@ -377,6 +401,10 @@ impl TerminalRelay {
     }
 
     /// Run the message loop until WebSocket disconnects.
+    ///
+    /// Includes connection health monitoring: if no server activity (pings,
+    /// messages) is received for `CONNECTION_STALE_TIMEOUT_SECS`, assumes the
+    /// connection is dead and breaks to trigger reconnection.
     #[allow(clippy::too_many_arguments)]
     async fn run_message_loop(
         signal_manager: &mut SignalProtocolManager,
@@ -390,23 +418,59 @@ impl TerminalRelay {
         event_tx: &mpsc::Sender<IdentifiedBrowserEvent>,
         browser_identities: &mut HashSet<String>,
     ) {
+        // Track last server activity for connection health monitoring.
+        // ActionCable sends pings every 3 seconds, so if we don't see any
+        // activity for CONNECTION_STALE_TIMEOUT_SECS, the connection is likely dead.
+        let mut last_server_activity = Instant::now();
+        let mut health_check_interval = tokio::time::interval(
+            Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS)
+        );
+
         loop {
             tokio::select! {
-                // Handle outgoing messages (CLI -> browser)
+                // Handle outgoing messages (CLI -> browser) and commands
                 Some(output_msg) = output_rx.recv() => {
-                    if *connected.read().await && !browser_identities.is_empty() {
-                        Self::handle_output(
-                            signal_manager,
-                            write,
-                            identifier_json,
-                            output_msg,
-                            browser_identities,
-                        ).await;
+                    match output_msg {
+                        OutputMessage::RegenerateBundle => {
+                            // Generate a new PreKeyBundle with a fresh PreKey
+                            log::info!("Regenerating PreKeyBundle on request");
+                            match signal_manager.build_prekey_bundle_data(
+                                signal_manager.next_prekey_id().await.unwrap_or(1)
+                            ).await {
+                                Ok(bundle) => {
+                                    log::info!("New PreKeyBundle generated with PreKey {}",
+                                        bundle.prekey_id.unwrap_or(0));
+                                    // Send the new bundle back to the hub via event channel
+                                    let _ = event_tx.send((
+                                        BrowserEvent::BundleRegenerated { bundle },
+                                        String::new(), // No browser identity for this event
+                                    )).await;
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to regenerate PreKeyBundle: {}", e);
+                                }
+                            }
+                        }
+                        _ => {
+                            // Normal output handling - requires connected browsers
+                            if *connected.read().await && !browser_identities.is_empty() {
+                                Self::handle_output(
+                                    signal_manager,
+                                    write,
+                                    identifier_json,
+                                    output_msg,
+                                    browser_identities,
+                                ).await;
+                            }
+                        }
                     }
                 }
 
                 // Handle incoming messages (browser -> CLI)
                 Some(msg) = read.next() => {
+                    // Any message from server means connection is alive
+                    last_server_activity = Instant::now();
+
                     match msg {
                         Ok(Message::Text(text)) => {
                             Self::handle_incoming_text(
@@ -438,6 +502,19 @@ impl TerminalRelay {
                     }
                 }
 
+                // Periodic health check for stale connections
+                _ = health_check_interval.tick() => {
+                    let elapsed = last_server_activity.elapsed();
+                    if elapsed > Duration::from_secs(CONNECTION_STALE_TIMEOUT_SECS) {
+                        log::warn!(
+                            "No server activity for {}s (timeout: {}s), connection likely dead - reconnecting",
+                            elapsed.as_secs(),
+                            CONNECTION_STALE_TIMEOUT_SECS
+                        );
+                        break;
+                    }
+                }
+
                 else => break,
             }
         }
@@ -462,6 +539,11 @@ impl TerminalRelay {
                     log::warn!("Targeted send to unknown identity: {}", identity);
                     return;
                 }
+            }
+            OutputMessage::RegenerateBundle => {
+                // This is handled in the main select! loop, not here
+                log::warn!("RegenerateBundle reached handle_output - should not happen");
+                return;
             }
         };
 
@@ -584,10 +666,19 @@ impl TerminalRelay {
             log::warn!("Failed to persist: {}", e);
         }
 
-        // Track browser identity
+        // Track browser identity and ensure connected flag is set.
+        // IMPORTANT: Always set connected=true when we receive a valid message,
+        // not just for new identities. This handles the case where:
+        // 1. WebSocket reconnects after silent disconnect
+        // 2. browser_identities still has the identity from before
+        // 3. But connected was set to false on disconnect
+        // Without this, all sends would silently fail.
         let is_new = browser_identities.insert(envelope.sender_identity.clone());
         if is_new {
             log::info!("Browser connected: {} (total: {})", envelope.sender_identity, browser_identities.len());
+        }
+        // Always ensure connected=true when we have active browsers
+        if !browser_identities.is_empty() {
             *connected.write().await = true;
         }
 

@@ -15,7 +15,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use vt100::Parser;
 
 use super::notification::{detect_notifications, AgentNotification};
-use super::pty::MAX_BUFFER_LINES;
+use super::pty::MAX_SCROLLBACK_BYTES;
 
 /// Maximum number of raw output chunks to queue for browser streaming.
 /// Each chunk is at most 4096 bytes, so 1000 chunks = ~4MB max.
@@ -69,12 +69,12 @@ pub fn build_command(
 /// Spawn a CLI PTY reader thread with notification detection.
 ///
 /// Reads PTY output, processes it through the VT100 parser for terminal emulation,
-/// adds lines to the buffer for pattern detection, detects OSC notification
-/// sequences, and queues raw output for browser streaming.
+/// adds raw bytes to the scrollback buffer, detects OSC notification sequences,
+/// and queues raw output for browser streaming.
 pub fn spawn_cli_reader_thread(
     reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<Parser>>,
-    buffer: Arc<Mutex<VecDeque<String>>>,
+    scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
     raw_output_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     notification_tx: Sender<AgentNotification>,
 ) -> thread::JoinHandle<()> {
@@ -100,21 +100,19 @@ pub fn spawn_cli_reader_thread(
                         let _ = notification_tx.send(notif);
                     }
 
-                    // Process through parser
+                    // Process through parser (for TUI mode screen state)
                     {
                         let mut p = parser.lock().expect("parser lock poisoned");
                         p.process(&buf[..n]);
                     }
 
-                    // Add to buffer
-                    let output = String::from_utf8_lossy(&buf[..n]);
+                    // Add raw bytes to scrollback buffer
                     {
-                        let mut buffer_lock = buffer.lock().expect("buffer lock poisoned");
-                        for line in output.lines() {
-                            buffer_lock.push_back(line.to_string());
-                            if buffer_lock.len() > MAX_BUFFER_LINES {
-                                buffer_lock.pop_front();
-                            }
+                        let mut buffer = scrollback_buffer.lock().expect("scrollback_buffer lock poisoned");
+                        buffer.extend(buf[..n].iter().copied());
+                        // Trim from front if over limit
+                        while buffer.len() > MAX_SCROLLBACK_BYTES {
+                            buffer.pop_front();
                         }
                     }
 
@@ -142,7 +140,7 @@ pub fn spawn_cli_reader_thread(
 pub fn spawn_server_reader_thread(
     reader: Box<dyn Read + Send>,
     pty_parser: Arc<Mutex<Parser>>,
-    pty_buffer: Arc<Mutex<VecDeque<String>>>,
+    scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = reader;
@@ -159,21 +157,19 @@ pub fn spawn_server_reader_thread(
                         log::info!("Server PTY reader: {total_bytes_read} total bytes read");
                     }
 
-                    // Process through parser only
+                    // Process through parser (for TUI mode screen state)
                     {
                         let mut parser = pty_parser.lock().expect("parser lock poisoned");
                         parser.process(&buf[..n]);
                     }
 
-                    // Add to buffer
-                    let output = String::from_utf8_lossy(&buf[..n]);
+                    // Add raw bytes to scrollback buffer
                     {
-                        let mut buffer_lock = pty_buffer.lock().expect("buffer lock poisoned");
-                        for line in output.lines() {
-                            buffer_lock.push_back(line.to_string());
-                            if buffer_lock.len() > MAX_BUFFER_LINES {
-                                buffer_lock.pop_front();
-                            }
+                        let mut buffer = scrollback_buffer.lock().expect("scrollback_buffer lock poisoned");
+                        buffer.extend(buf[..n].iter().copied());
+                        // Trim from front if over limit
+                        while buffer.len() > MAX_SCROLLBACK_BYTES {
+                            buffer.pop_front();
                         }
                     }
                 }

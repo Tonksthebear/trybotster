@@ -91,10 +91,13 @@ pub enum TerminalMessage {
     ///
     /// Sent when an agent is selected so the browser can populate
     /// xterm's scrollback buffer with historical output.
+    /// Data is gzip compressed and base64 encoded for efficient transport.
     #[serde(rename = "scrollback")]
     Scrollback {
-        /// Lines of scrollback history (oldest first).
-        lines: Vec<String>,
+        /// Base64-encoded gzip-compressed scrollback data.
+        data: String,
+        /// Whether data is compressed (always true for new messages).
+        compressed: bool,
     },
     /// Invite bundle for sharing hub connection.
     ///
@@ -362,6 +365,12 @@ pub enum BrowserEvent {
     /// Request invite bundle for sharing.
     /// Handled directly in relay, not forwarded to Hub.
     GenerateInvite,
+    /// New PreKeyBundle was generated (response to RegenerateBundle command).
+    /// Sent from relay to hub when bundle regeneration is requested.
+    BundleRegenerated {
+        /// The new PreKeyBundle data.
+        bundle: super::signal::PreKeyBundleData,
+    },
 }
 
 #[cfg(test)]
@@ -550,36 +559,34 @@ mod tests {
     #[test]
     fn test_terminal_message_scrollback_serialization() {
         let msg = TerminalMessage::Scrollback {
-            lines: vec![
-                "Line 1: some output".to_string(),
-                "Line 2: more output".to_string(),
-                "Line 3: \x1b[32mcolored\x1b[0m output".to_string(),
-            ],
+            data: "H4sIAAAAAAAA".to_string(), // base64 gzip data
+            compressed: true,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"scrollback""#));
-        assert!(json.contains(r#""lines":"#));
-        assert!(json.contains("Line 1: some output"));
-        assert!(json.contains("Line 3:"));
+        assert!(json.contains(r#""data":"#));
+        assert!(json.contains(r#""compressed":true"#));
     }
 
     #[test]
     fn test_terminal_message_scrollback_empty() {
-        let msg = TerminalMessage::Scrollback { lines: vec![] };
+        let msg = TerminalMessage::Scrollback {
+            data: String::new(),
+            compressed: true,
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"scrollback""#));
-        assert!(json.contains(r#""lines":[]"#));
+        assert!(json.contains(r#""data":"""#));
     }
 
     #[test]
     fn test_terminal_message_scrollback_deserialization() {
-        let json = r#"{"type":"scrollback","lines":["line1","line2"]}"#;
+        let json = r#"{"type":"scrollback","data":"H4sIAAAAAAAA","compressed":true}"#;
         let parsed: TerminalMessage = serde_json::from_str(json).unwrap();
         match parsed {
-            TerminalMessage::Scrollback { lines } => {
-                assert_eq!(lines.len(), 2);
-                assert_eq!(lines[0], "line1");
-                assert_eq!(lines[1], "line2");
+            TerminalMessage::Scrollback { data, compressed } => {
+                assert!(!data.is_empty());
+                assert!(compressed);
             }
             _ => panic!("Wrong variant"),
         }

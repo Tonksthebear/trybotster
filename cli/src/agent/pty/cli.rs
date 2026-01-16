@@ -98,7 +98,7 @@ pub fn spawn_cli_pty(
     pty.reader_thread = Some(spawn::spawn_cli_reader_thread(
         reader,
         Arc::clone(&pty.vt100_parser),
-        Arc::clone(&pty.buffer),
+        Arc::clone(&pty.scrollback_buffer),
         Arc::clone(&pty.raw_output_queue),
         notification_tx,
     ));

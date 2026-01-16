@@ -474,7 +474,7 @@ fn test_spawn_real_pty_with_init_script() {
         thread::sleep(Duration::from_millis(500));
 
         // Verify we received some output
-        let buffer = agent.get_buffer_snapshot();
+        let buffer = agent.get_scrollback_snapshot();
         assert!(!buffer.is_empty(), "PTY should have produced output");
 
         // Wait longer for more output (the test script generates 100 lines)
@@ -562,7 +562,7 @@ fn test_spawn_server_pty() {
         thread::sleep(Duration::from_secs(3));
 
         // Check server PTY content
-        let server_buffer = agent.server_pty.as_ref().unwrap().get_buffer_snapshot();
+        let server_buffer = agent.server_pty.as_ref().unwrap().get_scrollback_snapshot();
         assert!(!server_buffer.is_empty(), "Server PTY should have output");
 
         // Test switching views

@@ -600,6 +600,12 @@ impl SignalProtocolManager {
             .map_err(|e| anyhow::anyhow!("Failed to get registration ID: {e}"))
     }
 
+    /// Get the next available PreKey ID for bundle generation.
+    /// Returns None if all PreKeys have been consumed.
+    pub async fn next_prekey_id(&self) -> Option<u32> {
+        self.store.get_available_prekey_id().await
+    }
+
     /// Check if we have a session with a peer.
     pub async fn has_session(&self, peer_identity: &str) -> Result<bool> {
         let address = self.peer_address(peer_identity);

@@ -138,9 +138,10 @@ pub fn browser_event_to_client_action(
             })
         }
 
-        // Events with no Hub action mapping
+        // Events with no Hub action mapping (handled directly in browser.rs)
         BrowserEvent::SetMode { .. }
-        | BrowserEvent::GenerateInvite => None,
+        | BrowserEvent::GenerateInvite
+        | BrowserEvent::BundleRegenerated { .. } => None,
     }
 }
 
@@ -690,5 +691,33 @@ mod tests {
             }
             _ => panic!("Expected TogglePtyViewForClient, got {:?}", action),
         }
+    }
+
+    #[test]
+    fn test_bundle_regenerated_returns_none() {
+        // BundleRegenerated is handled directly in browser.rs, not via action dispatch
+        use crate::relay::signal::PreKeyBundleData;
+
+        let event = BrowserEvent::BundleRegenerated {
+            bundle: PreKeyBundleData {
+                version: 1,
+                hub_id: "test-hub".to_string(),
+                registration_id: 12345,
+                device_id: 1,
+                identity_key: "test-identity".to_string(),
+                signed_prekey_id: 1,
+                signed_prekey: "test-spk".to_string(),
+                signed_prekey_signature: "test-sig".to_string(),
+                prekey_id: Some(1),
+                prekey: Some("test-pk".to_string()),
+                kyber_prekey_id: 1,
+                kyber_prekey: "test-kyber".to_string(),
+                kyber_prekey_signature: "test-kyber-sig".to_string(),
+            },
+        };
+        let browser_identity = "browser-bundle";
+        let action = browser_event_to_client_action(&event, browser_identity);
+
+        assert!(action.is_none(), "BundleRegenerated should return None (handled in browser.rs)");
     }
 }
