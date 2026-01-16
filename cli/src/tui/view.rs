@@ -52,6 +52,8 @@ pub struct ViewState {
     pub connection_url: Option<String>,
     /// Error message for Error mode.
     pub error_message: Option<String>,
+    /// Whether the current bundle's PreKey has been used (needs regeneration for new devices).
+    pub bundle_used: bool,
 }
 
 impl ViewState {
@@ -78,6 +80,7 @@ impl ViewState {
             tunnel_status: context.tunnel_status,
             connection_url: context.connection_url,
             error_message: context.error_message,
+            bundle_used: context.bundle_used,
         }
     }
 
@@ -128,6 +131,8 @@ pub struct ViewContext {
     pub connection_url: Option<String>,
     /// Error message for Error mode.
     pub error_message: Option<String>,
+    /// Whether the current bundle's PreKey has been used.
+    pub bundle_used: bool,
 }
 
 impl Default for ViewContext {
@@ -144,6 +149,7 @@ impl Default for ViewContext {
             tunnel_status: TunnelStatus::Disconnected,
             connection_url: None,
             error_message: None,
+            bundle_used: false,
         }
     }
 }

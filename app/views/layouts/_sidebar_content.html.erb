@@ -1,4 +1,4 @@
-<div class="flex h-full min-h-svh flex-col bg-zinc-900 border-r border-zinc-800">
+<div class="flex h-full flex-col bg-zinc-900 border-r border-zinc-800">
   <%# Logo %>
   <div class="shrink-0 flex items-center gap-2 px-4 py-4 border-b border-zinc-800">
     <%= link_to root_path, class: "flex items-center gap-2 text-primary-400 hover:text-primary-300 transition-colors" do %>
@@ -39,7 +39,7 @@
 
     <%# Agents Section - only shown when hub is selected %>
     <% if defined?(@hub) && @hub %>
-      <div class="flex flex-col min-h-0 border-t border-zinc-800" data-controller="sidebar-agents" data-sidebar-agents-hub-id-value="<%= @hub.id %>">
+      <div class="flex flex-col min-h-0 border-t border-zinc-800">
         <div class="shrink-0 flex items-center justify-between px-4 py-3">
           <h2 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Agents</h2>
           <button type="button"
@@ -52,10 +52,8 @@
             </svg>
           </button>
         </div>
-        <div class="flex-1 overflow-y-auto px-2 pb-2" data-sidebar-agents-target="list">
-          <p class="px-2 py-4 text-center text-xs text-zinc-600">
-            <span data-sidebar-agents-target="status">Connecting...</span>
-          </p>
+        <div class="sidebar-agents-list flex-1 overflow-y-auto px-2 pb-2">
+          <p class="px-2 py-4 text-center text-xs text-zinc-600">Connecting...</p>
         </div>
       </div>
     <% end %>

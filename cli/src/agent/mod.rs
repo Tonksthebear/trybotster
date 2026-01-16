@@ -34,7 +34,6 @@ pub use pty::PtySession;
 pub use screen::ScreenInfo;
 
 use anyhow::Result;
-use pty::MAX_BUFFER_LINES;
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
@@ -184,16 +183,16 @@ impl Agent {
         scroll::to_top(self);
     }
 
-    /// Get the buffer for the currently active PTY.
+    /// Get the scrollback buffer for the currently active PTY.
     #[must_use]
-    pub fn get_active_buffer(&self) -> Arc<Mutex<VecDeque<String>>> {
+    pub fn get_active_scrollback_buffer(&self) -> Arc<Mutex<VecDeque<u8>>> {
         match self.active_pty {
-            PtyView::Cli => Arc::clone(&self.cli_pty.buffer),
+            PtyView::Cli => Arc::clone(&self.cli_pty.scrollback_buffer),
             PtyView::Server => {
                 if let Some(server_pty) = &self.server_pty {
-                    Arc::clone(&server_pty.buffer)
+                    Arc::clone(&server_pty.scrollback_buffer)
                 } else {
-                    Arc::clone(&self.cli_pty.buffer)
+                    Arc::clone(&self.cli_pty.scrollback_buffer)
                 }
             }
         }
@@ -282,14 +281,15 @@ impl Agent {
         init_commands: Vec<String>,
         env_vars: &HashMap<String, String>,
     ) -> Result<()> {
-        let agent_label = self.issue_number.map_or_else(
-            || format!("{}/{}", self.repo, self.branch_name),
-            |num| format!("{}#{num}", self.repo),
+        log::info!(
+            "Spawning agent for {}: command={}, worktree={}",
+            self.issue_number.map_or_else(
+                || format!("{}/{}", self.repo, self.branch_name),
+                |num| format!("{}#{num}", self.repo),
+            ),
+            command_str,
+            self.worktree_path.display()
         );
-        self.add_to_buffer(&format!("==> Spawning agent: {agent_label}"));
-        self.add_to_buffer(&format!("==> Command: {command_str}"));
-        self.add_to_buffer(&format!("==> Worktree: {}", self.worktree_path.display()));
-        self.add_to_buffer("");
 
         // Use the extracted spawn function
         let result = pty::spawn_cli_pty(
@@ -373,15 +373,6 @@ impl Agent {
         self.cli_pty.write_input(input)
     }
 
-    /// Add a line to the buffer.
-    pub fn add_to_buffer(&self, line: &str) {
-        let mut buffer = self.cli_pty.buffer.lock().expect("buffer lock poisoned");
-        buffer.push_back(line.to_string());
-        if buffer.len() > MAX_BUFFER_LINES {
-            buffer.pop_front();
-        }
-    }
-
     /// Get how long this agent has been running.
     #[must_use]
     pub fn age(&self) -> Duration {
@@ -414,16 +405,13 @@ impl Agent {
         notifications
     }
 
-    /// Get a snapshot of the buffer contents.
+    /// Get a snapshot of the scrollback buffer as raw bytes.
+    ///
+    /// Returns raw PTY output bytes that can be replayed in xterm.js.
+    /// Preserves escape sequences, carriage returns, and all terminal control.
     #[must_use]
-    pub fn get_buffer_snapshot(&self) -> Vec<String> {
-        self.cli_pty
-            .buffer
-            .lock()
-            .expect("buffer lock poisoned")
-            .iter()
-            .cloned()
-            .collect()
+    pub fn get_scrollback_snapshot(&self) -> Vec<u8> {
+        self.cli_pty.get_scrollback_snapshot()
     }
 
     /// Get the rendered VT100 screen as lines.
@@ -446,10 +434,12 @@ impl Agent {
         (lines, cursor)
     }
 
-    /// Get scrollback from the line buffer.
+    /// Get scrollback as raw bytes.
+    ///
+    /// Alias for `get_scrollback_snapshot` for API compatibility.
     #[must_use]
-    pub fn get_vt100_with_scrollback(&self) -> Vec<String> {
-        self.get_buffer_snapshot()
+    pub fn get_scrollback_bytes(&self) -> Vec<u8> {
+        self.get_scrollback_snapshot()
     }
 
     /// Get the screen as ANSI escape sequences for streaming.
@@ -543,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_to_buffer() {
+    fn test_scrollback_snapshot() {
         let temp_dir = TempDir::new().unwrap();
         let agent = Agent::new(
             uuid::Uuid::new_v4(),
@@ -553,33 +543,9 @@ mod tests {
             temp_dir.path().to_path_buf(),
         );
 
-        agent.add_to_buffer("line 1");
-        agent.add_to_buffer("line 2");
-
-        let snapshot = agent.get_buffer_snapshot();
-        assert_eq!(snapshot.len(), 2);
-        assert_eq!(snapshot[0], "line 1");
-        assert_eq!(snapshot[1], "line 2");
-    }
-
-    #[test]
-    fn test_buffer_limit() {
-        let temp_dir = TempDir::new().unwrap();
-        let agent = Agent::new(
-            uuid::Uuid::new_v4(),
-            "test/repo".to_string(),
-            Some(1),
-            "issue-1".to_string(),
-            temp_dir.path().to_path_buf(),
-        );
-
-        for i in 0..MAX_BUFFER_LINES + 100 {
-            agent.add_to_buffer(&format!("line {i}"));
-        }
-
-        let snapshot = agent.get_buffer_snapshot();
-        assert_eq!(snapshot.len(), MAX_BUFFER_LINES);
-        assert_eq!(snapshot[0], "line 100");
+        // Scrollback is initially empty (populated by PTY reader thread)
+        let snapshot = agent.get_scrollback_snapshot();
+        assert!(snapshot.is_empty());
     }
 
     #[test]

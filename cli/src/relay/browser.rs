@@ -142,6 +142,34 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
                 log::warn!("GenerateInvite reached Hub - should be handled in relay");
             }
 
+            // BundleRegenerated - new PreKeyBundle was generated
+            BrowserEvent::BundleRegenerated { bundle } => {
+                log::info!("Received regenerated PreKeyBundle");
+                hub.browser.signal_bundle = Some(bundle);
+                hub.browser.bundle_used = false;
+                // Update connection URL with new bundle
+                if let Some(ref bundle) = hub.browser.signal_bundle {
+                    use data_encoding::BASE32_NOPAD;
+                    if let Ok(bytes) = bundle.to_binary() {
+                        let encoded = BASE32_NOPAD.encode(&bytes);
+                        hub.connection_url = Some(format!(
+                            "{}/hubs/{}#{}",
+                            hub.config.server_url,
+                            hub.server_hub_id(),
+                            encoded
+                        ));
+                        // Also write to file for external access
+                        let _ = crate::relay::write_connection_url(
+                            &hub.hub_identifier,
+                            hub.connection_url.as_ref().unwrap()
+                        );
+                        // Reset QR image flag so it renders with new URL
+                        hub.qr_image_displayed = false;
+                        log::info!("Connection URL updated with new bundle");
+                    }
+                }
+            }
+
             // All other events are handled by client-scoped actions above
             _ => {}
         }
@@ -207,9 +235,9 @@ pub fn send_scrollback_for_agent(hub: &Hub, agent_key: &str) {
         return;
     };
 
-    let lines = agent.get_buffer_snapshot();
-    log::info!("Sending {} scrollback lines to browser for agent {}", lines.len(), agent_key);
-    crate::relay::send_scrollback(&ctx, lines);
+    let bytes = agent.get_scrollback_snapshot();
+    log::info!("Sending {} scrollback bytes to browser for agent {}", bytes.len(), agent_key);
+    crate::relay::send_scrollback(&ctx, bytes);
 }
 
 // === Targeted send functions (per-client routing) ===
@@ -257,10 +285,10 @@ fn send_scrollback_for_agent_to_browser(hub: &Hub, browser_identity: &str, agent
         return;
     };
 
-    let lines = agent.get_buffer_snapshot();
-    log::info!("Sending {} scrollback lines to browser {} for agent {}",
-        lines.len(), &browser_identity[..8.min(browser_identity.len())], agent_key);
-    crate::relay::send_scrollback_to(&ctx, browser_identity, lines);
+    let bytes = agent.get_scrollback_snapshot();
+    log::info!("Sending {} scrollback bytes to browser {} for agent {}",
+        bytes.len(), &browser_identity[..8.min(browser_identity.len())], agent_key);
+    crate::relay::send_scrollback_to(&ctx, browser_identity, bytes);
 }
 
 /// Drain PTY output from all agents and route to viewing clients.

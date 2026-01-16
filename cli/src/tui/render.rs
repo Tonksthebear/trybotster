@@ -67,6 +67,8 @@ pub fn render(
     let vpn_status: Option<VpnStatus> = None;
     // E2E encryption: connection URL for QR code display
     let connection_url = hub.connection_url.clone();
+    // Whether the connection bundle has been used (needs regeneration for new devices)
+    let bundle_used = hub.browser.bundle_used;
     // Error message for Error mode
     let error_message = hub.error_message.clone();
     // TUI creation progress for display
@@ -220,7 +222,7 @@ pub fn render(
                 None
             }
             AppMode::ConnectionCode => {
-                render_connection_code_modal(f, connection_url.as_deref())
+                render_connection_code_modal(f, connection_url.as_deref(), bundle_used)
             }
             AppMode::Error => {
                 render_error_modal(f, error_message.as_deref());
@@ -486,20 +488,30 @@ pub struct QrImageState {
     pub col: u16,
 }
 
-fn render_connection_code_modal(f: &mut Frame, connection_url: Option<&str>) -> Option<QrImageState> {
+fn render_connection_code_modal(f: &mut Frame, connection_url: Option<&str>, bundle_used: bool) -> Option<QrImageState> {
     use crate::tui::qr::{generate_qr_code_lines, generate_qr_kitty_image, QrRenderResult};
     use ratatui::layout::Rect;
 
     let terminal = f.area();
     let secure_url = connection_url.unwrap_or("Error: No connection URL generated");
 
+    // Footer varies based on whether the bundle has been used
+    let footer = if bundle_used {
+        "[r] new link  [c] copy  [Esc] close"
+    } else {
+        "[r] new link  [c] copy  [Esc] close"
+    };
+
     // Try Kitty graphics first (module_size=4 gives good balance of size/quality)
     if let Some(QrRenderResult::KittyImage { escape_sequence, width_cells, height_cells }) =
         generate_qr_kitty_image(secure_url, 4)
     {
         // Kitty image mode: render a compact modal sized to QR + text
-        let header = "Scan QR to connect securely";
-        let footer = "[c] copy URL  [Esc/q/Enter] close";
+        let header = if bundle_used {
+            "Link used - [r] to pair new device"
+        } else {
+            "Scan QR to connect securely"
+        };
 
         // Modal sized to fit QR image + header/footer
         let content_width = width_cells.max(header.len() as u16).max(footer.len() as u16);
@@ -554,11 +566,15 @@ fn render_connection_code_modal(f: &mut Frame, connection_url: Option<&str>) -> 
     let qr_width = qr_lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
     let qr_height = qr_lines.len() as u16;
 
-    let header = "Scan QR to connect securely";
-    let footer = if qr_fits {
-        "[c] copy URL  [Esc/q/Enter] close"
+    let header = if bundle_used {
+        "Link used - [r] to pair new device"
     } else {
-        "Terminal graphics not supported. [c] copy URL  [Esc] close"
+        "Scan QR to connect securely"
+    };
+    let footer = if qr_fits {
+        "[r] new link  [c] copy  [Esc] close"
+    } else {
+        "No graphics. [r] new  [c] copy  [Esc] close"
     };
 
     let content_width = qr_width.max(header.len() as u16).max(footer.len() as u16);

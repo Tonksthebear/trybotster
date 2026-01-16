@@ -18,7 +18,10 @@
 // Rust guideline compliant 2025-01
 
 use std::collections::HashMap;
+use std::io::Write;
 use tokio::sync::mpsc;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use flate2::{Compression, write::GzEncoder};
 
 use super::connection::TerminalOutputSender;
 use super::signal::PreKeyBundleData;
@@ -51,6 +54,9 @@ pub struct BrowserState {
     pub last_screen_hash: Option<u64>,
     /// Signal PreKeyBundle data for QR code generation.
     pub signal_bundle: Option<PreKeyBundleData>,
+    /// Whether the current bundle's PreKey has been used (consumed by a connection).
+    /// When true, the QR code should be regenerated before pairing additional devices.
+    pub bundle_used: bool,
 }
 
 impl std::fmt::Debug for BrowserState {
@@ -78,11 +84,15 @@ impl BrowserState {
 
     /// Handle browser connected event.
     ///
-    /// Sets the connected flag and default mode.
+    /// Sets the connected flag and default mode. Also marks the bundle as used
+    /// since the PreKey has been consumed for this session.
     pub fn handle_connected(&mut self, device_name: &str) {
         log::info!("Browser connected: {device_name} - E2E encryption active");
         self.connected = true;
         self.mode = Some(BrowserMode::Gui);
+        // Mark bundle as used - the PreKey was consumed to establish this session.
+        // A new QR code should be generated before pairing additional devices.
+        self.bundle_used = true;
     }
 
     /// Handle browser disconnected event.
@@ -282,20 +292,42 @@ pub fn send_output(ctx: &BrowserSendContext, output: &str) {
     });
 }
 
-/// Build a scrollback message from buffer lines.
+/// Build a scrollback message from raw bytes.
+///
+/// Compresses the raw PTY bytes with gzip and base64 encodes for transport.
+/// Browser decompresses with native DecompressionStream API.
+/// Typical compression ratio is 10:1 for terminal output.
 ///
 /// This is a pure function for testability.
 #[must_use]
-pub fn build_scrollback_message(lines: Vec<String>) -> TerminalMessage {
-    TerminalMessage::Scrollback { lines }
+pub fn build_scrollback_message(bytes: Vec<u8>) -> TerminalMessage {
+    // Compress with gzip
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let compressed = if encoder.write_all(&bytes).is_ok() {
+        encoder.finish().unwrap_or_else(|_| bytes.clone())
+    } else {
+        bytes.clone()
+    };
+
+    // Base64 encode for JSON transport
+    let data = BASE64.encode(&compressed);
+
+    log::debug!(
+        "Scrollback compression: {} bytes -> {} bytes ({:.1}x)",
+        bytes.len(),
+        compressed.len(),
+        bytes.len() as f64 / compressed.len().max(1) as f64
+    );
+
+    TerminalMessage::Scrollback { data, compressed: true }
 }
 
 /// Send scrollback history to browser.
 ///
 /// Called when an agent is selected so the browser can populate
 /// xterm's scrollback buffer with historical output.
-pub fn send_scrollback(ctx: &BrowserSendContext, lines: Vec<String>) {
-    let message = build_scrollback_message(lines);
+pub fn send_scrollback(ctx: &BrowserSendContext, bytes: Vec<u8>) {
+    let message = build_scrollback_message(bytes);
     send_message(ctx, &message);
 }
 
@@ -359,8 +391,8 @@ pub fn send_agent_selected_to(ctx: &BrowserSendContext, identity: &str, agent_id
 }
 
 /// Send scrollback history to a specific browser.
-pub fn send_scrollback_to(ctx: &BrowserSendContext, identity: &str, lines: Vec<String>) {
-    let message = build_scrollback_message(lines);
+pub fn send_scrollback_to(ctx: &BrowserSendContext, identity: &str, bytes: Vec<u8>) {
+    let message = build_scrollback_message(bytes);
     send_message_to(ctx, identity, &message);
 }
 
@@ -513,18 +545,16 @@ mod tests {
 
     #[test]
     fn test_build_scrollback_message() {
-        let lines = vec![
-            "First line".to_string(),
-            "Second line".to_string(),
-            "Third line with \x1b[32mcolor\x1b[0m".to_string(),
-        ];
-        let message = build_scrollback_message(lines.clone());
+        let bytes = b"First line\r\nSecond line\r\n\x1b[32mcolored\x1b[0m output".to_vec();
+        let message = build_scrollback_message(bytes);
 
         match message {
-            TerminalMessage::Scrollback { lines: msg_lines } => {
-                assert_eq!(msg_lines.len(), 3);
-                assert_eq!(msg_lines[0], "First line");
-                assert_eq!(msg_lines[2], "Third line with \x1b[32mcolor\x1b[0m");
+            TerminalMessage::Scrollback { data, compressed } => {
+                assert!(compressed, "Should be marked as compressed");
+                assert!(!data.is_empty(), "Data should not be empty");
+                // Small inputs won't compress well due to gzip header + base64 overhead
+                // Just verify it produces valid base64
+                assert!(data.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
             }
             _ => panic!("Expected Scrollback message"),
         }
@@ -535,10 +565,54 @@ mod tests {
         let message = build_scrollback_message(vec![]);
 
         match message {
-            TerminalMessage::Scrollback { lines } => {
-                assert!(lines.is_empty());
+            TerminalMessage::Scrollback { data, compressed } => {
+                assert!(compressed, "Should be marked as compressed");
+                // Empty input still produces gzip header
+                assert!(!data.is_empty(), "Gzip of empty still has header");
             }
             _ => panic!("Expected Scrollback message"),
         }
+    }
+
+    #[test]
+    fn test_build_scrollback_message_compression_ratio() {
+        // Terminal output with repeated patterns compresses very well
+        let repeated = "$ ls -la\r\ntotal 0\r\ndrwxr-xr-x  2 user user  40 Jan  1 00:00 .\r\n"
+            .repeat(100);
+        let bytes = repeated.as_bytes().to_vec();
+        let original_len = bytes.len();
+        let message = build_scrollback_message(bytes);
+
+        match message {
+            TerminalMessage::Scrollback { data, .. } => {
+                // Base64 adds ~33% overhead, but gzip should give >5x compression
+                // So final size should be less than original
+                assert!(
+                    data.len() < original_len,
+                    "Compressed+encoded ({}) should be smaller than original ({})",
+                    data.len(),
+                    original_len
+                );
+            }
+            _ => panic!("Expected Scrollback message"),
+        }
+    }
+
+    #[test]
+    fn test_handle_connected_sets_bundle_used() {
+        let mut state = BrowserState::default();
+        assert!(!state.bundle_used, "bundle_used should be false initially");
+
+        state.handle_connected("Test Device");
+
+        assert!(state.bundle_used, "bundle_used should be true after connection");
+        assert!(state.connected);
+        assert_eq!(state.mode, Some(BrowserMode::Gui));
+    }
+
+    #[test]
+    fn test_bundle_used_default_false() {
+        let state = BrowserState::default();
+        assert!(!state.bundle_used, "bundle_used should default to false");
     }
 }
