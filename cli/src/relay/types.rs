@@ -110,6 +110,36 @@ pub enum TerminalMessage {
         /// Shareable URL with bundle in fragment.
         url: String,
     },
+    /// HTTP response for preview proxy (CLI -> browser).
+    ///
+    /// Part of the preview feature that tunnels HTTP through the encrypted channel.
+    #[serde(rename = "http_response")]
+    HttpResponse {
+        /// Request ID for correlation with the original request.
+        request_id: u64,
+        /// HTTP status code.
+        status: u16,
+        /// HTTP status text.
+        #[serde(default)]
+        status_text: String,
+        /// Response headers.
+        #[serde(default)]
+        headers: std::collections::HashMap<String, String>,
+        /// Response body (base64 encoded, possibly gzip compressed).
+        #[serde(default)]
+        body: Option<String>,
+        /// Whether body is gzip compressed.
+        #[serde(default)]
+        compressed: bool,
+    },
+    /// HTTP proxy error response (CLI -> browser).
+    #[serde(rename = "http_error")]
+    HttpError {
+        /// Request ID for correlation.
+        request_id: u64,
+        /// Error message.
+        error: String,
+    },
 }
 
 /// Agent info for list response.

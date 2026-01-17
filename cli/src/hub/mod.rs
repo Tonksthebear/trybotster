@@ -56,6 +56,7 @@ use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 
 use crate::app::AppMode;
+use crate::channel::{ActionCableChannel, Channel, ChannelConfig};
 use crate::client::{ClientId, ClientRegistry, Response, TuiClient};
 use crate::config::Config;
 use crate::device::Device;
@@ -397,6 +398,115 @@ impl Hub {
         self.mode = AppMode::Normal;
     }
 
+    /// Connect an agent's channels (terminal and optionally preview).
+    ///
+    /// This creates and connects ActionCable channels that the agent owns.
+    /// Each agent owns its terminal channel for PTY I/O. Hub-level communication
+    /// (agent lists, commands) goes through HubRelay.
+    ///
+    /// Requires:
+    /// - crypto_service to be available (browser connected via QR)
+    ///
+    /// # Arguments
+    ///
+    /// * `session_key` - The agent's session key
+    /// * `agent_index` - Index of the agent for channel routing
+    pub fn connect_agent_channels(&mut self, session_key: &str, agent_index: usize) {
+        // Check if crypto service is available
+        let Some(crypto_service) = self.browser.crypto_service.clone() else {
+            log::debug!(
+                "No crypto service available, deferring channel connection for {}",
+                session_key
+            );
+            return;
+        };
+
+        let hub_id = self.server_hub_id().to_string();
+        let server_url = self.config.server_url.clone();
+        let api_key = self.config.get_api_key().to_string();
+
+        // Get tunnel_port from agent if it exists
+        let tunnel_port = self.state.agents.get(session_key).and_then(|a| a.tunnel_port);
+
+        log::info!(
+            "Connecting channels for agent {} (index={})",
+            session_key,
+            agent_index
+        );
+
+        // Create terminal channel
+        let mut terminal_channel = ActionCableChannel::encrypted(
+            crypto_service.clone(),
+            server_url.clone(),
+            api_key.clone(),
+        );
+
+        // Connect terminal channel synchronously using block_on
+        let terminal_result = self.tokio_runtime.block_on(async {
+            terminal_channel
+                .connect(ChannelConfig {
+                    channel_name: "TerminalRelayChannel".into(),
+                    hub_id: hub_id.clone(),
+                    agent_index: Some(agent_index),
+                    encrypt: true,
+                    compression_threshold: Some(4096),
+                })
+                .await
+        });
+
+        if let Err(e) = terminal_result {
+            log::error!(
+                "Failed to connect terminal channel for {}: {}",
+                session_key,
+                e
+            );
+            return;
+        }
+
+        // Store terminal channel on agent
+        if let Some(agent) = self.state.agents.get_mut(session_key) {
+            agent.terminal_channel = Some(terminal_channel);
+            log::info!("Terminal channel connected for {}", session_key);
+        }
+
+        // Create and connect preview channel if tunnel_port is set
+        if let Some(port) = tunnel_port {
+            let mut preview_channel =
+                ActionCableChannel::encrypted(crypto_service, server_url, api_key);
+
+            let preview_result = self.tokio_runtime.block_on(async {
+                preview_channel
+                    .connect(ChannelConfig {
+                        channel_name: "PreviewChannel".into(),
+                        hub_id,
+                        agent_index: Some(agent_index),
+                        encrypt: true,
+                        compression_threshold: Some(4096),
+                    })
+                    .await
+            });
+
+            if let Err(e) = preview_result {
+                log::error!(
+                    "Failed to connect preview channel for {}: {}",
+                    session_key,
+                    e
+                );
+                return;
+            }
+
+            // Store preview channel on agent
+            if let Some(agent) = self.state.agents.get_mut(session_key) {
+                agent.preview_channel = Some(preview_channel);
+                log::info!(
+                    "Preview channel connected for {} (port {})",
+                    session_key,
+                    port
+                );
+            }
+        }
+    }
+
     /// Get the number of active agents.
     #[must_use]
     pub fn agent_count(&self) -> usize {
@@ -429,6 +539,57 @@ impl Hub {
         self.clients
             .get(&ClientId::Tui)
             .and_then(|client| client.state().selected_agent.clone())
+    }
+
+    /// Ensure TUI has a valid selection if agents exist.
+    ///
+    /// This prevents the visual fallback mismatch where render.rs shows
+    /// the first agent (index 0) but TuiClient.selected_agent is None,
+    /// causing input to not route anywhere.
+    ///
+    /// Called from tick() to sync TUI selection with visual display.
+    fn ensure_tui_selection(&mut self) {
+        // If no agents exist, nothing to select
+        if self.state.agent_keys_ordered.is_empty() {
+            return;
+        }
+
+        // Check current TUI selection
+        let current_selection = self.get_tui_selected_agent_key();
+
+        // If no selection, select the first agent
+        if current_selection.is_none() {
+            if let Some(first_key) = self.state.agent_keys_ordered.first().cloned() {
+                log::debug!("Auto-selecting first agent {} for TUI (was None)", first_key);
+                actions::dispatch(
+                    self,
+                    HubAction::SelectAgentForClient {
+                        client_id: ClientId::Tui,
+                        agent_key: first_key,
+                    },
+                );
+            }
+            return;
+        }
+
+        // If selection exists but agent doesn't (deleted), select first agent
+        let selection = current_selection.unwrap();
+        if !self.state.agents.contains_key(&selection) {
+            if let Some(first_key) = self.state.agent_keys_ordered.first().cloned() {
+                log::debug!(
+                    "Auto-selecting first agent {} for TUI (previous {} no longer exists)",
+                    first_key,
+                    selection
+                );
+                actions::dispatch(
+                    self,
+                    HubAction::SelectAgentForClient {
+                        client_id: ClientId::Tui,
+                        agent_key: first_key,
+                    },
+                );
+            }
+        }
     }
 
     /// Get the next agent key for a client's navigation.
@@ -566,6 +727,10 @@ impl Hub {
     /// When workers aren't available (offline mode, testing):
     /// - Falls back to blocking HTTP calls on main thread
     pub fn tick(&mut self) {
+        // Ensure TUI has a valid selection if agents exist
+        // (fixes visual fallback mismatch where render shows first agent but input routes to None)
+        self.ensure_tui_selection();
+
         // Process completed background agent creations (always non-blocking)
         self.poll_pending_agents();
 
@@ -857,6 +1022,16 @@ impl Hub {
                             });
                         }
 
+                        // Connect agent's channels (terminal + preview if tunnel exists)
+                        if let Some(agent_index) = self
+                            .state
+                            .agents
+                            .keys()
+                            .position(|k| k == &result.session_key)
+                        {
+                            self.connect_agent_channels(&result.session_key, agent_index);
+                        }
+
                         // Send response to requesting client
                         if let Some(client) = self.clients.get_mut(&pending.client_id) {
                             client.receive_response(Response::agent_created(&result.session_key));
@@ -873,8 +1048,9 @@ impl Hub {
                             }
                         }
 
-                        // Broadcast updated agent list to all clients
-                        self.broadcast_agent_list();
+                        // Send updated agent list to all browsers via relay
+                        // (BrowserClient::receive_agent_list is no-op, must use relay)
+                        crate::relay::browser::send_agent_list(self);
 
                         // Auto-select the new agent for the requesting client
                         let session_key = result.session_key.clone();
@@ -885,6 +1061,16 @@ impl Hub {
                                 agent_key: session_key.clone(),
                             },
                         );
+
+                        // Send scrollback to browser client after auto-selection
+                        // (handle_select_agent_for_client doesn't send scrollback - it's generic)
+                        if let ClientId::Browser(ref identity) = pending.client_id {
+                            crate::relay::browser::send_scrollback_for_agent_to_browser(
+                                self,
+                                identity,
+                                &session_key,
+                            );
+                        }
 
                         // Also auto-select for TUI if it has no selection
                         // (ensures TUI state matches what's visually displayed)
@@ -1091,15 +1277,18 @@ impl Hub {
         registration::start_tunnel(&self.tunnel_manager, &self.tokio_runtime);
     }
 
-    /// Connect to terminal relay for browser access (Signal E2E encryption).
-    pub fn connect_terminal_relay(&mut self) {
+    /// Connect to hub relay for browser communication (Signal E2E encryption).
+    ///
+    /// The hub relay handles hub-level commands and broadcasts. Terminal I/O
+    /// goes through agent-owned channels, not this relay.
+    pub fn connect_hub_relay(&mut self) {
         // Extract values before mutable borrow of browser
         let server_id = self.server_hub_id().to_string();
         let local_id = self.hub_identifier.clone();
         let server_url = self.config.server_url.clone();
         let api_key = self.config.get_api_key().to_string();
 
-        registration::connect_terminal_relay(
+        registration::connect_hub_relay(
             &mut self.browser,
             &server_id,
             &local_id,
@@ -1114,7 +1303,7 @@ impl Hub {
         self.register_device();
         self.register_hub_with_server();
         self.start_tunnel();
-        self.connect_terminal_relay();
+        self.connect_hub_relay();
 
         // Start background workers for non-blocking network I/O
         // Must be called after register_hub_with_server() sets botster_id
@@ -1214,95 +1403,12 @@ impl Hub {
         }
     }
 
-    /// Broadcast PTY output to all clients viewing a specific agent.
-    ///
-    /// Uses the viewer index for O(1) routing - only clients that have
-    /// selected this agent will receive the output.
-    ///
-    /// For browser clients, output is buffered in BrowserClient. Call
-    /// `drain_and_send_browser_outputs()` from the event loop to send
-    /// buffered output to each browser via relay with per-client targeting.
-    ///
-    /// For TUI, output is a no-op since TUI reads directly from the agent's PTY.
-    pub fn broadcast_pty_output(&mut self, agent_key: &str, data: &[u8]) {
-        // Get viewer IDs first to avoid borrow issues
-        let viewer_ids: Vec<ClientId> = self.clients.viewers_of(agent_key).cloned().collect();
-
-        // Update client state (for TUI this is no-op, for BrowserClient this buffers)
-        for client_id in viewer_ids {
-            if let Some(client) = self.clients.get_mut(&client_id) {
-                client.receive_output(data);
-            }
-        }
-
-        // Note: Browser output is buffered above in BrowserClient.receive_output().
-        // The event loop calls drain_and_send_browser_outputs() to send per-client.
-        // This removes the old broadcast-to-all workaround (Phase 5 complete).
-    }
-
     /// Flush all client output buffers.
     ///
     /// Call this at the end of each event loop iteration to ensure
     /// batched output is sent to browsers.
     pub fn flush_all_clients(&mut self) {
         self.clients.flush_all();
-    }
-
-    /// Drain buffered output from all browser clients.
-    ///
-    /// Returns a vector of (identity, data) tuples for relay sending.
-    /// Only includes browsers with buffered output. TUI is excluded.
-    ///
-    /// This method is used to collect per-client output for targeted relay
-    /// sending, enabling proper client isolation (each browser only receives
-    /// output from agents it's viewing).
-    pub fn drain_browser_outputs(&mut self) -> Vec<(String, Vec<u8>)> {
-        let mut outputs = Vec::new();
-
-        for (client_id, client) in self.clients.iter_mut() {
-            // Only process browser clients
-            if let ClientId::Browser(identity) = client_id {
-                // Drain any buffered output
-                if let Some(data) = client.drain_buffered_output() {
-                    outputs.push((identity.clone(), data));
-                }
-            }
-        }
-
-        outputs
-    }
-
-    /// Drain and send browser outputs via relay with per-client targeting.
-    ///
-    /// This method:
-    /// 1. Drains buffered output from each BrowserClient
-    /// 2. Sends each client's output via relay to that specific browser
-    ///
-    /// This enables proper client isolation - each browser only receives
-    /// output from agents it's viewing, not from all agents.
-    ///
-    /// Call this from the event loop to route PTY output to browsers.
-    pub fn drain_and_send_browser_outputs(&mut self) {
-        let outputs = self.drain_browser_outputs();
-
-        if outputs.is_empty() {
-            return;
-        }
-
-        let Some(ref sender) = self.browser.sender else {
-            return;
-        };
-
-        for (identity, data) in outputs {
-            let output = String::from_utf8_lossy(&data).to_string();
-            let sender = sender.clone();
-            let identity_clone = identity.clone();
-            self.tokio_runtime.spawn(async move {
-                if let Err(e) = sender.send_to(&identity_clone, &output).await {
-                    log::error!("Failed to send output to {}: {}", identity_clone, e);
-                }
-            });
-        }
     }
 }
 
@@ -1545,159 +1651,4 @@ mod tests {
         );
     }
 
-    // === Phase 3B: Hub drains browser output buffers ===
-    //
-    // These tests verify that:
-    // 1. Hub can drain buffered output from BrowserClients
-    // 2. Drained output is returned with browser identity for relay routing
-    // 3. TUI client has no buffered output (returns None)
-
-    #[test]
-    fn test_hub_drain_browser_outputs_returns_buffered_data() {
-        use crate::client::{BrowserClient, ClientId};
-        use std::path::PathBuf;
-        use uuid::Uuid;
-
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        // Add a test agent
-        let agent = crate::agent::Agent::new(
-            Uuid::new_v4(),
-            "test/repo".to_string(),
-            Some(42),
-            "botster-issue-42".to_string(),
-            PathBuf::from("/tmp/test"),
-        );
-        let agent_key = "test-repo-42".to_string();
-        hub.state.add_agent(agent_key.clone(), agent);
-
-        // Register a browser client and select the agent
-        let browser_id = "browser-test-drain".to_string();
-        let browser_client = BrowserClient::new(browser_id.clone());
-        hub.clients.register(Box::new(browser_client));
-
-        hub.handle_action(HubAction::SelectAgentForClient {
-            client_id: ClientId::Browser(browser_id.clone()),
-            agent_key: agent_key.clone(),
-        });
-
-        // Simulate PTY output via broadcast (this buffers in BrowserClient)
-        hub.broadcast_pty_output(&agent_key, b"Hello from PTY!");
-
-        // Drain browser outputs - should get the buffered data with identity
-        let outputs = hub.drain_browser_outputs();
-
-        assert_eq!(outputs.len(), 1, "Should have one browser's output");
-        let (identity, data) = &outputs[0];
-        assert_eq!(identity, &browser_id, "Identity should match browser");
-        assert_eq!(data, b"Hello from PTY!", "Data should match what was buffered");
-
-        // Second drain should return empty (buffer was cleared)
-        let outputs_after = hub.drain_browser_outputs();
-        assert!(outputs_after.is_empty(), "Should be empty after drain");
-    }
-
-    #[test]
-    fn test_hub_drain_multiple_browsers() {
-        use crate::client::{BrowserClient, ClientId};
-        use std::path::PathBuf;
-        use uuid::Uuid;
-
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        // Add two test agents
-        for i in 1..=2 {
-            let agent = crate::agent::Agent::new(
-                Uuid::new_v4(),
-                "test/repo".to_string(),
-                Some(i),
-                format!("botster-issue-{}", i),
-                PathBuf::from("/tmp/test"),
-            );
-            hub.state.add_agent(format!("test-repo-{}", i), agent);
-        }
-
-        // Register two browser clients viewing different agents
-        let browser1 = BrowserClient::new("browser-1".to_string());
-        let browser2 = BrowserClient::new("browser-2".to_string());
-        hub.clients.register(Box::new(browser1));
-        hub.clients.register(Box::new(browser2));
-
-        hub.handle_action(HubAction::SelectAgentForClient {
-            client_id: ClientId::Browser("browser-1".to_string()),
-            agent_key: "test-repo-1".to_string(),
-        });
-        hub.handle_action(HubAction::SelectAgentForClient {
-            client_id: ClientId::Browser("browser-2".to_string()),
-            agent_key: "test-repo-2".to_string(),
-        });
-
-        // Send different output to each agent
-        hub.broadcast_pty_output("test-repo-1", b"Output for agent 1");
-        hub.broadcast_pty_output("test-repo-2", b"Output for agent 2");
-
-        // Drain outputs - should get both browsers' data
-        let outputs = hub.drain_browser_outputs();
-
-        assert_eq!(outputs.len(), 2, "Should have two browsers' output");
-
-        // Check both outputs are present (order may vary)
-        let output_map: std::collections::HashMap<_, _> = outputs.into_iter().collect();
-        assert_eq!(
-            output_map.get("browser-1"),
-            Some(&b"Output for agent 1".to_vec()),
-            "Browser 1 should have agent 1's output"
-        );
-        assert_eq!(
-            output_map.get("browser-2"),
-            Some(&b"Output for agent 2".to_vec()),
-            "Browser 2 should have agent 2's output"
-        );
-    }
-
-    #[test]
-    fn test_hub_drain_does_not_include_tui() {
-        use crate::client::{BrowserClient, ClientId};
-        use std::path::PathBuf;
-        use uuid::Uuid;
-
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        // Add a test agent
-        let agent = crate::agent::Agent::new(
-            Uuid::new_v4(),
-            "test/repo".to_string(),
-            Some(42),
-            "botster-issue-42".to_string(),
-            PathBuf::from("/tmp/test"),
-        );
-        let agent_key = "test-repo-42".to_string();
-        hub.state.add_agent(agent_key.clone(), agent);
-
-        // Select with TUI (TUI client is already registered)
-        hub.handle_action(HubAction::SelectAgentForClient {
-            client_id: ClientId::Tui,
-            agent_key: agent_key.clone(),
-        });
-
-        // Register a browser client viewing the same agent
-        let browser_client = BrowserClient::new("browser-only".to_string());
-        hub.clients.register(Box::new(browser_client));
-        hub.handle_action(HubAction::SelectAgentForClient {
-            client_id: ClientId::Browser("browser-only".to_string()),
-            agent_key: agent_key.clone(),
-        });
-
-        // Both TUI and browser are viewing - send output
-        hub.broadcast_pty_output(&agent_key, b"Shared output");
-
-        // Drain outputs - should only get browser's data, not TUI
-        let outputs = hub.drain_browser_outputs();
-
-        assert_eq!(outputs.len(), 1, "Should only have browser output, not TUI");
-        assert_eq!(outputs[0].0, "browser-only");
-    }
 }

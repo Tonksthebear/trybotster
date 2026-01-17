@@ -1,33 +1,37 @@
 # frozen_string_literal: true
 
-# Terminal Relay Channel - E2E Encrypted Browser-CLI Communication
+# Hub Channel - E2E Encrypted Hub-Level Communication
 #
-# This channel acts as a pure relay for Signal Protocol encrypted messages
-# between browser clients and the CLI. The server CANNOT decrypt messages -
-# it only forwards encrypted blobs.
+# This channel handles hub-level commands and broadcasts between browser clients
+# and the CLI. Used for:
+# - Agent list updates (broadcast to all browsers)
+# - Agent creation progress (broadcast)
+# - Browser commands (create agent, select agent, etc.)
+# - Browser handshake and connection management
+#
+# Terminal I/O (PTY output/input) is handled by agent-owned channels.
 #
 # Architecture:
-# - Each agent subscribes with hub_id + agent_index (no browser_identity)
-# - Each browser subscribes with hub_id + agent_index + browser_identity
-# - Server routes messages to appropriate streams based on recipient_identity
+# - CLI subscribes with hub_id only
+# - Browsers subscribe with hub_id + browser_identity
+# - Server routes messages to appropriate streams
 # - All encryption/decryption happens at endpoints
 #
-# Streams (per-agent):
-# - CLI:     terminal_relay:{hub_id}:{agent_index}:cli
-# - Browser: terminal_relay:{hub_id}:{agent_index}:browser:{identity}
+# Streams:
+# - CLI:     hub:{hub_id}:cli
+# - Browser: hub:{hub_id}:browser:{identity}
 #
 # Security:
-# - Server never sees plaintext terminal content
+# - Server never sees plaintext content
 # - Double Ratchet provides forward secrecy
 # - Post-quantum security via Kyber/PQXDH
-class TerminalRelayChannel < ApplicationCable::Channel
+class HubChannel < ApplicationCable::Channel
   def subscribed
     @hub_id = params[:hub_id]
-    @agent_index = params[:agent_index] || 0  # Default to first agent for backwards compatibility
     @browser_identity = params[:browser_identity]
 
     unless @hub_id.present?
-      Rails.logger.warn "[TerminalRelay] Missing hub_id"
+      Rails.logger.warn "[HubChannel] Missing hub_id"
       reject
       return
     end
@@ -36,17 +40,17 @@ class TerminalRelayChannel < ApplicationCable::Channel
     stream_from my_stream_name
 
     if @browser_identity.present?
-      Rails.logger.info "[TerminalRelay] Browser subscribed: hub=#{@hub_id} agent=#{@agent_index} identity=#{@browser_identity[0..8]}..."
+      Rails.logger.info "[HubChannel] Browser subscribed: hub=#{@hub_id} identity=#{@browser_identity[0..8]}..."
     else
-      Rails.logger.info "[TerminalRelay] CLI subscribed: hub=#{@hub_id} agent=#{@agent_index}"
+      Rails.logger.info "[HubChannel] CLI subscribed: hub=#{@hub_id}"
     end
   end
 
   def unsubscribed
     if @browser_identity.present?
-      Rails.logger.info "[TerminalRelay] Browser unsubscribed: hub=#{@hub_id} agent=#{@agent_index}"
+      Rails.logger.info "[HubChannel] Browser unsubscribed: hub=#{@hub_id}"
     else
-      Rails.logger.info "[TerminalRelay] CLI unsubscribed: hub=#{@hub_id} agent=#{@agent_index}"
+      Rails.logger.info "[HubChannel] CLI unsubscribed: hub=#{@hub_id}"
     end
   end
 
@@ -59,7 +63,7 @@ class TerminalRelayChannel < ApplicationCable::Channel
     envelope = data["envelope"]
 
     unless envelope.present?
-      Rails.logger.warn "[TerminalRelay] Missing envelope in relay"
+      Rails.logger.warn "[HubChannel] Missing envelope in relay"
       return
     end
 
@@ -69,11 +73,11 @@ class TerminalRelayChannel < ApplicationCable::Channel
       # CLI -> specific browser: route to that browser's stream
       target_stream = browser_stream_name(recipient_identity)
       ActionCable.server.broadcast(target_stream, { envelope: envelope })
-      Rails.logger.debug "[TerminalRelay] Routed to browser: #{recipient_identity[0..8]}..."
+      Rails.logger.debug "[HubChannel] Routed to browser: #{recipient_identity[0..8]}..."
     else
       # Browser -> CLI: route to CLI stream
       ActionCable.server.broadcast(cli_stream_name, { envelope: envelope })
-      Rails.logger.debug "[TerminalRelay] Routed to CLI"
+      Rails.logger.debug "[HubChannel] Routed to CLI"
     end
   end
 
@@ -85,15 +89,14 @@ class TerminalRelayChannel < ApplicationCable::Channel
     distribution = data["distribution"]
 
     unless distribution.present?
-      Rails.logger.warn "[TerminalRelay] Missing distribution in distribute_sender_key"
+      Rails.logger.warn "[HubChannel] Missing distribution in distribute_sender_key"
       return
     end
 
     # SenderKey distribution goes to all browsers (broadcast pattern)
-    # TODO: When implementing SenderKey, need a browser broadcast stream
     ActionCable.server.broadcast(cli_stream_name, { sender_key_distribution: distribution })
 
-    Rails.logger.debug "[TerminalRelay] Distributed SenderKey for hub=#{@hub_id}"
+    Rails.logger.debug "[HubChannel] Distributed SenderKey for hub=#{@hub_id}"
   end
 
   private
@@ -108,10 +111,10 @@ class TerminalRelayChannel < ApplicationCable::Channel
   end
 
   def cli_stream_name
-    "terminal_relay:#{@hub_id}:#{@agent_index}:cli"
+    "hub:#{@hub_id}:cli"
   end
 
   def browser_stream_name(identity)
-    "terminal_relay:#{@hub_id}:#{@agent_index}:browser:#{identity}"
+    "hub:#{@hub_id}:browser:#{identity}"
   end
 end

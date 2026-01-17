@@ -21,7 +21,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::hub::Hub;
-use crate::relay::{browser, check_browser_resize, drain_and_route_pty_output, ResizeAction};
+use crate::relay::{browser, check_browser_resize, drain_and_route_browser_input, drain_and_route_pty_output, ResizeAction};
 use crate::{constants, tui, BrowserDimensions, BrowserMode};
 
 /// Run the Hub event loop.
@@ -89,17 +89,21 @@ pub fn run_event_loop(
             hub.qr_image_displayed = true;
         }
 
-        // 5. Poll and handle browser events
+        // 5. Poll and handle browser events (HubRelay - hub-level commands)
         browser::poll_events(hub, terminal)?;
 
-        // 6. Drain PTY output from all agents and route to viewing clients
+        // 6. Drain browser input from agent channels and route to PTY
+        // Agent channels receive input directly from browsers
+        drain_and_route_browser_input(hub);
+
+        // 7. Drain PTY output from all agents and route to viewing clients
         // Each client receives output only from their selected agent
         drain_and_route_pty_output(hub);
 
-        // 7. Flush client output buffers (sends batched output to browsers)
+        // 8. Flush client output buffers (sends batched output to browsers)
         hub.flush_all_clients();
 
-        // 8. Periodic tasks (polling, heartbeat, notifications)
+        // 9. Periodic tasks (polling, heartbeat, notifications)
         hub.tick();
 
         // Small sleep to prevent CPU spinning (60 FPS max)

@@ -51,8 +51,11 @@
 
 pub mod browser;
 pub mod connection;
+pub mod crypto_service;
 pub mod events;
+pub mod http_proxy;
 pub mod persistence;
+pub mod preview_types;
 pub mod signal;
 pub mod signal_stores;
 pub mod state;
@@ -75,10 +78,19 @@ pub use types::{
     TerminalMessage, WorktreeInfo,
 };
 
-pub use connection::{TerminalOutputSender, TerminalRelay};
+pub use connection::{HubSender, HubRelay};
 
 pub use signal::{PreKeyBundleData, SignalEnvelope, SignalProtocolManager, SIGNAL_PROTOCOL_VERSION, binary_format};
 
 pub use persistence::{read_connection_url, write_connection_url, delete_connection_url};
 
-pub use browser::{drain_and_route_pty_output, poll_events_headless};
+pub use browser::{drain_and_route_browser_input, drain_and_route_pty_output, poll_events_headless};
+
+pub use preview_types::{
+    HttpRequest, HttpResponse, PreviewCommand, PreviewEvent, PreviewMessage, ProxyConfig,
+    ProxyResult,
+};
+
+pub use http_proxy::HttpProxy;
+
+pub use crypto_service::{CryptoService, CryptoServiceHandle};

@@ -27,7 +27,10 @@ use anyhow::Result;
 
 use crate::client::ClientId;
 use crate::hub::{actions, Hub};
-use crate::relay::{BrowserEvent, BrowserSendContext, events::browser_event_to_client_action};
+use crate::relay::{
+    BrowserEvent, BrowserSendContext,
+    events::browser_event_to_client_action,
+};
 
 /// Get browser send context if browser is connected.
 fn browser_ctx(hub: &Hub) -> Option<BrowserSendContext<'_>> {
@@ -106,18 +109,8 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
                 }
                 BrowserEvent::CreateAgent { .. } | BrowserEvent::ReopenWorktree { .. } => {
                     hub.browser.invalidate_screen();
-                    // All browsers need updated agent list
-                    send_agent_list(hub);
-                    // The creating browser was auto-selected to the new agent by the action
-                    // handler (handle_select_agent_for_client). We need to send the selection
-                    // notification and scrollback since BrowserClient methods are no-ops.
-                    let browser_client_id = ClientId::Browser(browser_identity.clone());
-                    if let Some(client) = hub.clients.get(&browser_client_id) {
-                        if let Some(agent_key) = client.state().selected_agent.clone() {
-                            send_agent_selected_to_browser(hub, &browser_identity, &agent_key);
-                            send_scrollback_for_agent_to_browser(hub, &browser_identity, &agent_key);
-                        }
-                    }
+                    // Agent creation is async - agent_list, selection, and scrollback
+                    // are sent from handle_pending_agent_result when the agent is ready
                 }
                 BrowserEvent::TogglePtyView
                 | BrowserEvent::Scroll { .. }
@@ -278,7 +271,7 @@ fn send_agent_selected_to_browser(hub: &Hub, browser_identity: &str, agent_id: &
 }
 
 /// Send scrollback history to a specific browser (not broadcast).
-fn send_scrollback_for_agent_to_browser(hub: &Hub, browser_identity: &str, agent_key: &str) {
+pub fn send_scrollback_for_agent_to_browser(hub: &Hub, browser_identity: &str, agent_key: &str) {
     let Some(ctx) = browser_ctx(hub) else { return };
     let Some(agent) = hub.state.agents.get(agent_key) else {
         log::warn!("Cannot send scrollback for unknown agent: {}", agent_key);
@@ -291,27 +284,133 @@ fn send_scrollback_for_agent_to_browser(hub: &Hub, browser_identity: &str, agent
     crate::relay::send_scrollback_to(&ctx, browser_identity, bytes);
 }
 
+
+/// Drain browser input from agent channels and route to PTY.
+///
+/// Each agent owns its terminal_channel. Browsers send input to the agent's
+/// channel stream. This function drains that input and writes to the agent's PTY.
+///
+/// Call this each event loop iteration to process browser input for all agents.
+pub fn drain_and_route_browser_input(hub: &mut crate::hub::Hub) {
+    // Collect all agent keys
+    let agent_keys: Vec<String> = hub.state.agents.keys().cloned().collect();
+
+    for agent_key in agent_keys {
+        // Drain input for this agent
+        let inputs = {
+            let Some(agent) = hub.state.agents.get_mut(&agent_key) else {
+                continue;
+            };
+            agent.drain_terminal_input()
+        };
+
+        // Write each input to the agent's PTY
+        if !inputs.is_empty() {
+            let Some(agent) = hub.state.agents.get_mut(&agent_key) else {
+                continue;
+            };
+            for (data, peer_id) in inputs {
+                if let Err(e) = agent.write_input(&data) {
+                    log::error!(
+                        "Failed to write input from {} to agent {}: {}",
+                        &peer_id.0[..8.min(peer_id.0.len())],
+                        agent_key,
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Drain PTY output from all agents and route to viewing clients.
 ///
-/// This enables per-client output routing: each browser sees only the
-/// agent they have selected, and TUI sees the globally selected agent.
+/// Each agent owns its terminal_channel. Output is sent via the agent's
+/// channel to browsers subscribed to that agent's stream.
 ///
 /// Call this each event loop iteration to stream PTY output to clients.
 pub fn drain_and_route_pty_output(hub: &mut crate::hub::Hub) {
-    // Collect agent keys and their output first to avoid borrow issues
-    let agent_outputs: Vec<(String, Vec<u8>)> = hub.state.agents
+    // Collect agent keys and output
+    let agent_outputs: Vec<(String, Vec<u8>)> = hub
+        .state
+        .agents
         .iter()
         .map(|(key, agent)| (key.clone(), agent.drain_raw_output()))
         .filter(|(_, bytes)| !bytes.is_empty())
         .collect();
 
-    // Route each agent's output to clients viewing it (buffers in BrowserClient)
-    for (agent_key, data) in agent_outputs {
-        hub.broadcast_pty_output(&agent_key, &data);
-    }
+    // Collect viewers per agent before we need to borrow hub mutably
+    let agent_viewers: std::collections::HashMap<String, Vec<String>> = agent_outputs
+        .iter()
+        .map(|(key, _)| {
+            let viewers: Vec<String> = hub
+                .clients
+                .viewers_of(key)
+                .filter_map(|id| {
+                    if let ClientId::Browser(identity) = id {
+                        Some(identity.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            (key.clone(), viewers)
+        })
+        .collect();
 
-    // Send buffered browser outputs via relay with per-client targeting
-    hub.drain_and_send_browser_outputs();
+    // Route each agent's output via its terminal_channel
+    for (agent_key, data) in agent_outputs {
+        if let Some(viewers) = agent_viewers.get(&agent_key) {
+            for identity in viewers {
+                send_via_agent_channel(hub, &agent_key, identity, &data);
+            }
+        }
+    }
+}
+
+/// Send output via an agent's terminal channel.
+///
+/// Spawns an async task to send the output through the agent's channel
+/// to a specific browser identity.
+fn send_via_agent_channel(
+    hub: &crate::hub::Hub,
+    agent_key: &str,
+    browser_identity: &str,
+    data: &[u8],
+) {
+    let Some(agent) = hub.state.agents.get(agent_key) else {
+        return;
+    };
+
+    let Some(ref channel) = agent.terminal_channel else {
+        return;
+    };
+
+    // Get a cloneable sender handle from the channel
+    let Some(sender_handle) = channel.get_sender_handle() else {
+        log::warn!(
+            "Agent {} terminal channel not connected, cannot send output",
+            agent_key
+        );
+        return;
+    };
+
+    // Clone what we need for the async task
+    let data = data.to_vec();
+    let peer_id = crate::channel::PeerId(browser_identity.to_string());
+    let agent_key = agent_key.to_string();
+    let browser_id = browser_identity.to_string();
+
+    hub.tokio_runtime.spawn(async move {
+        if let Err(e) = sender_handle.send_to(&data, &peer_id).await {
+            log::error!(
+                "Failed to send output via agent {} channel to {}: {}",
+                agent_key,
+                &browser_id[..8.min(browser_id.len())],
+                e
+            );
+        }
+    });
 }
 
 #[cfg(test)]

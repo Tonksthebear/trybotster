@@ -18,7 +18,7 @@ use reqwest::blocking::Client;
 
 use crate::config::Config;
 use crate::device::Device;
-use crate::relay::{connection::TerminalRelay, signal::SignalProtocolManager, BrowserState};
+use crate::relay::{connection::HubRelay, CryptoService, BrowserState};
 use crate::tunnel::TunnelManager;
 
 /// Register the device with the server if not already registered.
@@ -139,19 +139,24 @@ pub fn start_tunnel(
     });
 }
 
-/// Connect to the terminal relay for browser access.
+/// Connect to the hub relay for browser communication.
 ///
 /// This establishes an Action Cable WebSocket connection with E2E encryption
-/// using Signal Protocol for secure browser-based terminal access.
+/// using Signal Protocol. The hub relay handles:
+/// - Browser handshake and connection
+/// - Hub-level commands (create agent, list agents, etc.)
+/// - Broadcasting state changes to all browsers
 ///
-/// The relay runs on a dedicated thread with its own LocalSet because
-/// Signal Protocol uses non-Send futures that require spawn_local.
+/// Terminal I/O (PTY output/input) is handled separately by agent-owned channels.
+///
+/// The relay runs on a dedicated thread. Signal Protocol operations are
+/// handled by the CryptoService (which runs in its own LocalSet thread).
 ///
 /// # Returns
 ///
 /// Returns `Ok(())` if connection succeeds and the browser state is updated,
 /// or logs a warning and continues if connection fails.
-pub fn connect_terminal_relay(
+pub fn connect_hub_relay(
     browser: &mut BrowserState,
     server_hub_id: &str,
     local_identifier: &str,
@@ -172,28 +177,33 @@ pub fn connect_terminal_relay(
     let (sender_tx, sender_rx) = std_mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel(100);
 
-    // Spawn dedicated thread for relay (Signal Protocol needs LocalSet)
+    // Start CryptoService - runs Signal Protocol in its own LocalSet thread
+    // The handle is Send + Clone and can be used from any thread
+    let crypto_service = match CryptoService::start(&local_id) {
+        Ok(handle) => handle,
+        Err(e) => {
+            log::error!("Failed to start crypto service: {e}");
+            browser.event_rx = Some(event_rx);
+            return;
+        }
+    };
+
+    // Store the crypto service handle for agent channel encryption
+    browser.crypto_service = Some(crypto_service.clone());
+
+    // Clone for the relay thread
+    let crypto_service_for_relay = crypto_service.clone();
+
+    // Spawn dedicated thread for relay
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("Failed to create relay runtime");
 
-        let local = tokio::task::LocalSet::new();
-
-        local.block_on(&rt, async {
-            // Load or create Signal Protocol manager (uses local identifier for config)
-            let signal_manager = match SignalProtocolManager::load_or_create(&local_id).await {
-                Ok(manager) => manager,
-                Err(e) => {
-                    log::error!("Failed to load/create Signal Protocol manager: {e}");
-                    let _ = bundle_tx.send(None);
-                    return;
-                }
-            };
-
-            // Build PreKeyBundle data for QR code
-            let bundle = match signal_manager.build_prekey_bundle_data(1).await {
+        rt.block_on(async {
+            // Build PreKeyBundle data for QR code (via CryptoService)
+            let bundle = match crypto_service_for_relay.get_prekey_bundle(1).await {
                 Ok(bundle) => bundle,
                 Err(e) => {
                     log::error!("Failed to build PreKeyBundle: {e}");
@@ -210,10 +220,10 @@ pub fn connect_terminal_relay(
             // Send bundle back to main thread
             let _ = bundle_tx.send(Some(bundle));
 
-            // Terminal relay uses server ID for channel subscription
+            // Hub relay uses server ID for channel subscription
             // Relay handles reconnection internally with exponential backoff
-            let relay = TerminalRelay::new(
-                signal_manager,
+            let relay = HubRelay::new(
+                crypto_service_for_relay,
                 server_id.clone(),
                 server,
                 key,
@@ -221,17 +231,17 @@ pub fn connect_terminal_relay(
 
             match relay.connect_with_event_channel(event_tx).await {
                 Ok((sender, _shutdown_rx)) => {
-                    log::info!("Terminal relay started with auto-reconnection");
+                    log::info!("Hub relay started with auto-reconnection");
                     let _ = sender_tx.send(Some(sender));
 
-                    // Keep the LocalSet running forever
+                    // Keep the runtime running forever
                     // The relay task handles reconnection internally
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
                     }
                 }
                 Err(e) => {
-                    log::warn!("Failed to start terminal relay: {e} - browser access disabled");
+                    log::warn!("Failed to start hub relay: {e} - browser access disabled");
                     let _ = sender_tx.send(None);
                 }
             }

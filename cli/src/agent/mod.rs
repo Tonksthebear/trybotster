@@ -33,6 +33,8 @@ pub use notification::{detect_notifications, AgentNotification, AgentStatus};
 pub use pty::PtySession;
 pub use screen::ScreenInfo;
 
+use crate::channel::{ActionCableChannel, Channel, ChannelConfig, PeerId};
+use crate::relay::crypto_service::CryptoServiceHandle;
 use anyhow::Result;
 use std::{
     collections::{HashMap, VecDeque},
@@ -100,6 +102,14 @@ pub struct Agent {
     /// Which PTY is currently displayed.
     pub active_pty: PtyView,
 
+    /// Terminal relay channel for this agent's encrypted terminal I/O.
+    /// Owned by the agent - connects on spawn, disconnects on drop.
+    pub terminal_channel: Option<ActionCableChannel>,
+
+    /// Preview channel for encrypted HTTP proxying.
+    /// Only created if `tunnel_port` is set.
+    pub preview_channel: Option<ActionCableChannel>,
+
     notification_rx: Option<Receiver<AgentNotification>>,
 }
 
@@ -141,6 +151,8 @@ impl Agent {
             cli_pty: PtySession::new(24, 80),
             server_pty: None,
             active_pty: PtyView::Cli,
+            terminal_channel: None,
+            preview_channel: None,
             notification_rx: None,
         }
     }
@@ -477,14 +489,153 @@ impl Agent {
         let (rows, cols) = s.size();
         ScreenInfo { rows, cols }
     }
+
+    /// Connect this agent's channels (terminal and optionally preview).
+    ///
+    /// Creates encrypted ActionCable connections for:
+    /// - Terminal relay: Always connected for PTY I/O
+    /// - Preview relay: Only if `tunnel_port` is set (HTTP proxying)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if channel connection fails.
+    pub async fn connect_channels(
+        &mut self,
+        crypto_service: CryptoServiceHandle,
+        server_url: &str,
+        api_key: &str,
+        hub_id: &str,
+        agent_index: usize,
+    ) -> Result<()> {
+        log::info!(
+            "Agent {} connecting channels (agent_index={})",
+            self.session_key(),
+            agent_index
+        );
+
+        // Create and connect terminal channel
+        let mut terminal = ActionCableChannel::encrypted(
+            crypto_service.clone(),
+            server_url.to_string(),
+            api_key.to_string(),
+        );
+        terminal
+            .connect(ChannelConfig {
+                channel_name: "TerminalRelayChannel".into(),
+                hub_id: hub_id.to_string(),
+                agent_index: Some(agent_index),
+                encrypt: true,
+                compression_threshold: Some(4096),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Terminal channel connect failed: {}", e))?;
+
+        self.terminal_channel = Some(terminal);
+        log::info!("Agent {} terminal channel connected", self.session_key());
+
+        // Create preview channel only if tunnel_port is set
+        if self.tunnel_port.is_some() {
+            let mut preview = ActionCableChannel::encrypted(
+                crypto_service,
+                server_url.to_string(),
+                api_key.to_string(),
+            );
+            preview
+                .connect(ChannelConfig {
+                    channel_name: "PreviewChannel".into(),
+                    hub_id: hub_id.to_string(),
+                    agent_index: Some(agent_index),
+                    encrypt: true,
+                    compression_threshold: Some(4096),
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("Preview channel connect failed: {}", e))?;
+
+            self.preview_channel = Some(preview);
+            log::info!("Agent {} preview channel connected", self.session_key());
+        }
+
+        Ok(())
+    }
+
+    /// Send PTY output to a specific browser via this agent's terminal channel.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Raw PTY output bytes
+    /// * `peer` - Browser's Signal identity key (peer ID)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the channel send fails.
+    pub async fn send_output(&self, data: &[u8], peer: &PeerId) -> Result<()> {
+        if let Some(ref channel) = self.terminal_channel {
+            channel
+                .send_to(data, peer)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send output: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Check if this agent has a connected terminal channel.
+    #[must_use]
+    pub fn has_terminal_channel(&self) -> bool {
+        self.terminal_channel.is_some()
+    }
+
+    /// Drain incoming input from this agent's terminal channel.
+    ///
+    /// Returns a vector of (payload, sender) tuples for all pending input.
+    /// Non-blocking - returns immediately if no input is available.
+    ///
+    /// This is called by the event loop to process browser input for this agent.
+    pub fn drain_terminal_input(&mut self) -> Vec<(Vec<u8>, PeerId)> {
+        let Some(ref mut channel) = self.terminal_channel else {
+            return Vec::new();
+        };
+
+        channel
+            .drain_incoming()
+            .into_iter()
+            .map(|msg| (msg.payload, msg.sender))
+            .collect()
+    }
+
+    /// Disconnect this agent's channels.
+    ///
+    /// Cleanly closes WebSocket connections for terminal and preview channels.
+    pub async fn disconnect_channels(&mut self) {
+        log::info!("Agent {} disconnecting channels", self.session_key());
+
+        if let Some(ref mut ch) = self.terminal_channel {
+            ch.disconnect().await;
+            log::info!("Agent {} terminal channel disconnected", self.session_key());
+        }
+        self.terminal_channel = None;
+
+        if let Some(ref mut ch) = self.preview_channel {
+            ch.disconnect().await;
+            log::info!("Agent {} preview channel disconnected", self.session_key());
+        }
+        self.preview_channel = None;
+    }
 }
 
 impl Drop for Agent {
     fn drop(&mut self) {
         log::info!(
-            "Agent {} dropping - cleaning up PTY sessions",
+            "Agent {} dropping - cleaning up PTY sessions and channels",
             self.session_key()
         );
+
+        // Channels clean up via their own Drop (sends shutdown signal)
+        if self.terminal_channel.is_some() {
+            log::info!("Agent {} dropping terminal channel", self.session_key());
+        }
+        if self.preview_channel.is_some() {
+            log::info!("Agent {} dropping preview channel", self.session_key());
+        }
 
         if let Some(ref mut server_pty) = self.server_pty {
             log::info!("Killing server PTY child process");

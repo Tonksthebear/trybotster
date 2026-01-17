@@ -23,7 +23,8 @@ use tokio::sync::mpsc;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use flate2::{Compression, write::GzEncoder};
 
-use super::connection::TerminalOutputSender;
+use super::connection::HubSender;
+use super::crypto_service::CryptoServiceHandle;
 use super::signal::PreKeyBundleData;
 use super::types::{BrowserEvent, BrowserResize};
 use crate::{AgentInfo, BrowserMode, TerminalMessage, WorktreeInfo, WorktreeManager};
@@ -39,7 +40,7 @@ pub type IdentifiedBrowserEvent = (BrowserEvent, String);
 #[derive(Default)]
 pub struct BrowserState {
     /// Terminal output sender for encrypted relay.
-    pub sender: Option<TerminalOutputSender>,
+    pub sender: Option<HubSender>,
     /// Browser event receiver (events include browser identity).
     pub event_rx: Option<mpsc::Receiver<IdentifiedBrowserEvent>>,
     /// Whether a browser is currently connected.
@@ -57,6 +58,9 @@ pub struct BrowserState {
     /// Whether the current bundle's PreKey has been used (consumed by a connection).
     /// When true, the QR code should be regenerated before pairing additional devices.
     pub bundle_used: bool,
+    /// Shared crypto service handle for E2E encryption.
+    /// Used by HubRelay and agent channels for Signal Protocol operations.
+    pub crypto_service: Option<CryptoServiceHandle>,
 }
 
 impl std::fmt::Debug for BrowserState {
@@ -76,7 +80,7 @@ impl BrowserState {
     }
 
     /// Set connection established with sender and receiver.
-    pub fn set_connected(&mut self, sender: TerminalOutputSender, rx: mpsc::Receiver<IdentifiedBrowserEvent>) {
+    pub fn set_connected(&mut self, sender: HubSender, rx: mpsc::Receiver<IdentifiedBrowserEvent>) {
         self.sender = Some(sender);
         self.event_rx = Some(rx);
         self.connected = false; // Will be true after Connected event
@@ -154,7 +158,7 @@ impl BrowserState {
 /// Context needed for sending browser messages.
 pub struct BrowserSendContext<'a> {
     /// Terminal output sender for encrypted relay.
-    pub sender: &'a TerminalOutputSender,
+    pub sender: &'a HubSender,
     /// Async runtime for spawning send tasks.
     pub runtime: &'a tokio::runtime::Runtime,
 }
