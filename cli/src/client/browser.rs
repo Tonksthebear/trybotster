@@ -5,22 +5,15 @@
 //!
 //! # Output Routing
 //!
-//! Output to browsers flows through `hub.browser.sender` (the relay's encrypted
-//! channel), NOT through this client directly. This is because:
-//! 1. The relay handles Signal Protocol encryption per-browser
-//! 2. Multiple browsers share the same relay sender
+//! Terminal output goes directly through agent-owned channels, not this client.
+//! Hub-level messages (agent lists, selections) go through HubRelay.
 //!
-//! The `receive_*` methods are no-ops since actual output goes via relay.
-//! BrowserClient exists to track per-client state for:
+//! BrowserClient tracks per-client state for:
 //! - Independent agent selection per browser
 //! - Per-client terminal dimensions
 //! - Viewer tracking (who's viewing which agent)
 
 use super::{AgentInfo, Client, ClientId, ClientState, Response, WorktreeInfo};
-
-/// Maximum size of the output buffer in bytes (4MB).
-/// If browser isn't draining fast enough, excess data is dropped from the front.
-const MAX_OUTPUT_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 /// Browser connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,10 +24,10 @@ pub enum ConnectionState {
     Disconnected,
 }
 
-/// Browser client - tracks per-browser state and buffers output.
+/// Browser client - tracks per-browser state.
 ///
-/// Output is buffered in `output_buffer` and drained by the Hub event loop.
-/// The Hub then sends buffered output via relay to this specific browser.
+/// Terminal output goes through agent-owned channels.
+/// This client tracks state for routing and viewer management.
 #[derive(Debug)]
 pub struct BrowserClient {
     id: ClientId,
@@ -45,10 +38,6 @@ pub struct BrowserClient {
 
     /// Connection tracking.
     connection: ConnectionState,
-
-    /// Output buffer - accumulated PTY output waiting to be sent.
-    /// Drained by Hub.drain_browser_outputs() and sent via relay.
-    output_buffer: Vec<u8>,
 }
 
 impl BrowserClient {
@@ -63,19 +52,6 @@ impl BrowserClient {
             state: ClientState::default(),
             identity,
             connection: ConnectionState::Connected,
-            output_buffer: Vec::new(),
-        }
-    }
-
-    /// Drain buffered output for sending via relay.
-    ///
-    /// Returns `Some(data)` if there's buffered output, `None` if empty.
-    /// The Hub calls this method and sends the data via relay to this browser.
-    pub fn drain_output(&mut self) -> Option<Vec<u8>> {
-        if self.output_buffer.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.output_buffer))
         }
     }
 
@@ -108,41 +84,28 @@ impl Client for BrowserClient {
         &mut self.state
     }
 
-    fn receive_output(&mut self, data: &[u8]) {
-        // Buffer output data for later draining.
-        // Hub.drain_browser_outputs() will send this via relay to this browser.
-        self.output_buffer.extend_from_slice(data);
-
-        // Enforce buffer size limit to prevent memory leaks
-        if self.output_buffer.len() > MAX_OUTPUT_BUFFER_SIZE {
-            // Drop oldest data - keep most recent MAX_OUTPUT_BUFFER_SIZE bytes
-            let excess = self.output_buffer.len() - MAX_OUTPUT_BUFFER_SIZE;
-            self.output_buffer.drain(..excess);
-        }
+    fn receive_output(&mut self, _data: &[u8]) {
+        // No-op: Terminal output goes through agent-owned channels
     }
 
     fn receive_scrollback(&mut self, _lines: Vec<String>) {
-        // No-op: Scrollback sent via relay in browser.rs::send_scrollback_for_selected_agent()
+        // No-op: Scrollback sent via agent channel
     }
 
     fn receive_agent_list(&mut self, _agents: Vec<AgentInfo>) {
-        // No-op: Agent list sent via relay in browser.rs::send_agent_list()
+        // No-op: Agent list sent via HubRelay
     }
 
     fn receive_worktree_list(&mut self, _worktrees: Vec<WorktreeInfo>) {
-        // No-op: Worktree list sent via relay in browser.rs::send_worktree_list()
+        // No-op: Worktree list sent via HubRelay
     }
 
     fn receive_response(&mut self, _response: Response) {
-        // No-op: Responses sent via relay
+        // No-op: Responses sent via HubRelay
     }
 
     fn is_connected(&self) -> bool {
         self.connection == ConnectionState::Connected
-    }
-
-    fn drain_buffered_output(&mut self) -> Option<Vec<u8>> {
-        self.drain_output()
     }
 }
 
@@ -190,38 +153,14 @@ mod tests {
         assert_eq!(client.state().dims, Some((120, 40)));
     }
 
-    // === Phase 3: BrowserClient should buffer output for relay ===
-    //
-    // Instead of no-op, BrowserClient should buffer output data.
-    // The buffer is drained by the Hub and sent via relay to the specific browser.
-
     #[test]
-    fn test_browser_client_buffers_output() {
-        let mut client = BrowserClient::new("test-identity".to_string());
-
-        // Initially no buffered output
-        assert!(client.drain_output().is_none(), "Should have no output initially");
-
-        // receive_output should buffer the data
-        client.receive_output(b"Hello, ");
-        client.receive_output(b"world!");
-
-        // drain_output should return all buffered data
-        let output = client.drain_output();
-        assert_eq!(output, Some(b"Hello, world!".to_vec()), "Should drain buffered output");
-
-        // After draining, buffer should be empty
-        assert!(client.drain_output().is_none(), "Should be empty after drain");
-    }
-
-    #[test]
-    fn test_browser_client_output_identity_tracking() {
+    fn test_browser_client_identity_tracking() {
         let client = BrowserClient::new("my-unique-identity-key".to_string());
 
         // BrowserClient must track its identity for routing
         assert_eq!(client.identity(), "my-unique-identity-key");
 
-        // The identity is used by Hub to route output to the correct browser
+        // The identity is used for per-agent channel routing
         match client.id() {
             ClientId::Browser(ref id) => assert_eq!(id, "my-unique-identity-key"),
             _ => panic!("Should be a Browser client"),

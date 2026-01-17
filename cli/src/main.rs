@@ -115,6 +115,9 @@ fn run_headless() -> Result<()> {
             log::error!("Failed to process browser events: {}", e);
         }
 
+        // Drain browser input from agent channels and route to PTY
+        botster_hub::relay::drain_and_route_browser_input(&mut hub);
+
         // Drain PTY output from all agents and route to viewing clients
         botster_hub::relay::drain_and_route_pty_output(&mut hub);
 

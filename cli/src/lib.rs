@@ -23,6 +23,7 @@
 
 // Library modules
 pub mod agent;
+pub mod channel;
 pub mod client;
 pub mod hub;
 pub mod relay;
@@ -60,11 +61,17 @@ pub use process::{get_parent_pid, kill_orphaned_processes};
 pub use prompt::PromptManager;
 pub use render::render_agent_terminal;
 pub use relay::{
-    AgentInfo, BrowserEvent, BrowserResize, TerminalMessage, TerminalOutputSender,
+    AgentInfo, BrowserEvent, BrowserResize, TerminalMessage, HubSender,
     WorktreeInfo,
 };
 pub use terminal_widget::TerminalWidget;
 pub use tunnel::{allocate_tunnel_port, TunnelManager, TunnelStatus};
+
+// Re-export Channel types
+pub use channel::{
+    ActionCableChannel, Channel, ChannelConfig, ChannelError, ConnectionState, IncomingMessage,
+    PeerId, SharedConnectionState,
+};
 
 // Re-export Hub types
 pub use hub::{Hub, HubAction, HubState};

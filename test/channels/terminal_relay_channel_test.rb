@@ -7,33 +7,34 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
 
   setup do
     @hub_id = 12345  # Numeric hub ID for channel tests
+    @agent_index = 0  # Per-agent channel routing
     @browser_identity = "browser-#{SecureRandom.hex(16)}"
   end
 
   # === Subscription Tests ===
 
   test "CLI subscribes to CLI stream (no browser_identity)" do
-    subscribe hub_id: @hub_id
+    subscribe hub_id: @hub_id, agent_index: @agent_index
 
     assert subscription.confirmed?
-    assert_has_stream "terminal_relay:#{@hub_id}:cli"
+    assert_has_stream "terminal_relay:#{@hub_id}:#{@agent_index}:cli"
   end
 
   test "browser subscribes to dedicated browser stream" do
-    subscribe hub_id: @hub_id, browser_identity: @browser_identity
+    subscribe hub_id: @hub_id, agent_index: @agent_index, browser_identity: @browser_identity
 
     assert subscription.confirmed?
-    assert_has_stream "terminal_relay:#{@hub_id}:browser:#{@browser_identity}"
+    assert_has_stream "terminal_relay:#{@hub_id}:#{@agent_index}:browser:#{@browser_identity}"
   end
 
   test "rejects subscription without hub_id" do
-    subscribe
+    subscribe agent_index: @agent_index
 
     assert subscription.rejected?
   end
 
   test "rejects subscription with blank hub_id" do
-    subscribe hub_id: ""
+    subscribe hub_id: "", agent_index: @agent_index
 
     assert subscription.rejected?
   end
@@ -41,9 +42,9 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
   # === Routing Tests (Server-Side Routing) ===
 
   test "relay routes to browser stream when recipient_identity present" do
-    subscribe hub_id: @hub_id
-    browser_stream = "terminal_relay:#{@hub_id}:browser:#{@browser_identity}"
-    cli_stream = "terminal_relay:#{@hub_id}:cli"
+    subscribe hub_id: @hub_id, agent_index: @agent_index
+    browser_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:browser:#{@browser_identity}"
+    cli_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:cli"
 
     # Message with recipient_identity goes to that browser's stream
     assert_broadcasts(browser_stream, 1) do
@@ -61,9 +62,9 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
   end
 
   test "relay routes to CLI stream when no recipient_identity" do
-    subscribe hub_id: @hub_id, browser_identity: @browser_identity
-    browser_stream = "terminal_relay:#{@hub_id}:browser:#{@browser_identity}"
-    cli_stream = "terminal_relay:#{@hub_id}:cli"
+    subscribe hub_id: @hub_id, agent_index: @agent_index, browser_identity: @browser_identity
+    browser_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:browser:#{@browser_identity}"
+    cli_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:cli"
 
     # Message without recipient_identity goes to CLI stream
     assert_broadcasts(cli_stream, 1) do
@@ -83,8 +84,8 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
   # === Relay Format Tests ===
 
   test "relay does NOT broadcast when envelope wrapper is missing" do
-    subscribe hub_id: @hub_id
-    cli_stream = "terminal_relay:#{@hub_id}:cli"
+    subscribe hub_id: @hub_id, agent_index: @agent_index
+    cli_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:cli"
 
     # Wrong format: envelope fields at top level
     assert_no_broadcasts(cli_stream) do
@@ -99,8 +100,8 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
   end
 
   test "relay does NOT broadcast with nil envelope" do
-    subscribe hub_id: @hub_id
-    cli_stream = "terminal_relay:#{@hub_id}:cli"
+    subscribe hub_id: @hub_id, agent_index: @agent_index
+    cli_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:cli"
 
     assert_no_broadcasts(cli_stream) do
       perform :relay, envelope: nil
@@ -110,8 +111,8 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
   # === SenderKey Distribution Tests ===
 
   test "distribute_sender_key broadcasts to CLI stream" do
-    subscribe hub_id: @hub_id, browser_identity: @browser_identity
-    cli_stream = "terminal_relay:#{@hub_id}:cli"
+    subscribe hub_id: @hub_id, agent_index: @agent_index, browser_identity: @browser_identity
+    cli_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:cli"
 
     assert_broadcasts(cli_stream, 1) do
       perform :distribute_sender_key, distribution: "base64_sender_key_distribution_message"
@@ -119,8 +120,8 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
   end
 
   test "distribute_sender_key does NOT broadcast without distribution" do
-    subscribe hub_id: @hub_id
-    cli_stream = "terminal_relay:#{@hub_id}:cli"
+    subscribe hub_id: @hub_id, agent_index: @agent_index
+    cli_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:cli"
 
     assert_no_broadcasts(cli_stream) do
       perform :distribute_sender_key, distribution: nil
@@ -130,8 +131,8 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
   # === Signal Protocol Version Tests ===
 
   test "relay handles PreKeySignalMessage (message_type 1)" do
-    subscribe hub_id: @hub_id, browser_identity: @browser_identity
-    cli_stream = "terminal_relay:#{@hub_id}:cli"
+    subscribe hub_id: @hub_id, agent_index: @agent_index, browser_identity: @browser_identity
+    cli_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:cli"
 
     # PreKeySignalMessage from browser to CLI (no recipient_identity)
     assert_broadcasts(cli_stream, 1) do
@@ -147,8 +148,8 @@ class TerminalRelayChannelTest < ActionCable::Channel::TestCase
   end
 
   test "relay handles SignalMessage (message_type 2)" do
-    subscribe hub_id: @hub_id
-    browser_stream = "terminal_relay:#{@hub_id}:browser:#{@browser_identity}"
+    subscribe hub_id: @hub_id, agent_index: @agent_index
+    browser_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:browser:#{@browser_identity}"
 
     # SignalMessage from CLI to specific browser
     assert_broadcasts(browser_stream, 1) do

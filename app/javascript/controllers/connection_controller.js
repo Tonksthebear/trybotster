@@ -124,19 +124,23 @@ export default class extends Controller {
     workerUrl: String,
     wasmJsUrl: String,
     wasmBinaryUrl: String,
+    agentIndex: { type: Number, default: 0 },  // Per-agent channel routing
   };
 
   static classes = ["securityBannerBase"];
 
   connect() {
     this.signalSession = null;
-    this.subscription = null;
+    this.hubSubscription = null;      // Hub-level messages (agent list, creation progress)
+    this.terminalSubscription = null; // Per-agent terminal I/O
+    this.subscription = null;         // Legacy alias for terminalSubscription
     this.hubId = null;
     this.ourIdentityKey = null;
     this.connected = false;
     this.state = ConnectionState.DISCONNECTED;
     this.errorReason = null;
     this.handshakeTimer = null;
+    this.currentAgentIndex = this.agentIndexValue;  // Track which agent we're subscribed to
 
     // Don't overwrite listeners - outlet callbacks may have already registered
     if (!this.listeners) {
@@ -322,32 +326,78 @@ export default class extends Controller {
     }
   }
 
-  subscribeToChannel() {
+  subscribeToChannel(agentIndex = this.currentAgentIndex) {
+    // Subscribe to both HubChannel and TerminalRelayChannel
+    return Promise.all([
+      this.subscribeToHubChannel(),
+      this.subscribeToTerminalChannel(agentIndex),
+    ]).then(() => {
+      // Both connected successfully
+    });
+  }
+
+  subscribeToHubChannel() {
     return new Promise((resolve, reject) => {
-      this.subscription = consumer.subscriptions.create(
+      this.hubSubscription = consumer.subscriptions.create(
         {
-          channel: "TerminalRelayChannel",
+          channel: "HubChannel",
           hub_id: this.hubId,
           browser_identity: this.ourIdentityKey,
         },
         {
           connected: () => {
-            console.log("[Connection] Action Cable connected");
+            console.log("[Connection] HubChannel connected");
             resolve();
           },
           disconnected: () => {
-            console.log("[Connection] Action Cable disconnected");
+            console.log("[Connection] HubChannel disconnected");
+            // Hub disconnect is critical - trigger reconnect
             this.handleDisconnect();
           },
           rejected: () => {
-            console.error("[Connection] Action Cable subscription rejected");
-            reject(new Error("Subscription rejected - hub may be offline"));
+            console.error("[Connection] HubChannel subscription rejected");
+            reject(new Error("Hub subscription rejected - hub may be offline"));
           },
           received: async (data) => {
+            // Hub-level messages (agent list, creation progress, etc.)
             await this.handleReceived(data);
           },
         }
       );
+    });
+  }
+
+  subscribeToTerminalChannel(agentIndex = this.currentAgentIndex) {
+    return new Promise((resolve, reject) => {
+      this.terminalSubscription = consumer.subscriptions.create(
+        {
+          channel: "TerminalRelayChannel",
+          hub_id: this.hubId,
+          agent_index: agentIndex,  // Per-agent channel routing
+          browser_identity: this.ourIdentityKey,
+        },
+        {
+          connected: () => {
+            console.log(`[Connection] TerminalRelayChannel connected to agent ${agentIndex}`);
+            this.currentAgentIndex = agentIndex;
+            resolve();
+          },
+          disconnected: () => {
+            console.log("[Connection] TerminalRelayChannel disconnected");
+            // Terminal disconnect is less critical - just log
+          },
+          rejected: () => {
+            console.error("[Connection] TerminalRelayChannel subscription rejected");
+            reject(new Error("Terminal subscription rejected"));
+          },
+          received: async (data) => {
+            // Per-agent terminal I/O
+            await this.handleReceived(data);
+          },
+        }
+      );
+      // Legacy alias
+      this.subscription = this.terminalSubscription;
     });
   }
 
@@ -528,12 +578,14 @@ export default class extends Controller {
 
   /**
    * Send encrypted message via Action Cable.
+   * Hub-level messages go through hubSubscription.
    */
   async sendEncrypted(message) {
     try {
       const envelope = await this.signalSession.encrypt(message);
-      console.log("[Connection] Encrypted envelope, sending via relay");
-      this.subscription.perform("relay", { envelope });
+      console.log("[Connection] Encrypted envelope, sending via hub relay");
+      // Hub-level messages (handshake, commands) go through HubChannel
+      this.hubSubscription.perform("relay", { envelope });
       return true;
     } catch (error) {
       console.error("[Connection] Encryption failed:", error);
@@ -565,6 +617,63 @@ export default class extends Controller {
 
   selectAgent(agentId) {
     return this.send("select_agent", { id: agentId });
+  }
+
+  /**
+   * Switch to a different agent's channel.
+   * This resubscribes to the new agent's terminal stream.
+   * @param {number} agentIndex - Index of the agent to switch to
+   */
+  async switchToAgentChannel(agentIndex) {
+    if (agentIndex === this.currentAgentIndex) {
+      console.log(`[Connection] Already subscribed to agent ${agentIndex}`);
+      return true;
+    }
+
+    if (!this.signalSession || !this.connected) {
+      console.warn("[Connection] Cannot switch agent - not connected");
+      return false;
+    }
+
+    console.log(`[Connection] Switching from agent ${this.currentAgentIndex} to ${agentIndex}`);
+
+    // Unsubscribe from current agent's terminal channel (keep hub subscription)
+    if (this.terminalSubscription) {
+      this.terminalSubscription.unsubscribe();
+      this.terminalSubscription = null;
+      this.subscription = null;
+    }
+
+    // Subscribe to new agent's terminal channel
+    try {
+      await this.subscribeToTerminalChannel(agentIndex);
+      console.log(`[Connection] Switched to agent ${agentIndex}`);
+
+      // Notify listeners of agent switch
+      this.notifyListeners("message", {
+        type: "agent_channel_switched",
+        agent_index: agentIndex,
+      });
+
+      return true;
+    } catch (error) {
+      console.error(`[Connection] Failed to switch to agent ${agentIndex}:`, error);
+      // Try to reconnect to previous agent's terminal channel
+      try {
+        await this.subscribeToTerminalChannel(this.currentAgentIndex);
+      } catch (reconnectError) {
+        console.error("[Connection] Failed to reconnect to previous agent:", reconnectError);
+        this.handleDisconnect();
+      }
+      return false;
+    }
+  }
+
+  /**
+   * Get the current agent index we're subscribed to.
+   */
+  getCurrentAgentIndex() {
+    return this.currentAgentIndex;
   }
 
   deleteAgent(agentId, deleteWorktree = false) {
@@ -725,10 +834,17 @@ export default class extends Controller {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;
     }
-    if (this.subscription) {
-      this.subscription.unsubscribe();
-      this.subscription = null;
+    // Unsubscribe from hub channel
+    if (this.hubSubscription) {
+      this.hubSubscription.unsubscribe();
+      this.hubSubscription = null;
     }
+    // Unsubscribe from terminal channel
+    if (this.terminalSubscription) {
+      this.terminalSubscription.unsubscribe();
+      this.terminalSubscription = null;
+    }
+    this.subscription = null; // Legacy alias
     this.connected = false;
     this.listeners?.clear();
   }

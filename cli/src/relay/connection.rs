@@ -1,27 +1,32 @@
-//! Terminal relay for E2E encrypted communication with browser via Action Cable.
+//! Hub relay for E2E encrypted hub-level communication with browsers.
 //!
-//! This module handles:
-//! - WebSocket connection to Rails Action Cable (TerminalChannel)
-//! - E2E encryption using Signal Protocol (X3DH + Double Ratchet)
-//! - Relaying encrypted terminal output to browser
-//! - Receiving encrypted terminal input from browser
-//! - Automatic reconnection with exponential backoff
+//! This module handles hub-level commands and responses between CLI and browsers:
+//! - Agent list updates (broadcast to all browsers)
+//! - Agent creation progress (broadcast)
+//! - Browser commands (create agent, select agent, etc.)
+//! - Browser handshake and connection management
+//!
+//! Terminal I/O (PTY output/input) is handled by agent-owned channels, not this relay.
+//! See `cli/src/channel/action_cable.rs` for per-agent terminal channels.
 //!
 //! # Protocol
 //!
 //! 1. CLI connects to Action Cable WebSocket
-//! 2. CLI subscribes to TerminalChannel with hub_identifier
+//! 2. CLI subscribes to TerminalRelayChannel with hub_id
 //! 3. CLI displays QR code with PreKeyBundle
 //! 4. Browser scans QR, processes PreKeyBundle, creates session
-//! 5. Browser sends PreKeySignalMessage in presence "join"
-//! 6. CLI decrypts PreKeySignalMessage, creating Double Ratchet session
-//! 7. Both sides have session - server only sees encrypted blobs
+//! 5. Browser sends encrypted handshake
+//! 6. CLI decrypts, creating Double Ratchet session
+//! 7. Hub-level messages flow encrypted through this relay
 //!
-//! # Architecture Note
+//! # Architecture
 //!
-//! Signal Protocol uses non-Send futures (async_trait(?Send)), so all
-//! encryption/decryption must run on the same task. We use tokio::select!
-//! to multiplex WebSocket I/O with output processing on a single task.
+//! ```text
+//! HubRelay (this module)           Agent Channels
+//! - Browser handshake              - Per-agent terminal I/O
+//! - Agent list broadcasts          - PTY output → browser
+//! - Hub commands from browser      - Keyboard input → PTY
+//! ```
 //!
 //! Rust guideline compliant 2025-01
 
@@ -36,7 +41,8 @@ use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, t
 
 use data_encoding::BASE32_NOPAD;
 
-use super::signal::{SignalEnvelope, SignalProtocolManager};
+use super::crypto_service::CryptoServiceHandle;
+use super::signal::SignalEnvelope;
 use super::state::IdentifiedBrowserEvent;
 use super::types::{BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage};
 
@@ -104,18 +110,18 @@ enum OutputMessage {
 ///
 /// This is a simple channel sender that queues output for the relay task.
 #[derive(Clone)]
-pub struct TerminalOutputSender {
+pub struct HubSender {
     tx: mpsc::Sender<OutputMessage>,
     connected: Arc<RwLock<bool>>,
 }
 
-impl std::fmt::Debug for TerminalOutputSender {
+impl std::fmt::Debug for HubSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TerminalOutputSender").finish_non_exhaustive()
+        f.debug_struct("HubSender").finish_non_exhaustive()
     }
 }
 
-impl TerminalOutputSender {
+impl HubSender {
     /// Send terminal output to all browsers (will be encrypted by relay task).
     pub async fn send(&self, output: &str) -> Result<()> {
         // Only send if browser is connected
@@ -158,32 +164,38 @@ impl TerminalOutputSender {
 }
 
 /// Terminal relay connection manager.
-pub struct TerminalRelay {
-    signal_manager: SignalProtocolManager,
+///
+/// Uses a `CryptoServiceHandle` for all encryption/decryption operations,
+/// allowing the relay to run in any thread (not restricted to a LocalSet).
+pub struct HubRelay {
+    crypto_service: CryptoServiceHandle,
     hub_identifier: String,
     server_url: String,
     api_key: String,
 }
 
-impl std::fmt::Debug for TerminalRelay {
+impl std::fmt::Debug for HubRelay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TerminalRelay")
+        f.debug_struct("HubRelay")
             .field("hub_identifier", &self.hub_identifier)
             .field("server_url", &self.server_url)
             .finish_non_exhaustive()
     }
 }
 
-impl TerminalRelay {
-    /// Create a new terminal relay with a Signal Protocol manager.
+impl HubRelay {
+    /// Create a new terminal relay with a crypto service handle.
+    ///
+    /// The `crypto_service` handle is Send + Clone, so this relay can run
+    /// in any thread, not just a LocalSet.
     pub fn new(
-        signal_manager: SignalProtocolManager,
+        crypto_service: CryptoServiceHandle,
         hub_identifier: String,
         server_url: String,
         api_key: String,
     ) -> Self {
         Self {
-            signal_manager,
+            crypto_service,
             hub_identifier,
             server_url,
             api_key,
@@ -193,13 +205,13 @@ impl TerminalRelay {
     /// Connect to Action Cable and start relaying messages.
     ///
     /// Returns:
-    /// - `TerminalOutputSender` - for sending terminal output to browser
+    /// - `HubSender` - for sending terminal output to browser
     /// - `mpsc::Receiver<IdentifiedBrowserEvent>` - for receiving events from browser with identity
     /// - `oneshot::Receiver<()>` - signals when the relay task exits permanently
     ///
     /// The relay automatically reconnects on WebSocket disconnection with exponential backoff.
     /// The shutdown receiver only fires when the entire relay task exits (rare).
-    pub async fn connect(self) -> Result<(TerminalOutputSender, mpsc::Receiver<IdentifiedBrowserEvent>, oneshot::Receiver<()>)> {
+    pub async fn connect(self) -> Result<(HubSender, mpsc::Receiver<IdentifiedBrowserEvent>, oneshot::Receiver<()>)> {
         let (event_tx, event_rx) = mpsc::channel::<IdentifiedBrowserEvent>(100);
         let (sender, shutdown_rx) = self.connect_with_event_channel(event_tx).await?;
         Ok((sender, event_rx, shutdown_rx))
@@ -211,15 +223,18 @@ impl TerminalRelay {
     /// separately (e.g., for cross-thread communication).
     ///
     /// Returns:
-    /// - `TerminalOutputSender` for sending terminal output to browser
+    /// - `HubSender` for sending terminal output to browser
     /// - `oneshot::Receiver<()>` that fires when the relay task exits permanently
     ///
     /// Events are sent to the provided `event_tx` channel with browser identity attached.
     /// The relay automatically reconnects on WebSocket disconnection with exponential backoff.
+    ///
+    /// Note: Since we now use `CryptoServiceHandle` instead of owning `SignalProtocolManager`,
+    /// this task can run in any thread (no LocalSet required).
     pub async fn connect_with_event_channel(
         self,
         event_tx: mpsc::Sender<IdentifiedBrowserEvent>,
-    ) -> Result<(TerminalOutputSender, oneshot::Receiver<()>)> {
+    ) -> Result<(HubSender, oneshot::Receiver<()>)> {
         // Create channel for terminal output (lives across reconnections)
         let (output_tx, output_rx) = mpsc::channel::<OutputMessage>(100);
 
@@ -227,7 +242,7 @@ impl TerminalRelay {
         let connected = Arc::new(RwLock::new(false));
 
         // Create output sender handle
-        let output_sender = TerminalOutputSender {
+        let output_sender = HubSender {
             tx: output_tx,
             connected: Arc::clone(&connected),
         };
@@ -235,20 +250,20 @@ impl TerminalRelay {
         // Shutdown signal - fires when relay task exits permanently
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-        // Spawn reconnection task
+        // Spawn reconnection task - no LocalSet required since crypto ops go through CryptoService
         let hub_identifier = self.hub_identifier.clone();
         let server_url = self.server_url.clone();
         let api_key = self.api_key.clone();
-        let signal_manager = self.signal_manager;
+        let crypto_service = self.crypto_service;
 
-        tokio::task::spawn_local(async move {
+        tokio::spawn(async move {
             // Ensure shutdown signal is sent when task exits
             let _shutdown_guard = scopeguard::guard(shutdown_tx, |tx| {
                 let _ = tx.send(());
             });
 
             Self::run_with_reconnection(
-                signal_manager,
+                crypto_service,
                 hub_identifier,
                 server_url,
                 api_key,
@@ -263,7 +278,7 @@ impl TerminalRelay {
 
     /// Run the relay with automatic reconnection on WebSocket failure.
     async fn run_with_reconnection(
-        mut signal_manager: SignalProtocolManager,
+        crypto_service: CryptoServiceHandle,
         hub_identifier: String,
         server_url: String,
         api_key: String,
@@ -283,7 +298,7 @@ impl TerminalRelay {
 
                     // Run message loop until WebSocket dies
                     Self::run_message_loop(
-                        &mut signal_manager,
+                        &crypto_service,
                         &hub_identifier,
                         &server_url,
                         &mut write,
@@ -380,9 +395,9 @@ impl TerminalRelay {
             Err(_) => anyhow::bail!("Timeout waiting for Action Cable welcome"),
         }
 
-        // Build channel identifier
+        // Build channel identifier for hub-level commands
         let identifier = ChannelIdentifier {
-            channel: "TerminalRelayChannel".to_string(),
+            channel: "HubChannel".to_string(),
             hub_id: hub_identifier.to_string(),
         };
         let identifier_json = serde_json::to_string(&identifier)?;
@@ -395,7 +410,7 @@ impl TerminalRelay {
         };
         write.send(Message::Text(serde_json::to_string(&subscribe)?)).await?;
 
-        log::info!("Subscribed to TerminalRelayChannel for hub {}", hub_identifier);
+        log::info!("Subscribed to HubChannel for hub {}", hub_identifier);
 
         Ok((write, read, identifier_json))
     }
@@ -407,7 +422,7 @@ impl TerminalRelay {
     /// connection is dead and breaks to trigger reconnection.
     #[allow(clippy::too_many_arguments)]
     async fn run_message_loop(
-        signal_manager: &mut SignalProtocolManager,
+        crypto_service: &CryptoServiceHandle,
         hub_identifier: &str,
         server_url: &str,
         write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
@@ -434,8 +449,8 @@ impl TerminalRelay {
                         OutputMessage::RegenerateBundle => {
                             // Generate a new PreKeyBundle with a fresh PreKey
                             log::info!("Regenerating PreKeyBundle on request");
-                            match signal_manager.build_prekey_bundle_data(
-                                signal_manager.next_prekey_id().await.unwrap_or(1)
+                            match crypto_service.get_prekey_bundle(
+                                crypto_service.next_prekey_id().await.unwrap_or(1)
                             ).await {
                                 Ok(bundle) => {
                                     log::info!("New PreKeyBundle generated with PreKey {}",
@@ -455,7 +470,7 @@ impl TerminalRelay {
                             // Normal output handling - requires connected browsers
                             if *connected.read().await && !browser_identities.is_empty() {
                                 Self::handle_output(
-                                    signal_manager,
+                                    crypto_service,
                                     write,
                                     identifier_json,
                                     output_msg,
@@ -474,7 +489,7 @@ impl TerminalRelay {
                     match msg {
                         Ok(Message::Text(text)) => {
                             Self::handle_incoming_text(
-                                signal_manager,
+                                crypto_service,
                                 hub_identifier,
                                 server_url,
                                 write,
@@ -522,7 +537,7 @@ impl TerminalRelay {
 
     /// Handle outgoing message to browser(s).
     async fn handle_output(
-        signal_manager: &mut SignalProtocolManager,
+        crypto_service: &CryptoServiceHandle,
         write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
         identifier_json: &str,
         output_msg: OutputMessage,
@@ -562,7 +577,7 @@ impl TerminalRelay {
         };
 
         for identity in targets {
-            match signal_manager.encrypt(&plaintext, identity).await {
+            match crypto_service.encrypt(&plaintext, identity).await {
                 Ok(envelope) => {
                     let data = serde_json::json!({
                         "action": "relay",
@@ -598,7 +613,7 @@ impl TerminalRelay {
     /// Handle incoming text message from Action Cable.
     #[allow(clippy::too_many_arguments)]
     async fn handle_incoming_text(
-        signal_manager: &mut SignalProtocolManager,
+        crypto_service: &CryptoServiceHandle,
         hub_identifier: &str,
         server_url: &str,
         write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
@@ -654,7 +669,7 @@ impl TerminalRelay {
         };
 
         // Decrypt the envelope
-        let plaintext = match signal_manager.decrypt(&envelope).await {
+        let plaintext = match crypto_service.decrypt(&envelope).await {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("Decryption failed: {}", e);
@@ -662,7 +677,7 @@ impl TerminalRelay {
             }
         };
 
-        if let Err(e) = signal_manager.persist().await {
+        if let Err(e) = crypto_service.persist().await {
             log::warn!("Failed to persist: {}", e);
         }
 
@@ -696,7 +711,7 @@ impl TerminalRelay {
         };
 
         Self::handle_browser_command(
-            signal_manager,
+            crypto_service,
             hub_identifier,
             server_url,
             write,
@@ -710,7 +725,7 @@ impl TerminalRelay {
     /// Handle a parsed browser command.
     #[allow(clippy::too_many_arguments)]
     async fn handle_browser_command(
-        signal_manager: &mut SignalProtocolManager,
+        crypto_service: &CryptoServiceHandle,
         hub_identifier: &str,
         server_url: &str,
         write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
@@ -729,7 +744,7 @@ impl TerminalRelay {
                     "cli_version": env!("CARGO_PKG_VERSION"),
                     "hub_id": hub_identifier,
                 });
-                Self::send_encrypted(signal_manager, write, identifier_json, sender_identity, &ack).await;
+                Self::send_encrypted(crypto_service, write, identifier_json, sender_identity, &ack).await;
 
                 if let Err(e) = event_tx.send((
                     BrowserEvent::Connected {
@@ -745,7 +760,7 @@ impl TerminalRelay {
             BrowserCommand::GenerateInvite => {
                 log::info!("Browser requested invite bundle");
 
-                match signal_manager.build_prekey_bundle_data(2).await {
+                match crypto_service.get_prekey_bundle(2).await {
                     Ok(bundle) => {
                         let bundle_bytes = bundle.to_binary().expect("PreKeyBundle binary serializable");
                         let bundle_encoded = BASE32_NOPAD.encode(&bundle_bytes);
@@ -755,14 +770,14 @@ impl TerminalRelay {
                             bundle: bundle_encoded,
                             url: invite_url,
                         };
-                        Self::send_encrypted(signal_manager, write, identifier_json, sender_identity, &response).await;
+                        Self::send_encrypted(crypto_service, write, identifier_json, sender_identity, &response).await;
                     }
                     Err(e) => {
                         log::error!("Failed to generate invite bundle: {}", e);
                         let error_msg = TerminalMessage::Error {
                             message: format!("Failed to generate invite: {}", e),
                         };
-                        Self::send_encrypted(signal_manager, write, identifier_json, sender_identity, &error_msg).await;
+                        Self::send_encrypted(crypto_service, write, identifier_json, sender_identity, &error_msg).await;
                     }
                 }
                 return;
@@ -802,7 +817,7 @@ impl TerminalRelay {
 
     /// Send an encrypted message to a browser.
     async fn send_encrypted<T: Serialize>(
-        signal_manager: &mut SignalProtocolManager,
+        crypto_service: &CryptoServiceHandle,
         write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
         identifier_json: &str,
         recipient_identity: &str,
@@ -816,7 +831,7 @@ impl TerminalRelay {
             }
         };
 
-        match signal_manager.encrypt(&bytes, recipient_identity).await {
+        match crypto_service.encrypt(&bytes, recipient_identity).await {
             Ok(envelope) => {
                 let data = serde_json::json!({
                     "action": "relay",

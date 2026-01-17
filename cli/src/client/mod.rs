@@ -114,9 +114,9 @@ pub trait Client: Send {
 
     /// Terminal output from PTY (raw bytes).
     ///
-    /// Called by Hub when the agent this client is viewing produces output.
-    /// Browser clients buffer and send via WebSocket.
-    /// TUI client is a no-op (reads from vt100_parser during render).
+    /// No-op for both TUI and Browser clients:
+    /// - TUI reads directly from vt100_parser during render
+    /// - Browser clients receive output via agent-owned channels
     fn receive_output(&mut self, data: &[u8]);
 
     /// Scrollback history (sent on agent selection).
@@ -169,16 +169,12 @@ pub trait Client: Send {
         true
     }
 
-    /// Drain buffered output for sending via relay.
+    /// Drain buffered output (legacy - always returns None).
     ///
-    /// Returns `Some(data)` if there's buffered output, `None` if empty.
-    /// Browser clients return their accumulated output buffer.
-    /// TUI client always returns None (no buffering needed).
-    ///
-    /// This is used by Hub.drain_browser_outputs() to collect output
-    /// from all browsers for per-client relay sending.
+    /// Terminal output now goes through agent-owned channels.
+    /// This method exists for trait compatibility but is unused.
     fn drain_buffered_output(&mut self) -> Option<Vec<u8>> {
-        None // Default: no buffering (TUI)
+        None
     }
 }
 

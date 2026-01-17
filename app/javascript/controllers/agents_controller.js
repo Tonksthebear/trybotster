@@ -38,6 +38,9 @@ export default class extends Controller {
   // Private field for cached sidebar list elements (there can be multiple - mobile + desktop)
   #sidebarListElements = null;
 
+  // Track pending selection to avoid race condition with CLI confirmation
+  #pendingSelection = null;
+
   connect() {
     this.agents = [];
     this.worktrees = [];
@@ -46,23 +49,52 @@ export default class extends Controller {
 
     // Two-step modal state
     this.pendingSelection = null; // { type: 'existing' | 'new', path?, branch?, issueOrBranch? }
+
+    // Set up event delegation for sidebar agent buttons (outside this controller's scope)
+    this.#setupSidebarClickDelegation();
+  }
+
+  // Bound click handler stored as instance property for cleanup
+  #boundSidebarClickHandler = null;
+
+  // Private: Set up click delegation for sidebar agent buttons
+  // Uses document-level delegation since sidebar is outside controller scope
+  // and may be rendered before or after this controller connects
+  #setupSidebarClickDelegation() {
+    this.#boundSidebarClickHandler = (e) => {
+      // Check if click is within a sidebar-agents-list
+      const sidebar = e.target.closest(`.${this.sidebarListClassValue}`);
+      if (!sidebar) return;
+
+      const agentBtn = e.target.closest('[data-agent-button]');
+      if (agentBtn && agentBtn.dataset.agentId) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.#handleAgentClick(agentBtn.dataset.agentId);
+      }
+    };
+
+    document.addEventListener('click', this.#boundSidebarClickHandler);
   }
 
   disconnect() {
+    // Remove document-level click delegation listener
+    if (this.#boundSidebarClickHandler) {
+      document.removeEventListener('click', this.#boundSidebarClickHandler);
+      this.#boundSidebarClickHandler = null;
+    }
+
     // Clear reference to external elements
     this.#sidebarListElements = null;
   }
 
-  // Lazy getter for sidebar list elements (outside this controller's scope)
+  // Getter for sidebar list elements (outside this controller's scope)
   // Returns array of elements - there can be multiple (mobile + desktop sidebars)
+  // Note: Always query fresh to avoid stale DOM references after re-renders
   get sidebarListElements() {
-    if (!this.#sidebarListElements) {
-      this.#sidebarListElements = Array.from(
-        document.querySelectorAll(`.${this.sidebarListClassValue}`)
-      );
-      console.log("[Agents] Looking for sidebar lists:", this.sidebarListClassValue, "found:", this.#sidebarListElements.length);
-    }
-    return this.#sidebarListElements;
+    return Array.from(
+      document.querySelectorAll(`.${this.sidebarListClassValue}`)
+    );
   }
 
   // Called by Stimulus when connection outlet becomes available
@@ -307,16 +339,19 @@ export default class extends Controller {
         }`;
 
         // Agent button (main clickable area)
+        // Note: command="close" commandfor="sidebar" removed - was causing issues
+        // with agent selection on desktop. Mobile sidebar close handled separately.
         const agentBtn = document.createElement("button");
         agentBtn.type = "button";
-        agentBtn.setAttribute("command", "close");
-        agentBtn.setAttribute("commandfor", "sidebar");
         agentBtn.className = `flex-1 text-left px-2 py-1.5 min-w-0 ${
           isSelected
             ? "text-primary-400 font-medium"
             : "text-zinc-400 hover:text-zinc-200"
         }`;
         agentBtn.innerHTML = `<span class="truncate font-mono text-xs block">${this.escapeHtml(agent.name || agent.id)}</span>`;
+        // Store agent ID and attach click handler directly
+        agentBtn.dataset.agentId = agent.id;
+        agentBtn.dataset.agentButton = "true";
         agentBtn.addEventListener("click", () => this.#handleAgentClick(agent.id));
 
         // Delete button (visible on hover)
@@ -379,13 +414,29 @@ export default class extends Controller {
     });
   }
 
-  // Handle agent selection from CLI
-  handleAgentSelected(message) {
+  // Handle agent selection from CLI (e.g., auto-selection after agent creation)
+  async handleAgentSelected(message) {
     this.selectedAgentId = message.id;
     const displayName = message.name || message.id;
     this.updateSelectedLabel(displayName);
     this.updateMobileAgentUI(displayName);
     this.updateAgentList(this.agents); // Re-render to show selection
+
+    // Only switch channels if this selection wasn't initiated by us
+    // (avoids race condition when user clicks quickly between agents)
+    if (this.#pendingSelection === message.id) {
+      // This is a confirmation of our click - we already switched channels
+      this.#pendingSelection = null;
+    } else {
+      // This is a selection from CLI (e.g., on connect, auto-select, or another client)
+      // We need to switch to the correct channel
+      if (this.connection && this.agents.length > 0) {
+        const agentIndex = this.agents.findIndex(a => a.id === message.id);
+        if (agentIndex >= 0) {
+          await this.connection.switchToAgentChannel(agentIndex);
+        }
+      }
+    }
   }
 
   // Update mobile header agent UI
@@ -453,8 +504,21 @@ export default class extends Controller {
   }
 
   // Private: Handle agent selection (used by both action and direct click)
-  #handleAgentClick(agentId) {
+  async #handleAgentClick(agentId) {
     if (!agentId || !this.connection) return;
+
+    // Find agent index for channel switching
+    const agentIndex = this.agents.findIndex(a => a.id === agentId);
+    if (agentIndex === -1) return;
+
+    // Switch to the agent's terminal channel
+    // This ensures we receive terminal output from the correct agent
+    await this.connection.switchToAgentChannel(agentIndex);
+
+    // Track that we initiated this selection (to avoid race condition in handleAgentSelected)
+    this.#pendingSelection = agentId;
+
+    // Send select_agent to CLI (for state tracking)
     this.connection.selectAgent(agentId);
   }
 

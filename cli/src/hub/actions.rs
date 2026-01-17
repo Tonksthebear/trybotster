@@ -838,10 +838,11 @@ fn create_and_spawn_agent(hub: &mut Hub) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Helper to spawn an agent and register its tunnel.
+/// Helper to spawn an agent and connect its channels.
 ///
 /// This is used by TUI's "New Agent" menu flow. After spawning:
 /// - Registers tunnel if port assigned
+/// - Connects agent's channels (terminal + preview if tunnel exists)
 /// - Auto-selects the new agent for TUI (consistent with browser behavior)
 fn spawn_agent_with_tunnel(hub: &mut Hub, config: &crate::agents::AgentSpawnConfig) -> anyhow::Result<()> {
     // Use TUI's dims from terminal_dims (not browser.dims)
@@ -852,12 +853,24 @@ fn spawn_agent_with_tunnel(hub: &mut Hub, config: &crate::agents::AgentSpawnConf
     // Clone session_key before moving into async
     let session_key = result.session_key.clone();
 
+    // Register tunnel for HTTP forwarding if tunnel port allocated
     if let Some(port) = result.tunnel_port {
         let tm = Arc::clone(&hub.tunnel_manager);
-        let key = result.session_key;
+        let key = result.session_key.clone();
         hub.tokio_runtime.spawn(async move {
             tm.register_agent(key, port).await;
         });
+    }
+
+    // Connect agent's channels (terminal always, preview if tunnel_port set)
+    // Agent owns its channels per spec Section 7
+    if let Some(agent_index) = hub
+        .state
+        .agents
+        .keys()
+        .position(|k| k == &result.session_key)
+    {
+        hub.connect_agent_channels(&result.session_key, agent_index);
     }
 
     // Auto-select the new agent for TUI (matches browser behavior in handle_create_agent_for_client)
@@ -895,8 +908,8 @@ fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_key:
     if let Some(client) = hub.clients.get_mut(&client_id) {
         client.select_agent(&agent_key);
 
-        // TODO: Send scrollback from agent's CLI PTY when method available
-        // For now, browsers will receive live output going forward.
+        // Note: Scrollback is sent via browser.rs event handler (send_scrollback_for_agent_to_browser)
+        // when BrowserEvent::SelectAgent is processed. This action handler is generic for all clients.
         // TUI doesn't need scrollback pushed - it reads directly from vt100 parser.
 
         client.receive_response(Response::agent_selected(&agent_key));
@@ -1139,12 +1152,23 @@ fn spawn_agent_sync(
         Ok(result) => {
             log::info!("Client {} created agent: {}", client_id, result.session_key);
 
+            // Register tunnel for HTTP forwarding if tunnel port allocated
             if let Some(port) = result.tunnel_port {
                 let tm = Arc::clone(&hub.tunnel_manager);
                 let key = result.session_key.clone();
                 hub.tokio_runtime.spawn(async move {
                     tm.register_agent(key, port).await;
                 });
+            }
+
+            // Connect agent's channels (terminal + preview if tunnel exists)
+            if let Some(agent_index) = hub
+                .state
+                .agents
+                .keys()
+                .position(|k| k == &result.session_key)
+            {
+                hub.connect_agent_channels(&result.session_key, agent_index);
             }
 
             if let Some(client) = hub.clients.get_mut(&client_id) {
@@ -2905,8 +2929,9 @@ mod tests {
 
     /// TEST: Output not routed to disconnected browser.
     ///
-    /// After browser disconnects, PTY output should not be routed to it.
-    /// This verifies the viewer index is properly used for routing decisions.
+    /// After browser disconnects, it should no longer be in the viewer index.
+    /// With agent-owned channels, output routing uses viewers_of() to determine
+    /// which browsers to send to.
     #[test]
     fn test_output_not_routed_to_disconnected_browser() {
         let (mut hub, _td1, _td2) = setup_hub_with_scrollable_agents();
@@ -2925,19 +2950,8 @@ mod tests {
         // Browser disconnects
         dispatch(&mut hub, HubAction::ClientDisconnected { client_id: browser_id.clone() });
 
-        // No viewers - output should not be routed anywhere
+        // No viewers after disconnect - output routing will skip this agent
         assert_eq!(hub.clients.viewer_count("agent-1"), 0);
-
-        // Broadcast PTY output - should be a no-op since no viewers
-        // This verifies the routing logic handles empty viewer list gracefully
-        hub.broadcast_pty_output("agent-1", b"test output");
-
-        // Drain browser outputs - should be empty since browser was unregistered
-        let outputs = hub.drain_browser_outputs();
-        assert!(
-            outputs.is_empty(),
-            "No output should be buffered for disconnected browser"
-        );
     }
 
     // === TUI Menu Tests ===
