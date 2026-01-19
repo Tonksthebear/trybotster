@@ -33,6 +33,8 @@ Rails.application.routes.draw do
       resources :messages, only: [ :index, :update ]
       resources :notifications, only: [ :create ]
       resource :connection, only: [ :show ]
+      # Agent terminal view by index
+      resources :agents, only: [ :show ], param: :index
     end
   end
 

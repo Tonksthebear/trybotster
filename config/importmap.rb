@@ -18,4 +18,5 @@ pin_all_from "app/javascript/workers", under: "workers"
 # Encrypted transport layer for preview
 pin_all_from "app/javascript/transport", under: "transport"
 pin_all_from "app/javascript/preview", under: "preview"
+pin_all_from "app/javascript/channels", under: "channels"
 pin "@tailwindplus/elements", to: "@tailwindplus--elements.js" # @1.0.22

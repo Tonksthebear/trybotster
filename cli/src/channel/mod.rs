@@ -49,6 +49,7 @@
 
 pub mod action_cable;
 pub mod compression;
+pub mod reliable;
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -268,5 +269,6 @@ impl SharedConnectionState {
 }
 
 // Re-exports
-pub use action_cable::{ActionCableChannel, ChannelSenderHandle};
+pub use action_cable::{ActionCableChannel, ActionCableChannelBuilder, ChannelSenderHandle};
 pub use compression::{maybe_compress, maybe_decompress, should_compress_response};
+pub use reliable::{ReliableMessage, ReliableReceiver, ReliableSender, ReliableSession};

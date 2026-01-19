@@ -8,6 +8,7 @@ import {
   ConnectionState,
   ConnectionError,
 } from "signal";
+import { Channel } from "channels/channel";
 
 /**
  * Connection Controller - Signal Protocol E2E Encryption
@@ -124,23 +125,25 @@ export default class extends Controller {
     workerUrl: String,
     wasmJsUrl: String,
     wasmBinaryUrl: String,
-    agentIndex: { type: Number, default: 0 },  // Per-agent channel routing
+    agentIndex: { type: Number, default: 0 }, // Per-agent channel routing
   };
 
   static classes = ["securityBannerBase"];
 
   connect() {
     this.signalSession = null;
-    this.hubSubscription = null;      // Hub-level messages (agent list, creation progress)
-    this.terminalSubscription = null; // Per-agent terminal I/O
-    this.subscription = null;         // Legacy alias for terminalSubscription
+    this.hubChannel = null; // Hub channel with reliability (agent list, creation progress)
+    this.hubSubscription = null; // Raw ActionCable subscription for hub (internal)
+    this.terminalChannel = null; // Terminal channel with reliability (PTY I/O)
+    this.terminalSubscription = null; // Raw ActionCable subscription for terminal (internal)
+    this.subscription = null; // Legacy alias for terminalSubscription
     this.hubId = null;
     this.ourIdentityKey = null;
     this.connected = false;
     this.state = ConnectionState.DISCONNECTED;
     this.errorReason = null;
     this.handshakeTimer = null;
-    this.currentAgentIndex = this.agentIndexValue;  // Track which agent we're subscribed to
+    this.currentAgentIndex = this.agentIndexValue; // Track which agent we're subscribed to
 
     // Don't overwrite listeners - outlet callbacks may have already registered
     if (!this.listeners) {
@@ -224,14 +227,21 @@ export default class extends Controller {
     try {
       // Step 1: Load Signal WASM
       this.setState(ConnectionState.LOADING_WASM);
-      this.updateStatus("Loading encryption...", "Initializing Signal Protocol");
+      this.updateStatus(
+        "Loading encryption...",
+        "Initializing Signal Protocol",
+      );
 
       try {
-        await initSignal(this.workerUrlValue, this.wasmJsUrlValue, this.wasmBinaryUrlValue);
+        await initSignal(
+          this.workerUrlValue,
+          this.wasmJsUrlValue,
+          this.wasmBinaryUrlValue,
+        );
       } catch (wasmError) {
         this.setError(
           ConnectionError.WASM_LOAD_FAILED,
-          `Failed to load encryption: ${wasmError.message}`
+          `Failed to load encryption: ${wasmError.message}`,
         );
         return;
       }
@@ -245,7 +255,7 @@ export default class extends Controller {
       } catch (sessionError) {
         this.setError(
           ConnectionError.SESSION_CREATE_FAILED,
-          `Encryption setup failed: ${sessionError.message}`
+          `Encryption setup failed: ${sessionError.message}`,
         );
         return;
       }
@@ -253,7 +263,7 @@ export default class extends Controller {
       if (!this.signalSession) {
         this.setError(
           ConnectionError.NO_BUNDLE,
-          "No encryption bundle. Scan QR code to connect."
+          "No encryption bundle. Scan QR code to connect.",
         );
         return;
       }
@@ -263,14 +273,17 @@ export default class extends Controller {
 
       // Step 3: Subscribe to Action Cable channel
       this.setState(ConnectionState.SUBSCRIBING);
-      this.updateStatus("Connecting to server...", "Establishing secure channel");
+      this.updateStatus(
+        "Connecting to server...",
+        "Establishing secure channel",
+      );
 
       try {
         await this.subscribeToChannel();
       } catch (subError) {
         this.setError(
           ConnectionError.SUBSCRIBE_REJECTED,
-          `Connection rejected: ${subError.message}`
+          `Connection rejected: ${subError.message}`,
         );
         return;
       }
@@ -288,7 +301,7 @@ export default class extends Controller {
       console.error("[Connection] Failed to initialize:", error);
       this.setError(
         ConnectionError.WEBSOCKET_ERROR,
-        `Connection error: ${error.message}`
+        `Connection error: ${error.message}`,
       );
     }
   }
@@ -300,16 +313,13 @@ export default class extends Controller {
     if (urlBundle) {
       // Fresh bundle from QR code - always use it (replaces any cached session)
       console.log("[Connection] Creating new session from URL bundle");
-      this.signalSession = await SignalSession.create(
-        urlBundle,
-        this.hubId
-      );
+      this.signalSession = await SignalSession.create(urlBundle, this.hubId);
       // Clear fragment after successful session creation (clean URL)
       if (window.history.replaceState) {
         window.history.replaceState(
           null,
           "",
-          window.location.pathname + window.location.search
+          window.location.pathname + window.location.search,
         );
       }
     } else {
@@ -319,7 +329,7 @@ export default class extends Controller {
       if (this.signalSession) {
         console.log(
           "[Connection] Restored cached session for hub:",
-          this.hubId
+          this.hubId,
         );
       }
       // If no cached session, user needs to scan QR code
@@ -338,6 +348,7 @@ export default class extends Controller {
 
   subscribeToHubChannel() {
     return new Promise((resolve, reject) => {
+      // Create raw ActionCable subscription
       this.hubSubscription = consumer.subscriptions.create(
         {
           channel: "HubChannel",
@@ -347,10 +358,24 @@ export default class extends Controller {
         {
           connected: () => {
             console.log("[Connection] HubChannel connected");
+            // Create Channel wrapper with E2E encryption and reliable delivery
+            this.hubChannel = Channel.builder(this.hubSubscription)
+              .session(this.signalSession)
+              .reliable(true)
+              .onMessage((msg) => this.handleDecryptedMessage(msg))
+              .onConnect(() => console.log("[Connection] Hub channel ready"))
+              .onDisconnect(() => this.handleDisconnect())
+              .build();
+            this.hubChannel.markConnected();
             resolve();
           },
           disconnected: () => {
             console.log("[Connection] HubChannel disconnected");
+            // Clean up channel
+            if (this.hubChannel) {
+              this.hubChannel.destroy();
+              this.hubChannel = null;
+            }
             // Hub disconnect is critical - trigger reconnect
             this.handleDisconnect();
           },
@@ -359,10 +384,12 @@ export default class extends Controller {
             reject(new Error("Hub subscription rejected - hub may be offline"));
           },
           received: async (data) => {
-            // Hub-level messages (agent list, creation progress, etc.)
-            await this.handleReceived(data);
+            // Route through Channel's receive method (handles decryption + reliability)
+            if (this.hubChannel) {
+              await this.hubChannel.receive(data);
+            }
           },
-        }
+        },
       );
     });
   }
@@ -373,28 +400,63 @@ export default class extends Controller {
         {
           channel: "TerminalRelayChannel",
           hub_id: this.hubId,
-          agent_index: agentIndex,  // Per-agent channel routing
+          agent_index: agentIndex, // Per-agent channel routing
           browser_identity: this.ourIdentityKey,
         },
         {
           connected: () => {
-            console.log(`[Connection] TerminalRelayChannel connected to agent ${agentIndex}`);
+            console.log(
+              `[Connection] TerminalRelayChannel connected to agent ${agentIndex}`,
+            );
+            // Create Channel wrapper with E2E encryption and reliable delivery
+            this.terminalChannel = Channel.builder(this.terminalSubscription)
+              .session(this.signalSession)
+              .reliable(true)
+              .onMessage((msg) => this.handleDecryptedMessage(msg))
+              .onConnect(() =>
+                console.log("[Connection] Terminal channel ready"),
+              )
+              .onDisconnect(() =>
+                console.log("[Connection] Terminal channel disconnected"),
+              )
+              .build();
+            this.terminalChannel.markConnected();
             this.currentAgentIndex = agentIndex;
             resolve();
           },
           disconnected: () => {
             console.log("[Connection] TerminalRelayChannel disconnected");
-            // Terminal disconnect is less critical - just log
+            // Clean up channel
+            if (this.terminalChannel) {
+              this.terminalChannel.destroy();
+              this.terminalChannel = null;
+            }
           },
           rejected: () => {
-            console.error("[Connection] TerminalRelayChannel subscription rejected");
+            console.error(
+              "[Connection] TerminalRelayChannel subscription rejected",
+            );
             reject(new Error("Terminal subscription rejected"));
           },
           received: async (data) => {
-            // Per-agent terminal I/O
-            await this.handleReceived(data);
+            // Handle special server messages before Channel processing
+            if (data.sender_key_distribution) {
+              await this.signalSession?.processSenderKeyDistribution(
+                data.sender_key_distribution,
+              );
+              console.log("[Connection] Processed SenderKey distribution");
+              return;
+            }
+            if (data.error) {
+              this.setError(ConnectionError.WEBSOCKET_ERROR, data.error);
+              return;
+            }
+            // Route encrypted messages through Channel (handles decryption + reliability)
+            if (this.terminalChannel) {
+              await this.terminalChannel.receive(data);
+            }
           },
-        }
+        },
       );
       // Legacy alias
       this.subscription = this.terminalSubscription;
@@ -415,7 +477,7 @@ export default class extends Controller {
     if (!sent) {
       this.setError(
         ConnectionError.HANDSHAKE_FAILED,
-        "Failed to send handshake"
+        "Failed to send handshake",
       );
       return;
     }
@@ -428,7 +490,7 @@ export default class extends Controller {
         console.warn("[Connection] Handshake timeout - no ACK from CLI");
         this.setError(
           ConnectionError.HANDSHAKE_TIMEOUT,
-          "CLI did not respond. Try refreshing the page."
+          "CLI did not respond. Try refreshing the page.",
         );
         // DON'T clear session on timeout - this is likely a transient network issue,
         // not a session problem. Clearing would force unnecessary QR re-scan.
@@ -448,59 +510,6 @@ export default class extends Controller {
     return "Browser";
   }
 
-  async handleReceived(data) {
-    // Skip if session is not ready
-    if (!this.signalSession) {
-      return;
-    }
-
-    try {
-      // Data from server is an encrypted SignalEnvelope
-      // Server routes messages to our dedicated stream, so all messages here are for us
-      if (data.envelope) {
-        const decrypted = await this.signalSession.decrypt(data.envelope);
-        this.handleDecryptedMessage(decrypted);
-      } else if (data.sender_key_distribution) {
-        // Handle SenderKey distribution for group messaging
-        await this.signalSession.processSenderKeyDistribution(
-          data.sender_key_distribution
-        );
-        console.log("[Connection] Processed SenderKey distribution");
-      } else if (data.error) {
-        this.setError(ConnectionError.WEBSOCKET_ERROR, data.error);
-      }
-    } catch (error) {
-      console.error("[Connection] Failed to handle received data:", error);
-
-      // Check if this is a session/crypto error
-      // DON'T automatically clear the session - this is too aggressive and forces
-      // unnecessary QR re-scans. Most crypto errors are transient (network issues,
-      // timing problems) and will resolve on retry.
-      //
-      // The session should only be cleared if:
-      // 1. User explicitly requests it (via resetSession())
-      // 2. CLI confirms identity has changed (future: implement identity verification)
-      const errorMsg = error.message || error.toString();
-      if (
-        errorMsg.includes("decrypt") ||
-        errorMsg.includes("prekey") ||
-        errorMsg.includes("session") ||
-        errorMsg.includes("invalid") ||
-        errorMsg.includes("MAC")
-      ) {
-        console.warn(
-          "[Connection] Crypto error (keeping session for retry):",
-          errorMsg
-        );
-        this.setError(
-          ConnectionError.DECRYPT_FAILED,
-          "Decryption failed. Try refreshing the page."
-        );
-        // Session is preserved - user can refresh to retry
-      }
-    }
-  }
-
   handleDecryptedMessage(message) {
     // Handle handshake acknowledgment
     if (message.type === "handshake_ack") {
@@ -517,7 +526,7 @@ export default class extends Controller {
       this.setState(ConnectionState.CONNECTED);
       this.updateStatus(
         "Connected",
-        `E2E encrypted to ${this.hubId.substring(0, 8)}...`
+        `E2E encrypted to ${this.hubId.substring(0, 8)}...`,
       );
 
       // Notify all registered listeners
@@ -577,34 +586,56 @@ export default class extends Controller {
   }
 
   /**
-   * Send encrypted message via Action Cable.
-   * Hub-level messages go through hubSubscription.
+   * Send encrypted message via Hub Channel with reliable delivery.
+   * The Channel handles reliability (seq numbers, ACKs, retransmit) and
+   * encryption internally.
    */
   async sendEncrypted(message) {
-    try {
-      const envelope = await this.signalSession.encrypt(message);
-      console.log("[Connection] Encrypted envelope, sending via hub relay");
-      // Hub-level messages (handshake, commands) go through HubChannel
-      this.hubSubscription.perform("relay", { envelope });
-      return true;
-    } catch (error) {
-      console.error("[Connection] Encryption failed:", error);
-      return false;
+    if (this.hubChannel) {
+      // Send through hub channel (handles reliability + encryption)
+      return await this.hubChannel.send(message);
+    } else {
+      // Fallback: no channel yet (during early setup)
+      try {
+        const envelope = await this.signalSession.encrypt(message);
+        this.hubSubscription.perform("relay", { envelope });
+        return true;
+      } catch (error) {
+        console.error("[Connection] Encryption failed:", error);
+        return false;
+      }
     }
   }
 
   /**
    * Send raw input to CLI (terminal keystrokes).
+   * Uses terminal channel for PTY I/O (not hub channel).
    */
   async sendInput(inputData) {
-    return await this.send("input", { data: inputData });
+    return await this.sendTerminalMessage("input", { data: inputData });
   }
 
   /**
    * Resize the terminal.
+   * Uses terminal channel for PTY I/O (not hub channel).
    */
   async sendResize(cols, rows) {
-    return await this.send("resize", { cols, rows });
+    return await this.sendTerminalMessage("resize", { cols, rows });
+  }
+
+  /**
+   * Send message via terminal channel (for PTY I/O).
+   * Separate from hub channel which handles agent list, creation, etc.
+   */
+  async sendTerminalMessage(type, data = {}) {
+    if (!this.terminalChannel || !this.connected || !this.signalSession) {
+      console.warn("[Connection] Cannot send terminal message - not connected");
+      return false;
+    }
+
+    const message = { type, ...data };
+    console.log("[Connection] Sending terminal message:", type);
+    return await this.terminalChannel.send(message);
   }
 
   requestAgents() {
@@ -635,9 +666,15 @@ export default class extends Controller {
       return false;
     }
 
-    console.log(`[Connection] Switching from agent ${this.currentAgentIndex} to ${agentIndex}`);
+    console.log(
+      `[Connection] Switching from agent ${this.currentAgentIndex} to ${agentIndex}`,
+    );
 
-    // Unsubscribe from current agent's terminal channel (keep hub subscription)
+    // Clean up current agent's terminal channel (keep hub subscription)
+    if (this.terminalChannel) {
+      this.terminalChannel.destroy();
+      this.terminalChannel = null;
+    }
     if (this.terminalSubscription) {
       this.terminalSubscription.unsubscribe();
       this.terminalSubscription = null;
@@ -657,12 +694,18 @@ export default class extends Controller {
 
       return true;
     } catch (error) {
-      console.error(`[Connection] Failed to switch to agent ${agentIndex}:`, error);
+      console.error(
+        `[Connection] Failed to switch to agent ${agentIndex}:`,
+        error,
+      );
       // Try to reconnect to previous agent's terminal channel
       try {
         await this.subscribeToTerminalChannel(this.currentAgentIndex);
       } catch (reconnectError) {
-        console.error("[Connection] Failed to reconnect to previous agent:", reconnectError);
+        console.error(
+          "[Connection] Failed to reconnect to previous agent:",
+          reconnectError,
+        );
         this.handleDisconnect();
       }
       return false;
@@ -677,7 +720,10 @@ export default class extends Controller {
   }
 
   deleteAgent(agentId, deleteWorktree = false) {
-    return this.send("delete_agent", { id: agentId, delete_worktree: deleteWorktree });
+    return this.send("delete_agent", {
+      id: agentId,
+      delete_worktree: deleteWorktree,
+    });
   }
 
   isConnected() {
@@ -704,7 +750,7 @@ export default class extends Controller {
     this.cleanup();
     this.setError(
       ConnectionError.SESSION_CREATE_FAILED,
-      "Session cleared. Scan QR code to reconnect."
+      "Session cleared. Scan QR code to reconnect.",
     );
   }
 
@@ -744,7 +790,10 @@ export default class extends Controller {
       return;
     }
 
-    console.log("[Connection] Received invite URL:", url.substring(0, 50) + "...");
+    console.log(
+      "[Connection] Received invite URL:",
+      url.substring(0, 50) + "...",
+    );
 
     // Try native share first (mobile), fall back to clipboard
     if (navigator.share && /iPhone|iPad|Android/i.test(navigator.userAgent)) {
@@ -834,12 +883,21 @@ export default class extends Controller {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;
     }
-    // Unsubscribe from hub channel
+    // Clean up hub channel (includes reliable delivery layer)
+    if (this.hubChannel) {
+      this.hubChannel.destroy();
+      this.hubChannel = null;
+    }
+    // Unsubscribe from hub subscription
     if (this.hubSubscription) {
       this.hubSubscription.unsubscribe();
       this.hubSubscription = null;
     }
-    // Unsubscribe from terminal channel
+    // Clean up terminal channel
+    if (this.terminalChannel) {
+      this.terminalChannel.destroy();
+      this.terminalChannel = null;
+    }
     if (this.terminalSubscription) {
       this.terminalSubscription.unsubscribe();
       this.terminalSubscription = null;
@@ -861,50 +919,70 @@ export default class extends Controller {
     // Update based on current state
     const config = STATUS_CONFIG[this.state] || STATUS_CONFIG.disconnected;
 
-    if (this.hasStatusIconTarget) {
-      this.statusIconTarget.innerHTML = config.icon;
-      // Apply color class to icon
-      this.statusIconTarget.className = `shrink-0 ${config.iconClass}`;
+    // Find status elements - use targets if available, fallback to global query
+    // This supports both: controller wrapping content, and separate permanent container
+    const statusIcon = this.hasStatusIconTarget
+      ? this.statusIconTarget
+      : document.querySelector("[data-connection-target='statusIcon']");
+    const statusText = this.hasStatusTextTarget
+      ? this.statusTextTarget
+      : document.querySelector("[data-connection-target='statusText']");
+
+    if (statusIcon) {
+      statusIcon.innerHTML = config.icon;
+      statusIcon.className = `shrink-0 ${config.iconClass}`;
     }
 
-    if (this.hasStatusTextTarget) {
-      this.statusTextTarget.textContent = text || config.text;
-      this.statusTextTarget.className = config.textClass;
+    if (statusText) {
+      statusText.textContent = text || config.text;
+      statusText.className = config.textClass;
     }
 
-    if (this.hasStatusDetailTarget) {
-      this.statusDetailTarget.textContent = detail;
-      // Show detail in appropriate color
+    const statusDetail = this.hasStatusDetailTarget
+      ? this.statusDetailTarget
+      : document.querySelector("[data-connection-target='statusDetail']");
+    if (statusDetail) {
+      statusDetail.textContent = detail;
       if (this.state === ConnectionState.ERROR) {
-        this.statusDetailTarget.className = "text-xs text-red-400/80 font-mono max-w-xs text-right";
+        statusDetail.className = "text-xs text-red-400/80 font-mono max-w-xs text-right";
       } else if (this.state === ConnectionState.CONNECTED) {
-        this.statusDetailTarget.className = "text-xs text-emerald-400/60 font-mono";
+        statusDetail.className = "text-xs text-emerald-400/60 font-mono";
       } else {
-        this.statusDetailTarget.className = "text-xs text-zinc-500 font-mono";
+        statusDetail.className = "text-xs text-zinc-500 font-mono";
       }
     }
 
     // Update mobile status (compact)
-    if (this.hasStatusIconMobileTarget) {
-      // Use smaller icon for mobile
+    const statusIconMobile = this.hasStatusIconMobileTarget
+      ? this.statusIconMobileTarget
+      : document.querySelector("[data-connection-target='statusIconMobile']");
+    if (statusIconMobile) {
       const mobileIcon = config.icon.replace(/size-4/g, "size-3");
-      this.statusIconMobileTarget.innerHTML = mobileIcon;
-      this.statusIconMobileTarget.className = `shrink-0 ${config.iconClass}`;
+      statusIconMobile.innerHTML = mobileIcon;
+      statusIconMobile.className = `shrink-0 ${config.iconClass}`;
     }
 
-    if (this.hasStatusTextMobileTarget) {
-      // Shorter text for mobile
-      const shortText = (text || config.text).replace("Initializing...", "Init...").replace("Connecting...", "...").replace("Connected", "Live");
-      this.statusTextMobileTarget.textContent = shortText;
-      this.statusTextMobileTarget.className = `text-xs shrink-0 ${config.textClass}`;
+    const statusTextMobile = this.hasStatusTextMobileTarget
+      ? this.statusTextMobileTarget
+      : document.querySelector("[data-connection-target='statusTextMobile']");
+    if (statusTextMobile) {
+      const shortText = (text || config.text)
+        .replace("Initializing...", "Init...")
+        .replace("Connecting...", "...")
+        .replace("Connected", "Live");
+      statusTextMobile.textContent = shortText;
+      statusTextMobile.className = `text-xs shrink-0 ${config.textClass}`;
     }
 
     // Show/hide disconnect button
-    if (this.hasDisconnectBtnTarget) {
+    const disconnectBtn = this.hasDisconnectBtnTarget
+      ? this.disconnectBtnTarget
+      : document.querySelector("[data-connection-target='disconnectBtn']");
+    if (disconnectBtn) {
       if (this.state === ConnectionState.CONNECTED) {
-        this.disconnectBtnTarget.classList.remove("hidden");
+        disconnectBtn.classList.remove("hidden");
       } else {
-        this.disconnectBtnTarget.classList.add("hidden");
+        disconnectBtn.classList.add("hidden");
       }
     }
 
@@ -913,7 +991,22 @@ export default class extends Controller {
   }
 
   updateSecurityBanner() {
-    if (!this.hasSecurityBannerTarget) return;
+    // Find elements with fallback to global query
+    const securityBanner = this.hasSecurityBannerTarget
+      ? this.securityBannerTarget
+      : document.querySelector("[data-connection-target='securityBanner']");
+    const securityIcon = this.hasSecurityIconTarget
+      ? this.securityIconTarget
+      : document.querySelector("[data-connection-target='securityIcon']");
+    const securityText = this.hasSecurityTextTarget
+      ? this.securityTextTarget
+      : document.querySelector("[data-connection-target='securityText']");
+
+    if (!securityBanner) {
+      // No security banner on this page, just update terminal badge
+      this.updateTerminalBadge();
+      return;
+    }
 
     const lockIcon = `<svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
       <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
@@ -925,19 +1018,19 @@ export default class extends Controller {
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
     </svg>`;
 
-    // Use Stimulus classes API for base classes (responsive hiding)
-    const baseClasses = this.hasSecurityBannerBaseClass ? this.securityBannerBaseClass : "";
+    const baseClasses = this.hasSecurityBannerBaseClass
+      ? this.securityBannerBaseClass
+      : "";
 
     switch (this.state) {
       case ConnectionState.CONNECTED:
-        this.securityBannerTarget.className =
-          `${baseClasses} border-b border-emerald-500/20 bg-emerald-500/5 transition-colors duration-300`;
-        if (this.hasSecurityIconTarget) {
-          this.securityIconTarget.innerHTML = lockIcon;
-          this.securityIconTarget.className = "shrink-0 text-emerald-400";
+        securityBanner.className = `${baseClasses} border-b border-emerald-500/20 bg-emerald-500/5 transition-colors duration-300`;
+        if (securityIcon) {
+          securityIcon.innerHTML = lockIcon;
+          securityIcon.className = "shrink-0 text-emerald-400";
         }
-        if (this.hasSecurityTextTarget) {
-          this.securityTextTarget.innerHTML = `
+        if (securityText) {
+          securityText.innerHTML = `
             <strong class="text-emerald-300">Signal Protocol E2E Encryption</strong>
             <span class="text-emerald-200/80">&mdash; Double Ratchet + Post-Quantum (Kyber)</span>
           `;
@@ -945,14 +1038,13 @@ export default class extends Controller {
         break;
 
       case ConnectionState.ERROR:
-        this.securityBannerTarget.className =
-          `${baseClasses} border-b border-red-500/20 bg-red-500/5 transition-colors duration-300`;
-        if (this.hasSecurityIconTarget) {
-          this.securityIconTarget.innerHTML = errorIcon;
-          this.securityIconTarget.className = "shrink-0 text-red-400";
+        securityBanner.className = `${baseClasses} border-b border-red-500/20 bg-red-500/5 transition-colors duration-300`;
+        if (securityIcon) {
+          securityIcon.innerHTML = errorIcon;
+          securityIcon.className = "shrink-0 text-red-400";
         }
-        if (this.hasSecurityTextTarget) {
-          this.securityTextTarget.innerHTML = `
+        if (securityText) {
+          securityText.innerHTML = `
             <strong class="text-red-300">Connection Failed</strong>
             <span class="text-red-200/80">&mdash; ${this.errorReason || "Unable to establish secure connection"}</span>
           `;
@@ -961,14 +1053,13 @@ export default class extends Controller {
 
       case ConnectionState.CHANNEL_CONNECTED:
       case ConnectionState.HANDSHAKE_SENT:
-        this.securityBannerTarget.className =
-          `${baseClasses} border-b border-amber-500/20 bg-amber-500/5 transition-colors duration-300`;
-        if (this.hasSecurityIconTarget) {
-          this.securityIconTarget.innerHTML = unlockIcon;
-          this.securityIconTarget.className = "shrink-0 text-amber-400";
+        securityBanner.className = `${baseClasses} border-b border-amber-500/20 bg-amber-500/5 transition-colors duration-300`;
+        if (securityIcon) {
+          securityIcon.innerHTML = unlockIcon;
+          securityIcon.className = "shrink-0 text-amber-400";
         }
-        if (this.hasSecurityTextTarget) {
-          this.securityTextTarget.innerHTML = `
+        if (securityText) {
+          securityText.innerHTML = `
             <strong class="text-amber-300">Establishing E2E Encryption</strong>
             <span class="text-amber-200/80">&mdash; Waiting for CLI acknowledgment...</span>
           `;
@@ -976,14 +1067,13 @@ export default class extends Controller {
         break;
 
       default:
-        this.securityBannerTarget.className =
-          `${baseClasses} border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300`;
-        if (this.hasSecurityIconTarget) {
-          this.securityIconTarget.innerHTML = unlockIcon;
-          this.securityIconTarget.className = "shrink-0 text-zinc-500";
+        securityBanner.className = `${baseClasses} border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300`;
+        if (securityIcon) {
+          securityIcon.innerHTML = unlockIcon;
+          securityIcon.className = "shrink-0 text-zinc-500";
         }
-        if (this.hasSecurityTextTarget) {
-          this.securityTextTarget.innerHTML = `
+        if (securityText) {
+          securityText.innerHTML = `
             <span class="text-zinc-400">Establishing secure connection...</span>
           `;
         }
@@ -995,7 +1085,12 @@ export default class extends Controller {
   }
 
   updateTerminalBadge() {
-    if (!this.hasTerminalBadgeTarget) return;
+    // Find terminal badge with fallback to global query
+    const terminalBadge = this.hasTerminalBadgeTarget
+      ? this.terminalBadgeTarget
+      : document.querySelector("[data-connection-target='terminalBadge']");
+
+    if (!terminalBadge) return;
 
     const lockIcon = `<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
       <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
@@ -1006,28 +1101,28 @@ export default class extends Controller {
 
     switch (this.state) {
       case ConnectionState.CONNECTED:
-        this.terminalBadgeTarget.className =
+        terminalBadge.className =
           "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-emerald-500/10 text-emerald-400 rounded";
-        this.terminalBadgeTarget.innerHTML = `${lockIcon}<span>E2E Encrypted</span>`;
+        terminalBadge.innerHTML = `${lockIcon}<span>E2E Encrypted</span>`;
         break;
 
       case ConnectionState.ERROR:
-        this.terminalBadgeTarget.className =
+        terminalBadge.className =
           "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-red-500/10 text-red-400 rounded";
-        this.terminalBadgeTarget.innerHTML = `${unlockIcon}<span>Not Connected</span>`;
+        terminalBadge.innerHTML = `${unlockIcon}<span>Not Connected</span>`;
         break;
 
       case ConnectionState.CHANNEL_CONNECTED:
       case ConnectionState.HANDSHAKE_SENT:
-        this.terminalBadgeTarget.className =
+        terminalBadge.className =
           "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-amber-500/10 text-amber-400 rounded";
-        this.terminalBadgeTarget.innerHTML = `${unlockIcon}<span>Handshaking...</span>`;
+        terminalBadge.innerHTML = `${unlockIcon}<span>Handshaking...</span>`;
         break;
 
       default:
-        this.terminalBadgeTarget.className =
+        terminalBadge.className =
           "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-zinc-700/50 text-zinc-500 rounded";
-        this.terminalBadgeTarget.innerHTML = `${unlockIcon}<span>Connecting...</span>`;
+        terminalBadge.innerHTML = `${unlockIcon}<span>Connecting...</span>`;
         break;
     }
   }

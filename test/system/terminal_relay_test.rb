@@ -34,11 +34,23 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     # Reaching "connected" proves the full crypto handshake worked:
     # X3DH key agreement, encrypted handshake, encrypted ACK
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    begin
+      assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    rescue Minitest::Assertion => e
+      puts "\n=== CLI OUTPUT ON FAILURE ===\n#{@cli.recent_output(lines: 100)}\n=== END CLI OUTPUT ===\n"
+      puts "\n=== CLI LOG FILE ===\n#{@cli.log_contents(lines: 200)}\n=== END CLI LOG ===\n"
+      # Capture browser console logs
+      begin
+        logs = page.driver.browser.logs.get(:browser)
+        puts "\n=== BROWSER CONSOLE ===\n#{logs.map { |log| "#{log.level}: #{log.message}" }.join("\n")}\n=== END BROWSER CONSOLE ===\n"
+      rescue => log_error
+        puts "Failed to get browser logs: #{log_error.message}"
+      end
+      raise e
+    end
 
-    # Security indicator confirms E2E - check terminal badge which is always visible
-    # The security text is in a desktop-only banner, but the terminal badge shows on all viewports
-    assert_selector "[data-connection-target='terminalBadge']", text: /E2E|encrypted/i, wait: 10
+    # Connection established - landing page shows connected status
+    # Terminal badge is only on agent pages, so just verify connection status here
   end
 
   test "CLI connection URL matches Rails hubs#show route" do
@@ -88,10 +100,29 @@ class TerminalRelayTest < ApplicationSystemTestCase
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
 
+    # Brief pause to let any pending messages complete
+    sleep 0.5
+
     page.refresh
 
     # Session restored from IndexedDB
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    begin
+      assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    rescue Minitest::Assertion => e
+      # Capture debug info on failure
+      puts "\n=== CLI LOG ON REFRESH FAILURE ==="
+      puts @cli.log_contents(lines: 100)
+      puts "=== END CLI LOG ==="
+      begin
+        logs = page.driver.browser.logs.get(:browser)
+        puts "\n=== BROWSER CONSOLE ==="
+        puts logs.map { |log| "#{log.level}: #{log.message}" }.join("\n")
+        puts "=== END BROWSER CONSOLE ==="
+      rescue => log_error
+        puts "Failed to get browser logs: #{log_error.message}"
+      end
+      raise e
+    end
   end
 
   test "second browser connects via shared invite link" do
@@ -144,8 +175,8 @@ class TerminalRelayTest < ApplicationSystemTestCase
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
-    # Agent appearing proves encrypted message flow works
-    assert_selector ".sidebar-agents-list button", text: /test-repo-999/, wait: 10
+    # Agent appearing proves encrypted message flow works (now rendered as links)
+    assert_selector ".sidebar-agents-list a", text: /test-repo-999/, wait: 10
   end
 
   test "agent selection roundtrip works" do
@@ -156,24 +187,17 @@ class TerminalRelayTest < ApplicationSystemTestCase
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
-    # Select agent
-    within ".sidebar-agents-list" do
-      find("button", text: /test-repo-888/).click
-    end
+    # Select agent (navigates to agent page via Turbo)
+    first(:link, text: /test-repo-888/).click
+
+    # Wait for agent page to load (terminal container is only on agent page)
+    assert_selector "[data-terminal-display-target='container']", wait: 10
 
     # CLI responds with selection confirmation
     assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-888/, wait: 10
   end
 
   test "multiple agents can be switched" do
-    # SKIP: Click handlers on re-rendered buttons don't fire in Capybara tests
-    # The first click works, but subsequent clicks after updateAgentList re-renders
-    # the sidebar buttons don't trigger the event handlers. This appears to be a
-    # test environment issue - the actual UI works in manual testing.
-    # TODO: Investigate if this is related to Stimulus controller lifecycle or
-    # Chrome DevTools event handling in headless mode.
-    skip "Click handlers on re-rendered buttons don't fire in test environment"
-
     @cli = start_cli_with_agent_support(@hub, timeout: 30)
 
     # Spawn two agents
@@ -183,16 +207,16 @@ class TerminalRelayTest < ApplicationSystemTestCase
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
-    # Both visible
-    assert_selector ".sidebar-agents-list button", text: /test-repo-555/, wait: 10
-    assert_selector ".sidebar-agents-list button", text: /test-repo-556/
+    # Both visible (now as links)
+    assert_selector ".sidebar-agents-list a", text: /test-repo-555/, wait: 10
+    assert_selector ".sidebar-agents-list a", text: /test-repo-556/
 
-    # Click first agent
-    find(".sidebar-agents-list button", text: /test-repo-555/).click
+    # Click first agent (link navigation)
+    first(:link, text: /test-repo-555/).click
     assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-555/, wait: 10
 
-    # Click second agent
-    find(".sidebar-agents-list button", text: /test-repo-556/).click
+    # Click second agent (link navigation)
+    first(:link, text: /test-repo-556/).click
     assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-556/, wait: 15
   end
 
@@ -204,8 +228,11 @@ class TerminalRelayTest < ApplicationSystemTestCase
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
-    # Select agent and send input
-    find(".sidebar-agents-list button", text: /test-repo-777/).click
+    # Select agent (navigates to agent page via Turbo)
+    first(:link, text: /test-repo-777/).click
+
+    # Wait for agent page to load
+    assert_selector "[data-terminal-display-target='container']", wait: 10
     assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-777/, wait: 10
 
     find("[data-terminal-display-target='container']").click
@@ -217,6 +244,74 @@ class TerminalRelayTest < ApplicationSystemTestCase
     assert_selector "[data-connection-target='status']", text: /connected/i
   end
 
+  test "full roundtrip: browser keystroke to CLI and output back to browser" do
+    # This test verifies the complete data flow through reliable delivery:
+    # 1. Browser sends keystroke → encrypted → reliable envelope → ActionCable → CLI
+    # 2. CLI receives, writes to PTY, PTY executes command
+    # 3. PTY output → encrypted → reliable envelope → ActionCable → Browser
+    # 4. Browser receives, decrypts, displays in terminal
+    @cli = start_cli_with_agent_support(@hub, timeout: 30)
+    create_and_wait_for_agent(@hub, issue_number: 888)
+
+    sign_in_as(@user)
+    visit @cli.connection_url
+    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+
+    # Select the agent (via link navigation)
+    first(:link, text: /test-repo-888/).click
+    assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-888/, wait: 10
+
+    # Wait for terminal to be ready
+    sleep 1
+
+    # Use a unique string that we can search for in the terminal output
+    unique_marker = "ROUNDTRIP_#{SecureRandom.hex(4)}"
+
+    # Send input directly via JavaScript to bypass xterm.js keyboard handling
+    # This tests the actual reliable delivery path
+    page.execute_script(<<~JS)
+      const controller = document.querySelector('[data-controller~="connection"]');
+      const connectionController = window.Stimulus.getControllerForElementAndIdentifier(controller, 'connection');
+      connectionController.sendInput("echo #{unique_marker}\\r");
+    JS
+
+    # Wait for the output to appear in the terminal display
+    # The terminal should show the echoed marker (proves full roundtrip worked)
+    begin
+      assert_text unique_marker, wait: 15
+    rescue Minitest::Assertion => e
+      puts "\n=== ROUNDTRIP TEST FAILURE ==="
+      puts "Expected to see '#{unique_marker}' in browser terminal"
+      puts "CLI log:\n#{@cli.log_contents(lines: 100)}"
+
+      # Capture browser console logs
+      begin
+        logs = page.driver.browser.logs.get(:browser)
+        puts "\n=== BROWSER CONSOLE ===\n#{logs.map { |log| "#{log.level}: #{log.message}" }.join("\n")}\n=== END BROWSER CONSOLE ===\n"
+      rescue => log_error
+        puts "Failed to get browser logs: #{log_error.message}"
+      end
+
+      # Check if xterm is initialized
+      xterm_check = page.execute_script(<<~JS)
+        const container = document.querySelector('[data-terminal-display-target="container"]');
+        const xtermScreen = container?.querySelector('.xterm-screen');
+        return {
+          hasContainer: !!container,
+          containerSize: container ? { w: container.offsetWidth, h: container.offsetHeight } : null,
+          hasXtermScreen: !!xtermScreen,
+          xtermScreenSize: xtermScreen ? { w: xtermScreen.offsetWidth, h: xtermScreen.offsetHeight } : null
+        };
+      JS
+      puts "\n=== XTERM DEBUG ===\n#{xterm_check.inspect}\n=== END XTERM DEBUG ===\n"
+
+      raise e
+    end
+
+    # Verify connection is still healthy after roundtrip
+    assert_selector "[data-connection-target='status']", text: /connected/i
+  end
+
   test "window resize flows through encrypted channel" do
     @cli = start_cli_with_agent_support(@hub, timeout: 30)
     create_and_wait_for_agent(@hub, issue_number: 666)
@@ -225,7 +320,8 @@ class TerminalRelayTest < ApplicationSystemTestCase
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
-    find(".sidebar-agents-list button", text: /test-repo-666/).click
+    # Select agent via link navigation
+    first(:link, text: /test-repo-666/).click
     assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-666/, wait: 10
 
     # Resize triggers encrypted resize message
@@ -246,7 +342,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
     # Click "New Agent" button (use first one - the + icon in agent list header)
-    find("button[title='New Agent']").click
+    first("button[title='New Agent']").click
 
     # Modal step 1 should be visible
     assert_selector "[data-agents-target='step1']", visible: true
@@ -277,7 +373,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     assert_text(/creating|worktree|starting/i, wait: 5)
 
     # Wait for agent to be created and progress to clear
-    assert_selector ".sidebar-agents-list button", text: /42/, wait: 60
+    assert_selector ".sidebar-agents-list a", text: /42/, wait: 60
 
     # Progress indicator should be gone
     assert_no_selector "[data-creating-indicator]"
@@ -291,7 +387,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
     # Open modal
-    find("button[title='New Agent']").click
+    first("button[title='New Agent']").click
     assert_selector "[data-agents-target='step1']", visible: true
 
     # Enter branch name and proceed
@@ -305,7 +401,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     click_button "Start Agent"
 
     # Should create agent with default behavior
-    assert_selector ".sidebar-agents-list button", text: /feature-test/, wait: 60
+    assert_selector ".sidebar-agents-list a", text: /feature-test/, wait: 60
   end
 
   test "user can go back from step 2 to step 1" do
@@ -316,7 +412,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
     # Navigate to step 2
-    find("button[title='New Agent']").click
+    first("button[title='New Agent']").click
     fill_in placeholder: "Issue # or branch name", with: "123"
     within "[data-agents-target='step1']" do
       click_button "Next"
@@ -339,7 +435,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
     # Open modal
-    find("button[title='New Agent']").click
+    first("button[title='New Agent']").click
     assert_selector "[data-agents-target='step1']", visible: true
 
     # Cancel
@@ -359,7 +455,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
     # Create agent
-    find("button[title='New Agent']").click
+    first("button[title='New Agent']").click
     fill_in placeholder: "Issue # or branch name", with: "789"
     within "[data-agents-target='step1']" do
       click_button "Next"
@@ -371,7 +467,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     assert_selector "[data-creating-indicator]", wait: 10
 
     # Eventually agent should appear and progress should clear
-    assert_selector ".sidebar-agents-list button", text: /789/, wait: 60
+    assert_selector ".sidebar-agents-list a", text: /789/, wait: 60
     assert_no_selector "[data-creating-indicator]"
   end
 
@@ -389,7 +485,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     sleep 2
 
     # Open modal
-    find("button[title='New Agent']").click
+    first("button[title='New Agent']").click
     assert_selector "[data-agents-target='step1']", visible: true
 
     # Wait for worktree list to populate
@@ -415,7 +511,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     click_button "Start Agent"
 
     # Agent should be created
-    assert_selector ".sidebar-agents-list button", wait: 60
+    assert_selector ".sidebar-agents-list a", wait: 60
   end
 
   test "pressing enter in branch input advances to step 2" do
@@ -426,7 +522,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
     # Open modal
-    find("button[title='New Agent']").click
+    first("button[title='New Agent']").click
     assert_selector "[data-agents-target='step1']", visible: true
 
     # Type and press enter
@@ -452,9 +548,9 @@ class TerminalRelayTest < ApplicationSystemTestCase
     Process.kill("KILL", @cli.pid)
     Process.wait(@cli.pid) rescue nil
 
-    # UI shouldn't crash
+    # UI shouldn't crash - landing page elements should still be present
     assert_selector "[data-controller~='connection']"
-    assert_selector "[data-terminal-display-target='container']"
+    assert_selector "[data-controller~='agents']"
   end
 
   test "each CLI instance has unique keys" do
@@ -468,6 +564,28 @@ class TerminalRelayTest < ApplicationSystemTestCase
     second_bundle = @cli.connection_url.split("#").last
 
     refute_equal first_bundle, second_bundle, "New CLI should have different keys"
+  end
+
+  test "connection remains stable over heartbeat interval" do
+    # Test that reliable delivery heartbeat ACKs keep connection alive
+    # The heartbeat interval is 5 seconds, so we wait 10+ seconds to verify
+    @cli = start_cli(@hub, timeout: 20)
+
+    sign_in_as(@user)
+    visit @cli.connection_url
+    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+
+    # Wait for at least 2 heartbeat intervals (5s each = 10s)
+    # Connection should remain stable due to heartbeat ACKs
+    sleep 12
+
+    # Connection should still be alive
+    assert_selector "[data-connection-target='status']", text: /connected/i
+
+    # Verify heartbeat ACKs are being sent (proves maintenance loop is running)
+    cli_log = @cli.log_contents(lines: 100)
+    assert_match(/heartbeat ACK/i, cli_log,
+      "CLI should have sent heartbeat ACK during idle period")
   end
 
   test "stale session requires new QR scan" do

@@ -434,12 +434,14 @@ impl Hub {
             agent_index
         );
 
-        // Create terminal channel
-        let mut terminal_channel = ActionCableChannel::encrypted(
-            crypto_service.clone(),
-            server_url.clone(),
-            api_key.clone(),
-        );
+        // Create terminal channel with E2E encryption and reliable delivery
+        // Must use reliable(true) to match browser's reliable delivery layer
+        let mut terminal_channel = ActionCableChannel::builder()
+            .server_url(&server_url)
+            .api_key(&api_key)
+            .crypto_service(crypto_service.clone())
+            .reliable(true)
+            .build();
 
         // Connect terminal channel synchronously using block_on
         let terminal_result = self.tokio_runtime.block_on(async {
