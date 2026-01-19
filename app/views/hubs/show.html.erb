@@ -1,197 +1,134 @@
-<% content_for :head do %>
-  <%= stylesheet_link_tag "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" %>
-<% end %>
-
 <%#
-  Multi-controller architecture:
-  - connection: Signal Protocol E2E encryption via ActionCable
-  - terminal-display: xterm.js rendering
-  - agents: Agent list and management (now in sidebar)
-
-  Communication:
-  - Events: connection:connected, connection:message, connection:disconnected
-  - Outlets: terminal-display and agents use connection outlet
+  Hub Landing Page
+  - Shows hub information
+  - Lists agents with links to terminal views
+  - Connection controller for QR code flow (fragment contains E2E bundle)
+  - No terminal - user selects an agent to view terminal
 %>
-<div class="h-full flex flex-col overflow-hidden"
-     data-controller="connection terminal-display agents"
+
+<%# Permanent connection container - survives Turbo navigation, uses global queries for status %>
+<div id="hub-connection-permanent"
+     data-turbo-permanent
+     data-controller="connection"
      data-connection-hub-id-value="<%= @hub.id %>"
      data-connection-worker-url-value="<%= asset_path('workers/signal.js') %>"
      data-connection-wasm-js-url-value="<%= asset_path('libsignal_wasm.js') %>"
      data-connection-wasm-binary-url-value="<%= asset_path('libsignal_wasm_bg.wasm') %>"
-     data-connection-security-banner-base-class="hidden lg:block shrink-0"
-     data-terminal-display-connection-outlet="[data-controller~='connection']"
-     data-agents-connection-outlet="[data-controller~='connection']"
-     data-agents-hub-name-value="<%= @hub.repo.presence || @hub.identifier.truncate(16) %>">
+     data-connection-security-banner-base-class="hidden">
+</div>
 
-  <%# Header - compact on mobile, expanded on desktop %>
+<div class="h-full flex flex-col overflow-hidden"
+     data-controller="agents"
+     data-agents-connection-outlet="#hub-connection-permanent"
+     data-agents-hub-name-value="<%= @hub.repo.presence || @hub.identifier.truncate(16) %>"
+     data-agents-hub-id-value="<%= @hub.id %>">
+
+  <%# Header %>
   <div class="shrink-0 border-b border-zinc-800 bg-zinc-900/50">
-    <%# Mobile: ultra-compact single line with agent dropdown %>
-    <div class="lg:hidden px-3 py-2">
-      <div class="flex items-center justify-between gap-2">
-        <div class="flex items-center gap-2 min-w-0">
-          <span data-connection-target="statusIconMobile" class="shrink-0">
-            <svg class="size-3 animate-spin text-zinc-500" fill="none" viewBox="0 0 24 24">
-              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-            </svg>
-          </span>
-          <%# Agent dropdown %>
-          <%= render Elements::DropdownComponent.new(anchor: "bottom start", class: "min-w-0") do |dropdown| %>
-            <% dropdown.with_button class: "flex items-center gap-1 min-w-0 text-sm font-mono text-zinc-300 hover:text-zinc-100 transition-colors" do %>
-              <span data-agents-target="mobileAgentLabel" class="truncate"><%= @hub.repo.presence || @hub.identifier.truncate(16) %></span>
-              <svg class="size-3 shrink-0 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-              </svg>
-            <% end %>
-
-            <div class="min-w-48 py-1">
-              <%# Selected agent info %>
-              <div data-agents-target="mobileAgentInfo" class="hidden px-3 py-2 border-b border-zinc-700">
-                <span class="text-xs text-zinc-500">Selected Agent</span>
-                <span data-agents-target="mobileAgentName" class="block text-sm text-zinc-200 font-mono truncate"></span>
-              </div>
-
-              <%# Delete agent - only shown when agent selected %>
-              <button type="button"
-                      data-agents-target="mobileDeleteBtn"
-                      data-action="agents#deleteSelectedAgent"
-                      class="hidden w-full text-left px-3 py-2 text-sm text-red-400 hover:bg-zinc-700 transition-colors flex items-center gap-2">
-                <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                </svg>
-                Delete Agent
-              </button>
-
-              <%# New agent %>
-              <button type="button"
-                      command="show-modal"
-                      commandfor="new-agent-modal"
-                      data-action="agents#createAgent"
-                      class="w-full text-left px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-700 transition-colors flex items-center gap-2">
-                <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-                </svg>
-                New Agent
-              </button>
-            </div>
-          <% end %>
-        </div>
-        <span data-connection-target="statusTextMobile" class="text-xs text-zinc-500 shrink-0">Initializing...</span>
-      </div>
-    </div>
-
-    <%# Desktop: full header %>
-    <div class="hidden lg:block px-4 py-3">
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-4 min-w-0">
-          <div class="min-w-0">
-            <h1 class="text-lg font-bold text-zinc-100 font-mono truncate"><%= @hub.identifier.truncate(24) %></h1>
-            <p class="text-xs text-zinc-500 truncate">
-              <%= @hub.repo || "No repository" %>
-            </p>
-          </div>
+    <div class="px-4 py-4 lg:py-6">
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <h1 class="text-xl lg:text-2xl font-bold text-zinc-100 font-mono truncate"><%= @hub.identifier.truncate(32) %></h1>
+          <p class="text-sm text-zinc-500 mt-1 truncate">
+            <%= @hub.repo || "No repository" %>
+          </p>
         </div>
 
         <%# Connection status %>
-        <div class="flex items-center gap-3 shrink-0">
-          <div data-connection-target="statusContainer" class="flex flex-col items-end gap-0.5">
-            <div data-connection-target="status" class="text-sm font-medium text-zinc-400 flex items-center gap-2">
-              <span data-connection-target="statusIcon" class="shrink-0">
-                <svg class="size-4 animate-spin text-zinc-500" fill="none" viewBox="0 0 24 24">
-                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-              </span>
-              <span data-connection-target="statusText">Initializing...</span>
-            </div>
-            <div data-connection-target="statusDetail" class="text-xs text-zinc-600 font-mono"></div>
+        <div class="flex items-center gap-2 shrink-0">
+          <div data-connection-target="status" class="text-sm font-medium text-zinc-400 flex items-center gap-2">
+            <span data-connection-target="statusIcon" class="shrink-0">
+              <svg class="size-4 animate-spin text-zinc-500" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+            </span>
+            <span data-connection-target="statusText">Initializing...</span>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <%# Content %>
+  <div class="flex-1 overflow-y-auto">
+    <div class="max-w-3xl mx-auto px-4 py-6 lg:py-8">
+      <%# Hub Info Card %>
+      <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6 mb-6">
+        <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-4">Hub Information</h2>
+        <dl class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <dt class="text-xs text-zinc-500">Identifier</dt>
+            <dd class="text-sm text-zinc-200 font-mono mt-1 truncate"><%= @hub.identifier %></dd>
+          </div>
+          <div>
+            <dt class="text-xs text-zinc-500">Repository</dt>
+            <dd class="text-sm text-zinc-200 font-mono mt-1 truncate"><%= @hub.repo || "—" %></dd>
+          </div>
+          <div>
+            <dt class="text-xs text-zinc-500">Status</dt>
+            <dd class="text-sm mt-1 flex items-center gap-2">
+              <span class="size-2 rounded-full <%= @hub.active? ? 'bg-success-500' : 'bg-zinc-600' %>"></span>
+              <span class="text-zinc-200"><%= @hub.active? ? "Online" : "Offline" %></span>
+            </dd>
+          </div>
+          <div>
+            <dt class="text-xs text-zinc-500">Last Seen</dt>
+            <dd class="text-sm text-zinc-200 mt-1">
+              <% if @hub.last_seen_at %>
+                <%= time_ago_in_words(@hub.last_seen_at) %> ago
+              <% else %>
+                Never
+              <% end %>
+            </dd>
+          </div>
+        </dl>
+      </div>
+
+      <%# Agents Section %>
+      <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider">Agents</h2>
           <button type="button"
-                  data-action="connection#disconnectAction"
-                  data-connection-target="disconnectBtn"
-                  class="hidden px-3 py-1.5 text-sm font-medium text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-600 rounded transition-colors">
-            Disconnect
+                  class="p-1.5 text-zinc-500 hover:text-primary-400 hover:bg-zinc-800/50 rounded transition-colors"
+                  title="New Agent"
+                  command="show-modal"
+                  commandfor="new-agent-modal">
+            <svg class="size-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+            </svg>
           </button>
         </div>
-      </div>
-    </div>
-  </div>
 
-  <%# Security Banner - desktop only %>
-  <div data-connection-target="securityBanner" class="hidden lg:block shrink-0 border-b border-zinc-700/50 bg-zinc-800/30 transition-colors duration-300">
-    <div class="px-4 py-2">
-      <div class="flex items-center gap-3">
-        <span data-connection-target="securityIcon" class="shrink-0">
-          <svg class="size-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
-          </svg>
-        </span>
-        <p class="text-sm" data-connection-target="securityText">
-          <span class="text-zinc-400">Establishing secure connection...</span>
-        </p>
-      </div>
-    </div>
-  </div>
-
-  <%# Terminal Panel - fills remaining space %>
-  <div class="flex-1 min-h-0 flex flex-col">
-    <div class="flex-1 flex flex-col min-h-0 bg-zinc-950 overflow-hidden">
-      <%# Terminal header - minimal on mobile %>
-      <div class="shrink-0 px-2 lg:px-4 py-1.5 lg:py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900">
-        <div class="flex items-center gap-3">
-          <%# Traffic lights - desktop only %>
-          <div class="hidden lg:flex items-center gap-1.5">
-            <span class="size-3 rounded-full bg-red-500/80"></span>
-            <span class="size-3 rounded-full bg-yellow-500/80"></span>
-            <span class="size-3 rounded-full bg-green-500/80"></span>
-          </div>
-          <span class="text-xs lg:text-sm font-mono text-zinc-500 lg:text-zinc-400">Terminal</span>
-        </div>
-        <div class="flex items-center gap-2 lg:gap-3">
-          <span class="text-xs text-zinc-600 hidden lg:inline">scroll: mouse wheel</span>
-          <span class="text-xs text-zinc-600 lg:text-zinc-500 hidden sm:inline" data-agents-target="selectedLabel">No agent</span>
-          <span data-connection-target="terminalBadge" class="inline-flex items-center gap-1 px-1.5 lg:px-2 py-0.5 text-xs font-medium bg-zinc-700/50 text-zinc-500 rounded">
-            <svg class="size-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+        <div data-test="hub-agents-list" data-agents-target="landingAgentList" class="space-y-2">
+          <%# Populated by JS after connection %>
+          <div class="py-8 text-center">
+            <svg class="size-8 text-zinc-700 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
             </svg>
-            <span class="hidden sm:inline">Connecting...</span>
-          </span>
+            <p class="text-sm text-zinc-500">Connecting to hub...</p>
+            <p class="text-xs text-zinc-600 mt-1">Agents will appear here once connected</p>
+          </div>
         </div>
       </div>
-      <%# Terminal content %>
-      <div data-terminal-display-target="container" class="terminal-container flex-1 min-h-0 bg-zinc-950"></div>
-    </div>
-  </div>
 
-  <%# Mobile Touch Controls - horizontal scrollable bar, sticks above keyboard %>
-  <div class="shrink-0 lg:hidden border-t border-zinc-800 bg-zinc-900 touch-controls-container"
-       data-controller="keyboard-viewport">
-    <div class="flex gap-1.5 px-2 py-2 overflow-x-auto scrollbar-none">
-      <%# Primary keys %>
-      <%= render Elements::ButtonComponent.new("^C", color: :neutral, variant: :soft, size: :sm, class: "shrink-0 font-mono", data: { action: "terminal-display#sendCtrlC" }) %>
-      <%= render Elements::ButtonComponent.new("Enter", color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendEnter" }) %>
-      <%= render Elements::ButtonComponent.new("Tab", color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendTab" }) %>
-      <%= render Elements::ButtonComponent.new("Esc", color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendEscape" }) %>
-
-      <%# Separator %>
-      <div class="shrink-0 w-px bg-zinc-700 mx-0.5"></div>
-
-      <%# Arrow keys %>
-      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowUp" }) do %>
-        <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7" /></svg>
-      <% end %>
-      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowDown" }) do %>
-        <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" /></svg>
-      <% end %>
-      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowLeft" }) do %>
-        <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" /></svg>
-      <% end %>
-      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowRight" }) do %>
-        <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" /></svg>
-      <% end %>
-
-      <%# Scroll hint padding %>
-      <div class="shrink-0 w-4"></div>
+      <%# Empty state message when no agents %>
+      <div data-agents-target="noAgentsMessage" class="hidden mt-6 text-center py-8">
+        <svg class="size-12 text-zinc-700 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z" />
+        </svg>
+        <h3 class="text-lg font-medium text-zinc-300 mb-2">No agents running</h3>
+        <p class="text-sm text-zinc-500 mb-4">Start a new agent to begin working</p>
+        <button type="button"
+                command="show-modal"
+                commandfor="new-agent-modal"
+                class="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-500 text-white rounded-lg text-sm font-medium transition-colors">
+          <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+          </svg>
+          New Agent
+        </button>
+      </div>
     </div>
   </div>
 

@@ -883,10 +883,28 @@ fn spawn_agent_with_tunnel(hub: &mut Hub, config: &crate::agents::AgentSpawnConf
 
 /// Handle selecting an agent for a specific client.
 fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_key: String) {
+    log::info!("handle_select_agent_for_client: client={}, agent={}", client_id, &agent_key[..8.min(agent_key.len())]);
+
     // Validate agent exists
     if !hub.state.agents.contains_key(&agent_key) {
         hub.send_error_to(&client_id, "Agent not found".to_string());
         return;
+    }
+
+    // Connect agent's terminal channel if not already connected (lazy connection)
+    // This handles agents created before a browser connected (no crypto service yet)
+    let has_channel = hub.state.agents
+        .get(&agent_key)
+        .map(|a| a.has_terminal_channel())
+        .unwrap_or(true); // Default true to avoid connecting if agent doesn't exist
+
+    log::info!("Agent {} has_terminal_channel={}", &agent_key[..8.min(agent_key.len())], has_channel);
+
+    if !has_channel {
+        if let Some(agent_index) = hub.state.agents.keys().position(|k| k == &agent_key) {
+            log::info!("Lazy-connecting terminal channel for agent {}", &agent_key[..8.min(agent_key.len())]);
+            hub.connect_agent_channels(&agent_key, agent_index);
+        }
     }
 
     // Get old selection for viewer index update
@@ -1243,9 +1261,59 @@ fn handle_client_connected(hub: &mut Hub, client_id: ClientId) {
 }
 
 /// Handle client disconnected event.
+///
+/// When a client disconnects, we check if they were viewing an agent and if so,
+/// resize that agent to match any remaining viewer's dimensions.
 fn handle_client_disconnected(hub: &mut Hub, client_id: ClientId) {
+    // Get the agent this client was viewing BEFORE unregistering
+    let agent_key = hub
+        .clients
+        .get(&client_id)
+        .and_then(|c| c.state().selected_agent.clone());
+
+    // Unregister the client
     hub.clients.unregister(&client_id);
     log::info!("Client disconnected: {}", client_id);
+
+    // If client was viewing an agent, check for remaining viewers and resize
+    if let Some(key) = agent_key {
+        resize_agent_for_remaining_viewers(hub, &key);
+    }
+}
+
+/// Resize agent to match a remaining viewer's dimensions.
+///
+/// Called when a client disconnects to potentially resize the agent for remaining viewers.
+/// If no remaining viewers have dimensions, the agent keeps its current size.
+fn resize_agent_for_remaining_viewers(hub: &mut Hub, agent_key: &str) {
+    // Find first remaining viewer with dimensions
+    let viewer_dims: Option<(ClientId, u16, u16)> = hub
+        .clients
+        .viewers_of(agent_key)
+        .find_map(|id| {
+            hub.clients
+                .get(id)
+                .and_then(|c| c.state().dims)
+                .map(|(cols, rows)| (id.clone(), cols, rows))
+        });
+
+    if let Some((viewer_id, cols, rows)) = viewer_dims {
+        if let Some(agent) = hub.state.agents.get_mut(agent_key) {
+            agent.resize(rows, cols);
+            log::info!(
+                "Resized agent {} to {}x{} for remaining viewer {}",
+                &agent_key[..8.min(agent_key.len())],
+                cols,
+                rows,
+                viewer_id
+            );
+        }
+    } else {
+        log::debug!(
+            "No remaining viewers with dims for agent {}, keeping current size",
+            &agent_key[..8.min(agent_key.len())]
+        );
+    }
 }
 
 /// Handle scroll for a specific client.

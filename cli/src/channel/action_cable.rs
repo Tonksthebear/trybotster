@@ -2,16 +2,29 @@
 //!
 //! This module provides `ActionCableChannel`, an implementation of the `Channel`
 //! trait that communicates via Rails ActionCable WebSocket with optional Signal
-//! Protocol encryption.
+//! Protocol encryption and optional reliable delivery.
 //!
 //! # Architecture
 //!
 //! ```text
 //! ActionCableChannel
 //!     ├── WebSocket connection (tokio-tungstenite)
-//!     ├── Signal encryption (optional, via SignalProtocolManager)
+//!     ├── Signal encryption (optional, via CryptoServiceHandle)
+//!     ├── Reliable delivery (optional, per-peer seq/ack/retransmit)
 //!     ├── Gzip compression (optional, via compression module)
 //!     └── Reconnection (exponential backoff)
+//! ```
+//!
+//! # Usage
+//!
+//! ```ignore
+//! // Builder pattern for configuration
+//! let channel = ActionCableChannel::builder()
+//!     .server_url("https://example.com")
+//!     .api_key("secret")
+//!     .crypto_service(crypto_handle)  // optional: enables E2E encryption
+//!     .reliable(true)                 // optional: enables guaranteed delivery
+//!     .build();
 //! ```
 //!
 //! Rust guideline compliant 2025-01
@@ -19,8 +32,8 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message};
@@ -29,6 +42,7 @@ use crate::relay::crypto_service::CryptoServiceHandle;
 use crate::relay::signal::SignalEnvelope;
 
 use super::compression::{maybe_compress, maybe_decompress};
+use super::reliable::{ReliableMessage, ReliableSession};
 use super::{Channel, ChannelConfig, ChannelError, ConnectionState, IncomingMessage, PeerId, SharedConnectionState};
 
 /// Reconnection backoff configuration.
@@ -81,7 +95,7 @@ enum OutgoingMessage {
 #[derive(Clone, Debug)]
 pub struct ChannelSenderHandle {
     send_tx: mpsc::Sender<OutgoingMessage>,
-    peers: Arc<RwLock<HashSet<PeerId>>>,
+    peers: Arc<StdRwLock<HashSet<PeerId>>>,
 }
 
 impl ChannelSenderHandle {
@@ -93,7 +107,7 @@ impl ChannelSenderHandle {
     pub async fn send_to(&self, msg: &[u8], peer: &PeerId) -> Result<(), ChannelError> {
         // Check if peer is connected
         {
-            let peers = self.peers.read().await;
+            let peers = self.peers.read().expect("peers lock poisoned");
             if !peers.contains(peer) {
                 return Err(ChannelError::NoSession(peer.clone()));
             }
@@ -116,7 +130,7 @@ struct RawIncoming {
     sender: PeerId,
 }
 
-/// ActionCable channel with optional Signal Protocol encryption.
+/// ActionCable channel with optional Signal Protocol encryption and reliable delivery.
 pub struct ActionCableChannel {
     /// Channel configuration (set on connect).
     config: Option<ChannelConfig>,
@@ -134,6 +148,13 @@ pub struct ActionCableChannel {
     /// API key for authentication.
     api_key: String,
 
+    /// Whether reliable delivery is enabled.
+    reliable: bool,
+
+    /// Per-peer reliable sessions (only if reliable=true).
+    /// Each peer has independent sequence number spaces.
+    reliable_sessions: Arc<RwLock<HashMap<String, ReliableSession>>>,
+
     /// Send queue for outgoing messages.
     send_tx: Option<mpsc::Sender<OutgoingMessage>>,
 
@@ -141,10 +162,85 @@ pub struct ActionCableChannel {
     recv_rx: Option<mpsc::Receiver<RawIncoming>>,
 
     /// Connected peer identities.
-    peers: Arc<RwLock<HashSet<PeerId>>>,
+    peers: Arc<StdRwLock<HashSet<PeerId>>>,
 
     /// Shutdown signal sender.
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// Builder for `ActionCableChannel`.
+///
+/// Provides fluent API for constructing channels with optional features.
+/// Follows M-INIT-BUILDER guideline for complex type initialization.
+#[derive(Debug, Default)]
+pub struct ActionCableChannelBuilder {
+    server_url: Option<String>,
+    api_key: Option<String>,
+    crypto_service: Option<CryptoServiceHandle>,
+    reliable: bool,
+}
+
+impl ActionCableChannelBuilder {
+    /// Create a new builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the server URL (required).
+    #[must_use]
+    pub fn server_url(mut self, url: impl Into<String>) -> Self {
+        self.server_url = Some(url.into());
+        self
+    }
+
+    /// Set the API key (required).
+    #[must_use]
+    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+        self.api_key = Some(key.into());
+        self
+    }
+
+    /// Enable E2E encryption with the given crypto service.
+    #[must_use]
+    pub fn crypto_service(mut self, cs: CryptoServiceHandle) -> Self {
+        self.crypto_service = Some(cs);
+        self
+    }
+
+    /// Enable reliable delivery (TCP-like guarantees).
+    ///
+    /// When enabled, the channel automatically:
+    /// - Assigns sequence numbers to outgoing messages
+    /// - Buffers and reorders incoming messages
+    /// - Sends selective acknowledgments
+    /// - Retransmits unacknowledged messages
+    #[must_use]
+    pub fn reliable(mut self, enable: bool) -> Self {
+        self.reliable = enable;
+        self
+    }
+
+    /// Build the channel.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `server_url` or `api_key` are not set.
+    #[must_use]
+    pub fn build(self) -> ActionCableChannel {
+        ActionCableChannel {
+            config: None,
+            state: SharedConnectionState::new(),
+            crypto_service: self.crypto_service,
+            server_url: self.server_url.expect("server_url is required"),
+            api_key: self.api_key.expect("api_key is required"),
+            reliable: self.reliable,
+            reliable_sessions: Arc::new(RwLock::new(HashMap::new())),
+            send_tx: None,
+            recv_rx: None,
+            peers: Arc::new(StdRwLock::new(HashSet::new())),
+            shutdown_tx: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for ActionCableChannel {
@@ -153,48 +249,57 @@ impl std::fmt::Debug for ActionCableChannel {
             .field("config", &self.config)
             .field("server_url", &self.server_url)
             .field("encrypted", &self.crypto_service.is_some())
+            .field("reliable", &self.reliable)
             .finish_non_exhaustive()
     }
 }
 
 impl ActionCableChannel {
+    /// Create a new channel builder.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let channel = ActionCableChannel::builder()
+    ///     .server_url("https://example.com")
+    ///     .api_key("secret")
+    ///     .crypto_service(handle)
+    ///     .reliable(true)
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn builder() -> ActionCableChannelBuilder {
+        ActionCableChannelBuilder::new()
+    }
+
     /// Create an encrypted channel using the provided crypto service handle.
     ///
     /// The crypto service is shared, enabling session reuse across channels.
     /// CryptoServiceHandle is Send + Clone, so this channel can run on any thread.
+    ///
+    /// For more options, use `ActionCableChannel::builder()`.
     #[must_use]
     pub fn encrypted(
         crypto_service: CryptoServiceHandle,
         server_url: String,
         api_key: String,
     ) -> Self {
-        Self {
-            config: None,
-            state: SharedConnectionState::new(),
-            crypto_service: Some(crypto_service),
-            server_url,
-            api_key,
-            send_tx: None,
-            recv_rx: None,
-            peers: Arc::new(RwLock::new(HashSet::new())),
-            shutdown_tx: None,
-        }
+        Self::builder()
+            .server_url(server_url)
+            .api_key(api_key)
+            .crypto_service(crypto_service)
+            .build()
     }
 
     /// Create an unencrypted channel.
+    ///
+    /// For more options, use `ActionCableChannel::builder()`.
     #[must_use]
     pub fn unencrypted(server_url: String, api_key: String) -> Self {
-        Self {
-            config: None,
-            state: SharedConnectionState::new(),
-            crypto_service: None,
-            server_url,
-            api_key,
-            send_tx: None,
-            recv_rx: None,
-            peers: Arc::new(RwLock::new(HashSet::new())),
-            shutdown_tx: None,
-        }
+        Self::builder()
+            .server_url(server_url)
+            .api_key(api_key)
+            .build()
     }
 
     /// Get the shared connection state for external observation.
@@ -247,8 +352,10 @@ impl ActionCableChannel {
         config: ChannelConfig,
         server_url: String,
         api_key: String,
+        reliable: bool,
+        reliable_sessions: Arc<RwLock<HashMap<String, ReliableSession>>>,
         state: Arc<SharedConnectionState>,
-        peers: Arc<RwLock<HashSet<PeerId>>>,
+        peers: Arc<StdRwLock<HashSet<PeerId>>>,
         mut send_rx: mpsc::Receiver<OutgoingMessage>,
         recv_tx: mpsc::Sender<RawIncoming>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
@@ -281,6 +388,8 @@ impl ActionCableChannel {
                         &crypto_service,
                         &config,
                         &identifier_json,
+                        reliable,
+                        &reliable_sessions,
                         &mut write,
                         &mut read,
                         &mut send_rx,
@@ -452,6 +561,8 @@ impl ActionCableChannel {
         crypto_service: &Option<CryptoServiceHandle>,
         config: &ChannelConfig,
         identifier_json: &str,
+        reliable: bool,
+        reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
         write: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<
                 tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -465,7 +576,7 @@ impl ActionCableChannel {
         >,
         send_rx: &mut mpsc::Receiver<OutgoingMessage>,
         recv_tx: &mpsc::Sender<RawIncoming>,
-        peers: &Arc<RwLock<HashSet<PeerId>>>,
+        peers: &Arc<StdRwLock<HashSet<PeerId>>>,
         shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
     ) -> bool {
         let mut last_activity = Instant::now();
@@ -480,6 +591,8 @@ impl ActionCableChannel {
                         crypto_service,
                         config,
                         identifier_json,
+                        reliable,
+                        reliable_sessions,
                         write,
                         msg,
                         peers,
@@ -492,12 +605,17 @@ impl ActionCableChannel {
 
                     match msg {
                         Ok(Message::Text(text)) => {
-                            if let Some(incoming) = Self::handle_incoming(
+                            let incoming_list = Self::handle_incoming(
                                 crypto_service,
                                 config,
                                 &text,
+                                reliable,
+                                reliable_sessions,
+                                identifier_json,
+                                write,
                                 peers,
-                            ).await {
+                            ).await;
+                            for incoming in incoming_list {
                                 if recv_tx.send(incoming).await.is_err() {
                                     log::warn!("Receive channel closed");
                                     return false;
@@ -522,11 +640,21 @@ impl ActionCableChannel {
                     }
                 }
 
-                // Health check
+                // Health check + reliable delivery maintenance
                 _ = health_interval.tick() => {
                     if last_activity.elapsed() > Duration::from_secs(CONNECTION_STALE_TIMEOUT_SECS) {
                         log::warn!("Connection stale ({}s), reconnecting", last_activity.elapsed().as_secs());
                         return false;
+                    }
+
+                    // Reliable delivery maintenance: heartbeat ACKs and retransmits
+                    if reliable {
+                        Self::reliable_maintenance(
+                            reliable_sessions,
+                            crypto_service,
+                            identifier_json,
+                            write,
+                        ).await;
                     }
                 }
 
@@ -540,10 +668,13 @@ impl ActionCableChannel {
     }
 
     /// Handle outgoing message.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_outgoing(
         crypto_service: &Option<CryptoServiceHandle>,
         config: &ChannelConfig,
         identifier_json: &str,
+        reliable: bool,
+        reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
         write: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<
                 tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -551,11 +682,11 @@ impl ActionCableChannel {
             Message,
         >,
         msg: OutgoingMessage,
-        peers: &Arc<RwLock<HashSet<PeerId>>>,
+        peers: &Arc<StdRwLock<HashSet<PeerId>>>,
     ) {
         let (data, targets): (Vec<u8>, Vec<PeerId>) = match msg {
             OutgoingMessage::Broadcast(d) => {
-                let peer_list: Vec<PeerId> = peers.read().await.iter().cloned().collect();
+                let peer_list: Vec<PeerId> = peers.read().expect("peers lock poisoned").iter().cloned().collect();
                 (d, peer_list)
             }
             OutgoingMessage::Targeted { peer, data } => (data, vec![peer]),
@@ -565,7 +696,7 @@ impl ActionCableChannel {
             return;
         }
 
-        // Compress
+        // Compress first (before any per-peer operations)
         let compressed = match maybe_compress(&data, config.compression_threshold) {
             Ok(c) => c,
             Err(e) => {
@@ -574,11 +705,23 @@ impl ActionCableChannel {
             }
         };
 
-        // Send to each target (encrypted if enabled)
+        // Send to each target (wrapped in reliable envelope if enabled, then encrypted)
         for target in targets {
+            // Wrap in reliable message if enabled (per-peer sequence numbers)
+            let to_encrypt = if reliable {
+                let mut sessions = reliable_sessions.write().await;
+                let session = sessions
+                    .entry(target.0.clone())
+                    .or_insert_with(ReliableSession::new);
+                let reliable_msg = session.sender.prepare_send(compressed.clone());
+                serde_json::to_vec(&reliable_msg).expect("reliable message serializable")
+            } else {
+                compressed.clone()
+            };
+
             let envelope_data = if let Some(ref cs) = crypto_service {
                 // Encrypt via CryptoServiceHandle (message passing, no lock needed)
-                match cs.encrypt(&compressed, target.as_ref()).await {
+                match cs.encrypt(&to_encrypt, target.as_ref()).await {
                     Ok(envelope) => {
                         serde_json::json!({
                             "action": "relay",
@@ -602,7 +745,7 @@ impl ActionCableChannel {
                 // Unencrypted
                 serde_json::json!({
                     "action": "relay",
-                    "data": data_encoding::BASE64.encode(&compressed),
+                    "data": data_encoding::BASE64.encode(&to_encrypt),
                 })
             };
 
@@ -623,14 +766,26 @@ impl ActionCableChannel {
         }
     }
 
-    /// Handle incoming message, returns parsed message if valid.
+    /// Handle incoming message, returns parsed messages (may be multiple due to reordering).
+    #[allow(clippy::too_many_arguments)]
     async fn handle_incoming(
         crypto_service: &Option<CryptoServiceHandle>,
         config: &ChannelConfig,
         text: &str,
-        peers: &Arc<RwLock<HashSet<PeerId>>>,
-    ) -> Option<RawIncoming> {
-        let cable_msg: IncomingCableMessage = serde_json::from_str(text).ok()?;
+        reliable: bool,
+        reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
+        identifier_json: &str,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+        peers: &Arc<StdRwLock<HashSet<PeerId>>>,
+    ) -> Vec<RawIncoming> {
+        let Some(cable_msg) = serde_json::from_str::<IncomingCableMessage>(text).ok() else {
+            return Vec::new();
+        };
 
         // Handle system messages
         if let Some(ref msg_type) = cable_msg.msg_type {
@@ -643,32 +798,50 @@ impl ActionCableChannel {
         }
 
         // Handle data messages
-        let message = cable_msg.message?;
+        let Some(message) = cable_msg.message else {
+            log::debug!("No message content in cable message");
+            return Vec::new();
+        };
+        let has_envelope = message.get("envelope").is_some();
+        log::debug!("Received cable message: has_envelope={}, action={:?}", has_envelope, message.get("action"));
 
-        if let Some(ref cs) = crypto_service {
+        // Decrypt/decode raw payload
+        let (plaintext, sender) = if let Some(ref cs) = crypto_service {
             // Encrypted - parse envelope
-            let envelope_json = message.get("envelope")?;
+            let Some(envelope_json) = message.get("envelope") else {
+                return Vec::new();
+            };
             let envelope: SignalEnvelope = match envelope_json {
-                serde_json::Value::String(s) => serde_json::from_str(s).ok()?,
-                _ => serde_json::from_value(envelope_json.clone()).ok()?,
+                serde_json::Value::String(s) => match serde_json::from_str(s) {
+                    Ok(e) => e,
+                    Err(_) => return Vec::new(),
+                },
+                _ => match serde_json::from_value(envelope_json.clone()) {
+                    Ok(e) => e,
+                    Err(_) => return Vec::new(),
+                },
             };
 
             let sender = PeerId(envelope.sender_identity.clone());
 
             // Track peer
             {
-                let mut peer_set = peers.write().await;
+                let mut peer_set = peers.write().expect("peers lock poisoned");
                 if peer_set.insert(sender.clone()) {
                     log::info!("New peer connected: {}", sender);
                 }
             }
 
-            // Decrypt via CryptoServiceHandle (message passing, no lock needed)
+            // Decrypt via CryptoServiceHandle
+            log::debug!("Decrypting message from {}", sender);
             let plaintext = match cs.decrypt(&envelope).await {
-                Ok(p) => p,
+                Ok(p) => {
+                    log::debug!("Decrypted {} bytes from {}", p.len(), sender);
+                    p
+                }
                 Err(e) => {
-                    log::warn!("Decryption failed: {}", e);
-                    return None;
+                    log::warn!("Decryption failed for {}: {}", sender, e);
+                    return Vec::new();
                 }
             };
 
@@ -677,30 +850,300 @@ impl ActionCableChannel {
                 log::warn!("Failed to persist session: {}", e);
             }
 
-            // Decompress
-            let decompressed = match maybe_decompress(&plaintext) {
-                Ok(d) => d,
-                Err(e) => {
-                    log::warn!("Decompression failed: {}", e);
-                    return None;
-                }
-            };
-
-            Some(RawIncoming {
-                payload: decompressed,
-                sender,
-            })
+            (plaintext, sender)
         } else {
             // Unencrypted - parse raw data
-            let data_b64 = message.get("data")?.as_str()?;
-            let compressed = data_encoding::BASE64.decode(data_b64.as_bytes()).ok()?;
-            let decompressed = maybe_decompress(&compressed).ok()?;
+            let Some(data_b64) = message.get("data").and_then(|v| v.as_str()) else {
+                return Vec::new();
+            };
+            let Ok(compressed) = data_encoding::BASE64.decode(data_b64.as_bytes()) else {
+                return Vec::new();
+            };
+            (compressed, PeerId("anonymous".to_string()))
+        };
 
-            // Unencrypted channels don't have peer identity
-            Some(RawIncoming {
-                payload: decompressed,
-                sender: PeerId("anonymous".to_string()),
+        // Process reliable layer if enabled
+        if reliable {
+            Self::process_reliable_message(
+                &plaintext,
+                &sender,
+                reliable_sessions,
+                crypto_service,
+                identifier_json,
+                write,
+            )
+            .await
+        } else {
+            // Non-reliable: just decompress and return
+            log::debug!("Non-reliable message from {}: {} bytes", sender, plaintext.len());
+            match maybe_decompress(&plaintext) {
+                Ok(d) => {
+                    if let Ok(text) = String::from_utf8(d.clone()) {
+                        log::debug!("Decompressed message: {}", text);
+                    }
+                    vec![RawIncoming { payload: d, sender }]
+                }
+                Err(e) => {
+                    log::warn!("Decompression failed: {}", e);
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    /// Process a reliable message (data or ack) and return any deliverable payloads.
+    async fn process_reliable_message(
+        plaintext: &[u8],
+        sender: &PeerId,
+        reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
+        crypto_service: &Option<CryptoServiceHandle>,
+        identifier_json: &str,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+    ) -> Vec<RawIncoming> {
+        // Parse as reliable message
+        let Ok(reliable_msg) = serde_json::from_slice::<ReliableMessage>(plaintext) else {
+            log::warn!("Failed to parse reliable message");
+            return Vec::new();
+        };
+
+        match reliable_msg {
+            ReliableMessage::Data { seq, payload } => {
+                // Decompress the payload
+                let decompressed = match maybe_decompress(&payload) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::warn!("Decompression failed: {}", e);
+                        return Vec::new();
+                    }
+                };
+
+                // Process through receiver, which handles reordering
+                let deliverable = {
+                    let mut sessions = reliable_sessions.write().await;
+                    let session = sessions
+                        .entry(sender.0.clone())
+                        .or_insert_with(ReliableSession::new);
+                    let (messages, reset_occurred) = session.receiver.receive(seq, decompressed);
+
+                    // If peer reset their session, also reset our sender
+                    if reset_occurred {
+                        log::info!("Resetting sender for peer {} due to session reset", sender);
+                        session.sender.reset();
+                    }
+
+                    messages
+                };
+
+                // Send ACK back to sender
+                Self::send_ack(sender, reliable_sessions, crypto_service, identifier_json, write).await;
+
+                // Convert deliverable payloads to RawIncoming
+                deliverable
+                    .into_iter()
+                    .map(|payload| RawIncoming {
+                        payload,
+                        sender: sender.clone(),
+                    })
+                    .collect()
+            }
+            ReliableMessage::Ack { ranges } => {
+                // Process ACK - remove acknowledged messages from pending
+                let mut sessions = reliable_sessions.write().await;
+                if let Some(session) = sessions.get_mut(&sender.0) {
+                    let acked = session.sender.process_ack(&ranges);
+                    if acked > 0 {
+                        log::debug!(
+                            "Received ACK for {} messages from {}, {} pending",
+                            acked,
+                            sender,
+                            session.sender.pending_count()
+                        );
+                    }
+                }
+                Vec::new() // ACKs don't deliver data
+            }
+        }
+    }
+
+    /// Perform reliable delivery maintenance: heartbeat ACKs and retransmits.
+    ///
+    /// Called periodically from the health check interval. For each peer session:
+    /// - Sends heartbeat ACK if receiver hasn't ACK'd recently (keeps sender from
+    ///   false retransmits when connection is idle but alive)
+    /// - Sends retransmits for any unacked messages past their timeout
+    async fn reliable_maintenance(
+        reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
+        crypto_service: &Option<CryptoServiceHandle>,
+        identifier_json: &str,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+    ) {
+        // Collect peers needing maintenance (avoid holding lock during I/O)
+        let maintenance: Vec<(PeerId, bool, Vec<ReliableMessage>)> = {
+            let mut sessions = reliable_sessions.write().await;
+            sessions
+                .iter_mut()
+                .map(|(peer_id, session)| {
+                    let needs_heartbeat = session.receiver.should_send_ack_heartbeat();
+                    let retransmits = session.sender.get_retransmits();
+                    (PeerId(peer_id.clone()), needs_heartbeat, retransmits)
+                })
+                .filter(|(_, needs_heartbeat, retransmits)| *needs_heartbeat || !retransmits.is_empty())
+                .collect()
+        };
+
+        for (peer, needs_heartbeat, retransmits) in maintenance {
+            // Send heartbeat ACK if needed
+            if needs_heartbeat {
+                log::debug!("Sending heartbeat ACK to {}", peer);
+                Self::send_ack(&peer, reliable_sessions, crypto_service, identifier_json, write).await;
+            }
+
+            // Send retransmits
+            for msg in retransmits {
+                if let ReliableMessage::Data { seq, ref payload } = msg {
+                    log::info!("Retransmitting seq={} to {} ({} bytes)", seq, peer, payload.len());
+                    Self::send_reliable_message(&peer, &msg, crypto_service, identifier_json, write).await;
+                }
+            }
+        }
+    }
+
+    /// Send a reliable message (data or ack) to a specific peer.
+    async fn send_reliable_message(
+        peer: &PeerId,
+        msg: &ReliableMessage,
+        crypto_service: &Option<CryptoServiceHandle>,
+        identifier_json: &str,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+    ) {
+        let msg_bytes = serde_json::to_vec(msg).expect("reliable message serializable");
+
+        let envelope_data = if let Some(ref cs) = crypto_service {
+            match cs.encrypt(&msg_bytes, peer.as_ref()).await {
+                Ok(envelope) => {
+                    serde_json::json!({
+                        "action": "relay",
+                        "recipient_identity": peer.as_ref(),
+                        "envelope": {
+                            "version": envelope.version,
+                            "message_type": envelope.message_type,
+                            "ciphertext": envelope.ciphertext,
+                            "sender_identity": envelope.sender_identity,
+                            "registration_id": envelope.registration_id,
+                            "device_id": envelope.device_id,
+                        }
+                    })
+                }
+                Err(e) => {
+                    log::error!("Failed to encrypt retransmit: {}", e);
+                    return;
+                }
+            }
+        } else {
+            serde_json::json!({
+                "action": "relay",
+                "data": data_encoding::BASE64.encode(&msg_bytes),
             })
+        };
+
+        let cable_msg = CableMessage {
+            command: "message".to_string(),
+            identifier: identifier_json.to_string(),
+            data: Some(serde_json::to_string(&envelope_data).expect("serializable")),
+        };
+
+        if let Err(e) = write
+            .send(Message::Text(
+                serde_json::to_string(&cable_msg).expect("serializable"),
+            ))
+            .await
+        {
+            log::warn!("Failed to send reliable message to {}: {}", peer, e);
+        }
+    }
+
+    /// Send an ACK to a peer.
+    async fn send_ack(
+        peer: &PeerId,
+        reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
+        crypto_service: &Option<CryptoServiceHandle>,
+        identifier_json: &str,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+    ) {
+        // Generate ACK from receiver state
+        let ack_msg = {
+            let mut sessions = reliable_sessions.write().await;
+            let Some(session) = sessions.get_mut(&peer.0) else {
+                return;
+            };
+            session.receiver.generate_ack()
+        };
+
+        // Serialize ACK
+        let ack_bytes = serde_json::to_vec(&ack_msg).expect("ack serializable");
+
+        // Encrypt if needed
+        let envelope_data = if let Some(ref cs) = crypto_service {
+            match cs.encrypt(&ack_bytes, peer.as_ref()).await {
+                Ok(envelope) => {
+                    serde_json::json!({
+                        "action": "relay",
+                        "recipient_identity": peer.as_ref(),
+                        "envelope": {
+                            "version": envelope.version,
+                            "message_type": envelope.message_type,
+                            "ciphertext": envelope.ciphertext,
+                            "sender_identity": envelope.sender_identity,
+                            "registration_id": envelope.registration_id,
+                            "device_id": envelope.device_id,
+                        }
+                    })
+                }
+                Err(e) => {
+                    log::error!("Failed to encrypt ACK: {}", e);
+                    return;
+                }
+            }
+        } else {
+            serde_json::json!({
+                "action": "relay",
+                "data": data_encoding::BASE64.encode(&ack_bytes),
+            })
+        };
+
+        let cable_msg = CableMessage {
+            command: "message".to_string(),
+            identifier: identifier_json.to_string(),
+            data: Some(serde_json::to_string(&envelope_data).expect("serializable")),
+        };
+
+        if let Err(e) = write
+            .send(Message::Text(
+                serde_json::to_string(&cable_msg).expect("serializable"),
+            ))
+            .await
+        {
+            log::warn!("Failed to send ACK to {}: {}", peer, e);
         }
     }
 }
@@ -728,6 +1171,8 @@ impl Channel for ActionCableChannel {
         let crypto_service = self.crypto_service.clone();
         let server_url = self.server_url.clone();
         let api_key = self.api_key.clone();
+        let reliable = self.reliable;
+        let reliable_sessions = Arc::clone(&self.reliable_sessions);
         let state = Arc::clone(&self.state);
         let peers = Arc::clone(&self.peers);
 
@@ -737,6 +1182,8 @@ impl Channel for ActionCableChannel {
                 config,
                 server_url,
                 api_key,
+                reliable,
+                reliable_sessions,
                 state,
                 peers,
                 send_rx,
@@ -810,17 +1257,11 @@ impl Channel for ActionCableChannel {
     }
 
     fn peers(&self) -> Vec<PeerId> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { self.peers.read().await.iter().cloned().collect() })
-        })
+        self.peers.read().expect("peers lock poisoned").iter().cloned().collect()
     }
 
     fn has_peer(&self, peer: &PeerId) -> bool {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { self.peers.read().await.contains(peer) })
-        })
+        self.peers.read().expect("peers lock poisoned").contains(peer)
     }
 }
 

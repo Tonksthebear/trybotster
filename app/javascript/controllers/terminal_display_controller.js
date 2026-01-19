@@ -120,6 +120,11 @@ export default class extends Controller {
     this.#terminal.writeln("Secure Terminal (Signal Protocol E2E Encryption)");
     this.#terminal.writeln("Connecting...");
     this.#terminal.writeln("");
+
+    // If connection was established before terminal initialized, write greeting now
+    if (this.#connection) {
+      this.#writeConnectionGreeting();
+    }
   }
 
   // Touch scrolling with momentum
@@ -272,7 +277,20 @@ export default class extends Controller {
   // Connection handlers
   #handleConnected(outlet) {
     this.#connection = outlet;
-    const hubId = outlet.getHubId();
+
+    // Terminal may not be initialized yet (outlet callbacks can fire before connect())
+    if (!this.#terminal) {
+      // Store connection, will write greeting when terminal initializes
+      return;
+    }
+
+    this.#writeConnectionGreeting();
+  }
+
+  #writeConnectionGreeting() {
+    if (!this.#connection || !this.#terminal) return;
+
+    const hubId = this.#connection.getHubId();
     this.#terminal.writeln(`[Connected to hub: ${hubId.substring(0, 8)}...]`);
     this.#terminal.writeln("[Signal E2E encryption active]");
     this.#terminal.writeln("");
@@ -289,7 +307,16 @@ export default class extends Controller {
   #handleMessage(message) {
     switch (message.type) {
       case "output":
-        this.#terminal?.write(message.data);
+        // Decode base64 output from CLI (terminal output is base64 encoded for JSON transport)
+        try {
+          const bytes = Uint8Array.from(atob(message.data), (c) =>
+            c.charCodeAt(0),
+          );
+          this.#terminal?.write(bytes);
+        } catch (e) {
+          // Fallback: write as string if not base64 (backwards compatibility)
+          this.#terminal?.write(message.data);
+        }
         break;
       case "clear":
       case "agent_selected":
@@ -302,7 +329,12 @@ export default class extends Controller {
   }
 
   #handleError(error) {
-    this.#terminal?.writeln(`\r\n[Error: ${error}]`);
+    // Format error properly - error may be { reason, message } object from connection
+    const message =
+      typeof error === "object"
+        ? error.message || error.reason || JSON.stringify(error)
+        : error;
+    this.#terminal?.writeln(`\r\n[Error: ${message}]`);
   }
 
   // Scrollback decompression

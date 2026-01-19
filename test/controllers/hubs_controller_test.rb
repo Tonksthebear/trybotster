@@ -76,12 +76,12 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to root_path
   end
 
-  test "show displays terminal for hub" do
+  test "show displays landing page with connection controller" do
     sign_in @user
     get hub_path(@active_hub)
     assert_response :success
 
-    # Should have connection controller attached (with other controllers like terminal-display, agents)
+    # Should have connection controller attached (permanent container for Turbo navigation)
     assert_select "[data-controller~='connection']"
 
     # Should pass hub ID to connection controller
@@ -133,22 +133,31 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "Hub not found", flash[:alert]
   end
 
-  test "show displays terminal badge for E2E connection status" do
+  test "show displays connection status indicator" do
     sign_in @user
     get hub_path(@active_hub)
     assert_response :success
 
-    # Terminal has a badge showing E2E connection status (initially shows "Connecting...")
-    assert_select "[data-connection-target='terminalBadge']"
+    # Landing page has connection status in header (status text, not terminal badge)
+    assert_select "[data-connection-target='status']"
+    assert_select "[data-connection-target='statusText']"
   end
 
-  test "show displays security banner placeholder" do
+  test "show displays agents section" do
     sign_in @user
     get hub_path(@active_hub)
     assert_response :success
 
-    # Security banner exists with initial loading state (JavaScript updates it after E2E connection)
-    assert_select "[data-connection-target='securityBanner']"
-    assert_match /secure connection/i, response.body
+    # Landing page has agents section (JS populates after connection)
+    assert_select "[data-agents-target='landingAgentList']"
+  end
+
+  test "show displays new agent button" do
+    sign_in @user
+    get hub_path(@active_hub)
+    assert_response :success
+
+    # Landing page has button to create new agent
+    assert_select "[commandfor='new-agent-modal']"
   end
 end

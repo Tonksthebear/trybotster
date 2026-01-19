@@ -28,7 +28,7 @@ use anyhow::Result;
 use crate::client::ClientId;
 use crate::hub::{actions, Hub};
 use crate::relay::{
-    BrowserEvent, BrowserSendContext,
+    BrowserCommand, BrowserEvent, BrowserSendContext,
     events::browser_event_to_client_action,
 };
 
@@ -295,6 +295,10 @@ pub fn drain_and_route_browser_input(hub: &mut crate::hub::Hub) {
     // Collect all agent keys
     let agent_keys: Vec<String> = hub.state.agents.keys().cloned().collect();
 
+    // Collect resize operations to apply client dims after agent borrow is released
+    // (peer_id, cols, rows)
+    let mut client_resizes: Vec<(String, u16, u16)> = Vec::new();
+
     for agent_key in agent_keys {
         // Drain input for this agent
         let inputs = {
@@ -304,21 +308,69 @@ pub fn drain_and_route_browser_input(hub: &mut crate::hub::Hub) {
             agent.drain_terminal_input()
         };
 
-        // Write each input to the agent's PTY
+        // Parse and route each command to the agent's PTY
         if !inputs.is_empty() {
             let Some(agent) = hub.state.agents.get_mut(&agent_key) else {
                 continue;
             };
             for (data, peer_id) in inputs {
-                if let Err(e) = agent.write_input(&data) {
-                    log::error!(
-                        "Failed to write input from {} to agent {}: {}",
-                        &peer_id.0[..8.min(peer_id.0.len())],
-                        agent_key,
-                        e
-                    );
+                // Parse as BrowserCommand to extract the actual input data
+                match serde_json::from_slice::<BrowserCommand>(&data) {
+                    Ok(BrowserCommand::Input { data: input_data }) => {
+                        log::debug!(
+                            "Routing input from {} to agent {}: {} bytes",
+                            &peer_id.0[..8.min(peer_id.0.len())],
+                            agent_key,
+                            input_data.len()
+                        );
+                        if let Err(e) = agent.write_input(input_data.as_bytes()) {
+                            log::error!(
+                                "Failed to write input from {} to agent {}: {}",
+                                &peer_id.0[..8.min(peer_id.0.len())],
+                                agent_key,
+                                e
+                            );
+                        }
+                    }
+                    Ok(BrowserCommand::Resize { cols, rows }) => {
+                        log::debug!(
+                            "Resize from {} for agent {}: {}x{}",
+                            &peer_id.0[..8.min(peer_id.0.len())],
+                            agent_key,
+                            cols,
+                            rows
+                        );
+                        // Resize the agent immediately
+                        agent.resize(cols, rows);
+                        // Collect client update for later (avoid borrow conflict)
+                        client_resizes.push((peer_id.0.clone(), cols, rows));
+                    }
+                    Ok(other) => {
+                        log::warn!(
+                            "Unexpected command on terminal channel from {}: {:?}",
+                            &peer_id.0[..8.min(peer_id.0.len())],
+                            other
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to parse terminal command from {}: {}",
+                            &peer_id.0[..8.min(peer_id.0.len())],
+                            e
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    // Apply client dimension updates after agent borrows are released.
+    // This ensures client dims are stored for use when checking remaining viewers on disconnect.
+    for (peer_id, cols, rows) in client_resizes {
+        let client_id = ClientId::browser(&peer_id);
+        if let Some(client) = hub.clients.get_mut(&client_id) {
+            client.resize(cols, rows);
+            log::debug!("Updated client {} dims to {}x{}", client_id, cols, rows);
         }
     }
 }
@@ -359,11 +411,16 @@ pub fn drain_and_route_pty_output(hub: &mut crate::hub::Hub) {
         .collect();
 
     // Route each agent's output via its terminal_channel
-    for (agent_key, data) in agent_outputs {
-        if let Some(viewers) = agent_viewers.get(&agent_key) {
+    for (agent_key, data) in &agent_outputs {
+        if let Some(viewers) = agent_viewers.get(agent_key) {
+            log::debug!("PTY output: {} bytes from agent {} to {} viewers",
+                data.len(), &agent_key[..8.min(agent_key.len())], viewers.len());
             for identity in viewers {
-                send_via_agent_channel(hub, &agent_key, identity, &data);
+                send_via_agent_channel(hub, agent_key, identity, data);
             }
+        } else {
+            log::debug!("PTY output: {} bytes from agent {} but no viewers",
+                data.len(), &agent_key[..8.min(agent_key.len())]);
         }
     }
 }
@@ -379,10 +436,13 @@ fn send_via_agent_channel(
     data: &[u8],
 ) {
     let Some(agent) = hub.state.agents.get(agent_key) else {
+        log::warn!("Agent {} not found for output routing", agent_key);
         return;
     };
 
     let Some(ref channel) = agent.terminal_channel else {
+        log::warn!("Agent {} has no terminal channel, dropping {} bytes of output",
+            &agent_key[..8.min(agent_key.len())], data.len());
         return;
     };
 
@@ -402,13 +462,26 @@ fn send_via_agent_channel(
     let browser_id = browser_identity.to_string();
 
     hub.tokio_runtime.spawn(async move {
-        if let Err(e) = sender_handle.send_to(&data, &peer_id).await {
+        log::debug!("Sending {} bytes via agent {} channel to {}",
+            data.len(), &agent_key[..8.min(agent_key.len())], &browser_id[..8.min(browser_id.len())]);
+
+        // Wrap output in JSON structure for browser deserialization
+        // Browser's reliable_channel.js expects JSON payloads
+        let output_msg = serde_json::json!({
+            "type": "output",
+            "data": data_encoding::BASE64.encode(&data),
+        });
+        let msg_bytes = serde_json::to_vec(&output_msg).expect("JSON serialization");
+
+        if let Err(e) = sender_handle.send_to(&msg_bytes, &peer_id).await {
             log::error!(
                 "Failed to send output via agent {} channel to {}: {}",
                 agent_key,
                 &browser_id[..8.min(browser_id.len())],
                 e
             );
+        } else {
+            log::debug!("Sent {} bytes to {}", data.len(), &browser_id[..8.min(browser_id.len())]);
         }
     });
 }

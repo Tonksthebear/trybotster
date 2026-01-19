@@ -132,9 +132,11 @@ pub fn maybe_decompress(data: &[u8]) -> Result<Vec<u8>, ChannelError> {
             })?;
             Ok(decompressed)
         }
-        marker => Err(ChannelError::CompressionError(format!(
-            "unknown compression marker: 0x{marker:02x}"
-        ))),
+        _ => {
+            // No recognized marker - treat as raw uncompressed data (e.g., JSON from browser).
+            // This provides backwards compatibility with clients that don't add markers.
+            Ok(data.to_vec())
+        }
     }
 }
 
@@ -224,10 +226,19 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_marker() {
+    fn test_unknown_marker_passthrough() {
+        // Unknown markers should be treated as raw data (pass-through)
         let data = vec![0x42, 0x01, 0x02, 0x03];
-        let result = maybe_decompress(&data);
-        assert!(matches!(result, Err(ChannelError::CompressionError(_))));
+        let result = maybe_decompress(&data).expect("should pass through");
+        assert_eq!(result, data); // Raw data returned as-is
+    }
+
+    #[test]
+    fn test_json_passthrough() {
+        // JSON data (starting with '{') should pass through unchanged
+        let json_data = br#"{"type":"connected","device_name":"Chrome"}"#;
+        let result = maybe_decompress(json_data).expect("should pass through");
+        assert_eq!(result, json_data);
     }
 
     #[test]

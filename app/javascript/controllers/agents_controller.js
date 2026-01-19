@@ -26,13 +26,16 @@ export default class extends Controller {
     "mobileAgentInfo",       // Mobile dropdown agent info section
     "mobileAgentName",       // Mobile dropdown agent name
     "mobileDeleteBtn",       // Mobile dropdown delete button
+    "landingAgentList",      // Agent list on hub landing page
+    "noAgentsMessage",       // No agents empty state on landing page
   ];
 
   static outlets = ["connection"];
 
   static values = {
     sidebarListClass: { type: String, default: "sidebar-agents-list" },
-    hubName: { type: String, default: "" }
+    hubName: { type: String, default: "" },
+    hubId: { type: String, default: "" }
   };
 
   // Private field for cached sidebar list elements (there can be multiple - mobile + desktop)
@@ -119,6 +122,18 @@ export default class extends Controller {
     // Request agent list and worktrees when connected
     this.requestAgentList();
     this.requestWorktrees();
+
+    // Check if we should auto-select an agent from URL
+    const agentIndex = this.#getAgentIndexFromUrl();
+    if (agentIndex !== null) {
+      this.pendingAutoSelectIndex = agentIndex;
+    }
+  }
+
+  // Private: Extract agent index from URL path
+  #getAgentIndexFromUrl() {
+    const match = window.location.pathname.match(/\/hubs\/\d+\/agents\/(\d+)/);
+    return match ? parseInt(match[1], 10) : null;
   }
 
   // Handle connection lost
@@ -142,6 +157,18 @@ export default class extends Controller {
         this.hideCreatingState();
         console.log("[Agents] Updating agent list with:", message.agents);
         this.updateAgentList(message.agents || []);
+
+        // Auto-select agent from URL if pending
+        if (this.pendingAutoSelectIndex !== undefined && this.pendingAutoSelectIndex !== null) {
+          const agents = message.agents || [];
+          if (this.pendingAutoSelectIndex < agents.length) {
+            const agent = agents[this.pendingAutoSelectIndex];
+            console.log(`[Agents] Auto-selecting agent at index ${this.pendingAutoSelectIndex}:`, agent.id);
+            // Update UI and send select_agent to CLI
+            this.#handleAgentClick(agent.id);
+          }
+          this.pendingAutoSelectIndex = null;
+        }
         break;
 
       case "worktrees":
@@ -300,12 +327,14 @@ export default class extends Controller {
     });
   }
 
-  // Update the agent list UI (renders to all sidebar elements)
+  // Update the agent list UI (renders to all sidebar elements and landing page)
   updateAgentList(agents) {
     this.agents = agents;
 
     const lists = this.sidebarListElements;
-    if (lists.length === 0) return;
+
+    // Get hub ID for building links
+    const hubId = this.hubIdValue || this.#getHubIdFromUrl();
 
     // Update each sidebar list (mobile + desktop)
     lists.forEach((listElement) => {
@@ -326,11 +355,12 @@ export default class extends Controller {
         this.emptyStateTarget.classList.add("hidden");
       }
 
-      // Render agent list
-      agents.forEach((agent) => {
+      // Render agent list as links (for URL-based navigation)
+      agents.forEach((agent, index) => {
         const isSelected = agent.id === this.selectedAgentId;
+        const agentUrl = `/hubs/${hubId}/agents/${index}`;
 
-        // Container with flex layout for agent name and delete button
+        // Container with flex layout for agent link and delete button
         const item = document.createElement("div");
         item.className = `group flex items-center gap-1 rounded transition-colors ${
           isSelected
@@ -338,21 +368,18 @@ export default class extends Controller {
             : "hover:bg-zinc-800/50"
         }`;
 
-        // Agent button (main clickable area)
-        // Note: command="close" commandfor="sidebar" removed - was causing issues
-        // with agent selection on desktop. Mobile sidebar close handled separately.
-        const agentBtn = document.createElement("button");
-        agentBtn.type = "button";
-        agentBtn.className = `flex-1 text-left px-2 py-1.5 min-w-0 ${
+        // Agent link (main clickable area) - navigates to agent URL
+        const agentLink = document.createElement("a");
+        agentLink.href = agentUrl;
+        agentLink.className = `flex-1 text-left px-2 py-1.5 min-w-0 ${
           isSelected
             ? "text-primary-400 font-medium"
             : "text-zinc-400 hover:text-zinc-200"
         }`;
-        agentBtn.innerHTML = `<span class="truncate font-mono text-xs block">${this.escapeHtml(agent.name || agent.id)}</span>`;
-        // Store agent ID and attach click handler directly
-        agentBtn.dataset.agentId = agent.id;
-        agentBtn.dataset.agentButton = "true";
-        agentBtn.addEventListener("click", () => this.#handleAgentClick(agent.id));
+        agentLink.innerHTML = `<span class="truncate font-mono text-xs block">${this.escapeHtml(agent.name || agent.id)}</span>`;
+        // Store agent ID for reference
+        agentLink.dataset.agentId = agent.id;
+        agentLink.dataset.agentIndex = index;
 
         // Delete button (visible on hover)
         const deleteBtn = document.createElement("button");
@@ -365,11 +392,74 @@ export default class extends Controller {
         deleteBtn.dataset.agentId = agent.id;
         deleteBtn.addEventListener("click", (e) => this.deleteAgent(e));
 
-        item.appendChild(agentBtn);
+        item.appendChild(agentLink);
         item.appendChild(deleteBtn);
         listElement.appendChild(item);
       });
     });
+
+    // Also update landing page agent list if present
+    this.#updateLandingAgentList(agents, hubId);
+  }
+
+  // Private: Update the landing page agent list
+  #updateLandingAgentList(agents, hubId) {
+    if (!this.hasLandingAgentListTarget) return;
+
+    this.landingAgentListTarget.innerHTML = "";
+
+    if (agents.length === 0) {
+      // Show empty state message
+      if (this.hasNoAgentsMessageTarget) {
+        this.noAgentsMessageTarget.classList.remove("hidden");
+      }
+      this.landingAgentListTarget.innerHTML = `
+        <div class="py-8 text-center">
+          <svg class="size-8 text-zinc-700 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+          </svg>
+          <p class="text-sm text-zinc-500">No agents running</p>
+          <p class="text-xs text-zinc-600 mt-1">Create a new agent to get started</p>
+        </div>
+      `;
+      return;
+    }
+
+    // Hide empty state message
+    if (this.hasNoAgentsMessageTarget) {
+      this.noAgentsMessageTarget.classList.add("hidden");
+    }
+
+    // Render agent cards as links
+    agents.forEach((agent, index) => {
+      const agentUrl = `/hubs/${hubId}/agents/${index}`;
+
+      const item = document.createElement("a");
+      item.href = agentUrl;
+      item.className = "flex items-center gap-3 px-4 py-3 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 hover:border-zinc-700 rounded-lg transition-colors";
+      item.innerHTML = `
+        <div class="size-10 rounded-lg bg-zinc-700/50 flex items-center justify-center text-zinc-400">
+          <svg class="size-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+          </svg>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-medium text-zinc-200 truncate font-mono">${this.escapeHtml(agent.name || agent.id)}</div>
+          <div class="text-xs text-zinc-500">Agent ${index + 1}</div>
+        </div>
+        <svg class="size-5 text-zinc-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+        </svg>
+      `;
+
+      this.landingAgentListTarget.appendChild(item);
+    });
+  }
+
+  // Private: Extract hub ID from URL
+  #getHubIdFromUrl() {
+    const match = window.location.pathname.match(/\/hubs\/(\d+)/);
+    return match ? match[1] : "";
   }
 
   // Update worktree list in modal
@@ -496,7 +586,6 @@ export default class extends Controller {
     }
   }
 
-  // Action: Select an agent
   // Action: Select an agent (for elements within controller scope)
   selectAgent(event) {
     const agentId = event.currentTarget.dataset.agentId;
