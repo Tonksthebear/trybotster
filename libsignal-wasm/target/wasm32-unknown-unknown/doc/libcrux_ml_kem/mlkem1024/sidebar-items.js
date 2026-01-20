@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["decapsulate","encapsulate","generate_key_pair","validate_private_key","validate_public_key"],"mod":["incremental","portable"],"struct":["MlKem1024"],"type":["MlKem1024Ciphertext","MlKem1024KeyPair","MlKem1024PrivateKey","MlKem1024PublicKey"]};

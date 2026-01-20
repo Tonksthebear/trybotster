@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["ENCAPS_SEED_SIZE","KEY_GENERATION_SEED_SIZE","SHARED_SECRET_SIZE"],"mod":["kyber1024","kyber768","mlkem1024","mlkem768"],"struct":["MlKemCiphertext","MlKemKeyPair","MlKemPrivateKey","MlKemPublicKey"],"type":["MlKemSharedSecret"]};

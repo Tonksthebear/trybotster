@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["DeriveError","GenerateSecretError","SecretToPublicError","ValidateSecretError"],"macro":["impl_ecdh_slice_trait"],"trait":["EcdhSlice"]};

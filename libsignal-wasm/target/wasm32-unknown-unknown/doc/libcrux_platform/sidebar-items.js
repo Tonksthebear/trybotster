@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["adv_simd_support","aes_ni_support","bmi2_adx_support","pmull_support","sha256_support","simd128_support","simd256_support","x25519_support"]};

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["add","add_mod","eq","eq_mask","gt","gte","gte_mask","logand","lognot","logor","logxor","lt","lte","mul32","mul_wide","shift_left","shift_right","sub","sub_mod","uint128_to_uint64","uint64_to_uint128"],"type":["uint128"]};

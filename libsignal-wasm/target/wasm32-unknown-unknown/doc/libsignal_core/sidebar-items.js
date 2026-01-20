@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["VERSION"],"enum":["ServiceId","ServiceIdKind"],"fn":["try_scoped"],"mod":["curve"],"struct":["DeviceId","E164","InvalidDeviceId","ProtocolAddress","WrongKindOfServiceIdError"],"type":["Aci","Pni","ServiceIdFixedWidthBinaryBytes"]};

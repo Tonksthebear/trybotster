@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["add_carry_u32","add_carry_u64","sub_borrow_u32","sub_borrow_u64"]};
