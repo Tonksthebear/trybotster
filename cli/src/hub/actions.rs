@@ -183,14 +183,6 @@ pub enum HubAction {
     /// Refresh available worktrees list.
     RefreshWorktrees,
 
-    /// Handle terminal resize.
-    Resize {
-        /// New terminal height.
-        rows: u16,
-        /// New terminal width.
-        cols: u16,
-    },
-
     /// No action (used for unhandled inputs).
     None,
 
@@ -385,12 +377,6 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
                 }
             }
         }
-        HubAction::Resize { rows, cols } => {
-            hub.terminal_dims = (rows, cols);
-            for agent in hub.state.agents.values_mut() {
-                agent.resize(rows, cols);
-            }
-        }
         HubAction::TogglePolling => {
             hub.polling_enabled = !hub.polling_enabled;
         }
@@ -429,9 +415,8 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
                 message_id,
                 invocation_url,
             };
-            let dims = hub.browser.dims
-                .as_ref()
-                .map_or(hub.terminal_dims, |d| (d.rows, d.cols));
+            // Use terminal dims for agents spawned via Rails server (no browser involved)
+            let dims = hub.terminal_dims;
 
             match lifecycle::spawn_agent(&mut hub.state, &config, dims) {
                 Ok(result) => {
@@ -933,14 +918,18 @@ fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_key:
         client.receive_response(Response::agent_selected(&agent_key));
     }
 
-    // Resize agent to match client's terminal dimensions.
-    // This is critical for browsers that resize BEFORE selecting an agent -
-    // the stored dims must be applied when selection happens.
-    if let Some((cols, rows)) = client_dims {
-        if let Some(agent) = hub.state.agents.get(&agent_key) {
+    // Client viewing the agent becomes the size owner and their dims are applied
+    if let Some(agent) = hub.state.agents.get_mut(&agent_key) {
+        agent.size_owner = Some(client_id.clone());
+        if let Some((cols, rows)) = client_dims {
             agent.resize(rows, cols);
-            log::debug!("Resized agent {} to {}x{} for client {}",
-                &agent_key[..8.min(agent_key.len())], cols, rows, client_id);
+            log::debug!(
+                "Client {} now owns size of agent {} ({}x{})",
+                client_id,
+                &agent_key[..8.min(agent_key.len())],
+                cols,
+                rows
+            );
         }
     }
 
@@ -971,27 +960,43 @@ fn handle_send_input_for_client(hub: &mut Hub, client_id: ClientId, data: Vec<u8
 }
 
 /// Handle resize for a specific client.
+///
+/// Only resizes the agent if the client is the current size owner.
+/// This prevents resize conflicts when multiple clients view the same agent.
 fn handle_resize_for_client(hub: &mut Hub, client_id: ClientId, cols: u16, rows: u16) {
-    // Update client dims
+    // Update client dims (stored for use when selecting agents or on disconnect)
     if let Some(client) = hub.clients.get_mut(&client_id) {
         client.resize(cols, rows);
     }
 
-    // Also update hub terminal_dims for TUI
+    // Also update hub terminal_dims for TUI (used for new agent spawns)
     if client_id.is_tui() {
         hub.terminal_dims = (rows, cols);
-        // TUI resize affects all agents (for consistent rendering)
-        for agent in hub.state.agents.values_mut() {
-            agent.resize(rows, cols);
-        }
-    } else {
-        // Browser resize only affects the agent they're viewing
-        let agent_key = hub.clients.get(&client_id)
-            .and_then(|c| c.state().selected_agent.clone());
+    }
 
-        if let Some(key) = agent_key {
-            if let Some(agent) = hub.state.agents.get_mut(&key) {
+    // Get the agent this client is viewing
+    let agent_key = hub.clients.get(&client_id)
+        .and_then(|c| c.state().selected_agent.clone());
+
+    // Only resize if this client is the size owner
+    if let Some(key) = agent_key {
+        if let Some(agent) = hub.state.agents.get_mut(&key) {
+            if agent.size_owner.as_ref() == Some(&client_id) {
                 agent.resize(rows, cols);
+                log::debug!(
+                    "Resized agent {} to {}x{} (owner: {})",
+                    &key[..8.min(key.len())],
+                    cols,
+                    rows,
+                    client_id
+                );
+            } else {
+                log::debug!(
+                    "Ignored resize from {} for agent {} (owner: {:?})",
+                    client_id,
+                    &key[..8.min(key.len())],
+                    agent.size_owner
+                );
             }
         }
     }
@@ -1275,44 +1280,59 @@ fn handle_client_disconnected(hub: &mut Hub, client_id: ClientId) {
     hub.clients.unregister(&client_id);
     log::info!("Client disconnected: {}", client_id);
 
-    // If client was viewing an agent, check for remaining viewers and resize
+    // If client was viewing an agent and was the size owner, transfer ownership
     if let Some(key) = agent_key {
-        resize_agent_for_remaining_viewers(hub, &key);
+        resize_agent_for_remaining_viewers(hub, &key, &client_id);
     }
 }
 
-/// Resize agent to match a remaining viewer's dimensions.
+/// Transfer size ownership when a client disconnects.
 ///
-/// Called when a client disconnects to potentially resize the agent for remaining viewers.
-/// If no remaining viewers have dimensions, the agent keeps its current size.
-fn resize_agent_for_remaining_viewers(hub: &mut Hub, agent_key: &str) {
+/// If the disconnected client was the size owner, find a new owner from
+/// remaining viewers and resize to their dimensions.
+fn resize_agent_for_remaining_viewers(hub: &mut Hub, agent_key: &str, disconnected_id: &ClientId) {
+    // Check if the disconnected client was the size owner
+    let was_owner = hub.state.agents.get(agent_key)
+        .map(|a| a.size_owner.as_ref() == Some(disconnected_id))
+        .unwrap_or(false);
+
+    if !was_owner {
+        return; // Not the owner, nothing to do
+    }
+
     // Find first remaining viewer with dimensions
-    let viewer_dims: Option<(ClientId, u16, u16)> = hub
+    let new_owner: Option<(ClientId, u16, u16)> = hub
         .clients
         .viewers_of(agent_key)
-        .find_map(|id| {
+        .filter_map(|id| {
             hub.clients
                 .get(id)
                 .and_then(|c| c.state().dims)
                 .map(|(cols, rows)| (id.clone(), cols, rows))
-        });
+        })
+        .next();
 
-    if let Some((viewer_id, cols, rows)) = viewer_dims {
+    if let Some((new_owner_id, cols, rows)) = new_owner {
         if let Some(agent) = hub.state.agents.get_mut(agent_key) {
+            agent.size_owner = Some(new_owner_id.clone());
             agent.resize(rows, cols);
             log::info!(
-                "Resized agent {} to {}x{} for remaining viewer {}",
+                "Transferred size ownership of agent {} to {} ({}x{})",
                 &agent_key[..8.min(agent_key.len())],
+                new_owner_id,
                 cols,
-                rows,
-                viewer_id
+                rows
             );
         }
     } else {
-        log::debug!(
-            "No remaining viewers with dims for agent {}, keeping current size",
-            &agent_key[..8.min(agent_key.len())]
-        );
+        // No remaining viewers - clear ownership
+        if let Some(agent) = hub.state.agents.get_mut(agent_key) {
+            agent.size_owner = None;
+            log::debug!(
+                "Cleared size ownership of agent {} (no remaining viewers)",
+                &agent_key[..8.min(agent_key.len())]
+            );
+        }
     }
 }
 
@@ -2430,9 +2450,9 @@ mod tests {
         assert_eq!(client.state().dims, Some((200, 60)));
     }
 
-    /// Test that TUI resize affects all agents (global behavior).
+    /// Test that TUI resize only affects the selected agent (newest wins behavior).
     #[test]
-    fn test_tui_resize_affects_all_agents() {
+    fn test_tui_resize_affects_selected_agent() {
         use crate::agent::Agent;
         use tempfile::TempDir;
         use uuid::Uuid;
@@ -2461,14 +2481,20 @@ mod tests {
         );
         hub.state.add_agent("agent-2".to_string(), agent2);
 
-        // TUI resize should affect ALL agents
+        // TUI selects agent-1
+        dispatch(&mut hub, HubAction::SelectAgentForClient {
+            client_id: ClientId::Tui,
+            agent_key: "agent-1".to_string(),
+        });
+
+        // TUI resize should only affect the selected agent (agent-1)
         dispatch(&mut hub, HubAction::ResizeForClient {
             client_id: ClientId::Tui,
             cols: 150,
             rows: 40,
         });
 
-        // Both agents should be resized
+        // Only agent-1 should be resized
         let agent1 = hub.state.agents.get("agent-1").unwrap();
         let agent2 = hub.state.agents.get("agent-2").unwrap();
 
@@ -2476,7 +2502,7 @@ mod tests {
         let (rows2, cols2) = agent2.get_pty_size();
 
         assert_eq!((rows1, cols1), (40, 150), "Agent 1 should be resized to TUI dims");
-        assert_eq!((rows2, cols2), (40, 150), "Agent 2 should be resized to TUI dims");
+        assert_eq!((rows2, cols2), TEST_DIMS, "Agent 2 should keep original dims (not selected)");
     }
 
     /// Test that browser resize only affects selected agent.
@@ -2537,6 +2563,224 @@ mod tests {
         let agent2 = hub.state.agents.get("agent-2").unwrap();
         let (rows2, cols2) = agent2.get_pty_size();
         assert_eq!((rows2, cols2), (init_rows2, init_cols2), "Unselected agent should not be resized");
+    }
+
+    // =========================================================================
+    // SIZE OWNER TESTS
+    // =========================================================================
+
+    /// Test that selecting an agent sets the client as size owner.
+    #[test]
+    fn test_selecting_agent_sets_size_owner() {
+        use crate::agent::Agent;
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "branch-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+        hub.state.add_agent("agent-1".to_string(), agent);
+
+        // Initially no owner
+        assert!(hub.state.agents.get("agent-1").unwrap().size_owner.is_none());
+
+        // TUI selects agent -> becomes size owner
+        dispatch(&mut hub, HubAction::SelectAgentForClient {
+            client_id: ClientId::Tui,
+            agent_key: "agent-1".to_string(),
+        });
+
+        assert_eq!(
+            hub.state.agents.get("agent-1").unwrap().size_owner,
+            Some(ClientId::Tui),
+            "TUI should be size owner after selecting"
+        );
+    }
+
+    /// Test that only size owner can resize the agent.
+    #[test]
+    fn test_only_size_owner_can_resize() {
+        use crate::agent::Agent;
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "branch-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+        hub.state.add_agent("agent-1".to_string(), agent);
+
+        // TUI selects agent (becomes owner)
+        dispatch(&mut hub, HubAction::SelectAgentForClient {
+            client_id: ClientId::Tui,
+            agent_key: "agent-1".to_string(),
+        });
+
+        // TUI resize should work (owner)
+        dispatch(&mut hub, HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            cols: 100,
+            rows: 50,
+        });
+        let (rows, cols) = hub.state.agents.get("agent-1").unwrap().get_pty_size();
+        assert_eq!((rows, cols), (50, 100), "Owner resize should work");
+
+        // Browser connects and tries to resize (but doesn't select)
+        let browser_id = ClientId::Browser("browser-1".to_string());
+        dispatch(&mut hub, HubAction::ClientConnected { client_id: browser_id.clone() });
+
+        // Browser resize should be ignored (not owner)
+        dispatch(&mut hub, HubAction::ResizeForClient {
+            client_id: browser_id.clone(),
+            cols: 80,
+            rows: 24,
+        });
+        let (rows, cols) = hub.state.agents.get("agent-1").unwrap().get_pty_size();
+        assert_eq!((rows, cols), (50, 100), "Non-owner resize should be ignored");
+    }
+
+    /// Test that selecting an agent transfers size ownership.
+    #[test]
+    fn test_selecting_transfers_size_ownership() {
+        use crate::agent::Agent;
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "branch-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+        hub.state.add_agent("agent-1".to_string(), agent);
+
+        // TUI selects agent (becomes owner), resize to 100x50
+        dispatch(&mut hub, HubAction::SelectAgentForClient {
+            client_id: ClientId::Tui,
+            agent_key: "agent-1".to_string(),
+        });
+        dispatch(&mut hub, HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            cols: 100,
+            rows: 50,
+        });
+
+        // Browser connects with different dims, then selects (becomes new owner)
+        let browser_id = ClientId::Browser("browser-1".to_string());
+        dispatch(&mut hub, HubAction::ClientConnected { client_id: browser_id.clone() });
+        dispatch(&mut hub, HubAction::ResizeForClient {
+            client_id: browser_id.clone(),
+            cols: 80,
+            rows: 24,
+        });
+        dispatch(&mut hub, HubAction::SelectAgentForClient {
+            client_id: browser_id.clone(),
+            agent_key: "agent-1".to_string(),
+        });
+
+        // Browser is now owner, agent should be at browser dims
+        assert_eq!(
+            hub.state.agents.get("agent-1").unwrap().size_owner,
+            Some(browser_id.clone()),
+            "Browser should be size owner after selecting"
+        );
+        let (rows, cols) = hub.state.agents.get("agent-1").unwrap().get_pty_size();
+        assert_eq!((rows, cols), (24, 80), "Agent should resize to new owner's dims");
+
+        // TUI resize should now be ignored
+        dispatch(&mut hub, HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            cols: 200,
+            rows: 60,
+        });
+        let (rows, cols) = hub.state.agents.get("agent-1").unwrap().get_pty_size();
+        assert_eq!((rows, cols), (24, 80), "Old owner resize should be ignored");
+    }
+
+    /// Test that ownership transfers on disconnect.
+    #[test]
+    fn test_ownership_transfers_on_disconnect() {
+        use crate::agent::Agent;
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        let config = test_config();
+        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "branch-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+        hub.state.add_agent("agent-1".to_string(), agent);
+
+        // Browser 1 connects and selects (becomes owner)
+        let browser1_id = ClientId::Browser("browser-1".to_string());
+        dispatch(&mut hub, HubAction::ClientConnected { client_id: browser1_id.clone() });
+        dispatch(&mut hub, HubAction::ResizeForClient {
+            client_id: browser1_id.clone(),
+            cols: 80,
+            rows: 24,
+        });
+        dispatch(&mut hub, HubAction::SelectAgentForClient {
+            client_id: browser1_id.clone(),
+            agent_key: "agent-1".to_string(),
+        });
+
+        // Browser 2 connects and also selects (becomes new owner)
+        let browser2_id = ClientId::Browser("browser-2".to_string());
+        dispatch(&mut hub, HubAction::ClientConnected { client_id: browser2_id.clone() });
+        dispatch(&mut hub, HubAction::ResizeForClient {
+            client_id: browser2_id.clone(),
+            cols: 120,
+            rows: 40,
+        });
+        dispatch(&mut hub, HubAction::SelectAgentForClient {
+            client_id: browser2_id.clone(),
+            agent_key: "agent-1".to_string(),
+        });
+
+        // Browser 2 is owner
+        assert_eq!(
+            hub.state.agents.get("agent-1").unwrap().size_owner,
+            Some(browser2_id.clone())
+        );
+
+        // Browser 2 disconnects -> ownership should transfer to browser 1
+        dispatch(&mut hub, HubAction::ClientDisconnected { client_id: browser2_id });
+
+        assert_eq!(
+            hub.state.agents.get("agent-1").unwrap().size_owner,
+            Some(browser1_id.clone()),
+            "Ownership should transfer to remaining viewer"
+        );
+
+        // Agent should be resized to browser 1's dims
+        let (rows, cols) = hub.state.agents.get("agent-1").unwrap().get_pty_size();
+        assert_eq!((rows, cols), (24, 80), "Agent should resize to new owner's dims");
     }
 
     // =========================================================================

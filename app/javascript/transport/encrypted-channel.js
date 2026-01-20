@@ -247,19 +247,28 @@ export class EncryptedChannel {
    * Handle received data from channel.
    */
   async handleReceived(data) {
+    console.log(`[EncryptedChannel] ${this.channelName} received data:`, {
+      hasEnvelope: !!data.envelope,
+      hasError: !!data.error,
+      keys: Object.keys(data),
+    });
     try {
       if (data.envelope) {
         // Decrypt Signal envelope
+        console.log(`[EncryptedChannel] ${this.channelName} decrypting envelope...`);
         const decrypted = await this.signal.decrypt(data.envelope);
+        console.log(`[EncryptedChannel] ${this.channelName} decrypted:`, decrypted?.type || "unknown type");
         this.onMessage(decrypted);
       } else if (data.error) {
+        console.error(`[EncryptedChannel] ${this.channelName} server error:`, data.error);
         this.onError({ type: "server_error", error: data.error });
       } else {
         // Pass through unencrypted messages (e.g., control messages)
+        console.log(`[EncryptedChannel] ${this.channelName} unencrypted message:`, data);
         this.onMessage(data);
       }
     } catch (error) {
-      console.error("[EncryptedChannel] Decryption failed:", error);
+      console.error(`[EncryptedChannel] ${this.channelName} decryption failed:`, error);
       this.onError({ type: "decryption_failed", error });
     }
   }

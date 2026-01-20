@@ -153,10 +153,12 @@ impl TunnelManager {
         };
 
         // Set Origin header (required by ActionCable)
-        request.headers_mut().insert(
-            "Origin",
-            self.server_url.parse().unwrap_or_else(|_| "http://localhost".parse().expect("localhost is valid")),
-        );
+        // No fallback - invalid server_url should fail explicitly
+        let origin_header = self.server_url.parse().map_err(|e| {
+            error!("[Tunnel] Invalid server URL '{}' cannot be used as Origin header: {}", self.server_url, e);
+            anyhow::anyhow!("Invalid server URL: {}", e)
+        })?;
+        request.headers_mut().insert("Origin", origin_header);
 
         // Set Authorization header with bearer token (Fizzy pattern)
         request.headers_mut().insert(

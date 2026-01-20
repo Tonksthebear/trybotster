@@ -39,6 +39,16 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        // Worktree base: prefer home directory, but don't silently fall back
+        // If home directory is unavailable, we'll catch this when loading config
+        let worktree_base = dirs::home_dir()
+            .map(|h| h.join("botster-sessions"))
+            .unwrap_or_else(|| {
+                // Log warning - this will be caught when config is actually used
+                eprintln!("Warning: Could not determine home directory for worktree_base");
+                PathBuf::from("botster-sessions")
+            });
+
         Self {
             server_url: "https://trybotster.com".to_string(),
             token: String::new(),
@@ -46,19 +56,30 @@ impl Default for Config {
             poll_interval: 5,
             agent_timeout: 3600,
             max_sessions: 20,
-            worktree_base: dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("botster-sessions"),
+            worktree_base,
         }
     }
 }
 
 impl Config {
     /// Returns the configuration directory path, creating it if necessary.
+    ///
+    /// Directory selection priority:
+    /// 1. `BOTSTER_CONFIG_DIR` env var: explicit override
+    /// 2. `BOTSTER_ENV=test`: `tmp/botster-test` (integration tests)
+    /// 3. Default: `~/.botster_hub`
     pub fn config_dir() -> Result<PathBuf> {
         let dir = if let Ok(test_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
+            // Explicit override via env var
             PathBuf::from(test_dir)
+        } else if is_test_mode() {
+            // Integration tests (BOTSTER_ENV=test): use repo's tmp/ directory
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .context("cli/ has no parent directory")?
+                .join("tmp/botster-test")
         } else {
+            // Production: use home directory
             dirs::home_dir()
                 .context("No home directory")?
                 .join(".botster_hub")

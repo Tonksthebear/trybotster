@@ -102,12 +102,15 @@ export default class extends Controller {
 
   // Called by Stimulus when connection outlet becomes available
   connectionOutletConnected(outlet) {
+    console.log("[Agents] connectionOutletConnected called");
+    console.log("[Agents] Outlet state:", outlet?.state, "connected:", outlet?.connected);
     outlet.registerListener(this, {
       onConnected: (outlet) => this.handleConnected(outlet),
       onDisconnected: () => this.handleDisconnected(),
       onMessage: (message) => this.handleMessage(message),
       onError: (error) => this.handleError(error),
     });
+    console.log("[Agents] Registered listener with connection outlet");
   }
 
   // Called by Stimulus when connection outlet is removed
@@ -118,14 +121,17 @@ export default class extends Controller {
 
   // Handle connection established
   handleConnected(outlet) {
+    console.log("[Agents] handleConnected called, outlet:", !!outlet);
     this.connection = outlet;
     // Request agent list and worktrees when connected
+    console.log("[Agents] Requesting agent list and worktrees...");
     this.requestAgentList();
     this.requestWorktrees();
 
     // Check if we should auto-select an agent from URL
     const agentIndex = this.#getAgentIndexFromUrl();
     if (agentIndex !== null) {
+      console.log("[Agents] Will auto-select agent at index:", agentIndex);
       this.pendingAutoSelectIndex = agentIndex;
     }
   }
@@ -202,6 +208,37 @@ export default class extends Controller {
   // Handle connection errors
   handleError(error) {
     console.error("[Agents] Connection error:", error);
+
+    // Update landing page agent list to show error
+    if (this.hasLandingAgentListTarget) {
+      const isQrScanNeeded = error.reason === "no_bundle" || error.reason === "session_invalid";
+
+      if (isQrScanNeeded) {
+        this.landingAgentListTarget.innerHTML = `
+          <div class="py-8 text-center">
+            <svg class="size-10 text-amber-500 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+            </svg>
+            <h3 class="text-base font-medium text-zinc-200 mb-2">QR Code Required</h3>
+            <p class="text-sm text-zinc-400 max-w-xs mx-auto">
+              ${error.reason === "session_invalid"
+                ? "Session expired. Press Ctrl+P in the CLI and select \"Show Connection Code\"."
+                : "Press Ctrl+P in the CLI and select \"Show Connection Code\" to scan."}
+            </p>
+          </div>
+        `;
+      } else {
+        this.landingAgentListTarget.innerHTML = `
+          <div class="py-8 text-center">
+            <svg class="size-10 text-red-500 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+            </svg>
+            <h3 class="text-base font-medium text-zinc-200 mb-2">Connection Failed</h3>
+            <p class="text-sm text-zinc-400 max-w-xs mx-auto">${this.escapeHtml(error.message || "Unable to connect to CLI")}</p>
+          </div>
+        `;
+      }
+    }
   }
 
   // Show creating state (loading indicator)
@@ -731,15 +768,23 @@ export default class extends Controller {
 
   // Action: Request agent list refresh
   requestAgentList() {
+    console.log("[Agents] requestAgentList called, connection:", !!this.connection);
     if (this.connection) {
+      console.log("[Agents] Sending requestAgents to connection");
       this.connection.requestAgents();
+    } else {
+      console.warn("[Agents] No connection available for requestAgentList");
     }
   }
 
   // Action: Request worktree list refresh
   requestWorktrees() {
+    console.log("[Agents] requestWorktrees called, connection:", !!this.connection);
     if (this.connection) {
+      console.log("[Agents] Sending requestWorktrees to connection");
       this.connection.requestWorktrees();
+    } else {
+      console.warn("[Agents] No connection available for requestWorktrees");
     }
   }
 

@@ -94,18 +94,36 @@ fn should_skip_keyring() -> bool {
 }
 
 /// Get the hub state directory for a given hub_identifier.
+///
+/// Directory selection priority:
+/// 1. `#[cfg(test)]` (unit tests): `tmp/botster-test/hubs`
+/// 2. `BOTSTER_CONFIG_DIR` env var: `{custom_dir}/hubs`
+/// 3. `BOTSTER_ENV=test`: `tmp/botster-test/hubs` (integration tests)
+/// 4. Default: system config directory (e.g., `~/Library/Application Support/botster/hubs`)
 fn hub_state_dir(hub_id: &str) -> Result<PathBuf> {
     let base_dir = {
         #[cfg(test)]
         {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-config/hubs")
+            // Use repo's tmp/ directory (already gitignored)
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("cli/ has parent directory")
+                .join("tmp/botster-test/hubs")
         }
 
         #[cfg(not(test))]
         {
             if let Ok(custom_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
+                // Explicit override via env var
                 PathBuf::from(custom_dir).join("hubs")
+            } else if crate::env::is_test_mode() {
+                // Integration tests (BOTSTER_ENV=test): use repo's tmp/ directory
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("cli/ has parent directory")
+                    .join("tmp/botster-test/hubs")
             } else {
+                // Production: use system config directory
                 dirs::config_dir()
                     .context("Could not determine config directory")?
                     .join("botster")

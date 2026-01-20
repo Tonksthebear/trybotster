@@ -92,10 +92,8 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
                 BrowserEvent::Disconnected => {
                     hub.browser.handle_disconnected();
                 }
-                BrowserEvent::Resize(resize) => {
-                    // Update shared dims for rendering compatibility
-                    hub.browser.handle_resize(resize.clone());
-                }
+                // Note: BrowserEvent::Resize is intentionally not handled here.
+                // Resize is now per-client via terminal channel (drain_and_route_browser_input).
                 BrowserEvent::SelectAgent { id } => {
                     hub.browser.invalidate_screen();
                     // Send to THIS browser only (not broadcast to all browsers)
@@ -340,9 +338,9 @@ pub fn drain_and_route_browser_input(hub: &mut crate::hub::Hub) {
                             cols,
                             rows
                         );
-                        // Resize the agent immediately
-                        agent.resize(cols, rows);
-                        // Collect client update for later (avoid borrow conflict)
+                        // Collect resize for later dispatch (avoid borrow conflict)
+                        // Don't resize agent directly - let action dispatch handle it
+                        // with proper size_owner tracking
                         client_resizes.push((peer_id.0.clone(), cols, rows));
                     }
                     Ok(other) => {
@@ -364,14 +362,18 @@ pub fn drain_and_route_browser_input(hub: &mut crate::hub::Hub) {
         }
     }
 
-    // Apply client dimension updates after agent borrows are released.
-    // This ensures client dims are stored for use when checking remaining viewers on disconnect.
+    // Dispatch resize actions after agent borrows are released.
+    // Action dispatch handles size_owner tracking.
     for (peer_id, cols, rows) in client_resizes {
-        let client_id = ClientId::browser(&peer_id);
-        if let Some(client) = hub.clients.get_mut(&client_id) {
-            client.resize(cols, rows);
-            log::debug!("Updated client {} dims to {}x{}", client_id, cols, rows);
-        }
+        use crate::hub::HubAction;
+        actions::dispatch(
+            hub,
+            HubAction::ResizeForClient {
+                client_id: ClientId::browser(&peer_id),
+                cols,
+                rows,
+            },
+        );
     }
 }
 

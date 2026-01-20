@@ -110,6 +110,10 @@ pub struct Agent {
     /// Only created if `tunnel_port` is set.
     pub preview_channel: Option<ActionCableChannel>,
 
+    /// Client that currently "owns" the PTY size.
+    /// Only this client can resize the PTY. Updated when a client views the agent.
+    pub size_owner: Option<crate::client::ClientId>,
+
     notification_rx: Option<Receiver<AgentNotification>>,
 }
 
@@ -153,6 +157,7 @@ impl Agent {
             active_pty: PtyView::Cli,
             terminal_channel: None,
             preview_channel: None,
+            size_owner: None,
             notification_rx: None,
         }
     }
