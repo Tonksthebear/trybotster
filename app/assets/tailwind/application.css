@@ -22,6 +22,11 @@
   touch-action: pan-y;
 }
 
+/* Hide iOS native cursor on xterm's hidden input textarea */
+.terminal-container .xterm-helper-textarea {
+  @apply caret-transparent select-none;
+}
+
 /*
  * iOS safe area insets for touch controls
  * Uses CSS env() function which has no Tailwind equivalent

@@ -45,8 +45,6 @@ pub struct BrowserState {
     pub event_rx: Option<mpsc::Receiver<IdentifiedBrowserEvent>>,
     /// Whether a browser is currently connected.
     pub connected: bool,
-    /// Browser terminal dimensions.
-    pub dims: Option<BrowserResize>,
     /// Browser display mode (TUI or GUI).
     pub mode: Option<BrowserMode>,
     /// Last screen hash per agent (bandwidth optimization).
@@ -67,7 +65,6 @@ impl std::fmt::Debug for BrowserState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrowserState")
             .field("connected", &self.connected)
-            .field("dims", &self.dims)
             .field("mode", &self.mode)
             .finish_non_exhaustive()
     }
@@ -103,19 +100,7 @@ impl BrowserState {
     pub fn handle_disconnected(&mut self) {
         log::info!("Browser disconnected");
         self.connected = false;
-        self.dims = None;
         self.last_screen_hash = None;
-    }
-
-    /// Handle browser resize event.
-    ///
-    /// Returns the new dimensions for agent resizing.
-    pub fn handle_resize(&mut self, resize: BrowserResize) -> (u16, u16) {
-        log::info!("Browser resize: {}x{}", resize.cols, resize.rows);
-        let dims = (resize.rows, resize.cols);
-        self.dims = Some(resize);
-        self.last_screen_hash = None;
-        dims
     }
 
     /// Handle browser mode change.
@@ -456,20 +441,18 @@ mod tests {
     fn test_browser_state_default() {
         let state = BrowserState::default();
         assert!(!state.is_connected());
-        assert!(state.dims.is_none());
+        assert!(state.mode.is_none());
     }
 
     #[test]
     fn test_browser_state_disconnect() {
         let mut state = BrowserState::default();
         state.connected = true;
-        state.dims = Some(BrowserResize { rows: 24, cols: 80 });
         state.last_screen_hash = Some(12345);
 
         state.disconnect();
 
         assert!(!state.connected);
-        assert!(state.dims.is_none());
         assert!(state.last_screen_hash.is_none());
     }
 
@@ -480,19 +463,6 @@ mod tests {
 
         assert!(state.connected);
         assert_eq!(state.mode, Some(BrowserMode::Gui));
-    }
-
-    #[test]
-    fn test_handle_resize() {
-        let mut state = BrowserState::default();
-        state.last_screen_hash = Some(12345);
-
-        let (rows, cols) = state.handle_resize(BrowserResize { rows: 40, cols: 120 });
-
-        assert_eq!(rows, 40);
-        assert_eq!(cols, 120);
-        assert!(state.dims.is_some());
-        assert!(state.last_screen_hash.is_none()); // Invalidated
     }
 
     #[test]

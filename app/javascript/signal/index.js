@@ -392,6 +392,7 @@ export const ConnectionError = {
   HANDSHAKE_FAILED: "handshake_failed",
   DECRYPT_FAILED: "decrypt_failed",
   WEBSOCKET_ERROR: "websocket_error",
+  SESSION_INVALID: "session_invalid", // CLI restarted, keys don't match
 };
 
 export default {

@@ -21,8 +21,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::hub::Hub;
-use crate::relay::{browser, check_browser_resize, drain_and_route_browser_input, drain_and_route_pty_output, ResizeAction};
-use crate::{constants, tui, BrowserDimensions, BrowserMode};
+use crate::relay::{browser, drain_and_route_browser_input, drain_and_route_pty_output};
+use crate::{constants, tui};
 
 /// Run the Hub event loop.
 ///
@@ -69,41 +69,31 @@ pub fn run_event_loop(
             break;
         }
 
-        // 2. Get browser dimensions for rendering
-        let browser_dims: Option<BrowserDimensions> = hub.browser.dims.as_ref().map(|dims| {
-            BrowserDimensions {
-                cols: dims.cols,
-                rows: dims.rows,
-                mode: hub.browser.mode.unwrap_or(BrowserMode::Tui),
-            }
-        });
-
-        // 3. Handle browser resize
-        handle_browser_resize_action(hub, browser_dims.as_ref(), terminal);
-
-        // 4. Render using tui::render()
-        let (_ansi_output, _rows, _cols, qr_image_written) = tui::render(terminal, hub, browser_dims.clone())?;
+        // 2. Render using tui::render()
+        // Note: Browser resize is now handled per-client via terminal channel,
+        // not globally. TUI rendering uses local terminal dimensions only.
+        let (_ansi_output, _rows, _cols, qr_image_written) = tui::render(terminal, hub, None)?;
 
         // Track QR image display to prevent re-rendering every frame
         if qr_image_written {
             hub.qr_image_displayed = true;
         }
 
-        // 5. Poll and handle browser events (HubRelay - hub-level commands)
+        // 3. Poll and handle browser events (HubRelay - hub-level commands)
         browser::poll_events(hub, terminal)?;
 
-        // 6. Drain browser input from agent channels and route to PTY
+        // 4. Drain browser input from agent channels and route to PTY
         // Agent channels receive input directly from browsers
         drain_and_route_browser_input(hub);
 
-        // 7. Drain PTY output from all agents and route to viewing clients
+        // 5. Drain PTY output from all agents and route to viewing clients
         // Each client receives output only from their selected agent
         drain_and_route_pty_output(hub);
 
-        // 8. Flush client output buffers (sends batched output to browsers)
+        // 6. Flush client output buffers (sends batched output to browsers)
         hub.flush_all_clients();
 
-        // 9. Periodic tasks (polling, heartbeat, notifications)
+        // 7. Periodic tasks (polling, heartbeat, notifications)
         hub.tick();
 
         // Small sleep to prevent CPU spinning (60 FPS max)
@@ -112,24 +102,4 @@ pub fn run_event_loop(
 
     log::info!("Hub event loop exiting");
     Ok(())
-}
-
-/// Handle browser resize by applying dimension changes to agents.
-fn handle_browser_resize_action(
-    hub: &mut Hub,
-    browser_dims: Option<&BrowserDimensions>,
-    terminal: &Terminal<CrosstermBackend<Stdout>>,
-) {
-    let dims_tuple = browser_dims.map(|d| (d.rows, d.cols, d.mode));
-    let terminal_size = terminal.size().unwrap_or_default();
-    let local_dims = (terminal_size.height, terminal_size.width);
-
-    match check_browser_resize(dims_tuple, local_dims) {
-        ResizeAction::ResizeAgents { rows, cols } | ResizeAction::ResetToLocal { rows, cols } => {
-            for agent in hub.state.agents.values() {
-                agent.resize(rows, cols);
-            }
-        }
-        ResizeAction::None => {}
-    }
 }

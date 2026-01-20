@@ -24,6 +24,9 @@ export default class extends Controller {
   #keyboardHandler = null;
   #boundHandleResize = null;
   #momentumAnimationId = null;
+  #isComposing = false;
+  #sentDuringComposition = "";
+  #isHandlingAutocorrect = false;
 
   connect() {
     this.#boundHandleResize = this.#handleResize.bind(this);
@@ -111,11 +114,25 @@ export default class extends Controller {
 
     requestAnimationFrame(() => this.#fitAddon.fit());
 
-    this.#terminal.onData((data) => this.#sendInput(data));
+    this.#terminal.onData((data) => {
+      // Cancel any momentum scrolling when user starts typing
+      if (this.#momentumAnimationId) {
+        cancelAnimationFrame(this.#momentumAnimationId);
+        this.#momentumAnimationId = null;
+      }
+      // Skip if we're handling autocorrect directly (prevents double-send)
+      if (this.#isHandlingAutocorrect) return;
+      // Track what xterm sends during composition for autocorrect handling
+      if (this.#isComposing) {
+        this.#sentDuringComposition += data;
+      }
+      this.#sendInput(data);
+    });
     container.addEventListener("click", () => this.focus());
 
     this.#setupTouchScroll();
     this.#setupKeyboardHandler();
+    this.#setupMobileAutocorrect();
 
     this.#terminal.writeln("Secure Terminal (Signal Protocol E2E Encryption)");
     this.#terminal.writeln("Connecting...");
@@ -197,12 +214,11 @@ export default class extends Controller {
     overlay.addEventListener("touchend", (e) => {
       if (!isScrolling) {
         // Pass tap through to terminal for focus/keyboard
-        overlay.style.pointerEvents = "none";
-        const touch = e.changedTouches[0];
-        const target = document.elementFromPoint(touch.clientX, touch.clientY);
-        target?.focus?.();
-        target?.click?.();
-        requestAnimationFrame(() => overlay.style.pointerEvents = "auto");
+        // Only call focus() - calling click() can cause keyboard to close immediately
+        const xtermTextarea = this.#terminal?.element?.querySelector(".xterm-helper-textarea");
+        if (xtermTextarea) {
+          xtermTextarea.focus();
+        }
         return;
       }
 
@@ -249,8 +265,9 @@ export default class extends Controller {
 
     const container = this.hasContainerTarget ? this.containerTarget : this.element;
     let isKeyboardOpen = false;
+    let debounceTimer = null;
 
-    this.#keyboardHandler = () => {
+    const handleViewportChange = () => {
       const vh = window.visualViewport.height;
       const offset = window.visualViewport.offsetTop;
       const rect = container.getBoundingClientRect();
@@ -268,6 +285,12 @@ export default class extends Controller {
         isKeyboardOpen = false;
         requestAnimationFrame(() => this.#fitAddon?.fit());
       }
+    };
+
+    // Debounce to avoid rapid fire during keyboard animations
+    this.#keyboardHandler = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(handleViewportChange, 50);
     };
 
     window.visualViewport.addEventListener("resize", this.#keyboardHandler);
@@ -295,7 +318,8 @@ export default class extends Controller {
     this.#terminal.writeln("[Signal E2E encryption active]");
     this.#terminal.writeln("");
     this.#connection.send("set_mode", { mode: "gui" });
-    this.#sendResize();
+    // Note: resize is NOT sent here - terminal channel isn't ready yet
+    // Resize is sent when agent_selected/agent_channel_switched is received
     this.focus();
   }
 
@@ -319,8 +343,16 @@ export default class extends Controller {
         }
         break;
       case "clear":
-      case "agent_selected":
         this.#terminal?.clear();
+        break;
+      case "agent_selected":
+      case "agent_channel_switched":
+        // Terminal channel is now ready - send resize
+        this.#terminal?.clear();
+        requestAnimationFrame(() => {
+          this.#fitAddon?.fit();
+          this.#sendResize();
+        });
         break;
       case "scrollback":
         this.#writeScrollback(message.data, message.compressed);
@@ -374,5 +406,124 @@ export default class extends Controller {
   #handleResize() {
     this.#fitAddon?.fit();
     this.#sendResize();
+  }
+
+  // Mobile Autocorrect/Autocomplete Support (iOS and Android)
+  //
+  // xterm.js doesn't handle mobile autocorrect. iOS fires `insertReplacementText`
+  // but getTargetRanges() returns empty. We use two strategies:
+  //
+  // 1. Composition events (Android IME, some autocorrect): Track what xterm sends
+  //    during composition, delete that amount on compositionend
+  //
+  // 2. Word-based fallback (iOS): Autocorrect replaces the last word being typed,
+  //    so we find the last word in the textarea and delete that many chars
+  //
+  #setupMobileAutocorrect() {
+    const textarea = this.#terminal?.element?.querySelector(".xterm-helper-textarea");
+    if (!textarea) return;
+
+    // Composition events (Android IME)
+    textarea.addEventListener("compositionstart", () => {
+      this.#isComposing = true;
+      this.#sentDuringComposition = "";
+    });
+
+    textarea.addEventListener("compositionend", (e) => {
+      this.#isComposing = false;
+      const deleteCount = this.#sentDuringComposition.length;
+      if (deleteCount > 0 && e.data) {
+        this.#sendInput("\x7f".repeat(deleteCount) + e.data);
+      }
+      this.#sentDuringComposition = "";
+    });
+
+    // iOS won't send delete events when textarea is empty
+    // Keep dummy content in the textarea so iOS always thinks there's something to delete
+    const DUMMY_CONTENT = "     "; // 5 spaces
+
+    // Initialize textarea with dummy content on focus
+    textarea.addEventListener("focus", () => {
+      if (textarea.value.length < 3) {
+        textarea.value = DUMMY_CONTENT;
+      }
+    });
+
+    // Unified beforeinput handler for iOS
+    textarea.addEventListener("beforeinput", (e) => {
+      // Handle delete key
+      if (e.inputType === "deleteContentBackward" || e.inputType === "deleteContentForward") {
+        e.preventDefault();
+        this.#sendInput("\x7f");
+        setTimeout(() => {
+          if (textarea.value.length < 3) {
+            textarea.value = DUMMY_CONTENT;
+          }
+        }, 0);
+        return;
+      }
+
+      // Word-delete mode - iOS may use different inputTypes
+      if (e.inputType === "deleteWordBackward" || e.inputType === "deleteWordForward" ||
+          e.inputType === "deleteSoftLineBackward" || e.inputType === "deleteHardLineBackward") {
+        e.preventDefault();
+        this.#sendInput("\x17");
+        setTimeout(() => {
+          if (textarea.value.length < 3) {
+            textarea.value = DUMMY_CONTENT;
+          }
+        }, 0);
+        return;
+      }
+
+      // Autocorrect/replacement handler
+      if (this.#isComposing) return;
+      if (e.inputType !== "insertReplacementText") return;
+
+      // Block xterm's onData from double-sending
+      this.#isHandlingAutocorrect = true;
+
+      const text = textarea.value;
+      const replacement = e.data || "";
+
+      // Detect punctuation replacement (double-space-to-period, etc.)
+      // These replace just the trailing space, not a whole word
+      const isPunctuationReplacement = /^[.!?,;:]+\s*$/.test(replacement);
+
+      let deleteCount;
+      let textToSend;
+
+      if (isPunctuationReplacement) {
+        // Double-space-to-period: iOS sends space first, then replacement
+        // Terminal has TWO spaces, delete both then add ". "
+        e.preventDefault();
+        this.#sendInput("\x7f\x7f");
+        setTimeout(() => {
+          this.#sendInput(". ");
+          this.#isHandlingAutocorrect = false;
+        }, 50);
+        return;
+      }
+
+      // Autocomplete: delete the word being replaced
+      const words = text.trim().split(/\s+/);
+      const wordToReplace = words[words.length - 1] || "";
+      deleteCount = wordToReplace.length;
+      textToSend = replacement.trimStart();
+
+      if (deleteCount > 0) {
+        this.#sendInput("\x7f".repeat(deleteCount));
+      }
+      // Send replacement with trailing space for next word
+      if (textToSend) {
+        setTimeout(() => this.#sendInput(textToSend + " "), 50);
+      }
+
+      // Clear flag after iOS finishes updating
+      setTimeout(() => {
+        this.#isHandlingAutocorrect = false;
+        this.#terminal?.scrollToBottom();
+      }, 100);
+    }, { capture: true });
   }
 }

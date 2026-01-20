@@ -225,7 +225,8 @@ impl Hub {
         let state = HubState::new(config.worktree_base.clone());
         let tokio_runtime = tokio::runtime::Runtime::new()?;
 
-        // Generate stable hub_identifier: env var (for testing) > repo path > UUID
+        // Generate stable hub_identifier: env var > repo path hash
+        // NO FALLBACKS - if we can't determine a stable identifier, fail explicitly
         let hub_identifier = if let Ok(id) = std::env::var("BOTSTER_HUB_ID") {
             log::info!("Hub identifier (from env): {}...", &id[..id.len().min(8)]);
             id
@@ -236,11 +237,16 @@ impl Hub {
                     log::info!("Hub identifier (from repo): {}...", &id[..8]);
                     id
                 }
-                Err(_) => {
-                    // Fallback to UUID if not in a repo
-                    let id = uuid::Uuid::new_v4().to_string();
-                    log::info!("Hub identifier (random): {}...", &id[..8]);
-                    id
+                Err(e) => {
+                    // No silent fallback to random UUID - that causes session mismatches
+                    // Either set BOTSTER_HUB_ID env var or run from a git repository
+                    anyhow::bail!(
+                        "Cannot determine hub identifier. Either:\n\
+                         1. Run from within a git repository, or\n\
+                         2. Set BOTSTER_HUB_ID environment variable\n\
+                         \n\
+                         Error: {e}"
+                    );
                 }
             }
         };
@@ -1497,10 +1503,16 @@ mod tests {
 
     #[test]
     fn test_handle_action_resize() {
+        use crate::client::ClientId;
+
         let config = test_config();
         let mut hub = Hub::new(config, TEST_DIMS).unwrap();
 
-        hub.handle_action(HubAction::Resize { rows: 50, cols: 150 });
+        hub.handle_action(HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            cols: 150,
+            rows: 50,
+        });
         assert_eq!(hub.terminal_dims(), (50, 150));
     }
 

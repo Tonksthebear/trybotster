@@ -84,6 +84,11 @@ export class Channel {
     this.onMessage = options.onMessage || (() => {});
     this.onConnect = options.onConnect || (() => {});
     this.onDisconnect = options.onDisconnect || (() => {});
+    this.onError = options.onError || (() => {});
+
+    // Track consecutive decryption failures to detect stale sessions
+    this.decryptionFailureCount = 0;
+    this.maxDecryptionFailures = 3; // After 3 failures, emit session_invalid error
 
     // Reliable delivery components (only if enabled)
     this.sender = this.reliable
@@ -193,8 +198,21 @@ export class Channel {
     if (this.session && data.envelope) {
       try {
         decrypted = await this.session.decrypt(data.envelope);
+        // Reset failure count on successful decryption
+        this.decryptionFailureCount = 0;
       } catch (error) {
-        console.error("[Channel] Decryption failed:", error);
+        this.decryptionFailureCount++;
+        console.error(`[Channel] Decryption failed (${this.decryptionFailureCount}/${this.maxDecryptionFailures}):`, error);
+
+        // After repeated failures, the session is likely invalid (CLI restarted, keys changed)
+        if (this.decryptionFailureCount >= this.maxDecryptionFailures) {
+          console.error("[Channel] Session appears invalid - CLI may have restarted. Re-scan QR code required.");
+          this.onError({
+            type: "session_invalid",
+            message: "Encryption session expired. Please re-scan the QR code to reconnect.",
+            failureCount: this.decryptionFailureCount,
+          });
+        }
         return;
       }
     }
@@ -306,6 +324,7 @@ export class ChannelBuilder {
     this._onMessage = () => {};
     this._onConnect = () => {};
     this._onDisconnect = () => {};
+    this._onError = () => {};
   }
 
   /**
@@ -349,6 +368,14 @@ export class ChannelBuilder {
   }
 
   /**
+   * Set the error callback.
+   */
+  onError(callback) {
+    this._onError = callback;
+    return this;
+  }
+
+  /**
    * Build the channel.
    */
   build() {
@@ -359,6 +386,7 @@ export class ChannelBuilder {
       onMessage: this._onMessage,
       onConnect: this._onConnect,
       onDisconnect: this._onDisconnect,
+      onError: this._onError,
     });
   }
 }

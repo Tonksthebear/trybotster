@@ -226,6 +226,7 @@ export default class extends Controller {
 
     try {
       // Step 1: Load Signal WASM
+      console.log("[Connection] Step 1: Loading WASM...");
       this.setState(ConnectionState.LOADING_WASM);
       this.updateStatus(
         "Loading encryption...",
@@ -233,12 +234,19 @@ export default class extends Controller {
       );
 
       try {
+        console.log("[Connection] WASM URLs:", {
+          worker: this.workerUrlValue,
+          wasmJs: this.wasmJsUrlValue,
+          wasmBinary: this.wasmBinaryUrlValue,
+        });
         await initSignal(
           this.workerUrlValue,
           this.wasmJsUrlValue,
           this.wasmBinaryUrlValue,
         );
+        console.log("[Connection] Step 1 COMPLETE: WASM loaded");
       } catch (wasmError) {
+        console.error("[Connection] Step 1 FAILED: WASM error:", wasmError);
         this.setError(
           ConnectionError.WASM_LOAD_FAILED,
           `Failed to load encryption: ${wasmError.message}`,
@@ -247,12 +255,15 @@ export default class extends Controller {
       }
 
       // Step 2: Set up Signal session
+      console.log("[Connection] Step 2: Setting up Signal session...");
       this.setState(ConnectionState.CREATING_SESSION);
       this.updateStatus("Setting up encryption...", "Processing security keys");
 
       try {
         await this.setupSignalSession();
+        console.log("[Connection] Step 2 COMPLETE: Session created, signalSession =", !!this.signalSession);
       } catch (sessionError) {
+        console.error("[Connection] Step 2 FAILED: Session error:", sessionError);
         this.setError(
           ConnectionError.SESSION_CREATE_FAILED,
           `Encryption setup failed: ${sessionError.message}`,
@@ -261,6 +272,7 @@ export default class extends Controller {
       }
 
       if (!this.signalSession) {
+        console.error("[Connection] Step 2 FAILED: No signal session after setup");
         this.setError(
           ConnectionError.NO_BUNDLE,
           "No encryption bundle. Scan QR code to connect.",
@@ -270,8 +282,10 @@ export default class extends Controller {
 
       // Get our identity key to filter out our own messages
       this.ourIdentityKey = await this.signalSession.getIdentityKey();
+      console.log("[Connection] Our identity key:", this.ourIdentityKey?.substring(0, 20) + "...");
 
       // Step 3: Subscribe to Action Cable channel
+      console.log("[Connection] Step 3: Subscribing to Action Cable...");
       this.setState(ConnectionState.SUBSCRIBING);
       this.updateStatus(
         "Connecting to server...",
@@ -280,7 +294,9 @@ export default class extends Controller {
 
       try {
         await this.subscribeToChannel();
+        console.log("[Connection] Step 3 COMPLETE: Subscribed to channel");
       } catch (subError) {
+        console.error("[Connection] Step 3 FAILED: Subscribe error:", subError);
         this.setError(
           ConnectionError.SUBSCRIBE_REJECTED,
           `Connection rejected: ${subError.message}`,
@@ -289,16 +305,20 @@ export default class extends Controller {
       }
 
       // Step 4: Channel connected - CLI is reachable
+      console.log("[Connection] Step 4: Channel connected, sending handshake...");
       this.setState(ConnectionState.CHANNEL_CONNECTED);
       this.updateStatus("CLI reachable", "Sending encrypted handshake...");
 
       // Step 5: Send handshake and wait for ACK
+      console.log("[Connection] Step 5: Sending handshake with timeout...");
       this.setState(ConnectionState.HANDSHAKE_SENT);
       await this.sendHandshakeWithTimeout();
+      console.log("[Connection] Step 5 COMPLETE: Handshake sent, waiting for ACK...");
 
       // Note: Connection completes when we receive handshake_ack in handleDecryptedMessage
     } catch (error) {
       console.error("[Connection] Failed to initialize:", error);
+      console.error("[Connection] Error stack:", error.stack);
       this.setError(
         ConnectionError.WEBSOCKET_ERROR,
         `Connection error: ${error.message}`,
@@ -308,12 +328,21 @@ export default class extends Controller {
 
   async setupSignalSession() {
     // Check for bundle in URL fragment (fresh QR code scan)
+    console.log("[Connection] setupSignalSession: checking URL fragment...");
+    console.log("[Connection] URL hash:", window.location.hash ? "(has hash)" : "(no hash)");
     const urlBundle = parseBundleFromFragment();
+    console.log("[Connection] urlBundle parsed:", urlBundle ? "yes" : "no");
 
     if (urlBundle) {
       // Fresh bundle from QR code - always use it (replaces any cached session)
       console.log("[Connection] Creating new session from URL bundle");
-      this.signalSession = await SignalSession.create(urlBundle, this.hubId);
+      try {
+        this.signalSession = await SignalSession.create(urlBundle, this.hubId);
+        console.log("[Connection] Session created from bundle successfully");
+      } catch (err) {
+        console.error("[Connection] Failed to create session from bundle:", err);
+        throw err;
+      }
       // Clear fragment after successful session creation (clean URL)
       if (window.history.replaceState) {
         window.history.replaceState(
@@ -324,15 +353,23 @@ export default class extends Controller {
       }
     } else {
       // No URL bundle - try to restore from IndexedDB
-      this.signalSession = await SignalSession.load(this.hubId);
+      console.log("[Connection] No URL bundle, trying to load from IndexedDB for hub:", this.hubId);
+      try {
+        this.signalSession = await SignalSession.load(this.hubId);
+        console.log("[Connection] IndexedDB load result:", this.signalSession ? "session found" : "no session");
+      } catch (err) {
+        console.error("[Connection] Failed to load session from IndexedDB:", err);
+        throw err;
+      }
 
       if (this.signalSession) {
         console.log(
           "[Connection] Restored cached session for hub:",
           this.hubId,
         );
+      } else {
+        console.log("[Connection] No cached session found - user needs to scan QR code");
       }
-      // If no cached session, user needs to scan QR code
     }
   }
 
@@ -365,6 +402,7 @@ export default class extends Controller {
               .onMessage((msg) => this.handleDecryptedMessage(msg))
               .onConnect(() => console.log("[Connection] Hub channel ready"))
               .onDisconnect(() => this.handleDisconnect())
+              .onError((err) => this.handleChannelError(err))
               .build();
             this.hubChannel.markConnected();
             resolve();
@@ -419,6 +457,7 @@ export default class extends Controller {
               .onDisconnect(() =>
                 console.log("[Connection] Terminal channel disconnected"),
               )
+              .onError((err) => this.handleChannelError(err))
               .build();
             this.terminalChannel.markConnected();
             this.currentAgentIndex = agentIndex;
@@ -567,6 +606,48 @@ export default class extends Controller {
     this.setState(ConnectionState.DISCONNECTED);
     this.updateStatus("Disconnected", "Connection lost");
     this.notifyListeners("disconnected");
+  }
+
+  /**
+   * Handle channel-level errors (e.g., session_invalid from repeated decryption failures).
+   */
+  handleChannelError(error) {
+    console.error("[Connection] Channel error:", error);
+
+    if (error.type === "session_invalid") {
+      // The Signal session is stale - CLI has different keys
+      // Clear the cached session and show error
+      this.clearSessionAndShowError(error.message);
+    } else {
+      // Generic error
+      this.setError(ConnectionError.WEBSOCKET_ERROR, error.message || "Channel error");
+    }
+  }
+
+  /**
+   * Clear the cached Signal session and show an error prompting user to re-scan QR.
+   */
+  async clearSessionAndShowError(message) {
+    console.log("[Connection] Clearing stale session for hub:", this.hubId);
+
+    // Clear the cached session from IndexedDB
+    if (this.signalSession) {
+      try {
+        await this.signalSession.clear();
+      } catch (err) {
+        console.error("[Connection] Failed to clear session:", err);
+      }
+      this.signalSession = null;
+    }
+
+    // Cleanup connection state
+    this.cleanup();
+
+    // Show error with instructions to re-scan
+    this.setError(
+      ConnectionError.SESSION_INVALID,
+      message || "Session expired. Please re-scan the QR code.",
+    );
   }
 
   // ========== Public API for Outlets ==========

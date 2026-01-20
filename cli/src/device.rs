@@ -103,21 +103,35 @@ impl Device {
 
     /// Get the device config file path
     ///
-    /// In test mode (`cfg(test)`), uses `target/test-config/` to avoid touching real config.
-    /// Also respects `BOTSTER_CONFIG_DIR` for integration test isolation.
+    /// Directory selection priority:
+    /// 1. `#[cfg(test)]` (unit tests): `tmp/botster-test`
+    /// 2. `BOTSTER_CONFIG_DIR` env var: explicit override
+    /// 3. `BOTSTER_ENV=test`: `tmp/botster-test` (integration tests)
+    /// 4. Default: system config directory (e.g., `~/Library/Application Support/botster`)
     fn config_path() -> Result<PathBuf> {
         let config_dir = {
-            // Test mode: use target/test-config/ within the project
             #[cfg(test)]
             {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-config")
+                // Use repo's tmp/ directory (already gitignored)
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("cli/ has parent directory")
+                    .join("tmp/botster-test")
             }
 
             #[cfg(not(test))]
             {
                 if let Ok(custom_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
+                    // Explicit override via env var
                     PathBuf::from(custom_dir)
+                } else if crate::env::is_test_mode() {
+                    // Integration tests (BOTSTER_ENV=test): use repo's tmp/ directory
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .expect("cli/ has parent directory")
+                        .join("tmp/botster-test")
                 } else {
+                    // Production: use system config directory
                     dirs::config_dir()
                         .context("Could not determine config directory")?
                         .join("botster")

@@ -476,12 +476,11 @@ impl ActionCableChannel {
             .into_client_request()
             .map_err(|e| ChannelError::ConnectionFailed(format!("invalid URL: {e}")))?;
 
-        request.headers_mut().insert(
-            "Origin",
-            server_url
-                .parse()
-                .unwrap_or_else(|_| "http://localhost".parse().expect("valid")),
-        );
+        // No fallback - invalid server_url should fail explicitly
+        let origin_header = server_url
+            .parse()
+            .map_err(|e| ChannelError::ConnectionFailed(format!("Invalid server URL '{server_url}': {e}")))?;
+        request.headers_mut().insert("Origin", origin_header);
         request.headers_mut().insert(
             "Authorization",
             format!("Bearer {}", api_key).parse().expect("valid header"),
