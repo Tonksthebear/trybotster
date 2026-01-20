@@ -28,7 +28,7 @@ class CliIntegrationTestCase < ApplicationSystemTestCase
 
   # Use headless Chrome but we won't actually interact with the browser
   # This ensures the full server stack (including Action Cable) is running
-  driven_by :selenium, using: :headless_chrome, screen_size: [1024, 768]
+  driven_by :selenium, using: :headless_chrome, screen_size: [ 1024, 768 ]
 
   setup do
     @user = users(:jason)

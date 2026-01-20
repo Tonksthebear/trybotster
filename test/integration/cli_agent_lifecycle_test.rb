@@ -161,7 +161,7 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
   end
 
   test "multiple agents can run concurrently" do
-    messages = [111, 222, 333].map do |issue_num|
+    messages = [ 111, 222, 333 ].map do |issue_num|
       Bot::Message.create!(
         event_type: "github_mention",
         payload: { repo: @hub.repo, issue_number: issue_num, prompt: "Task #{issue_num}" },
@@ -186,7 +186,7 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
 
     # Each should have a unique session key (format: repo-safe-issue_number)
     session_keys = @hub.hub_agents.pluck(:session_key).sort
-    assert_equal ["test-repo-111", "test-repo-222", "test-repo-333"], session_keys
+    assert_equal [ "test-repo-111", "test-repo-222", "test-repo-333" ], session_keys
   end
 
   private
@@ -261,7 +261,7 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
       lines_read = { stdout: 0, stderr: 0 }
       Rails.logger.info "[CliAgentTest] Log thread started"
       while cli.running?
-        ready = IO.select([stdout_r, stderr_r], nil, nil, 0.1)
+        ready = IO.select([ stdout_r, stderr_r ], nil, nil, 0.1)
         next unless ready
 
         ready[0].each do |io|

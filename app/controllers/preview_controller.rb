@@ -16,7 +16,7 @@ class PreviewController < ApplicationController
   # Risk: An attacker with hub UUID + agent session_key could CSRF POST/PUT/DELETE
   # to the user's own dev server. Mitigated by UUID unpredictability and the fact
   # that the target is the user's own development environment.
-  skip_forgery_protection only: [:service_worker, :proxy]
+  skip_forgery_protection only: [ :service_worker, :proxy ]
 
   before_action :authenticate_user!
   before_action :find_hub_agent
@@ -45,7 +45,7 @@ class PreviewController < ApplicationController
 
     response.headers["Content-Type"] = "application/javascript"
     response.headers["Service-Worker-Allowed"] = scope_path
-    render template: "preview/service_worker", formats: [:js], layout: false
+    render template: "preview/service_worker", formats: [ :js ], layout: false
   end
 
   private

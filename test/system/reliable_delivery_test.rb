@@ -13,7 +13,7 @@ require "application_system_test_case"
 class ReliableDeliveryTest < ApplicationSystemTestCase
   include CliTestHelper
 
-  driven_by :selenium, using: :headless_chrome, screen_size: [1280, 900]
+  driven_by :selenium, using: :headless_chrome, screen_size: [ 1280, 900 ]
 
   setup do
     @user = users(:one)
