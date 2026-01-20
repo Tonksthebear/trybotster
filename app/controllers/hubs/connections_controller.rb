@@ -48,7 +48,7 @@ module Hubs
 
       device_info = if @hub&.device
                       { fingerprint: @hub.device.fingerprint, name: @hub.device.name }
-                    end
+      end
 
       render json: {
         error: "Server-assisted pairing is disabled",

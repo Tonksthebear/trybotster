@@ -38,7 +38,7 @@ class CliMessagePollingTest < CliIntegrationTestCase
     assert_message_claimed(message, timeout: 10)
 
     message.reload
-    assert_includes ["sent", "acknowledged"], message.status, "Message should be claimed (sent or acknowledged) after CLI polls"
+    assert_includes [ "sent", "acknowledged" ], message.status, "Message should be claimed (sent or acknowledged) after CLI polls"
     assert_equal @user.id, message.claimed_by_user_id, "Message should be claimed by correct user"
     assert message.claimed_at.present?, "claimed_at should be set"
   end

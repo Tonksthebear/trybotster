@@ -212,9 +212,9 @@ module CliTestHelper
 
     # Start log reader thread
     log_thread = Thread.new do
-      combined = IO.select([stdout_r, stderr_r])
+      combined = IO.select([ stdout_r, stderr_r ])
       while cli.running?
-        ready = IO.select([stdout_r, stderr_r], nil, nil, 0.1)
+        ready = IO.select([ stdout_r, stderr_r ], nil, nil, 0.1)
         next unless ready
 
         ready[0].each do |io|

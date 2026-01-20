@@ -45,7 +45,7 @@ class DeviceAuthorization < ApplicationRecord
   end
 
   def expires_in
-    [(expires_at - Time.current).to_i, 0].max
+    [ (expires_at - Time.current).to_i, 0 ].max
   end
 
   def formatted_user_code

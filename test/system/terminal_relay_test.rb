@@ -8,7 +8,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
   include CliTestHelper
 
   # Use larger viewport for desktop-only elements like security banner (hidden lg:block = 1024px+)
-  driven_by :selenium, using: :headless_chrome, screen_size: [1280, 900]
+  driven_by :selenium, using: :headless_chrome, screen_size: [ 1280, 900 ]
 
   setup do
     @user = users(:one)
@@ -201,7 +201,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     @cli = start_cli_with_agent_support(@hub, timeout: 30)
 
     # Spawn two agents
-    [555, 556].each { |n| create_and_wait_for_agent(@hub, issue_number: n) }
+    [ 555, 556 ].each { |n| create_and_wait_for_agent(@hub, issue_number: n) }
 
     sign_in_as(@user)
     visit @cli.connection_url
@@ -697,7 +697,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     # Start log reader thread
     log_thread = Thread.new do
       while cli.running?
-        ready = IO.select([stdout_r, stderr_r], nil, nil, 0.1)
+        ready = IO.select([ stdout_r, stderr_r ], nil, nil, 0.1)
         next unless ready
 
         ready[0].each do |io|

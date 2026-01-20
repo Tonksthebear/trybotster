@@ -194,5 +194,4 @@ class HubAgentTest < ActiveSupport::TestCase
     assert_includes result, connected_agent
     assert_not_includes result, disconnected_agent
   end
-
 end

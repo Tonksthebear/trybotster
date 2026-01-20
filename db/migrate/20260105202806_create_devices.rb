@@ -12,7 +12,7 @@ class CreateDevices < ActiveRecord::Migration[8.1]
     end
 
     add_index :devices, :public_key, unique: true
-    add_index :devices, [:user_id, :device_type]
+    add_index :devices, [ :user_id, :device_type ]
     add_index :devices, :fingerprint
   end
 end

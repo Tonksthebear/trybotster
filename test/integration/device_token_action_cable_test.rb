@@ -5,7 +5,6 @@ require "test_helper"
 # Integration test to verify DeviceToken authentication works for Action Cable
 # This simulates what the CLI does when connecting
 class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
-
   setup do
     @user = users(:one)
     @hub = Hub.create!(

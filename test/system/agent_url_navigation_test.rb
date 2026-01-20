@@ -13,7 +13,7 @@ require "application_system_test_case"
 class AgentUrlNavigationTest < ApplicationSystemTestCase
   include CliTestHelper
 
-  driven_by :selenium, using: :headless_chrome, screen_size: [1280, 900]
+  driven_by :selenium, using: :headless_chrome, screen_size: [ 1280, 900 ]
 
   setup do
     @user = users(:one)
@@ -352,7 +352,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     # Start log reader thread
     log_thread = Thread.new do
       while cli.running?
-        ready = IO.select([stdout_r, stderr_r], nil, nil, 0.1)
+        ready = IO.select([ stdout_r, stderr_r ], nil, nil, 0.1)
         next unless ready
 
         ready[0].each do |io|
