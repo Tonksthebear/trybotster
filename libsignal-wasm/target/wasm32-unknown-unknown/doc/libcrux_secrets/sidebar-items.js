@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["I128","I16","I32","I64","I8","U128","U16","U32","U64","U8","classify_mut_slice","declassify_mut_slice","secret"],"trait":["CastOps","Classify","ClassifyRef","ClassifyRefMut","Declassify","DeclassifyRef","DeclassifyRefMut","EncodeOps","IntOps","Scalar","Select","Swap"],"type":["I128","I16","I32","I64","I8","U128","U16","U32","U64","U8"]};

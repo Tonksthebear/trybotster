@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["AuthenticatorError","CurrentVersion","Direction","EncodingError","Error","PolynomialError","SecretOutput","SerializationError","Version"],"fn":["current_version","empty_state","initial_state","recv","send"],"struct":["ChainParams","EpochSecret","Params","Recv","Send"],"type":["Epoch","MessageKey","Secret","SerializedMessage","SerializedState"]};

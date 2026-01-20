@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["DecryptError","EncryptError"],"struct":["KeyMut","KeyRef","NonceRef","TagMut","TagRef","WrongLengthError"],"trait":["Aead","Multiplexes"]};

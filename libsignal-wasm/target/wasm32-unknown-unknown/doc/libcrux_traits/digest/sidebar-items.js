@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["UpdateError"],"mod":["arrayref","owned","slice"],"struct":["Hasher"],"trait":["DigestIncrementalBase","InitializeDigestState"]};

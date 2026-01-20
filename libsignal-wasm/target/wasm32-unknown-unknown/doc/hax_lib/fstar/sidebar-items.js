@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"attr":["after","before","options","postprocess_with","replace","replace_body","smt_pat","verification_status"],"macro":["prop"]};

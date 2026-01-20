@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"attr":["after","before","replace","replace_body"],"macro":["prop"]};

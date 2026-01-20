@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["decapsulate","encapsulate","generate_key_pair"],"struct":["Kyber768"]};

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"mod":["arrayref","consts","owned","slice","tests","typed_owned","typed_refs"]};
