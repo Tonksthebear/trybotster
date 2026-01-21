@@ -6,9 +6,8 @@
 //! # Security
 //!
 //! All data is encrypted at rest using AES-256-GCM with a key stored in the
-//! OS keyring (Keychain on macOS, Secret Service on Linux). This follows
-//! industry best practice (Signal, Matrix/Element) for protecting E2E
-//! encryption session state.
+//! consolidated keyring entry. This follows industry best practice
+//! (Signal, Matrix/Element) for protecting E2E encryption session state.
 //!
 //! # Storage structure
 //!
@@ -16,8 +15,8 @@
 //! ~/.config/botster/hubs/{hub_id}/
 //!     signal_store.enc    # AES-GCM encrypted store state
 //!
-//! OS Keyring:
-//!     botster/{hub_id}-signal-key   # 256-bit AES key
+//! OS Keyring (consolidated):
+//!     botster/credentials  # Contains signal_keys[hub_id] = base64 AES key
 //! ```
 //!
 //! Rust guideline compliant 2025-01
@@ -28,7 +27,6 @@ use aes_gcm::{
 };
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use keyring::Entry;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,11 +34,19 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-/// Keyring service name (matches device.rs).
-const KEYRING_SERVICE: &str = "botster";
+use crate::keyring::Credentials;
+
+use std::sync::{OnceLock, RwLock};
 
 /// Nonce size for AES-GCM (96 bits = 12 bytes).
 const NONCE_SIZE: usize = 12;
+
+/// Cache for encryption keys to avoid repeated keyring access.
+/// Maps hub_id -> encryption key.
+fn key_cache() -> &'static RwLock<HashMap<String, [u8; 32]>> {
+    static CACHE: OnceLock<RwLock<HashMap<String, [u8; 32]>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 /// Encrypted data format stored on disk.
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,12 +82,8 @@ pub struct SignalStoreState {
     pub used_pre_keys: Vec<u32>,
 }
 
-/// Check if keyring should be skipped (for testing).
-///
-/// Keyring is skipped when:
-/// - Compiled with `cfg(test)` (unit tests via `cargo test --lib`)
-/// - `BOTSTER_ENV=test` is set (integration/system tests)
-fn should_skip_keyring() -> bool {
+/// Check if we're in test mode (for deterministic key generation).
+fn is_test_mode() -> bool {
     #[cfg(test)]
     {
         return true;
@@ -155,8 +157,11 @@ pub fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
 }
 
 /// Get or create the encryption key for a hub.
+///
+/// Keys are cached in memory after the first load to avoid repeated keyring access.
+/// This is important on macOS where excessive keychain access can cause issues.
 fn get_or_create_encryption_key(hub_id: &str) -> Result<[u8; 32]> {
-    if should_skip_keyring() {
+    if is_test_mode() {
         // Test mode: use deterministic key derived from hub_id
         let hash = Sha256::digest(format!("test-signal-key-{hub_id}").as_bytes());
         let mut key = [0u8; 32];
@@ -164,33 +169,47 @@ fn get_or_create_encryption_key(hub_id: &str) -> Result<[u8; 32]> {
         return Ok(key);
     }
 
-    let entry_name = format!("{hub_id}-signal-key");
-    let entry = Entry::new(KEYRING_SERVICE, &entry_name)
-        .map_err(|e| anyhow::anyhow!("Failed to create keyring entry: {e:?}"))?;
-
-    // Try to load existing key
-    if let Ok(key_b64) = entry.get_password() {
-        let key_bytes = BASE64
-            .decode(&key_b64)
-            .context("Invalid encryption key encoding in keyring")?;
-        let key: [u8; 32] = key_bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid encryption key length in keyring"))?;
-        log::debug!("Loaded Signal encryption key from OS keyring");
-        return Ok(key);
+    // Check cache first
+    {
+        let cache = key_cache().read().expect("key cache lock poisoned");
+        if let Some(key) = cache.get(hub_id) {
+            return Ok(*key);
+        }
     }
 
-    // Generate new key
-    let mut key = [0u8; 32];
-    rand::rng().fill_bytes(&mut key);
+    // Load from keyring (cache miss)
+    let mut creds = Credentials::load().unwrap_or_default();
 
-    // Store in keyring
-    let key_b64 = BASE64.encode(key);
-    entry
-        .set_password(&key_b64)
-        .map_err(|e| anyhow::anyhow!("Failed to store encryption key in keyring: {e:?}"))?;
+    // Try to load existing key for this hub
+    let key = if let Some(key_b64) = creds.signal_key(hub_id) {
+        let key_bytes = BASE64
+            .decode(key_b64)
+            .context("Invalid encryption key encoding in credentials")?;
+        let key: [u8; 32] = key_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid encryption key length in credentials"))?;
+        log::debug!("Loaded Signal encryption key from consolidated credentials");
+        key
+    } else {
+        // Generate new key
+        let mut key = [0u8; 32];
+        rand::rng().fill_bytes(&mut key);
 
-    log::info!("Generated and stored new Signal encryption key in OS keyring");
+        // Store in consolidated credentials
+        let key_b64 = BASE64.encode(key);
+        creds.set_signal_key(hub_id.to_string(), key_b64);
+        creds.save()?;
+
+        log::info!("Generated and stored new Signal encryption key in consolidated credentials");
+        key
+    };
+
+    // Cache the key
+    {
+        let mut cache = key_cache().write().expect("key cache lock poisoned");
+        cache.insert(hub_id.to_string(), key);
+    }
+
     Ok(key)
 }
 

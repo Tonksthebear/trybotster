@@ -1402,7 +1402,6 @@ mod tests {
         Config {
             server_url: "http://localhost:3000".to_string(),
             token: "btstr_test-key".to_string(),
-            api_key: String::new(),
             poll_interval: 10,
             agent_timeout: 300,
             max_sessions: 10,

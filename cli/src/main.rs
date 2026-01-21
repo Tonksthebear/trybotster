@@ -45,9 +45,9 @@ fn ensure_authenticated() -> Result<()> {
     // Check if we have a token at all
     if !config.has_token() {
         println!("No authentication token found. Starting device authorization...");
-        let token = auth::device_flow(&config.server_url)?;
-        config.save_token(&token)?;
-        println!("Token saved successfully.");
+        let token_response = auth::device_flow(&config.server_url)?;
+        save_tokens(&mut config, &token_response)?;
+        println!("Tokens saved successfully.");
         return Ok(());
     }
 
@@ -55,19 +55,40 @@ fn ensure_authenticated() -> Result<()> {
     println!("Checking authentication...");
     if !auth::validate_token(&config.server_url, config.get_api_key()) {
         println!("Token invalid or expired. Re-authenticating...");
-        let token = auth::device_flow(&config.server_url)?;
+        let token_response = auth::device_flow(&config.server_url)?;
 
         if using_env_var {
             // Don't save to config - user is managing token via env var
             // Just print instructions
             println!();
-            println!("New token obtained. Update your environment variable:");
-            println!("  export BOTSTER_TOKEN={}", token);
+            println!("New tokens obtained. Update your environment variables:");
+            println!("  export BOTSTER_TOKEN={}", token_response.access_token);
+            if let Some(ref mcp_token) = token_response.mcp_token {
+                println!("  export BOTSTER_MCP_TOKEN={}", mcp_token);
+            }
             println!();
-            anyhow::bail!("Please update your environment variable and restart.");
+            anyhow::bail!("Please update your environment variables and restart.");
         }
-        config.save_token(&token)?;
-        println!("Token saved successfully.");
+        save_tokens(&mut config, &token_response)?;
+        println!("Tokens saved successfully.");
+    }
+
+    Ok(())
+}
+
+/// Save both hub and MCP tokens from auth response.
+fn save_tokens(config: &mut Config, token_response: &botster_hub::auth::TokenResponse) -> Result<()> {
+    use botster_hub::keyring::Credentials;
+
+    // Save hub token via config (which updates Credentials internally)
+    config.save_token(&token_response.access_token)?;
+
+    // Save MCP token if provided
+    if let Some(ref mcp_token) = token_response.mcp_token {
+        let mut creds = Credentials::load().unwrap_or_default();
+        creds.set_mcp_token(mcp_token.clone());
+        creds.save()?;
+        log::info!("Saved MCP token to credentials");
     }
 
     Ok(())
@@ -149,14 +170,14 @@ fn run_with_hub() -> Result<()> {
     flag::register(SIGHUP, Arc::clone(&SHUTDOWN_FLAG))?;
 
     // Get terminal size BEFORE entering raw mode (in case of errors)
-    let (rows, cols) = crossterm::terminal::size()?;
-    let terminal_cols = (cols * 70 / 100).saturating_sub(2);
-    let terminal_rows = rows.saturating_sub(2);
+    // Use the layout helper to calculate the actual terminal widget inner area
+    let (cols, rows) = crossterm::terminal::size()?;
+    let (inner_rows, inner_cols) = tui::terminal_widget_inner_area(cols, rows);
 
     // Create Hub BEFORE entering raw mode so errors are visible
     println!("Initializing hub...");
     let config = Config::load()?;
-    let mut hub = Hub::new(config, (terminal_rows, terminal_cols))?;
+    let mut hub = Hub::new(config, (inner_rows, inner_cols))?;
 
     // Perform setup BEFORE entering raw mode so errors are visible
     println!("Setting up connections...");
@@ -251,6 +272,12 @@ enum Commands {
         /// Hub identifier
         #[arg(long)]
         hub: String,
+    },
+    /// Remove all botster data (credentials, config, device identity)
+    Reset {
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -349,6 +376,9 @@ fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+        Commands::Reset { yes } => {
+            commands::reset::run(yes)?;
         }
     }
 

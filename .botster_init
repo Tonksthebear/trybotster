@@ -21,13 +21,13 @@ fi
 # This works regardless of notification settings.
 
 # Register trybotster MCP server for this worktree (if token is available)
-if [ -n "$BOTSTER_TOKEN" ]; then
+if [ -n "$BOTSTER_MCP_TOKEN" ]; then
   echo "Registering trybotster MCP server..."
   claude mcp add trybotster \
     --transport http \
     https://mcp-dev.trybotster.com \
     --header \
-    "Authorization: Bearer `echo $BOTSTER_TOKEN`"
+    "Authorization: Bearer `echo $BOTSTER_MCP_TOKEN`"
 fi
 
 if [ "$BOTSTER_ISSUE_NUMBER" != "0" ]; then

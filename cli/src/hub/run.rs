@@ -48,6 +48,23 @@ pub fn run_event_loop(
 ) -> Result<()> {
     log::info!("Hub event loop starting");
 
+    // Send initial resize to ensure TUI client has dimensions set.
+    // This is critical: when an agent is selected, it resizes to client_dims,
+    // but if no resize event has fired yet, client_dims is None and no resize happens.
+    // Use terminal_dims which was already calculated at startup with the correct inner area.
+    let (rows, cols) = hub.terminal_dims;
+    hub.handle_action(crate::hub::HubAction::ResizeForClient {
+        client_id: crate::client::ClientId::Tui,
+        rows,
+        cols,
+    });
+    log::info!("Initial TUI resize: {}cols x {}rows (PTY inner area)", cols, rows);
+
+    // Also log the actual terminal size for debugging
+    if let Ok((term_cols, term_rows)) = crossterm::terminal::size() {
+        log::info!("Actual terminal size: {}cols x {}rows", term_cols, term_rows);
+    }
+
     while !hub.quit && !shutdown_flag.load(Ordering::SeqCst) {
         // 1. Handle keyboard/mouse input
         if event::poll(Duration::from_millis(10))? {

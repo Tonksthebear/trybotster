@@ -34,6 +34,8 @@ use crate::app::AppMode;
 use crate::client::ClientId;
 use crate::hub::HubAction;
 
+use super::layout::terminal_widget_inner_area;
+
 /// Convert a crossterm Event to a HubAction.
 ///
 /// Returns `None` if the event doesn't map to any action (e.g., key release events).
@@ -53,11 +55,16 @@ pub fn event_to_hub_action(
         Event::Key(key) => key_event_to_action(key, mode, context),
         Event::Mouse(mouse) => mouse_event_to_action(*mouse, *mode),
         // Use client-scoped resize action for TUI
-        Event::Resize(cols, rows) => Some(HubAction::ResizeForClient {
-            client_id: ClientId::Tui,
-            rows: *rows,
-            cols: *cols,
-        }),
+        // Calculate the actual terminal widget inner area (70% width minus borders)
+        // to ensure PTY dimensions match the visible rendering area
+        Event::Resize(cols, rows) => {
+            let (inner_rows, inner_cols) = terminal_widget_inner_area(*cols, *rows);
+            Some(HubAction::ResizeForClient {
+                client_id: ClientId::Tui,
+                rows: inner_rows,
+                cols: inner_cols,
+            })
+        }
         _ => None,
     }
 }
@@ -477,13 +484,18 @@ mod tests {
     #[test]
     fn test_resize_event() {
         use crate::client::ClientId;
+        use super::terminal_widget_inner_area;
+
         let event = Event::Resize(120, 40);
         let context = default_context();
         let action = event_to_hub_action(&event, &AppMode::Normal, &context);
+
+        // Resize should use the calculated inner area, not raw terminal dims
+        let (expected_rows, expected_cols) = terminal_widget_inner_area(120, 40);
         assert_eq!(action, Some(HubAction::ResizeForClient {
             client_id: ClientId::Tui,
-            cols: 120,
-            rows: 40,
+            cols: expected_cols,
+            rows: expected_rows,
         }));
     }
 
@@ -533,18 +545,22 @@ mod tests {
     #[test]
     fn test_tui_resize_uses_client_scoped_action() {
         use crate::client::ClientId;
+        use super::terminal_widget_inner_area;
         let context = default_context();
 
         let event = Event::Resize(120, 40);
         let action = event_to_hub_action(&event, &AppMode::Normal, &context);
+
+        // Resize should use the calculated inner area for PTY dimensions
+        let (expected_rows, expected_cols) = terminal_widget_inner_area(120, 40);
         assert_eq!(
             action,
             Some(HubAction::ResizeForClient {
                 client_id: ClientId::Tui,
-                cols: 120,
-                rows: 40,
+                cols: expected_cols,
+                rows: expected_rows,
             }),
-            "TUI resize should produce ResizeForClient with ClientId::Tui"
+            "TUI resize should produce ResizeForClient with ClientId::Tui and calculated inner area"
         );
     }
 

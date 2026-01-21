@@ -1,29 +1,60 @@
-//! PTY session management for agents.
+//! PTY session management with integrated channel ownership.
 //!
-//! This module provides pseudo-terminal (PTY) session handling for agent processes.
-//! Each agent can have multiple PTY sessions (CLI and server) running concurrently.
+//! This module provides pseudo-terminal (PTY) session handling where each PTY
+//! owns its communication channel. This architecture ensures channel lifecycle
+//! is tied to PTY lifecycle - when a PTY dies, its channel dies with it.
 //!
 //! # Architecture
 //!
 //! ```text
-//! PtySession
-//! ├── master_pty: MasterPty (for resizing)
-//! ├── writer: Write (for input)
-//! ├── vt100_parser: Parser (terminal emulation)
-//! └── scrollback_buffer: VecDeque<u8> (raw byte history)
+//! Agent (container)
+//!  └── cli_pty: PtySession
+//!  └── server_pty: Option<PtySession>
+//!
+//! PtySession (owns I/O and channel)
+//!  ├── master_pty: MasterPty (for resizing)
+//!  ├── writer: Write (for input)
+//!  ├── vt100_parser: Parser (terminal emulation)
+//!  ├── scrollback_buffer: VecDeque<u8> (raw byte history)
+//!  ├── raw_output_queue: VecDeque<Vec<u8>> (pending output)
+//!  └── channel: Option<ActionCableChannel> (encrypted relay)
 //! ```
+//!
+//! # Channel Ownership
+//!
+//! Each PTY session owns its terminal relay channel:
+//! - CLI PTY (pty_index=0) owns the CLI terminal channel
+//! - Server PTY (pty_index=1) owns the Server terminal channel
+//!
+//! The channel handles:
+//! - **Output broadcast**: PTY output is encrypted and sent to all connected browsers
+//! - **Input routing**: Browser input is decrypted and written to the PTY
 //!
 //! # Usage
 //!
-//! PTY sessions are typically created and managed by the [`Agent`](super::Agent) struct.
-//! Direct usage is for advanced scenarios like custom PTY spawning.
-//!
 //! ```ignore
+//! // Create PTY session
 //! let mut session = PtySession::new(24, 80);
-//! // Spawn a process...
+//!
+//! // Spawn a process
+//! session.spawn("bash", &env)?;
+//!
+//! // Connect channel (typically done by Hub after spawn)
+//! session.connect_channel(channel_config, crypto_service).await?;
+//!
+//! // Write input (from browser or keyboard)
 //! session.write_input(b"ls -la\n")?;
-//! let screen = session.get_vt100_screen();
+//!
+//! // Drain and broadcast output
+//! let output = session.drain_raw_output();
+//! session.broadcast_output(&output).await?;
 //! ```
+//!
+//! # Thread Safety
+//!
+//! The VT100 parser, scrollback buffer, and raw output queue are wrapped in
+//! `Arc<Mutex<>>` to allow concurrent reads from the PTY reader thread and
+//! writes from the main thread.
 
 // Rust guideline compliant 2025-01
 
@@ -43,6 +74,9 @@ use std::{
 };
 use vt100::Parser;
 
+use crate::channel::{ActionCableChannel, Channel, ChannelConfig, ChannelError};
+use crate::relay::crypto_service::CryptoServiceHandle;
+
 use super::notification::AgentNotification;
 use super::screen;
 
@@ -51,13 +85,6 @@ use super::screen;
 /// Clears the VT100 screen before resizing to prevent content from being stuck
 /// at old dimensions. This is necessary because terminal emulators don't
 /// automatically reflow content.
-///
-/// # Arguments
-///
-/// * `pty` - The PTY session to resize
-/// * `rows` - New terminal height
-/// * `cols` - New terminal width
-/// * `label` - Label for logging (e.g., "CLI" or "Server")
 pub fn resize_with_clear(pty: &PtySession, rows: u16, cols: u16, label: &str) {
     let needs_clear = {
         let parser = pty.vt100_parser.lock().expect("parser lock poisoned");
@@ -84,19 +111,32 @@ pub fn resize_with_clear(pty: &PtySession, rows: u16, cols: u16, label: &str) {
 /// several hours of scrollback.
 pub const MAX_SCROLLBACK_BYTES: usize = 4 * 1024 * 1024;
 
+/// PTY index constants for channel routing.
+pub mod pty_index {
+    /// CLI PTY index (main agent process).
+    pub const CLI: usize = 0;
+    /// Server PTY index (dev server process).
+    pub const SERVER: usize = 1;
+}
+
 /// Encapsulates all state for a single PTY session.
 ///
 /// Each PTY session manages:
 /// - A pseudo-terminal for process I/O
 /// - A VT100 parser for terminal emulation
 /// - A raw byte scrollback buffer for history replay
-/// - Notification channel for OSC sequences
-/// - Raw output queue for browser streaming
+/// - An optional encrypted ActionCable channel for browser communication
+///
+/// # Channel Ownership
+///
+/// The PTY owns its channel, ensuring lifecycle alignment. When the PTY is
+/// dropped, its channel is automatically disconnected and cleaned up.
 ///
 /// # Thread Safety
 ///
-/// The VT100 parser, scrollback buffer, and raw output queue are wrapped in `Arc<Mutex<>>`
-/// to allow concurrent reads from the PTY reader thread and writes from the main thread.
+/// The VT100 parser, scrollback buffer, and raw output queue are wrapped in
+/// `Arc<Mutex<>>` to allow concurrent reads from the PTY reader thread and
+/// writes from the main thread.
 pub struct PtySession {
     /// Master PTY for resizing.
     pub master_pty: Option<Box<dyn MasterPty + Send>>,
@@ -116,6 +156,13 @@ pub struct PtySession {
     pub notification_tx: Option<Sender<AgentNotification>>,
     /// Child process handle - stored so we can kill it on drop.
     child: Option<Box<dyn Child + Send>>,
+
+    // === Channel ownership ===
+    /// Encrypted terminal relay channel.
+    ///
+    /// The PTY owns its channel for output broadcast and input routing.
+    /// Connected after spawn via `connect_channel()`.
+    pub channel: Option<ActionCableChannel>,
 }
 
 impl std::fmt::Debug for PtySession {
@@ -124,7 +171,7 @@ impl std::fmt::Debug for PtySession {
             .field("has_master_pty", &self.master_pty.is_some())
             .field("has_writer", &self.writer.is_some())
             .field("has_reader_thread", &self.reader_thread.is_some())
-            .field("has_child", &self.child.is_some())
+            .field("has_channel", &self.channel.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -133,11 +180,7 @@ impl PtySession {
     /// Creates a new PTY session with the specified dimensions.
     ///
     /// The VT100 parser is initialized with scrollback enabled.
-    ///
-    /// # Arguments
-    ///
-    /// * `rows` - Terminal height in rows
-    /// * `cols` - Terminal width in columns
+    /// The channel is initially None - call `connect_channel()` after spawn.
     #[must_use]
     pub fn new(rows: u16, cols: u16) -> Self {
         // Use a reasonable scrollback for the vt100 parser (current screen state)
@@ -151,8 +194,67 @@ impl PtySession {
             raw_output_queue: Arc::new(Mutex::new(VecDeque::new())),
             notification_tx: None,
             child: None,
+            channel: None,
         }
     }
+
+    // =========================================================================
+    // Channel Management
+    // =========================================================================
+
+    /// Connect the PTY's terminal relay channel.
+    ///
+    /// Creates an encrypted ActionCable channel for browser communication.
+    /// The channel broadcasts output and receives input from connected browsers.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Channel configuration (hub_id, agent_index, pty_index, etc.)
+    /// * `crypto_service` - Crypto service handle for Signal Protocol encryption
+    /// * `server_url` - Rails server URL
+    /// * `api_key` - API key for authentication
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if channel connection fails.
+    pub async fn connect_channel(
+        &mut self,
+        config: ChannelConfig,
+        crypto_service: CryptoServiceHandle,
+        server_url: &str,
+        api_key: &str,
+    ) -> Result<(), ChannelError> {
+        use crate::channel::ActionCableChannelBuilder;
+
+        let mut channel = ActionCableChannelBuilder::default()
+            .server_url(server_url)
+            .api_key(api_key)
+            .crypto_service(crypto_service)
+            .reliable(true)
+            .build();
+
+        channel.connect(config).await?;
+        self.channel = Some(channel);
+        Ok(())
+    }
+
+    /// Check if the channel is connected.
+    #[must_use]
+    pub fn has_channel(&self) -> bool {
+        self.channel.is_some()
+    }
+
+    /// Get the channel's sender handle for async output broadcasting.
+    ///
+    /// Returns None if no channel is connected.
+    #[must_use]
+    pub fn get_channel_sender(&self) -> Option<crate::channel::ChannelSenderHandle> {
+        self.channel.as_ref().and_then(|c| c.get_sender_handle())
+    }
+
+    // =========================================================================
+    // PTY I/O
+    // =========================================================================
 
     /// Drain all pending raw output from the queue.
     ///
@@ -195,11 +297,6 @@ impl PtySession {
     }
 
     /// Resize the PTY and VT100 parser to new dimensions.
-    ///
-    /// # Arguments
-    ///
-    /// * `rows` - New terminal height
-    /// * `cols` - New terminal width
     pub fn resize(&self, rows: u16, cols: u16) {
         // Resize the VT100 parser
         {
@@ -239,6 +336,10 @@ impl PtySession {
     pub fn write_input_str(&mut self, input: &str) -> Result<()> {
         self.write_input(input.as_bytes())
     }
+
+    // =========================================================================
+    // Scrollback & Screen
+    // =========================================================================
 
     /// Add raw bytes to the scrollback buffer.
     ///
@@ -297,6 +398,7 @@ impl PtySession {
 impl Drop for PtySession {
     fn drop(&mut self) {
         self.kill_child();
+        // Channel is dropped automatically, which disconnects it
     }
 }
 
@@ -353,5 +455,38 @@ mod tests {
 
         let snapshot = session.get_scrollback_snapshot();
         assert!(snapshot.len() <= MAX_SCROLLBACK_BYTES);
+    }
+
+    #[test]
+    fn test_pty_session_has_no_channel_initially() {
+        let session = PtySession::new(24, 80);
+        assert!(!session.has_channel());
+        assert!(session.get_channel_sender().is_none());
+    }
+
+    #[test]
+    fn test_pty_session_drain_output_empty() {
+        let session = PtySession::new(24, 80);
+        let output = session.drain_raw_output();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_pty_session_drain_output_with_data() {
+        let session = PtySession::new(24, 80);
+
+        // Simulate PTY reader thread pushing output
+        {
+            let mut queue = session.raw_output_queue.lock().unwrap();
+            queue.push_back(b"hello".to_vec());
+            queue.push_back(b" world".to_vec());
+        }
+
+        let output = session.drain_raw_output();
+        assert_eq!(output, b"hello world");
+
+        // Second drain should be empty
+        let output2 = session.drain_raw_output();
+        assert!(output2.is_empty());
     }
 }

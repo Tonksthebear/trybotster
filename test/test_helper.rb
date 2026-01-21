@@ -51,15 +51,6 @@ module CliProcessCleanup
   end
 end
 
-# Clean up before tests start
-CliProcessCleanup.cleanup_stale_processes
-
-# Clean up after all tests complete (at_exit runs after Minitest finishes)
-at_exit do
-  CliProcessCleanup.cleanup_stale_processes
-  CliProcessCleanup.cleanup_test_config_dir
-end
-
 # Set default host for URL generation in tests
 Rails.application.routes.default_url_options[:host] = "test.host"
 
@@ -67,6 +58,18 @@ module ActiveSupport
   class TestCase
     # Run tests in parallel with specified workers
     parallelize(workers: :number_of_processors)
+
+    # Clean up stale CLI processes ONCE before forking workers.
+    # This prevents orphaned processes from previous runs without
+    # workers killing each other's processes during parallel testing.
+    parallelize_before_fork do
+      CliProcessCleanup.cleanup_stale_processes
+    end
+
+    # Clean up config dir after workers complete
+    parallelize_teardown do |_worker|
+      CliProcessCleanup.cleanup_test_config_dir
+    end
 
     # Setup all fixtures in test/fixtures/*.yml for all tests in alphabetical order.
     fixtures :all

@@ -510,6 +510,9 @@ mod tests {
         let handle = CryptoService::start("test-crypto-concurrent").unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
+        // First request a bundle to trigger lazy key generation
+        let _bundle = handle.get_prekey_bundle(1).await.unwrap();
+
         // Fire off multiple concurrent requests
         let h1 = handle.clone();
         let h2 = handle.clone();
@@ -523,7 +526,7 @@ mod tests {
 
         assert!(r1.is_ok());
         assert!(r2.is_ok());
-        assert!(r3.is_some());
+        assert!(r3.is_some(), "PreKeys should exist after bundle request");
 
         handle.shutdown().await.unwrap();
     }

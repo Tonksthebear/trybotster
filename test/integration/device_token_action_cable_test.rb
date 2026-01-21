@@ -20,24 +20,24 @@ class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
   end
 
   test "device token is properly created with btstr_ prefix" do
-    device_token = @user.device_tokens.create!(name: "Test CLI")
+    device_token = create_device_token(@user, "Test CLI")
 
     assert device_token.token.present?
     assert device_token.token.start_with?("btstr_"), "Token should have btstr_ prefix, got: #{device_token.token[0..10]}..."
   end
 
   test "device token can be found by token value" do
-    device_token = @user.device_tokens.create!(name: "Test CLI")
+    device_token = create_device_token(@user, "Test CLI")
     token_value = device_token.token
 
     found = DeviceToken.find_by(token: token_value)
     assert_not_nil found
     assert_equal device_token.id, found.id
-    assert_equal @user.id, found.user_id
+    assert_equal @user.id, found.user.id
   end
 
   test "action cable connection find_user_by_token works with device token" do
-    device_token = @user.device_tokens.create!(name: "Test CLI")
+    device_token = create_device_token(@user, "Test CLI")
 
     # Simulate what ApplicationCable::Connection does
     token = device_token.token
@@ -78,7 +78,7 @@ class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
 
   test "config get_api_key returns device token when set" do
     # This simulates what the CLI's Config does
-    device_token = @user.device_tokens.create!(name: "Test CLI")
+    device_token = create_device_token(@user, "Test CLI")
 
     # The CLI would call config.get_api_key() which should return the token
     # For this test, we just verify the token is usable
@@ -105,5 +105,16 @@ class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
     actual_url = "#{ws_url}/cable"
 
     assert_equal expected_url, actual_url
+  end
+
+  private
+
+  def create_device_token(user, name)
+    device = user.devices.create!(
+      name: name,
+      device_type: "cli",
+      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+    )
+    device.create_device_token!(name: name)
   end
 end

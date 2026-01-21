@@ -88,10 +88,24 @@ pub fn render(
 
     // Helper to render UI to a frame
     let render_ui = |f: &mut Frame, agents: &HashMap<String, Agent>| {
+        let frame_area = f.area();
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
-            .split(f.area());
+            .split(frame_area);
+
+        // Log frame and chunk sizes once for debugging
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let block = Block::default().borders(Borders::ALL);
+            let inner = block.inner(chunks[1]);
+            log::info!(
+                "Render areas - Frame: {}x{}, Right chunk: {}x{}, Inner (visible): {}x{}",
+                frame_area.width, frame_area.height,
+                chunks[1].width, chunks[1].height,
+                inner.width, inner.height
+            );
+        }
 
         // Render agent list
         let mut items: Vec<ListItem> = Vec::new();

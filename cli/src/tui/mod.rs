@@ -25,12 +25,14 @@
 
 pub mod guard;
 pub mod input;
+pub mod layout;
 pub mod qr;
 pub mod render;
 pub mod view;
 
 pub use guard::TerminalGuard;
 pub use input::{event_to_hub_action, InputContext};
+pub use layout::terminal_widget_inner_area;
 pub use qr::generate_qr_code_lines;
 pub use render::render;
 pub use view::{AgentDisplayInfo, ViewContext, ViewState};

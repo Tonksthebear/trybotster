@@ -102,12 +102,9 @@ pub struct Agent {
     /// Which PTY is currently displayed.
     pub active_pty: PtyView,
 
-    /// Terminal relay channel for this agent's encrypted terminal I/O.
-    /// Owned by the agent - connects on spawn, disconnects on drop.
-    pub terminal_channel: Option<ActionCableChannel>,
-
     /// Preview channel for encrypted HTTP proxying.
     /// Only created if `tunnel_port` is set.
+    /// Note: Terminal channels are owned by PtySession, not Agent.
     pub preview_channel: Option<ActionCableChannel>,
 
     /// Client that currently "owns" the PTY size.
@@ -155,7 +152,6 @@ impl Agent {
             cli_pty: PtySession::new(24, 80),
             server_pty: None,
             active_pty: PtyView::Cli,
-            terminal_channel: None,
             preview_channel: None,
             size_owner: None,
             notification_rx: None,
@@ -467,16 +463,6 @@ impl Agent {
         screen::render_screen_as_ansi(parser.screen())
     }
 
-    /// Drain raw PTY output for browser streaming.
-    ///
-    /// Returns all raw bytes that have accumulated since last drain.
-    /// Used by browser GUI to stream raw output - xterm.js handles
-    /// parsing and scrollback naturally.
-    #[must_use]
-    pub fn drain_raw_output(&self) -> Vec<u8> {
-        self.cli_pty.drain_raw_output()
-    }
-
     /// Get a hash of the current screen content for change detection.
     #[must_use]
     pub fn get_screen_hash(&self) -> u64 {
@@ -512,31 +498,53 @@ impl Agent {
         hub_id: &str,
         agent_index: usize,
     ) -> Result<()> {
+        use crate::agent::pty::pty_index;
+
         log::info!(
             "Agent {} connecting channels (agent_index={})",
             self.session_key(),
             agent_index
         );
 
-        // Create and connect terminal channel
-        let mut terminal = ActionCableChannel::encrypted(
-            crypto_service.clone(),
-            server_url.to_string(),
-            api_key.to_string(),
-        );
-        terminal
-            .connect(ChannelConfig {
-                channel_name: "TerminalRelayChannel".into(),
-                hub_id: hub_id.to_string(),
-                agent_index: Some(agent_index),
-                encrypt: true,
-                compression_threshold: Some(4096),
-            })
+        // Connect CLI PTY channel (pty_index=0)
+        self.cli_pty
+            .connect_channel(
+                ChannelConfig {
+                    channel_name: "TerminalRelayChannel".into(),
+                    hub_id: hub_id.to_string(),
+                    agent_index: Some(agent_index),
+                    pty_index: Some(pty_index::CLI),
+                    encrypt: true,
+                    compression_threshold: Some(4096),
+                },
+                crypto_service.clone(),
+                server_url,
+                api_key,
+            )
             .await
-            .map_err(|e| anyhow::anyhow!("Terminal channel connect failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("CLI PTY channel connect failed: {}", e))?;
+        log::info!("Agent {} CLI PTY channel connected", self.session_key());
 
-        self.terminal_channel = Some(terminal);
-        log::info!("Agent {} terminal channel connected", self.session_key());
+        // Connect Server PTY channel if server_pty exists (pty_index=1)
+        if let Some(ref mut server_pty) = self.server_pty {
+            server_pty
+                .connect_channel(
+                    ChannelConfig {
+                        channel_name: "TerminalRelayChannel".into(),
+                        hub_id: hub_id.to_string(),
+                        agent_index: Some(agent_index),
+                        pty_index: Some(pty_index::SERVER),
+                        encrypt: true,
+                        compression_threshold: Some(4096),
+                    },
+                    crypto_service.clone(),
+                    server_url,
+                    api_key,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("Server PTY channel connect failed: {}", e))?;
+            log::info!("Agent {} Server PTY channel connected", self.session_key());
+        }
 
         // Create preview channel only if tunnel_port is set
         if self.tunnel_port.is_some() {
@@ -550,6 +558,7 @@ impl Agent {
                     channel_name: "PreviewChannel".into(),
                     hub_id: hub_id.to_string(),
                     agent_index: Some(agent_index),
+                    pty_index: None, // Preview channel doesn't use PTY index
                     encrypt: true,
                     compression_threshold: Some(4096),
                 })
@@ -563,40 +572,45 @@ impl Agent {
         Ok(())
     }
 
-    /// Send PTY output to a specific browser via this agent's terminal channel.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - Raw PTY output bytes
-    /// * `peer` - Browser's Signal identity key (peer ID)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the channel send fails.
-    pub async fn send_output(&self, data: &[u8], peer: &PeerId) -> Result<()> {
-        if let Some(ref channel) = self.terminal_channel {
-            channel
-                .send_to(data, peer)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send output: {}", e))?;
-        }
-        Ok(())
-    }
-
-    /// Check if this agent has a connected terminal channel.
+    /// Check if CLI PTY has a connected terminal channel.
     #[must_use]
     pub fn has_terminal_channel(&self) -> bool {
-        self.terminal_channel.is_some()
+        self.cli_pty.has_channel()
     }
 
-    /// Drain incoming input from this agent's terminal channel.
+    /// Check if Server PTY has a connected terminal channel.
+    #[must_use]
+    pub fn has_server_terminal_channel(&self) -> bool {
+        self.server_pty
+            .as_ref()
+            .map_or(false, |pty| pty.has_channel())
+    }
+
+    /// Drain incoming input from CLI PTY's terminal channel.
     ///
     /// Returns a vector of (payload, sender) tuples for all pending input.
     /// Non-blocking - returns immediately if no input is available.
+    pub fn drain_cli_input(&mut self) -> Vec<(Vec<u8>, PeerId)> {
+        let Some(ref mut channel) = self.cli_pty.channel else {
+            return Vec::new();
+        };
+
+        channel
+            .drain_incoming()
+            .into_iter()
+            .map(|msg| (msg.payload, msg.sender))
+            .collect()
+    }
+
+    /// Drain incoming input from Server PTY's terminal channel.
     ///
-    /// This is called by the event loop to process browser input for this agent.
-    pub fn drain_terminal_input(&mut self) -> Vec<(Vec<u8>, PeerId)> {
-        let Some(ref mut channel) = self.terminal_channel else {
+    /// Returns a vector of (payload, sender) tuples for all pending input.
+    /// Non-blocking - returns immediately if no input is available.
+    pub fn drain_server_input(&mut self) -> Vec<(Vec<u8>, PeerId)> {
+        let Some(ref mut server_pty) = self.server_pty else {
+            return Vec::new();
+        };
+        let Some(ref mut channel) = server_pty.channel else {
             return Vec::new();
         };
 
@@ -609,19 +623,31 @@ impl Agent {
 
     /// Disconnect this agent's channels.
     ///
-    /// Cleanly closes WebSocket connections for terminal and preview channels.
+    /// Cleanly closes WebSocket connections for all PTY and preview channels.
     pub async fn disconnect_channels(&mut self) {
-        log::info!("Agent {} disconnecting channels", self.session_key());
+        let session_key = self.session_key();
+        log::info!("Agent {} disconnecting channels", session_key);
 
-        if let Some(ref mut ch) = self.terminal_channel {
+        // Disconnect CLI PTY channel
+        if let Some(ref mut ch) = self.cli_pty.channel {
             ch.disconnect().await;
-            log::info!("Agent {} terminal channel disconnected", self.session_key());
+            log::info!("Agent {} CLI PTY channel disconnected", session_key);
         }
-        self.terminal_channel = None;
+        self.cli_pty.channel = None;
 
+        // Disconnect Server PTY channel if exists
+        if let Some(ref mut server_pty) = self.server_pty {
+            if let Some(ref mut ch) = server_pty.channel {
+                ch.disconnect().await;
+                log::info!("Agent {} Server PTY channel disconnected", session_key);
+            }
+            server_pty.channel = None;
+        }
+
+        // Disconnect preview channel
         if let Some(ref mut ch) = self.preview_channel {
             ch.disconnect().await;
-            log::info!("Agent {} preview channel disconnected", self.session_key());
+            log::info!("Agent {} preview channel disconnected", session_key);
         }
         self.preview_channel = None;
     }
@@ -634,21 +660,20 @@ impl Drop for Agent {
             self.session_key()
         );
 
-        // Channels clean up via their own Drop (sends shutdown signal)
-        if self.terminal_channel.is_some() {
-            log::info!("Agent {} dropping terminal channel", self.session_key());
+        // PTY channels clean up via PtySession's Drop
+        // Preview channel cleans up via its own Drop
+        if self.cli_pty.has_channel() {
+            log::info!("Agent {} dropping CLI PTY channel", self.session_key());
+        }
+        if self.has_server_terminal_channel() {
+            log::info!("Agent {} dropping Server PTY channel", self.session_key());
         }
         if self.preview_channel.is_some() {
             log::info!("Agent {} dropping preview channel", self.session_key());
         }
 
-        if let Some(ref mut server_pty) = self.server_pty {
-            log::info!("Killing server PTY child process");
-            server_pty.kill_child();
-        }
-
-        log::info!("Killing CLI PTY child process");
-        self.cli_pty.kill_child();
+        // PTY child processes are killed by PtySession's Drop
+        // which is called when Agent is dropped
     }
 }
 

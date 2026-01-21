@@ -345,7 +345,6 @@ mod tests {
         let config = Config {
             server_url: "http://localhost:3000".to_string(),
             token: "test".to_string(),
-            api_key: String::new(),
             poll_interval: 10,
             agent_timeout: 300,
             max_sessions: 10,

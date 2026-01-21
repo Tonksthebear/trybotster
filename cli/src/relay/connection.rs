@@ -180,6 +180,7 @@ impl HubRelay {
                 channel_name: "HubChannel".to_string(),
                 hub_id: self.hub_identifier.clone(),
                 agent_index: None,
+                pty_index: None, // Hub channel doesn't use PTY index
                 encrypt: true,
                 compression_threshold: Some(4096),
             })
