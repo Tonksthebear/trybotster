@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 
 use crate::agent::Agent;
 use crate::agents::AgentSpawnConfig;
+use crate::keyring::Credentials;
 use crate::process::kill_orphaned_processes;
 use crate::tunnel::allocate_tunnel_port;
 
@@ -236,6 +237,13 @@ fn build_spawn_environment(config: &AgentSpawnConfig) -> HashMap<String, String>
         .unwrap_or_else(|| "botster-hub".to_string());
     env_vars.insert("BOTSTER_HUB_BIN".to_string(), bin_path);
 
+    // Add MCP token for agent authentication (scoped to MCP operations only)
+    if let Ok(creds) = Credentials::load() {
+        if let Some(mcp_token) = creds.mcp_token() {
+            env_vars.insert("BOTSTER_MCP_TOKEN".to_string(), mcp_token.to_string());
+        }
+    }
+
     env_vars
 }
 
@@ -338,5 +346,38 @@ mod tests {
         let mut state = HubState::new(PathBuf::from("/tmp/worktrees"));
         let result = close_agent(&mut state, "nonexistent-key", false).unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    fn test_build_spawn_environment_includes_mcp_token() {
+        use crate::keyring::Credentials;
+
+        // Set up credentials with MCP token (test mode uses file storage)
+        let mut creds = Credentials::load().unwrap_or_default();
+        creds.set_mcp_token("btmcp_test_agent_token".to_string());
+        creds.save().unwrap();
+
+        let config = AgentSpawnConfig {
+            issue_number: Some(1),
+            branch_name: "test".to_string(),
+            worktree_path: PathBuf::from("/tmp/worktree"),
+            repo_path: PathBuf::from("/tmp/repo"),
+            repo_name: "test/repo".to_string(),
+            prompt: "Test".to_string(),
+            message_id: None,
+            invocation_url: None,
+        };
+
+        let env = build_spawn_environment(&config);
+
+        // MCP token should be in the environment
+        assert_eq!(
+            env.get("BOTSTER_MCP_TOKEN"),
+            Some(&"btmcp_test_agent_token".to_string())
+        );
+
+        // Clean up
+        creds.clear_mcp_token();
+        creds.save().unwrap();
     }
 }

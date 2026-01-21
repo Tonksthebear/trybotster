@@ -36,7 +36,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     visit hub_path(@hub)
 
     # Should show hub info, not terminal container
-    assert_selector "h1", text: @hub.name, wait: 10
+    assert_selector "h1", text: @hub.identifier.truncate(32), wait: 10
     assert_no_selector "[data-terminal-display-target='container']"
 
     # Should show list of agents (if any)
@@ -309,7 +309,13 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     setup_test_git_repo(temp_dir, hub.repo)
 
     # Create device token
-    device_token = hub.user.device_tokens.create!(name: "Nav Test #{SecureRandom.hex(4)}")
+    token_name = "Nav Test #{SecureRandom.hex(4)}"
+    device = hub.user.devices.create!(
+      name: token_name,
+      device_type: "cli",
+      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+    )
+    device_token = device.create_device_token!(name: token_name)
 
     env = {
       "BOTSTER_ENV" => "test",

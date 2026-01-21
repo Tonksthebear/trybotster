@@ -283,10 +283,10 @@ pub fn send_scrollback_for_agent_to_browser(hub: &Hub, browser_identity: &str, a
 }
 
 
-/// Drain browser input from agent channels and route to PTY.
+/// Drain browser input from PTY channels and route to PTY.
 ///
-/// Each agent owns its terminal_channel. Browsers send input to the agent's
-/// channel stream. This function drains that input and writes to the agent's PTY.
+/// Each PTY session owns its channel. Browsers send input to the PTY's
+/// channel stream. This function drains that input and writes to the PTY.
 ///
 /// Call this each event loop iteration to process browser input for all agents.
 pub fn drain_and_route_browser_input(hub: &mut crate::hub::Hub) {
@@ -298,12 +298,12 @@ pub fn drain_and_route_browser_input(hub: &mut crate::hub::Hub) {
     let mut client_resizes: Vec<(String, u16, u16)> = Vec::new();
 
     for agent_key in agent_keys {
-        // Drain input for this agent
+        // Drain CLI PTY input for this agent
         let inputs = {
             let Some(agent) = hub.state.agents.get_mut(&agent_key) else {
                 continue;
             };
-            agent.drain_terminal_input()
+            agent.drain_cli_input()
         };
 
         // Parse and route each command to the agent's PTY
@@ -379,93 +379,120 @@ pub fn drain_and_route_browser_input(hub: &mut crate::hub::Hub) {
 
 /// Drain PTY output from all agents and route to viewing clients.
 ///
-/// Each agent owns its terminal_channel. Output is sent via the agent's
-/// channel to browsers subscribed to that agent's stream.
+/// Each agent owns its terminal_channel (CLI PTY) and optionally server_terminal_channel
+/// (Server PTY). Output is sent via the appropriate channel to browsers subscribed
+/// to that agent's stream.
 ///
 /// Call this each event loop iteration to stream PTY output to clients.
 pub fn drain_and_route_pty_output(hub: &mut crate::hub::Hub) {
-    // Collect agent keys and output
-    let agent_outputs: Vec<(String, Vec<u8>)> = hub
+    // Collect agent keys and CLI PTY output (access PtySession directly)
+    let cli_outputs: Vec<(String, Vec<u8>)> = hub
         .state
         .agents
         .iter()
-        .map(|(key, agent)| (key.clone(), agent.drain_raw_output()))
+        .map(|(key, agent)| (key.clone(), agent.cli_pty.drain_raw_output()))
         .filter(|(_, bytes)| !bytes.is_empty())
         .collect();
 
-    // Collect viewers per agent before we need to borrow hub mutably
-    let agent_viewers: std::collections::HashMap<String, Vec<String>> = agent_outputs
+    // Collect agent keys and Server PTY output (access PtySession directly)
+    let server_outputs: Vec<(String, Vec<u8>)> = hub
+        .state
+        .agents
         .iter()
-        .map(|(key, _)| {
-            let viewers: Vec<String> = hub
-                .clients
-                .viewers_of(key)
-                .filter_map(|id| {
-                    if let ClientId::Browser(identity) = id {
-                        Some(identity.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            (key.clone(), viewers)
+        .filter_map(|(key, agent)| {
+            agent
+                .server_pty
+                .as_ref()
+                .map(|pty| (key.clone(), pty.drain_raw_output()))
         })
+        .filter(|(_, bytes)| !bytes.is_empty())
         .collect();
 
-    // Route each agent's output via its terminal_channel
-    for (agent_key, data) in &agent_outputs {
-        if let Some(viewers) = agent_viewers.get(agent_key) {
-            log::debug!("PTY output: {} bytes from agent {} to {} viewers",
-                data.len(), &agent_key[..8.min(agent_key.len())], viewers.len());
-            for identity in viewers {
-                send_via_agent_channel(hub, agent_key, identity, data);
+    // Route CLI PTY output via cli_pty.channel (pty_index=0)
+    // Browsers subscribed to this stream will receive it
+    for (agent_key, data) in &cli_outputs {
+        if let Some(agent) = hub.state.agents.get(agent_key) {
+            if agent.cli_pty.has_channel() {
+                send_via_pty_channel(hub, agent_key, &data, PtyType::Cli);
+            } else {
+                log::debug!(
+                    "CLI output: {} bytes from agent {} but no channel",
+                    data.len(),
+                    &agent_key[..8.min(agent_key.len())]
+                );
             }
-        } else {
-            log::debug!("PTY output: {} bytes from agent {} but no viewers",
-                data.len(), &agent_key[..8.min(agent_key.len())]);
+        }
+    }
+
+    // Route Server PTY output via server_pty.channel (pty_index=1)
+    // Browsers subscribed to this stream will receive it
+    for (agent_key, data) in &server_outputs {
+        if let Some(agent) = hub.state.agents.get(agent_key) {
+            if agent.has_server_terminal_channel() {
+                send_via_pty_channel(hub, agent_key, &data, PtyType::Server);
+            } else {
+                log::debug!(
+                    "Server output: {} bytes from agent {} but no channel",
+                    data.len(),
+                    &agent_key[..8.min(agent_key.len())]
+                );
+            }
         }
     }
 }
 
-/// Send output via an agent's terminal channel.
+/// Which PTY type to send output through.
+enum PtyType {
+    /// CLI PTY (index 0) - uses cli_pty.channel.
+    Cli,
+    /// Server PTY (index 1) - uses server_pty.channel.
+    Server,
+}
+
+/// Send output via a PTY's terminal channel.
 ///
-/// Spawns an async task to send the output through the agent's channel
-/// to a specific browser identity.
-fn send_via_agent_channel(
-    hub: &crate::hub::Hub,
-    agent_key: &str,
-    browser_identity: &str,
-    data: &[u8],
-) {
+/// Broadcasts output through the specified PTY's channel. The channel handles
+/// encryption and delivery to all connected browsers subscribed to that stream.
+fn send_via_pty_channel(hub: &crate::hub::Hub, agent_key: &str, data: &[u8], pty_type: PtyType) {
     let Some(agent) = hub.state.agents.get(agent_key) else {
         log::warn!("Agent {} not found for output routing", agent_key);
         return;
     };
 
-    let Some(ref channel) = agent.terminal_channel else {
-        log::warn!("Agent {} has no terminal channel, dropping {} bytes of output",
-            &agent_key[..8.min(agent_key.len())], data.len());
-        return;
+    // Get the sender handle from the appropriate PTY's channel
+    let (sender_handle, label) = match pty_type {
+        PtyType::Cli => (agent.cli_pty.get_channel_sender(), "CLI"),
+        PtyType::Server => (
+            agent
+                .server_pty
+                .as_ref()
+                .and_then(|pty| pty.get_channel_sender()),
+            "Server",
+        ),
     };
 
-    // Get a cloneable sender handle from the channel
-    let Some(sender_handle) = channel.get_sender_handle() else {
+    let Some(sender_handle) = sender_handle else {
         log::warn!(
-            "Agent {} terminal channel not connected, cannot send output",
-            agent_key
+            "Agent {} {} PTY has no channel sender, dropping {} bytes",
+            &agent_key[..8.min(agent_key.len())],
+            label,
+            data.len()
         );
         return;
     };
 
     // Clone what we need for the async task
     let data = data.to_vec();
-    let peer_id = crate::channel::PeerId(browser_identity.to_string());
     let agent_key = agent_key.to_string();
-    let browser_id = browser_identity.to_string();
+    let label = label.to_string();
 
     hub.tokio_runtime.spawn(async move {
-        log::debug!("Sending {} bytes via agent {} channel to {}",
-            data.len(), &agent_key[..8.min(agent_key.len())], &browser_id[..8.min(browser_id.len())]);
+        log::debug!(
+            "Broadcasting {} bytes via agent {} {} channel",
+            data.len(),
+            &agent_key[..8.min(agent_key.len())],
+            label
+        );
 
         // Wrap output in JSON structure for browser deserialization
         // Browser's reliable_channel.js expects JSON payloads
@@ -475,15 +502,21 @@ fn send_via_agent_channel(
         });
         let msg_bytes = serde_json::to_vec(&output_msg).expect("JSON serialization");
 
-        if let Err(e) = sender_handle.send_to(&msg_bytes, &peer_id).await {
+        // Broadcast to all peers on this channel
+        // The Rails channel routes to browsers subscribed to this pty_index stream
+        if let Err(e) = sender_handle.send(&msg_bytes).await {
             log::error!(
-                "Failed to send output via agent {} channel to {}: {}",
-                agent_key,
-                &browser_id[..8.min(browser_id.len())],
+                "Failed to broadcast {} output for agent {}: {}",
+                label,
+                &agent_key[..8.min(agent_key.len())],
                 e
             );
         } else {
-            log::debug!("Sent {} bytes to {}", data.len(), &browser_id[..8.min(browser_id.len())]);
+            log::debug!(
+                "Broadcast {} bytes via {} channel",
+                data.len(),
+                label
+            );
         }
     });
 }

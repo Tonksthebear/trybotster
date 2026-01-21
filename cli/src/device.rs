@@ -7,11 +7,12 @@
 //!
 //! Note: E2E encryption is handled by Olm (vodozemac) in the relay module.
 //! This module only manages device identity for authentication.
+//!
+//! Signing keys are stored in the consolidated keyring entry via the keyring module.
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use keyring::Entry;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,30 +21,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-/// Keyring service name for storing secrets
-const KEYRING_SERVICE: &str = "botster";
-/// Keyring entry suffix for signing key
-const KEYRING_SIGNING_SUFFIX: &str = "signing";
-
-/// Check if keyring should be skipped (for testing).
-///
-/// Keyring is skipped when:
-/// - Compiled with `cfg(test)` (unit tests via `cargo test --lib`)
-/// - `BOTSTER_ENV=test` is set (integration/system tests)
-///
-/// This avoids macOS keychain prompts during test runs.
-fn should_skip_keyring() -> bool {
-    // Compile-time check for unit tests
-    #[cfg(test)]
-    {
-        return true;
-    }
-
-    #[cfg(not(test))]
-    {
-        crate::env::is_test_mode()
-    }
-}
+use crate::keyring::Credentials;
 
 /// Stored device identity (public keys + metadata)
 ///
@@ -87,11 +65,22 @@ impl std::fmt::Debug for Device {
     }
 }
 
+/// Global mutex to prevent race conditions when multiple threads
+/// try to load/create the device simultaneously.
+/// This is especially important in tests where multiple threads
+/// share the same config directory.
+static DEVICE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Device {
     /// Load existing device or create new one.
     ///
-    /// Keypair is stored in ~/.config/botster/device.json
+    /// Keypair is stored in ~/.config/botster/device.json.
+    /// Uses a process-wide mutex to prevent race conditions when
+    /// multiple threads (e.g., parallel tests) call this simultaneously.
     pub fn load_or_create() -> Result<Self> {
+        // Hold lock for entire load/create operation to prevent races
+        let _guard = DEVICE_LOCK.lock().expect("device lock poisoned");
+
         let config_path = Self::config_path()?;
 
         if config_path.exists() {
@@ -144,74 +133,46 @@ impl Device {
         Ok(config_dir.join("device.json"))
     }
 
-    /// Get the path for file-based signing key storage (test mode).
-    fn signing_key_file_path(config_path: &PathBuf) -> PathBuf {
-        config_path.with_extension("signing_key")
+    /// Store signing secret key in consolidated credentials.
+    fn store_signing_key(fingerprint: &str, signing_key: &SigningKey) -> Result<()> {
+        let secret_b64 = BASE64.encode(signing_key.to_bytes());
+
+        // Load existing credentials, update signing key, save back
+        let mut creds = Credentials::load().unwrap_or_default();
+        creds.set_signing_key(secret_b64, fingerprint.to_string());
+        creds.save()?;
+
+        log::info!("Stored signing key in consolidated credentials");
+        Ok(())
     }
 
-    /// Store signing secret key (keyring or file based on environment).
-    fn store_signing_key(config_path: &PathBuf, fingerprint: &str, signing_key: &SigningKey) -> Result<()> {
-        if should_skip_keyring() {
-            // Test mode: store in file
-            let key_path = Self::signing_key_file_path(config_path);
-            let secret_b64 = BASE64.encode(signing_key.to_bytes());
-            fs::write(&key_path, &secret_b64).context("Failed to write signing key file")?;
-            #[cfg(unix)]
-            {
-                let perms = fs::Permissions::from_mode(0o600);
-                fs::set_permissions(&key_path, perms).context("Failed to set signing key permissions")?;
-            }
-            log::info!("Stored signing key in file (test mode, keyring skipped)");
-            Ok(())
-        } else {
-            // Production: use OS keyring
-            let entry_name = format!("{}-{}", fingerprint, KEYRING_SIGNING_SUFFIX);
-            log::debug!("Creating keyring entry: service={} user={}", KEYRING_SERVICE, entry_name);
+    /// Load signing secret key from consolidated credentials.
+    fn load_signing_key(fingerprint: &str) -> Result<SigningKey> {
+        let creds = Credentials::load()
+            .context("Failed to load credentials")?;
 
-            let entry = Entry::new(KEYRING_SERVICE, &entry_name)
-                .map_err(|e| anyhow::anyhow!("Failed to create keyring entry: {:?}", e))?;
-
-            let secret_b64 = BASE64.encode(signing_key.to_bytes());
-            entry
-                .set_password(&secret_b64)
-                .map_err(|e| anyhow::anyhow!("Failed to store in keyring: {:?}", e))?;
-
-            log::info!("Stored signing key in OS keyring");
-            Ok(())
+        // Verify fingerprint matches
+        if !creds.signing_key_matches_fingerprint(fingerprint) {
+            anyhow::bail!(
+                "Signing key fingerprint mismatch: expected {}, got {:?}",
+                fingerprint,
+                creds.fingerprint
+            );
         }
-    }
 
-    /// Load signing secret key (keyring or file based on environment).
-    fn load_signing_key(config_path: &PathBuf, fingerprint: &str) -> Result<SigningKey> {
-        if should_skip_keyring() {
-            // Test mode: load from file
-            let key_path = Self::signing_key_file_path(config_path);
-            let secret_b64 = fs::read_to_string(&key_path)
-                .context("Signing key file not found (test mode)")?;
-            let secret_bytes = BASE64
-                .decode(secret_b64.trim())
-                .context("Invalid signing key encoding in file")?;
-            let key_bytes: [u8; 32] = secret_bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("Invalid signing key length in file"))?;
-            log::debug!("Loaded signing key from file (test mode, keyring skipped)");
-            Ok(SigningKey::from_bytes(&key_bytes))
-        } else {
-            // Production: use OS keyring
-            let entry_name = format!("{}-{}", fingerprint, KEYRING_SIGNING_SUFFIX);
-            let entry = Entry::new(KEYRING_SERVICE, &entry_name)
-                .context("Failed to create keyring entry for signing key")?;
-            let secret_b64 = entry
-                .get_password()
-                .context("Signing key not found in keyring")?;
-            let secret_bytes = BASE64
-                .decode(&secret_b64)
-                .context("Invalid signing key encoding in keyring")?;
-            let key_bytes: [u8; 32] = secret_bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("Invalid signing key length in keyring"))?;
-            Ok(SigningKey::from_bytes(&key_bytes))
-        }
+        let secret_b64 = creds.signing_key()
+            .context("Signing key not found in credentials")?;
+
+        let secret_bytes = BASE64
+            .decode(secret_b64)
+            .context("Invalid signing key encoding")?;
+
+        let key_bytes: [u8; 32] = secret_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid signing key length"))?;
+
+        log::debug!("Loaded signing key from consolidated credentials");
+        Ok(SigningKey::from_bytes(&key_bytes))
     }
 
     /// Load device from config file
@@ -221,8 +182,8 @@ impl Device {
         let stored: StoredDevice =
             serde_json::from_str(&content).context("Failed to parse device config")?;
 
-        // Load signing key (from keyring or file depending on environment)
-        let signing_key = match Self::load_signing_key(path, &stored.fingerprint) {
+        // Load signing key from consolidated credentials
+        let signing_key = match Self::load_signing_key(&stored.fingerprint) {
             Ok(sk) => sk,
             Err(e) => {
                 anyhow::bail!(
@@ -257,8 +218,8 @@ impl Device {
         let fingerprint = Self::compute_fingerprint(&verifying_key);
         let name = Self::default_name();
 
-        // Store signing key (in keyring or file depending on environment)
-        Self::store_signing_key(path, &fingerprint, &signing_key)?;
+        // Store signing key in consolidated credentials
+        Self::store_signing_key(&fingerprint, &signing_key)?;
 
         // Store only public info in file
         let stored = StoredDevice {
@@ -279,11 +240,9 @@ impl Device {
             fs::set_permissions(path, perms).context("Failed to set device config permissions")?;
         }
 
-        let storage_location = if should_skip_keyring() { "file (test mode)" } else { "OS keyring" };
         log::info!(
-            "Created new device identity: fingerprint={} (signing key in {})",
-            fingerprint,
-            storage_location
+            "Created new device identity: fingerprint={} (signing key in consolidated credentials)",
+            fingerprint
         );
 
         Ok(Self {

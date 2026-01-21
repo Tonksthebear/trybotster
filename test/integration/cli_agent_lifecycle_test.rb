@@ -147,8 +147,8 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
       status: "pending"
     )
 
-    # Wait for cleanup to be processed
-    assert_message_acknowledged(cleanup_message, timeout: 15)
+    # Wait for cleanup to be processed (poll interval is 5s, plus processing time)
+    assert_message_acknowledged(cleanup_message, timeout: 20)
 
     # Wait for next heartbeat to update agent list (heartbeat interval is 2s in test mode)
     sleep 4
@@ -207,7 +207,13 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
     @worktree_base = worktree_base
 
     # Create device token for CLI authentication
-    device_token = hub.user.device_tokens.create!(name: "CLI Test Token #{SecureRandom.hex(4)}")
+    token_name = "CLI Test Token #{SecureRandom.hex(4)}"
+    device = hub.user.devices.create!(
+      name: token_name,
+      device_type: "cli",
+      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+    )
+    device_token = device.create_device_token!(name: token_name)
     api_key = device_token.token
 
     # Set up environment with git repo as working directory
@@ -373,12 +379,6 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
       sleep 0.5
     end
     flunk "Message #{message.id} was not acknowledged within #{timeout}s (status: #{message.status})"
-  end
-
-  def server_url
-    host = Capybara.current_session.server.host
-    port = Capybara.current_session.server.port
-    "http://#{host}:#{port}"
   end
 
   def teardown

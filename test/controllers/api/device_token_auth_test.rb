@@ -9,7 +9,12 @@ module Api
         email: "token_auth_test@example.com",
         username: "token_auth_test"
       )
-      @device_token = @user.device_tokens.create!(name: "Test CLI")
+      @device = @user.devices.create!(
+        name: "Test CLI",
+        device_type: "cli",
+        fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+      )
+      @device_token = @device.create_device_token!(name: "Test CLI")
     end
 
     teardown do

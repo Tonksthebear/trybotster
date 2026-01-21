@@ -158,7 +158,7 @@ module CliTestHelper
     device_token = create_device_token_for_hub(hub)
     api_key = device_token.token
     Rails.logger.info "[CliTestHelper] Created DeviceToken id=#{device_token.id} token=#{api_key[0..15]}..."
-    Rails.logger.info "[CliTestHelper] DeviceToken user_id=#{device_token.user_id}"
+    Rails.logger.info "[CliTestHelper] DeviceToken user_id=#{device_token.user&.id}"
 
     # Set up environment
     # BOTSTER_ENV=test enables all test-specific behaviors:
@@ -279,7 +279,14 @@ module CliTestHelper
   def create_device_token_for_hub(hub)
     # Create a device token for the CLI to authenticate
     # Returns the DeviceToken record (not just the token string) for cleanup
-    hub.user.device_tokens.create!(name: "CLI Test Token #{SecureRandom.hex(4)}")
+    # DeviceToken now belongs to Device, so we need to create a device first
+    name = "CLI Test Token #{SecureRandom.hex(4)}"
+    device = hub.user.devices.create!(
+      name: name,
+      device_type: "cli",
+      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+    )
+    device.create_device_token!(name: name)
   end
 
   def cli_binary_current?

@@ -403,7 +403,8 @@ impl std::fmt::Debug for SignalProtocolManager {
 impl SignalProtocolManager {
     /// Create a new Signal Protocol manager with fresh identity.
     ///
-    /// Generates new identity keys, PreKeys, SignedPreKey, and KyberPreKey.
+    /// Creates identity keypair immediately but defers PreKey generation
+    /// until first bundle request (lazy initialization for faster startup).
     pub async fn new(hub_id: &str) -> Result<Self> {
         let store = SignalProtocolStore::new().await?;
 
@@ -417,37 +418,31 @@ impl SignalProtocolManager {
         // Derive group ID from hub_id for SenderKey
         let group_id = Self::derive_group_id(hub_id);
 
-        let mut manager = Self {
+        log::info!(
+            "Created new SignalProtocolManager for hub {} (keys deferred)",
+            &hub_id[..hub_id.len().min(8)]
+        );
+
+        Ok(Self {
             store,
             hub_id: hub_id.to_string(),
             our_address,
             group_id,
-        };
-
-        // Generate initial key material
-        manager.generate_prekeys().await?;
-
-        // Persist the new keys so they survive CLI restarts
-        manager.store.persist(hub_id).await?;
-
-        log::info!(
-            "Created new SignalProtocolManager for hub {}",
-            &hub_id[..hub_id.len().min(8)]
-        );
-
-        Ok(manager)
+        })
     }
 
     /// Load existing manager or create new one.
+    ///
+    /// Key generation is deferred until first bundle request for fast startup.
     pub async fn load_or_create(hub_id: &str) -> Result<Self> {
         // Try to load existing store
         match SignalProtocolStore::load(hub_id).await {
             Ok(store) => {
                 let address_name = Self::derive_address_name(hub_id);
                 let our_address = ProtocolAddress::new(
-            address_name,
-            DeviceId::new(CLI_DEVICE_ID as u8).expect("valid device ID"),
-        );
+                    address_name,
+                    DeviceId::new(CLI_DEVICE_ID as u8).expect("valid device ID"),
+                );
                 let group_id = Self::derive_group_id(hub_id);
 
                 log::info!(
@@ -466,17 +461,47 @@ impl SignalProtocolManager {
         }
     }
 
+    /// Ensure keys are ready for bundle generation.
+    ///
+    /// Generates PreKeys, SignedPreKey, and KyberPreKey if not already present.
+    /// This is called lazily when the first connection code is requested.
+    pub async fn ensure_keys_ready(&mut self) -> Result<()> {
+        // Check if we already have keys
+        if self.store.get_signed_pre_key(SignedPreKeyId::from(1)).await.is_ok() {
+            log::debug!("Signal keys already present");
+            return Ok(());
+        }
+
+        log::info!("Generating Signal Protocol keys (first connection code request)...");
+        self.generate_prekeys().await?;
+
+        // Persist the new keys so they survive CLI restarts
+        self.store.persist(&self.hub_id).await?;
+
+        Ok(())
+    }
+
+    /// Number of one-time PreKeys to generate.
+    ///
+    /// Signal servers generate 100 for distribution to many clients.
+    /// For a local CLI connecting 1-2 browsers, 10 is plenty.
+    const PREKEY_COUNT: u32 = 10;
+
     /// Generate PreKeys for session establishment.
     async fn generate_prekeys(&mut self) -> Result<()> {
-        // Generate 100 one-time PreKeys
-        for id in 1..=100u32 {
+        let start = std::time::Instant::now();
+
+        // Generate one-time PreKeys (reduced count for local CLI use case)
+        for id in 1..=Self::PREKEY_COUNT {
             let key_pair = KeyPair::generate(&mut rand::rngs::StdRng::from_os_rng());
             let record = PreKeyRecord::new(PreKeyId::from(id), &key_pair);
             self.store.save_pre_key(PreKeyId::from(id), &record).await
                 .map_err(|e| anyhow::anyhow!("Failed to save PreKey: {e}"))?;
         }
+        log::debug!("Generated {} PreKeys in {:?}", Self::PREKEY_COUNT, start.elapsed());
 
         // Generate SignedPreKey
+        let signed_start = std::time::Instant::now();
         let signed_key_pair = KeyPair::generate(&mut rand::rngs::StdRng::from_os_rng());
         let identity_key_pair = self.store.get_identity_key_pair().await
             .map_err(|e| anyhow::anyhow!("Failed to get identity: {e}"))?;
@@ -499,8 +524,10 @@ impl SignalProtocolManager {
         );
         self.store.save_signed_pre_key(SignedPreKeyId::from(1), &signed_record).await
             .map_err(|e| anyhow::anyhow!("Failed to save SignedPreKey: {e}"))?;
+        log::debug!("Generated SignedPreKey in {:?}", signed_start.elapsed());
 
-        // Generate KyberPreKey (post-quantum)
+        // Generate KyberPreKey (post-quantum) - this is CPU-intensive
+        let kyber_start = std::time::Instant::now();
         let kyber_key_pair = libsignal_protocol::kem::KeyPair::generate(
             libsignal_protocol::kem::KeyType::Kyber1024,
             &mut rand::rngs::StdRng::from_os_rng(),
@@ -523,8 +550,13 @@ impl SignalProtocolManager {
         );
         self.store.save_kyber_pre_key(KyberPreKeyId::from(1), &kyber_record).await
             .map_err(|e| anyhow::anyhow!("Failed to save KyberPreKey: {e}"))?;
+        log::debug!("Generated KyberPreKey in {:?}", kyber_start.elapsed());
 
-        log::debug!("Generated PreKeys: 100 one-time, 1 signed, 1 Kyber");
+        log::info!(
+            "Signal key generation complete: {} PreKeys, 1 SignedPreKey, 1 KyberPreKey in {:?}",
+            Self::PREKEY_COUNT,
+            start.elapsed()
+        );
         Ok(())
     }
 
@@ -535,8 +567,13 @@ impl SignalProtocolManager {
     ///
     /// Automatically selects an available PreKey. If `preferred_prekey_id` is
     /// provided and available, uses that; otherwise finds any available PreKey.
-    pub async fn build_prekey_bundle_data(&self, preferred_prekey_id: u32) -> Result<PreKeyBundleData> {
+    ///
+    /// Keys are generated lazily on first call for faster startup.
+    pub async fn build_prekey_bundle_data(&mut self, preferred_prekey_id: u32) -> Result<PreKeyBundleData> {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+        // Ensure keys are generated (lazy initialization)
+        self.ensure_keys_ready().await?;
 
         let identity_key_pair = self.store.get_identity_key_pair().await
             .map_err(|e| anyhow::anyhow!("Failed to get identity: {e}"))?;
@@ -820,7 +857,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prekey_bundle_generation() {
-        let manager = SignalProtocolManager::new("test-hub-bundle").await.unwrap();
+        let mut manager = SignalProtocolManager::new("test-hub-bundle").await.unwrap();
         let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
 
         assert_eq!(bundle.version, SIGNAL_PROTOCOL_VERSION);
@@ -834,7 +871,7 @@ mod tests {
     async fn test_prekey_bundle_url_size() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
-        let manager = SignalProtocolManager::new("test-hub-size").await.unwrap();
+        let mut manager = SignalProtocolManager::new("test-hub-size").await.unwrap();
         let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
 
         let json = serde_json::to_string(&bundle).unwrap();
@@ -863,7 +900,7 @@ mod tests {
     async fn test_qr_size_options() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
-        let manager = SignalProtocolManager::new("test-hub-qr-options").await.unwrap();
+        let mut manager = SignalProtocolManager::new("test-hub-qr-options").await.unwrap();
         let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
         let json = serde_json::to_string(&bundle).unwrap();
 
@@ -914,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_binary_bundle_round_trip() {
-        let manager = SignalProtocolManager::new("test-hub-binary").await.unwrap();
+        let mut manager = SignalProtocolManager::new("test-hub-binary").await.unwrap();
         let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
 
         // Serialize to binary
@@ -940,7 +977,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_binary_bundle_size() {
-        let manager = SignalProtocolManager::new("test-hub-binary-size").await.unwrap();
+        let mut manager = SignalProtocolManager::new("test-hub-binary-size").await.unwrap();
         let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
 
         let bytes = bundle.to_binary().expect("serialization should succeed");
@@ -956,7 +993,7 @@ mod tests {
     async fn test_binary_bundle_fits_in_qr_with_base32() {
         use data_encoding::BASE32_NOPAD;
 
-        let manager = SignalProtocolManager::new("test-hub-qr-fit").await.unwrap();
+        let mut manager = SignalProtocolManager::new("test-hub-qr-fit").await.unwrap();
         let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
 
         let bytes = bundle.to_binary().expect("serialization should succeed");
@@ -1008,5 +1045,50 @@ mod tests {
         let bytes2 = bundle.to_binary().unwrap();
 
         assert_eq!(bytes1, bytes2, "Binary serialization should be deterministic");
+    }
+
+    #[tokio::test]
+    async fn test_lazy_key_generation() {
+        // Create manager - should NOT generate keys yet
+        let mut manager = SignalProtocolManager::new("test-hub-lazy").await.unwrap();
+
+        // Keys should not exist initially
+        let has_signed_key = manager.store.get_signed_pre_key(SignedPreKeyId::from(1)).await.is_ok();
+        assert!(!has_signed_key, "SignedPreKey should not exist before bundle request");
+
+        // Request bundle - this should trigger key generation
+        let bundle = manager.build_prekey_bundle_data(1).await.unwrap();
+        assert!(!bundle.identity_key.is_empty(), "Bundle should have identity key");
+        assert!(!bundle.signed_prekey.is_empty(), "Bundle should have signed prekey");
+        assert!(!bundle.kyber_prekey.is_empty(), "Bundle should have kyber prekey");
+
+        // Keys should now exist
+        let has_signed_key_after = manager.store.get_signed_pre_key(SignedPreKeyId::from(1)).await.is_ok();
+        assert!(has_signed_key_after, "SignedPreKey should exist after bundle request");
+
+        // Second bundle request should NOT regenerate keys
+        let bundle2 = manager.build_prekey_bundle_data(1).await.unwrap();
+        assert_eq!(bundle.identity_key, bundle2.identity_key, "Identity should be same on second request");
+        assert_eq!(bundle.signed_prekey, bundle2.signed_prekey, "SignedPreKey should be same on second request");
+    }
+
+    #[tokio::test]
+    async fn test_loaded_store_has_keys_immediately() {
+        let hub_id = "test-hub-loaded-keys";
+
+        // Create and populate a manager
+        let mut manager = SignalProtocolManager::new(hub_id).await.unwrap();
+        let _bundle = manager.build_prekey_bundle_data(1).await.unwrap();
+
+        // Persist and reload
+        manager.store.persist(hub_id).await.unwrap();
+        let loaded_manager = SignalProtocolManager::load_or_create(hub_id).await.unwrap();
+
+        // Loaded store should already have keys
+        let has_signed_key = loaded_manager.store.get_signed_pre_key(SignedPreKeyId::from(1)).await.is_ok();
+        assert!(has_signed_key, "Loaded store should have SignedPreKey from previous session");
+
+        // Cleanup
+        let _ = super::super::persistence::delete_signal_store(hub_id);
     }
 }

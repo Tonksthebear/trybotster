@@ -52,6 +52,6 @@ module ApiKeyAuthenticatable
     return nil unless device_token
 
     device_token.touch_usage!(ip: request.remote_ip)
-    device_token.user
+    device_token.device&.user
   end
 end

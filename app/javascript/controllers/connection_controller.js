@@ -126,6 +126,7 @@ export default class extends Controller {
     wasmJsUrl: String,
     wasmBinaryUrl: String,
     agentIndex: { type: Number, default: 0 }, // Per-agent channel routing
+    ptyIndex: { type: Number, default: 0 }, // Per-PTY stream routing (0=CLI, 1=Server)
   };
 
   static classes = ["securityBannerBase"];
@@ -144,6 +145,8 @@ export default class extends Controller {
     this.errorReason = null;
     this.handshakeTimer = null;
     this.currentAgentIndex = this.agentIndexValue; // Track which agent we're subscribed to
+    this.currentPtyIndex = this.ptyIndexValue; // Track which PTY we're subscribed to (0=CLI, 1=Server)
+    this.hasCompletedInitialSetup = false; // Track whether we've finished initial setup (for reconnection detection)
 
     // Don't overwrite listeners - outlet callbacks may have already registered
     if (!this.listeners) {
@@ -385,6 +388,8 @@ export default class extends Controller {
 
   subscribeToHubChannel() {
     return new Promise((resolve, reject) => {
+      let initialConnectionResolved = false;
+
       // Create raw ActionCable subscription
       this.hubSubscription = consumer.subscriptions.create(
         {
@@ -395,6 +400,12 @@ export default class extends Controller {
         {
           connected: () => {
             console.log("[Connection] HubChannel connected");
+
+            // Clean up old channel if exists (reconnection case)
+            if (this.hubChannel) {
+              this.hubChannel.destroy();
+            }
+
             // Create Channel wrapper with E2E encryption and reliable delivery
             this.hubChannel = Channel.builder(this.hubSubscription)
               .session(this.signalSession)
@@ -405,16 +416,25 @@ export default class extends Controller {
               .onError((err) => this.handleChannelError(err))
               .build();
             this.hubChannel.markConnected();
-            resolve();
+
+            // Initial connection - resolve Promise
+            if (!initialConnectionResolved) {
+              initialConnectionResolved = true;
+              resolve();
+            } else if (this.hasCompletedInitialSetup) {
+              // Reconnection after disconnect - restart handshake flow
+              console.log("[Connection] HubChannel reconnected, restarting handshake");
+              this.restartHandshake();
+            }
           },
           disconnected: () => {
             console.log("[Connection] HubChannel disconnected");
-            // Clean up channel
+            // Clean up channel but keep subscription for auto-reconnect
             if (this.hubChannel) {
               this.hubChannel.destroy();
               this.hubChannel = null;
             }
-            // Hub disconnect is critical - trigger reconnect
+            // Hub disconnect is critical - update state
             this.handleDisconnect();
           },
           rejected: () => {
@@ -432,20 +452,29 @@ export default class extends Controller {
     });
   }
 
-  subscribeToTerminalChannel(agentIndex = this.currentAgentIndex) {
+  subscribeToTerminalChannel(agentIndex = this.currentAgentIndex, ptyIndex = this.currentPtyIndex) {
     return new Promise((resolve, reject) => {
+      let initialConnectionResolved = false;
+
       this.terminalSubscription = consumer.subscriptions.create(
         {
           channel: "TerminalRelayChannel",
           hub_id: this.hubId,
           agent_index: agentIndex, // Per-agent channel routing
+          pty_index: ptyIndex, // Per-PTY routing (0=CLI, 1=Server)
           browser_identity: this.ourIdentityKey,
         },
         {
           connected: () => {
             console.log(
-              `[Connection] TerminalRelayChannel connected to agent ${agentIndex}`,
+              `[Connection] TerminalRelayChannel connected to agent ${agentIndex} pty ${ptyIndex}`,
             );
+
+            // Clean up old channel if exists (reconnection case)
+            if (this.terminalChannel) {
+              this.terminalChannel.destroy();
+            }
+
             // Create Channel wrapper with E2E encryption and reliable delivery
             this.terminalChannel = Channel.builder(this.terminalSubscription)
               .session(this.signalSession)
@@ -461,11 +490,18 @@ export default class extends Controller {
               .build();
             this.terminalChannel.markConnected();
             this.currentAgentIndex = agentIndex;
-            resolve();
+            this.currentPtyIndex = ptyIndex;
+
+            // Initial connection - resolve Promise
+            if (!initialConnectionResolved) {
+              initialConnectionResolved = true;
+              resolve();
+            }
+            // Note: Terminal channel reconnection is handled by hub channel's restartHandshake
           },
           disconnected: () => {
             console.log("[Connection] TerminalRelayChannel disconnected");
-            // Clean up channel
+            // Clean up channel but keep subscription for auto-reconnect
             if (this.terminalChannel) {
               this.terminalChannel.destroy();
               this.terminalChannel = null;
@@ -538,6 +574,37 @@ export default class extends Controller {
     }, HANDSHAKE_TIMEOUT_MS);
   }
 
+  /**
+   * Restart handshake flow after ActionCable reconnection.
+   * Called when subscriptions reconnect after a disconnect.
+   */
+  async restartHandshake() {
+    // Only restart if we have a valid signal session
+    if (!this.signalSession) {
+      console.warn("[Connection] Cannot restart handshake - no signal session");
+      return;
+    }
+
+    // Only restart if both channels are connected
+    if (!this.hubChannel || !this.terminalChannel) {
+      console.log("[Connection] Waiting for both channels to reconnect before handshake");
+      return;
+    }
+
+    // Clear any existing handshake timer
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer);
+      this.handshakeTimer = null;
+    }
+
+    console.log("[Connection] Restarting handshake after reconnection");
+    this.setState(ConnectionState.CHANNEL_CONNECTED);
+    this.updateStatus("Reconnected", "Re-establishing secure connection...");
+
+    this.setState(ConnectionState.HANDSHAKE_SENT);
+    await this.sendHandshakeWithTimeout();
+  }
+
   getDeviceName() {
     const ua = navigator.userAgent;
     if (ua.includes("iPhone")) return "iPhone";
@@ -562,6 +629,7 @@ export default class extends Controller {
 
       // Complete connection
       this.connected = true;
+      this.hasCompletedInitialSetup = true; // Mark initial setup complete for reconnection detection
       this.setState(ConnectionState.CONNECTED);
       this.updateStatus(
         "Connected",
@@ -733,25 +801,38 @@ export default class extends Controller {
 
   /**
    * Switch to a different agent's channel.
-   * This resubscribes to the new agent's terminal stream.
+   * This resubscribes to the new agent's terminal stream (defaults to CLI PTY).
    * @param {number} agentIndex - Index of the agent to switch to
    */
   async switchToAgentChannel(agentIndex) {
-    if (agentIndex === this.currentAgentIndex) {
-      console.log(`[Connection] Already subscribed to agent ${agentIndex}`);
+    // When switching agents, always start with CLI PTY (index 0)
+    return this.switchToPtyStream(agentIndex, 0);
+  }
+
+  /**
+   * Switch to a different PTY stream.
+   * @param {number} agentIndex - Index of the agent
+   * @param {number} ptyIndex - Index of the PTY (0=CLI, 1=Server)
+   */
+  async switchToPtyStream(agentIndex, ptyIndex) {
+    if (agentIndex === this.currentAgentIndex && ptyIndex === this.currentPtyIndex) {
+      console.log(`[Connection] Already subscribed to agent ${agentIndex} pty ${ptyIndex}`);
       return true;
     }
 
     if (!this.signalSession || !this.connected) {
-      console.warn("[Connection] Cannot switch agent - not connected");
+      console.warn("[Connection] Cannot switch PTY - not connected");
       return false;
     }
 
     console.log(
-      `[Connection] Switching from agent ${this.currentAgentIndex} to ${agentIndex}`,
+      `[Connection] Switching from agent ${this.currentAgentIndex} pty ${this.currentPtyIndex} to agent ${agentIndex} pty ${ptyIndex}`,
     );
 
-    // Clean up current agent's terminal channel (keep hub subscription)
+    const prevAgentIndex = this.currentAgentIndex;
+    const prevPtyIndex = this.currentPtyIndex;
+
+    // Clean up current terminal channel (keep hub subscription)
     if (this.terminalChannel) {
       this.terminalChannel.destroy();
       this.terminalChannel = null;
@@ -762,29 +843,30 @@ export default class extends Controller {
       this.subscription = null;
     }
 
-    // Subscribe to new agent's terminal channel
+    // Subscribe to new PTY stream
     try {
-      await this.subscribeToTerminalChannel(agentIndex);
-      console.log(`[Connection] Switched to agent ${agentIndex}`);
+      await this.subscribeToTerminalChannel(agentIndex, ptyIndex);
+      console.log(`[Connection] Switched to agent ${agentIndex} pty ${ptyIndex}`);
 
-      // Notify listeners of agent switch
+      // Notify listeners of PTY switch
       this.notifyListeners("message", {
-        type: "agent_channel_switched",
+        type: "pty_channel_switched",
         agent_index: agentIndex,
+        pty_index: ptyIndex,
       });
 
       return true;
     } catch (error) {
       console.error(
-        `[Connection] Failed to switch to agent ${agentIndex}:`,
+        `[Connection] Failed to switch to agent ${agentIndex} pty ${ptyIndex}:`,
         error,
       );
-      // Try to reconnect to previous agent's terminal channel
+      // Try to reconnect to previous PTY stream
       try {
-        await this.subscribeToTerminalChannel(this.currentAgentIndex);
+        await this.subscribeToTerminalChannel(prevAgentIndex, prevPtyIndex);
       } catch (reconnectError) {
         console.error(
-          "[Connection] Failed to reconnect to previous agent:",
+          "[Connection] Failed to reconnect to previous PTY:",
           reconnectError,
         );
         this.handleDisconnect();
@@ -798,6 +880,14 @@ export default class extends Controller {
    */
   getCurrentAgentIndex() {
     return this.currentAgentIndex;
+  }
+
+  /**
+   * Get the current PTY index we're subscribed to.
+   * @returns {number} 0 for CLI, 1 for Server
+   */
+  getCurrentPtyIndex() {
+    return this.currentPtyIndex;
   }
 
   deleteAgent(agentId, deleteWorktree = false) {
@@ -833,6 +923,54 @@ export default class extends Controller {
       ConnectionError.SESSION_CREATE_FAILED,
       "Session cleared. Scan QR code to reconnect.",
     );
+  }
+
+  /**
+   * Manually trigger reconnection.
+   * Useful for recovering from disconnected state without page refresh.
+   */
+  async reconnect() {
+    console.log("[Connection] Manual reconnect requested");
+
+    // If we have a valid session, try to restart handshake
+    if (this.signalSession && this.hubChannel && this.terminalChannel) {
+      await this.restartHandshake();
+      return;
+    }
+
+    // Otherwise, do a full reinitialization
+    // Clean up existing state (but preserve listeners)
+    const savedListeners = this.listeners;
+
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer);
+      this.handshakeTimer = null;
+    }
+    if (this.hubChannel) {
+      this.hubChannel.destroy();
+      this.hubChannel = null;
+    }
+    if (this.hubSubscription) {
+      this.hubSubscription.unsubscribe();
+      this.hubSubscription = null;
+    }
+    if (this.terminalChannel) {
+      this.terminalChannel.destroy();
+      this.terminalChannel = null;
+    }
+    if (this.terminalSubscription) {
+      this.terminalSubscription.unsubscribe();
+      this.terminalSubscription = null;
+    }
+    this.subscription = null;
+    this.connected = false;
+    this.hasCompletedInitialSetup = false;
+
+    // Restore listeners
+    this.listeners = savedListeners;
+
+    // Reinitialize (will load session from IndexedDB if available)
+    await this.initializeConnection();
   }
 
   // ========== Share Hub ==========
@@ -985,6 +1123,7 @@ export default class extends Controller {
     }
     this.subscription = null; // Legacy alias
     this.connected = false;
+    this.hasCompletedInitialSetup = false; // Reset for fresh connect()
     this.listeners?.clear();
   }
 

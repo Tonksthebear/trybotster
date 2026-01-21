@@ -92,6 +92,8 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
 
   test "POST /devices creates new device with fingerprint" do
     fingerprint = unique_fingerprint("create")
+    # Pre-create auth headers so auth device isn't counted in assert_difference
+    headers = auth_headers_for(:jason)
 
     assert_difference -> { Device.count }, 1 do
       post devices_url,
@@ -100,7 +102,7 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
           name: "My CLI Device",
           fingerprint: fingerprint
         }.to_json,
-        headers: auth_headers_for(:jason)
+        headers: headers
     end
 
     assert_response :created
@@ -113,6 +115,8 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
 
   test "POST /devices returns existing device if fingerprint matches" do
     fingerprint = unique_fingerprint("existing")
+    # Pre-create auth headers so auth device isn't counted in assert_difference
+    headers = auth_headers_for(:jason)
 
     # Create device first
     existing = users(:jason).devices.create!(
@@ -128,7 +132,7 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
           name: "Updated Name",
           fingerprint: fingerprint
         }.to_json,
-        headers: auth_headers_for(:jason)
+        headers: headers
     end
 
     assert_response :ok  # Not 201 since not newly created
@@ -192,6 +196,9 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
   # ==========================================================================
 
   test "DELETE /devices/:id removes device" do
+    # Pre-create auth headers so auth device isn't counted in assert_difference
+    headers = auth_headers_for(:jason)
+
     device = users(:jason).devices.create!(
       device_type: "cli",
       name: "Device to Delete",
@@ -199,13 +206,16 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
     )
 
     assert_difference -> { Device.count }, -1 do
-      delete device_url(device), headers: auth_headers_for(:jason)
+      delete device_url(device), headers: headers
     end
 
     assert_response :no_content
   end
 
   test "DELETE /devices/:id returns 404 for other user's device" do
+    # Pre-create auth headers so auth device isn't counted in assert_difference
+    headers = auth_headers_for(:jason)
+
     other_device = users(:one).devices.create!(
       device_type: "cli",
       name: "Other User Device",
@@ -213,7 +223,7 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
     )
 
     assert_no_difference -> { Device.count } do
-      delete device_url(other_device), headers: auth_headers_for(:jason)
+      delete device_url(other_device), headers: headers
     end
 
     assert_response :not_found

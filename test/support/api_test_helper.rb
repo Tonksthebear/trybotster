@@ -26,7 +26,7 @@ module ApiTestHelper
   end
 
   # Returns authorization headers for a user fixture.
-  # Creates a device token dynamically to avoid encrypted attribute issues.
+  # Creates a device and device token dynamically to avoid encrypted attribute issues.
   #
   # @param user_fixture [Symbol] Name of the user fixture
   # @return [Hash] Headers hash with Authorization bearer token
@@ -37,7 +37,14 @@ module ApiTestHelper
   def auth_headers_for(user_fixture)
     user = users(user_fixture)
     @_api_tokens ||= {}
-    @_api_tokens[user_fixture] ||= user.device_tokens.create!(name: "Test Token")
+    @_api_tokens[user_fixture] ||= begin
+      device = user.devices.create!(
+        name: "Test Device",
+        device_type: "cli",
+        fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+      )
+      device.create_device_token!(name: "Test Token")
+    end
 
     {
       "Authorization" => "Bearer #{@_api_tokens[user_fixture].token}",
@@ -94,18 +101,34 @@ module ApiTestHelper
     json
   end
 
-  # Creates a device token for a user and returns auth headers.
+  # Creates a device and device token for a user and returns auth headers.
   # Useful when you need a fresh token not from fixtures.
   #
   # @param user [User, Symbol] User record or fixture name
   # @return [Hash] Headers hash with Authorization bearer token
   def create_token_headers(user)
     user = users(user) if user.is_a?(Symbol)
-    token = user.device_tokens.create!(name: "Test Token #{SecureRandom.hex(4)}")
+    token = create_device_token_for(user)
     {
       "Authorization" => "Bearer #{token.token}",
       "Content-Type" => "application/json",
       "Accept" => "application/json"
     }
+  end
+
+  # Creates a device and device token for a user.
+  # DeviceToken now belongs to Device, so we need to create a device first.
+  #
+  # @param user [User] User record
+  # @param name [String] Token name (also used for device name)
+  # @return [DeviceToken] The created device token
+  def create_device_token_for(user, name: nil)
+    name ||= "Test Token #{SecureRandom.hex(4)}"
+    device = user.devices.create!(
+      name: name,
+      device_type: "cli",
+      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+    )
+    device.create_device_token!(name: name)
   end
 end

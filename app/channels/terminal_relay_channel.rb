@@ -7,14 +7,18 @@
 # it only forwards encrypted blobs.
 #
 # Architecture:
-# - Each agent subscribes with hub_id + agent_index (no browser_identity)
-# - Each browser subscribes with hub_id + agent_index + browser_identity
+# - Each agent subscribes with hub_id + agent_index + pty_index (no browser_identity)
+# - Each browser subscribes with hub_id + agent_index + pty_index + browser_identity
 # - Server routes messages to appropriate streams based on recipient_identity
 # - All encryption/decryption happens at endpoints
 #
-# Streams (per-agent):
-# - CLI:     terminal_relay:{hub_id}:{agent_index}:cli
-# - Browser: terminal_relay:{hub_id}:{agent_index}:browser:{identity}
+# Streams (per-agent, per-PTY):
+# - CLI:     terminal_relay:{hub_id}:{agent_index}:{pty_index}:cli
+# - Browser: terminal_relay:{hub_id}:{agent_index}:{pty_index}:browser:{identity}
+#
+# PTY indices:
+# - 0: CLI PTY (Claude agent terminal)
+# - 1: Server PTY (development server)
 #
 # Security:
 # - Server never sees plaintext terminal content
@@ -23,7 +27,8 @@
 class TerminalRelayChannel < ApplicationCable::Channel
   def subscribed
     @hub_id = params[:hub_id]
-    @agent_index = params[:agent_index] || 0  # Default to first agent for backwards compatibility
+    @agent_index = params[:agent_index] || 0
+    @pty_index = params[:pty_index] || 0  # 0=CLI, 1=Server
     @browser_identity = params[:browser_identity]
 
     unless @hub_id.present?
@@ -36,17 +41,17 @@ class TerminalRelayChannel < ApplicationCable::Channel
     stream_from my_stream_name
 
     if @browser_identity.present?
-      Rails.logger.info "[TerminalRelay] Browser subscribed: hub=#{@hub_id} agent=#{@agent_index} identity=#{@browser_identity[0..8]}..."
+      Rails.logger.info "[TerminalRelay] Browser subscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index} identity=#{@browser_identity[0..8]}..."
     else
-      Rails.logger.info "[TerminalRelay] CLI subscribed: hub=#{@hub_id} agent=#{@agent_index}"
+      Rails.logger.info "[TerminalRelay] CLI subscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
     end
   end
 
   def unsubscribed
     if @browser_identity.present?
-      Rails.logger.info "[TerminalRelay] Browser unsubscribed: hub=#{@hub_id} agent=#{@agent_index}"
+      Rails.logger.info "[TerminalRelay] Browser unsubscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
     else
-      Rails.logger.info "[TerminalRelay] CLI unsubscribed: hub=#{@hub_id} agent=#{@agent_index}"
+      Rails.logger.info "[TerminalRelay] CLI unsubscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
     end
   end
 
@@ -89,8 +94,7 @@ class TerminalRelayChannel < ApplicationCable::Channel
       return
     end
 
-    # SenderKey distribution goes to all browsers (broadcast pattern)
-    # TODO: When implementing SenderKey, need a browser broadcast stream
+    # SenderKey distribution goes to CLI (which then redistributes to browsers)
     ActionCable.server.broadcast(cli_stream_name, { sender_key_distribution: distribution })
 
     Rails.logger.debug "[TerminalRelay] Distributed SenderKey for hub=#{@hub_id}"
@@ -108,10 +112,10 @@ class TerminalRelayChannel < ApplicationCable::Channel
   end
 
   def cli_stream_name
-    "terminal_relay:#{@hub_id}:#{@agent_index}:cli"
+    "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:cli"
   end
 
   def browser_stream_name(identity)
-    "terminal_relay:#{@hub_id}:#{@agent_index}:browser:#{identity}"
+    "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:browser:#{identity}"
   end
 end

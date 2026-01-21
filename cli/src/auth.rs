@@ -27,10 +27,14 @@ pub struct DeviceCodeResponse {
 /// Successful token response from GET /hubs/codes/:id
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
-    /// The access token for API authentication.
+    /// The access token for hub-server authentication (btstr_...).
     pub access_token: String,
     /// Token type (typically "Bearer").
     pub token_type: String,
+    /// Optional MCP token for agent authentication (btmcp_...).
+    /// Scoped to MCP operations only, passed to spawned agents.
+    #[serde(default)]
+    pub mcp_token: Option<String>,
 }
 
 /// Error response during polling
@@ -40,15 +44,15 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
-/// Perform device authorization flow to obtain an access token.
+/// Perform device authorization flow to obtain access tokens.
 ///
 /// This function will:
 /// 1. Request a device code from the server
 /// 2. Display the verification URL and user code to the user
 /// 3. Optionally open the browser (unless BOTSTER_NO_BROWSER is set)
 /// 4. Poll the server until the user approves or the code expires
-/// 5. Return the access token on success
-pub fn device_flow(server_url: &str) -> Result<String> {
+/// 5. Return the token response containing both hub and MCP tokens
+pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -131,7 +135,7 @@ pub fn device_flow(server_url: &str) -> Result<String> {
 
         match status.as_u16() {
             200 => {
-                // Success - we got the token
+                // Success - we got the tokens
                 let token: TokenResponse =
                     response.json().context("Invalid token response")?;
                 println!();
@@ -140,7 +144,7 @@ pub fn device_flow(server_url: &str) -> Result<String> {
                 println!();
                 // Browser thread will be dropped/ignored
                 drop(browser_thread);
-                return Ok(token.access_token);
+                return Ok(token);
             }
             202 => {
                 // Still pending - continue polling
@@ -296,5 +300,30 @@ mod tests {
         let resp: TokenResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.access_token, "btstr_xyz789");
         assert_eq!(resp.token_type, "bearer");
+        assert_eq!(resp.mcp_token, None);
+    }
+
+    #[test]
+    fn test_token_response_with_mcp_token() {
+        let json = r#"{
+            "access_token": "btstr_hub123",
+            "token_type": "bearer",
+            "mcp_token": "btmcp_agent456"
+        }"#;
+        let resp: TokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.access_token, "btstr_hub123");
+        assert_eq!(resp.mcp_token, Some("btmcp_agent456".to_string()));
+    }
+
+    #[test]
+    fn test_token_response_mcp_token_optional() {
+        // Old servers might not return mcp_token - should still work
+        let json = r#"{
+            "access_token": "btstr_old",
+            "token_type": "bearer"
+        }"#;
+        let resp: TokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.access_token, "btstr_old");
+        assert!(resp.mcp_token.is_none());
     }
 }

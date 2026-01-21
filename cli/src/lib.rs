@@ -41,6 +41,7 @@ pub mod constants;
 pub mod device;
 pub mod env;
 pub mod git;
+pub mod keyring;
 pub mod notifications;
 pub mod process;
 pub mod prompt;

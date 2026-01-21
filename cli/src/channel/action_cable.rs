@@ -69,6 +69,8 @@ struct ChannelIdentifier {
     hub_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pty_index: Option<usize>,
 }
 
 /// Incoming Action Cable message.
@@ -99,6 +101,20 @@ pub struct ChannelSenderHandle {
 }
 
 impl ChannelSenderHandle {
+    /// Broadcast a message to all connected peers.
+    ///
+    /// The message is encrypted separately for each peer with an active session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if sending fails.
+    pub async fn send(&self, msg: &[u8]) -> Result<(), ChannelError> {
+        self.send_tx
+            .send(OutgoingMessage::Broadcast(msg.to_vec()))
+            .await
+            .map_err(|_| ChannelError::SendFailed("Send channel closed".to_string()))
+    }
+
     /// Send a message to a specific peer.
     ///
     /// # Errors
@@ -524,6 +540,7 @@ impl ActionCableChannel {
             channel: config.channel_name.clone(),
             hub_id: config.hub_id.clone(),
             agent_index: config.agent_index,
+            pty_index: config.pty_index,
         };
         let identifier_json =
             serde_json::to_string(&identifier).expect("identifier serializable");

@@ -140,20 +140,55 @@
   </div>
 
   <%# Terminal Panel - fills remaining space %>
-  <div class="flex-1 min-h-0 flex flex-col">
+  <div class="flex-1 min-h-0 flex flex-col"
+       data-controller="terminal-view"
+       data-terminal-view-connection-outlet="#hub-connection-permanent"
+       data-terminal-view-hub-id-value="<%= @hub.identifier %>">
     <div class="flex-1 flex flex-col min-h-0 bg-zinc-950 overflow-hidden">
       <%# Terminal header - minimal on mobile %>
       <div class="shrink-0 px-2 lg:px-4 py-1.5 lg:py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900">
-        <div class="flex items-center gap-3">
+        <div class="flex items-center gap-2 lg:gap-3">
           <%# Traffic lights - desktop only %>
           <div class="hidden lg:flex items-center gap-1.5">
             <span class="size-3 rounded-full bg-red-500/80"></span>
             <span class="size-3 rounded-full bg-yellow-500/80"></span>
             <span class="size-3 rounded-full bg-green-500/80"></span>
           </div>
-          <span class="text-xs lg:text-sm font-mono text-zinc-500 lg:text-zinc-400">Terminal</span>
+
+          <%# View switcher tabs - shown when server PTY exists %>
+          <div data-terminal-view-target="tabContainer" class="hidden flex items-center bg-zinc-800/50 rounded p-0.5">
+            <button type="button"
+                    data-terminal-view-target="agentTab"
+                    data-action="terminal-view#showAgentView"
+                    class="px-2 py-1 text-xs font-medium rounded transition-colors bg-zinc-700 text-zinc-100">
+              <span class="hidden sm:inline">Agent</span>
+              <span class="sm:hidden">CLI</span>
+            </button>
+            <button type="button"
+                    data-terminal-view-target="serverTab"
+                    data-action="terminal-view#showServerView"
+                    class="px-2 py-1 text-xs font-medium rounded transition-colors text-zinc-500 hover:text-zinc-300">
+              Server
+            </button>
+          </div>
+
+          <%# Fallback label when no tabs (no server PTY) %>
+          <span data-terminal-view-target="fallbackLabel" class="text-xs lg:text-sm font-mono text-zinc-500 lg:text-zinc-400">Terminal</span>
         </div>
+
         <div class="flex items-center gap-2 lg:gap-3">
+          <%# Preview link - shown when tunnel is connected %>
+          <a href="#"
+             target="_blank"
+             rel="noopener"
+             data-terminal-view-target="previewLink"
+             class="hidden inline-flex items-center gap-1.5 px-2 py-1 text-xs font-medium bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 rounded transition-colors">
+            <svg class="size-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+            </svg>
+            <span class="hidden sm:inline">Preview</span>
+          </a>
+
           <span class="text-xs text-zinc-600 hidden lg:inline">scroll: mouse wheel</span>
           <span class="text-xs text-zinc-600 lg:text-zinc-500 hidden sm:inline" data-agents-target="selectedLabel">No agent</span>
           <span data-connection-target="terminalBadge" class="inline-flex items-center gap-1 px-1.5 lg:px-2 py-0.5 text-xs font-medium bg-zinc-700/50 text-zinc-500 rounded">

@@ -418,6 +418,8 @@ impl Hub {
     /// * `session_key` - The agent's session key
     /// * `agent_index` - Index of the agent for channel routing
     pub fn connect_agent_channels(&mut self, session_key: &str, agent_index: usize) {
+        use crate::agent::pty::pty_index;
+
         // Check if crypto service is available
         let Some(crypto_service) = self.browser.crypto_service.clone() else {
             log::debug!(
@@ -431,8 +433,12 @@ impl Hub {
         let server_url = self.config.server_url.clone();
         let api_key = self.config.get_api_key().to_string();
 
-        // Get tunnel_port from agent if it exists
-        let tunnel_port = self.state.agents.get(session_key).and_then(|a| a.tunnel_port);
+        // Get tunnel_port and has_server_pty from agent
+        let (tunnel_port, has_server_pty) = self
+            .state
+            .agents
+            .get(session_key)
+            .map_or((None, false), |a| (a.tunnel_port, a.has_server_pty()));
 
         log::info!(
             "Connecting channels for agent {} (index={})",
@@ -440,44 +446,85 @@ impl Hub {
             agent_index
         );
 
-        // Create terminal channel with E2E encryption and reliable delivery
-        // Must use reliable(true) to match browser's reliable delivery layer
-        let mut terminal_channel = ActionCableChannel::builder()
-            .server_url(&server_url)
-            .api_key(&api_key)
-            .crypto_service(crypto_service.clone())
-            .reliable(true)
-            .build();
+        // Connect CLI PTY channel (owned by cli_pty)
+        let cli_result = {
+            let Some(agent) = self.state.agents.get_mut(session_key) else {
+                log::error!("Agent {} not found for channel connection", session_key);
+                return;
+            };
 
-        // Connect terminal channel synchronously using block_on
-        let terminal_result = self.tokio_runtime.block_on(async {
-            terminal_channel
-                .connect(ChannelConfig {
-                    channel_name: "TerminalRelayChannel".into(),
-                    hub_id: hub_id.clone(),
-                    agent_index: Some(agent_index),
-                    encrypt: true,
-                    compression_threshold: Some(4096),
-                })
-                .await
-        });
+            self.tokio_runtime.block_on(async {
+                agent
+                    .cli_pty
+                    .connect_channel(
+                        ChannelConfig {
+                            channel_name: "TerminalRelayChannel".into(),
+                            hub_id: hub_id.clone(),
+                            agent_index: Some(agent_index),
+                            pty_index: Some(pty_index::CLI),
+                            encrypt: true,
+                            compression_threshold: Some(4096),
+                        },
+                        crypto_service.clone(),
+                        &server_url,
+                        &api_key,
+                    )
+                    .await
+            })
+        };
 
-        if let Err(e) = terminal_result {
+        if let Err(e) = cli_result {
             log::error!(
-                "Failed to connect terminal channel for {}: {}",
+                "Failed to connect CLI PTY channel for {}: {}",
                 session_key,
                 e
             );
             return;
         }
+        log::info!("CLI PTY channel connected for {}", session_key);
 
-        // Store terminal channel on agent
-        if let Some(agent) = self.state.agents.get_mut(session_key) {
-            agent.terminal_channel = Some(terminal_channel);
-            log::info!("Terminal channel connected for {}", session_key);
+        // Connect Server PTY channel if server_pty exists (owned by server_pty)
+        if has_server_pty {
+            let server_result = {
+                let Some(agent) = self.state.agents.get_mut(session_key) else {
+                    return;
+                };
+                let Some(ref mut server_pty) = agent.server_pty else {
+                    return;
+                };
+
+                self.tokio_runtime.block_on(async {
+                    server_pty
+                        .connect_channel(
+                            ChannelConfig {
+                                channel_name: "TerminalRelayChannel".into(),
+                                hub_id: hub_id.clone(),
+                                agent_index: Some(agent_index),
+                                pty_index: Some(pty_index::SERVER),
+                                encrypt: true,
+                                compression_threshold: Some(4096),
+                            },
+                            crypto_service.clone(),
+                            &server_url,
+                            &api_key,
+                        )
+                        .await
+                })
+            };
+
+            if let Err(e) = server_result {
+                log::error!(
+                    "Failed to connect Server PTY channel for {}: {}",
+                    session_key,
+                    e
+                );
+                // Don't return - CLI channel is still connected
+            } else {
+                log::info!("Server PTY channel connected for {}", session_key);
+            }
         }
 
-        // Create and connect preview channel if tunnel_port is set
+        // Connect preview channel if tunnel_port is set (owned by agent)
         if let Some(port) = tunnel_port {
             let mut preview_channel =
                 ActionCableChannel::encrypted(crypto_service, server_url, api_key);
@@ -488,6 +535,7 @@ impl Hub {
                         channel_name: "PreviewChannel".into(),
                         hub_id,
                         agent_index: Some(agent_index),
+                        pty_index: None, // Preview channel doesn't use PTY index
                         encrypt: true,
                         compression_threshold: Some(4096),
                     })
@@ -1429,7 +1477,6 @@ mod tests {
         Config {
             server_url: "http://localhost:3000".to_string(),
             token: "btstr_test-key".to_string(),
-            api_key: String::new(),
             poll_interval: 10,
             agent_timeout: 300,
             max_sessions: 10,

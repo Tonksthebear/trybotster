@@ -75,23 +75,32 @@ class Hubs::CodesControllerTest < ActionDispatch::IntegrationTest
     json = assert_json_error("authorization_pending")
   end
 
-  test "GET /hubs/codes/:id returns access_token when approved" do
+  test "GET /hubs/codes/:id returns access_token and mcp_token when approved" do
     auth = DeviceAuthorization.create!(device_name: "Test CLI")
     auth.approve!(users(:jason))
 
     get code_url(auth.device_code), headers: json_headers
 
     assert_response :ok
-    json = assert_json_keys(:access_token, :token_type)
+    json = assert_json_keys(:access_token, :mcp_token, :token_type)
 
-    # Verify token format matches what CLI expects
-    assert json["access_token"].start_with?("btstr_"), "Token should start with btstr_ prefix"
+    # Verify token formats match what CLI expects
+    assert json["access_token"].start_with?("btstr_"), "Access token should start with btstr_ prefix"
+    assert json["mcp_token"].start_with?("btmcp_"), "MCP token should start with btmcp_ prefix"
     assert_equal "bearer", json["token_type"]
 
-    # Verify a DeviceToken was created
-    token = DeviceToken.find_by(token: json["access_token"])
-    assert_not_nil token
-    assert_equal users(:jason), token.user
+    # Verify DeviceToken was created
+    device_token = DeviceToken.find_by(token: json["access_token"])
+    assert_not_nil device_token
+    assert_equal users(:jason), device_token.user
+
+    # Verify MCPToken was created
+    mcp_token = MCPToken.find_by(token: json["mcp_token"])
+    assert_not_nil mcp_token
+    assert_equal users(:jason), mcp_token.user
+
+    # Both tokens should belong to the same device
+    assert_equal device_token.device, mcp_token.device
   end
 
   test "GET /hubs/codes/:id returns access_denied when denied" do

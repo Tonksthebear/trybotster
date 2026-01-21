@@ -1,17 +1,19 @@
 # frozen_string_literal: true
 
-require "application_system_test_case"
+require "test_helper"
+require "capybara"
 
-# Base class for CLI integration tests that don't require browser interactions.
+# Base class for CLI integration tests.
 #
-# Extends ApplicationSystemTestCase to get the full server infrastructure
-# (including Action Cable WebSocket support) but doesn't use browser assertions.
+# These are proper Rails integration tests that spawn a real HTTP server
+# for the CLI binary to connect to. Unlike system tests, they don't use
+# a browser - all assertions are through database state and CLI output.
 #
 # Key characteristics:
-# - Full server with Action Cable support (like system tests)
+# - Real Puma server via Capybara (no browser/Selenium overhead)
 # - Spawns real CLI binary
-# - No browser interactions - tests verify through database state
-# - Faster than browser tests (no Selenium overhead for simple cases)
+# - Non-transactional (CLI process needs to see committed data)
+# - Verifies through database state, not UI
 #
 # Usage:
 #   class HubRegistrationCliTest < CliIntegrationTestCase
@@ -23,14 +25,14 @@ require "application_system_test_case"
 #     end
 #   end
 #
-class CliIntegrationTestCase < ApplicationSystemTestCase
+class CliIntegrationTestCase < ActionDispatch::IntegrationTest
   include CliTestHelper
 
-  # Use headless Chrome but we won't actually interact with the browser
-  # This ensures the full server stack (including Action Cable) is running
-  driven_by :selenium, using: :headless_chrome, screen_size: [ 1024, 768 ]
+  # Disable transactional tests - CLI process needs to see committed data
+  self.use_transactional_tests = false
 
   setup do
+    boot_server
     @user = users(:jason)
     @hub = create_test_hub(user: @user)
     @started_clis = []
@@ -40,7 +42,7 @@ class CliIntegrationTestCase < ApplicationSystemTestCase
     # Stop all CLI processes
     @started_clis.each { |cli| stop_cli(cli) }
 
-    # Clean up test data (non-transactional inherited from ApplicationSystemTestCase)
+    # Clean up test data (non-transactional, so manual cleanup needed)
     @hub&.reload&.destroy rescue nil
   end
 
@@ -51,6 +53,19 @@ class CliIntegrationTestCase < ApplicationSystemTestCase
     cli
   end
 
-  # No need to override server_url - inherited from CliTestHelper
-  # which uses Capybara.current_session.server
+  private
+
+  # Boot a real Puma server for CLI to connect to.
+  # Uses Capybara's server infrastructure without browser overhead.
+  def boot_server
+    return if @server
+
+    Capybara.server = :puma, { Silent: true }
+    @server = Capybara::Server.new(Rails.application).boot
+  end
+
+  # Override CliTestHelper's server_url to use our booted server
+  def server_url
+    "http://#{@server.host}:#{@server.port}"
+  end
 end

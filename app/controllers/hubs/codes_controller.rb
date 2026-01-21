@@ -40,8 +40,12 @@ module Hubs
       when "pending"
         render json: { error: "authorization_pending" }, status: :accepted
       when "approved"
-        token = create_device_token(auth)
-        render json: { access_token: token.token, token_type: "bearer" }
+        tokens = create_device_tokens(auth)
+        render json: {
+          access_token: tokens[:device_token].token,
+          mcp_token: tokens[:mcp_token].token,
+          token_type: "bearer"
+        }
       when "denied"
         render json: { error: "access_denied" }, status: :bad_request
       else
@@ -51,8 +55,17 @@ module Hubs
 
     private
 
-    def create_device_token(auth)
-      auth.user.device_tokens.create!(name: auth.device_name)
+    def create_device_tokens(auth)
+      device = auth.user.devices.create!(
+        name: auth.device_name,
+        device_type: "cli",
+        fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+      )
+
+      {
+        device_token: device.create_device_token!(name: auth.device_name),
+        mcp_token: device.create_mcp_token!(name: "#{auth.device_name} MCP")
+      }
     end
   end
 end

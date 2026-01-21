@@ -24,6 +24,11 @@ class Hub < ApplicationRecord
     alive? && last_seen_at > 2.minutes.ago
   end
 
+  # Display name for the hub (uses repo name)
+  def name
+    repo
+  end
+
   # Synchronize hub_agents with data from CLI heartbeat.
   # Removes agents not in the list, creates/updates those present.
   # @param agents_data [Array<Hash>, ActionController::Parameters] Agent data from CLI
@@ -45,13 +50,13 @@ class Hub < ApplicationRecord
     end
   end
 
-  # Broadcast Turbo Stream update for user dashboard
+  # Broadcast Turbo Stream update for sidebar hubs list
   def broadcast_update!
     Turbo::StreamsChannel.broadcast_update_to(
       turbo_stream_name,
-      target: "hubs_list",
-      partial: "hubs/list",
-      locals: { hubs: user.hubs.active.includes(:hub_agents) }
+      target: "sidebar_hubs_list",
+      partial: "layouts/sidebar_hubs",
+      locals: { hubs: user.hubs.includes(:device).order(last_seen_at: :desc) }
     )
   rescue => e
     Rails.logger.warn "Failed to broadcast hub update: #{e.message}"
@@ -61,9 +66,9 @@ class Hub < ApplicationRecord
   def broadcast_removal!
     Turbo::StreamsChannel.broadcast_update_to(
       turbo_stream_name,
-      target: "hubs_list",
-      partial: "hubs/list",
-      locals: { hubs: user.hubs.active.includes(:hub_agents) }
+      target: "sidebar_hubs_list",
+      partial: "layouts/sidebar_hubs",
+      locals: { hubs: user.hubs.includes(:device).order(last_seen_at: :desc) }
     )
   rescue => e
     Rails.logger.warn "Failed to broadcast hub removal: #{e.message}"

@@ -25,7 +25,7 @@ module ApplicationCable
         device_token = DeviceToken.find_by(token: token)
         if device_token
           device_token.touch_usage!(ip: request.remote_ip)
-          Rails.logger.info "[ActionCable] Auth via DeviceToken: user=#{device_token.user_id}"
+          Rails.logger.info "[ActionCable] Auth via DeviceToken: user=#{device_token.user&.id}"
           return device_token.user
         else
           Rails.logger.warn "[ActionCable] DeviceToken not found for provided token"
