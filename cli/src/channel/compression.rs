@@ -151,7 +151,11 @@ pub fn maybe_decompress(data: &[u8]) -> Result<Vec<u8>, ChannelError> {
 /// * `body` - Response body bytes
 /// * `headers` - Response headers as (name, value) pairs
 /// * `threshold` - Minimum body size to consider compression
-pub fn should_compress_response(body: &[u8], headers: &[(String, String)], threshold: usize) -> bool {
+pub fn should_compress_response(
+    body: &[u8],
+    headers: &[(String, String)],
+    threshold: usize,
+) -> bool {
     if body.len() < threshold {
         return false;
     }

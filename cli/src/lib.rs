@@ -23,15 +23,15 @@
 
 // Library modules
 pub mod agent;
-pub mod channel;
-pub mod client;
-pub mod hub;
-pub mod relay;
-pub mod tui;
 pub mod agents;
 pub mod app;
 pub mod auth;
+pub mod channel;
+pub mod client;
 pub mod commands;
+pub mod hub;
+pub mod relay;
+pub mod tui;
 
 // Re-export auth types for tests
 pub use auth::{DeviceCodeResponse, ErrorResponse, TokenResponse};
@@ -60,11 +60,7 @@ pub use git::WorktreeManager;
 pub use notifications::{NotificationSender, NotificationType};
 pub use process::{get_parent_pid, kill_orphaned_processes};
 pub use prompt::PromptManager;
-pub use render::render_agent_terminal;
-pub use relay::{
-    AgentInfo, BrowserEvent, BrowserResize, TerminalMessage, HubSender,
-    WorktreeInfo,
-};
+pub use relay::{AgentInfo, BrowserEvent, BrowserResize, HubSender, TerminalMessage, WorktreeInfo};
 pub use terminal_widget::TerminalWidget;
 pub use tunnel::{allocate_tunnel_port, TunnelManager, TunnelStatus};
 
@@ -75,11 +71,17 @@ pub use channel::{
 };
 
 // Re-export Hub types
-pub use hub::{Hub, HubAction, HubState};
 pub use agents::AgentSpawnConfig;
+pub use hub::{Hub, HubAction, HubState};
 
 // Re-export Client types
 pub use client::{
-    BrowserClient, Client, ClientId, ClientRegistry, ClientState, CreateAgentRequest,
-    DeleteAgentRequest, Response, TuiClient,
+    BrowserClient, Client, ClientId, ClientRegistry, CreateAgentRequest, DeleteAgentRequest,
+    Response, TuiClient,
 };
+
+// Re-export PTY event types (for pub/sub integration)
+pub use agent::pty::{ConnectedClient, PtyEvent};
+
+// Re-export Hub event/command types (for event-driven architecture)
+pub use hub::{HubCommand, HubCommandSender, HubEvent};

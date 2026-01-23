@@ -1,38 +1,76 @@
-//! TUI - Terminal User Interface adapter.
+//! TUI - Terminal User Interface.
 //!
-//! This module provides the terminal rendering and input handling for
-//! the botster-hub. It acts as an adapter between the Hub (business logic)
-//! and the local terminal.
+//! This module provides the terminal rendering, input handling, and event loop
+//! for the botster-hub TUI. The TUI runs independently from the Hub, communicating
+//! via channels.
 //!
 //! # Architecture
 //!
-//! The TUI is an optional component - the Hub can run in headless mode
-//! without it. When present, the TUI:
+//! ```text
+//! TuiRunner (TUI thread)
+//! ├── owns: mode, menu_selected, input_buffer, vt100_parser
+//! ├── sends: HubCommand via command_tx
+//! ├── receives: HubEvent via hub_event_rx
+//! └── receives: PtyEvent via pty_rx (for selected agent)
+//! ```
 //!
-//! - Renders the Hub's state to the terminal
-//! - Converts keyboard/mouse input into [`HubAction`]s
-//! - Handles terminal setup/teardown via RAII guards
+//! The TuiRunner owns all TUI state and runs its own event loop. It converts
+//! keyboard/mouse input into either local TUI actions or PTY input, and
+//! communicates with the Hub via the command channel.
 //!
 //! # Modules
 //!
+//! - [`actions`] - TUI-local action types (`TuiAction`, `InputResult`)
+//! - [`events`] - TUI-specific event types (creation stages)
 //! - [`guard`] - Terminal state RAII guard for cleanup
+//! - [`input`] - Event to action/input conversion
+//! - [`layout`] - Layout calculations
 //! - [`qr`] - QR code generation for browser connection
-//! - [`render`] - Main rendering function for Hub state
-//! - [`input`] - Event to HubAction conversion
+//! - [`render`] - Main rendering function
+//! - [`runner`] - TuiRunner struct, event loop, and `run_with_hub()`
+//! - [`runner_agent`] - Agent navigation methods for TuiRunner
+//! - [`runner_handlers`] - Action and event handlers for TuiRunner
+//! - [`runner_input`] - Input submission handlers for TuiRunner
+//! - [`menu`] - Context-aware menu system
 //! - [`view`] - View state types
-//!
-//! [`HubAction`]: crate::hub::HubAction
 
+// Rust guideline compliant 2026-01
+
+pub mod actions;
+pub mod events;
 pub mod guard;
 pub mod input;
 pub mod layout;
+pub mod menu;
 pub mod qr;
 pub mod render;
+pub mod runner;
+mod runner_agent;
+mod runner_handlers;
+mod runner_input;
+pub mod screen;
+pub mod scroll;
 pub mod view;
 
+#[doc(inline)]
+pub use actions::{InputResult, TuiAction};
+#[doc(inline)]
+pub use events::CreationStage;
+#[doc(inline)]
 pub use guard::TerminalGuard;
-pub use input::{event_to_hub_action, InputContext};
+#[doc(inline)]
+pub use input::{process_event, InputContext};
+#[doc(inline)]
 pub use layout::terminal_widget_inner_area;
+#[doc(inline)]
+pub use menu::{build_menu, MenuAction, MenuContext, MenuItem};
+#[doc(inline)]
 pub use qr::generate_qr_code_lines;
-pub use render::render;
+#[doc(inline)]
+pub use render::{render, AgentRenderInfo, RenderContext, RenderResult};
+#[doc(inline)]
+pub use runner::{run_with_hub, TuiRunner};
+#[doc(inline)]
+pub use screen::ScreenInfo;
+#[doc(inline)]
 pub use view::{AgentDisplayInfo, ViewContext, ViewState};

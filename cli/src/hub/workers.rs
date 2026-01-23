@@ -129,10 +129,7 @@ impl PollingWorker {
         shutdown: Arc<AtomicBool>,
     ) {
         // Create HTTP client for this thread
-        let client = match Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
+        let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
             Ok(c) => c,
             Err(e) => {
                 log::error!("Failed to create HTTP client for polling worker: {e}");
@@ -197,11 +194,7 @@ impl PollingWorker {
             config.server_url, config.server_hub_id, config.repo_name
         );
 
-        let response = match client
-            .get(&url)
-            .bearer_auth(&config.api_key)
-            .send()
-        {
+        let response = match client.get(&url).bearer_auth(&config.api_key).send() {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("Polling worker: connection failed: {e}");
@@ -359,10 +352,7 @@ impl HeartbeatWorker {
         shutdown: Arc<AtomicBool>,
     ) {
         // Create HTTP client for this thread
-        let client = match Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
+        let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
             Ok(c) => c,
             Err(e) => {
                 log::error!("Failed to create HTTP client for heartbeat worker: {e}");
@@ -370,7 +360,10 @@ impl HeartbeatWorker {
             }
         };
 
-        log::info!("Heartbeat worker started: interval={}s", Self::HEARTBEAT_INTERVAL);
+        log::info!(
+            "Heartbeat worker started: interval={}s",
+            Self::HEARTBEAT_INTERVAL
+        );
 
         // Current agent list (updated via channel)
         let mut agents: Vec<HeartbeatAgentData> = Vec::new();
@@ -393,7 +386,11 @@ impl HeartbeatWorker {
             }
 
             // Sleep for heartbeat interval (checking shutdown periodically)
-            let interval = if crate::env::is_test_mode() { 2 } else { Self::HEARTBEAT_INTERVAL };
+            let interval = if crate::env::is_any_test() {
+                2
+            } else {
+                Self::HEARTBEAT_INTERVAL
+            };
             let sleep_duration = Duration::from_secs(interval);
             let check_interval = Duration::from_millis(100);
             let mut elapsed = Duration::ZERO;
@@ -440,7 +437,10 @@ impl HeartbeatWorker {
             .send()
         {
             Ok(response) if response.status().is_success() => {
-                log::debug!("Heartbeat worker: sent heartbeat with {} agents", agents.len());
+                log::debug!(
+                    "Heartbeat worker: sent heartbeat with {} agents",
+                    agents.len()
+                );
             }
             Ok(response) => {
                 log::warn!("Heartbeat worker: server returned {}", response.status());
@@ -535,10 +535,7 @@ impl NotificationWorker {
         shutdown: Arc<AtomicBool>,
     ) {
         // Create HTTP client for this thread
-        let client = match Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
+        let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
             Ok(c) => c,
             Err(e) => {
                 log::error!("Failed to create HTTP client for notification worker: {e}");
@@ -702,12 +699,10 @@ mod tests {
         let worker = HeartbeatWorker::new(config);
 
         // Should not panic when updating agents
-        worker.update_agents(vec![
-            HeartbeatAgentData {
-                session_key: "test-session".to_string(),
-                last_invocation_url: None,
-            },
-        ]);
+        worker.update_agents(vec![HeartbeatAgentData {
+            session_key: "test-session".to_string(),
+            last_invocation_url: None,
+        }]);
 
         worker.shutdown();
     }

@@ -174,7 +174,9 @@ mod tests {
 
         // Should only have Hub section
         assert!(items.iter().any(|i| i.label.contains("Hub")));
-        assert!(!items.iter().any(|i| i.label.contains("Agent") && i.is_header));
+        assert!(!items
+            .iter()
+            .any(|i| i.label.contains("Agent") && i.is_header));
 
         // Should have 3 selectable items (New Agent, Connection Code, Toggle Polling)
         assert_eq!(selectable_count(&items), 3);
@@ -191,7 +193,9 @@ mod tests {
         let items = build_menu(&ctx);
 
         // Should have both sections
-        assert!(items.iter().any(|i| i.label.contains("Agent") && i.is_header));
+        assert!(items
+            .iter()
+            .any(|i| i.label.contains("Agent") && i.is_header));
         assert!(items.iter().any(|i| i.label.contains("Hub")));
 
         // Should have Close Agent but NOT View Server

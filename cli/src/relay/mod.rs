@@ -66,25 +66,29 @@ pub use events::{
     BrowserEventResult, BrowserResponse, ResizeAction,
 };
 pub use state::{
-    build_agent_info, build_worktree_info, send_agent_created_to, send_agent_creating,
-    send_agent_creating_to, send_agent_list, send_agent_list_to, send_agent_progress,
-    send_agent_progress_to, send_agent_selected, send_agent_selected_to, send_scrollback,
+    build_agent_info, build_worktree_info, send_agent_created_to, send_agent_creating_to,
+    send_agent_list, send_agent_list_to, send_agent_progress_to, send_agent_selected_to,
     send_scrollback_to, send_worktree_list, send_worktree_list_to, BrowserSendContext,
     BrowserState, IdentifiedBrowserEvent,
 };
 
 pub use types::{
-    AgentCreationStage, AgentInfo, BrowserCommand, BrowserEvent, BrowserResize,
-    TerminalMessage, WorktreeInfo,
+    AgentCreationStage, AgentInfo, BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage,
+    WorktreeInfo,
 };
 
-pub use connection::{HubSender, HubRelay};
+pub use connection::{HubRelay, HubSender};
 
-pub use signal::{PreKeyBundleData, SignalEnvelope, SignalProtocolManager, SIGNAL_PROTOCOL_VERSION, binary_format};
+// Note: OutputMessage is pub(crate) and only used internally for testing.
+// Tests within the relay module can use connection::OutputMessage directly.
 
-pub use persistence::{read_connection_url, write_connection_url, delete_connection_url};
+pub use signal::{
+    binary_format, PreKeyBundleData, SignalEnvelope, SignalProtocolManager, SIGNAL_PROTOCOL_VERSION,
+};
 
-pub use browser::{drain_and_route_browser_input, drain_and_route_pty_output, poll_events_headless};
+pub use persistence::{delete_connection_url, read_connection_url, write_connection_url};
+
+pub use browser::poll_events_headless;
 
 pub use preview_types::{
     HttpRequest, HttpResponse, PreviewCommand, PreviewEvent, PreviewMessage, ProxyConfig,

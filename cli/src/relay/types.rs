@@ -506,7 +506,10 @@ mod tests {
     fn test_raw_output_not_detected_as_structured() {
         let raw_output = "Hello, this is terminal output with special chars: \x1b[32mgreen\x1b[0m";
         let parsed: Result<TerminalMessage, _> = serde_json::from_str(raw_output);
-        assert!(parsed.is_err(), "Raw output should not parse as TerminalMessage");
+        assert!(
+            parsed.is_err(),
+            "Raw output should not parse as TerminalMessage"
+        );
     }
 
     // ========== BrowserCommand Parsing Tests ==========

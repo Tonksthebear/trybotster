@@ -111,8 +111,8 @@ impl CreateAgentRequest {
 /// Sent by clients when user wants to delete an agent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteAgentRequest {
-    /// Session key of the agent to delete.
-    pub agent_key: String,
+    /// Agent ID of the agent to delete.
+    pub agent_id: String,
 
     /// Whether to also delete the worktree (files on disk).
     /// If false, only the PTY/process is terminated.
@@ -121,9 +121,9 @@ pub struct DeleteAgentRequest {
 
 impl DeleteAgentRequest {
     /// Create a delete request (keeping worktree by default).
-    pub fn new(agent_key: impl Into<String>) -> Self {
+    pub fn new(agent_id: impl Into<String>) -> Self {
         Self {
-            agent_key: agent_key.into(),
+            agent_id: agent_id.into(),
             delete_worktree: false,
         }
     }
@@ -159,8 +159,7 @@ mod tests {
 
     #[test]
     fn test_create_agent_request_builder() {
-        let req = CreateAgentRequest::new("42")
-            .with_prompt("Fix the bug");
+        let req = CreateAgentRequest::new("42").with_prompt("Fix the bug");
 
         assert_eq!(req.issue_or_branch, "42");
         assert_eq!(req.prompt, Some("Fix the bug".to_string()));
@@ -171,7 +170,7 @@ mod tests {
     fn test_delete_agent_request_builder() {
         let req = DeleteAgentRequest::new("agent-123").with_worktree_deletion();
 
-        assert_eq!(req.agent_key, "agent-123");
+        assert_eq!(req.agent_id, "agent-123");
         assert!(req.delete_worktree);
     }
 }

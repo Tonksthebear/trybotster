@@ -18,27 +18,19 @@ use reqwest::blocking::Client;
 
 use crate::config::Config;
 use crate::device::Device;
-use crate::relay::{connection::HubRelay, CryptoService, BrowserState};
+use crate::relay::{connection::HubRelay, BrowserState, CryptoService};
 use crate::tunnel::TunnelManager;
 
 /// Register the device with the server if not already registered.
 ///
 /// This should be called after Hub creation to ensure the device identity
 /// is known to the server for browser-based key exchange.
-pub fn register_device(
-    device: &mut Device,
-    client: &Client,
-    config: &Config,
-) {
+pub fn register_device(device: &mut Device, client: &Client, config: &Config) {
     if device.device_id.is_some() {
         return;
     }
 
-    match device.register(
-        client,
-        &config.server_url,
-        config.get_api_key(),
-    ) {
+    match device.register(client, &config.server_url, config.get_api_key()) {
         Ok(id) => log::info!("Device registered with server: id={id}"),
         Err(e) => log::warn!("Device registration failed: {e} - will retry later"),
     }
@@ -61,17 +53,20 @@ pub fn register_hub_with_server(
     device_id: Option<i64>,
 ) -> String {
     // Detect repo: env var > git detection > test fallback > error
-    let repo_name = std::env::var("BOTSTER_REPO").ok()
+    let repo_name = std::env::var("BOTSTER_REPO")
+        .ok()
         .or_else(|| {
             crate::git::WorktreeManager::detect_current_repo()
                 .map(|(_, name)| name)
                 .ok()
         })
         .unwrap_or_else(|| {
-            if crate::env::is_test_mode() {
+            if crate::env::is_any_test() {
                 "test/repo".to_string()
             } else {
-                log::error!("Not in a git repository. Run from a git repo or set BOTSTER_REPO env var.");
+                log::error!(
+                    "Not in a git repository. Run from a git repo or set BOTSTER_REPO env var."
+                );
                 String::new() // Will fail validation on server
             }
         });
@@ -124,10 +119,7 @@ pub fn register_hub_with_server(
 /// Start the tunnel connection in background.
 ///
 /// The tunnel provides HTTP forwarding for agent dev servers.
-pub fn start_tunnel(
-    tunnel_manager: &Arc<TunnelManager>,
-    runtime: &tokio::runtime::Runtime,
-) {
+pub fn start_tunnel(tunnel_manager: &Arc<TunnelManager>, runtime: &tokio::runtime::Runtime) {
     let tm = Arc::clone(tunnel_manager);
     runtime.spawn(async move {
         loop {
@@ -222,12 +214,7 @@ pub fn connect_hub_relay(
 
             // Hub relay uses server ID for channel subscription
             // Relay handles reconnection internally with exponential backoff
-            let relay = HubRelay::new(
-                crypto_service_for_relay,
-                server_id.clone(),
-                server,
-                key,
-            );
+            let relay = HubRelay::new(crypto_service_for_relay, server_id.clone(), server, key);
 
             match relay.connect_with_event_channel(event_tx).await {
                 Ok((sender, _shutdown_rx)) => {
@@ -252,19 +239,14 @@ pub fn connect_hub_relay(
     match bundle_rx.recv_timeout(std::time::Duration::from_secs(10)) {
         Ok(Some(bundle)) => {
             // Build connection URL and write to file for external access (testing/automation)
-            use data_encoding::BASE32_NOPAD;
             use crate::relay::write_connection_url;
+            use data_encoding::BASE32_NOPAD;
 
             if let Ok(bytes) = bundle.to_binary() {
                 let encoded = BASE32_NOPAD.encode(&bytes);
                 // Mixed-mode QR: byte for URL, alphanumeric for Base32 bundle
                 // URL uses server ID, file uses local identifier for config path
-                let connection_url = format!(
-                    "{}/hubs/{}#{}",
-                    server_url,
-                    server_hub_id,
-                    encoded
-                );
+                let connection_url = format!("{}/hubs/{}#{}", server_url, server_hub_id, encoded);
 
                 if let Err(e) = write_connection_url(local_identifier, &connection_url) {
                     log::warn!("Failed to write connection URL: {e}");
@@ -303,20 +285,11 @@ pub fn connect_hub_relay(
 /// Send shutdown notification to server.
 ///
 /// Call this when the hub is shutting down to unregister from the server.
-pub fn shutdown(
-    client: &Client,
-    server_url: &str,
-    hub_identifier: &str,
-    api_key: &str,
-) {
+pub fn shutdown(client: &Client, server_url: &str, hub_identifier: &str, api_key: &str) {
     log::info!("Sending shutdown notification to server...");
     let shutdown_url = format!("{server_url}/hubs/{hub_identifier}");
 
-    match client
-        .delete(&shutdown_url)
-        .bearer_auth(api_key)
-        .send()
-    {
+    match client.delete(&shutdown_url).bearer_auth(api_key).send() {
         Ok(response) if response.status().is_success() => {
             log::info!("Hub unregistered from server");
         }

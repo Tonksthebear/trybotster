@@ -20,10 +20,10 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use super::types::{BrowserCommand, BrowserEvent, BrowserResize};
 use crate::client::{ClientId, CreateAgentRequest, DeleteAgentRequest};
 use crate::hub::{HubAction, ScrollDirection};
 use crate::BrowserMode;
-use super::types::{BrowserCommand, BrowserEvent, BrowserResize};
 
 /// Convert a BrowserEvent to a client-scoped HubAction.
 ///
@@ -46,64 +46,52 @@ pub fn browser_event_to_client_action(
     let client_id = ClientId::Browser(browser_identity.to_string());
 
     match event {
-        BrowserEvent::Input(data) => {
-            Some(HubAction::SendInputForClient {
-                client_id,
-                data: data.as_bytes().to_vec(),
-            })
-        }
+        BrowserEvent::Input(data) => Some(HubAction::SendInputForClient {
+            client_id,
+            data: data.as_bytes().to_vec(),
+        }),
 
-        BrowserEvent::SelectAgent { id } => {
-            Some(HubAction::SelectAgentForClient {
-                client_id,
-                agent_key: id.clone(),
-            })
-        }
+        BrowserEvent::SelectAgent { id } => Some(HubAction::SelectAgentForClient {
+            client_id,
+            agent_key: id.clone(),
+        }),
 
-        BrowserEvent::CreateAgent { issue_or_branch, prompt } => {
-            Some(HubAction::CreateAgentForClient {
-                client_id,
-                request: CreateAgentRequest {
-                    issue_or_branch: issue_or_branch.clone().unwrap_or_default(),
-                    prompt: prompt.clone(),
-                    from_worktree: None,
-                },
-            })
-        }
+        BrowserEvent::CreateAgent {
+            issue_or_branch,
+            prompt,
+        } => Some(HubAction::CreateAgentForClient {
+            client_id,
+            request: CreateAgentRequest {
+                issue_or_branch: issue_or_branch.clone().unwrap_or_default(),
+                prompt: prompt.clone(),
+                from_worktree: None,
+            },
+        }),
 
-        BrowserEvent::DeleteAgent { id, delete_worktree } => {
-            Some(HubAction::DeleteAgentForClient {
-                client_id,
-                request: DeleteAgentRequest {
-                    agent_key: id.clone(),
-                    delete_worktree: *delete_worktree,
-                },
-            })
-        }
+        BrowserEvent::DeleteAgent {
+            id,
+            delete_worktree,
+        } => Some(HubAction::DeleteAgentForClient {
+            client_id,
+            request: DeleteAgentRequest {
+                agent_id: id.clone(),
+                delete_worktree: *delete_worktree,
+            },
+        }),
 
-        BrowserEvent::Resize(resize) => {
-            Some(HubAction::ResizeForClient {
-                client_id,
-                rows: resize.rows,
-                cols: resize.cols,
-            })
-        }
+        BrowserEvent::Resize(resize) => Some(HubAction::ResizeForClient {
+            client_id,
+            rows: resize.rows,
+            cols: resize.cols,
+        }),
 
-        BrowserEvent::ListAgents => {
-            Some(HubAction::RequestAgentList { client_id })
-        }
+        BrowserEvent::ListAgents => Some(HubAction::RequestAgentList { client_id }),
 
-        BrowserEvent::ListWorktrees => {
-            Some(HubAction::RequestWorktreeList { client_id })
-        }
+        BrowserEvent::ListWorktrees => Some(HubAction::RequestWorktreeList { client_id }),
 
-        BrowserEvent::Connected { .. } => {
-            Some(HubAction::ClientConnected { client_id })
-        }
+        BrowserEvent::Connected { .. } => Some(HubAction::ClientConnected { client_id }),
 
-        BrowserEvent::Disconnected => {
-            Some(HubAction::ClientDisconnected { client_id })
-        }
+        BrowserEvent::Disconnected => Some(HubAction::ClientDisconnected { client_id }),
 
         // Client-scoped scroll and toggle actions
         BrowserEvent::TogglePtyView => Some(HubAction::TogglePtyViewForClient { client_id }),
@@ -127,16 +115,18 @@ pub fn browser_event_to_client_action(
             scroll: ScrollDirection::ToTop,
         }),
 
-        BrowserEvent::ReopenWorktree { path, branch, prompt } => {
-            Some(HubAction::CreateAgentForClient {
-                client_id,
-                request: CreateAgentRequest {
-                    issue_or_branch: branch.clone(),
-                    prompt: prompt.clone(),
-                    from_worktree: Some(PathBuf::from(path)),
-                },
-            })
-        }
+        BrowserEvent::ReopenWorktree {
+            path,
+            branch,
+            prompt,
+        } => Some(HubAction::CreateAgentForClient {
+            client_id,
+            request: CreateAgentRequest {
+                issue_or_branch: branch.clone(),
+                prompt: prompt.clone(),
+                from_worktree: Some(PathBuf::from(path)),
+            },
+        }),
 
         // Events with no Hub action mapping (handled directly in browser.rs)
         BrowserEvent::SetMode { .. }
@@ -211,7 +201,10 @@ pub fn command_to_event(cmd: &BrowserCommand) -> BrowserEvent {
             branch: branch.clone(),
             prompt: prompt.clone(),
         },
-        BrowserCommand::DeleteAgent { id, delete_worktree } => BrowserEvent::DeleteAgent {
+        BrowserCommand::DeleteAgent {
+            id,
+            delete_worktree,
+        } => BrowserEvent::DeleteAgent {
             id: id.clone(),
             delete_worktree: delete_worktree.unwrap_or(false),
         },
@@ -279,7 +272,11 @@ pub fn check_browser_resize(
 
     if let Some((rows, cols, mode)) = browser_dims {
         if cols >= 20 && rows >= 5 {
-            let mode_bit = if mode == BrowserMode::Gui { 1u32 << 31 } else { 0 };
+            let mode_bit = if mode == BrowserMode::Gui {
+                1u32 << 31
+            } else {
+                0
+            };
             let combined = mode_bit | (u32::from(cols) << 16) | u32::from(rows);
             let last = LAST_DIMS.swap(combined, Ordering::Relaxed);
 
@@ -451,7 +448,10 @@ mod tests {
         let action = browser_event_to_client_action(&event, browser_identity);
 
         match action {
-            Some(HubAction::SelectAgentForClient { client_id, agent_key }) => {
+            Some(HubAction::SelectAgentForClient {
+                client_id,
+                agent_key,
+            }) => {
                 assert_eq!(client_id, ClientId::Browser("browser-xyz".to_string()));
                 assert_eq!(agent_key, "owner-repo-42");
             }
@@ -496,7 +496,10 @@ mod tests {
                 // branch becomes issue_or_branch directly (not Option)
                 assert_eq!(request.issue_or_branch, "my-branch");
                 assert_eq!(request.prompt, Some("Continue working".to_string()));
-                assert_eq!(request.from_worktree, Some(PathBuf::from("/tmp/worktrees/my-branch")));
+                assert_eq!(
+                    request.from_worktree,
+                    Some(PathBuf::from("/tmp/worktrees/my-branch"))
+                );
             }
             _ => panic!("Expected CreateAgentForClient action with from_worktree"),
         }
@@ -514,7 +517,7 @@ mod tests {
         match action {
             Some(HubAction::DeleteAgentForClient { client_id, request }) => {
                 assert_eq!(client_id, ClientId::Browser("browser-del".to_string()));
-                assert_eq!(request.agent_key, "owner-repo-99");
+                assert_eq!(request.agent_id, "owner-repo-99");
                 assert!(request.delete_worktree);
             }
             _ => panic!("Expected DeleteAgentForClient action"),
@@ -523,12 +526,19 @@ mod tests {
 
     #[test]
     fn test_client_resize_event() {
-        let event = BrowserEvent::Resize(BrowserResize { rows: 50, cols: 120 });
+        let event = BrowserEvent::Resize(BrowserResize {
+            rows: 50,
+            cols: 120,
+        });
         let browser_identity = "browser-resize";
         let action = browser_event_to_client_action(&event, browser_identity);
 
         match action {
-            Some(HubAction::ResizeForClient { client_id, rows, cols }) => {
+            Some(HubAction::ResizeForClient {
+                client_id,
+                rows,
+                cols,
+            }) => {
                 assert_eq!(client_id, ClientId::Browser("browser-resize".to_string()));
                 assert_eq!(rows, 50);
                 assert_eq!(cols, 120);
@@ -605,7 +615,10 @@ mod tests {
         let browser_identity = "browser-mode";
         let action = browser_event_to_client_action(&event, browser_identity);
 
-        assert!(action.is_none(), "SetMode should return None (handled directly)");
+        assert!(
+            action.is_none(),
+            "SetMode should return None (handled directly)"
+        );
     }
 
     #[test]
@@ -615,7 +628,10 @@ mod tests {
         let browser_identity = "browser-invite";
         let action = browser_event_to_client_action(&event, browser_identity);
 
-        assert!(action.is_none(), "GenerateInvite should return None (handled in relay)");
+        assert!(
+            action.is_none(),
+            "GenerateInvite should return None (handled in relay)"
+        );
     }
 
     /// TEST: Scroll events are now CLIENT-SCOPED, not global.
@@ -718,6 +734,9 @@ mod tests {
         let browser_identity = "browser-bundle";
         let action = browser_event_to_client_action(&event, browser_identity);
 
-        assert!(action.is_none(), "BundleRegenerated should return None (handled in browser.rs)");
+        assert!(
+            action.is_none(),
+            "BundleRegenerated should return None (handled in browser.rs)"
+        );
     }
 }

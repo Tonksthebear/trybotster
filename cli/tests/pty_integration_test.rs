@@ -32,9 +32,7 @@ fn binary_exists() -> bool {
 
 /// Check if any botster-hub processes are running (excluding our test)
 fn count_botster_processes() -> usize {
-    let output = Command::new("pgrep")
-        .args(["-f", "botster-hub"])
-        .output();
+    let output = Command::new("pgrep").args(["-f", "botster-hub"]).output();
 
     match output {
         Ok(out) => {
@@ -44,7 +42,6 @@ fn count_botster_processes() -> usize {
         Err(_) => 0,
     }
 }
-
 
 /// Spawn a thread to capture PTY output (prevents blocking on full buffer)
 /// Returns a handle and a receiver for the captured output
@@ -89,8 +86,12 @@ fn safe_pty_write(
     }
 
     // Try to write
-    writer.write_all(data).map_err(|e| format!("PTY write failed: {}", e))?;
-    writer.flush().map_err(|e| format!("PTY flush failed: {}", e))?;
+    writer
+        .write_all(data)
+        .map_err(|e| format!("PTY write failed: {}", e))?;
+    writer
+        .flush()
+        .map_err(|e| format!("PTY flush failed: {}", e))?;
     Ok(())
 }
 
@@ -127,7 +128,10 @@ fn test_ctrl_q_exits_cleanly() {
     let mut writer = pair.master.take_writer().expect("Failed to get PTY writer");
 
     // Capture output to see errors if CLI fails
-    let reader = pair.master.try_clone_reader().expect("Failed to get PTY reader");
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .expect("Failed to get PTY reader");
     let (_capture_handle, output_rx) = spawn_output_capture(reader);
 
     // Give the TUI time to initialize
@@ -136,8 +140,13 @@ fn test_ctrl_q_exits_cleanly() {
     // Send Ctrl+Q (ASCII 0x11)
     if let Err(e) = safe_pty_write(&mut writer, &mut child, &[0x11]) {
         // Get captured output to show in error message
-        let output = output_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
-        panic!("Failed to send input to CLI: {}\nCLI output:\n{}", e, output);
+        let output = output_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or_default();
+        panic!(
+            "Failed to send input to CLI: {}\nCLI output:\n{}",
+            e, output
+        );
     }
 
     // Wait for process to exit (should be quick)
@@ -201,7 +210,10 @@ fn test_sigint_triggers_graceful_shutdown() {
         .expect("Failed to spawn CLI in PTY");
 
     // Capture output to see errors if CLI fails
-    let reader = pair.master.try_clone_reader().expect("Failed to get PTY reader");
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .expect("Failed to get PTY reader");
     let (_capture_handle, output_rx) = spawn_output_capture(reader);
 
     // Give the TUI time to initialize
@@ -209,8 +221,13 @@ fn test_sigint_triggers_graceful_shutdown() {
 
     // Check if process is still running before sending signal
     if let Ok(Some(status)) = child.try_wait() {
-        let output = output_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
-        panic!("CLI exited before test could run with status: {:?}\nCLI output:\n{}", status, output);
+        let output = output_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or_default();
+        panic!(
+            "CLI exited before test could run with status: {:?}\nCLI output:\n{}",
+            status, output
+        );
     }
 
     // Get the process ID and send SIGINT
@@ -275,7 +292,10 @@ fn test_sigterm_triggers_graceful_shutdown() {
         .expect("Failed to spawn CLI in PTY");
 
     // Capture output to see errors if CLI fails
-    let reader = pair.master.try_clone_reader().expect("Failed to get PTY reader");
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .expect("Failed to get PTY reader");
     let (_capture_handle, output_rx) = spawn_output_capture(reader);
 
     // Give the TUI time to initialize
@@ -283,8 +303,13 @@ fn test_sigterm_triggers_graceful_shutdown() {
 
     // Check if process is still running before sending signal
     if let Ok(Some(status)) = child.try_wait() {
-        let output = output_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
-        panic!("CLI exited before test could run with status: {:?}\nCLI output:\n{}", status, output);
+        let output = output_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or_default();
+        panic!(
+            "CLI exited before test could run with status: {:?}\nCLI output:\n{}",
+            status, output
+        );
     }
 
     // Send SIGTERM
@@ -426,7 +451,10 @@ fn test_input_is_responsive() {
     let mut writer = pair.master.take_writer().expect("Failed to get PTY writer");
 
     // Capture output to see errors if CLI fails
-    let reader = pair.master.try_clone_reader().expect("Failed to get PTY reader");
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .expect("Failed to get PTY reader");
     let (_capture_handle, output_rx) = spawn_output_capture(reader);
 
     // Give the TUI time to initialize
@@ -437,8 +465,13 @@ fn test_input_is_responsive() {
 
     // Send Ctrl+Q
     if let Err(e) = safe_pty_write(&mut writer, &mut child, &[0x11]) {
-        let output = output_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
-        panic!("Failed to send input to CLI: {}\nCLI output:\n{}", e, output);
+        let output = output_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or_default();
+        panic!(
+            "Failed to send input to CLI: {}\nCLI output:\n{}",
+            e, output
+        );
     }
 
     // The CLI should respond within 500ms if input handling is working
@@ -523,7 +556,10 @@ fn test_no_orphan_processes_after_exit() {
     let mut writer = pair.master.take_writer().expect("Failed to get PTY writer");
 
     // Capture output to see errors if CLI fails
-    let reader = pair.master.try_clone_reader().expect("Failed to get PTY reader");
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .expect("Failed to get PTY reader");
     let (_capture_handle, output_rx) = spawn_output_capture(reader);
 
     // Give the TUI time to initialize
@@ -531,8 +567,13 @@ fn test_no_orphan_processes_after_exit() {
 
     // Exit cleanly with Ctrl+Q
     if let Err(e) = safe_pty_write(&mut writer, &mut child, &[0x11]) {
-        let output = output_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
-        panic!("Failed to send input to CLI: {}\nCLI output:\n{}", e, output);
+        let output = output_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or_default();
+        panic!(
+            "Failed to send input to CLI: {}\nCLI output:\n{}",
+            e, output
+        );
     }
 
     // Wait for exit

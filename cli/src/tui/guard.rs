@@ -4,9 +4,9 @@
 //! properly restored even if the application panics.
 
 use crossterm::{
+    event::DisableMouseCapture,
     execute,
     terminal::{disable_raw_mode, LeaveAlternateScreen},
-    event::DisableMouseCapture,
 };
 
 /// Guard struct that ensures terminal cleanup on drop (including panics).
@@ -55,11 +55,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Always attempt to restore terminal state, ignoring errors
         let _ = disable_raw_mode();
-        let _ = execute!(
-            std::io::stdout(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        );
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
         // Try to show cursor
         let _ = execute!(std::io::stdout(), crossterm::cursor::Show);
     }

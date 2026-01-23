@@ -83,6 +83,7 @@ pub struct SignalStoreState {
 }
 
 /// Check if we're in test mode (for deterministic key generation).
+/// Returns true for both BOTSTER_ENV=test and BOTSTER_ENV=system_test.
 fn is_test_mode() -> bool {
     #[cfg(test)]
     {
@@ -91,7 +92,7 @@ fn is_test_mode() -> bool {
 
     #[cfg(not(test))]
     {
-        crate::env::is_test_mode()
+        crate::env::should_skip_keyring()
     }
 }
 
@@ -118,8 +119,8 @@ fn hub_state_dir(hub_id: &str) -> Result<PathBuf> {
             if let Ok(custom_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
                 // Explicit override via env var
                 PathBuf::from(custom_dir).join("hubs")
-            } else if crate::env::is_test_mode() {
-                // Integration tests (BOTSTER_ENV=test): use repo's tmp/ directory
+            } else if crate::env::should_skip_keyring() {
+                // Integration/system tests (BOTSTER_ENV=test or system_test): use repo's tmp/ directory
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .parent()
                     .expect("cli/ has parent directory")
@@ -260,7 +261,10 @@ pub fn load_signal_store(hub_id: &str) -> Result<SignalStoreState> {
     let store_path = state_dir.join("signal_store.enc");
 
     if !store_path.exists() {
-        anyhow::bail!("Signal store not found for hub {}", &hub_id[..hub_id.len().min(8)]);
+        anyhow::bail!(
+            "Signal store not found for hub {}",
+            &hub_id[..hub_id.len().min(8)]
+        );
     }
 
     let key = get_or_create_encryption_key(hub_id)?;

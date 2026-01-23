@@ -35,6 +35,7 @@ module Hubs
       # Note: Agent list is dynamic; this is a soft validation
       if @hub.hub_agents.any? && @agent_index >= @hub.hub_agents.count
         redirect_to hub_path(@hub), alert: "Agent not found"
+        return
       end
     end
   end

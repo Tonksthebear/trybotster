@@ -131,22 +131,23 @@ impl std::fmt::Debug for CryptoRequest {
                     .field("peer_identity", &truncated)
                     .finish_non_exhaustive()
             }
-            Self::Decrypt { envelope, .. } => {
-                f.debug_struct("Decrypt")
-                    .field("message_type", &envelope.message_type)
-                    .finish_non_exhaustive()
-            }
+            Self::Decrypt { envelope, .. } => f
+                .debug_struct("Decrypt")
+                .field("message_type", &envelope.message_type)
+                .finish_non_exhaustive(),
             Self::HasSession { peer_identity, .. } => {
                 let truncated: &str = &peer_identity[..peer_identity.len().min(16)];
                 f.debug_struct("HasSession")
                     .field("peer_identity", &truncated)
                     .finish_non_exhaustive()
             }
-            Self::GetPreKeyBundle { preferred_prekey_id, .. } => {
-                f.debug_struct("GetPreKeyBundle")
-                    .field("preferred_prekey_id", preferred_prekey_id)
-                    .finish_non_exhaustive()
-            }
+            Self::GetPreKeyBundle {
+                preferred_prekey_id,
+                ..
+            } => f
+                .debug_struct("GetPreKeyBundle")
+                .field("preferred_prekey_id", preferred_prekey_id)
+                .finish_non_exhaustive(),
             Self::GetIdentityKey { .. } => write!(f, "GetIdentityKey"),
             Self::GetRegistrationId { .. } => write!(f, "GetRegistrationId"),
             Self::NextPreKeyId { .. } => write!(f, "NextPreKeyId"),
@@ -357,7 +358,10 @@ impl CryptoService {
             })
             .context("Failed to spawn crypto service thread")?;
 
-        log::info!("Started crypto service for hub {}", &hub_id[..hub_id.len().min(8)]);
+        log::info!(
+            "Started crypto service for hub {}",
+            &hub_id[..hub_id.len().min(8)]
+        );
 
         Ok(CryptoServiceHandle { tx })
     }
@@ -518,11 +522,8 @@ mod tests {
         let h2 = handle.clone();
         let h3 = handle.clone();
 
-        let (r1, r2, r3) = tokio::join!(
-            h1.identity_key(),
-            h2.registration_id(),
-            h3.next_prekey_id()
-        );
+        let (r1, r2, r3) =
+            tokio::join!(h1.identity_key(), h2.registration_id(), h3.next_prekey_id());
 
         assert!(r1.is_ok());
         assert!(r2.is_ok());

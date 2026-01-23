@@ -65,7 +65,11 @@
 
     <%# User dropdown %>
     <% if user_signed_in? %>
-      <%= render Elements::DropdownComponent.new(anchor: "top start", class: "block") do |dropdown| %>
+      <%= render Elements::DropdownComponent.new(
+        anchor: "top start",
+        class: "block",
+        panel: "w-(--button-width) rounded-md bg-zinc-800 shadow-lg outline-1 -outline-offset-1 outline-white/10"
+      ) do |dropdown| %>
         <% dropdown.with_button class: "w-full flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
           <div class="size-8 rounded-full bg-zinc-800 flex items-center justify-center text-xs font-medium text-zinc-300">
             <%= current_user.username&.first&.upcase || "?" %>
@@ -78,7 +82,7 @@
 
         <%= link_to destroy_user_session_path,
             data: { turbo_method: :delete },
-            class: "block px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-700 transition-colors" do %>
+            class: "block px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-700 rounded-md transition-colors" do %>
           Logout
         <% end %>
       <% end %>

@@ -77,7 +77,8 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
         anyhow::bail!("Server returned {}: {}", status, body);
     }
 
-    let device_code: DeviceCodeResponse = response.json().context("Invalid device code response")?;
+    let device_code: DeviceCodeResponse =
+        response.json().context("Invalid device code response")?;
 
     // Step 2: Display instructions to user
     println!();
@@ -136,8 +137,7 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
         match status.as_u16() {
             200 => {
                 // Success - we got the tokens
-                let token: TokenResponse =
-                    response.json().context("Invalid token response")?;
+                let token: TokenResponse = response.json().context("Invalid token response")?;
                 println!();
                 println!();
                 println!("  Authorized successfully!");
@@ -154,9 +154,9 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
             }
             400 | 401 | 403 => {
                 // Check error type
-                let error: ErrorResponse = response
-                    .json()
-                    .unwrap_or(ErrorResponse { error: "unknown".to_string() });
+                let error: ErrorResponse = response.json().unwrap_or(ErrorResponse {
+                    error: "unknown".to_string(),
+                });
 
                 match error.error.as_str() {
                     "authorization_pending" => {

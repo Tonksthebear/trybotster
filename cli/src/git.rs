@@ -11,6 +11,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Returns the path for debug logging.
+/// In test mode, writes to project tmp/ to avoid leaking outside the project.
+fn debug_log_path() -> PathBuf {
+    if crate::env::is_any_test() {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.join("tmp/botster_debug.log"))
+            .unwrap_or_else(|| PathBuf::from("/tmp/botster_debug.log"))
+    } else {
+        PathBuf::from("/tmp/botster_debug.log")
+    }
+}
+
 /// Manages git worktrees for agent sessions.
 #[derive(Debug)]
 pub struct WorktreeManager {
@@ -116,7 +129,7 @@ impl WorktreeManager {
             source_repo.display(),
             dest_worktree.display()
         );
-        let _ = std::fs::write("/tmp/botster_debug.log", &debug_log);
+        let _ = std::fs::write(debug_log_path(), &debug_log);
 
         // Build globset from patterns
         let mut builder = GlobSetBuilder::new();
@@ -217,7 +230,7 @@ impl WorktreeManager {
                             if let Ok(mut file) = std::fs::OpenOptions::new()
                                 .create(true)
                                 .append(true)
-                                .open("/tmp/botster_debug.log")
+                                .open(debug_log_path())
                             {
                                 let _ = file.write_all(debug_msg.as_bytes());
                             }
@@ -465,7 +478,9 @@ impl WorktreeManager {
                 .output();
 
             // If git command fails, try to prune and remove directory manually
-            if remove_result.as_ref().is_err() || remove_result.as_ref().is_ok_and(|r| !r.status.success()) {
+            if remove_result.as_ref().is_err()
+                || remove_result.as_ref().is_ok_and(|r| !r.status.success())
+            {
                 log::warn!("Git worktree remove failed, trying prune...");
                 let _ = std::process::Command::new("git")
                     .args(["worktree", "prune"])
@@ -501,7 +516,10 @@ impl WorktreeManager {
 
     /// Finds an existing worktree for a given issue number
     /// Returns the worktree path and branch name if found
-    pub fn find_existing_worktree_for_issue(&self, issue_number: u32) -> Result<Option<(PathBuf, String)>> {
+    pub fn find_existing_worktree_for_issue(
+        &self,
+        issue_number: u32,
+    ) -> Result<Option<(PathBuf, String)>> {
         let (repo_path, repo_name) = Self::detect_current_repo()?;
         let repo_safe = repo_name.replace('/', "-");
         let branch_name = format!("botster-issue-{}", issue_number);
@@ -516,7 +534,10 @@ impl WorktreeManager {
         // Verify it's actually a git worktree
         let git_file = worktree_path.join(".git");
         if !git_file.exists() {
-            log::warn!("Directory exists but is not a git worktree: {}", worktree_path.display());
+            log::warn!(
+                "Directory exists but is not a git worktree: {}",
+                worktree_path.display()
+            );
             return Ok(None);
         }
 
@@ -539,7 +560,11 @@ impl WorktreeManager {
             if line.starts_with("worktree ") {
                 let path = line.strip_prefix("worktree ").unwrap_or("");
                 if path == worktree_path_str {
-                    log::info!("Found existing worktree for issue #{} at {}", issue_number, worktree_path.display());
+                    log::info!(
+                        "Found existing worktree for issue #{} at {}",
+                        issue_number,
+                        worktree_path.display()
+                    );
                     return Ok(Some((worktree_path, branch_name)));
                 }
             }
@@ -575,9 +600,12 @@ impl WorktreeManager {
         branch_name: &str,
     ) -> Result<()> {
         // DEFENSE-IN-DEPTH CHECK 1: Verify path is within managed base directory
-        let canonical_worktree = worktree_path.canonicalize()
+        let canonical_worktree = worktree_path
+            .canonicalize()
             .context("Failed to canonicalize worktree path")?;
-        let canonical_base = self.base_dir.canonicalize()
+        let canonical_base = self
+            .base_dir
+            .canonicalize()
             .unwrap_or_else(|_| self.base_dir.clone());
 
         if !canonical_worktree.starts_with(&canonical_base) {
@@ -723,7 +751,10 @@ impl WorktreeManager {
                     .env("BOTSTER_REPO", &repo_name)
                     .env("BOTSTER_ISSUE_NUMBER", issue_number.to_string())
                     .env("BOTSTER_BRANCH_NAME", branch_name)
-                    .env("BOTSTER_WORKTREE_PATH", worktree_path.to_str().expect("path is valid UTF-8"))
+                    .env(
+                        "BOTSTER_WORKTREE_PATH",
+                        worktree_path.to_str().expect("path is valid UTF-8"),
+                    )
                     .env(
                         "BOTSTER_HUB_BIN",
                         std::env::current_exe()
@@ -841,7 +872,10 @@ impl WorktreeManager {
                     .env("BOTSTER_REPO", &repo_name)
                     .env("BOTSTER_ISSUE_NUMBER", issue_number.to_string())
                     .env("BOTSTER_BRANCH_NAME", &branch_name)
-                    .env("BOTSTER_WORKTREE_PATH", worktree_path.to_str().expect("path is valid UTF-8"))
+                    .env(
+                        "BOTSTER_WORKTREE_PATH",
+                        worktree_path.to_str().expect("path is valid UTF-8"),
+                    )
                     .env(
                         "BOTSTER_HUB_BIN",
                         std::env::current_exe()

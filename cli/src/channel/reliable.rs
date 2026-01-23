@@ -248,16 +248,14 @@ impl ReliableSender {
         for (seq, pending) in self.pending.iter_mut() {
             if pending.attempts >= MAX_RETRANSMIT_ATTEMPTS {
                 // Max retransmits exceeded - remove and track as failed
-                log::error!(
-                    "Message seq={} exceeded max retransmits, removing",
-                    seq
-                );
+                log::error!("Message seq={} exceeded max retransmits, removing", seq);
                 failed_seqs.push((*seq, pending.payload.clone()));
                 continue;
             }
 
             // Use exponential backoff for timeout
-            let timeout = Self::calculate_timeout_with_base(self.retransmit_timeout, pending.attempts);
+            let timeout =
+                Self::calculate_timeout_with_base(self.retransmit_timeout, pending.attempts);
 
             if now.duration_since(pending.last_sent_at) >= timeout {
                 pending.last_sent_at = now;
@@ -503,7 +501,6 @@ impl ReliableSession {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,7 +620,10 @@ mod tests {
 
         let retransmits = sender.get_retransmits();
         assert_eq!(retransmits.len(), 1);
-        assert!(matches!(&retransmits[0], ReliableMessage::Data { seq: 1, .. }));
+        assert!(matches!(
+            &retransmits[0],
+            ReliableMessage::Data { seq: 1, .. }
+        ));
     }
 
     // ========== ReliableReceiver Tests ==========
@@ -932,10 +932,17 @@ mod tests {
 
         // Session reset: peer sends seq=1 again (simulating page refresh)
         let (delivered, reset) = receiver.receive(1, b"new session start".to_vec());
-        assert!(reset, "Should detect session reset when seq=1 arrives after seq>1");
+        assert!(
+            reset,
+            "Should detect session reset when seq=1 arrives after seq>1"
+        );
         assert_eq!(delivered.len(), 1, "Should deliver the new seq=1 message");
         assert_eq!(delivered[0], b"new session start");
-        assert_eq!(receiver.next_expected(), 2, "Should be waiting for seq=2 in new session");
+        assert_eq!(
+            receiver.next_expected(),
+            2,
+            "Should be waiting for seq=2 in new session"
+        );
     }
 
     #[test]
@@ -1051,7 +1058,10 @@ mod tests {
 
         // After max attempts, retransmits should stop (but message stays pending)
         let retransmits = sender.get_retransmits();
-        assert!(retransmits.is_empty(), "Should stop retransmitting after max attempts");
+        assert!(
+            retransmits.is_empty(),
+            "Should stop retransmitting after max attempts"
+        );
     }
 
     // ========== Phase 2: Exponential Backoff Tests ==========

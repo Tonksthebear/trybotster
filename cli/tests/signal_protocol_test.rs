@@ -51,8 +51,7 @@ fn test_relay_message_format_has_envelope_wrapper() {
         "Correct format must have 'envelope' key"
     );
     assert_eq!(
-        correct_message["envelope"]["version"],
-        4,
+        correct_message["envelope"]["version"], 4,
         "Envelope version should be 4"
     );
 
@@ -156,11 +155,17 @@ fn test_action_cable_message_format() {
     });
 
     assert_eq!(cable_message["command"], "message");
-    assert!(cable_message["identifier"].as_str().unwrap().contains("TerminalRelayChannel"));
+    assert!(cable_message["identifier"]
+        .as_str()
+        .unwrap()
+        .contains("TerminalRelayChannel"));
 
     // Parse the data field and verify envelope structure
     let data: Value = serde_json::from_str(cable_message["data"].as_str().unwrap()).unwrap();
-    assert!(data.get("envelope").is_some(), "Parsed data must have envelope");
+    assert!(
+        data.get("envelope").is_some(),
+        "Parsed data must have envelope"
+    );
 }
 
 // === PreKeyBundle Format Tests ===
@@ -188,9 +193,18 @@ fn test_prekey_bundle_data_format() {
     // Verify required fields
     assert_eq!(bundle["version"], 4, "Protocol version should be 4");
     assert!(bundle["hub_id"].as_str().is_some(), "hub_id required");
-    assert!(bundle["identity_key"].as_str().is_some(), "identity_key required");
-    assert!(bundle["signed_prekey"].as_str().is_some(), "signed_prekey required");
-    assert!(bundle["kyber_prekey"].as_str().is_some(), "kyber_prekey required for PQXDH");
+    assert!(
+        bundle["identity_key"].as_str().is_some(),
+        "identity_key required"
+    );
+    assert!(
+        bundle["signed_prekey"].as_str().is_some(),
+        "signed_prekey required"
+    );
+    assert!(
+        bundle["kyber_prekey"].as_str().is_some(),
+        "kyber_prekey required for PQXDH"
+    );
 }
 
 // === Handshake ACK Format Tests ===
@@ -225,7 +239,10 @@ fn test_handshake_ack_format() {
         "envelope": encrypted_ack_envelope
     });
 
-    assert!(relay_message.get("envelope").is_some(), "ACK must have envelope wrapper");
+    assert!(
+        relay_message.get("envelope").is_some(),
+        "ACK must have envelope wrapper"
+    );
 }
 
 /// Test handshake message structure (browser → CLI)
@@ -278,7 +295,7 @@ fn test_browser_command_formats() {
     // All valid browser commands (after decryption)
     let commands = vec![
         json!({"type": "handshake", "device_name": "Mac Browser", "timestamp": 1234567890}),
-        json!({"type": "input", "data": [27, 91, 65]}),  // Arrow key bytes
+        json!({"type": "input", "data": [27, 91, 65]}), // Arrow key bytes
         json!({"type": "set_mode", "mode": "insert"}),
         json!({"type": "list_agents"}),
         json!({"type": "list_worktrees"}),
@@ -288,7 +305,11 @@ fn test_browser_command_formats() {
     ];
 
     for cmd in commands {
-        assert!(cmd.get("type").is_some(), "All commands need type field: {:?}", cmd);
+        assert!(
+            cmd.get("type").is_some(),
+            "All commands need type field: {:?}",
+            cmd
+        );
     }
 }
 
@@ -404,5 +425,9 @@ fn test_identity_key_format() {
     // Verify it's valid base64
     let decoded = BASE64.decode(&mock_identity_key);
     assert!(decoded.is_ok(), "Identity key should be valid base64");
-    assert_eq!(decoded.unwrap().len(), 33, "Identity key should be 33 bytes");
+    assert_eq!(
+        decoded.unwrap().len(),
+        33,
+        "Identity key should be 33 bytes"
+    );
 }

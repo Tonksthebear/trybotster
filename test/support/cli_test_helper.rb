@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "wait_helper"
+
 # Helper module for spawning and managing CLI instances in system tests.
 #
 # Usage in system tests:
@@ -25,15 +27,19 @@
 #   end
 #
 module CliTestHelper
+  include WaitHelper
+
   CLI_PATH = Rails.root.join("cli").freeze
   CLI_BINARY = CLI_PATH.join("target/debug/botster-hub").freeze
 
   # Represents a running CLI instance
   class CliProcess
-    attr_reader :pid, :hub, :temp_dir, :log_file_path
+    include WaitHelper
+
+    attr_reader :pid, :hub, :temp_dir, :log_file_path, :started_at
     attr_accessor :device_token
 
-    def initialize(pid:, hub:, stdout_r:, stderr_r:, temp_dir:, log_thread:, log_file_path: nil, device_token: nil)
+    def initialize(pid:, hub:, stdout_r:, stderr_r:, temp_dir:, log_thread:, log_file_path: nil, device_token: nil, started_at: nil)
       @pid = pid
       @hub = hub
       @stdout_r = stdout_r
@@ -42,6 +48,7 @@ module CliTestHelper
       @log_thread = log_thread
       @log_file_path = log_file_path
       @device_token = device_token
+      @started_at = started_at || Time.current
       @output_buffer = []
       @mutex = Mutex.new
     end
@@ -60,10 +67,10 @@ module CliTestHelper
 
       begin
         Process.kill("TERM", @pid)
-        # Give it a moment to clean up
-        sleep 0.5
-        # Force kill if still running
-        Process.kill("KILL", @pid) if running?
+        # Wait for graceful shutdown, then force kill if needed
+        unless wait_for_process_exit(@pid, timeout: 1)
+          Process.kill("KILL", @pid)
+        end
         Process.wait(@pid)
       rescue Errno::ESRCH, Errno::ECHILD
         # Already stopped
@@ -80,19 +87,16 @@ module CliTestHelper
 
     # Wait for CLI to be ready (connected to relay)
     def wait_for_ready(timeout: 15)
-      deadline = Time.current + timeout
-
-      while Time.current < deadline
-        return true if ready?
-        sleep 0.2
-      end
-
-      false
+      wait_until?(timeout: timeout, poll: 0.2) { ready? }
     end
 
     def ready?
-      # CLI is ready when connection URL file exists
-      connection_url.present?
+      # CLI is ready when it has sent at least one heartbeat
+      # Heartbeat updates hub.last_seen_at - more reliable than file-based detection
+      @hub.reload
+      @hub.last_seen_at.present? && @hub.last_seen_at > @started_at
+    rescue ActiveRecord::RecordNotFound
+      false
     end
 
     # Get the connection URL from the running CLI
@@ -103,6 +107,7 @@ module CliTestHelper
       return @cached_url if @cached_url
 
       # Read directly from the file written by the CLI
+      # CLI uses hub.identifier for directory structure (the string identifier passed via BOTSTER_HUB_ID)
       url_path = File.join(@temp_dir, "hubs", @hub.identifier, "connection_url.txt")
       return nil unless File.exist?(url_path)
 
@@ -161,15 +166,17 @@ module CliTestHelper
     Rails.logger.info "[CliTestHelper] DeviceToken user_id=#{device_token.user&.id}"
 
     # Set up environment
-    # BOTSTER_ENV=test enables all test-specific behaviors:
-    # - Skip authentication validation
+    # BOTSTER_ENV=system_test enables test behaviors while making network calls:
     # - Use file storage instead of OS keyring
+    # - Use test directories
+    # - Full auth with test server (not skipped like BOTSTER_ENV=test)
     env = {
-      "BOTSTER_ENV" => "test",
+      "BOTSTER_ENV" => "system_test",
       "BOTSTER_CONFIG_DIR" => temp_dir,
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => api_key,  # Use BOTSTER_TOKEN (takes precedence over BOTSTER_API_KEY)
-      "BOTSTER_HUB_ID" => hub.identifier,  # Use Rails hub identifier for consistency
+      "BOTSTER_HUB_ID" => hub.identifier,  # Use string identifier for find_or_initialize_by lookup
+      "BOTSTER_REPO" => hub.repo,  # Required for hub registration
       "RUST_LOG" => options[:log_level] || "info,botster_hub=debug"
     }
 
@@ -182,14 +189,15 @@ module CliTestHelper
     stdout_r, stdout_w = IO.pipe
     stderr_r, stderr_w = IO.pipe
 
+    # Run from project root so CLI can detect git repo for heartbeats
+    # Config files still go to temp_dir via BOTSTER_CONFIG_DIR env var
     pid = spawn(
       env,
       CLI_BINARY.to_s,
       "start",
       "--headless",
       out: stdout_w,
-      err: stderr_w,
-      chdir: temp_dir
+      err: stderr_w
     )
 
     stdout_w.close
@@ -199,6 +207,9 @@ module CliTestHelper
     log_file_path = File.join(temp_dir, "botster-hub.log")
     Rails.logger.info "[CliTestHelper] CLI log file: #{log_file_path}"
 
+    # Capture start time for heartbeat-based readiness detection
+    started_at = Time.current
+
     cli = CliProcess.new(
       pid: pid,
       hub: hub,
@@ -207,7 +218,8 @@ module CliTestHelper
       temp_dir: temp_dir,
       log_thread: nil,
       log_file_path: log_file_path,
-      device_token: device_token
+      device_token: device_token,
+      started_at: started_at
     )
 
     # Start log reader thread

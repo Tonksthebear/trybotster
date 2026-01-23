@@ -34,7 +34,12 @@ Rails.application.routes.draw do
       resources :notifications, only: [ :create ]
       resource :connection, only: [ :show ]
       # Agent terminal view by index
-      resources :agents, only: [ :show ], param: :index
+      resources :agents, only: [ :show ], param: :index do
+        # PTY preview - proxied through E2E WebSocket by service worker
+        get ":pty_index/preview/sw.js", to: "agents/previews#service_worker", as: :pty_service_worker
+        get ":pty_index/preview", to: "agents/previews#show", as: :pty_preview, defaults: { path: "" }
+        get ":pty_index/preview/*path", to: "agents/previews#show", format: false
+      end
     end
   end
 
@@ -43,12 +48,6 @@ Rails.application.routes.draw do
 
   # User settings
   resource :settings, only: [ :show, :update ]
-
-  # Private tunnel preview (authenticated, user's own hubs only)
-  get "preview/:hub_id/:agent_id", to: "preview#proxy", as: :tunnel_root, defaults: { path: "" }
-  get "preview/:hub_id/:agent_id/sw.js", to: "preview#service_worker", as: :tunnel_service_worker
-  get "preview/:hub_id/:agent_id/*path", to: "preview#proxy", as: :tunnel_preview, format: false
-  match "preview/:hub_id/:agent_id/*path", to: "preview#proxy", via: [ :post, :patch, :put, :delete ], format: false
 
   root to: "home#index"
 

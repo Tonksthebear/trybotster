@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Preview</title>
+  <%= csrf_meta_tags %>
+  <%= csp_meta_tag %>
+  <%= stylesheet_link_tag "application", "data-turbo-track": "reload" %>
+  <%= javascript_importmap_tags %>
+  <style>
+    .preview-frame {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+    .status-bar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      padding: 8px 16px;
+      background: rgba(17, 24, 39, 0.95);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      z-index: 1000;
+    }
+    .status-bar.connected {
+      background: rgba(5, 46, 22, 0.95);
+      border-bottom-color: rgba(34, 197, 94, 0.3);
+    }
+    .status-bar.error {
+      background: rgba(69, 10, 10, 0.95);
+      border-bottom-color: rgba(239, 68, 68, 0.3);
+    }
+    .status-text {
+      color: #9ca3af;
+    }
+    .status-bar.connected .status-text {
+      color: #86efac;
+    }
+    .status-bar.error .status-text {
+      color: #fca5a5;
+    }
+    .preview-container {
+      position: fixed;
+      top: 41px;
+      left: 0;
+      right: 0;
+      bottom: 0;
+    }
+  </style>
+</head>
+<body class="h-full bg-zinc-950">
+  <%# Connection container - establishes E2E WebSocket %>
+  <div id="preview-connection"
+       data-controller="preview-proxy"
+       data-preview-proxy-hub-id-value="<%= @hub_id %>"
+       data-preview-proxy-agent-index-value="<%= @agent_index_value %>"
+       data-preview-proxy-pty-index-value="<%= @pty_index_value %>"
+       data-preview-proxy-scope-value="<%= @scope %>"
+       data-preview-proxy-worker-url-value="<%= asset_path('workers/signal.js') %>"
+       data-preview-proxy-wasm-js-url-value="<%= asset_path('libsignal_wasm.js') %>"
+       data-preview-proxy-wasm-binary-url-value="<%= asset_path('libsignal_wasm_bg.wasm') %>">
+
+    <%# Status bar %>
+    <div class="status-bar" data-preview-proxy-target="statusBar">
+      <span class="status-text" data-preview-proxy-target="statusText">Connecting...</span>
+      <a href="<%= hub_agent_path(@hub_id, @agent_index_value) %>"
+         class="text-zinc-500 hover:text-zinc-300 text-xs">
+        Back to Terminal
+      </a>
+    </div>
+
+    <%# Preview iframe - loads proxied content %>
+    <div class="preview-container">
+      <iframe
+        data-preview-proxy-target="frame"
+        class="preview-frame"
+        sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-modals"
+        src="<%= @scope %>/">
+      </iframe>
+    </div>
+  </div>
+</body>
+</html>

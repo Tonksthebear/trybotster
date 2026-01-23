@@ -1,0 +1,159 @@
+// Preview Service Worker
+// Intercepts HTTP requests and proxies them through the E2E WebSocket connection
+// via postMessage to the preview shell page.
+
+const SW_VERSION = '<%= Digest::MD5.hexdigest(File.read(Rails.root.join("app/views/hubs/agents/previews/service_worker.js.erb")))[0..7] %>';
+const SCOPE = '<%= @proxy_base %>';
+
+// Take control immediately
+self.addEventListener('activate', (event) => {
+  event.waitUntil(clients.claim());
+});
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(self.skipWaiting());
+});
+
+// Map of pending requests waiting for responses
+const pendingRequests = new Map();
+let requestIdCounter = 0;
+
+// Handle messages from the preview shell page
+self.addEventListener('message', (event) => {
+  const { type, requestId, response, error } = event.data;
+
+  if (type === 'http_response') {
+    const pending = pendingRequests.get(requestId);
+    if (pending) {
+      pendingRequests.delete(requestId);
+      if (error) {
+        pending.reject(new Error(error));
+      } else {
+        pending.resolve(response);
+      }
+    }
+  }
+});
+
+// Intercept fetch requests
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+
+  // Only intercept same-origin requests
+  if (url.origin !== location.origin) {
+    return;
+  }
+
+  // Pass through the preview shell page itself (exact scope path or with just query string)
+  // This allows the shell page to load from Rails
+  const scopePath = SCOPE;
+  if (url.pathname === scopePath || url.pathname === scopePath + '/') {
+    return;
+  }
+
+  // Pass through service worker requests
+  if (url.pathname.endsWith('/sw.js')) {
+    return;
+  }
+
+  // Pass through Rails assets and other non-preview paths
+  if (!url.pathname.startsWith(scopePath + '/')) {
+    return;
+  }
+
+  // Extract the path relative to the preview scope
+  // e.g., /hubs/123/agents/0/1/preview/api/users -> /api/users
+  const relativePath = url.pathname.slice(scopePath.length) || '/';
+
+  event.respondWith(proxyRequest(event.request, relativePath, url.search));
+});
+
+async function proxyRequest(request, path, queryString) {
+  // Get a client (the preview shell page) to communicate with
+  const clients = await self.clients.matchAll({ type: 'window' });
+  const client = clients.find(c => c.url.includes(SCOPE));
+
+  if (!client) {
+    return new Response('Preview shell not loaded. Please refresh the page.', {
+      status: 503,
+      statusText: 'Service Unavailable'
+    });
+  }
+
+  // Generate unique request ID
+  const requestId = `req_${++requestIdCounter}_${Date.now()}`;
+
+  // Read request body if present
+  let body = null;
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    try {
+      body = await request.text();
+    } catch (e) {
+      // No body or couldn't read it
+    }
+  }
+
+  // Collect headers
+  const headers = {};
+  request.headers.forEach((value, key) => {
+    // Skip headers that shouldn't be forwarded
+    if (!['host', 'connection', 'upgrade'].includes(key.toLowerCase())) {
+      headers[key] = value;
+    }
+  });
+
+  // Create promise for the response
+  const responsePromise = new Promise((resolve, reject) => {
+    pendingRequests.set(requestId, { resolve, reject });
+
+    // Timeout after 30 seconds
+    setTimeout(() => {
+      if (pendingRequests.has(requestId)) {
+        pendingRequests.delete(requestId);
+        reject(new Error('Request timeout'));
+      }
+    }, 30000);
+  });
+
+  // Send request to preview shell via postMessage
+  client.postMessage({
+    type: 'http_request',
+    requestId,
+    method: request.method,
+    path: path + queryString,
+    headers,
+    body
+  });
+
+  try {
+    const response = await responsePromise;
+
+    // Decode body from base64 if present
+    let responseBody = null;
+    if (response.body) {
+      try {
+        // Body is base64 encoded
+        const binaryString = atob(response.body);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        responseBody = bytes;
+      } catch (e) {
+        // Plain text fallback
+        responseBody = response.body;
+      }
+    }
+
+    return new Response(responseBody, {
+      status: response.status || 200,
+      statusText: response.statusText || 'OK',
+      headers: response.headers || {}
+    });
+  } catch (error) {
+    return new Response(`Proxy error: ${error.message}`, {
+      status: 502,
+      statusText: 'Bad Gateway'
+    });
+  }
+}

@@ -10,9 +10,38 @@
 //! This module only manages the agent registry itself.
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use crate::agent::Agent;
 use crate::git::WorktreeManager;
+use crate::hub::agent_handle::AgentHandle;
+use crate::relay::types::AgentInfo;
+
+/// Shared reference to HubState for thread-safe read access.
+///
+/// Clients store a clone of this to access agent state without going through
+/// Hub commands. The RwLock allows multiple readers without blocking Hub's
+/// write operations (when no write is in progress).
+///
+/// # Usage
+///
+/// ```ignore
+/// let shared_state = hub.shared_state();
+///
+/// // In client code (possibly different thread):
+/// let state = shared_state.read().unwrap();
+/// let agents = state.get_agents_info();
+/// for info in &agents {
+///     println!("{}: {:?}", info.id, info.status);
+/// }
+///
+/// // Get a handle for specific agent
+/// if let Some(handle) = state.get_agent_handle(0) {
+///     let pty = handle.cli_pty();
+///     // Use pty handle...
+/// }
+/// ```
+pub type SharedHubState = Arc<RwLock<HubState>>;
 
 /// Core hub state - manages active agents.
 ///
@@ -106,6 +135,123 @@ impl HubState {
         self.agent_keys_ordered
             .iter()
             .filter_map(|key| self.agents.get(key).map(|agent| (key.as_str(), agent)))
+    }
+
+    // =========================================================================
+    // Client Data Access Methods
+    // =========================================================================
+
+    /// Get a snapshot of all agents as `AgentInfo` in display order.
+    ///
+    /// Returns a vector of `AgentInfo` structs that clients can use to
+    /// display agent lists and implement `Client::get_agents()`.
+    /// This is a snapshot - changes won't be reflected until the next call.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let state = hub.shared_state().read().unwrap();
+    /// let agents = state.get_agents_info();
+    /// for info in &agents {
+    ///     println!("{}: {}", info.id, info.status.as_deref().unwrap_or("Unknown"));
+    /// }
+    /// ```
+    #[must_use]
+    pub fn get_agents_info(&self) -> Vec<AgentInfo> {
+        self.agents_ordered()
+            .map(|(agent_id, agent)| self.agent_to_info(agent_id, agent))
+            .collect()
+    }
+
+    /// Get an `AgentHandle` for the agent at the given index.
+    ///
+    /// Returns `None` if the index is out of bounds.
+    ///
+    /// The handle provides:
+    /// - Agent metadata via `info()`
+    /// - PTY access via `cli_pty()` and `server_pty()`
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The index of the agent in display order (0-based)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let state = hub.shared_state().read().unwrap();
+    /// if let Some(handle) = state.get_agent_handle(0) {
+    ///     println!("Agent: {}", handle.info().id);
+    ///     // Connect to CLI PTY
+    ///     let pty = handle.cli_pty();
+    ///     // ...
+    /// }
+    /// ```
+    #[must_use]
+    pub fn get_agent_handle(&self, index: usize) -> Option<AgentHandle> {
+        let agent_id = self.agent_keys_ordered.get(index)?;
+        let agent = self.agents.get(agent_id)?;
+
+        let info = self.agent_to_info(agent_id, agent);
+
+        // Get CLI PTY channels
+        let (cli_event_tx, cli_cmd_tx) = agent.cli_pty.get_channels();
+
+        // Get server PTY channels if available
+        let (server_event_tx, server_cmd_tx) = if let Some(ref server_pty) = agent.server_pty {
+            let (ev, cmd) = server_pty.get_channels();
+            (Some(ev), Some(cmd))
+        } else {
+            (None, None)
+        };
+
+        Some(AgentHandle::new(
+            agent_id,
+            info,
+            cli_event_tx,
+            cli_cmd_tx,
+            server_event_tx,
+            server_cmd_tx,
+        ))
+    }
+
+    /// Get an `AgentHandle` for the agent with the given ID.
+    ///
+    /// Returns `None` if no agent with that ID exists.
+    #[must_use]
+    pub fn get_agent_handle_by_id(&self, agent_id: &str) -> Option<AgentHandle> {
+        let index = self
+            .agent_keys_ordered
+            .iter()
+            .position(|id| id == agent_id)?;
+        self.get_agent_handle(index)
+    }
+
+    /// Get the index of an agent by its ID.
+    ///
+    /// Returns `None` if no agent with that ID exists.
+    #[must_use]
+    pub fn get_agent_index(&self, agent_id: &str) -> Option<usize> {
+        self.agent_keys_ordered.iter().position(|id| id == agent_id)
+    }
+
+    /// Convert an Agent to AgentInfo.
+    ///
+    /// Internal helper for creating snapshots.
+    fn agent_to_info(&self, agent_id: &str, agent: &Agent) -> AgentInfo {
+        AgentInfo {
+            id: agent_id.to_string(),
+            repo: Some(agent.repo.clone()),
+            issue_number: agent.issue_number.map(u64::from),
+            branch_name: Some(agent.branch_name.clone()),
+            name: None,
+            status: Some(format!("{:?}", agent.status)),
+            tunnel_port: agent.tunnel_port,
+            server_running: Some(agent.is_server_running()),
+            has_server_pty: Some(agent.has_server_pty()),
+            active_pty_view: None, // Client-owned state, not agent state
+            scroll_offset: None,   // Client-owned state, not agent state
+            hub_identifier: None,  // Set by Hub when sending to browser
+        }
     }
 
     /// Load available worktrees for the selection UI.

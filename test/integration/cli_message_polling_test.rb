@@ -110,11 +110,12 @@ class CliMessagePollingTest < CliIntegrationTestCase
 
     cli = start_cli(@hub, timeout: 20)
 
-    # Wait a moment for CLI to send heartbeat
-    sleep 2
+    # CLI should have sent heartbeat during startup (wait_for_ready checks this)
+    # Verify the timestamp was actually updated
+    wait_until(timeout: 5, message: "Hub last_seen_at should be updated by CLI") do
+      @hub.reload.last_seen_at > old_time
+    end
 
-    @hub.reload
-    assert @hub.last_seen_at > old_time, "Hub last_seen_at should be updated by CLI"
     assert @hub.last_seen_at > 30.seconds.ago, "Hub should have been seen recently"
   end
 
@@ -163,8 +164,11 @@ class CliMessagePollingTest < CliIntegrationTestCase
 
     cli = start_cli(@hub, timeout: 20)
 
-    # Wait a bit for any polling to happen
-    sleep 3
+    # Negative test: CLI should not steal messages claimed by other users.
+    # We need to wait long enough for polling to have run at least once.
+    # Since start_cli waits for heartbeat (2s interval), we know polling ran.
+    # Add a small buffer to be safe.
+    sleep 1
 
     # Message should still be claimed by original user
     claimed_message.reload
@@ -174,22 +178,16 @@ class CliMessagePollingTest < CliIntegrationTestCase
   private
 
   def assert_message_claimed(message, timeout: 10)
-    deadline = Time.current + timeout
-    while Time.current < deadline
-      message.reload
-      return true if message.status == "sent" || message.status == "acknowledged"
-      sleep 0.5
-    end
-    flunk "Message #{message.id} was not claimed within #{timeout}s (status: #{message.status})"
+    wait_until(
+      timeout: timeout,
+      message: -> { "Message #{message.id} was not claimed within #{timeout}s (status: #{message.reload.status})" }
+    ) { %w[sent acknowledged].include?(message.reload.status) }
   end
 
   def assert_message_acknowledged(message, timeout: 15)
-    deadline = Time.current + timeout
-    while Time.current < deadline
-      message.reload
-      return true if message.status == "acknowledged"
-      sleep 0.5
-    end
-    flunk "Message #{message.id} was not acknowledged within #{timeout}s (status: #{message.status})"
+    wait_until(
+      timeout: timeout,
+      message: -> { "Message #{message.id} was not acknowledged within #{timeout}s (status: #{message.reload.status})" }
+    ) { message.reload.status == "acknowledged" }
   end
 end

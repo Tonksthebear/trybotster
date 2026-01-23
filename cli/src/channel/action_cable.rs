@@ -36,14 +36,19 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
-use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message,
+};
 
 use crate::relay::crypto_service::CryptoServiceHandle;
 use crate::relay::signal::SignalEnvelope;
 
 use super::compression::{maybe_compress, maybe_decompress};
 use super::reliable::{ReliableMessage, ReliableSession};
-use super::{Channel, ChannelConfig, ChannelError, ConnectionState, IncomingMessage, PeerId, SharedConnectionState};
+use super::{
+    Channel, ChannelConfig, ChannelError, ConnectionState, IncomingMessage, PeerId,
+    SharedConnectionState,
+};
 
 /// Reconnection backoff configuration.
 const INITIAL_BACKOFF_SECS: u64 = 1;
@@ -493,18 +498,18 @@ impl ActionCableChannel {
             .map_err(|e| ChannelError::ConnectionFailed(format!("invalid URL: {e}")))?;
 
         // No fallback - invalid server_url should fail explicitly
-        let origin_header = server_url
-            .parse()
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Invalid server URL '{server_url}': {e}")))?;
+        let origin_header = server_url.parse().map_err(|e| {
+            ChannelError::ConnectionFailed(format!("Invalid server URL '{server_url}': {e}"))
+        })?;
         request.headers_mut().insert("Origin", origin_header);
         request.headers_mut().insert(
             "Authorization",
             format!("Bearer {}", api_key).parse().expect("valid header"),
         );
 
-        let (ws_stream, _) = connect_async(request)
-            .await
-            .map_err(|e| ChannelError::ConnectionFailed(format!("WebSocket connect failed: {e}")))?;
+        let (ws_stream, _) = connect_async(request).await.map_err(|e| {
+            ChannelError::ConnectionFailed(format!("WebSocket connect failed: {e}"))
+        })?;
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -542,8 +547,7 @@ impl ActionCableChannel {
             agent_index: config.agent_index,
             pty_index: config.pty_index,
         };
-        let identifier_json =
-            serde_json::to_string(&identifier).expect("identifier serializable");
+        let identifier_json = serde_json::to_string(&identifier).expect("identifier serializable");
 
         let subscribe = CableMessage {
             command: "subscribe".to_string(),
@@ -702,7 +706,12 @@ impl ActionCableChannel {
     ) {
         let (data, targets): (Vec<u8>, Vec<PeerId>) = match msg {
             OutgoingMessage::Broadcast(d) => {
-                let peer_list: Vec<PeerId> = peers.read().expect("peers lock poisoned").iter().cloned().collect();
+                let peer_list: Vec<PeerId> = peers
+                    .read()
+                    .expect("peers lock poisoned")
+                    .iter()
+                    .cloned()
+                    .collect();
                 (d, peer_list)
             }
             OutgoingMessage::Targeted { peer, data } => (data, vec![peer]),
@@ -807,7 +816,9 @@ impl ActionCableChannel {
         if let Some(ref msg_type) = cable_msg.msg_type {
             match msg_type.as_str() {
                 "welcome" => log::debug!("Welcome received"),
-                "confirm_subscription" => log::info!("{} subscription confirmed", config.channel_name),
+                "confirm_subscription" => {
+                    log::info!("{} subscription confirmed", config.channel_name)
+                }
                 "ping" => {}
                 _ => {}
             }
@@ -819,7 +830,11 @@ impl ActionCableChannel {
             return Vec::new();
         };
         let has_envelope = message.get("envelope").is_some();
-        log::debug!("Received cable message: has_envelope={}, action={:?}", has_envelope, message.get("action"));
+        log::debug!(
+            "Received cable message: has_envelope={}, action={:?}",
+            has_envelope,
+            message.get("action")
+        );
 
         // Decrypt/decode raw payload
         let (plaintext, sender) = if let Some(ref cs) = crypto_service {
@@ -891,7 +906,11 @@ impl ActionCableChannel {
             .await
         } else {
             // Non-reliable: just decompress and return
-            log::debug!("Non-reliable message from {}: {} bytes", sender, plaintext.len());
+            log::debug!(
+                "Non-reliable message from {}: {} bytes",
+                sender,
+                plaintext.len()
+            );
             match maybe_decompress(&plaintext) {
                 Ok(d) => {
                     if let Ok(text) = String::from_utf8(d.clone()) {
@@ -956,7 +975,14 @@ impl ActionCableChannel {
                 };
 
                 // Send ACK back to sender
-                Self::send_ack(sender, reliable_sessions, crypto_service, identifier_json, write).await;
+                Self::send_ack(
+                    sender,
+                    reliable_sessions,
+                    crypto_service,
+                    identifier_json,
+                    write,
+                )
+                .await;
 
                 // Convert deliverable payloads to RawIncoming
                 deliverable
@@ -1013,7 +1039,9 @@ impl ActionCableChannel {
                     let retransmits = session.sender.get_retransmits();
                     (PeerId(peer_id.clone()), needs_heartbeat, retransmits)
                 })
-                .filter(|(_, needs_heartbeat, retransmits)| *needs_heartbeat || !retransmits.is_empty())
+                .filter(|(_, needs_heartbeat, retransmits)| {
+                    *needs_heartbeat || !retransmits.is_empty()
+                })
                 .collect()
         };
 
@@ -1021,14 +1049,33 @@ impl ActionCableChannel {
             // Send heartbeat ACK if needed
             if needs_heartbeat {
                 log::debug!("Sending heartbeat ACK to {}", peer);
-                Self::send_ack(&peer, reliable_sessions, crypto_service, identifier_json, write).await;
+                Self::send_ack(
+                    &peer,
+                    reliable_sessions,
+                    crypto_service,
+                    identifier_json,
+                    write,
+                )
+                .await;
             }
 
             // Send retransmits
             for msg in retransmits {
                 if let ReliableMessage::Data { seq, ref payload } = msg {
-                    log::info!("Retransmitting seq={} to {} ({} bytes)", seq, peer, payload.len());
-                    Self::send_reliable_message(&peer, &msg, crypto_service, identifier_json, write).await;
+                    log::info!(
+                        "Retransmitting seq={} to {} ({} bytes)",
+                        seq,
+                        peer,
+                        payload.len()
+                    );
+                    Self::send_reliable_message(
+                        &peer,
+                        &msg,
+                        crypto_service,
+                        identifier_json,
+                        write,
+                    )
+                    .await;
                 }
             }
         }
@@ -1224,9 +1271,7 @@ impl Channel for ActionCableChannel {
 
     fn state(&self) -> ConnectionState {
         // Blocking read for sync interface
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.state.get())
-        })
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(self.state.get()))
     }
 
     async fn send(&self, msg: &[u8]) -> Result<(), ChannelError> {
@@ -1259,10 +1304,7 @@ impl Channel for ActionCableChannel {
     }
 
     async fn recv(&mut self) -> Result<IncomingMessage, ChannelError> {
-        let rx = self
-            .recv_rx
-            .as_mut()
-            .ok_or(ChannelError::Closed)?;
+        let rx = self.recv_rx.as_mut().ok_or(ChannelError::Closed)?;
 
         let raw = rx.recv().await.ok_or(ChannelError::Closed)?;
 
@@ -1273,11 +1315,19 @@ impl Channel for ActionCableChannel {
     }
 
     fn peers(&self) -> Vec<PeerId> {
-        self.peers.read().expect("peers lock poisoned").iter().cloned().collect()
+        self.peers
+            .read()
+            .expect("peers lock poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 
     fn has_peer(&self, peer: &PeerId) -> bool {
-        self.peers.read().expect("peers lock poisoned").contains(peer)
+        self.peers
+            .read()
+            .expect("peers lock poisoned")
+            .contains(peer)
     }
 }
 

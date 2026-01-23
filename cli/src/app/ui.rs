@@ -286,7 +286,10 @@ pub fn convert_browser_key_to_crossterm(input: &KeyInput) -> Option<KeyEvent> {
     let key_code = match input.key.as_str() {
         // Single character keys
         k if k.len() == 1 => {
-            let c = k.chars().next().expect("single char string has at least one char");
+            let c = k
+                .chars()
+                .next()
+                .expect("single char string has at least one char");
             KeyCode::Char(c)
         }
         // Special keys

@@ -11,9 +11,16 @@
 //! ```text
 //! HubState ──► ViewState::from_hub() ──► render functions
 //! ```
+//!
+//! # Client-Owned View State
+//!
+//! Note that `active_view` (which PTY is being viewed) and scroll position
+//! are per-client state. The caller (TuiRunner/TuiClient) tracks which view
+//! is active and passes it as a parameter when needed.
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-01
 
+use crate::agent::PtyView;
 use crate::app::AppMode;
 use crate::hub::HubState;
 use crate::tunnel::TunnelStatus;
@@ -26,10 +33,10 @@ use crate::tunnel::TunnelStatus;
 pub struct ViewState {
     /// Number of active agents.
     pub agent_count: usize,
-    /// Ordered list of agent session keys.
-    pub agent_keys: Vec<String>,
-    /// Currently selected agent key (from TUI client).
-    pub selected_agent_key: Option<String>,
+    /// Ordered list of agent IDs.
+    pub agent_ids: Vec<String>,
+    /// Currently selected agent ID (from TUI client).
+    pub selected_agent_id: Option<String>,
     /// Current application mode.
     pub mode: AppMode,
     /// Whether server polling is enabled.
@@ -67,8 +74,8 @@ impl ViewState {
     pub fn from_hub(hub_state: &HubState, context: ViewContext) -> Self {
         Self {
             agent_count: hub_state.agent_count(),
-            agent_keys: hub_state.agent_keys_ordered.clone(),
-            selected_agent_key: context.selected_key,
+            agent_ids: hub_state.agent_keys_ordered.clone(),
+            selected_agent_id: context.selected_key,
             mode: context.mode,
             polling_enabled: context.polling_enabled,
             seconds_since_poll: context.seconds_since_poll,
@@ -84,10 +91,10 @@ impl ViewState {
         }
     }
 
-    /// Get the session key of the currently selected agent.
+    /// Get the agent ID of the currently selected agent.
     #[must_use]
     pub fn selected_key(&self) -> Option<&str> {
-        self.selected_agent_key.as_deref()
+        self.selected_agent_id.as_deref()
     }
 
     /// Check if there are any active agents.
@@ -155,6 +162,9 @@ impl Default for ViewContext {
 }
 
 /// Information about an agent for display.
+///
+/// Note: `active_view` and `is_scrolled` are per-client state.
+/// The caller provides these when constructing the display info.
 #[derive(Debug, Clone)]
 pub struct AgentDisplayInfo {
     /// Display label for the agent.
@@ -163,16 +173,25 @@ pub struct AgentDisplayInfo {
     pub tunnel_port: Option<u16>,
     /// Whether the server is running.
     pub server_running: bool,
-    /// Which PTY view is active.
-    pub active_view: crate::agent::PtyView,
-    /// Whether the agent is scrolled up.
+    /// Which PTY view is being displayed (client's current view).
+    pub active_view: PtyView,
+    /// Whether the view is scrolled up (client's scroll state).
     pub is_scrolled: bool,
 }
 
 impl AgentDisplayInfo {
-    /// Create display info from an agent.
+    /// Create display info from an agent for a specific view.
+    ///
+    /// # Arguments
+    ///
+    /// * `agent` - The agent to extract info from
+    /// * `view` - Which PTY view the client is currently viewing
+    /// * `is_scrolled` - Whether the client's parser is scrolled (caller tracks this)
+    ///
+    /// The `view` and `is_scrolled` parameters are required because they are per-client state,
+    /// not agent state. The caller (TuiRunner/TuiClient) knows its own view and scroll state.
     #[must_use]
-    pub fn from_agent(agent: &crate::agent::Agent) -> Self {
+    pub fn from_agent(agent: &crate::agent::Agent, view: PtyView, is_scrolled: bool) -> Self {
         let label = if let Some(issue_num) = agent.issue_number {
             format!("{}#{}", agent.repo, issue_num)
         } else {
@@ -183,8 +202,8 @@ impl AgentDisplayInfo {
             label,
             tunnel_port: agent.tunnel_port,
             server_running: agent.is_server_running(),
-            active_view: agent.active_pty,
-            is_scrolled: agent.is_scrolled(),
+            active_view: view,
+            is_scrolled,
         }
     }
 
@@ -225,7 +244,7 @@ pub fn format_tunnel_status(status: TunnelStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{Agent, PtyView};
+    use crate::agent::Agent;
     use std::path::PathBuf;
 
     #[test]
@@ -236,7 +255,7 @@ mod tests {
         let view_state = ViewState::from_hub(&hub_state, context);
 
         assert_eq!(view_state.agent_count, 0);
-        assert!(view_state.agent_keys.is_empty());
+        assert!(view_state.agent_ids.is_empty());
         assert!(!view_state.has_agents());
     }
 
@@ -284,11 +303,13 @@ mod tests {
             PathBuf::from("/tmp/worktree"),
         );
 
-        let info = AgentDisplayInfo::from_agent(&agent);
+        // Pass view and is_scrolled as parameters - caller tracks these
+        let info = AgentDisplayInfo::from_agent(&agent, PtyView::Cli, false);
         assert_eq!(info.label, "owner/repo#42");
         assert!(info.tunnel_port.is_none());
         assert!(!info.server_running);
         assert_eq!(info.active_view, PtyView::Cli);
+        assert!(!info.is_scrolled);
     }
 
     #[test]
@@ -301,8 +322,24 @@ mod tests {
             PathBuf::from("/tmp/worktree"),
         );
 
-        let info = AgentDisplayInfo::from_agent(&agent);
+        let info = AgentDisplayInfo::from_agent(&agent, PtyView::Cli, false);
         assert_eq!(info.label, "owner/repo/feature-branch");
+    }
+
+    #[test]
+    fn test_agent_display_info_server_view() {
+        let agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "owner/repo".to_string(),
+            Some(42),
+            "issue-42".to_string(),
+            PathBuf::from("/tmp/worktree"),
+        );
+
+        // Same agent, different view - demonstrates per-client view state
+        let info = AgentDisplayInfo::from_agent(&agent, PtyView::Server, true);
+        assert_eq!(info.active_view, PtyView::Server);
+        assert!(info.is_scrolled);
     }
 
     #[test]

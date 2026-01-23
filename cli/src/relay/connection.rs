@@ -28,17 +28,23 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use super::crypto_service::CryptoServiceHandle;
 use super::state::IdentifiedBrowserEvent;
 use super::types::{BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage};
-use crate::channel::{
-    ActionCableChannel, Channel, ChannelConfig, IncomingMessage, PeerId,
-};
+use crate::channel::{ActionCableChannel, Channel, ChannelConfig, IncomingMessage, PeerId};
 
 /// Output message for relay task.
+///
+/// Private to this module in production, but exposed for testing.
 #[derive(Debug)]
-enum OutputMessage {
+#[cfg_attr(test, derive(Clone))]
+pub(crate) enum OutputMessage {
     /// Broadcast to all connected browsers.
     Broadcast(String),
     /// Send to a specific browser by identity.
-    Targeted { identity: String, data: String },
+    Targeted {
+        /// Target browser identity.
+        identity: String,
+        /// Data to send.
+        data: String,
+    },
     /// Request to regenerate the PreKeyBundle with a fresh PreKey.
     RegenerateBundle,
 }
@@ -97,6 +103,36 @@ impl HubSender {
             .send(OutputMessage::RegenerateBundle)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to request bundle regeneration: {}", e))
+    }
+
+    /// Create a test sender with a receiver for capturing output.
+    ///
+    /// Returns the sender and a receiver that captures all sent messages as raw strings.
+    /// The sender is pre-configured as "connected".
+    ///
+    /// # Test Use Only
+    ///
+    /// This function is only available in test builds.
+    #[cfg(test)]
+    pub(crate) fn test_sender() -> (Self, mpsc::Receiver<OutputMessage>) {
+        let (tx, rx) = mpsc::channel(100);
+        let sender = Self {
+            tx,
+            connected: Arc::new(RwLock::new(true)),
+        };
+        (sender, rx)
+    }
+}
+
+/// Output message for relay task - test helpers.
+#[cfg(test)]
+impl OutputMessage {
+    /// Extract the identity and data if this is a targeted message.
+    pub(crate) fn as_targeted(&self) -> Option<(&str, &str)> {
+        match self {
+            OutputMessage::Targeted { identity, data } => Some((identity, data)),
+            _ => None,
+        }
     }
 }
 
@@ -327,7 +363,10 @@ impl HubRelay {
         };
 
         for identity in targets {
-            if let Err(e) = channel.send_to(&payload, &PeerId::from(identity.as_str())).await {
+            if let Err(e) = channel
+                .send_to(&payload, &PeerId::from(identity.as_str()))
+                .await
+            {
                 log::error!("Failed to send to {}: {}", identity, e);
             }
         }
@@ -361,7 +400,11 @@ impl HubRelay {
         }
 
         // Parse command from payload
-        log::debug!("Received message from peer {} ({} bytes)", sender_identity, msg.payload.len());
+        log::debug!(
+            "Received message from peer {} ({} bytes)",
+            sender_identity,
+            msg.payload.len()
+        );
         let cmd: BrowserCommand = match serde_json::from_slice(&msg.payload) {
             Ok(c) => {
                 log::debug!("Parsed command: {:?}", c);
@@ -431,8 +474,9 @@ impl HubRelay {
 
                 match crypto_service.get_prekey_bundle(2).await {
                     Ok(bundle) => {
-                        let bundle_bytes =
-                            bundle.to_binary().expect("PreKeyBundle binary serializable");
+                        let bundle_bytes = bundle
+                            .to_binary()
+                            .expect("PreKeyBundle binary serializable");
                         let bundle_encoded = BASE32_NOPAD.encode(&bundle_bytes);
                         let invite_url =
                             format!("{}/hubs/{}#{}", server_url, hub_identifier, bundle_encoded);

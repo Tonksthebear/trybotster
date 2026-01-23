@@ -103,8 +103,8 @@ fn test_multiple_agents_different_issues() {
         temp_dir.path().to_path_buf(),
     );
 
-    // Different issue numbers should have different session keys
-    assert_ne!(agent1.session_key(), agent2.session_key());
-    assert_eq!(agent1.session_key(), "owner-repo-1");
-    assert_eq!(agent2.session_key(), "owner-repo-2");
+    // Different issue numbers should have different agent IDs
+    assert_ne!(agent1.agent_id(), agent2.agent_id());
+    assert_eq!(agent1.agent_id(), "owner-repo-1");
+    assert_eq!(agent2.agent_id(), "owner-repo-2");
 }

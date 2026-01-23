@@ -104,12 +104,7 @@ pub fn poll_messages(config: &PollingConfig, repo_name: &str) -> Vec<MessageData
         config.server_url, config.server_hub_id, repo_name
     );
 
-    let response = match config
-        .client
-        .get(&url)
-        .bearer_auth(config.api_key)
-        .send()
-    {
+    let response = match config.client.get(&url).bearer_auth(config.api_key).send() {
         Ok(r) => r,
         Err(e) => {
             log::warn!("Failed to connect to server: {e}");
@@ -238,7 +233,10 @@ pub struct AgentNotificationPayload<'a> {
 /// Send an agent notification to Rails.
 ///
 /// Used when agents emit OSC notifications that should be forwarded.
-pub fn send_agent_notification(config: &PollingConfig, payload: &AgentNotificationPayload) -> Result<()> {
+pub fn send_agent_notification(
+    config: &PollingConfig,
+    payload: &AgentNotificationPayload,
+) -> Result<()> {
     let url = format!(
         "{}/hubs/{}/notifications",
         config.server_url, config.server_hub_id
@@ -317,10 +315,12 @@ pub fn send_heartbeat_if_due(hub: &mut Hub) {
     // Build agents list for heartbeat
     let agents: Vec<HeartbeatAgentInfo> = hub
         .state
+        .read()
+        .unwrap()
         .agents
         .values()
         .map(|agent| HeartbeatAgentInfo {
-            session_key: agent.session_key(),
+            session_key: agent.agent_id(),
             last_invocation_url: agent.last_invocation_url.clone(),
         })
         .collect();
@@ -346,7 +346,7 @@ pub fn poll_and_send_agent_notifications(hub: &mut Hub) {
     // Collect notifications
     let mut notifications: Vec<AgentNotificationData> = Vec::new();
 
-    for (session_key, agent) in &hub.state.agents {
+    for (session_key, agent) in &hub.state.read().unwrap().agents {
         for notification in agent.poll_notifications() {
             let notification_type = match &notification {
                 AgentNotification::Osc9(_) | AgentNotification::Osc777 { .. } => "question_asked",
@@ -375,7 +375,9 @@ pub fn poll_and_send_agent_notifications(hub: &mut Hub) {
         if notif.issue_number.is_some() || notif.invocation_url.is_some() {
             log::info!(
                 "Agent {} sent notification: {} (url: {:?})",
-                notif.session_key, notif.notification_type, notif.invocation_url
+                notif.session_key,
+                notif.notification_type,
+                notif.invocation_url
             );
 
             let payload = AgentNotificationPayload {

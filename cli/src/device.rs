@@ -113,8 +113,8 @@ impl Device {
                 if let Ok(custom_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
                     // Explicit override via env var
                     PathBuf::from(custom_dir)
-                } else if crate::env::is_test_mode() {
-                    // Integration tests (BOTSTER_ENV=test): use repo's tmp/ directory
+                } else if crate::env::should_skip_keyring() {
+                    // Integration/system tests (BOTSTER_ENV=test or system_test): use repo's tmp/ directory
                     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .parent()
                         .expect("cli/ has parent directory")
@@ -148,8 +148,7 @@ impl Device {
 
     /// Load signing secret key from consolidated credentials.
     fn load_signing_key(fingerprint: &str) -> Result<SigningKey> {
-        let creds = Credentials::load()
-            .context("Failed to load credentials")?;
+        let creds = Credentials::load().context("Failed to load credentials")?;
 
         // Verify fingerprint matches
         if !creds.signing_key_matches_fingerprint(fingerprint) {
@@ -160,7 +159,8 @@ impl Device {
             );
         }
 
-        let secret_b64 = creds.signing_key()
+        let secret_b64 = creds
+            .signing_key()
             .context("Signing key not found in credentials")?;
 
         let secret_bytes = BASE64
