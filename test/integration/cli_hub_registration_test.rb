@@ -73,12 +73,9 @@ class CliHubRegistrationTest < CliIntegrationTestCase
 
     assert cli.running?, "CLI should be running initially"
 
-    # Stop CLI
+    # Stop CLI (waits for process exit internally)
     stop_cli(cli)
     @started_clis.delete(cli)
-
-    # Give it a moment
-    sleep 0.5
 
     refute cli.running?, "CLI should not be running after stop"
   end

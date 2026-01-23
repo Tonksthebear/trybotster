@@ -146,11 +146,7 @@ fn notify_server_of_reset() {
         .build()
         .unwrap_or_else(|_| reqwest::blocking::Client::new());
 
-    match client
-        .delete(&url)
-        .bearer_auth(config.get_api_key())
-        .send()
-    {
+    match client.delete(&url).bearer_auth(config.get_api_key()).send() {
         Ok(response) if response.status().is_success() => {
             println!("  ✓ Notified server (device removed)");
         }
@@ -163,7 +159,10 @@ fn notify_server_of_reset() {
         }
         Err(e) => {
             // Network error, server unreachable, etc.
-            println!("  - Could not reach server ({}), continuing with local cleanup", e);
+            println!(
+                "  - Could not reach server ({}), continuing with local cleanup",
+                e
+            );
         }
     }
 }

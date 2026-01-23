@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tokio_tungstenite::{connect_async, tungstenite::Message, tungstenite::client::IntoClientRequest};
+use tokio_tungstenite::{
+    connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message,
+};
 
 /// Tunnel connection status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +120,10 @@ impl TunnelManager {
         }) {
             warn!("[Tunnel] Failed to queue agent registration: {}", e);
         } else {
-            debug!("[Tunnel] Queued registration for agent {} on port {}", session_key, port);
+            debug!(
+                "[Tunnel] Queued registration for agent {} on port {}",
+                session_key, port
+            );
         }
     }
 
@@ -155,7 +160,10 @@ impl TunnelManager {
         // Set Origin header (required by ActionCable)
         // No fallback - invalid server_url should fail explicitly
         let origin_header = self.server_url.parse().map_err(|e| {
-            error!("[Tunnel] Invalid server URL '{}' cannot be used as Origin header: {}", self.server_url, e);
+            error!(
+                "[Tunnel] Invalid server URL '{}' cannot be used as Origin header: {}",
+                self.server_url, e
+            );
             anyhow::anyhow!("Invalid server URL: {}", e)
         })?;
         request.headers_mut().insert("Origin", origin_header);
@@ -163,7 +171,9 @@ impl TunnelManager {
         // Set Authorization header with bearer token (Fizzy pattern)
         request.headers_mut().insert(
             "Authorization",
-            format!("Bearer {}", self.api_key).parse().expect("Bearer token is valid"),
+            format!("Bearer {}", self.api_key)
+                .parse()
+                .expect("Bearer token is valid"),
         );
 
         let (ws_stream, _) = match connect_async(request).await {
@@ -188,11 +198,12 @@ impl TunnelManager {
             }).to_string()
         });
         info!("[Tunnel] Sending subscribe message: {}", subscribe_msg);
-        write
-            .send(Message::Text(subscribe_msg.to_string()))
-            .await?;
+        write.send(Message::Text(subscribe_msg.to_string())).await?;
 
-        info!("[Tunnel] Subscribe sent, entering message loop for hub {}", self.hub_identifier);
+        info!(
+            "[Tunnel] Subscribe sent, entering message loop for hub {}",
+            self.hub_identifier
+        );
 
         // Handle incoming HTTP request messages and pending registrations
         loop {
@@ -287,7 +298,10 @@ impl TunnelManager {
                     // Send all existing registered agents to Rails
                     let ports = self.agent_ports.lock().await;
                     for (session_key, port) in ports.iter() {
-                        info!("[Tunnel] Registering existing agent {} on port {}", session_key, port);
+                        info!(
+                            "[Tunnel] Registering existing agent {} on port {}",
+                            session_key, port
+                        );
                         if let Err(e) = self.notify_agent_tunnel(write, session_key, *port).await {
                             warn!("[Tunnel] Failed to notify agent tunnel: {}", e);
                         }
@@ -358,9 +372,7 @@ impl TunnelManager {
                     }).to_string()
                 });
 
-                write
-                    .send(Message::Text(response_msg.to_string()))
-                    .await?;
+                write.send(Message::Text(response_msg.to_string())).await?;
             }
         }
 
@@ -392,9 +404,7 @@ impl TunnelManager {
                 "content_type": "text/plain"
             }).to_string()
         });
-        write
-            .send(Message::Text(response_msg.to_string()))
-            .await?;
+        write.send(Message::Text(response_msg.to_string())).await?;
         Ok(())
     }
 

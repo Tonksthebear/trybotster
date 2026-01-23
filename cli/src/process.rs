@@ -77,7 +77,8 @@ pub fn kill_orphaned_processes(worktree_path: &Path) {
 
     log::debug!(
         "[orphan-cleanup] Our PID: {}, Parent PID: {:?}",
-        our_pid, our_ppid
+        our_pid,
+        our_ppid
     );
 
     let pids_to_kill = find_processes_in_directory(worktree_path, our_pid, our_ppid);
@@ -129,9 +130,7 @@ fn find_processes_in_directory(
                 } else if let Some(cwd) = line.strip_prefix('n') {
                     if let Some(pid) = current_pid {
                         // Check if CWD matches our worktree
-                        if cwd == worktree_str
-                            || cwd.starts_with(&format!("{}/", worktree_str))
-                        {
+                        if cwd == worktree_str || cwd.starts_with(&format!("{}/", worktree_str)) {
                             // Skip our own process and parent
                             if pid == exclude_pid {
                                 log::debug!("[orphan-cleanup] Skipping own PID {}", pid);
@@ -140,7 +139,8 @@ fn find_processes_in_directory(
                             } else {
                                 log::debug!(
                                     "[orphan-cleanup] Found orphan PID {} (CWD: {})",
-                                    pid, cwd
+                                    pid,
+                                    cwd
                                 );
                                 pids_to_kill.push(pid);
                             }
@@ -171,7 +171,8 @@ fn find_processes_in_directory(
                         {
                             log::debug!(
                                 "[orphan-cleanup] Found orphan PID {} (CWD: {})",
-                                pid, cwd_str
+                                pid,
+                                cwd_str
                             );
                             pids_to_kill.push(pid);
                         }

@@ -79,7 +79,12 @@ impl NotificationSender {
     /// * `server_url` - Base URL of the Rails server
     /// * `api_key` - API key for authentication
     /// * `hub_identifier` - Hub identifier for routing notifications
-    pub fn new(client: Client, server_url: String, api_key: String, hub_identifier: String) -> Self {
+    pub fn new(
+        client: Client,
+        server_url: String,
+        api_key: String,
+        hub_identifier: String,
+    ) -> Self {
         Self {
             client,
             server_url,
@@ -186,7 +191,10 @@ mod tests {
 
     #[test]
     fn test_notification_type_equality() {
-        assert_eq!(NotificationType::QuestionAsked, NotificationType::QuestionAsked);
+        assert_eq!(
+            NotificationType::QuestionAsked,
+            NotificationType::QuestionAsked
+        );
     }
 
     #[test]

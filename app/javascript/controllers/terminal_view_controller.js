@@ -25,7 +25,6 @@ export default class extends Controller {
     hasServerPty: { type: Boolean, default: false },
     tunnelConnected: { type: Boolean, default: false },
     tunnelPort: { type: Number, default: 0 },
-    agentSessionKey: String,
   };
 
   connect() {
@@ -77,14 +76,12 @@ export default class extends Controller {
       this.hasServerPtyValue = agent.has_server_pty || false;
       this.tunnelConnectedValue = agent.tunnel_connected || agent.tunnel_status === "connected";
       this.tunnelPortValue = agent.tunnel_port || 0;
-      this.agentSessionKeyValue = agent.session_key || agent.id || "";
       // Don't override ptyIndex from agent data - it's managed by connection
     } else {
       // No agent selected
       this.hasServerPtyValue = false;
       this.tunnelConnectedValue = false;
       this.tunnelPortValue = 0;
-      this.agentSessionKeyValue = "";
       this.ptyIndexValue = 0;
     }
 
@@ -169,8 +166,17 @@ export default class extends Controller {
   #updatePreviewLink() {
     if (!this.hasPreviewLinkTarget) return;
 
-    if (this.tunnelConnectedValue && this.hubIdValue && this.agentSessionKeyValue) {
-      const previewUrl = `/preview/${this.hubIdValue}/${this.agentSessionKeyValue}`;
+    // Preview is available when tunnel is connected and we have agent info
+    // URL format: /hubs/:hub_id/agents/:agent_index/:pty_index/preview
+    // Server PTY with port forwarding is typically pty_index 1
+    if (this.tunnelConnectedValue && this.hubIdValue) {
+      // Get agent index from connection outlet if available
+      const agentIndex = this.hasConnectionOutlet
+        ? this.connectionOutlet.getCurrentAgentIndex()
+        : 0;
+      // Server PTY is index 1 (CLI is index 0)
+      const ptyIndex = 1;
+      const previewUrl = `/hubs/${this.hubIdValue}/agents/${agentIndex}/${ptyIndex}/preview`;
       this.previewLinkTarget.href = previewUrl;
       this.previewLinkTarget.classList.remove("hidden");
     } else if (this.tunnelPortValue > 0) {

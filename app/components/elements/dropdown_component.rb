@@ -14,7 +14,10 @@ module Elements
     end
 
     def before_render
-      @options[:class] = class_names(@options[:class], "inline-block")
+      # Only add inline-block if no block-level display class was passed
+      unless @options[:class].to_s.match?(/\bblock\b/)
+        @options[:class] = class_names(@options[:class], "inline-block")
+      end
     end
 
     def menu_classes

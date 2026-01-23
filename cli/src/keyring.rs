@@ -22,7 +22,12 @@ const KEYRING_SERVICE: &str = "botster";
 /// Consolidated keyring entry name.
 const KEYRING_CREDENTIALS: &str = "credentials";
 
-/// Check if keyring should be skipped (test mode).
+/// Check if keyring should be skipped (any test mode).
+///
+/// Uses multiple checks to ensure keyring is never accessed during tests:
+/// 1. `#[cfg(test)]` - Always skip during Rust unit tests
+/// 2. Direct env var check - Fallback if env module detection fails
+/// 3. `crate::env::should_skip_keyring()` - Standard environment detection
 fn should_skip_keyring() -> bool {
     #[cfg(test)]
     {
@@ -31,7 +36,17 @@ fn should_skip_keyring() -> bool {
 
     #[cfg(not(test))]
     {
-        crate::env::is_test_mode()
+        // Direct env var check as a safety fallback.
+        // This catches cases where BOTSTER_ENV is set but env detection
+        // might fail or be called before module initialization.
+        if let Ok(env_val) = std::env::var("BOTSTER_ENV") {
+            if env_val == "test" || env_val == "system_test" {
+                return true;
+            }
+        }
+
+        // Standard environment detection
+        crate::env::should_skip_keyring()
     }
 }
 

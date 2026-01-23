@@ -77,7 +77,10 @@ fn ensure_authenticated() -> Result<()> {
 }
 
 /// Save both hub and MCP tokens from auth response.
-fn save_tokens(config: &mut Config, token_response: &botster_hub::auth::TokenResponse) -> Result<()> {
+fn save_tokens(
+    config: &mut Config,
+    token_response: &botster_hub::auth::TokenResponse,
+) -> Result<()> {
     use botster_hub::keyring::Credentials;
 
     // Save hub token via config (which updates Credentials internally)
@@ -107,15 +110,15 @@ fn run_headless() -> Result<()> {
     ensure_authenticated()?;
 
     // Set up signal handlers
-    use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGHUP};
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::flag;
     flag::register(SIGINT, Arc::clone(&SHUTDOWN_FLAG))?;
     flag::register(SIGTERM, Arc::clone(&SHUTDOWN_FLAG))?;
     flag::register(SIGHUP, Arc::clone(&SHUTDOWN_FLAG))?;
 
-    // Create Hub with default terminal size (not used in headless)
+    // Create Hub with default terminal size (80x24 for headless)
     let config = Config::load()?;
-    let mut hub = Hub::new(config, (24, 80))?;
+    let mut hub = Hub::new(config, (80, 24))?;
 
     println!("Setting up connections...");
     hub.setup();
@@ -136,14 +139,9 @@ fn run_headless() -> Result<()> {
             log::error!("Failed to process browser events: {}", e);
         }
 
-        // Drain browser input from agent channels and route to PTY
-        botster_hub::relay::drain_and_route_browser_input(&mut hub);
-
-        // Drain PTY output from all agents and route to viewing clients
-        botster_hub::relay::drain_and_route_pty_output(&mut hub);
-
-        // Flush client output buffers
-        hub.flush_all_clients();
+        // Poll pending agents and progress
+        hub.poll_pending_agents();
+        hub.poll_progress_events();
 
         // Sleep to avoid busy-looping (100ms = 10 ticks/sec is plenty for headless)
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -155,29 +153,28 @@ fn run_headless() -> Result<()> {
     Ok(())
 }
 
-/// Run the hub using the Hub architecture.
+/// Run the hub using the Hub architecture with TUI.
 ///
-/// This sets up the terminal and delegates to Hub::run() for the event loop.
-fn run_with_hub() -> Result<()> {
+/// This sets up the terminal and delegates to tui::run_with_hub() for the event loop.
+/// The TUI module now owns TuiRunner instantiation, maintaining proper layer separation
+/// (Hub should not know about TUI implementation details).
+fn run_with_tui() -> Result<()> {
     // Ensure we have a valid authentication token
     ensure_authenticated()?;
 
     // Set up signal handlers
-    use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGHUP};
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::flag;
     flag::register(SIGINT, Arc::clone(&SHUTDOWN_FLAG))?;
     flag::register(SIGTERM, Arc::clone(&SHUTDOWN_FLAG))?;
     flag::register(SIGHUP, Arc::clone(&SHUTDOWN_FLAG))?;
 
-    // Get terminal size BEFORE entering raw mode (in case of errors)
-    // Use the layout helper to calculate the actual terminal widget inner area
-    let (cols, rows) = crossterm::terminal::size()?;
-    let (inner_rows, inner_cols) = tui::terminal_widget_inner_area(cols, rows);
-
     // Create Hub BEFORE entering raw mode so errors are visible
     println!("Initializing hub...");
     let config = Config::load()?;
-    let mut hub = Hub::new(config, (inner_rows, inner_cols))?;
+    // Get terminal size for Hub initialization
+    let terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut hub = Hub::new(config, terminal_size)?;
 
     // Perform setup BEFORE entering raw mode so errors are visible
     println!("Setting up connections...");
@@ -192,12 +189,12 @@ fn run_with_hub() -> Result<()> {
     let _terminal_guard = tui::TerminalGuard::new();
 
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let terminal = Terminal::new(backend)?;
 
-    log::info!("Botster Hub v{} started with Hub architecture", VERSION);
+    log::info!("Botster Hub v{} started with TUI", VERSION);
 
-    // Run the event loop - Hub owns this now
-    hub.run(&mut terminal, &SHUTDOWN_FLAG)?;
+    // Run the event loop - TUI module now owns TuiRunner instantiation
+    tui::run_with_hub(&mut hub, terminal, &*SHUTDOWN_FLAG)?;
 
     // Shutdown
     hub.shutdown();
@@ -288,6 +285,12 @@ fn main() -> Result<()> {
         std::path::PathBuf::from(path)
     } else if let Ok(config_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
         std::path::PathBuf::from(config_dir).join("botster-hub.log")
+    } else if botster_hub::env::is_any_test() {
+        // Test mode: use project tmp/ to avoid leaking outside the project
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.join("tmp/botster-hub.log"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/botster-hub.log"))
     } else {
         std::path::PathBuf::from("/tmp/botster-hub.log")
     };
@@ -324,8 +327,8 @@ fn main() -> Result<()> {
             if headless {
                 run_headless()?;
             } else {
-                // Use the new Hub-based architecture
-                run_with_hub()?;
+                // Use the TUI-based architecture (proper layer separation)
+                run_with_tui()?;
             }
         }
         Commands::Status => {
@@ -372,7 +375,10 @@ fn main() -> Result<()> {
                     println!("{}", url);
                 }
                 None => {
-                    eprintln!("No connection URL found for hub '{}'. Is the CLI running?", hub);
+                    eprintln!(
+                        "No connection URL found for hub '{}'. Is the CLI running?",
+                        hub
+                    );
                     std::process::exit(1);
                 }
             }
@@ -402,7 +408,10 @@ mod tests {
             message_id: None,
             invocation_url: Some("https://github.com/owner/repo/issues/42".to_string()),
         };
-        assert_eq!(config.invocation_url, Some("https://github.com/owner/repo/issues/42".to_string()));
+        assert_eq!(
+            config.invocation_url,
+            Some("https://github.com/owner/repo/issues/42".to_string())
+        );
     }
 
     #[test]

@@ -1,67 +1,66 @@
-//! PTY session management with integrated channel ownership.
+//! PTY session management with event-driven broadcasting.
 //!
-//! This module provides pseudo-terminal (PTY) session handling where each PTY
-//! owns its communication channel. This architecture ensures channel lifecycle
-//! is tied to PTY lifecycle - when a PTY dies, its channel dies with it.
+//! This module provides pseudo-terminal (PTY) session handling with a pub/sub
+//! architecture. PTY sessions broadcast events to connected clients, and each
+//! client maintains its own terminal state (vt100 parser, etc.).
 //!
 //! # Architecture
 //!
 //! ```text
-//! Agent (container)
-//!  └── cli_pty: PtySession
-//!  └── server_pty: Option<PtySession>
-//!
-//! PtySession (owns I/O and channel)
+//! PtySession (owns I/O, broadcasts events)
 //!  ├── master_pty: MasterPty (for resizing)
 //!  ├── writer: Write (for input)
-//!  ├── vt100_parser: Parser (terminal emulation)
-//!  ├── scrollback_buffer: VecDeque<u8> (raw byte history)
-//!  ├── raw_output_queue: VecDeque<Vec<u8>> (pending output)
-//!  └── channel: Option<ActionCableChannel> (encrypted relay)
+//!  ├── reader_thread: JoinHandle (PTY output reader)
+//!  ├── child: Child (spawned process)
+//!  ├── scrollback_buffer: Arc<Mutex<VecDeque<u8>>> (raw byte history)
+//!  ├── event_tx: broadcast::Sender<PtyEvent> (output broadcast)
+//!  ├── connected_clients: Vec<ConnectedClient> (client tracking)
+//!  └── notification_tx: Sender<AgentNotification> (agent notifications)
 //! ```
 //!
-//! # Channel Ownership
+//! # Event Broadcasting
 //!
-//! Each PTY session owns its terminal relay channel:
-//! - CLI PTY (pty_index=0) owns the CLI terminal channel
-//! - Server PTY (pty_index=1) owns the Server terminal channel
+//! PTY sessions emit [`PtyEvent`]s to all subscribers via a broadcast channel:
+//! - [`PtyEvent::Output`] - Raw terminal output bytes
+//! - [`PtyEvent::Resized`] - PTY dimensions changed
+//! - [`PtyEvent::ProcessExited`] - Process terminated
+//! - [`PtyEvent::OwnerChanged`] - Size ownership transferred
 //!
-//! The channel handles:
-//! - **Output broadcast**: PTY output is encrypted and sent to all connected browsers
-//! - **Input routing**: Browser input is decrypted and written to the PTY
+//! # Client Connection
 //!
-//! # Usage
+//! Clients connect with their terminal dimensions. The newest client becomes
+//! the "size owner" whose dimensions are applied to the PTY:
 //!
 //! ```ignore
-//! // Create PTY session
-//! let mut session = PtySession::new(24, 80);
+//! // Client connects and receives a subscription
+//! let rx = pty.connect(ClientId::Tui, (80, 24));
 //!
-//! // Spawn a process
-//! session.spawn("bash", &env)?;
+//! // Receive events
+//! match rx.recv().await {
+//!     Ok(PtyEvent::Output(data)) => handle_output(&data),
+//!     Ok(PtyEvent::Resized { rows, cols }) => resize_display(rows, cols),
+//!     // ...
+//! }
 //!
-//! // Connect channel (typically done by Hub after spawn)
-//! session.connect_channel(channel_config, crypto_service).await?;
-//!
-//! // Write input (from browser or keyboard)
-//! session.write_input(b"ls -la\n")?;
-//!
-//! // Drain and broadcast output
-//! let output = session.drain_raw_output();
-//! session.broadcast_output(&output).await?;
+//! // Client disconnects
+//! pty.disconnect(ClientId::Tui);
 //! ```
 //!
 //! # Thread Safety
 //!
-//! The VT100 parser, scrollback buffer, and raw output queue are wrapped in
-//! `Arc<Mutex<>>` to allow concurrent reads from the PTY reader thread and
-//! writes from the main thread.
+//! The scrollback buffer is wrapped in `Arc<Mutex<>>` to allow concurrent
+//! reads from the PTY reader thread and writes from the main thread.
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-01
 
 pub mod cli;
+pub mod connected_client;
+pub mod events;
 pub mod server;
 
 pub use cli::{spawn_cli_pty, CliSpawnResult};
+pub use connected_client::ConnectedClient;
+pub use events::PtyEvent;
 pub use server::spawn_server_pty;
 
 use anyhow::Result;
@@ -72,37 +71,16 @@ use std::{
     sync::{mpsc::Sender, Arc, Mutex},
     thread,
 };
-use vt100::Parser;
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 
-use crate::channel::{ActionCableChannel, Channel, ChannelConfig, ChannelError};
-use crate::relay::crypto_service::CryptoServiceHandle;
+use crate::client::ClientId;
+use crate::hub::agent_handle::PtyCommand;
 
 use super::notification::AgentNotification;
-use super::screen;
 
-/// Resize a PTY session with screen clearing if dimensions changed.
-///
-/// Clears the VT100 screen before resizing to prevent content from being stuck
-/// at old dimensions. This is necessary because terminal emulators don't
-/// automatically reflow content.
-pub fn resize_with_clear(pty: &PtySession, rows: u16, cols: u16, label: &str) {
-    let needs_clear = {
-        let parser = pty.vt100_parser.lock().expect("parser lock poisoned");
-        let (current_rows, current_cols) = parser.screen().size();
-        current_rows != rows || current_cols != cols
-    };
-
-    if needs_clear {
-        log::info!("{label} PTY resize: clearing screen and setting {cols}x{rows}");
-        let mut parser = pty.vt100_parser.lock().expect("parser lock poisoned");
-        // Reset attributes, clear screen, clear scrollback, move cursor home
-        parser.process(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
-        parser.screen_mut().set_scrollback(0);
-        parser.screen_mut().set_size(rows, cols);
-    }
-
-    pty.resize(rows, cols);
-}
+/// Default channel capacity for PTY command channels.
+const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
 
 /// Maximum bytes to keep in scrollback buffer.
 ///
@@ -110,6 +88,12 @@ pub fn resize_with_clear(pty: &PtySession, rows: u16, cols: u16, label: &str) {
 /// Based on typical agent session output rates, this provides
 /// several hours of scrollback.
 pub const MAX_SCROLLBACK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Default broadcast channel capacity.
+///
+/// This determines how many events can be buffered before slow receivers
+/// start missing events. Set high enough to handle bursts of output.
+const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
 
 /// PTY index constants for channel routing.
 pub mod pty_index {
@@ -119,59 +103,133 @@ pub mod pty_index {
     pub const SERVER: usize = 1;
 }
 
+/// Shared mutable state for PTY command processing.
+///
+/// This struct holds state that needs concurrent access from both the
+/// command processor task and the main `PtySession`. All fields are
+/// wrapped in the outer `Mutex` of `PtySession::shared_state`.
+struct SharedPtyState {
+    /// Master PTY for resizing operations.
+    master_pty: Option<Box<dyn MasterPty + Send>>,
+
+    /// Writer for sending input to the PTY.
+    writer: Option<Box<dyn Write + Send>>,
+
+    /// Current PTY dimensions (rows, cols).
+    dimensions: (u16, u16),
+
+    /// Connected clients with their terminal dimensions.
+    connected_clients: Vec<ConnectedClient>,
+}
+
+impl std::fmt::Debug for SharedPtyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedPtyState")
+            .field("has_master_pty", &self.master_pty.is_some())
+            .field("has_writer", &self.writer.is_some())
+            .field("dimensions", &self.dimensions)
+            .field("connected_clients", &self.connected_clients.len())
+            .finish()
+    }
+}
+
 /// Encapsulates all state for a single PTY session.
 ///
 /// Each PTY session manages:
 /// - A pseudo-terminal for process I/O
-/// - A VT100 parser for terminal emulation
 /// - A raw byte scrollback buffer for history replay
-/// - An optional encrypted ActionCable channel for browser communication
+/// - A broadcast channel for event distribution to clients
+/// - A list of connected clients with their dimensions
 ///
-/// # Channel Ownership
+/// # Event Broadcasting
 ///
-/// The PTY owns its channel, ensuring lifecycle alignment. When the PTY is
-/// dropped, its channel is automatically disconnected and cleaned up.
+/// Output and lifecycle events are broadcast to all connected clients via
+/// [`PtyEvent`]. Clients subscribe via [`subscribe()`](Self::subscribe) or
+/// [`connect()`](Self::connect).
+///
+/// # Terminal Emulation
+///
+/// PtySession does NOT own a vt100 parser. It emits raw bytes via broadcast.
+/// Clients (TuiClient, TuiRunner) own their own parsers and feed bytes in
+/// their `on_output()` handlers. This keeps PtySession as pure I/O.
+///
+/// # Size Ownership
+///
+/// The newest connected client is the "size owner" - their terminal dimensions
+/// are applied to the PTY. When they disconnect, ownership passes to the next
+/// most recent client.
+///
+/// # Command Processing
+///
+/// After spawning, call [`spawn_command_processor()`](Self::spawn_command_processor)
+/// to start the background task that processes commands from `PtyHandle` clients.
+/// The processor handles Input, Resize, Connect, and Disconnect commands.
 ///
 /// # Thread Safety
 ///
-/// The VT100 parser, scrollback buffer, and raw output queue are wrapped in
-/// `Arc<Mutex<>>` to allow concurrent reads from the PTY reader thread and
-/// writes from the main thread.
+/// The scrollback buffer and shared state are wrapped in `Arc<Mutex<>>` to allow
+/// concurrent access from the PTY reader thread, command processor task, and main
+/// event loop.
 pub struct PtySession {
-    /// Master PTY for resizing.
-    pub master_pty: Option<Box<dyn MasterPty + Send>>,
-    /// Writer for sending input to the PTY.
-    pub writer: Option<Box<dyn Write + Send>>,
+    /// Shared mutable state accessed by the command processor task.
+    ///
+    /// Contains: master_pty, writer, dimensions, connected_clients.
+    shared_state: Arc<Mutex<SharedPtyState>>,
+
     /// Reader thread handle.
     pub reader_thread: Option<thread::JoinHandle<()>>,
-    /// VT100 terminal emulator with scrollback.
-    pub vt100_parser: Arc<Mutex<Parser>>,
-    /// Raw byte scrollback buffer for history replay.
-    /// Stores raw PTY output so xterm.js can interpret escape sequences correctly.
-    pub scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
-    /// Raw output queue for streaming to browser (GUI mode).
-    /// Reader thread pushes raw PTY bytes here; browser output drains it.
-    pub raw_output_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    /// Channel for sending detected notifications.
-    pub notification_tx: Option<Sender<AgentNotification>>,
+
+    /// Command processor task handle.
+    command_processor_handle: Option<JoinHandle<()>>,
+
     /// Child process handle - stored so we can kill it on drop.
     child: Option<Box<dyn Child + Send>>,
 
-    // === Channel ownership ===
-    /// Encrypted terminal relay channel.
+    /// Raw byte scrollback buffer for history replay.
     ///
-    /// The PTY owns its channel for output broadcast and input routing.
-    /// Connected after spawn via `connect_channel()`.
-    pub channel: Option<ActionCableChannel>,
+    /// Stores raw PTY output so xterm.js can interpret escape sequences correctly.
+    /// Clients can request a snapshot for session replay.
+    pub scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
+
+    /// Broadcast sender for PTY events.
+    ///
+    /// All output and lifecycle events are broadcast through this channel.
+    /// Clients receive events by subscribing to this sender.
+    event_tx: broadcast::Sender<PtyEvent>,
+
+    /// Command sender for PTY operations.
+    ///
+    /// Clients send commands (input, resize, connect, disconnect) through this
+    /// channel. The receiver is consumed by the command processor task.
+    command_tx: mpsc::Sender<PtyCommand>,
+
+    /// Command receiver for PTY operations.
+    ///
+    /// Taken by [`spawn_command_processor()`](Self::spawn_command_processor)
+    /// to be processed in a background task.
+    command_rx: Option<mpsc::Receiver<PtyCommand>>,
+
+    /// Channel for sending detected notifications.
+    pub notification_tx: Option<Sender<AgentNotification>>,
 }
 
 impl std::fmt::Debug for PtySession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self
+            .shared_state
+            .lock()
+            .expect("shared_state lock poisoned");
         f.debug_struct("PtySession")
-            .field("has_master_pty", &self.master_pty.is_some())
-            .field("has_writer", &self.writer.is_some())
+            .field("has_master_pty", &state.master_pty.is_some())
+            .field("has_writer", &state.writer.is_some())
             .field("has_reader_thread", &self.reader_thread.is_some())
-            .field("has_channel", &self.channel.is_some())
+            .field("has_child", &self.child.is_some())
+            .field("connected_clients", &state.connected_clients.len())
+            .field("has_notification_tx", &self.notification_tx.is_some())
+            .field(
+                "has_command_processor",
+                &self.command_processor_handle.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -179,101 +237,383 @@ impl std::fmt::Debug for PtySession {
 impl PtySession {
     /// Creates a new PTY session with the specified dimensions.
     ///
-    /// The VT100 parser is initialized with scrollback enabled.
-    /// The channel is initially None - call `connect_channel()` after spawn.
+    /// The broadcast channel is initialized with sufficient capacity for
+    /// burst output. No clients are connected initially.
     #[must_use]
     pub fn new(rows: u16, cols: u16) -> Self {
-        // Use a reasonable scrollback for the vt100 parser (current screen state)
-        let parser = Parser::new(rows, cols, 1000);
-        Self {
+        let (event_tx, _) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+        let (command_tx, command_rx) = mpsc::channel(PTY_COMMAND_CHANNEL_CAPACITY);
+
+        let shared_state = SharedPtyState {
             master_pty: None,
             writer: None,
+            dimensions: (rows, cols),
+            connected_clients: Vec::new(),
+        };
+
+        Self {
+            shared_state: Arc::new(Mutex::new(shared_state)),
             reader_thread: None,
-            vt100_parser: Arc::new(Mutex::new(parser)),
-            scrollback_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_SCROLLBACK_BYTES))),
-            raw_output_queue: Arc::new(Mutex::new(VecDeque::new())),
-            notification_tx: None,
+            command_processor_handle: None,
             child: None,
-            channel: None,
+            scrollback_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_SCROLLBACK_BYTES))),
+            event_tx,
+            command_tx,
+            command_rx: Some(command_rx),
+            notification_tx: None,
+        }
+    }
+
+    /// Get the current PTY dimensions (rows, cols).
+    #[must_use]
+    pub fn dimensions(&self) -> (u16, u16) {
+        self.shared_state
+            .lock()
+            .expect("shared_state lock poisoned")
+            .dimensions
+    }
+
+    /// Set the master PTY handle.
+    ///
+    /// Called by spawn functions after creating the PTY.
+    pub fn set_master_pty(&mut self, master_pty: Box<dyn MasterPty + Send>) {
+        self.shared_state
+            .lock()
+            .expect("shared_state lock poisoned")
+            .master_pty = Some(master_pty);
+    }
+
+    /// Set the PTY writer.
+    ///
+    /// Called by spawn functions after creating the PTY.
+    pub fn set_writer(&mut self, writer: Box<dyn Write + Send>) {
+        self.shared_state
+            .lock()
+            .expect("shared_state lock poisoned")
+            .writer = Some(writer);
+    }
+
+    /// Get a clone of the shared state Arc for the command processor.
+    ///
+    /// Used internally by `spawn_command_processor()`.
+    fn shared_state_clone(&self) -> Arc<Mutex<SharedPtyState>> {
+        Arc::clone(&self.shared_state)
+    }
+
+    /// Get the event and command channel senders for this PTY.
+    ///
+    /// Returns a tuple of (event_tx, command_tx) that can be used to create
+    /// a `PtyHandle` for client access.
+    #[must_use]
+    pub fn get_channels(&self) -> (broadcast::Sender<PtyEvent>, mpsc::Sender<PtyCommand>) {
+        (self.event_tx.clone(), self.command_tx.clone())
+    }
+
+    /// Take the command receiver from this PTY session.
+    ///
+    /// This should be called once during setup to obtain the receiver for
+    /// processing commands in the event loop. Returns None if already taken.
+    pub fn take_command_receiver(&mut self) -> Option<mpsc::Receiver<PtyCommand>> {
+        self.command_rx.take()
+    }
+
+    /// Spawn the command processor task.
+    ///
+    /// This starts a background tokio task that processes commands from the
+    /// `command_rx` channel. The task handles:
+    /// - `PtyCommand::Input` - Writes data to the PTY
+    /// - `PtyCommand::Resize` - Resizes the PTY (if client is size owner)
+    /// - `PtyCommand::Connect` - Registers a new client
+    /// - `PtyCommand::Disconnect` - Removes a client
+    ///
+    /// The task runs until the command channel is closed (all senders dropped)
+    /// or the PTY session is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once (command receiver already taken).
+    pub fn spawn_command_processor(&mut self) {
+        let rx = self
+            .command_rx
+            .take()
+            .expect("Command receiver already taken - spawn_command_processor called twice?");
+
+        let shared_state = self.shared_state_clone();
+        let event_tx = self.event_sender();
+
+        let handle = tokio::spawn(async move {
+            run_command_processor(rx, shared_state, event_tx).await;
+        });
+
+        self.command_processor_handle = Some(handle);
+        log::debug!("PTY command processor spawned");
+    }
+
+    /// Process pending commands from clients (synchronous version).
+    ///
+    /// Call this in the event loop to handle commands sent via `PtyHandle`.
+    /// Returns the number of commands processed.
+    ///
+    /// NOTE: Prefer using `spawn_command_processor()` for async command
+    /// processing. This method is provided for backwards compatibility.
+    pub fn process_commands(&mut self) -> usize {
+        // Collect commands first to avoid borrow conflict with handle_command
+        let mut commands = Vec::new();
+
+        if let Some(ref mut rx) = self.command_rx {
+            // Drain up to 100 commands per tick
+            // Magic value: balances responsiveness with not blocking too long
+            for _ in 0..100 {
+                match rx.try_recv() {
+                    Ok(cmd) => commands.push(cmd),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        log::warn!("PTY command channel disconnected");
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Now process collected commands
+        let count = commands.len();
+        for cmd in commands {
+            self.handle_command(&cmd);
+        }
+        count
+    }
+
+    /// Handle a single PTY command.
+    fn handle_command(&self, cmd: &PtyCommand) {
+        match cmd {
+            PtyCommand::Input(data) => {
+                if let Err(e) = self.write_input(data) {
+                    log::error!("Failed to write PTY input: {}", e);
+                }
+            }
+            PtyCommand::Resize {
+                client_id,
+                rows,
+                cols,
+            } => {
+                self.client_resized(client_id.clone(), (*cols, *rows));
+            }
+            PtyCommand::Connect { client_id, dims } => {
+                let _ = self.connect(client_id.clone(), *dims);
+            }
+            PtyCommand::Disconnect { client_id } => {
+                self.disconnect(client_id.clone());
+            }
         }
     }
 
     // =========================================================================
-    // Channel Management
+    // Event Broadcasting
     // =========================================================================
 
-    /// Connect the PTY's terminal relay channel.
+    /// Subscribe to PTY events without registering as a client.
     ///
-    /// Creates an encrypted ActionCable channel for browser communication.
-    /// The channel broadcasts output and receives input from connected browsers.
+    /// Returns a broadcast receiver that will receive all future events.
+    /// Use this for passive listeners that don't need size ownership.
+    ///
+    /// For clients that need size tracking, use [`connect()`](Self::connect) instead.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<PtyEvent> {
+        self.event_tx.subscribe()
+    }
+
+    /// Broadcast an event to all subscribers.
+    ///
+    /// This is the primary method for emitting events. The reader thread
+    /// uses this to broadcast output, and lifecycle methods use it for
+    /// resize and ownership events.
+    ///
+    /// Returns the number of receivers that received the event.
+    pub fn broadcast(&self, event: PtyEvent) -> usize {
+        // Ignore send errors - they occur when there are no receivers,
+        // which is valid (no clients connected yet)
+        self.event_tx.send(event).unwrap_or(0)
+    }
+
+    /// Get a clone of the broadcast sender.
+    ///
+    /// Useful for passing to background tasks (like the reader thread)
+    /// that need to emit events.
+    #[must_use]
+    pub fn event_sender(&self) -> broadcast::Sender<PtyEvent> {
+        self.event_tx.clone()
+    }
+
+    // =========================================================================
+    // Client Connection
+    // =========================================================================
+
+    /// Connect a client and return a subscription.
+    ///
+    /// The client is registered with their terminal dimensions and receives
+    /// a broadcast receiver for PTY events. If this client becomes the size
+    /// owner (newest client), the PTY is resized to their dimensions.
     ///
     /// # Arguments
     ///
-    /// * `config` - Channel configuration (hub_id, agent_index, pty_index, etc.)
-    /// * `crypto_service` - Crypto service handle for Signal Protocol encryption
-    /// * `server_url` - Rails server URL
-    /// * `api_key` - API key for authentication
+    /// * `client_id` - Unique identifier for this client
+    /// * `dims` - Terminal dimensions as (cols, rows)
     ///
-    /// # Errors
+    /// # Returns
     ///
-    /// Returns an error if channel connection fails.
-    pub async fn connect_channel(
-        &mut self,
-        config: ChannelConfig,
-        crypto_service: CryptoServiceHandle,
-        server_url: &str,
-        api_key: &str,
-    ) -> Result<(), ChannelError> {
-        use crate::channel::ActionCableChannelBuilder;
+    /// A broadcast receiver for PTY events.
+    pub fn connect(&self, client_id: ClientId, dims: (u16, u16)) -> broadcast::Receiver<PtyEvent> {
+        {
+            let mut state = self
+                .shared_state
+                .lock()
+                .expect("shared_state lock poisoned");
 
-        let mut channel = ActionCableChannelBuilder::default()
-            .server_url(server_url)
-            .api_key(api_key)
-            .crypto_service(crypto_service)
-            .reliable(true)
-            .build();
+            // Remove any existing connection for this client (reconnect case)
+            state.connected_clients.retain(|c| c.id != client_id);
 
-        channel.connect(config).await?;
-        self.channel = Some(channel);
-        Ok(())
+            // Add the new client
+            let client = ConnectedClient::new(client_id.clone(), dims);
+            state.connected_clients.push(client);
+
+            // Sort by connection time - newest last
+            state.connected_clients.sort_by_key(|c| c.connected_at);
+        }
+
+        // New client is now the size owner - resize PTY to their dimensions
+        let (cols, rows) = dims;
+        self.resize(rows, cols);
+
+        // Broadcast owner changed event
+        self.broadcast(PtyEvent::owner_changed(Some(client_id)));
+
+        // Return a subscription
+        self.subscribe()
     }
 
-    /// Check if the channel is connected.
-    #[must_use]
-    pub fn has_channel(&self) -> bool {
-        self.channel.is_some()
+    /// Disconnect a client.
+    ///
+    /// Removes the client from the connected list. If this was the size owner,
+    /// ownership passes to the next most recent client (if any) and the PTY
+    /// is resized to their dimensions.
+    pub fn disconnect(&self, client_id: ClientId) {
+        let (was_owner, new_owner_info) = {
+            let mut state = self
+                .shared_state
+                .lock()
+                .expect("shared_state lock poisoned");
+
+            let was_owner = state
+                .connected_clients
+                .last()
+                .map(|o| o.id == client_id)
+                .unwrap_or(false);
+
+            state.connected_clients.retain(|c| c.id != client_id);
+
+            let new_owner_info = if was_owner {
+                state
+                    .connected_clients
+                    .last()
+                    .map(|o| (o.id.clone(), o.dims))
+            } else {
+                None
+            };
+
+            (was_owner, new_owner_info)
+        };
+
+        // If the disconnected client was the owner, transfer ownership
+        if was_owner {
+            if let Some((new_owner_id, (cols, rows))) = new_owner_info {
+                // Resize to new owner's dimensions
+                self.resize(rows, cols);
+                self.broadcast(PtyEvent::owner_changed(Some(new_owner_id)));
+            } else {
+                // No clients left
+                self.broadcast(PtyEvent::owner_changed(None));
+            }
+        }
     }
 
-    /// Get the channel's sender handle for async output broadcasting.
+    /// Update a client's terminal dimensions.
     ///
-    /// Returns None if no channel is connected.
+    /// If the client is the size owner, the PTY is resized and a resize
+    /// event is broadcast. Otherwise, only the client's stored dimensions
+    /// are updated.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The client whose dimensions changed
+    /// * `dims` - New dimensions as (cols, rows)
+    pub fn client_resized(&self, client_id: ClientId, dims: (u16, u16)) {
+        let is_owner = {
+            let mut state = self
+                .shared_state
+                .lock()
+                .expect("shared_state lock poisoned");
+
+            let is_owner = state
+                .connected_clients
+                .last()
+                .map(|o| o.id == client_id)
+                .unwrap_or(false);
+
+            // Update the client's stored dimensions
+            if let Some(client) = state
+                .connected_clients
+                .iter_mut()
+                .find(|c| c.id == client_id)
+            {
+                client.dims = dims;
+            }
+
+            is_owner
+        };
+
+        // If this is the owner, resize the PTY
+        if is_owner {
+            let (cols, rows) = dims;
+            self.resize(rows, cols);
+        }
+    }
+
+    /// Get a clone of the current size owner (newest connected client).
+    ///
+    /// Returns `None` if no clients are connected.
     #[must_use]
-    pub fn get_channel_sender(&self) -> Option<crate::channel::ChannelSenderHandle> {
-        self.channel.as_ref().and_then(|c| c.get_sender_handle())
+    pub fn size_owner(&self) -> Option<ConnectedClient> {
+        // Newest client is last (sorted by connected_at)
+        self.shared_state
+            .lock()
+            .expect("shared_state lock poisoned")
+            .connected_clients
+            .last()
+            .cloned()
+    }
+
+    /// Get a clone of all connected clients.
+    #[must_use]
+    pub fn connected_clients(&self) -> Vec<ConnectedClient> {
+        self.shared_state
+            .lock()
+            .expect("shared_state lock poisoned")
+            .connected_clients
+            .clone()
     }
 
     // =========================================================================
     // PTY I/O
     // =========================================================================
 
-    /// Drain all pending raw output from the queue.
-    ///
-    /// Returns the raw PTY bytes that have accumulated since last drain.
-    /// Used by browser streaming to send raw output instead of rendered screen.
-    #[must_use]
-    pub fn drain_raw_output(&self) -> Vec<u8> {
-        let mut queue = self.raw_output_queue.lock().expect("raw_output_queue lock poisoned");
-        let mut result = Vec::new();
-        while let Some(chunk) = queue.pop_front() {
-            result.extend(chunk);
-        }
-        result
-    }
-
     /// Check if a process has been spawned in this PTY session.
     #[must_use]
     pub fn is_spawned(&self) -> bool {
-        self.master_pty.is_some()
+        self.shared_state
+            .lock()
+            .expect("shared_state lock poisoned")
+            .master_pty
+            .is_some()
     }
 
     /// Store the child process handle (called after spawn).
@@ -296,23 +636,36 @@ impl PtySession {
         }
     }
 
-    /// Resize the PTY and VT100 parser to new dimensions.
+    /// Resize the PTY to new dimensions.
+    ///
+    /// Updates the underlying PTY size and broadcasts a resize event.
+    /// Clients should update their own parsers when they receive the resize event.
     pub fn resize(&self, rows: u16, cols: u16) {
-        // Resize the VT100 parser
         {
-            let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-            parser.screen_mut().set_size(rows, cols);
+            let mut state = self
+                .shared_state
+                .lock()
+                .expect("shared_state lock poisoned");
+
+            // Track dimensions locally
+            state.dimensions = (rows, cols);
+
+            // Resize the PTY
+            if let Some(master_pty) = &state.master_pty {
+                if let Err(e) = master_pty.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                }) {
+                    log::warn!("Failed to resize PTY: {e}");
+                    return;
+                }
+            }
         }
 
-        // Resize the PTY to match
-        if let Some(master_pty) = &self.master_pty {
-            let _ = master_pty.resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
-        }
+        // Broadcast resize event
+        self.broadcast(PtyEvent::resized(rows, cols));
     }
 
     /// Write input bytes to the PTY.
@@ -320,8 +673,12 @@ impl PtySession {
     /// # Errors
     ///
     /// Returns an error if the write fails or no writer is available.
-    pub fn write_input(&mut self, input: &[u8]) -> Result<()> {
-        if let Some(writer) = &mut self.writer {
+    pub fn write_input(&self, input: &[u8]) -> Result<()> {
+        let mut state = self
+            .shared_state
+            .lock()
+            .expect("shared_state lock poisoned");
+        if let Some(writer) = &mut state.writer {
             writer.write_all(input)?;
             writer.flush()?;
         }
@@ -333,19 +690,22 @@ impl PtySession {
     /// # Errors
     ///
     /// Returns an error if the write fails.
-    pub fn write_input_str(&mut self, input: &str) -> Result<()> {
+    pub fn write_input_str(&self, input: &str) -> Result<()> {
         self.write_input(input.as_bytes())
     }
 
     // =========================================================================
-    // Scrollback & Screen
+    // Scrollback
     // =========================================================================
 
     /// Add raw bytes to the scrollback buffer.
     ///
     /// Bytes exceeding `MAX_SCROLLBACK_BYTES` are dropped from the front.
     pub fn add_to_scrollback(&self, data: &[u8]) {
-        let mut buffer = self.scrollback_buffer.lock().expect("scrollback_buffer lock poisoned");
+        let mut buffer = self
+            .scrollback_buffer
+            .lock()
+            .expect("scrollback_buffer lock poisoned");
 
         // Add new bytes
         buffer.extend(data.iter().copied());
@@ -357,6 +717,8 @@ impl PtySession {
     }
 
     /// Get a snapshot of the scrollback buffer as raw bytes.
+    ///
+    /// Returns the complete scrollback history for session replay.
     #[must_use]
     pub fn get_scrollback_snapshot(&self) -> Vec<u8> {
         self.scrollback_buffer
@@ -366,40 +728,219 @@ impl PtySession {
             .copied()
             .collect()
     }
-
-    /// Get the rendered VT100 screen as lines.
-    #[must_use]
-    pub fn get_vt100_screen(&self) -> Vec<String> {
-        let parser = self.vt100_parser.lock().expect("parser lock poisoned");
-        let s = parser.screen();
-        s.rows(0, s.size().1).collect()
-    }
-
-    /// Get the screen as ANSI escape sequences for streaming.
-    ///
-    /// The output includes cursor positioning and attribute sequences
-    /// suitable for replaying on a remote terminal.
-    #[must_use]
-    pub fn get_screen_as_ansi(&self) -> String {
-        let parser = self.vt100_parser.lock().expect("parser lock poisoned");
-        screen::render_screen_as_ansi(parser.screen())
-    }
-
-    /// Get a hash of the current screen content for change detection.
-    ///
-    /// The hash includes screen contents, cursor position, and scrollback offset.
-    #[must_use]
-    pub fn get_screen_hash(&self) -> u64 {
-        let parser = self.vt100_parser.lock().expect("parser lock poisoned");
-        screen::compute_screen_hash(parser.screen())
-    }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
+        // Abort the command processor task if running
+        if let Some(handle) = self.command_processor_handle.take() {
+            handle.abort();
+        }
         self.kill_child();
-        // Channel is dropped automatically, which disconnects it
     }
+}
+
+// =============================================================================
+// Command Processor Task
+// =============================================================================
+
+/// Run the command processor loop.
+///
+/// This function processes commands from `PtyHandle` clients in a background
+/// task. It runs until the command channel is closed (all senders dropped).
+///
+/// The processor is self-contained within the PTY module - Hub does not need
+/// to poll for commands.
+async fn run_command_processor(
+    mut rx: mpsc::Receiver<PtyCommand>,
+    shared_state: Arc<Mutex<SharedPtyState>>,
+    event_tx: broadcast::Sender<PtyEvent>,
+) {
+    log::debug!("Command processor started");
+
+    while let Some(cmd) = rx.recv().await {
+        process_single_command(&cmd, &shared_state, &event_tx);
+    }
+
+    log::debug!("Command processor exiting - channel closed");
+}
+
+/// Process a single PTY command.
+///
+/// Handles Input, Resize, Connect, and Disconnect commands using the shared
+/// state. This is called from the async command processor task.
+fn process_single_command(
+    cmd: &PtyCommand,
+    shared_state: &Arc<Mutex<SharedPtyState>>,
+    event_tx: &broadcast::Sender<PtyEvent>,
+) {
+    match cmd {
+        PtyCommand::Input(data) => {
+            let mut state = shared_state.lock().expect("shared_state lock poisoned");
+            if let Some(writer) = &mut state.writer {
+                if let Err(e) = writer.write_all(data) {
+                    log::error!("Failed to write PTY input: {}", e);
+                    return;
+                }
+                if let Err(e) = writer.flush() {
+                    log::error!("Failed to flush PTY writer: {}", e);
+                }
+            }
+        }
+        PtyCommand::Resize {
+            client_id,
+            rows,
+            cols,
+        } => {
+            process_resize_command(client_id, *rows, *cols, shared_state, event_tx);
+        }
+        PtyCommand::Connect { client_id, dims } => {
+            process_connect_command(client_id, *dims, shared_state, event_tx);
+        }
+        PtyCommand::Disconnect { client_id } => {
+            process_disconnect_command(client_id, shared_state, event_tx);
+        }
+    }
+}
+
+/// Process a Resize command.
+fn process_resize_command(
+    client_id: &ClientId,
+    rows: u16,
+    cols: u16,
+    shared_state: &Arc<Mutex<SharedPtyState>>,
+    event_tx: &broadcast::Sender<PtyEvent>,
+) {
+    let should_resize = {
+        let mut state = shared_state.lock().expect("shared_state lock poisoned");
+
+        // Check if client is the size owner
+        let is_owner = state
+            .connected_clients
+            .last()
+            .map(|o| &o.id == client_id)
+            .unwrap_or(false);
+
+        // Update the client's stored dimensions
+        if let Some(client) = state
+            .connected_clients
+            .iter_mut()
+            .find(|c| &c.id == client_id)
+        {
+            client.dims = (cols, rows);
+        }
+
+        is_owner
+    };
+
+    // If this is the owner, resize the PTY
+    if should_resize {
+        do_resize(rows, cols, shared_state, event_tx);
+    }
+}
+
+/// Process a Connect command.
+fn process_connect_command(
+    client_id: &ClientId,
+    dims: (u16, u16),
+    shared_state: &Arc<Mutex<SharedPtyState>>,
+    event_tx: &broadcast::Sender<PtyEvent>,
+) {
+    {
+        let mut state = shared_state.lock().expect("shared_state lock poisoned");
+
+        // Remove any existing connection for this client (reconnect case)
+        state.connected_clients.retain(|c| c.id != *client_id);
+
+        // Add the new client
+        let client = ConnectedClient::new(client_id.clone(), dims);
+        state.connected_clients.push(client);
+
+        // Sort by connection time - newest last
+        state.connected_clients.sort_by_key(|c| c.connected_at);
+    }
+
+    // New client is now the size owner - resize PTY to their dimensions
+    let (cols, rows) = dims;
+    do_resize(rows, cols, shared_state, event_tx);
+
+    // Broadcast owner changed event
+    let _ = event_tx.send(PtyEvent::owner_changed(Some(client_id.clone())));
+}
+
+/// Process a Disconnect command.
+fn process_disconnect_command(
+    client_id: &ClientId,
+    shared_state: &Arc<Mutex<SharedPtyState>>,
+    event_tx: &broadcast::Sender<PtyEvent>,
+) {
+    let (was_owner, new_owner_info) = {
+        let mut state = shared_state.lock().expect("shared_state lock poisoned");
+
+        let was_owner = state
+            .connected_clients
+            .last()
+            .map(|o| &o.id == client_id)
+            .unwrap_or(false);
+
+        state.connected_clients.retain(|c| c.id != *client_id);
+
+        let new_owner_info = if was_owner {
+            state
+                .connected_clients
+                .last()
+                .map(|o| (o.id.clone(), o.dims))
+        } else {
+            None
+        };
+
+        (was_owner, new_owner_info)
+    };
+
+    // If the disconnected client was the owner, transfer ownership
+    if was_owner {
+        if let Some((new_owner_id, (cols, rows))) = new_owner_info {
+            // Resize to new owner's dimensions
+            do_resize(rows, cols, shared_state, event_tx);
+            let _ = event_tx.send(PtyEvent::owner_changed(Some(new_owner_id)));
+        } else {
+            // No clients left
+            let _ = event_tx.send(PtyEvent::owner_changed(None));
+        }
+    }
+}
+
+/// Perform PTY resize operation.
+///
+/// Updates dimensions, resizes the PTY, and broadcasts the resize event.
+fn do_resize(
+    rows: u16,
+    cols: u16,
+    shared_state: &Arc<Mutex<SharedPtyState>>,
+    event_tx: &broadcast::Sender<PtyEvent>,
+) {
+    {
+        let mut state = shared_state.lock().expect("shared_state lock poisoned");
+
+        // Track dimensions
+        state.dimensions = (rows, cols);
+
+        // Resize the PTY
+        if let Some(master_pty) = &state.master_pty {
+            if let Err(e) = master_pty.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
+                log::warn!("Failed to resize PTY: {e}");
+                return;
+            }
+        }
+    }
+
+    // Broadcast resize event
+    let _ = event_tx.send(PtyEvent::resized(rows, cols));
 }
 
 #[cfg(test)]
@@ -407,28 +948,120 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pty_session_creation_with_scrollback() {
+    fn test_pty_session_creation() {
         let session = PtySession::new(24, 80);
 
-        let parser = session.vt100_parser.lock().unwrap();
-        let s = parser.screen();
-        let (rows, cols) = s.size();
-
-        assert_eq!(rows, 24);
-        assert_eq!(cols, 80);
+        assert!(!session.is_spawned());
+        assert!(session.connected_clients().is_empty());
+        assert!(session.size_owner().is_none());
+        assert_eq!(session.dimensions(), (24, 80));
     }
 
     #[test]
-    fn test_pty_session_resize() {
+    fn test_pty_session_subscribe() {
         let session = PtySession::new(24, 80);
-        session.resize(40, 120);
 
-        let parser = session.vt100_parser.lock().unwrap();
-        let s = parser.screen();
-        let (rows, cols) = s.size();
+        let _rx1 = session.subscribe();
+        let _rx2 = session.subscribe();
 
-        assert_eq!(rows, 40);
-        assert_eq!(cols, 120);
+        // Multiple subscriptions should work
+        assert!(session.connected_clients().is_empty()); // subscribe doesn't add client
+    }
+
+    #[test]
+    fn test_pty_session_connect_single_client() {
+        let session = PtySession::new(24, 80);
+
+        let _rx = session.connect(ClientId::Tui, (80, 24));
+
+        assert_eq!(session.connected_clients().len(), 1);
+        assert!(session.size_owner().is_some());
+        assert_eq!(session.size_owner().unwrap().id, ClientId::Tui);
+    }
+
+    #[test]
+    fn test_pty_session_connect_multiple_clients() {
+        let session = PtySession::new(24, 80);
+
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+        let _rx2 = session.connect(ClientId::browser("abc123"), (120, 40));
+
+        assert_eq!(session.connected_clients().len(), 2);
+        // Newest client (browser) should be the owner
+        assert_eq!(
+            session.size_owner().unwrap().id,
+            ClientId::browser("abc123")
+        );
+    }
+
+    #[test]
+    fn test_pty_session_disconnect() {
+        let session = PtySession::new(24, 80);
+
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+        let _rx2 = session.connect(ClientId::browser("abc123"), (120, 40));
+
+        // Disconnect the owner
+        session.disconnect(ClientId::browser("abc123"));
+
+        assert_eq!(session.connected_clients().len(), 1);
+        // TUI should now be the owner
+        assert_eq!(session.size_owner().unwrap().id, ClientId::Tui);
+    }
+
+    #[test]
+    fn test_pty_session_disconnect_last_client() {
+        let session = PtySession::new(24, 80);
+
+        let _rx = session.connect(ClientId::Tui, (80, 24));
+        session.disconnect(ClientId::Tui);
+
+        assert!(session.connected_clients().is_empty());
+        assert!(session.size_owner().is_none());
+    }
+
+    #[test]
+    fn test_pty_session_client_resized_owner() {
+        let session = PtySession::new(24, 80);
+
+        let _rx = session.connect(ClientId::Tui, (80, 24));
+        session.client_resized(ClientId::Tui, (100, 30));
+
+        let owner = session.size_owner().unwrap();
+        assert_eq!(owner.dims, (100, 30));
+    }
+
+    #[test]
+    fn test_pty_session_client_resized_non_owner() {
+        let session = PtySession::new(24, 80);
+
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+        let _rx2 = session.connect(ClientId::browser("abc123"), (120, 40));
+
+        // Resize TUI (not the owner)
+        session.client_resized(ClientId::Tui, (100, 30));
+
+        // TUI's dims should be updated
+        let clients = session.connected_clients();
+        let tui_client = clients.iter().find(|c| c.id == ClientId::Tui).unwrap();
+        assert_eq!(tui_client.dims, (100, 30));
+
+        // Owner should still be browser with original dims
+        let owner = session.size_owner().unwrap();
+        assert_eq!(owner.id, ClientId::browser("abc123"));
+        assert_eq!(owner.dims, (120, 40));
+    }
+
+    #[test]
+    fn test_pty_session_reconnect_same_client() {
+        let session = PtySession::new(24, 80);
+
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+        let _rx2 = session.connect(ClientId::Tui, (100, 30)); // Reconnect with new dims
+
+        // Should only have one client entry
+        assert_eq!(session.connected_clients().len(), 1);
+        assert_eq!(session.size_owner().unwrap().dims, (100, 30));
     }
 
     #[test]
@@ -458,35 +1091,745 @@ mod tests {
     }
 
     #[test]
-    fn test_pty_session_has_no_channel_initially() {
+    fn test_pty_session_broadcast() {
         let session = PtySession::new(24, 80);
-        assert!(!session.has_channel());
-        assert!(session.get_channel_sender().is_none());
+
+        let mut rx = session.subscribe();
+
+        // Broadcast an event
+        let count = session.broadcast(PtyEvent::output(b"hello".to_vec()));
+        assert_eq!(count, 1);
+
+        // Receiver should get the event
+        let event = rx.try_recv().unwrap();
+        match event {
+            PtyEvent::Output(data) => assert_eq!(data, b"hello"),
+            _ => panic!("Expected Output event"),
+        }
     }
 
     #[test]
-    fn test_pty_session_drain_output_empty() {
+    fn test_pty_session_broadcast_no_receivers() {
         let session = PtySession::new(24, 80);
-        let output = session.drain_raw_output();
-        assert!(output.is_empty());
+
+        // Broadcasting with no receivers should not panic
+        let count = session.broadcast(PtyEvent::output(b"hello".to_vec()));
+        assert_eq!(count, 0);
     }
 
     #[test]
-    fn test_pty_session_drain_output_with_data() {
+    fn test_pty_session_event_sender() {
         let session = PtySession::new(24, 80);
 
-        // Simulate PTY reader thread pushing output
-        {
-            let mut queue = session.raw_output_queue.lock().unwrap();
-            queue.push_back(b"hello".to_vec());
-            queue.push_back(b" world".to_vec());
+        let tx = session.event_sender();
+        let mut rx = session.subscribe();
+
+        // Send via the cloned sender
+        let _ = tx.send(PtyEvent::resized(30, 100));
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            PtyEvent::Resized { rows, cols } => {
+                assert_eq!(rows, 30);
+                assert_eq!(cols, 100);
+            }
+            _ => panic!("Expected Resized event"),
+        }
+    }
+
+    #[test]
+    fn test_pty_session_debug() {
+        let session = PtySession::new(24, 80);
+        let debug = format!("{:?}", session);
+
+        assert!(debug.contains("PtySession"));
+        assert!(debug.contains("has_master_pty"));
+        assert!(debug.contains("connected_clients"));
+    }
+
+    // =========================================================================
+    // Multi-Client Lifecycle Tests
+    // =========================================================================
+
+    #[test]
+    fn test_pty_session_multiple_clients_connect_verifies_dimensions() {
+        // Test: Connect client A, then client B
+        // Verify: B is size owner (newest)
+        // Verify: PTY resized to B's dimensions
+        let session = PtySession::new(24, 80);
+
+        // Initial dimensions
+        assert_eq!(session.dimensions(), (24, 80));
+
+        // Connect client A with 80x24 (cols, rows)
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+
+        // After A connects: A is owner, PTY resized to A's dims
+        assert_eq!(session.size_owner().unwrap().id, ClientId::Tui);
+        assert_eq!(session.dimensions(), (24, 80)); // (rows, cols)
+
+        // Connect client B with 120x40
+        let _rx2 = session.connect(ClientId::browser("browser1"), (120, 40));
+
+        // After B connects: B is owner (newest), PTY resized to B's dims
+        assert_eq!(
+            session.size_owner().unwrap().id,
+            ClientId::browser("browser1")
+        );
+        assert_eq!(session.dimensions(), (40, 120)); // (rows, cols)
+
+        // Connect client C with 100x30
+        let _rx3 = session.connect(ClientId::browser("browser2"), (100, 30));
+
+        // After C connects: C is owner (newest), PTY resized to C's dims
+        assert_eq!(
+            session.size_owner().unwrap().id,
+            ClientId::browser("browser2")
+        );
+        assert_eq!(session.dimensions(), (30, 100)); // (rows, cols)
+        assert_eq!(session.connected_clients().len(), 3);
+    }
+
+    #[test]
+    fn test_pty_session_owner_disconnect_fallback_with_dimensions() {
+        // Test: Connect A, connect B (B is owner), disconnect B
+        // Verify: A becomes owner
+        // Verify: PTY resized to A's dimensions
+        let session = PtySession::new(24, 80);
+
+        // Connect A with 80x24
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+        assert_eq!(session.dimensions(), (24, 80));
+
+        // Connect B with 120x40 - B becomes owner
+        let _rx2 = session.connect(ClientId::browser("browser1"), (120, 40));
+        assert_eq!(session.dimensions(), (40, 120));
+        assert_eq!(
+            session.size_owner().unwrap().id,
+            ClientId::browser("browser1")
+        );
+
+        // Disconnect B (the owner)
+        session.disconnect(ClientId::browser("browser1"));
+
+        // A should now be owner with PTY resized to A's dimensions
+        assert_eq!(session.connected_clients().len(), 1);
+        assert_eq!(session.size_owner().unwrap().id, ClientId::Tui);
+        assert_eq!(session.dimensions(), (24, 80)); // Resized back to A's dims
+    }
+
+    #[test]
+    fn test_pty_session_owner_disconnect_fallback_chain() {
+        // Test: Connect A, B, C (C is owner)
+        // Disconnect C -> B becomes owner with B's dims
+        // Disconnect B -> A becomes owner with A's dims
+        let session = PtySession::new(24, 80);
+
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+        let _rx2 = session.connect(ClientId::browser("b1"), (100, 30));
+        let _rx3 = session.connect(ClientId::browser("b2"), (120, 40));
+
+        assert_eq!(session.dimensions(), (40, 120)); // C's dims
+        assert_eq!(session.size_owner().unwrap().id, ClientId::browser("b2"));
+
+        // Disconnect C
+        session.disconnect(ClientId::browser("b2"));
+        assert_eq!(session.dimensions(), (30, 100)); // B's dims
+        assert_eq!(session.size_owner().unwrap().id, ClientId::browser("b1"));
+
+        // Disconnect B
+        session.disconnect(ClientId::browser("b1"));
+        assert_eq!(session.dimensions(), (24, 80)); // A's dims
+        assert_eq!(session.size_owner().unwrap().id, ClientId::Tui);
+    }
+
+    #[test]
+    fn test_pty_session_broadcasts_owner_changed_on_connect() {
+        // Test: Connect client, verify OwnerChanged event broadcast
+        let session = PtySession::new(24, 80);
+
+        // Subscribe BEFORE connecting
+        let mut rx = session.subscribe();
+
+        // Connect client
+        let _client_rx = session.connect(ClientId::Tui, (80, 24));
+
+        // connect() broadcasts Resized first, then OwnerChanged
+        let resize_event = rx.try_recv().expect("Should receive Resized event");
+        assert!(resize_event.is_resized(), "First event should be Resized");
+
+        // Then OwnerChanged event with the new owner
+        let owner_event = rx.try_recv().expect("Should receive OwnerChanged event");
+        match owner_event {
+            PtyEvent::OwnerChanged { new_owner } => {
+                assert_eq!(new_owner, Some(ClientId::Tui));
+            }
+            other => panic!("Expected OwnerChanged, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pty_session_broadcasts_owner_changed_on_disconnect() {
+        // Test: Connect two clients, disconnect owner, verify OwnerChanged broadcast
+        let session = PtySession::new(24, 80);
+
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+        let _rx2 = session.connect(ClientId::browser("b1"), (120, 40));
+
+        // Subscribe after connecting both
+        let mut rx = session.subscribe();
+
+        // Disconnect the owner (browser)
+        session.disconnect(ClientId::browser("b1"));
+
+        // Should receive Resized event (from fallback resize)
+        let resize_event = rx.try_recv().expect("Should receive Resized event");
+        assert!(resize_event.is_resized());
+
+        // Should receive OwnerChanged event with new owner
+        let owner_event = rx.try_recv().expect("Should receive OwnerChanged event");
+        match owner_event {
+            PtyEvent::OwnerChanged { new_owner } => {
+                assert_eq!(new_owner, Some(ClientId::Tui));
+            }
+            other => panic!("Expected OwnerChanged, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pty_session_broadcasts_owner_changed_none_when_last_disconnects() {
+        // Test: Connect single client, disconnect, verify OwnerChanged(None)
+        let session = PtySession::new(24, 80);
+
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+
+        // Subscribe after connecting
+        let mut rx = session.subscribe();
+
+        // Disconnect the only client
+        session.disconnect(ClientId::Tui);
+
+        // Should receive OwnerChanged(None)
+        let event = rx.try_recv().expect("Should receive OwnerChanged event");
+        match event {
+            PtyEvent::OwnerChanged { new_owner } => {
+                assert_eq!(new_owner, None);
+            }
+            other => panic!("Expected OwnerChanged(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pty_session_client_resize_only_affects_owner() {
+        // Test: Connect A, connect B (B is owner)
+        // A resizes - should NOT affect PTY
+        // B resizes - SHOULD affect PTY
+        let session = PtySession::new(24, 80);
+
+        // Connect A with 80x24
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+        assert_eq!(session.dimensions(), (24, 80));
+
+        // Connect B with 120x40 - B becomes owner
+        let _rx2 = session.connect(ClientId::browser("b1"), (120, 40));
+        assert_eq!(session.dimensions(), (40, 120));
+
+        // A resizes to 90x25 - should NOT affect PTY (A is not owner)
+        session.client_resized(ClientId::Tui, (90, 25));
+
+        // PTY should still have B's dimensions
+        assert_eq!(session.dimensions(), (40, 120));
+
+        // But A's stored dims should be updated
+        let clients = session.connected_clients();
+        let a_client = clients.iter().find(|c| c.id == ClientId::Tui).unwrap();
+        assert_eq!(a_client.dims, (90, 25));
+
+        // B resizes to 150x50 - SHOULD affect PTY (B is owner)
+        session.client_resized(ClientId::browser("b1"), (150, 50));
+
+        // PTY should now have B's new dimensions
+        assert_eq!(session.dimensions(), (50, 150));
+    }
+
+    #[test]
+    fn test_pty_session_resize_broadcasts_event() {
+        // Verify that client resize as owner broadcasts a Resized event
+        let session = PtySession::new(24, 80);
+
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+
+        // Subscribe after initial connect
+        let mut rx = session.subscribe();
+
+        // Owner resizes
+        session.client_resized(ClientId::Tui, (100, 30));
+
+        // Should receive Resized event
+        let event = rx.try_recv().expect("Should receive Resized event");
+        match event {
+            PtyEvent::Resized { rows, cols } => {
+                assert_eq!(rows, 30);
+                assert_eq!(cols, 100);
+            }
+            other => panic!("Expected Resized, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pty_session_non_owner_resize_no_broadcast() {
+        // Verify that non-owner resize does NOT broadcast a Resized event
+        let session = PtySession::new(24, 80);
+
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+        let _rx2 = session.connect(ClientId::browser("b1"), (120, 40));
+
+        // Subscribe after both connected
+        let mut rx = session.subscribe();
+
+        // Non-owner (TUI) resizes
+        session.client_resized(ClientId::Tui, (90, 25));
+
+        // Should NOT receive any event (non-owner resize is silent)
+        let result = rx.try_recv();
+        assert!(
+            result.is_err(),
+            "Non-owner resize should not broadcast, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pty_session_disconnect_non_owner_no_ownership_change() {
+        // Verify disconnecting a non-owner doesn't trigger ownership change
+        let session = PtySession::new(24, 80);
+
+        let _rx1 = session.connect(ClientId::Tui, (80, 24));
+        let _rx2 = session.connect(ClientId::browser("b1"), (120, 40));
+
+        // B is owner, PTY has B's dims
+        assert_eq!(session.size_owner().unwrap().id, ClientId::browser("b1"));
+        assert_eq!(session.dimensions(), (40, 120));
+
+        // Subscribe before disconnecting
+        let mut rx = session.subscribe();
+
+        // Disconnect A (not the owner)
+        session.disconnect(ClientId::Tui);
+
+        // B should still be owner, dims unchanged
+        assert_eq!(session.size_owner().unwrap().id, ClientId::browser("b1"));
+        assert_eq!(session.dimensions(), (40, 120));
+
+        // Should NOT receive any events (no ownership change)
+        let result = rx.try_recv();
+        assert!(
+            result.is_err(),
+            "Disconnecting non-owner should not broadcast, got {:?}",
+            result
+        );
+    }
+
+    // =========================================================================
+    // Hot Path Tests - PTY Output Broadcasting
+    // =========================================================================
+    // These tests verify the critical output hot path:
+    // PTY process writes -> Reader thread reads -> broadcast::send() ->
+    //   -> Multiple subscribers receive Output events
+
+    #[test]
+    fn test_hot_path_broadcast_to_multiple_subscribers() {
+        // CRITICAL: Tests that Output events reach ALL subscribers simultaneously.
+        // This is the core of the hot path fan-out - simulating TUI + Browser clients.
+        let session = PtySession::new(24, 80);
+
+        // Create multiple subscribers (simulating TUI + multiple Browser clients)
+        let mut rx1 = session.subscribe();
+        let mut rx2 = session.subscribe();
+        let mut rx3 = session.subscribe();
+
+        // Broadcast output event (simulating reader thread behavior)
+        let count = session.broadcast(PtyEvent::output(b"hello world".to_vec()));
+        assert_eq!(count, 3, "All 3 subscribers should receive the event");
+
+        // Verify all receivers got the same data
+        for (i, rx) in [&mut rx1, &mut rx2, &mut rx3].iter_mut().enumerate() {
+            let event = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("Receiver {} should have event", i));
+            match event {
+                PtyEvent::Output(data) => {
+                    assert_eq!(data, b"hello world", "Receiver {} got wrong data", i);
+                }
+                _ => panic!("Receiver {} expected Output event", i),
+            }
+        }
+    }
+
+    #[test]
+    fn test_hot_path_output_event_ordering() {
+        // Tests that multiple Output events arrive in order (FIFO guarantee).
+        // Critical for terminal rendering correctness.
+        let session = PtySession::new(24, 80);
+        let mut rx = session.subscribe();
+
+        // Broadcast multiple events in sequence (simulating rapid PTY output)
+        session.broadcast(PtyEvent::output(b"first".to_vec()));
+        session.broadcast(PtyEvent::output(b"second".to_vec()));
+        session.broadcast(PtyEvent::output(b"third".to_vec()));
+
+        // Verify ordering is preserved
+        let expected = [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"third".as_slice(),
+        ];
+        for (i, expected_data) in expected.iter().enumerate() {
+            let event = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("Event {} should exist", i));
+            match event {
+                PtyEvent::Output(data) => {
+                    assert_eq!(&data[..], *expected_data, "Event {} has wrong data", i);
+                }
+                _ => panic!("Event {} should be Output", i),
+            }
+        }
+    }
+
+    #[test]
+    fn test_hot_path_dropped_subscriber_doesnt_block_others() {
+        // Tests that dropping one subscriber doesn't affect others.
+        // Critical for robustness when browser clients disconnect.
+        let session = PtySession::new(24, 80);
+
+        let mut rx1 = session.subscribe();
+        let rx2 = session.subscribe(); // Will be dropped
+        let mut rx3 = session.subscribe();
+
+        // Drop rx2 before broadcasting (simulates browser disconnect)
+        drop(rx2);
+
+        // Broadcast should still succeed for remaining subscribers
+        let count = session.broadcast(PtyEvent::output(b"test".to_vec()));
+        assert_eq!(count, 2, "Should deliver to 2 remaining subscribers");
+
+        // Verify remaining receivers got the event
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx3.try_recv().is_ok());
+    }
+
+    #[test]
+    fn test_hot_path_event_sender_for_reader_thread() {
+        // Tests the pattern used by spawn_cli_reader_thread:
+        // Get a cloned sender and use it from a separate context.
+        // This is exactly how the reader thread broadcasts output.
+        let session = PtySession::new(24, 80);
+        let tx = session.event_sender();
+        let mut rx = session.subscribe();
+
+        // Simulate reader thread sending output
+        let output_data = b"PTY output from reader thread";
+        let _ = tx.send(PtyEvent::output(output_data.to_vec()));
+
+        // Subscriber receives the event
+        let event = rx
+            .try_recv()
+            .expect("Should receive event from cloned sender");
+        match event {
+            PtyEvent::Output(data) => assert_eq!(data, output_data),
+            _ => panic!("Expected Output event"),
+        }
+    }
+
+    #[test]
+    fn test_hot_path_high_volume_broadcast() {
+        // Tests broadcasting many events quickly (simulates high output rate).
+        // The hot path must handle burst traffic without dropping events.
+        let session = PtySession::new(24, 80);
+        let mut rx = session.subscribe();
+
+        // Broadcast 100 events rapidly (simulating fast command output)
+        for i in 0..100 {
+            let data = format!("chunk-{}", i);
+            session.broadcast(PtyEvent::output(data.into_bytes()));
         }
 
-        let output = session.drain_raw_output();
-        assert_eq!(output, b"hello world");
+        // Verify all 100 events arrived in order
+        for i in 0..100 {
+            let expected = format!("chunk-{}", i);
+            let event = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("Event {} should exist", i));
+            match event {
+                PtyEvent::Output(data) => {
+                    assert_eq!(
+                        String::from_utf8_lossy(&data),
+                        expected,
+                        "Event {} wrong",
+                        i
+                    );
+                }
+                _ => panic!("Event {} should be Output", i),
+            }
+        }
+    }
 
-        // Second drain should be empty
-        let output2 = session.drain_raw_output();
-        assert!(output2.is_empty());
+    #[test]
+    fn test_hot_path_connect_returns_working_subscription() {
+        // Tests that connect() returns a subscription that receives events.
+        // This is how TuiClient and BrowserClient get their event streams.
+        let session = PtySession::new(24, 80);
+
+        // Connect returns a subscription (via connect, not subscribe)
+        let mut rx = session.connect(ClientId::Tui, (80, 24));
+
+        // Send an output event after connection
+        session.broadcast(PtyEvent::output(b"after connect".to_vec()));
+
+        // Drain any OwnerChanged events first
+        loop {
+            match rx.try_recv() {
+                Ok(PtyEvent::Output(data)) => {
+                    assert_eq!(data, b"after connect");
+                    return; // Success
+                }
+                Ok(_) => continue, // Skip non-Output events
+                Err(_) => break,
+            }
+        }
+        panic!("Connected subscription should receive Output events");
+    }
+
+    // =========================================================================
+    // Command Processor Tests
+    // =========================================================================
+    // These tests verify the async command processor task behavior.
+
+    #[tokio::test]
+    async fn test_command_processor_input_command() {
+        // Test that Input commands are processed correctly
+        let (event_tx, _) = broadcast::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<PtyCommand>(16);
+
+        let shared_state = Arc::new(Mutex::new(SharedPtyState {
+            master_pty: None,
+            writer: None, // No writer - input will be silently ignored
+            dimensions: (24, 80),
+            connected_clients: Vec::new(),
+        }));
+
+        // Process a single command
+        process_single_command(
+            &PtyCommand::Input(b"test input".to_vec()),
+            &shared_state,
+            &event_tx,
+        );
+
+        // Command should be processed without panic (no writer available)
+        // This verifies the command processor handles missing writer gracefully
+        drop(cmd_tx);
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
+    async fn test_command_processor_connect_command() {
+        // Test that Connect commands register clients correctly
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+
+        let shared_state = Arc::new(Mutex::new(SharedPtyState {
+            master_pty: None,
+            writer: None,
+            dimensions: (24, 80),
+            connected_clients: Vec::new(),
+        }));
+
+        // Process Connect command
+        process_single_command(
+            &PtyCommand::Connect {
+                client_id: ClientId::Tui,
+                dims: (100, 40),
+            },
+            &shared_state,
+            &event_tx,
+        );
+
+        // Verify client was added
+        let state = shared_state.lock().unwrap();
+        assert_eq!(state.connected_clients.len(), 1);
+        assert_eq!(state.connected_clients[0].id, ClientId::Tui);
+        assert_eq!(state.connected_clients[0].dims, (100, 40));
+        drop(state);
+
+        // Verify events were broadcast (Resized + OwnerChanged)
+        let resize_event = event_rx.try_recv().expect("Should receive Resized event");
+        assert!(matches!(resize_event, PtyEvent::Resized { .. }));
+
+        let owner_event = event_rx
+            .try_recv()
+            .expect("Should receive OwnerChanged event");
+        match owner_event {
+            PtyEvent::OwnerChanged { new_owner } => {
+                assert_eq!(new_owner, Some(ClientId::Tui));
+            }
+            _ => panic!("Expected OwnerChanged event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_command_processor_disconnect_command() {
+        // Test that Disconnect commands remove clients correctly
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+
+        let shared_state = Arc::new(Mutex::new(SharedPtyState {
+            master_pty: None,
+            writer: None,
+            dimensions: (24, 80),
+            connected_clients: vec![ConnectedClient::new(ClientId::Tui, (80, 24))],
+        }));
+
+        // Process Disconnect command
+        process_single_command(
+            &PtyCommand::Disconnect {
+                client_id: ClientId::Tui,
+            },
+            &shared_state,
+            &event_tx,
+        );
+
+        // Verify client was removed
+        let state = shared_state.lock().unwrap();
+        assert!(state.connected_clients.is_empty());
+        drop(state);
+
+        // Verify OwnerChanged(None) was broadcast
+        let event = event_rx
+            .try_recv()
+            .expect("Should receive OwnerChanged event");
+        match event {
+            PtyEvent::OwnerChanged { new_owner } => {
+                assert_eq!(new_owner, None);
+            }
+            _ => panic!("Expected OwnerChanged(None) event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_command_processor_resize_command_owner() {
+        // Test that Resize from owner updates dimensions
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+
+        let shared_state = Arc::new(Mutex::new(SharedPtyState {
+            master_pty: None,
+            writer: None,
+            dimensions: (24, 80),
+            connected_clients: vec![ConnectedClient::new(ClientId::Tui, (80, 24))],
+        }));
+
+        // Process Resize command from owner
+        process_single_command(
+            &PtyCommand::Resize {
+                client_id: ClientId::Tui,
+                rows: 50,
+                cols: 120,
+            },
+            &shared_state,
+            &event_tx,
+        );
+
+        // Verify dimensions were updated
+        let state = shared_state.lock().unwrap();
+        assert_eq!(state.dimensions, (50, 120));
+        assert_eq!(state.connected_clients[0].dims, (120, 50)); // (cols, rows)
+        drop(state);
+
+        // Verify Resized event was broadcast
+        let event = event_rx.try_recv().expect("Should receive Resized event");
+        match event {
+            PtyEvent::Resized { rows, cols } => {
+                assert_eq!(rows, 50);
+                assert_eq!(cols, 120);
+            }
+            _ => panic!("Expected Resized event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_command_processor_resize_command_non_owner() {
+        // Test that Resize from non-owner only updates client dims, not PTY
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+
+        let shared_state = Arc::new(Mutex::new(SharedPtyState {
+            master_pty: None,
+            writer: None,
+            dimensions: (40, 120), // Browser is owner
+            connected_clients: vec![
+                ConnectedClient::new(ClientId::Tui, (80, 24)),
+                ConnectedClient::new(ClientId::browser("b1"), (120, 40)),
+            ],
+        }));
+
+        // Process Resize command from non-owner (TUI)
+        process_single_command(
+            &PtyCommand::Resize {
+                client_id: ClientId::Tui,
+                rows: 30,
+                cols: 100,
+            },
+            &shared_state,
+            &event_tx,
+        );
+
+        // Verify PTY dimensions unchanged
+        let state = shared_state.lock().unwrap();
+        assert_eq!(state.dimensions, (40, 120)); // Still browser's dims
+
+        // Verify TUI's stored dims were updated
+        let tui = state
+            .connected_clients
+            .iter()
+            .find(|c| c.id == ClientId::Tui)
+            .unwrap();
+        assert_eq!(tui.dims, (100, 30)); // Updated to new dims
+        drop(state);
+
+        // Verify NO Resized event was broadcast (non-owner resize is silent)
+        assert!(
+            event_rx.try_recv().is_err(),
+            "Non-owner resize should not broadcast"
+        );
+    }
+
+    #[test]
+    fn test_spawn_command_processor_takes_receiver() {
+        // Test that spawn_command_processor takes the command receiver
+        let mut session = PtySession::new(24, 80);
+
+        // Before spawning, command_rx should exist
+        assert!(session.command_rx.is_some());
+        assert!(session.command_processor_handle.is_none());
+
+        // Spawn the processor (requires tokio runtime)
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            session.spawn_command_processor();
+        });
+
+        // After spawning, command_rx should be taken
+        assert!(session.command_rx.is_none());
+        assert!(session.command_processor_handle.is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "Command receiver already taken")]
+    fn test_spawn_command_processor_panics_if_called_twice() {
+        // Test that calling spawn_command_processor twice panics
+        let mut session = PtySession::new(24, 80);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            session.spawn_command_processor();
+            session.spawn_command_processor(); // Should panic
+        });
     }
 }

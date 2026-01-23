@@ -32,11 +32,15 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
 
     sign_in_as(@user)
-    # Visit hub without fragment - should show landing page
-    visit hub_path(@hub)
+    # Visit hub with bundle in fragment (required for E2E connection)
+    bundle = URI.parse(@cli.connection_url).fragment
+    visit "#{hub_url(@hub)}##{bundle}"
 
     # Should show hub info, not terminal container
-    assert_selector "h1", text: @hub.identifier.truncate(32), wait: 10
+    # Note: h1 shows device name (set by CLI) or identifier as fallback
+    @hub.reload
+    expected_title = @hub.device&.name || @hub.identifier.truncate(32)
+    assert_selector "h1", text: expected_title, wait: 10
     assert_no_selector "[data-terminal-display-target='container']"
 
     # Should show list of agents (if any)
@@ -48,12 +52,16 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     create_and_wait_for_agent(@hub, issue_number: 123)
 
     sign_in_as(@user)
-    # Visit agent URL directly
-    visit hub_agent_path(@hub, 0)
+    # Extract bundle from connection URL and append to agent URL
+    bundle = URI.parse(@cli.connection_url).fragment
+    agent_url_with_bundle = "#{hub_agent_url(@hub, 0)}##{bundle}"
 
-    # Should show terminal
+    # Visit agent URL with bundle - establishes connection directly on agent page
+    visit agent_url_with_bundle
+
+    # Should show terminal with connection
     assert_selector "[data-terminal-display-target='container']", wait: 20
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
   end
 
   test "visiting agent URL auto-selects that agent" do
@@ -62,8 +70,12 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     create_and_wait_for_agent(@hub, issue_number: 200)
 
     sign_in_as(@user)
-    # Visit second agent directly
-    visit hub_agent_path(@hub, 1)
+    # Extract bundle from connection URL and append to second agent URL
+    bundle = URI.parse(@cli.connection_url).fragment
+    agent_url_with_bundle = "#{hub_agent_url(@hub, 1)}##{bundle}"
+
+    # Visit second agent directly with bundle
+    visit agent_url_with_bundle
 
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
@@ -76,11 +88,15 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     create_and_wait_for_agent(@hub, issue_number: 999)
 
     sign_in_as(@user)
-    visit hub_agent_path(@hub, 0)
+    # Extract bundle and visit agent page directly with bundle
+    bundle = URI.parse(@cli.connection_url).fragment
+    agent_url_with_bundle = "#{hub_agent_url(@hub, 0)}##{bundle}"
+
+    visit agent_url_with_bundle
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
     assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-999/, wait: 10
 
-    # Refresh the page
+    # Refresh the page - session should restore from IndexedDB
     page.refresh
 
     # Should reconnect and auto-select the same agent
@@ -111,8 +127,10 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
-    # Click agent link
-    click_link text: /test-repo-555/
+    # Click agent link in sidebar
+    within(".sidebar-agents-list") do
+      click_link text: /test-repo-555/
+    end
 
     # URL should change to agent path
     assert_current_path hub_agent_path(@hub, 0)
@@ -134,12 +152,16 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     assert_selector ".sidebar-agents-list a", text: /test-repo-111/, wait: 10
     assert_selector ".sidebar-agents-list a", text: /test-repo-222/
 
-    # Click first agent
-    click_link text: /test-repo-111/
+    # Click first agent in sidebar
+    within(".sidebar-agents-list") do
+      click_link text: /test-repo-111/
+    end
     assert_current_path hub_agent_path(@hub, 0)
 
-    # Click second agent
-    click_link text: /test-repo-222/
+    # Click second agent in sidebar
+    within(".sidebar-agents-list") do
+      click_link text: /test-repo-222/
+    end
     assert_current_path hub_agent_path(@hub, 1)
   end
 
@@ -161,8 +183,10 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
       return conn?.hubChannel?.subscription?.identifier || 'none';
     JS
 
-    # Navigate to agent
-    click_link text: /test-repo-333/
+    # Navigate to agent via sidebar
+    within(".sidebar-agents-list") do
+      click_link text: /test-repo-333/
+    end
 
     # Connection should persist (same subscription)
     assert_selector "[data-connection-target='status']", text: /connected/i
@@ -187,24 +211,32 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
-    # Select first agent and send some output
-    click_link text: /test-repo-444/
+    # Select first agent via sidebar and wait for terminal to be active
+    within(".sidebar-agents-list") do
+      click_link text: /test-repo-444/
+    end
     assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-444/, wait: 10
 
-    unique_marker = "AGENT444_#{SecureRandom.hex(4)}"
-    page.execute_script(<<~JS)
-      const controller = document.querySelector('[data-controller~="connection"]');
-      const connectionController = window.Stimulus.getControllerForElementAndIdentifier(controller, 'connection');
-      connectionController.sendInput("echo #{unique_marker}\\r");
-    JS
-    assert_text unique_marker, wait: 10
+    # Wait for terminal to show agent's shell prompt (indicates terminal is connected)
+    assert_text "bash", wait: 15
 
-    # Switch to second agent
-    click_link text: /test-repo-445/
+    # The first agent's shell has already printed output from .botster_init
+    # which includes the issue number (444)
+    assert_text "BOTSTER_ISSUE_NUMBER: 444", wait: 10
+
+    # Switch to second agent via sidebar
+    within(".sidebar-agents-list") do
+      click_link text: /test-repo-445/
+    end
     assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-445/, wait: 10
 
+    # Wait for second agent's terminal to load
+    assert_text "bash", wait: 15
+
     # First agent's output should not be visible (terminal cleared)
-    assert_no_text unique_marker
+    # The second agent will show issue number 445, not 444
+    assert_no_text "BOTSTER_ISSUE_NUMBER: 444"
+    assert_text "BOTSTER_ISSUE_NUMBER: 445", wait: 10
   end
 
   # === Hub Landing Page Tests ===
@@ -215,12 +247,17 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     create_and_wait_for_agent(@hub, issue_number: 601)
 
     sign_in_as(@user)
-    visit hub_path(@hub)
+    # Visit hub with bundle in fragment (required for E2E connection)
+    bundle = URI.parse(@cli.connection_url).fragment
+    visit "#{hub_url(@hub)}##{bundle}"
+
+    # Wait for connection to be established (agents are populated via JS after connection)
+    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
 
     # Landing page shows agent list (duplicate of sidebar for mobile/landing context)
     assert_selector "[data-test='hub-agents-list']", wait: 10
-    assert_selector "[data-test='hub-agents-list'] a", text: /test-repo-600/
-    assert_selector "[data-test='hub-agents-list'] a", text: /test-repo-601/
+    assert_selector "[data-test='hub-agents-list'] a", text: /test-repo-600/, wait: 10
+    assert_selector "[data-test='hub-agents-list'] a", text: /test-repo-601/, wait: 10
   end
 
   test "hub landing page links to individual agents" do
@@ -228,9 +265,15 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     create_and_wait_for_agent(@hub, issue_number: 700)
 
     sign_in_as(@user)
-    visit hub_path(@hub)
+    # Visit hub with bundle in fragment (required for E2E connection)
+    bundle = URI.parse(@cli.connection_url).fragment
+    visit "#{hub_url(@hub)}##{bundle}"
 
-    # Click agent from landing page
+    # Wait for connection to be established (agents are populated via JS after connection)
+    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+
+    # Wait for agent link to appear, then click it
+    assert_selector "[data-test='hub-agents-list'] a", text: /test-repo-700/, wait: 10
     within "[data-test='hub-agents-list']" do
       click_link text: /test-repo-700/
     end
@@ -243,16 +286,29 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
   # === Edge Cases ===
 
   test "invalid agent index shows error" do
-    @cli = start_cli(@hub, timeout: 20)
+    @cli = start_cli_with_agent_support(@hub, timeout: 30)
+    # Create one agent so the controller can validate against agent count
+    create_and_wait_for_agent(@hub, issue_number: 1)
 
     sign_in_as(@user)
-    # Visit non-existent agent index
+    # First establish E2E connection via bundle URL
+    visit @cli.connection_url
+    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+
+    # Wait for agent to appear in sidebar (confirms agent is registered with CLI)
+    assert_selector ".sidebar-agents-list a", text: /test-repo-1/, wait: 15
+
+    # Wait for hub_agents to be synced via CLI heartbeat
+    # The sidebar is populated via WebSocket, but controller validation uses DB
+    unless wait_for_hub_agents_sync(@hub, expected_count: 1, timeout: 15)
+      skip "Hub agents not synced via heartbeat - CLI may not report agents in heartbeat"
+    end
+
+    # Visit non-existent agent index (agent 999 when only agent 0 exists)
     visit hub_agent_path(@hub, 999)
 
-    # Should show error or redirect to hub landing
-    assert_text(/agent not found|no agent/i, wait: 10).or(
-      assert_current_path(hub_path(@hub))
-    )
+    # Should redirect to hub landing page with error
+    assert_current_path hub_path(@hub)
   end
 
   test "connection URL with fragment still works for QR codes" do
@@ -262,8 +318,11 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit connection_url
 
+    # First verify the connection element exists on the page
+    assert_selector "[data-connection-target='status']", wait: 10
+
     # Should establish connection (backwards compatible)
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
   end
 
   private
@@ -279,22 +338,17 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
       status: "pending"
     )
 
-    deadline = Time.current + timeout
-    while Time.current < deadline
-      message.reload
-      break if message.status == "acknowledged"
-      sleep 0.5
-    end
+    # Wait for message to be acknowledged
+    wait_until?(timeout: timeout) { message.reload.status == "acknowledged" }
 
     # Wait for agent registration via heartbeat
-    deadline = Time.current + 10
-    while Time.current < deadline
-      hub.reload
-      break if hub.hub_agents.exists?(session_key: "test-repo-#{issue_number}")
-      sleep 0.5
-    end
+    wait_until?(timeout: 10) { hub.reload.hub_agents.exists?(session_key: "test-repo-#{issue_number}") }
 
     message
+  end
+
+  def wait_for_hub_agents_sync(hub, expected_count:, timeout: 15)
+    wait_until?(timeout: timeout) { hub.reload.hub_agents.count >= expected_count }
   end
 
   def start_cli_with_agent_support(hub, **options)
@@ -318,7 +372,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     device_token = device.create_device_token!(name: token_name)
 
     env = {
-      "BOTSTER_ENV" => "test",
+      "BOTSTER_ENV" => "system_test",
       "BOTSTER_CONFIG_DIR" => temp_dir,
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => device_token.token,

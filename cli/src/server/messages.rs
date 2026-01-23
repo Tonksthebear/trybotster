@@ -199,10 +199,10 @@ pub fn message_to_hub_action(
             .ok_or(MessageError::MissingField("repo"))?;
 
         let repo_safe = repo.replace('/', "-");
-        let session_key = format!("{repo_safe}-{issue_number}");
+        let agent_id = format!("{repo_safe}-{issue_number}");
 
         return Ok(Some(HubAction::CloseAgent {
-            session_key,
+            session_key: agent_id,
             delete_worktree: false, // Cleanup keeps worktree by default
         }));
     }

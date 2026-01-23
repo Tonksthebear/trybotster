@@ -161,8 +161,7 @@ impl HttpProxy {
                 // Read body
                 match response.bytes().await {
                     Ok(body) => {
-                        let (body_b64, compressed) =
-                            self.encode_body(&body, &headers);
+                        let (body_b64, compressed) = self.encode_body(&body, &headers);
 
                         log::debug!(
                             "[HttpProxy] Response: {} {} ({} bytes, compressed={})",

@@ -191,10 +191,7 @@ mod tests {
     #[test]
     fn test_ui_percentages_sum_correctly() {
         // Agent list + terminal should equal 100%
-        assert_eq!(
-            AGENT_LIST_WIDTH_PERCENT + TERMINAL_WIDTH_PERCENT,
-            100
-        );
+        assert_eq!(AGENT_LIST_WIDTH_PERCENT + TERMINAL_WIDTH_PERCENT, 100);
     }
 
     #[test]

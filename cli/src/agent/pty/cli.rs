@@ -3,10 +3,13 @@
 //! This module provides the CLI PTY spawning functionality, handling:
 //! - PTY creation with specified dimensions
 //! - Process spawning with environment variables
-//! - Reader thread setup for output processing
+//! - Reader thread setup for output broadcasting
 //! - Notification channel configuration
 //!
-//! # Usage
+//! # Event-Driven Output
+//!
+//! The reader thread broadcasts [`PtyEvent::Output`] via the PTY session's
+//! event channel. Clients subscribe to receive output events:
 //!
 //! ```ignore
 //! let result = spawn_cli_pty(
@@ -17,9 +20,12 @@
 //!     vec!["source .botster_init".to_string()],
 //!     "Context for the agent",
 //! )?;
+//!
+//! // Subscribe to output events
+//! let rx = agent.cli_pty.subscribe();
 //! ```
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-01
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -43,12 +49,13 @@ pub struct CliSpawnResult {
 /// Spawn a CLI PTY process.
 ///
 /// This function:
-/// 1. Opens a PTY with the current parser dimensions
+/// 1. Opens a PTY with dimensions from the PtySession
 /// 2. Spawns the command in the PTY
 /// 3. Sets up the notification channel
 /// 4. Configures the PTY session
-/// 5. Starts the reader thread
-/// 6. Sends initial context and commands
+/// 5. Starts the reader thread (broadcasts events, does NOT parse)
+/// 6. Starts the command processor task
+/// 7. Sends initial context and commands
 ///
 /// # Arguments
 ///
@@ -66,7 +73,10 @@ pub struct CliSpawnResult {
 /// # Errors
 ///
 /// Returns an error if PTY creation or command spawn fails.
-#[allow(clippy::implicit_hasher, reason = "internal API doesn't need hasher generalization")]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "internal API doesn't need hasher generalization"
+)]
 pub fn spawn_cli_pty(
     pty: &mut PtySession,
     worktree_path: &Path,
@@ -75,43 +85,42 @@ pub fn spawn_cli_pty(
     init_commands: Vec<String>,
     context: &str,
 ) -> Result<CliSpawnResult> {
-    let (rows, cols) = {
-        let parser = pty.vt100_parser.lock().expect("parser lock poisoned");
-        parser.screen().size()
-    };
+    // Get dimensions from the PtySession
+    let (rows, cols) = pty.dimensions();
 
     // Open PTY and spawn command
     let pair = spawn::open_pty(rows, cols)?;
     let cmd = spawn::build_command(command_str, worktree_path, env_vars);
-    let child = pair.slave.spawn_command(cmd).context("Failed to spawn command")?;
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .context("Failed to spawn command")?;
 
     // Set up notification channel
     let (notification_tx, notification_rx) = mpsc::channel::<AgentNotification>();
 
     // Configure pty with spawned PTY
     pty.set_child(child);
-    pty.writer = Some(pair.master.take_writer()?);
+    pty.set_writer(pair.master.take_writer()?);
     pty.notification_tx = Some(notification_tx.clone());
 
-    // Start reader thread
+    // Start reader thread - broadcasts events (clients parse in their own parsers)
     let reader = pair.master.try_clone_reader()?;
     pty.reader_thread = Some(spawn::spawn_cli_reader_thread(
         reader,
-        Arc::clone(&pty.vt100_parser),
         Arc::clone(&pty.scrollback_buffer),
-        Arc::clone(&pty.raw_output_queue),
+        pty.event_sender(),
         notification_tx,
     ));
 
-    pty.master_pty = Some(pair.master);
+    pty.set_master_pty(pair.master);
+
+    // Start command processor task - handles Input, Resize, Connect, Disconnect
+    pty.spawn_command_processor();
 
     // Send initial context
     if !context.is_empty() {
-        if let Some(ref mut writer) = pty.writer {
-            use std::io::Write;
-            let _ = writer.write_all(format!("{context}\n").as_bytes());
-            let _ = writer.flush();
-        }
+        let _ = pty.write_input_str(&format!("{context}\n"));
     }
 
     // Send init commands
@@ -120,11 +129,7 @@ pub fn spawn_cli_pty(
         thread::sleep(Duration::from_millis(100));
         for cmd in init_commands {
             log::debug!("Running init command: {cmd}");
-            if let Some(ref mut writer) = pty.writer {
-                use std::io::Write;
-                let _ = writer.write_all(format!("{cmd}\n").as_bytes());
-                let _ = writer.flush();
-            }
+            let _ = pty.write_input_str(&format!("{cmd}\n"));
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -137,8 +142,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_spawn_cli_pty_basic() {
+    #[tokio::test]
+    async fn test_spawn_cli_pty_basic() {
         let temp_dir = TempDir::new().unwrap();
         let mut pty = PtySession::new(24, 80);
 

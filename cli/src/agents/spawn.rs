@@ -72,10 +72,10 @@ impl AgentSpawnConfig {
         self
     }
 
-    /// Generates the session key for this agent.
+    /// Generates the agent ID for this agent.
     ///
-    /// The session key uniquely identifies this agent in the system.
-    pub fn session_key(&self) -> String {
+    /// The agent ID uniquely identifies this agent in the system.
+    pub fn agent_id(&self) -> String {
         SessionKeyGenerator::generate(&self.repo_name, self.issue_number, &self.branch_name)
     }
 }
@@ -138,10 +138,7 @@ impl SessionKeyGenerator {
     ///
     /// Returns None if the key doesn't end with a number.
     pub fn extract_issue_number(session_key: &str) -> Option<u32> {
-        session_key
-            .rsplit('-')
-            .next()
-            .and_then(|s| s.parse().ok())
+        session_key.rsplit('-').next().and_then(|s| s.parse().ok())
     }
 }
 
@@ -188,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_config_session_key() {
+    fn test_spawn_config_agent_id() {
         let config = AgentSpawnConfig::new(
             Some(42),
             "issue-42".to_string(),
@@ -198,7 +195,7 @@ mod tests {
             "Fix the bug".to_string(),
         );
 
-        assert_eq!(config.session_key(), "owner-repo-42");
+        assert_eq!(config.agent_id(), "owner-repo-42");
     }
 
     #[test]

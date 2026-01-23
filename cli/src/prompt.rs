@@ -43,8 +43,7 @@ impl PromptManager {
 
             let url = format!(
                 "https://raw.githubusercontent.com/{}/main/{}",
-                DEFAULT_PROMPT_REPO,
-                filename
+                DEFAULT_PROMPT_REPO, filename
             );
 
             log::debug!("Trying to fetch prompt from: {}", url);

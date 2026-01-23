@@ -75,11 +75,7 @@ impl ApiClient {
             self.server_url, hub_identifier, repo
         );
 
-        let response = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.api_key)
-            .send()?;
+        let response = self.client.get(&url).bearer_auth(&self.api_key).send()?;
 
         if !response.status().is_success() {
             anyhow::bail!("Failed to poll messages: {}", response.status());
@@ -205,10 +201,7 @@ impl ApiClient {
         invocation_url: Option<&str>,
         notification_type: &str,
     ) -> Result<()> {
-        let url = format!(
-            "{}/hubs/{}/notifications",
-            self.server_url, hub_identifier
-        );
+        let url = format!("{}/hubs/{}/notifications", self.server_url, hub_identifier);
 
         let payload = NotificationPayload {
             repo: repo.to_string(),
@@ -250,10 +243,7 @@ mod tests {
 
     #[test]
     fn test_api_client_creation() {
-        let client = ApiClient::new(
-            "https://example.com".to_string(),
-            "test-key".to_string(),
-        );
+        let client = ApiClient::new("https://example.com".to_string(), "test-key".to_string());
 
         assert!(client.is_ok());
         let client = client.unwrap();

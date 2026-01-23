@@ -37,8 +37,8 @@ use super::HubState;
 /// Result of spawning an agent, containing information for coordination.
 #[derive(Debug)]
 pub struct SpawnResult {
-    /// The session key for the spawned agent.
-    pub session_key: String,
+    /// The agent ID for the spawned agent.
+    pub agent_id: String,
     /// The allocated tunnel port, if any.
     pub tunnel_port: Option<u16>,
     /// Whether a server PTY was spawned.
@@ -92,9 +92,9 @@ pub fn spawn_agent(
 
     // Set invocation URL for notifications
     agent.last_invocation_url = config.invocation_url.clone().or_else(|| {
-        config.issue_number.map(|num| {
-            format!("https://github.com/{}/issues/{num}", config.repo_name)
-        })
+        config
+            .issue_number
+            .map(|num| format!("https://github.com/{}/issues/{num}", config.repo_name))
     });
     if let Some(ref url) = agent.last_invocation_url {
         log::info!("Agent invocation URL: {url}");
@@ -145,14 +145,14 @@ pub fn spawn_agent(
     };
 
     // Register the agent
-    let session_key = agent.session_key();
+    let agent_id = agent.agent_id();
     let label = format_agent_label(config.issue_number, &config.branch_name);
 
-    state.add_agent(session_key.clone(), agent);
+    state.add_agent(agent_id.clone(), agent);
     log::info!("Spawned agent for {label}");
 
     Ok(SpawnResult {
-        session_key,
+        agent_id,
         tunnel_port,
         has_server_pty,
     })
@@ -163,7 +163,7 @@ pub fn spawn_agent(
 /// # Arguments
 ///
 /// * `state` - Mutable reference to the Hub state
-/// * `session_key` - The session key of the agent to close
+/// * `agent_id` - The agent ID of the agent to close
 /// * `delete_worktree` - Whether to delete the agent's worktree
 ///
 /// # Returns
@@ -173,13 +173,9 @@ pub fn spawn_agent(
 /// # Errors
 ///
 /// Returns an error if worktree deletion fails (but agent is still removed).
-pub fn close_agent(
-    state: &mut HubState,
-    session_key: &str,
-    delete_worktree: bool,
-) -> Result<bool> {
-    let Some(agent) = state.remove_agent(session_key) else {
-        log::info!("No agent found with session key: {session_key}");
+pub fn close_agent(state: &mut HubState, agent_id: &str, delete_worktree: bool) -> Result<bool> {
+    let Some(agent) = state.remove_agent(agent_id) else {
+        log::info!("No agent found with agent ID: {agent_id}");
         return Ok(false);
     };
 
@@ -214,9 +210,13 @@ fn build_spawn_environment(config: &AgentSpawnConfig) -> HashMap<String, String>
     env_vars.insert(
         "BOTSTER_ISSUE_NUMBER".to_string(),
         config
-            .issue_number.map_or_else(|| "0".to_string(), |n| n.to_string()),
+            .issue_number
+            .map_or_else(|| "0".to_string(), |n| n.to_string()),
     );
-    env_vars.insert("BOTSTER_BRANCH_NAME".to_string(), config.branch_name.clone());
+    env_vars.insert(
+        "BOTSTER_BRANCH_NAME".to_string(),
+        config.branch_name.clone(),
+    );
     env_vars.insert(
         "BOTSTER_WORKTREE_PATH".to_string(),
         config.worktree_path.display().to_string(),
@@ -305,7 +305,10 @@ mod tests {
 
         assert_eq!(env.get("BOTSTER_REPO"), Some(&"owner/repo".to_string()));
         assert_eq!(env.get("BOTSTER_ISSUE_NUMBER"), Some(&"42".to_string()));
-        assert_eq!(env.get("BOTSTER_BRANCH_NAME"), Some(&"issue-42".to_string()));
+        assert_eq!(
+            env.get("BOTSTER_BRANCH_NAME"),
+            Some(&"issue-42".to_string())
+        );
         assert_eq!(env.get("BOTSTER_MESSAGE_ID"), Some(&"123".to_string()));
         assert!(env.contains_key("BOTSTER_HUB_BIN"));
     }

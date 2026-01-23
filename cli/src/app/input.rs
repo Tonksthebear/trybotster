@@ -695,12 +695,7 @@ mod tests {
             worktree_selection: 0,
             worktree_count: 5,
         };
-        let action = dispatch_key_event(
-            &AppMode::Menu,
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            ctx,
-        );
+        let action = dispatch_key_event(&AppMode::Menu, KeyCode::Enter, KeyModifiers::NONE, ctx);
         assert_eq!(action, InputAction::MenuSelect(1));
     }
 

@@ -17,11 +17,11 @@
 
 // Rust guideline compliant 2025-01
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use flate2::{write::GzEncoder, Compression};
 use std::collections::HashMap;
 use std::io::Write;
 use tokio::sync::mpsc;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use flate2::{Compression, write::GzEncoder};
 
 use super::connection::HubSender;
 use super::crypto_service::CryptoServiceHandle;
@@ -114,11 +114,6 @@ impl BrowserState {
         self.last_screen_hash = None;
     }
 
-    /// Handle disconnect (legacy method name).
-    pub fn disconnect(&mut self) {
-        self.handle_disconnected();
-    }
-
     /// Invalidate screen hash (forces re-send).
     pub fn invalidate_screen(&mut self) {
         self.last_screen_hash = None;
@@ -157,12 +152,12 @@ impl std::fmt::Debug for BrowserSendContext<'_> {
 /// Build AgentInfo from agent data.
 ///
 /// This is a helper to convert agent data into the format expected by browsers.
+///
+/// Note: `active_pty_view` and `scroll_offset` are set to `None` because these
+/// are now client-scoped state. Each browser tracks its own view selection and
+/// scroll position independently via xterm.js.
 #[must_use]
-pub fn build_agent_info(
-    id: &str,
-    agent: &crate::Agent,
-    hub_identifier: &str,
-) -> AgentInfo {
+pub fn build_agent_info(id: &str, agent: &crate::Agent, hub_identifier: &str) -> AgentInfo {
     AgentInfo {
         id: id.to_string(),
         repo: Some(agent.repo.clone()),
@@ -173,8 +168,9 @@ pub fn build_agent_info(
         tunnel_port: agent.tunnel_port,
         server_running: Some(agent.is_server_running()),
         has_server_pty: Some(agent.has_server_pty()),
-        active_pty_view: Some(format!("{:?}", agent.active_pty).to_lowercase()),
-        scroll_offset: Some(agent.get_scroll_offset() as u32),
+        // View and scroll are client-scoped - browser tracks its own state
+        active_pty_view: None,
+        scroll_offset: None,
         hub_identifier: Some(hub_identifier.to_string()),
     }
 }
@@ -193,43 +189,18 @@ pub fn build_worktree_info(path: &str, branch: &str) -> WorktreeInfo {
 }
 
 /// Send agent list to connected browser.
-pub fn send_agent_list(
-    ctx: &BrowserSendContext,
-    agents: Vec<AgentInfo>,
-) {
+pub fn send_agent_list(ctx: &BrowserSendContext, agents: Vec<AgentInfo>) {
     let message = TerminalMessage::Agents { agents };
     send_message(ctx, &message);
 }
 
 /// Send worktree list to connected browser.
-pub fn send_worktree_list(
-    ctx: &BrowserSendContext,
-    worktrees: Vec<WorktreeInfo>,
-) {
+pub fn send_worktree_list(ctx: &BrowserSendContext, worktrees: Vec<WorktreeInfo>) {
     let repo = WorktreeManager::detect_current_repo()
         .map(|(_, name)| name)
         .ok();
 
     let message = TerminalMessage::Worktrees { worktrees, repo };
-    send_message(ctx, &message);
-}
-
-/// Send agent selection notification to browser.
-pub fn send_agent_selected(ctx: &BrowserSendContext, agent_id: &str) {
-    let message = TerminalMessage::AgentSelected {
-        id: agent_id.to_string(),
-    };
-    send_message(ctx, &message);
-}
-
-/// Send agent creating notification to browser.
-///
-/// Sent immediately when agent creation begins, before blocking operations.
-/// Allows browser to show loading state.
-pub fn send_agent_creating(ctx: &BrowserSendContext, identifier: &str) {
-    let message = TerminalMessage::AgentCreating {
-        identifier: identifier.to_string(),
-    };
     send_message(ctx, &message);
 }
 
@@ -239,20 +210,6 @@ pub fn send_agent_creating_to(ctx: &BrowserSendContext, identity: &str, identifi
         identifier: identifier.to_string(),
     };
     send_message_to(ctx, identity, &message);
-}
-
-/// Send agent creation progress update to all browsers.
-pub fn send_agent_progress(
-    ctx: &BrowserSendContext,
-    identifier: &str,
-    stage: super::types::AgentCreationStage,
-) {
-    let message = TerminalMessage::AgentCreatingProgress {
-        identifier: identifier.to_string(),
-        stage,
-        message: stage.description().to_string(),
-    };
-    send_message(ctx, &message);
 }
 
 /// Send agent creation progress update to a specific browser.
@@ -268,17 +225,6 @@ pub fn send_agent_progress_to(
         message: stage.description().to_string(),
     };
     send_message_to(ctx, identity, &message);
-}
-
-/// Send terminal output to browser.
-pub fn send_output(ctx: &BrowserSendContext, output: &str) {
-    let sender = ctx.sender.clone();
-    let output = output.to_string();
-    ctx.runtime.spawn(async move {
-        if let Err(e) = sender.send(&output).await {
-            log::warn!("Failed to send output to browser: {e}");
-        }
-    });
 }
 
 /// Build a scrollback message from raw bytes.
@@ -308,16 +254,10 @@ pub fn build_scrollback_message(bytes: Vec<u8>) -> TerminalMessage {
         bytes.len() as f64 / compressed.len().max(1) as f64
     );
 
-    TerminalMessage::Scrollback { data, compressed: true }
-}
-
-/// Send scrollback history to browser.
-///
-/// Called when an agent is selected so the browser can populate
-/// xterm's scrollback buffer with historical output.
-pub fn send_scrollback(ctx: &BrowserSendContext, bytes: Vec<u8>) {
-    let message = build_scrollback_message(bytes);
-    send_message(ctx, &message);
+    TerminalMessage::Scrollback {
+        data,
+        compressed: true,
+    }
 }
 
 /// Send a JSON message to all browsers (broadcast).
@@ -348,11 +288,7 @@ fn send_message_to(ctx: &BrowserSendContext, identity: &str, message: &TerminalM
 // === Targeted send functions (per-client routing) ===
 
 /// Send agent list to a specific browser.
-pub fn send_agent_list_to(
-    ctx: &BrowserSendContext,
-    identity: &str,
-    agents: Vec<AgentInfo>,
-) {
+pub fn send_agent_list_to(ctx: &BrowserSendContext, identity: &str, agents: Vec<AgentInfo>) {
     let message = TerminalMessage::Agents { agents };
     send_message_to(ctx, identity, &message);
 }
@@ -445,12 +381,12 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_state_disconnect() {
+    fn test_browser_state_handle_disconnected() {
         let mut state = BrowserState::default();
         state.connected = true;
         state.last_screen_hash = Some(12345);
 
-        state.disconnect();
+        state.handle_disconnected();
 
         assert!(!state.connected);
         assert!(state.last_screen_hash.is_none());
@@ -481,7 +417,10 @@ mod tests {
 
     #[test]
     fn test_calculate_agent_dims_gui() {
-        let dims = BrowserResize { rows: 40, cols: 120 };
+        let dims = BrowserResize {
+            rows: 40,
+            cols: 120,
+        };
         let (cols, rows) = calculate_agent_dims(&dims, BrowserMode::Gui);
         assert_eq!(cols, 120);
         assert_eq!(rows, 40);
@@ -489,7 +428,10 @@ mod tests {
 
     #[test]
     fn test_calculate_agent_dims_tui() {
-        let dims = BrowserResize { rows: 40, cols: 100 };
+        let dims = BrowserResize {
+            rows: 40,
+            cols: 100,
+        };
         let (cols, rows) = calculate_agent_dims(&dims, BrowserMode::Tui);
         // 70% of 100 = 70, minus 2 = 68
         assert_eq!(cols, 68);
@@ -528,7 +470,9 @@ mod tests {
                 assert!(!data.is_empty(), "Data should not be empty");
                 // Small inputs won't compress well due to gzip header + base64 overhead
                 // Just verify it produces valid base64
-                assert!(data.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+                assert!(data
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
             }
             _ => panic!("Expected Scrollback message"),
         }
@@ -551,8 +495,8 @@ mod tests {
     #[test]
     fn test_build_scrollback_message_compression_ratio() {
         // Terminal output with repeated patterns compresses very well
-        let repeated = "$ ls -la\r\ntotal 0\r\ndrwxr-xr-x  2 user user  40 Jan  1 00:00 .\r\n"
-            .repeat(100);
+        let repeated =
+            "$ ls -la\r\ntotal 0\r\ndrwxr-xr-x  2 user user  40 Jan  1 00:00 .\r\n".repeat(100);
         let bytes = repeated.as_bytes().to_vec();
         let original_len = bytes.len();
         let message = build_scrollback_message(bytes);
@@ -579,7 +523,10 @@ mod tests {
 
         state.handle_connected("Test Device");
 
-        assert!(state.bundle_used, "bundle_used should be true after connection");
+        assert!(
+            state.bundle_used,
+            "bundle_used should be true after connection"
+        );
         assert!(state.connected);
         assert_eq!(state.mode, Some(BrowserMode::Gui));
     }

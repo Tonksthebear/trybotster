@@ -26,7 +26,7 @@
      data-controller="terminal-display agents"
      data-terminal-display-connection-outlet="#hub-connection-permanent"
      data-agents-connection-outlet="#hub-connection-permanent"
-     data-agents-hub-name-value="<%= @hub.repo.presence || @hub.identifier.truncate(16) %>"
+     data-agents-hub-name-value="<%= @hub.device&.name || @hub.identifier.truncate(16) %>"
      data-agents-hub-id-value="<%= @hub.id %>">
 
   <%# Header - compact on mobile, expanded on desktop %>
@@ -44,7 +44,7 @@
           <%# Agent dropdown %>
           <%= render Elements::DropdownComponent.new(anchor: "bottom start", class: "min-w-0") do |dropdown| %>
             <% dropdown.with_button class: "flex items-center gap-1 min-w-0 text-sm font-mono text-zinc-300 hover:text-zinc-100 transition-colors" do %>
-              <span data-agents-target="mobileAgentLabel" class="truncate"><%= @hub.repo.presence || @hub.identifier.truncate(16) %></span>
+              <span data-agents-target="mobileAgentLabel" class="truncate"><%= @hub.device&.name || @hub.identifier.truncate(16) %></span>
               <svg class="size-3 shrink-0 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
               </svg>
@@ -91,7 +91,7 @@
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-4 min-w-0">
           <div class="min-w-0">
-            <h1 class="text-lg font-bold text-zinc-100 font-mono truncate"><%= @hub.identifier.truncate(24) %></h1>
+            <h1 class="text-lg font-bold text-zinc-100 font-mono truncate"><%= @hub.device&.name || @hub.identifier.truncate(24) %></h1>
             <p class="text-xs text-zinc-500 truncate">
               <%= @hub.repo || "No repository" %>
             </p>

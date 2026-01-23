@@ -14,8 +14,8 @@
 // IMPORTANT: Run `cargo build --release` before running these tests!
 
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Path to the release binary (built by cargo build --release)
 fn get_binary_path() -> std::path::PathBuf {
@@ -47,7 +47,10 @@ fn kill_process(child: &mut std::process::Child, signal: i32) -> std::io::Result
 
 /// Wait for process to exit with timeout
 #[allow(dead_code)]
-fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
     let start = Instant::now();
     loop {
         match child.try_wait() {
@@ -80,12 +83,23 @@ fn test_help_command_exits_immediately() {
     let elapsed = start.elapsed();
 
     // --help should complete very quickly (under 2 seconds)
-    assert!(elapsed < Duration::from_secs(2), "--help took too long: {:?}", elapsed);
-    assert!(output.status.success(), "--help failed: {:?}", output.status);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "--help took too long: {:?}",
+        elapsed
+    );
+    assert!(
+        output.status.success(),
+        "--help failed: {:?}",
+        output.status
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("botster-hub") || stdout.contains("Usage"),
-            "Unexpected --help output: {}", stdout);
+    assert!(
+        stdout.contains("botster-hub") || stdout.contains("Usage"),
+        "Unexpected --help output: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -104,11 +118,23 @@ fn test_version_command_exits_immediately() {
 
     let elapsed = start.elapsed();
 
-    assert!(elapsed < Duration::from_secs(2), "--version took too long: {:?}", elapsed);
-    assert!(output.status.success(), "--version failed: {:?}", output.status);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "--version took too long: {:?}",
+        elapsed
+    );
+    assert!(
+        output.status.success(),
+        "--version failed: {:?}",
+        output.status
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("botster-hub"), "Unexpected --version output: {}", stdout);
+    assert!(
+        stdout.contains("botster-hub"),
+        "Unexpected --version output: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -138,7 +164,11 @@ fn test_start_without_tty_fails_gracefully() {
     let elapsed = start.elapsed();
 
     // Should fail quickly (not hang waiting for TTY)
-    assert!(elapsed < Duration::from_secs(5), "start command took too long without TTY: {:?}", elapsed);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "start command took too long without TTY: {:?}",
+        elapsed
+    );
 
     // Should fail (no TTY available)
     assert!(!output.status.success(), "start should fail without TTY");
@@ -146,11 +176,12 @@ fn test_start_without_tty_fails_gracefully() {
     // Error message should mention the issue
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Device not configured") ||
-        stderr.contains("not a terminal") ||
-        stderr.contains("tty") ||
-        stderr.contains("Error"),
-        "Expected TTY-related error, got: {}", stderr
+        stderr.contains("Device not configured")
+            || stderr.contains("not a terminal")
+            || stderr.contains("tty")
+            || stderr.contains("Error"),
+        "Expected TTY-related error, got: {}",
+        stderr
     );
 }
 
@@ -169,12 +200,19 @@ fn test_config_command_works() {
         .output()
         .expect("Failed to run config command");
 
-    assert!(output.status.success(), "config command failed: {:?}", output.status);
+    assert!(
+        output.status.success(),
+        "config command failed: {:?}",
+        output.status
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Should output JSON config
-    assert!(stdout.contains("{") && stdout.contains("}"),
-            "Expected JSON output, got: {}", stdout);
+    assert!(
+        stdout.contains("{") && stdout.contains("}"),
+        "Expected JSON output, got: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -190,7 +228,11 @@ fn test_status_command_works() {
         .expect("Failed to run status command");
 
     // Status command may not be fully implemented, but should not crash
-    assert!(output.status.success(), "status command failed: {:?}", output.status);
+    assert!(
+        output.status.success(),
+        "status command failed: {:?}",
+        output.status
+    );
 }
 
 #[test]
@@ -210,10 +252,11 @@ fn test_invalid_command_fails() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.to_lowercase().contains("error") ||
-        stderr.to_lowercase().contains("invalid") ||
-        stderr.to_lowercase().contains("unknown"),
-        "Expected error message about invalid command, got: {}", stderr
+        stderr.to_lowercase().contains("error")
+            || stderr.to_lowercase().contains("invalid")
+            || stderr.to_lowercase().contains("unknown"),
+        "Expected error message about invalid command, got: {}",
+        stderr
     );
 }
 

@@ -113,7 +113,12 @@ mod tests {
         eprintln!("Total area: {:?}", area);
         eprintln!("Left chunk (30%): {:?}", chunks[0]);
         eprintln!("Right chunk (70%): {:?}", chunks[1]);
-        eprintln!("Left + Right widths: {} + {} = {}", chunks[0].width, chunks[1].width, chunks[0].width + chunks[1].width);
+        eprintln!(
+            "Left + Right widths: {} + {} = {}",
+            chunks[0].width,
+            chunks[1].width,
+            chunks[0].width + chunks[1].width
+        );
 
         let block = Block::default().borders(Borders::ALL);
         let inner = block.inner(chunks[1]);
@@ -121,6 +126,10 @@ mod tests {
         eprintln!("PTY should be: {}cols x {}rows", inner.width, inner.height);
 
         // The chunks should fill the entire width
-        assert_eq!(chunks[0].width + chunks[1].width, area.width, "Chunks should fill total width");
+        assert_eq!(
+            chunks[0].width + chunks[1].width,
+            area.width,
+            "Chunks should fill total width"
+        );
     }
 }

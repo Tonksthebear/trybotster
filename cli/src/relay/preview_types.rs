@@ -185,7 +185,7 @@ impl Default for ProxyConfig {
             port: 3000,
             timeout_secs: 30,
             max_body_size: 10 * 1024 * 1024, // 10MB
-            compression_threshold: 4096,      // 4KB
+            compression_threshold: 4096,     // 4KB
         }
     }
 }

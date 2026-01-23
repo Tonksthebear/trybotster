@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use libsignal_protocol::{
     Direction, GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair, KyberPreKeyId,
     KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress,
-    PublicKey, SenderKeyRecord, SenderKeyStore, SessionRecord, SessionStore, SignedPreKeyId,
-    SignedPreKeyRecord, SignedPreKeyStore, SignalProtocolError,
+    PublicKey, SenderKeyRecord, SenderKeyStore, SessionRecord, SessionStore, SignalProtocolError,
+    SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -147,7 +147,9 @@ impl SignalProtocolStore {
     }
 
     /// Get identity key pair.
-    pub async fn get_identity_key_pair(&self) -> std::result::Result<IdentityKeyPair, SignalProtocolError> {
+    pub async fn get_identity_key_pair(
+        &self,
+    ) -> std::result::Result<IdentityKeyPair, SignalProtocolError> {
         Ok(self.identity_key_pair.clone())
     }
 
@@ -176,7 +178,12 @@ impl SignalProtocolStore {
 
     /// Create sender key map key.
     fn sender_key_key(sender: &ProtocolAddress, distribution_id: Uuid) -> String {
-        format!("{}:{}:{}", sender.name(), sender.device_id(), distribution_id)
+        format!(
+            "{}:{}:{}",
+            sender.name(),
+            sender.device_id(),
+            distribution_id
+        )
     }
 }
 
@@ -186,7 +193,9 @@ impl SignalProtocolStore {
 
 #[async_trait(?Send)]
 impl libsignal_protocol::IdentityKeyStore for SignalProtocolStore {
-    async fn get_identity_key_pair(&self) -> std::result::Result<IdentityKeyPair, SignalProtocolError> {
+    async fn get_identity_key_pair(
+        &self,
+    ) -> std::result::Result<IdentityKeyPair, SignalProtocolError> {
         Ok(self.identity_key_pair.clone())
     }
 
@@ -244,8 +253,9 @@ impl libsignal_protocol::IdentityKeyStore for SignalProtocolStore {
 
         match identities.get(&key) {
             Some(bytes) => {
-                let identity = IdentityKey::try_from(bytes.as_slice())
-                    .map_err(|e| SignalProtocolError::InvalidArgument(format!("Invalid identity: {e}")))?;
+                let identity = IdentityKey::try_from(bytes.as_slice()).map_err(|e| {
+                    SignalProtocolError::InvalidArgument(format!("Invalid identity: {e}"))
+                })?;
                 Ok(Some(identity))
             }
             None => Ok(None),
@@ -268,8 +278,9 @@ impl SessionStore for SignalProtocolStore {
 
         match sessions.get(&key) {
             Some(bytes) => {
-                let record = SessionRecord::deserialize(bytes)
-                    .map_err(|e| SignalProtocolError::InvalidArgument(format!("Invalid session: {e}")))?;
+                let record = SessionRecord::deserialize(bytes).map_err(|e| {
+                    SignalProtocolError::InvalidArgument(format!("Invalid session: {e}"))
+                })?;
                 Ok(Some(record))
             }
             None => Ok(None),
@@ -282,8 +293,9 @@ impl SessionStore for SignalProtocolStore {
         record: &SessionRecord,
     ) -> std::result::Result<(), SignalProtocolError> {
         let key = Self::address_key(address);
-        let bytes = record.serialize()
-            .map_err(|e| SignalProtocolError::InvalidArgument(format!("Failed to serialize session: {e}")))?;
+        let bytes = record.serialize().map_err(|e| {
+            SignalProtocolError::InvalidArgument(format!("Failed to serialize session: {e}"))
+        })?;
 
         let mut sessions = self.sessions.write().await;
         sessions.insert(key, bytes);
@@ -317,15 +329,19 @@ impl PreKeyStore for SignalProtocolStore {
         record: &PreKeyRecord,
     ) -> std::result::Result<(), SignalProtocolError> {
         let id_u32: u32 = id.into();
-        let bytes = record.serialize()
-            .map_err(|e| SignalProtocolError::InvalidArgument(format!("Failed to serialize PreKey: {e}")))?;
+        let bytes = record.serialize().map_err(|e| {
+            SignalProtocolError::InvalidArgument(format!("Failed to serialize PreKey: {e}"))
+        })?;
 
         let mut pre_keys = self.pre_keys.write().await;
         pre_keys.insert(id_u32, bytes);
         Ok(())
     }
 
-    async fn remove_pre_key(&mut self, id: PreKeyId) -> std::result::Result<(), SignalProtocolError> {
+    async fn remove_pre_key(
+        &mut self,
+        id: PreKeyId,
+    ) -> std::result::Result<(), SignalProtocolError> {
         let id_u32: u32 = id.into();
 
         let mut pre_keys = self.pre_keys.write().await;
@@ -355,8 +371,9 @@ impl SignedPreKeyStore for SignalProtocolStore {
         let id_u32: u32 = id.into();
 
         match signed_pre_keys.get(&id_u32) {
-            Some(bytes) => SignedPreKeyRecord::deserialize(bytes)
-                .map_err(|e| SignalProtocolError::InvalidArgument(format!("Invalid SignedPreKey: {e}"))),
+            Some(bytes) => SignedPreKeyRecord::deserialize(bytes).map_err(|e| {
+                SignalProtocolError::InvalidArgument(format!("Invalid SignedPreKey: {e}"))
+            }),
             None => Err(SignalProtocolError::InvalidSignedPreKeyId),
         }
     }
@@ -367,8 +384,9 @@ impl SignedPreKeyStore for SignalProtocolStore {
         record: &SignedPreKeyRecord,
     ) -> std::result::Result<(), SignalProtocolError> {
         let id_u32: u32 = id.into();
-        let bytes = record.serialize()
-            .map_err(|e| SignalProtocolError::InvalidArgument(format!("Failed to serialize SignedPreKey: {e}")))?;
+        let bytes = record.serialize().map_err(|e| {
+            SignalProtocolError::InvalidArgument(format!("Failed to serialize SignedPreKey: {e}"))
+        })?;
 
         let mut signed_pre_keys = self.signed_pre_keys.write().await;
         signed_pre_keys.insert(id_u32, bytes);
@@ -390,8 +408,9 @@ impl KyberPreKeyStore for SignalProtocolStore {
         let id_u32: u32 = id.into();
 
         match kyber_pre_keys.get(&id_u32) {
-            Some(bytes) => KyberPreKeyRecord::deserialize(bytes)
-                .map_err(|e| SignalProtocolError::InvalidArgument(format!("Invalid KyberPreKey: {e}"))),
+            Some(bytes) => KyberPreKeyRecord::deserialize(bytes).map_err(|e| {
+                SignalProtocolError::InvalidArgument(format!("Invalid KyberPreKey: {e}"))
+            }),
             None => Err(SignalProtocolError::InvalidKyberPreKeyId),
         }
     }
@@ -402,8 +421,9 @@ impl KyberPreKeyStore for SignalProtocolStore {
         record: &KyberPreKeyRecord,
     ) -> std::result::Result<(), SignalProtocolError> {
         let id_u32: u32 = id.into();
-        let bytes = record.serialize()
-            .map_err(|e| SignalProtocolError::InvalidArgument(format!("Failed to serialize KyberPreKey: {e}")))?;
+        let bytes = record.serialize().map_err(|e| {
+            SignalProtocolError::InvalidArgument(format!("Failed to serialize KyberPreKey: {e}"))
+        })?;
 
         let mut kyber_pre_keys = self.kyber_pre_keys.write().await;
         kyber_pre_keys.insert(id_u32, bytes);
@@ -436,8 +456,9 @@ impl SenderKeyStore for SignalProtocolStore {
         record: &SenderKeyRecord,
     ) -> std::result::Result<(), SignalProtocolError> {
         let key = Self::sender_key_key(sender, distribution_id);
-        let bytes = record.serialize()
-            .map_err(|e| SignalProtocolError::InvalidArgument(format!("Failed to serialize SenderKey: {e}")))?;
+        let bytes = record.serialize().map_err(|e| {
+            SignalProtocolError::InvalidArgument(format!("Failed to serialize SenderKey: {e}"))
+        })?;
 
         let mut sender_keys = self.sender_keys.write().await;
         sender_keys.insert(key, bytes);
@@ -454,8 +475,9 @@ impl SenderKeyStore for SignalProtocolStore {
 
         match sender_keys.get(&key) {
             Some(bytes) => {
-                let record = SenderKeyRecord::deserialize(bytes)
-                    .map_err(|e| SignalProtocolError::InvalidArgument(format!("Invalid SenderKey: {e}")))?;
+                let record = SenderKeyRecord::deserialize(bytes).map_err(|e| {
+                    SignalProtocolError::InvalidArgument(format!("Invalid SenderKey: {e}"))
+                })?;
                 Ok(Some(record))
             }
             None => Ok(None),
@@ -491,7 +513,10 @@ mod tests {
         let key_pair = KeyPair::generate(&mut rand::rng());
         let record = PreKeyRecord::new(PreKeyId::from(42), &key_pair);
 
-        store.save_pre_key(PreKeyId::from(42), &record).await.unwrap();
+        store
+            .save_pre_key(PreKeyId::from(42), &record)
+            .await
+            .unwrap();
 
         let loaded = store.get_pre_key(PreKeyId::from(42)).await.unwrap();
         assert_eq!(

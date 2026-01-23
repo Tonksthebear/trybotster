@@ -5,12 +5,10 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::{fs, path::PathBuf};
 
-#[cfg(not(test))]
-use crate::env::is_test_mode;
 use crate::keyring::Credentials;
 
 /// Configuration for the botster-hub CLI.
@@ -33,15 +31,22 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        // Worktree base: prefer home directory, but don't silently fall back
-        // If home directory is unavailable, we'll catch this when loading config
-        let worktree_base = dirs::home_dir()
-            .map(|h| h.join("botster-sessions"))
-            .unwrap_or_else(|| {
-                // Log warning - this will be caught when config is actually used
-                eprintln!("Warning: Could not determine home directory for worktree_base");
-                PathBuf::from("botster-sessions")
-            });
+        // Worktree base: in test mode use project tmp/, otherwise use home directory
+        let worktree_base = if crate::env::is_any_test() {
+            // Test mode: use project tmp/ to avoid leaking outside the project
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .map(|p| p.join("tmp/botster-sessions"))
+                .unwrap_or_else(|| PathBuf::from("tmp/botster-sessions"))
+        } else {
+            dirs::home_dir()
+                .map(|h| h.join("botster-sessions"))
+                .unwrap_or_else(|| {
+                    // Log warning - this will be caught when config is actually used
+                    eprintln!("Warning: Could not determine home directory for worktree_base");
+                    PathBuf::from("botster-sessions")
+                })
+        };
 
         Self {
             server_url: "https://trybotster.com".to_string(),
@@ -78,8 +83,8 @@ impl Config {
                 if let Ok(test_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
                     // Explicit override via env var
                     PathBuf::from(test_dir)
-                } else if is_test_mode() {
-                    // Integration tests (BOTSTER_ENV=test): use repo's tmp/ directory
+                } else if crate::env::should_skip_keyring() {
+                    // Integration/system tests (BOTSTER_ENV=test or system_test): use repo's tmp/ directory
                     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .parent()
                         .context("cli/ has no parent directory")?

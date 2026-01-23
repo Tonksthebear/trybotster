@@ -71,14 +71,10 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
     expected_worktree = File.join(@worktree_base, "#{repo_safe}-botster-issue-456")
 
     # Wait for worktree to be created
-    deadline = Time.current + 15
-    while Time.current < deadline
-      break if File.directory?(expected_worktree)
-      sleep 0.5
-    end
-
-    assert File.directory?(expected_worktree),
-      "Worktree directory should exist at #{expected_worktree}.\nCLI logs:\n#{cli.log_contents(lines: 50)}"
+    wait_until(
+      timeout: 15,
+      message: -> { "Worktree directory should exist at #{expected_worktree}.\nCLI logs:\n#{cli.log_contents(lines: 50)}" }
+    ) { File.directory?(expected_worktree) }
   end
 
   test "agent receives environment variables" do
@@ -102,14 +98,10 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
     prompt_file = File.join(worktree_path, ".botster_prompt")
 
     # Wait for prompt file to be written
-    deadline = Time.current + 15
-    while Time.current < deadline
-      break if File.exist?(prompt_file)
-      sleep 0.5
-    end
-
-    assert File.exist?(prompt_file),
-      "Prompt file should be written to worktree at #{prompt_file}.\nCLI logs:\n#{cli.log_contents(lines: 50)}"
+    wait_until(
+      timeout: 15,
+      message: -> { "Prompt file should be written to worktree at #{prompt_file}.\nCLI logs:\n#{cli.log_contents(lines: 50)}" }
+    ) { File.exist?(prompt_file) }
 
     prompt_content = File.read(prompt_file)
     assert_includes prompt_content, "Check environment", "Prompt file should contain task description"
@@ -150,14 +142,15 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
     # Wait for cleanup to be processed (poll interval is 5s, plus processing time)
     assert_message_acknowledged(cleanup_message, timeout: 20)
 
-    # Wait for next heartbeat to update agent list (heartbeat interval is 2s in test mode)
-    sleep 4
-
-    # Agent should be removed
-    @hub.reload
-    cli_output = cli.recent_output(lines: 100)
-    assert_equal initial_agent_count - 1, @hub.hub_agents.count,
-      "Agent count should decrease after cleanup.\nCLI output:\n#{cli_output}\n\nHub agents: #{@hub.hub_agents.pluck(:session_key)}"
+    # Wait for heartbeat to report agent removal
+    expected_count = initial_agent_count - 1
+    wait_until(
+      timeout: 10,
+      message: -> {
+        cli_output = cli.recent_output(lines: 100)
+        "Agent count should decrease after cleanup.\nCLI output:\n#{cli_output}\n\nHub agents: #{@hub.reload.hub_agents.pluck(:session_key)}"
+      }
+    ) { @hub.reload.hub_agents.count == expected_count }
   end
 
   test "multiple agents can run concurrently" do
@@ -218,7 +211,7 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
 
     # Set up environment with git repo as working directory
     env = {
-      "BOTSTER_ENV" => "test",
+      "BOTSTER_ENV" => "system_test",
       "BOTSTER_CONFIG_DIR" => temp_dir,
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => api_key,
@@ -352,33 +345,18 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
   end
 
   def wait_for_agent_registration(hub, timeout: 10)
-    deadline = Time.current + timeout
-    while Time.current < deadline
-      hub.reload
-      return true if hub.hub_agents.exists?
-      sleep 0.5
-    end
-    false
+    wait_until?(timeout: timeout) { hub.reload.hub_agents.exists? }
   end
 
   def wait_for_agent_count(hub, count:, timeout: 10)
-    deadline = Time.current + timeout
-    while Time.current < deadline
-      hub.reload
-      return true if hub.hub_agents.count >= count
-      sleep 0.5
-    end
-    false
+    wait_until?(timeout: timeout) { hub.reload.hub_agents.count >= count }
   end
 
   def assert_message_acknowledged(message, timeout: 15)
-    deadline = Time.current + timeout
-    while Time.current < deadline
-      message.reload
-      return true if message.status == "acknowledged"
-      sleep 0.5
-    end
-    flunk "Message #{message.id} was not acknowledged within #{timeout}s (status: #{message.status})"
+    wait_until(
+      timeout: timeout,
+      message: -> { "Message #{message.id} was not acknowledged within #{timeout}s (status: #{message.reload.status})" }
+    ) { message.reload.status == "acknowledged" }
   end
 
   def teardown

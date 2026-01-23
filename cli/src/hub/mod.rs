@@ -21,6 +21,15 @@
 //!   (renders)     (Rails API)    (Browser WS)
 //! ```
 //!
+//! # Module Structure
+//!
+//! - `client_routing`: TUI selection helpers, client communication
+//! - `server_comms`: Message polling, server registration, heartbeat
+//! - `actions`: Hub action dispatch
+//! - `lifecycle`: Agent spawn/close operations
+//! - `polling`: Server polling utilities
+//! - `registration`: Device and hub registration
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -33,22 +42,32 @@
 // Rust guideline compliant 2025-01
 
 pub mod actions;
+pub mod agent_handle;
+mod client_routing;
+pub mod commands;
+pub mod events;
+pub mod hub_handle;
 pub mod lifecycle;
-pub mod menu;
 pub mod polling;
 pub mod registration;
 pub mod run;
+mod server_comms;
 pub mod state;
 pub mod workers;
 
-pub use actions::{HubAction, ScrollDirection};
 pub use crate::agents::AgentSpawnConfig;
+pub use actions::{HubAction, ScrollDirection};
+pub use agent_handle::AgentHandle;
+pub use commands::{
+    CreateAgentRequest, CreateAgentResult, DeleteAgentRequest, HubCommand, HubCommandSender,
+};
+pub use events::HubEvent;
+pub use hub_handle::HubHandle;
 pub use lifecycle::{close_agent, spawn_agent, SpawnResult};
-pub use menu::{build_menu, MenuAction, MenuContext, MenuItem};
-pub use state::HubState;
+pub use state::{HubState, SharedHubState};
 
-use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use reqwest::blocking::Client;
@@ -57,11 +76,10 @@ use sha2::{Digest, Sha256};
 
 use crate::app::AppMode;
 use crate::channel::{ActionCableChannel, Channel, ChannelConfig};
-use crate::client::{ClientId, ClientRegistry, Response, TuiClient};
+use crate::client::{ClientId, ClientRegistry, TuiClient};
 use crate::config::Config;
 use crate::device::Device;
 use crate::git::WorktreeManager;
-use crate::relay::AgentInfo;
 use crate::tunnel::TunnelManager;
 
 /// Progress event during agent creation.
@@ -113,8 +131,8 @@ pub fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
 /// TUI mode (with terminal rendering) or headless mode (for CI/daemon use).
 pub struct Hub {
     // === Core State ===
-    /// Core agent and worktree state.
-    pub state: HubState,
+    /// Core agent and worktree state (shared for thread-safe access).
+    pub state: SharedHubState,
     /// Application configuration.
     pub config: Config,
     /// HTTP client for server communication.
@@ -195,6 +213,16 @@ pub struct Hub {
     pub notification_worker: Option<workers::NotificationWorker>,
     /// Last agent count sent to heartbeat worker (for change detection).
     last_heartbeat_agent_count: usize,
+
+    // === Command Channel (Actor Pattern) ===
+    /// Sender for Hub commands (cloned for each client).
+    command_tx: tokio::sync::mpsc::Sender<HubCommand>,
+    /// Receiver for Hub commands (owned by Hub, polled in event loop).
+    command_rx: tokio::sync::mpsc::Receiver<HubCommand>,
+
+    // === Event Broadcast ===
+    /// Sender for Hub events (clients subscribe via `subscribe_events()`).
+    event_tx: tokio::sync::broadcast::Sender<HubEvent>,
 }
 
 impl std::fmt::Debug for Hub {
@@ -220,9 +248,10 @@ impl Hub {
     /// - The HTTP client cannot be created
     /// - Device identity cannot be loaded
     pub fn new(config: Config, terminal_dims: (u16, u16)) -> anyhow::Result<Self> {
+        use std::sync::RwLock;
         use std::time::Duration;
 
-        let state = HubState::new(config.worktree_base.clone());
+        let state = Arc::new(RwLock::new(HubState::new(config.worktree_base.clone())));
         let tokio_runtime = tokio::runtime::Runtime::new()?;
 
         // Generate stable hub_identifier: env var > repo path hash
@@ -251,9 +280,7 @@ impl Hub {
             }
         };
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?;
+        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
         // Load or create device identity for E2E encryption
         let device = Device::load_or_create()?;
@@ -273,6 +300,14 @@ impl Hub {
         let (pending_agent_tx, pending_agent_rx) = std_mpsc::channel();
         // Create channel for progress updates during agent creation
         let (progress_tx, progress_rx) = std_mpsc::channel();
+
+        // Create command channel for actor pattern
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(256);
+        let command_sender = HubCommandSender::new(command_tx.clone());
+        let hub_handle_for_tui = hub_handle::HubHandle::new(command_sender);
+
+        // Create event broadcast channel for pub/sub
+        let (event_tx, _) = tokio::sync::broadcast::channel(64);
 
         Ok(Self {
             state,
@@ -298,7 +333,7 @@ impl Hub {
             browser: crate::relay::BrowserState::default(),
             clients: {
                 let mut registry = ClientRegistry::new();
-                registry.register(Box::new(TuiClient::new()));
+                registry.register(Box::new(TuiClient::new(hub_handle_for_tui)));
                 registry
             },
             pending_agent_tx,
@@ -311,6 +346,9 @@ impl Hub {
             heartbeat_worker: None,
             notification_worker: None,
             last_heartbeat_agent_count: 0,
+            command_tx,
+            command_rx,
+            event_tx,
         })
     }
 
@@ -369,6 +407,25 @@ impl Hub {
         }
     }
 
+    /// Get a shared reference to the hub state for thread-safe access.
+    ///
+    /// Clients can clone this to access agent state without going through
+    /// Hub commands. The RwLock allows multiple readers without blocking.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let shared_state = hub.shared_state();
+    ///
+    /// // In client code (possibly different thread):
+    /// let state = shared_state.read().unwrap();
+    /// let agents = state.get_agents_info();
+    /// ```
+    #[must_use]
+    pub fn shared_state(&self) -> SharedHubState {
+        Arc::clone(&self.state)
+    }
+
     /// Get the current terminal dimensions.
     #[must_use]
     pub fn terminal_dims(&self) -> (u16, u16) {
@@ -406,20 +463,17 @@ impl Hub {
 
     /// Connect an agent's channels (terminal and optionally preview).
     ///
-    /// This creates and connects ActionCable channels that the agent owns.
-    /// Each agent owns its terminal channel for PTY I/O. Hub-level communication
-    /// (agent lists, commands) goes through HubRelay.
+    /// NOTE: PtySession.connect_channel was removed in the client refactor.
+    /// Terminal relay is now handled through different architecture (PtySession broadcasts
+    /// events, browser clients subscribe via relay module).
     ///
-    /// Requires:
-    /// - crypto_service to be available (browser connected via QR)
+    /// This method now only connects the preview channel for HTTP proxying.
     ///
     /// # Arguments
     ///
     /// * `session_key` - The agent's session key
     /// * `agent_index` - Index of the agent for channel routing
     pub fn connect_agent_channels(&mut self, session_key: &str, agent_index: usize) {
-        use crate::agent::pty::pty_index;
-
         // Check if crypto service is available
         let Some(crypto_service) = self.browser.crypto_service.clone() else {
             log::debug!(
@@ -433,12 +487,14 @@ impl Hub {
         let server_url = self.config.server_url.clone();
         let api_key = self.config.get_api_key().to_string();
 
-        // Get tunnel_port and has_server_pty from agent
-        let (tunnel_port, has_server_pty) = self
+        // Get tunnel_port from agent
+        let tunnel_port = self
             .state
+            .read()
+            .unwrap()
             .agents
             .get(session_key)
-            .map_or((None, false), |a| (a.tunnel_port, a.has_server_pty()));
+            .and_then(|a| a.tunnel_port);
 
         log::info!(
             "Connecting channels for agent {} (index={})",
@@ -446,83 +502,8 @@ impl Hub {
             agent_index
         );
 
-        // Connect CLI PTY channel (owned by cli_pty)
-        let cli_result = {
-            let Some(agent) = self.state.agents.get_mut(session_key) else {
-                log::error!("Agent {} not found for channel connection", session_key);
-                return;
-            };
-
-            self.tokio_runtime.block_on(async {
-                agent
-                    .cli_pty
-                    .connect_channel(
-                        ChannelConfig {
-                            channel_name: "TerminalRelayChannel".into(),
-                            hub_id: hub_id.clone(),
-                            agent_index: Some(agent_index),
-                            pty_index: Some(pty_index::CLI),
-                            encrypt: true,
-                            compression_threshold: Some(4096),
-                        },
-                        crypto_service.clone(),
-                        &server_url,
-                        &api_key,
-                    )
-                    .await
-            })
-        };
-
-        if let Err(e) = cli_result {
-            log::error!(
-                "Failed to connect CLI PTY channel for {}: {}",
-                session_key,
-                e
-            );
-            return;
-        }
-        log::info!("CLI PTY channel connected for {}", session_key);
-
-        // Connect Server PTY channel if server_pty exists (owned by server_pty)
-        if has_server_pty {
-            let server_result = {
-                let Some(agent) = self.state.agents.get_mut(session_key) else {
-                    return;
-                };
-                let Some(ref mut server_pty) = agent.server_pty else {
-                    return;
-                };
-
-                self.tokio_runtime.block_on(async {
-                    server_pty
-                        .connect_channel(
-                            ChannelConfig {
-                                channel_name: "TerminalRelayChannel".into(),
-                                hub_id: hub_id.clone(),
-                                agent_index: Some(agent_index),
-                                pty_index: Some(pty_index::SERVER),
-                                encrypt: true,
-                                compression_threshold: Some(4096),
-                            },
-                            crypto_service.clone(),
-                            &server_url,
-                            &api_key,
-                        )
-                        .await
-                })
-            };
-
-            if let Err(e) = server_result {
-                log::error!(
-                    "Failed to connect Server PTY channel for {}: {}",
-                    session_key,
-                    e
-                );
-                // Don't return - CLI channel is still connected
-            } else {
-                log::info!("Server PTY channel connected for {}", session_key);
-            }
-        }
+        // Terminal channels are now managed by PtySession broadcasting + browser relay.
+        // See relay/browser.rs for PTY event routing to browsers.
 
         // Connect preview channel if tunnel_port is set (owned by agent)
         if let Some(port) = tunnel_port {
@@ -552,7 +533,7 @@ impl Hub {
             }
 
             // Store preview channel on agent
-            if let Some(agent) = self.state.agents.get_mut(session_key) {
+            if let Some(agent) = self.state.write().unwrap().agents.get_mut(session_key) {
                 agent.preview_channel = Some(preview_channel);
                 log::info!(
                     "Preview channel connected for {} (port {})",
@@ -566,140 +547,7 @@ impl Hub {
     /// Get the number of active agents.
     #[must_use]
     pub fn agent_count(&self) -> usize {
-        self.state.agent_count()
-    }
-
-    /// Get the currently selected agent for TUI.
-    ///
-    /// This uses `TuiClient.state().selected_agent` as the source of truth,
-    /// NOT `HubState.selected`. This is part of the client abstraction.
-    #[must_use]
-    pub fn selected_agent(&self) -> Option<&crate::agent::Agent> {
-        self.get_tui_selected_agent_key()
-            .and_then(|key| self.state.agents.get(&key))
-    }
-
-    /// Get a mutable reference to the currently selected agent for TUI.
-    #[must_use]
-    pub fn selected_agent_mut(&mut self) -> Option<&mut crate::agent::Agent> {
-        let key = self.get_tui_selected_agent_key()?;
-        self.state.agents.get_mut(&key)
-    }
-
-    /// Get the selected agent key from TuiClient.
-    ///
-    /// TuiClient is the single source of truth for TUI's selection.
-    /// This replaces the old `hub.state.selected` index-based approach.
-    #[must_use]
-    pub fn get_tui_selected_agent_key(&self) -> Option<String> {
-        self.clients
-            .get(&ClientId::Tui)
-            .and_then(|client| client.state().selected_agent.clone())
-    }
-
-    /// Ensure TUI has a valid selection if agents exist.
-    ///
-    /// This prevents the visual fallback mismatch where render.rs shows
-    /// the first agent (index 0) but TuiClient.selected_agent is None,
-    /// causing input to not route anywhere.
-    ///
-    /// Called from tick() to sync TUI selection with visual display.
-    fn ensure_tui_selection(&mut self) {
-        // If no agents exist, nothing to select
-        if self.state.agent_keys_ordered.is_empty() {
-            return;
-        }
-
-        // Check current TUI selection
-        let current_selection = self.get_tui_selected_agent_key();
-
-        // If no selection, select the first agent
-        if current_selection.is_none() {
-            if let Some(first_key) = self.state.agent_keys_ordered.first().cloned() {
-                log::debug!("Auto-selecting first agent {} for TUI (was None)", first_key);
-                actions::dispatch(
-                    self,
-                    HubAction::SelectAgentForClient {
-                        client_id: ClientId::Tui,
-                        agent_key: first_key,
-                    },
-                );
-            }
-            return;
-        }
-
-        // If selection exists but agent doesn't (deleted), select first agent
-        let selection = current_selection.unwrap();
-        if !self.state.agents.contains_key(&selection) {
-            if let Some(first_key) = self.state.agent_keys_ordered.first().cloned() {
-                log::debug!(
-                    "Auto-selecting first agent {} for TUI (previous {} no longer exists)",
-                    first_key,
-                    selection
-                );
-                actions::dispatch(
-                    self,
-                    HubAction::SelectAgentForClient {
-                        client_id: ClientId::Tui,
-                        agent_key: first_key,
-                    },
-                );
-            }
-        }
-    }
-
-    /// Get the next agent key for a client's navigation.
-    ///
-    /// Returns the next agent in the ordered list, wrapping around.
-    /// If no agent is selected, returns the first agent.
-    #[must_use]
-    pub fn get_next_agent_key(&self, client_id: &ClientId) -> Option<String> {
-        if self.state.agent_keys_ordered.is_empty() {
-            return None;
-        }
-
-        let current = self.clients.get(client_id)
-            .and_then(|c| c.state().selected_agent.as_ref());
-
-        match current {
-            Some(key) => {
-                let idx = self.state.agent_keys_ordered.iter()
-                    .position(|k| k == key)
-                    .unwrap_or(0);
-                let next_idx = (idx + 1) % self.state.agent_keys_ordered.len();
-                Some(self.state.agent_keys_ordered[next_idx].clone())
-            }
-            None => Some(self.state.agent_keys_ordered[0].clone()),
-        }
-    }
-
-    /// Get the previous agent key for a client's navigation.
-    ///
-    /// Returns the previous agent in the ordered list, wrapping around.
-    /// If no agent is selected, returns the last agent.
-    #[must_use]
-    pub fn get_previous_agent_key(&self, client_id: &ClientId) -> Option<String> {
-        if self.state.agent_keys_ordered.is_empty() {
-            return None;
-        }
-
-        let current = self.clients.get(client_id)
-            .and_then(|c| c.state().selected_agent.as_ref());
-
-        match current {
-            Some(key) => {
-                let idx = self.state.agent_keys_ordered.iter()
-                    .position(|k| k == key)
-                    .unwrap_or(0);
-                let prev_idx = if idx == 0 {
-                    self.state.agent_keys_ordered.len() - 1
-                } else {
-                    idx - 1
-                };
-                Some(self.state.agent_keys_ordered[prev_idx].clone())
-            }
-            None => Some(self.state.agent_keys_ordered.last()?.clone()),
-        }
+        self.state.read().unwrap().agent_count()
     }
 
     /// Check if the hub should quit.
@@ -728,7 +576,7 @@ impl Hub {
     ///
     /// Delegates to `HubState::load_available_worktrees()`.
     pub fn load_available_worktrees(&mut self) -> anyhow::Result<()> {
-        self.state.load_available_worktrees()
+        self.state.write().unwrap().load_available_worktrees()
     }
 
     /// Toggle server polling on/off.
@@ -764,595 +612,7 @@ impl Hub {
         self.last_heartbeat = Instant::now();
     }
 
-    // === Event Loop Support ===
-
-    /// Perform periodic tasks (polling, heartbeat, notifications).
-    ///
-    /// Call this from your event loop to handle time-based operations.
-    /// This method is **non-blocking** when background workers are running.
-    ///
-    /// # Worker-based flow (non-blocking)
-    ///
-    /// When workers are active (after `setup()`):
-    /// - `poll_worker_messages()` - non-blocking try_recv from PollingWorker
-    /// - `update_heartbeat_agents()` - non-blocking send to HeartbeatWorker
-    /// - `poll_agent_notifications_async()` - non-blocking send to NotificationWorker
-    ///
-    /// # Fallback flow (blocking)
-    ///
-    /// When workers aren't available (offline mode, testing):
-    /// - Falls back to blocking HTTP calls on main thread
-    pub fn tick(&mut self) {
-        // Ensure TUI has a valid selection if agents exist
-        // (fixes visual fallback mismatch where render shows first agent but input routes to None)
-        self.ensure_tui_selection();
-
-        // Process completed background agent creations (always non-blocking)
-        self.poll_pending_agents();
-
-        // Process progress events from background agent creations
-        self.poll_progress_events();
-
-        // Use background workers if available (non-blocking)
-        if self.polling_worker.is_some() {
-            self.poll_worker_messages();
-            self.update_heartbeat_agents();
-            self.poll_agent_notifications_async();
-        } else {
-            // Fallback to blocking calls (offline mode, testing, or before setup)
-            self.poll_messages();
-            self.send_heartbeat();
-            self.poll_agent_notifications();
-        }
-    }
-
-    /// Poll for messages from background worker (non-blocking).
-    ///
-    /// Checks the polling worker's result channel for new messages
-    /// and processes them without blocking the main thread.
-    fn poll_worker_messages(&mut self) {
-        // Collect all available results first (to release borrow)
-        let results: Vec<workers::PollingResult> = {
-            let Some(ref worker) = self.polling_worker else {
-                return;
-            };
-
-            let mut results = Vec::new();
-            while let Some(result) = worker.try_recv() {
-                results.push(result);
-            }
-            results
-        };
-
-        // Now process each result (borrow released)
-        for result in results {
-            match result {
-                workers::PollingResult::Messages(messages) => {
-                    if !messages.is_empty() {
-                        self.process_polled_messages(messages);
-                    }
-                }
-                workers::PollingResult::Skipped => {
-                    // Offline mode or similar - nothing to do
-                }
-                workers::PollingResult::Error(e) => {
-                    log::debug!("Background poll error (will retry): {e}");
-                }
-            }
-        }
-    }
-
-    /// Process messages received from background polling.
-    ///
-    /// Converts messages to actions and dispatches them.
-    /// Acknowledgments are queued back to the worker thread.
-    fn process_polled_messages(&mut self, messages: Vec<crate::server::types::MessageData>) {
-        use crate::server::messages::{message_to_hub_action, MessageContext, ParsedMessage};
-
-        // Detect repo for context
-        let (repo_path, repo_name) = if let Ok(repo) = std::env::var("BOTSTER_REPO") {
-            (std::path::PathBuf::from("."), repo)
-        } else {
-            match crate::git::WorktreeManager::detect_current_repo() {
-                Ok(result) => result,
-                Err(_) if crate::env::is_test_mode() => {
-                    (std::path::PathBuf::from("."), "test/repo".to_string())
-                }
-                Err(e) => {
-                    log::warn!("Not in a git repository, skipping message processing: {e}");
-                    return;
-                }
-            }
-        };
-
-        log::info!("Processing {} messages from background poll", messages.len());
-
-        let context = MessageContext {
-            repo_path,
-            repo_name: repo_name.clone(),
-            worktree_base: self.config.worktree_base.clone(),
-            max_sessions: self.config.max_sessions,
-            current_agent_count: self.state.agent_count(),
-        };
-
-        for msg in &messages {
-            let parsed = ParsedMessage::from_message_data(msg);
-
-            // Try to notify existing agent first
-            if self.try_notify_existing_agent(&parsed, &context.repo_name) {
-                self.acknowledge_message_async(msg.id);
-                continue;
-            }
-
-            // Convert to action and dispatch
-            match message_to_hub_action(&parsed, &context) {
-                Ok(Some(action)) => {
-                    self.handle_action(action);
-                    self.acknowledge_message_async(msg.id);
-                }
-                Ok(None) => self.acknowledge_message_async(msg.id),
-                Err(e) => {
-                    // IMPORTANT: Acknowledge even on error to prevent infinite redelivery.
-                    // The message is malformed or we can't handle it - retrying won't help.
-                    log::error!("Failed to process message {}: {e} (acknowledging to prevent redelivery)", msg.id);
-                    self.acknowledge_message_async(msg.id);
-                }
-            }
-        }
-    }
-
-    /// Queue message acknowledgment to background worker (non-blocking).
-    fn acknowledge_message_async(&self, message_id: i64) {
-        if let Some(ref worker) = self.polling_worker {
-            worker.acknowledge(message_id);
-        } else {
-            // Fallback to blocking ack
-            self.acknowledge_message(message_id);
-        }
-    }
-
-    /// Update heartbeat worker with current agent list (non-blocking).
-    ///
-    /// Only sends updates when the agent count changes to avoid
-    /// sending redundant data every tick (60 FPS would be wasteful).
-    ///
-    /// The heartbeat worker maintains its own 30-second timer, so we just
-    /// need to keep it updated with the current agent list.
-    fn update_heartbeat_agents(&mut self) {
-        let Some(ref worker) = self.heartbeat_worker else {
-            return;
-        };
-
-        // Only send if agent count changed (simple change detection)
-        let current_count = self.state.agents.len();
-        if current_count == self.last_heartbeat_agent_count {
-            return;
-        }
-        self.last_heartbeat_agent_count = current_count;
-
-        // Build agent data for heartbeat
-        let agents: Vec<workers::HeartbeatAgentData> = self
-            .state
-            .agents
-            .values()
-            .map(|agent| workers::HeartbeatAgentData {
-                session_key: agent.session_key(),
-                last_invocation_url: agent.last_invocation_url.clone(),
-            })
-            .collect();
-
-        log::debug!("Heartbeat agent list updated: {} agents", agents.len());
-        worker.update_agents(agents);
-    }
-
-    /// Poll agents for notifications and send via background worker (non-blocking).
-    ///
-    /// Collects notifications from all agents and queues them to the
-    /// notification worker for background sending to Rails.
-    fn poll_agent_notifications_async(&self) {
-        use crate::agent::AgentNotification;
-
-        let Some(ref worker) = self.notification_worker else {
-            return;
-        };
-
-        // Collect and send notifications from all agents
-        for agent in self.state.agents.values() {
-            for notification in agent.poll_notifications() {
-                // Only send if we have issue context (otherwise there's nowhere to post)
-                if agent.issue_number.is_none() && agent.last_invocation_url.is_none() {
-                    continue;
-                }
-
-                let notification_type = match &notification {
-                    AgentNotification::Osc9(_) | AgentNotification::Osc777 { .. } => "question_asked",
-                };
-
-                log::info!(
-                    "Agent {} sent notification: {} (url: {:?})",
-                    agent.session_key(), notification_type, agent.last_invocation_url
-                );
-
-                let request = workers::NotificationRequest {
-                    repo: agent.repo.clone(),
-                    issue_number: agent.issue_number,
-                    invocation_url: agent.last_invocation_url.clone(),
-                    notification_type: notification_type.to_string(),
-                };
-
-                worker.send(request);
-            }
-        }
-    }
-
-    /// Poll for completed background agent creation tasks.
-    ///
-    /// Non-blocking check for results from spawn_blocking tasks.
-    /// Processes all completed creations and sends appropriate responses to clients.
-    pub fn poll_pending_agents(&mut self) {
-        // Process all pending results (non-blocking)
-        while let Ok(pending) = self.pending_agent_rx.try_recv() {
-            self.handle_pending_agent_result(pending);
-        }
-    }
-
-    /// Poll for progress events from background agent creation.
-    ///
-    /// Non-blocking check for progress updates. Sends progress to the requesting
-    /// client (browser or TUI).
-    pub fn poll_progress_events(&mut self) {
-        while let Ok(event) = self.progress_rx.try_recv() {
-            self.handle_progress_event(event);
-        }
-    }
-
-    /// Handle a progress event from background agent creation.
-    fn handle_progress_event(&mut self, event: AgentProgressEvent) {
-        log::debug!(
-            "Progress: {} -> {:?} for client {:?}",
-            event.identifier,
-            event.stage,
-            event.client_id
-        );
-
-        // Send progress to browser clients via relay
-        if let ClientId::Browser(ref identity) = event.client_id {
-            if let Some(ref sender) = self.browser.sender {
-                let ctx = crate::relay::BrowserSendContext {
-                    sender,
-                    runtime: &self.tokio_runtime,
-                };
-                crate::relay::send_agent_progress_to(
-                    &ctx,
-                    identity,
-                    &event.identifier,
-                    event.stage,
-                );
-            }
-        }
-
-        // Track TUI creation progress for display
-        if event.client_id.is_tui() {
-            self.creating_agent = Some((event.identifier.clone(), event.stage));
-        }
-    }
-
-    /// Handle a completed agent creation from background thread.
-    ///
-    /// The background thread has completed the slow git/file operations.
-    /// Now we do the fast PTY spawn on the main thread (needs &mut state).
-    fn handle_pending_agent_result(&mut self, pending: PendingAgentResult) {
-        // Clear TUI creating indicator on completion (success or failure)
-        if pending.client_id.is_tui() {
-            self.creating_agent = None;
-        }
-
-        match pending.result {
-            Ok(_) => {
-                // Background work succeeded - now spawn the agent (fast, needs &mut state)
-                log::info!(
-                    "Background worktree ready for {:?}, spawning agent...",
-                    pending.client_id
-                );
-
-                // Get client dims for PTY
-                let dims = self.clients.get(&pending.client_id)
-                    .and_then(|c| c.state().dims)
-                    .unwrap_or(self.terminal_dims);
-
-                // Spawn agent (fast - just PTY creation)
-                match lifecycle::spawn_agent(&mut self.state, &pending.config, dims) {
-                    Ok(result) => {
-                        log::info!(
-                            "Agent spawned: {} for client {:?}",
-                            result.session_key,
-                            pending.client_id
-                        );
-
-                        // Register tunnel if port assigned
-                        if let Some(port) = result.tunnel_port {
-                            let tm = Arc::clone(&self.tunnel_manager);
-                            let key = result.session_key.clone();
-                            self.tokio_runtime.spawn(async move {
-                                tm.register_agent(key, port).await;
-                            });
-                        }
-
-                        // Connect agent's channels (terminal + preview if tunnel exists)
-                        if let Some(agent_index) = self
-                            .state
-                            .agents
-                            .keys()
-                            .position(|k| k == &result.session_key)
-                        {
-                            self.connect_agent_channels(&result.session_key, agent_index);
-                        }
-
-                        // Send response to requesting client
-                        if let Some(client) = self.clients.get_mut(&pending.client_id) {
-                            client.receive_response(Response::agent_created(&result.session_key));
-                        }
-
-                        // Send agent_created to browser clients via relay
-                        if let ClientId::Browser(ref identity) = pending.client_id {
-                            if let Some(ref sender) = self.browser.sender {
-                                let ctx = crate::relay::BrowserSendContext {
-                                    sender,
-                                    runtime: &self.tokio_runtime,
-                                };
-                                crate::relay::send_agent_created_to(&ctx, identity, &result.session_key);
-                            }
-                        }
-
-                        // Send updated agent list to all browsers via relay
-                        // (BrowserClient::receive_agent_list is no-op, must use relay)
-                        crate::relay::browser::send_agent_list(self);
-
-                        // Auto-select the new agent for the requesting client
-                        let session_key = result.session_key.clone();
-                        actions::dispatch(
-                            self,
-                            HubAction::SelectAgentForClient {
-                                client_id: pending.client_id.clone(),
-                                agent_key: session_key.clone(),
-                            },
-                        );
-
-                        // Send scrollback to browser client after auto-selection
-                        // (handle_select_agent_for_client doesn't send scrollback - it's generic)
-                        if let ClientId::Browser(ref identity) = pending.client_id {
-                            crate::relay::browser::send_scrollback_for_agent_to_browser(
-                                self,
-                                identity,
-                                &session_key,
-                            );
-                        }
-
-                        // Also auto-select for TUI if it has no selection
-                        // (ensures TUI state matches what's visually displayed)
-                        if pending.client_id != ClientId::Tui {
-                            let tui_has_selection = self.get_tui_selected_agent_key().is_some();
-                            if !tui_has_selection {
-                                actions::dispatch(
-                                    self,
-                                    HubAction::SelectAgentForClient {
-                                        client_id: ClientId::Tui,
-                                        agent_key: session_key,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to spawn agent: {}", e);
-                        self.send_error_to(&pending.client_id, format!("Failed to spawn agent: {}", e));
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!(
-                    "Background agent creation failed for {:?}: {}",
-                    pending.client_id,
-                    e
-                );
-                self.send_error_to(&pending.client_id, format!("Failed to create agent: {}", e));
-            }
-        }
-    }
-
-    // === Server Communication ===
-
-    /// Build polling configuration from Hub state.
-    fn polling_config(&self) -> polling::PollingConfig<'_> {
-        polling::PollingConfig {
-            client: &self.client,
-            server_url: &self.config.server_url,
-            api_key: self.config.get_api_key(),
-            poll_interval: self.config.poll_interval,
-            server_hub_id: self.server_hub_id(),
-        }
-    }
-
-    /// Poll the server for new messages and process them.
-    ///
-    /// This method polls at the configured interval and processes any pending
-    /// messages from the server, converting them to HubActions.
-    pub fn poll_messages(&mut self) {
-        use crate::server::messages::{message_to_hub_action, MessageContext, ParsedMessage};
-        use std::time::Duration;
-
-        if polling::should_skip_polling(self.quit, self.polling_enabled) {
-            return;
-        }
-        if self.last_poll.elapsed() < Duration::from_secs(self.config.poll_interval) {
-            return;
-        }
-        self.last_poll = Instant::now();
-
-        // Detect repo: env var > git detection > test fallback
-        let (repo_path, repo_name) = if let Ok(repo) = std::env::var("BOTSTER_REPO") {
-            // Explicit repo override (used in tests and special cases)
-            (std::path::PathBuf::from("."), repo)
-        } else {
-            match crate::git::WorktreeManager::detect_current_repo() {
-                Ok(result) => result,
-                Err(_) if crate::env::is_test_mode() => {
-                    // Test mode fallback - use dummy repo
-                    (std::path::PathBuf::from("."), "test/repo".to_string())
-                }
-                Err(e) => {
-                    log::warn!("Not in a git repository, skipping poll: {e}");
-                    return;
-                }
-            }
-        };
-
-        let messages = polling::poll_messages(&self.polling_config(), &repo_name);
-        if messages.is_empty() {
-            return;
-        }
-
-        log::info!("Polled {} messages for repo={}", messages.len(), repo_name);
-
-        let context = MessageContext {
-            repo_path,
-            repo_name: repo_name.clone(),
-            worktree_base: self.config.worktree_base.clone(),
-            max_sessions: self.config.max_sessions,
-            current_agent_count: self.state.agent_count(),
-        };
-
-        for msg in &messages {
-            let parsed = ParsedMessage::from_message_data(msg);
-
-            // Try to notify existing agent first
-            if self.try_notify_existing_agent(&parsed, &context.repo_name) {
-                self.acknowledge_message(msg.id);
-                continue;
-            }
-
-            // Convert to action and dispatch
-            match message_to_hub_action(&parsed, &context) {
-                Ok(Some(action)) => {
-                    self.handle_action(action);
-                    self.acknowledge_message(msg.id);
-                }
-                Ok(None) => self.acknowledge_message(msg.id),
-                Err(e) => log::error!("Failed to process message {}: {e}", msg.id),
-            }
-        }
-    }
-
-    /// Try to send a notification to an existing agent for this issue.
-    ///
-    /// Returns true if an agent was found and notified, false otherwise.
-    /// Does NOT apply to cleanup messages - those need to go through the action dispatch.
-    fn try_notify_existing_agent(
-        &mut self,
-        parsed: &crate::server::messages::ParsedMessage,
-        default_repo: &str,
-    ) -> bool {
-        // Cleanup messages should not be treated as notifications
-        if parsed.is_cleanup() {
-            return false;
-        }
-
-        let Some(issue_number) = parsed.issue_number else {
-            return false;
-        };
-
-        let repo_safe = parsed.repo.as_deref().unwrap_or(default_repo).replace('/', "-");
-        let session_key = format!("{repo_safe}-{issue_number}");
-
-        let Some(agent) = self.state.agents.get_mut(&session_key) else {
-            return false;
-        };
-
-        log::info!("Agent exists for issue #{issue_number}, sending notification");
-        let notification = parsed.format_notification();
-
-        if let Err(e) = agent.write_input_to_cli(notification.as_bytes()) {
-            log::error!("Failed to send notification to agent: {e}");
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let _ = agent.write_input_to_cli(b"\r");
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let _ = agent.write_input_to_cli(b"\r");
-        }
-
-        true
-    }
-
-    /// Acknowledge a message to the server.
-    fn acknowledge_message(&self, message_id: i64) {
-        let config = self.polling_config();
-        polling::acknowledge_message(&config, message_id);
-    }
-
-    /// Send heartbeat to the server.
-    ///
-    /// Registers this hub instance and its active agents with the server.
-    /// Delegates to `polling::send_heartbeat_if_due()`.
-    pub fn send_heartbeat(&mut self) {
-        polling::send_heartbeat_if_due(self);
-    }
-
-    /// Poll agents for terminal notifications (OSC 9, OSC 777).
-    ///
-    /// When agents emit notifications, sends them to Rails for GitHub comments.
-    /// Delegates to `polling::poll_and_send_agent_notifications()`.
-    pub fn poll_agent_notifications(&mut self) {
-        polling::poll_and_send_agent_notifications(self);
-    }
-
-    // === Connection Setup ===
-
-    /// Register the device with the server if not already registered.
-    pub fn register_device(&mut self) {
-        registration::register_device(&mut self.device, &self.client, &self.config);
-    }
-
-    /// Register the hub with the server and store the server-assigned ID.
-    ///
-    /// The server-assigned `botster_id` is used for all URLs and WebSocket subscriptions
-    /// to guarantee uniqueness (no collision between different CLI instances).
-    /// The local `hub_identifier` is kept for config directories.
-    pub fn register_hub_with_server(&mut self) {
-        let botster_id = registration::register_hub_with_server(
-            &self.hub_identifier,
-            &self.config.server_url,
-            self.config.get_api_key(),
-            self.device.device_id,
-        );
-        // Store server-assigned ID (used for all server communication)
-        self.botster_id = Some(botster_id);
-    }
-
-    /// Start the tunnel connection in background.
-    pub fn start_tunnel(&self) {
-        registration::start_tunnel(&self.tunnel_manager, &self.tokio_runtime);
-    }
-
-    /// Connect to hub relay for browser communication (Signal E2E encryption).
-    ///
-    /// The hub relay handles hub-level commands and broadcasts. Terminal I/O
-    /// goes through agent-owned channels, not this relay.
-    pub fn connect_hub_relay(&mut self) {
-        // Extract values before mutable borrow of browser
-        let server_id = self.server_hub_id().to_string();
-        let local_id = self.hub_identifier.clone();
-        let server_url = self.config.server_url.clone();
-        let api_key = self.config.get_api_key().to_string();
-
-        registration::connect_hub_relay(
-            &mut self.browser,
-            &server_id,
-            &local_id,
-            &server_url,
-            &api_key,
-            &self.tokio_runtime,
-        );
-    }
+    // === Event Loop ===
 
     /// Perform all initial setup steps.
     pub fn setup(&mut self) {
@@ -1366,17 +626,17 @@ impl Hub {
         self.start_background_workers();
     }
 
-    // === Event Loop ===
-
-    /// Run the Hub event loop with TUI.
+    /// Run the Hub event loop without TUI.
     ///
-    /// Delegates to `hub::run::run_event_loop()` for the main loop implementation.
-    pub fn run(
+    /// For TUI mode, use `crate::tui::run_with_hub()` instead - the TUI
+    /// module now owns TuiRunner instantiation.
+    ///
+    /// For headless mode, use `hub::run::run_headless_loop()`.
+    pub fn run_headless(
         &mut self,
-        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
         shutdown_flag: &std::sync::atomic::AtomicBool,
     ) -> anyhow::Result<()> {
-        run::run_event_loop(self, terminal, shutdown_flag)
+        run::run_headless_loop(self, shutdown_flag)
     }
 
     /// Send shutdown notification to server and cleanup resources.
@@ -1393,78 +653,210 @@ impl Hub {
         );
     }
 
-    // === Client Communication Helpers ===
+    // === Command Channel (Actor Pattern) ===
 
-    /// Build the agent list for sending to clients.
-    fn build_agent_list(&self) -> Vec<AgentInfo> {
-        self.state
-            .agents
-            .iter()
-            .map(|(key, agent)| AgentInfo {
-                id: key.clone(),
-                repo: Some(agent.repo.clone()),
-                issue_number: agent.issue_number.map(u64::from),
-                branch_name: Some(agent.branch_name.clone()),
-                name: None, // Agent doesn't have a separate name field
-                status: Some(format!("{:?}", agent.status)),
-                tunnel_port: agent.tunnel_port,
-                server_running: Some(agent.server_pty.is_some()),
-                has_server_pty: Some(agent.server_pty.is_some()),
-                active_pty_view: None, // Not tracked at Agent level
-                scroll_offset: None,   // Not tracked at Agent level
-                hub_identifier: Some(self.hub_identifier.clone()),
-            })
-            .collect()
-    }
-
-    /// Send agent list to a specific client.
-    pub fn send_agent_list_to(&mut self, client_id: &ClientId) {
-        let agents = self.build_agent_list();
-        if let Some(client) = self.clients.get_mut(client_id) {
-            client.receive_agent_list(agents);
-        }
-    }
-
-    /// Send worktree list to a specific client.
-    pub fn send_worktree_list_to(&mut self, client_id: &ClientId) {
-        // available_worktrees is Vec<(path: String, branch: String)>
-        let worktrees = self
-            .state
-            .available_worktrees
-            .iter()
-            .map(|(path, branch)| crate::relay::WorktreeInfo {
-                path: path.clone(),
-                branch: branch.clone(),
-                issue_number: None, // Not tracked in tuple format
-            })
-            .collect();
-
-        if let Some(client) = self.clients.get_mut(client_id) {
-            client.receive_worktree_list(worktrees);
-        }
-    }
-
-    /// Send error response to a specific client.
-    pub fn send_error_to(&mut self, client_id: &ClientId, message: String) {
-        if let Some(client) = self.clients.get_mut(client_id) {
-            client.receive_response(Response::Error { message });
-        }
-    }
-
-    /// Broadcast agent list to all connected clients.
-    pub fn broadcast_agent_list(&mut self) {
-        let agents = self.build_agent_list();
-        for (_client_id, client) in self.clients.iter_mut() {
-            client.receive_agent_list(agents.clone());
-        }
-    }
-
-    /// Flush all client output buffers.
+    /// Get a command sender for clients to communicate with the Hub.
     ///
-    /// Call this at the end of each event loop iteration to ensure
-    /// batched output is sent to browsers.
-    pub fn flush_all_clients(&mut self) {
-        self.clients.flush_all();
+    /// Clients use this to send commands (create agent, delete agent, etc.)
+    /// to the Hub. The Hub processes commands in its event loop via
+    /// `process_commands()`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let sender = hub.command_sender();
+    /// // Pass to TuiRunner or other clients
+    /// let runner = TuiRunner::new(terminal, sender, ...);
+    /// ```
+    #[must_use]
+    pub fn command_sender(&self) -> HubCommandSender {
+        HubCommandSender::new(self.command_tx.clone())
+    }
+
+    /// Get a `HubHandle` for thread-safe client communication.
+    ///
+    /// `HubHandle` provides a simplified, blocking API for clients running
+    /// in their own threads. It wraps the command channel and provides
+    /// convenient methods for querying agents and sending commands.
+    ///
+    /// # Thread Safety
+    ///
+    /// The returned handle is `Clone + Send + Sync` and can be freely
+    /// passed to other threads.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handle = hub.handle();
+    ///
+    /// // Pass to client thread
+    /// std::thread::spawn(move || {
+    ///     let agents = handle.get_agents();
+    ///     if let Some(agent) = handle.get_agent(0) {
+    ///         // Use agent handle...
+    ///     }
+    /// });
+    /// ```
+    #[must_use]
+    pub fn handle(&self) -> hub_handle::HubHandle {
+        hub_handle::HubHandle::new(self.command_sender())
+    }
+
+    /// Subscribe to Hub events.
+    ///
+    /// Returns a receiver that will receive all Hub events:
+    /// - `AgentCreated` - New agent was created
+    /// - `AgentDeleted` - Agent was deleted
+    /// - `AgentStatusChanged` - Agent status changed
+    /// - `Shutdown` - Hub is shutting down
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut rx = hub.subscribe_events();
+    /// tokio::spawn(async move {
+    ///     while let Ok(event) = rx.recv().await {
+    ///         match event {
+    ///             HubEvent::AgentCreated { agent_id, .. } => {
+    ///                 println!("Agent created: {}", agent_id);
+    ///             }
+    ///             // ...
+    ///         }
+    ///     }
+    /// });
+    /// ```
+    #[must_use]
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<HubEvent> {
+        self.event_tx.subscribe()
+    }
+
+    /// Broadcast an event to all subscribers.
+    ///
+    /// Events are sent to all clients that have called `subscribe_events()`.
+    /// If no subscribers exist, the event is silently dropped.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// hub.broadcast(HubEvent::agent_created("agent-123", info));
+    /// ```
+    pub fn broadcast(&self, event: HubEvent) {
+        // Ignore send errors - they just mean no subscribers exist
+        let _ = self.event_tx.send(event);
+    }
+
+    /// Process pending commands from clients.
+    ///
+    /// Call this in the event loop to handle commands sent via `command_sender()`.
+    /// Non-blocking - processes all available commands without waiting.
+    ///
+    /// Returns the number of commands processed.
+    pub fn process_commands(&mut self) -> usize {
+        let mut processed = 0;
+
+        while let Ok(cmd) = self.command_rx.try_recv() {
+            self.handle_command(cmd);
+            processed += 1;
+        }
+
+        processed
+    }
+
+    /// Handle a single Hub command.
+    fn handle_command(&mut self, cmd: HubCommand) {
+        match cmd {
+            HubCommand::CreateAgent {
+                request,
+                response_tx,
+            } => {
+                // Agent creation is async - dispatch to background worker
+                // For now, respond that the request was received
+                log::info!(
+                    "Received CreateAgent command for: {}",
+                    request.issue_or_branch
+                );
+
+                // Convert from commands::CreateAgentRequest to client::CreateAgentRequest
+                let client_request = crate::client::CreateAgentRequest {
+                    issue_or_branch: request.issue_or_branch,
+                    prompt: request.prompt,
+                    from_worktree: request.from_worktree,
+                };
+
+                // Dispatch to background creation
+                let action = HubAction::CreateAgentForClient {
+                    client_id: ClientId::Tui, // TODO: Track requesting client
+                    request: client_request,
+                };
+                self.handle_action(action);
+
+                // Can't return result immediately for async operation
+                // Client will be notified via HubEvent::AgentCreated
+                drop(response_tx);
+            }
+
+            HubCommand::DeleteAgent {
+                request,
+                response_tx,
+            } => {
+                log::info!("Received DeleteAgent command for: {}", request.agent_id);
+
+                // Convert from commands::DeleteAgentRequest to client::DeleteAgentRequest
+                let client_request = crate::client::DeleteAgentRequest {
+                    agent_id: request.agent_id,
+                    delete_worktree: request.delete_worktree,
+                };
+
+                let action = HubAction::DeleteAgentForClient {
+                    client_id: ClientId::Tui, // TODO: Track requesting client
+                    request: client_request,
+                };
+                self.handle_action(action);
+                let _ = response_tx.send(Ok(()));
+            }
+
+            HubCommand::ListAgents { response_tx } => {
+                let agents = self.state.read().unwrap().get_agents_info();
+                let _ = response_tx.send(agents);
+            }
+
+            HubCommand::GetAgent {
+                agent_id,
+                response_tx,
+            } => {
+                let result = self
+                    .state
+                    .read()
+                    .unwrap()
+                    .get_agent_handle_by_id(&agent_id)
+                    .ok_or_else(|| format!("Agent not found: {}", agent_id));
+                let _ = response_tx.send(result);
+            }
+
+            HubCommand::GetAgentByIndex { index, response_tx } => {
+                let handle = self.state.read().unwrap().get_agent_handle(index);
+                let _ = response_tx.send(handle);
+            }
+
+            HubCommand::Quit => {
+                log::info!("Received Quit command");
+                self.quit = true;
+                self.broadcast(HubEvent::shutdown());
+            }
+
+            HubCommand::DispatchAction(action) => {
+                self.handle_action(action);
+            }
+
+            HubCommand::ListWorktrees { response_tx } => {
+                // Reload worktrees and return the list
+                if let Err(e) = self.load_available_worktrees() {
+                    log::error!("Failed to load worktrees: {}", e);
+                }
+                let worktrees = self.state.read().unwrap().available_worktrees.clone();
+                let _ = response_tx.send(worktrees);
+            }
+        }
     }
 }
 
@@ -1578,12 +970,17 @@ mod tests {
         let hub = Hub::new(config, TEST_DIMS).unwrap();
 
         // TUI client should be registered
-        let tui_client = hub.clients.get(&ClientId::Tui);
-        assert!(tui_client.is_some(), "TuiClient should be registered");
+        assert!(
+            hub.clients.get(&ClientId::Tui).is_some(),
+            "TuiClient should be registered"
+        );
 
         // Initial selection should be None (no agents)
-        let tui_selection = tui_client.unwrap().state().selected_agent.clone();
-        assert!(tui_selection.is_none(), "TuiClient should have no selection initially");
+        let tui_selection = hub.clients.selected_agent(&ClientId::Tui);
+        assert!(
+            tui_selection.is_none(),
+            "TuiClient should have no selection initially"
+        );
     }
 
     #[test]
@@ -1604,7 +1001,10 @@ mod tests {
             PathBuf::from("/tmp/test"),
         );
         let agent_key = "test-repo-42".to_string();
-        hub.state.add_agent(agent_key.clone(), agent);
+        hub.state
+            .write()
+            .unwrap()
+            .add_agent(agent_key.clone(), agent);
 
         // Use SelectAgentForClient action (client-scoped)
         hub.handle_action(HubAction::SelectAgentForClient {
@@ -1612,12 +1012,11 @@ mod tests {
             agent_key: agent_key.clone(),
         });
 
-        // TuiClient should now have the agent selected
-        let tui_client = hub.clients.get(&ClientId::Tui).unwrap();
-        let tui_selection = tui_client.state().selected_agent.clone();
+        // TuiClient should now have the agent selected (tracked by registry)
+        let tui_selection = hub.clients.selected_agent(&ClientId::Tui);
         assert_eq!(
             tui_selection,
-            Some(agent_key.clone()),
+            Some(agent_key.as_str()),
             "TuiClient.selected_agent should be updated by SelectAgentForClient"
         );
     }
@@ -1640,11 +1039,14 @@ mod tests {
                 format!("botster-issue-{}", i),
                 PathBuf::from("/tmp/test"),
             );
-            hub.state.add_agent(format!("test-repo-{}", i), agent);
+            hub.state
+                .write()
+                .unwrap()
+                .add_agent(format!("test-repo-{}", i), agent);
         }
 
         // Register a browser client
-        let browser_client = BrowserClient::new("browser-test-123".to_string());
+        let browser_client = BrowserClient::new(hub_handle::HubHandle::mock(), "browser-test-123".to_string());
         hub.clients.register(Box::new(browser_client));
 
         // TUI selects agent 1
@@ -1659,21 +1061,16 @@ mod tests {
             agent_key: "test-repo-2".to_string(),
         });
 
-        // Verify they have different selections
-        let tui_selection = hub.clients.get(&ClientId::Tui)
-            .unwrap()
-            .state()
-            .selected_agent
-            .clone();
-        let browser_selection = hub.clients.get(&ClientId::browser("browser-test-123"))
-            .unwrap()
-            .state()
-            .selected_agent
-            .clone();
+        // Verify they have different selections (via registry)
+        let tui_selection = hub.clients.selected_agent(&ClientId::Tui);
+        let browser_selection = hub.clients.selected_agent(&ClientId::browser("browser-test-123"));
 
-        assert_eq!(tui_selection, Some("test-repo-1".to_string()));
-        assert_eq!(browser_selection, Some("test-repo-2".to_string()));
-        assert_ne!(tui_selection, browser_selection, "TUI and browser should have independent selections");
+        assert_eq!(tui_selection, Some("test-repo-1"));
+        assert_eq!(browser_selection, Some("test-repo-2"));
+        assert_ne!(
+            tui_selection, browser_selection,
+            "TUI and browser should have independent selections"
+        );
     }
 
     #[test]
@@ -1694,7 +1091,10 @@ mod tests {
                 format!("botster-issue-{}", i),
                 PathBuf::from("/tmp/test"),
             );
-            hub.state.add_agent(format!("test-repo-{}", i), agent);
+            hub.state
+                .write()
+                .unwrap()
+                .add_agent(format!("test-repo-{}", i), agent);
         }
 
         // Use SelectAgentForClient to select agent 2 via TuiClient
@@ -1711,5 +1111,4 @@ mod tests {
             "get_tui_selected_agent_key should return TuiClient's selection"
         );
     }
-
 }

@@ -1,0 +1,12 @@
+# Cargo configuration for botster-hub
+#
+# Ensures tests always run in test mode (BOTSTER_ENV=test)
+# which enables test-specific behavior like:
+# - Skipping authentication
+# - Using tmp/botster-test for data directories
+# - Reduced heartbeat intervals
+
+[env]
+# Set BOTSTER_ENV=test for all test runs
+# Simple format is more reliable across cargo versions
+BOTSTER_ENV = "test"

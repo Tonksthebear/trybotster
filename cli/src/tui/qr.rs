@@ -80,17 +80,20 @@ pub fn generate_qr_kitty_image(data: &str, module_size: u8) -> Option<QrRenderRe
     let mut png_bytes = Vec::new();
     {
         let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
-        encoder.write_image(
-            img.as_raw(),
-            img_size,
-            img_size,
-            image::ExtendedColorType::L8,
-        ).ok()?;
+        encoder
+            .write_image(
+                img.as_raw(),
+                img_size,
+                img_size,
+                image::ExtendedColorType::L8,
+            )
+            .ok()?;
     }
 
     // Build Kitty graphics protocol escape sequence with explicit cell sizing
     let b64_data = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-    let escape_sequence = build_kitty_escape_sequence(&b64_data, img_size, QR_IMAGE_COLS, QR_IMAGE_ROWS);
+    let escape_sequence =
+        build_kitty_escape_sequence(&b64_data, img_size, QR_IMAGE_COLS, QR_IMAGE_ROWS);
 
     Some(QrRenderResult::KittyImage {
         escape_sequence,
@@ -110,10 +113,16 @@ pub fn kitty_delete_images() -> &'static str {
 /// - `img_size_px`: actual image dimensions in pixels (square)
 /// - `display_cols`: number of terminal columns to display image in
 /// - `display_rows`: number of terminal rows to display image in
-fn build_kitty_escape_sequence(b64_data: &str, img_size_px: u32, display_cols: u16, display_rows: u16) -> String {
+fn build_kitty_escape_sequence(
+    b64_data: &str,
+    img_size_px: u32,
+    display_cols: u16,
+    display_rows: u16,
+) -> String {
     const CHUNK_SIZE: usize = 4096;
     let mut result = String::new();
-    let chunks: Vec<&str> = b64_data.as_bytes()
+    let chunks: Vec<&str> = b64_data
+        .as_bytes()
         .chunks(CHUNK_SIZE)
         .map(|c| std::str::from_utf8(c).unwrap_or(""))
         .collect();
@@ -136,10 +145,7 @@ fn build_kitty_escape_sequence(b64_data: &str, img_size_px: u32, display_cols: u
             ));
         } else {
             // Continuation chunks
-            result.push_str(&format!(
-                "\x1b_Gm={};{}\x1b\\",
-                more, chunk
-            ));
+            result.push_str(&format!("\x1b_Gm={};{}\x1b\\", more, chunk));
         }
     }
 
@@ -148,9 +154,8 @@ fn build_kitty_escape_sequence(b64_data: &str, img_size_px: u32, display_cols: u
 
 /// Generate QR code from data using optimal encoding.
 fn generate_qr_code(data: &str) -> Option<QrCode> {
-    let is_alphanumeric_char = |c: char| {
-        c.is_ascii_uppercase() || c.is_ascii_digit() || " $%*+-./:".contains(c)
-    };
+    let is_alphanumeric_char =
+        |c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || " $%*+-./:".contains(c);
 
     // Try different error correction levels
     for ec_level in [QrCodeEcc::Quartile, QrCodeEcc::Medium, QrCodeEcc::Low] {
@@ -163,7 +168,8 @@ fn generate_qr_code(data: &str) -> Option<QrCode> {
                     qrcodegen::Version::MAX,
                     None,
                     true,
-                ).ok()
+                )
+                .ok()
             })
             .map(Ok)
             .unwrap_or_else(|| QrCode::encode_text(data, ec_level));
@@ -194,7 +200,10 @@ pub fn kitty_image_rows(height_px: u32) -> u16 {
 /// This is efficient because the bulk of the data (the ~2900 char Base32 bundle)
 /// gets the higher-capacity alphanumeric encoding, while the short URL portion
 /// (~30 chars) uses flexible byte mode.
-fn build_mixed_mode_segments(data: &str, is_alphanumeric_char: &impl Fn(char) -> bool) -> Option<Vec<QrSegment>> {
+fn build_mixed_mode_segments(
+    data: &str,
+    is_alphanumeric_char: &impl Fn(char) -> bool,
+) -> Option<Vec<QrSegment>> {
     let hash_pos = data.find('#')?;
     let (url_with_hash, bundle) = data.split_at(hash_pos + 1); // Include # in first part
 
@@ -239,9 +248,8 @@ fn build_mixed_mode_segments(data: &str, is_alphanumeric_char: &impl Fn(char) ->
 pub fn generate_qr_code_lines(data: &str, max_width: u16, max_height: u16) -> Vec<String> {
     // QR alphanumeric charset: 0-9, A-Z, space, $ % * + - . / :
     // Note: # is NOT alphanumeric, so URLs with fragments need mixed-mode encoding
-    let is_alphanumeric_char = |c: char| {
-        c.is_ascii_uppercase() || c.is_ascii_digit() || " $%*+-./:".contains(c)
-    };
+    let is_alphanumeric_char =
+        |c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || " $%*+-./:".contains(c);
 
     // Try different error correction levels, from highest to lowest quality
     let ec_levels = [QrCodeEcc::Quartile, QrCodeEcc::Medium, QrCodeEcc::Low];
@@ -258,8 +266,9 @@ pub fn generate_qr_code_lines(data: &str, max_width: u16, max_height: u16) -> Ve
                     qrcodegen::Version::MIN,
                     qrcodegen::Version::MAX,
                     None,
-                    true
-                ).ok()
+                    true,
+                )
+                .ok()
             })
             .map(Ok)
             .unwrap_or_else(|| QrCode::encode_text(data, ec_level));
@@ -346,8 +355,9 @@ pub fn generate_qr_code_lines(data: &str, max_width: u16, max_height: u16) -> Ve
                     qrcodegen::Version::MIN,
                     qrcodegen::Version::MAX,
                     None,
-                    true
-                ).ok()
+                    true,
+                )
+                .ok()
             })
             .map(Ok)
             .unwrap_or_else(|| QrCode::encode_text(data, QrCodeEcc::Low));
@@ -367,10 +377,7 @@ pub fn generate_qr_code_lines(data: &str, max_width: u16, max_height: u16) -> Ve
     };
 
     if too_long {
-        log::warn!(
-            "URL too long for QR code ({} chars)",
-            data.len()
-        );
+        log::warn!("URL too long for QR code ({} chars)", data.len());
         vec![
             "URL too long for QR code".to_string(),
             format!("URL is {} chars", data.len()),
@@ -388,7 +395,10 @@ pub fn generate_qr_code_lines(data: &str, max_width: u16, max_height: u16) -> Ve
         vec![
             "Terminal too small for QR code".to_string(),
             format!("Available: {}x{}", max_width, max_height),
-            format!("Need: {}x{} (try larger terminal)", needed_width, needed_height),
+            format!(
+                "Need: {}x{} (try larger terminal)",
+                needed_width, needed_height
+            ),
             "".to_string(),
             "Press [c] to copy URL instead".to_string(),
         ]
@@ -431,7 +441,11 @@ mod tests {
         // Test what sizes can be created with alphanumeric mode
         for len in [100, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000] {
             // Use uppercase alphanumeric data
-            let data: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".chars().cycle().take(len).collect();
+            let data: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+                .chars()
+                .cycle()
+                .take(len)
+                .collect();
             let segments = QrSegment::make_alphanumeric(&data);
             let result = QrCode::encode_segments_advanced(
                 &[segments],
@@ -439,7 +453,7 @@ mod tests {
                 qrcodegen::Version::MIN,
                 qrcodegen::Version::MAX,
                 None,
-                true
+                true,
             );
             match result {
                 Ok(code) => {
@@ -462,7 +476,10 @@ mod tests {
 
         // At 140x70, should work now with alphanumeric mode
         let lines_medium = generate_qr_code_lines(&url, 140, 70);
-        println!("1600 char URL at 140x70: {:?}", &lines_medium[0..2.min(lines_medium.len())]);
+        println!(
+            "1600 char URL at 140x70: {:?}",
+            &lines_medium[0..2.min(lines_medium.len())]
+        );
 
         // At 180x90, QR definitely fits
         let lines_large = generate_qr_code_lines(&url, 180, 90);
@@ -476,7 +493,11 @@ mod tests {
     fn test_qr_code_with_base32_uppercase_url() {
         // Simulate the new uppercase Base32 URL format
         // ~2900 chars of Base32 (uppercase + digits only)
-        let base32_bundle: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".chars().cycle().take(2901).collect();
+        let base32_bundle: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+            .chars()
+            .cycle()
+            .take(2901)
+            .collect();
         let url = format!("HTTPS://BOTSTER.DEV/H/123#{}", base32_bundle);
 
         println!("Test URL length: {} chars", url.len());
@@ -485,9 +506,9 @@ mod tests {
         let lines = generate_qr_code_lines(&url, 180, 90);
 
         // Should NOT show error message
-        let has_error = lines.iter().any(|l|
-            l.contains("too long") || l.contains("too small") || l.contains("Terminal")
-        );
+        let has_error = lines
+            .iter()
+            .any(|l| l.contains("too long") || l.contains("too small") || l.contains("Terminal"));
 
         if has_error {
             println!("Error lines: {:?}", lines);
@@ -500,7 +521,8 @@ mod tests {
 
         // Should contain QR code characters
         let all_text: String = lines.join("");
-        let has_qr_chars = all_text.contains('█') || all_text.contains('▀') || all_text.contains('▄');
+        let has_qr_chars =
+            all_text.contains('█') || all_text.contains('▀') || all_text.contains('▄');
         assert!(has_qr_chars, "Should contain QR code block characters");
     }
 }

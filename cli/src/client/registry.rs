@@ -2,6 +2,12 @@
 //!
 //! The registry maintains all connected clients and provides O(1) lookup
 //! for PTY output routing via a reverse index.
+//!
+//! # Selection State
+//!
+//! Selection state (which agent each client is viewing) is owned by the registry,
+//! not by the Client trait. This keeps the Client trait focused on IO concerns
+//! while the registry handles routing state.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,12 +20,23 @@ use super::{Client, ClientId};
 /// The `viewers` HashMap maps agent keys to sets of client IDs viewing that agent.
 /// This enables O(1) lookup when routing PTY output, instead of iterating all clients.
 ///
+/// # Selection Tracking
+///
+/// The `selections` HashMap tracks which agent each client is viewing.
+/// This is the authoritative source for selection state - the Client trait
+/// does not expose selection state.
+///
 /// # Example
 ///
 /// ```text
 /// viewers: {
 ///     "agent-abc": { ClientId::Tui, ClientId::Browser("xyz") },
 ///     "agent-def": { ClientId::Browser("123") },
+/// }
+/// selections: {
+///     ClientId::Tui: "agent-abc",
+///     ClientId::Browser("xyz"): "agent-abc",
+///     ClientId::Browser("123"): "agent-def",
 /// }
 /// ```
 ///
@@ -28,9 +45,13 @@ pub struct ClientRegistry {
     /// All clients by ID.
     clients: HashMap<ClientId, Box<dyn Client>>,
 
-    /// Reverse index: agent_key -> set of client IDs viewing that agent.
+    /// Reverse index: agent_id -> set of client IDs viewing that agent.
     /// Enables O(1) lookup for PTY output routing.
     viewers: HashMap<String, HashSet<ClientId>>,
+
+    /// Forward index: client_id -> selected agent_id.
+    /// Registry owns selection state since Client trait doesn't expose it.
+    selections: HashMap<ClientId, String>,
 }
 
 impl ClientRegistry {
@@ -39,37 +60,29 @@ impl ClientRegistry {
         Self {
             clients: HashMap::new(),
             viewers: HashMap::new(),
+            selections: HashMap::new(),
         }
     }
 
     /// Register a new client.
     ///
-    /// If a client with the same ID already exists, it is replaced.
+    /// Client starts with no selection. Call `select_agent` to set selection.
     pub fn register(&mut self, client: Box<dyn Client>) {
         let id = client.id().clone();
-
-        // If client already has a selection, add to viewer index
-        if let Some(agent_key) = client.state().selected_agent.as_ref() {
-            self.viewers
-                .entry(agent_key.clone())
-                .or_default()
-                .insert(id.clone());
-        }
-
         self.clients.insert(id, client);
     }
 
-    /// Unregister a client, cleaning up viewer index.
+    /// Unregister a client, cleaning up viewer index and selection state.
     ///
     /// Returns the removed client if it existed.
     pub fn unregister(&mut self, id: &ClientId) -> Option<Box<dyn Client>> {
         if let Some(client) = self.clients.remove(id) {
-            // Remove from viewer index
-            if let Some(agent_key) = client.state().selected_agent.as_ref() {
-                if let Some(viewers) = self.viewers.get_mut(agent_key) {
+            // Remove from viewer index using our tracked selection
+            if let Some(agent_id) = self.selections.remove(id) {
+                if let Some(viewers) = self.viewers.get_mut(&agent_id) {
                     viewers.remove(id);
                     if viewers.is_empty() {
-                        self.viewers.remove(agent_key);
+                        self.viewers.remove(&agent_id);
                     }
                 }
             }
@@ -89,46 +102,53 @@ impl ClientRegistry {
         self.clients.get_mut(id)
     }
 
-    /// Update viewer index when client changes selection.
+    /// Set the selected agent for a client.
     ///
-    /// This must be called BEFORE updating the client's state to maintain consistency.
+    /// This updates both the forward index (client -> agent) and
+    /// the reverse index (agent -> clients).
     ///
     /// # Arguments
     ///
     /// * `client_id` - The client changing selection
-    /// * `old_agent` - Previous selected agent (if any)
-    /// * `new_agent` - New selected agent (if any)
-    pub fn update_selection(
-        &mut self,
-        client_id: &ClientId,
-        old_agent: Option<&str>,
-        new_agent: Option<&str>,
-    ) {
-        // Remove from old agent's viewers
-        if let Some(old_key) = old_agent {
-            if let Some(viewers) = self.viewers.get_mut(old_key) {
+    /// * `agent_id` - The agent to select (None to clear selection)
+    pub fn select_agent(&mut self, client_id: &ClientId, agent_id: Option<&str>) {
+        // Remove from old agent's viewers if there was a selection
+        if let Some(old_id) = self.selections.remove(client_id) {
+            if let Some(viewers) = self.viewers.get_mut(&old_id) {
                 viewers.remove(client_id);
                 if viewers.is_empty() {
-                    self.viewers.remove(old_key);
+                    self.viewers.remove(&old_id);
                 }
             }
         }
 
         // Add to new agent's viewers
-        if let Some(new_key) = new_agent {
+        if let Some(new_id) = agent_id {
+            self.selections
+                .insert(client_id.clone(), new_id.to_string());
             self.viewers
-                .entry(new_key.to_string())
+                .entry(new_id.to_string())
                 .or_default()
                 .insert(client_id.clone());
         }
     }
 
+    /// Get the selected agent for a client.
+    pub fn selected_agent(&self, client_id: &ClientId) -> Option<&str> {
+        self.selections.get(client_id).map(|s| s.as_str())
+    }
+
+    /// Clear selection for a client (convenience method).
+    pub fn clear_selection(&mut self, client_id: &ClientId) {
+        self.select_agent(client_id, None);
+    }
+
     /// Get all client IDs viewing a specific agent (O(1) lookup).
     ///
     /// Returns an empty iterator if no clients are viewing the agent.
-    pub fn viewers_of(&self, agent_key: &str) -> impl Iterator<Item = &ClientId> {
+    pub fn viewers_of(&self, agent_id: &str) -> impl Iterator<Item = &ClientId> {
         self.viewers
-            .get(agent_key)
+            .get(agent_id)
             .into_iter()
             .flat_map(|set| set.iter())
     }
@@ -160,27 +180,21 @@ impl ClientRegistry {
 
     /// Remove agent from all viewer indices (when agent is deleted).
     ///
-    /// Note: This does NOT clear clients' selected_agent state.
-    /// The caller should separately call clear_selection on affected clients.
-    pub fn remove_agent_viewers(&mut self, agent_key: &str) {
-        self.viewers.remove(agent_key);
-    }
-
-    /// Flush all clients (for batched output).
-    ///
-    /// Called at end of event loop iteration to send batched output.
-    pub fn flush_all(&mut self) {
-        for client in self.clients.values_mut() {
-            client.flush();
+    /// This clears the selection for all clients that were viewing this agent,
+    /// updating both the forward and reverse indices.
+    pub fn remove_agent_viewers(&mut self, agent_id: &str) {
+        // Get all clients viewing this agent
+        if let Some(viewer_ids) = self.viewers.remove(agent_id) {
+            // Clear their selection in the forward index
+            for client_id in viewer_ids {
+                self.selections.remove(&client_id);
+            }
         }
     }
 
     /// Get count of viewers for a specific agent.
-    pub fn viewer_count(&self, agent_key: &str) -> usize {
-        self.viewers
-            .get(agent_key)
-            .map(|set| set.len())
-            .unwrap_or(0)
+    pub fn viewer_count(&self, agent_id: &str) -> usize {
+        self.viewers.get(agent_id).map(|set| set.len()).unwrap_or(0)
     }
 }
 
@@ -195,6 +209,7 @@ impl std::fmt::Debug for ClientRegistry {
         f.debug_struct("ClientRegistry")
             .field("client_count", &self.clients.len())
             .field("viewer_count", &self.viewers.len())
+            .field("selection_count", &self.selections.len())
             .finish_non_exhaustive()
     }
 }
@@ -202,12 +217,14 @@ impl std::fmt::Debug for ClientRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{AgentInfo, ClientState, Response, WorktreeInfo};
+    use crate::client::types::CreateAgentRequest;
+    use crate::client::{AgentHandle, AgentInfo};
 
-    /// Test client for unit tests.
+    /// Test client implementing the event-driven Client trait.
     struct TestClient {
         id: ClientId,
-        state: ClientState,
+        dims: (u16, u16),
+        connected: bool,
         output_received: Vec<u8>,
     }
 
@@ -215,14 +232,10 @@ mod tests {
         fn new(id: ClientId) -> Self {
             Self {
                 id,
-                state: ClientState::default(),
+                dims: (80, 24),
+                connected: true,
                 output_received: Vec::new(),
             }
-        }
-
-        fn with_selection(mut self, agent_key: &str) -> Self {
-            self.state.selected_agent = Some(agent_key.to_string());
-            self
         }
     }
 
@@ -231,25 +244,45 @@ mod tests {
             &self.id
         }
 
-        fn state(&self) -> &ClientState {
-            &self.state
+        fn dims(&self) -> (u16, u16) {
+            self.dims
         }
 
-        fn state_mut(&mut self) -> &mut ClientState {
-            &mut self.state
+        fn get_agents(&self) -> Vec<AgentInfo> {
+            // Test client returns empty
+            Vec::new()
         }
 
-        fn receive_output(&mut self, data: &[u8]) {
+        fn get_agent(&self, _index: usize) -> Option<AgentHandle> {
+            // Test client returns None
+            None
+        }
+
+        fn request_create_agent(&self, _request: CreateAgentRequest) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn request_delete_agent(&self, _agent_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn on_output(&mut self, data: &[u8]) {
             self.output_received.extend_from_slice(data);
         }
 
-        fn receive_scrollback(&mut self, _lines: Vec<String>) {}
+        fn on_resized(&mut self, _rows: u16, _cols: u16) {}
 
-        fn receive_agent_list(&mut self, _agents: Vec<AgentInfo>) {}
+        fn on_process_exit(&mut self, _exit_code: Option<i32>) {}
 
-        fn receive_worktree_list(&mut self, _worktrees: Vec<WorktreeInfo>) {}
+        fn on_agent_created(&mut self, _index: usize, _info: &AgentInfo) {}
 
-        fn receive_response(&mut self, _response: Response) {}
+        fn on_agent_deleted(&mut self, _index: usize) {}
+
+        fn on_hub_shutdown(&mut self) {}
+
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
     }
 
     #[test]
@@ -260,19 +293,22 @@ mod tests {
 
         assert_eq!(registry.len(), 1);
         assert!(registry.get(&ClientId::Tui).is_some());
-        assert!(registry.get(&ClientId::Browser("xyz".to_string())).is_none());
+        assert!(registry
+            .get(&ClientId::Browser("xyz".to_string()))
+            .is_none());
     }
 
     #[test]
-    fn test_unregister() {
+    fn test_unregister_clears_selection() {
         let mut registry = ClientRegistry::new();
-        let client = TestClient::new(ClientId::Tui).with_selection("agent-123");
+        let client = TestClient::new(ClientId::Tui);
         registry.register(Box::new(client));
 
-        // Verify viewer index populated
+        // Select an agent via registry
+        registry.select_agent(&ClientId::Tui, Some("agent-123"));
         assert_eq!(registry.viewer_count("agent-123"), 1);
 
-        // Unregister
+        // Unregister - should clean up selection
         let removed = registry.unregister(&ClientId::Tui);
         assert!(removed.is_some());
         assert_eq!(registry.len(), 0);
@@ -280,48 +316,71 @@ mod tests {
     }
 
     #[test]
-    fn test_viewer_index_on_register() {
+    fn test_select_agent_updates_indices() {
         let mut registry = ClientRegistry::new();
-
-        // Register client already viewing an agent
-        let client = TestClient::new(ClientId::Tui).with_selection("agent-abc");
+        let client = TestClient::new(ClientId::Tui);
         registry.register(Box::new(client));
+
+        // Select an agent
+        registry.select_agent(&ClientId::Tui, Some("agent-abc"));
 
         // Should be in viewer index
         let viewers: Vec<_> = registry.viewers_of("agent-abc").collect();
         assert_eq!(viewers.len(), 1);
         assert_eq!(viewers[0], &ClientId::Tui);
+
+        // Should be in selection index
+        assert_eq!(registry.selected_agent(&ClientId::Tui), Some("agent-abc"));
     }
 
     #[test]
-    fn test_update_selection() {
+    fn test_select_agent_changes_selection() {
         let mut registry = ClientRegistry::new();
-        let client = TestClient::new(ClientId::Tui).with_selection("agent-old");
+        let client = TestClient::new(ClientId::Tui);
         registry.register(Box::new(client));
 
-        // Update selection
-        registry.update_selection(&ClientId::Tui, Some("agent-old"), Some("agent-new"));
+        // Initial selection
+        registry.select_agent(&ClientId::Tui, Some("agent-old"));
+        assert_eq!(registry.viewer_count("agent-old"), 1);
 
-        // Update client state (caller responsibility)
-        if let Some(client) = registry.get_mut(&ClientId::Tui) {
-            client.select_agent("agent-new");
-        }
+        // Change selection
+        registry.select_agent(&ClientId::Tui, Some("agent-new"));
 
-        // Verify viewer index updated
+        // Verify indices updated
         assert_eq!(registry.viewer_count("agent-old"), 0);
         assert_eq!(registry.viewer_count("agent-new"), 1);
+        assert_eq!(registry.selected_agent(&ClientId::Tui), Some("agent-new"));
+    }
+
+    #[test]
+    fn test_clear_selection() {
+        let mut registry = ClientRegistry::new();
+        let client = TestClient::new(ClientId::Tui);
+        registry.register(Box::new(client));
+
+        registry.select_agent(&ClientId::Tui, Some("agent-123"));
+        assert_eq!(registry.viewer_count("agent-123"), 1);
+
+        // Clear selection
+        registry.clear_selection(&ClientId::Tui);
+
+        assert_eq!(registry.viewer_count("agent-123"), 0);
+        assert_eq!(registry.selected_agent(&ClientId::Tui), None);
     }
 
     #[test]
     fn test_multiple_viewers() {
         let mut registry = ClientRegistry::new();
 
-        // Two clients viewing same agent
-        let tui = TestClient::new(ClientId::Tui).with_selection("agent-shared");
-        let browser = TestClient::new(ClientId::browser("xyz")).with_selection("agent-shared");
+        let tui = TestClient::new(ClientId::Tui);
+        let browser = TestClient::new(ClientId::browser("xyz"));
 
         registry.register(Box::new(tui));
         registry.register(Box::new(browser));
+
+        // Both select the same agent via registry
+        registry.select_agent(&ClientId::Tui, Some("agent-shared"));
+        registry.select_agent(&ClientId::browser("xyz"), Some("agent-shared"));
 
         assert_eq!(registry.viewer_count("agent-shared"), 2);
 
@@ -331,20 +390,19 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_agent_viewers() {
+    fn test_remove_agent_viewers_clears_selections() {
         let mut registry = ClientRegistry::new();
-        let client = TestClient::new(ClientId::Tui).with_selection("agent-123");
+        let client = TestClient::new(ClientId::Tui);
         registry.register(Box::new(client));
+
+        registry.select_agent(&ClientId::Tui, Some("agent-123"));
 
         // Remove agent from viewer index
         registry.remove_agent_viewers("agent-123");
 
-        // Viewer index cleared
+        // Both viewer index and selection should be cleared
         assert_eq!(registry.viewer_count("agent-123"), 0);
-
-        // But client still has selection (caller must clear separately)
-        let state = registry.get(&ClientId::Tui).unwrap().state();
-        assert_eq!(state.selected_agent, Some("agent-123".to_string()));
+        assert_eq!(registry.selected_agent(&ClientId::Tui), None);
     }
 
     #[test]
@@ -354,5 +412,15 @@ mod tests {
         // No viewers for non-existent agent
         let viewers: Vec<_> = registry.viewers_of("nonexistent").collect();
         assert!(viewers.is_empty());
+    }
+
+    #[test]
+    fn test_client_starts_with_no_selection() {
+        let mut registry = ClientRegistry::new();
+        let client = TestClient::new(ClientId::Tui);
+        registry.register(Box::new(client));
+
+        // New clients have no selection
+        assert_eq!(registry.selected_agent(&ClientId::Tui), None);
     }
 }
