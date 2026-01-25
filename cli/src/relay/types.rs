@@ -140,6 +140,15 @@ pub enum TerminalMessage {
         /// Error message.
         error: String,
     },
+    /// PTY process exited notification.
+    ///
+    /// Sent when the PTY process terminates. Browser should handle this
+    /// appropriately (e.g., show exit status, disable input).
+    #[serde(rename = "process_exited")]
+    ProcessExited {
+        /// Exit code from the PTY process, if available.
+        exit_code: Option<i32>,
+    },
 }
 
 /// Agent info for list response.
@@ -620,6 +629,36 @@ mod tests {
             TerminalMessage::Scrollback { data, compressed } => {
                 assert!(!data.is_empty());
                 assert!(compressed);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    // ========== ProcessExited Message Tests ==========
+
+    #[test]
+    fn test_terminal_message_process_exited_with_code() {
+        let msg = TerminalMessage::ProcessExited { exit_code: Some(0) };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"process_exited""#));
+        assert!(json.contains(r#""exit_code":0"#));
+    }
+
+    #[test]
+    fn test_terminal_message_process_exited_without_code() {
+        let msg = TerminalMessage::ProcessExited { exit_code: None };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"process_exited""#));
+        assert!(json.contains(r#""exit_code":null"#));
+    }
+
+    #[test]
+    fn test_terminal_message_process_exited_deserialization() {
+        let json = r#"{"type":"process_exited","exit_code":1}"#;
+        let parsed: TerminalMessage = serde_json::from_str(json).unwrap();
+        match parsed {
+            TerminalMessage::ProcessExited { exit_code } => {
+                assert_eq!(exit_code, Some(1));
             }
             _ => panic!("Wrong variant"),
         }

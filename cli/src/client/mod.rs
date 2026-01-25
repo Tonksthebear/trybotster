@@ -61,10 +61,11 @@ mod types;
 
 pub use browser::BrowserClient;
 pub use registry::ClientRegistry;
-pub use tui::TuiClient;
+pub use tui::{TuiClient, TuiOutput};
 pub use types::{CreateAgentRequest, DeleteAgentRequest, Response};
 
-pub use crate::hub::agent_handle::{AgentHandle, PtyCommand, PtyHandle};
+pub use crate::agent::pty::PtyCommand;
+pub use crate::hub::agent_handle::{AgentHandle, PtyHandle};
 pub use crate::hub::HubHandle;
 pub use crate::relay::AgentInfo;
 

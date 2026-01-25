@@ -33,39 +33,9 @@
 
 use tokio::sync::{broadcast, mpsc};
 
-use crate::agent::pty::PtyEvent;
+use crate::agent::pty::{PtyCommand, PtyEvent};
 use crate::client::ClientId;
 use crate::relay::types::AgentInfo;
-
-/// Command sent through PtyHandle to the PtySession.
-#[derive(Debug)]
-pub enum PtyCommand {
-    /// Send input data to the PTY.
-    Input(Vec<u8>),
-    /// Resize the PTY (from a specific client).
-    Resize {
-        /// The client requesting the resize.
-        client_id: ClientId,
-        /// Number of rows.
-        rows: u16,
-        /// Number of columns.
-        cols: u16,
-    },
-    /// Client connected to this PTY.
-    Connect {
-        /// The connecting client.
-        client_id: ClientId,
-        /// Terminal dimensions (rows, cols).
-        dims: (u16, u16),
-        /// Response channel for scrollback data.
-        response_tx: tokio::sync::oneshot::Sender<Vec<u8>>,
-    },
-    /// Client disconnected from this PTY.
-    Disconnect {
-        /// The disconnecting client.
-        client_id: ClientId,
-    },
-}
 
 /// Handle for interacting with an agent.
 ///

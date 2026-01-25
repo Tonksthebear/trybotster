@@ -336,7 +336,11 @@ impl Hub {
             browser: crate::relay::BrowserState::default(),
             clients: {
                 let mut registry = ClientRegistry::new();
-                registry.register(Box::new(TuiClient::new(hub_handle_for_tui)));
+                // Create TuiClient with a dummy output channel.
+                // In Hub context, TuiClient is used for client identity and dimensions,
+                // not for receiving PTY output (TuiRunner has its own TuiClient for that).
+                let (output_tx, _output_rx) = tokio::sync::mpsc::unbounded_channel();
+                registry.register(Box::new(TuiClient::new(hub_handle_for_tui, output_tx)));
                 registry
             },
             pending_agent_tx,

@@ -56,10 +56,9 @@ use vt100::Parser;
 
 use ratatui::backend::CrosstermBackend;
 
-use crate::agent::pty::PtyEvent;
 use crate::agent::PtyView;
 use crate::app::AppMode;
-use crate::client::{Client, TuiClient};
+use crate::client::{Client, TuiClient, TuiOutput};
 use crate::constants;
 use crate::hub::{AgentHandle, Hub, HubCommandSender, HubEvent, HubHandle};
 use crate::relay::{browser, AgentInfo};
@@ -91,15 +90,15 @@ pub struct TuiRunner<B: Backend> {
     // === Client (owns shared state) ===
     /// The TuiClient instance that implements the Client trait.
     ///
-    /// Owns: selected_agent, active_pty_view, pty_event_rx, current_pty_handle.
-    /// TuiRunner delegates to client for these fields.
+    /// Handles PTY I/O routing via output_sink channel. TuiRunner receives
+    /// TuiOutput messages through output_rx and feeds them to vt100_parser.
     pub(super) client: TuiClient,
 
     // === Terminal ===
     /// VT100 parser for terminal emulation.
     ///
-    /// Receives PTY output from selected agent and maintains screen state.
-    /// Shared with TuiClient via Arc.
+    /// Receives PTY output via output_rx channel and maintains screen state.
+    /// Owned exclusively by TuiRunner (TuiClient only routes bytes).
     pub(super) vt100_parser: Arc<Mutex<Parser>>,
 
     /// Ratatui terminal for rendering.
@@ -176,6 +175,14 @@ pub struct TuiRunner<B: Backend> {
     /// input and is displayed in the terminal widget.
     pub(super) current_pty_index: Option<usize>,
 
+    // === Output Channel ===
+    /// Receiver for PTY output from TuiClient.
+    ///
+    /// TuiClient sends `TuiOutput` messages through this channel when connected
+    /// to a PTY. TuiRunner receives and processes them (feeding to vt100 parser,
+    /// handling process exit, etc.).
+    output_rx: tokio::sync::mpsc::UnboundedReceiver<TuiOutput>,
+
     // === Control ===
     /// Shutdown flag (shared with Hub for coordinated shutdown).
     shutdown: Arc<AtomicBool>,
@@ -234,8 +241,12 @@ where
         let parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
         let vt100_parser = Arc::new(Mutex::new(parser));
 
-        // Create TuiClient sharing the same vt100 parser
-        let client = TuiClient::with_parser(hub_handle, Arc::clone(&vt100_parser), cols, rows);
+        // Create channel for PTY output from TuiClient to TuiRunner.
+        // TuiClient sends TuiOutput messages, TuiRunner receives and processes them.
+        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // TuiClient handles I/O routing, TuiRunner owns the parser
+        let client = TuiClient::with_dims(hub_handle, output_tx, cols, rows);
 
         Self {
             client,
@@ -259,6 +270,7 @@ where
             active_pty_view: PtyView::default(),
             current_agent_index: None,
             current_pty_index: None,
+            output_rx,
             shutdown,
             quit: false,
             terminal_dims,
@@ -411,32 +423,40 @@ where
         }
     }
 
-    /// Poll PTY events and feed to parser.
+    /// Poll PTY output from channel and feed to parser.
+    ///
+    /// TuiClient sends `TuiOutput` messages through the channel when connected
+    /// to a PTY. TuiRunner receives and processes them here (feeding to vt100
+    /// parser, handling process exit, etc.).
+    ///
+    /// This mirrors Browser architecture: BrowserClient sends output through
+    /// WebSocket, web browser (xterm.js) does the parsing/rendering.
     fn poll_pty_events(&mut self) {
+        use tokio::sync::mpsc::error::TryRecvError;
+
         // Process up to 100 events per tick
         for _ in 0..100 {
-            match self.client.poll_pty_events() {
-                Ok(Some(PtyEvent::Output(data))) => {
-                    // Feed output to vt100 parser
-                    self.client.process_output(&data);
+            match self.output_rx.try_recv() {
+                Ok(TuiOutput::Scrollback(data)) => {
+                    // Feed historical output to TuiRunner's vt100 parser
+                    let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
+                    parser.process(&data);
+                    log::debug!("Processed {} bytes of scrollback", data.len());
                 }
-                Ok(Some(PtyEvent::Resized { rows, cols })) => {
-                    log::debug!("PTY resized to {}x{}", cols, rows);
-                    // Update local dimensions to match PTY
-                    self.client.update_dims(cols, rows);
+                Ok(TuiOutput::Output(data)) => {
+                    // Feed ongoing output to TuiRunner's vt100 parser
+                    let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
+                    parser.process(&data);
                 }
-                Ok(Some(PtyEvent::ProcessExited { exit_code })) => {
+                Ok(TuiOutput::ProcessExited { exit_code }) => {
                     log::info!("PTY process exited with code {:?}", exit_code);
-                    // Process exited - we remain subscribed for any final output
+                    // Process exited - we remain connected for any final output
                 }
-                Ok(Some(PtyEvent::OwnerChanged { new_owner })) => {
-                    log::debug!("PTY owner changed to {:?}", new_owner);
-                    // Owner changed - no action needed, just informational
-                }
-                Ok(None) => break,
-                Err(broadcast::error::RecvError::Closed) => {
-                    log::debug!("PTY channel closed");
-                    // Disconnect from the current PTY if we have indices
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    log::debug!("PTY output channel disconnected");
+                    // Channel closed - TuiClient was dropped or terminated.
+                    // Disconnect from the current PTY if we have indices.
                     if let (Some(agent_idx), Some(pty_idx)) =
                         (self.current_agent_index, self.current_pty_index)
                     {
@@ -446,10 +466,6 @@ where
                     self.current_pty_index = None;
                     self.selected_agent = None;
                     break;
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    log::warn!("TUI lagged {} PTY events", n);
-                    continue;
                 }
             }
         }

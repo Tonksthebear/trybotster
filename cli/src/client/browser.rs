@@ -46,7 +46,7 @@ use crate::agent::pty::PtyEvent;
 use crate::channel::{ActionCableChannel, Channel, ChannelConfig};
 use crate::hub::agent_handle::PtyHandle;
 use crate::hub::HubHandle;
-use crate::relay::{BrowserCommand, TerminalMessage};
+use crate::relay::{build_scrollback_message, BrowserCommand, TerminalMessage};
 
 use super::{Client, ClientId};
 
@@ -246,6 +246,23 @@ impl Client for BrowserClient {
             .take_receiver_handle()
             .ok_or_else(|| "Failed to get channel receiver handle".to_string())?;
 
+        // Connect to PTY and get scrollback BEFORE spawning forwarder.
+        // This ensures the browser receives historical output first.
+        let scrollback = pty_handle.connect_blocking(self.id.clone(), self.dims)?;
+
+        // Send scrollback to browser if available.
+        if !scrollback.is_empty() {
+            let scrollback_msg = build_scrollback_message(scrollback);
+            if let Ok(json) = serde_json::to_string(&scrollback_msg) {
+                let sender_clone = sender_handle.clone();
+                runtime.spawn(async move {
+                    if let Err(e) = sender_clone.send(json.as_bytes()).await {
+                        log::debug!("Failed to send scrollback: {}", e);
+                    }
+                });
+            }
+        }
+
         // Subscribe to PTY events for output forwarding.
         let pty_rx = pty_handle.subscribe();
 
@@ -285,9 +302,6 @@ impl Client for BrowserClient {
                 input_task,
             },
         );
-
-        // Notify PTY that we connected and get scrollback (currently unused).
-        let _scrollback = pty_handle.connect_blocking(self.id.clone(), self.dims);
 
         log::info!(
             "Browser {} connected to PTY ({}, {})",
@@ -377,7 +391,11 @@ async fn spawn_pty_output_forwarder(
                     &agent_id[..8.min(agent_id.len())],
                     pty_index
                 );
-                // Continue receiving - may have final output.
+                // Send exit notification to browser, then continue - may have final output.
+                let message = TerminalMessage::ProcessExited { exit_code };
+                if let Ok(json) = serde_json::to_string(&message) {
+                    let _ = sender.send(json.as_bytes()).await;
+                }
             }
             Ok(_other_event) => {
                 // Ignore other events (Resized, OwnerChanged).
