@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use crate::agent::AgentNotification;
 use crate::client::ClientId;
 use crate::hub::actions::{self, HubAction};
+use crate::hub::events::HubEvent;
 use crate::hub::lifecycle::SpawnResult;
 use crate::hub::{polling, registration, workers, AgentProgressEvent, Hub, PendingAgentResult};
 use crate::server::messages::{message_to_hub_action, MessageContext, ParsedMessage};
@@ -311,6 +312,12 @@ impl Hub {
         if event.client_id.is_tui() {
             self.creating_agent = Some((event.identifier.clone(), event.stage));
         }
+
+        // Broadcast progress event to all subscribers (including TUI)
+        self.broadcast(HubEvent::AgentCreationProgress {
+            identifier: event.identifier,
+            stage: event.stage,
+        });
     }
 
     /// Handle a completed agent creation from background thread.
@@ -339,6 +346,9 @@ impl Hub {
                     .get(&pending.client_id)
                     .map(|c| c.dims())
                     .unwrap_or(self.terminal_dims);
+
+                // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
+                let _runtime_guard = self.tokio_runtime.enter();
 
                 // Spawn agent (fast - just PTY creation) - release lock after spawning
                 let spawn_result = {
@@ -448,10 +458,15 @@ impl Hub {
                     self,
                     HubAction::SelectAgentForClient {
                         client_id: ClientId::Tui,
-                        agent_key: session_key,
+                        agent_key: session_key.clone(),
                     },
                 );
             }
+        }
+
+        // Broadcast AgentCreated event to all subscribers (including TUI)
+        if let Some(info) = self.state.read().unwrap().get_agent_info(&session_key) {
+            self.broadcast(HubEvent::agent_created(session_key, info));
         }
     }
 
@@ -473,7 +488,7 @@ impl Hub {
     /// This method polls at the configured interval and processes any pending
     /// messages from the server, converting them to HubActions.
     pub fn poll_messages(&mut self) {
-        if polling::should_skip_polling(self.quit, self.polling_enabled) {
+        if polling::should_skip_polling(self.quit) {
             return;
         }
         if self.last_poll.elapsed() < Duration::from_secs(self.config.poll_interval) {

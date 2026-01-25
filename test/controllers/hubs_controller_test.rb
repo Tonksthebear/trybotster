@@ -160,4 +160,49 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     # Landing page has button to create new agent
     assert_select "[commandfor='new-agent-modal']"
   end
+
+  # === JSON Status Endpoint Tests ===
+
+  test "show json returns hub status for active hub" do
+    sign_in @user
+    get hub_path(@active_hub), as: :json
+    assert_response :success
+
+    json = JSON.parse(response.body)
+    assert_equal @active_hub.id, json["id"]
+    assert_equal @active_hub.identifier, json["identifier"]
+    assert json["active"], "Expected active hub to be marked active"
+    assert json["alive"], "Expected active hub to have alive=true"
+    assert_not_nil json["last_seen_at"]
+    assert_not_nil json["seconds_since_heartbeat"]
+    assert json["seconds_since_heartbeat"] < 120, "Active hub should have recent heartbeat"
+  end
+
+  test "show json returns hub status for stale hub" do
+    sign_in @user
+    get hub_path(@stale_hub), as: :json
+    assert_response :success
+
+    json = JSON.parse(response.body)
+    assert_equal @stale_hub.id, json["id"]
+    assert_not json["active"], "Expected stale hub to be marked inactive"
+    assert_not json["alive"], "Expected stale hub to have alive=false"
+    # Stale hub should have heartbeat > 2 minutes ago
+    assert json["seconds_since_heartbeat"] > 120, "Stale hub should have old heartbeat"
+  end
+
+  test "show json returns 404 for non-existent hub" do
+    sign_in @user
+    get hub_path("non-existent"), as: :json
+    assert_response :not_found
+
+    json = JSON.parse(response.body)
+    assert_equal "Hub not found", json["error"]
+  end
+
+  test "show json requires authentication" do
+    get hub_path(@active_hub), as: :json
+    # JSON requests get 401 Unauthorized instead of redirect
+    assert_response :unauthorized
+  end
 end

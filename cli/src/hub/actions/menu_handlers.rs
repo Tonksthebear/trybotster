@@ -65,16 +65,22 @@ pub fn handle_show_connection_code(hub: &mut Hub) {
 }
 
 /// Handle copying connection URL to clipboard.
+///
+/// Generates the connection URL fresh from the current Signal bundle rather than
+/// using the potentially stale `hub.connection_url` cache. This ensures the copied
+/// URL always contains the current Kyber bundle.
 pub fn handle_copy_connection_url(hub: &mut Hub) {
-    if let Some(url) = &hub.connection_url {
-        match arboard::Clipboard::new() {
+    // Generate URL fresh from current Signal bundle (canonical source)
+    match hub.generate_connection_url() {
+        Ok(url) => match arboard::Clipboard::new() {
             Ok(mut clipboard) => {
-                if clipboard.set_text(url.clone()).is_ok() {
+                if clipboard.set_text(url).is_ok() {
                     log::info!("Connection URL copied to clipboard");
                 }
             }
             Err(e) => log::warn!("Could not access clipboard: {}", e),
-        }
+        },
+        Err(e) => log::warn!("Cannot copy connection URL: {}", e),
     }
 }
 
@@ -151,10 +157,6 @@ pub fn handle_menu_select(hub: &mut Hub, selection_index: usize) {
         MenuAction::ShowConnectionCode => {
             dispatch(hub, HubAction::ShowConnectionCode);
         }
-        MenuAction::TogglePolling => {
-            hub.polling_enabled = !hub.polling_enabled;
-            hub.mode = AppMode::Normal;
-        }
     }
 }
 
@@ -184,6 +186,5 @@ pub fn build_menu_context(hub: &Hub) -> crate::tui::MenuContext {
         // Active PTY view is client-local state (TuiClient owns it, not Agent)
         // Default to CLI view for menu context
         active_pty: PtyView::Cli,
-        polling_enabled: hub.polling_enabled,
     }
 }

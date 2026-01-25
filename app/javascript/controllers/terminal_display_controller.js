@@ -318,8 +318,13 @@ export default class extends Controller {
     this.#terminal.writeln("[Signal E2E encryption active]");
     this.#terminal.writeln("");
     this.#connection.send("set_mode", { mode: "gui" });
-    // Note: resize is NOT sent here - terminal channel isn't ready yet
-    // Resize is sent when agent_selected/agent_channel_switched is received
+    // Send initial dimensions via hub channel so CLI knows browser size
+    // before any agent is selected. This ensures agents are spawned with
+    // correct dimensions from the start.
+    requestAnimationFrame(() => {
+      this.#fitAddon?.fit();
+      this.#sendResize();
+    });
     this.focus();
   }
 

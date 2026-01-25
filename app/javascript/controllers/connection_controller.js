@@ -137,7 +137,6 @@ export default class extends Controller {
     this.hubSubscription = null; // Raw ActionCable subscription for hub (internal)
     this.terminalChannel = null; // Terminal channel with reliability (PTY I/O)
     this.terminalSubscription = null; // Raw ActionCable subscription for terminal (internal)
-    this.subscription = null; // Legacy alias for terminalSubscription
     this.hubId = null;
     this.ourIdentityKey = null;
     this.connected = false;
@@ -278,7 +277,7 @@ export default class extends Controller {
         console.error("[Connection] Step 2 FAILED: No signal session after setup");
         this.setError(
           ConnectionError.NO_BUNDLE,
-          "No encryption bundle. Scan QR code to connect.",
+          "Not paired yet. Press Ctrl+P in CLI and select 'Show Connection Code' to scan QR code.",
         );
         return;
       }
@@ -533,8 +532,6 @@ export default class extends Controller {
           },
         },
       );
-      // Legacy alias
-      this.subscription = this.terminalSubscription;
     });
   }
 
@@ -560,18 +557,73 @@ export default class extends Controller {
     this.updateStatus("Handshake sent", "Waiting for CLI acknowledgment...");
 
     // Start timeout for handshake ACK
-    this.handshakeTimer = setTimeout(() => {
+    this.handshakeTimer = setTimeout(async () => {
       if (this.state === ConnectionState.HANDSHAKE_SENT) {
         console.warn("[Connection] Handshake timeout - no ACK from CLI");
-        this.setError(
-          ConnectionError.HANDSHAKE_TIMEOUT,
-          "CLI did not respond. Try refreshing the page.",
-        );
-        // DON'T clear session on timeout - this is likely a transient network issue,
-        // not a session problem. Clearing would force unnecessary QR re-scan.
-        // User can refresh to retry with existing session.
+        // Check hub status to determine appropriate error message
+        await this.handleHandshakeTimeout();
       }
     }, HANDSHAKE_TIMEOUT_MS);
+  }
+
+  /**
+   * Handle handshake timeout by checking hub status and showing appropriate error.
+   *
+   * If CLI is online (recent heartbeat) but handshake failed:
+   *   -> Signal session keys are stale, user needs to re-scan QR
+   *
+   * If CLI is offline (stale heartbeat):
+   *   -> CLI is not running, user needs to start botster-hub
+   */
+  async handleHandshakeTimeout() {
+    try {
+      // Fetch hub status from Rails
+      const response = await fetch(`/hubs/${this.hubId}.json`, {
+        credentials: "same-origin",
+        headers: { "Accept": "application/json" },
+      });
+
+      if (response.ok) {
+        const status = await response.json();
+        console.log("[Connection] Hub status:", status);
+
+        // CLI is considered "online" if heartbeat was within 30 seconds
+        const isCliOnline = status.seconds_since_heartbeat !== null &&
+                           status.seconds_since_heartbeat < 30;
+
+        if (isCliOnline) {
+          // CLI is running and sending heartbeats, but handshake failed
+          // This means Signal session keys don't match (CLI restarted, keys rotated)
+          console.log("[Connection] CLI is online - session keys likely stale");
+          // Use SESSION_INVALID reason so agents_controller shows appropriate UI
+          this.setError(
+            ConnectionError.SESSION_INVALID,
+            "Session expired. Re-scan QR code from CLI (Ctrl+P).",
+          );
+        } else {
+          // CLI is not running or hasn't sent heartbeat recently
+          console.log("[Connection] CLI is offline or stale");
+          this.setError(
+            ConnectionError.HANDSHAKE_TIMEOUT,
+            "CLI not responding. Is botster-hub running?",
+          );
+        }
+      } else {
+        // Couldn't fetch status, use generic message
+        console.warn("[Connection] Failed to fetch hub status:", response.status);
+        this.setError(
+          ConnectionError.HANDSHAKE_TIMEOUT,
+          "CLI did not respond. Is botster-hub running?",
+        );
+      }
+    } catch (error) {
+      // Network error fetching status, use generic message
+      console.warn("[Connection] Error fetching hub status:", error);
+      this.setError(
+        ConnectionError.HANDSHAKE_TIMEOUT,
+        "CLI did not respond. Is botster-hub running?",
+      );
+    }
   }
 
   /**
@@ -724,7 +776,7 @@ export default class extends Controller {
    * Send a JSON message to CLI (encrypted).
    */
   async send(type, data = {}) {
-    if (!this.subscription || !this.connected || !this.signalSession) {
+    if (!this.connected || !this.signalSession) {
       console.warn("[Connection] Cannot send - not connected");
       return false;
     }
@@ -758,7 +810,7 @@ export default class extends Controller {
 
   /**
    * Send raw input to CLI (terminal keystrokes).
-   * Uses terminal channel for PTY I/O (not hub channel).
+   * Routes through TerminalRelayChannel - the PTY data plane.
    */
   async sendInput(inputData) {
     return await this.sendTerminalMessage("input", { data: inputData });
@@ -766,7 +818,7 @@ export default class extends Controller {
 
   /**
    * Resize the terminal.
-   * Uses terminal channel for PTY I/O (not hub channel).
+   * Routes through TerminalRelayChannel - the PTY data plane.
    */
   async sendResize(cols, rows) {
     return await this.sendTerminalMessage("resize", { cols, rows });
@@ -840,7 +892,6 @@ export default class extends Controller {
     if (this.terminalSubscription) {
       this.terminalSubscription.unsubscribe();
       this.terminalSubscription = null;
-      this.subscription = null;
     }
 
     // Subscribe to new PTY stream
@@ -962,7 +1013,6 @@ export default class extends Controller {
       this.terminalSubscription.unsubscribe();
       this.terminalSubscription = null;
     }
-    this.subscription = null;
     this.connected = false;
     this.hasCompletedInitialSetup = false;
 
@@ -1121,7 +1171,6 @@ export default class extends Controller {
       this.terminalSubscription.unsubscribe();
       this.terminalSubscription = null;
     }
-    this.subscription = null; // Legacy alias
     this.connected = false;
     this.hasCompletedInitialSetup = false; // Reset for fresh connect()
     this.listeners?.clear();

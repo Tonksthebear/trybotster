@@ -136,8 +136,19 @@ impl std::fmt::Debug for Agent {
     }
 }
 
+/// Default PTY dimensions used when no specific dimensions are provided.
+///
+/// These are placeholder values; the PTY should be resized to actual terminal
+/// dimensions before spawning a process. See `new_with_dims()` for creating
+/// agents with specific dimensions.
+const DEFAULT_PTY_ROWS: u16 = 24;
+const DEFAULT_PTY_COLS: u16 = 80;
+
 impl Agent {
     /// Creates a new agent for the specified repository and worktree.
+    ///
+    /// Uses default PTY dimensions (24x80). For production use, prefer
+    /// `new_with_dims()` which accepts actual terminal dimensions.
     #[must_use]
     pub fn new(
         id: uuid::Uuid,
@@ -146,6 +157,36 @@ impl Agent {
         branch_name: String,
         worktree_path: PathBuf,
     ) -> Self {
+        Self::new_with_dims(
+            id,
+            repo,
+            issue_number,
+            branch_name,
+            worktree_path,
+            (DEFAULT_PTY_ROWS, DEFAULT_PTY_COLS),
+        )
+    }
+
+    /// Creates a new agent with specific PTY dimensions.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Unique agent identifier
+    /// * `repo` - Repository name in "owner/repo" format
+    /// * `issue_number` - Optional issue number
+    /// * `branch_name` - Git branch name
+    /// * `worktree_path` - Path to the git worktree
+    /// * `terminal_dims` - PTY dimensions as (rows, cols)
+    #[must_use]
+    pub fn new_with_dims(
+        id: uuid::Uuid,
+        repo: String,
+        issue_number: Option<u32>,
+        branch_name: String,
+        worktree_path: PathBuf,
+        terminal_dims: (u16, u16),
+    ) -> Self {
+        let (rows, cols) = terminal_dims;
         Self {
             id,
             repo,
@@ -157,7 +198,7 @@ impl Agent {
             last_invocation_url: None,
             tunnel_port: None,
             terminal_window_id: None,
-            cli_pty: PtySession::new(24, 80),
+            cli_pty: PtySession::new(rows, cols),
             server_pty: None,
             preview_channel: None,
             notification_rx: None,
@@ -206,6 +247,32 @@ impl Agent {
     #[must_use]
     pub fn has_server_pty(&self) -> bool {
         self.server_pty.is_some()
+    }
+
+    /// Get a PtyHandle for the specified PTY index.
+    ///
+    /// - Index 0: CLI PTY (always present)
+    /// - Index 1: Server PTY (if server is running)
+    ///
+    /// Returns `None` if index is out of bounds or server PTY not available.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Get handle for CLI PTY
+    /// let cli_handle = agent.get_pty_handle(0)?;
+    ///
+    /// // Subscribe to PTY events
+    /// let rx = cli_handle.subscribe();
+    /// ```
+    #[must_use]
+    pub fn get_pty_handle(&self, pty_index: usize) -> Option<crate::hub::agent_handle::PtyHandle> {
+        let (event_tx, command_tx) = match pty_index {
+            0 => self.cli_pty.get_channels(),
+            1 => self.server_pty.as_ref()?.get_channels(),
+            _ => return None,
+        };
+        Some(crate::hub::agent_handle::PtyHandle::new(event_tx, command_tx))
     }
 
     /// Get the current PTY size (rows, cols).

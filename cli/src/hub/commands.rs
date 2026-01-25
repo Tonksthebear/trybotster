@@ -9,14 +9,14 @@
 //! - [`HubCommand::CreateAgent`] - Create a new agent
 //! - [`HubCommand::DeleteAgent`] - Delete an existing agent
 //! - [`HubCommand::ListAgents`] - Get list of all agents
-//! - [`HubCommand::GetAgent`] - Get agent handle for PTY access
+//! - [`HubCommand::GetAgentByIndex`] - Get agent handle by display index
 //!
 //! # Hierarchy
 //!
 //! ```text
-//! Client → HubCommand::GetAgent(id) → AgentHandle
-//!                                        ├── cli_pty() → PtyHandle → subscribe()
-//!                                        └── server_pty() → Option<PtyHandle>
+//! Client → HubCommand::GetAgentByIndex(idx) → AgentHandle
+//!                                                ├── get_pty(0) → PtyHandle (CLI)
+//!                                                └── get_pty(1) → Option<PtyHandle> (Server)
 //! ```
 //!
 //! # Actor Pattern
@@ -25,12 +25,12 @@
 //!
 //! ```ignore
 //! // Client sends command
-//! let (cmd, rx) = HubCommand::get_agent("agent-123");
+//! let (cmd, rx) = HubCommand::get_agent_by_index(0);
 //! hub_tx.send(cmd).await;
-//! let handle = rx.await?;
+//! let handle = rx.await?.unwrap();
 //!
 //! // Client subscribes to PTY events via handle
-//! let mut pty_rx = handle.cli_pty().subscribe();
+//! let mut pty_rx = handle.get_pty(0).unwrap().subscribe();
 //! ```
 
 // Rust guideline compliant 2026-01
@@ -40,6 +40,7 @@ use tokio::sync::oneshot;
 
 use super::actions::HubAction;
 use super::agent_handle::AgentHandle;
+use crate::client::ClientId;
 use crate::relay::types::AgentInfo;
 
 /// Request to create an agent.
@@ -117,9 +118,6 @@ pub type CreateAgentResult = Result<AgentInfo, String>;
 /// Result of agent deletion.
 pub type DeleteAgentResult = Result<(), String>;
 
-/// Result of getting an agent.
-pub type GetAgentResult = Result<AgentHandle, String>;
-
 /// Commands sent from clients to the Hub.
 ///
 /// The Hub processes these commands in its main loop using the actor pattern.
@@ -160,28 +158,17 @@ pub enum HubCommand {
     },
 
     // === Agent Access ===
-    /// Get an agent handle for PTY access.
-    ///
-    /// Returns an `AgentHandle` that provides:
-    /// - Agent info snapshot
-    /// - CLI PTY handle (for subscribing to events)
-    /// - Server PTY handle (if available)
-    ///
-    /// Clients subscribe to PTY events via the handle, then send input
-    /// via `SendInput` command.
-    GetAgent {
-        /// Agent ID.
-        agent_id: String,
-        /// Channel for sending the agent handle back.
-        response_tx: oneshot::Sender<GetAgentResult>,
-    },
-
     /// Get an agent handle by display index.
     ///
-    /// Similar to `GetAgent` but uses the display index instead of agent ID.
+    /// Returns an `AgentHandle` that provides:
+    /// - Agent info snapshot via `info()`
+    /// - PTY handles via `get_pty(index)` - index 0 = CLI, index 1 = Server
+    ///
     /// Returns `None` if the index is out of bounds.
     ///
-    /// Useful for clients that navigate agents by position rather than ID.
+    /// Clients use the agent's display index (0-based position in the agent list)
+    /// to request handles. This is the only way to get agent handles - ID-based
+    /// access has been removed to enforce index-based navigation.
     GetAgentByIndex {
         /// Display index (0-based).
         index: usize,
@@ -205,6 +192,91 @@ pub enum HubCommand {
     ListWorktrees {
         /// Channel for sending the worktree list back.
         response_tx: oneshot::Sender<Vec<(String, String)>>,
+    },
+
+    // ============================================================
+    // Browser PTY I/O Commands (fire-and-forget)
+    // ============================================================
+
+    /// Browser PTY input (routes through Client trait).
+    ///
+    /// Routes keyboard input from a browser client to the appropriate PTY
+    /// via the Client trait's `send_input()` method. This ensures all PTY I/O
+    /// goes through the same code path regardless of client type.
+    BrowserPtyInput {
+        /// Client identifier for routing.
+        client_id: ClientId,
+        /// Agent index in the Hub's ordered list.
+        agent_index: usize,
+        /// PTY index within the agent (0 = CLI, 1 = Server).
+        pty_index: usize,
+        /// Raw input data.
+        data: Vec<u8>,
+    },
+
+    // ============================================================
+    // Connection Code Commands
+    // ============================================================
+
+    /// Get the current connection code URL.
+    ///
+    /// Returns the full URL containing the Signal PreKeyBundle for browser
+    /// connection. Format: `{server_url}/hubs/{id}#{base32_binary_bundle}`
+    ///
+    /// Returns an error if the Signal bundle is not initialized.
+    GetConnectionCode {
+        /// Channel for sending the connection code URL back.
+        response_tx: oneshot::Sender<ConnectionCodeResult>,
+    },
+
+    /// Refresh the connection code (regenerate Signal bundle).
+    ///
+    /// Requests regeneration of the Signal PreKeyBundle, which invalidates
+    /// the previous connection code. Returns the new connection code URL.
+    ///
+    /// Returns an error if the relay is not connected.
+    RefreshConnectionCode {
+        /// Channel for sending the new connection code URL back.
+        response_tx: oneshot::Sender<ConnectionCodeResult>,
+    },
+
+    // ============================================================
+    // Browser Client Support Commands
+    // ============================================================
+
+    /// Get the crypto service handle for E2E encryption.
+    ///
+    /// Returns the crypto service handle if initialized, None otherwise.
+    GetCryptoService {
+        /// Channel for sending the crypto service handle back.
+        response_tx:
+            oneshot::Sender<Option<crate::relay::crypto_service::CryptoServiceHandle>>,
+    },
+
+    /// Get the server hub ID.
+    ///
+    /// Returns the hub ID if set, None otherwise.
+    GetServerHubId {
+        /// Channel for sending the hub ID back.
+        response_tx: oneshot::Sender<Option<String>>,
+    },
+
+    /// Get the server URL from config.
+    GetServerUrl {
+        /// Channel for sending the server URL back.
+        response_tx: oneshot::Sender<String>,
+    },
+
+    /// Get the API key from config.
+    GetApiKey {
+        /// Channel for sending the API key back.
+        response_tx: oneshot::Sender<String>,
+    },
+
+    /// Get a handle to the tokio runtime.
+    GetTokioRuntime {
+        /// Channel for sending the runtime handle back.
+        response_tx: oneshot::Sender<Option<tokio::runtime::Handle>>,
     },
 }
 
@@ -252,22 +324,6 @@ impl HubCommand {
         (Self::ListAgents { response_tx: tx }, rx)
     }
 
-    /// Create a command to get an agent handle.
-    ///
-    /// Returns the command and a receiver for the `AgentHandle`.
-    /// The handle provides PTY access via `cli_pty().subscribe()`.
-    #[must_use]
-    pub fn get_agent(agent_id: impl Into<String>) -> (Self, oneshot::Receiver<GetAgentResult>) {
-        let (tx, rx) = oneshot::channel();
-        (
-            Self::GetAgent {
-                agent_id: agent_id.into(),
-                response_tx: tx,
-            },
-            rx,
-        )
-    }
-
     /// Create a command to get an agent handle by display index.
     ///
     /// Returns the command and a receiver for the optional `AgentHandle`.
@@ -300,12 +356,6 @@ impl HubCommand {
     #[must_use]
     pub fn is_list_agents(&self) -> bool {
         matches!(self, Self::ListAgents { .. })
-    }
-
-    /// Check if this is a get agent command.
-    #[must_use]
-    pub fn is_get_agent(&self) -> bool {
-        matches!(self, Self::GetAgent { .. })
     }
 
     /// Check if this is a get agent by index command.
@@ -347,6 +397,40 @@ impl HubCommand {
     #[must_use]
     pub fn is_list_worktrees(&self) -> bool {
         matches!(self, Self::ListWorktrees { .. })
+    }
+
+    // ============================================================
+    // Connection Code Command Constructors
+    // ============================================================
+
+    /// Create a command to get the current connection code.
+    ///
+    /// Returns the command and a receiver for the connection code URL.
+    #[must_use]
+    pub fn get_connection_code() -> (Self, oneshot::Receiver<ConnectionCodeResult>) {
+        let (tx, rx) = oneshot::channel();
+        (Self::GetConnectionCode { response_tx: tx }, rx)
+    }
+
+    /// Create a command to refresh the connection code.
+    ///
+    /// Returns the command and a receiver for the new connection code URL.
+    #[must_use]
+    pub fn refresh_connection_code() -> (Self, oneshot::Receiver<ConnectionCodeResult>) {
+        let (tx, rx) = oneshot::channel();
+        (Self::RefreshConnectionCode { response_tx: tx }, rx)
+    }
+
+    /// Check if this is a get connection code command.
+    #[must_use]
+    pub fn is_get_connection_code(&self) -> bool {
+        matches!(self, Self::GetConnectionCode { .. })
+    }
+
+    /// Check if this is a refresh connection code command.
+    #[must_use]
+    pub fn is_refresh_connection_code(&self) -> bool {
+        matches!(self, Self::RefreshConnectionCode { .. })
     }
 }
 
@@ -417,54 +501,6 @@ impl HubCommandSender {
             .await
             .map_err(|_| "Hub command channel closed".to_string())?;
         rx.await.map_err(|_| "Response channel dropped".to_string())
-    }
-
-    /// Get an agent handle for PTY access.
-    ///
-    /// Returns an `AgentHandle` that provides access to:
-    /// - Agent info snapshot
-    /// - CLI PTY (always present)
-    /// - Server PTY (if server running)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let handle = sender.get_agent("agent-123").await?;
-    /// let mut rx = handle.cli_pty().subscribe();
-    /// while let Ok(event) = rx.recv().await {
-    ///     // Handle PTY events
-    /// }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The command channel is closed
-    /// - The agent doesn't exist
-    pub async fn get_agent(&self, agent_id: impl Into<String>) -> Result<AgentHandle, String> {
-        let (cmd, rx) = HubCommand::get_agent(agent_id);
-        self.tx
-            .send(cmd)
-            .await
-            .map_err(|_| "Hub command channel closed".to_string())?;
-        rx.await
-            .map_err(|_| "Response channel dropped".to_string())?
-    }
-
-    /// Get an agent handle (blocking version).
-    ///
-    /// Use this from synchronous code.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command channel is closed or the agent doesn't exist.
-    pub fn get_agent_blocking(&self, agent_id: impl Into<String>) -> Result<AgentHandle, String> {
-        let (cmd, rx) = HubCommand::get_agent(agent_id);
-        self.tx
-            .blocking_send(cmd)
-            .map_err(|_| "Hub command channel closed".to_string())?;
-        rx.blocking_recv()
-            .map_err(|_| "Response channel dropped".to_string())?
     }
 
     /// Get an agent handle by display index (blocking version).
@@ -558,11 +594,253 @@ impl HubCommandSender {
         rx.blocking_recv()
             .map_err(|_| "Response channel dropped".to_string())
     }
+
+    // ============================================================
+    // Connection Code Methods
+    // ============================================================
+
+    /// Get the current connection code URL.
+    ///
+    /// Returns the full URL containing the Signal PreKeyBundle for browser
+    /// connection. The URL format is:
+    /// `{server_url}/hubs/{id}#{base32_binary_bundle}`
+    ///
+    /// The bundle in the fragment contains the full Kyber prekey bundle
+    /// (~2900 chars Base32 encoded).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The Signal bundle is not initialized
+    /// - The command channel is closed
+    pub async fn get_connection_code(&self) -> Result<String, String> {
+        let (cmd, rx) = HubCommand::get_connection_code();
+        self.tx
+            .send(cmd)
+            .await
+            .map_err(|_| "Hub command channel closed".to_string())?;
+        rx.await
+            .map_err(|_| "Response channel dropped".to_string())?
+    }
+
+    /// Get the current connection code URL (blocking version).
+    ///
+    /// Use this from synchronous code.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Signal bundle is not initialized or the
+    /// channel is closed.
+    pub fn get_connection_code_blocking(&self) -> Result<String, String> {
+        let (cmd, rx) = HubCommand::get_connection_code();
+        self.tx
+            .blocking_send(cmd)
+            .map_err(|_| "Hub command channel closed".to_string())?;
+        rx.blocking_recv()
+            .map_err(|_| "Response channel dropped".to_string())?
+    }
+
+    /// Refresh the connection code (regenerate Signal bundle).
+    ///
+    /// Requests regeneration of the Signal PreKeyBundle. This invalidates
+    /// the previous connection code and returns a new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The relay is not connected
+    /// - Bundle regeneration fails
+    /// - The command channel is closed
+    pub async fn refresh_connection_code(&self) -> Result<String, String> {
+        let (cmd, rx) = HubCommand::refresh_connection_code();
+        self.tx
+            .send(cmd)
+            .await
+            .map_err(|_| "Hub command channel closed".to_string())?;
+        rx.await
+            .map_err(|_| "Response channel dropped".to_string())?
+    }
+
+    /// Refresh the connection code (blocking version).
+    ///
+    /// Use this from synchronous code.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the relay is not connected or the channel is closed.
+    pub fn refresh_connection_code_blocking(&self) -> Result<String, String> {
+        let (cmd, rx) = HubCommand::refresh_connection_code();
+        self.tx
+            .blocking_send(cmd)
+            .map_err(|_| "Hub command channel closed".to_string())?;
+        rx.blocking_recv()
+            .map_err(|_| "Response channel dropped".to_string())?
+    }
+
+    // ============================================================
+    // Browser Client Support Methods
+    // ============================================================
+
+    /// Get the crypto service handle (blocking).
+    ///
+    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub fn get_crypto_service_blocking(
+        &self,
+    ) -> Result<Option<crate::relay::crypto_service::CryptoServiceHandle>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .blocking_send(HubCommand::GetCryptoService { response_tx: tx })
+            .map_err(|_| "Hub command channel closed".to_string())?;
+        rx.blocking_recv()
+            .map_err(|_| "Response channel dropped".to_string())
+    }
+
+    /// Get the server hub ID (blocking).
+    ///
+    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub fn get_server_hub_id_blocking(&self) -> Result<Option<String>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .blocking_send(HubCommand::GetServerHubId { response_tx: tx })
+            .map_err(|_| "Hub command channel closed".to_string())?;
+        rx.blocking_recv()
+            .map_err(|_| "Response channel dropped".to_string())
+    }
+
+    /// Get the server URL (blocking).
+    ///
+    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub fn get_server_url_blocking(&self) -> Result<String, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .blocking_send(HubCommand::GetServerUrl { response_tx: tx })
+            .map_err(|_| "Hub command channel closed".to_string())?;
+        rx.blocking_recv()
+            .map_err(|_| "Response channel dropped".to_string())
+    }
+
+    /// Get the API key (blocking).
+    ///
+    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub fn get_api_key_blocking(&self) -> Result<String, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .blocking_send(HubCommand::GetApiKey { response_tx: tx })
+            .map_err(|_| "Hub command channel closed".to_string())?;
+        rx.blocking_recv()
+            .map_err(|_| "Response channel dropped".to_string())
+    }
+
+    /// Get the tokio runtime handle (blocking).
+    ///
+    /// Used by `BrowserClient::connect_to_pty()` for async task spawning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub fn get_tokio_runtime_blocking(&self) -> Result<Option<tokio::runtime::Handle>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .blocking_send(HubCommand::GetTokioRuntime { response_tx: tx })
+            .map_err(|_| "Hub command channel closed".to_string())?;
+        rx.blocking_recv()
+            .map_err(|_| "Response channel dropped".to_string())
+    }
 }
+
+/// Result type for connection code operations.
+pub type ConnectionCodeResult = Result<String, String>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ============================================================
+    // Connection Code Command Tests (TDD - tests written first)
+    // ============================================================
+
+    #[test]
+    fn test_hub_command_get_connection_code() {
+        let (cmd, _rx) = HubCommand::get_connection_code();
+
+        assert!(cmd.is_get_connection_code());
+        assert!(!cmd.is_list_agents());
+        assert!(!cmd.is_create_agent());
+    }
+
+    #[test]
+    fn test_hub_command_refresh_connection_code() {
+        let (cmd, _rx) = HubCommand::refresh_connection_code();
+
+        assert!(cmd.is_refresh_connection_code());
+        assert!(!cmd.is_get_connection_code());
+    }
+
+    #[tokio::test]
+    async fn test_hub_command_get_connection_code_response_flow() {
+        let (cmd, rx) = HubCommand::get_connection_code();
+
+        // Simulate Hub processing the command
+        if let HubCommand::GetConnectionCode { response_tx } = cmd {
+            let url = "https://botster.dev/hubs/123#GEZDGNBVGY3TQOJQ".to_string();
+            let _ = response_tx.send(Ok(url));
+        }
+
+        // Client receives response
+        let result = rx.await.unwrap();
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("botster.dev"));
+    }
+
+    #[tokio::test]
+    async fn test_hub_command_get_connection_code_no_bundle() {
+        let (cmd, rx) = HubCommand::get_connection_code();
+
+        // Simulate Hub responding with no bundle available
+        if let HubCommand::GetConnectionCode { response_tx } = cmd {
+            let _ = response_tx.send(Err("Signal bundle not initialized".to_string()));
+        }
+
+        let result = rx.await.unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Signal bundle"));
+    }
+
+    #[tokio::test]
+    async fn test_hub_command_refresh_connection_code_response_flow() {
+        let (cmd, rx) = HubCommand::refresh_connection_code();
+
+        // Simulate Hub processing the command
+        if let HubCommand::RefreshConnectionCode { response_tx } = cmd {
+            let new_url = "https://botster.dev/hubs/123#NEWBUNDLEDATA".to_string();
+            let _ = response_tx.send(Ok(new_url));
+        }
+
+        // Client receives response
+        let result = rx.await.unwrap();
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("NEWBUNDLEDATA"));
+    }
+
+    // ============================================================
+    // Original Tests
+    // ============================================================
 
     #[test]
     fn test_create_agent_request_builder() {
@@ -626,10 +904,10 @@ mod tests {
     }
 
     #[test]
-    fn test_hub_command_get_agent() {
-        let (cmd, _rx) = HubCommand::get_agent("agent-789");
+    fn test_hub_command_get_agent_by_index() {
+        let (cmd, _rx) = HubCommand::get_agent_by_index(0);
 
-        assert!(cmd.is_get_agent());
+        assert!(cmd.is_get_agent_by_index());
         assert!(!cmd.is_list_agents());
     }
 

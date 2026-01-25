@@ -8,17 +8,29 @@
 //!
 //! ```text
 //! TuiClient
-//!   ├── vt100_parser (owns terminal emulation state)
-//!   ├── pty_event_rx (subscribed to PTY events via PtyHandle)
 //!   ├── hub_handle (required - thread-safe access to Hub state and commands)
-//!   └── hub_event_rx (receives Hub events)
+//!   ├── id (always ClientId::Tui)
+//!   ├── dims (cols, rows)
+//!   ├── vt100_parser (owns terminal emulation state)
+//!   └── pty_event_rx (subscribed to currently-displayed PTY events)
 //! ```
 //!
 //! # Event Flow
 //!
-//! 1. PTY emits `PtyEvent::Output` → TuiClient receives → feeds to vt100_parser
-//! 2. User types → TuiClient calls `send_input()` via PtyHandle
-//! 3. Hub emits `HubEvent::AgentCreated` → TuiClient receives → updates UI state
+//! 1. PTY emits `PtyEvent::Output` -> TuiClient polls via `poll_pty_events()`
+//!    -> TuiRunner calls `process_output()` to feed vt100_parser
+//! 2. User types -> TuiRunner calls trait's `send_input()` via hub_handle lookup
+//! 3. Hub emits events -> TuiRunner polls Hub directly, not through TuiClient
+//!
+//! # Minimal Design
+//!
+//! TuiClient is intentionally minimal:
+//! - NO selection tracking (TuiRunner owns `selected_agent`, `active_pty_view`)
+//! - NO pty_handles storage (uses hub_handle lookup for each operation)
+//! - NO hub_event_rx (TuiRunner subscribes directly to Hub events)
+//!
+//! The trait's default implementations handle `get_agents`, `get_agent`,
+//! `send_input`, `resize_pty`, and `agent_count` via hub_handle lookup.
 
 // Rust guideline compliant 2026-01
 
@@ -26,24 +38,32 @@ use std::sync::{Arc, Mutex};
 
 use log::warn;
 use tokio::sync::broadcast;
+use vt100::Parser;
 
 use crate::agent::pty::PtyEvent;
-use crate::agent::PtyView;
-use crate::hub::agent_handle::{AgentHandle, PtyHandle};
-use crate::hub::commands::CreateAgentRequest as HubCreateAgentRequest;
-use crate::hub::events::HubEvent;
 use crate::hub::hub_handle::HubHandle;
-use crate::relay::AgentInfo;
 
-use super::types::CreateAgentRequest;
-
-use super::ClientId;
+use super::{Client, ClientId};
 
 /// TUI client - the local terminal interface.
 ///
-/// Owns UI state and terminal emulation. Implements the Client trait for
-/// Hub/PTY interaction while maintaining its own view state for the TUI.
+/// Minimal implementation that stores only what's required:
+/// - Hub access via `hub_handle`
+/// - Client identity (`id`)
+/// - Terminal dimensions (`dims`)
+/// - Terminal emulation (`vt100_parser`)
+/// - PTY event subscription (`pty_event_rx`)
+///
+/// # What's NOT Here (GUI State in TuiRunner)
+///
+/// - Current agent/PTY selection for display (TuiRunner tracks this)
+/// - Scroll position (TuiRunner manages)
+/// - Which PTY is "active" for viewing (TuiRunner manages)
+/// - PTY handles storage (uses hub_handle lookup instead)
 pub struct TuiClient {
+    /// Thread-safe access to Hub state and operations.
+    hub_handle: HubHandle,
+
     /// Unique identifier (always `ClientId::Tui`).
     id: ClientId,
 
@@ -53,49 +73,19 @@ pub struct TuiClient {
     /// Terminal emulator for processing PTY output.
     ///
     /// Shared with the render loop for screen access.
-    vt100_parser: Arc<Mutex<vt100::Parser>>,
+    vt100_parser: Arc<Mutex<Parser>>,
 
-    /// Whether this client owns the PTY size.
+    /// Receiver for PTY events from the currently-displayed PTY.
     ///
-    /// The most recently connected client becomes the size owner.
-    /// When multiple clients are connected, only the owner's resize
-    /// events affect the actual PTY dimensions.
-    is_size_owner: bool,
-
-    // === UI State (TuiClient's own, not on Client trait) ===
-    /// Currently selected agent in the agent list.
-    selected_agent: Option<String>,
-
-    /// Which PTY view is active (CLI or Server).
-    active_pty_view: PtyView,
-
-    /// Which agent's PTY we're subscribed to.
-    ///
-    /// Different from `selected_agent` - this tracks the actual PTY
-    /// subscription. Selection can change before connection.
-    connected_agent: Option<String>,
-
-    // === Channels ===
-    /// Receiver for PTY events from the connected agent.
-    ///
-    /// `None` when not connected to any agent's PTY.
+    /// `None` when not subscribed to any PTY for display.
+    /// Set by `connect_to_pty()`, cleared by `disconnect_from_pty()`.
     pty_event_rx: Option<broadcast::Receiver<PtyEvent>>,
 
-    /// Receiver for Hub-level events.
+    /// Currently connected PTY indices, if any.
     ///
-    /// Receives agent created/deleted/status events.
-    hub_event_rx: Option<broadcast::Receiver<HubEvent>>,
-
-    /// Current PTY handle for the connected agent.
-    ///
-    /// Stored to enable `send_input()` and resize operations.
-    current_pty_handle: Option<PtyHandle>,
-
-    /// Handle for Hub communication.
-    ///
-    /// Used by `get_agents()` and `get_agent()` to query Hub state.
-    /// Also used for fire-and-forget create/delete agent commands.
-    hub_handle: HubHandle,
+    /// Stores (agent_index, pty_index) when connected to a PTY.
+    /// Used by `set_dims()` to propagate resize to the connected PTY.
+    connected_pty: Option<(usize, usize)>,
 }
 
 impl TuiClient {
@@ -109,17 +99,14 @@ impl TuiClient {
     #[must_use]
     pub fn with_dims(hub_handle: HubHandle, cols: u16, rows: u16) -> Self {
         Self {
+            hub_handle,
             id: ClientId::Tui,
             dims: (cols, rows),
-            vt100_parser: Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10000))),
-            is_size_owner: true, // TUI starts as owner
-            selected_agent: None,
-            active_pty_view: PtyView::default(),
-            connected_agent: None,
+            // Magic value 10000: scrollback buffer size, large enough for typical
+            // terminal sessions. Too small loses history, too large wastes memory.
+            vt100_parser: Arc::new(Mutex::new(Parser::new(rows, cols, 10000))),
             pty_event_rx: None,
-            hub_event_rx: None,
-            current_pty_handle: None,
-            hub_handle,
+            connected_pty: None,
         }
     }
 
@@ -129,241 +116,28 @@ impl TuiClient {
     #[must_use]
     pub fn with_parser(
         hub_handle: HubHandle,
-        parser: Arc<Mutex<vt100::Parser>>,
+        parser: Arc<Mutex<Parser>>,
         cols: u16,
         rows: u16,
     ) -> Self {
         Self {
+            hub_handle,
             id: ClientId::Tui,
             dims: (cols, rows),
             vt100_parser: parser,
-            is_size_owner: true,
-            selected_agent: None,
-            active_pty_view: PtyView::default(),
-            connected_agent: None,
             pty_event_rx: None,
-            hub_event_rx: None,
-            current_pty_handle: None,
-            hub_handle,
+            connected_pty: None,
         }
     }
 
-    // === Client trait methods ===
-
-    /// Get the client ID.
-    #[must_use]
-    pub fn id(&self) -> &ClientId {
-        &self.id
-    }
-
-    /// Get current terminal dimensions (cols, rows).
-    #[must_use]
-    pub fn dims(&self) -> (u16, u16) {
-        self.dims
-    }
-
-    /// Handle PTY output by feeding to vt100 parser.
-    ///
-    /// Called when receiving `PtyEvent::Output`.
-    pub fn on_output(&mut self, data: &[u8]) {
-        if let Ok(mut parser) = self.vt100_parser.lock() {
-            parser.process(data);
-        }
-    }
-
-    /// Handle PTY resized notification.
-    ///
-    /// Updates the vt100 parser dimensions to match the new PTY size.
-    pub fn on_resized(&mut self, rows: u16, cols: u16) {
-        self.dims = (cols, rows);
-        if let Ok(mut parser) = self.vt100_parser.lock() {
-            parser.screen_mut().set_size(rows, cols);
-        }
-    }
-
-    /// Handle PTY process exit.
-    ///
-    /// The connected agent's process has terminated.
-    pub fn on_process_exit(&mut self, _exit_code: Option<i32>) {
-        // The process exited but we remain subscribed to the PTY
-        // for any final output. UI can show exit status.
-    }
-
-    /// Handle PTY size ownership change.
-    ///
-    /// Updates whether this client owns the PTY size.
-    pub fn on_owner_changed(&mut self, new_owner: Option<ClientId>) {
-        self.is_size_owner = new_owner.as_ref() == Some(&self.id);
-    }
-
-    /// Handle agent created event from Hub.
-    ///
-    /// A new agent was created at the given index. UI should update agent list.
-    pub fn on_agent_created(&mut self, _index: usize, _info: &AgentInfo) {
-        // UI will re-render agent list from Hub state
-    }
-
-    /// Handle agent deleted event from Hub.
-    ///
-    /// An agent at the given index was deleted. If we were connected to it, disconnect.
-    /// Note: The index refers to the position before deletion.
-    pub fn on_agent_deleted(&mut self, index: usize) {
-        // Get the agent_id at this index to check if we need to disconnect
-        let agent_id = self.get_agent_id_at_index(index);
-
-        // If we were connected to this agent, clean up
-        if let Some(ref aid) = agent_id {
-            if self.connected_agent.as_deref() == Some(aid) {
-                self.disconnect_from_pty();
-            }
-
-            // If this was our selected agent, clear selection
-            if self.selected_agent.as_deref() == Some(aid) {
-                self.selected_agent = None;
-            }
-        }
-    }
-
-    /// Get the agent ID at a specific index (helper for on_agent_deleted).
-    fn get_agent_id_at_index(&self, index: usize) -> Option<String> {
-        self.hub_handle
-            .get_agents()
-            .get(index)
-            .map(|info| info.id.clone())
-    }
-
-    /// Handle Hub shutdown event.
-    ///
-    /// The Hub is shutting down. Clean up all state.
-    pub fn on_hub_shutdown(&mut self) {
-        self.disconnect_from_pty();
-        self.selected_agent = None;
-        self.hub_event_rx = None;
-    }
-
-    /// Send input to the connected PTY.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if not connected to any PTY or if the channel is closed.
-    pub fn send_input(&self, data: &[u8]) -> Result<(), String> {
-        match &self.current_pty_handle {
-            Some(handle) => handle.write_input_blocking(data),
-            None => Err("Not connected to any PTY".to_string()),
-        }
-    }
-
-    /// Send input to the connected PTY (async version).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if not connected to any PTY or if the channel is closed.
-    pub async fn send_input_async(&self, data: &[u8]) -> Result<(), String> {
-        match &self.current_pty_handle {
-            Some(handle) => handle.write_input(data).await,
-            None => Err("Not connected to any PTY".to_string()),
-        }
-    }
-
-    /// Update local dimensions.
-    ///
-    /// Also resizes the vt100 parser and notifies the PTY if we're the size owner.
-    pub fn update_dims(&mut self, cols: u16, rows: u16) {
-        self.dims = (cols, rows);
-
-        // Update parser
-        if let Ok(mut parser) = self.vt100_parser.lock() {
-            parser.screen_mut().set_size(rows, cols);
-        }
-
-        // Notify PTY if connected and we own the size
-        if self.is_size_owner {
-            if let Some(handle) = &self.current_pty_handle {
-                let _ = handle.resize_blocking(self.id.clone(), rows, cols);
-            }
-        }
-    }
-
-    /// Check if connected (always true for TUI).
-    #[must_use]
-    pub fn is_connected(&self) -> bool {
-        true
-    }
-
-    // === UI State methods (TuiClient's own) ===
-
-    /// Get the currently selected agent.
-    #[must_use]
-    pub fn selected_agent(&self) -> Option<&str> {
-        self.selected_agent.as_deref()
-    }
-
-    /// Set the selected agent.
-    pub fn set_selected_agent(&mut self, agent_id: Option<&str>) {
-        self.selected_agent = agent_id.map(String::from);
-    }
-
-    /// Get the active PTY view (CLI or Server).
-    #[must_use]
-    pub fn active_pty_view(&self) -> PtyView {
-        self.active_pty_view
-    }
-
-    /// Set the active PTY view.
-    pub fn set_active_pty_view(&mut self, view: PtyView) {
-        self.active_pty_view = view;
-    }
-
-    /// Toggle between CLI and Server PTY views.
-    pub fn toggle_pty_view(&mut self) {
-        self.active_pty_view = match self.active_pty_view {
-            PtyView::Cli => PtyView::Server,
-            PtyView::Server => PtyView::Cli,
-        };
-    }
-
-    /// Get the connected agent (which agent's PTY we're subscribed to).
-    #[must_use]
-    pub fn connected_agent(&self) -> Option<&str> {
-        self.connected_agent.as_deref()
-    }
-
-    // === PTY Subscription methods ===
-
-    /// Connect to an agent's PTY via handle.
-    ///
-    /// Subscribes to PTY events and stores the handle for input/resize.
-    pub fn connect_to_pty(&mut self, agent_id: &str, pty_handle: PtyHandle) {
-        // Disconnect from previous if any
-        self.disconnect_from_pty();
-
-        // Subscribe to new PTY
-        self.pty_event_rx = Some(pty_handle.subscribe());
-        self.current_pty_handle = Some(pty_handle);
-        self.connected_agent = Some(agent_id.to_string());
-
-        // Notify PTY that we connected
-        if let Some(handle) = &self.current_pty_handle {
-            let _ = handle.connect_blocking(self.id.clone(), self.dims);
-        }
-    }
-
-    /// Disconnect from the current PTY.
-    pub fn disconnect_from_pty(&mut self) {
-        // Notify PTY that we're disconnecting
-        if let Some(handle) = &self.current_pty_handle {
-            let _ = handle.disconnect_blocking(self.id.clone());
-        }
-
-        self.pty_event_rx = None;
-        self.current_pty_handle = None;
-        self.connected_agent = None;
-    }
+    // === Helper methods (not part of trait) ===
 
     /// Poll for PTY events (non-blocking).
     ///
     /// Returns the next PTY event if available, or `None` if no events pending.
     /// Returns `Err` if the channel is closed (agent terminated).
+    ///
+    /// Called by TuiRunner in the event loop to check for PTY output.
     pub fn poll_pty_events(&mut self) -> Result<Option<PtyEvent>, broadcast::error::RecvError> {
         match &mut self.pty_event_rx {
             Some(rx) => match rx.try_recv() {
@@ -382,80 +156,33 @@ impl TuiClient {
         }
     }
 
-    /// Poll for Hub events (non-blocking).
+    /// Update local dimensions.
     ///
-    /// Returns the next Hub event if available, or `None` if no events pending.
-    /// Returns `Err` if the channel is closed (Hub shut down).
-    pub fn poll_hub_events(&mut self) -> Result<Option<HubEvent>, broadcast::error::RecvError> {
-        match &mut self.hub_event_rx {
-            Some(rx) => match rx.try_recv() {
-                Ok(event) => Ok(Some(event)),
-                Err(broadcast::error::TryRecvError::Empty) => Ok(None),
-                Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    warn!("TUI lagged behind Hub by {} events", n);
-                    Ok(None)
-                }
-                Err(broadcast::error::TryRecvError::Closed) => {
-                    Err(broadcast::error::RecvError::Closed)
-                }
-            },
-            None => Ok(None),
+    /// Also resizes the vt100 parser. Does NOT automatically resize PTYs -
+    /// caller should use trait's `resize_pty()` for specific PTYs that should be resized.
+    pub fn update_dims(&mut self, cols: u16, rows: u16) {
+        self.dims = (cols, rows);
+
+        // Update parser
+        if let Ok(mut parser) = self.vt100_parser.lock() {
+            parser.screen_mut().set_size(rows, cols);
         }
     }
 
-    // === Channel setup methods ===
-
-    /// Set the Hub event receiver.
-    ///
-    /// Called during initialization to receive Hub events.
-    pub fn set_hub_event_rx(&mut self, rx: broadcast::Receiver<HubEvent>) {
-        self.hub_event_rx = Some(rx);
-    }
-
-    /// Get a reference to the Hub handle.
-    #[must_use]
-    pub fn hub_handle(&self) -> &HubHandle {
-        &self.hub_handle
-    }
-
-    // === Data Access Methods (Client trait) ===
-
-    /// Get snapshot of all agents.
-    ///
-    /// Returns `AgentInfo` for all active agents in display order.
-    /// This is a snapshot - changes won't be reflected until next call.
-    #[must_use]
-    pub fn get_agents(&self) -> Vec<AgentInfo> {
-        self.hub_handle.get_agents()
-    }
-
-    /// Get handle for agent at index.
-    ///
-    /// Returns `AgentHandle` for the agent at the given index in display order,
-    /// or `None` if index is out of bounds.
-    #[must_use]
-    pub fn get_agent(&self, index: usize) -> Option<AgentHandle> {
-        self.hub_handle.get_agent(index)
-    }
-
-    // === Accessor methods ===
-
     /// Get the vt100 parser for rendering.
     #[must_use]
-    pub fn vt100_parser(&self) -> &Arc<Mutex<vt100::Parser>> {
+    pub fn vt100_parser(&self) -> &Arc<Mutex<Parser>> {
         &self.vt100_parser
     }
 
-    /// Check if this client is the size owner.
-    #[must_use]
-    pub fn is_size_owner(&self) -> bool {
-        self.is_size_owner
-    }
-
-    /// Check if connected to a PTY.
-    #[must_use]
-    pub fn is_pty_connected(&self) -> bool {
-        self.connected_agent.is_some()
+    /// Process PTY output by feeding to vt100 parser.
+    ///
+    /// Called by TuiRunner when `poll_pty_events()` returns `PtyEvent::Output`.
+    /// Separated from polling so TuiRunner controls when parsing happens.
+    pub fn process_output(&mut self, data: &[u8]) {
+        if let Ok(mut parser) = self.vt100_parser.lock() {
+            parser.process(data);
+        }
     }
 }
 
@@ -464,21 +191,15 @@ impl std::fmt::Debug for TuiClient {
         f.debug_struct("TuiClient")
             .field("id", &self.id)
             .field("dims", &self.dims)
-            .field("is_size_owner", &self.is_size_owner)
-            .field("selected_agent", &self.selected_agent)
-            .field("active_pty_view", &self.active_pty_view)
-            .field("connected_agent", &self.connected_agent)
             .field("has_pty_event_rx", &self.pty_event_rx.is_some())
-            .field("has_hub_event_rx", &self.hub_event_rx.is_some())
-            .field("has_current_pty_handle", &self.current_pty_handle.is_some())
             .finish()
     }
 }
 
-impl super::Client for TuiClient {
-    // ============================================================
-    // Identity
-    // ============================================================
+impl Client for TuiClient {
+    fn hub_handle(&self) -> &HubHandle {
+        &self.hub_handle
+    }
 
     fn id(&self) -> &ClientId {
         &self.id
@@ -488,84 +209,63 @@ impl super::Client for TuiClient {
         self.dims
     }
 
-    // ============================================================
-    // Data Access (reads from Hub state)
-    // ============================================================
+    fn set_dims(&mut self, cols: u16, rows: u16) {
+        self.update_dims(cols, rows);
 
-    fn get_agents(&self) -> Vec<AgentInfo> {
-        TuiClient::get_agents(self)
+        // Propagate resize to connected PTY
+        if let Some((agent_idx, pty_idx)) = self.connected_pty {
+            if let Err(e) = self.resize_pty(agent_idx, pty_idx, rows, cols) {
+                log::debug!("Failed to resize PTY: {}", e);
+            }
+        }
     }
 
-    fn get_agent(&self, index: usize) -> Option<AgentHandle> {
-        TuiClient::get_agent(self, index)
+    fn connect_to_pty(&mut self, agent_index: usize, pty_index: usize) -> Result<(), String> {
+        // Disconnect from previous if any
+        if self.pty_event_rx.is_some() {
+            self.pty_event_rx = None;
+            self.connected_pty = None;
+        }
+
+        // Get PTY handle via hub_handle and subscribe
+        let agent = self
+            .hub_handle
+            .get_agent(agent_index)
+            .ok_or_else(|| format!("Agent at index {} not found", agent_index))?;
+        let pty = agent
+            .get_pty(pty_index)
+            .ok_or_else(|| format!("PTY at index {} not found", pty_index))?;
+
+        self.pty_event_rx = Some(pty.subscribe());
+
+        // Track connected PTY indices for resize propagation
+        self.connected_pty = Some((agent_index, pty_index));
+
+        // Notify PTY of connection and get scrollback (currently unused)
+        let _scrollback = pty.connect_blocking(self.id.clone(), self.dims);
+
+        Ok(())
     }
 
-    // ============================================================
-    // Hub Commands (fire-and-forget via channel)
-    // ============================================================
+    fn disconnect_from_pty(&mut self, agent_index: usize, pty_index: usize) {
+        self.pty_event_rx = None;
+        self.connected_pty = None;
 
-    fn request_create_agent(&self, request: CreateAgentRequest) -> Result<(), String> {
-        // Convert client-facing request to Hub command request
-        let hub_request = HubCreateAgentRequest::new(&request.issue_or_branch);
-        let hub_request = if let Some(ref prompt) = request.prompt {
-            hub_request.with_prompt(prompt)
-        } else {
-            hub_request
-        };
-        let hub_request = if let Some(ref path) = request.from_worktree {
-            hub_request.from_worktree(path.clone())
-        } else {
-            hub_request
-        };
-
-        self.hub_handle.create_agent(hub_request)
+        // Notify PTY of disconnection
+        if let Some(agent) = self.hub_handle.get_agent(agent_index) {
+            if let Some(pty) = agent.get_pty(pty_index) {
+                let _ = pty.disconnect_blocking(self.id.clone());
+            }
+        }
     }
 
-    fn request_delete_agent(&self, agent_id: &str) -> Result<(), String> {
-        self.hub_handle.delete_agent(agent_id)
-    }
-
-    // ============================================================
-    // Event Handlers (Hub/PTY push to Client)
-    // ============================================================
-
-    fn on_output(&mut self, data: &[u8]) {
-        TuiClient::on_output(self, data);
-    }
-
-    fn on_resized(&mut self, rows: u16, cols: u16) {
-        TuiClient::on_resized(self, rows, cols);
-    }
-
-    fn on_process_exit(&mut self, exit_code: Option<i32>) {
-        TuiClient::on_process_exit(self, exit_code);
-    }
-
-    fn on_agent_created(&mut self, index: usize, info: &AgentInfo) {
-        TuiClient::on_agent_created(self, index, info);
-    }
-
-    fn on_agent_deleted(&mut self, index: usize) {
-        TuiClient::on_agent_deleted(self, index);
-    }
-
-    fn on_hub_shutdown(&mut self) {
-        TuiClient::on_hub_shutdown(self);
-    }
-
-    // ============================================================
-    // Connection State
-    // ============================================================
-
-    fn is_connected(&self) -> bool {
-        true // TUI is always connected
-    }
+    // NOTE: get_agents, get_agent, send_input, resize_pty, agent_count
+    // all use DEFAULT IMPLEMENTATIONS from the trait - not implemented here
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
 
     /// Helper to create a TuiClient with a mock HubHandle for testing.
     fn test_client() -> TuiClient {
@@ -578,50 +278,45 @@ mod tests {
     }
 
     #[test]
-    fn test_tui_client_default() {
+    fn test_construction_default() {
         let client = test_client();
         assert_eq!(client.id(), &ClientId::Tui);
         assert_eq!(client.dims(), (80, 24));
-        assert!(client.selected_agent().is_none());
-        assert!(client.connected_agent().is_none());
-        assert!(client.is_connected());
     }
 
     #[test]
-    fn test_tui_client_with_dims() {
+    fn test_construction_with_dims() {
         let client = test_client_with_dims(120, 40);
         assert_eq!(client.dims(), (120, 40));
     }
 
     #[test]
-    fn test_tui_client_selected_agent() {
-        let mut client = test_client();
+    fn test_construction_with_parser() {
+        let parser = Arc::new(Mutex::new(Parser::new(30, 100, 5000)));
+        let client = TuiClient::with_parser(HubHandle::mock(), parser.clone(), 100, 30);
 
-        client.set_selected_agent(Some("agent-123"));
-        assert_eq!(client.selected_agent(), Some("agent-123"));
-
-        client.set_selected_agent(None);
-        assert!(client.selected_agent().is_none());
+        // Verify same parser is shared
+        assert!(Arc::ptr_eq(client.vt100_parser(), &parser));
+        assert_eq!(client.dims(), (100, 30));
     }
 
     #[test]
-    fn test_tui_client_pty_view() {
-        let mut client = test_client();
-
-        assert_eq!(client.active_pty_view(), PtyView::Cli);
-
-        client.set_active_pty_view(PtyView::Server);
-        assert_eq!(client.active_pty_view(), PtyView::Server);
-
-        client.toggle_pty_view();
-        assert_eq!(client.active_pty_view(), PtyView::Cli);
-
-        client.toggle_pty_view();
-        assert_eq!(client.active_pty_view(), PtyView::Server);
+    fn test_dims_accessor() {
+        let client = test_client_with_dims(100, 50);
+        assert_eq!(client.dims(), (100, 50));
     }
 
     #[test]
-    fn test_tui_client_update_dims() {
+    fn test_vt100_parser_accessor() {
+        let client = test_client();
+        let parser = client.vt100_parser();
+        // Verify we can access the parser
+        let lock = parser.lock().unwrap();
+        assert_eq!(lock.screen().size(), (24, 80));
+    }
+
+    #[test]
+    fn test_update_dims() {
         let mut client = test_client();
 
         client.update_dims(100, 30);
@@ -633,10 +328,10 @@ mod tests {
     }
 
     #[test]
-    fn test_tui_client_on_output() {
+    fn test_process_output() {
         let mut client = test_client();
 
-        client.on_output(b"Hello, World!");
+        client.process_output(b"Hello, World!");
 
         let parser = client.vt100_parser().lock().unwrap();
         let contents = parser.screen().contents();
@@ -644,73 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tui_client_on_resized() {
-        let mut client = test_client();
-
-        client.on_resized(50, 150);
-        assert_eq!(client.dims(), (150, 50));
-
-        let parser = client.vt100_parser().lock().unwrap();
-        assert_eq!(parser.screen().size(), (50, 150));
-    }
-
-    #[test]
-    fn test_tui_client_on_owner_changed() {
-        let mut client = test_client();
-        assert!(client.is_size_owner());
-
-        client.on_owner_changed(Some(ClientId::Browser("other".to_string())));
-        assert!(!client.is_size_owner());
-
-        client.on_owner_changed(Some(ClientId::Tui));
-        assert!(client.is_size_owner());
-
-        client.on_owner_changed(None);
-        assert!(!client.is_size_owner());
-    }
-
-    #[test]
-    fn test_tui_client_on_agent_deleted_with_mock_handle() {
-        // With mock hub_handle, on_agent_deleted returns empty list for get_agents
-        // so it won't find the agent_id at index, and selection won't be cleared
-        let mut client = test_client();
-        client.set_selected_agent(Some("agent-123"));
-
-        // Delete at index 0 - mock handle returns empty agent list
-        // so selected_agent won't be cleared
-        client.on_agent_deleted(0);
-        // Selection unchanged because we can't map index to agent_id with mock
-        assert_eq!(client.selected_agent(), Some("agent-123"));
-    }
-
-    #[test]
-    fn test_tui_client_connect_disconnect_pty() {
-        let (event_tx, _) = broadcast::channel::<PtyEvent>(16);
-        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
-        let pty_handle = PtyHandle::new(event_tx, cmd_tx);
-
-        let mut client = test_client();
-        assert!(!client.is_pty_connected());
-
-        client.connect_to_pty("agent-123", pty_handle);
-        assert!(client.is_pty_connected());
-        assert_eq!(client.connected_agent(), Some("agent-123"));
-
-        client.disconnect_from_pty();
-        assert!(!client.is_pty_connected());
-        assert!(client.connected_agent().is_none());
-    }
-
-    #[test]
-    fn test_tui_client_send_input_without_connection() {
-        let client = test_client();
-        let result = client.send_input(b"test");
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Not connected to any PTY");
-    }
-
-    #[test]
-    fn test_tui_client_poll_pty_events_without_connection() {
+    fn test_poll_pty_events_without_subscription() {
         let mut client = test_client();
         let result = client.poll_pty_events();
         assert!(result.is_ok());
@@ -718,43 +347,18 @@ mod tests {
     }
 
     #[test]
-    fn test_tui_client_poll_hub_events_without_subscription() {
-        let mut client = test_client();
-        let result = client.poll_hub_events();
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_tui_client_with_shared_parser() {
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(30, 100, 5000)));
-        let client = TuiClient::with_parser(HubHandle::mock(), parser.clone(), 100, 30);
-
-        // Verify same parser is shared
-        assert!(Arc::ptr_eq(&client.vt100_parser, &parser));
-
-        // Output through client affects shared parser
-        let mut client = client;
-        client.on_output(b"shared");
-
-        let p = parser.lock().unwrap();
-        assert!(p.screen().contents().contains("shared"));
-    }
-
-    #[test]
-    fn test_tui_client_poll_pty_events_receives_output() {
-        // Set up channel and manually assign receiver to avoid calling connect_to_pty
-        // which uses blocking_send (incompatible with async context).
+    fn test_poll_pty_events_with_subscription() {
+        // Set up channel and manually assign receiver
         let (event_tx, _) = broadcast::channel::<PtyEvent>(16);
 
         let mut client = test_client();
-        // Directly set the receiver instead of calling connect_to_pty
+        // Directly set the receiver for testing
         client.pty_event_rx = Some(event_tx.subscribe());
 
         // Send an event
         event_tx.send(PtyEvent::output(b"hello".to_vec())).unwrap();
 
-        // Poll should receive it (uses try_recv, no async needed)
+        // Poll should receive it
         let result = client.poll_pty_events();
         assert!(result.is_ok());
         let event = result.unwrap();
@@ -767,39 +371,79 @@ mod tests {
     }
 
     #[test]
-    fn test_tui_client_on_hub_shutdown() {
-        let (event_tx, _) = broadcast::channel::<PtyEvent>(16);
-        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
-        let pty_handle = PtyHandle::new(event_tx, cmd_tx);
-
+    fn test_connect_to_pty_fails_with_mock() {
+        // With mock hub_handle, connect_to_pty will fail because
+        // get_agent returns None.
         let mut client = test_client();
-        client.set_selected_agent(Some("agent-123"));
-        client.connect_to_pty("agent-123", pty_handle);
 
-        client.on_hub_shutdown();
-
-        assert!(client.selected_agent().is_none());
-        assert!(!client.is_pty_connected());
+        let result = client.connect_to_pty(0, 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
     }
 
     #[test]
-    fn test_tui_client_get_agents_with_mock_handle() {
-        let client = test_client();
-        // Mock hub_handle returns empty vec (channel is closed)
-        assert!(client.get_agents().is_empty());
+    fn test_disconnect_from_pty_safe_when_not_connected() {
+        let mut client = test_client();
+
+        // Disconnect is always safe (no-op when not connected)
+        client.disconnect_from_pty(0, 0);
+        // Should not panic
     }
 
     #[test]
-    fn test_tui_client_get_agent_with_mock_handle() {
+    fn test_trait_hub_handle_accessor() {
         let client = test_client();
-        // Mock hub_handle returns None (channel is closed)
-        assert!(client.get_agent(0).is_none());
-    }
-
-    #[test]
-    fn test_tui_client_hub_handle_accessor() {
-        let client = test_client();
-        // hub_handle is always set (required in constructor)
+        // Verify hub_handle() returns a reference (trait method)
         let _ = client.hub_handle();
+    }
+
+    #[test]
+    fn test_trait_default_get_agents() {
+        let client = test_client();
+        // Mock hub_handle returns empty vec
+        let agents = Client::get_agents(&client);
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn test_trait_default_get_agent() {
+        let client = test_client();
+        // Mock hub_handle returns None
+        let agent = Client::get_agent(&client, 0);
+        assert!(agent.is_none());
+    }
+
+    #[test]
+    fn test_trait_default_send_input_fails_without_agent() {
+        let client = test_client();
+        // Default implementation looks up via hub_handle, which returns None
+        let result = Client::send_input(&client, 0, 0, b"test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_trait_default_resize_pty_fails_without_agent() {
+        let client = test_client();
+        // Default implementation looks up via hub_handle, which returns None
+        let result = Client::resize_pty(&client, 0, 0, 24, 80);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_trait_default_agent_count() {
+        let client = test_client();
+        // Mock returns empty, so count is 0
+        assert_eq!(Client::agent_count(&client), 0);
+    }
+
+    #[test]
+    fn test_debug_format() {
+        let client = test_client();
+        let debug_str = format!("{:?}", client);
+        assert!(debug_str.contains("TuiClient"));
+        assert!(debug_str.contains("id"));
+        assert!(debug_str.contains("dims"));
     }
 }

@@ -40,22 +40,34 @@ pub enum QrRenderResult {
     },
 }
 
-/// Target width for QR image in terminal columns.
-pub const QR_IMAGE_COLS: u16 = 40;
-/// Target height for QR image in terminal rows.
-/// Rows are ~2x taller than columns, so use half the width for square aspect.
-pub const QR_IMAGE_ROWS: u16 = 20;
-
 /// Generate QR code as PNG image and encode for Kitty graphics protocol.
 ///
 /// Returns the escape sequence to display the image inline, or None if generation fails.
-/// The image is displayed in a fixed cell size for consistent modal sizing.
-pub fn generate_qr_kitty_image(data: &str, module_size: u8) -> Option<QrRenderResult> {
+/// The caller specifies max display dimensions; the image scales to fit while maintaining
+/// aspect ratio. High-res PNG ensures scannability even when scaled down.
+///
+/// # Arguments
+///
+/// * `data` - The data to encode in the QR code
+/// * `module_size` - Pixels per QR module in the generated PNG (4 recommended for quality)
+/// * `max_cols` - Maximum terminal columns available for display
+/// * `max_rows` - Maximum terminal rows available for display
+pub fn generate_qr_kitty_image(
+    data: &str,
+    module_size: u8,
+    max_cols: u16,
+    max_rows: u16,
+) -> Option<QrRenderResult> {
     let code = generate_qr_code(data)?;
     let size = code.size() as u32;
     let quiet_zone = 2u32;
     let total_modules = size + quiet_zone * 2;
     let img_size = total_modules * module_size as u32;
+
+    // Use available space, but don't exceed QR's natural size in cells.
+    // QR is square, but terminal cells are ~2:1 (height:width), so rows = cols/2.
+    let display_cols = max_cols.min(total_modules as u16);
+    let display_rows = max_rows.min(display_cols / 2);
 
     // Create grayscale image (white background)
     let mut img = GrayImage::from_pixel(img_size, img_size, Luma([255u8]));
@@ -90,15 +102,15 @@ pub fn generate_qr_kitty_image(data: &str, module_size: u8) -> Option<QrRenderRe
             .ok()?;
     }
 
-    // Build Kitty graphics protocol escape sequence with explicit cell sizing
+    // Build Kitty graphics protocol escape sequence with calculated cell sizing
     let b64_data = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
     let escape_sequence =
-        build_kitty_escape_sequence(&b64_data, img_size, QR_IMAGE_COLS, QR_IMAGE_ROWS);
+        build_kitty_escape_sequence(&b64_data, img_size, display_cols, display_rows);
 
     Some(QrRenderResult::KittyImage {
         escape_sequence,
-        width_cells: QR_IMAGE_COLS,
-        height_cells: QR_IMAGE_ROWS,
+        width_cells: display_cols,
+        height_cells: display_rows,
     })
 }
 

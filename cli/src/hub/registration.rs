@@ -10,7 +10,7 @@
 //! - Tunnel connection for HTTP forwarding
 //! - Terminal relay connection for browser access
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-01
 
 use std::sync::Arc;
 
@@ -267,17 +267,33 @@ pub fn connect_hub_relay(
         }
     }
 
-    // Wait for sender from relay thread
+    // Wait for sender from relay thread.
+    // If this fails, we have a valid Signal bundle but no way to receive
+    // browser handshakes - the QR code should not be shown.
     match sender_rx.recv_timeout(std::time::Duration::from_secs(10)) {
         Ok(Some(sender)) => {
             browser.sender = Some(sender);
             browser.event_rx = Some(event_rx);
+            browser.relay_connected = true;
+            log::info!("Hub relay connected - browser access enabled");
         }
         Ok(None) => {
-            log::warn!("Relay connection failed");
+            log::warn!(
+                "Relay connection failed - browser access disabled. \
+                 QR code will not be shown to prevent 'CLI did not respond' errors."
+            );
+            browser.relay_connected = false;
+            // Clear the bundle since we can't receive handshakes anyway.
+            // This prevents showing a QR code that leads to user confusion.
+            browser.signal_bundle = None;
         }
         Err(_) => {
-            log::error!("Timeout waiting for relay connection");
+            log::error!(
+                "Timeout waiting for relay connection - browser access disabled. \
+                 Check network connectivity to the relay server."
+            );
+            browser.relay_connected = false;
+            browser.signal_bundle = None;
         }
     }
 }

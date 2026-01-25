@@ -20,7 +20,9 @@ use vt100::Parser;
 
 use crate::agent::PtyView;
 use crate::app::AppMode;
-use crate::hub::{CreateAgentRequest, DeleteAgentRequest, HubAction, HubCommand};
+use crate::client::Client;
+use crate::hub::{CreateAgentRequest, DeleteAgentRequest, HubCommand};
+use crate::tui::events::CreationStage;
 use crate::tui::menu::{build_menu, get_action_for_selection, MenuAction, MenuContext};
 
 use super::runner::{TuiRunner, DEFAULT_SCROLLBACK};
@@ -69,7 +71,7 @@ where
                 }
             }
             MenuAction::CloseAgent => {
-                if self.client.selected_agent().is_some() {
+                if self.selected_agent.is_some() {
                     self.mode = AppMode::CloseAgentConfirm;
                 }
             }
@@ -77,31 +79,36 @@ where
                 self.mode = AppMode::ConnectionCode;
                 self.qr_image_displayed = false;
             }
-            MenuAction::TogglePolling => {
-                // Send command to Hub to toggle polling
-                let action = HubAction::TogglePolling;
-                if let Err(e) = self.command_tx.dispatch_action_blocking(action) {
-                    log::error!("Failed to toggle polling: {}", e);
-                }
-                self.mode = AppMode::Normal;
-            }
             MenuAction::TogglePtyView => {
                 // Toggle PTY view - same logic as TuiAction::TogglePtyView
                 if let Some(ref handle) = self.agent_handle {
-                    let current_view = self.client.active_pty_view();
+                    let current_view = self.active_pty_view;
                     let new_view = match current_view {
                         PtyView::Cli => PtyView::Server,
                         PtyView::Server => PtyView::Cli,
                     };
-                    self.client.set_active_pty_view(new_view);
+                    self.active_pty_view = new_view;
 
-                    let new_pty = match new_view {
-                        PtyView::Cli => Some(handle.cli_pty().clone()),
-                        PtyView::Server => handle.server_pty().cloned(),
+                    // Get PTY index (0 = CLI, 1 = Server)
+                    let pty_index = match new_view {
+                        PtyView::Cli => 0,
+                        PtyView::Server => 1,
                     };
 
-                    if let Some(pty) = new_pty {
-                        self.client.connect_to_pty(handle.agent_id(), pty);
+                    // Check if PTY exists and connect
+                    if handle.get_pty(pty_index).is_some() {
+                        // Find agent index in our local list
+                        let agent_id = handle.agent_id();
+                        let agent_index = self
+                            .agents
+                            .iter()
+                            .position(|a| a.id == agent_id)
+                            .unwrap_or(0);
+
+                        self.current_pty_index = Some(pty_index);
+                        if let Err(e) = self.client.connect_to_pty(agent_index, pty_index) {
+                            log::warn!("Failed to connect to PTY: {}", e);
+                        }
 
                         // Clear and reset parser for new PTY stream
                         let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
@@ -124,19 +131,17 @@ where
     /// A `MenuContext` reflecting the current TUI state for dynamic menu building.
     pub fn build_menu_context(&self) -> MenuContext {
         // Check if we have a selected agent with server PTY
-        let has_agent = self.client.selected_agent().is_some();
+        let has_agent = self.selected_agent.is_some();
+        // Check if server PTY exists (index 1)
         let has_server_pty = self
             .agent_handle
             .as_ref()
-            .is_some_and(|h| h.server_pty().is_some());
+            .is_some_and(|h| h.get_pty(1).is_some());
 
         MenuContext {
             has_agent,
             has_server_pty,
-            active_pty: self.client.active_pty_view(),
-            // TuiRunner currently doesn't track polling state - default to true
-            // This affects menu label display but not action mapping
-            polling_enabled: true,
+            active_pty: self.active_pty_view,
         }
     }
 
@@ -166,9 +171,15 @@ where
                     CreateAgentRequest::new(branch.clone()).from_worktree(PathBuf::from(path));
                 let (cmd, _rx) = HubCommand::create_agent(request);
                 if let Err(e) = self.command_tx.inner().blocking_send(cmd) {
+                    // Channel closed - Hub is shutting down, return to Normal
                     log::error!("Failed to send create agent command: {}", e);
+                    self.mode = AppMode::Normal;
+                } else {
+                    // Track pending creation for sidebar display
+                    self.creating_agent = Some((branch.clone(), CreationStage::CreatingWorktree));
+                    // Close modal immediately - creation progress shown in sidebar
+                    self.mode = AppMode::Normal;
                 }
-                self.mode = AppMode::Normal;
             }
         }
     }
@@ -209,7 +220,7 @@ where
                     );
 
                     // Build the CreateAgentRequest
-                    let mut request = CreateAgentRequest::new(issue_or_branch);
+                    let mut request = CreateAgentRequest::new(issue_or_branch.clone());
                     if let Some(p) = prompt {
                         request = request.with_prompt(p);
                     }
@@ -217,11 +228,23 @@ where
                     // Send the create agent command
                     let (cmd, _rx) = HubCommand::create_agent(request);
                     if let Err(e) = self.command_tx.inner().blocking_send(cmd) {
+                        // Channel closed - Hub is shutting down, return to Normal
                         log::error!("Failed to send create agent command: {}", e);
+                        self.mode = AppMode::Normal;
+                        self.input_buffer.clear();
+                    } else {
+                        // Track pending creation for sidebar display
+                        self.creating_agent =
+                            Some((issue_or_branch, CreationStage::CreatingWorktree));
+                        self.input_buffer.clear();
+                        // Close modal immediately - creation progress shown in sidebar
+                        self.mode = AppMode::Normal;
                     }
+                } else {
+                    // No pending issue/branch - just return to normal
+                    self.mode = AppMode::Normal;
+                    self.input_buffer.clear();
                 }
-                self.mode = AppMode::Normal;
-                self.input_buffer.clear();
             }
             _ => {}
         }
@@ -236,7 +259,7 @@ where
     ///
     /// * `delete_worktree` - If true, also delete the agent's worktree
     pub fn handle_confirm_close_agent(&mut self, delete_worktree: bool) {
-        if let Some(key) = self.client.selected_agent() {
+        if let Some(ref key) = self.selected_agent {
             let request = if delete_worktree {
                 DeleteAgentRequest::new(key).with_worktree_deletion()
             } else {

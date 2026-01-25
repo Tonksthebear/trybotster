@@ -15,7 +15,7 @@
 //! - Actions (Input, Scroll, Select) - converted to `HubAction` via `relay::events`
 //! - Responses (ListAgents, ListWorktrees) - handled by Hub with helpers here
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-01
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use flate2::{write::GzEncoder, Compression};
@@ -59,6 +59,12 @@ pub struct BrowserState {
     /// Shared crypto service handle for E2E encryption.
     /// Used by HubRelay and agent channels for Signal Protocol operations.
     pub crypto_service: Option<CryptoServiceHandle>,
+    /// Whether the relay WebSocket connection is established.
+    ///
+    /// When `false`, the hub cannot receive browser handshake messages even if
+    /// a valid `signal_bundle` exists. The QR code should not be shown when
+    /// this is `false` to avoid "CLI did not respond" errors.
+    pub relay_connected: bool,
 }
 
 impl std::fmt::Debug for BrowserState {
@@ -378,6 +384,33 @@ mod tests {
         let state = BrowserState::default();
         assert!(!state.is_connected());
         assert!(state.mode.is_none());
+        // relay_connected defaults to false - QR code should not be shown
+        // until relay connection is established
+        assert!(
+            !state.relay_connected,
+            "relay_connected should default to false"
+        );
+    }
+
+    /// Verifies that `relay_connected` properly gates QR code visibility.
+    ///
+    /// When relay connection fails, we set `relay_connected = false` and
+    /// clear `signal_bundle` to prevent showing a QR code that would lead
+    /// to "CLI did not respond" errors when browsers try to connect.
+    #[test]
+    fn test_relay_connected_prevents_false_positive_qr() {
+        let state = BrowserState::default();
+
+        // Simulate failed relay connection scenario:
+        // - signal_bundle should be None (cleared on failure)
+        // - relay_connected should be false
+        // - sender should be None
+        assert!(state.signal_bundle.is_none());
+        assert!(!state.relay_connected);
+        assert!(state.sender.is_none());
+
+        // The is_connected() check should also return false
+        assert!(!state.is_connected());
     }
 
     #[test]

@@ -22,6 +22,14 @@
 //! - [`PollingWorker`] - Polls server for messages in background
 //! - [`HeartbeatWorker`] - Sends heartbeat every 30 seconds
 //! - [`NotificationWorker`] - Sends agent notifications to Rails
+//!
+//! # Backoff Strategy
+//!
+//! Workers implement exponential backoff on consecutive failures to avoid
+//! overwhelming the server with unauthorized or failed requests. See
+//! [`BackoffState`] for implementation details.
+
+// Rust guideline compliant 2025-01
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -34,6 +42,87 @@ use reqwest::blocking::Client;
 use crate::server::types::MessageData;
 
 use super::polling::MessageResponse;
+
+// ============================================================================
+// Backoff State
+// ============================================================================
+
+/// Base delay for exponential backoff in seconds (M-DOCUMENTED-MAGIC).
+///
+/// Starting point for backoff calculation: 2^0 * BASE = 2 seconds after first failure.
+/// Chosen to be short enough to recover quickly from transient failures while
+/// providing immediate relief from request spam.
+const BACKOFF_BASE_SECS: u64 = 2;
+
+/// Maximum backoff delay in seconds (M-DOCUMENTED-MAGIC).
+///
+/// Caps the exponential growth to prevent excessively long waits. 60 seconds
+/// balances server protection against reasonable reconnection latency.
+/// At this cap: unauthorized requests drop from ~1/sec to ~1/min.
+const BACKOFF_MAX_SECS: u64 = 60;
+
+/// Tracks consecutive failures and computes exponential backoff delays.
+///
+/// # Backoff Formula
+///
+/// delay = min(BASE * 2^(consecutive_failures - 1), MAX)
+///
+/// - After 1 failure: 2s
+/// - After 2 failures: 4s
+/// - After 3 failures: 8s
+/// - After 4 failures: 16s
+/// - After 5 failures: 32s
+/// - After 6+ failures: 60s (capped)
+///
+/// # Reset Behavior
+///
+/// Counter resets to zero on any successful response, immediately restoring
+/// normal polling interval.
+#[derive(Debug, Default)]
+struct BackoffState {
+    /// Number of consecutive failures since last success.
+    consecutive_failures: u32,
+}
+
+impl BackoffState {
+    /// Record a successful request; resets backoff to zero.
+    fn record_success(&mut self) {
+        if self.consecutive_failures > 0 {
+            log::info!(
+                "Server connection restored after {} consecutive failures",
+                self.consecutive_failures
+            );
+        }
+        self.consecutive_failures = 0;
+    }
+
+    /// Record a failed request; increments failure counter.
+    fn record_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+
+    /// Calculate current backoff delay based on consecutive failures.
+    ///
+    /// Returns `Duration::ZERO` if no failures have occurred.
+    fn current_delay(&self) -> Duration {
+        if self.consecutive_failures == 0 {
+            return Duration::ZERO;
+        }
+
+        // Calculate: BASE * 2^(failures - 1), capped at MAX
+        // Cap exponent at 6 to prevent overflow (2^6 = 64, 2 * 64 = 128 > 60 = MAX)
+        let exponent = self.consecutive_failures.saturating_sub(1).min(6);
+        let multiplier = 1u64 << exponent;
+        let delay_secs = BACKOFF_BASE_SECS.saturating_mul(multiplier).min(BACKOFF_MAX_SECS);
+
+        Duration::from_secs(delay_secs)
+    }
+
+    /// Check if currently in backoff state (has consecutive failures).
+    fn is_backing_off(&self) -> bool {
+        self.consecutive_failures > 0
+    }
+}
 
 /// Configuration for background workers.
 ///
@@ -143,6 +232,8 @@ impl PollingWorker {
             config.repo_name
         );
 
+        let mut backoff = BackoffState::default();
+
         loop {
             // Check for shutdown
             if shutdown.load(Ordering::SeqCst) {
@@ -161,14 +252,44 @@ impl PollingWorker {
             } else {
                 // Poll for messages
                 let result = Self::poll_messages(&client, &config);
+
+                // Update backoff state based on result
+                match &result {
+                    PollingResult::Messages(_) => backoff.record_success(),
+                    PollingResult::Error(e) => {
+                        backoff.record_failure();
+                        let delay = backoff.current_delay();
+                        log::warn!(
+                            "Polling failed (attempt {}): {}. Backing off for {}s",
+                            backoff.consecutive_failures,
+                            e,
+                            delay.as_secs()
+                        );
+                    }
+                    PollingResult::Skipped => {} // No change to backoff
+                }
+
                 if result_tx.send(result).is_err() {
                     log::warn!("Polling worker: main thread disconnected");
                     break;
                 }
             }
 
-            // Sleep for poll interval (checking shutdown periodically)
-            let sleep_duration = Duration::from_secs(config.poll_interval);
+            // Calculate total sleep: normal interval + any backoff delay
+            let base_interval = Duration::from_secs(config.poll_interval);
+            let backoff_delay = backoff.current_delay();
+            let sleep_duration = base_interval + backoff_delay;
+
+            if backoff.is_backing_off() {
+                log::debug!(
+                    "Polling worker: sleeping {}s ({}s base + {}s backoff)",
+                    sleep_duration.as_secs(),
+                    base_interval.as_secs(),
+                    backoff_delay.as_secs()
+                );
+            }
+
+            // Sleep with periodic shutdown checks
             let check_interval = Duration::from_millis(100);
             let mut elapsed = Duration::ZERO;
 
@@ -367,6 +488,7 @@ impl HeartbeatWorker {
 
         // Current agent list (updated via channel)
         let mut agents: Vec<HeartbeatAgentData> = Vec::new();
+        let mut backoff = BackoffState::default();
 
         loop {
             // Check for shutdown
@@ -382,16 +504,41 @@ impl HeartbeatWorker {
 
             // Skip if offline mode
             if std::env::var("BOTSTER_OFFLINE_MODE").is_err() {
-                Self::send_heartbeat(&client, &config, &agents);
+                match Self::send_heartbeat(&client, &config, &agents) {
+                    Ok(()) => backoff.record_success(),
+                    Err(e) => {
+                        backoff.record_failure();
+                        let delay = backoff.current_delay();
+                        log::warn!(
+                            "Heartbeat failed (attempt {}): {}. Backing off for {}s",
+                            backoff.consecutive_failures,
+                            e,
+                            delay.as_secs()
+                        );
+                    }
+                }
             }
 
-            // Sleep for heartbeat interval (checking shutdown periodically)
-            let interval = if crate::env::is_any_test() {
+            // Calculate total sleep: normal interval + any backoff delay
+            let base_interval = if crate::env::is_any_test() {
                 2
             } else {
                 Self::HEARTBEAT_INTERVAL
             };
-            let sleep_duration = Duration::from_secs(interval);
+            let base_duration = Duration::from_secs(base_interval);
+            let backoff_delay = backoff.current_delay();
+            let sleep_duration = base_duration + backoff_delay;
+
+            if backoff.is_backing_off() {
+                log::debug!(
+                    "Heartbeat worker: sleeping {}s ({}s base + {}s backoff)",
+                    sleep_duration.as_secs(),
+                    base_interval,
+                    backoff_delay.as_secs()
+                );
+            }
+
+            // Sleep with periodic shutdown checks
             let check_interval = Duration::from_millis(100);
             let mut elapsed = Duration::ZERO;
 
@@ -411,7 +558,13 @@ impl HeartbeatWorker {
     }
 
     /// Send heartbeat to server.
-    fn send_heartbeat(client: &Client, config: &WorkerConfig, agents: &[HeartbeatAgentData]) {
+    ///
+    /// Returns `Ok(())` on success, `Err(message)` on failure (for backoff tracking).
+    fn send_heartbeat(
+        client: &Client,
+        config: &WorkerConfig,
+        agents: &[HeartbeatAgentData],
+    ) -> Result<(), String> {
         let agents_list: Vec<serde_json::Value> = agents
             .iter()
             .map(|agent| {
@@ -441,12 +594,16 @@ impl HeartbeatWorker {
                     "Heartbeat worker: sent heartbeat with {} agents",
                     agents.len()
                 );
+                Ok(())
             }
             Ok(response) => {
+                let msg = format!("HTTP {}", response.status());
                 log::warn!("Heartbeat worker: server returned {}", response.status());
+                Err(msg)
             }
             Err(e) => {
                 log::warn!("Heartbeat worker: failed to send heartbeat: {e}");
+                Err(e.to_string())
             }
         }
     }
@@ -649,6 +806,94 @@ mod tests {
             device_id: Some(123),
         }
     }
+
+    // ========================================================================
+    // BackoffState Tests
+    // ========================================================================
+
+    #[test]
+    fn test_backoff_state_default() {
+        let backoff = BackoffState::default();
+        assert_eq!(backoff.consecutive_failures, 0);
+        assert!(!backoff.is_backing_off());
+        assert_eq!(backoff.current_delay(), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_backoff_exponential_growth() {
+        let mut backoff = BackoffState::default();
+
+        // After 1 failure: 2s
+        backoff.record_failure();
+        assert_eq!(backoff.consecutive_failures, 1);
+        assert!(backoff.is_backing_off());
+        assert_eq!(backoff.current_delay(), Duration::from_secs(2));
+
+        // After 2 failures: 4s
+        backoff.record_failure();
+        assert_eq!(backoff.consecutive_failures, 2);
+        assert_eq!(backoff.current_delay(), Duration::from_secs(4));
+
+        // After 3 failures: 8s
+        backoff.record_failure();
+        assert_eq!(backoff.consecutive_failures, 3);
+        assert_eq!(backoff.current_delay(), Duration::from_secs(8));
+
+        // After 4 failures: 16s
+        backoff.record_failure();
+        assert_eq!(backoff.consecutive_failures, 4);
+        assert_eq!(backoff.current_delay(), Duration::from_secs(16));
+
+        // After 5 failures: 32s
+        backoff.record_failure();
+        assert_eq!(backoff.consecutive_failures, 5);
+        assert_eq!(backoff.current_delay(), Duration::from_secs(32));
+
+        // After 6 failures: 60s (capped at BACKOFF_MAX_SECS)
+        backoff.record_failure();
+        assert_eq!(backoff.consecutive_failures, 6);
+        assert_eq!(backoff.current_delay(), Duration::from_secs(60));
+
+        // After 7+ failures: still 60s (stays at max)
+        backoff.record_failure();
+        assert_eq!(backoff.consecutive_failures, 7);
+        assert_eq!(backoff.current_delay(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_backoff_reset_on_success() {
+        let mut backoff = BackoffState::default();
+
+        // Accumulate some failures
+        backoff.record_failure();
+        backoff.record_failure();
+        backoff.record_failure();
+        assert_eq!(backoff.consecutive_failures, 3);
+        assert!(backoff.is_backing_off());
+
+        // Success resets to zero
+        backoff.record_success();
+        assert_eq!(backoff.consecutive_failures, 0);
+        assert!(!backoff.is_backing_off());
+        assert_eq!(backoff.current_delay(), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_backoff_overflow_protection() {
+        let mut backoff = BackoffState::default();
+
+        // Simulate many failures to test overflow protection
+        for _ in 0..100 {
+            backoff.record_failure();
+        }
+
+        // Should be capped at max delay, not overflow
+        assert_eq!(backoff.current_delay(), Duration::from_secs(BACKOFF_MAX_SECS));
+    }
+
+    // ========================================================================
+    // Worker Tests
+    // ========================================================================
 
     #[test]
     fn test_polling_worker_creation() {

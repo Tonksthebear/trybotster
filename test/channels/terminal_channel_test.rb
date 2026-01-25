@@ -140,4 +140,153 @@ class TerminalChannelTest < ActionCable::Channel::TestCase
       perform :distribute_sender_key, distribution: nil
     end
   end
+
+  # === Browser -> PTY I/O Flow Integration Tests ===
+  #
+  # These tests verify the explicit routing architecture established in Tasks #1-4:
+  # - Task #2: PTY channels stored in ClientRegistry, created on agent selection
+  # - Task #3: Output forwarding tasks spawn per-channel, input routes via BrowserCommand
+  # - Task #4: Input/resize use TerminalRelayChannel, not HubChannel
+
+  test "multiple browsers can subscribe to same agent with isolated streams" do
+    browser1_identity = "browser-1-#{SecureRandom.hex(8)}"
+    browser2_identity = "browser-2-#{SecureRandom.hex(8)}"
+
+    # Subscribe both browsers to the same agent
+    subscribe hub_id: @hub_id, agent_index: @agent_index, pty_index: @pty_index, browser_identity: browser1_identity
+
+    assert subscription.confirmed?
+    browser1_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:browser:#{browser1_identity}"
+    assert_has_stream browser1_stream
+
+    # Verify browser 1's stream is isolated (doesn't include browser 2's stream)
+    browser2_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:browser:#{browser2_identity}"
+    refute_includes subscription.streams, browser2_stream
+  end
+
+  test "CLI relay to browser routes to correct browser stream only" do
+    browser1_identity = "browser-1-#{SecureRandom.hex(8)}"
+    browser2_identity = "browser-2-#{SecureRandom.hex(8)}"
+
+    # Subscribe as CLI
+    subscribe hub_id: @hub_id, agent_index: @agent_index, pty_index: @pty_index
+
+    browser1_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:browser:#{browser1_identity}"
+    browser2_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:browser:#{browser2_identity}"
+
+    # CLI sends to browser 1 - should ONLY go to browser 1's stream
+    assert_broadcasts(browser1_stream, 1) do
+      assert_no_broadcasts(browser2_stream) do
+        perform :relay, recipient_identity: browser1_identity, envelope: {
+          version: 4,
+          message_type: 2,
+          ciphertext: "encrypted_output_for_browser1"
+        }
+      end
+    end
+  end
+
+  test "browser input relay routes to CLI stream regardless of which browser sends" do
+    browser1_identity = "browser-1-#{SecureRandom.hex(8)}"
+    browser2_identity = "browser-2-#{SecureRandom.hex(8)}"
+    cli_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:cli"
+
+    # Browser 1 sends input to CLI
+    subscribe hub_id: @hub_id, agent_index: @agent_index, pty_index: @pty_index, browser_identity: browser1_identity
+
+    assert_broadcasts(cli_stream, 1) do
+      perform :relay, envelope: {
+        version: 4,
+        message_type: 1,
+        ciphertext: "encrypted_input_from_browser1"
+      }
+    end
+  end
+
+  test "different agents have completely separate streams" do
+    agent0_cli_stream = "terminal_relay:#{@hub_id}:0:#{@pty_index}:cli"
+    agent1_cli_stream = "terminal_relay:#{@hub_id}:1:#{@pty_index}:cli"
+
+    # Subscribe to agent 0
+    subscribe hub_id: @hub_id, agent_index: 0, pty_index: @pty_index
+
+    assert subscription.confirmed?
+    assert_has_stream agent0_cli_stream
+    refute_includes subscription.streams, agent1_cli_stream
+  end
+
+  test "PTY index isolation - CLI PTY and Server PTY have separate streams" do
+    cli_pty_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:0:cli"
+    server_pty_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:1:cli"
+
+    # Subscribe to CLI PTY (index 0)
+    subscribe hub_id: @hub_id, agent_index: @agent_index, pty_index: 0
+
+    assert subscription.confirmed?
+    assert_has_stream cli_pty_stream
+    refute_includes subscription.streams, server_pty_stream
+  end
+
+  test "browser switching agents gets new stream" do
+    browser_identity = "browser-switch-#{SecureRandom.hex(8)}"
+
+    # First subscription to agent 0
+    subscribe hub_id: @hub_id, agent_index: 0, pty_index: @pty_index, browser_identity: browser_identity
+
+    agent0_browser_stream = "terminal_relay:#{@hub_id}:0:#{@pty_index}:browser:#{browser_identity}"
+    assert subscription.confirmed?
+    assert_has_stream agent0_browser_stream
+
+    # Note: In practice, browser would unsubscribe from agent 0 and subscribe to agent 1
+    # This test verifies stream names are correctly derived from agent_index
+    agent1_browser_stream = "terminal_relay:#{@hub_id}:1:#{@pty_index}:browser:#{browser_identity}"
+    refute_includes subscription.streams, agent1_browser_stream
+  end
+
+  test "output message format includes envelope wrapper" do
+    subscribe hub_id: @hub_id, agent_index: @agent_index, pty_index: @pty_index
+    browser_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:browser:#{@browser_identity}"
+
+    # Capture the broadcast message format
+    # Note: We verify broadcast happens, and the relay method wraps in { envelope: ... }
+    # by checking the channel implementation directly
+    assert_broadcasts(browser_stream, 1) do
+      perform :relay, recipient_identity: @browser_identity, envelope: {
+        version: 4,
+        message_type: 2,
+        ciphertext: "test_output"
+      }
+    end
+
+    # The relay method broadcasts { envelope: envelope } - verified by code inspection
+    # ActionCable test helpers don't provide direct access to broadcast content in Rails 8+
+  end
+
+  test "input message without envelope is rejected" do
+    subscribe hub_id: @hub_id, agent_index: @agent_index, pty_index: @pty_index, browser_identity: @browser_identity
+    cli_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:cli"
+
+    # Send without envelope wrapper - should not broadcast
+    assert_no_broadcasts(cli_stream) do
+      # Note: Missing envelope key
+      perform :relay, ciphertext: "raw_data"
+    end
+  end
+
+  test "resize message routes through terminal relay channel" do
+    # Resize is sent as part of the encrypted message payload
+    # This test verifies the relay mechanism works for resize messages
+    subscribe hub_id: @hub_id, agent_index: @agent_index, pty_index: @pty_index, browser_identity: @browser_identity
+    cli_stream = "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:cli"
+
+    # Browser sends resize (wrapped in envelope like any terminal message)
+    assert_broadcasts(cli_stream, 1) do
+      perform :relay, envelope: {
+        version: 4,
+        message_type: 1,
+        # The actual resize data is encrypted, this is just the envelope
+        ciphertext: "encrypted_resize_80x24"
+      }
+    end
+  end
 end

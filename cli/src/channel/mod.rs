@@ -272,6 +272,8 @@ impl SharedConnectionState {
 }
 
 // Re-exports
-pub use action_cable::{ActionCableChannel, ActionCableChannelBuilder, ChannelSenderHandle};
+pub use action_cable::{
+    ActionCableChannel, ActionCableChannelBuilder, ChannelReceiverHandle, ChannelSenderHandle,
+};
 pub use compression::{maybe_compress, maybe_decompress, should_compress_response};
 pub use reliable::{ReliableMessage, ReliableReceiver, ReliableSender, ReliableSession};

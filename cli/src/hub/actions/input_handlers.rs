@@ -113,6 +113,9 @@ pub fn spawn_agent_with_tunnel(
     // Use TUI's dims from terminal_dims (not browser.dims)
     let dims = hub.terminal_dims;
 
+    // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
+    let _runtime_guard = hub.tokio_runtime.enter();
+
     let result = lifecycle::spawn_agent(&mut hub.state.write().unwrap(), config, dims)?;
 
     // Clone agent_id before moving into async

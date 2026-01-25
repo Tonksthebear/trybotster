@@ -50,6 +50,20 @@ WireGuard VPN replaces WebSocket tunnels:
 4. CLI configures WireGuard interface
 5. Direct connectivity via VPN
 
+## Running Tests
+
+**Rust CLI:** Always use the test script, never `cargo test` directly:
+```bash
+cd cli
+./test.sh              # Run all tests
+./test.sh --unit       # Unit tests only
+./test.sh -- scroll    # Tests matching 'scroll'
+```
+
+This ensures `BOTSTER_ENV=test` is set, preventing macOS keyring prompts.
+
+**Rails:** Standard `rails test` or `rspec`.
+
 ## Patterns
 
 See `.claude/skills/rails-backend-guidelines/` - fat models, no service objects, POROs.

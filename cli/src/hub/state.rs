@@ -37,7 +37,7 @@ use crate::relay::types::AgentInfo;
 ///
 /// // Get a handle for specific agent
 /// if let Some(handle) = state.get_agent_handle(0) {
-///     let pty = handle.cli_pty();
+///     let pty = handle.get_pty(0).unwrap(); // CLI PTY
 ///     // Use pty handle...
 /// }
 /// ```
@@ -163,13 +163,23 @@ impl HubState {
             .collect()
     }
 
+    /// Get `AgentInfo` for a specific agent by ID.
+    ///
+    /// Returns `None` if the agent does not exist.
+    #[must_use]
+    pub fn get_agent_info(&self, agent_id: &str) -> Option<AgentInfo> {
+        self.agents
+            .get(agent_id)
+            .map(|agent| self.agent_to_info(agent_id, agent))
+    }
+
     /// Get an `AgentHandle` for the agent at the given index.
     ///
     /// Returns `None` if the index is out of bounds.
     ///
     /// The handle provides:
     /// - Agent metadata via `info()`
-    /// - PTY access via `cli_pty()` and `server_pty()`
+    /// - PTY access via `get_pty(0)` (CLI) and `get_pty(1)` (Server)
     ///
     /// # Arguments
     ///
@@ -182,48 +192,33 @@ impl HubState {
     /// if let Some(handle) = state.get_agent_handle(0) {
     ///     println!("Agent: {}", handle.info().id);
     ///     // Connect to CLI PTY
-    ///     let pty = handle.cli_pty();
+    ///     let pty = handle.get_pty(0).unwrap();
     ///     // ...
     /// }
     /// ```
     #[must_use]
     pub fn get_agent_handle(&self, index: usize) -> Option<AgentHandle> {
+        use crate::hub::agent_handle::PtyHandle;
+
         let agent_id = self.agent_keys_ordered.get(index)?;
         let agent = self.agents.get(agent_id)?;
 
         let info = self.agent_to_info(agent_id, agent);
 
-        // Get CLI PTY channels
+        // Build PTY handles vector: ptys[0] = CLI, ptys[1] = Server (if exists)
+        let mut ptys = Vec::with_capacity(2);
+
+        // CLI PTY is always present (index 0)
         let (cli_event_tx, cli_cmd_tx) = agent.cli_pty.get_channels();
+        ptys.push(PtyHandle::new(cli_event_tx, cli_cmd_tx));
 
-        // Get server PTY channels if available
-        let (server_event_tx, server_cmd_tx) = if let Some(ref server_pty) = agent.server_pty {
-            let (ev, cmd) = server_pty.get_channels();
-            (Some(ev), Some(cmd))
-        } else {
-            (None, None)
-        };
+        // Server PTY if available (index 1)
+        if let Some(ref server_pty) = agent.server_pty {
+            let (server_event_tx, server_cmd_tx) = server_pty.get_channels();
+            ptys.push(PtyHandle::new(server_event_tx, server_cmd_tx));
+        }
 
-        Some(AgentHandle::new(
-            agent_id,
-            info,
-            cli_event_tx,
-            cli_cmd_tx,
-            server_event_tx,
-            server_cmd_tx,
-        ))
-    }
-
-    /// Get an `AgentHandle` for the agent with the given ID.
-    ///
-    /// Returns `None` if no agent with that ID exists.
-    #[must_use]
-    pub fn get_agent_handle_by_id(&self, agent_id: &str) -> Option<AgentHandle> {
-        let index = self
-            .agent_keys_ordered
-            .iter()
-            .position(|id| id == agent_id)?;
-        self.get_agent_handle(index)
+        Some(AgentHandle::new(agent_id, info, ptys, index))
     }
 
     /// Get the index of an agent by its ID.

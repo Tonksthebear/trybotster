@@ -1,7 +1,7 @@
 //! Agent handle for client-to-agent communication.
 //!
 //! `AgentHandle` provides a clean interface for clients to interact with agents.
-//! Clients obtain handles via `HubCommand::GetAgent`, then use the handle to:
+//! Clients obtain handles via `HubCommand::GetAgentByIndex`, then use the handle to:
 //! - Get agent info
 //! - Access PTY sessions (subscribe, send input, resize)
 //!
@@ -9,16 +9,22 @@
 //!
 //! ```text
 //! Hub
-//!   └── GetAgent(id) → AgentHandle
-//!                         ├── info() → AgentInfo
-//!                         ├── cli_pty() → PtyHandle
-//!                         └── server_pty() → Option<PtyHandle>
+//!   └── GetAgentByIndex(idx) → Option<AgentHandle>
+//!                                 ├── info() → AgentInfo
+//!                                 ├── get_pty(0) → Option<&PtyHandle>  (CLI PTY)
+//!                                 └── get_pty(1) → Option<&PtyHandle>  (Server PTY)
 //!
 //! PtyHandle
 //!   ├── subscribe() → broadcast::Receiver<PtyEvent>
 //!   ├── write_input(data) → sends input to PTY
 //!   └── resize(rows, cols) → resizes PTY
 //! ```
+//!
+//! # PTY Indexing
+//!
+//! PTYs are accessed by index:
+//! - Index 0: CLI PTY (always present)
+//! - Index 1: Server PTY (present when server is running)
 //!
 //! This matches the CLIENT_REFACTOR_DESIGN.md architecture where clients
 //! call `pty.write_input()` directly rather than through Hub.
@@ -32,7 +38,7 @@ use crate::client::ClientId;
 use crate::relay::types::AgentInfo;
 
 /// Command sent through PtyHandle to the PtySession.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum PtyCommand {
     /// Send input data to the PTY.
     Input(Vec<u8>),
@@ -51,6 +57,8 @@ pub enum PtyCommand {
         client_id: ClientId,
         /// Terminal dimensions (rows, cols).
         dims: (u16, u16),
+        /// Response channel for scrollback data.
+        response_tx: tokio::sync::oneshot::Sender<Vec<u8>>,
     },
     /// Client disconnected from this PTY.
     Disconnect {
@@ -61,13 +69,19 @@ pub enum PtyCommand {
 
 /// Handle for interacting with an agent.
 ///
-/// Clients obtain this via `HubCommand::GetAgent`. The handle provides
+/// Clients obtain this via `HubCommand::GetAgentByIndex`. The handle provides
 /// access to agent info and PTY sessions without exposing internal state.
 ///
 /// # Thread Safety
 ///
 /// `AgentHandle` is `Clone` + `Send` + `Sync`, allowing it to be passed
 /// across threads and shared between async tasks.
+///
+/// # PTY Access
+///
+/// PTYs are accessed by index via `get_pty()`:
+/// - Index 0: CLI PTY (always present)
+/// - Index 1: Server PTY (present when server is running)
 #[derive(Debug, Clone)]
 pub struct AgentHandle {
     /// Agent identifier.
@@ -76,45 +90,47 @@ pub struct AgentHandle {
     /// Agent info snapshot at time of handle creation.
     info: AgentInfo,
 
-    /// CLI PTY handle.
-    cli_pty: PtyHandle,
+    /// PTY handles for this agent.
+    ///
+    /// - ptys[0]: CLI PTY (always present)
+    /// - ptys[1]: Server PTY (if server is running)
+    ptys: Vec<PtyHandle>,
 
-    /// Server PTY handle (if server is running).
-    server_pty: Option<PtyHandle>,
+    /// Index of this agent in the Hub's agent list.
+    ///
+    /// Used for index-based navigation in clients.
+    agent_index: usize,
 }
 
 impl AgentHandle {
     /// Create a new agent handle.
     ///
-    /// Called internally by Hub when processing `GetAgent` command.
+    /// Called internally by Hub when processing `GetAgentByIndex` command.
     ///
     /// # Arguments
     ///
     /// * `agent_id` - Unique agent identifier
     /// * `info` - Agent info snapshot
-    /// * `cli_pty_event_tx` - Broadcast sender for CLI PTY events
-    /// * `cli_pty_cmd_tx` - Command channel for CLI PTY operations
-    /// * `server_pty_event_tx` - Optional broadcast sender for server PTY events
-    /// * `server_pty_cmd_tx` - Optional command channel for server PTY operations
+    /// * `ptys` - Vector of PTY handles (index 0 = CLI, index 1 = Server if present)
+    /// * `agent_index` - Index of this agent in the Hub's ordered agent list
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ptys` is empty. At minimum, the CLI PTY must be present.
     #[must_use]
     pub fn new(
         agent_id: impl Into<String>,
         info: AgentInfo,
-        cli_pty_event_tx: broadcast::Sender<PtyEvent>,
-        cli_pty_cmd_tx: mpsc::Sender<PtyCommand>,
-        server_pty_event_tx: Option<broadcast::Sender<PtyEvent>>,
-        server_pty_cmd_tx: Option<mpsc::Sender<PtyCommand>>,
+        ptys: Vec<PtyHandle>,
+        agent_index: usize,
     ) -> Self {
-        let server_pty = match (server_pty_event_tx, server_pty_cmd_tx) {
-            (Some(event_tx), Some(cmd_tx)) => Some(PtyHandle::new(event_tx, cmd_tx)),
-            _ => None,
-        };
+        assert!(!ptys.is_empty(), "AgentHandle requires at least one PTY (CLI PTY)");
 
         Self {
             agent_id: agent_id.into(),
             info,
-            cli_pty: PtyHandle::new(cli_pty_event_tx, cli_pty_cmd_tx),
-            server_pty,
+            ptys,
+            agent_index,
         }
     }
 
@@ -133,12 +149,20 @@ impl AgentHandle {
         &self.info
     }
 
+    /// Get the agent's index in the Hub's ordered agent list.
+    ///
+    /// Used for index-based navigation in clients.
+    #[must_use]
+    pub fn agent_index(&self) -> usize {
+        self.agent_index
+    }
+
     /// Get PTY handle by index.
     ///
     /// - Index 0: CLI PTY (always present)
     /// - Index 1: Server PTY (if server is running)
     ///
-    /// Returns `None` if index is out of bounds or PTY doesn't exist.
+    /// Returns `None` if index is out of bounds.
     ///
     /// # Example
     ///
@@ -153,35 +177,7 @@ impl AgentHandle {
     /// ```
     #[must_use]
     pub fn get_pty(&self, pty_index: usize) -> Option<&PtyHandle> {
-        match pty_index {
-            0 => Some(&self.cli_pty),
-            1 => self.server_pty.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// Get the CLI PTY handle.
-    ///
-    /// All agents have a CLI PTY for Claude Code interaction.
-    /// Equivalent to `get_pty(0).unwrap()`.
-    #[must_use]
-    pub fn cli_pty(&self) -> &PtyHandle {
-        &self.cli_pty
-    }
-
-    /// Get the server PTY handle (if available).
-    ///
-    /// Only present when the agent has spawned a dev server.
-    /// Equivalent to `get_pty(1)`.
-    #[must_use]
-    pub fn server_pty(&self) -> Option<&PtyHandle> {
-        self.server_pty.as_ref()
-    }
-
-    /// Check if this agent has a server PTY.
-    #[must_use]
-    pub fn has_server_pty(&self) -> bool {
-        self.server_pty.is_some()
+        self.ptys.get(pty_index)
     }
 
     /// Get the number of PTYs available.
@@ -189,11 +185,7 @@ impl AgentHandle {
     /// Returns 1 if only CLI PTY, 2 if server PTY also exists.
     #[must_use]
     pub fn pty_count(&self) -> usize {
-        if self.server_pty.is_some() {
-            2
-        } else {
-            1
-        }
+        self.ptys.len()
     }
 }
 
@@ -208,8 +200,8 @@ impl AgentHandle {
 /// # Example
 ///
 /// ```ignore
-/// let handle = hub.get_agent("agent-123").await?;
-/// let pty = handle.cli_pty();
+/// let handle = hub.get_agent_by_index(0).await?.unwrap();
+/// let pty = handle.get_pty(0).unwrap();
 ///
 /// // Subscribe to output events
 /// let mut rx = pty.subscribe();
@@ -332,26 +324,43 @@ impl PtyHandle {
     /// Connect a client to this PTY.
     ///
     /// The PTY will track the client and may become the size owner.
+    /// Returns the scrollback buffer containing terminal history.
     ///
     /// # Errors
     ///
-    /// Returns an error if the command channel is closed.
-    pub async fn connect(&self, client_id: ClientId, dims: (u16, u16)) -> Result<(), String> {
+    /// Returns an error if the command channel is closed or the response fails.
+    pub async fn connect(&self, client_id: ClientId, dims: (u16, u16)) -> Result<Vec<u8>, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
         self.command_tx
-            .send(PtyCommand::Connect { client_id, dims })
+            .send(PtyCommand::Connect {
+                client_id,
+                dims,
+                response_tx: tx,
+            })
             .await
-            .map_err(|_| "PTY command channel closed".to_string())
+            .map_err(|_| "PTY command channel closed".to_string())?;
+        rx.await
+            .map_err(|_| "PTY response channel closed".to_string())
     }
 
     /// Connect a client to this PTY (blocking version).
     ///
+    /// Returns the scrollback buffer containing terminal history.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the command channel is closed.
-    pub fn connect_blocking(&self, client_id: ClientId, dims: (u16, u16)) -> Result<(), String> {
+    /// Returns an error if the command channel is closed or the response fails.
+    pub fn connect_blocking(&self, client_id: ClientId, dims: (u16, u16)) -> Result<Vec<u8>, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
         self.command_tx
-            .blocking_send(PtyCommand::Connect { client_id, dims })
-            .map_err(|_| "PTY command channel closed".to_string())
+            .blocking_send(PtyCommand::Connect {
+                client_id,
+                dims,
+                response_tx: tx,
+            })
+            .map_err(|_| "PTY command channel closed".to_string())?;
+        rx.blocking_recv()
+            .map_err(|_| "PTY response channel closed".to_string())
     }
 
     /// Disconnect a client from this PTY.
@@ -409,48 +418,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_agent_handle_creation() {
+    /// Helper to create a PTY handle for testing.
+    fn create_test_pty() -> PtyHandle {
         let (event_tx, _) = broadcast::channel(16);
         let (cmd_tx, _) = mpsc::channel(16);
-        let handle = AgentHandle::new("agent-123", test_info(), event_tx, cmd_tx, None, None);
+        PtyHandle::new(event_tx, cmd_tx)
+    }
+
+    #[test]
+    fn test_agent_handle_creation() {
+        let ptys = vec![create_test_pty()];
+        let handle = AgentHandle::new("agent-123", test_info(), ptys, 0);
 
         assert_eq!(handle.agent_id(), "agent-123");
         assert_eq!(handle.info().id, "test-agent");
-        assert!(!handle.has_server_pty());
+        assert_eq!(handle.agent_index(), 0);
+        assert_eq!(handle.pty_count(), 1);
     }
 
     #[test]
     fn test_agent_handle_with_server_pty() {
-        let (cli_event_tx, _) = broadcast::channel(16);
-        let (cli_cmd_tx, _) = mpsc::channel(16);
-        let (server_event_tx, _) = broadcast::channel(16);
-        let (server_cmd_tx, _) = mpsc::channel(16);
-        let handle = AgentHandle::new(
-            "agent-123",
-            test_info(),
-            cli_event_tx,
-            cli_cmd_tx,
-            Some(server_event_tx),
-            Some(server_cmd_tx),
-        );
+        let ptys = vec![create_test_pty(), create_test_pty()];
+        let handle = AgentHandle::new("agent-123", test_info(), ptys, 0);
 
-        assert!(handle.has_server_pty());
-        assert!(handle.server_pty().is_some());
+        assert_eq!(handle.pty_count(), 2);
+        assert!(handle.get_pty(0).is_some());
+        assert!(handle.get_pty(1).is_some());
     }
 
     #[test]
     fn test_get_pty_index_based_access() {
-        let (cli_event_tx, _) = broadcast::channel(16);
-        let (cli_cmd_tx, _) = mpsc::channel(16);
-        let handle = AgentHandle::new(
-            "agent-123",
-            test_info(),
-            cli_event_tx,
-            cli_cmd_tx,
-            None,
-            None,
-        );
+        let ptys = vec![create_test_pty()];
+        let handle = AgentHandle::new("agent-123", test_info(), ptys, 0);
 
         // Index 0 is CLI PTY (always present)
         assert!(handle.get_pty(0).is_some());
@@ -465,18 +464,8 @@ mod tests {
 
     #[test]
     fn test_get_pty_with_server() {
-        let (cli_event_tx, _) = broadcast::channel(16);
-        let (cli_cmd_tx, _) = mpsc::channel(16);
-        let (server_event_tx, _) = broadcast::channel(16);
-        let (server_cmd_tx, _) = mpsc::channel(16);
-        let handle = AgentHandle::new(
-            "agent-123",
-            test_info(),
-            cli_event_tx,
-            cli_cmd_tx,
-            Some(server_event_tx),
-            Some(server_cmd_tx),
-        );
+        let ptys = vec![create_test_pty(), create_test_pty()];
+        let handle = AgentHandle::new("agent-123", test_info(), ptys, 0);
 
         // Both PTYs present
         assert!(handle.get_pty(0).is_some());
@@ -487,32 +476,22 @@ mod tests {
     #[test]
     fn test_pty_count() {
         // Without server PTY
-        let (cli_event_tx, _) = broadcast::channel(16);
-        let (cli_cmd_tx, _) = mpsc::channel(16);
-        let handle = AgentHandle::new(
-            "agent-123",
-            test_info(),
-            cli_event_tx,
-            cli_cmd_tx,
-            None,
-            None,
-        );
+        let ptys = vec![create_test_pty()];
+        let handle = AgentHandle::new("agent-123", test_info(), ptys, 0);
         assert_eq!(handle.pty_count(), 1);
 
         // With server PTY
-        let (cli_event_tx, _) = broadcast::channel(16);
-        let (cli_cmd_tx, _) = mpsc::channel(16);
-        let (server_event_tx, _) = broadcast::channel(16);
-        let (server_cmd_tx, _) = mpsc::channel(16);
-        let handle = AgentHandle::new(
-            "agent-456",
-            test_info(),
-            cli_event_tx,
-            cli_cmd_tx,
-            Some(server_event_tx),
-            Some(server_cmd_tx),
-        );
+        let ptys = vec![create_test_pty(), create_test_pty()];
+        let handle = AgentHandle::new("agent-456", test_info(), ptys, 1);
         assert_eq!(handle.pty_count(), 2);
+        assert_eq!(handle.agent_index(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "AgentHandle requires at least one PTY")]
+    fn test_agent_handle_panics_on_empty_ptys() {
+        let ptys: Vec<PtyHandle> = vec![];
+        let _ = AgentHandle::new("agent-123", test_info(), ptys, 0);
     }
 
     #[test]
@@ -596,16 +575,37 @@ mod tests {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let handle = PtyHandle::new(event_tx, cmd_tx);
 
-        // Connect
-        handle.connect(ClientId::Tui, (24, 80)).await.unwrap();
+        // Spawn a task to handle the connect command and send response
+        let connect_handle = tokio::spawn(async move {
+            handle.connect(ClientId::Tui, (24, 80)).await
+        });
+
+        // Receive the command and send response
         let cmd = cmd_rx.recv().await.unwrap();
         match cmd {
-            PtyCommand::Connect { client_id, dims } => {
+            PtyCommand::Connect {
+                client_id,
+                dims,
+                response_tx,
+            } => {
                 assert_eq!(client_id, ClientId::Tui);
                 assert_eq!(dims, (24, 80));
+                // Send scrollback response
+                let _ = response_tx.send(b"test scrollback".to_vec());
             }
             _ => panic!("Expected Connect command"),
         }
+
+        // Verify connect returns the scrollback
+        let scrollback = connect_handle.await.unwrap().unwrap();
+        assert_eq!(scrollback, b"test scrollback");
+    }
+
+    #[tokio::test]
+    async fn test_pty_handle_disconnect() {
+        let (event_tx, _) = broadcast::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let handle = PtyHandle::new(event_tx, cmd_tx);
 
         // Disconnect
         handle.disconnect(ClientId::Tui).await.unwrap();

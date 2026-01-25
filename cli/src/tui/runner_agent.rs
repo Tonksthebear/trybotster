@@ -7,8 +7,8 @@
 //! # Navigation Flow
 //!
 //! 1. User presses Ctrl+J/K (next/previous)
-//! 2. TuiRunner computes next agent key from local cache
-//! 3. TuiRunner requests agent handle from Hub via `GetAgent` command
+//! 2. TuiRunner computes next agent index from local cache
+//! 3. TuiRunner requests agent handle from Hub via `GetAgentByIndex` command
 //! 4. Hub returns `AgentHandle` with PTY channels
 //! 5. TuiRunner connects to the PTY and updates selection
 
@@ -18,7 +18,8 @@ use ratatui::backend::Backend;
 use vt100::Parser;
 
 use crate::agent::PtyView;
-use crate::hub::{AgentHandle, HubCommand};
+use crate::client::{Client, ClientId};
+use crate::hub::{AgentHandle, HubAction, HubCommand};
 
 use super::runner::{TuiRunner, DEFAULT_SCROLLBACK};
 
@@ -30,7 +31,7 @@ where
     /// Request to select the next agent.
     ///
     /// Navigation is handled locally using the agent list. We compute the next
-    /// agent key and then connect to it via the Hub.
+    /// agent index and then connect to it via the Hub.
     ///
     /// The selection wraps around: after the last agent, it goes back to the first.
     pub fn request_select_next(&mut self) {
@@ -38,20 +39,19 @@ where
             return;
         }
 
-        let next_key = match self.client.selected_agent() {
+        let next_idx = match &self.selected_agent {
             Some(current) => {
                 // Find current index and select next
-                let current_idx = self.agents.iter().position(|a| a.id == current);
-                let next_idx = match current_idx {
+                let current_idx = self.agents.iter().position(|a| a.id == *current);
+                match current_idx {
                     Some(idx) => (idx + 1) % self.agents.len(),
                     None => 0,
-                };
-                self.agents[next_idx].id.clone()
+                }
             }
-            None => self.agents[0].id.clone(),
+            None => 0,
         };
 
-        self.request_select_agent(&next_key);
+        self.request_select_agent_by_index(next_idx);
     }
 
     /// Request to select the previous agent.
@@ -63,43 +63,56 @@ where
             return;
         }
 
-        let prev_key = match self.client.selected_agent() {
+        let prev_idx = match &self.selected_agent {
             Some(current) => {
                 // Find current index and select previous
-                let current_idx = self.agents.iter().position(|a| a.id == current);
-                let prev_idx = match current_idx {
+                let current_idx = self.agents.iter().position(|a| a.id == *current);
+                match current_idx {
                     Some(idx) if idx > 0 => idx - 1,
                     Some(_) => self.agents.len() - 1,
                     None => 0,
-                };
-                self.agents[prev_idx].id.clone()
+                }
             }
-            None => self.agents.last().map(|a| a.id.clone()).unwrap_or_default(),
+            None => self.agents.len().saturating_sub(1),
         };
 
-        if !prev_key.is_empty() {
-            self.request_select_agent(&prev_key);
-        }
+        self.request_select_agent_by_index(prev_idx);
     }
 
-    /// Request to select a specific agent via Hub.
+    /// Request to select a specific agent by ID.
     ///
-    /// Sends a `GetAgent` command to the Hub and waits for the response.
-    /// If successful, applies the agent handle to connect to the PTY.
+    /// Looks up the agent index in the local cache and delegates to
+    /// `request_select_agent_by_index`.
     ///
     /// # Arguments
     ///
     /// * `agent_id` - The ID of the agent to select
     pub fn request_select_agent(&mut self, agent_id: &str) {
-        let (cmd, rx) = HubCommand::get_agent(agent_id);
+        let Some(index) = self.agents.iter().position(|a| a.id == agent_id) else {
+            log::warn!("Agent not found in local cache: {}", agent_id);
+            return;
+        };
+        self.request_select_agent_by_index(index);
+    }
+
+    /// Request to select a specific agent by index via Hub.
+    ///
+    /// Sends a `GetAgentByIndex` command to the Hub and waits for the response.
+    /// If successful, applies the agent handle to connect to the PTY.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The display index of the agent to select (0-based)
+    pub fn request_select_agent_by_index(&mut self, index: usize) {
+        let (cmd, rx) = HubCommand::get_agent_by_index(index);
         if self.command_tx.inner().blocking_send(cmd).is_err() {
-            log::error!("Failed to send GetAgent command");
+            log::error!("Failed to send GetAgentByIndex command");
             return;
         }
         match rx.blocking_recv() {
-            Ok(Ok(handle)) => self.apply_agent_handle(handle),
-            Ok(Err(e)) => log::error!("Failed to get agent: {}", e),
-            Err(_) => log::error!("Failed to receive GetAgent response"),
+            Ok(Some(handle)) => self.apply_agent_handle(handle),
+            Ok(None) => log::warn!("Agent at index {} not found", index),
+            Err(_) => log::error!("Failed to receive GetAgentByIndex response"),
         }
     }
 
@@ -108,7 +121,7 @@ where
     /// This method:
     /// 1. Resets to CLI view (default when switching agents)
     /// 2. Connects the client to the agent's CLI PTY
-    /// 3. Updates the selected agent
+    /// 3. Updates the selected agent (TuiRunner state) and notifies Hub registry
     /// 4. Stores the full handle for PTY view toggling
     /// 5. Clears and resets the parser for fresh output
     ///
@@ -117,13 +130,31 @@ where
     /// * `handle` - The agent handle from the Hub containing PTY channels
     pub fn apply_agent_handle(&mut self, handle: AgentHandle) {
         // Reset to CLI view when switching agents
-        self.client.set_active_pty_view(PtyView::Cli);
+        self.active_pty_view = PtyView::Cli;
 
-        // Connect client to the CLI PTY
+        // Get agent info from handle
         let agent_id = handle.agent_id().to_string();
-        self.client
-            .connect_to_pty(&agent_id, handle.cli_pty().clone());
-        self.client.set_selected_agent(Some(&agent_id));
+        let agent_index = handle.agent_index();
+
+        // CLI PTY is always at index 0
+        if let Err(e) = self.client.connect_to_pty(agent_index, 0) {
+            log::warn!("Failed to connect to PTY: {}", e);
+        }
+
+        // Update TuiRunner state
+        self.selected_agent = Some(agent_id.clone());
+        self.current_agent_index = Some(agent_index);
+        self.current_pty_index = Some(0); // CLI PTY
+
+        // Notify Hub of selection change to keep registry in sync.
+        // The registry tracks client->agent mappings for input routing and viewer management.
+        let action = HubAction::SelectAgentForClient {
+            client_id: ClientId::Tui,
+            agent_key: agent_id,
+        };
+        if let Err(e) = self.command_tx.dispatch_action_blocking(action) {
+            log::warn!("Failed to notify Hub of TUI selection change: {}", e);
+        }
 
         // Store full handle for PTY view toggling (TuiRunner-specific)
         self.agent_handle = Some(handle);

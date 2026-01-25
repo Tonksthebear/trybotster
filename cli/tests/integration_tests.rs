@@ -364,6 +364,10 @@ fn test_spawn_real_pty_with_init_script() {
     let (tx, rx) = mpsc::channel();
 
     let handle = thread::spawn(move || {
+        // Create tokio runtime for spawn_command_processor() which uses tokio::spawn()
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let _runtime_guard = runtime.enter();
+
         let temp_dir = TempDir::new().unwrap();
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
@@ -426,6 +430,10 @@ fn test_spawn_server_pty() {
     let (tx, rx) = mpsc::channel();
 
     let handle = thread::spawn(move || {
+        // Create tokio runtime for spawn_command_processor() which uses tokio::spawn()
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let _runtime_guard = runtime.enter();
+
         let temp_dir = TempDir::new().unwrap();
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
@@ -486,6 +494,10 @@ fn test_real_pty_view_switching() {
     let (tx, rx) = mpsc::channel();
 
     let handle = thread::spawn(move || {
+        // Create tokio runtime for spawn_command_processor() which uses tokio::spawn()
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let _runtime_guard = runtime.enter();
+
         let temp_dir = TempDir::new().unwrap();
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
@@ -596,6 +608,271 @@ fn test_rapid_scroll_parser_no_deadlock() {
         }
         Err(_) => {
             panic!("DEADLOCK: Rapid scroll test did not complete within 10 seconds");
+        }
+    }
+}
+
+// ============================================================================
+// Browser -> PTY I/O Flow Integration Tests
+// ============================================================================
+//
+// These tests verify the browser -> PTY I/O flow architecture:
+// - Task #1: Removed "active PTY" concept, explicit routing only
+// - Task #2: PTY channels stored in ClientRegistry, created on agent selection
+// - Task #3: Output forwarding tasks spawn per-channel, input routes via BrowserCommand
+// - Task #4: Input/resize use TerminalRelayChannel, not HubChannel
+
+/// Test that Agent provides PTY handle for event subscription.
+///
+/// This tests the foundation of PTY output routing: agents expose PTY handles
+/// that clients (including browser forwarding tasks) can subscribe to.
+#[test]
+fn test_agent_pty_handle_subscription() {
+
+    let (agent, _temp_dir) = create_test_agent();
+
+    // Get PTY handle for CLI PTY (index 0)
+    let handle = agent.get_pty_handle(0);
+    assert!(handle.is_some(), "CLI PTY handle should exist");
+
+    let handle = handle.unwrap();
+
+    // Subscribe to events
+    let mut rx = handle.subscribe();
+
+    // Verify subscription is active (can receive events)
+    // Note: Without a spawned process, no events will be sent,
+    // but the subscription mechanism should work
+    assert!(
+        rx.try_recv().is_err(),
+        "Should not have events before spawn"
+    );
+
+    // Server PTY (index 1) should not exist for un-spawned agent
+    let server_handle = agent.get_pty_handle(1);
+    assert!(
+        server_handle.is_none(),
+        "Server PTY should not exist without spawn"
+    );
+}
+
+/// Test that multiple subscribers can receive PTY events (broadcast pattern).
+///
+/// This is the foundation of multi-browser output routing: multiple browsers
+/// viewing the same agent should all receive PTY output.
+#[test]
+fn test_pty_broadcast_to_multiple_subscribers() {
+    use botster_hub::agent::pty::PtySession;
+
+    // Create a PTY session directly for testing broadcast
+    let session = PtySession::new(24, 80);
+
+    // Get multiple subscribers
+    let (event_tx, _cmd_tx) = session.get_channels();
+    let mut rx1 = event_tx.subscribe();
+    let mut rx2 = event_tx.subscribe();
+    let mut rx3 = event_tx.subscribe();
+
+    // Send an event through the broadcast channel
+    use botster_hub::agent::pty::PtyEvent;
+    let _ = event_tx.send(PtyEvent::Output(b"test output".to_vec()));
+
+    // All subscribers should receive the event
+    assert!(rx1.try_recv().is_ok(), "Subscriber 1 should receive event");
+    assert!(rx2.try_recv().is_ok(), "Subscriber 2 should receive event");
+    assert!(rx3.try_recv().is_ok(), "Subscriber 3 should receive event");
+}
+
+/// Test that PTY input can be written via command channel.
+///
+/// This is the foundation of browser input routing: input from browsers
+/// is written to the PTY via the command channel.
+#[test]
+fn test_pty_input_via_command_channel() {
+    use botster_hub::agent::pty::PtySession;
+    use botster_hub::client::PtyCommand;
+
+    // Create a PTY session
+    let session = PtySession::new(24, 80);
+
+    // Get command channel
+    let (_event_tx, cmd_tx) = session.get_channels();
+
+    // Create tokio runtime for async send
+    let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+
+    // Send input command (even without spawned process, channel should accept)
+    let result = runtime.block_on(async { cmd_tx.send(PtyCommand::Input(b"test input".to_vec())).await });
+
+    // Command should be accepted (channel is open)
+    assert!(result.is_ok(), "Command channel should accept input");
+}
+
+/// Test that PTY resize can be sent via command channel.
+///
+/// This verifies browser resize events can be delivered to the PTY.
+#[test]
+fn test_pty_resize_via_command_channel() {
+    use botster_hub::agent::pty::PtySession;
+    use botster_hub::client::{ClientId, PtyCommand};
+
+    let session = PtySession::new(24, 80);
+    let (_event_tx, cmd_tx) = session.get_channels();
+
+    // Create tokio runtime for async send
+    let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+
+    // Send resize command with client_id
+    let result = runtime.block_on(async {
+        cmd_tx
+            .send(PtyCommand::Resize {
+                client_id: ClientId::Tui,
+                rows: 50,
+                cols: 100,
+            })
+            .await
+    });
+
+    assert!(result.is_ok(), "Command channel should accept resize");
+}
+
+/// Test that Agent's get_scrollback_snapshot works correctly.
+///
+/// This is used to send initial scrollback to newly connected browsers.
+#[test]
+fn test_agent_scrollback_snapshot_for_browser() {
+    let (agent, _temp_dir) = create_test_agent();
+
+    // Get scrollback snapshot for CLI view
+    let snapshot = agent.get_scrollback_snapshot(PtyView::Cli);
+
+    // Without spawned process, snapshot should be empty
+    assert!(
+        snapshot.is_empty(),
+        "Scrollback should be empty before spawn"
+    );
+}
+
+/// Test that spawned PTY produces output that appears in scrollback.
+///
+/// This is an integration test for the complete output flow:
+/// PTY process -> output -> scrollback buffer
+/// Note: We test via scrollback rather than event subscription because
+/// the event channel requires precise timing to catch the output.
+#[test]
+fn test_spawned_pty_output_reaches_scrollback() {
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let _runtime_guard = runtime.enter();
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "test-branch".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        // Spawn a simple command that produces output
+        let empty_env = HashMap::new();
+        agent
+            .spawn(
+                "bash",
+                "",
+                vec!["echo 'Hello from PTY output test'".to_string()],
+                &empty_env,
+            )
+            .expect("Failed to spawn PTY");
+
+        // Wait for output to appear in scrollback
+        let mut found_output = false;
+        for _ in 0..50 {
+            let scrollback = agent.get_scrollback_snapshot(PtyView::Cli);
+            let scrollback_str = String::from_utf8_lossy(&scrollback);
+            if scrollback_str.contains("Hello from PTY output test") {
+                found_output = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        tx.send(found_output).unwrap();
+    });
+
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(found) => {
+            handle.join().unwrap();
+            assert!(found, "PTY output should appear in scrollback");
+        }
+        Err(_) => {
+            panic!("TIMEOUT: PTY output test did not complete within 10 seconds");
+        }
+    }
+}
+
+/// Test that input written to PTY appears in scrollback.
+///
+/// This is an integration test verifying browser input reaches the PTY:
+/// Input -> write_input_to_cli() -> PTY -> scrollback
+#[test]
+fn test_input_written_to_pty_appears_in_scrollback() {
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let _runtime_guard = runtime.enter();
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "test-branch".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        // Spawn bash with no initial commands
+        let empty_env = HashMap::new();
+        agent
+            .spawn("bash", "", vec![], &empty_env)
+            .expect("Failed to spawn PTY");
+
+        // Wait for shell to initialize
+        thread::sleep(Duration::from_millis(500));
+
+        // Write input to PTY (simulating browser input)
+        let input = b"echo 'Browser input test'\n";
+        agent
+            .write_input_to_cli(input)
+            .expect("Failed to write input");
+
+        // Wait for command to execute
+        thread::sleep(Duration::from_secs(1));
+
+        // Check scrollback contains our input
+        let scrollback = agent.get_scrollback_snapshot(PtyView::Cli);
+        let scrollback_str = String::from_utf8_lossy(&scrollback);
+        let contains_echo = scrollback_str.contains("Browser input test");
+
+        tx.send(contains_echo).unwrap();
+    });
+
+    match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(found) => {
+            handle.join().unwrap();
+            assert!(found, "Scrollback should contain the echoed input");
+        }
+        Err(_) => {
+            panic!("TIMEOUT: Input test did not complete within 15 seconds");
         }
     }
 }

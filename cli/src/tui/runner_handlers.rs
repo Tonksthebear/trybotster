@@ -18,6 +18,7 @@ use ratatui::backend::Backend;
 use vt100::Parser;
 
 use crate::agent::PtyView;
+use crate::client::Client;
 use crate::hub::{HubAction, HubEvent};
 
 use super::actions::TuiAction;
@@ -63,6 +64,13 @@ where
             }
 
             TuiAction::CloseModal => {
+                // Delete Kitty graphics images if closing ConnectionCode modal
+                if self.mode == AppMode::ConnectionCode {
+                    use crate::tui::qr::kitty_delete_images;
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(kitty_delete_images().as_bytes());
+                    let _ = std::io::stdout().flush();
+                }
                 self.mode = AppMode::Normal;
                 self.input_buffer.clear();
                 self.qr_image_displayed = false;
@@ -123,17 +131,21 @@ where
             }
 
             TuiAction::RegenerateConnectionCode => {
-                // Send command to Hub to regenerate Signal keys and QR code
+                // Use fire-and-forget dispatch to avoid blocking the TUI event loop.
+                // The Hub spawns an async task for bundle regeneration. When the new
+                // bundle arrives, the QR will refresh on next render (qr_image_displayed = false).
                 let action = HubAction::RegenerateConnectionCode;
                 if let Err(e) = self.command_tx.dispatch_action_blocking(action) {
-                    log::error!("Failed to send regenerate connection code: {}", e);
+                    log::error!("Failed to dispatch regenerate connection code: {}", e);
                 }
                 self.qr_image_displayed = false;
             }
 
             TuiAction::CopyConnectionUrl => {
-                if let Some(ref _url) = self.connection_url {
-                    log::info!("Copy connection URL requested");
+                // Dispatch to Hub which has access to arboard clipboard
+                let action = HubAction::CopyConnectionUrl;
+                if let Err(e) = self.command_tx.dispatch_action_blocking(action) {
+                    log::error!("Failed to send copy connection URL: {}", e);
                 }
             }
 
@@ -188,27 +200,40 @@ where
     fn handle_pty_view_toggle(&mut self) {
         if let Some(ref handle) = self.agent_handle {
             // Toggle the view
-            let current_view = self.client.active_pty_view();
+            let current_view = self.active_pty_view;
             let new_view = match current_view {
                 PtyView::Cli => PtyView::Server,
                 PtyView::Server => PtyView::Cli,
             };
 
-            // Get the PTY handle for the new view
-            let new_pty = match new_view {
-                PtyView::Cli => Some(handle.cli_pty().clone()),
-                PtyView::Server => handle.server_pty().cloned(),
+            // Get the PTY index for the new view (0 = CLI, 1 = Server)
+            let pty_index = match new_view {
+                PtyView::Cli => 0,
+                PtyView::Server => 1,
             };
 
-            if let Some(pty) = new_pty {
+            // Check if the PTY exists for this view
+            if handle.get_pty(pty_index).is_some() {
                 log::debug!(
                     "Toggling PTY view to {:?} for agent {}",
                     new_view,
                     handle.agent_id()
                 );
-                // Update client state and reconnect to new PTY
-                self.client.set_active_pty_view(new_view);
-                self.client.connect_to_pty(handle.agent_id(), pty);
+
+                // Find agent index in our local list
+                let agent_id = handle.agent_id();
+                let agent_index = self
+                    .agents
+                    .iter()
+                    .position(|a| a.id == agent_id)
+                    .unwrap_or(0);
+
+                // Update TuiRunner state and reconnect to new PTY
+                self.active_pty_view = new_view;
+                self.current_pty_index = Some(pty_index);
+                if let Err(e) = self.client.connect_to_pty(agent_index, pty_index) {
+                    log::warn!("Failed to connect to PTY: {}", e);
+                }
 
                 // Clear and reset parser for new PTY stream
                 let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
@@ -241,23 +266,42 @@ where
                 log::debug!("TUI: Agent created: {}", agent_id);
                 // Add to local cache
                 if !self.agents.iter().any(|a| a.id == agent_id) {
-                    self.agents.push(info);
+                    self.agents.push(info.clone());
                 }
-                // Clear creating indicator
-                if self.creating_agent.as_ref().map(|(id, _)| id) == Some(&agent_id) {
+                // Clear creating indicator and transition to Normal if this was our pending creation
+                // Match against branch_name since that's what we stored in creating_agent
+                let was_creating = self
+                    .creating_agent
+                    .as_ref()
+                    .map(|(identifier, _)| {
+                        info.branch_name.as_ref() == Some(identifier)
+                            || info.issue_number.map(|n| n.to_string()).as_ref() == Some(identifier)
+                    })
+                    .unwrap_or(false);
+                if was_creating {
                     self.creating_agent = None;
+                    self.mode = AppMode::Normal;
+                    // Auto-select the newly created agent so user sees PTY output
+                    self.request_select_agent(&agent_id);
                 }
             }
 
             HubEvent::AgentDeleted { agent_id } => {
                 log::debug!("TUI: Agent deleted: {}", agent_id);
-                // Find index before removing (needed for TuiClient)
+                // Find index before removing
                 let index = self.agents.iter().position(|a| a.id == agent_id);
                 // Remove from local cache
                 self.agents.retain(|a| a.id != agent_id);
-                // Notify client (handles selection and PTY cleanup)
-                if let Some(idx) = index {
-                    self.client.on_agent_deleted(idx);
+                // If this was the selected agent, clear selection
+                if self.selected_agent.as_ref() == Some(&agent_id) {
+                    // Disconnect from PTY if we have indices
+                    if let Some(idx) = index {
+                        let pty_index = self.current_pty_index.unwrap_or(0);
+                        self.client.disconnect_from_pty(idx, pty_index);
+                    }
+                    self.selected_agent = None;
+                    self.current_agent_index = None;
+                    self.current_pty_index = None;
                 }
                 // Clear agent handle if it was for this agent
                 if self.agent_handle.as_ref().map(|h| h.agent_id()) == Some(&agent_id) {

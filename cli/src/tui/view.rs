@@ -39,8 +39,6 @@ pub struct ViewState {
     pub selected_agent_id: Option<String>,
     /// Current application mode.
     pub mode: AppMode,
-    /// Whether server polling is enabled.
-    pub polling_enabled: bool,
     /// Seconds since last poll.
     pub seconds_since_poll: u64,
     /// Poll interval in seconds.
@@ -77,7 +75,6 @@ impl ViewState {
             agent_ids: hub_state.agent_keys_ordered.clone(),
             selected_agent_id: context.selected_key,
             mode: context.mode,
-            polling_enabled: context.polling_enabled,
             seconds_since_poll: context.seconds_since_poll,
             poll_interval: context.poll_interval,
             menu_selected: context.menu_selected,
@@ -120,8 +117,6 @@ pub struct ViewContext {
     pub selected_key: Option<String>,
     /// Current application mode.
     pub mode: AppMode,
-    /// Whether polling is enabled.
-    pub polling_enabled: bool,
     /// Seconds since last poll.
     pub seconds_since_poll: u64,
     /// Poll interval configuration.
@@ -147,7 +142,6 @@ impl Default for ViewContext {
         Self {
             selected_key: None,
             mode: AppMode::Normal,
-            polling_enabled: true,
             seconds_since_poll: 0,
             poll_interval: 10,
             menu_selected: 0,
@@ -221,10 +215,8 @@ impl AgentDisplayInfo {
 
 /// Format the poll status indicator.
 #[must_use]
-pub fn format_poll_status(enabled: bool, seconds_since_poll: u64) -> &'static str {
-    if !enabled {
-        "PAUSED"
-    } else if seconds_since_poll < 1 {
+pub fn format_poll_status(seconds_since_poll: u64) -> &'static str {
+    if seconds_since_poll < 1 {
         "●"
     } else {
         "○"
@@ -367,9 +359,8 @@ mod tests {
 
     #[test]
     fn test_format_poll_status() {
-        assert_eq!(format_poll_status(false, 0), "PAUSED");
-        assert_eq!(format_poll_status(true, 0), "●");
-        assert_eq!(format_poll_status(true, 5), "○");
+        assert_eq!(format_poll_status(0), "●");
+        assert_eq!(format_poll_status(5), "○");
     }
 
     #[test]

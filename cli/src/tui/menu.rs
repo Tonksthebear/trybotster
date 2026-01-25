@@ -24,8 +24,6 @@ pub enum MenuAction {
     NewAgent,
     /// Show the connection code/QR code for browser access.
     ShowConnectionCode,
-    /// Toggle automatic polling for new messages.
-    TogglePolling,
 }
 
 /// A menu item with its display text and action.
@@ -48,8 +46,6 @@ pub struct MenuContext {
     pub has_server_pty: bool,
     /// Current PTY view for the selected agent.
     pub active_pty: PtyView,
-    /// Whether polling is enabled.
-    pub polling_enabled: bool,
 }
 
 impl Default for MenuContext {
@@ -58,7 +54,6 @@ impl Default for MenuContext {
             has_agent: false,
             has_server_pty: false,
             active_pty: PtyView::Cli,
-            polling_enabled: true,
         }
     }
 }
@@ -118,16 +113,6 @@ pub fn build_menu(ctx: &MenuContext) -> Vec<MenuItem> {
         is_header: false,
     });
 
-    let polling_label = format!(
-        "Toggle Polling ({})",
-        if ctx.polling_enabled { "ON" } else { "OFF" }
-    );
-    items.push(MenuItem {
-        label: polling_label,
-        action: MenuAction::TogglePolling,
-        is_header: false,
-    });
-
     items
 }
 
@@ -168,7 +153,6 @@ mod tests {
             has_agent: false,
             has_server_pty: false,
             active_pty: PtyView::Cli,
-            polling_enabled: true,
         };
         let items = build_menu(&ctx);
 
@@ -178,8 +162,8 @@ mod tests {
             .iter()
             .any(|i| i.label.contains("Agent") && i.is_header));
 
-        // Should have 3 selectable items (New Agent, Connection Code, Toggle Polling)
-        assert_eq!(selectable_count(&items), 3);
+        // Should have 2 selectable items (New Agent, Connection Code)
+        assert_eq!(selectable_count(&items), 2);
     }
 
     #[test]
@@ -188,7 +172,6 @@ mod tests {
             has_agent: true,
             has_server_pty: false,
             active_pty: PtyView::Cli,
-            polling_enabled: true,
         };
         let items = build_menu(&ctx);
 
@@ -202,8 +185,8 @@ mod tests {
         assert!(items.iter().any(|i| i.label == "Close Agent"));
         assert!(!items.iter().any(|i| i.label == "View Server"));
 
-        // 4 selectable items (Close Agent + 3 Hub items)
-        assert_eq!(selectable_count(&items), 4);
+        // 3 selectable items (Close Agent + 2 Hub items)
+        assert_eq!(selectable_count(&items), 3);
     }
 
     #[test]
@@ -212,7 +195,6 @@ mod tests {
             has_agent: true,
             has_server_pty: true,
             active_pty: PtyView::Cli,
-            polling_enabled: false,
         };
         let items = build_menu(&ctx);
 
@@ -220,11 +202,8 @@ mod tests {
         assert!(items.iter().any(|i| i.label == "View Server"));
         assert!(!items.iter().any(|i| i.label == "View Agent"));
 
-        // Polling should show OFF
-        assert!(items.iter().any(|i| i.label.contains("OFF")));
-
-        // 5 selectable items
-        assert_eq!(selectable_count(&items), 5);
+        // 4 selectable items
+        assert_eq!(selectable_count(&items), 4);
     }
 
     #[test]
@@ -233,7 +212,6 @@ mod tests {
             has_agent: true,
             has_server_pty: true,
             active_pty: PtyView::Server,
-            polling_enabled: true,
         };
         let items = build_menu(&ctx);
 
@@ -248,7 +226,6 @@ mod tests {
             has_agent: true,
             has_server_pty: true,
             active_pty: PtyView::Cli,
-            polling_enabled: true,
         };
         let items = build_menu(&ctx);
 
@@ -264,7 +241,6 @@ mod tests {
             has_agent: true,
             has_server_pty: false,
             active_pty: PtyView::Cli,
-            polling_enabled: true,
         };
         let items = build_menu(&ctx);
 
