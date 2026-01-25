@@ -1,51 +1,56 @@
 //! Client abstraction for TUI and browser connections.
 //!
 //! This module provides a unified interface for all client types (TUI, Browser).
-//! The `Client` trait is a clean API layer - both implementations have identical
-//! interfaces with thread safety hidden behind handles.
+//! The `Client` trait uses **index-based routing** - all PTY operations take explicit
+//! `(agent_index, pty_index)` parameters. "Current" PTY state belongs in the GUI layer
+//! (TuiRunner for TUI, JavaScript for Browser), NOT in Client implementations.
 //!
 //! # Architecture
 //!
 //! ```text
 //! Hub (owns state via Arc<RwLock<HubState>>)
 //!   │
-//!   ├── HubCommandSender (fire-and-forget via channel)
-//!   │
-//!   └── Clients
-//!         ├── TuiClient (owns local view state: selection, scroll, vt100)
+//!   └── HubHandle (thread-safe access to Hub operations)
 //!         │
-//!         └── BrowserClient (thin IO pipe, no UI state)
+//!         └── Clients (store HubHandle, implement trait methods)
+//!               ├── TuiClient
+//!               │     └── hub_handle: HubHandle
+//!               │
+//!               └── BrowserClient
+//!                     └── hub_handle: HubHandle
 //! ```
+//!
+//! **Key insight**: Clients access Hub data through `hub_handle()`. PTY operations
+//! like `send_input` and `resize_pty` look up agents/PTYs via `HubHandle` on each
+//! call - no handles are stored in the client.
+//!
+//! # Index-Based Routing
+//!
+//! All PTY operations take explicit indices:
+//!
+//! ```text
+//! client.connect_to_pty(agent_idx, pty_idx)     // Connect to specific PTY
+//! client.disconnect_from_pty(agent_idx, pty_idx) // Disconnect from specific PTY
+//! client.send_input(agent_idx, pty_idx, data)   // Send to specific PTY
+//! client.resize_pty(agent_idx, pty_idx, r, c)   // Resize specific PTY
+//! ```
+//!
+//! This design:
+//! - Makes TUI and Browser implementations symmetric
+//! - Allows multiple simultaneous PTY connections (Browser can have multiple tabs)
+//! - Keeps "current" state in the GUI where it belongs
 //!
 //! # Data Access Pattern
 //!
-//! Clients read agent data via `get_agents()` / `get_agent(index)` which return
-//! snapshots. For live PTY interaction, clients get handles:
+//! Clients read agent data via `hub_handle().get_agents()` / `hub_handle().get_agent(index)`.
+//! Default implementations provide convenient wrappers:
 //!
 //! ```text
-//! client.get_agent(0) → AgentHandle
-//!                          ├── info() → AgentInfo (snapshot)
-//!                          └── get_pty(0) → PtyHandle
-//!                                              ├── subscribe() → events
-//!                                              ├── connect()
-//!                                              ├── send_input()
-//!                                              └── resize()
+//! client.get_agents() → Vec<AgentInfo> (via hub_handle)
+//! client.get_agent(0) → Option<AgentHandle> (via hub_handle)
+//! client.send_input(0, 0, data) → looks up agent/PTY via hub_handle
+//! client.resize_pty(0, 0, r, c) → looks up agent/PTY via hub_handle
 //! ```
-//!
-//! # Hub Commands (fire-and-forget)
-//!
-//! Commands to mutate state go through channels. Results come back as events.
-//!
-//! ```text
-//! client.request_create_agent(req) → Hub processes → HubEvent::AgentCreated
-//! client.request_delete_agent(id)  → Hub processes → HubEvent::AgentDeleted
-//! ```
-//!
-//! # Event Handlers (Hub/PTY push to Client)
-//!
-//! Hub and PTY broadcast events. Clients handle IO delivery:
-//! - TUI: renders via ratatui
-//! - Browser: encrypts and sends via ActionCable
 
 // Rust guideline compliant 2026-01
 
@@ -60,6 +65,7 @@ pub use tui::TuiClient;
 pub use types::{CreateAgentRequest, DeleteAgentRequest, Response};
 
 pub use crate::hub::agent_handle::{AgentHandle, PtyCommand, PtyHandle};
+pub use crate::hub::HubHandle;
 pub use crate::relay::AgentInfo;
 
 /// Unique identifier for a client session.
@@ -113,22 +119,45 @@ impl std::fmt::Display for ClientId {
 ///
 /// # Design Principles
 ///
-/// 1. **Index-based access** - Clients work with agent indices, not IDs
-/// 2. **Handles for interaction** - `AgentHandle` and `PtyHandle` encapsulate channels
-/// 3. **Fire-and-forget commands** - Hub commands return immediately, results via events
-/// 4. **Push events** - Hub/PTY call `on_*` methods, client handles IO
+/// 1. **Index-based routing** - All PTY ops take `(agent_index, pty_index)` explicitly
+/// 2. **GUI owns "current"** - Which PTY is active lives in TuiRunner/JavaScript
+/// 3. **HubHandle for data** - All data access goes through `hub_handle()`
+/// 4. **Default implementations** - `get_agents`, `get_agent`, `send_input`, `resize_pty`, `agent_count`
+///    have default implementations using `hub_handle()`
 /// 5. **No downcasts** - No `as_any`, `as_tui`, etc.
 ///
-/// # What's NOT on this trait (UI state)
+/// # Required Methods (clients must implement)
 ///
-/// - Selected agent index (TUI manages locally)
-/// - Scroll position (TUI manages locally)
-/// - Active PTY view (TUI manages locally)
-/// - vt100 parser (TUI owns)
+/// - `hub_handle()` - Access to Hub data and operations
+/// - `id()` - Unique client identifier
+/// - `dims()` - Terminal dimensions for PTY resize
+/// - `connect_to_pty()` - Establish PTY connection
+/// - `disconnect_from_pty()` - Terminate PTY connection
+///
+/// # Default Methods (using hub_handle)
+///
+/// - `get_agents()` - Get all agent info snapshots
+/// - `get_agent()` - Get specific agent handle by index
+/// - `send_input()` - Send input to PTY (looks up via hub_handle)
+/// - `resize_pty()` - Resize PTY (looks up via hub_handle)
+/// - `agent_count()` - Number of active agents
+///
+/// # What's NOT on this trait (GUI state)
+///
+/// - Current agent/PTY selection (TuiRunner/JavaScript manages)
+/// - Scroll position (TuiRunner manages)
+/// - vt100 parser state (TuiRunner owns)
 pub trait Client: Send {
     // ============================================================
-    // Identity
+    // Required (clients must implement)
     // ============================================================
+
+    /// Access to Hub data and operations.
+    ///
+    /// All data access and PTY operations go through this handle.
+    /// The default implementations for `get_agents`, `get_agent`,
+    /// `send_input`, and `resize_pty` use this.
+    fn hub_handle(&self) -> &HubHandle;
 
     /// Unique identifier for this client.
     fn id(&self) -> &ClientId;
@@ -138,8 +167,52 @@ pub trait Client: Send {
     /// Used when connecting to PTY to report initial size.
     fn dims(&self) -> (u16, u16);
 
+    /// Update terminal dimensions.
+    ///
+    /// Called when the client's terminal is resized. Each client implementation
+    /// should update its internal stored dimensions.
+    ///
+    /// # Arguments
+    ///
+    /// * `cols` - New terminal width in columns
+    /// * `rows` - New terminal height in rows
+    fn set_dims(&mut self, cols: u16, rows: u16);
+
+    /// Connect to an agent's PTY.
+    ///
+    /// Establishes a connection to the specified PTY. The client is responsible
+    /// for subscribing to PTY events and handling output delivery.
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_index` - Index of the agent in the Hub's ordered list
+    /// * `pty_index` - Index of the PTY within the agent (0 = CLI, 1 = Server)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The agent at the given index doesn't exist
+    /// - The PTY at the given index doesn't exist
+    /// - The connection fails for any other reason
+    fn connect_to_pty(&mut self, agent_index: usize, pty_index: usize) -> Result<(), String>;
+
+    /// Disconnect from a specific PTY.
+    ///
+    /// Notifies the PTY that this client is disconnecting. Should be called when:
+    /// - Client explicitly disconnects from a PTY
+    /// - Client session ends
+    /// - Agent is deleted while client is connected
+    ///
+    /// Safe to call when not connected to the specified PTY (no-op).
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_index` - Index of the agent
+    /// * `pty_index` - Index of the PTY within the agent
+    fn disconnect_from_pty(&mut self, agent_index: usize, pty_index: usize);
+
     // ============================================================
-    // Data Access (reads from Hub state)
+    // Default implementations (using hub_handle)
     // ============================================================
 
     /// Get snapshot of all agents.
@@ -147,143 +220,86 @@ pub trait Client: Send {
     /// Returns `AgentInfo` for all active agents in display order.
     /// This is a snapshot - changes won't be reflected until next call.
     ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let agents = client.get_agents();
-    /// for (i, info) in agents.iter().enumerate() {
-    ///     println!("{}: {}", i, info.id);
-    /// }
-    /// ```
-    fn get_agents(&self) -> Vec<AgentInfo>;
+    /// Default implementation delegates to `hub_handle().get_agents()`.
+    fn get_agents(&self) -> Vec<AgentInfo> {
+        self.hub_handle().get_agents()
+    }
 
     /// Get handle for agent at index.
     ///
     /// Returns `AgentHandle` for the agent at the given index in display order,
     /// or `None` if index is out of bounds.
     ///
-    /// The handle provides:
-    /// - Agent metadata via `info()`
-    /// - PTY access via `get_pty(pty_index)` where 0=CLI, 1=Server
+    /// Default implementation delegates to `hub_handle().get_agent(index)`.
+    fn get_agent(&self, index: usize) -> Option<AgentHandle> {
+        self.hub_handle().get_agent(index)
+    }
+
+    /// Send input to a specific PTY.
     ///
-    /// # Example
+    /// Routes input to the PTY identified by the given indices. Looks up the
+    /// agent and PTY via `hub_handle()` on each call.
     ///
-    /// ```ignore
-    /// if let Some(handle) = client.get_agent(0) {
-    ///     println!("Agent: {}", handle.info().id);
+    /// # Arguments
     ///
-    ///     // Connect to CLI PTY
-    ///     if let Some(pty) = handle.get_pty(0) {
-    ///         pty.connect(client.id().clone(), client.dims()).await?;
-    ///         let mut rx = pty.subscribe();
-    ///         // ...
-    ///     }
-    /// }
-    /// ```
-    fn get_agent(&self, index: usize) -> Option<AgentHandle>;
+    /// * `agent_index` - Index of the agent
+    /// * `pty_index` - Index of the PTY within the agent
+    /// * `data` - Raw bytes to send to the PTY
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the agent or PTY doesn't exist at the given indices,
+    /// or if the write fails.
+    fn send_input(&self, agent_index: usize, pty_index: usize, data: &[u8]) -> Result<(), String> {
+        let agent = self
+            .hub_handle()
+            .get_agent(agent_index)
+            .ok_or_else(|| format!("Agent at index {} not found", agent_index))?;
+        let pty = agent
+            .get_pty(pty_index)
+            .ok_or_else(|| format!("PTY at index {} not found", pty_index))?;
+        pty.write_input_blocking(data)
+    }
+
+    /// Resize a specific PTY.
+    ///
+    /// Sends a resize request to the PTY identified by the given indices. Looks
+    /// up the agent and PTY via `hub_handle()` on each call.
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_index` - Index of the agent
+    /// * `pty_index` - Index of the PTY within the agent
+    /// * `rows` - New terminal height in rows
+    /// * `cols` - New terminal width in columns
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the agent or PTY doesn't exist at the given indices,
+    /// or if the resize fails.
+    fn resize_pty(
+        &self,
+        agent_index: usize,
+        pty_index: usize,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), String> {
+        let agent = self
+            .hub_handle()
+            .get_agent(agent_index)
+            .ok_or_else(|| format!("Agent at index {} not found", agent_index))?;
+        let pty = agent
+            .get_pty(pty_index)
+            .ok_or_else(|| format!("PTY at index {} not found", pty_index))?;
+        pty.resize_blocking(self.id().clone(), rows, cols)
+    }
 
     /// Get agent count.
     ///
-    /// Convenience method, equivalent to `get_agents().len()` but potentially
-    /// more efficient.
+    /// Convenience method, equivalent to `get_agents().len()`.
     fn agent_count(&self) -> usize {
         self.get_agents().len()
     }
-
-    // ============================================================
-    // Hub Commands (fire-and-forget via channel)
-    // ============================================================
-
-    /// Request to create an agent.
-    ///
-    /// This is fire-and-forget. The Hub processes the request asynchronously.
-    /// Results are communicated via `on_agent_created` event (success) or
-    /// `on_error` event (failure).
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - Agent creation parameters
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if command was sent, `Err` if channel closed.
-    fn request_create_agent(&self, request: CreateAgentRequest) -> Result<(), String>;
-
-    /// Request to delete an agent.
-    ///
-    /// This is fire-and-forget. The Hub processes the request asynchronously.
-    /// Results are communicated via `on_agent_deleted` event.
-    ///
-    /// # Arguments
-    ///
-    /// * `agent_id` - Session key of the agent to delete
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if command was sent, `Err` if channel closed.
-    fn request_delete_agent(&self, agent_id: &str) -> Result<(), String>;
-
-    // ============================================================
-    // Event Handlers (Hub/PTY push to Client)
-    // ============================================================
-
-    /// Terminal output from PTY.
-    ///
-    /// Called when PTY broadcasts output to viewing clients.
-    ///
-    /// - TUI: Feeds to vt100 parser, schedules re-render
-    /// - Browser: Encrypts and sends via PTY channel
-    fn on_output(&mut self, data: &[u8]);
-
-    /// PTY was resized.
-    ///
-    /// Called when PTY broadcasts resize event.
-    ///
-    /// - TUI: May update local state
-    /// - Browser: Sends via PTY channel (xterm.js handles)
-    fn on_resized(&mut self, rows: u16, cols: u16);
-
-    /// PTY process exited.
-    ///
-    /// Called when process in PTY terminates.
-    ///
-    /// - TUI: Shows exit notification, may clear view
-    /// - Browser: Sends status update via hub channel
-    fn on_process_exit(&mut self, exit_code: Option<i32>);
-
-    /// Agent was created.
-    ///
-    /// Called when Hub broadcasts agent creation event.
-    ///
-    /// - TUI: Updates agent list, may auto-select
-    /// - Browser: Sends via hub channel
-    fn on_agent_created(&mut self, index: usize, info: &AgentInfo);
-
-    /// Agent was deleted.
-    ///
-    /// Called when Hub broadcasts agent deletion event.
-    ///
-    /// - TUI: Updates agent list, clears selection if needed
-    /// - Browser: Sends via hub channel, cleans up PTY channels
-    fn on_agent_deleted(&mut self, index: usize);
-
-    /// Hub is shutting down.
-    ///
-    /// Called when Hub broadcasts shutdown event.
-    ///
-    /// - TUI: Shows shutdown message, exits gracefully
-    /// - Browser: Sends shutdown notification via hub channel
-    fn on_hub_shutdown(&mut self);
-
-    // ============================================================
-    // Connection State
-    // ============================================================
-
-    /// Check if client connection is healthy.
-    ///
-    /// - TUI: Always true (local)
-    /// - Browser: Channel is open and session is valid
-    fn is_connected(&self) -> bool;
 }
 
 #[cfg(test)]

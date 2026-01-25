@@ -34,22 +34,40 @@ pub fn get_offset_parser(parser: &Arc<Mutex<Parser>>) -> usize {
 }
 
 /// Scroll up by the specified number of lines.
+///
+/// Skips lock acquisition if `lines` is zero (no-op optimization).
 pub fn up_parser(parser: &Arc<Mutex<Parser>>, lines: usize) {
+    if lines == 0 {
+        return;
+    }
     let mut p = parser.lock().expect("parser lock poisoned");
     let current = p.screen().scrollback();
     p.screen_mut().set_scrollback(current.saturating_add(lines));
 }
 
 /// Scroll down by the specified number of lines.
+///
+/// Skips operation if already at bottom (scrollback == 0) or `lines` is zero.
 pub fn down_parser(parser: &Arc<Mutex<Parser>>, lines: usize) {
+    if lines == 0 {
+        return;
+    }
     let mut p = parser.lock().expect("parser lock poisoned");
     let current = p.screen().scrollback();
+    if current == 0 {
+        return; // Already at bottom, no-op
+    }
     p.screen_mut().set_scrollback(current.saturating_sub(lines));
 }
 
 /// Scroll to the bottom (return to live view).
+///
+/// Skips operation if already at bottom.
 pub fn to_bottom_parser(parser: &Arc<Mutex<Parser>>) {
     let mut p = parser.lock().expect("parser lock poisoned");
+    if p.screen().scrollback() == 0 {
+        return; // Already at bottom
+    }
     p.screen_mut().set_scrollback(0);
 }
 

@@ -272,10 +272,9 @@ pub fn send_agent_notification(
 ///
 /// Returns true if:
 /// - Quit flag is set
-/// - Polling is disabled
 /// - Offline mode is enabled
-pub fn should_skip_polling(quit: bool, polling_enabled: bool) -> bool {
-    if quit || !polling_enabled {
+pub fn should_skip_polling(quit: bool) -> bool {
+    if quit {
         return true;
     }
 
@@ -292,7 +291,7 @@ pub fn should_skip_polling(quit: bool, polling_enabled: bool) -> bool {
 /// This function encapsulates the entire heartbeat logic from Hub.
 pub fn send_heartbeat_if_due(hub: &mut Hub) {
     // Skip if shutdown requested or offline
-    if should_skip_polling(hub.quit, true) {
+    if should_skip_polling(hub.quit) {
         return;
     }
 
@@ -408,8 +407,7 @@ mod tests {
 
     #[test]
     fn test_should_skip_polling() {
-        assert!(should_skip_polling(true, true)); // quit = true
-        assert!(should_skip_polling(false, false)); // polling disabled
-        assert!(!should_skip_polling(false, true)); // normal operation
+        assert!(should_skip_polling(true)); // quit = true
+        assert!(!should_skip_polling(false)); // normal operation
     }
 }

@@ -29,6 +29,11 @@ static SHUTDOWN_FLAG: std::sync::LazyLock<Arc<AtomicBool>> =
     std::sync::LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
 /// Ensure user is authenticated, running device flow if needed.
+///
+/// This function validates the token against the server before returning.
+/// After returning successfully, callers can be confident that:
+/// 1. A valid token exists in the keyring (or env var)
+/// 2. The token has been verified against the server
 fn ensure_authenticated() -> Result<()> {
     use botster_hub::auth;
 
@@ -48,11 +53,33 @@ fn ensure_authenticated() -> Result<()> {
         let token_response = auth::device_flow(&config.server_url)?;
         save_tokens(&mut config, &token_response)?;
         println!("Tokens saved successfully.");
+
+        // Verify the token was saved correctly by reloading
+        let verify_config = Config::load()?;
+        if !verify_config.has_token() {
+            anyhow::bail!(
+                "Token was not saved correctly to keyring. \
+                 This may be a permissions issue with your system keychain."
+            );
+        }
+        log::info!(
+            "New token saved and verified: {}...{}",
+            &verify_config.get_api_key()[..10.min(verify_config.get_api_key().len())],
+            &verify_config.get_api_key()
+                [verify_config.get_api_key().len().saturating_sub(4)..]
+        );
         return Ok(());
     }
 
     // Validate the token - even if from env var, we need to check it works
     println!("Checking authentication...");
+    let token_preview = format!(
+        "{}...{}",
+        &config.get_api_key()[..10.min(config.get_api_key().len())],
+        &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
+    );
+    log::info!("Validating token: {}", token_preview);
+
     if !auth::validate_token(&config.server_url, config.get_api_key()) {
         println!("Token invalid or expired. Re-authenticating...");
         let token_response = auth::device_flow(&config.server_url)?;
@@ -71,6 +98,23 @@ fn ensure_authenticated() -> Result<()> {
         }
         save_tokens(&mut config, &token_response)?;
         println!("Tokens saved successfully.");
+
+        // Verify the token was saved correctly by reloading
+        let verify_config = Config::load()?;
+        if !verify_config.has_token() {
+            anyhow::bail!(
+                "Token was not saved correctly to keyring. \
+                 This may be a permissions issue with your system keychain."
+            );
+        }
+        log::info!(
+            "New token saved and verified: {}...{}",
+            &verify_config.get_api_key()[..10.min(verify_config.get_api_key().len())],
+            &verify_config.get_api_key()
+                [verify_config.get_api_key().len().saturating_sub(4)..]
+        );
+    } else {
+        println!("  Authentication valid.");
     }
 
     Ok(())
@@ -118,6 +162,22 @@ fn run_headless() -> Result<()> {
 
     // Create Hub with default terminal size (80x24 for headless)
     let config = Config::load()?;
+
+    // Verify token is available after load - catches keyring save/load issues
+    if !config.has_token() {
+        anyhow::bail!(
+            "Authentication token not found after auth flow. \
+             This may indicate a keyring access issue. \
+             Try running 'botster-hub reset' and re-authenticating."
+        );
+    }
+
+    log::info!(
+        "Token loaded: {}...{} (valid format)",
+        &config.get_api_key()[..10.min(config.get_api_key().len())],
+        &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
+    );
+
     let mut hub = Hub::new(config, (80, 24))?;
 
     println!("Setting up connections...");
@@ -172,6 +232,21 @@ fn run_with_tui() -> Result<()> {
     // Create Hub BEFORE entering raw mode so errors are visible
     println!("Initializing hub...");
     let config = Config::load()?;
+
+    // Verify token is available after load - catches keyring save/load issues
+    if !config.has_token() {
+        anyhow::bail!(
+            "Authentication token not found after auth flow. \
+             This may indicate a keyring access issue. \
+             Try running 'botster-hub reset' and re-authenticating."
+        );
+    }
+
+    log::info!(
+        "Token loaded: {}...{} (valid format)",
+        &config.get_api_key()[..10.min(config.get_api_key().len())],
+        &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
+    );
     // Get terminal size for Hub initialization
     let terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
     let mut hub = Hub::new(config, terminal_size)?;

@@ -59,13 +59,13 @@ impl Hub {
         }
     }
 
-    /// Get the selected agent key from TuiClient.
+    /// Get the selected agent key for TUI.
     ///
-    /// Get the TUI client's selected agent key from the registry.
-    /// This replaces the old `hub.state.selected` index-based approach.
+    /// Returns the TUI's currently selected agent key.
+    /// Updated by `handle_select_agent_for_client()` when TUI selects an agent.
     #[must_use]
     pub fn get_tui_selected_agent_key(&self) -> Option<String> {
-        self.clients.selected_agent(&ClientId::Tui).map(String::from)
+        self.tui_selected_agent.clone()
     }
 
     /// Ensure TUI has a valid selection if agents exist.
@@ -130,6 +130,9 @@ impl Hub {
     ///
     /// Returns the next agent in the ordered list, wrapping around.
     /// If no agent is selected, returns the first agent.
+    ///
+    /// Currently only supports TUI navigation. Browser navigation uses
+    /// their own selection tracking.
     #[must_use]
     pub fn get_next_agent_key(&self, client_id: &ClientId) -> Option<String> {
         let state = self.state.read().unwrap();
@@ -137,7 +140,12 @@ impl Hub {
             return None;
         }
 
-        let current = self.clients.selected_agent(client_id);
+        // Get current selection (TUI only for now)
+        let current = if client_id.is_tui() {
+            self.tui_selected_agent.as_ref()
+        } else {
+            None
+        };
 
         match current {
             Some(key) => {
@@ -157,6 +165,9 @@ impl Hub {
     ///
     /// Returns the previous agent in the ordered list, wrapping around.
     /// If no agent is selected, returns the last agent.
+    ///
+    /// Currently only supports TUI navigation. Browser navigation uses
+    /// their own selection tracking.
     #[must_use]
     pub fn get_previous_agent_key(&self, client_id: &ClientId) -> Option<String> {
         let state = self.state.read().unwrap();
@@ -164,7 +175,12 @@ impl Hub {
             return None;
         }
 
-        let current = self.clients.selected_agent(client_id);
+        // Get current selection (TUI only for now)
+        let current = if client_id.is_tui() {
+            self.tui_selected_agent.as_ref()
+        } else {
+            None
+        };
 
         match current {
             Some(key) => {

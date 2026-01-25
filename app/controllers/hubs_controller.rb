@@ -16,13 +16,34 @@ class HubsController < ApplicationController
   # GET /hubs/:id
   # Terminal view for a specific hub
   # URL fragment contains E2E key: /hubs/:id#<bundle>
+  #
+  # JSON format returns status info for browser-side error handling
   def show
     unless @hub
-      redirect_to hubs_path, alert: "Hub not found"
+      respond_to do |format|
+        format.html { redirect_to hubs_path, alert: "Hub not found" }
+        format.json { render json: { error: "Hub not found" }, status: :not_found }
+      end
       return
     end
 
-    @browser_device = current_user.devices.browser_devices.order(last_seen_at: :desc).first
+    respond_to do |format|
+      format.html do
+        @browser_device = current_user.devices.browser_devices.order(last_seen_at: :desc).first
+      end
+      format.json do
+        # Return hub status for browser-side error handling
+        # Used by connection_controller.js to show appropriate error messages
+        render json: {
+          id: @hub.id,
+          identifier: @hub.identifier,
+          active: @hub.active?,
+          alive: @hub.alive?,
+          last_seen_at: @hub.last_seen_at&.iso8601,
+          seconds_since_heartbeat: @hub.last_seen_at ? (Time.current - @hub.last_seen_at).to_i : nil
+        }
+      end
+    end
   end
 
   # POST /hubs

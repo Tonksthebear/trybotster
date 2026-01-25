@@ -35,13 +35,13 @@
 //!
 //!     // Get specific agent by index
 //!     if let Some(agent_handle) = handle.get_agent(0) {
-//!         let pty = agent_handle.cli_pty();
+//!         let pty = agent_handle.get_pty(0).expect("CLI PTY always present");
 //!         // Use PTY handle...
 //!     }
 //! });
 //! ```
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-01-23
 
 use super::agent_handle::AgentHandle;
 use super::commands::{CreateAgentRequest, DeleteAgentRequest, HubCommand, HubCommandSender};
@@ -157,8 +157,9 @@ impl HubHandle {
     /// if let Some(agent) = handle.get_agent(0) {
     ///     println!("Agent: {}", agent.info().id);
     ///
-    ///     // Subscribe to PTY events
-    ///     let mut rx = agent.cli_pty().subscribe();
+    ///     // Subscribe to CLI PTY events (index 0)
+    ///     let pty = agent.get_pty(0).expect("CLI PTY always present");
+    ///     let mut rx = pty.subscribe();
     /// }
     /// ```
     #[must_use]
@@ -167,31 +168,6 @@ impl HubHandle {
             .get_agent_by_index_blocking(index)
             .ok()
             .flatten()
-    }
-
-    /// Get an agent handle by agent ID.
-    ///
-    /// Returns an `AgentHandle` for the agent with the given ID.
-    ///
-    /// Returns `None` if:
-    /// - No agent with that ID exists
-    /// - The Hub is shutting down
-    /// - The channel is closed
-    ///
-    /// # Arguments
-    ///
-    /// * `agent_id` - The agent's unique identifier (session key)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// if let Some(agent) = handle.get_agent_by_id("owner-repo-42") {
-    ///     println!("Found agent: {:?}", agent.info().status);
-    /// }
-    /// ```
-    #[must_use]
-    pub fn get_agent_by_id(&self, agent_id: &str) -> Option<AgentHandle> {
-        self.command_tx.get_agent_blocking(agent_id).ok()
     }
 
     /// Request agent creation (fire-and-forget).
@@ -304,6 +280,115 @@ impl HubHandle {
     pub fn has_agents(&self) -> bool {
         !self.get_agents().is_empty()
     }
+
+    // ============================================================
+    // Connection Code Methods
+    // ============================================================
+
+    /// Get the current connection code URL (blocking).
+    ///
+    /// Returns the full URL containing the Signal PreKeyBundle for browser
+    /// connection. The URL format is:
+    /// `{server_url}/hubs/{id}#{base32_binary_bundle}`
+    ///
+    /// The bundle in the fragment contains the full Kyber prekey bundle
+    /// (~2900 chars Base32 encoded).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The Signal bundle is not initialized
+    /// - The command channel is closed
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// match handle.get_connection_code() {
+    ///     Ok(url) => println!("Connection URL: {}", url),
+    ///     Err(e) => eprintln!("Error: {}", e),
+    /// }
+    /// ```
+    pub fn get_connection_code(&self) -> Result<String, String> {
+        self.command_tx.get_connection_code_blocking()
+    }
+
+    /// Refresh the connection code (regenerate Signal bundle) (blocking).
+    ///
+    /// Requests regeneration of the Signal PreKeyBundle. This invalidates
+    /// the previous connection code and returns a new one.
+    ///
+    /// Note: This operation may take some time as it waits for the relay
+    /// to generate and return a new bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The relay is not connected
+    /// - Bundle regeneration fails
+    /// - The command channel is closed
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// match handle.refresh_connection_code() {
+    ///     Ok(new_url) => println!("New connection URL: {}", new_url),
+    ///     Err(e) => eprintln!("Failed to refresh: {}", e),
+    /// }
+    /// ```
+    pub fn refresh_connection_code(&self) -> Result<String, String> {
+        self.command_tx.refresh_connection_code_blocking()
+    }
+
+    // ============================================================
+    // Browser Client Support Methods
+    // ============================================================
+
+    /// Get the crypto service handle for E2E encryption.
+    ///
+    /// Returns `None` if crypto service is not initialized (no browser connected).
+    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    #[must_use]
+    pub fn crypto_service(&self) -> Option<crate::relay::crypto_service::CryptoServiceHandle> {
+        self.command_tx.get_crypto_service_blocking().ok().flatten()
+    }
+
+    /// Get the server hub ID.
+    ///
+    /// Returns `None` if hub ID is not set.
+    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    #[must_use]
+    pub fn server_hub_id(&self) -> Option<String> {
+        self.command_tx.get_server_hub_id_blocking().ok().flatten()
+    }
+
+    /// Get the server URL.
+    ///
+    /// Returns the server URL from Hub config.
+    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    #[must_use]
+    pub fn server_url(&self) -> String {
+        self.command_tx
+            .get_server_url_blocking()
+            .unwrap_or_default()
+    }
+
+    /// Get the API key.
+    ///
+    /// Returns the API key from Hub config.
+    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    #[must_use]
+    pub fn api_key(&self) -> String {
+        self.command_tx.get_api_key_blocking().unwrap_or_default()
+    }
+
+    /// Get a handle to the tokio runtime.
+    ///
+    /// Returns `None` if the runtime is not available.
+    /// Used by `BrowserClient::connect_to_pty()` for async task spawning.
+    #[must_use]
+    pub fn tokio_runtime(&self) -> Option<tokio::runtime::Handle> {
+        self.command_tx.get_tokio_runtime_blocking().ok().flatten()
+    }
 }
 
 #[cfg(test)]
@@ -413,5 +498,156 @@ mod tests {
 
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].id, "test-agent");
+    }
+
+    // ============================================================
+    // Connection Code Tests
+    // ============================================================
+
+    #[test]
+    fn test_hub_handle_get_connection_code_error_on_closed_channel() {
+        // Create a runtime just for channel creation
+        let (tx, rx) = {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async { tokio::sync::mpsc::channel::<HubCommand>(16) })
+        };
+        let sender = HubCommandSender::new(tx);
+        let handle = HubHandle::new(sender);
+
+        // Drop receiver to close channel
+        drop(rx);
+
+        // Should return error on closed channel
+        let result = handle.get_connection_code();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("channel"));
+    }
+
+    #[test]
+    fn test_hub_handle_refresh_connection_code_error_on_closed_channel() {
+        // Create a runtime just for channel creation
+        let (tx, rx) = {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async { tokio::sync::mpsc::channel::<HubCommand>(16) })
+        };
+        let sender = HubCommandSender::new(tx);
+        let handle = HubHandle::new(sender);
+
+        // Drop receiver to close channel
+        drop(rx);
+
+        // Should return error on closed channel
+        let result = handle.refresh_connection_code();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("channel"));
+    }
+
+    #[tokio::test]
+    async fn test_hub_handle_get_connection_code_success() {
+        let (tx, mut rx) = mpsc::channel::<HubCommand>(16);
+        let sender = HubCommandSender::new(tx);
+        let handle = HubHandle::new(sender);
+
+        // Spawn task to handle the command
+        let handler = tokio::spawn(async move {
+            if let Some(cmd) = rx.recv().await {
+                if let HubCommand::GetConnectionCode { response_tx } = cmd {
+                    let url = "https://botster.dev/hubs/123#GEZDGNBVGY3TQOJQ".to_string();
+                    let _ = response_tx.send(Ok(url));
+                }
+            }
+        });
+
+        // Use spawn_blocking for the blocking call
+        let result = tokio::task::spawn_blocking(move || handle.get_connection_code())
+            .await
+            .unwrap();
+
+        handler.await.unwrap();
+
+        assert!(result.is_ok());
+        let url = result.unwrap();
+        assert!(url.contains("botster.dev"));
+        assert!(url.contains("#")); // Fragment with bundle
+    }
+
+    #[tokio::test]
+    async fn test_hub_handle_get_connection_code_no_bundle() {
+        let (tx, mut rx) = mpsc::channel::<HubCommand>(16);
+        let sender = HubCommandSender::new(tx);
+        let handle = HubHandle::new(sender);
+
+        // Spawn task to handle the command with error response
+        let handler = tokio::spawn(async move {
+            if let Some(cmd) = rx.recv().await {
+                if let HubCommand::GetConnectionCode { response_tx } = cmd {
+                    let _ = response_tx.send(Err("Signal bundle not initialized".to_string()));
+                }
+            }
+        });
+
+        // Use spawn_blocking for the blocking call
+        let result = tokio::task::spawn_blocking(move || handle.get_connection_code())
+            .await
+            .unwrap();
+
+        handler.await.unwrap();
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Signal bundle"));
+    }
+
+    #[tokio::test]
+    async fn test_hub_handle_refresh_connection_code_success() {
+        let (tx, mut rx) = mpsc::channel::<HubCommand>(16);
+        let sender = HubCommandSender::new(tx);
+        let handle = HubHandle::new(sender);
+
+        // Spawn task to handle the command
+        let handler = tokio::spawn(async move {
+            if let Some(cmd) = rx.recv().await {
+                if let HubCommand::RefreshConnectionCode { response_tx } = cmd {
+                    let new_url = "https://botster.dev/hubs/123#NEWBUNDLEDATA".to_string();
+                    let _ = response_tx.send(Ok(new_url));
+                }
+            }
+        });
+
+        // Use spawn_blocking for the blocking call
+        let result = tokio::task::spawn_blocking(move || handle.refresh_connection_code())
+            .await
+            .unwrap();
+
+        handler.await.unwrap();
+
+        assert!(result.is_ok());
+        let url = result.unwrap();
+        assert!(url.contains("NEWBUNDLEDATA"));
+    }
+
+    #[tokio::test]
+    async fn test_hub_handle_refresh_connection_code_relay_not_connected() {
+        let (tx, mut rx) = mpsc::channel::<HubCommand>(16);
+        let sender = HubCommandSender::new(tx);
+        let handle = HubHandle::new(sender);
+
+        // Spawn task to handle the command with error response
+        let handler = tokio::spawn(async move {
+            if let Some(cmd) = rx.recv().await {
+                if let HubCommand::RefreshConnectionCode { response_tx } = cmd {
+                    let _ = response_tx.send(Err("Relay not connected".to_string()));
+                }
+            }
+        });
+
+        // Use spawn_blocking for the blocking call
+        let result = tokio::task::spawn_blocking(move || handle.refresh_connection_code())
+            .await
+            .unwrap();
+
+        handler.await.unwrap();
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Relay not connected"));
     }
 }

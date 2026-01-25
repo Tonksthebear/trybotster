@@ -212,22 +212,38 @@ export default class extends Controller {
     // Update landing page agent list to show error
     if (this.hasLandingAgentListTarget) {
       const isQrScanNeeded = error.reason === "no_bundle" || error.reason === "session_invalid";
+      const isCliNotResponding = error.reason === "handshake_timeout";
 
       if (isQrScanNeeded) {
+        // Not paired - need to scan QR code
         this.landingAgentListTarget.innerHTML = `
           <div class="py-8 text-center">
             <svg class="size-10 text-amber-500 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
             </svg>
-            <h3 class="text-base font-medium text-zinc-200 mb-2">QR Code Required</h3>
+            <h3 class="text-base font-medium text-zinc-200 mb-2">Not Paired Yet</h3>
             <p class="text-sm text-zinc-400 max-w-xs mx-auto">
               ${error.reason === "session_invalid"
-                ? "Session expired. Press Ctrl+P in the CLI and select \"Show Connection Code\"."
-                : "Press Ctrl+P in the CLI and select \"Show Connection Code\" to scan."}
+                ? "Session expired. Press Ctrl+P in CLI and select 'Show Connection Code' to scan QR code."
+                : "Press Ctrl+P in CLI and select 'Show Connection Code' to scan QR code."}
+            </p>
+          </div>
+        `;
+      } else if (isCliNotResponding) {
+        // Paired but CLI not responding - probably not running
+        this.landingAgentListTarget.innerHTML = `
+          <div class="py-8 text-center">
+            <svg class="size-10 text-amber-500 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12.53 18.22l-.53.53-.53-.53a.75.75 0 011.06 0z" />
+            </svg>
+            <h3 class="text-base font-medium text-zinc-200 mb-2">CLI Not Responding</h3>
+            <p class="text-sm text-zinc-400 max-w-xs mx-auto">
+              Is botster-hub running? Start it with <code class="text-zinc-300 bg-zinc-800 px-1 rounded">botster-hub</code> in your terminal.
             </p>
           </div>
         `;
       } else {
+        // Generic error
         this.landingAgentListTarget.innerHTML = `
           <div class="py-8 text-center">
             <svg class="size-10 text-red-500 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

@@ -39,7 +39,7 @@
 //! hub.run_headless()?;  // Starts event loop without TUI
 //! ```
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-01-23
 
 pub mod actions;
 pub mod agent_handle;
@@ -153,8 +153,6 @@ pub struct Hub {
     // === Control Flags ===
     /// Whether the hub should quit.
     pub quit: bool,
-    /// Whether server polling is enabled.
-    pub polling_enabled: bool,
 
     // === Timing ===
     /// Last time we polled for messages.
@@ -199,6 +197,13 @@ pub struct Hub {
     /// Receiver for agent creation progress updates (polled in main loop).
     pub progress_rx: std_mpsc::Receiver<AgentProgressEvent>,
 
+    // === TUI Selection ===
+    /// Currently selected agent for TUI.
+    ///
+    /// Tracked here so Hub methods like `get_tui_selected_agent_key()` can access it.
+    /// Updated by `handle_select_agent_for_client()` when TUI selects an agent.
+    pub tui_selected_agent: Option<String>,
+
     // === TUI Creation Progress ===
     /// Current agent creation in progress for TUI display (identifier, stage).
     /// Cleared when agent is created or creation fails.
@@ -231,7 +236,6 @@ impl std::fmt::Debug for Hub {
             .field("state", &self.state)
             .field("hub_identifier", &self.hub_identifier)
             .field("quit", &self.quit)
-            .field("polling_enabled", &self.polling_enabled)
             .field("terminal_dims", &self.terminal_dims)
             .field("mode", &self.mode)
             .finish_non_exhaustive()
@@ -319,7 +323,6 @@ impl Hub {
             botster_id: None,
             tokio_runtime,
             quit: false,
-            polling_enabled: true,
             last_poll: past,
             last_heartbeat: past,
             terminal_dims,
@@ -340,6 +343,7 @@ impl Hub {
             pending_agent_rx,
             progress_tx,
             progress_rx,
+            tui_selected_agent: None,
             creating_agent: None,
             // Workers are started later via start_background_workers() after registration
             polling_worker: None,
@@ -579,17 +583,6 @@ impl Hub {
         self.state.write().unwrap().load_available_worktrees()
     }
 
-    /// Toggle server polling on/off.
-    pub fn toggle_polling(&mut self) {
-        self.polling_enabled = !self.polling_enabled;
-    }
-
-    /// Check if polling is enabled.
-    #[must_use]
-    pub fn is_polling_enabled(&self) -> bool {
-        self.polling_enabled
-    }
-
     /// Get seconds since last poll.
     #[must_use]
     pub fn seconds_since_poll(&self) -> u64 {
@@ -820,19 +813,6 @@ impl Hub {
                 let _ = response_tx.send(agents);
             }
 
-            HubCommand::GetAgent {
-                agent_id,
-                response_tx,
-            } => {
-                let result = self
-                    .state
-                    .read()
-                    .unwrap()
-                    .get_agent_handle_by_id(&agent_id)
-                    .ok_or_else(|| format!("Agent not found: {}", agent_id));
-                let _ = response_tx.send(result);
-            }
-
             HubCommand::GetAgentByIndex { index, response_tx } => {
                 let handle = self.state.read().unwrap().get_agent_handle(index);
                 let _ = response_tx.send(handle);
@@ -856,7 +836,161 @@ impl Hub {
                 let worktrees = self.state.read().unwrap().available_worktrees.clone();
                 let _ = response_tx.send(worktrees);
             }
+
+            HubCommand::GetConnectionCode { response_tx } => {
+                let result = self.generate_connection_url();
+                let _ = response_tx.send(result);
+            }
+
+            HubCommand::RefreshConnectionCode { response_tx } => {
+                // Request bundle regeneration from relay, then return new URL
+                let result = self.refresh_and_get_connection_url();
+                let _ = response_tx.send(result);
+            }
+
+            // ============================================================
+            // Browser Client Support Commands
+            // ============================================================
+
+            HubCommand::GetCryptoService { response_tx } => {
+                let _ = response_tx.send(self.browser.crypto_service.clone());
+            }
+
+            HubCommand::GetServerHubId { response_tx } => {
+                let _ = response_tx.send(Some(self.server_hub_id().to_string()));
+            }
+
+            HubCommand::GetServerUrl { response_tx } => {
+                let _ = response_tx.send(self.config.server_url.clone());
+            }
+
+            HubCommand::GetApiKey { response_tx } => {
+                let _ = response_tx.send(self.config.get_api_key().to_string());
+            }
+
+            HubCommand::GetTokioRuntime { response_tx } => {
+                let _ = response_tx.send(Some(self.tokio_runtime.handle().clone()));
+            }
+
+            // ============================================================
+            // Browser PTY I/O Commands (fire-and-forget)
+            // ============================================================
+
+            HubCommand::BrowserPtyInput {
+                client_id,
+                agent_index,
+                pty_index,
+                data,
+            } => {
+                // Route input through Client trait
+                if let Some(client) = self.clients.get(&client_id) {
+                    if let Err(e) = client.send_input(agent_index, pty_index, &data) {
+                        log::warn!("Failed to send browser PTY input: {}", e);
+                    }
+                }
+            }
+
         }
+    }
+
+    /// Generate the connection URL from the current Signal bundle.
+    ///
+    /// Format: `{server_url}/hubs/{id}#{base32_binary_bundle}`
+    /// - URL portion: byte mode (any case allowed)
+    /// - Bundle (after #): alphanumeric mode (uppercase Base32)
+    ///
+    /// This is the canonical source for connection URLs. Use this method
+    /// instead of accessing `hub.connection_url` cache directly.
+    pub(crate) fn generate_connection_url(&self) -> Result<String, String> {
+        let bundle = self
+            .browser
+            .signal_bundle
+            .as_ref()
+            .ok_or_else(|| "Signal bundle not initialized".to_string())?;
+
+        let bytes = bundle
+            .to_binary()
+            .map_err(|e| format!("Cannot serialize PreKeyBundle: {}", e))?;
+
+        let encoded = data_encoding::BASE32_NOPAD.encode(&bytes);
+        let url = format!(
+            "{}/hubs/{}#{}",
+            self.config.server_url,
+            self.server_hub_id(),
+            encoded
+        );
+
+        log::debug!(
+            "Generated connection URL: {} chars (QR alphanumeric capacity: 4296)",
+            url.len()
+        );
+
+        Ok(url)
+    }
+
+    /// Request bundle regeneration from relay and return the new connection URL.
+    ///
+    /// This is a blocking operation that:
+    /// 1. Requests bundle regeneration from the relay
+    /// 2. Waits for the new bundle to arrive
+    /// 3. Returns the new connection URL
+    fn refresh_and_get_connection_url(&mut self) -> Result<String, String> {
+        use std::time::Duration;
+
+        // Check if relay is connected
+        let sender = self
+            .browser
+            .sender
+            .as_ref()
+            .ok_or_else(|| "Relay not connected".to_string())?
+            .clone();
+
+        // Get original bundle bytes for comparison (if any)
+        let original_bytes = self
+            .browser
+            .signal_bundle
+            .as_ref()
+            .and_then(|b| b.to_binary().ok());
+
+        // Request bundle regeneration
+        self.tokio_runtime.block_on(async {
+            sender
+                .request_bundle_regeneration()
+                .await
+                .map_err(|e| format!("Failed to request bundle regeneration: {}", e))
+        })?;
+
+        log::info!("Requested bundle regeneration, waiting for new bundle...");
+
+        // Wait for new bundle (with timeout)
+        // Bundle regeneration timeout: 10 seconds should be plenty
+        const BUNDLE_TIMEOUT: Duration = Duration::from_secs(10);
+        const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+        let start = Instant::now();
+
+        while start.elapsed() < BUNDLE_TIMEOUT {
+            // Process relay events to receive the new bundle
+            self.tokio_runtime.block_on(async {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            });
+
+            // Check if bundle changed by comparing binary representation
+            if let Some(ref bundle) = self.browser.signal_bundle {
+                if let Ok(new_bytes) = bundle.to_binary() {
+                    let changed = match &original_bytes {
+                        Some(orig) => &new_bytes != orig,
+                        None => true, // Had no bundle before, now we do
+                    };
+                    if changed {
+                        log::info!("New bundle received");
+                        return self.generate_connection_url();
+                    }
+                }
+            }
+        }
+
+        Err("Timeout waiting for new bundle".to_string())
     }
 }
 
@@ -885,7 +1019,6 @@ mod tests {
         let hub = Hub::new(config, TEST_DIMS).unwrap();
 
         assert!(!hub.should_quit());
-        assert!(hub.is_polling_enabled());
         assert_eq!(hub.agent_count(), 0);
     }
 
@@ -897,18 +1030,6 @@ mod tests {
         assert!(!hub.should_quit());
         hub.request_quit();
         assert!(hub.should_quit());
-    }
-
-    #[test]
-    fn test_hub_toggle_polling() {
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        assert!(hub.is_polling_enabled());
-        hub.toggle_polling();
-        assert!(!hub.is_polling_enabled());
-        hub.toggle_polling();
-        assert!(hub.is_polling_enabled());
     }
 
     #[test]
@@ -928,16 +1049,6 @@ mod tests {
 
         hub.handle_action(HubAction::Quit);
         assert!(hub.should_quit());
-    }
-
-    #[test]
-    fn test_handle_action_toggle_polling() {
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        assert!(hub.is_polling_enabled());
-        hub.handle_action(HubAction::TogglePolling);
-        assert!(!hub.is_polling_enabled());
     }
 
     #[test]
@@ -963,7 +1074,7 @@ mod tests {
     // 3. SelectAgentForClient updates TuiClient, not HubState
 
     #[test]
-    fn test_tui_selection_comes_from_tui_client() {
+    fn test_tui_selection_comes_from_hub() {
         use crate::client::ClientId;
 
         let config = test_config();
@@ -976,15 +1087,14 @@ mod tests {
         );
 
         // Initial selection should be None (no agents)
-        let tui_selection = hub.clients.selected_agent(&ClientId::Tui);
         assert!(
-            tui_selection.is_none(),
-            "TuiClient should have no selection initially"
+            hub.tui_selected_agent.is_none(),
+            "TUI should have no selection initially"
         );
     }
 
     #[test]
-    fn test_select_agent_for_client_updates_tui_client() {
+    fn test_select_agent_for_client_updates_hub_tui_selection() {
         use crate::client::ClientId;
         use std::path::PathBuf;
         use uuid::Uuid;
@@ -1012,69 +1122,16 @@ mod tests {
             agent_key: agent_key.clone(),
         });
 
-        // TuiClient should now have the agent selected (tracked by registry)
-        let tui_selection = hub.clients.selected_agent(&ClientId::Tui);
+        // Hub should now track the TUI selection
         assert_eq!(
-            tui_selection,
-            Some(agent_key.as_str()),
-            "TuiClient.selected_agent should be updated by SelectAgentForClient"
+            hub.tui_selected_agent.as_ref(),
+            Some(&agent_key),
+            "hub.tui_selected_agent should be updated by SelectAgentForClient"
         );
     }
 
     #[test]
-    fn test_tui_and_browser_can_have_different_selections() {
-        use crate::client::{BrowserClient, ClientId};
-        use std::path::PathBuf;
-        use uuid::Uuid;
-
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        // Add two test agents
-        for i in 1..=2 {
-            let agent = crate::agent::Agent::new(
-                Uuid::new_v4(),
-                "test/repo".to_string(),
-                Some(i),
-                format!("botster-issue-{}", i),
-                PathBuf::from("/tmp/test"),
-            );
-            hub.state
-                .write()
-                .unwrap()
-                .add_agent(format!("test-repo-{}", i), agent);
-        }
-
-        // Register a browser client
-        let browser_client = BrowserClient::new(hub_handle::HubHandle::mock(), "browser-test-123".to_string());
-        hub.clients.register(Box::new(browser_client));
-
-        // TUI selects agent 1
-        hub.handle_action(HubAction::SelectAgentForClient {
-            client_id: ClientId::Tui,
-            agent_key: "test-repo-1".to_string(),
-        });
-
-        // Browser selects agent 2
-        hub.handle_action(HubAction::SelectAgentForClient {
-            client_id: ClientId::browser("browser-test-123"),
-            agent_key: "test-repo-2".to_string(),
-        });
-
-        // Verify they have different selections (via registry)
-        let tui_selection = hub.clients.selected_agent(&ClientId::Tui);
-        let browser_selection = hub.clients.selected_agent(&ClientId::browser("browser-test-123"));
-
-        assert_eq!(tui_selection, Some("test-repo-1"));
-        assert_eq!(browser_selection, Some("test-repo-2"));
-        assert_ne!(
-            tui_selection, browser_selection,
-            "TUI and browser should have independent selections"
-        );
-    }
-
-    #[test]
-    fn test_get_tui_selected_agent_uses_client_not_hub_state() {
+    fn test_get_tui_selected_agent_uses_hub_field() {
         use crate::client::ClientId;
         use std::path::PathBuf;
         use uuid::Uuid;
@@ -1097,18 +1154,18 @@ mod tests {
                 .add_agent(format!("test-repo-{}", i), agent);
         }
 
-        // Use SelectAgentForClient to select agent 2 via TuiClient
+        // Use SelectAgentForClient to select agent 2 via TUI
         hub.handle_action(HubAction::SelectAgentForClient {
             client_id: ClientId::Tui,
             agent_key: "test-repo-2".to_string(),
         });
 
-        // The helper method should return the agent based on TuiClient selection
+        // The helper method should return the agent based on hub.tui_selected_agent
         let selected_key = hub.get_tui_selected_agent_key();
         assert_eq!(
             selected_key,
             Some("test-repo-2".to_string()),
-            "get_tui_selected_agent_key should return TuiClient's selection"
+            "get_tui_selected_agent_key should return hub.tui_selected_agent"
         );
     }
 }

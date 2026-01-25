@@ -2,6 +2,20 @@
 //!
 //! Handlers for actions that operate on a specific client's view,
 //! including selection, input routing, resize, and agent management.
+//!
+//! # Architecture
+//!
+//! BrowserClient owns its PTY channels internally (see `client/browser.rs`).
+//! This module handles high-level client actions:
+//!
+//! - Agent selection: `handle_select_agent_for_client()`
+//! - Agent creation/deletion: `handle_create_agent_for_client()`, `handle_delete_agent_for_client()`
+//! - Client lifecycle: `handle_client_connected()`, `handle_client_disconnected()`
+//! - Input/resize: `handle_send_input_for_client()`, `handle_resize_for_client()`
+//!
+//! PTY I/O routing (output forwarder, input receiver) is handled by BrowserClient directly.
+
+// Rust guideline compliant 2026-01
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,6 +24,11 @@ use crate::client::{BrowserClient, ClientId, CreateAgentRequest, DeleteAgentRequ
 use crate::hub::{lifecycle, Hub};
 
 /// Handle selecting an agent for a specific client.
+///
+/// When a client selects an agent:
+/// 1. Validates agent exists
+/// 2. Ensures agent's channels are connected (lazy connection)
+/// 3. Connects the client to the agent's PTY via Client trait
 pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_key: String) {
     log::info!(
         "handle_select_agent_for_client: client={}, agent={}",
@@ -25,7 +44,6 @@ pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_
 
     // Connect agent's channels if not already connected (lazy connection)
     // This handles agents created before a browser connected (no crypto service yet)
-    // Terminal channels are managed by BrowserClient, not Agent - just ensure connection
     let agent_index = hub
         .state
         .read()
@@ -42,31 +60,28 @@ pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_
         hub.connect_agent_channels(&agent_key, idx);
     }
 
-    // Get client dims BEFORE updating state (for resize after selection)
-    let client_dims = hub.clients.get(&client_id).map(|c| c.dims());
+    // Track TUI selection in Hub for get_tui_selected_agent_key()
+    if client_id.is_tui() {
+        hub.tui_selected_agent = Some(agent_key.clone());
+    }
 
-    // Update selection in registry (this updates both forward and reverse indices)
-    hub.clients.select_agent(&client_id, Some(&agent_key));
+    // NOTE: PTY connection is NOT handled here.
+    //
+    // SelectAgentForClient is about SELECTION TRACKING, not PTY I/O setup.
+    // - TuiRunner manages its own PTY subscription (has direct state access)
+    // - BrowserClient creates PTY channels when browser actually requests output
+    //
+    // Previously this called client.connect_to_pty(), but that blocks on
+    // HubHandle command channel which requires the Hub event loop to be running.
+    // For unit tests, this caused deadlocks.
+    //
+    // Actual PTY connection happens:
+    // - TUI: TuiRunner.handle_select_agent() calls connect_to_pty directly
+    // - Browser: BrowserEvent::SelectAgent handler in relay/browser.rs
 
     // Note: Scrollback is sent via browser.rs event handler (send_scrollback_for_agent_to_browser)
     // when BrowserEvent::SelectAgent is processed. This action handler is generic for all clients.
     // TUI doesn't need scrollback pushed - it reads directly from vt100 parser.
-    // Response delivery is handled via browser relay channels, not here.
-
-    // Resize agent to client's dimensions if available
-    // Note: Size ownership tracking removed - PTY sessions manage their own viewers
-    if let Some((cols, rows)) = client_dims {
-        if let Some(agent) = hub.state.write().unwrap().agents.get_mut(&agent_key) {
-            agent.resize(rows, cols);
-            log::debug!(
-                "Resized agent {} to {}x{} for client {}",
-                &agent_key[..8.min(agent_key.len())],
-                cols,
-                rows,
-                client_id
-            );
-        }
-    }
 
     log::debug!(
         "Client {} selected agent {}",
@@ -76,52 +91,51 @@ pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_
 }
 
 /// Handle sending input for a specific client.
+///
+/// Uses direct state access to write input to the selected agent's PTY.
+/// This avoids blocking on `hub_handle` which would deadlock in tests.
 pub fn handle_send_input_for_client(hub: &mut Hub, client_id: ClientId, data: Vec<u8>) {
-    // Get client's selected agent from registry
-    let agent_key = hub.clients.selected_agent(&client_id).map(String::from);
+    use crate::agent::PtyView;
 
-    // Route input to agent's CLI PTY
+    // Get selected agent key based on client type
+    let agent_key = match &client_id {
+        ClientId::Tui => hub.tui_selected_agent.clone(),
+        ClientId::Browser(_) => {
+            // Browser selection not tracked in hub yet - browser input goes through
+            // the PTY input receiver spawned by BrowserClient, not this handler.
+            log::debug!("Browser input routing not implemented via this handler");
+            return;
+        }
+    };
+
+    // Direct state access - no hub_handle blocking
     if let Some(key) = agent_key {
         if let Some(agent) = hub.state.write().unwrap().agents.get_mut(&key) {
-            if let Err(e) = agent.write_input_to_cli(&data) {
-                log::error!("Failed to send input to agent {}: {}", key, e);
+            // Default to CLI PTY for input
+            if let Err(e) = agent.write_input(PtyView::Cli, &data) {
+                log::debug!("Failed to write to agent PTY: {}", e);
             }
+        } else {
+            log::debug!("Agent {} not found for input", key);
         }
     } else {
-        log::debug!("Client {} sent input but no agent selected", client_id);
+        log::debug!("Client {} has no agent selected", client_id);
     }
 }
 
 /// Handle resize for a specific client.
 ///
-/// Resizes the client's stored dimensions and the agent the client is currently viewing.
-/// Note: Size ownership tracking removed - all resize requests are applied.
+/// For TUI, updates hub.terminal_dims (used for new agent spawns).
+/// The client's internal dimensions are updated by the caller (TuiRunner/Browser).
 pub fn handle_resize_for_client(hub: &mut Hub, client_id: ClientId, cols: u16, rows: u16) {
-    // Also update hub terminal_dims for TUI (used for new agent spawns)
+    // Update hub terminal_dims for TUI (used for new agent spawns)
     if client_id.is_tui() {
         hub.terminal_dims = (rows, cols);
     }
 
-    // Update the client's stored dimensions
+    // Update client's internal dimensions
     if let Some(client) = hub.clients.get_mut(&client_id) {
-        client.on_resized(rows, cols);
-    }
-
-    // Get the agent this client is viewing from registry
-    let agent_key = hub.clients.selected_agent(&client_id).map(String::from);
-
-    // Resize the agent the client is viewing
-    if let Some(key) = agent_key {
-        if let Some(agent) = hub.state.write().unwrap().agents.get_mut(&key) {
-            agent.resize(rows, cols);
-            log::debug!(
-                "Resized agent {} to {}x{} for client {}",
-                &key[..8.min(key.len())],
-                cols,
-                rows,
-                client_id
-            );
-        }
+        client.set_dims(cols, rows);
     }
 }
 
@@ -311,6 +325,9 @@ fn spawn_agent_sync(
         .map(|c| c.dims())
         .unwrap_or(hub.terminal_dims);
 
+    // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
+    let _runtime_guard = hub.tokio_runtime.enter();
+
     // Spawn agent - release lock before continuing
     let spawn_result = {
         let mut state = hub.state.write().unwrap();
@@ -358,7 +375,12 @@ fn spawn_agent_sync(
             }
 
             hub.broadcast_agent_list();
-            handle_select_agent_for_client(hub, client_id, agent_id);
+            handle_select_agent_for_client(hub, client_id, agent_id.clone());
+
+            // Broadcast AgentCreated event to all subscribers (including TUI)
+            if let Some(info) = hub.state.read().unwrap().get_agent_info(&agent_id) {
+                hub.broadcast(crate::hub::HubEvent::agent_created(agent_id, info));
+            }
         }
         Err(e) => {
             hub.send_error_to(&client_id, format!("Failed to spawn agent: {}", e));
@@ -367,21 +389,32 @@ fn spawn_agent_sync(
 }
 
 /// Handle deleting an agent for a specific client.
+///
+/// When an agent is deleted:
+/// 1. All clients connected to that agent's PTYs are disconnected
+/// 2. The agent and optionally its worktree are deleted
 pub fn handle_delete_agent_for_client(
     hub: &mut Hub,
     client_id: ClientId,
     request: DeleteAgentRequest,
 ) {
-    // Collect viewers before modifying (to avoid borrow issues)
-    let viewers: Vec<ClientId> = hub.clients.viewers_of(&request.agent_id).cloned().collect();
+    // Get agent index before deletion
+    let agent_index = hub
+        .state
+        .read()
+        .unwrap()
+        .agents
+        .keys()
+        .position(|k| k == &request.agent_id);
 
-    // Clear selection for each viewer
-    for viewer_id in &viewers {
-        hub.clients.clear_selection(viewer_id);
+    // Disconnect all clients from this agent's PTYs
+    if let Some(idx) = agent_index {
+        for (_client_id, client) in hub.clients.iter_mut() {
+            // Disconnect from CLI PTY (index 0) and Server PTY (index 1)
+            client.disconnect_from_pty(idx, 0);
+            client.disconnect_from_pty(idx, 1);
+        }
     }
-
-    // Remove from viewer index
-    hub.clients.remove_agent_viewers(&request.agent_id);
 
     // Delete the agent - release lock before continuing
     let close_result = {
@@ -392,9 +425,6 @@ pub fn handle_delete_agent_for_client(
     match close_result {
         Ok(_was_deleted) => {
             log::info!("Client {} deleted agent: {}", client_id, request.agent_id);
-
-            // Response delivery is handled via browser relay channels
-
             hub.broadcast_agent_list();
         }
         Err(e) => {
@@ -418,54 +448,14 @@ pub fn handle_client_connected(hub: &mut Hub, client_id: ClientId) {
 
 /// Handle client disconnected event.
 ///
-/// When a client disconnects, we check if they were viewing an agent and if so,
-/// resize that agent to match any remaining viewer's dimensions.
+/// When a client disconnects:
+/// 1. Disconnect from all connected PTYs (via Client trait)
+/// 2. Unregister the client from the registry
 pub fn handle_client_disconnected(hub: &mut Hub, client_id: ClientId) {
-    // Get the agent this client was viewing BEFORE unregistering via registry
-    let agent_key = hub.clients.selected_agent(&client_id).map(String::from);
+    log::info!("Client disconnecting: {}", client_id);
 
-    // Unregister the client
+    // Unregister the client - this drops BrowserClient which cleans up its channels
     hub.clients.unregister(&client_id);
+
     log::info!("Client disconnected: {}", client_id);
-
-    // If client was viewing an agent and was the size owner, transfer ownership
-    if let Some(key) = agent_key {
-        resize_agent_for_remaining_viewers(hub, &key, &client_id);
-    }
-}
-
-/// Resize agent for remaining viewers when a client disconnects.
-///
-/// Finds the first remaining viewer and resizes the agent to their dimensions.
-/// Note: Size ownership tracking removed - just resize to first viewer's dims.
-fn resize_agent_for_remaining_viewers(hub: &mut Hub, agent_key: &str, _disconnected_id: &ClientId) {
-    // Find first remaining viewer with dimensions
-    let new_viewer: Option<(ClientId, u16, u16)> = hub
-        .clients
-        .viewers_of(agent_key)
-        .filter_map(|id| {
-            hub.clients.get(id).map(|c| {
-                let (cols, rows) = c.dims();
-                (id.clone(), cols, rows)
-            })
-        })
-        .next();
-
-    if let Some((viewer_id, cols, rows)) = new_viewer {
-        if let Some(agent) = hub.state.write().unwrap().agents.get_mut(agent_key) {
-            agent.resize(rows, cols);
-            log::info!(
-                "Resized agent {} to {}x{} for remaining viewer {}",
-                &agent_key[..8.min(agent_key.len())],
-                cols,
-                rows,
-                viewer_id
-            );
-        }
-    } else {
-        log::debug!(
-            "Agent {} has no remaining viewers",
-            &agent_key[..8.min(agent_key.len())]
-        );
-    }
 }

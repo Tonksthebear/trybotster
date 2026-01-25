@@ -165,9 +165,6 @@ pub enum HubAction {
     /// Request application shutdown.
     Quit,
 
-    /// Toggle server message polling.
-    TogglePolling,
-
     /// Refresh available worktrees list.
     RefreshWorktrees,
 
@@ -274,9 +271,6 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         // === Simple Inline Handlers (1-3 lines) ===
         HubAction::Quit => {
             hub.quit = true;
-        }
-        HubAction::TogglePolling => {
-            hub.polling_enabled = !hub.polling_enabled;
         }
         HubAction::None => {}
 

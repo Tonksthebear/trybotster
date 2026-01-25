@@ -147,35 +147,76 @@ impl Device {
     }
 
     /// Load signing secret key from consolidated credentials.
-    fn load_signing_key(fingerprint: &str) -> Result<SigningKey> {
-        let creds = Credentials::load().context("Failed to load credentials")?;
-
-        // Verify fingerprint matches
-        if !creds.signing_key_matches_fingerprint(fingerprint) {
-            anyhow::bail!(
-                "Signing key fingerprint mismatch: expected {}, got {:?}",
-                fingerprint,
-                creds.fingerprint
-            );
-        }
+    ///
+    /// Implements graceful degradation for fingerprint mismatches:
+    /// - If fingerprint in keyring is stale but key is valid, update fingerprint
+    /// - This handles macOS keychain issues when binary signature changes
+    fn load_signing_key(expected_fingerprint: &str) -> Result<SigningKey> {
+        let mut creds = Credentials::load().context("Failed to load credentials")?;
 
         let secret_b64 = creds
             .signing_key()
             .context("Signing key not found in credentials")?;
 
+        // First, try to decode and validate the key itself
         let secret_bytes = BASE64
             .decode(secret_b64)
             .context("Invalid signing key encoding")?;
 
         let key_bytes: [u8; 32] = secret_bytes
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid signing key length"))?;
+            .map_err(|_vec| anyhow::anyhow!("Invalid signing key length"))?;
 
-        log::debug!("Loaded signing key from consolidated credentials");
-        Ok(SigningKey::from_bytes(&key_bytes))
+        let signing_key = SigningKey::from_bytes(&key_bytes);
+
+        // Derive the actual fingerprint from the key
+        let actual_fingerprint = Self::compute_fingerprint(&signing_key.verifying_key());
+
+        // Check if fingerprints match
+        if actual_fingerprint == expected_fingerprint {
+            // Key is valid and matches expected fingerprint
+            // Check if keyring's stored fingerprint needs updating
+            if !creds.signing_key_matches_fingerprint(expected_fingerprint) {
+                log::warn!(
+                    "Keyring fingerprint stale (was {:?}, updating to {}). \
+                     This can happen after rebuilding the binary.",
+                    creds.fingerprint,
+                    expected_fingerprint
+                );
+                // Update the stale fingerprint in keyring
+                creds.set_signing_key(secret_b64.to_string(), expected_fingerprint.to_string());
+                if let Err(e) = creds.save() {
+                    // Log but don't fail - we have a valid key
+                    log::warn!("Failed to update stale fingerprint in keyring: {}", e);
+                } else {
+                    log::info!("Updated keyring fingerprint successfully");
+                }
+            }
+            log::debug!("Loaded signing key from consolidated credentials");
+            return Ok(signing_key);
+        }
+
+        // Key exists but derives to wrong fingerprint - this is a real mismatch
+        // The key in keyring belongs to a different device identity
+        log::error!(
+            "Signing key fingerprint mismatch: key derives to {}, expected {}. \
+             The stored key does not belong to this device identity.",
+            actual_fingerprint,
+            expected_fingerprint
+        );
+        anyhow::bail!(
+            "Signing key fingerprint mismatch: expected {}, key derives to {}. \
+             Device identity may need to be recreated.",
+            expected_fingerprint,
+            actual_fingerprint
+        );
     }
 
-    /// Load device from config file
+    /// Load device from config file.
+    ///
+    /// Handles keyring access failures gracefully:
+    /// - Stale fingerprints are automatically updated
+    /// - Clear error messages guide users to resolution
     fn load_from_file(path: &PathBuf) -> Result<Self> {
         let content = fs::read_to_string(path).context("Failed to read device config")?;
 
@@ -186,8 +227,24 @@ impl Device {
         let signing_key = match Self::load_signing_key(&stored.fingerprint) {
             Ok(sk) => sk,
             Err(e) => {
+                // Provide actionable error message
+                let err_str = e.to_string();
+                if err_str.contains("not found") {
+                    log::error!(
+                        "Signing key not found in keyring. \
+                         This may happen if:\n  \
+                         - The keychain is locked (try unlocking it)\n  \
+                         - macOS blocked access due to binary signature change\n  \
+                         - The keychain entry was deleted"
+                    );
+                    anyhow::bail!(
+                        "Signing key not found in keyring. \
+                         Try unlocking your keychain or re-authenticate with 'botster auth'."
+                    );
+                }
                 anyhow::bail!(
-                    "Signing key not found. Device may need to be recreated: {}",
+                    "Failed to load signing key: {}. \
+                     Device may need to be recreated with 'botster auth'.",
                     e
                 );
             }

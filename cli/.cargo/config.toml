@@ -1,12 +1,12 @@
 # Cargo configuration for botster-hub
 #
-# Ensures tests always run in test mode (BOTSTER_ENV=test)
-# which enables test-specific behavior like:
-# - Skipping authentication
-# - Using tmp/botster-test for data directories
-# - Reduced heartbeat intervals
-
-[env]
-# Set BOTSTER_ENV=test for all test runs
-# Simple format is more reliable across cargo versions
-BOTSTER_ENV = "test"
+# IMPORTANT FOR AGENTS: Do NOT run `cargo test` directly!
+# Instead, use: ./test.sh
+#
+# This ensures BOTSTER_ENV=test is set, which prevents macOS keyring
+# access prompts during test runs.
+#
+# Examples:
+#   ./test.sh              # Run all tests
+#   ./test.sh --unit       # Run unit tests only (cargo test --lib)
+#   ./test.sh -- scroll    # Run tests matching 'scroll'

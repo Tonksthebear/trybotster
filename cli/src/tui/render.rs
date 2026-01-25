@@ -121,8 +121,6 @@ pub struct RenderContext<'a> {
     pub is_scrolled: bool,
 
     // === Status Indicators ===
-    /// Whether server polling is enabled.
-    pub polling_enabled: bool,
     /// Seconds since last poll.
     pub seconds_since_poll: u64,
     /// Poll interval in seconds.
@@ -144,7 +142,6 @@ impl<'a> std::fmt::Debug for RenderContext<'a> {
             .field("active_pty_view", &self.active_pty_view)
             .field("scroll_offset", &self.scroll_offset)
             .field("is_scrolled", &self.is_scrolled)
-            .field("polling_enabled", &self.polling_enabled)
             .field("tunnel_status", &self.tunnel_status)
             .finish_non_exhaustive()
     }
@@ -165,7 +162,6 @@ impl<'a> RenderContext<'a> {
             has_agent: selected_agent.is_some(),
             has_server_pty: selected_agent.map_or(false, |a| a.has_server_pty),
             active_pty: self.active_pty_view,
-            polling_enabled: self.polling_enabled,
         }
     }
 }
@@ -415,9 +411,7 @@ fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect) {
     ));
 
     // Add polling indicator
-    let poll_status = if !ctx.polling_enabled {
-        "PAUSED"
-    } else if ctx.seconds_since_poll < 1 {
+    let poll_status = if ctx.seconds_since_poll < 1 {
         "*"
     } else {
         "o"
@@ -443,11 +437,7 @@ fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect) {
         " Agents ({}) {} {}s T:{} V:{} ",
         ctx.agents.len(),
         poll_status,
-        if ctx.polling_enabled {
-            ctx.poll_interval - ctx.seconds_since_poll.min(ctx.poll_interval)
-        } else {
-            0
-        },
+        ctx.poll_interval - ctx.seconds_since_poll.min(ctx.poll_interval),
         tunnel_indicator,
         vpn_indicator
     );
@@ -714,12 +704,17 @@ fn render_connection_code_modal(
         "[r] new link  [c] copy  [Esc] close"
     };
 
+    // Calculate available space for QR (terminal minus modal chrome)
+    // Leave room for: borders (4), header, 2 blank lines, footer
+    let max_qr_cols = terminal.width.saturating_sub(4);
+    let max_qr_rows = terminal.height.saturating_sub(8);
+
     // Try Kitty graphics first (module_size=4 gives good balance of size/quality)
     if let Some(QrRenderResult::KittyImage {
         escape_sequence,
         width_cells,
         height_cells,
-    }) = generate_qr_kitty_image(secure_url, 4)
+    }) = generate_qr_kitty_image(secure_url, 4, max_qr_cols, max_qr_rows)
     {
         // Kitty image mode: render a compact modal sized to QR + text
         let header = if bundle_used {
@@ -948,7 +943,6 @@ mod tests {
             active_pty_view: PtyView::Cli,
             scroll_offset: 0,
             is_scrolled: false,
-            polling_enabled: true,
             seconds_since_poll: 0,
             poll_interval: 10,
             tunnel_status: TunnelStatus::Connected,
@@ -991,7 +985,6 @@ mod tests {
             active_pty_view: PtyView::Server,
             scroll_offset: 0,
             is_scrolled: false,
-            polling_enabled: false,
             seconds_since_poll: 5,
             poll_interval: 10,
             tunnel_status: TunnelStatus::Disconnected,
@@ -1002,7 +995,6 @@ mod tests {
         assert!(menu_ctx.has_agent);
         assert!(menu_ctx.has_server_pty);
         assert_eq!(menu_ctx.active_pty, PtyView::Server);
-        assert!(!menu_ctx.polling_enabled);
     }
 
     #[test]

@@ -105,6 +105,45 @@ pub struct ChannelSenderHandle {
     peers: Arc<StdRwLock<HashSet<PeerId>>>,
 }
 
+/// Handle for receiving messages from a channel.
+///
+/// This wraps the internal receive queue and allows receiving messages
+/// in a separate async task. Unlike `ChannelSenderHandle`, this is NOT
+/// cloneable since it owns the receive end of the channel.
+///
+/// Created via [`ActionCableChannel::take_receiver_handle()`].
+#[derive(Debug)]
+pub struct ChannelReceiverHandle {
+    recv_rx: mpsc::Receiver<RawIncoming>,
+}
+
+impl ChannelReceiverHandle {
+    /// Receive the next message from the channel.
+    ///
+    /// This method blocks until a message is available or the channel is closed.
+    /// Returns `None` when the channel is closed.
+    pub async fn recv(&mut self) -> Option<super::IncomingMessage> {
+        let raw = self.recv_rx.recv().await?;
+        Some(super::IncomingMessage {
+            payload: raw.payload,
+            sender: raw.sender,
+        })
+    }
+
+    /// Try to receive a message without blocking.
+    ///
+    /// Returns `None` if no message is available or the channel is closed.
+    pub fn try_recv(&mut self) -> Option<super::IncomingMessage> {
+        match self.recv_rx.try_recv() {
+            Ok(raw) => Some(super::IncomingMessage {
+                payload: raw.payload,
+                sender: raw.sender,
+            }),
+            Err(_) => None,
+        }
+    }
+}
+
 impl ChannelSenderHandle {
     /// Broadcast a message to all connected peers.
     ///
@@ -342,6 +381,38 @@ impl ActionCableChannel {
             send_tx: tx.clone(),
             peers: Arc::clone(&self.peers),
         })
+    }
+
+    /// Take the receiver handle from this channel for use in a spawned task.
+    ///
+    /// This method takes ownership of the receive side of the channel,
+    /// allowing it to be used in a separate async task for processing
+    /// incoming messages. Once taken, the channel can still send messages
+    /// but `recv()` and `drain_incoming()` will return empty results.
+    ///
+    /// Returns `None` if the channel is not connected or the receiver
+    /// was already taken.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut channel = ActionCableChannel::encrypted(...);
+    /// channel.connect(config).await?;
+    ///
+    /// // Get sender for output
+    /// let sender = channel.get_sender_handle();
+    ///
+    /// // Take receiver for input processing
+    /// if let Some(mut receiver) = channel.take_receiver_handle() {
+    ///     tokio::spawn(async move {
+    ///         while let Some(msg) = receiver.recv().await {
+    ///             // Process incoming message
+    ///         }
+    ///     });
+    /// }
+    /// ```
+    pub fn take_receiver_handle(&mut self) -> Option<ChannelReceiverHandle> {
+        self.recv_rx.take().map(|rx| ChannelReceiverHandle { recv_rx: rx })
     }
 
     /// Non-blocking drain of all available incoming messages.
@@ -1336,5 +1407,110 @@ impl Drop for ActionCableChannel {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that `ChannelReceiverHandle` can receive messages.
+    #[tokio::test]
+    async fn test_channel_receiver_handle_recv() {
+        // Create a channel pair (simulating the internal receive queue)
+        let (tx, rx) = mpsc::channel::<RawIncoming>(16);
+        let mut receiver = ChannelReceiverHandle { recv_rx: rx };
+
+        // Send a message through the internal channel
+        let payload = b"test message".to_vec();
+        tx.send(RawIncoming {
+            payload: payload.clone(),
+            sender: PeerId("sender-123".to_string()),
+        })
+        .await
+        .unwrap();
+
+        // Receive via the handle
+        let msg = receiver.recv().await;
+        assert!(msg.is_some());
+        let msg = msg.unwrap();
+        assert_eq!(msg.payload, payload);
+        assert_eq!(msg.sender.0, "sender-123");
+    }
+
+    /// Test that `ChannelReceiverHandle` returns `None` when channel is closed.
+    #[tokio::test]
+    async fn test_channel_receiver_handle_recv_closed() {
+        let (tx, rx) = mpsc::channel::<RawIncoming>(16);
+        let mut receiver = ChannelReceiverHandle { recv_rx: rx };
+
+        // Close the sender
+        drop(tx);
+
+        // Receive should return None
+        let msg = receiver.recv().await;
+        assert!(msg.is_none());
+    }
+
+    /// Test that `ChannelReceiverHandle::try_recv` works non-blocking.
+    #[tokio::test]
+    async fn test_channel_receiver_handle_try_recv() {
+        let (tx, rx) = mpsc::channel::<RawIncoming>(16);
+        let mut receiver = ChannelReceiverHandle { recv_rx: rx };
+
+        // Try receive when empty - should return None immediately
+        let msg = receiver.try_recv();
+        assert!(msg.is_none());
+
+        // Send a message
+        tx.send(RawIncoming {
+            payload: b"hello".to_vec(),
+            sender: PeerId("sender".to_string()),
+        })
+        .await
+        .unwrap();
+
+        // Try receive when message available
+        let msg = receiver.try_recv();
+        assert!(msg.is_some());
+        assert_eq!(msg.unwrap().payload, b"hello".to_vec());
+
+        // Try receive again - should be empty
+        let msg = receiver.try_recv();
+        assert!(msg.is_none());
+    }
+
+    /// Test that `take_receiver_handle` returns the receiver and subsequent calls return None.
+    #[test]
+    fn test_take_receiver_handle_returns_once() {
+        // Create channel directly with internal queue initialized
+        let (_send_tx, send_rx) = mpsc::channel::<OutgoingMessage>(16);
+        let (recv_tx, recv_rx) = mpsc::channel::<RawIncoming>(16);
+
+        let mut channel = ActionCableChannel {
+            config: None,
+            state: SharedConnectionState::new(),
+            crypto_service: None,
+            server_url: "http://test".to_string(),
+            api_key: "key".to_string(),
+            reliable: false,
+            reliable_sessions: Arc::new(RwLock::new(HashMap::new())),
+            send_tx: None,
+            recv_rx: Some(recv_rx),
+            peers: Arc::new(StdRwLock::new(HashSet::new())),
+            shutdown_tx: None,
+        };
+
+        // Drop unused channels to avoid warnings
+        drop(send_rx);
+        drop(recv_tx);
+
+        // First call should return the receiver
+        let handle1 = channel.take_receiver_handle();
+        assert!(handle1.is_some());
+
+        // Second call should return None (already taken)
+        let handle2 = channel.take_receiver_handle();
+        assert!(handle2.is_none());
     }
 }

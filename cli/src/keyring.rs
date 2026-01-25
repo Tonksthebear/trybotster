@@ -7,8 +7,16 @@
 //!
 //! Production: Single OS keyring entry `botster/credentials` containing JSON.
 //! Test mode: File at `{config_dir}/credentials.json`.
+//!
+//! # Graceful Degradation
+//!
+//! macOS keychain may block access when binary signature changes (new builds).
+//! This module implements retry logic and distinguishes between:
+//! - Keyring locked (user can unlock)
+//! - Entry missing (normal first-run)
+//! - Access denied (signature mismatch, may need re-auth)
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,11 +24,75 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 /// Keyring service name.
 const KEYRING_SERVICE: &str = "botster";
 /// Consolidated keyring entry name.
 const KEYRING_CREDENTIALS: &str = "credentials";
+
+/// Number of retry attempts for keyring access.
+const KEYRING_RETRY_ATTEMPTS: u32 = 2;
+/// Delay between retry attempts in milliseconds.
+const KEYRING_RETRY_DELAY_MS: u64 = 500;
+
+/// Categorized keyring access errors for better user feedback.
+#[derive(Debug)]
+pub enum KeyringAccessError {
+    /// Keyring is locked and requires user interaction to unlock.
+    Locked(String),
+    /// Entry does not exist (normal for first run).
+    NotFound,
+    /// Access denied, likely due to binary signature change.
+    AccessDenied(String),
+    /// Data exists but is corrupted or unparseable.
+    Corrupted(String),
+    /// Other/unknown error.
+    Other(String),
+}
+
+impl std::fmt::Display for KeyringAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Locked(msg) => write!(f, "Keyring locked: {msg}"),
+            Self::NotFound => write!(f, "Keyring entry not found"),
+            Self::AccessDenied(msg) => write!(f, "Keyring access denied: {msg}"),
+            Self::Corrupted(msg) => write!(f, "Keyring data corrupted: {msg}"),
+            Self::Other(msg) => write!(f, "Keyring error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for KeyringAccessError {}
+
+/// Categorize a keyring error for better user feedback.
+fn categorize_keyring_error(err: &keyring::Error) -> KeyringAccessError {
+    let msg = format!("{err:?}");
+    let msg_lower = msg.to_lowercase();
+
+    // Check for common macOS keychain error patterns
+    if msg_lower.contains("no password")
+        || msg_lower.contains("not found")
+        || msg_lower.contains("nopassword")
+    {
+        return KeyringAccessError::NotFound;
+    }
+
+    if msg_lower.contains("user interaction") || msg_lower.contains("user canceled") {
+        return KeyringAccessError::Locked(msg);
+    }
+
+    if msg_lower.contains("denied")
+        || msg_lower.contains("codesign")
+        || msg_lower.contains("authorization")
+        || msg_lower.contains("not allowed")
+    {
+        return KeyringAccessError::AccessDenied(msg);
+    }
+
+    KeyringAccessError::Other(msg)
+}
 
 /// Check if keyring should be skipped (any test mode).
 ///
@@ -95,27 +167,100 @@ fn default_version() -> u8 {
 
 impl Credentials {
     /// Load credentials from keyring (or file in test mode).
+    ///
+    /// Implements retry logic for transient keyring access failures.
+    /// On macOS, keychain access may fail temporarily when:
+    /// - Keychain is locked and awaiting user interaction
+    /// - Binary signature changed (new build)
     pub fn load() -> Result<Self> {
         if should_skip_keyring() {
             return Self::load_from_file();
         }
 
-        // Load consolidated credentials from keyring
+        Self::load_from_keyring_with_retry()
+    }
+
+    /// Load from keyring with retry logic for transient failures.
+    ///
+    /// Always succeeds by returning empty credentials on failure.
+    /// Uses `Result` for API consistency with `load()`.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "Result type for API consistency with load()"
+    )]
+    fn load_from_keyring_with_retry() -> Result<Self> {
+        let mut last_error: Option<KeyringAccessError> = None;
+
+        for attempt in 0..KEYRING_RETRY_ATTEMPTS {
+            if attempt > 0 {
+                log::debug!(
+                    "Retrying keyring access (attempt {}/{})",
+                    attempt + 1,
+                    KEYRING_RETRY_ATTEMPTS
+                );
+                thread::sleep(Duration::from_millis(KEYRING_RETRY_DELAY_MS));
+            }
+
+            match Self::try_load_from_keyring() {
+                Ok(creds) => return Ok(creds),
+                Err(err) => {
+                    log::debug!("Keyring access attempt {} failed: {}", attempt + 1, err);
+
+                    // Don't retry for NotFound - that's expected on first run
+                    if matches!(err, KeyringAccessError::NotFound) {
+                        log::debug!("No credentials found in keyring, returning empty");
+                        return Ok(Credentials::default());
+                    }
+
+                    // Don't retry for corrupted data - it won't fix itself
+                    if matches!(err, KeyringAccessError::Corrupted(_)) {
+                        log::warn!(
+                            "Keyring data corrupted, returning empty credentials: {}",
+                            err
+                        );
+                        return Ok(Credentials::default());
+                    }
+
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        // All retries exhausted - log warning and return empty
+        // This allows the app to continue and potentially re-authenticate
+        if let Some(err) = &last_error {
+            log::warn!(
+                "Keyring access failed after {} attempts: {}. \
+                 Credentials may need to be re-entered.",
+                KEYRING_RETRY_ATTEMPTS,
+                err
+            );
+
+            // For access denied, provide a helpful hint
+            if matches!(err, KeyringAccessError::AccessDenied(_)) {
+                log::info!(
+                    "Hint: Binary signature may have changed. \
+                     You may need to re-authenticate or unlock your keychain."
+                );
+            }
+        }
+
+        Ok(Credentials::default())
+    }
+
+    /// Attempt a single load from keyring, categorizing any errors.
+    fn try_load_from_keyring() -> std::result::Result<Self, KeyringAccessError> {
         let entry = Entry::new(KEYRING_SERVICE, KEYRING_CREDENTIALS)
-            .map_err(|e| anyhow::anyhow!("Failed to create keyring entry: {e:?}"))?;
+            .map_err(|e| KeyringAccessError::Other(format!("Failed to create entry: {e:?}")))?;
 
         match entry.get_password() {
             Ok(json) => {
                 let creds: Credentials = serde_json::from_str(&json)
-                    .context("Failed to parse credentials from keyring")?;
+                    .map_err(|e| KeyringAccessError::Corrupted(format!("JSON parse error: {e}")))?;
                 log::debug!("Loaded consolidated credentials from keyring");
                 Ok(creds)
             }
-            Err(_) => {
-                // No credentials yet - return empty
-                log::debug!("No credentials found in keyring, returning empty");
-                Ok(Credentials::default())
-            }
+            Err(e) => Err(categorize_keyring_error(&e)),
         }
     }
 
@@ -233,11 +378,19 @@ impl Credentials {
         self.fingerprint.as_deref() == Some(expected)
     }
 
+    /// Update the fingerprint without changing the signing key.
+    ///
+    /// Used when the stored fingerprint is stale (e.g., after binary rebuild)
+    /// but the signing key is still valid.
+    pub fn update_fingerprint(&mut self, fingerprint: String) {
+        self.fingerprint = Some(fingerprint);
+    }
+
     // === Signal key accessors ===
 
     /// Get Signal encryption key for a hub.
     pub fn signal_key(&self, hub_id: &str) -> Option<&str> {
-        self.signal_keys.get(hub_id).map(|s| s.as_str())
+        self.signal_keys.get(hub_id).map(String::as_str)
     }
 
     /// Set Signal encryption key for a hub.
@@ -352,5 +505,42 @@ mod tests {
 
         assert_eq!(loaded.api_token(), Some("btstr_hub"));
         assert_eq!(loaded.mcp_token(), Some("btmcp_agent"));
+    }
+
+    // === Fingerprint Update Tests ===
+
+    #[test]
+    fn test_update_fingerprint_preserves_signing_key() {
+        let mut creds = Credentials::default();
+        creds.set_signing_key("secret_key".to_string(), "old:fp".to_string());
+
+        // Verify initial state
+        assert_eq!(creds.signing_key(), Some("secret_key"));
+        assert!(creds.signing_key_matches_fingerprint("old:fp"));
+
+        // Update fingerprint
+        creds.update_fingerprint("new:fp".to_string());
+
+        // Key should be preserved, fingerprint updated
+        assert_eq!(creds.signing_key(), Some("secret_key"));
+        assert!(creds.signing_key_matches_fingerprint("new:fp"));
+        assert!(!creds.signing_key_matches_fingerprint("old:fp"));
+    }
+
+    // === KeyringAccessError Tests ===
+
+    #[test]
+    fn test_keyring_access_error_display() {
+        let locked = KeyringAccessError::Locked("user canceled".to_string());
+        assert!(locked.to_string().contains("Keyring locked"));
+
+        let not_found = KeyringAccessError::NotFound;
+        assert!(not_found.to_string().contains("not found"));
+
+        let denied = KeyringAccessError::AccessDenied("codesign".to_string());
+        assert!(denied.to_string().contains("access denied"));
+
+        let corrupted = KeyringAccessError::Corrupted("invalid json".to_string());
+        assert!(corrupted.to_string().contains("corrupted"));
     }
 }

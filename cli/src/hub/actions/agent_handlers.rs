@@ -58,6 +58,9 @@ pub fn handle_spawn_agent(
     // Use terminal dims for agents spawned via Rails server (no browser involved)
     let dims = hub.terminal_dims;
 
+    // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
+    let _runtime_guard = hub.tokio_runtime.enter();
+
     match lifecycle::spawn_agent(&mut hub.state.write().unwrap(), &config, dims) {
         Ok(result) => {
             log::info!("Spawned agent: {}", result.agent_id);

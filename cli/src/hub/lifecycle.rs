@@ -78,17 +78,14 @@ pub fn spawn_agent(
     terminal_dims: (u16, u16),
 ) -> Result<SpawnResult> {
     let id = uuid::Uuid::new_v4();
-    let mut agent = Agent::new(
+    let mut agent = Agent::new_with_dims(
         id,
         config.repo_name.clone(),
         config.issue_number,
         config.branch_name.clone(),
         config.worktree_path.clone(),
+        terminal_dims,
     );
-
-    // Resize to terminal dimensions
-    let (rows, cols) = terminal_dims;
-    agent.resize(rows, cols);
 
     // Set invocation URL for notifications
     agent.last_invocation_url = config.invocation_url.clone().or_else(|| {

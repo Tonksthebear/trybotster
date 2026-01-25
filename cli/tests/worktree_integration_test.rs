@@ -55,8 +55,8 @@ fn test_worktree_creation_with_real_git() {
     assert!(worktrees.contains("test-repo"));
 }
 
-#[test]
-fn test_agent_spawns_with_echo_command() {
+#[tokio::test]
+async fn test_agent_spawns_with_echo_command() {
     let temp_dir = TempDir::new().unwrap();
     let worktree = temp_dir.path().to_path_buf();
 
@@ -77,7 +77,7 @@ fn test_agent_spawns_with_echo_command() {
     assert!(result.is_ok());
 
     // Give it a moment to run
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Verify PTY is spawned and has a master
     assert!(agent.cli_pty.is_spawned());
