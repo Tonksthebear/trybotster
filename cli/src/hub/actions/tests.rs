@@ -1906,7 +1906,8 @@ fn test_resize_routes_via_selection() {
 /// Test that BrowserCommand::Input is correctly routed to PtyHandle.
 #[tokio::test]
 async fn test_pty_input_receiver_routes_input_command() {
-    use crate::hub::agent_handle::{PtyCommand, PtyHandle};
+    use crate::agent::pty::PtyCommand;
+    use crate::hub::agent_handle::PtyHandle;
     use crate::relay::BrowserCommand;
     use tokio::sync::{broadcast, mpsc};
 
@@ -1946,7 +1947,8 @@ async fn test_pty_input_receiver_routes_input_command() {
 /// Test that BrowserCommand::Resize is correctly routed to PtyHandle.
 #[tokio::test]
 async fn test_pty_input_receiver_routes_resize_command() {
-    use crate::hub::agent_handle::{PtyCommand, PtyHandle};
+    use crate::agent::pty::PtyCommand;
+    use crate::hub::agent_handle::PtyHandle;
     use crate::relay::BrowserCommand;
     use tokio::sync::{broadcast, mpsc};
 

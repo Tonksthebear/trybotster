@@ -24,6 +24,7 @@
 
 use anyhow::Result;
 
+use crate::client::ClientId;
 use crate::hub::{actions, Hub};
 use crate::relay::{events::browser_event_to_client_action, BrowserEvent, BrowserSendContext};
 
@@ -92,16 +93,29 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
                 }
                 BrowserEvent::SelectAgent { id } => {
                     hub.browser.invalidate_screen();
-                    // Send to THIS browser only (not broadcast to all browsers)
                     send_agent_selected_to_browser(hub, &browser_identity, id);
-                    // Default to CLI view when selecting agent - browser specifies view
-                    // via the PTY channel it subscribes to
-                    send_scrollback_for_agent_to_browser(
-                        hub,
-                        &browser_identity,
-                        id,
-                        crate::agent::PtyView::Cli,
-                    );
+
+                    // Connect browser to PTY - creates output forwarder and sends scrollback
+                    let agent_index = hub
+                        .state
+                        .read()
+                        .unwrap()
+                        .agent_keys_ordered
+                        .iter()
+                        .position(|k| k == id);
+
+                    if let Some(idx) = agent_index {
+                        let client_id = ClientId::Browser(browser_identity.clone());
+                        if let Some(client) = hub.clients.get_mut(&client_id) {
+                            if let Err(e) = client.connect_to_pty(idx, 0) {
+                                log::warn!(
+                                    "Failed to connect browser {} to PTY: {}",
+                                    &browser_identity[..8.min(browser_identity.len())],
+                                    e
+                                );
+                            }
+                        }
+                    }
                 }
                 BrowserEvent::DeleteAgent { .. } => {
                     hub.browser.invalidate_screen();

@@ -57,9 +57,12 @@
 // Rust guideline compliant 2026-01
 
 pub mod cli;
+mod commands;
 pub mod connected_client;
 pub mod events;
 pub mod server;
+
+pub use commands::PtyCommand;
 
 pub use cli::{spawn_cli_pty, CliSpawnResult};
 pub use connected_client::ConnectedClient;
@@ -78,7 +81,6 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::client::ClientId;
-use crate::hub::agent_handle::PtyCommand;
 
 use super::notification::AgentNotification;
 

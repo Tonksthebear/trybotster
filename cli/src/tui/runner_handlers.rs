@@ -228,17 +228,22 @@ where
                     .position(|a| a.id == agent_id)
                     .unwrap_or(0);
 
-                // Update TuiRunner state and reconnect to new PTY
+                // Update TuiRunner state
                 self.active_pty_view = new_view;
                 self.current_pty_index = Some(pty_index);
+
+                // Reset parser FIRST (before loading new scrollback)
+                {
+                    let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
+                    let (rows, cols) = self.terminal_dims;
+                    *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
+                }
+
+                // Connect to PTY - scrollback arrives via channel, gets processed
+                // in poll_pty_events() and fed to the fresh parser above.
                 if let Err(e) = self.client.connect_to_pty(agent_index, pty_index) {
                     log::warn!("Failed to connect to PTY: {}", e);
                 }
-
-                // Clear and reset parser for new PTY stream
-                let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-                let (rows, cols) = self.terminal_dims;
-                *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
             } else {
                 log::debug!("Cannot toggle to Server PTY - no server PTY available");
             }

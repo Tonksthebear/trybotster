@@ -120,10 +120,16 @@ where
     ///
     /// This method:
     /// 1. Resets to CLI view (default when switching agents)
-    /// 2. Connects the client to the agent's CLI PTY
-    /// 3. Updates the selected agent (TuiRunner state) and notifies Hub registry
-    /// 4. Stores the full handle for PTY view toggling
-    /// 5. Clears and resets the parser for fresh output
+    /// 2. Resets the parser for fresh output
+    /// 3. Connects the client to the agent's CLI PTY (scrollback arrives via channel)
+    /// 4. Updates the selected agent (TuiRunner state) and notifies Hub registry
+    /// 5. Stores the full handle for PTY view toggling
+    ///
+    /// # Scrollback Flow
+    ///
+    /// `TuiClient::connect_to_pty()` calls `pty.connect_blocking()` which returns
+    /// scrollback. TuiClient sends this through the output channel as `TuiOutput::Scrollback`.
+    /// TuiRunner's event loop receives it via `poll_pty_events()` and feeds to parser.
     ///
     /// # Arguments
     ///
@@ -136,7 +142,16 @@ where
         let agent_id = handle.agent_id().to_string();
         let agent_index = handle.agent_index();
 
-        // CLI PTY is always at index 0
+        // Reset parser FIRST (before loading new scrollback)
+        {
+            let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
+            let (rows, cols) = self.terminal_dims;
+            *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
+        }
+
+        // Connect client to PTY - this fetches scrollback and sends it through
+        // the output channel. TuiRunner receives it in poll_pty_events() and
+        // feeds to parser. Also spawns forwarder task for ongoing output.
         if let Err(e) = self.client.connect_to_pty(agent_index, 0) {
             log::warn!("Failed to connect to PTY: {}", e);
         }
@@ -158,10 +173,5 @@ where
 
         // Store full handle for PTY view toggling (TuiRunner-specific)
         self.agent_handle = Some(handle);
-
-        // Clear and reset parser for new agent
-        let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-        let (rows, cols) = self.terminal_dims;
-        *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
     }
 }
