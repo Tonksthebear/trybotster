@@ -134,13 +134,11 @@ pub fn handle_resize_for_client(hub: &mut Hub, client_id: ClientId, cols: u16, r
 
     // Get connected PTY indices BEFORE mutating the client
     // (can't borrow client and state at the same time)
+    // TUI PTY resize is handled through TuiRequest::SetDims with explicit indices,
+    // so only BrowserClient needs to gather connected PTY indices here.
     let connected_ptys: Vec<(usize, usize)> = match &client_id {
         ClientId::Tui => {
-            if let Some(tui) = hub.clients.get_tui() {
-                tui.connected_pty().into_iter().collect()
-            } else {
-                vec![]
-            }
+            vec![]
         }
         ClientId::Browser(_) => {
             if let Some(client) = hub.clients.get(&client_id) {

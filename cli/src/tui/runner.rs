@@ -379,17 +379,14 @@ where
 
     /// Handle PTY input (send to connected agent).
     fn handle_pty_input(&mut self, data: &[u8]) {
-        // Get current agent/pty indices
-        let Some(_agent_index) = self.current_agent_index else {
-            log::debug!("PTY input ignored - no agent selected");
-            return;
-        };
-
-        // Send input via TuiRequest - TuiClient knows which PTY we're connected to
-        if let Err(e) = self.request_tx.send(TuiRequest::SendInput {
-            data: data.to_vec(),
-        }) {
-            log::error!("Failed to send input to TuiClient: {}", e);
+        if let (Some(agent_index), Some(pty_index)) = (self.current_agent_index, self.current_pty_index) {
+            if let Err(e) = self.request_tx.send(TuiRequest::SendInput {
+                agent_index,
+                pty_index,
+                data: data.to_vec(),
+            }) {
+                log::error!("Failed to send input to TuiClient: {}", e);
+            }
         }
     }
 
@@ -398,7 +395,8 @@ where
     /// Updates both local state and propagates to the connected PTY:
     /// 1. Updates `terminal_dims` for TuiRunner's own use
     /// 2. Resizes the vt100 parser so output is interpreted correctly
-    /// 3. Sends `TuiRequest::SetDims` to TuiClient which propagates to the connected PTY
+    /// 3. If connected, sends `TuiRequest::SetDims` to TuiClient with explicit
+    ///    agent and PTY indices for PTY resize propagation
     fn handle_resize(&mut self, rows: u16, cols: u16) {
         self.terminal_dims = (rows, cols);
 
@@ -411,8 +409,10 @@ where
         }
 
         // Propagate resize to the connected PTY via TuiClient.
-        if let Err(e) = self.request_tx.send(TuiRequest::SetDims { cols, rows }) {
-            log::warn!("Failed to set dims: {}", e);
+        if let (Some(agent_index), Some(pty_index)) = (self.current_agent_index, self.current_pty_index) {
+            if let Err(e) = self.request_tx.send(TuiRequest::SetDims { agent_index, pty_index, cols, rows }) {
+                log::warn!("Failed to set dims: {}", e);
+            }
         }
     }
 
@@ -469,8 +469,10 @@ where
                 Err(TryRecvError::Disconnected) => {
                     log::debug!("PTY output channel disconnected");
                     // Channel closed - TuiClient was dropped or terminated.
-                    // Request disconnect from the current PTY.
-                    let _ = self.request_tx.send(TuiRequest::DisconnectFromPty);
+                    // Request disconnect from the current PTY if connected.
+                    if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
+                        let _ = self.request_tx.send(TuiRequest::DisconnectFromPty { agent_index: ai, pty_index: pi });
+                    }
                     self.current_agent_index = None;
                     self.current_pty_index = None;
                     self.selected_agent = None;
@@ -684,9 +686,11 @@ pub fn run_with_hub(
     let shutdown = Arc::new(AtomicBool::new(false));
     let tui_shutdown = Arc::clone(&shutdown);
 
-    // Sync TuiClient dims before TuiRunner creation so PTY connections use correct size
-    if let Err(e) = request_tx.send(TuiRequest::SetDims { cols: inner_cols, rows: inner_rows }) {
-        log::warn!("Failed to sync initial dims: {}", e);
+    // Sync TuiClient dims before TuiRunner creation so PTY connections use correct size.
+    // Done directly via client registry since TuiRequest::SetDims requires PTY indices
+    // and no agent is connected yet at startup.
+    if let Some(client) = hub.clients.get_mut(&crate::client::ClientId::Tui) {
+        client.set_dims(inner_cols, inner_rows);
     }
 
     let mut tui_runner = TuiRunner::new(
@@ -936,17 +940,17 @@ mod tests {
                                 // Fire-and-forget
                                 let _ = passthrough_tx.send(TuiRequest::CopyConnectionUrl);
                             }
-                            TuiRequest::SendInput { data } => {
-                                let _ = passthrough_tx.send(TuiRequest::SendInput { data });
+                            TuiRequest::SendInput { agent_index, pty_index, data } => {
+                                let _ = passthrough_tx.send(TuiRequest::SendInput { agent_index, pty_index, data });
                             }
-                            TuiRequest::SetDims { cols, rows } => {
-                                let _ = passthrough_tx.send(TuiRequest::SetDims { cols, rows });
+                            TuiRequest::SetDims { agent_index, pty_index, cols, rows } => {
+                                let _ = passthrough_tx.send(TuiRequest::SetDims { agent_index, pty_index, cols, rows });
                             }
                             TuiRequest::ConnectToPty { agent_index, pty_index } => {
                                 let _ = passthrough_tx.send(TuiRequest::ConnectToPty { agent_index, pty_index });
                             }
-                            TuiRequest::DisconnectFromPty => {
-                                let _ = passthrough_tx.send(TuiRequest::DisconnectFromPty);
+                            TuiRequest::DisconnectFromPty { agent_index, pty_index } => {
+                                let _ = passthrough_tx.send(TuiRequest::DisconnectFromPty { agent_index, pty_index });
                             }
                         }
                     }
@@ -2729,24 +2733,32 @@ mod tests {
         );
     }
 
-    /// Verifies `handle_resize()` sends `TuiRequest::SetDims` with correct dimensions.
+    /// Verifies `handle_resize()` sends `TuiRequest::SetDims` with correct dimensions
+    /// when connected to a PTY.
     ///
     /// # Scenario
     ///
-    /// When terminal is resized to 40 rows x 120 cols, TuiRunner should:
+    /// When terminal is resized to 40 rows x 120 cols with a PTY connected,
+    /// TuiRunner should:
     /// 1. Update local `terminal_dims`
     /// 2. Resize the vt100 parser
-    /// 3. Send `TuiRequest::SetDims { cols: 120, rows: 40 }` to TuiClient
+    /// 3. Send `TuiRequest::SetDims` with explicit agent/PTY indices to TuiClient
     #[test]
     fn test_handle_resize_sends_set_dims() {
         let (mut runner, mut request_rx) = create_test_runner();
 
+        // Set up connected state so SetDims is sent
+        runner.current_agent_index = Some(0);
+        runner.current_pty_index = Some(0);
+
         // Action: resize to 40 rows x 120 cols
         runner.handle_resize(40, 120);
 
-        // Verify: SetDims request sent with correct dimensions
+        // Verify: SetDims request sent with correct dimensions and indices
         match request_rx.try_recv() {
-            Ok(TuiRequest::SetDims { cols, rows }) => {
+            Ok(TuiRequest::SetDims { agent_index, pty_index, cols, rows }) => {
+                assert_eq!(agent_index, 0, "agent_index should be 0");
+                assert_eq!(pty_index, 0, "pty_index should be 0");
                 assert_eq!(cols, 120, "cols should be 120");
                 assert_eq!(rows, 40, "rows should be 40");
             }
@@ -2759,6 +2771,25 @@ mod tests {
         }
 
         // Verify: local state also updated
+        assert_eq!(runner.terminal_dims, (40, 120));
+    }
+
+    /// Verifies `handle_resize()` updates local state but does not send SetDims
+    /// when no PTY is connected.
+    #[test]
+    fn test_handle_resize_without_connection_updates_local_only() {
+        let (mut runner, mut request_rx) = create_test_runner();
+
+        // No agent/pty indices set (not connected)
+        runner.handle_resize(40, 120);
+
+        // Verify: no SetDims request sent
+        assert!(
+            request_rx.try_recv().is_err(),
+            "No TuiRequest::SetDims should be sent when not connected to a PTY"
+        );
+
+        // Verify: local state still updated
         assert_eq!(runner.terminal_dims, (40, 120));
     }
 

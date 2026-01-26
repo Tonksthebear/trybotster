@@ -105,7 +105,7 @@ impl ClientRegistry {
     ///
     /// Returns a mutable reference to the TuiClient if one is registered.
     /// This allows Hub to access TuiClient-specific methods that aren't on
-    /// the Client trait (like `connected_pty()` and `clear_connection()`).
+    /// the Client trait (like `clear_connection()`).
     ///
     /// Uses `Any` for downcasting internally.
     #[must_use]

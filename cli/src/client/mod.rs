@@ -478,7 +478,7 @@ pub trait Client: Send {
         pty_index: usize,
     ) {
         // Default implementation just notifies PTY of disconnection.
-        // Clients with additional cleanup (like TuiClient's connected_pty tracking)
+        // Clients with additional cleanup (like TuiClient's output task abort)
         // should override this method.
         let _ = pty.disconnect_blocking(self.id().clone());
         // Suppress unused variable warnings - these are used by overriding implementations
