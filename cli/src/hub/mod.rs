@@ -1275,13 +1275,13 @@ mod tests {
         );
     }
 
-    // === TUI set_dims PTY Resize Test ===
+    // === TUI set_dims and resize_pty Test ===
     //
-    // This test verifies that Client::set_dims() properly propagates to the connected PTY.
-    // The flow is: TuiClient.set_dims() -> resize_pty() -> PTY.
+    // This test verifies that set_dims() updates local dims and resize_pty()
+    // propagates to the connected PTY.
     //
-    // Flow: TuiRunner sends TuiRequest::SetDims -> TuiClient.set_dims() -> resize_pty()
-    // TuiClient manages connected PTY tracking and propagates resize directly.
+    // Flow: TuiRunner sends TuiRequest::SetDims -> handle_request() updates dims
+    // and calls resize_pty() with explicit agent/PTY indices.
 
     // === Agent Lifecycle / HandleCache Integration Tests ===
     //
@@ -1561,15 +1561,19 @@ mod tests {
         );
     }
 
-    /// Test that TuiClient.set_dims() propagates dimension changes to the connected PTY.
+    /// Test that TuiClient.set_dims() updates dims and resize_pty() propagates to PTY.
+    ///
+    /// After refactoring, set_dims() only updates local dims. PTY resize propagation
+    /// happens through TuiRequest::SetDims which calls resize_pty() with explicit indices.
     ///
     /// The scenario:
     /// 1. Create Hub and Agent with PTY at (24 rows, 80 cols)
-    /// 2. Register TuiClient and manually mark it as connected to the PTY
-    /// 3. Call TuiClient.set_dims(100 cols, 40 rows) directly
-    /// 4. Verify: PTY is resized to (40 rows, 100 cols)
+    /// 2. Register TuiClient and connect to the PTY
+    /// 3. Call set_dims(100, 40) to update local dims
+    /// 4. Call resize_pty(0, 0, 40, 100) to propagate to PTY
+    /// 5. Verify: client dims updated and PTY resized
     #[test]
-    fn test_tui_set_dims_propagates_to_pty() {
+    fn test_tui_set_dims_and_resize_pty() {
         use crate::agent::Agent;
         use crate::client::ClientId;
         use std::path::PathBuf;
@@ -1595,16 +1599,10 @@ mod tests {
         hub.sync_handle_cache();
 
         // Connect TuiClient to the PTY (agent_index=0, pty_index=0)
-        // This is required for set_dims() to propagate resize to the PTY.
         // Must register with PTY so TUI becomes the size owner.
         {
             let state = hub.state.read().unwrap();
             let _ = state.agents.get(&agent_key).unwrap().cli_pty.connect(ClientId::Tui, (80, 24));
-        }
-        if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
-            if let Some(tui_client) = client.as_any_mut().and_then(|c| c.downcast_mut::<crate::client::TuiClient>()) {
-                tui_client.set_connected_pty_for_test(0, 0);
-            }
         }
 
         // Get initial PTY dimensions
@@ -1614,32 +1612,42 @@ mod tests {
         };
         assert_eq!(initial_pty_dims, (24, 80), "Initial PTY dims");
 
-        // Call set_dims directly on TuiClient (this is what TuiRequest::SetDims does)
+        // Update dims on TuiClient (set_dims only updates local dims now)
         if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
             client.set_dims(100, 40);
         }
 
-        // Process pending PTY commands (in production, the command processor task does this)
+        // Verify TuiClient dims were updated
+        let tui_dims = hub.clients.get(&ClientId::Tui).unwrap().dims();
+        assert_eq!(tui_dims, (100, 40), "TuiClient dims should be updated");
+
+        // PTY should NOT be resized yet (set_dims no longer propagates)
+        let pty_dims_before_resize = {
+            let state = hub.state.read().unwrap();
+            state.agents.get(&agent_key).unwrap().cli_pty.dimensions()
+        };
+        assert_eq!(pty_dims_before_resize, (24, 80), "PTY should not be resized by set_dims alone");
+
+        // Now call resize_pty directly (this is what TuiRequest::SetDims handler does)
+        if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
+            let _ = client.resize_pty(0, 0, 40, 100);
+        }
+
+        // Process pending PTY commands
         {
             let mut state = hub.state.write().unwrap();
             state.agents.get_mut(&agent_key).unwrap().cli_pty.process_commands();
         }
 
-        // Verify TuiClient dims were updated (this works correctly)
-        let tui_dims = hub.clients.get(&ClientId::Tui).unwrap().dims();
-        assert_eq!(tui_dims, (100, 40), "TuiClient dims should be updated");
-
-        // Check PTY dimensions after set_dims
+        // Verify PTY dimensions were updated
         let pty_dims_after = {
             let state = hub.state.read().unwrap();
             state.agents.get(&agent_key).unwrap().cli_pty.dimensions()
         };
-
-        // PTY dimensions should match client dims (rows=40, cols=100)
         assert_eq!(
             pty_dims_after,
             (40, 100),
-            "TuiClient.set_dims() should resize PTY to match client dims"
+            "PTY should be resized after explicit resize_pty call"
         );
     }
 
@@ -1672,25 +1680,15 @@ mod tests {
     /// Helper: connect TuiClient to an agent's PTY for testing.
     ///
     /// Registers the TUI as a connected client on the PTY (making it the size
-    /// owner) and sets the TuiClient's connected_pty tracking.
+    /// owner).
     fn connect_tui_to_pty(hub: &mut Hub, agent_key: &str) {
-        {
-            let state = hub.state.read().unwrap();
-            let _ = state
-                .agents
-                .get(agent_key)
-                .unwrap()
-                .cli_pty
-                .connect(ClientId::Tui, (80, 24));
-        }
-        if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
-            if let Some(tui_client) = client
-                .as_any_mut()
-                .and_then(|c| c.downcast_mut::<crate::client::TuiClient>())
-            {
-                tui_client.set_connected_pty_for_test(0, 0);
-            }
-        }
+        let state = hub.state.read().unwrap();
+        let _ = state
+            .agents
+            .get(agent_key)
+            .unwrap()
+            .cli_pty
+            .connect(ClientId::Tui, (80, 24));
     }
 
     /// Test that calling set_dims() without a PTY connection is safe.
@@ -1730,12 +1728,13 @@ mod tests {
     /// Test that multiple resize calls result in the correct final PTY state.
     ///
     /// Verifies:
-    /// 1. Multiple rapid set_dims() calls are all processed
+    /// 1. Multiple rapid set_dims() + resize_pty() calls are all processed
     /// 2. PTY commands are processed after each resize
     /// 3. Final PTY dimensions match the last resize call
     ///
     /// This exercises the scenario where terminal resize events arrive in rapid
-    /// succession (e.g., user dragging the window edge).
+    /// succession (e.g., user dragging the window edge). In production, both
+    /// set_dims() and resize_pty() are called from TuiRequest::SetDims handler.
     #[test]
     fn test_resize_multiple_times_final_state_correct() {
         use crate::agent::Agent;
@@ -1768,6 +1767,7 @@ mod tests {
         // Resize #1: (100 cols, 30 rows)
         if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
             client.set_dims(100, 30);
+            let _ = client.resize_pty(0, 0, 30, 100);
         }
         {
             let mut state = hub.state.write().unwrap();
@@ -1777,6 +1777,7 @@ mod tests {
         // Resize #2: (120 cols, 40 rows)
         if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
             client.set_dims(120, 40);
+            let _ = client.resize_pty(0, 0, 40, 120);
         }
         {
             let mut state = hub.state.write().unwrap();
@@ -1786,6 +1787,7 @@ mod tests {
         // Resize #3: (80 cols, 24 rows) - back to default
         if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
             client.set_dims(80, 24);
+            let _ = client.resize_pty(0, 0, 24, 80);
         }
         {
             let mut state = hub.state.write().unwrap();

@@ -298,8 +298,10 @@ where
                 self.agents.retain(|a| a.id != agent_id);
                 // If this was the selected agent, clear selection
                 if self.selected_agent.as_ref() == Some(&agent_id) {
-                    // Request disconnect from PTY
-                    let _ = self.request_tx.send(TuiRequest::DisconnectFromPty);
+                    // Request disconnect from PTY if connected
+                    if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
+                        let _ = self.request_tx.send(TuiRequest::DisconnectFromPty { agent_index: ai, pty_index: pi });
+                    }
                     self.selected_agent = None;
                     self.current_agent_index = None;
                     self.current_pty_index = None;

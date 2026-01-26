@@ -60,14 +60,30 @@ use super::{Client, ClientId};
 #[derive(Debug)]
 pub enum TuiRequest {
     // === PTY I/O Operations ===
-    /// Send keyboard input to the connected PTY.
+    /// Send keyboard input to a specific PTY.
+    ///
+    /// Carries explicit agent and PTY indices from TuiRunner,
+    /// which tracks the current selection via `current_agent_index`
+    /// and `current_pty_index`.
     SendInput {
+        /// Index of the agent in Hub's agent list.
+        agent_index: usize,
+        /// Index of the PTY within the agent (0=CLI, 1=server).
+        pty_index: usize,
         /// Raw bytes to send (keyboard input).
         data: Vec<u8>,
     },
 
-    /// Update terminal dimensions and resize connected PTY.
+    /// Update terminal dimensions and resize a specific PTY.
+    ///
+    /// Carries explicit agent and PTY indices from TuiRunner,
+    /// which tracks the current selection via `current_agent_index`
+    /// and `current_pty_index`.
     SetDims {
+        /// Index of the agent in Hub's agent list.
+        agent_index: usize,
+        /// Index of the PTY within the agent (0=CLI, 1=server).
+        pty_index: usize,
         /// Terminal width in columns.
         cols: u16,
         /// Terminal height in rows.
@@ -96,8 +112,17 @@ pub enum TuiRequest {
         pty_index: usize,
     },
 
-    /// Disconnect from the current PTY.
-    DisconnectFromPty,
+    /// Disconnect from a specific PTY.
+    ///
+    /// Carries explicit agent and PTY indices from TuiRunner,
+    /// which tracks the current selection via `current_agent_index`
+    /// and `current_pty_index`.
+    DisconnectFromPty {
+        /// Index of the agent in Hub's agent list.
+        agent_index: usize,
+        /// Index of the PTY within the agent (0=CLI, 1=server).
+        pty_index: usize,
+    },
 
     // === Hub Operations ===
     /// Request Hub shutdown.
@@ -224,12 +249,6 @@ pub struct TuiClient {
     /// simultaneous connections), TUI only connects to one PTY at a time.
     output_task: Option<JoinHandle<()>>,
 
-    /// Currently connected PTY indices, if any.
-    ///
-    /// Stores (agent_index, pty_index) when connected to a PTY.
-    /// Used by `set_dims()` to propagate resize to the connected PTY.
-    connected_pty: Option<(usize, usize)>,
-
     /// Channel for receiving requests from TuiRunner.
     ///
     /// TuiRunner sends `TuiRequest` messages through this channel, which are
@@ -279,7 +298,6 @@ impl TuiClient {
             dims: (cols, rows),
             output_sink,
             output_task: None,
-            connected_pty: None,
             request_rx: None,
         }
     }
@@ -292,38 +310,20 @@ impl TuiClient {
 
     /// Update terminal dimensions without propagating to PTY.
     ///
-    /// Updates local dims only. For full resize that propagates to the connected
-    /// PTY, use `set_dims()` (the Client trait method).
+    /// Updates local dims only. PTY resize propagation happens through
+    /// `TuiRequest::SetDims` which carries explicit agent and PTY indices.
     pub fn update_dims(&mut self, cols: u16, rows: u16) {
         self.dims = (cols, rows);
-    }
-
-    /// Get the currently connected PTY indices, if any.
-    ///
-    /// Returns `Some((agent_index, pty_index))` when connected to a PTY,
-    /// `None` when not connected.
-    #[must_use]
-    pub fn connected_pty(&self) -> Option<(usize, usize)> {
-        self.connected_pty
     }
 
     /// Clear connection state without notifying PTY.
     ///
     /// Used when PTY no longer exists (agent deleted) but client state needs cleanup.
-    /// Aborts the output forwarder task and clears `connected_pty` tracking.
+    /// Aborts the output forwarder task.
     pub fn clear_connection(&mut self) {
         if let Some(task) = self.output_task.take() {
             task.abort();
         }
-        self.connected_pty = None;
-    }
-
-    /// Set connected PTY indices for testing.
-    ///
-    /// Allows tests to simulate a connected state without spawning async tasks.
-    #[cfg(test)]
-    pub fn set_connected_pty_for_test(&mut self, agent_index: usize, pty_index: usize) {
-        self.connected_pty = Some((agent_index, pty_index));
     }
 
     /// Set the request receiver for TuiRunner → TuiClient communication.
@@ -368,15 +368,16 @@ impl TuiClient {
     fn handle_request(&mut self, request: TuiRequest) {
         match request {
             // === PTY I/O Operations (Client trait methods) ===
-            TuiRequest::SendInput { data } => {
-                if let Some((agent_idx, pty_idx)) = self.connected_pty {
-                    if let Err(e) = self.send_input(agent_idx, pty_idx, &data) {
-                        log::error!("Failed to send input: {}", e);
-                    }
+            TuiRequest::SendInput { agent_index, pty_index, data } => {
+                if let Err(e) = self.send_input(agent_index, pty_index, &data) {
+                    log::error!("Failed to send input: {}", e);
                 }
             }
-            TuiRequest::SetDims { cols, rows } => {
-                self.set_dims(cols, rows);
+            TuiRequest::SetDims { agent_index, pty_index, cols, rows } => {
+                self.dims = (cols, rows);
+                if let Err(e) = self.resize_pty(agent_index, pty_index, rows, cols) {
+                    log::error!("Failed to resize PTY: {}", e);
+                }
             }
             TuiRequest::SelectAgent { index, response_tx } => {
                 let result = self.select_agent(index);
@@ -391,10 +392,8 @@ impl TuiClient {
                     log::error!("Failed to connect to PTY: {}", e);
                 }
             }
-            TuiRequest::DisconnectFromPty => {
-                if let Some((agent_idx, pty_idx)) = self.connected_pty {
-                    self.disconnect_from_pty(agent_idx, pty_idx);
-                }
+            TuiRequest::DisconnectFromPty { agent_index, pty_index } => {
+                self.disconnect_from_pty(agent_index, pty_index);
             }
 
             // === Hub Management Operations (Client trait methods) ===
@@ -438,7 +437,6 @@ impl std::fmt::Debug for TuiClient {
         f.debug_struct("TuiClient")
             .field("id", &self.id)
             .field("dims", &self.dims)
-            .field("connected_pty", &self.connected_pty)
             .finish_non_exhaustive()
     }
 }
@@ -464,14 +462,13 @@ impl Client for TuiClient {
         Some(self)
     }
 
+    /// Update terminal dimensions.
+    ///
+    /// Only updates local dims. PTY resize propagation happens through
+    /// `TuiRequest::SetDims` which carries explicit agent and PTY indices
+    /// from TuiRunner.
     fn set_dims(&mut self, cols: u16, rows: u16) {
         self.dims = (cols, rows);
-        // Propagate resize to connected PTY via resize_pty()
-        if let Some((agent_index, pty_index)) = self.connected_pty {
-            if let Err(e) = self.resize_pty(agent_index, pty_index, rows, cols) {
-                log::error!("Failed to resize PTY: {}", e);
-            }
-        }
     }
 
     /// Connect to a PTY and start forwarding output (using pre-resolved handle).
@@ -501,7 +498,6 @@ impl Client for TuiClient {
         if let Some(task) = self.output_task.take() {
             task.abort();
         }
-        self.connected_pty = None;
 
         // Get PTY handle from agent.
         let pty_handle = agent_handle
@@ -528,9 +524,6 @@ impl Client for TuiClient {
         let sink = self.output_sink.clone();
         self.output_task = Some(self.runtime.spawn(spawn_tui_output_forwarder(pty_rx, sink)));
 
-        // Track connected PTY indices for resize propagation.
-        self.connected_pty = Some((agent_index, pty_index));
-
         log::info!(
             "TUI connected to PTY ({}, {})",
             agent_index,
@@ -542,8 +535,7 @@ impl Client for TuiClient {
 
     /// Disconnect from a PTY using an already-resolved handle.
     ///
-    /// Overrides the default to also clear `connected_pty` tracking and abort
-    /// the output forwarder task.
+    /// Overrides the default to also abort the output forwarder task.
     fn disconnect_from_pty_with_handle(
         &mut self,
         pty: &crate::hub::agent_handle::PtyHandle,
@@ -554,7 +546,6 @@ impl Client for TuiClient {
         if let Some(task) = self.output_task.take() {
             task.abort();
         }
-        self.connected_pty = None;
 
         // Notify PTY of disconnection.
         let _ = pty.disconnect_blocking(self.id.clone());
@@ -571,7 +562,6 @@ impl Client for TuiClient {
         if let Some(task) = self.output_task.take() {
             task.abort();
         }
-        self.connected_pty = None;
 
         // Notify PTY of disconnection.
         // NOTE: hub_handle.get_agent() reads from HandleCache (non-blocking).
@@ -713,12 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn test_connected_pty_initially_none() {
-        let (client, _rx) = test_client();
-        assert!(client.connected_pty.is_none());
-    }
-
-    #[test]
     fn test_output_task_initially_none() {
         let (client, _rx) = test_client();
         assert!(client.output_task.is_none());
@@ -775,7 +759,7 @@ mod tests {
         client.set_request_receiver(rx);
 
         // Send SetDims request
-        tx.send(TuiRequest::SetDims { cols: 120, rows: 40 }).unwrap();
+        tx.send(TuiRequest::SetDims { agent_index: 0, pty_index: 0, cols: 120, rows: 40 }).unwrap();
 
         // Process it
         client.poll_requests();
@@ -791,9 +775,9 @@ mod tests {
         client.set_request_receiver(rx);
 
         // Send multiple SetDims requests
-        tx.send(TuiRequest::SetDims { cols: 100, rows: 30 }).unwrap();
-        tx.send(TuiRequest::SetDims { cols: 120, rows: 40 }).unwrap();
-        tx.send(TuiRequest::SetDims { cols: 80, rows: 24 }).unwrap();
+        tx.send(TuiRequest::SetDims { agent_index: 0, pty_index: 0, cols: 100, rows: 30 }).unwrap();
+        tx.send(TuiRequest::SetDims { agent_index: 0, pty_index: 0, cols: 120, rows: 40 }).unwrap();
+        tx.send(TuiRequest::SetDims { agent_index: 0, pty_index: 0, cols: 80, rows: 24 }).unwrap();
 
         // Process all
         client.poll_requests();
@@ -818,12 +802,12 @@ mod tests {
     #[test]
     fn test_tui_request_debug() {
         // Verify TuiRequest variants can be debugged
-        let send_input = TuiRequest::SendInput { data: vec![1, 2, 3] };
-        let set_dims = TuiRequest::SetDims { cols: 80, rows: 24 };
+        let send_input = TuiRequest::SendInput { agent_index: 0, pty_index: 0, data: vec![1, 2, 3] };
+        let set_dims = TuiRequest::SetDims { agent_index: 0, pty_index: 0, cols: 80, rows: 24 };
         let (response_tx, _rx) = tokio::sync::oneshot::channel();
         let select_agent = TuiRequest::SelectAgent { index: 0, response_tx };
         let connect = TuiRequest::ConnectToPty { agent_index: 0, pty_index: 0 };
-        let disconnect = TuiRequest::DisconnectFromPty;
+        let disconnect = TuiRequest::DisconnectFromPty { agent_index: 0, pty_index: 0 };
 
         assert!(format!("{:?}", send_input).contains("SendInput"));
         assert!(format!("{:?}", set_dims).contains("SetDims"));
@@ -969,12 +953,13 @@ mod tests {
                     .cli_pty
                     .connect(ClientId::Tui, (80, 24));
             }
-            get_tui_client_mut(&mut hub).set_connected_pty_for_test(0, 0);
 
             // Send input through the TuiRequest channel
             let input_data = b"echo hello\n".to_vec();
             request_tx
                 .send(TuiRequest::SendInput {
+                    agent_index: 0,
+                    pty_index: 0,
                     data: input_data.clone(),
                 })
                 .unwrap();
@@ -1031,7 +1016,6 @@ mod tests {
                     .cli_pty
                     .connect(ClientId::Tui, (80, 24));
             }
-            get_tui_client_mut(&mut hub).set_connected_pty_for_test(0, 0);
 
             // Verify initial PTY dimensions
             let initial_dims = hub
@@ -1048,6 +1032,8 @@ mod tests {
             // Send SetDims through the request channel
             request_tx
                 .send(TuiRequest::SetDims {
+                    agent_index: 0,
+                    pty_index: 0,
                     cols: 120,
                     rows: 40,
                 })
@@ -1142,14 +1128,6 @@ mod tests {
                 !metadata.has_server_pty,
                 "Test agent should not have server PTY"
             );
-
-            // Verify TuiClient is now connected to agent 0's PTY
-            let connected = get_tui_client_mut(&mut hub).connected_pty();
-            assert_eq!(
-                connected,
-                Some((0, 0)),
-                "TuiClient should be connected to (agent_index=0, pty_index=0)"
-            );
         }
 
         // =====================================================================
@@ -1206,15 +1184,14 @@ mod tests {
         // TEST 5: DisconnectFromPty clears connection state
         // =====================================================================
 
-        /// Verify that TuiRequest::DisconnectFromPty clears the client's
-        /// connection state.
+        /// Verify that TuiRequest::DisconnectFromPty does not panic.
         ///
         /// Full flow:
         /// 1. Setup Hub with agent
         /// 2. Connect TuiClient to PTY
-        /// 3. Send TuiRequest::DisconnectFromPty
+        /// 3. Send TuiRequest::DisconnectFromPty with explicit indices
         /// 4. Call poll_requests()
-        /// 5. Verify TuiClient is disconnected (connected_pty is None)
+        /// 5. Verify no panic
         #[test]
         fn test_tui_disconnect_from_pty() {
             let (mut hub, request_tx, _output_rx) = setup_tui_integration();
@@ -1230,29 +1207,14 @@ mod tests {
                     .cli_pty
                     .connect(ClientId::Tui, (80, 24));
             }
-            get_tui_client_mut(&mut hub).set_connected_pty_for_test(0, 0);
 
-            // Verify we're connected
-            assert_eq!(
-                get_tui_client_mut(&mut hub).connected_pty(),
-                Some((0, 0)),
-                "Should be connected before disconnect"
-            );
-
-            // Send DisconnectFromPty
+            // Send DisconnectFromPty with explicit indices
             request_tx
-                .send(TuiRequest::DisconnectFromPty)
+                .send(TuiRequest::DisconnectFromPty { agent_index: 0, pty_index: 0 })
                 .unwrap();
 
-            // Process the request
+            // Process the request - should not panic
             get_tui_client_mut(&mut hub).poll_requests();
-
-            // Verify TuiClient is disconnected
-            let connected = get_tui_client_mut(&mut hub).connected_pty();
-            assert_eq!(
-                connected, None,
-                "TuiClient should be disconnected after DisconnectFromPty"
-            );
         }
 
         // =====================================================================
@@ -1285,46 +1247,7 @@ mod tests {
         }
 
         // =====================================================================
-        // TEST 7: SendInput without connection is a no-op
-        // =====================================================================
-
-        /// Verify that SendInput is silently ignored when not connected to any PTY.
-        #[test]
-        fn test_tui_send_input_without_connection_is_noop() {
-            let (mut hub, request_tx, _output_rx) = setup_tui_integration();
-            let _agent_key = add_agent_to_hub(&mut hub, 42);
-
-            // Do NOT connect - TuiClient.connected_pty is None
-
-            // Send input (should be silently ignored)
-            request_tx
-                .send(TuiRequest::SendInput {
-                    data: b"echo hello\n".to_vec(),
-                })
-                .unwrap();
-
-            // Process the request - should not panic
-            get_tui_client_mut(&mut hub).poll_requests();
-
-            // Verify no commands were sent to PTY
-            let commands_processed = hub
-                .state
-                .write()
-                .unwrap()
-                .agents
-                .get_mut("test-repo-42")
-                .unwrap()
-                .cli_pty
-                .process_commands();
-
-            assert_eq!(
-                commands_processed, 0,
-                "No commands should reach PTY when TuiClient is not connected"
-            );
-        }
-
-        // =====================================================================
-        // TEST 8: Full lifecycle: Select -> Input -> Resize -> Disconnect
+        // TEST 7: Full lifecycle: Select -> Input -> Resize -> Disconnect
         // =====================================================================
 
         /// End-to-end test exercising the full TuiRequest lifecycle.
@@ -1354,11 +1277,12 @@ mod tests {
                 .unwrap()
                 .expect("Agent should exist");
             assert_eq!(metadata.agent_index, 0);
-            assert!(get_tui_client_mut(&mut hub).connected_pty().is_some());
 
             // Step 2: Send input
             request_tx
                 .send(TuiRequest::SendInput {
+                    agent_index: 0,
+                    pty_index: 0,
                     data: b"ls -la\n".to_vec(),
                 })
                 .unwrap();
@@ -1370,6 +1294,8 @@ mod tests {
             // Step 3: Resize
             request_tx
                 .send(TuiRequest::SetDims {
+                    agent_index: 0,
+                    pty_index: 0,
                     cols: 200,
                     rows: 50,
                 })
@@ -1392,14 +1318,9 @@ mod tests {
 
             // Step 4: Disconnect
             request_tx
-                .send(TuiRequest::DisconnectFromPty)
+                .send(TuiRequest::DisconnectFromPty { agent_index: 0, pty_index: 0 })
                 .unwrap();
             get_tui_client_mut(&mut hub).poll_requests();
-
-            assert!(
-                get_tui_client_mut(&mut hub).connected_pty().is_none(),
-                "Should be disconnected"
-            );
         }
 
         // =====================================================================
