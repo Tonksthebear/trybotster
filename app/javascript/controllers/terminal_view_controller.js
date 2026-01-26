@@ -106,7 +106,7 @@ export default class extends Controller {
     if (!this.hasConnectionOutlet) return;
 
     const agentIndex = this.connectionOutlet.getCurrentAgentIndex();
-    const success = await this.connectionOutlet.switchToPtyStream(agentIndex, ptyIndex);
+    const success = await this.connectionOutlet.connectToPty(agentIndex, ptyIndex);
 
     if (success) {
       this.ptyIndexValue = ptyIndex;

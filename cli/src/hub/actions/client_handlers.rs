@@ -31,8 +31,9 @@ use crate::hub::{lifecycle, Hub};
 /// 2. Ensures agent's channels are connected (lazy connection)
 ///
 /// TUI selection state is owned by TuiRunner, not Hub.
-/// PTY connection is handled separately by each client type via their
-/// async task loops (TuiRequest::SelectAgent, BrowserEvent::SelectAgent).
+/// PTY connection is handled separately:
+/// - TUI: TuiRequest::SelectAgent triggers PTY connection
+/// - Browser: Explicit BrowserEvent::ConnectToPty triggers PTY connection
 pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_key: String) {
     log::info!(
         "handle_select_agent_for_client: client={}, agent={}",
