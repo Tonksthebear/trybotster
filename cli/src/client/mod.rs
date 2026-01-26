@@ -333,7 +333,14 @@ pub trait Client: Send {
             .hub_handle()
             .get_agent(agent_index)
             .ok_or_else(|| format!("Agent at index {} not found", agent_index))?;
-        self.connect_to_pty_with_handle(&agent_handle, agent_index, pty_index).await
+        self.connect_to_pty_with_handle(&agent_handle, agent_index, pty_index).await?;
+
+        // Send initial resize so the PTY knows this client's dimensions.
+        let (cols, rows) = self.dims();
+        if cols > 0 && rows > 0 {
+            let _ = self.resize_pty(agent_index, pty_index, rows, cols).await;
+        }
+        Ok(())
     }
 
     /// Send input to a specific PTY.
