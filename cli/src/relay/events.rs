@@ -11,9 +11,8 @@
 //!
 //! # Resize Handling
 //!
-//! Browser resize events are tracked for dimension changes. The resize
-//! handler returns actions to apply (agent resize dimensions) based on
-//! browser mode (TUI vs GUI) and connection state.
+//! Browser resize events are handled directly by BrowserClient's async task
+//! via BrowserRequest::Resize. They do not flow through Hub dispatch.
 
 // Rust guideline compliant 2025-01
 
@@ -79,11 +78,9 @@ pub fn browser_event_to_client_action(
             },
         }),
 
-        BrowserEvent::Resize(resize) => Some(HubAction::ResizeForClient {
-            client_id,
-            rows: resize.rows,
-            cols: resize.cols,
-        }),
+        // Resize is handled directly by BrowserClient's async task via
+        // BrowserRequest::Resize, not through Hub dispatch.
+        BrowserEvent::Resize(_) => None,
 
         BrowserEvent::ListAgents => Some(HubAction::RequestAgentList { client_id }),
 
@@ -522,7 +519,9 @@ mod tests {
     }
 
     #[test]
-    fn test_client_resize_event() {
+    fn test_client_resize_event_returns_none() {
+        // Resize is handled directly by BrowserClient's async task via
+        // BrowserRequest::Resize, not through Hub dispatch.
         let event = BrowserEvent::Resize(BrowserResize {
             rows: 50,
             cols: 120,
@@ -530,18 +529,7 @@ mod tests {
         let browser_identity = "browser-resize";
         let action = browser_event_to_client_action(&event, browser_identity);
 
-        match action {
-            Some(HubAction::ResizeForClient {
-                client_id,
-                rows,
-                cols,
-            }) => {
-                assert_eq!(client_id, ClientId::Browser("browser-resize".to_string()));
-                assert_eq!(rows, 50);
-                assert_eq!(cols, 120);
-            }
-            _ => panic!("Expected ResizeForClient action"),
-        }
+        assert!(action.is_none(), "Resize events should not produce Hub actions");
     }
 
     #[test]

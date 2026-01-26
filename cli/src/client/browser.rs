@@ -38,7 +38,7 @@
 //! # Minimal Design
 //!
 //! BrowserClient implements only the required Client trait methods:
-//! - `hub_handle()`, `id()`, `dims()`, `set_dims()`, `connect_to_pty_with_handle()`,
+//! - `hub_handle()`, `id()`, `dims()`, `connect_to_pty_with_handle()`,
 //!   `disconnect_from_pty()`, `disconnect_from_pty_with_handle()`
 //!
 //! Default trait implementations handle:
@@ -232,13 +232,6 @@ impl BrowserClient {
         &self.identity
     }
 
-    /// Update terminal dimensions.
-    ///
-    /// Called when browser reports new terminal size.
-    pub fn update_dims(&mut self, cols: u16, rows: u16) {
-        self.dims = (cols, rows);
-    }
-
     /// Get a clone of the request sender for testing.
     ///
     /// Allows tests to send `BrowserRequest` messages directly to the client's
@@ -278,6 +271,7 @@ impl BrowserClient {
                 }
             }
             BrowserRequest::Resize { agent_index, pty_index, rows, cols } => {
+                self.dims = (cols, rows);
                 if let Err(e) = self.resize_pty(agent_index, pty_index, rows, cols).await {
                     log::error!("Failed to resize PTY ({}, {}): {}", agent_index, pty_index, e);
                 }
@@ -308,9 +302,6 @@ impl BrowserClient {
                 }
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(ClientCmd::SetDims { cols, rows }) => {
-                            self.set_dims(cols, rows);
-                        }
                         Some(ClientCmd::DisconnectFromPty { agent_index, pty_index }) => {
                             self.disconnect_from_pty(agent_index, pty_index).await;
                         }
@@ -350,13 +341,6 @@ impl Client for BrowserClient {
 
     fn dims(&self) -> (u16, u16) {
         self.dims
-    }
-
-    fn set_dims(&mut self, cols: u16, rows: u16) {
-        self.update_dims(cols, rows);
-        // NOTE: BrowserClient does NOT propagate resize here.
-        // Browser clients manage multiple simultaneous PTY connections,
-        // so resize is handled per-PTY via BrowserRequest::Resize.
     }
 
     async fn connect_to_pty_with_handle(
@@ -772,8 +756,8 @@ mod tests {
         // Default dims
         assert_eq!(client.dims(), (80, 24));
 
-        // Update dims
-        client.update_dims(120, 40);
+        // Update dims directly
+        client.dims = (120, 40);
         assert_eq!(client.dims(), (120, 40));
     }
 
