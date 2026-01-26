@@ -127,7 +127,8 @@ pub fn browser_event_to_client_action(
         }),
 
         // Events with no Hub action mapping (handled directly in browser.rs)
-        BrowserEvent::SetMode { .. }
+        BrowserEvent::ConnectToPty { .. }
+        | BrowserEvent::SetMode { .. }
         | BrowserEvent::GenerateInvite
         | BrowserEvent::BundleRegenerated { .. } => None,
     }
@@ -217,6 +218,13 @@ pub fn command_to_event(cmd: &BrowserCommand) -> BrowserEvent {
             cols: *cols,
             rows: *rows,
         }),
+        BrowserCommand::ConnectToPty {
+            agent_index,
+            pty_index,
+        } => BrowserEvent::ConnectToPty {
+            agent_index: *agent_index,
+            pty_index: *pty_index,
+        },
         BrowserCommand::GenerateInvite => BrowserEvent::GenerateInvite,
     }
 }

@@ -123,7 +123,6 @@ export default class extends Controller {
   handleConnected(outlet) {
     console.log("[Agents] handleConnected called, outlet:", !!outlet);
     this.connection = outlet;
-    // Request agent list and worktrees when connected
     console.log("[Agents] Requesting agent list and worktrees...");
     this.requestAgentList();
     this.requestWorktrees();
@@ -132,7 +131,8 @@ export default class extends Controller {
     const agentIndex = this.#getAgentIndexFromUrl();
     if (agentIndex !== null) {
       console.log("[Agents] Will auto-select agent at index:", agentIndex);
-      this.pendingAutoSelectIndex = agentIndex;
+      const ptyIndex = this.#getPtyIndexFromUrl();
+      this.pendingAutoSelect = { agentIndex, ptyIndex: ptyIndex || 0 };
     }
   }
 
@@ -140,6 +140,13 @@ export default class extends Controller {
   #getAgentIndexFromUrl() {
     const match = window.location.pathname.match(/\/hubs\/\d+\/agents\/(\d+)/);
     return match ? parseInt(match[1], 10) : null;
+  }
+
+  // Private: Extract PTY index from URL query params
+  #getPtyIndexFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const pty = params.get('pty');
+    return pty ? parseInt(pty, 10) : 0;
   }
 
   // Handle connection lost
@@ -165,15 +172,20 @@ export default class extends Controller {
         this.updateAgentList(message.agents || []);
 
         // Auto-select agent from URL if pending
-        if (this.pendingAutoSelectIndex !== undefined && this.pendingAutoSelectIndex !== null) {
+        if (this.pendingAutoSelect !== undefined && this.pendingAutoSelect !== null) {
           const agents = message.agents || [];
-          if (this.pendingAutoSelectIndex < agents.length) {
-            const agent = agents[this.pendingAutoSelectIndex];
-            console.log(`[Agents] Auto-selecting agent at index ${this.pendingAutoSelectIndex}:`, agent.id);
-            // Update UI and send select_agent to CLI
-            this.#handleAgentClick(agent.id);
+          if (this.pendingAutoSelect.agentIndex < agents.length) {
+            const agent = agents[this.pendingAutoSelect.agentIndex];
+            const ptyIndex = this.pendingAutoSelect.ptyIndex;
+            console.log(`[Agents] Auto-selecting agent at index ${this.pendingAutoSelect.agentIndex}:`, agent.id);
+            this.selectedAgentId = agent.id;
+            this.updateSelectedLabel(agent.name || agent.id);
+            this.updateMobileAgentUI(agent.name || agent.id);
+            this.updateAgentList(agents);
+            this.connection.selectAgent(agent.id);
+            this.connection.connectToPty(this.pendingAutoSelect.agentIndex, ptyIndex);
           }
-          this.pendingAutoSelectIndex = null;
+          this.pendingAutoSelect = null;
         }
         break;
 
@@ -565,18 +577,18 @@ export default class extends Controller {
     this.updateMobileAgentUI(displayName);
     this.updateAgentList(this.agents); // Re-render to show selection
 
-    // Only switch channels if this selection wasn't initiated by us
+    // Only connect to PTY if this selection wasn't initiated by us
     // (avoids race condition when user clicks quickly between agents)
     if (this.#pendingSelection === message.id) {
-      // This is a confirmation of our click - we already switched channels
+      // This is a confirmation of our click - we already connected
       this.#pendingSelection = null;
     } else {
       // This is a selection from CLI (e.g., on connect, auto-select, or another client)
-      // We need to switch to the correct channel
+      // We need to connect to the correct PTY
       if (this.connection && this.agents.length > 0) {
         const agentIndex = this.agents.findIndex(a => a.id === message.id);
         if (agentIndex >= 0) {
-          await this.connection.switchToAgentChannel(agentIndex);
+          await this.connection.connectToPty(agentIndex, 0);
         }
       }
     }
@@ -653,15 +665,14 @@ export default class extends Controller {
     const agentIndex = this.agents.findIndex(a => a.id === agentId);
     if (agentIndex === -1) return;
 
-    // Switch to the agent's terminal channel
-    // This ensures we receive terminal output from the correct agent
-    await this.connection.switchToAgentChannel(agentIndex);
-
     // Track that we initiated this selection (to avoid race condition in handleAgentSelected)
     this.#pendingSelection = agentId;
 
     // Send select_agent to CLI (for state tracking)
     this.connection.selectAgent(agentId);
+
+    // Connect to the agent's PTY (sends connect_to_pty to CLI + subscribes browser-side)
+    await this.connection.connectToPty(agentIndex, 0);
   }
 
   // Action: Select existing worktree - go to step 2 for prompt

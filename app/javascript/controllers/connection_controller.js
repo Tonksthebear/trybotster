@@ -19,8 +19,8 @@ import { Channel } from "channels/channel";
  * Connection Flow:
  * 1. LOADING_WASM - Loading Signal Protocol WASM module
  * 2. CREATING_SESSION - Setting up encryption from QR bundle
- * 3. SUBSCRIBING - Connecting to Action Cable channel
- * 4. CHANNEL_CONNECTED - Action Cable confirmed (CLI is reachable)
+ * 3. SUBSCRIBING - Connecting to HubChannel (control plane)
+ * 4. CHANNEL_CONNECTED - HubChannel confirmed (CLI is reachable)
  * 5. HANDSHAKE_SENT - Sent encrypted handshake, waiting for CLI ACK
  * 6. CONNECTED - CLI acknowledged, E2E encryption active
  *
@@ -125,8 +125,6 @@ export default class extends Controller {
     workerUrl: String,
     wasmJsUrl: String,
     wasmBinaryUrl: String,
-    agentIndex: { type: Number, default: 0 }, // Per-agent channel routing
-    ptyIndex: { type: Number, default: 0 }, // Per-PTY stream routing (0=CLI, 1=Server)
   };
 
   static classes = ["securityBannerBase"];
@@ -143,8 +141,8 @@ export default class extends Controller {
     this.state = ConnectionState.DISCONNECTED;
     this.errorReason = null;
     this.handshakeTimer = null;
-    this.currentAgentIndex = this.agentIndexValue; // Track which agent we're subscribed to
-    this.currentPtyIndex = this.ptyIndexValue; // Track which PTY we're subscribed to (0=CLI, 1=Server)
+    this.currentAgentIndex = null; // No terminal channel until explicitly connected
+    this.currentPtyIndex = 0;
     this.hasCompletedInitialSetup = false; // Track whether we've finished initial setup (for reconnection detection)
 
     // Don't overwrite listeners - outlet callbacks may have already registered
@@ -375,14 +373,8 @@ export default class extends Controller {
     }
   }
 
-  subscribeToChannel(agentIndex = this.currentAgentIndex) {
-    // Subscribe to both HubChannel and TerminalRelayChannel
-    return Promise.all([
-      this.subscribeToHubChannel(),
-      this.subscribeToTerminalChannel(agentIndex),
-    ]).then(() => {
-      // Both connected successfully
-    });
+  subscribeToChannel() {
+    return this.subscribeToHubChannel();
   }
 
   subscribeToHubChannel() {
@@ -637,9 +629,9 @@ export default class extends Controller {
       return;
     }
 
-    // Only restart if both channels are connected
-    if (!this.hubChannel || !this.terminalChannel) {
-      console.log("[Connection] Waiting for both channels to reconnect before handshake");
+    // Only restart if hub channel is connected
+    if (!this.hubChannel) {
+      console.log("[Connection] Waiting for hub channel to reconnect before handshake");
       return;
     }
 
@@ -690,6 +682,12 @@ export default class extends Controller {
 
       // Notify all registered listeners
       this.notifyListeners("connected", this);
+
+      // Reconnect to previous PTY if we had one (e.g., after ActionCable reconnection)
+      if (this.currentAgentIndex !== null && !this.terminalSubscription) {
+        console.log(`[Connection] Reconnecting to previous PTY: agent ${this.currentAgentIndex}, pty ${this.currentPtyIndex}`);
+        this.connectToPty(this.currentAgentIndex, this.currentPtyIndex);
+      }
       return;
     }
 
@@ -852,22 +850,13 @@ export default class extends Controller {
   }
 
   /**
-   * Switch to a different agent's channel.
-   * This resubscribes to the new agent's terminal stream (defaults to CLI PTY).
-   * @param {number} agentIndex - Index of the agent to switch to
-   */
-  async switchToAgentChannel(agentIndex) {
-    // When switching agents, always start with CLI PTY (index 0)
-    return this.switchToPtyStream(agentIndex, 0);
-  }
-
-  /**
    * Switch to a different PTY stream.
    * @param {number} agentIndex - Index of the agent
    * @param {number} ptyIndex - Index of the PTY (0=CLI, 1=Server)
    */
   async switchToPtyStream(agentIndex, ptyIndex) {
-    if (agentIndex === this.currentAgentIndex && ptyIndex === this.currentPtyIndex) {
+    // Only skip if we're actually subscribed to this exact stream
+    if (this.terminalSubscription && agentIndex === this.currentAgentIndex && ptyIndex === this.currentPtyIndex) {
       console.log(`[Connection] Already subscribed to agent ${agentIndex} pty ${ptyIndex}`);
       return true;
     }
@@ -924,6 +913,50 @@ export default class extends Controller {
       }
       return false;
     }
+  }
+
+  /**
+   * Connect to a specific agent's PTY.
+   * Sends connect_to_pty to CLI via hub channel, then subscribes to the
+   * browser-side terminal channel. This is the primary API for PTY connections.
+   * @param {number} agentIndex - Index of the agent
+   * @param {number} ptyIndex - Index of the PTY (0=CLI, 1=Server)
+   */
+  async connectToPty(agentIndex, ptyIndex = 0) {
+    if (!this.connected || !this.signalSession) {
+      console.warn("[Connection] Cannot connect to PTY - not connected");
+      return false;
+    }
+
+    console.log(`[Connection] Connecting to PTY: agent ${agentIndex}, pty ${ptyIndex}`);
+
+    // 1. Tell CLI to establish its side of the PTY connection
+    await this.send("connect_to_pty", {
+      agent_index: agentIndex,
+      pty_index: ptyIndex,
+    });
+
+    // 2. Subscribe browser-side to terminal channel
+    await this.switchToPtyStream(agentIndex, ptyIndex);
+
+    // 3. Update URL to reflect current agent+PTY
+    this.updateUrlForPty(ptyIndex);
+
+    return true;
+  }
+
+  /**
+   * Update URL query params to reflect current PTY index.
+   * Enables page refresh to reconnect to correct PTY.
+   */
+  updateUrlForPty(ptyIndex) {
+    const url = new URL(window.location);
+    if (ptyIndex > 0) {
+      url.searchParams.set("pty", ptyIndex);
+    } else {
+      url.searchParams.delete("pty");
+    }
+    history.replaceState(null, "", url);
   }
 
   /**
@@ -984,7 +1017,7 @@ export default class extends Controller {
     console.log("[Connection] Manual reconnect requested");
 
     // If we have a valid session, try to restart handshake
-    if (this.signalSession && this.hubChannel && this.terminalChannel) {
+    if (this.signalSession && this.hubChannel) {
       await this.restartHandshake();
       return;
     }

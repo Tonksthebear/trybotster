@@ -318,6 +318,14 @@ pub enum BrowserCommand {
         /// Number of rows.
         rows: u16,
     },
+    /// Connect to a specific agent's PTY.
+    #[serde(rename = "connect_to_pty")]
+    ConnectToPty {
+        /// Agent index to connect to.
+        agent_index: usize,
+        /// PTY index within the agent.
+        pty_index: usize,
+    },
     /// Request a fresh invite bundle for sharing hub connection.
     #[serde(rename = "generate_invite")]
     GenerateInvite,
@@ -401,6 +409,14 @@ pub enum BrowserEvent {
     ScrollToBottom,
     /// Scroll to top.
     ScrollToTop,
+    /// Connect to a specific agent's PTY.
+    /// Handled directly in relay/browser.rs, not via HubAction dispatch.
+    ConnectToPty {
+        /// Agent index to connect to.
+        agent_index: usize,
+        /// PTY index within the agent.
+        pty_index: usize,
+    },
     /// Request invite bundle for sharing.
     /// Handled directly in relay, not forwarded to Hub.
     GenerateInvite,

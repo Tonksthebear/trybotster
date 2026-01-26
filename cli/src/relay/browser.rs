@@ -91,24 +91,33 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
                 BrowserEvent::Disconnected => {
                     hub.browser.handle_disconnected();
                 }
-                BrowserEvent::SelectAgent { id } => {
-                    hub.browser.invalidate_screen();
-                    send_agent_selected_to_browser(hub, &browser_identity, id);
+                BrowserEvent::ConnectToPty { agent_index, pty_index } => {
+                    // Ensure agent's relay channels are wired up
+                    let agent_key = hub.state.read().unwrap()
+                        .agent_keys_ordered
+                        .get(*agent_index)
+                        .cloned();
 
-                    // Send ConnectToPty command to BrowserClient's async task.
-                    // The client's run_task handles PTY connection internally.
-                    let state = hub.state.read().unwrap();
-                    let agent_index = state.agent_keys_ordered.iter().position(|k| k == id);
-                    drop(state);
+                    if let Some(key) = agent_key {
+                        hub.connect_agent_channels(&key, *agent_index);
 
-                    if let Some(idx) = agent_index {
+                        // Send ConnectToPty to BrowserClient's async task
                         let client_id = ClientId::Browser(browser_identity.clone());
                         if let Some(handle) = hub.clients.get(&client_id) {
                             let _ = handle.cmd_tx.try_send(
-                                crate::client::ClientCmd::ConnectToPty { agent_index: idx, pty_index: 0 },
+                                crate::client::ClientCmd::ConnectToPty {
+                                    agent_index: *agent_index,
+                                    pty_index: *pty_index,
+                                },
                             );
                         }
+                    } else {
+                        log::warn!("ConnectToPty: agent at index {} not found", agent_index);
                     }
+                }
+                BrowserEvent::SelectAgent { id } => {
+                    hub.browser.invalidate_screen();
+                    send_agent_selected_to_browser(hub, &browser_identity, id);
                 }
                 BrowserEvent::DeleteAgent { .. } => {
                     hub.browser.invalidate_screen();
