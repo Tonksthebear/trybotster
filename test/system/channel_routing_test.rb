@@ -5,8 +5,8 @@ require "application_system_test_case"
 # Tests for correct channel routing in browser JavaScript.
 #
 # Verifies the architecture:
-# - HubChannel: hub-level commands (list agents, select, create)
-# - TerminalRelayChannel: PTY I/O (input, output, resize)
+# - HubChannel: hub-level commands (list agents, select, create) - subscribed on page load
+# - TerminalRelayChannel: PTY I/O (input, output, resize) - subscribed on demand via connectToPty()
 #
 # This ensures PTY I/O doesn't route through the hub channel which
 # would be architecturally wrong (hub should not be in the PTY data path).
@@ -32,6 +32,9 @@ class ChannelRoutingTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+
+    # Connect to PTY to establish terminal channel (on-demand architecture)
+    connect_to_pty_in_browser
 
     # Verify sendInput uses sendTerminalMessage internally
     routing_check = page.execute_script(<<~JS)
@@ -91,6 +94,9 @@ class ChannelRoutingTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+
+    # Connect to PTY to establish terminal channel (on-demand architecture)
+    connect_to_pty_in_browser
 
     # Verify sendResize uses sendTerminalMessage internally
     routing_check = page.execute_script(<<~JS)
@@ -228,6 +234,9 @@ class ChannelRoutingTest < ApplicationSystemTestCase
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
 
+    # Connect to PTY to establish terminal channel (on-demand architecture)
+    connect_to_pty_in_browser
+
     # Verify the channels are distinct objects
     channel_check = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
@@ -265,21 +274,36 @@ class ChannelRoutingTest < ApplicationSystemTestCase
     visit @cli.connection_url
     assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
 
-    # Verify terminal channel is subscribed after connection
-    channel_state = page.execute_script(<<~JS)
+    # Verify terminal channel does NOT exist before PTY connection (on-demand architecture)
+    before_state = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
         document.querySelector('[data-controller~="connection"]'), 'connection'
       );
-
       return {
         hasTerminalChannel: !!conn.terminalChannel,
-        hasTerminalSubscription: !!conn.terminalSubscription,
-        terminalChannelConnected: conn.terminalChannel?.isConnected?.() ?? false
+        hasTerminalSubscription: !!conn.terminalSubscription
       };
     JS
 
-    assert channel_state["hasTerminalChannel"], "Should have terminal channel after connection"
-    assert channel_state["hasTerminalSubscription"], "Should have terminal subscription after connection"
+    refute before_state["hasTerminalChannel"], "Should NOT have terminal channel before connectToPty"
+    refute before_state["hasTerminalSubscription"], "Should NOT have terminal subscription before connectToPty"
+
+    # Connect to PTY (triggers on-demand terminal channel subscription)
+    connect_to_pty_in_browser
+
+    # Verify terminal channel NOW exists after connectToPty
+    after_state = page.execute_script(<<~JS)
+      const conn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="connection"]'), 'connection'
+      );
+      return {
+        hasTerminalChannel: !!conn.terminalChannel,
+        hasTerminalSubscription: !!conn.terminalSubscription
+      };
+    JS
+
+    assert after_state["hasTerminalChannel"], "Should have terminal channel after connectToPty"
+    assert after_state["hasTerminalSubscription"], "Should have terminal subscription after connectToPty"
   end
 
   test "terminal output appears in browser terminal" do
@@ -299,6 +323,16 @@ class ChannelRoutingTest < ApplicationSystemTestCase
   end
 
   private
+
+  def connect_to_pty_in_browser(agent_index = 0, pty_index = 0)
+    page.execute_script(<<~JS)
+      const conn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="connection"]'), 'connection'
+      );
+      conn.connectToPty(#{agent_index}, #{pty_index});
+    JS
+    sleep 1 # Wait for ActionCable subscription to establish
+  end
 
   def sign_in_as(user)
     visit "/test/sessions/new?user_id=#{user.id}"
