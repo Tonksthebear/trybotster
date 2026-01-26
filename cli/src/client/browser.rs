@@ -12,11 +12,23 @@
 //!   ├── id (ClientId::Browser(identity))
 //!   ├── dims (cols, rows)
 //!   ├── identity (Signal identity key)
+//!   ├── request_tx (cloned to each input receiver task)
+//!   ├── request_rx (single receiver, processed by poll_requests())
 //!   └── terminal_channels (HashMap keyed by (agent_index, pty_index))
 //!         └── TerminalChannel
 //!               ├── channel (ActionCableChannel for WebSocket)
 //!               └── task handles for cleanup
 //! ```
+//!
+//! # Request Channel (BrowserRequest)
+//!
+//! Symmetric with TuiRequest. Browser background tasks (input receivers) send
+//! `BrowserRequest` messages through a channel, which `poll_requests()` processes
+//! in Hub's event loop. This routes operations through the Client trait rather
+//! than calling PtyHandle directly from background tasks.
+//!
+//! Unlike TuiRequest, every BrowserRequest variant includes explicit PTY indices
+//! because Browser supports multiple simultaneous PTY connections.
 //!
 //! # PTY I/O Routing
 //!
@@ -25,7 +37,7 @@
 //! 1. Creates a TerminalRelayChannel (ActionCable with E2E encryption)
 //! 2. Subscribes to PTY events via PtyHandle
 //! 3. Spawns output forwarder: PTY events -> channel -> browser
-//! 4. Spawns input receiver: channel -> PTY (keyboard input, resize)
+//! 4. Spawns input receiver: channel -> BrowserRequest -> poll_requests() -> Client trait
 //!
 //! # Minimal Design
 //!
@@ -39,16 +51,51 @@
 
 use std::collections::HashMap;
 
+use tokio::runtime::Handle;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
 
 use crate::agent::pty::PtyEvent;
 use crate::channel::{ActionCableChannel, Channel, ChannelConfig};
-use crate::hub::agent_handle::PtyHandle;
 use crate::hub::HubHandle;
+use crate::relay::crypto_service::CryptoServiceHandle;
 use crate::relay::{build_scrollback_message, BrowserCommand, TerminalMessage};
 
 use super::{Client, ClientId};
+
+/// Requests from Browser to BrowserClient.
+///
+/// Symmetric with `TuiRequest`. Browser background tasks send these via channel,
+/// BrowserClient routes them through Client trait methods in Hub's event loop.
+///
+/// Unlike `TuiRequest`, these include PTY target indices on every variant because
+/// Browser supports multiple simultaneous PTY connections (one per tab).
+#[derive(Debug)]
+pub enum BrowserRequest {
+    /// Send keyboard input to a specific PTY.
+    SendInput {
+        /// Index of the target agent in Hub's ordered list.
+        agent_index: usize,
+        /// Index of the PTY within the agent (0 = CLI, 1 = Server).
+        pty_index: usize,
+        /// Raw input bytes to send to the PTY.
+        data: Vec<u8>,
+    },
+
+    /// Resize a specific PTY.
+    Resize {
+        /// Index of the target agent in Hub's ordered list.
+        agent_index: usize,
+        /// Index of the PTY within the agent (0 = CLI, 1 = Server).
+        pty_index: usize,
+        /// New terminal height in rows.
+        rows: u16,
+        /// New terminal width in columns.
+        cols: u16,
+    },
+}
 
 /// Terminal channel for a single PTY connection.
 ///
@@ -88,6 +135,22 @@ impl std::fmt::Debug for TerminalChannel {
     }
 }
 
+/// Configuration needed for ActionCable channel connections.
+///
+/// Stored at construction time to avoid blocking Hub command calls
+/// during `connect_to_pty`. These values don't change after Hub initialization.
+#[derive(Debug, Clone)]
+pub struct BrowserClientConfig {
+    /// Crypto service handle for E2E encryption.
+    pub crypto_service: CryptoServiceHandle,
+    /// Server URL for ActionCable WebSocket connections.
+    pub server_url: String,
+    /// API key for authentication.
+    pub api_key: String,
+    /// Server-assigned hub ID for channel routing.
+    pub server_hub_id: String,
+}
+
 /// Browser client - WebSocket connection from browser.
 ///
 /// Owns terminal channels for PTY I/O routing. Each channel corresponds
@@ -105,6 +168,12 @@ pub struct BrowserClient {
     /// Thread-safe access to Hub state and operations.
     hub_handle: HubHandle,
 
+    /// Tokio runtime handle for spawning async tasks.
+    ///
+    /// Stored directly to avoid blocking cross-thread calls when spawning
+    /// forwarder tasks. Hub passes this at construction time.
+    runtime: Handle,
+
     /// Unique identifier (ClientId::Browser(identity)).
     id: ClientId,
 
@@ -114,28 +183,59 @@ pub struct BrowserClient {
     /// Signal identity key for encryption routing.
     identity: String,
 
+    /// Connection config for ActionCable channels.
+    ///
+    /// Stored at construction to avoid blocking hub_handle calls in connect_to_pty.
+    config: BrowserClientConfig,
+
     /// Terminal channels keyed by (agent_index, pty_index).
     ///
     /// Browser can have multiple simultaneous connections (one per tab).
     terminal_channels: HashMap<(usize, usize), TerminalChannel>,
+
+    /// Sender for browser background tasks to route operations through Client trait.
+    ///
+    /// Cloned and passed to each `spawn_pty_input_receiver` task. Each task sends
+    /// `BrowserRequest` with its specific (agent_index, pty_index) so poll_requests()
+    /// can route to the correct PTY via Client trait methods.
+    request_tx: UnboundedSender<BrowserRequest>,
+
+    /// Receiver for requests from browser background tasks.
+    ///
+    /// Processed by `poll_requests()` in Hub's event loop. All input receiver tasks
+    /// (one per PTY connection) share the single `request_tx` sender.
+    request_rx: UnboundedReceiver<BrowserRequest>,
 }
 
 impl BrowserClient {
-    /// Create a new browser client.
+    /// Create a new browser client with connection config.
     ///
     /// # Arguments
     ///
     /// * `hub_handle` - Handle for Hub communication and agent queries.
     /// * `identity` - Signal identity key from browser handshake.
+    /// * `runtime` - Tokio runtime handle for spawning async tasks.
+    /// * `config` - Connection config for ActionCable channels.
     #[must_use]
-    pub fn new(hub_handle: HubHandle, identity: String) -> Self {
+    pub fn new(
+        hub_handle: HubHandle,
+        identity: String,
+        runtime: Handle,
+        config: BrowserClientConfig,
+    ) -> Self {
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+
         // Default terminal size: 80 columns x 24 rows
         Self {
             id: ClientId::Browser(identity.clone()),
             dims: (80, 24),
             identity,
             hub_handle,
+            runtime,
+            config,
             terminal_channels: HashMap::new(),
+            request_tx,
+            request_rx,
         }
     }
 
@@ -150,6 +250,73 @@ impl BrowserClient {
     /// Called when browser reports new terminal size.
     pub fn update_dims(&mut self, cols: u16, rows: u16) {
         self.dims = (cols, rows);
+    }
+
+    /// Get a clone of the request sender for testing.
+    ///
+    /// Allows tests to send `BrowserRequest` messages directly to the client's
+    /// request channel, simulating what background PTY input receiver tasks do
+    /// in production.
+    #[cfg(test)]
+    pub fn request_sender_for_test(&self) -> UnboundedSender<BrowserRequest> {
+        self.request_tx.clone()
+    }
+
+    /// Get the currently connected PTY indices.
+    ///
+    /// Returns an iterator over `(agent_index, pty_index)` pairs for all
+    /// connected PTYs. BrowserClient can have multiple simultaneous connections.
+    ///
+    /// Used by Hub to look up PTYs directly from state when resizing,
+    /// avoiding the deadlock that would occur if we called through `hub_handle`.
+    pub fn connected_ptys(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.terminal_channels.keys().copied()
+    }
+
+    /// Poll for requests from browser background tasks and process them.
+    ///
+    /// Called from Hub's event loop. Processes up to 100 requests per tick
+    /// to prevent blocking on high-volume input. Symmetric with
+    /// `TuiClient::poll_requests()`.
+    pub fn poll_requests(&mut self) {
+        // Collect requests first to avoid borrow checker issues
+        // (can't call handle_request while borrowing request_rx).
+        let mut requests = Vec::with_capacity(100);
+        for _ in 0..100 {
+            match self.request_rx.try_recv() {
+                Ok(request) => requests.push(request),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    log::warn!("Browser request channel disconnected");
+                    break;
+                }
+            }
+        }
+
+        // Now process all collected requests.
+        for request in requests {
+            self.handle_request(request);
+        }
+    }
+
+    /// Handle a single request from a browser background task.
+    ///
+    /// Routes the request to the appropriate Client trait method. Unlike
+    /// TuiClient's handler, every variant includes explicit PTY indices
+    /// because Browser supports multiple simultaneous connections.
+    fn handle_request(&mut self, request: BrowserRequest) {
+        match request {
+            BrowserRequest::SendInput { agent_index, pty_index, data } => {
+                if let Err(e) = self.send_input(agent_index, pty_index, &data) {
+                    log::error!("Failed to send input to PTY ({}, {}): {}", agent_index, pty_index, e);
+                }
+            }
+            BrowserRequest::Resize { agent_index, pty_index, rows, cols } => {
+                if let Err(e) = self.resize_pty(agent_index, pty_index, rows, cols) {
+                    log::error!("Failed to resize PTY ({}, {}): {}", agent_index, pty_index, e);
+                }
+            }
+        }
     }
 }
 
@@ -166,19 +333,27 @@ impl Client for BrowserClient {
         self.dims
     }
 
-    fn set_dims(&mut self, cols: u16, rows: u16) {
-        self.update_dims(cols, rows);
-
-        // Propagate resize to all connected PTYs
-        let pty_indices: Vec<_> = self.terminal_channels.keys().copied().collect();
-        for (agent_idx, pty_idx) in pty_indices {
-            if let Err(e) = self.resize_pty(agent_idx, pty_idx, rows, cols) {
-                log::debug!("Failed to resize PTY ({}, {}): {}", agent_idx, pty_idx, e);
-            }
-        }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 
-    fn connect_to_pty(&mut self, agent_index: usize, pty_index: usize) -> Result<(), String> {
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn set_dims(&mut self, cols: u16, rows: u16) {
+        self.update_dims(cols, rows);
+        // NOTE: BrowserClient does NOT propagate resize here.
+        // Browser clients manage multiple simultaneous PTY connections,
+        // so resize is handled per-PTY via BrowserEvent::Resize in relay/browser.rs.
+    }
+
+    fn connect_to_pty_with_handle(
+        &mut self,
+        agent_handle: &super::AgentHandle,
+        agent_index: usize,
+        pty_index: usize,
+    ) -> Result<(), String> {
         let key = (agent_index, pty_index);
 
         // Idempotent: return Ok if already connected to this PTY.
@@ -186,43 +361,24 @@ impl Client for BrowserClient {
             return Ok(());
         }
 
-        // Get crypto service from hub_handle for E2E encryption.
-        let crypto_service = self
-            .hub_handle
-            .crypto_service()
-            .ok_or_else(|| "No crypto service available for E2E encryption".to_string())?;
-
-        // Get agent handle from Hub.
-        let agent_handle = self
-            .hub_handle
-            .get_agent(agent_index)
-            .ok_or_else(|| format!("Agent at index {} not found", agent_index))?;
-
         // Get PTY handle from agent.
         let pty_handle = agent_handle
             .get_pty(pty_index)
             .ok_or_else(|| format!("PTY at index {} not found for agent", pty_index))?
             .clone();
 
-        // Get connection config from hub_handle.
-        let hub_id = self
-            .hub_handle
-            .server_hub_id()
-            .ok_or_else(|| "No hub ID available".to_string())?;
-        let server_url = self.hub_handle.server_url();
-        let api_key = self.hub_handle.api_key();
+        // Use stored config (avoids blocking hub_handle calls that would deadlock).
+        let crypto_service = self.config.crypto_service.clone();
+        let server_url = self.config.server_url.clone();
+        let api_key = self.config.api_key.clone();
+        let hub_id = self.config.server_hub_id.clone();
 
         // Create ActionCableChannel with E2E encryption.
         let mut channel = ActionCableChannel::encrypted(crypto_service, server_url, api_key);
 
         // Connect to TerminalRelayChannel.
-        // Uses tokio runtime from hub_handle for blocking connect.
-        let runtime = self
-            .hub_handle
-            .tokio_runtime()
-            .ok_or_else(|| "No tokio runtime available".to_string())?;
-
-        let connect_result = runtime.block_on(async {
+        // Uses stored runtime handle - no blocking cross-thread call needed.
+        let connect_result = self.runtime.block_on(async {
             channel
                 .connect(ChannelConfig {
                     channel_name: "TerminalRelayChannel".into(),
@@ -255,7 +411,7 @@ impl Client for BrowserClient {
             let scrollback_msg = build_scrollback_message(scrollback);
             if let Ok(json) = serde_json::to_string(&scrollback_msg) {
                 let sender_clone = sender_handle.clone();
-                runtime.spawn(async move {
+                self.runtime.spawn(async move {
                     if let Err(e) = sender_clone.send(json.as_bytes()).await {
                         log::debug!("Failed to send scrollback: {}", e);
                     }
@@ -271,7 +427,7 @@ impl Client for BrowserClient {
         let agent_id = agent_handle.agent_id().to_string();
 
         // Spawn output forwarder: PTY -> Browser.
-        let output_task = runtime.spawn(spawn_pty_output_forwarder(
+        let output_task = self.runtime.spawn(spawn_pty_output_forwarder(
             pty_rx,
             sender_handle,
             browser_identity.clone(),
@@ -279,18 +435,15 @@ impl Client for BrowserClient {
             pty_index,
         ));
 
-        // Clone for input receiver.
-        let pty_handle_clone = pty_handle.clone();
-        let client_id = self.id.clone();
-
-        // Spawn input receiver: Browser -> PTY.
-        let input_task = runtime.spawn(spawn_pty_input_receiver(
+        // Spawn input receiver: Browser -> BrowserRequest channel -> Client trait.
+        let request_tx = self.request_tx.clone();
+        let input_task = self.runtime.spawn(spawn_pty_input_receiver(
             receiver_handle,
-            pty_handle_clone,
-            client_id,
+            request_tx,
+            agent_index,
+            pty_index,
             browser_identity,
             agent_id,
-            pty_index,
         ));
 
         // Store channel and task handles.
@@ -313,10 +466,35 @@ impl Client for BrowserClient {
         Ok(())
     }
 
+    /// Disconnect from a PTY using an already-resolved handle.
+    ///
+    /// Overrides the default to also remove the terminal channel from tracking.
+    fn disconnect_from_pty_with_handle(
+        &mut self,
+        pty: &crate::hub::agent_handle::PtyHandle,
+        agent_index: usize,
+        pty_index: usize,
+    ) {
+        // Remove channel from map - dropping it cleans up tasks.
+        if self.terminal_channels.remove(&(agent_index, pty_index)).is_some() {
+            // Notify PTY of disconnection.
+            let _ = pty.disconnect_blocking(self.id.clone());
+
+            log::info!(
+                "Browser {} disconnected from PTY ({}, {})",
+                &self.identity[..8.min(self.identity.len())],
+                agent_index,
+                pty_index
+            );
+        }
+    }
+
     fn disconnect_from_pty(&mut self, agent_index: usize, pty_index: usize) {
         // Remove channel from map - dropping it cleans up tasks.
         if let Some(_channel) = self.terminal_channels.remove(&(agent_index, pty_index)) {
             // Notify PTY of disconnection.
+            // NOTE: hub_handle.get_agent() reads from HandleCache (non-blocking).
+            // However, disconnect_blocking() is blocking and must not be called from Hub's event loop.
             if let Some(agent) = self.hub_handle.get_agent(agent_index) {
                 if let Some(pty) = agent.get_pty(pty_index) {
                     let _ = pty.disconnect_blocking(self.id.clone());
@@ -429,25 +607,28 @@ async fn spawn_pty_output_forwarder(
     );
 }
 
-/// Background task that receives input from browser via ActionCableChannel and routes to PTY.
+/// Background task that receives input from browser and sends BrowserRequest to BrowserClient.
 ///
 /// Listens for incoming messages from the browser (through the encrypted channel)
-/// and routes them to the appropriate PTY session. Handles both input data and
-/// resize commands.
+/// and sends them as `BrowserRequest` variants through the channel. BrowserClient's
+/// `poll_requests()` routes these through the Client trait to the correct PTY.
+///
+/// This task does NOT call PtyHandle directly. All PTY operations go through
+/// the BrowserRequest channel -> poll_requests() -> Client trait methods.
 ///
 /// # Message Types
 ///
-/// - `BrowserCommand::Input { data }` - Keyboard input to send to PTY
-/// - `BrowserCommand::Resize { cols, rows }` - Terminal resize from browser
+/// - `BrowserCommand::Input { data }` -> `BrowserRequest::SendInput`
+/// - `BrowserCommand::Resize { cols, rows }` -> `BrowserRequest::Resize`
 ///
 /// Other `BrowserCommand` variants should go through the main hub channel.
 async fn spawn_pty_input_receiver(
     mut receiver: crate::channel::ChannelReceiverHandle,
-    pty_handle: PtyHandle,
-    client_id: ClientId,
+    request_tx: UnboundedSender<BrowserRequest>,
+    agent_index: usize,
+    pty_index: usize,
     browser_identity: String,
     agent_id: String,
-    pty_index: usize,
 ) {
     log::info!(
         "Started PTY input receiver for browser {} agent {} pty {}",
@@ -488,26 +669,26 @@ async fn spawn_pty_input_receiver(
 
         match command {
             BrowserCommand::Input { data } => {
-                // Route input to PTY.
-                if let Err(e) = pty_handle.write_input(data.as_bytes()).await {
-                    log::warn!(
-                        "Failed to write input to PTY for browser {} agent {}: {}",
-                        &browser_identity[..8.min(browser_identity.len())],
-                        &agent_id[..8.min(agent_id.len())],
-                        e
-                    );
-                    // Continue - PTY might recover.
+                // Send input request through channel to BrowserClient.
+                if request_tx.send(BrowserRequest::SendInput {
+                    agent_index,
+                    pty_index,
+                    data: data.into_bytes(),
+                }).is_err() {
+                    log::debug!("BrowserRequest channel closed, stopping input receiver");
+                    break;
                 }
             }
             BrowserCommand::Resize { cols, rows } => {
-                // Route resize to PTY.
-                if let Err(e) = pty_handle.resize(client_id.clone(), rows, cols).await {
-                    log::warn!(
-                        "Failed to resize PTY for browser {} agent {}: {}",
-                        &browser_identity[..8.min(browser_identity.len())],
-                        &agent_id[..8.min(agent_id.len())],
-                        e
-                    );
+                // Send resize request through channel to BrowserClient.
+                if request_tx.send(BrowserRequest::Resize {
+                    agent_index,
+                    pty_index,
+                    rows,
+                    cols,
+                }).is_err() {
+                    log::debug!("BrowserRequest channel closed, stopping input receiver");
+                    break;
                 }
             }
             _ => {
@@ -534,18 +715,51 @@ async fn spawn_pty_input_receiver(
 mod tests {
     use super::*;
 
+    /// Get a mock runtime handle for testing.
+    ///
+    /// Creates a runtime handle that can be used in tests. Since tests
+    /// don't actually spawn async tasks, we just need a valid handle.
+    fn mock_runtime_handle() -> Handle {
+        // Use the current runtime if we're in a tokio context, otherwise create one
+        Handle::try_current().unwrap_or_else(|_| {
+            // Create a minimal runtime just for the handle
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create test runtime");
+            rt.handle().clone()
+        })
+    }
+
+    /// Create a mock BrowserClientConfig for testing.
+    fn mock_config() -> BrowserClientConfig {
+        BrowserClientConfig {
+            crypto_service: CryptoServiceHandle::mock(),
+            server_url: "http://localhost:3000".to_string(),
+            api_key: "test-api-key".to_string(),
+            server_hub_id: "test-hub-id".to_string(),
+        }
+    }
+
+    /// Helper to create a BrowserClient with mock dependencies for testing.
+    fn test_client(identity: &str) -> BrowserClient {
+        BrowserClient::new(
+            HubHandle::mock(),
+            identity.to_string(),
+            mock_runtime_handle(),
+            mock_config(),
+        )
+    }
+
     // ========== Unit Tests (No Async) ==========
 
     #[test]
     fn test_browser_client_creation() {
-        let client = BrowserClient::new(HubHandle::mock(), "test-identity-12345678".to_string());
+        let client = test_client("test-identity-12345678");
         assert!(client.id().is_browser());
         assert_eq!(client.dims(), (80, 24)); // Default size
     }
 
     #[test]
     fn test_browser_client_identity() {
-        let client = BrowserClient::new(HubHandle::mock(), "my-signal-key".to_string());
+        let client = test_client("my-signal-key");
         assert_eq!(client.identity(), "my-signal-key");
 
         match client.id() {
@@ -556,7 +770,7 @@ mod tests {
 
     #[test]
     fn test_browser_client_dims() {
-        let mut client = BrowserClient::new(HubHandle::mock(), "test".to_string());
+        let mut client = test_client("test");
 
         // Default dims
         assert_eq!(client.dims(), (80, 24));
@@ -568,7 +782,7 @@ mod tests {
 
     #[test]
     fn test_browser_client_get_agents_returns_empty_with_mock_handle() {
-        let client = BrowserClient::new(HubHandle::mock(), "test".to_string());
+        let client = test_client("test");
 
         // Mock hub_handle returns empty.
         let agents = client.get_agents();
@@ -577,7 +791,7 @@ mod tests {
 
     #[test]
     fn test_browser_client_get_agent_returns_none_with_mock_handle() {
-        let client = BrowserClient::new(HubHandle::mock(), "test".to_string());
+        let client = test_client("test");
 
         // Mock hub_handle returns None.
         assert!(client.get_agent(0).is_none());
@@ -588,7 +802,7 @@ mod tests {
 
     #[test]
     fn test_debug_format() {
-        let client = BrowserClient::new(HubHandle::mock(), "test".to_string());
+        let client = test_client("test");
         let debug = format!("{:?}", client);
 
         // These fields SHOULD exist.
@@ -631,14 +845,14 @@ mod tests {
     // ========== PTY Communication Tests ==========
 
     #[test]
-    fn test_browser_client_connect_to_pty_fails_without_crypto() {
+    fn test_browser_client_connect_to_pty_fails_without_agent() {
         // With mock hub_handle, connect_to_pty will fail because
-        // crypto_service is not available.
-        let mut client = BrowserClient::new(HubHandle::mock(), "test".to_string());
+        // hub_handle.get_agent() returns None.
+        let mut client = test_client("test");
 
         let result = client.connect_to_pty(0, 0);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("crypto service"));
+        assert!(result.unwrap_err().contains("not found"));
 
         // terminal_channels should remain empty.
         assert!(client.terminal_channels.is_empty());
@@ -646,7 +860,7 @@ mod tests {
 
     #[test]
     fn test_browser_client_disconnect_from_pty_is_safe_when_not_connected() {
-        let mut client = BrowserClient::new(HubHandle::mock(), "test".to_string());
+        let mut client = test_client("test");
 
         // Should not panic when not connected.
         client.disconnect_from_pty(0, 0);
@@ -658,7 +872,7 @@ mod tests {
 
     #[test]
     fn test_browser_client_trait_default_send_input_fails_without_agent() {
-        let client = BrowserClient::new(HubHandle::mock(), "test".to_string());
+        let client = test_client("test");
 
         // Default implementation looks up via hub_handle, which returns None.
         let result = Client::send_input(&client, 0, 0, b"test input");
@@ -668,7 +882,7 @@ mod tests {
 
     #[test]
     fn test_browser_client_trait_default_resize_pty_fails_without_agent() {
-        let client = BrowserClient::new(HubHandle::mock(), "test".to_string());
+        let client = test_client("test");
 
         // Default implementation looks up via hub_handle, which returns None.
         let result = Client::resize_pty(&client, 0, 0, 24, 80);
@@ -678,9 +892,476 @@ mod tests {
 
     #[test]
     fn test_browser_client_trait_default_agent_count() {
-        let client = BrowserClient::new(HubHandle::mock(), "test".to_string());
+        let client = test_client("test");
 
         // Mock returns empty, so count is 0.
         assert_eq!(Client::agent_count(&client), 0);
+    }
+
+    // ========== BrowserRequest Channel Tests ==========
+
+    #[test]
+    fn test_request_channel_created_at_construction() {
+        let client = test_client("test");
+        // Channel is created at construction - tx can send without error.
+        assert!(client.request_tx.send(BrowserRequest::SendInput {
+            agent_index: 0,
+            pty_index: 0,
+            data: vec![b'x'],
+        }).is_ok());
+    }
+
+    #[test]
+    fn test_poll_requests_empty_channel() {
+        let mut client = test_client("test");
+
+        // Should not panic with empty channel.
+        client.poll_requests();
+    }
+
+    #[test]
+    fn test_poll_requests_send_input() {
+        let mut client = test_client("test");
+
+        // Send input request (will fail since mock hub has no agents, but should not panic).
+        client.request_tx.send(BrowserRequest::SendInput {
+            agent_index: 0,
+            pty_index: 0,
+            data: vec![b'h', b'i'],
+        }).unwrap();
+
+        // Process it - should log error but not panic.
+        client.poll_requests();
+    }
+
+    #[test]
+    fn test_poll_requests_resize() {
+        let mut client = test_client("test");
+
+        // Send resize request (will fail since mock hub has no agents, but should not panic).
+        client.request_tx.send(BrowserRequest::Resize {
+            agent_index: 0,
+            pty_index: 0,
+            rows: 40,
+            cols: 120,
+        }).unwrap();
+
+        // Process it - should log error but not panic.
+        client.poll_requests();
+    }
+
+    #[test]
+    fn test_poll_requests_multiple() {
+        let mut client = test_client("test");
+
+        // Send multiple requests from different PTYs.
+        client.request_tx.send(BrowserRequest::SendInput {
+            agent_index: 0,
+            pty_index: 0,
+            data: vec![b'a'],
+        }).unwrap();
+        client.request_tx.send(BrowserRequest::Resize {
+            agent_index: 1,
+            pty_index: 0,
+            rows: 24,
+            cols: 80,
+        }).unwrap();
+        client.request_tx.send(BrowserRequest::SendInput {
+            agent_index: 0,
+            pty_index: 1,
+            data: vec![b'b'],
+        }).unwrap();
+
+        // Process all - should not panic.
+        client.poll_requests();
+    }
+
+    #[test]
+    fn test_poll_requests_from_cloned_sender() {
+        let mut client = test_client("test");
+
+        // Clone the sender (simulates what connect_to_pty_with_handle does).
+        let tx_clone = client.request_tx.clone();
+        tx_clone.send(BrowserRequest::SendInput {
+            agent_index: 0,
+            pty_index: 0,
+            data: vec![b'z'],
+        }).unwrap();
+
+        // Process it - should not panic.
+        client.poll_requests();
+    }
+
+    #[test]
+    fn test_browser_request_debug() {
+        // Verify BrowserRequest variants can be debugged.
+        let send_input = BrowserRequest::SendInput {
+            agent_index: 0,
+            pty_index: 1,
+            data: vec![1, 2, 3],
+        };
+        let resize = BrowserRequest::Resize {
+            agent_index: 2,
+            pty_index: 0,
+            rows: 40,
+            cols: 120,
+        };
+
+        assert!(format!("{:?}", send_input).contains("SendInput"));
+        assert!(format!("{:?}", resize).contains("Resize"));
+    }
+
+    // =========================================================================
+    // Integration Tests: BrowserRequest full flow with real Hub
+    // =========================================================================
+    //
+    // These tests exercise the complete BrowserRequest pipeline:
+    //   Background task sends BrowserRequest -> BrowserClient.poll_requests() ->
+    //   Client trait method -> PTY
+    //
+    // Unlike the unit tests above (which use mock HubHandle), these create a
+    // real Hub with real agents and PTY sessions to verify end-to-end behavior.
+
+    mod integration {
+        use super::*;
+        use crate::agent::Agent;
+        use crate::config::Config;
+        use crate::hub::Hub;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        /// Test configuration matching hub::tests::test_config().
+        fn test_config() -> Config {
+            Config {
+                server_url: "http://localhost:3000".to_string(),
+                token: "btstr_test-key".to_string(),
+                poll_interval: 10,
+                agent_timeout: 300,
+                max_sessions: 10,
+                worktree_base: PathBuf::from("/tmp/test-worktrees"),
+            }
+        }
+
+        const TEST_DIMS: (u16, u16) = (24, 80);
+
+        /// Create a test agent with given issue number.
+        fn create_test_agent(issue: u32) -> (String, Agent) {
+            let agent = Agent::new(
+                Uuid::new_v4(),
+                "test/repo".to_string(),
+                Some(issue),
+                format!("botster-issue-{}", issue),
+                PathBuf::from("/tmp/test"),
+            );
+            let key = format!("test-repo-{}", issue);
+            (key, agent)
+        }
+
+        /// Set up a Hub with a BrowserClient wired up.
+        ///
+        /// Returns:
+        /// - The Hub (owns all state)
+        /// - The BrowserClient (with request_tx for sending BrowserRequests)
+        ///
+        /// BrowserClient is NOT registered in the Hub's ClientRegistry here -
+        /// it's returned separately because the integration tests need direct
+        /// mutable access to call poll_requests(). The Hub is used for state
+        /// and agent management.
+        fn setup_browser_integration() -> (Hub, BrowserClient) {
+            let config = test_config();
+            let hub = Hub::new(config, TEST_DIMS).unwrap();
+
+            let hub_handle = hub.handle();
+            let runtime_handle = hub.tokio_runtime.handle().clone();
+            let browser_config = BrowserClientConfig {
+                crypto_service: CryptoServiceHandle::mock(),
+                server_url: "http://localhost:3000".to_string(),
+                api_key: "test-api-key".to_string(),
+                server_hub_id: "test-hub-id".to_string(),
+            };
+
+            let client = BrowserClient::new(
+                hub_handle,
+                "test-browser-identity-12345678".to_string(),
+                runtime_handle,
+                browser_config,
+            );
+
+            (hub, client)
+        }
+
+        /// Add an agent to the hub and sync the handle cache.
+        ///
+        /// Returns the agent key for reference.
+        fn add_agent_to_hub(hub: &mut Hub, issue: u32) -> String {
+            let (key, agent) = create_test_agent(issue);
+            hub.state.write().unwrap().add_agent(key.clone(), agent);
+            hub.sync_handle_cache();
+            key
+        }
+
+        // =====================================================================
+        // TEST 1: SendInput reaches PTY via BrowserRequest pipeline
+        // =====================================================================
+
+        /// Verify that BrowserRequest::SendInput routes keyboard input to the PTY.
+        ///
+        /// Full flow:
+        /// 1. Setup Hub with agent
+        /// 2. Create BrowserClient, connect to agent PTY directly via PtySession
+        /// 3. Send BrowserRequest::SendInput via request_tx
+        /// 4. Call poll_requests() to process the request
+        /// 5. Verify input command arrived at PTY's command channel
+        #[test]
+        fn test_browser_send_input_reaches_pty() {
+            let (mut hub, mut client) = setup_browser_integration();
+            let agent_key = add_agent_to_hub(&mut hub, 42);
+
+            // Connect BrowserClient to the agent's PTY directly (bypassing ActionCable).
+            // We register the client with the PTY so send_input works via hub_handle.
+            {
+                let state = hub.state.read().unwrap();
+                let _ = state
+                    .agents
+                    .get(&agent_key)
+                    .unwrap()
+                    .cli_pty
+                    .connect(client.id().clone(), (80, 24));
+            }
+
+            // Send input through the BrowserRequest channel
+            let input_data = b"echo hello\n".to_vec();
+            client.request_tx.send(BrowserRequest::SendInput {
+                agent_index: 0,
+                pty_index: 0,
+                data: input_data.clone(),
+            }).unwrap();
+
+            // Process the request through BrowserClient
+            client.poll_requests();
+
+            // Verify the input command arrived at the PTY.
+            // process_commands() drains the PTY's command channel and handles them.
+            let commands_processed = hub
+                .state
+                .write()
+                .unwrap()
+                .agents
+                .get_mut(&agent_key)
+                .unwrap()
+                .cli_pty
+                .process_commands();
+
+            assert!(
+                commands_processed > 0,
+                "PTY should have received at least one command (Input) from SendInput request"
+            );
+        }
+
+        // =====================================================================
+        // TEST 2: Resize reaches PTY via BrowserRequest pipeline
+        // =====================================================================
+
+        /// Verify that BrowserRequest::Resize updates PTY dimensions.
+        ///
+        /// Full flow:
+        /// 1. Setup Hub with agent
+        /// 2. Create BrowserClient, connect to agent PTY with initial dims
+        /// 3. Send BrowserRequest::Resize with new dimensions
+        /// 4. Call poll_requests()
+        /// 5. Process PTY commands
+        /// 6. Verify PTY dimensions updated
+        #[test]
+        fn test_browser_resize_reaches_pty() {
+            let (mut hub, mut client) = setup_browser_integration();
+            let agent_key = add_agent_to_hub(&mut hub, 42);
+
+            // Connect BrowserClient to the agent's PTY (becomes size owner).
+            {
+                let state = hub.state.read().unwrap();
+                let _ = state
+                    .agents
+                    .get(&agent_key)
+                    .unwrap()
+                    .cli_pty
+                    .connect(client.id().clone(), (80, 24));
+            }
+
+            // Verify initial PTY dimensions
+            let initial_dims = hub
+                .state
+                .read()
+                .unwrap()
+                .agents
+                .get(&agent_key)
+                .unwrap()
+                .cli_pty
+                .dimensions();
+            assert_eq!(initial_dims, (24, 80), "Initial PTY dims should be (24, 80)");
+
+            // Send Resize through the BrowserRequest channel
+            client.request_tx.send(BrowserRequest::Resize {
+                agent_index: 0,
+                pty_index: 0,
+                rows: 40,
+                cols: 120,
+            }).unwrap();
+
+            // Process the request (BrowserClient routes to Client::resize_pty)
+            client.poll_requests();
+
+            // Process PTY commands to apply the resize
+            hub.state
+                .write()
+                .unwrap()
+                .agents
+                .get_mut(&agent_key)
+                .unwrap()
+                .cli_pty
+                .process_commands();
+
+            // Verify PTY dimensions were updated
+            let pty_dims = hub
+                .state
+                .read()
+                .unwrap()
+                .agents
+                .get(&agent_key)
+                .unwrap()
+                .cli_pty
+                .dimensions();
+            assert_eq!(
+                pty_dims,
+                (40, 120),
+                "PTY dimensions should be (rows=40, cols=120) after Resize"
+            );
+        }
+
+        // =====================================================================
+        // TEST 3: Multi-connection - input to multiple PTYs independently
+        // =====================================================================
+
+        /// Verify that BrowserClient can route input to multiple agents' PTYs
+        /// independently.
+        ///
+        /// Browser supports multiple simultaneous PTY connections (one per tab).
+        /// This test verifies that SendInput with different agent_index values
+        /// routes to the correct PTY.
+        ///
+        /// Full flow:
+        /// 1. Setup Hub with 2 agents
+        /// 2. Create BrowserClient, connect to BOTH agent PTYs
+        /// 3. Send input to agent 0's PTY
+        /// 4. Send input to agent 1's PTY
+        /// 5. Verify each PTY received its input independently
+        #[test]
+        fn test_browser_multi_connection() {
+            let (mut hub, mut client) = setup_browser_integration();
+            let agent_key_0 = add_agent_to_hub(&mut hub, 42);
+            let agent_key_1 = add_agent_to_hub(&mut hub, 43);
+
+            // Connect BrowserClient to both agents' PTYs directly.
+            {
+                let state = hub.state.read().unwrap();
+                let _ = state
+                    .agents
+                    .get(&agent_key_0)
+                    .unwrap()
+                    .cli_pty
+                    .connect(client.id().clone(), (80, 24));
+                let _ = state
+                    .agents
+                    .get(&agent_key_1)
+                    .unwrap()
+                    .cli_pty
+                    .connect(client.id().clone(), (80, 24));
+            }
+
+            // Send input to agent 0
+            client.request_tx.send(BrowserRequest::SendInput {
+                agent_index: 0,
+                pty_index: 0,
+                data: b"agent-0-input\n".to_vec(),
+            }).unwrap();
+
+            // Send input to agent 1
+            client.request_tx.send(BrowserRequest::SendInput {
+                agent_index: 1,
+                pty_index: 0,
+                data: b"agent-1-input\n".to_vec(),
+            }).unwrap();
+
+            // Process all requests
+            client.poll_requests();
+
+            // Verify agent 0's PTY received its command
+            let commands_0 = hub
+                .state
+                .write()
+                .unwrap()
+                .agents
+                .get_mut(&agent_key_0)
+                .unwrap()
+                .cli_pty
+                .process_commands();
+            assert!(
+                commands_0 > 0,
+                "Agent 0's PTY should have received input command"
+            );
+
+            // Verify agent 1's PTY received its command
+            let commands_1 = hub
+                .state
+                .write()
+                .unwrap()
+                .agents
+                .get_mut(&agent_key_1)
+                .unwrap()
+                .cli_pty
+                .process_commands();
+            assert!(
+                commands_1 > 0,
+                "Agent 1's PTY should have received input command"
+            );
+        }
+
+        // =====================================================================
+        // TEST 4: SendInput without connection is a no-op (no crash)
+        // =====================================================================
+
+        /// Verify that BrowserRequest::SendInput is handled gracefully when
+        /// no PTY connection exists.
+        ///
+        /// Browser clients might send input before connecting to any PTY
+        /// (race condition). This should not crash - the error is logged and
+        /// the request is silently dropped.
+        ///
+        /// Full flow:
+        /// 1. Create BrowserClient but do NOT connect to any PTY
+        /// 2. Send BrowserRequest::SendInput
+        /// 3. Call poll_requests()
+        /// 4. Verify no crash (request is gracefully ignored)
+        #[test]
+        fn test_browser_send_input_without_connection_is_noop() {
+            let (_hub, mut client) = setup_browser_integration();
+
+            // Do NOT connect to any PTY.
+            // BrowserClient has no connected PTYs.
+
+            // Send input (should be gracefully handled - error logged, no crash)
+            client.request_tx.send(BrowserRequest::SendInput {
+                agent_index: 0,
+                pty_index: 0,
+                data: b"echo hello\n".to_vec(),
+            }).unwrap();
+
+            // Process the request - should not panic.
+            // The Client::send_input default implementation will fail because
+            // hub_handle.get_agent(0) returns None (no agents), but BrowserClient
+            // logs the error and continues.
+            client.poll_requests();
+
+            // If we got here without panic, the test passes.
+        }
     }
 }

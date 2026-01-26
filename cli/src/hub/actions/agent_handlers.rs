@@ -64,6 +64,10 @@ pub fn handle_spawn_agent(
     match lifecycle::spawn_agent(&mut hub.state.write().unwrap(), &config, dims) {
         Ok(result) => {
             log::info!("Spawned agent: {}", result.agent_id);
+
+            // Sync handle cache for thread-safe agent access
+            hub.sync_handle_cache();
+
             if let Some(port) = result.tunnel_port {
                 let tm = Arc::clone(&hub.tunnel_manager);
                 let key = result.agent_id.clone();
@@ -87,6 +91,9 @@ pub fn handle_close_agent(hub: &mut Hub, session_key: &str, delete_worktree: boo
         delete_worktree,
     ) {
         log::error!("Failed to close agent {}: {}", session_key, e);
+    } else {
+        // Sync handle cache for thread-safe agent access
+        hub.sync_handle_cache();
     }
 }
 
@@ -98,6 +105,9 @@ pub fn handle_kill_selected_agent(hub: &mut Hub) {
     if let Some(key) = hub.get_tui_selected_agent_key() {
         if let Err(e) = lifecycle::close_agent(&mut hub.state.write().unwrap(), &key, false) {
             log::error!("Failed to kill agent: {}", e);
+        } else {
+            // Sync handle cache for thread-safe agent access
+            hub.sync_handle_cache();
         }
     }
 }

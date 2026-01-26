@@ -96,23 +96,23 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
                     send_agent_selected_to_browser(hub, &browser_identity, id);
 
                     // Connect browser to PTY - creates output forwarder and sends scrollback
-                    let agent_index = hub
-                        .state
-                        .read()
-                        .unwrap()
-                        .agent_keys_ordered
-                        .iter()
-                        .position(|k| k == id);
+                    // Look up agent handle directly from Hub's state (NOT through hub_handle,
+                    // which would send a command back to Hub and deadlock).
+                    let state = hub.state.read().unwrap();
+                    let agent_index = state.agent_keys_ordered.iter().position(|k| k == id);
 
                     if let Some(idx) = agent_index {
-                        let client_id = ClientId::Browser(browser_identity.clone());
-                        if let Some(client) = hub.clients.get_mut(&client_id) {
-                            if let Err(e) = client.connect_to_pty(idx, 0) {
-                                log::warn!(
-                                    "Failed to connect browser {} to PTY: {}",
-                                    &browser_identity[..8.min(browser_identity.len())],
-                                    e
-                                );
+                        if let Some(agent_handle) = state.get_agent_handle(idx) {
+                            drop(state); // Release lock before calling connect
+                            let client_id = ClientId::Browser(browser_identity.clone());
+                            if let Some(client) = hub.clients.get_mut(&client_id) {
+                                if let Err(e) = client.connect_to_pty_with_handle(&agent_handle, idx, 0) {
+                                    log::warn!(
+                                        "Failed to connect browser {} to PTY: {}",
+                                        &browser_identity[..8.min(browser_identity.len())],
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
@@ -155,25 +155,18 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
                 log::info!("Received regenerated PreKeyBundle");
                 hub.browser.signal_bundle = Some(bundle);
                 hub.browser.bundle_used = false;
-                // Update connection URL with new bundle
-                if let Some(ref bundle) = hub.browser.signal_bundle {
-                    use data_encoding::BASE32_NOPAD;
-                    if let Ok(bytes) = bundle.to_binary() {
-                        let encoded = BASE32_NOPAD.encode(&bytes);
-                        hub.connection_url = Some(format!(
-                            "{}/hubs/{}#{}",
-                            hub.config.server_url,
-                            hub.server_hub_id(),
-                            encoded
-                        ));
-                        // Also write to file for external access
-                        let _ = crate::relay::write_connection_url(
-                            &hub.hub_identifier,
-                            hub.connection_url.as_ref().unwrap(),
-                        );
-                        // NOTE: qr_image_displayed is TUI state, handled by TuiRunner
-                        log::info!("Connection URL updated with new bundle");
-                    }
+                // Update cached connection URL with new bundle
+                let result = hub.generate_connection_url();
+                hub.handle_cache.set_connection_url(result.clone());
+                if let Ok(ref url) = result {
+                    hub.connection_url = Some(url.clone());
+                    // Also write to file for external access
+                    let _ = crate::relay::write_connection_url(
+                        &hub.hub_identifier,
+                        url,
+                    );
+                    // NOTE: qr_image_displayed is TUI state, handled by TuiRunner
+                    log::info!("Connection URL updated with new bundle");
                 }
             }
 

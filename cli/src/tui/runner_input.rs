@@ -20,8 +20,7 @@ use vt100::Parser;
 
 use crate::agent::PtyView;
 use crate::app::AppMode;
-use crate::client::Client;
-use crate::hub::{CreateAgentRequest, DeleteAgentRequest, HubCommand};
+use crate::client::{CreateAgentRequest, DeleteAgentRequest, TuiRequest};
 use crate::tui::events::CreationStage;
 use crate::tui::menu::{build_menu, get_action_for_selection, MenuAction, MenuContext};
 
@@ -58,16 +57,22 @@ where
             MenuAction::NewAgent => {
                 self.mode = AppMode::NewAgentSelectWorktree;
                 self.worktree_selected = 0;
-                // Request worktree list from Hub
-                match self.command_tx.list_worktrees_blocking() {
-                    Ok(worktrees) => {
-                        self.available_worktrees = worktrees;
-                        log::debug!("Loaded {} worktrees", self.available_worktrees.len());
+                // Request worktree list via TuiRequest (blocking with oneshot response)
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                if self.request_tx.send(TuiRequest::ListWorktrees { response_tx }).is_ok() {
+                    match response_rx.blocking_recv() {
+                        Ok(worktrees) => {
+                            self.available_worktrees = worktrees;
+                            log::debug!("Loaded {} worktrees", self.available_worktrees.len());
+                        }
+                        Err(_) => {
+                            log::error!("Failed to receive worktree list");
+                            self.available_worktrees = Vec::new();
+                        }
                     }
-                    Err(e) => {
-                        log::error!("Failed to load worktrees: {}", e);
-                        self.available_worktrees = Vec::new();
-                    }
+                } else {
+                    log::error!("Failed to send list worktrees request");
+                    self.available_worktrees = Vec::new();
                 }
             }
             MenuAction::CloseAgent => {
@@ -81,13 +86,12 @@ where
             }
             MenuAction::TogglePtyView => {
                 // Toggle PTY view - same logic as TuiAction::TogglePtyView
-                if let Some(ref handle) = self.agent_handle {
+                if let Some(agent_index) = self.current_agent_index {
                     let current_view = self.active_pty_view;
                     let new_view = match current_view {
                         PtyView::Cli => PtyView::Server,
                         PtyView::Server => PtyView::Cli,
                     };
-                    self.active_pty_view = new_view;
 
                     // Get PTY index (0 = CLI, 1 = Server)
                     let pty_index = match new_view {
@@ -96,18 +100,20 @@ where
                     };
 
                     // Check if PTY exists and connect
-                    if handle.get_pty(pty_index).is_some() {
-                        // Find agent index in our local list
-                        let agent_id = handle.agent_id();
-                        let agent_index = self
-                            .agents
-                            .iter()
-                            .position(|a| a.id == agent_id)
-                            .unwrap_or(0);
+                    let can_toggle = match new_view {
+                        PtyView::Cli => true, // CLI PTY always exists
+                        PtyView::Server => self.has_server_pty,
+                    };
 
+                    if can_toggle {
+                        self.active_pty_view = new_view;
                         self.current_pty_index = Some(pty_index);
-                        if let Err(e) = self.client.connect_to_pty(agent_index, pty_index) {
-                            log::warn!("Failed to connect to PTY: {}", e);
+
+                        if let Err(e) = self.request_tx.send(TuiRequest::ConnectToPty {
+                            agent_index,
+                            pty_index,
+                        }) {
+                            log::warn!("Failed to send connect to PTY request: {}", e);
                         }
 
                         // Clear and reset parser for new PTY stream
@@ -130,17 +136,9 @@ where
     ///
     /// A `MenuContext` reflecting the current TUI state for dynamic menu building.
     pub fn build_menu_context(&self) -> MenuContext {
-        // Check if we have a selected agent with server PTY
-        let has_agent = self.selected_agent.is_some();
-        // Check if server PTY exists (index 1)
-        let has_server_pty = self
-            .agent_handle
-            .as_ref()
-            .is_some_and(|h| h.get_pty(1).is_some());
-
         MenuContext {
-            has_agent,
-            has_server_pty,
+            has_agent: self.selected_agent.is_some(),
+            has_server_pty: self.has_server_pty,
             active_pty: self.active_pty_view,
         }
     }
@@ -169,10 +167,9 @@ where
                 // Create agent request with the existing worktree
                 let request =
                     CreateAgentRequest::new(branch.clone()).from_worktree(PathBuf::from(path));
-                let (cmd, _rx) = HubCommand::create_agent(request);
-                if let Err(e) = self.command_tx.inner().blocking_send(cmd) {
-                    // Channel closed - Hub is shutting down, return to Normal
-                    log::error!("Failed to send create agent command: {}", e);
+                if let Err(e) = self.request_tx.send(TuiRequest::CreateAgent { request }) {
+                    // Channel closed - TuiClient is shutting down
+                    log::error!("Failed to send create agent request: {}", e);
                     self.mode = AppMode::Normal;
                 } else {
                     // Track pending creation for sidebar display
@@ -225,11 +222,10 @@ where
                         request = request.with_prompt(p);
                     }
 
-                    // Send the create agent command
-                    let (cmd, _rx) = HubCommand::create_agent(request);
-                    if let Err(e) = self.command_tx.inner().blocking_send(cmd) {
-                        // Channel closed - Hub is shutting down, return to Normal
-                        log::error!("Failed to send create agent command: {}", e);
+                    // Send the create agent request via TuiClient
+                    if let Err(e) = self.request_tx.send(TuiRequest::CreateAgent { request }) {
+                        // Channel closed - TuiClient is shutting down
+                        log::error!("Failed to send create agent request: {}", e);
                         self.mode = AppMode::Normal;
                         self.input_buffer.clear();
                     } else {
@@ -252,7 +248,7 @@ where
 
     /// Handle confirm close agent.
     ///
-    /// Sends a `DeleteAgent` command to the Hub with the current selected agent.
+    /// Sends a `DeleteAgent` request via TuiClient with the current selected agent.
     /// The `delete_worktree` flag determines whether to also delete the worktree.
     ///
     /// # Arguments
@@ -265,8 +261,7 @@ where
             } else {
                 DeleteAgentRequest::new(key)
             };
-            let (cmd, _rx) = HubCommand::delete_agent(request);
-            let _ = self.command_tx.inner().blocking_send(cmd);
+            let _ = self.request_tx.send(TuiRequest::DeleteAgent { request });
         }
         self.mode = AppMode::Normal;
     }

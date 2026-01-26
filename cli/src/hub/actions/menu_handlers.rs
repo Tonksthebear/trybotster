@@ -24,41 +24,17 @@ pub fn handle_close_modal(hub: &mut Hub) {
 
 /// Handle showing the connection QR code.
 pub fn handle_show_connection_code(hub: &mut Hub) {
-    // Generate connection URL with Signal PreKeyBundle
-    // Format: /hubs/{id}#{base32_binary_bundle}
-    // - All uppercase for QR alphanumeric mode (4296 char capacity vs 2953 byte mode)
-    // - Binary format (1813 bytes) + Base32 = ~2900 chars (fits easily)
-    // - Hub ID in path, bundle in fragment (never sent to server)
-    hub.connection_url = if let Some(ref bundle) = hub.browser.signal_bundle {
-        use data_encoding::BASE32_NOPAD;
-        match bundle.to_binary() {
-            Ok(bytes) => {
-                let encoded = BASE32_NOPAD.encode(&bytes);
-                // URL uses mixed-mode QR encoding:
-                // - URL portion (up to #): byte mode (any case allowed)
-                // - Bundle (after #): alphanumeric mode (must be uppercase Base32)
-                // Rails ID is numeric, uppercase is no-op but harmless
-                let url = format!(
-                    "{}/hubs/{}#{}",
-                    hub.config.server_url,
-                    hub.server_hub_id(),
-                    encoded
-                );
-                log::debug!(
-                    "Connection URL: {} chars (QR alphanumeric capacity: 4296)",
-                    url.len()
-                );
-                Some(url)
-            }
-            Err(e) => {
-                log::error!("Cannot serialize PreKeyBundle to binary: {e}");
-                None
-            }
+    // Generate connection URL using the canonical method
+    let result = hub.generate_connection_url();
+    hub.connection_url = match &result {
+        Ok(url) => Some(url.clone()),
+        Err(e) => {
+            log::error!("Cannot show connection code: {e}");
+            None
         }
-    } else {
-        log::error!("Cannot show connection code: Signal bundle not initialized");
-        None
     };
+    // Cache for direct reads by clients on Hub thread (via HandleCache)
+    hub.handle_cache.set_connection_url(result);
     // Reset QR image flag so it renders fresh when modal opens
     hub.qr_image_displayed = false;
     hub.mode = AppMode::ConnectionCode;

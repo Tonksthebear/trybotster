@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::{Client, ClientId};
+use super::{BrowserClient, Client, ClientId, TuiClient};
 
 /// Registry of all connected clients.
 ///
@@ -80,6 +80,50 @@ impl ClientRegistry {
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
     }
+
+    /// Poll all clients for pending requests.
+    ///
+    /// Processes request channels for TuiClient and all BrowserClients.
+    /// Called from Hub's main event loop to drain request queues.
+    ///
+    /// Without this, `TuiRequest` and `BrowserRequest` messages sent by
+    /// TuiRunner and browser input receivers will sit in their channels
+    /// forever, causing `blocking_recv()` calls in TuiRunner to deadlock.
+    pub fn poll_all_requests(&mut self) {
+        for client in self.clients.values_mut() {
+            if let Some(any) = client.as_any_mut() {
+                if let Some(tui) = any.downcast_mut::<TuiClient>() {
+                    tui.poll_requests();
+                } else if let Some(browser) = any.downcast_mut::<BrowserClient>() {
+                    browser.poll_requests();
+                }
+            }
+        }
+    }
+
+    /// Get the TuiClient if registered.
+    ///
+    /// Returns a mutable reference to the TuiClient if one is registered.
+    /// This allows Hub to access TuiClient-specific methods that aren't on
+    /// the Client trait (like `connected_pty()` and `clear_connection()`).
+    ///
+    /// Uses `Any` for downcasting internally.
+    #[must_use]
+    pub fn get_tui_mut(&mut self) -> Option<&mut TuiClient> {
+        self.clients.get_mut(&ClientId::Tui).and_then(|boxed| {
+            boxed.as_any_mut().and_then(|any| any.downcast_mut::<TuiClient>())
+        })
+    }
+
+    /// Get the TuiClient if registered (immutable).
+    ///
+    /// Returns an immutable reference to the TuiClient if one is registered.
+    #[must_use]
+    pub fn get_tui(&self) -> Option<&TuiClient> {
+        self.clients.get(&ClientId::Tui).and_then(|boxed| {
+            boxed.as_any().and_then(|any| any.downcast_ref::<TuiClient>())
+        })
+    }
 }
 
 impl Default for ClientRegistry {
@@ -99,7 +143,7 @@ impl std::fmt::Debug for ClientRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hub::HubHandle;
+    use crate::hub::{AgentHandle, HubHandle};
 
     /// Test client implementing the Client trait.
     ///
@@ -138,7 +182,12 @@ mod tests {
             self.dims = (cols, rows);
         }
 
-        fn connect_to_pty(&mut self, _agent_index: usize, _pty_index: usize) -> Result<(), String> {
+        fn connect_to_pty_with_handle(
+            &mut self,
+            _agent_handle: &AgentHandle,
+            _agent_index: usize,
+            _pty_index: usize,
+        ) -> Result<(), String> {
             Ok(())
         }
 

@@ -1,18 +1,39 @@
 //! Agent handle for client-to-agent communication.
 //!
 //! `AgentHandle` provides a clean interface for clients to interact with agents.
-//! Clients obtain handles via `HubCommand::GetAgentByIndex`, then use the handle to:
+//! Clients obtain handles and use them to:
 //! - Get agent info
 //! - Access PTY sessions (subscribe, send input, resize)
+//!
+//! # How to Get Agent Handles
+//!
+//! There are two ways to obtain handles, depending on thread context:
+//!
+//! ## 1. Via HandleCache (preferred for clients)
+//!
+//! Clients using `HubHandle` read directly from the cache:
+//!
+//! ```text
+//! HubHandle::get_agent(idx) → HandleCache → Option<AgentHandle>
+//! ```
+//!
+//! Use this from TuiClient, BrowserClient, or any code on Hub's thread.
+//!
+//! ## 2. Via GetAgentByIndex command (TuiRunner only)
+//!
+//! TuiRunner runs on a separate thread and uses blocking commands:
+//!
+//! ```text
+//! TuiRunner → HubCommand::GetAgentByIndex(idx) → Hub → AgentHandle
+//! ```
 //!
 //! # Hierarchy
 //!
 //! ```text
-//! Hub
-//!   └── GetAgentByIndex(idx) → Option<AgentHandle>
-//!                                 ├── info() → AgentInfo
-//!                                 ├── get_pty(0) → Option<&PtyHandle>  (CLI PTY)
-//!                                 └── get_pty(1) → Option<&PtyHandle>  (Server PTY)
+//! AgentHandle
+//!   ├── info() → AgentInfo
+//!   ├── get_pty(0) → Option<&PtyHandle>  (CLI PTY)
+//!   └── get_pty(1) → Option<&PtyHandle>  (Server PTY)
 //!
 //! PtyHandle
 //!   ├── subscribe() → broadcast::Receiver<PtyEvent>
@@ -39,8 +60,12 @@ use crate::relay::types::AgentInfo;
 
 /// Handle for interacting with an agent.
 ///
-/// Clients obtain this via `HubCommand::GetAgentByIndex`. The handle provides
-/// access to agent info and PTY sessions without exposing internal state.
+/// Clients obtain this via:
+/// - `HubHandle::get_agent()` - reads from HandleCache (preferred)
+/// - `HubCommand::GetAgentByIndex` - cross-thread only (TuiRunner)
+///
+/// The handle provides access to agent info and PTY sessions without
+/// exposing internal state.
 ///
 /// # Thread Safety
 ///

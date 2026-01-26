@@ -1,8 +1,8 @@
 //! Hub handle for thread-safe client communication.
 //!
 //! `HubHandle` provides a clean, synchronous API for clients to query Hub state.
-//! It wraps the command channel and provides blocking methods suitable for
-//! client threads that don't run in an async context.
+//! It wraps the command channel AND the HandleCache to provide safe access
+//! from any thread without deadlocks.
 //!
 //! # Design
 //!
@@ -11,6 +11,15 @@
 //! - Encapsulates channel details from clients
 //! - Provides type-safe, discoverable API
 //! - Handles errors gracefully (returns empty/None on channel errors)
+//!
+//! # Agent Access
+//!
+//! `get_agent()` reads from `HandleCache` directly - it does NOT send a
+//! blocking command. This is critical for avoiding deadlocks when called
+//! from Hub's thread (TuiClient, BrowserClient).
+//!
+//! TuiRunner runs on a separate thread and uses `GetAgentByIndex` command
+//! instead (see `runner_agent.rs`).
 //!
 //! # Thread Safety
 //!
@@ -25,23 +34,20 @@
 //! // Get handle from Hub
 //! let handle = hub.handle();
 //!
-//! // Pass to client thread
-//! std::thread::spawn(move || {
-//!     // Query agents (blocking)
-//!     let agents = handle.get_agents();
-//!     for info in &agents {
-//!         println!("{}: {:?}", info.id, info.status);
-//!     }
+//! // TuiClient/BrowserClient on Hub's thread
+//! if let Some(agent_handle) = handle.get_agent(0) {
+//!     // Safe - reads from cache, no blocking command
+//!     let pty = agent_handle.get_pty(0).expect("CLI PTY always present");
+//!     pty.write_input_blocking(b"hello")?;
+//! }
 //!
-//!     // Get specific agent by index
-//!     if let Some(agent_handle) = handle.get_agent(0) {
-//!         let pty = agent_handle.get_pty(0).expect("CLI PTY always present");
-//!         // Use PTY handle...
-//!     }
-//! });
+//! // Query agents (uses ListAgents command)
+//! let agents = handle.get_agents();
 //! ```
 
 // Rust guideline compliant 2026-01-23
+
+use std::sync::Arc;
 
 use super::agent_handle::AgentHandle;
 use super::commands::{CreateAgentRequest, DeleteAgentRequest, HubCommand, HubCommandSender};
@@ -81,15 +87,20 @@ use crate::relay::types::AgentInfo;
 pub struct HubHandle {
     /// Underlying command sender.
     command_tx: HubCommandSender,
+    /// Thread-safe cache for direct agent handle access and shared state.
+    ///
+    /// Provides non-blocking reads for agent handles, worktrees, and
+    /// connection URLs. Hub updates the cache on lifecycle events.
+    handle_cache: Arc<super::handle_cache::HandleCache>,
 }
 
 impl HubHandle {
-    /// Create a new `HubHandle` from a command sender.
+    /// Create a new `HubHandle` from a command sender and handle cache.
     ///
     /// Called internally by `Hub::handle()`.
     #[must_use]
-    pub fn new(command_tx: HubCommandSender) -> Self {
-        Self { command_tx }
+    pub fn new(command_tx: HubCommandSender, handle_cache: Arc<super::handle_cache::HandleCache>) -> Self {
+        Self { command_tx, handle_cache }
     }
 
     /// Create a mock `HubHandle` for testing.
@@ -109,6 +120,7 @@ impl HubHandle {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         Self {
             command_tx: HubCommandSender::new(tx),
+            handle_cache: Arc::new(super::handle_cache::HandleCache::new()),
         }
     }
 
@@ -133,7 +145,7 @@ impl HubHandle {
         self.command_tx.list_agents_blocking().unwrap_or_default()
     }
 
-    /// Get an agent handle by display index.
+    /// Get an agent handle by display index (non-blocking).
     ///
     /// Returns an `AgentHandle` for the agent at the given position in the
     /// display order. The handle provides access to:
@@ -143,8 +155,11 @@ impl HubHandle {
     ///
     /// Returns `None` if:
     /// - The index is out of bounds
-    /// - The Hub is shutting down
-    /// - The channel is closed
+    /// - The cache is empty
+    ///
+    /// **NOTE**: Reads directly from HandleCache without sending commands to Hub.
+    /// This allows clients to access agent handles from any context, including
+    /// within Hub command handlers, without blocking or deadlocking.
     ///
     /// # Arguments
     ///
@@ -164,10 +179,8 @@ impl HubHandle {
     /// ```
     #[must_use]
     pub fn get_agent(&self, index: usize) -> Option<AgentHandle> {
-        self.command_tx
-            .get_agent_by_index_blocking(index)
-            .ok()
-            .flatten()
+        // Read directly from cache - no blocking command channel
+        self.handle_cache.get_agent(index)
     }
 
     /// Request agent creation (fire-and-forget).
@@ -282,10 +295,44 @@ impl HubHandle {
     }
 
     // ============================================================
+    // Worktree Methods
+    // ============================================================
+
+    /// List available worktrees for agent creation (non-blocking).
+    ///
+    /// Reads directly from HandleCache. Hub maintains the worktree list
+    /// on agent lifecycle changes and worktree refresh events.
+    ///
+    /// Returns a list of (path, branch_name) pairs for existing worktrees
+    /// that can be reopened.
+    pub fn list_worktrees(&self) -> Result<Vec<(String, String)>, String> {
+        Ok(self.handle_cache.get_worktrees())
+    }
+
+    // ============================================================
+    // Action Dispatch Methods
+    // ============================================================
+
+    /// Dispatch a HubAction (fire-and-forget).
+    ///
+    /// Sends an action to the Hub for processing. Returns immediately
+    /// without waiting for the action to complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub fn dispatch_action(&self, action: super::HubAction) -> Result<(), String> {
+        self.command_tx.dispatch_action_blocking(action)
+    }
+
+    // ============================================================
     // Connection Code Methods
     // ============================================================
 
-    /// Get the current connection code URL (blocking).
+    /// Get the current connection code URL (non-blocking).
+    ///
+    /// Reads the cached URL directly from shared state. Hub updates this
+    /// cache whenever the Signal bundle changes (initialization or refresh).
     ///
     /// Returns the full URL containing the Signal PreKeyBundle for browser
     /// connection. The URL format is:
@@ -297,8 +344,9 @@ impl HubHandle {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The Signal bundle is not initialized
-    /// - The command channel is closed
+    /// - The connection code has not yet been generated
+    /// - The Signal bundle was not initialized
+    /// - The state lock is poisoned
     ///
     /// # Example
     ///
@@ -309,34 +357,24 @@ impl HubHandle {
     /// }
     /// ```
     pub fn get_connection_code(&self) -> Result<String, String> {
-        self.command_tx.get_connection_code_blocking()
+        self.handle_cache.get_connection_url()
     }
 
-    /// Refresh the connection code (regenerate Signal bundle) (blocking).
+    /// Request connection code refresh (fire-and-forget).
     ///
-    /// Requests regeneration of the Signal PreKeyBundle. This invalidates
-    /// the previous connection code and returns a new one.
+    /// Sends a command to Hub to regenerate the Signal bundle. The new URL
+    /// will be available via `get_connection_code()` after Hub processes the
+    /// command and updates shared state.
     ///
-    /// Note: This operation may take some time as it waits for the relay
-    /// to generate and return a new bundle.
+    /// This is non-blocking and safe to call from Hub's thread.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The relay is not connected
-    /// - Bundle regeneration fails
-    /// - The command channel is closed
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// match handle.refresh_connection_code() {
-    ///     Ok(new_url) => println!("New connection URL: {}", new_url),
-    ///     Err(e) => eprintln!("Failed to refresh: {}", e),
-    /// }
-    /// ```
-    pub fn refresh_connection_code(&self) -> Result<String, String> {
-        self.command_tx.refresh_connection_code_blocking()
+    /// Returns an error if the command channel is full or closed.
+    pub fn refresh_connection_code(&self) -> Result<(), String> {
+        let (response_tx, _rx) = tokio::sync::oneshot::channel();
+        let cmd = HubCommand::RefreshConnectionCode { response_tx };
+        self.command_tx.try_send(cmd)
     }
 
     // ============================================================
@@ -394,6 +432,7 @@ impl HubHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::handle_cache::HandleCache;
     use tokio::sync::mpsc;
 
     #[test]
@@ -408,6 +447,11 @@ mod tests {
         assert_clone::<HubHandle>();
     }
 
+    /// Helper to create a handle with custom cache for tests
+    fn test_handle_with_cache(tx: tokio::sync::mpsc::Sender<HubCommand>, cache: Arc<HandleCache>) -> HubHandle {
+        HubHandle::new(HubCommandSender::new(tx), cache)
+    }
+
     #[test]
     fn test_hub_handle_get_agents_empty_on_closed_channel() {
         // Create a runtime just for channel creation, then drop it
@@ -416,8 +460,8 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async { tokio::sync::mpsc::channel::<HubCommand>(16) })
         };
-        let sender = HubCommandSender::new(tx);
-        let handle = HubHandle::new(sender);
+        let cache = Arc::new(HandleCache::new());
+        let handle = test_handle_with_cache(tx, cache);
 
         // Drop receiver to close channel
         drop(rx);
@@ -428,20 +472,11 @@ mod tests {
     }
 
     #[test]
-    fn test_hub_handle_get_agent_none_on_closed_channel() {
-        // Create a runtime just for channel creation, then drop it
-        // before calling blocking methods
-        let (tx, rx) = {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async { tokio::sync::mpsc::channel::<HubCommand>(16) })
-        };
-        let sender = HubCommandSender::new(tx);
-        let handle = HubHandle::new(sender);
+    fn test_hub_handle_get_agent_none_on_empty_cache() {
+        // get_agent now reads from cache, not channel
+        let handle = HubHandle::mock();
 
-        // Drop receiver to close channel
-        drop(rx);
-
-        // Should return None on error
+        // Should return None on empty cache
         let agent = handle.get_agent(0);
         assert!(agent.is_none());
     }
@@ -449,8 +484,8 @@ mod tests {
     #[tokio::test]
     async fn test_hub_handle_is_closed() {
         let (tx, rx) = mpsc::channel::<HubCommand>(16);
-        let sender = HubCommandSender::new(tx);
-        let handle = HubHandle::new(sender);
+        let cache = Arc::new(HandleCache::new());
+        let handle = test_handle_with_cache(tx, cache);
 
         assert!(!handle.is_closed());
 
@@ -463,8 +498,8 @@ mod tests {
     #[tokio::test]
     async fn test_hub_handle_get_agents_with_response() {
         let (tx, mut rx) = mpsc::channel::<HubCommand>(16);
-        let sender = HubCommandSender::new(tx);
-        let handle = HubHandle::new(sender);
+        let cache = Arc::new(HandleCache::new());
+        let handle = test_handle_with_cache(tx, cache);
 
         // Spawn task to handle the command
         let handler = tokio::spawn(async move {
@@ -501,26 +536,48 @@ mod tests {
     }
 
     // ============================================================
-    // Connection Code Tests
+    // Connection Code Tests (reads from shared state)
     // ============================================================
 
     #[test]
-    fn test_hub_handle_get_connection_code_error_on_closed_channel() {
-        // Create a runtime just for channel creation
-        let (tx, rx) = {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async { tokio::sync::mpsc::channel::<HubCommand>(16) })
-        };
-        let sender = HubCommandSender::new(tx);
-        let handle = HubHandle::new(sender);
-
-        // Drop receiver to close channel
-        drop(rx);
-
-        // Should return error on closed channel
+    fn test_hub_handle_get_connection_code_not_yet_generated() {
+        // With no cached URL, should return error
+        let handle = HubHandle::mock();
         let result = handle.get_connection_code();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("channel"));
+        assert!(result.unwrap_err().contains("not yet generated"));
+    }
+
+    #[test]
+    fn test_hub_handle_get_connection_code_success() {
+        let (tx, _rx) = mpsc::channel::<HubCommand>(16);
+        let cache = Arc::new(HandleCache::new());
+
+        // Pre-populate the cached connection URL in HandleCache
+        cache.set_connection_url(Ok(
+            "https://botster.dev/hubs/123#GEZDGNBVGY3TQOJQ".to_string(),
+        ));
+
+        let handle = test_handle_with_cache(tx, cache);
+        let result = handle.get_connection_code();
+        assert!(result.is_ok());
+        let url = result.unwrap();
+        assert!(url.contains("botster.dev"));
+        assert!(url.contains("#")); // Fragment with bundle
+    }
+
+    #[test]
+    fn test_hub_handle_get_connection_code_no_bundle() {
+        let (tx, _rx) = mpsc::channel::<HubCommand>(16);
+        let cache = Arc::new(HandleCache::new());
+
+        // Pre-populate with an error result
+        cache.set_connection_url(Err("Signal bundle not initialized".to_string()));
+
+        let handle = test_handle_with_cache(tx, cache);
+        let result = handle.get_connection_code();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Signal bundle"));
     }
 
     #[test]
@@ -530,124 +587,61 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async { tokio::sync::mpsc::channel::<HubCommand>(16) })
         };
-        let sender = HubCommandSender::new(tx);
-        let handle = HubHandle::new(sender);
+        let cache = Arc::new(HandleCache::new());
+        let handle = test_handle_with_cache(tx, cache);
 
         // Drop receiver to close channel
         drop(rx);
 
-        // Should return error on closed channel
+        // Should return error on closed channel (try_send fails)
         let result = handle.refresh_connection_code();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("channel"));
     }
 
     #[tokio::test]
-    async fn test_hub_handle_get_connection_code_success() {
+    async fn test_hub_handle_refresh_connection_code_sends_command() {
         let (tx, mut rx) = mpsc::channel::<HubCommand>(16);
-        let sender = HubCommandSender::new(tx);
-        let handle = HubHandle::new(sender);
+        let cache = Arc::new(HandleCache::new());
+        let handle = test_handle_with_cache(tx, cache);
 
-        // Spawn task to handle the command
-        let handler = tokio::spawn(async move {
-            if let Some(cmd) = rx.recv().await {
-                if let HubCommand::GetConnectionCode { response_tx } = cmd {
-                    let url = "https://botster.dev/hubs/123#GEZDGNBVGY3TQOJQ".to_string();
-                    let _ = response_tx.send(Ok(url));
-                }
-            }
-        });
-
-        // Use spawn_blocking for the blocking call
-        let result = tokio::task::spawn_blocking(move || handle.get_connection_code())
-            .await
-            .unwrap();
-
-        handler.await.unwrap();
-
+        // Fire-and-forget refresh
+        let result = handle.refresh_connection_code();
         assert!(result.is_ok());
-        let url = result.unwrap();
-        assert!(url.contains("botster.dev"));
-        assert!(url.contains("#")); // Fragment with bundle
+
+        // Verify the command was sent
+        let cmd = rx.try_recv().expect("Should have received a command");
+        assert!(cmd.is_refresh_connection_code());
     }
 
-    #[tokio::test]
-    async fn test_hub_handle_get_connection_code_no_bundle() {
-        let (tx, mut rx) = mpsc::channel::<HubCommand>(16);
-        let sender = HubCommandSender::new(tx);
-        let handle = HubHandle::new(sender);
+    // ============================================================
+    // List Worktrees Tests (reads from shared state)
+    // ============================================================
 
-        // Spawn task to handle the command with error response
-        let handler = tokio::spawn(async move {
-            if let Some(cmd) = rx.recv().await {
-                if let HubCommand::GetConnectionCode { response_tx } = cmd {
-                    let _ = response_tx.send(Err("Signal bundle not initialized".to_string()));
-                }
-            }
-        });
-
-        // Use spawn_blocking for the blocking call
-        let result = tokio::task::spawn_blocking(move || handle.get_connection_code())
-            .await
-            .unwrap();
-
-        handler.await.unwrap();
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Signal bundle"));
-    }
-
-    #[tokio::test]
-    async fn test_hub_handle_refresh_connection_code_success() {
-        let (tx, mut rx) = mpsc::channel::<HubCommand>(16);
-        let sender = HubCommandSender::new(tx);
-        let handle = HubHandle::new(sender);
-
-        // Spawn task to handle the command
-        let handler = tokio::spawn(async move {
-            if let Some(cmd) = rx.recv().await {
-                if let HubCommand::RefreshConnectionCode { response_tx } = cmd {
-                    let new_url = "https://botster.dev/hubs/123#NEWBUNDLEDATA".to_string();
-                    let _ = response_tx.send(Ok(new_url));
-                }
-            }
-        });
-
-        // Use spawn_blocking for the blocking call
-        let result = tokio::task::spawn_blocking(move || handle.refresh_connection_code())
-            .await
-            .unwrap();
-
-        handler.await.unwrap();
-
+    #[test]
+    fn test_hub_handle_list_worktrees_empty() {
+        let handle = HubHandle::mock();
+        let result = handle.list_worktrees();
         assert!(result.is_ok());
-        let url = result.unwrap();
-        assert!(url.contains("NEWBUNDLEDATA"));
+        assert!(result.unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn test_hub_handle_refresh_connection_code_relay_not_connected() {
-        let (tx, mut rx) = mpsc::channel::<HubCommand>(16);
-        let sender = HubCommandSender::new(tx);
-        let handle = HubHandle::new(sender);
+    #[test]
+    fn test_hub_handle_list_worktrees_from_cache() {
+        let (tx, _rx) = mpsc::channel::<HubCommand>(16);
+        let cache = Arc::new(HandleCache::new());
 
-        // Spawn task to handle the command with error response
-        let handler = tokio::spawn(async move {
-            if let Some(cmd) = rx.recv().await {
-                if let HubCommand::RefreshConnectionCode { response_tx } = cmd {
-                    let _ = response_tx.send(Err("Relay not connected".to_string()));
-                }
-            }
-        });
+        // Pre-populate worktrees in HandleCache
+        cache.set_worktrees(vec![
+            ("/tmp/wt1".to_string(), "feature-1".to_string()),
+            ("/tmp/wt2".to_string(), "feature-2".to_string()),
+        ]);
 
-        // Use spawn_blocking for the blocking call
-        let result = tokio::task::spawn_blocking(move || handle.refresh_connection_code())
-            .await
-            .unwrap();
-
-        handler.await.unwrap();
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Relay not connected"));
+        let handle = test_handle_with_cache(tx, cache);
+        let result = handle.list_worktrees();
+        assert!(result.is_ok());
+        let worktrees = result.unwrap();
+        assert_eq!(worktrees.len(), 2);
+        assert_eq!(worktrees[0].1, "feature-1");
+        assert_eq!(worktrees[1].1, "feature-2");
     }
 }

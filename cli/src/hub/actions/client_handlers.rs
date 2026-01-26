@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::client::{BrowserClient, ClientId, CreateAgentRequest, DeleteAgentRequest};
+use crate::client::browser::BrowserClientConfig;
 use crate::hub::{lifecycle, Hub};
 
 /// Handle selecting an agent for a specific client.
@@ -71,12 +72,8 @@ pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_
     // - TuiRunner manages its own PTY subscription (has direct state access)
     // - BrowserClient creates PTY channels when browser actually requests output
     //
-    // Previously this called client.connect_to_pty(), but that blocks on
-    // HubHandle command channel which requires the Hub event loop to be running.
-    // For unit tests, this caused deadlocks.
-    //
-    // Actual PTY connection happens:
-    // - TUI: TuiRunner.handle_select_agent() calls connect_to_pty directly
+    // PTY connection is handled separately by each client type:
+    // - TUI: TuiRequest::SelectAgent -> TuiClient.handle_request() -> connect_to_pty
     // - Browser: BrowserEvent::SelectAgent handler in relay/browser.rs
 
     // Note: Scrollback is sent via browser.rs event handler (send_scrollback_for_agent_to_browser)
@@ -126,16 +123,64 @@ pub fn handle_send_input_for_client(hub: &mut Hub, client_id: ClientId, data: Ve
 /// Handle resize for a specific client.
 ///
 /// For TUI, updates hub.terminal_dims (used for new agent spawns).
-/// The client's internal dimensions are updated by the caller (TuiRunner/Browser).
+/// Updates client's internal dimensions and resizes connected PTYs directly
+/// (avoiding the deadlock that would occur if client.set_dims called hub_handle).
 pub fn handle_resize_for_client(hub: &mut Hub, client_id: ClientId, cols: u16, rows: u16) {
+
     // Update hub terminal_dims for TUI (used for new agent spawns)
     if client_id.is_tui() {
         hub.terminal_dims = (rows, cols);
     }
 
-    // Update client's internal dimensions
+    // Get connected PTY indices BEFORE mutating the client
+    // (can't borrow client and state at the same time)
+    let connected_ptys: Vec<(usize, usize)> = match &client_id {
+        ClientId::Tui => {
+            if let Some(tui) = hub.clients.get_tui() {
+                tui.connected_pty().into_iter().collect()
+            } else {
+                vec![]
+            }
+        }
+        ClientId::Browser(_) => {
+            if let Some(client) = hub.clients.get(&client_id) {
+                if let Some(browser) = client.as_any().and_then(|a| a.downcast_ref::<BrowserClient>()) {
+                    browser.connected_ptys().collect()
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        }
+    };
+
+    // Update client's internal dimensions (this no longer calls resize_pty internally)
     if let Some(client) = hub.clients.get_mut(&client_id) {
         client.set_dims(cols, rows);
+    }
+
+    // Resize all connected PTYs directly
+    for (agent_idx, pty_idx) in connected_ptys {
+        let pty_handle = {
+            let state = hub.state.read().unwrap();
+            state.get_agent_handle(agent_idx)
+                .and_then(|agent| agent.get_pty(pty_idx).cloned())
+        };
+
+        if let Some(pty) = pty_handle {
+            if let Some(client) = hub.clients.get(&client_id) {
+                if let Err(e) = client.resize_pty_with_handle(&pty, rows, cols) {
+                    log::debug!(
+                        "Failed to resize PTY ({}, {}) for {}: {}",
+                        agent_idx,
+                        pty_idx,
+                        client_id,
+                        e
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -338,6 +383,9 @@ fn spawn_agent_sync(
         Ok(result) => {
             log::info!("Client {} created agent: {}", client_id, result.agent_id);
 
+            // Sync handle cache for thread-safe agent access
+            hub.sync_handle_cache();
+
             // Register tunnel for HTTP forwarding if tunnel port allocated
             if let Some(port) = result.tunnel_port {
                 let tm = Arc::clone(&hub.tunnel_manager);
@@ -425,6 +473,10 @@ pub fn handle_delete_agent_for_client(
     match close_result {
         Ok(_was_deleted) => {
             log::info!("Client {} deleted agent: {}", client_id, request.agent_id);
+
+            // Sync handle cache for thread-safe agent access
+            hub.sync_handle_cache();
+
             hub.broadcast_agent_list();
         }
         Err(e) => {
@@ -439,8 +491,23 @@ pub fn handle_client_connected(hub: &mut Hub, client_id: ClientId) {
 
     // For browser clients, create and register BrowserClient
     if let ClientId::Browser(ref identity) = client_id {
+        // Get crypto service - required for BrowserClient
+        let Some(crypto_service) = hub.browser.crypto_service.clone() else {
+            log::error!("Cannot create BrowserClient: crypto service not initialized");
+            return;
+        };
+
+        // Build config from Hub's direct access (avoid hub_handle commands that would deadlock)
+        let config = BrowserClientConfig {
+            crypto_service,
+            server_url: hub.config.server_url.clone(),
+            api_key: hub.config.get_api_key().to_string(),
+            server_hub_id: hub.server_hub_id().to_string(),
+        };
+
         let hub_handle = hub.handle();
-        let browser_client = BrowserClient::new(hub_handle, identity.clone());
+        let runtime_handle = hub.tokio_runtime.handle().clone();
+        let browser_client = BrowserClient::new(hub_handle, identity.clone(), runtime_handle, config);
         hub.clients.register(Box::new(browser_client));
         log::info!("Registered BrowserClient for {}", identity);
     }

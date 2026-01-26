@@ -323,6 +323,17 @@ impl CryptoServiceHandle {
             .await
             .map_err(|_| anyhow::anyhow!("Crypto service already shut down"))
     }
+
+    /// Create a mock handle for testing.
+    ///
+    /// Creates a handle with a closed channel - operations will fail gracefully.
+    /// Suitable for tests that don't need actual crypto operations.
+    #[cfg(test)]
+    #[must_use]
+    pub fn mock() -> Self {
+        let (tx, _rx) = mpsc::channel(1);
+        Self { tx }
+    }
 }
 
 /// The crypto service that runs in its own thread.
