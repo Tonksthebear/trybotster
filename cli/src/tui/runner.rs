@@ -685,13 +685,6 @@ pub fn run_with_hub(
     let shutdown = Arc::new(AtomicBool::new(false));
     let tui_shutdown = Arc::clone(&shutdown);
 
-    // Send initial dims to TuiClient task (TuiRunner owns its own dims).
-    if let Some(handle) = hub.clients.get(&crate::client::ClientId::Tui) {
-        let _ = handle.cmd_tx.try_send(
-            crate::client::ClientCmd::SetDims { cols: inner_cols, rows: inner_rows },
-        );
-    }
-
     let mut tui_runner = TuiRunner::new(
         terminal,
         request_tx,

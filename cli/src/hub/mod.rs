@@ -1016,8 +1016,6 @@ mod tests {
         }
     }
 
-    // Default terminal dimensions for tests
-
     #[test]
     fn test_hub_creation() {
         let config = test_config();
@@ -1045,40 +1043,6 @@ mod tests {
         hub.handle_action(HubAction::Quit);
         assert!(hub.should_quit());
     }
-
-    #[test]
-    fn test_handle_action_resize() {
-        use crate::client::ClientId;
-
-        let config = test_config();
-        let mut hub = Hub::new(config).unwrap();
-
-        // Register TuiClient task for SetDims to be received
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(64);
-        let join_handle = hub.tokio_runtime.spawn(async {});
-        hub.clients.register(ClientId::Tui, ClientTaskHandle {
-            cmd_tx,
-            join_handle,
-        });
-
-        hub.handle_action(HubAction::ResizeForClient {
-            client_id: ClientId::Tui,
-            cols: 150,
-            rows: 50,
-        });
-
-        // Verify SetDims was sent to client (Hub no longer caches dims)
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, crate::client::ClientCmd::SetDims { cols: 150, rows: 50 }));
-    }
-
-    // === TUI set_dims and resize_pty Test ===
-    //
-    // This test verifies that set_dims() updates local dims and resize_pty()
-    // propagates to the connected PTY.
-    //
-    // Flow: TuiRunner sends TuiRequest::SetDims -> handle_request() updates dims
-    // and calls resize_pty() with explicit agent/PTY indices.
 
     // === Agent Lifecycle / HandleCache Integration Tests ===
     //
@@ -1200,142 +1164,6 @@ mod tests {
         );
     }
 
-    /// Test that TUI resize sends SetDims command to client.
-    ///
-    /// Dims travel with requests from clients. The Hub no longer caches them.
-    /// The client's async task receives SetDims via its command channel.
-    #[test]
-    fn test_resize_sends_set_dims_cmd() {
-        let config = test_config();
-        let mut hub = Hub::new(config).unwrap();
-
-        // Register TuiClient task -- get command receiver for verification
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(64);
-        let join_handle = hub.tokio_runtime.spawn(async {});
-        hub.clients.register(ClientId::Tui, ClientTaskHandle {
-            cmd_tx,
-            join_handle,
-        });
-
-        // Resize via action
-        hub.handle_action(HubAction::ResizeForClient {
-            client_id: ClientId::Tui,
-            cols: 120,
-            rows: 40,
-        });
-
-        // Verify SetDims command was sent to client
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, crate::client::ClientCmd::SetDims { cols: 120, rows: 40 }));
-    }
-
-    // === Resize Flow Integration Tests ===
-    //
-    // These tests verify the complete resize flow across different scenarios:
-    // - Resize without connection (safety check)
-    // - Multiple resizes (final state correctness)
-    // - Browser resize via BrowserRequest channel
-    // - Resize updates client dims even without PTY
-
-    /// Test that resize without a connected PTY is safe.
-    ///
-    /// Hub sends SetDims via channel to the client task. Even without a PTY,
-    /// the command is sent successfully.
-    #[test]
-    fn test_resize_without_connection_is_safe() {
-        let config = test_config();
-        let mut hub = Hub::new(config).unwrap();
-
-        // Register TuiClient task with command receiver
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(64);
-        let join_handle = hub.tokio_runtime.spawn(async {});
-        hub.clients.register(ClientId::Tui, ClientTaskHandle {
-            cmd_tx,
-            join_handle,
-        });
-
-        // Resize via action
-        hub.handle_action(HubAction::ResizeForClient {
-            client_id: ClientId::Tui,
-            cols: 120,
-            rows: 40,
-        });
-
-        // Verify SetDims was sent
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, crate::client::ClientCmd::SetDims { cols: 120, rows: 40 }));
-    }
-
-    /// Test that multiple resize actions send correct SetDims commands.
-    #[test]
-    fn test_resize_multiple_times_sends_all_cmds() {
-        let config = test_config();
-        let mut hub = Hub::new(config).unwrap();
-
-        // Register TuiClient task with command receiver
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(64);
-        let join_handle = hub.tokio_runtime.spawn(async {});
-        hub.clients.register(ClientId::Tui, ClientTaskHandle {
-            cmd_tx,
-            join_handle,
-        });
-
-        // Resize #1: (100 cols, 30 rows)
-        hub.handle_action(HubAction::ResizeForClient {
-            client_id: ClientId::Tui,
-            cols: 100,
-            rows: 30,
-        });
-
-        // Resize #2: (120 cols, 40 rows)
-        hub.handle_action(HubAction::ResizeForClient {
-            client_id: ClientId::Tui,
-            cols: 120,
-            rows: 40,
-        });
-
-        // Resize #3: (80 cols, 24 rows) - back to default
-        hub.handle_action(HubAction::ResizeForClient {
-            client_id: ClientId::Tui,
-            cols: 80,
-            rows: 24,
-        });
-
-        // Verify three SetDims commands were sent
-        let cmd1 = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd1, crate::client::ClientCmd::SetDims { cols: 100, rows: 30 }));
-        let cmd2 = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd2, crate::client::ClientCmd::SetDims { cols: 120, rows: 40 }));
-        let cmd3 = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd3, crate::client::ClientCmd::SetDims { cols: 80, rows: 24 }));
-    }
-
-    /// Test that ResizeForClient sends SetDims command even without a PTY.
-    #[test]
-    fn test_resize_sends_cmd_even_without_pty() {
-        let config = test_config();
-        let mut hub = Hub::new(config).unwrap();
-
-        // Register TuiClient task with command receiver
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(64);
-        let join_handle = hub.tokio_runtime.spawn(async {});
-        hub.clients.register(ClientId::Tui, ClientTaskHandle {
-            cmd_tx,
-            join_handle,
-        });
-
-        // Update via ResizeForClient action
-        hub.handle_action(HubAction::ResizeForClient {
-            client_id: ClientId::Tui,
-            cols: 120,
-            rows: 40,
-        });
-
-        // Verify SetDims sent
-        let cmd = cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, crate::client::ClientCmd::SetDims { cols: 120, rows: 40 }));
-    }
-
     // === Stress / Concurrency Tests ===
     //
     // These tests verify thread safety and deadlock freedom under concurrent
@@ -1447,59 +1275,6 @@ mod tests {
                 cached_agent.is_some(),
                 "Agent at index 1 should still be accessible after rapid selection"
             );
-        }, Duration::from_secs(5));
-    }
-
-    /// Stress test: interleaved resize and agent selection via Hub actions.
-    ///
-    /// Interleaves ResizeForClient and SelectAgentForClient actions to verify
-    /// no crash when terminal resize events arrive during agent selection.
-    #[test]
-    fn test_resize_during_agent_selection() {
-        use std::time::Duration;
-
-        run_with_timeout(|| {
-            let config = test_config();
-            let mut hub = Hub::new(config).unwrap();
-
-            // Register TuiClient task with command receiver
-            let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(256);
-            let join_handle = hub.tokio_runtime.spawn(async {});
-            hub.clients.register(ClientId::Tui, ClientTaskHandle {
-                cmd_tx,
-                join_handle,
-            });
-
-            // Add an agent and sync cache
-            let key = add_agent_to_hub(&hub, 42);
-            hub.sync_handle_cache();
-
-            // Interleave resize and selection 20 times
-            for i in 0..20u16 {
-                // Resize with varying dimensions
-                let cols = 80 + i;
-                let rows = 24 + (i % 10);
-                hub.handle_action(HubAction::ResizeForClient {
-                    client_id: ClientId::Tui,
-                    cols,
-                    rows,
-                });
-
-                // Select agent
-                hub.handle_action(HubAction::SelectAgentForClient {
-                    client_id: ClientId::Tui,
-                    agent_key: key.clone(),
-                });
-
-                // Another resize after selection
-                hub.handle_action(HubAction::ResizeForClient {
-                    client_id: ClientId::Tui,
-                    cols: cols + 1,
-                    rows: rows + 1,
-                });
-            }
-
-            // Test passes if no panics or deadlocks during interleaved operations
         }, Duration::from_secs(5));
     }
 

@@ -423,9 +423,6 @@ impl TuiClient {
                 }
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(ClientCmd::SetDims { cols, rows }) => {
-                            self.set_dims(cols, rows);
-                        }
                         Some(ClientCmd::DisconnectFromPty { agent_index, pty_index }) => {
                             self.disconnect_from_pty(agent_index, pty_index).await;
                         }
@@ -474,15 +471,6 @@ impl Client for TuiClient {
 
     fn hub_handle(&self) -> &HubHandle {
         &self.hub_handle
-    }
-
-    /// Update terminal dimensions.
-    ///
-    /// Only updates local dims. PTY resize propagation happens through
-    /// `TuiRequest::SetDims` which carries explicit agent and PTY indices
-    /// from TuiRunner.
-    fn set_dims(&mut self, cols: u16, rows: u16) {
-        self.dims = (cols, rows);
     }
 
     /// Connect to a PTY and start forwarding output (using pre-resolved handle).

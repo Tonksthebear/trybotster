@@ -82,13 +82,6 @@ pub use crate::relay::AgentInfo;
 /// commands internally using its own trait methods.
 #[derive(Debug, Clone)]
 pub enum ClientCmd {
-    /// Update terminal dimensions (no PTY propagation).
-    SetDims {
-        /// Terminal width in columns.
-        cols: u16,
-        /// Terminal height in rows.
-        rows: u16,
-    },
     /// Disconnect from a specific PTY.
     DisconnectFromPty {
         /// Agent index in the ordered agent list.
@@ -189,7 +182,6 @@ impl std::fmt::Display for ClientId {
 /// - `hub_handle()` - Access to Hub data and operations
 /// - `id()` - Unique client identifier
 /// - `dims()` - Terminal dimensions for PTY resize
-/// - `set_dims()` - Update terminal dimensions
 /// - `connect_to_pty_with_handle()` - Establish PTY connection (async)
 /// - `disconnect_from_pty()` - Terminate PTY connection (async)
 ///
@@ -236,18 +228,6 @@ pub trait Client: Send {
     ///
     /// Used when connecting to PTY to report initial size.
     fn dims(&self) -> (u16, u16);
-
-    /// Update terminal dimensions.
-    ///
-    /// Called when the client's terminal is resized. Each client implementation
-    /// should update its internal stored dimensions. This only updates local
-    /// state -- PTY resize propagation uses `resize_pty()`.
-    ///
-    /// # Arguments
-    ///
-    /// * `cols` - New terminal width in columns
-    /// * `rows` - New terminal height in rows
-    fn set_dims(&mut self, cols: u16, rows: u16);
 
     // ============================================================
     // Required - async (clients must implement)
@@ -643,9 +623,6 @@ mod tests {
 
     #[test]
     fn test_client_cmd_debug() {
-        let cmd = ClientCmd::SetDims { cols: 80, rows: 24 };
-        assert!(format!("{:?}", cmd).contains("SetDims"));
-
         let cmd = ClientCmd::Shutdown;
         assert!(format!("{:?}", cmd).contains("Shutdown"));
 

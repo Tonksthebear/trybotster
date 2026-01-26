@@ -7,7 +7,7 @@
 //!
 //! - `mod.rs` - HubAction enum and dispatch() routing
 //! - `agent_handlers.rs` - Agent lifecycle: spawn, close
-//! - `client_handlers.rs` - Client-scoped: selection, resize, create, delete
+//! - `client_handlers.rs` - Client-scoped: selection, create, delete, lifecycle
 //! - `connection_handlers.rs` - Connection URL copy and regeneration
 //! - `input_handlers.rs` - Agent spawn helper
 //!
@@ -121,16 +121,6 @@ pub enum HubAction {
         client_id: ClientId,
         /// Agent session key to select.
         agent_key: String,
-    },
-
-    /// Resize the client's terminal and optionally the viewed agent's PTY.
-    ResizeForClient {
-        /// Which client is resizing.
-        client_id: ClientId,
-        /// New terminal width.
-        cols: u16,
-        /// New terminal height.
-        rows: u16,
     },
 
     /// Create a new agent (client-scoped for response routing).
@@ -248,14 +238,6 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
             agent_key,
         } => {
             client_handlers::handle_select_agent_for_client(hub, client_id, agent_key);
-        }
-
-        HubAction::ResizeForClient {
-            client_id,
-            cols,
-            rows,
-        } => {
-            client_handlers::handle_resize_for_client(hub, client_id, cols, rows);
         }
 
         HubAction::CreateAgentForClient { client_id, request } => {

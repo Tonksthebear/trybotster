@@ -1,7 +1,7 @@
 //! Client-scoped action handlers.
 //!
 //! Handlers for actions that operate on a specific client's view,
-//! including selection, input routing, resize, and agent management.
+//! including selection, input routing, and agent management.
 //!
 //! # Architecture
 //!
@@ -14,7 +14,6 @@
 //! - Agent selection: `handle_select_agent_for_client()`
 //! - Agent creation/deletion: `handle_create_agent_for_client()`, `handle_delete_agent_for_client()`
 //! - Client lifecycle: `handle_client_connected()`, `handle_client_disconnected()`
-//! - Resize: `handle_resize_for_client()`
 
 // Rust guideline compliant 2026-01
 
@@ -70,19 +69,6 @@ pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_
         client_id,
         &agent_key[..8.min(agent_key.len())]
     );
-}
-
-/// Handle resize for a specific client.
-///
-/// Sends SetDims command to the client's async task, which handles
-/// PTY resize internally. Dims are not cached on Hub -- they flow
-/// through requests from clients when creating agents.
-pub fn handle_resize_for_client(hub: &mut Hub, client_id: ClientId, cols: u16, rows: u16) {
-    // Send SetDims to the client's async task.
-    // The client's run_task handles resizing all connected PTYs internally.
-    if let Some(handle) = hub.clients.get(&client_id) {
-        let _ = handle.cmd_tx.try_send(ClientCmd::SetDims { cols, rows });
-    }
 }
 
 /// Handle creating an agent for a specific client.
