@@ -677,20 +677,19 @@ pub fn run_with_hub(
     // Create TuiRequest channel for TuiRunner -> TuiClient communication
     let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<TuiRequest>();
 
-    // Register TuiClient in Hub and get the output receiver
-    // Hub now owns TuiClient, TuiRunner just receives output
-    // Also wire the request channel so TuiClient can receive TuiRunner's requests
+    // Register TuiClient in Hub and get the output receiver.
+    // Hub spawns TuiClient as an async task and registers the task handle.
     let output_rx = hub.register_tui_client_with_request_channel(request_rx);
 
     let hub_event_rx = hub.subscribe_events();
     let shutdown = Arc::new(AtomicBool::new(false));
     let tui_shutdown = Arc::clone(&shutdown);
 
-    // Sync TuiClient dims before TuiRunner creation so PTY connections use correct size.
-    // Done directly via client registry since TuiRequest::SetDims requires PTY indices
-    // and no agent is connected yet at startup.
-    if let Some(client) = hub.clients.get_mut(&crate::client::ClientId::Tui) {
-        client.set_dims(inner_cols, inner_rows);
+    // Send initial dims to TuiClient task (TuiRunner owns its own dims).
+    if let Some(handle) = hub.clients.get(&crate::client::ClientId::Tui) {
+        let _ = handle.cmd_tx.try_send(
+            crate::client::ClientCmd::SetDims { cols: inner_cols, rows: inner_rows },
+        );
     }
 
     let mut tui_runner = TuiRunner::new(
@@ -713,15 +712,11 @@ pub fn run_with_hub(
 
     log::info!("TuiRunner spawned in dedicated thread");
 
-    // Main thread: Hub tick loop for non-TUI operations
+    // Main thread: Hub tick loop for non-TUI operations.
+    // Client request processing is handled by each client's async run_task().
     while !hub.quit && !shutdown_flag.load(Ordering::SeqCst) {
         // 1. Process commands from TuiRunner and other clients
         hub.process_commands();
-
-        // 2. Poll client request channels (TuiClient, BrowserClient)
-        // Without this, TuiRequest/BrowserRequest messages are never processed,
-        // and blocking_recv() calls in TuiRunner deadlock.
-        hub.clients.poll_all_requests();
 
         // Check quit after command processing (TuiRunner may have sent Quit)
         if hub.quit {
@@ -789,7 +784,7 @@ mod tests {
     //! Tests follow MS Rust guidelines with canonical documentation format.
 
     use super::*;
-    use crate::client::{CreateAgentRequest, DeleteAgentRequest, TuiRequest};
+    use crate::client::{CreateAgentRequest, DeleteAgentRequest};
     use crate::tui::actions::TuiAction;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
@@ -880,7 +875,7 @@ mod tests {
         };
 
         // Create real Hub (without setup() to avoid network calls) - for event channels
-        let hub = Hub::new(hub_config, (24, 80)).expect("Failed to create Hub");
+        let hub = Hub::new(hub_config).expect("Failed to create Hub");
 
         // Subscribe to Hub's event channel
         let hub_event_rx = hub.subscribe_events();
@@ -965,7 +960,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let terminal = Terminal::new(backend).expect("Failed to create test terminal");
 
-        // Create output channel (in real code, Hub.register_tui_client() does this)
+        // Create output channel (in real code, Hub.register_tui_client_with_request_channel() does this)
         let (_output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let runner = TuiRunner::new(
@@ -2077,7 +2072,7 @@ mod tests {
 
         // Create real Hub (without setup() to avoid network calls)
         // BOTSTER_ENV=test is automatically set in test mode
-        let hub = Hub::new(config, (24, 80)).expect("Failed to create Hub");
+        let hub = Hub::new(config).expect("Failed to create Hub");
 
         // Get Hub's event channel for TuiRunner to subscribe to
         let hub_event_rx = hub.subscribe_events();
@@ -2089,7 +2084,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let terminal = Terminal::new(backend).expect("Failed to create test terminal");
         let shutdown = Arc::new(AtomicBool::new(false));
-        // Create output channel (in real code, Hub.register_tui_client() does this)
+        // Create output channel (in real code, Hub.register_tui_client_with_request_channel() does this)
         let (_output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mut runner = TuiRunner::new(
@@ -2297,7 +2292,7 @@ mod tests {
             }
         });
 
-        // Create output channel (in real code, Hub.register_tui_client() does this)
+        // Create output channel (in real code, Hub.register_tui_client_with_request_channel() does this)
         let (_output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mut runner = TuiRunner::new(
@@ -2611,7 +2606,7 @@ mod tests {
     #[test]
     fn test_select_next_agent_sends_request() {
         let config = TestClientConfig::default();
-        let (mut runner, _hub, mut request_rx, shutdown) =
+        let (mut runner, _hub, _request_rx, shutdown) =
             create_test_runner_with_mock_client(config);
 
         // Setup: 3 agents, agent 0 selected

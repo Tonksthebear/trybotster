@@ -34,12 +34,16 @@ pub struct AgentSpawnConfig {
 
     /// Invocation URL for tracking this agent instance.
     pub invocation_url: Option<String>,
+
+    /// Terminal dimensions (rows, cols) for PTY sizing.
+    pub dims: (u16, u16),
 }
 
 impl AgentSpawnConfig {
     /// Creates a new spawn configuration with required fields.
     ///
     /// Optional fields (message_id, invocation_url) are set to None.
+    /// Dims default to (24, 80).
     pub fn new(
         issue_number: Option<u32>,
         branch_name: String,
@@ -57,6 +61,7 @@ impl AgentSpawnConfig {
             prompt,
             message_id: None,
             invocation_url: None,
+            dims: (24, 80),
         }
     }
 

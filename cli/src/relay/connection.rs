@@ -105,35 +105,6 @@ impl HubSender {
             .map_err(|e| anyhow::anyhow!("Failed to request bundle regeneration: {}", e))
     }
 
-    /// Create a test sender with a receiver for capturing output.
-    ///
-    /// Returns the sender and a receiver that captures all sent messages as raw strings.
-    /// The sender is pre-configured as "connected".
-    ///
-    /// # Test Use Only
-    ///
-    /// This function is only available in test builds.
-    #[cfg(test)]
-    pub(crate) fn test_sender() -> (Self, mpsc::Receiver<OutputMessage>) {
-        let (tx, rx) = mpsc::channel(100);
-        let sender = Self {
-            tx,
-            connected: Arc::new(RwLock::new(true)),
-        };
-        (sender, rx)
-    }
-}
-
-/// Output message for relay task - test helpers.
-#[cfg(test)]
-impl OutputMessage {
-    /// Extract the identity and data if this is a targeted message.
-    pub(crate) fn as_targeted(&self) -> Option<(&str, &str)> {
-        match self {
-            OutputMessage::Targeted { identity, data } => Some((identity, data)),
-            _ => None,
-        }
-    }
 }
 
 /// Hub relay connection manager.

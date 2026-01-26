@@ -23,7 +23,7 @@
 //!
 //! # Module Structure
 //!
-//! - `client_routing`: TUI selection helpers, client communication
+//! - `client_routing`: Client communication (agent/worktree lists, errors)
 //! - `server_comms`: Message polling, server registration, heartbeat
 //! - `actions`: Hub action dispatch
 //! - `lifecycle`: Agent spawn/close operations
@@ -75,9 +75,8 @@ use reqwest::blocking::Client;
 
 use sha2::{Digest, Sha256};
 
-use crate::app::AppMode;
 use crate::channel::{ActionCableChannel, Channel, ChannelConfig};
-use crate::client::{ClientId, ClientRegistry, TuiClient};
+use crate::client::{ClientId, ClientRegistry, ClientTaskHandle};
 use crate::config::Config;
 use crate::device::Device;
 use crate::git::WorktreeManager;
@@ -161,24 +160,6 @@ pub struct Hub {
     /// Last time we sent a heartbeat.
     pub last_heartbeat: Instant,
 
-    // === Terminal/TUI State ===
-    /// Current terminal dimensions (rows, cols).
-    pub terminal_dims: (u16, u16),
-    /// Current application mode (Normal, Menu, etc.).
-    pub mode: AppMode,
-    /// Currently selected menu item.
-    pub menu_selected: usize,
-    /// Text input buffer.
-    pub input_buffer: String,
-    /// Currently selected worktree index.
-    pub worktree_selected: usize,
-    /// Current connection URL for clipboard copying.
-    pub connection_url: Option<String>,
-    /// Error message to display in Error mode.
-    pub error_message: Option<String>,
-    /// Whether the QR image has been displayed (to avoid re-rendering every frame).
-    pub qr_image_displayed: bool,
-
     // === Browser Relay ===
     /// Browser connection state and communication.
     pub browser: crate::relay::BrowserState,
@@ -197,18 +178,6 @@ pub struct Hub {
     pub progress_tx: std_mpsc::Sender<AgentProgressEvent>,
     /// Receiver for agent creation progress updates (polled in main loop).
     pub progress_rx: std_mpsc::Receiver<AgentProgressEvent>,
-
-    // === TUI Selection ===
-    /// Currently selected agent for TUI.
-    ///
-    /// Tracked here so Hub methods like `get_tui_selected_agent_key()` can access it.
-    /// Updated by `handle_select_agent_for_client()` when TUI selects an agent.
-    pub tui_selected_agent: Option<String>,
-
-    // === TUI Creation Progress ===
-    /// Current agent creation in progress for TUI display (identifier, stage).
-    /// Cleared when agent is created or creation fails.
-    pub creating_agent: Option<(String, crate::relay::AgentCreationStage)>,
 
     // === Background Workers ===
     /// Background worker for message polling (non-blocking).
@@ -245,14 +214,12 @@ impl std::fmt::Debug for Hub {
             .field("state", &self.state)
             .field("hub_identifier", &self.hub_identifier)
             .field("quit", &self.quit)
-            .field("terminal_dims", &self.terminal_dims)
-            .field("mode", &self.mode)
             .finish_non_exhaustive()
     }
 }
 
 impl Hub {
-    /// Create a new Hub with the given configuration and terminal dimensions.
+    /// Create a new Hub with the given configuration.
     ///
     /// # Errors
     ///
@@ -260,7 +227,7 @@ impl Hub {
     /// - The tokio runtime cannot be created
     /// - The HTTP client cannot be created
     /// - Device identity cannot be loaded
-    pub fn new(config: Config, terminal_dims: (u16, u16)) -> anyhow::Result<Self> {
+    pub fn new(config: Config) -> anyhow::Result<Self> {
         use std::sync::RwLock;
         use std::time::Duration;
 
@@ -316,17 +283,10 @@ impl Hub {
 
         // Create command channel for actor pattern
         let (command_tx, command_rx) = tokio::sync::mpsc::channel(256);
-        let command_sender = HubCommandSender::new(command_tx.clone());
-
         // Create handle cache for thread-safe agent handle access
         let handle_cache = Arc::new(handle_cache::HandleCache::new());
-        let hub_handle_for_tui = hub_handle::HubHandle::new(command_sender, Arc::clone(&handle_cache));
-
         // Create event broadcast channel for pub/sub
         let (event_tx, _) = tokio::sync::broadcast::channel(64);
-
-        // Get runtime handle before moving tokio_runtime into struct
-        let runtime_handle = tokio_runtime.handle().clone();
 
         Ok(Self {
             state,
@@ -340,30 +300,12 @@ impl Hub {
             quit: false,
             last_poll: past,
             last_heartbeat: past,
-            terminal_dims,
-            mode: AppMode::Normal,
-            menu_selected: 0,
-            input_buffer: String::new(),
-            worktree_selected: 0,
-            connection_url: None,
-            error_message: None,
-            qr_image_displayed: false,
             browser: crate::relay::BrowserState::default(),
-            clients: {
-                let mut registry = ClientRegistry::new();
-                // Create TuiClient with a dummy output channel.
-                // In Hub context, TuiClient is used for client identity and dimensions,
-                // not for receiving PTY output (TuiRunner has its own TuiClient for that).
-                let (output_tx, _output_rx) = tokio::sync::mpsc::unbounded_channel();
-                registry.register(Box::new(TuiClient::new(hub_handle_for_tui, output_tx, runtime_handle.clone())));
-                registry
-            },
+            clients: ClientRegistry::new(),
             pending_agent_tx,
             pending_agent_rx,
             progress_tx,
             progress_rx,
-            tui_selected_agent: None,
-            creating_agent: None,
             // Workers are started later via start_background_workers() after registration
             polling_worker: None,
             heartbeat_worker: None,
@@ -450,12 +392,6 @@ impl Hub {
         Arc::clone(&self.state)
     }
 
-    /// Get the current terminal dimensions.
-    #[must_use]
-    pub fn terminal_dims(&self) -> (u16, u16) {
-        self.terminal_dims
-    }
-
     /// Get the hub ID to use for server communication.
     ///
     /// Returns the server-assigned `botster_id` if available (after registration),
@@ -463,26 +399,6 @@ impl Hub {
     #[must_use]
     pub fn server_hub_id(&self) -> &str {
         self.botster_id.as_deref().unwrap_or(&self.hub_identifier)
-    }
-
-    /// Set terminal dimensions.
-    pub fn set_terminal_dims(&mut self, rows: u16, cols: u16) {
-        self.terminal_dims = (rows, cols);
-    }
-
-    /// Show an error message to the user.
-    ///
-    /// Sets the error message and switches to Error mode.
-    /// The user can dismiss the error with Esc/Enter/q.
-    pub fn show_error(&mut self, message: impl Into<String>) {
-        self.error_message = Some(message.into());
-        self.mode = AppMode::Error;
-    }
-
-    /// Clear the error message and return to Normal mode.
-    pub fn clear_error(&mut self) {
-        self.error_message = None;
-        self.mode = AppMode::Normal;
     }
 
     /// Connect an agent's preview channel for HTTP proxying.
@@ -737,36 +653,12 @@ impl Hub {
         hub_handle::HubHandle::new(self.command_sender(), Arc::clone(&self.handle_cache))
     }
 
-    /// Register TuiClient and return the output receiver.
-    ///
-    /// Creates a new output channel, updates the TuiClient with the sender,
-    /// and returns the receiver for TuiRunner to consume.
-    ///
-    /// # Panics
-    ///
-    /// Panics if TuiClient is not registered (should always be present).
-    pub fn register_tui_client(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<crate::client::TuiOutput> {
-        use crate::client::TuiOutput;
-
-        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel::<TuiOutput>();
-
-        // Replace the TuiClient with one that has the real output channel
-        let hub_handle = self.handle();
-        let runtime_handle = self.tokio_runtime.handle().clone();
-        let tui_client = crate::client::TuiClient::new(hub_handle, output_tx, runtime_handle);
-
-        // Re-register (replaces existing)
-        self.clients.register(Box::new(tui_client));
-
-        output_rx
-    }
-
     /// Register TuiClient with output channel and request channel.
     ///
-    /// Creates a TuiClient with output channel for PTY output and wires the
-    /// request channel for TuiRunner -> TuiClient communication. TuiRunner
-    /// sends `TuiRequest` messages through the request channel, TuiClient
-    /// processes them (forwarding to Hub when needed).
+    /// Creates a TuiClient, wires the request channel, spawns it as an async
+    /// task via `run_task()`, and registers a `ClientTaskHandle` in the registry.
+    /// TuiRunner sends `TuiRequest` messages through the request channel,
+    /// TuiClient processes them in its async task loop.
     ///
     /// # Arguments
     ///
@@ -785,14 +677,22 @@ impl Hub {
 
         // Create TuiClient with output channel
         let hub_handle = self.handle();
-        let runtime_handle = self.tokio_runtime.handle().clone();
-        let mut tui_client = crate::client::TuiClient::new(hub_handle, output_tx, runtime_handle);
+        let mut tui_client = crate::client::TuiClient::new(hub_handle, output_tx);
 
         // Wire the request channel
         tui_client.set_request_receiver(request_rx);
 
-        // Re-register (replaces existing)
-        self.clients.register(Box::new(tui_client));
+        // Create Hub -> Client command channel
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
+
+        // Spawn TuiClient as an async task on the tokio runtime
+        let join_handle = self.tokio_runtime.spawn(tui_client.run_task(cmd_rx));
+
+        // Register the task handle (replaces existing if any)
+        self.clients.register(ClientId::Tui, ClientTaskHandle {
+            cmd_tx,
+            join_handle,
+        });
 
         output_rx
     }
@@ -876,6 +776,7 @@ impl Hub {
                     issue_or_branch: request.issue_or_branch,
                     prompt: request.prompt,
                     from_worktree: request.from_worktree,
+                    dims: request.dims,
                 };
 
                 // Dispatch to background creation
@@ -984,16 +885,16 @@ impl Hub {
 
             HubCommand::BrowserPtyInput {
                 client_id,
-                agent_index,
-                pty_index,
-                data,
+                agent_index: _,
+                pty_index: _,
+                data: _,
             } => {
-                // Route input through Client trait
-                if let Some(client) = self.clients.get(&client_id) {
-                    if let Err(e) = client.send_input(agent_index, pty_index, &data) {
-                        log::warn!("Failed to send browser PTY input: {}", e);
-                    }
-                }
+                // Browser PTY input now flows through BrowserClient's run_task()
+                // via BrowserRequest channel, not through Hub commands.
+                log::debug!(
+                    "BrowserPtyInput received for {} (routed via client task)",
+                    client_id
+                );
             }
 
         }
@@ -1005,8 +906,7 @@ impl Hub {
     /// - URL portion: byte mode (any case allowed)
     /// - Bundle (after #): alphanumeric mode (uppercase Base32)
     ///
-    /// This is the canonical source for connection URLs. Use this method
-    /// instead of accessing `hub.connection_url` cache directly.
+    /// This is the canonical source for connection URLs.
     pub(crate) fn generate_connection_url(&self) -> Result<String, String> {
         let bundle = self
             .browser
@@ -1117,12 +1017,11 @@ mod tests {
     }
 
     // Default terminal dimensions for tests
-    const TEST_DIMS: (u16, u16) = (24, 80);
 
     #[test]
     fn test_hub_creation() {
         let config = test_config();
-        let hub = Hub::new(config, TEST_DIMS).unwrap();
+        let hub = Hub::new(config).unwrap();
 
         assert!(!hub.should_quit());
         assert_eq!(hub.agent_count(), 0);
@@ -1131,7 +1030,7 @@ mod tests {
     #[test]
     fn test_hub_quit() {
         let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+        let mut hub = Hub::new(config).unwrap();
 
         assert!(!hub.should_quit());
         hub.request_quit();
@@ -1139,19 +1038,9 @@ mod tests {
     }
 
     #[test]
-    fn test_hub_terminal_dims() {
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        assert_eq!(hub.terminal_dims(), TEST_DIMS);
-        hub.set_terminal_dims(40, 120);
-        assert_eq!(hub.terminal_dims(), (40, 120));
-    }
-
-    #[test]
     fn test_handle_action_quit() {
         let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+        let mut hub = Hub::new(config).unwrap();
 
         hub.handle_action(HubAction::Quit);
         assert!(hub.should_quit());
@@ -1162,117 +1051,25 @@ mod tests {
         use crate::client::ClientId;
 
         let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+        let mut hub = Hub::new(config).unwrap();
+
+        // Register TuiClient task for SetDims to be received
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(64);
+        let join_handle = hub.tokio_runtime.spawn(async {});
+        hub.clients.register(ClientId::Tui, ClientTaskHandle {
+            cmd_tx,
+            join_handle,
+        });
 
         hub.handle_action(HubAction::ResizeForClient {
             client_id: ClientId::Tui,
             cols: 150,
             rows: 50,
         });
-        assert_eq!(hub.terminal_dims(), (50, 150));
-    }
 
-    // === Phase 2A: TuiClient is source of truth for TUI selection ===
-    //
-    // These tests verify that:
-    // 1. TuiClient owns TUI's selected_agent state
-    // 2. HubState.selected is NOT used for TUI selection
-    // 3. SelectAgentForClient updates TuiClient, not HubState
-
-    #[test]
-    fn test_tui_selection_comes_from_hub() {
-        use crate::client::ClientId;
-
-        let config = test_config();
-        let hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        // TUI client should be registered
-        assert!(
-            hub.clients.get(&ClientId::Tui).is_some(),
-            "TuiClient should be registered"
-        );
-
-        // Initial selection should be None (no agents)
-        assert!(
-            hub.tui_selected_agent.is_none(),
-            "TUI should have no selection initially"
-        );
-    }
-
-    #[test]
-    fn test_select_agent_for_client_updates_hub_tui_selection() {
-        use crate::client::ClientId;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        // Add a test agent directly to state
-        let agent = crate::agent::Agent::new(
-            Uuid::new_v4(),
-            "test/repo".to_string(),
-            Some(42),
-            "botster-issue-42".to_string(),
-            PathBuf::from("/tmp/test"),
-        );
-        let agent_key = "test-repo-42".to_string();
-        hub.state
-            .write()
-            .unwrap()
-            .add_agent(agent_key.clone(), agent);
-
-        // Use SelectAgentForClient action (client-scoped)
-        hub.handle_action(HubAction::SelectAgentForClient {
-            client_id: ClientId::Tui,
-            agent_key: agent_key.clone(),
-        });
-
-        // Hub should now track the TUI selection
-        assert_eq!(
-            hub.tui_selected_agent.as_ref(),
-            Some(&agent_key),
-            "hub.tui_selected_agent should be updated by SelectAgentForClient"
-        );
-    }
-
-    #[test]
-    fn test_get_tui_selected_agent_uses_hub_field() {
-        use crate::client::ClientId;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        // Add two test agents
-        for i in 1..=2 {
-            let agent = crate::agent::Agent::new(
-                Uuid::new_v4(),
-                "test/repo".to_string(),
-                Some(i),
-                format!("botster-issue-{}", i),
-                PathBuf::from("/tmp/test"),
-            );
-            hub.state
-                .write()
-                .unwrap()
-                .add_agent(format!("test-repo-{}", i), agent);
-        }
-
-        // Use SelectAgentForClient to select agent 2 via TUI
-        hub.handle_action(HubAction::SelectAgentForClient {
-            client_id: ClientId::Tui,
-            agent_key: "test-repo-2".to_string(),
-        });
-
-        // The helper method should return the agent based on hub.tui_selected_agent
-        let selected_key = hub.get_tui_selected_agent_key();
-        assert_eq!(
-            selected_key,
-            Some("test-repo-2".to_string()),
-            "get_tui_selected_agent_key should return hub.tui_selected_agent"
-        );
+        // Verify SetDims was sent to client (Hub no longer caches dims)
+        let cmd = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd, crate::client::ClientCmd::SetDims { cols: 150, rows: 50 }));
     }
 
     // === TUI set_dims and resize_pty Test ===
@@ -1307,47 +1104,10 @@ mod tests {
         key
     }
 
-    /// Helper: spawn a command processor on Hub's tokio runtime for a given agent.
-    ///
-    /// Takes the command_rx from the PtySession and processes Connect/Disconnect commands.
-    /// This unblocks `connect_blocking()` calls in `select_agent()` during tests.
-    ///
-    /// The processor runs as a tokio task on the Hub's runtime, which is necessary
-    /// because `blocking_send`/`blocking_recv` on tokio channels need the runtime's
-    /// worker threads to drive the async processing.
-    fn spawn_pty_command_processor(hub: &Hub, agent_key: &str) {
-        let command_rx = hub
-            .state
-            .write()
-            .unwrap()
-            .agents
-            .get_mut(agent_key)
-            .expect("agent must exist")
-            .cli_pty
-            .take_command_receiver()
-            .expect("command_rx not yet taken");
-
-        hub.tokio_runtime.spawn(async move {
-            use crate::agent::pty::PtyCommand;
-
-            let mut rx = command_rx;
-            while let Some(cmd) = rx.recv().await {
-                match cmd {
-                    PtyCommand::Connect { response_tx, .. } => {
-                        let _ = response_tx.send(Vec::new());
-                    }
-                    _ => {
-                        // Ignore other commands in tests
-                    }
-                }
-            }
-        });
-    }
-
     #[test]
     fn test_handle_cache_syncs_on_agent_create() {
         let config = test_config();
-        let hub = Hub::new(config, TEST_DIMS).unwrap();
+        let hub = Hub::new(config).unwrap();
 
         // Initially empty
         assert!(hub.handle_cache.is_empty());
@@ -1371,7 +1131,7 @@ mod tests {
     #[test]
     fn test_handle_cache_syncs_on_agent_delete() {
         let config = test_config();
-        let hub = Hub::new(config, TEST_DIMS).unwrap();
+        let hub = Hub::new(config).unwrap();
 
         // Add 2 agents
         let key1 = add_agent_to_hub(&hub, 1);
@@ -1395,81 +1155,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_select_agent_via_client_trait() {
-        use crate::client::{TuiRequest, TuiAgentMetadata};
-
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        // Add agent and sync cache (required for HubHandle.get_agent() to work)
-        let key = add_agent_to_hub(&hub, 42);
-        hub.sync_handle_cache();
-
-        // Spawn PTY command processor on Hub's runtime so connect_blocking() works.
-        spawn_pty_command_processor(&hub, &key);
-
-        // Create TuiRequest channel and register TuiClient with it
-        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<TuiRequest>();
-        let _output_rx = hub.register_tui_client_with_request_channel(request_rx);
-
-        // Send SelectAgent request through the channel
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel::<Option<TuiAgentMetadata>>();
-        request_tx
-            .send(TuiRequest::SelectAgent {
-                index: 0,
-                response_tx,
-            })
-            .unwrap();
-
-        // poll_requests() -> handle_request(SelectAgent) -> select_agent(0)
-        //   -> connect_to_pty_with_handle() -> pty_handle.connect_blocking()
-        hub.clients.get_tui_mut().unwrap().poll_requests();
-
-        // Verify response metadata
-        let result = response_rx.blocking_recv().unwrap();
-        assert!(result.is_some(), "SelectAgent(0) should return Some metadata");
-        let metadata = result.unwrap();
-        assert_eq!(metadata.agent_id, key);
-        assert_eq!(metadata.agent_index, 0);
-    }
-
-    #[test]
-    fn test_select_nonexistent_agent_returns_none() {
-        use crate::client::{TuiRequest, TuiAgentMetadata};
-
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        // No agents -- cache is empty
-
-        // Create TuiRequest channel and register TuiClient
-        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<TuiRequest>();
-        let _output_rx = hub.register_tui_client_with_request_channel(request_rx);
-
-        // Send SelectAgent with out-of-bounds index
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel::<Option<TuiAgentMetadata>>();
-        request_tx
-            .send(TuiRequest::SelectAgent {
-                index: 99,
-                response_tx,
-            })
-            .unwrap();
-
-        // Poll requests
-        if let Some(tui) = hub.clients.get_tui_mut() {
-            tui.poll_requests();
-        }
-
-        // Verify response is None
-        let result = response_rx.blocking_recv().unwrap();
-        assert!(result.is_none(), "SelectAgent(99) with no agents should return None");
-    }
+    // Note: Tests for TuiClient request processing (select_agent_via_client_trait,
+    // select_nonexistent_agent_returns_none) were removed because TuiClient now
+    // processes requests in its own async task. Those flows are tested in
+    // client/tui.rs tests. Hub-side tests verify selection tracking via
+    // handle_action(SelectAgentForClient) above.
 
     #[test]
     fn test_create_delete_agent_cycle() {
         let config = test_config();
-        let hub = Hub::new(config, TEST_DIMS).unwrap();
+        let hub = Hub::new(config).unwrap();
 
         // Add 3 agents, sync cache after each
         let key1 = add_agent_to_hub(&hub, 1);
@@ -1505,150 +1200,33 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_select_agent_after_deletion() {
-        use crate::client::{TuiRequest, TuiAgentMetadata};
-
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-        // Add 3 agents and sync cache
-        let key1 = add_agent_to_hub(&hub, 1);
-        let key2 = add_agent_to_hub(&hub, 2);
-        let key3 = add_agent_to_hub(&hub, 3);
-        hub.sync_handle_cache();
-
-        // Spawn PTY command processors on Hub's runtime for all agents
-        spawn_pty_command_processor(&hub, &key1);
-        spawn_pty_command_processor(&hub, &key2);
-        spawn_pty_command_processor(&hub, &key3);
-
-        // Create TuiRequest channel and register TuiClient
-        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<TuiRequest>();
-        let _output_rx = hub.register_tui_client_with_request_channel(request_rx);
-
-        // Select agent at index 1 (should be key2)
-        let (resp_tx1, resp_rx1) = tokio::sync::oneshot::channel::<Option<TuiAgentMetadata>>();
-        request_tx
-            .send(TuiRequest::SelectAgent {
-                index: 1,
-                response_tx: resp_tx1,
-            })
-            .unwrap();
-        hub.clients.get_tui_mut().unwrap().poll_requests();
-        let result1 = resp_rx1.blocking_recv().unwrap();
-        assert_eq!(result1.as_ref().unwrap().agent_id, key2, "Index 1 should be agent 2");
-
-        // Delete agent at index 0 (key1)
-        hub.state.write().unwrap().remove_agent(&key1);
-        hub.sync_handle_cache();
-
-        // Now index 0 should be key2, index 1 should be key3
-        // Select agent at index 0 (should now be key2)
-        let (resp_tx2, resp_rx2) = tokio::sync::oneshot::channel::<Option<TuiAgentMetadata>>();
-        request_tx
-            .send(TuiRequest::SelectAgent {
-                index: 0,
-                response_tx: resp_tx2,
-            })
-            .unwrap();
-        hub.clients.get_tui_mut().unwrap().poll_requests();
-        let result2 = resp_rx2.blocking_recv().unwrap();
-        assert!(result2.is_some(), "Index 0 after deletion should still return Some");
-        assert_eq!(
-            result2.unwrap().agent_id, key2,
-            "After deleting agent 0, index 0 should now point to what was agent 1 (key2)"
-        );
-    }
-
-    /// Test that TuiClient.set_dims() updates dims and resize_pty() propagates to PTY.
+    /// Test that TUI resize sends SetDims command to client.
     ///
-    /// After refactoring, set_dims() only updates local dims. PTY resize propagation
-    /// happens through TuiRequest::SetDims which calls resize_pty() with explicit indices.
-    ///
-    /// The scenario:
-    /// 1. Create Hub and Agent with PTY at (24 rows, 80 cols)
-    /// 2. Register TuiClient and connect to the PTY
-    /// 3. Call set_dims(100, 40) to update local dims
-    /// 4. Call resize_pty(0, 0, 40, 100) to propagate to PTY
-    /// 5. Verify: client dims updated and PTY resized
+    /// Dims travel with requests from clients. The Hub no longer caches them.
+    /// The client's async task receives SetDims via its command channel.
     #[test]
-    fn test_tui_set_dims_and_resize_pty() {
-        use crate::agent::Agent;
-        use crate::client::ClientId;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-
+    fn test_resize_sends_set_dims_cmd() {
         let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+        let mut hub = Hub::new(config).unwrap();
 
-        // Register TuiClient
-        let _output_rx = hub.register_tui_client();
+        // Register TuiClient task -- get command receiver for verification
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(64);
+        let join_handle = hub.tokio_runtime.spawn(async {});
+        hub.clients.register(ClientId::Tui, ClientTaskHandle {
+            cmd_tx,
+            join_handle,
+        });
 
-        // Create an agent with PTY at default dimensions (24 rows, 80 cols)
-        let agent = Agent::new(
-            Uuid::new_v4(),
-            "test/repo".to_string(),
-            Some(42),
-            "test-branch".to_string(),
-            PathBuf::from("/tmp/test"),
-        );
+        // Resize via action
+        hub.handle_action(HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            cols: 120,
+            rows: 40,
+        });
 
-        let agent_key = "test-repo-42".to_string();
-        hub.state.write().unwrap().add_agent(agent_key.clone(), agent);
-        hub.sync_handle_cache();
-
-        // Connect TuiClient to the PTY (agent_index=0, pty_index=0)
-        // Must register with PTY so TUI becomes the size owner.
-        {
-            let state = hub.state.read().unwrap();
-            let _ = state.agents.get(&agent_key).unwrap().cli_pty.connect(ClientId::Tui, (80, 24));
-        }
-
-        // Get initial PTY dimensions
-        let initial_pty_dims = {
-            let state = hub.state.read().unwrap();
-            state.agents.get(&agent_key).unwrap().cli_pty.dimensions()
-        };
-        assert_eq!(initial_pty_dims, (24, 80), "Initial PTY dims");
-
-        // Update dims on TuiClient (set_dims only updates local dims now)
-        if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
-            client.set_dims(100, 40);
-        }
-
-        // Verify TuiClient dims were updated
-        let tui_dims = hub.clients.get(&ClientId::Tui).unwrap().dims();
-        assert_eq!(tui_dims, (100, 40), "TuiClient dims should be updated");
-
-        // PTY should NOT be resized yet (set_dims no longer propagates)
-        let pty_dims_before_resize = {
-            let state = hub.state.read().unwrap();
-            state.agents.get(&agent_key).unwrap().cli_pty.dimensions()
-        };
-        assert_eq!(pty_dims_before_resize, (24, 80), "PTY should not be resized by set_dims alone");
-
-        // Now call resize_pty directly (this is what TuiRequest::SetDims handler does)
-        if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
-            let _ = client.resize_pty(0, 0, 40, 100);
-        }
-
-        // Process pending PTY commands
-        {
-            let mut state = hub.state.write().unwrap();
-            state.agents.get_mut(&agent_key).unwrap().cli_pty.process_commands();
-        }
-
-        // Verify PTY dimensions were updated
-        let pty_dims_after = {
-            let state = hub.state.read().unwrap();
-            state.agents.get(&agent_key).unwrap().cli_pty.dimensions()
-        };
-        assert_eq!(
-            pty_dims_after,
-            (40, 100),
-            "PTY should be resized after explicit resize_pty call"
-        );
+        // Verify SetDims command was sent to client
+        let cmd = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd, crate::client::ClientCmd::SetDims { cols: 120, rows: 40 }));
     }
 
     // === Resize Flow Integration Tests ===
@@ -1659,303 +1237,103 @@ mod tests {
     // - Browser resize via BrowserRequest channel
     // - Resize updates client dims even without PTY
 
-    /// Helper: create a Hub with TuiClient registered and crypto service initialized.
+    /// Test that resize without a connected PTY is safe.
     ///
-    /// Matches the pattern from `actions::tests::test_hub()`. The crypto service
-    /// is needed for BrowserClient creation via `ClientConnected` action.
-    fn test_hub_with_crypto() -> Hub {
-        use crate::relay::crypto_service::CryptoService;
-
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-        let _output_rx = hub.register_tui_client();
-
-        // Initialize crypto service for browser client tests
-        let crypto_service = CryptoService::start("test-hub").unwrap();
-        hub.browser.crypto_service = Some(crypto_service);
-
-        hub
-    }
-
-    /// Helper: connect TuiClient to an agent's PTY for testing.
-    ///
-    /// Registers the TUI as a connected client on the PTY (making it the size
-    /// owner).
-    fn connect_tui_to_pty(hub: &mut Hub, agent_key: &str) {
-        let state = hub.state.read().unwrap();
-        let _ = state
-            .agents
-            .get(agent_key)
-            .unwrap()
-            .cli_pty
-            .connect(ClientId::Tui, (80, 24));
-    }
-
-    /// Test that calling set_dims() without a PTY connection is safe.
-    ///
-    /// Verifies:
-    /// 1. No crash when resizing without a connected PTY
-    /// 2. Client dims are updated correctly despite no PTY
-    ///
-    /// This is important because resize events can arrive before agent selection
-    /// (e.g., terminal window resized while no agent is selected).
+    /// Hub sends SetDims via channel to the client task. Even without a PTY,
+    /// the command is sent successfully.
     #[test]
     fn test_resize_without_connection_is_safe() {
         let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+        let mut hub = Hub::new(config).unwrap();
 
-        // Register TuiClient but do NOT connect to any PTY
-        let _output_rx = hub.register_tui_client();
-
-        // Verify initial dims
-        let initial_dims = hub.clients.get(&ClientId::Tui).unwrap().dims();
-        assert_eq!(initial_dims, (80, 24), "Initial TuiClient dims should be (80, 24)");
-
-        // Call set_dims without any PTY connection - should NOT crash
-        if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
-            client.set_dims(120, 40);
-        }
-
-        // Verify dims were updated on the client despite no PTY
-        let updated_dims = hub.clients.get(&ClientId::Tui).unwrap().dims();
-        assert_eq!(
-            updated_dims,
-            (120, 40),
-            "TuiClient dims should be updated to (120, 40) even without PTY connection"
-        );
-    }
-
-    /// Test that multiple resize calls result in the correct final PTY state.
-    ///
-    /// Verifies:
-    /// 1. Multiple rapid set_dims() + resize_pty() calls are all processed
-    /// 2. PTY commands are processed after each resize
-    /// 3. Final PTY dimensions match the last resize call
-    ///
-    /// This exercises the scenario where terminal resize events arrive in rapid
-    /// succession (e.g., user dragging the window edge). In production, both
-    /// set_dims() and resize_pty() are called from TuiRequest::SetDims handler.
-    #[test]
-    fn test_resize_multiple_times_final_state_correct() {
-        use crate::agent::Agent;
-        use uuid::Uuid;
-
-        let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-        let _output_rx = hub.register_tui_client();
-
-        // Create agent and connect TuiClient to PTY
-        let agent = Agent::new(
-            Uuid::new_v4(),
-            "test/repo".to_string(),
-            Some(42),
-            "test-branch".to_string(),
-            PathBuf::from("/tmp/test"),
-        );
-        let agent_key = "test-repo-42".to_string();
-        hub.state.write().unwrap().add_agent(agent_key.clone(), agent);
-        hub.sync_handle_cache();
-        connect_tui_to_pty(&mut hub, &agent_key);
-
-        // Verify initial PTY dimensions
-        let initial_dims = {
-            let state = hub.state.read().unwrap();
-            state.agents.get(&agent_key).unwrap().cli_pty.dimensions()
-        };
-        assert_eq!(initial_dims, (24, 80), "Initial PTY dims should be (24, 80)");
-
-        // Resize #1: (100 cols, 30 rows)
-        if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
-            client.set_dims(100, 30);
-            let _ = client.resize_pty(0, 0, 30, 100);
-        }
-        {
-            let mut state = hub.state.write().unwrap();
-            state.agents.get_mut(&agent_key).unwrap().cli_pty.process_commands();
-        }
-
-        // Resize #2: (120 cols, 40 rows)
-        if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
-            client.set_dims(120, 40);
-            let _ = client.resize_pty(0, 0, 40, 120);
-        }
-        {
-            let mut state = hub.state.write().unwrap();
-            state.agents.get_mut(&agent_key).unwrap().cli_pty.process_commands();
-        }
-
-        // Resize #3: (80 cols, 24 rows) - back to default
-        if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
-            client.set_dims(80, 24);
-            let _ = client.resize_pty(0, 0, 24, 80);
-        }
-        {
-            let mut state = hub.state.write().unwrap();
-            state.agents.get_mut(&agent_key).unwrap().cli_pty.process_commands();
-        }
-
-        // Verify final PTY dimensions match the last resize: (24 rows, 80 cols)
-        let final_pty_dims = {
-            let state = hub.state.read().unwrap();
-            state.agents.get(&agent_key).unwrap().cli_pty.dimensions()
-        };
-        assert_eq!(
-            final_pty_dims,
-            (24, 80),
-            "Final PTY dims should be (24 rows, 80 cols) after three resizes"
-        );
-
-        // Verify client dims also match the last resize
-        let client_dims = hub.clients.get(&ClientId::Tui).unwrap().dims();
-        assert_eq!(
-            client_dims,
-            (80, 24),
-            "TuiClient dims should be (80 cols, 24 rows) after three resizes"
-        );
-    }
-
-    /// Test that BrowserRequest::Resize propagates to the PTY.
-    ///
-    /// Verifies the full browser resize flow:
-    /// 1. BrowserClient receives BrowserRequest::Resize via its request channel
-    /// 2. poll_requests() processes it and calls resize_pty()
-    /// 3. PTY receives the resize command and updates dimensions
-    ///
-    /// This mirrors the production flow where the browser input receiver task
-    /// sends BrowserRequest::Resize when it receives a resize command from the
-    /// browser via the encrypted ActionCable channel.
-    #[test]
-    fn test_browser_resize_propagates_to_pty() {
-        use crate::agent::Agent;
-        use crate::client::{BrowserClient, BrowserRequest};
-        use uuid::Uuid;
-
-        let mut hub = test_hub_with_crypto();
-
-        // Create agent
-        let agent = Agent::new(
-            Uuid::new_v4(),
-            "test/repo".to_string(),
-            Some(42),
-            "test-branch".to_string(),
-            PathBuf::from("/tmp/test"),
-        );
-        let agent_key = "test-repo-42".to_string();
-        hub.state.write().unwrap().add_agent(agent_key.clone(), agent);
-        hub.sync_handle_cache();
-
-        // Register BrowserClient via ClientConnected action
-        let browser_id = ClientId::Browser("test-browser-12345678".to_string());
-        hub.handle_action(HubAction::ClientConnected {
-            client_id: browser_id.clone(),
+        // Register TuiClient task with command receiver
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(64);
+        let join_handle = hub.tokio_runtime.spawn(async {});
+        hub.clients.register(ClientId::Tui, ClientTaskHandle {
+            cmd_tx,
+            join_handle,
         });
 
-        // Verify browser client was registered
-        assert!(
-            hub.clients.get(&browser_id).is_some(),
-            "BrowserClient should be registered after ClientConnected"
-        );
+        // Resize via action
+        hub.handle_action(HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            cols: 120,
+            rows: 40,
+        });
 
-        // Connect browser client to the PTY (register as size owner)
-        {
-            let state = hub.state.read().unwrap();
-            let _ = state
-                .agents
-                .get(&agent_key)
-                .unwrap()
-                .cli_pty
-                .connect(browser_id.clone(), (80, 24));
-        }
-
-        // Get the request sender from the BrowserClient for sending BrowserRequest
-        let request_tx = {
-            let client = hub.clients.get(&browser_id).unwrap();
-            let browser = client
-                .as_any()
-                .and_then(|a| a.downcast_ref::<BrowserClient>())
-                .expect("Should be a BrowserClient");
-            browser.request_sender_for_test()
-        };
-
-        // Send BrowserRequest::Resize through the channel
-        request_tx
-            .send(BrowserRequest::Resize {
-                agent_index: 0,
-                pty_index: 0,
-                rows: 50,
-                cols: 120,
-            })
-            .expect("Should send resize request");
-
-        // Process the request via poll_requests() on BrowserClient
-        {
-            let client = hub.clients.get_mut(&browser_id).unwrap();
-            let browser = client
-                .as_any_mut()
-                .and_then(|a| a.downcast_mut::<BrowserClient>())
-                .expect("Should be a BrowserClient");
-            browser.poll_requests();
-        }
-
-        // Process PTY commands to apply the resize
-        {
-            let mut state = hub.state.write().unwrap();
-            state
-                .agents
-                .get_mut(&agent_key)
-                .unwrap()
-                .cli_pty
-                .process_commands();
-        }
-
-        // Verify PTY dimensions updated to (50 rows, 120 cols)
-        let pty_dims = {
-            let state = hub.state.read().unwrap();
-            state.agents.get(&agent_key).unwrap().cli_pty.dimensions()
-        };
-        assert_eq!(
-            pty_dims,
-            (50, 120),
-            "PTY should be resized to (50 rows, 120 cols) after BrowserRequest::Resize"
-        );
+        // Verify SetDims was sent
+        let cmd = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd, crate::client::ClientCmd::SetDims { cols: 120, rows: 40 }));
     }
 
-    /// Test that set_dims() updates client dimensions even without a PTY.
-    ///
-    /// Verifies:
-    /// 1. TuiClient starts with default dims (80, 24)
-    /// 2. set_dims() updates the stored dims
-    /// 3. dims() returns the new values
-    ///
-    /// This is important because the client tracks its terminal size
-    /// independently of any PTY connection. When an agent is later selected,
-    /// the stored dims are used for the initial PTY size.
+    /// Test that multiple resize actions send correct SetDims commands.
     #[test]
-    fn test_resize_updates_client_dims_even_without_pty() {
+    fn test_resize_multiple_times_sends_all_cmds() {
         let config = test_config();
-        let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-        let _output_rx = hub.register_tui_client();
+        let mut hub = Hub::new(config).unwrap();
 
-        // Verify default dims
-        let default_dims = hub.clients.get(&ClientId::Tui).unwrap().dims();
-        assert_eq!(
-            default_dims,
-            (80, 24),
-            "TuiClient should start with default (80, 24)"
-        );
+        // Register TuiClient task with command receiver
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(64);
+        let join_handle = hub.tokio_runtime.spawn(async {});
+        hub.clients.register(ClientId::Tui, ClientTaskHandle {
+            cmd_tx,
+            join_handle,
+        });
 
-        // Call set_dims without connecting to any PTY
-        if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
-            client.set_dims(120, 40);
-        }
+        // Resize #1: (100 cols, 30 rows)
+        hub.handle_action(HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            cols: 100,
+            rows: 30,
+        });
 
-        // Verify dims() returns the new values
-        let new_dims = hub.clients.get(&ClientId::Tui).unwrap().dims();
-        assert_eq!(
-            new_dims,
-            (120, 40),
-            "client.dims() should return (120, 40) after set_dims(120, 40)"
-        );
+        // Resize #2: (120 cols, 40 rows)
+        hub.handle_action(HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            cols: 120,
+            rows: 40,
+        });
+
+        // Resize #3: (80 cols, 24 rows) - back to default
+        hub.handle_action(HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            cols: 80,
+            rows: 24,
+        });
+
+        // Verify three SetDims commands were sent
+        let cmd1 = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd1, crate::client::ClientCmd::SetDims { cols: 100, rows: 30 }));
+        let cmd2 = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd2, crate::client::ClientCmd::SetDims { cols: 120, rows: 40 }));
+        let cmd3 = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd3, crate::client::ClientCmd::SetDims { cols: 80, rows: 24 }));
+    }
+
+    /// Test that ResizeForClient sends SetDims command even without a PTY.
+    #[test]
+    fn test_resize_sends_cmd_even_without_pty() {
+        let config = test_config();
+        let mut hub = Hub::new(config).unwrap();
+
+        // Register TuiClient task with command receiver
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(64);
+        let join_handle = hub.tokio_runtime.spawn(async {});
+        hub.clients.register(ClientId::Tui, ClientTaskHandle {
+            cmd_tx,
+            join_handle,
+        });
+
+        // Update via ResizeForClient action
+        hub.handle_action(HubAction::ResizeForClient {
+            client_id: ClientId::Tui,
+            cols: 120,
+            rows: 40,
+        });
+
+        // Verify SetDims sent
+        let cmd = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd, crate::client::ClientCmd::SetDims { cols: 120, rows: 40 }));
     }
 
     // === Stress / Concurrency Tests ===
@@ -1994,7 +1372,7 @@ mod tests {
 
         run_with_timeout(|| {
             let config = test_config();
-            let hub = Hub::new(config, TEST_DIMS).unwrap();
+            let hub = Hub::new(config).unwrap();
             let cache = Arc::clone(&hub.handle_cache);
 
             // Spawn reader thread: continuously reads from cache
@@ -2029,55 +1407,32 @@ mod tests {
         }, Duration::from_secs(5));
     }
 
-    /// Stress test: rapid agent selection with no deadlock.
+    /// Stress test: rapid agent selection via Hub actions.
     ///
-    /// Creates 3 agents, registers a TuiClient with a request channel,
-    /// then sends 50 SelectAgent commands rapidly, alternating indices.
-    /// Calls poll_requests() between each to process the selection.
-    ///
-    /// This exercises the production pattern where a user rapidly switches
-    /// between agents via keyboard shortcuts. The test verifies that the
-    /// selection/PTY-connect flow doesn't deadlock under rapid switching.
+    /// Creates 3 agents, then sends 50 SelectAgentForClient actions rapidly,
+    /// alternating between agents. Verifies that the handle cache remains
+    /// consistent throughout.
     #[test]
     fn test_rapid_agent_selection_no_deadlock() {
-        use crate::client::{TuiAgentMetadata, TuiRequest};
         use std::time::Duration;
 
         run_with_timeout(|| {
             let config = test_config();
-            let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+            let mut hub = Hub::new(config).unwrap();
 
             // Add 3 agents
             let keys: Vec<String> = (1..=3).map(|i| add_agent_to_hub(&hub, i)).collect();
             hub.sync_handle_cache();
 
-            // Spawn PTY command processors so connect_blocking() won't block forever
-            for key in &keys {
-                spawn_pty_command_processor(&hub, key);
-            }
-
-            // Register TuiClient with request channel
-            let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<TuiRequest>();
-            let _output_rx = hub.register_tui_client_with_request_channel(request_rx);
-
-            // Rapid selection: 50 iterations, alternating between agents 0, 1, 2
+            // Rapid selection: 50 iterations, alternating between agents
             for i in 0..50usize {
                 let index = i % 3;
-                let (resp_tx, resp_rx) =
-                    tokio::sync::oneshot::channel::<Option<TuiAgentMetadata>>();
+                let agent_key = keys[index].clone();
 
-                request_tx
-                    .send(TuiRequest::SelectAgent {
-                        index,
-                        response_tx: resp_tx,
-                    })
-                    .unwrap();
-
-                // Process the request (this is where deadlocks would surface)
-                hub.clients.get_tui_mut().unwrap().poll_requests();
-
-                // Consume response to avoid channel backup
-                let _result = resp_rx.blocking_recv();
+                hub.handle_action(HubAction::SelectAgentForClient {
+                    client_id: ClientId::Tui,
+                    agent_key,
+                });
             }
 
             // Verify final state is consistent: cache should still have 3 agents
@@ -2087,11 +1442,6 @@ mod tests {
                 "HandleCache should still have 3 agents after rapid selection"
             );
 
-            // Verify Hub's TUI selection is set (should be the last selected agent)
-            // Last iteration: i=49, index=49%3=1, so agent at index 1 should be selected
-            // Note: hub.tui_selected_agent is updated by SelectAgentForClient action,
-            // but TuiClient.poll_requests() dispatches via HubHandle, not directly on Hub.
-            // So we verify the cache is consistent instead.
             let cached_agent = hub.handle_cache.get_agent(1);
             assert!(
                 cached_agent.is_some(),
@@ -2100,69 +1450,56 @@ mod tests {
         }, Duration::from_secs(5));
     }
 
-    /// Stress test: interleaved resize and agent selection.
+    /// Stress test: interleaved resize and agent selection via Hub actions.
     ///
-    /// Interleaves set_dims() and SelectAgent calls to verify no crash
-    /// or deadlock when terminal resize events arrive during agent selection.
-    ///
-    /// This exercises the production scenario where the user resizes the
-    /// terminal window while also switching between agents.
+    /// Interleaves ResizeForClient and SelectAgentForClient actions to verify
+    /// no crash when terminal resize events arrive during agent selection.
     #[test]
     fn test_resize_during_agent_selection() {
-        use crate::client::{TuiAgentMetadata, TuiRequest};
         use std::time::Duration;
 
         run_with_timeout(|| {
             let config = test_config();
-            let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+            let mut hub = Hub::new(config).unwrap();
+
+            // Register TuiClient task with command receiver
+            let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(256);
+            let join_handle = hub.tokio_runtime.spawn(async {});
+            hub.clients.register(ClientId::Tui, ClientTaskHandle {
+                cmd_tx,
+                join_handle,
+            });
 
             // Add an agent and sync cache
             let key = add_agent_to_hub(&hub, 42);
             hub.sync_handle_cache();
-
-            // Spawn PTY command processor
-            spawn_pty_command_processor(&hub, &key);
-
-            // Register TuiClient with request channel
-            let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<TuiRequest>();
-            let _output_rx = hub.register_tui_client_with_request_channel(request_rx);
 
             // Interleave resize and selection 20 times
             for i in 0..20u16 {
                 // Resize with varying dimensions
                 let cols = 80 + i;
                 let rows = 24 + (i % 10);
-                if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
-                    client.set_dims(cols, rows);
-                }
+                hub.handle_action(HubAction::ResizeForClient {
+                    client_id: ClientId::Tui,
+                    cols,
+                    rows,
+                });
 
-                // Select agent (always index 0 since we only have one)
-                let (resp_tx, resp_rx) =
-                    tokio::sync::oneshot::channel::<Option<TuiAgentMetadata>>();
-                request_tx
-                    .send(TuiRequest::SelectAgent {
-                        index: 0,
-                        response_tx: resp_tx,
-                    })
-                    .unwrap();
-                hub.clients.get_tui_mut().unwrap().poll_requests();
-                let _result = resp_rx.blocking_recv();
+                // Select agent
+                hub.handle_action(HubAction::SelectAgentForClient {
+                    client_id: ClientId::Tui,
+                    agent_key: key.clone(),
+                });
 
                 // Another resize after selection
-                if let Some(client) = hub.clients.get_mut(&ClientId::Tui) {
-                    client.set_dims(cols + 1, rows + 1);
-                }
+                hub.handle_action(HubAction::ResizeForClient {
+                    client_id: ClientId::Tui,
+                    cols: cols + 1,
+                    rows: rows + 1,
+                });
             }
 
-            // Verify final client dims match last resize (cols=100, rows=33+1=34)
-            // Last iteration: i=19, cols=80+19=99, rows=24+9=33
-            // After-selection resize: cols=100, rows=34
-            let final_dims = hub.clients.get(&ClientId::Tui).unwrap().dims();
-            assert_eq!(
-                final_dims,
-                (100, 34),
-                "Final client dims should match last set_dims call"
-            );
+            // Test passes if no panics or deadlocks during interleaved operations
         }, Duration::from_secs(5));
     }
 
@@ -2180,7 +1517,7 @@ mod tests {
 
         run_with_timeout(|| {
             let config = test_config();
-            let hub = Hub::new(config, TEST_DIMS).unwrap();
+            let hub = Hub::new(config).unwrap();
 
             // Add 5 agents one by one, verify cache matches state at each step
             let mut keys = Vec::new();

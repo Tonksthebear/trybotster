@@ -81,6 +81,11 @@ pub struct CreateAgentRequest {
     /// Optional path to an existing worktree to reopen.
     /// If provided, reuses existing worktree instead of creating new.
     pub from_worktree: Option<PathBuf>,
+
+    /// Terminal dimensions (rows, cols) from the requesting client.
+    /// Used to size the PTY when spawning the agent.
+    /// If None, a default of (24, 80) is used.
+    pub dims: Option<(u16, u16)>,
 }
 
 impl CreateAgentRequest {
@@ -90,6 +95,7 @@ impl CreateAgentRequest {
             issue_or_branch: issue_or_branch.into(),
             prompt: None,
             from_worktree: None,
+            dims: None,
         }
     }
 
@@ -102,6 +108,12 @@ impl CreateAgentRequest {
     /// Reopen an existing worktree.
     pub fn from_worktree(mut self, path: PathBuf) -> Self {
         self.from_worktree = Some(path);
+        self
+    }
+
+    /// Set terminal dimensions for PTY sizing.
+    pub fn with_dims(mut self, dims: (u16, u16)) -> Self {
+        self.dims = Some(dims);
         self
     }
 }
@@ -164,6 +176,14 @@ mod tests {
         assert_eq!(req.issue_or_branch, "42");
         assert_eq!(req.prompt, Some("Fix the bug".to_string()));
         assert!(req.from_worktree.is_none());
+        assert!(req.dims.is_none());
+    }
+
+    #[test]
+    fn test_create_agent_request_with_dims() {
+        let req = CreateAgentRequest::new("42").with_dims((40, 120));
+
+        assert_eq!(req.dims, Some((40, 120)));
     }
 
     #[test]

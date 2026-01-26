@@ -166,7 +166,9 @@ where
 
                 // Create agent request with the existing worktree
                 let request =
-                    CreateAgentRequest::new(branch.clone()).from_worktree(PathBuf::from(path));
+                    CreateAgentRequest::new(branch.clone())
+                        .from_worktree(PathBuf::from(path))
+                        .with_dims(self.terminal_dims);
                 if let Err(e) = self.request_tx.send(TuiRequest::CreateAgent { request }) {
                     // Channel closed - TuiClient is shutting down
                     log::error!("Failed to send create agent request: {}", e);
@@ -216,8 +218,9 @@ where
                         prompt
                     );
 
-                    // Build the CreateAgentRequest
-                    let mut request = CreateAgentRequest::new(issue_or_branch.clone());
+                    // Build the CreateAgentRequest with current terminal dims
+                    let mut request = CreateAgentRequest::new(issue_or_branch.clone())
+                        .with_dims(self.terminal_dims);
                     if let Some(p) = prompt {
                         request = request.with_prompt(p);
                     }

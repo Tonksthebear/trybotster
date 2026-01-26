@@ -59,8 +59,7 @@ pub struct SpawnResult {
 /// # Arguments
 ///
 /// * `state` - Mutable reference to the Hub state
-/// * `config` - Agent spawn configuration
-/// * `terminal_dims` - Terminal dimensions (rows, cols)
+/// * `config` - Agent spawn configuration (includes dims for PTY sizing)
 ///
 /// # Returns
 ///
@@ -75,7 +74,6 @@ pub struct SpawnResult {
 pub fn spawn_agent(
     state: &mut HubState,
     config: &AgentSpawnConfig,
-    terminal_dims: (u16, u16),
 ) -> Result<SpawnResult> {
     let id = uuid::Uuid::new_v4();
     let mut agent = Agent::new_with_dims(
@@ -84,7 +82,7 @@ pub fn spawn_agent(
         config.issue_number,
         config.branch_name.clone(),
         config.worktree_path.clone(),
-        terminal_dims,
+        config.dims,
     );
 
     // Set invocation URL for notifications
@@ -296,6 +294,7 @@ mod tests {
             prompt: "Fix the bug".to_string(),
             message_id: Some(123),
             invocation_url: None,
+            dims: (24, 80),
         };
 
         let env = build_spawn_environment(&config);
@@ -321,6 +320,7 @@ mod tests {
             prompt: "Work on feature".to_string(),
             message_id: None,
             invocation_url: None,
+            dims: (24, 80),
         };
 
         let env = build_spawn_environment(&config);
@@ -366,6 +366,7 @@ mod tests {
             prompt: "Test".to_string(),
             message_id: None,
             invocation_url: None,
+            dims: (24, 80),
         };
 
         let env = build_spawn_environment(&config);

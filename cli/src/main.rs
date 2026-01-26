@@ -178,7 +178,7 @@ fn run_headless() -> Result<()> {
         &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
     );
 
-    let mut hub = Hub::new(config, (80, 24))?;
+    let mut hub = Hub::new(config)?;
 
     println!("Setting up connections...");
     hub.setup();
@@ -247,9 +247,7 @@ fn run_with_tui() -> Result<()> {
         &config.get_api_key()[..10.min(config.get_api_key().len())],
         &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
     );
-    // Get terminal size for Hub initialization
-    let terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
-    let mut hub = Hub::new(config, terminal_size)?;
+    let mut hub = Hub::new(config)?;
 
     // Perform setup BEFORE entering raw mode so errors are visible
     println!("Setting up connections...");
@@ -482,6 +480,7 @@ mod tests {
             prompt: "Test prompt".to_string(),
             message_id: None,
             invocation_url: Some("https://github.com/owner/repo/issues/42".to_string()),
+            dims: (24, 80),
         };
         assert_eq!(
             config.invocation_url,
@@ -500,6 +499,7 @@ mod tests {
             prompt: "Test prompt".to_string(),
             message_id: None,
             invocation_url: None,
+            dims: (24, 80),
         };
         assert!(config.invocation_url.is_none());
     }

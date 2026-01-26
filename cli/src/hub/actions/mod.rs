@@ -6,10 +6,10 @@
 //! # Module Structure
 //!
 //! - `mod.rs` - HubAction enum and dispatch() routing
-//! - `agent_handlers.rs` - Agent lifecycle: spawn, close, kill
-//! - `client_handlers.rs` - Client-scoped: selection, input, resize
-//! - `menu_handlers.rs` - Menu/modal navigation and selection
-//! - `input_handlers.rs` - Text input processing and agent creation
+//! - `agent_handlers.rs` - Agent lifecycle: spawn, close
+//! - `client_handlers.rs` - Client-scoped: selection, resize, create, delete
+//! - `connection_handlers.rs` - Connection URL copy and regeneration
+//! - `input_handlers.rs` - Agent spawn helper
 //!
 //! # Dispatch
 //!
@@ -23,18 +23,17 @@
 
 mod agent_handlers;
 mod client_handlers;
+mod connection_handlers;
 mod input_handlers;
-mod menu_handlers;
 
 #[cfg(test)]
 mod tests;
 
 use std::path::PathBuf;
 
-use crate::app::AppMode;
 use crate::client::{ClientId, CreateAgentRequest, DeleteAgentRequest};
 
-use super::{lifecycle, Hub};
+use super::Hub;
 
 // Re-export handler functions that need to be called from other modules
 pub use client_handlers::handle_select_agent_for_client;
@@ -102,94 +101,26 @@ pub enum HubAction {
         delete_worktree: bool,
     },
 
-    // === Agent Interaction ===
-    /// Kill the currently selected agent.
-    KillSelectedAgent,
-
-    // === UI State ===
-    /// Open the menu overlay.
-    OpenMenu,
-
-    /// Close any modal/overlay, return to normal mode.
-    CloseModal,
-
-    /// Menu navigation up.
-    MenuUp,
-
-    /// Menu navigation down.
-    MenuDown,
-
-    /// Select the current menu item.
-    MenuSelect(usize),
-
-    /// Show the connection QR code.
-    ShowConnectionCode,
-
+    // === Connection ===
     /// Regenerate the connection QR code with a fresh PreKey.
     RegenerateConnectionCode,
 
     /// Copy connection URL to clipboard.
     CopyConnectionUrl,
 
-    // === Text Input ===
-    /// Add a character to the input buffer.
-    InputChar(char),
-
-    /// Delete the last character from the input buffer.
-    InputBackspace,
-
-    /// Submit the current input buffer.
-    InputSubmit,
-
-    /// Clear the input buffer.
-    InputClear,
-
-    // === Worktree Selection ===
-    /// Navigate up in worktree selection.
-    WorktreeUp,
-
-    /// Navigate down in worktree selection.
-    WorktreeDown,
-
-    /// Select a worktree for agent creation.
-    WorktreeSelect(usize),
-
-    // === Confirmation Dialogs ===
-    /// Confirm closing the selected agent (keep worktree).
-    ConfirmCloseAgent,
-
-    /// Confirm closing the selected agent and delete worktree.
-    ConfirmCloseAgentDeleteWorktree,
-
     // === Application Control ===
     /// Request application shutdown.
     Quit,
-
-    /// Refresh available worktrees list.
-    RefreshWorktrees,
-
-    /// No action (used for unhandled inputs).
-    None,
 
     // === Client-Scoped Actions ===
     // These include client_id for per-client agent selection.
     // Used by both TUI and browser clients.
     /// Select an agent for a specific client.
-    /// Replaces SelectNext/SelectPrevious/SelectByIndex/SelectByKey for client-aware selection.
     SelectAgentForClient {
         /// Which client is selecting.
         client_id: ClientId,
         /// Agent session key to select.
         agent_key: String,
-    },
-
-    /// Send input to the client's selected agent.
-    /// Client-scoped version of SendInput.
-    SendInputForClient {
-        /// Which client is sending input.
-        client_id: ClientId,
-        /// Input data.
-        data: Vec<u8>,
     },
 
     /// Resize the client's terminal and optionally the viewed agent's PTY.
@@ -231,7 +162,6 @@ pub enum HubAction {
     },
 
     /// Scroll the client's selected agent's terminal.
-    /// Client-scoped version of ScrollUp/ScrollDown/ScrollToTop/ScrollToBottom.
     ScrollForClient {
         /// Which client is scrolling.
         client_id: ClientId,
@@ -240,7 +170,6 @@ pub enum HubAction {
     },
 
     /// Toggle PTY view for the client's selected agent.
-    /// Client-scoped version of TogglePtyView.
     TogglePtyViewForClient {
         /// Which client is toggling.
         client_id: ClientId,
@@ -272,7 +201,6 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         HubAction::Quit => {
             hub.quit = true;
         }
-        HubAction::None => {}
 
         // === Agent Lifecycle ===
         HubAction::SpawnAgent {
@@ -305,112 +233,13 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
             agent_handlers::handle_close_agent(hub, &session_key, delete_worktree);
         }
 
-        HubAction::KillSelectedAgent => {
-            agent_handlers::handle_kill_selected_agent(hub);
-        }
-
-        // === UI Mode ===
-        HubAction::OpenMenu => {
-            hub.mode = AppMode::Menu;
-            hub.menu_selected = 0;
-        }
-
-        HubAction::CloseModal => {
-            menu_handlers::handle_close_modal(hub);
-        }
-
-        HubAction::ShowConnectionCode => {
-            menu_handlers::handle_show_connection_code(hub);
-        }
-
+        // === Connection ===
         HubAction::CopyConnectionUrl => {
-            menu_handlers::handle_copy_connection_url(hub);
+            connection_handlers::handle_copy_connection_url(hub);
         }
 
         HubAction::RegenerateConnectionCode => {
-            menu_handlers::handle_regenerate_connection_code(hub);
-        }
-
-        // === Menu Navigation ===
-        HubAction::MenuUp => {
-            menu_handlers::handle_menu_up(hub);
-        }
-
-        HubAction::MenuDown => {
-            menu_handlers::handle_menu_down(hub);
-        }
-
-        HubAction::MenuSelect(index) => {
-            menu_handlers::handle_menu_select(hub, index);
-        }
-
-        // === Worktree Selection ===
-        HubAction::WorktreeUp => {
-            if hub.worktree_selected > 0 {
-                hub.worktree_selected -= 1;
-            }
-        }
-
-        HubAction::WorktreeDown => {
-            if hub.worktree_selected < hub.state.read().unwrap().available_worktrees.len() {
-                hub.worktree_selected += 1;
-            }
-        }
-
-        HubAction::WorktreeSelect(index) => {
-            if index == 0 {
-                hub.mode = AppMode::NewAgentCreateWorktree;
-                hub.input_buffer.clear();
-            } else {
-                hub.mode = AppMode::NewAgentPrompt;
-                hub.input_buffer.clear();
-            }
-        }
-
-        // === Text Input ===
-        HubAction::InputChar(c) => {
-            hub.input_buffer.push(c);
-        }
-
-        HubAction::InputBackspace => {
-            hub.input_buffer.pop();
-        }
-
-        HubAction::InputSubmit => {
-            input_handlers::handle_input_submit(hub);
-        }
-
-        HubAction::InputClear => {
-            hub.input_buffer.clear();
-        }
-
-        // === Confirmation Dialogs ===
-        HubAction::ConfirmCloseAgent => {
-            // Uses TUI client's selection
-            if let Some(key) = hub.get_tui_selected_agent_key() {
-                if lifecycle::close_agent(&mut hub.state.write().unwrap(), &key, false).is_ok() {
-                    // Sync handle cache for thread-safe agent access
-                    hub.sync_handle_cache();
-                }
-            }
-            hub.mode = AppMode::Normal;
-        }
-
-        HubAction::ConfirmCloseAgentDeleteWorktree => {
-            // Uses TUI client's selection
-            if let Some(key) = hub.get_tui_selected_agent_key() {
-                if lifecycle::close_agent(&mut hub.state.write().unwrap(), &key, true).is_ok() {
-                    // Sync handle cache for thread-safe agent access
-                    hub.sync_handle_cache();
-                }
-            }
-            hub.mode = AppMode::Normal;
-        }
-
-        HubAction::RefreshWorktrees => {
-            if let Err(e) = hub.load_available_worktrees() {
-                log::error!("Failed to refresh worktrees: {}", e);
-            }
+            connection_handlers::handle_regenerate_connection_code(hub);
         }
 
         // === Client-Scoped Actions ===
@@ -419,10 +248,6 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
             agent_key,
         } => {
             client_handlers::handle_select_agent_for_client(hub, client_id, agent_key);
-        }
-
-        HubAction::SendInputForClient { client_id, data } => {
-            client_handlers::handle_send_input_for_client(hub, client_id, data);
         }
 
         HubAction::ResizeForClient {

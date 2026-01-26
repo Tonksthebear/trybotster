@@ -19,13 +19,20 @@
 //!   └── vt100_parser
 //! ```
 //!
+//! # Async Task Model
+//!
+//! TuiClient runs as an independent async task via `run_task()`. It processes:
+//! - `TuiRequest` from TuiRunner (user actions like input, resize, agent selection)
+//! - `ClientCmd` from Hub (commands like disconnect, shutdown)
+//!
 //! # Event Flow
 //!
-//! 1. PTY emits `PtyEvent::Output` → forwarder task receives via broadcast
-//!    → sends `TuiOutput::Output` through channel → TuiRunner receives and
+//! 1. PTY emits `PtyEvent::Output` -> forwarder task receives via broadcast
+//!    -> sends `TuiOutput::Output` through channel -> TuiRunner receives and
 //!    feeds to its vt100_parser
-//! 2. User types → TuiRunner routes input via hub_handle
-//! 3. Agent selected → `connect_to_pty()` fetches scrollback, sends via channel,
+//! 2. User types -> TuiRunner sends `TuiRequest::SendInput` -> `run_task()` processes
+//!    -> `Client::send_input().await`
+//! 3. Agent selected -> `connect_to_pty()` fetches scrollback, sends via channel,
 //!    spawns forwarder task
 //!
 //! # Why No Parser Here
@@ -35,17 +42,15 @@
 
 // Rust guideline compliant 2026-01
 
-use tokio::runtime::Handle;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
 
 use crate::agent::pty::PtyEvent;
 use crate::hub::hub_handle::HubHandle;
 use crate::hub::AgentHandle;
 
-use super::{Client, ClientId};
+use super::{Client, ClientCmd, ClientId};
 
 /// Requests from TuiRunner to TuiClient.
 ///
@@ -224,12 +229,6 @@ pub struct TuiClient {
     /// Thread-safe access to Hub state and operations.
     hub_handle: HubHandle,
 
-    /// Tokio runtime handle for spawning async tasks.
-    ///
-    /// Stored directly to avoid blocking cross-thread calls when spawning
-    /// forwarder tasks. Hub passes this at construction time.
-    runtime: Handle,
-
     /// Unique identifier (always `ClientId::Tui`).
     id: ClientId,
 
@@ -252,7 +251,7 @@ pub struct TuiClient {
     /// Channel for receiving requests from TuiRunner.
     ///
     /// TuiRunner sends `TuiRequest` messages through this channel, which are
-    /// processed by `poll_requests()` in Hub's event loop. This mirrors how
+    /// processed by `run_task()` in a `tokio::select!` loop. This mirrors how
     /// Browser sends requests to BrowserClient via WebSocket.
     request_rx: Option<UnboundedReceiver<TuiRequest>>,
 }
@@ -264,14 +263,12 @@ impl TuiClient {
     ///
     /// * `hub_handle` - Handle for Hub communication and agent queries.
     /// * `output_sink` - Channel sender for PTY output to TuiRunner.
-    /// * `runtime` - Tokio runtime handle for spawning async tasks.
     #[must_use]
     pub fn new(
         hub_handle: HubHandle,
         output_sink: UnboundedSender<TuiOutput>,
-        runtime: Handle,
     ) -> Self {
-        Self::with_dims(hub_handle, output_sink, runtime, 80, 24)
+        Self::with_dims(hub_handle, output_sink, 80, 24)
     }
 
     /// Create a new TUI client with specific dimensions.
@@ -280,20 +277,17 @@ impl TuiClient {
     ///
     /// * `hub_handle` - Handle for Hub communication and agent queries.
     /// * `output_sink` - Channel sender for PTY output to TuiRunner.
-    /// * `runtime` - Tokio runtime handle for spawning async tasks.
     /// * `cols` - Terminal width in columns.
     /// * `rows` - Terminal height in rows.
     #[must_use]
     pub fn with_dims(
         hub_handle: HubHandle,
         output_sink: UnboundedSender<TuiOutput>,
-        runtime: Handle,
         cols: u16,
         rows: u16,
     ) -> Self {
         Self {
             hub_handle,
-            runtime,
             id: ClientId::Tui,
             dims: (cols, rows),
             output_sink,
@@ -326,7 +320,7 @@ impl TuiClient {
         }
     }
 
-    /// Set the request receiver for TuiRunner → TuiClient communication.
+    /// Set the request receiver for TuiRunner -> TuiClient communication.
     ///
     /// Called during Hub initialization to wire up the channel. TuiRunner holds
     /// the sender end and sends `TuiRequest` messages through it.
@@ -334,53 +328,26 @@ impl TuiClient {
         self.request_rx = Some(rx);
     }
 
-    /// Poll for requests from TuiRunner and process them.
-    ///
-    /// Called from Hub's event loop. Processes up to 100 requests per tick
-    /// to prevent blocking on high-volume input.
-    pub fn poll_requests(&mut self) {
-        let Some(rx) = &mut self.request_rx else { return };
-
-        // Collect requests first to avoid borrow checker issues
-        // (can't call handle_request while borrowing request_rx)
-        let mut requests = Vec::with_capacity(100);
-        for _ in 0..100 {
-            match rx.try_recv() {
-                Ok(request) => requests.push(request),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    log::warn!("TuiRunner disconnected from request channel");
-                    break;
-                }
-            }
-        }
-
-        // Now process all collected requests
-        for request in requests {
-            self.handle_request(request);
-        }
-    }
-
     /// Handle a single request from TuiRunner.
     ///
-    /// Every variant is a one-liner delegating to a Client trait method.
-    /// TuiClient is pure transport - no business logic lives here.
-    fn handle_request(&mut self, request: TuiRequest) {
+    /// Every variant delegates to a Client trait method. TuiClient is pure
+    /// transport - no business logic lives here.
+    async fn handle_request(&mut self, request: TuiRequest) {
         match request {
             // === PTY I/O Operations (Client trait methods) ===
             TuiRequest::SendInput { agent_index, pty_index, data } => {
-                if let Err(e) = self.send_input(agent_index, pty_index, &data) {
+                if let Err(e) = self.send_input(agent_index, pty_index, &data).await {
                     log::error!("Failed to send input: {}", e);
                 }
             }
             TuiRequest::SetDims { agent_index, pty_index, cols, rows } => {
                 self.dims = (cols, rows);
-                if let Err(e) = self.resize_pty(agent_index, pty_index, rows, cols) {
+                if let Err(e) = self.resize_pty(agent_index, pty_index, rows, cols).await {
                     log::error!("Failed to resize PTY: {}", e);
                 }
             }
             TuiRequest::SelectAgent { index, response_tx } => {
-                let result = self.select_agent(index);
+                let result = self.select_agent(index).await;
                 let _ = response_tx.send(result.ok().map(|m| TuiAgentMetadata {
                     agent_id: m.agent_id,
                     agent_index: m.agent_index,
@@ -388,47 +355,102 @@ impl TuiClient {
                 }));
             }
             TuiRequest::ConnectToPty { agent_index, pty_index } => {
-                if let Err(e) = self.connect_to_pty(agent_index, pty_index) {
+                if let Err(e) = self.connect_to_pty(agent_index, pty_index).await {
                     log::error!("Failed to connect to PTY: {}", e);
                 }
             }
             TuiRequest::DisconnectFromPty { agent_index, pty_index } => {
-                self.disconnect_from_pty(agent_index, pty_index);
+                self.disconnect_from_pty(agent_index, pty_index).await;
             }
 
             // === Hub Management Operations (Client trait methods) ===
             TuiRequest::Quit => {
-                if let Err(e) = self.quit() {
+                if let Err(e) = self.quit().await {
                     log::error!("Failed to send quit command: {}", e);
                 }
             }
+            TuiRequest::CreateAgent { request } => {
+                if let Err(e) = Client::create_agent(self, request).await {
+                    log::error!("Failed to create agent: {}", e);
+                }
+            }
+            TuiRequest::DeleteAgent { request } => {
+                if let Err(e) = Client::delete_agent(self, request).await {
+                    log::error!("Failed to delete agent: {}", e);
+                }
+            }
+            TuiRequest::RegenerateConnectionCode => {
+                if let Err(e) = self.regenerate_connection_code().await {
+                    log::error!("Failed to regenerate connection code: {}", e);
+                }
+            }
+            TuiRequest::CopyConnectionUrl => {
+                if let Err(e) = self.copy_connection_url().await {
+                    log::error!("Failed to copy connection URL: {}", e);
+                }
+            }
+
+            // === Sync operations (HandleCache reads) ===
             TuiRequest::ListWorktrees { response_tx } => {
                 let _ = response_tx.send(self.list_worktrees());
             }
             TuiRequest::GetConnectionCode { response_tx } => {
                 let _ = response_tx.send(self.get_connection_code());
             }
-            TuiRequest::CreateAgent { request } => {
-                if let Err(e) = Client::create_agent(self, request) {
-                    log::error!("Failed to create agent: {}", e);
+        }
+    }
+
+    /// Run TuiClient as an independent async task.
+    ///
+    /// Processes requests from TuiRunner via `request_rx` and commands from Hub
+    /// via `cmd_rx` in a `tokio::select!` loop.
+    pub async fn run_task(mut self, mut cmd_rx: tokio::sync::mpsc::Receiver<ClientCmd>) {
+        let Some(mut request_rx) = self.request_rx.take() else {
+            log::error!("TuiClient has no request receiver");
+            return;
+        };
+
+        loop {
+            tokio::select! {
+                request = request_rx.recv() => {
+                    match request {
+                        Some(req) => self.handle_request(req).await,
+                        None => {
+                            log::info!("TuiRunner disconnected, stopping TuiClient task");
+                            break;
+                        }
+                    }
                 }
-            }
-            TuiRequest::DeleteAgent { request } => {
-                if let Err(e) = Client::delete_agent(self, request) {
-                    log::error!("Failed to delete agent: {}", e);
-                }
-            }
-            TuiRequest::RegenerateConnectionCode => {
-                if let Err(e) = self.regenerate_connection_code() {
-                    log::error!("Failed to regenerate connection code: {}", e);
-                }
-            }
-            TuiRequest::CopyConnectionUrl => {
-                if let Err(e) = self.copy_connection_url() {
-                    log::error!("Failed to copy connection URL: {}", e);
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(ClientCmd::SetDims { cols, rows }) => {
+                            self.set_dims(cols, rows);
+                        }
+                        Some(ClientCmd::DisconnectFromPty { agent_index, pty_index }) => {
+                            self.disconnect_from_pty(agent_index, pty_index).await;
+                        }
+                        Some(ClientCmd::ConnectToPty { agent_index, pty_index }) => {
+                            if let Err(e) = self.connect_to_pty(agent_index, pty_index).await {
+                                log::error!("Failed to connect to PTY: {}", e);
+                            }
+                        }
+                        Some(ClientCmd::ClearConnection) => {
+                            self.clear_connection();
+                        }
+                        Some(ClientCmd::Shutdown) => {
+                            log::info!("TuiClient received shutdown command");
+                            break;
+                        }
+                        None => {
+                            log::info!("Hub command channel closed, stopping TuiClient task");
+                            break;
+                        }
+                    }
                 }
             }
         }
+
+        log::info!("TuiClient task stopped");
     }
 }
 
@@ -454,14 +476,6 @@ impl Client for TuiClient {
         &self.hub_handle
     }
 
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
-    }
-
     /// Update terminal dimensions.
     ///
     /// Only updates local dims. PTY resize propagation happens through
@@ -473,13 +487,10 @@ impl Client for TuiClient {
 
     /// Connect to a PTY and start forwarding output (using pre-resolved handle).
     ///
-    /// Primary implementation of `Client::connect_to_pty_with_handle`. Uses the
-    /// pre-resolved AgentHandle to look up the PTY without re-acquiring locks.
-    ///
     /// Steps:
     /// 1. Aborts previous output task if any
     /// 2. Gets PTY handle from agent
-    /// 3. Calls `pty.connect_blocking()` to get scrollback
+    /// 3. Calls `pty.connect()` to get scrollback
     /// 4. Sends scrollback through output channel
     /// 5. Subscribes to PTY events
     /// 6. Spawns forwarder task to route events to TuiRunner
@@ -488,7 +499,7 @@ impl Client for TuiClient {
     ///
     /// - `Ok(())` on success
     /// - `Err(message)` if PTY not found or connection fails
-    fn connect_to_pty_with_handle(
+    async fn connect_to_pty_with_handle(
         &mut self,
         agent_handle: &AgentHandle,
         agent_index: usize,
@@ -507,12 +518,10 @@ impl Client for TuiClient {
 
         // Connect to PTY and get scrollback BEFORE spawning forwarder.
         // This ensures TuiRunner receives historical output first.
-        let scrollback = pty_handle.connect_blocking(self.id.clone(), self.dims)?;
+        let scrollback = pty_handle.connect(self.id.clone(), self.dims).await?;
 
         // Send scrollback to TuiRunner if available.
         if !scrollback.is_empty() {
-            // If receiver is dropped, this will fail - that's fine, we'll discover
-            // it when the forwarder task tries to send.
             let _ = self.output_sink.send(TuiOutput::Scrollback(scrollback));
         }
 
@@ -520,9 +529,8 @@ impl Client for TuiClient {
         let pty_rx = pty_handle.subscribe();
 
         // Spawn output forwarder: PTY -> TuiRunner.
-        // Uses stored runtime handle - no blocking cross-thread call needed.
         let sink = self.output_sink.clone();
-        self.output_task = Some(self.runtime.spawn(spawn_tui_output_forwarder(pty_rx, sink)));
+        self.output_task = Some(tokio::spawn(spawn_tui_output_forwarder(pty_rx, sink)));
 
         log::info!(
             "TUI connected to PTY ({}, {})",
@@ -536,7 +544,7 @@ impl Client for TuiClient {
     /// Disconnect from a PTY using an already-resolved handle.
     ///
     /// Overrides the default to also abort the output forwarder task.
-    fn disconnect_from_pty_with_handle(
+    async fn disconnect_from_pty_with_handle(
         &mut self,
         pty: &crate::hub::agent_handle::PtyHandle,
         agent_index: usize,
@@ -548,7 +556,9 @@ impl Client for TuiClient {
         }
 
         // Notify PTY of disconnection.
-        let _ = pty.disconnect_blocking(self.id.clone());
+        let pty = pty.clone();
+        let client_id = self.id.clone();
+        let _ = pty.disconnect(client_id).await;
 
         log::info!(
             "TUI disconnected from PTY ({}, {})",
@@ -557,18 +567,19 @@ impl Client for TuiClient {
         );
     }
 
-    fn disconnect_from_pty(&mut self, agent_index: usize, pty_index: usize) {
+    async fn disconnect_from_pty(&mut self, agent_index: usize, pty_index: usize) {
         // Abort output forwarder task if running.
         if let Some(task) = self.output_task.take() {
             task.abort();
         }
 
         // Notify PTY of disconnection.
-        // NOTE: hub_handle.get_agent() reads from HandleCache (non-blocking).
-        // However, disconnect_blocking() is blocking and must not be called from Hub's event loop.
+        // hub_handle.get_agent() reads from HandleCache (non-blocking).
         if let Some(agent) = self.hub_handle.get_agent(agent_index) {
             if let Some(pty) = agent.get_pty(pty_index) {
-                let _ = pty.disconnect_blocking(self.id.clone());
+                let pty = pty.clone();
+                let client_id = self.id.clone();
+                let _ = pty.disconnect(client_id).await;
             }
         }
 
@@ -579,8 +590,9 @@ impl Client for TuiClient {
         );
     }
 
-    // NOTE: get_agents, get_agent, send_input, resize_pty, agent_count
-    // all use DEFAULT IMPLEMENTATIONS from the trait - not implemented here
+    // NOTE: get_agent, send_input, resize_pty, select_agent, quit, create_agent,
+    // delete_agent, regenerate_connection_code, copy_connection_url, list_worktrees,
+    // get_connection_code all use DEFAULT IMPLEMENTATIONS from the trait
 }
 
 /// Background task that forwards PTY output to TuiRunner via channel.
@@ -631,24 +643,11 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    /// Get a mock runtime handle for testing.
-    ///
-    /// Creates a runtime handle that can be used in tests. Since tests
-    /// don't actually spawn async tasks, we just need a valid handle.
-    fn mock_runtime_handle() -> Handle {
-        // Use the current runtime if we're in a tokio context, otherwise create one
-        Handle::try_current().unwrap_or_else(|_| {
-            // Create a minimal runtime just for the handle
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create test runtime");
-            rt.handle().clone()
-        })
-    }
-
     /// Helper to create a TuiClient with a mock HubHandle for testing.
     /// Returns both the client and the receiver for TuiOutput messages.
     fn test_client() -> (TuiClient, mpsc::UnboundedReceiver<TuiOutput>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let client = TuiClient::new(HubHandle::mock(), tx, mock_runtime_handle());
+        let client = TuiClient::new(HubHandle::mock(), tx);
         (client, rx)
     }
 
@@ -656,7 +655,7 @@ mod tests {
     /// Returns both the client and the receiver for TuiOutput messages.
     fn test_client_with_dims(cols: u16, rows: u16) -> (TuiClient, mpsc::UnboundedReceiver<TuiOutput>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let client = TuiClient::with_dims(HubHandle::mock(), tx, mock_runtime_handle(), cols, rows);
+        let client = TuiClient::with_dims(HubHandle::mock(), tx, cols, rows);
         (client, rx)
     }
 
@@ -735,68 +734,39 @@ mod tests {
         assert!(client.request_rx.is_some());
     }
 
-    #[test]
-    fn test_poll_requests_without_receiver() {
-        let (mut client, _rx) = test_client();
-        // Should not panic when no receiver is set
-        client.poll_requests();
-    }
-
-    #[test]
-    fn test_poll_requests_empty_channel() {
+    #[tokio::test]
+    async fn test_handle_request_set_dims() {
         let (mut client, _output_rx) = test_client();
-        let (_tx, rx) = mpsc::unbounded_channel::<TuiRequest>();
-        client.set_request_receiver(rx);
 
-        // Should not panic with empty channel
-        client.poll_requests();
-    }
+        // Send SetDims request directly via handle_request
+        client.handle_request(TuiRequest::SetDims {
+            agent_index: 0,
+            pty_index: 0,
+            cols: 120,
+            rows: 40,
+        }).await;
 
-    #[test]
-    fn test_poll_requests_set_dims() {
-        let (mut client, _output_rx) = test_client();
-        let (tx, rx) = mpsc::unbounded_channel::<TuiRequest>();
-        client.set_request_receiver(rx);
-
-        // Send SetDims request
-        tx.send(TuiRequest::SetDims { agent_index: 0, pty_index: 0, cols: 120, rows: 40 }).unwrap();
-
-        // Process it
-        client.poll_requests();
-
-        // Dims should be updated
+        // Dims should be updated (resize will fail silently with mock hub)
         assert_eq!(client.dims(), (120, 40));
     }
 
-    #[test]
-    fn test_poll_requests_multiple() {
+    #[tokio::test]
+    async fn test_handle_request_multiple_set_dims() {
         let (mut client, _output_rx) = test_client();
-        let (tx, rx) = mpsc::unbounded_channel::<TuiRequest>();
-        client.set_request_receiver(rx);
 
         // Send multiple SetDims requests
-        tx.send(TuiRequest::SetDims { agent_index: 0, pty_index: 0, cols: 100, rows: 30 }).unwrap();
-        tx.send(TuiRequest::SetDims { agent_index: 0, pty_index: 0, cols: 120, rows: 40 }).unwrap();
-        tx.send(TuiRequest::SetDims { agent_index: 0, pty_index: 0, cols: 80, rows: 24 }).unwrap();
-
-        // Process all
-        client.poll_requests();
+        client.handle_request(TuiRequest::SetDims {
+            agent_index: 0, pty_index: 0, cols: 100, rows: 30,
+        }).await;
+        client.handle_request(TuiRequest::SetDims {
+            agent_index: 0, pty_index: 0, cols: 120, rows: 40,
+        }).await;
+        client.handle_request(TuiRequest::SetDims {
+            agent_index: 0, pty_index: 0, cols: 80, rows: 24,
+        }).await;
 
         // Final dims should be the last one
         assert_eq!(client.dims(), (80, 24));
-    }
-
-    #[test]
-    fn test_poll_requests_disconnected_channel() {
-        let (mut client, _output_rx) = test_client();
-        let (tx, rx) = mpsc::unbounded_channel::<TuiRequest>();
-        client.set_request_receiver(rx);
-
-        // Drop the sender
-        drop(tx);
-
-        // Should not panic, just log warning
-        client.poll_requests();
     }
 
     #[test]
@@ -816,12 +786,55 @@ mod tests {
         assert!(format!("{:?}", disconnect).contains("DisconnectFromPty"));
     }
 
+    #[tokio::test]
+    async fn test_run_task_shutdown() {
+        let (mut client, _output_rx) = test_client();
+        let (_tx, rx) = mpsc::unbounded_channel::<TuiRequest>();
+        client.set_request_receiver(rx);
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+
+        // Send shutdown command
+        cmd_tx.send(ClientCmd::Shutdown).await.unwrap();
+
+        // run_task should process the shutdown and exit
+        client.run_task(cmd_rx).await;
+        // If we reach here, the task completed successfully
+    }
+
+    #[tokio::test]
+    async fn test_run_task_request_channel_closed() {
+        let (mut client, _output_rx) = test_client();
+        let (tx, rx) = mpsc::unbounded_channel::<TuiRequest>();
+        client.set_request_receiver(rx);
+
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ClientCmd>(16);
+
+        // Drop the request sender to close the channel
+        drop(tx);
+
+        // run_task should detect the closed channel and exit
+        client.run_task(cmd_rx).await;
+        // If we reach here, the task completed successfully
+    }
+
+    #[tokio::test]
+    async fn test_run_task_no_receiver() {
+        let (client, _output_rx) = test_client();
+        // Don't set request_rx - should log error and return immediately
+
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ClientCmd>(16);
+
+        client.run_task(cmd_rx).await;
+        // If we reach here, the task handled missing receiver gracefully
+    }
+
     // =========================================================================
     // Integration Tests: TuiRequest full flow with real Hub
     // =========================================================================
     //
     // These tests exercise the complete TuiRequest pipeline:
-    //   TuiRunner sends TuiRequest -> TuiClient.poll_requests() -> Client trait method -> PTY
+    //   TuiRunner sends TuiRequest -> TuiClient.handle_request() -> Client trait method -> PTY
     //
     // Unlike the unit tests above (which use mock HubHandle), these create a
     // real Hub with real agents and PTY sessions to verify end-to-end behavior.
@@ -846,8 +859,6 @@ mod tests {
             }
         }
 
-        const TEST_DIMS: (u16, u16) = (24, 80);
-
         /// Create a test agent with given issue number.
         fn create_test_agent(issue: u32) -> (String, Agent) {
             let agent = Agent::new(
@@ -861,29 +872,6 @@ mod tests {
             (key, agent)
         }
 
-        /// Set up a Hub with a TuiClient wired through the request channel.
-        ///
-        /// Returns:
-        /// - The Hub (owns all state)
-        /// - The request sender (simulates TuiRunner sending requests)
-        /// - The output receiver (receives TuiOutput from TuiClient)
-        fn setup_tui_integration() -> (
-            Hub,
-            mpsc::UnboundedSender<TuiRequest>,
-            mpsc::UnboundedReceiver<TuiOutput>,
-        ) {
-            let config = test_config();
-            let mut hub = Hub::new(config, TEST_DIMS).unwrap();
-
-            // Create the request channel (TuiRunner -> TuiClient)
-            let (request_tx, request_rx) = mpsc::unbounded_channel();
-
-            // Register TuiClient with both output and request channels
-            let output_rx = hub.register_tui_client_with_request_channel(request_rx);
-
-            (hub, request_tx, output_rx)
-        }
-
         /// Add an agent to the hub and sync the handle cache.
         ///
         /// Returns the agent key for reference.
@@ -895,7 +883,7 @@ mod tests {
         }
 
         /// Add an agent and spawn its PTY command processor so that
-        /// `PtyHandle::connect_blocking()` (used by `select_agent()`) won't hang.
+        /// `PtyHandle::connect()` (used by `select_agent()`) won't hang.
         ///
         /// The command processor runs as a tokio task on Hub's runtime, processing
         /// Connect, Input, Resize, and Disconnect commands from PtyHandle callers.
@@ -919,29 +907,24 @@ mod tests {
             key
         }
 
-        /// Get a mutable reference to the TuiClient from the Hub's client registry.
-        fn get_tui_client_mut(hub: &mut Hub) -> &mut TuiClient {
-            hub.clients
-                .get_tui_mut()
-                .expect("TuiClient should be registered")
+        /// Create a TuiClient wired to the Hub's handle.
+        fn create_tui_client(hub: &Hub) -> (TuiClient, mpsc::UnboundedReceiver<TuiOutput>) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let client = TuiClient::new(hub.handle(), tx);
+            (client, rx)
         }
 
         // =====================================================================
-        // TEST 1: SendInput reaches PTY via TuiRequest pipeline
+        // TEST 1: SendInput reaches PTY via handle_request pipeline
         // =====================================================================
 
         /// Verify that TuiRequest::SendInput routes keyboard input to the PTY.
-        ///
-        /// Full flow:
-        /// 1. Setup Hub with agent and PTY
-        /// 2. Connect TuiClient to agent's PTY
-        /// 3. Send TuiRequest::SendInput through request channel
-        /// 4. Call poll_requests() to process the request
-        /// 5. Verify input command arrived at PTY's command channel
         #[test]
         fn test_tui_send_input_reaches_pty() {
-            let (mut hub, request_tx, _output_rx) = setup_tui_integration();
+            let mut hub = Hub::new(test_config()).unwrap();
             let agent_key = add_agent_to_hub(&mut hub, 42);
+
+            let (mut client, _output_rx) = create_tui_client(&hub);
 
             // Connect TuiClient to agent's PTY (register as client for size ownership)
             {
@@ -954,24 +937,17 @@ mod tests {
                     .connect(ClientId::Tui, (80, 24));
             }
 
-            // Send input through the TuiRequest channel
-            let input_data = b"echo hello\n".to_vec();
-            request_tx
-                .send(TuiRequest::SendInput {
+            // Process SendInput request (async, must run on Hub's runtime)
+            hub.tokio_runtime.block_on(async {
+                let input_data = b"echo hello\n".to_vec();
+                client.handle_request(TuiRequest::SendInput {
                     agent_index: 0,
                     pty_index: 0,
-                    data: input_data.clone(),
-                })
-                .unwrap();
-
-            // Process the request through TuiClient
-            get_tui_client_mut(&mut hub).poll_requests();
+                    data: input_data,
+                }).await;
+            });
 
             // Verify the input command arrived at the PTY.
-            // process_commands() drains the PTY's command channel and handles them.
-            // Since we have no actual writer, the command will be processed but
-            // the write will be a no-op. We verify the command was received by
-            // checking process_commands returns > 0.
             let commands_processed = hub
                 .state
                 .write()
@@ -989,22 +965,16 @@ mod tests {
         }
 
         // =====================================================================
-        // TEST 2: SetDims resizes PTY through TuiRequest pipeline
+        // TEST 2: SetDims resizes PTY through handle_request pipeline
         // =====================================================================
 
         /// Verify that TuiRequest::SetDims updates client dims and resizes PTY.
-        ///
-        /// Full flow:
-        /// 1. Setup Hub with agent and PTY at default (24, 80)
-        /// 2. Connect TuiClient to PTY (becomes size owner)
-        /// 3. Send TuiRequest::SetDims { cols: 120, rows: 40 }
-        /// 4. Call poll_requests()
-        /// 5. Process PTY commands
-        /// 6. Verify PTY dimensions are (40, 120)
         #[test]
         fn test_tui_set_dims_resizes_pty() {
-            let (mut hub, request_tx, _output_rx) = setup_tui_integration();
+            let mut hub = Hub::new(test_config()).unwrap();
             let agent_key = add_agent_to_hub(&mut hub, 42);
+
+            let (mut client, _output_rx) = create_tui_client(&hub);
 
             // Connect TuiClient to PTY (becomes size owner)
             {
@@ -1017,34 +987,18 @@ mod tests {
                     .connect(ClientId::Tui, (80, 24));
             }
 
-            // Verify initial PTY dimensions
-            let initial_dims = hub
-                .state
-                .read()
-                .unwrap()
-                .agents
-                .get(&agent_key)
-                .unwrap()
-                .cli_pty
-                .dimensions();
-            assert_eq!(initial_dims, (24, 80), "Initial PTY dims should be (24, 80)");
-
-            // Send SetDims through the request channel
-            request_tx
-                .send(TuiRequest::SetDims {
+            // Process SetDims request (async, must run on Hub's runtime)
+            hub.tokio_runtime.block_on(async {
+                client.handle_request(TuiRequest::SetDims {
                     agent_index: 0,
                     pty_index: 0,
                     cols: 120,
                     rows: 40,
-                })
-                .unwrap();
-
-            // Process the request (TuiClient updates dims and sends resize command)
-            get_tui_client_mut(&mut hub).poll_requests();
+                }).await;
+            });
 
             // Verify TuiClient dims were updated
-            let client_dims = hub.clients.get(&ClientId::Tui).unwrap().dims();
-            assert_eq!(client_dims, (120, 40), "TuiClient dims should be (120, 40)");
+            assert_eq!(client.dims(), (120, 40), "TuiClient dims should be (120, 40)");
 
             // Process PTY commands to apply the resize
             hub.state
@@ -1079,45 +1033,28 @@ mod tests {
 
         /// Verify that TuiRequest::SelectAgent connects to an agent's PTY
         /// and returns correct metadata.
-        ///
-        /// This test requires the PTY command processor to be running because
-        /// `select_agent()` calls `connect_to_pty_with_handle()` which calls
-        /// `PtyHandle::connect_blocking()`. That method sends a Connect command
-        /// through the PTY channel and waits for a response - without a command
-        /// processor, it would hang forever.
-        ///
-        /// Full flow:
-        /// 1. Setup Hub with 2 agents (command processors running)
-        /// 2. Send TuiRequest::SelectAgent { index: 0 }
-        /// 3. Call poll_requests()
-        /// 4. Verify response contains correct agent metadata
-        /// 5. Verify TuiClient is connected to agent 0's PTY
         #[test]
         fn test_tui_select_agent_connects_to_pty() {
-            let (mut hub, request_tx, _output_rx) = setup_tui_integration();
+            let mut hub = Hub::new(test_config()).unwrap();
             let _key_0 = add_agent_with_command_processor(&mut hub, 42);
             let _key_1 = add_agent_with_command_processor(&mut hub, 43);
 
-            // Send SelectAgent request for agent at index 0
-            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-            request_tx
-                .send(TuiRequest::SelectAgent {
+            let (mut client, _output_rx) = create_tui_client(&hub);
+
+            // Process SelectAgent request (async, must run on Hub's runtime)
+            let metadata = hub.tokio_runtime.block_on(async {
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                client.handle_request(TuiRequest::SelectAgent {
                     index: 0,
                     response_tx,
-                })
-                .unwrap();
+                }).await;
 
-            // Process the request.
-            // poll_requests() -> handle_request(SelectAgent) -> select_agent(0) ->
-            //   connect_to_pty(0, 0) -> connect_to_pty_with_handle() ->
-            //     PtyHandle::connect_blocking() -> PtyCommand::Connect -> response
-            get_tui_client_mut(&mut hub).poll_requests();
-
-            // Verify response contains metadata
-            let metadata = response_rx
-                .blocking_recv()
-                .expect("Should receive response")
-                .expect("Should have metadata (agent exists at index 0)");
+                // Verify response contains metadata
+                response_rx
+                    .await
+                    .expect("Should receive response")
+                    .expect("Should have metadata (agent exists at index 0)")
+            });
 
             assert_eq!(metadata.agent_index, 0, "Agent index should be 0");
             assert!(
@@ -1138,7 +1075,7 @@ mod tests {
         /// and has_server_pty fields.
         #[test]
         fn test_tui_select_agent_returns_metadata() {
-            let (mut hub, request_tx, _output_rx) = setup_tui_integration();
+            let mut hub = Hub::new(test_config()).unwrap();
             let key_0 = add_agent_with_command_processor(&mut hub, 42);
 
             // Add a server PTY to the agent to test has_server_pty
@@ -1150,25 +1087,23 @@ mod tests {
             // Re-sync handle cache since we changed agent state
             hub.sync_handle_cache();
 
-            // Send SelectAgent
-            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-            request_tx
-                .send(TuiRequest::SelectAgent {
+            let (mut client, _output_rx) = create_tui_client(&hub);
+
+            // Process SelectAgent request (async, must run on Hub's runtime)
+            let metadata = hub.tokio_runtime.block_on(async {
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                client.handle_request(TuiRequest::SelectAgent {
                     index: 0,
                     response_tx,
-                })
-                .unwrap();
+                }).await;
 
-            // Process the request
-            get_tui_client_mut(&mut hub).poll_requests();
+                response_rx
+                    .await
+                    .expect("Should receive response")
+                    .expect("Should have metadata")
+            });
 
             // Verify metadata
-            let metadata = response_rx
-                .blocking_recv()
-                .expect("Should receive response")
-                .expect("Should have metadata");
-
-            // agent_id comes from AgentHandle which derives from agent_key
             assert!(
                 !metadata.agent_id.is_empty(),
                 "agent_id should be populated"
@@ -1185,17 +1120,12 @@ mod tests {
         // =====================================================================
 
         /// Verify that TuiRequest::DisconnectFromPty does not panic.
-        ///
-        /// Full flow:
-        /// 1. Setup Hub with agent
-        /// 2. Connect TuiClient to PTY
-        /// 3. Send TuiRequest::DisconnectFromPty with explicit indices
-        /// 4. Call poll_requests()
-        /// 5. Verify no panic
         #[test]
         fn test_tui_disconnect_from_pty() {
-            let (mut hub, request_tx, _output_rx) = setup_tui_integration();
+            let mut hub = Hub::new(test_config()).unwrap();
             let agent_key = add_agent_to_hub(&mut hub, 42);
+
+            let (mut client, _output_rx) = create_tui_client(&hub);
 
             // First connect TuiClient to PTY
             {
@@ -1208,13 +1138,14 @@ mod tests {
                     .connect(ClientId::Tui, (80, 24));
             }
 
-            // Send DisconnectFromPty with explicit indices
-            request_tx
-                .send(TuiRequest::DisconnectFromPty { agent_index: 0, pty_index: 0 })
-                .unwrap();
-
-            // Process the request - should not panic
-            get_tui_client_mut(&mut hub).poll_requests();
+            // Process DisconnectFromPty request - should not panic
+            // (async, must run on Hub's runtime)
+            hub.tokio_runtime.block_on(async {
+                client.handle_request(TuiRequest::DisconnectFromPty {
+                    agent_index: 0,
+                    pty_index: 0,
+                }).await;
+            });
         }
 
         // =====================================================================
@@ -1224,22 +1155,24 @@ mod tests {
         /// Verify that SelectAgent returns None when no agent exists at index.
         #[test]
         fn test_tui_select_agent_invalid_index_returns_none() {
-            let (mut hub, request_tx, _output_rx) = setup_tui_integration();
+            let hub = Hub::new(test_config()).unwrap();
             // No agents added - index 0 should not exist
 
-            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-            request_tx
-                .send(TuiRequest::SelectAgent {
+            let (mut client, _output_rx) = create_tui_client(&hub);
+
+            // Process SelectAgent request (async, must run on Hub's runtime)
+            let result = hub.tokio_runtime.block_on(async {
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                client.handle_request(TuiRequest::SelectAgent {
                     index: 0,
                     response_tx,
-                })
-                .unwrap();
+                }).await;
 
-            get_tui_client_mut(&mut hub).poll_requests();
+                response_rx
+                    .await
+                    .expect("Should receive response")
+            });
 
-            let result = response_rx
-                .blocking_recv()
-                .expect("Should receive response");
             assert!(
                 result.is_none(),
                 "SelectAgent with no agents should return None"
@@ -1259,189 +1192,66 @@ mod tests {
         /// 4. Disconnect
         #[test]
         fn test_tui_full_lifecycle() {
-            let (mut hub, request_tx, _output_rx) = setup_tui_integration();
+            let mut hub = Hub::new(test_config()).unwrap();
             let agent_key = add_agent_with_command_processor(&mut hub, 42);
 
-            // Step 1: Select agent (connects to PTY via command processor)
-            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-            request_tx
-                .send(TuiRequest::SelectAgent {
+            let (mut client, _output_rx) = create_tui_client(&hub);
+
+            // Clone state handle for use inside block_on (Arc<RwLock> clone is cheap)
+            let state = hub.state.clone();
+
+            // Run all async operations on Hub's runtime to avoid nested runtime panic
+            hub.tokio_runtime.block_on(async {
+                // Step 1: Select agent (connects to PTY via command processor)
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                client.handle_request(TuiRequest::SelectAgent {
                     index: 0,
                     response_tx,
-                })
-                .unwrap();
-            get_tui_client_mut(&mut hub).poll_requests();
+                }).await;
 
-            let metadata = response_rx
-                .blocking_recv()
-                .unwrap()
-                .expect("Agent should exist");
-            assert_eq!(metadata.agent_index, 0);
+                let metadata = response_rx
+                    .await
+                    .unwrap()
+                    .expect("Agent should exist");
+                assert_eq!(metadata.agent_index, 0);
 
-            // Step 2: Send input
-            request_tx
-                .send(TuiRequest::SendInput {
+                // Step 2: Send input
+                client.handle_request(TuiRequest::SendInput {
                     agent_index: 0,
                     pty_index: 0,
                     data: b"ls -la\n".to_vec(),
-                })
-                .unwrap();
-            get_tui_client_mut(&mut hub).poll_requests();
+                }).await;
 
-            // Give the command processor a moment to handle the Input command
-            std::thread::sleep(std::time::Duration::from_millis(50));
+                // Give the command processor a moment to handle the Input command
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-            // Step 3: Resize
-            request_tx
-                .send(TuiRequest::SetDims {
+                // Step 3: Resize
+                client.handle_request(TuiRequest::SetDims {
                     agent_index: 0,
                     pty_index: 0,
                     cols: 200,
                     rows: 50,
-                })
-                .unwrap();
-            get_tui_client_mut(&mut hub).poll_requests();
+                }).await;
 
-            // Give the command processor a moment to handle the Resize command
-            std::thread::sleep(std::time::Duration::from_millis(50));
+                // Give the command processor a moment to handle the Resize command
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-            let dims = hub
-                .state
-                .read()
-                .unwrap()
-                .agents
-                .get(&agent_key)
-                .unwrap()
-                .cli_pty
-                .dimensions();
-            assert_eq!(dims, (50, 200), "PTY should be resized to (50, 200)");
+                let dims = state
+                    .read()
+                    .unwrap()
+                    .agents
+                    .get(&agent_key)
+                    .unwrap()
+                    .cli_pty
+                    .dimensions();
+                assert_eq!(dims, (50, 200), "PTY should be resized to (50, 200)");
 
-            // Step 4: Disconnect
-            request_tx
-                .send(TuiRequest::DisconnectFromPty { agent_index: 0, pty_index: 0 })
-                .unwrap();
-            get_tui_client_mut(&mut hub).poll_requests();
-        }
-
-        // =====================================================================
-        // TEST: poll_all_requests() processes TuiRequests (regression test)
-        // =====================================================================
-
-        /// Regression test: verify `ClientRegistry::poll_all_requests()` processes
-        /// TuiRequest messages sent through the request channel.
-        ///
-        /// This test reproduces the critical bug where `poll_requests()` was never
-        /// called from the Hub's main event loop, causing every `blocking_recv()`
-        /// in TuiRunner to deadlock. The fix was adding
-        /// `hub.clients.poll_all_requests()` to the Hub loop in `run_with_hub()`.
-        ///
-        /// # What this tests
-        ///
-        /// The multi-threaded pattern used in production:
-        /// 1. TuiRunner thread sends TuiRequest with oneshot response channel
-        /// 2. TuiRunner thread calls `blocking_recv()` on the oneshot
-        /// 3. Hub thread calls `hub.clients.poll_all_requests()`
-        /// 4. TuiClient processes the request and sends response
-        /// 5. TuiRunner thread unblocks
-        ///
-        /// Without `poll_all_requests()`, step 3 never happens and step 5 deadlocks.
-        #[test]
-        fn test_poll_all_requests_processes_tui_requests() {
-            let (mut hub, request_tx, _output_rx) = setup_tui_integration();
-            add_agent_with_command_processor(&mut hub, 42);
-
-            // Simulate TuiRunner: send SelectAgent from a separate thread
-            let tx = request_tx.clone();
-            let handle = std::thread::spawn(move || {
-                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                tx.send(TuiRequest::SelectAgent {
-                    index: 0,
-                    response_tx,
-                })
-                .expect("channel open");
-
-                // This would deadlock without poll_all_requests()
-                response_rx.blocking_recv().expect("response channel open")
+                // Step 4: Disconnect
+                client.handle_request(TuiRequest::DisconnectFromPty {
+                    agent_index: 0,
+                    pty_index: 0,
+                }).await;
             });
-
-            // Simulate Hub loop: poll client requests (the fix)
-            // Small delay to let the thread send its request
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            hub.clients.poll_all_requests();
-
-            // Verify the thread completed without deadlock
-            let result = handle.join().expect("thread should not panic");
-            assert!(result.is_some(), "SelectAgent should return metadata");
-
-            let metadata = result.unwrap();
-            assert_eq!(metadata.agent_index, 0);
-            assert!(!metadata.agent_id.is_empty());
-        }
-
-        /// Regression test: verify `poll_all_requests()` handles ListWorktrees.
-        ///
-        /// ListWorktrees is used when opening the New Agent modal. Now reads
-        /// directly from HandleCache (no Hub command channel round-trip),
-        /// which eliminates the re-entrant deadlock entirely.
-        #[test]
-        fn test_poll_all_requests_processes_list_worktrees() {
-            let (mut hub, request_tx, _output_rx) = setup_tui_integration();
-
-            // Pre-populate worktrees in HandleCache (Hub maintains this)
-            hub.handle_cache.set_worktrees(vec![
-                ("/tmp/wt1".to_string(), "feature-1".to_string()),
-                ("/tmp/wt2".to_string(), "feature-2".to_string()),
-            ]);
-
-            let tx = request_tx.clone();
-            let handle = std::thread::spawn(move || {
-                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                tx.send(TuiRequest::ListWorktrees { response_tx })
-                    .expect("channel open");
-
-                // Reads from HandleCache - no deadlock possible
-                response_rx.blocking_recv().expect("response channel open")
-            });
-
-            // Simulate Hub loop: poll client requests
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            hub.clients.poll_all_requests();
-
-            let worktrees = handle.join().expect("thread should not panic");
-            assert_eq!(worktrees.len(), 2);
-            assert_eq!(worktrees[0].1, "feature-1");
-        }
-
-        /// Regression test: verify `poll_all_requests()` handles GetConnectionCode.
-        ///
-        /// GetConnectionCode is called on EVERY RENDER FRAME while the connection
-        /// code modal is open. Now reads directly from HandleCache (no Hub
-        /// command channel round-trip), which eliminates the deadlock entirely.
-        #[test]
-        fn test_poll_all_requests_processes_get_connection_code() {
-            let (mut hub, request_tx, _output_rx) = setup_tui_integration();
-
-            // Pre-populate cached connection URL in HandleCache (Hub maintains this)
-            hub.handle_cache.set_connection_url(Ok(
-                "https://botster.dev/hubs/123#TESTBUNDLE".to_string(),
-            ));
-
-            let tx = request_tx.clone();
-            let handle = std::thread::spawn(move || {
-                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                tx.send(TuiRequest::GetConnectionCode { response_tx })
-                    .expect("channel open");
-
-                // Reads from HandleCache - no deadlock possible
-                response_rx.blocking_recv().expect("response channel open")
-            });
-
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            hub.clients.poll_all_requests();
-
-            let result = handle.join().expect("thread should not panic");
-            assert!(result.is_ok());
-            assert!(result.unwrap().contains("TESTBUNDLE"));
         }
     }
 }
