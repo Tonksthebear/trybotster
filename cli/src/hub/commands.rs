@@ -9,28 +9,44 @@
 //! - [`HubCommand::CreateAgent`] - Create a new agent
 //! - [`HubCommand::DeleteAgent`] - Delete an existing agent
 //! - [`HubCommand::ListAgents`] - Get list of all agents
-//! - [`HubCommand::GetAgentByIndex`] - Get agent handle by display index
+//! - [`HubCommand::GetAgentByIndex`] - Get agent handle by display index (cross-thread only)
 //!
-//! # Hierarchy
+//! # Agent Handle Access Patterns
+//!
+//! There are two ways to get agent handles, depending on thread context:
+//!
+//! ## 1. Via HandleCache (clients on Hub's thread)
+//!
+//! Clients using `HubHandle` (TuiClient, BrowserClient) read from the cache directly:
 //!
 //! ```text
-//! Client → HubCommand::GetAgentByIndex(idx) → AgentHandle
-//!                                                ├── get_pty(0) → PtyHandle (CLI)
-//!                                                └── get_pty(1) → Option<PtyHandle> (Server)
+//! HubHandle::get_agent(idx) → HandleCache → Option<AgentHandle>
 //! ```
+//!
+//! This avoids deadlocks since it doesn't send commands through the Hub.
+//!
+//! ## 2. Via GetAgentByIndex command (cross-thread access)
+//!
+//! `TuiRunner` runs on a separate thread and uses blocking commands:
+//!
+//! ```text
+//! TuiRunner → HubCommand::GetAgentByIndex(idx) → Hub → AgentHandle
+//! ```
+//!
+//! This is safe because it's cross-thread communication (no deadlock risk).
 //!
 //! # Actor Pattern
 //!
 //! Commands use oneshot channels for responses, enabling request/response semantics:
 //!
 //! ```ignore
-//! // Client sends command
+//! // TuiRunner (cross-thread) sends blocking command
 //! let (cmd, rx) = HubCommand::get_agent_by_index(0);
-//! hub_tx.send(cmd).await;
-//! let handle = rx.await?.unwrap();
+//! hub_tx.blocking_send(cmd)?;
+//! let handle = rx.blocking_recv()?.unwrap();
 //!
-//! // Client subscribes to PTY events via handle
-//! let mut pty_rx = handle.get_pty(0).unwrap().subscribe();
+//! // Clients on Hub's thread use HubHandle instead (no command)
+//! let handle = hub_handle.get_agent(0).unwrap();
 //! ```
 
 // Rust guideline compliant 2026-01
@@ -158,7 +174,7 @@ pub enum HubCommand {
     },
 
     // === Agent Access ===
-    /// Get an agent handle by display index.
+    /// Get an agent handle by display index (for cross-thread access).
     ///
     /// Returns an `AgentHandle` that provides:
     /// - Agent info snapshot via `info()`
@@ -166,9 +182,16 @@ pub enum HubCommand {
     ///
     /// Returns `None` if the index is out of bounds.
     ///
-    /// Clients use the agent's display index (0-based position in the agent list)
-    /// to request handles. This is the only way to get agent handles - ID-based
-    /// access has been removed to enforce index-based navigation.
+    /// # When to Use
+    ///
+    /// Use this command **only from TuiRunner** (which runs on a separate thread).
+    /// This is safe because cross-thread blocking commands don't cause deadlocks.
+    ///
+    /// # When NOT to Use
+    ///
+    /// Clients on Hub's thread (TuiClient, BrowserClient) should use
+    /// `HubHandle::get_agent()` instead, which reads from HandleCache directly.
+    /// Using blocking commands from Hub's thread causes deadlocks.
     GetAgentByIndex {
         /// Display index (0-based).
         index: usize,
@@ -195,7 +218,7 @@ pub enum HubCommand {
     },
 
     // ============================================================
-    // Browser PTY I/O Commands (fire-and-forget)
+    // Client PTY I/O Commands (fire-and-forget)
     // ============================================================
 
     /// Browser PTY input (routes through Client trait).
@@ -456,6 +479,18 @@ impl HubCommandSender {
         &self.tx
     }
 
+    /// Send a command without blocking.
+    ///
+    /// Used by TuiClient to forward requests to Hub's command channel
+    /// without blocking. Since TuiClient runs on the Hub thread,
+    /// it cannot use `blocking_send()` for commands that require a
+    /// response (would deadlock waiting for `process_commands()`).
+    pub fn try_send(&self, cmd: HubCommand) -> Result<(), String> {
+        self.tx
+            .try_send(cmd)
+            .map_err(|e| format!("Hub command channel: {}", e))
+    }
+
     /// Send a create agent command and await the response.
     ///
     /// # Errors
@@ -632,6 +667,12 @@ impl HubCommandSender {
     /// Returns an error if the Signal bundle is not initialized or the
     /// channel is closed.
     pub fn get_connection_code_blocking(&self) -> Result<String, String> {
+        // Check if channel is closed before sending to avoid blocking forever
+        // on a closed channel (happens with HubHandle::mock() or dropped receivers).
+        if self.tx.is_closed() {
+            return Err("Hub command channel closed".to_string());
+        }
+
         let (cmd, rx) = HubCommand::get_connection_code();
         self.tx
             .blocking_send(cmd)

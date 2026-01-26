@@ -9,14 +9,14 @@
 //! ```text
 //! TuiRunner (TUI thread)
 //! ├── owns: mode, menu_selected, input_buffer, vt100_parser
-//! ├── sends: HubCommand via command_tx
+//! ├── sends: TuiRequest via request_tx (to TuiClient)
 //! ├── receives: HubEvent via hub_event_rx
-//! └── receives: PtyEvent via pty_rx (for selected agent)
+//! └── receives: TuiOutput via output_rx (from TuiClient)
 //! ```
 //!
 //! The TuiRunner owns all TUI state and runs its own event loop. It converts
 //! keyboard/mouse input into either local TUI actions or PTY input, and
-//! communicates with the Hub via the command channel.
+//! communicates with TuiClient via the request channel. TuiRunner is Hub-agnostic.
 //!
 //! # Modules
 //!

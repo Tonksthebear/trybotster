@@ -18,8 +18,8 @@ use ratatui::backend::Backend;
 use vt100::Parser;
 
 use crate::agent::PtyView;
-use crate::client::Client;
-use crate::hub::{HubAction, HubEvent};
+use crate::client::TuiRequest;
+use crate::hub::HubEvent;
 
 use super::actions::TuiAction;
 use super::events::CreationStage;
@@ -54,7 +54,7 @@ where
             // === Application Control ===
             TuiAction::Quit => {
                 self.quit = true;
-                let _ = self.command_tx.quit_blocking();
+                let _ = self.request_tx.send(TuiRequest::Quit);
             }
 
             // === Modal State ===
@@ -131,20 +131,17 @@ where
             }
 
             TuiAction::RegenerateConnectionCode => {
-                // Use fire-and-forget dispatch to avoid blocking the TUI event loop.
-                // The Hub spawns an async task for bundle regeneration. When the new
-                // bundle arrives, the QR will refresh on next render (qr_image_displayed = false).
-                let action = HubAction::RegenerateConnectionCode;
-                if let Err(e) = self.command_tx.dispatch_action_blocking(action) {
-                    log::error!("Failed to dispatch regenerate connection code: {}", e);
+                // Fire-and-forget: TuiClient forwards to Hub for bundle regeneration.
+                // When the new bundle arrives, the QR will refresh on next render.
+                if let Err(e) = self.request_tx.send(TuiRequest::RegenerateConnectionCode) {
+                    log::error!("Failed to send regenerate connection code: {}", e);
                 }
                 self.qr_image_displayed = false;
             }
 
             TuiAction::CopyConnectionUrl => {
-                // Dispatch to Hub which has access to arboard clipboard
-                let action = HubAction::CopyConnectionUrl;
-                if let Err(e) = self.command_tx.dispatch_action_blocking(action) {
+                // Fire-and-forget: TuiClient forwards to Hub for clipboard access.
+                if let Err(e) = self.request_tx.send(TuiRequest::CopyConnectionUrl) {
                     log::error!("Failed to send copy connection URL: {}", e);
                 }
             }
@@ -198,55 +195,59 @@ where
     /// Toggles between CLI and Server PTY for the current agent.
     /// If no server PTY is available, this is a no-op.
     fn handle_pty_view_toggle(&mut self) {
-        if let Some(ref handle) = self.agent_handle {
-            // Toggle the view
-            let current_view = self.active_pty_view;
-            let new_view = match current_view {
-                PtyView::Cli => PtyView::Server,
-                PtyView::Server => PtyView::Cli,
-            };
+        // Need both an agent selected and a server PTY available
+        let Some(agent_index) = self.current_agent_index else {
+            log::debug!("Cannot toggle PTY view - no agent selected");
+            return;
+        };
 
-            // Get the PTY index for the new view (0 = CLI, 1 = Server)
-            let pty_index = match new_view {
-                PtyView::Cli => 0,
-                PtyView::Server => 1,
-            };
+        // Toggle the view
+        let current_view = self.active_pty_view;
+        let new_view = match current_view {
+            PtyView::Cli => PtyView::Server,
+            PtyView::Server => PtyView::Cli,
+        };
 
-            // Check if the PTY exists for this view
-            if handle.get_pty(pty_index).is_some() {
-                log::debug!(
-                    "Toggling PTY view to {:?} for agent {}",
-                    new_view,
-                    handle.agent_id()
-                );
+        // Get the PTY index for the new view (0 = CLI, 1 = Server)
+        let pty_index = match new_view {
+            PtyView::Cli => 0,
+            PtyView::Server => 1,
+        };
 
-                // Find agent index in our local list
-                let agent_id = handle.agent_id();
-                let agent_index = self
-                    .agents
-                    .iter()
-                    .position(|a| a.id == agent_id)
-                    .unwrap_or(0);
+        // Check if the PTY exists for this view
+        let can_toggle = match new_view {
+            PtyView::Cli => true, // CLI PTY always exists
+            PtyView::Server => self.has_server_pty,
+        };
 
-                // Update TuiRunner state
-                self.active_pty_view = new_view;
-                self.current_pty_index = Some(pty_index);
+        if can_toggle {
+            log::debug!(
+                "Toggling PTY view to {:?} for agent index {}",
+                new_view,
+                agent_index
+            );
 
-                // Reset parser FIRST (before loading new scrollback)
-                {
-                    let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-                    let (rows, cols) = self.terminal_dims;
-                    *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
-                }
+            // Update TuiRunner state
+            self.active_pty_view = new_view;
+            self.current_pty_index = Some(pty_index);
 
-                // Connect to PTY - scrollback arrives via channel, gets processed
-                // in poll_pty_events() and fed to the fresh parser above.
-                if let Err(e) = self.client.connect_to_pty(agent_index, pty_index) {
-                    log::warn!("Failed to connect to PTY: {}", e);
-                }
-            } else {
-                log::debug!("Cannot toggle to Server PTY - no server PTY available");
+            // Reset parser FIRST (before loading new scrollback)
+            {
+                let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
+                let (rows, cols) = self.terminal_dims;
+                *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
             }
+
+            // Connect to PTY - scrollback arrives via channel, gets processed
+            // in poll_pty_events() and fed to the fresh parser above.
+            if let Err(e) = self.request_tx.send(TuiRequest::ConnectToPty {
+                agent_index,
+                pty_index,
+            }) {
+                log::warn!("Failed to send connect to PTY request: {}", e);
+            }
+        } else {
+            log::debug!("Cannot toggle to Server PTY - no server PTY available");
         }
     }
 
@@ -293,24 +294,16 @@ where
 
             HubEvent::AgentDeleted { agent_id } => {
                 log::debug!("TUI: Agent deleted: {}", agent_id);
-                // Find index before removing
-                let index = self.agents.iter().position(|a| a.id == agent_id);
                 // Remove from local cache
                 self.agents.retain(|a| a.id != agent_id);
                 // If this was the selected agent, clear selection
                 if self.selected_agent.as_ref() == Some(&agent_id) {
-                    // Disconnect from PTY if we have indices
-                    if let Some(idx) = index {
-                        let pty_index = self.current_pty_index.unwrap_or(0);
-                        self.client.disconnect_from_pty(idx, pty_index);
-                    }
+                    // Request disconnect from PTY
+                    let _ = self.request_tx.send(TuiRequest::DisconnectFromPty);
                     self.selected_agent = None;
                     self.current_agent_index = None;
                     self.current_pty_index = None;
-                }
-                // Clear agent handle if it was for this agent
-                if self.agent_handle.as_ref().map(|h| h.agent_id()) == Some(&agent_id) {
-                    self.agent_handle = None;
+                    self.has_server_pty = false;
                 }
             }
 

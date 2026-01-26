@@ -1,16 +1,24 @@
 //! TUI Runner Agent Navigation - agent selection and navigation logic.
 //!
 //! This module contains the methods for navigating between agents in the TUI.
-//! Navigation is handled locally using the cached agent list, with the Hub
-//! providing agent handles when an agent is selected.
+//! Navigation is handled locally using the cached agent list, with TuiClient
+//! managing PTY connections through the Client trait.
 //!
 //! # Navigation Flow
 //!
 //! 1. User presses Ctrl+J/K (next/previous)
 //! 2. TuiRunner computes next agent index from local cache
-//! 3. TuiRunner requests agent handle from Hub via `GetAgentByIndex` command
-//! 4. Hub returns `AgentHandle` with PTY channels
-//! 5. TuiRunner connects to the PTY and updates selection
+//! 3. TuiRunner sends `TuiRequest::SelectAgent` to TuiClient
+//! 4. TuiClient uses `Client::select_agent()` to connect to PTY and return metadata
+//! 5. TuiRunner updates its state with the metadata
+//!
+//! # Why TuiRequest::SelectAgent (Clean Separation)
+//!
+//! TuiRunner should only interface with TuiClient through `TuiRequest`, not hold
+//! `AgentHandle` directly. The `Client::select_agent()` method:
+//! - Handles PTY connection logic in the Client trait
+//! - Returns only the metadata TuiRunner needs (agent_id, index, has_server_pty)
+//! - Maintains clean separation between TuiRunner (renderer) and Client (I/O layer)
 
 // Rust guideline compliant 2026-01
 
@@ -18,8 +26,7 @@ use ratatui::backend::Backend;
 use vt100::Parser;
 
 use crate::agent::PtyView;
-use crate::client::{Client, ClientId};
-use crate::hub::{AgentHandle, HubAction, HubCommand};
+use crate::client::{TuiAgentMetadata, TuiRequest};
 
 use super::runner::{TuiRunner, DEFAULT_SCROLLBACK};
 
@@ -95,52 +102,53 @@ where
         self.request_select_agent_by_index(index);
     }
 
-    /// Request to select a specific agent by index via Hub.
+    /// Request to select a specific agent by index via TuiClient.
     ///
-    /// Sends a `GetAgentByIndex` command to the Hub and waits for the response.
-    /// If successful, applies the agent handle to connect to the PTY.
+    /// Sends a `TuiRequest::SelectAgent` to TuiClient. TuiClient uses
+    /// `Client::select_agent()` which:
+    /// 1. Looks up the agent via HandleCache
+    /// 2. Connects to the agent's CLI PTY
+    /// 3. Returns metadata for TuiRunner to update its state
     ///
     /// # Arguments
     ///
     /// * `index` - The display index of the agent to select (0-based)
     pub fn request_select_agent_by_index(&mut self, index: usize) {
-        let (cmd, rx) = HubCommand::get_agent_by_index(index);
-        if self.command_tx.inner().blocking_send(cmd).is_err() {
-            log::error!("Failed to send GetAgentByIndex command");
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if self.request_tx.send(TuiRequest::SelectAgent { index, response_tx }).is_err() {
+            log::error!("Failed to send select agent request");
             return;
         }
-        match rx.blocking_recv() {
-            Ok(Some(handle)) => self.apply_agent_handle(handle),
+
+        match response_rx.blocking_recv() {
+            Ok(Some(metadata)) => self.apply_agent_metadata(metadata),
             Ok(None) => log::warn!("Agent at index {} not found", index),
-            Err(_) => log::error!("Failed to receive GetAgentByIndex response"),
+            Err(_) => log::error!("Select agent response channel closed"),
         }
     }
 
-    /// Apply an agent handle - subscribe to PTY and update selection.
+    /// Apply agent metadata after selection.
     ///
-    /// This method:
-    /// 1. Resets to CLI view (default when switching agents)
-    /// 2. Resets the parser for fresh output
-    /// 3. Connects the client to the agent's CLI PTY (scrollback arrives via channel)
-    /// 4. Updates the selected agent (TuiRunner state) and notifies Hub registry
-    /// 5. Stores the full handle for PTY view toggling
+    /// This method is called after TuiClient processes `TuiRequest::SelectAgent`.
+    /// TuiClient has already connected to the agent's CLI PTY via `Client::select_agent()`.
+    ///
+    /// TuiRunner just needs to:
+    /// 1. Reset to CLI view (default when switching agents)
+    /// 2. Reset the parser for fresh output
+    /// 3. Update local state (agent_id, index, has_server_pty)
     ///
     /// # Scrollback Flow
     ///
-    /// `TuiClient::connect_to_pty()` calls `pty.connect_blocking()` which returns
-    /// scrollback. TuiClient sends this through the output channel as `TuiOutput::Scrollback`.
-    /// TuiRunner's event loop receives it via `poll_pty_events()` and feeds to parser.
+    /// TuiClient's `connect_to_pty()` sends scrollback through the output channel
+    /// as `TuiOutput::Scrollback`. TuiRunner's event loop receives it via
+    /// `poll_pty_events()` and feeds to parser.
     ///
     /// # Arguments
     ///
-    /// * `handle` - The agent handle from the Hub containing PTY channels
-    pub fn apply_agent_handle(&mut self, handle: AgentHandle) {
+    /// * `metadata` - Agent metadata returned from TuiClient
+    fn apply_agent_metadata(&mut self, metadata: TuiAgentMetadata) {
         // Reset to CLI view when switching agents
         self.active_pty_view = PtyView::Cli;
-
-        // Get agent info from handle
-        let agent_id = handle.agent_id().to_string();
-        let agent_index = handle.agent_index();
 
         // Reset parser FIRST (before loading new scrollback)
         {
@@ -149,29 +157,10 @@ where
             *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
         }
 
-        // Connect client to PTY - this fetches scrollback and sends it through
-        // the output channel. TuiRunner receives it in poll_pty_events() and
-        // feeds to parser. Also spawns forwarder task for ongoing output.
-        if let Err(e) = self.client.connect_to_pty(agent_index, 0) {
-            log::warn!("Failed to connect to PTY: {}", e);
-        }
-
-        // Update TuiRunner state
-        self.selected_agent = Some(agent_id.clone());
-        self.current_agent_index = Some(agent_index);
+        // Update TuiRunner state (PTY connection already done by TuiClient)
+        self.selected_agent = Some(metadata.agent_id);
+        self.current_agent_index = Some(metadata.agent_index);
         self.current_pty_index = Some(0); // CLI PTY
-
-        // Notify Hub of selection change to keep registry in sync.
-        // The registry tracks client->agent mappings for input routing and viewer management.
-        let action = HubAction::SelectAgentForClient {
-            client_id: ClientId::Tui,
-            agent_key: agent_id,
-        };
-        if let Err(e) = self.command_tx.dispatch_action_blocking(action) {
-            log::warn!("Failed to notify Hub of TUI selection change: {}", e);
-        }
-
-        // Store full handle for PTY view toggling (TuiRunner-specific)
-        self.agent_handle = Some(handle);
+        self.has_server_pty = metadata.has_server_pty;
     }
 }

@@ -388,7 +388,10 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         HubAction::ConfirmCloseAgent => {
             // Uses TUI client's selection
             if let Some(key) = hub.get_tui_selected_agent_key() {
-                let _ = lifecycle::close_agent(&mut hub.state.write().unwrap(), &key, false);
+                if lifecycle::close_agent(&mut hub.state.write().unwrap(), &key, false).is_ok() {
+                    // Sync handle cache for thread-safe agent access
+                    hub.sync_handle_cache();
+                }
             }
             hub.mode = AppMode::Normal;
         }
@@ -396,7 +399,10 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         HubAction::ConfirmCloseAgentDeleteWorktree => {
             // Uses TUI client's selection
             if let Some(key) = hub.get_tui_selected_agent_key() {
-                let _ = lifecycle::close_agent(&mut hub.state.write().unwrap(), &key, true);
+                if lifecycle::close_agent(&mut hub.state.write().unwrap(), &key, true).is_ok() {
+                    // Sync handle cache for thread-safe agent access
+                    hub.sync_handle_cache();
+                }
             }
             hub.mode = AppMode::Normal;
         }

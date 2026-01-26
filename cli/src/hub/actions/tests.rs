@@ -15,6 +15,24 @@ fn test_config() -> Config {
     }
 }
 
+/// Create a Hub with TuiClient registered and crypto service initialized.
+///
+/// Most tests need TuiClient registered and some need crypto service for
+/// browser client tests, so this helper initializes both.
+fn test_hub() -> Hub {
+    use crate::relay::crypto_service::CryptoService;
+
+    let config = test_config();
+    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let _output_rx = hub.register_tui_client();
+
+    // Initialize crypto service for browser client tests
+    let crypto_service = CryptoService::start("test-hub").unwrap();
+    hub.browser.crypto_service = Some(crypto_service);
+
+    hub
+}
+
 /// Default test dimensions for Hub and PTY (rows, cols).
 /// Used with Hub::new() and Agent::get_pty_size().
 const TEST_DIMS: (u16, u16) = (24, 80);
@@ -28,8 +46,7 @@ const TEST_CLIENT_DIMS: (u16, u16) = (80, 24);
 /// Client-scoped input with no selection is a safe no-op.
 #[test]
 fn test_send_input_for_client_with_no_selection_is_noop() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // TUI client exists but has no selection (no agents)
     assert!(hub.state.read().unwrap().agents.is_empty());
@@ -51,8 +68,7 @@ fn test_send_input_for_client_with_no_selection_is_noop() {
 /// Client resize stores dimensions for client.
 #[test]
 fn test_resize_for_client_stores_dimensions() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // TUI client starts with default dimensions (80 cols, 24 rows)
     let tui_dims = hub.clients.get(&ClientId::Tui).unwrap().dims();
@@ -81,8 +97,7 @@ fn test_send_input_for_client_with_selection_reaches_agent() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Create and add a test agent
     let temp_dir = TempDir::new().unwrap();
@@ -129,8 +144,7 @@ fn test_send_input_for_client_with_selection_reaches_agent() {
 /// Test that ClientConnected registers a BrowserClient.
 #[test]
 fn test_client_connected_registers_browser_client() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     let browser_id = ClientId::Browser("test-browser-identity".to_string());
 
@@ -152,8 +166,7 @@ fn test_client_connected_registers_browser_client() {
 /// Test that ClientDisconnected unregisters a BrowserClient.
 #[test]
 fn test_client_disconnected_unregisters_browser_client() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     let browser_id = ClientId::Browser("test-browser-identity".to_string());
 
@@ -197,8 +210,7 @@ fn test_resize_before_selection_should_apply_when_agent_selected() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap(); // 24x80 default
+    let mut hub = test_hub(); // 24x80 default
 
     // Create an agent
     let temp_dir = TempDir::new().unwrap();
@@ -297,8 +309,7 @@ fn test_selecting_different_agent_should_resize_to_client_dims() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Create two agents
     let temp_dir1 = TempDir::new().unwrap();
@@ -421,8 +432,7 @@ fn test_selecting_different_agent_should_resize_to_client_dims() {
 /// before resize, resulting in agents with tiny (24x80) PTY size.
 #[test]
 fn test_create_agent_auto_selects_and_resizes() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Browser connects
     let browser_id = ClientId::Browser("browser-1".to_string());
@@ -467,8 +477,7 @@ fn test_resize_after_create_agent_still_works() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap(); // 24x80 default
+    let mut hub = test_hub(); // 24x80 default
 
     // Browser connects
     let browser_id = ClientId::Browser("browser-1".to_string());
@@ -543,8 +552,7 @@ fn test_resize_before_create_agent_works() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap(); // 24x80 default
+    let mut hub = test_hub(); // 24x80 default
 
     // Browser connects
     let browser_id = ClientId::Browser("browser-1".to_string());
@@ -625,8 +633,7 @@ fn test_resize_before_create_agent_works() {
 /// Test that deleting non-existent agent is handled gracefully.
 #[test]
 fn test_delete_nonexistent_agent_is_graceful() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     let browser_id = ClientId::Browser("browser-1".to_string());
     dispatch(
@@ -679,8 +686,7 @@ fn test_delete_nonexistent_agent_is_graceful() {
 /// Test that resize without agent selection stores dims for later.
 #[test]
 fn test_resize_without_selection_stores_dims() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     let browser_id = ClientId::Browser("browser-1".to_string());
     dispatch(
@@ -716,8 +722,7 @@ fn test_tui_resize_affects_selected_agent() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Create two agents
     let temp_dir1 = TempDir::new().unwrap();
@@ -781,8 +786,7 @@ fn test_browser_resize_only_affects_selected_agent() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Create two agents
     let temp_dir1 = TempDir::new().unwrap();
@@ -871,8 +875,7 @@ fn setup_hub_with_two_agents() -> (Hub, tempfile::TempDir, tempfile::TempDir) {
     use crate::agent::Agent;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     let temp_dir1 = tempfile::TempDir::new().unwrap();
     let agent1 = Agent::new(
@@ -1023,8 +1026,7 @@ fn test_request_worktree_list_targets_requesting_browser() {
 /// TEST: OpenMenu changes mode to Menu and resets selection.
 #[test]
 fn test_open_menu() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     assert_eq!(hub.mode, AppMode::Normal);
     assert_eq!(hub.menu_selected, 0);
@@ -1048,8 +1050,7 @@ fn test_open_menu() {
 /// TEST: CloseModal returns to Normal mode and clears input buffer.
 #[test]
 fn test_close_modal() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Open menu and add some input
     hub.mode = AppMode::Menu;
@@ -1071,8 +1072,7 @@ fn test_close_modal() {
 /// TEST: MenuUp decrements menu_selected (with bounds check).
 #[test]
 fn test_menu_up() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     hub.mode = AppMode::Menu;
     hub.menu_selected = 2;
@@ -1090,8 +1090,7 @@ fn test_menu_up() {
 /// TEST: MenuDown increments menu_selected (with bounds check).
 #[test]
 fn test_menu_down() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     hub.mode = AppMode::Menu;
     hub.menu_selected = 0;
@@ -1110,8 +1109,7 @@ fn test_menu_down() {
 /// TEST: MenuSelect NewAgent opens worktree selection.
 #[test]
 fn test_menu_select_new_agent() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     hub.mode = AppMode::Menu;
     // Without agent, menu is: [Hub header], New Agent (0), Connection Code (1)
@@ -1129,8 +1127,7 @@ fn test_menu_select_new_agent() {
 /// TEST: MenuSelect ShowConnectionCode opens connection code modal.
 #[test]
 fn test_menu_select_connection_code() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     hub.mode = AppMode::Menu;
     // Without agent: New Agent (0), Connection Code (1)
@@ -1152,8 +1149,7 @@ fn test_menu_select_close_agent() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Create an agent
     let temp_dir = TempDir::new().unwrap();
@@ -1199,8 +1195,7 @@ fn test_menu_select_close_agent() {
 /// TEST: Menu with no agents has correct selectable count.
 #[test]
 fn test_menu_selectable_count_no_agent() {
-    let config = test_config();
-    let hub = Hub::new(config, TEST_DIMS).unwrap();
+    let hub = test_hub();
 
     let ctx = build_menu_context(&hub);
     let items = crate::tui::menu::build_menu(&ctx);
@@ -1219,8 +1214,7 @@ fn test_menu_selectable_count_with_agent() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     let temp_dir = TempDir::new().unwrap();
     let agent = Agent::new(
@@ -1264,8 +1258,7 @@ fn test_menu_new_agent_with_existing_agent() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Create and select an agent
     let temp_dir = TempDir::new().unwrap();
@@ -1317,8 +1310,7 @@ fn test_menu_new_agent_with_server_pty() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Create agent with server PTY
     let temp_dir = TempDir::new().unwrap();
@@ -1366,8 +1358,7 @@ fn test_menu_selectable_count_with_server() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     let temp_dir = TempDir::new().unwrap();
     let mut agent = Agent::new(
@@ -1406,8 +1397,7 @@ fn test_menu_selectable_count_with_server() {
 /// TEST: show_error sets Error mode and error_message.
 #[test]
 fn test_show_error_sets_mode_and_message() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     hub.show_error("Test error message");
 
@@ -1418,8 +1408,7 @@ fn test_show_error_sets_mode_and_message() {
 /// TEST: clear_error returns to Normal and clears message.
 #[test]
 fn test_clear_error_returns_to_normal() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     hub.show_error("Test error");
     hub.clear_error();
@@ -1431,8 +1420,7 @@ fn test_clear_error_returns_to_normal() {
 /// TEST: Error mode can be dismissed with CloseModal.
 #[test]
 fn test_error_mode_can_be_dismissed() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Manually trigger error mode
     hub.show_error("Test error message");
@@ -1452,8 +1440,7 @@ fn test_error_mode_can_be_dismissed() {
 /// prevents Escape from closing the modal.
 #[test]
 fn test_connection_code_close_after_resize() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Open connection code modal
     dispatch(&mut hub, HubAction::ShowConnectionCode);
@@ -1490,8 +1477,7 @@ fn test_connection_code_close_after_resize() {
 /// TEST: Connection code modal survives multiple resize events.
 #[test]
 fn test_connection_code_survives_multiple_resizes() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Open connection code modal
     dispatch(&mut hub, HubAction::ShowConnectionCode);
@@ -1559,8 +1545,7 @@ fn create_test_prekey_bundle() -> crate::relay::PreKeyBundleData {
 /// - URL is generated fresh from the current Signal bundle
 #[test]
 fn test_copy_connection_url_generates_fresh_url() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Set up a mock Signal bundle (required for URL generation)
     hub.browser.signal_bundle = Some(create_test_prekey_bundle());
@@ -1604,8 +1589,7 @@ fn test_copy_connection_url_generates_fresh_url() {
 /// not panic and should handle the error gracefully.
 #[test]
 fn test_copy_connection_url_no_bundle_no_panic() {
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Verify no Signal bundle
     assert!(
@@ -1779,8 +1763,7 @@ fn test_resize_routes_via_selection() {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    let config = test_config();
-    let mut hub = Hub::new(config, TEST_DIMS).unwrap();
+    let mut hub = test_hub();
 
     // Create two agents
     let temp_dir1 = TempDir::new().unwrap();

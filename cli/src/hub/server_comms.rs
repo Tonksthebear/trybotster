@@ -388,6 +388,9 @@ impl Hub {
             client_id
         );
 
+        // Sync handle cache for thread-safe agent access
+        self.sync_handle_cache();
+
         // Register tunnel if port assigned
         if let Some(port) = result.tunnel_port {
             let tm = Arc::clone(&self.tunnel_manager);
