@@ -46,10 +46,9 @@ pub fn browser_event_to_client_action(
     let client_id = ClientId::Browser(browser_identity.to_string());
 
     match event {
-        BrowserEvent::Input(data) => Some(HubAction::SendInputForClient {
-            client_id,
-            data: data.as_bytes().to_vec(),
-        }),
+        // Input is handled directly by BrowserClient's async task via
+        // BrowserRequest::SendInput, not through Hub dispatch.
+        BrowserEvent::Input(_) => None,
 
         BrowserEvent::SelectAgent { id } => Some(HubAction::SelectAgentForClient {
             client_id,
@@ -65,6 +64,7 @@ pub fn browser_event_to_client_action(
                 issue_or_branch: issue_or_branch.clone().unwrap_or_default(),
                 prompt: prompt.clone(),
                 from_worktree: None,
+                dims: None,
             },
         }),
 
@@ -125,6 +125,7 @@ pub fn browser_event_to_client_action(
                 issue_or_branch: branch.clone(),
                 prompt: prompt.clone(),
                 from_worktree: Some(PathBuf::from(path)),
+                dims: None,
             },
         }),
 
@@ -425,18 +426,14 @@ mod tests {
     // === Client-scoped action conversion tests ===
 
     #[test]
-    fn test_client_input_event() {
+    fn test_client_input_event_returns_none() {
+        // BrowserEvent::Input is handled directly by BrowserClient's async task,
+        // not through Hub dispatch.
         let event = BrowserEvent::Input("hello".to_string());
         let browser_identity = "browser-abc123";
         let action = browser_event_to_client_action(&event, browser_identity);
 
-        match action {
-            Some(HubAction::SendInputForClient { client_id, data }) => {
-                assert_eq!(client_id, ClientId::Browser("browser-abc123".to_string()));
-                assert_eq!(data, b"hello");
-            }
-            _ => panic!("Expected SendInputForClient action"),
-        }
+        assert!(action.is_none(), "Input events should not produce Hub actions");
     }
 
     #[test]

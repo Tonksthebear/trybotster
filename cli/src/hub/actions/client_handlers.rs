@@ -5,22 +5,23 @@
 //!
 //! # Architecture
 //!
-//! BrowserClient owns its PTY channels internally (see `client/browser.rs`).
+//! Hub communicates with clients via `ClientCmd` channels, not by calling
+//! trait methods directly. Each client runs its own async task that
+//! processes commands from Hub and requests from its input source.
+//!
 //! This module handles high-level client actions:
 //!
 //! - Agent selection: `handle_select_agent_for_client()`
 //! - Agent creation/deletion: `handle_create_agent_for_client()`, `handle_delete_agent_for_client()`
 //! - Client lifecycle: `handle_client_connected()`, `handle_client_disconnected()`
-//! - Input/resize: `handle_send_input_for_client()`, `handle_resize_for_client()`
-//!
-//! PTY I/O routing (output forwarder, input receiver) is handled by BrowserClient directly.
+//! - Resize: `handle_resize_for_client()`
 
 // Rust guideline compliant 2026-01
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::client::{BrowserClient, ClientId, CreateAgentRequest, DeleteAgentRequest};
+use crate::client::{BrowserClient, ClientCmd, ClientId, ClientTaskHandle, CreateAgentRequest, DeleteAgentRequest};
 use crate::client::browser::BrowserClientConfig;
 use crate::hub::{lifecycle, Hub};
 
@@ -29,7 +30,10 @@ use crate::hub::{lifecycle, Hub};
 /// When a client selects an agent:
 /// 1. Validates agent exists
 /// 2. Ensures agent's channels are connected (lazy connection)
-/// 3. Connects the client to the agent's PTY via Client trait
+///
+/// TUI selection state is owned by TuiRunner, not Hub.
+/// PTY connection is handled separately by each client type via their
+/// async task loops (TuiRequest::SelectAgent, BrowserEvent::SelectAgent).
 pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_key: String) {
     log::info!(
         "handle_select_agent_for_client: client={}, agent={}",
@@ -61,25 +65,6 @@ pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_
         hub.connect_agent_channels(&agent_key, idx);
     }
 
-    // Track TUI selection in Hub for get_tui_selected_agent_key()
-    if client_id.is_tui() {
-        hub.tui_selected_agent = Some(agent_key.clone());
-    }
-
-    // NOTE: PTY connection is NOT handled here.
-    //
-    // SelectAgentForClient is about SELECTION TRACKING, not PTY I/O setup.
-    // - TuiRunner manages its own PTY subscription (has direct state access)
-    // - BrowserClient creates PTY channels when browser actually requests output
-    //
-    // PTY connection is handled separately by each client type:
-    // - TUI: TuiRequest::SelectAgent -> TuiClient.handle_request() -> connect_to_pty
-    // - Browser: BrowserEvent::SelectAgent handler in relay/browser.rs
-
-    // Note: Scrollback is sent via browser.rs event handler (send_scrollback_for_agent_to_browser)
-    // when BrowserEvent::SelectAgent is processed. This action handler is generic for all clients.
-    // TUI doesn't need scrollback pushed - it reads directly from vt100 parser.
-
     log::debug!(
         "Client {} selected agent {}",
         client_id,
@@ -87,98 +72,16 @@ pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_
     );
 }
 
-/// Handle sending input for a specific client.
-///
-/// Uses direct state access to write input to the selected agent's PTY.
-/// This avoids blocking on `hub_handle` which would deadlock in tests.
-pub fn handle_send_input_for_client(hub: &mut Hub, client_id: ClientId, data: Vec<u8>) {
-    use crate::agent::PtyView;
-
-    // Get selected agent key based on client type
-    let agent_key = match &client_id {
-        ClientId::Tui => hub.tui_selected_agent.clone(),
-        ClientId::Browser(_) => {
-            // Browser selection not tracked in hub yet - browser input goes through
-            // the PTY input receiver spawned by BrowserClient, not this handler.
-            log::debug!("Browser input routing not implemented via this handler");
-            return;
-        }
-    };
-
-    // Direct state access - no hub_handle blocking
-    if let Some(key) = agent_key {
-        if let Some(agent) = hub.state.write().unwrap().agents.get_mut(&key) {
-            // Default to CLI PTY for input
-            if let Err(e) = agent.write_input(PtyView::Cli, &data) {
-                log::debug!("Failed to write to agent PTY: {}", e);
-            }
-        } else {
-            log::debug!("Agent {} not found for input", key);
-        }
-    } else {
-        log::debug!("Client {} has no agent selected", client_id);
-    }
-}
-
 /// Handle resize for a specific client.
 ///
-/// For TUI, updates hub.terminal_dims (used for new agent spawns).
-/// Updates client's internal dimensions and resizes connected PTYs directly
-/// (avoiding the deadlock that would occur if client.set_dims called hub_handle).
+/// Sends SetDims command to the client's async task, which handles
+/// PTY resize internally. Dims are not cached on Hub -- they flow
+/// through requests from clients when creating agents.
 pub fn handle_resize_for_client(hub: &mut Hub, client_id: ClientId, cols: u16, rows: u16) {
-
-    // Update hub terminal_dims for TUI (used for new agent spawns)
-    if client_id.is_tui() {
-        hub.terminal_dims = (rows, cols);
-    }
-
-    // Get connected PTY indices BEFORE mutating the client
-    // (can't borrow client and state at the same time)
-    // TUI PTY resize is handled through TuiRequest::SetDims with explicit indices,
-    // so only BrowserClient needs to gather connected PTY indices here.
-    let connected_ptys: Vec<(usize, usize)> = match &client_id {
-        ClientId::Tui => {
-            vec![]
-        }
-        ClientId::Browser(_) => {
-            if let Some(client) = hub.clients.get(&client_id) {
-                if let Some(browser) = client.as_any().and_then(|a| a.downcast_ref::<BrowserClient>()) {
-                    browser.connected_ptys().collect()
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            }
-        }
-    };
-
-    // Update client's internal dimensions (this no longer calls resize_pty internally)
-    if let Some(client) = hub.clients.get_mut(&client_id) {
-        client.set_dims(cols, rows);
-    }
-
-    // Resize all connected PTYs directly
-    for (agent_idx, pty_idx) in connected_ptys {
-        let pty_handle = {
-            let state = hub.state.read().unwrap();
-            state.get_agent_handle(agent_idx)
-                .and_then(|agent| agent.get_pty(pty_idx).cloned())
-        };
-
-        if let Some(pty) = pty_handle {
-            if let Some(client) = hub.clients.get(&client_id) {
-                if let Err(e) = client.resize_pty_with_handle(&pty, rows, cols) {
-                    log::debug!(
-                        "Failed to resize PTY ({}, {}) for {}: {}",
-                        agent_idx,
-                        pty_idx,
-                        client_id,
-                        e
-                    );
-                }
-            }
-        }
+    // Send SetDims to the client's async task.
+    // The client's run_task handles resizing all connected PTYs internally.
+    if let Some(handle) = hub.clients.get(&client_id) {
+        let _ = handle.cmd_tx.try_send(ClientCmd::SetDims { cols, rows });
     }
 }
 
@@ -203,6 +106,9 @@ pub fn handle_create_agent_for_client(
         }
     }
 
+    // Resolve dims: use request dims if provided, otherwise default (24, 80)
+    let dims = request.dims.unwrap_or((24, 80));
+
     // Parse issue number or branch name
     let (issue_number, actual_branch_name) = if let Ok(num) = request.issue_or_branch.parse::<u32>()
     {
@@ -220,6 +126,7 @@ pub fn handle_create_agent_for_client(
             actual_branch_name,
             worktree_path,
             request.prompt,
+            dims,
         );
         return;
     }
@@ -286,6 +193,7 @@ pub fn handle_create_agent_for_client(
                         prompt,
                         message_id: None,
                         invocation_url: None,
+                        dims,
                     },
                 });
                 return;
@@ -305,6 +213,7 @@ pub fn handle_create_agent_for_client(
             prompt,
             message_id: None,
             invocation_url: None,
+            dims,
         };
 
         log::info!("Background worktree creation complete: {:?}", worktree_path);
@@ -335,6 +244,7 @@ fn spawn_agent_sync(
     branch_name: String,
     worktree_path: std::path::PathBuf,
     prompt: Option<String>,
+    dims: (u16, u16),
 ) {
     let (repo_path, repo_name) = match crate::git::WorktreeManager::detect_current_repo() {
         Ok(info) => info,
@@ -360,13 +270,8 @@ fn spawn_agent_sync(
         prompt,
         message_id: None,
         invocation_url: None,
+        dims,
     };
-
-    let dims = hub
-        .clients
-        .get(&client_id)
-        .map(|c| c.dims())
-        .unwrap_or(hub.terminal_dims);
 
     // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
     let _runtime_guard = hub.tokio_runtime.enter();
@@ -374,7 +279,7 @@ fn spawn_agent_sync(
     // Spawn agent - release lock before continuing
     let spawn_result = {
         let mut state = hub.state.write().unwrap();
-        lifecycle::spawn_agent(&mut state, &config, dims)
+        lifecycle::spawn_agent(&mut state, &config)
     };
 
     match spawn_result {
@@ -437,7 +342,7 @@ fn spawn_agent_sync(
 /// Handle deleting an agent for a specific client.
 ///
 /// When an agent is deleted:
-/// 1. All clients connected to that agent's PTYs are disconnected
+/// 1. All clients are notified to disconnect from that agent's PTYs via ClientCmd
 /// 2. The agent and optionally its worktree are deleted
 pub fn handle_delete_agent_for_client(
     hub: &mut Hub,
@@ -453,12 +358,12 @@ pub fn handle_delete_agent_for_client(
         .keys()
         .position(|k| k == &request.agent_id);
 
-    // Disconnect all clients from this agent's PTYs
+    // Broadcast disconnect commands to all clients for this agent's PTYs
     if let Some(idx) = agent_index {
-        for (_client_id, client) in hub.clients.iter_mut() {
-            // Disconnect from CLI PTY (index 0) and Server PTY (index 1)
-            client.disconnect_from_pty(idx, 0);
-            client.disconnect_from_pty(idx, 1);
+        // Disconnect from CLI PTY (index 0) and Server PTY (index 1)
+        for (_, handle) in hub.clients.iter() {
+            let _ = handle.cmd_tx.try_send(ClientCmd::DisconnectFromPty { agent_index: idx, pty_index: 0 });
+            let _ = handle.cmd_tx.try_send(ClientCmd::DisconnectFromPty { agent_index: idx, pty_index: 1 });
         }
     }
 
@@ -484,10 +389,13 @@ pub fn handle_delete_agent_for_client(
 }
 
 /// Handle client connected event.
+///
+/// For browser clients, creates a BrowserClient, spawns it as an async task,
+/// and registers the task handle in the client registry.
 pub fn handle_client_connected(hub: &mut Hub, client_id: ClientId) {
     log::info!("Client connected: {}", client_id);
 
-    // For browser clients, create and register BrowserClient
+    // For browser clients, create and register BrowserClient as async task
     if let ClientId::Browser(ref identity) = client_id {
         // Get crypto service - required for BrowserClient
         let Some(crypto_service) = hub.browser.crypto_service.clone() else {
@@ -504,23 +412,38 @@ pub fn handle_client_connected(hub: &mut Hub, client_id: ClientId) {
         };
 
         let hub_handle = hub.handle();
-        let runtime_handle = hub.tokio_runtime.handle().clone();
-        let browser_client = BrowserClient::new(hub_handle, identity.clone(), runtime_handle, config);
-        hub.clients.register(Box::new(browser_client));
-        log::info!("Registered BrowserClient for {}", identity);
+        let browser_client = BrowserClient::new(hub_handle, identity.clone(), config);
+
+        // Create Hub -> Client command channel
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
+
+        // Spawn BrowserClient as async task
+        let join_handle = hub.tokio_runtime.spawn(browser_client.run_task(cmd_rx));
+
+        // Register the task handle
+        hub.clients.register(client_id.clone(), ClientTaskHandle {
+            cmd_tx,
+            join_handle,
+        });
+
+        log::info!("Registered BrowserClient task for {}", identity);
     }
 }
 
 /// Handle client disconnected event.
 ///
 /// When a client disconnects:
-/// 1. Disconnect from all connected PTYs (via Client trait)
-/// 2. Unregister the client from the registry
+/// 1. Send Shutdown command to the client's async task
+/// 2. Abort the task and unregister from the registry
 pub fn handle_client_disconnected(hub: &mut Hub, client_id: ClientId) {
     log::info!("Client disconnecting: {}", client_id);
 
-    // Unregister the client - this drops BrowserClient which cleans up its channels
-    hub.clients.unregister(&client_id);
+    // Unregister the client task handle - dropping it closes the command channel
+    if let Some(handle) = hub.clients.unregister(&client_id) {
+        // Send shutdown command before aborting
+        let _ = handle.cmd_tx.try_send(ClientCmd::Shutdown);
+        handle.join_handle.abort();
+    }
 
     log::info!("Client disconnected: {}", client_id);
 }

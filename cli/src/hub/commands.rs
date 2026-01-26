@@ -72,6 +72,10 @@ pub struct CreateAgentRequest {
 
     /// Optional path to an existing worktree to reopen.
     pub from_worktree: Option<PathBuf>,
+
+    /// Terminal dimensions (rows, cols) from the requesting client.
+    /// If None, a default of (24, 80) is used when spawning.
+    pub dims: Option<(u16, u16)>,
 }
 
 impl CreateAgentRequest {
@@ -82,6 +86,7 @@ impl CreateAgentRequest {
             issue_or_branch: issue_or_branch.into(),
             prompt: None,
             from_worktree: None,
+            dims: None,
         }
     }
 
@@ -96,6 +101,13 @@ impl CreateAgentRequest {
     #[must_use]
     pub fn from_worktree(mut self, path: PathBuf) -> Self {
         self.from_worktree = Some(path);
+        self
+    }
+
+    /// Set terminal dimensions for PTY sizing.
+    #[must_use]
+    pub fn with_dims(mut self, dims: (u16, u16)) -> Self {
+        self.dims = Some(dims);
         self
     }
 }
@@ -613,6 +625,21 @@ impl HubCommandSender {
         let cmd = HubCommand::dispatch_action(action);
         self.tx
             .blocking_send(cmd)
+            .map_err(|_| "Hub command channel closed".to_string())
+    }
+
+    /// Dispatch a HubAction (fire-and-forget, async version).
+    ///
+    /// Use this from async client tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub async fn dispatch_action_async(&self, action: HubAction) -> Result<(), String> {
+        let cmd = HubCommand::dispatch_action(action);
+        self.tx
+            .send(cmd)
+            .await
             .map_err(|_| "Hub command channel closed".to_string())
     }
 

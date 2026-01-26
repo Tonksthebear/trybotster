@@ -266,6 +266,77 @@ impl HubHandle {
         self.command_tx.quit_blocking()
     }
 
+    /// Request Hub shutdown (async version).
+    ///
+    /// For use from async client tasks. Sends a quit command to the Hub.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub async fn quit_async(&self) -> Result<(), String> {
+        self.command_tx.quit().await
+    }
+
+    /// Create a new agent (async version).
+    ///
+    /// For use from async client tasks. Sends a create agent command to Hub.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub async fn create_agent_async(&self, request: super::commands::CreateAgentRequest) -> Result<(), String> {
+        let (cmd, _rx) = HubCommand::create_agent(request);
+        self.command_tx
+            .inner()
+            .send(cmd)
+            .await
+            .map_err(|e| format!("Failed to send create agent command: {}", e))
+    }
+
+    /// Delete an agent (async version).
+    ///
+    /// For use from async client tasks. Sends a delete agent command to Hub.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub async fn delete_agent_async(&self, agent_id: &str) -> Result<(), String> {
+        let (cmd, _rx) = HubCommand::delete_agent(super::commands::DeleteAgentRequest::new(agent_id));
+        self.command_tx
+            .inner()
+            .send(cmd)
+            .await
+            .map_err(|e| format!("Failed to send delete agent command: {}", e))
+    }
+
+    /// Delete an agent with worktree removal (async version).
+    ///
+    /// For use from async client tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub async fn delete_agent_with_worktree_async(&self, agent_id: &str) -> Result<(), String> {
+        let request = super::commands::DeleteAgentRequest::new(agent_id).with_worktree_deletion();
+        let (cmd, _rx) = HubCommand::delete_agent(request);
+        self.command_tx
+            .inner()
+            .send(cmd)
+            .await
+            .map_err(|e| format!("Failed to send delete agent command: {}", e))
+    }
+
+    /// Dispatch a HubAction (async version).
+    ///
+    /// For use from async client tasks. Sends an action to Hub for processing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed.
+    pub async fn dispatch_action_async(&self, action: super::HubAction) -> Result<(), String> {
+        self.command_tx.dispatch_action_async(action).await
+    }
+
     /// Check if the Hub command channel is closed.
     ///
     /// Returns `true` if the Hub has shut down and commands can no longer

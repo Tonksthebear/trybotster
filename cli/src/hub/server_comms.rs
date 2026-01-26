@@ -51,10 +51,6 @@ impl Hub {
     /// When workers aren't available (offline mode, testing):
     /// - Falls back to blocking HTTP calls on main thread
     pub fn tick(&mut self) {
-        // Ensure TUI has a valid selection if agents exist
-        // (fixes visual fallback mismatch where render shows first agent but input routes to None)
-        self.ensure_tui_selection();
-
         // Process completed background agent creations (always non-blocking)
         self.poll_pending_agents();
 
@@ -308,11 +304,6 @@ impl Hub {
             }
         }
 
-        // Track TUI creation progress for display
-        if event.client_id.is_tui() {
-            self.creating_agent = Some((event.identifier.clone(), event.stage));
-        }
-
         // Broadcast progress event to all subscribers (including TUI)
         self.broadcast(HubEvent::AgentCreationProgress {
             identifier: event.identifier,
@@ -327,11 +318,6 @@ impl Hub {
     fn handle_pending_agent_result(&mut self, pending: PendingAgentResult) {
         use crate::hub::lifecycle;
 
-        // Clear TUI creating indicator on completion (success or failure)
-        if pending.client_id.is_tui() {
-            self.creating_agent = None;
-        }
-
         match pending.result {
             Ok(_) => {
                 // Background work succeeded - now spawn the agent (fast, needs &mut state)
@@ -340,20 +326,14 @@ impl Hub {
                     pending.client_id
                 );
 
-                // Get client dims for PTY
-                let dims = self
-                    .clients
-                    .get(&pending.client_id)
-                    .map(|c| c.dims())
-                    .unwrap_or(self.terminal_dims);
-
                 // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
                 let _runtime_guard = self.tokio_runtime.enter();
 
                 // Spawn agent (fast - just PTY creation) - release lock after spawning
+                // Dims are carried in pending.config from the requesting client
                 let spawn_result = {
                     let mut state = self.state.write().unwrap();
-                    lifecycle::spawn_agent(&mut state, &pending.config, dims)
+                    lifecycle::spawn_agent(&mut state, &pending.config)
                 };
 
                 match spawn_result {
@@ -450,21 +430,6 @@ impl Hub {
                 &session_key,
                 crate::agent::PtyView::Cli,
             );
-        }
-
-        // Also auto-select for TUI if it has no selection
-        // (ensures TUI state matches what's visually displayed)
-        if *client_id != ClientId::Tui {
-            let tui_has_selection = self.get_tui_selected_agent_key().is_some();
-            if !tui_has_selection {
-                actions::dispatch(
-                    self,
-                    HubAction::SelectAgentForClient {
-                        client_id: ClientId::Tui,
-                        agent_key: session_key.clone(),
-                    },
-                );
-            }
         }
 
         // Broadcast AgentCreated event to all subscribers (including TUI)

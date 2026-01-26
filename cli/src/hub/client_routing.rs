@@ -1,205 +1,21 @@
-//! Client routing and selection helpers for Hub.
+//! Client communication helpers for Hub.
 //!
-//! This module contains methods for managing client-agent associations,
-//! including TUI selection state, agent navigation, and client communication.
-//!
-//! # Client Model
-//!
-//! Each client (TUI, browser) maintains its own selected agent. The registry
-//! tracks these selections, allowing independent navigation per client.
+//! This module contains methods for client communication,
+//! including building and sending agent/worktree lists and error messages.
 //!
 //! # Key Functions
 //!
-//! - Selection: `get_tui_selected_agent_key()`, `with_selected_agent()`
-//! - Navigation: `get_next_agent_key()`, `get_previous_agent_key()`
 //! - Communication: `send_agent_list_to()`, `broadcast_agent_list()`
+//! - Data: `build_agent_list()`
+//! - Error handling: `send_error_to()`
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-01
 
 use crate::client::ClientId;
-use crate::hub::actions::{self, HubAction};
 use crate::hub::Hub;
 use crate::relay::AgentInfo;
 
 impl Hub {
-    /// Execute a closure with a reference to the currently selected agent for TUI.
-    ///
-    /// This uses `TuiClient.state().selected_agent` as the source of truth,
-    /// NOT `HubState.selected`. This is part of the client abstraction.
-    ///
-    /// Returns `None` if no agent is selected or the agent doesn't exist.
-    pub fn with_selected_agent<T, F>(&self, f: F) -> Option<T>
-    where
-        F: FnOnce(&crate::agent::Agent) -> T,
-    {
-        let key = self.get_tui_selected_agent_key()?;
-        let state = self.state.read().unwrap();
-        state.agents.get(&key).map(f)
-    }
-
-    /// Execute a closure with a mutable reference to the currently selected agent for TUI.
-    ///
-    /// Returns `None` if no agent is selected or the agent doesn't exist.
-    pub fn with_selected_agent_mut<T, F>(&mut self, f: F) -> Option<T>
-    where
-        F: FnOnce(&mut crate::agent::Agent) -> T,
-    {
-        let key = self.get_tui_selected_agent_key()?;
-        let mut state = self.state.write().unwrap();
-        state.agents.get_mut(&key).map(f)
-    }
-
-    /// Check if TUI has a selected agent.
-    #[must_use]
-    pub fn has_selected_agent(&self) -> bool {
-        if let Some(key) = self.get_tui_selected_agent_key() {
-            self.state.read().unwrap().agents.contains_key(&key)
-        } else {
-            false
-        }
-    }
-
-    /// Get the selected agent key for TUI.
-    ///
-    /// Returns the TUI's currently selected agent key.
-    /// Updated by `handle_select_agent_for_client()` when TUI selects an agent.
-    #[must_use]
-    pub fn get_tui_selected_agent_key(&self) -> Option<String> {
-        self.tui_selected_agent.clone()
-    }
-
-    /// Ensure TUI has a valid selection if agents exist.
-    ///
-    /// This prevents the visual fallback mismatch where render.rs shows
-    /// the first agent (index 0) but TuiClient.selected_agent is None,
-    /// causing input to not route anywhere.
-    ///
-    /// Called from tick() to sync TUI selection with visual display.
-    pub(crate) fn ensure_tui_selection(&mut self) {
-        let state = self.state.read().unwrap();
-
-        // If no agents exist, nothing to select
-        if state.agent_keys_ordered.is_empty() {
-            return;
-        }
-
-        // Check current TUI selection
-        let current_selection = self.get_tui_selected_agent_key();
-
-        // If no selection, select the first agent
-        if current_selection.is_none() {
-            if let Some(first_key) = state.agent_keys_ordered.first().cloned() {
-                drop(state); // Release lock before dispatch
-                log::debug!(
-                    "Auto-selecting first agent {} for TUI (was None)",
-                    first_key
-                );
-                actions::dispatch(
-                    self,
-                    HubAction::SelectAgentForClient {
-                        client_id: ClientId::Tui,
-                        agent_key: first_key,
-                    },
-                );
-            }
-            return;
-        }
-
-        // If selection exists but agent doesn't (deleted), select first agent
-        let selection = current_selection.unwrap();
-        if !state.agents.contains_key(&selection) {
-            if let Some(first_key) = state.agent_keys_ordered.first().cloned() {
-                drop(state); // Release lock before dispatch
-                log::debug!(
-                    "Auto-selecting first agent {} for TUI (previous {} no longer exists)",
-                    first_key,
-                    selection
-                );
-                actions::dispatch(
-                    self,
-                    HubAction::SelectAgentForClient {
-                        client_id: ClientId::Tui,
-                        agent_key: first_key,
-                    },
-                );
-            }
-        }
-    }
-
-    /// Get the next agent key for a client's navigation.
-    ///
-    /// Returns the next agent in the ordered list, wrapping around.
-    /// If no agent is selected, returns the first agent.
-    ///
-    /// Currently only supports TUI navigation. Browser navigation uses
-    /// their own selection tracking.
-    #[must_use]
-    pub fn get_next_agent_key(&self, client_id: &ClientId) -> Option<String> {
-        let state = self.state.read().unwrap();
-        if state.agent_keys_ordered.is_empty() {
-            return None;
-        }
-
-        // Get current selection (TUI only for now)
-        let current = if client_id.is_tui() {
-            self.tui_selected_agent.as_ref()
-        } else {
-            None
-        };
-
-        match current {
-            Some(key) => {
-                let idx = state
-                    .agent_keys_ordered
-                    .iter()
-                    .position(|k| k == key)
-                    .unwrap_or(0);
-                let next_idx = (idx + 1) % state.agent_keys_ordered.len();
-                Some(state.agent_keys_ordered[next_idx].clone())
-            }
-            None => Some(state.agent_keys_ordered[0].clone()),
-        }
-    }
-
-    /// Get the previous agent key for a client's navigation.
-    ///
-    /// Returns the previous agent in the ordered list, wrapping around.
-    /// If no agent is selected, returns the last agent.
-    ///
-    /// Currently only supports TUI navigation. Browser navigation uses
-    /// their own selection tracking.
-    #[must_use]
-    pub fn get_previous_agent_key(&self, client_id: &ClientId) -> Option<String> {
-        let state = self.state.read().unwrap();
-        if state.agent_keys_ordered.is_empty() {
-            return None;
-        }
-
-        // Get current selection (TUI only for now)
-        let current = if client_id.is_tui() {
-            self.tui_selected_agent.as_ref()
-        } else {
-            None
-        };
-
-        match current {
-            Some(key) => {
-                let idx = state
-                    .agent_keys_ordered
-                    .iter()
-                    .position(|k| k == key)
-                    .unwrap_or(0);
-                let prev_idx = if idx == 0 {
-                    state.agent_keys_ordered.len() - 1
-                } else {
-                    idx - 1
-                };
-                Some(state.agent_keys_ordered[prev_idx].clone())
-            }
-            None => Some(state.agent_keys_ordered.last()?.clone()),
-        }
-    }
-
     /// Build the agent list for sending to clients.
     pub(crate) fn build_agent_list(&self) -> Vec<AgentInfo> {
         let state = self.state.read().unwrap();

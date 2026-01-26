@@ -1,4 +1,4 @@
-//! Agent lifecycle handlers - spawn, close, kill operations.
+//! Agent lifecycle handlers - spawn and close operations.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,15 +53,15 @@ pub fn handle_spawn_agent(
         prompt,
         message_id,
         invocation_url,
+        // Server-initiated agents (webhooks) have no client providing dims,
+        // so use a reasonable default.
+        dims: (24, 80),
     };
-
-    // Use terminal dims for agents spawned via Rails server (no browser involved)
-    let dims = hub.terminal_dims;
 
     // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
     let _runtime_guard = hub.tokio_runtime.enter();
 
-    match lifecycle::spawn_agent(&mut hub.state.write().unwrap(), &config, dims) {
+    match lifecycle::spawn_agent(&mut hub.state.write().unwrap(), &config) {
         Ok(result) => {
             log::info!("Spawned agent: {}", result.agent_id);
 
@@ -97,17 +97,3 @@ pub fn handle_close_agent(hub: &mut Hub, session_key: &str, delete_worktree: boo
     }
 }
 
-/// Handle killing the currently selected agent.
-///
-/// Uses TUI client's selection to determine which agent to kill.
-pub fn handle_kill_selected_agent(hub: &mut Hub) {
-    // Uses TUI client's selection
-    if let Some(key) = hub.get_tui_selected_agent_key() {
-        if let Err(e) = lifecycle::close_agent(&mut hub.state.write().unwrap(), &key, false) {
-            log::error!("Failed to kill agent: {}", e);
-        } else {
-            // Sync handle cache for thread-safe agent access
-            hub.sync_handle_cache();
-        }
-    }
-}

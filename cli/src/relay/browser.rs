@@ -95,25 +95,18 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
                     hub.browser.invalidate_screen();
                     send_agent_selected_to_browser(hub, &browser_identity, id);
 
-                    // Connect browser to PTY - creates output forwarder and sends scrollback
-                    // Look up agent handle directly from Hub's state (NOT through hub_handle,
-                    // which would send a command back to Hub and deadlock).
+                    // Send ConnectToPty command to BrowserClient's async task.
+                    // The client's run_task handles PTY connection internally.
                     let state = hub.state.read().unwrap();
                     let agent_index = state.agent_keys_ordered.iter().position(|k| k == id);
+                    drop(state);
 
                     if let Some(idx) = agent_index {
-                        if let Some(agent_handle) = state.get_agent_handle(idx) {
-                            drop(state); // Release lock before calling connect
-                            let client_id = ClientId::Browser(browser_identity.clone());
-                            if let Some(client) = hub.clients.get_mut(&client_id) {
-                                if let Err(e) = client.connect_to_pty_with_handle(&agent_handle, idx, 0) {
-                                    log::warn!(
-                                        "Failed to connect browser {} to PTY: {}",
-                                        &browser_identity[..8.min(browser_identity.len())],
-                                        e
-                                    );
-                                }
-                            }
+                        let client_id = ClientId::Browser(browser_identity.clone());
+                        if let Some(handle) = hub.clients.get(&client_id) {
+                            let _ = handle.cmd_tx.try_send(
+                                crate::client::ClientCmd::ConnectToPty { agent_index: idx, pty_index: 0 },
+                            );
                         }
                     }
                 }
@@ -159,13 +152,11 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
                 let result = hub.generate_connection_url();
                 hub.handle_cache.set_connection_url(result.clone());
                 if let Ok(ref url) = result {
-                    hub.connection_url = Some(url.clone());
-                    // Also write to file for external access
+                    // Write to file for external access
                     let _ = crate::relay::write_connection_url(
                         &hub.hub_identifier,
                         url,
                     );
-                    // NOTE: qr_image_displayed is TUI state, handled by TuiRunner
                     log::info!("Connection URL updated with new bundle");
                 }
             }

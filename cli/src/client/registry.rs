@@ -1,141 +1,105 @@
-//! Client registry for managing connected clients.
+//! Client task registry for managing async client tasks.
 //!
-//! A simple wrapper around `HashMap` for storing and retrieving clients by ID.
+//! A thin HashMap wrapper that stores task handles. Hub communicates with
+//! clients via `ClientCmd` channels. No business logic, no cached state.
 
 // Rust guideline compliant 2026-01
 
 use std::collections::HashMap;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
-use super::{BrowserClient, Client, ClientId, TuiClient};
+use super::{ClientCmd, ClientId};
 
-/// Registry of all connected clients.
+/// Handle to a spawned async client task.
 ///
-/// Provides basic CRUD operations for client storage.
+/// Hub holds these to communicate with clients via channels.
+/// When dropped, the command channel closes, signaling the client task to exit.
+#[derive(Debug)]
+pub struct ClientTaskHandle {
+    /// Channel for Hub -> Client commands.
+    pub cmd_tx: mpsc::Sender<ClientCmd>,
+    /// Async task join handle.
+    pub join_handle: JoinHandle<()>,
+}
+
+/// Registry of active client task handles.
 ///
-/// # Example
-///
-/// ```ignore
-/// let mut registry = ClientRegistry::new();
-/// registry.register(Box::new(my_client));
-/// if let Some(client) = registry.get(&ClientId::Tui) {
-///     // Use client
-/// }
-/// ```
+/// A thin HashMap wrapper. Business logic belongs on the Client trait,
+/// not here. Callers access handles directly via `get()` and `iter()`.
 pub struct ClientRegistry {
-    clients: HashMap<ClientId, Box<dyn Client>>,
+    handles: HashMap<ClientId, ClientTaskHandle>,
 }
 
 impl ClientRegistry {
     /// Creates an empty registry.
     pub fn new() -> Self {
-        Self {
-            clients: HashMap::new(),
-        }
+        Self { handles: HashMap::new() }
     }
 
-    /// Registers a new client.
-    pub fn register(&mut self, client: Box<dyn Client>) {
-        let id = client.id().clone();
-        self.clients.insert(id, client);
+    /// Register a client task handle.
+    pub fn register(&mut self, id: ClientId, handle: ClientTaskHandle) {
+        self.handles.insert(id, handle);
     }
 
-    /// Unregisters a client by ID.
+    /// Unregister and return the client task handle.
     ///
-    /// Returns the removed client if it existed.
-    pub fn unregister(&mut self, id: &ClientId) -> Option<Box<dyn Client>> {
-        self.clients.remove(id)
+    /// Dropping the handle closes the command channel, signaling shutdown.
+    pub fn unregister(&mut self, id: &ClientId) -> Option<ClientTaskHandle> {
+        self.handles.remove(id)
     }
 
-    /// Gets a client by ID (immutable).
-    pub fn get(&self, id: &ClientId) -> Option<&dyn Client> {
-        self.clients.get(id).map(|c| c.as_ref())
+    /// Check if a client is registered.
+    pub fn contains(&self, id: &ClientId) -> bool {
+        self.handles.contains_key(id)
     }
 
-    /// Gets a client by ID (mutable).
-    pub fn get_mut(&mut self, id: &ClientId) -> Option<&mut Box<dyn Client>> {
-        self.clients.get_mut(id)
+    /// Get a reference to a client task handle.
+    pub fn get(&self, id: &ClientId) -> Option<&ClientTaskHandle> {
+        self.handles.get(id)
     }
 
-    /// Iterates all clients (immutable).
-    pub fn iter(&self) -> impl Iterator<Item = (&ClientId, &Box<dyn Client>)> {
-        self.clients.iter()
+    /// Iterate over all registered client handles.
+    pub fn iter(&self) -> impl Iterator<Item = (&ClientId, &ClientTaskHandle)> {
+        self.handles.iter()
     }
 
-    /// Iterates all clients (mutable).
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&ClientId, &mut Box<dyn Client>)> {
-        self.clients.iter_mut()
-    }
-
-    /// Gets all client IDs.
+    /// Get all registered client IDs.
     pub fn client_ids(&self) -> impl Iterator<Item = &ClientId> {
-        self.clients.keys()
+        self.handles.keys()
     }
 
-    /// Returns the number of connected clients.
+    /// Returns the number of registered clients.
     pub fn len(&self) -> usize {
-        self.clients.len()
+        self.handles.len()
     }
 
-    /// Returns `true` if the registry contains no clients.
+    /// Returns true if no clients are registered.
     pub fn is_empty(&self) -> bool {
-        self.clients.is_empty()
+        self.handles.is_empty()
     }
 
-    /// Poll all clients for pending requests.
+    /// Shutdown all client tasks.
     ///
-    /// Processes request channels for TuiClient and all BrowserClients.
-    /// Called from Hub's main event loop to drain request queues.
-    ///
-    /// Without this, `TuiRequest` and `BrowserRequest` messages sent by
-    /// TuiRunner and browser input receivers will sit in their channels
-    /// forever, causing `blocking_recv()` calls in TuiRunner to deadlock.
-    pub fn poll_all_requests(&mut self) {
-        for client in self.clients.values_mut() {
-            if let Some(any) = client.as_any_mut() {
-                if let Some(tui) = any.downcast_mut::<TuiClient>() {
-                    tui.poll_requests();
-                } else if let Some(browser) = any.downcast_mut::<BrowserClient>() {
-                    browser.poll_requests();
-                }
-            }
+    /// Drains all handles and aborts their tasks. Dropping `cmd_tx` signals
+    /// the client's `run_task` to exit (it sees `None` from `cmd_rx.recv()`).
+    /// Abort is the safety net for tasks that don't check the channel.
+    pub fn shutdown_all(&mut self) {
+        for (id, handle) in self.handles.drain() {
+            handle.join_handle.abort();
+            log::info!("Shut down client {:?}", id);
         }
-    }
-
-    /// Get the TuiClient if registered.
-    ///
-    /// Returns a mutable reference to the TuiClient if one is registered.
-    /// This allows Hub to access TuiClient-specific methods that aren't on
-    /// the Client trait (like `clear_connection()`).
-    ///
-    /// Uses `Any` for downcasting internally.
-    #[must_use]
-    pub fn get_tui_mut(&mut self) -> Option<&mut TuiClient> {
-        self.clients.get_mut(&ClientId::Tui).and_then(|boxed| {
-            boxed.as_any_mut().and_then(|any| any.downcast_mut::<TuiClient>())
-        })
-    }
-
-    /// Get the TuiClient if registered (immutable).
-    ///
-    /// Returns an immutable reference to the TuiClient if one is registered.
-    #[must_use]
-    pub fn get_tui(&self) -> Option<&TuiClient> {
-        self.clients.get(&ClientId::Tui).and_then(|boxed| {
-            boxed.as_any().and_then(|any| any.downcast_ref::<TuiClient>())
-        })
     }
 }
 
 impl Default for ClientRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl std::fmt::Debug for ClientRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientRegistry")
-            .field("client_count", &self.clients.len())
+            .field("client_count", &self.handles.len())
             .finish()
     }
 }
@@ -143,115 +107,112 @@ impl std::fmt::Debug for ClientRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hub::{AgentHandle, HubHandle};
 
-    /// Test client implementing the Client trait.
-    ///
-    /// Minimal implementation that stores a mock HubHandle and implements
-    /// only the required trait methods. Uses trait defaults for the rest.
-    struct TestClient {
-        hub_handle: HubHandle,
-        id: ClientId,
-        dims: (u16, u16),
+    /// Register a test client and return the command receiver for verification.
+    fn register_test_client(registry: &mut ClientRegistry, id: ClientId) -> mpsc::Receiver<ClientCmd> {
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let join_handle = tokio::spawn(async {});
+        registry.register(id, ClientTaskHandle { cmd_tx, join_handle });
+        cmd_rx
     }
 
-    impl TestClient {
-        fn new(id: ClientId) -> Self {
-            Self {
-                hub_handle: HubHandle::mock(),
-                id,
-                dims: (80, 24),
-            }
-        }
-    }
-
-    impl Client for TestClient {
-        fn hub_handle(&self) -> &HubHandle {
-            &self.hub_handle
-        }
-
-        fn id(&self) -> &ClientId {
-            &self.id
-        }
-
-        fn dims(&self) -> (u16, u16) {
-            self.dims
-        }
-
-        fn set_dims(&mut self, cols: u16, rows: u16) {
-            self.dims = (cols, rows);
-        }
-
-        fn connect_to_pty_with_handle(
-            &mut self,
-            _agent_handle: &AgentHandle,
-            _agent_index: usize,
-            _pty_index: usize,
-        ) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn disconnect_from_pty(&mut self, _agent_index: usize, _pty_index: usize) {}
-
-        // NOTE: get_agents, get_agent, send_input, resize_pty, agent_count
-        // all use DEFAULT IMPLEMENTATIONS from the trait
-    }
-
-    #[test]
-    fn test_register_and_get() {
+    #[tokio::test]
+    async fn test_register_and_contains() {
         let mut registry = ClientRegistry::new();
-        let client = TestClient::new(ClientId::Tui);
-        registry.register(Box::new(client));
+        let _rx = register_test_client(&mut registry, ClientId::Tui);
 
         assert_eq!(registry.len(), 1);
-        assert!(registry.get(&ClientId::Tui).is_some());
-        assert!(registry
-            .get(&ClientId::Browser("xyz".to_string()))
-            .is_none());
+        assert!(registry.contains(&ClientId::Tui));
+        assert!(!registry.contains(&ClientId::Browser("xyz".to_string())));
     }
 
-    #[test]
-    fn test_unregister() {
+    #[tokio::test]
+    async fn test_unregister() {
         let mut registry = ClientRegistry::new();
-        let client = TestClient::new(ClientId::Tui);
-        registry.register(Box::new(client));
+        let _rx = register_test_client(&mut registry, ClientId::Tui);
 
         let removed = registry.unregister(&ClientId::Tui);
         assert!(removed.is_some());
         assert_eq!(registry.len(), 0);
     }
 
-    #[test]
-    fn test_iter() {
+    #[tokio::test]
+    async fn test_get() {
         let mut registry = ClientRegistry::new();
+        let _rx = register_test_client(&mut registry, ClientId::Tui);
 
-        let tui = TestClient::new(ClientId::Tui);
-        let browser = TestClient::new(ClientId::browser("xyz"));
-
-        registry.register(Box::new(tui));
-        registry.register(Box::new(browser));
-
-        assert_eq!(registry.iter().count(), 2);
+        let handle = registry.get(&ClientId::Tui);
+        assert!(handle.is_some());
+        assert!(registry.get(&ClientId::Browser("xyz".to_string())).is_none());
     }
 
-    #[test]
-    fn test_client_ids() {
+    #[tokio::test]
+    async fn test_iter() {
         let mut registry = ClientRegistry::new();
-        let client = TestClient::new(ClientId::Tui);
-        registry.register(Box::new(client));
+        let _rx1 = register_test_client(&mut registry, ClientId::Tui);
+        let _rx2 = register_test_client(&mut registry, ClientId::browser("xyz"));
+
+        let entries: Vec<_> = registry.iter().collect();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_send_via_get() {
+        let mut registry = ClientRegistry::new();
+        let mut rx = register_test_client(&mut registry, ClientId::Tui);
+
+        // Callers use get() + try_send() directly
+        if let Some(handle) = registry.get(&ClientId::Tui) {
+            let _ = handle.cmd_tx.try_send(ClientCmd::Shutdown);
+        }
+
+        let cmd = rx.try_recv().unwrap();
+        assert!(matches!(cmd, ClientCmd::Shutdown));
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_via_iter() {
+        let mut registry = ClientRegistry::new();
+        let mut rx1 = register_test_client(&mut registry, ClientId::Tui);
+        let mut rx2 = register_test_client(&mut registry, ClientId::browser("xyz"));
+
+        // Callers iterate and send directly
+        for (_, handle) in registry.iter() {
+            let _ = handle.cmd_tx.try_send(ClientCmd::Shutdown);
+        }
+
+        assert!(matches!(rx1.try_recv().unwrap(), ClientCmd::Shutdown));
+        assert!(matches!(rx2.try_recv().unwrap(), ClientCmd::Shutdown));
+    }
+
+    #[tokio::test]
+    async fn test_client_ids() {
+        let mut registry = ClientRegistry::new();
+        let _rx = register_test_client(&mut registry, ClientId::Tui);
 
         let ids: Vec<_> = registry.client_ids().collect();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], &ClientId::Tui);
     }
 
-    #[test]
-    fn test_is_empty() {
+    #[tokio::test]
+    async fn test_is_empty() {
         let mut registry = ClientRegistry::new();
         assert!(registry.is_empty());
 
-        let client = TestClient::new(ClientId::Tui);
-        registry.register(Box::new(client));
+        let _rx = register_test_client(&mut registry, ClientId::Tui);
         assert!(!registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_all() {
+        let mut registry = ClientRegistry::new();
+        let _rx1 = register_test_client(&mut registry, ClientId::Tui);
+        let _rx2 = register_test_client(&mut registry, ClientId::browser("xyz"));
+
+        registry.shutdown_all();
+
+        assert!(registry.is_empty());
+        // cmd_tx dropped during drain, so receivers will see channel closed
     }
 }
