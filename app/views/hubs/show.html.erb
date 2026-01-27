@@ -9,17 +9,17 @@
 <%# Permanent connection container - survives Turbo navigation, uses global queries for status %>
 <div id="hub-connection-permanent"
      data-turbo-permanent
-     data-controller="connection"
-     data-connection-hub-id-value="<%= @hub.id %>"
-     data-connection-worker-url-value="<%= asset_path('workers/signal.js') %>"
-     data-connection-wasm-js-url-value="<%= asset_path('libsignal_wasm.js') %>"
-     data-connection-wasm-binary-url-value="<%= asset_path('libsignal_wasm_bg.wasm') %>"
-     data-connection-security-banner-base-class="hidden">
+     data-controller="hub-connection"
+     data-hub-connection-hub-id-value="<%= @hub.id %>"
+     data-hub-connection-worker-url-value="<%= asset_path('workers/signal.js') %>"
+     data-hub-connection-wasm-js-url-value="<%= asset_path('libsignal_wasm.js') %>"
+     data-hub-connection-wasm-binary-url-value="<%= asset_path('libsignal_wasm_bg.wasm') %>"
+     data-hub-connection-security-banner-base-class="hidden">
 </div>
 
 <div class="h-full flex flex-col overflow-hidden"
      data-controller="agents"
-     data-agents-connection-outlet="#hub-connection-permanent"
+     data-agents-hub-connection-outlet="#hub-connection-permanent"
      data-agents-hub-name-value="<%= @hub.repo.presence || @hub.identifier.truncate(16) %>"
      data-agents-hub-id-value="<%= @hub.id %>">
 
@@ -36,14 +36,14 @@
 
         <%# Connection status %>
         <div class="flex items-center gap-2 shrink-0">
-          <div data-connection-target="status" class="text-sm font-medium text-zinc-400 flex items-center gap-2">
-            <span data-connection-target="statusIcon" class="shrink-0">
+          <div data-hub-connection-target="status" class="text-sm font-medium text-zinc-400 flex items-center gap-2">
+            <span data-hub-connection-target="statusIcon" class="shrink-0">
               <svg class="size-4 animate-spin text-zinc-500" fill="none" viewBox="0 0 24 24">
                 <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                 <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
               </svg>
             </span>
-            <span data-connection-target="statusText">Initializing...</span>
+            <span data-hub-connection-target="statusText">Initializing...</span>
           </div>
         </div>
       </div>

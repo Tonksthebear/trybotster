@@ -54,7 +54,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::agent::pty::PtyEvent;
-use crate::channel::{ActionCableChannel, Channel, ChannelConfig};
+use crate::channel::{ActionCableChannel, Channel, ChannelConfig, PeerId};
 use crate::hub::HubHandle;
 use crate::relay::crypto_service::CryptoServiceHandle;
 use crate::relay::{build_scrollback_message, BrowserCommand, TerminalMessage};
@@ -368,8 +368,18 @@ impl Client for BrowserClient {
         let api_key = self.config.api_key.clone();
         let hub_id = self.config.server_hub_id.clone();
 
-        // Create ActionCableChannel with E2E encryption.
-        let mut channel = ActionCableChannel::encrypted(crypto_service, server_url, api_key);
+        // Create ActionCableChannel with E2E encryption and reliable delivery.
+        // Must use `.reliable(true)` to match the browser's Channel which also
+        // uses reliable delivery. Without this, browser→CLI messages arrive
+        // wrapped in `{ type: "data", seq, payload }` but the CLI skips the
+        // reliable layer and tries to parse the wrapper as a BrowserCommand,
+        // which silently fails.
+        let mut channel = ActionCableChannel::builder()
+            .server_url(server_url)
+            .api_key(api_key)
+            .crypto_service(crypto_service)
+            .reliable(true)
+            .build();
 
         // Connect to TerminalRelayChannel (already in async context).
         channel
@@ -392,6 +402,11 @@ impl Client for BrowserClient {
         let receiver_handle = channel
             .take_receiver_handle()
             .ok_or_else(|| "Failed to get channel receiver handle".to_string())?;
+
+        // Pre-register the browser as a peer so broadcast works immediately.
+        // Without this, the peer set is empty until the browser's first message
+        // arrives, causing scrollback (and early output) to be silently dropped.
+        sender_handle.register_peer(PeerId(self.identity.clone()));
 
         // Connect to PTY and get scrollback BEFORE spawning forwarder.
         // This ensures the browser receives historical output first.
