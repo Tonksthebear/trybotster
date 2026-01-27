@@ -31,53 +31,56 @@ class ChannelRoutingTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Connect to PTY to establish terminal channel (on-demand architecture)
     connect_to_pty_in_browser
 
     # Verify sendInput uses sendTerminalMessage internally
     routing_check = page.execute_script(<<~JS)
-      const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+      const hubConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
+      );
+      const termConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="terminal-connection"]'), 'terminal-connection'
       );
 
       // Spy on the channel send methods
       let hubChannelCalled = false;
       let terminalChannelCalled = false;
 
-      const originalHubSend = conn.hubChannel?.send?.bind(conn.hubChannel);
-      const originalTerminalSend = conn.terminalChannel?.send?.bind(conn.terminalChannel);
+      const originalHubSend = hubConn.hubChannel?.send?.bind(hubConn.hubChannel);
+      const originalTerminalSend = termConn.terminalChannel?.send?.bind(termConn.terminalChannel);
 
-      if (conn.hubChannel?.send) {
-        conn.hubChannel.send = async (msg) => {
+      if (hubConn.hubChannel?.send) {
+        hubConn.hubChannel.send = async (msg) => {
           hubChannelCalled = true;
           return originalHubSend ? originalHubSend(msg) : false;
         };
       }
 
-      if (conn.terminalChannel?.send) {
-        conn.terminalChannel.send = async (msg) => {
+      if (termConn.terminalChannel?.send) {
+        termConn.terminalChannel.send = async (msg) => {
           terminalChannelCalled = true;
           return originalTerminalSend ? originalTerminalSend(msg) : false;
         };
       }
 
-      // Call sendInput
-      conn.sendInput('test');
+      // Call sendInput on terminal connection
+      termConn.sendInput('test');
 
       // Small delay to let async complete
       await new Promise(r => setTimeout(r, 50));
 
       // Restore originals
-      if (originalHubSend) conn.hubChannel.send = originalHubSend;
-      if (originalTerminalSend) conn.terminalChannel.send = originalTerminalSend;
+      if (originalHubSend) hubConn.hubChannel.send = originalHubSend;
+      if (originalTerminalSend) termConn.terminalChannel.send = originalTerminalSend;
 
       return {
         hubChannelCalled,
         terminalChannelCalled,
-        hasTerminalChannel: !!conn.terminalChannel,
-        hasHubChannel: !!conn.hubChannel
+        hasTerminalChannel: !!termConn.terminalChannel,
+        hasHubChannel: !!hubConn.hubChannel
       };
     JS
 
@@ -93,47 +96,50 @@ class ChannelRoutingTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Connect to PTY to establish terminal channel (on-demand architecture)
     connect_to_pty_in_browser
 
     # Verify sendResize uses sendTerminalMessage internally
     routing_check = page.execute_script(<<~JS)
-      const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+      const hubConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
+      );
+      const termConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="terminal-connection"]'), 'terminal-connection'
       );
 
       // Spy on the channel send methods
       let hubChannelCalled = false;
       let terminalChannelCalled = false;
 
-      const originalHubSend = conn.hubChannel?.send?.bind(conn.hubChannel);
-      const originalTerminalSend = conn.terminalChannel?.send?.bind(conn.terminalChannel);
+      const originalHubSend = hubConn.hubChannel?.send?.bind(hubConn.hubChannel);
+      const originalTerminalSend = termConn.terminalChannel?.send?.bind(termConn.terminalChannel);
 
-      if (conn.hubChannel?.send) {
-        conn.hubChannel.send = async (msg) => {
+      if (hubConn.hubChannel?.send) {
+        hubConn.hubChannel.send = async (msg) => {
           hubChannelCalled = true;
           return originalHubSend ? originalHubSend(msg) : false;
         };
       }
 
-      if (conn.terminalChannel?.send) {
-        conn.terminalChannel.send = async (msg) => {
+      if (termConn.terminalChannel?.send) {
+        termConn.terminalChannel.send = async (msg) => {
           terminalChannelCalled = true;
           return originalTerminalSend ? originalTerminalSend(msg) : false;
         };
       }
 
-      // Call sendResize
-      conn.sendResize(80, 24);
+      // Call sendResize on terminal connection
+      termConn.sendResize(80, 24);
 
       // Small delay to let async complete
       await new Promise(r => setTimeout(r, 50));
 
       // Restore originals
-      if (originalHubSend) conn.hubChannel.send = originalHubSend;
-      if (originalTerminalSend) conn.terminalChannel.send = originalTerminalSend;
+      if (originalHubSend) hubConn.hubChannel.send = originalHubSend;
+      if (originalTerminalSend) termConn.terminalChannel.send = originalTerminalSend;
 
       return {
         hubChannelCalled,
@@ -151,114 +157,106 @@ class ChannelRoutingTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Verify send() routes through hub channel
     routing_check = page.execute_script(<<~JS)
-      const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+      const hubConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
 
-      // Spy on the channel send methods
+      // Spy on the hub channel send method
       let hubChannelCalled = false;
-      let terminalChannelCalled = false;
 
-      const originalHubSend = conn.hubChannel?.send?.bind(conn.hubChannel);
-      const originalTerminalSend = conn.terminalChannel?.send?.bind(conn.terminalChannel);
+      const originalHubSend = hubConn.hubChannel?.send?.bind(hubConn.hubChannel);
 
-      if (conn.hubChannel?.send) {
-        conn.hubChannel.send = async (msg) => {
+      if (hubConn.hubChannel?.send) {
+        hubConn.hubChannel.send = async (msg) => {
           hubChannelCalled = true;
           return originalHubSend ? originalHubSend(msg) : false;
         };
       }
 
-      if (conn.terminalChannel?.send) {
-        conn.terminalChannel.send = async (msg) => {
-          terminalChannelCalled = true;
-          return originalTerminalSend ? originalTerminalSend(msg) : false;
-        };
-      }
-
       // Call send (hub-level command)
-      conn.send('list_agents');
+      hubConn.send('list_agents');
 
       // Small delay to let async complete
       await new Promise(r => setTimeout(r, 50));
 
       // Restore originals
-      if (originalHubSend) conn.hubChannel.send = originalHubSend;
-      if (originalTerminalSend) conn.terminalChannel.send = originalTerminalSend;
+      if (originalHubSend) hubConn.hubChannel.send = originalHubSend;
 
       return {
-        hubChannelCalled,
-        terminalChannelCalled
+        hubChannelCalled
       };
     JS
 
     assert routing_check["hubChannelCalled"],
       "send() should route through hub channel for agent commands"
-    refute routing_check["terminalChannelCalled"],
-      "send() should NOT route through terminal channel"
   end
 
   test "sendTerminalMessage has correct signature" do
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
-    # Verify sendTerminalMessage exists and works correctly
+    # Navigate to agent page to access terminal-connection controller
+    navigate_to_agent_page
+
+    # Verify terminal methods exist on terminal-connection and hub methods on hub-connection
     api_check = page.execute_script(<<~JS)
-      const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+      const hubConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
+      );
+      const termConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="terminal-connection"]'), 'terminal-connection'
       );
 
       return {
-        hasSendTerminalMessage: typeof conn.sendTerminalMessage === 'function',
-        hasSendInput: typeof conn.sendInput === 'function',
-        hasSendResize: typeof conn.sendResize === 'function',
-        hasSend: typeof conn.send === 'function'
+        hasSendTerminalMessage: typeof termConn.sendTerminalMessage === 'function',
+        hasSendInput: typeof termConn.sendInput === 'function',
+        hasSendResize: typeof termConn.sendResize === 'function',
+        hasHubSend: typeof hubConn.send === 'function'
       };
     JS
 
-    assert api_check["hasSendTerminalMessage"], "Should have sendTerminalMessage method"
-    assert api_check["hasSendInput"], "Should have sendInput method"
-    assert api_check["hasSendResize"], "Should have sendResize method"
-    assert api_check["hasSend"], "Should have send method"
+    assert api_check["hasSendTerminalMessage"], "Terminal connection should have sendTerminalMessage method"
+    assert api_check["hasSendInput"], "Terminal connection should have sendInput method"
+    assert api_check["hasSendResize"], "Terminal connection should have sendResize method"
+    assert api_check["hasHubSend"], "Hub connection should have send method"
   end
 
   test "terminal channel is separate from hub channel" do
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Connect to PTY to establish terminal channel (on-demand architecture)
     connect_to_pty_in_browser
 
-    # Verify the channels are distinct objects
+    # Verify the channels are on distinct controllers
     channel_check = page.execute_script(<<~JS)
-      const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+      const hubConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
+      );
+      const termConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="terminal-connection"]'), 'terminal-connection'
       );
 
       return {
-        hubChannel: !!conn.hubChannel,
-        terminalChannel: !!conn.terminalChannel,
-        channelsAreDifferent: conn.hubChannel !== conn.terminalChannel,
-        hubSubscription: !!conn.hubSubscription,
-        terminalSubscription: !!conn.terminalSubscription,
-        subscriptionsAreDifferent: conn.hubSubscription !== conn.terminalSubscription
+        hubChannel: !!hubConn.hubChannel,
+        terminalChannel: !!termConn.terminalChannel,
+        hubSubscription: !!hubConn.hubSubscription,
+        terminalSubscription: !!termConn.terminalSubscription
       };
     JS
 
-    assert channel_check["hubChannel"], "Should have hub channel"
-    assert channel_check["terminalChannel"], "Should have terminal channel"
-    assert channel_check["channelsAreDifferent"], "Hub and terminal channels should be different objects"
-    assert channel_check["hubSubscription"], "Should have hub subscription"
-    assert channel_check["terminalSubscription"], "Should have terminal subscription"
-    assert channel_check["subscriptionsAreDifferent"], "Hub and terminal subscriptions should be different"
+    assert channel_check["hubChannel"], "Hub connection should have hub channel"
+    assert channel_check["terminalChannel"], "Terminal connection should have terminal channel"
+    assert channel_check["hubSubscription"], "Hub connection should have hub subscription"
+    assert channel_check["terminalSubscription"], "Terminal connection should have terminal subscription"
   end
 
   # === Browser -> PTY I/O Flow E2E Tests ===
@@ -272,16 +270,19 @@ class ChannelRoutingTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
+
+    # Navigate to agent page (terminal-connection only exists there)
+    navigate_to_agent_page
 
     # Verify terminal channel does NOT exist before PTY connection (on-demand architecture)
     before_state = page.execute_script(<<~JS)
-      const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+      const termConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="terminal-connection"]'), 'terminal-connection'
       );
       return {
-        hasTerminalChannel: !!conn.terminalChannel,
-        hasTerminalSubscription: !!conn.terminalSubscription
+        hasTerminalChannel: !!termConn?.terminalChannel,
+        hasTerminalSubscription: !!termConn?.terminalSubscription
       };
     JS
 
@@ -293,12 +294,12 @@ class ChannelRoutingTest < ApplicationSystemTestCase
 
     # Verify terminal channel NOW exists after connectToPty
     after_state = page.execute_script(<<~JS)
-      const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+      const termConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="terminal-connection"]'), 'terminal-connection'
       );
       return {
-        hasTerminalChannel: !!conn.terminalChannel,
-        hasTerminalSubscription: !!conn.terminalSubscription
+        hasTerminalChannel: !!termConn.terminalChannel,
+        hasTerminalSubscription: !!termConn.terminalSubscription
       };
     JS
 
@@ -324,12 +325,27 @@ class ChannelRoutingTest < ApplicationSystemTestCase
 
   private
 
+  # Navigate to agent terminal page (which has terminal-connection controller).
+  # The hub landing page only has hub-connection; terminal-connection is on the agent page.
+  def navigate_to_agent_page(agent_index = 0)
+    hub_id = @hub.id
+    visit "/hubs/#{hub_id}/agents/#{agent_index}"
+    assert_selector "[data-controller~='terminal-connection']", wait: 5
+    # Wait for hub-connection to reconnect after Turbo navigation
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
+  end
+
   def connect_to_pty_in_browser(agent_index = 0, pty_index = 0)
+    # Ensure we're on the agent page (which has terminal-connection controller)
+    unless page.has_css?("[data-controller~='terminal-connection']", wait: 0)
+      navigate_to_agent_page(agent_index)
+    end
+
     page.execute_script(<<~JS)
-      const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+      const termConn = window.Stimulus.getControllerForElementAndIdentifier(
+        document.querySelector('[data-controller~="terminal-connection"]'), 'terminal-connection'
       );
-      conn.connectToPty(#{agent_index}, #{pty_index});
+      termConn.connectToPty(#{agent_index}, #{pty_index});
     JS
     sleep 1 # Wait for ActionCable subscription to establish
   end

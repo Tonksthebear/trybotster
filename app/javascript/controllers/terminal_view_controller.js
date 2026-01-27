@@ -3,10 +3,15 @@ import { Controller } from "@hotwired/stimulus";
 /**
  * Terminal View Controller
  *
- * Manages switching between Agent PTY (CLI, index 0) and Server PTY (index 1) views.
- * Also handles displaying the preview link when tunnel is connected.
+ * Manages PTY tab switching (CLI view at index 0, Server view at index 1)
+ * and shows a preview link when a tunnel is connected.
  *
- * Uses connection outlet to switch PTY streams via ActionCable.
+ * Agent state (hasServerPty, tunnelConnected, tunnelPort) is pushed via
+ * Stimulus values from agents_controller — this controller does NOT listen
+ * for agent messages itself.
+ *
+ * Listens for `pty_channel_switched` from the terminal-connection outlet to
+ * stay in sync when the connection controller switches PTY channels.
  */
 export default class extends Controller {
   static targets = [
@@ -17,7 +22,7 @@ export default class extends Controller {
     "fallbackLabel",
   ];
 
-  static outlets = ["connection"];
+  static outlets = ["terminal-connection"];
 
   static values = {
     hubId: String,
@@ -32,24 +37,19 @@ export default class extends Controller {
   }
 
   // Stimulus outlet callbacks
-  connectionOutletConnected(outlet) {
+  terminalConnectionOutletConnected(outlet) {
     outlet.registerListener(this, {
       onMessage: (msg) => this.#handleMessage(msg),
     });
   }
 
-  connectionOutletDisconnected(outlet) {
+  terminalConnectionOutletDisconnected(outlet) {
     outlet.unregisterListener(this);
   }
 
-  // Handle messages from CLI
+  // Handle messages from terminal-connection outlet
   #handleMessage(message) {
     switch (message.type) {
-      case "agent_selected":
-      case "agents":
-      case "agent_list":
-        this.#updateAgentData(message);
-        break;
       case "pty_channel_switched":
         // Connection controller switched PTY - update our state
         this.ptyIndexValue = message.pty_index || 0;
@@ -58,33 +58,16 @@ export default class extends Controller {
     }
   }
 
-  // Update agent data from message
-  #updateAgentData(message) {
-    // Find selected agent data
-    const agents = message.agents || [];
-    const selectedId = message.id;
+  // Stimulus value-changed callbacks — agents_controller pushes state via data attributes
+  hasServerPtyValueChanged() {
+    this.updateUI();
+  }
 
-    let agent = null;
-    if (selectedId) {
-      agent = agents.find(a => a.id === selectedId);
-    } else if (message.has_server_pty !== undefined) {
-      // Direct agent_selected message with data
-      agent = message;
-    }
+  tunnelConnectedValueChanged() {
+    this.updateUI();
+  }
 
-    if (agent) {
-      this.hasServerPtyValue = agent.has_server_pty || false;
-      this.tunnelConnectedValue = agent.tunnel_connected || agent.tunnel_status === "connected";
-      this.tunnelPortValue = agent.tunnel_port || 0;
-      // Don't override ptyIndex from agent data - it's managed by connection
-    } else {
-      // No agent selected
-      this.hasServerPtyValue = false;
-      this.tunnelConnectedValue = false;
-      this.tunnelPortValue = 0;
-      this.ptyIndexValue = 0;
-    }
-
+  tunnelPortValueChanged() {
     this.updateUI();
   }
 
@@ -103,10 +86,13 @@ export default class extends Controller {
 
   // Switch to a PTY by index
   async #switchToPty(ptyIndex) {
-    if (!this.hasConnectionOutlet) return;
+    if (!this.hasTerminalConnectionOutlet) return;
 
-    const agentIndex = this.connectionOutlet.getCurrentAgentIndex();
-    const success = await this.connectionOutlet.connectToPty(agentIndex, ptyIndex);
+    const agentIndex = this.terminalConnectionOutlet.getCurrentAgentIndex();
+    const success = await this.terminalConnectionOutlet.connectToPty(
+      agentIndex,
+      ptyIndex,
+    );
 
     if (success) {
       this.ptyIndexValue = ptyIndex;
@@ -144,20 +130,32 @@ export default class extends Controller {
     if (this.hasAgentTabTarget) {
       if (this.ptyIndexValue === 0) {
         this.agentTabTarget.classList.add("bg-zinc-700", "text-zinc-100");
-        this.agentTabTarget.classList.remove("text-zinc-500", "hover:text-zinc-300");
+        this.agentTabTarget.classList.remove(
+          "text-zinc-500",
+          "hover:text-zinc-300",
+        );
       } else {
         this.agentTabTarget.classList.remove("bg-zinc-700", "text-zinc-100");
-        this.agentTabTarget.classList.add("text-zinc-500", "hover:text-zinc-300");
+        this.agentTabTarget.classList.add(
+          "text-zinc-500",
+          "hover:text-zinc-300",
+        );
       }
     }
 
     if (this.hasServerTabTarget) {
       if (this.ptyIndexValue === 1) {
         this.serverTabTarget.classList.add("bg-zinc-700", "text-zinc-100");
-        this.serverTabTarget.classList.remove("text-zinc-500", "hover:text-zinc-300");
+        this.serverTabTarget.classList.remove(
+          "text-zinc-500",
+          "hover:text-zinc-300",
+        );
       } else {
         this.serverTabTarget.classList.remove("bg-zinc-700", "text-zinc-100");
-        this.serverTabTarget.classList.add("text-zinc-500", "hover:text-zinc-300");
+        this.serverTabTarget.classList.add(
+          "text-zinc-500",
+          "hover:text-zinc-300",
+        );
       }
     }
   }
@@ -171,8 +169,8 @@ export default class extends Controller {
     // Server PTY with port forwarding is typically pty_index 1
     if (this.tunnelConnectedValue && this.hubIdValue) {
       // Get agent index from connection outlet if available
-      const agentIndex = this.hasConnectionOutlet
-        ? this.connectionOutlet.getCurrentAgentIndex()
+      const agentIndex = this.hasTerminalConnectionOutlet
+        ? this.terminalConnectionOutlet.getCurrentAgentIndex()
         : 0;
       // Server PTY is index 1 (CLI is index 0)
       const ptyIndex = 1;

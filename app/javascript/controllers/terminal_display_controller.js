@@ -3,7 +3,8 @@ import * as xterm from "@xterm/xterm";
 import * as xtermFit from "@xterm/addon-fit";
 
 const Terminal = xterm.Terminal || xterm.default?.Terminal || xterm.default;
-const FitAddon = xtermFit.FitAddon || xtermFit.default?.FitAddon || xtermFit.default;
+const FitAddon =
+  xtermFit.FitAddon || xtermFit.default?.FitAddon || xtermFit.default;
 
 /**
  * Terminal Display Controller
@@ -14,7 +15,7 @@ const FitAddon = xtermFit.FitAddon || xtermFit.default?.FitAddon || xtermFit.def
  */
 export default class extends Controller {
   static targets = ["container"];
-  static outlets = ["connection"];
+  static outlets = ["terminal-connection"];
 
   // Private fields
   #terminal = null;
@@ -46,8 +47,14 @@ export default class extends Controller {
     }
 
     if (this.#keyboardHandler) {
-      window.visualViewport?.removeEventListener("resize", this.#keyboardHandler);
-      window.visualViewport?.removeEventListener("scroll", this.#keyboardHandler);
+      window.visualViewport?.removeEventListener(
+        "resize",
+        this.#keyboardHandler,
+      );
+      window.visualViewport?.removeEventListener(
+        "scroll",
+        this.#keyboardHandler,
+      );
       this.#keyboardHandler = null;
     }
 
@@ -56,7 +63,7 @@ export default class extends Controller {
   }
 
   // Stimulus outlet callbacks
-  connectionOutletConnected(outlet) {
+  terminalConnectionOutletConnected(outlet) {
     outlet.registerListener(this, {
       onConnected: (o) => this.#handleConnected(o),
       onDisconnected: () => this.#handleDisconnected(),
@@ -65,25 +72,47 @@ export default class extends Controller {
     });
   }
 
-  connectionOutletDisconnected(outlet) {
+  terminalConnectionOutletDisconnected(outlet) {
     outlet.unregisterListener(this);
     this.#connection = null;
   }
 
   // Public actions for touch control buttons
-  sendCtrlC() { this.#sendInput("\x03"); }
-  sendEnter() { this.#sendInput("\r"); }
-  sendEscape() { this.#sendInput("\x1b"); }
-  sendTab() { this.#sendInput("\t"); }
-  sendArrowUp() { this.#sendInput("\x1b[A"); }
-  sendArrowDown() { this.#sendInput("\x1b[B"); }
-  sendArrowLeft() { this.#sendInput("\x1b[D"); }
-  sendArrowRight() { this.#sendInput("\x1b[C"); }
+  sendCtrlC() {
+    this.#sendInput("\x03");
+  }
+  sendEnter() {
+    this.#sendInput("\r");
+  }
+  sendEscape() {
+    this.#sendInput("\x1b");
+  }
+  sendTab() {
+    this.#sendInput("\t");
+  }
+  sendArrowUp() {
+    this.#sendInput("\x1b[A");
+  }
+  sendArrowDown() {
+    this.#sendInput("\x1b[B");
+  }
+  sendArrowLeft() {
+    this.#sendInput("\x1b[D");
+  }
+  sendArrowRight() {
+    this.#sendInput("\x1b[C");
+  }
 
   // Public API
-  clear() { this.#terminal?.clear(); }
-  writeln(text) { this.#terminal?.writeln(text); }
-  focus() { this.#terminal?.focus(); }
+  clear() {
+    this.#terminal?.clear();
+  }
+  writeln(text) {
+    this.#terminal?.writeln(text);
+  }
+  focus() {
+    this.#terminal?.focus();
+  }
 
   getDimensions() {
     return this.#terminal
@@ -109,7 +138,9 @@ export default class extends Controller {
     this.#fitAddon = new FitAddon();
     this.#terminal.loadAddon(this.#fitAddon);
 
-    const container = this.hasContainerTarget ? this.containerTarget : this.element;
+    const container = this.hasContainerTarget
+      ? this.containerTarget
+      : this.element;
     this.#terminal.open(container);
 
     requestAnimationFrame(() => this.#fitAddon.fit());
@@ -215,7 +246,9 @@ export default class extends Controller {
       if (!isScrolling) {
         // Pass tap through to terminal for focus/keyboard
         // Only call focus() - calling click() can cause keyboard to close immediately
-        const xtermTextarea = this.#terminal?.element?.querySelector(".xterm-helper-textarea");
+        const xtermTextarea = this.#terminal?.element?.querySelector(
+          ".xterm-helper-textarea",
+        );
         if (xtermTextarea) {
           xtermTextarea.focus();
         }
@@ -263,7 +296,9 @@ export default class extends Controller {
   #setupKeyboardHandler() {
     if (!window.visualViewport) return;
 
-    const container = this.hasContainerTarget ? this.containerTarget : this.element;
+    const container = this.hasContainerTarget
+      ? this.containerTarget
+      : this.element;
     let isKeyboardOpen = false;
     let debounceTimer = null;
 
@@ -352,6 +387,7 @@ export default class extends Controller {
         break;
       case "agent_selected":
       case "agent_channel_switched":
+      case "pty_channel_switched":
         // Terminal channel is now ready - send resize
         this.#terminal?.clear();
         requestAnimationFrame(() => {
@@ -393,7 +429,9 @@ export default class extends Controller {
     for (let i = 0; i < binaryString.length; i++) {
       bytes[i] = binaryString.charCodeAt(i);
     }
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+    const stream = new Blob([bytes])
+      .stream()
+      .pipeThrough(new DecompressionStream("gzip"));
     return new Response(stream).text();
   }
 
@@ -425,7 +463,9 @@ export default class extends Controller {
   //    so we find the last word in the textarea and delete that many chars
   //
   #setupMobileAutocorrect() {
-    const textarea = this.#terminal?.element?.querySelector(".xterm-helper-textarea");
+    const textarea = this.#terminal?.element?.querySelector(
+      ".xterm-helper-textarea",
+    );
     if (!textarea) return;
 
     // Composition events (Android IME)
@@ -455,80 +495,91 @@ export default class extends Controller {
     });
 
     // Unified beforeinput handler for iOS
-    textarea.addEventListener("beforeinput", (e) => {
-      // Handle delete key
-      if (e.inputType === "deleteContentBackward" || e.inputType === "deleteContentForward") {
-        e.preventDefault();
-        this.#sendInput("\x7f");
+    textarea.addEventListener(
+      "beforeinput",
+      (e) => {
+        // Handle delete key
+        if (
+          e.inputType === "deleteContentBackward" ||
+          e.inputType === "deleteContentForward"
+        ) {
+          e.preventDefault();
+          this.#sendInput("\x7f");
+          setTimeout(() => {
+            if (textarea.value.length < 3) {
+              textarea.value = DUMMY_CONTENT;
+            }
+          }, 0);
+          return;
+        }
+
+        // Word-delete mode - iOS may use different inputTypes
+        if (
+          e.inputType === "deleteWordBackward" ||
+          e.inputType === "deleteWordForward" ||
+          e.inputType === "deleteSoftLineBackward" ||
+          e.inputType === "deleteHardLineBackward"
+        ) {
+          e.preventDefault();
+          this.#sendInput("\x17");
+          setTimeout(() => {
+            if (textarea.value.length < 3) {
+              textarea.value = DUMMY_CONTENT;
+            }
+          }, 0);
+          return;
+        }
+
+        // Autocorrect/replacement handler
+        if (this.#isComposing) return;
+        if (e.inputType !== "insertReplacementText") return;
+
+        // Block xterm's onData from double-sending
+        this.#isHandlingAutocorrect = true;
+
+        const text = textarea.value;
+        const replacement = e.data || "";
+
+        // Detect punctuation replacement (double-space-to-period, etc.)
+        // These replace just the trailing space, not a whole word
+        const isPunctuationReplacement = /^[.!?,;:]+\s*$/.test(replacement);
+
+        let deleteCount;
+        let textToSend;
+
+        if (isPunctuationReplacement) {
+          // Double-space-to-period: iOS sends space first, then replacement
+          // Terminal has TWO spaces, delete both then add ". "
+          e.preventDefault();
+          this.#sendInput("\x7f\x7f");
+          setTimeout(() => {
+            this.#sendInput(". ");
+            this.#isHandlingAutocorrect = false;
+          }, 50);
+          return;
+        }
+
+        // Autocomplete: delete the word being replaced
+        const words = text.trim().split(/\s+/);
+        const wordToReplace = words[words.length - 1] || "";
+        deleteCount = wordToReplace.length;
+        textToSend = replacement.trimStart();
+
+        if (deleteCount > 0) {
+          this.#sendInput("\x7f".repeat(deleteCount));
+        }
+        // Send replacement with trailing space for next word
+        if (textToSend) {
+          setTimeout(() => this.#sendInput(textToSend + " "), 50);
+        }
+
+        // Clear flag after iOS finishes updating
         setTimeout(() => {
-          if (textarea.value.length < 3) {
-            textarea.value = DUMMY_CONTENT;
-          }
-        }, 0);
-        return;
-      }
-
-      // Word-delete mode - iOS may use different inputTypes
-      if (e.inputType === "deleteWordBackward" || e.inputType === "deleteWordForward" ||
-          e.inputType === "deleteSoftLineBackward" || e.inputType === "deleteHardLineBackward") {
-        e.preventDefault();
-        this.#sendInput("\x17");
-        setTimeout(() => {
-          if (textarea.value.length < 3) {
-            textarea.value = DUMMY_CONTENT;
-          }
-        }, 0);
-        return;
-      }
-
-      // Autocorrect/replacement handler
-      if (this.#isComposing) return;
-      if (e.inputType !== "insertReplacementText") return;
-
-      // Block xterm's onData from double-sending
-      this.#isHandlingAutocorrect = true;
-
-      const text = textarea.value;
-      const replacement = e.data || "";
-
-      // Detect punctuation replacement (double-space-to-period, etc.)
-      // These replace just the trailing space, not a whole word
-      const isPunctuationReplacement = /^[.!?,;:]+\s*$/.test(replacement);
-
-      let deleteCount;
-      let textToSend;
-
-      if (isPunctuationReplacement) {
-        // Double-space-to-period: iOS sends space first, then replacement
-        // Terminal has TWO spaces, delete both then add ". "
-        e.preventDefault();
-        this.#sendInput("\x7f\x7f");
-        setTimeout(() => {
-          this.#sendInput(". ");
           this.#isHandlingAutocorrect = false;
-        }, 50);
-        return;
-      }
-
-      // Autocomplete: delete the word being replaced
-      const words = text.trim().split(/\s+/);
-      const wordToReplace = words[words.length - 1] || "";
-      deleteCount = wordToReplace.length;
-      textToSend = replacement.trimStart();
-
-      if (deleteCount > 0) {
-        this.#sendInput("\x7f".repeat(deleteCount));
-      }
-      // Send replacement with trailing space for next word
-      if (textToSend) {
-        setTimeout(() => this.#sendInput(textToSend + " "), 50);
-      }
-
-      // Clear flag after iOS finishes updating
-      setTimeout(() => {
-        this.#isHandlingAutocorrect = false;
-        this.#terminal?.scrollToBottom();
-      }, 100);
-    }, { capture: true });
+          this.#terminal?.scrollToBottom();
+        }, 100);
+      },
+      { capture: true },
+    );
   }
 }

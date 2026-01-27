@@ -91,30 +91,6 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
                 BrowserEvent::Disconnected => {
                     hub.browser.handle_disconnected();
                 }
-                BrowserEvent::ConnectToPty { agent_index, pty_index } => {
-                    // Ensure agent's relay channels are wired up
-                    let agent_key = hub.state.read().unwrap()
-                        .agent_keys_ordered
-                        .get(*agent_index)
-                        .cloned();
-
-                    if let Some(key) = agent_key {
-                        hub.connect_agent_channels(&key, *agent_index);
-
-                        // Send ConnectToPty to BrowserClient's async task
-                        let client_id = ClientId::Browser(browser_identity.clone());
-                        if let Some(handle) = hub.clients.get(&client_id) {
-                            let _ = handle.cmd_tx.try_send(
-                                crate::client::ClientCmd::ConnectToPty {
-                                    agent_index: *agent_index,
-                                    pty_index: *pty_index,
-                                },
-                            );
-                        }
-                    } else {
-                        log::warn!("ConnectToPty: agent at index {} not found", agent_index);
-                    }
-                }
                 BrowserEvent::SelectAgent { id } => {
                     hub.browser.invalidate_screen();
                     send_agent_selected_to_browser(hub, &browser_identity, id);
@@ -142,6 +118,30 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
 
         // Handle events not covered by client-scoped actions
         match event {
+            // ConnectToPty: wire up agent channels and send command to BrowserClient
+            BrowserEvent::ConnectToPty { agent_index, pty_index } => {
+                let agent_key = hub.state.read().unwrap()
+                    .agent_keys_ordered
+                    .get(agent_index)
+                    .cloned();
+
+                if let Some(key) = agent_key {
+                    hub.connect_agent_channels(&key, agent_index);
+
+                    let client_id = ClientId::Browser(browser_identity.clone());
+                    if let Some(handle) = hub.clients.get(&client_id) {
+                        let _ = handle.cmd_tx.try_send(
+                            crate::client::ClientCmd::ConnectToPty {
+                                agent_index,
+                                pty_index,
+                            },
+                        );
+                    }
+                } else {
+                    log::warn!("ConnectToPty: agent at index {} not found", agent_index);
+                }
+            }
+
             // SetMode updates shared BrowserState mode
             BrowserEvent::SetMode { mode } => {
                 hub.browser.handle_set_mode(&mode);

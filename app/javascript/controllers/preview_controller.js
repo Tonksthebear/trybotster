@@ -39,7 +39,7 @@ export default class extends Controller {
     initialUrl: { type: String, default: "/" },
   };
 
-  static outlets = ["connection"];
+  static outlets = ["hub-connection"];
 
   connect() {
     this.channel = null;
@@ -48,11 +48,12 @@ export default class extends Controller {
     this.signalSession = null;
 
     // Initialize when connection outlet is ready
-    if (this.hasConnectionOutlet && this.connectionOutlet.isConnected()) {
+    if (this.hasHubConnectionOutlet && this.hubConnectionOutlet.isConnected()) {
       this.initialize();
     } else {
       // Wait for connection
-      this.connectionOutletConnected = this.connectionOutletConnected.bind(this);
+      this.hubConnectionOutletConnected =
+        this.hubConnectionOutletConnected.bind(this);
     }
   }
 
@@ -63,7 +64,7 @@ export default class extends Controller {
   /**
    * Called when connection outlet becomes available.
    */
-  connectionOutletConnected(outlet) {
+  hubConnectionOutletConnected(outlet) {
     if (outlet.isConnected()) {
       this.initialize();
     } else {
@@ -127,8 +128,8 @@ export default class extends Controller {
    */
   async getSignalSession() {
     // Try to get from connection outlet
-    if (this.hasConnectionOutlet) {
-      const hubId = this.hubIdValue || this.connectionOutlet.getHubId();
+    if (this.hasHubConnectionOutlet) {
+      const hubId = this.hubIdValue || this.hubConnectionOutlet.getHubId();
       if (hubId) {
         return await SignalSession.load(hubId);
       }
@@ -176,7 +177,8 @@ export default class extends Controller {
       });
     }
 
-    this.serviceWorker = registration.active || registration.waiting || registration.installing;
+    this.serviceWorker =
+      registration.active || registration.waiting || registration.installing;
     console.log("[Preview] Service worker registered");
   }
 
@@ -196,7 +198,7 @@ export default class extends Controller {
         clientId,
         port: this.messageChannel.port2,
       },
-      [this.messageChannel.port2]
+      [this.messageChannel.port2],
     );
 
     // Listen for requests from service worker

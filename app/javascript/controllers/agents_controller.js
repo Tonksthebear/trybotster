@@ -13,29 +13,29 @@ import { Controller } from "@hotwired/stimulus";
  */
 export default class extends Controller {
   static targets = [
-    "selectedLabel",         // Label showing selected agent (desktop terminal header)
-    "emptyState",            // Message when no agents
-    "creatingState",         // Loading indicator for agent creation
-    "worktreeList",          // Container for worktree list in modal
-    "newBranchInput",        // Input for new branch/issue number
-    "step1",                 // Step 1: worktree selection
-    "step2",                 // Step 2: prompt input
+    "selectedLabel", // Label showing selected agent (desktop terminal header)
+    "emptyState", // Message when no agents
+    "creatingState", // Loading indicator for agent creation
+    "worktreeList", // Container for worktree list in modal
+    "newBranchInput", // Input for new branch/issue number
+    "step1", // Step 1: worktree selection
+    "step2", // Step 2: prompt input
     "selectedWorktreeLabel", // Label showing selected worktree in step 2
-    "promptInput",           // Textarea for initial prompt
-    "mobileAgentLabel",      // Mobile header agent/hub label
-    "mobileAgentInfo",       // Mobile dropdown agent info section
-    "mobileAgentName",       // Mobile dropdown agent name
-    "mobileDeleteBtn",       // Mobile dropdown delete button
-    "landingAgentList",      // Agent list on hub landing page
-    "noAgentsMessage",       // No agents empty state on landing page
+    "promptInput", // Textarea for initial prompt
+    "mobileAgentLabel", // Mobile header agent/hub label
+    "mobileAgentInfo", // Mobile dropdown agent info section
+    "mobileAgentName", // Mobile dropdown agent name
+    "mobileDeleteBtn", // Mobile dropdown delete button
+    "landingAgentList", // Agent list on hub landing page
+    "noAgentsMessage", // No agents empty state on landing page
   ];
 
-  static outlets = ["connection"];
+  static outlets = ["hub-connection", "terminal-connection"];
 
   static values = {
     sidebarListClass: { type: String, default: "sidebar-agents-list" },
     hubName: { type: String, default: "" },
-    hubId: { type: String, default: "" }
+    hubId: { type: String, default: "" },
   };
 
   // Private field for cached sidebar list elements (there can be multiple - mobile + desktop)
@@ -69,7 +69,7 @@ export default class extends Controller {
       const sidebar = e.target.closest(`.${this.sidebarListClassValue}`);
       if (!sidebar) return;
 
-      const agentBtn = e.target.closest('[data-agent-button]');
+      const agentBtn = e.target.closest("[data-agent-button]");
       if (agentBtn && agentBtn.dataset.agentId) {
         e.preventDefault();
         e.stopPropagation();
@@ -77,13 +77,13 @@ export default class extends Controller {
       }
     };
 
-    document.addEventListener('click', this.#boundSidebarClickHandler);
+    document.addEventListener("click", this.#boundSidebarClickHandler);
   }
 
   disconnect() {
     // Remove document-level click delegation listener
     if (this.#boundSidebarClickHandler) {
-      document.removeEventListener('click', this.#boundSidebarClickHandler);
+      document.removeEventListener("click", this.#boundSidebarClickHandler);
       this.#boundSidebarClickHandler = null;
     }
 
@@ -96,25 +96,30 @@ export default class extends Controller {
   // Note: Always query fresh to avoid stale DOM references after re-renders
   get sidebarListElements() {
     return Array.from(
-      document.querySelectorAll(`.${this.sidebarListClassValue}`)
+      document.querySelectorAll(`.${this.sidebarListClassValue}`),
     );
   }
 
-  // Called by Stimulus when connection outlet becomes available
-  connectionOutletConnected(outlet) {
-    console.log("[Agents] connectionOutletConnected called");
-    console.log("[Agents] Outlet state:", outlet?.state, "connected:", outlet?.connected);
+  // Called by Stimulus when hub-connection outlet becomes available
+  hubConnectionOutletConnected(outlet) {
+    console.log("[Agents] hubConnectionOutletConnected called");
+    console.log(
+      "[Agents] Outlet state:",
+      outlet?.state,
+      "connected:",
+      outlet?.connected,
+    );
     outlet.registerListener(this, {
       onConnected: (outlet) => this.handleConnected(outlet),
       onDisconnected: () => this.handleDisconnected(),
       onMessage: (message) => this.handleMessage(message),
       onError: (error) => this.handleError(error),
     });
-    console.log("[Agents] Registered listener with connection outlet");
+    console.log("[Agents] Registered listener with hub-connection outlet");
   }
 
-  // Called by Stimulus when connection outlet is removed
-  connectionOutletDisconnected(outlet) {
+  // Called by Stimulus when hub-connection outlet is removed
+  hubConnectionOutletDisconnected(outlet) {
     outlet.unregisterListener(this);
     this.connection = null;
   }
@@ -145,7 +150,7 @@ export default class extends Controller {
   // Private: Extract PTY index from URL query params
   #getPtyIndexFromUrl() {
     const params = new URLSearchParams(window.location.search);
-    const pty = params.get('pty');
+    const pty = params.get("pty");
     return pty ? parseInt(pty, 10) : 0;
   }
 
@@ -158,6 +163,7 @@ export default class extends Controller {
     this.updateAgentList([]);
     this.updateSelectedLabel(null);
     this.updateMobileAgentUI(null);
+    this.#pushAgentStateToTerminalView(null);
   }
 
   // Handle decrypted messages from CLI
@@ -172,18 +178,31 @@ export default class extends Controller {
         this.updateAgentList(message.agents || []);
 
         // Auto-select agent from URL if pending
-        if (this.pendingAutoSelect !== undefined && this.pendingAutoSelect !== null) {
+        if (
+          this.pendingAutoSelect !== undefined &&
+          this.pendingAutoSelect !== null
+        ) {
           const agents = message.agents || [];
           if (this.pendingAutoSelect.agentIndex < agents.length) {
             const agent = agents[this.pendingAutoSelect.agentIndex];
             const ptyIndex = this.pendingAutoSelect.ptyIndex;
-            console.log(`[Agents] Auto-selecting agent at index ${this.pendingAutoSelect.agentIndex}:`, agent.id);
+            console.log(
+              `[Agents] Auto-selecting agent at index ${this.pendingAutoSelect.agentIndex}:`,
+              agent.id,
+            );
             this.selectedAgentId = agent.id;
             this.updateSelectedLabel(agent.name || agent.id);
             this.updateMobileAgentUI(agent.name || agent.id);
             this.updateAgentList(agents);
+            this.#pendingSelection = agent.id;
             this.connection.selectAgent(agent.id);
-            this.connection.connectToPty(this.pendingAutoSelect.agentIndex, ptyIndex);
+            if (this.hasTerminalConnectionOutlet) {
+              this.terminalConnectionOutlet.connectToPty(
+                this.pendingAutoSelect.agentIndex,
+                ptyIndex,
+              );
+            }
+            this.#pushAgentStateToTerminalView(agent);
           }
           this.pendingAutoSelect = null;
         }
@@ -223,7 +242,8 @@ export default class extends Controller {
 
     // Update landing page agent list to show error
     if (this.hasLandingAgentListTarget) {
-      const isQrScanNeeded = error.reason === "no_bundle" || error.reason === "session_invalid";
+      const isQrScanNeeded =
+        error.reason === "no_bundle" || error.reason === "session_invalid";
       const isCliNotResponding = error.reason === "handshake_timeout";
 
       if (isQrScanNeeded) {
@@ -235,9 +255,11 @@ export default class extends Controller {
             </svg>
             <h3 class="text-base font-medium text-zinc-200 mb-2">Not Paired Yet</h3>
             <p class="text-sm text-zinc-400 max-w-xs mx-auto">
-              ${error.reason === "session_invalid"
-                ? "Session expired. Press Ctrl+P in CLI and select 'Show Connection Code' to scan QR code."
-                : "Press Ctrl+P in CLI and select 'Show Connection Code' to scan QR code."}
+              ${
+                error.reason === "session_invalid"
+                  ? "Session expired. Press Ctrl+P in CLI and select 'Show Connection Code' to scan QR code."
+                  : "Press Ctrl+P in CLI and select 'Show Connection Code' to scan QR code."
+              }
             </p>
           </div>
         `;
@@ -278,7 +300,9 @@ export default class extends Controller {
 
     if (this.hasCreatingStateTarget) {
       // Update text if element exists
-      const label = this.creatingStateTarget.querySelector("[data-creating-label]");
+      const label = this.creatingStateTarget.querySelector(
+        "[data-creating-label]",
+      );
       if (label) {
         label.textContent = stageInfo.message;
       }
@@ -286,11 +310,17 @@ export default class extends Controller {
     } else {
       // Inject creating state into all sidebar lists
       this.sidebarListElements.forEach((listElement) => {
-        const existingCreating = listElement.querySelector("[data-creating-indicator]");
+        const existingCreating = listElement.querySelector(
+          "[data-creating-indicator]",
+        );
         if (existingCreating) {
           // Update existing indicator
-          const statusText = existingCreating.querySelector("[data-creating-status]");
-          const progressBar = existingCreating.querySelector("[data-progress-bar]");
+          const statusText = existingCreating.querySelector(
+            "[data-creating-status]",
+          );
+          const progressBar = existingCreating.querySelector(
+            "[data-progress-bar]",
+          );
           if (statusText) {
             statusText.textContent = stageInfo.message;
           }
@@ -301,7 +331,8 @@ export default class extends Controller {
           // Create new indicator
           const creating = document.createElement("div");
           creating.dataset.creatingIndicator = "true";
-          creating.className = "px-2 py-2 bg-cyan-500/10 border border-cyan-500/20 rounded";
+          creating.className =
+            "px-2 py-2 bg-cyan-500/10 border border-cyan-500/20 rounded";
           creating.innerHTML = `
             <div class="flex items-center gap-2">
               <svg class="size-3 text-cyan-400 animate-spin shrink-0" fill="none" viewBox="0 0 24 24">
@@ -322,7 +353,7 @@ export default class extends Controller {
     }
 
     // Also close dialog if open
-    const dialog = document.getElementById('new-agent-modal');
+    const dialog = document.getElementById("new-agent-modal");
     if (dialog?.open) {
       dialog.close();
     }
@@ -368,7 +399,10 @@ export default class extends Controller {
   getStageInfo(stage) {
     const stages = {
       creating_worktree: { message: "Creating git worktree...", progress: 25 },
-      copying_config: { message: "Copying configuration files...", progress: 50 },
+      copying_config: {
+        message: "Copying configuration files...",
+        progress: 50,
+      },
       spawning_agent: { message: "Starting agent...", progress: 75 },
       ready: { message: "Agent ready", progress: 100 },
     };
@@ -428,9 +462,7 @@ export default class extends Controller {
         // Container with flex layout for agent link and delete button
         const item = document.createElement("div");
         item.className = `group flex items-center gap-1 rounded transition-colors ${
-          isSelected
-            ? "bg-primary-500/20"
-            : "hover:bg-zinc-800/50"
+          isSelected ? "bg-primary-500/20" : "hover:bg-zinc-800/50"
         }`;
 
         // Agent link (main clickable area) - navigates to agent URL
@@ -449,7 +481,8 @@ export default class extends Controller {
         // Delete button (visible on hover)
         const deleteBtn = document.createElement("button");
         deleteBtn.type = "button";
-        deleteBtn.className = "shrink-0 p-1.5 text-zinc-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity";
+        deleteBtn.className =
+          "shrink-0 p-1.5 text-zinc-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity";
         deleteBtn.title = "Delete agent";
         deleteBtn.innerHTML = `<svg class="size-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
@@ -501,7 +534,8 @@ export default class extends Controller {
 
       const item = document.createElement("a");
       item.href = agentUrl;
-      item.className = "flex items-center gap-3 px-4 py-3 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 hover:border-zinc-700 rounded-lg transition-colors";
+      item.className =
+        "flex items-center gap-3 px-4 py-3 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 hover:border-zinc-700 rounded-lg transition-colors";
       item.innerHTML = `
         <div class="size-10 rounded-lg bg-zinc-700/50 flex items-center justify-center text-zinc-400">
           <svg class="size-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -546,7 +580,8 @@ export default class extends Controller {
     this.worktrees.forEach((worktree) => {
       const item = document.createElement("button");
       item.type = "button";
-      item.className = "w-full text-left px-3 py-2 rounded-lg hover:bg-zinc-700 text-zinc-300 transition-colors";
+      item.className =
+        "w-full text-left px-3 py-2 rounded-lg hover:bg-zinc-700 text-zinc-300 transition-colors";
       item.dataset.action = "agents#selectWorktree";
       item.dataset.worktreePath = worktree.path;
       item.dataset.worktreeBranch = worktree.branch;
@@ -577,6 +612,9 @@ export default class extends Controller {
     this.updateMobileAgentUI(displayName);
     this.updateAgentList(this.agents); // Re-render to show selection
 
+    // Push agent state to the terminal-view element
+    this.#pushAgentStateToTerminalView(message);
+
     // Only connect to PTY if this selection wasn't initiated by us
     // (avoids race condition when user clicks quickly between agents)
     if (this.#pendingSelection === message.id) {
@@ -585,10 +623,14 @@ export default class extends Controller {
     } else {
       // This is a selection from CLI (e.g., on connect, auto-select, or another client)
       // We need to connect to the correct PTY
-      if (this.connection && this.agents.length > 0) {
-        const agentIndex = this.agents.findIndex(a => a.id === message.id);
+      if (
+        this.connection &&
+        this.hasTerminalConnectionOutlet &&
+        this.agents.length > 0
+      ) {
+        const agentIndex = this.agents.findIndex((a) => a.id === message.id);
         if (agentIndex >= 0) {
-          await this.connection.connectToPty(agentIndex, 0);
+          await this.terminalConnectionOutlet.connectToPty(agentIndex, 0);
         }
       }
     }
@@ -598,7 +640,8 @@ export default class extends Controller {
   updateMobileAgentUI(agentName) {
     // Update the dropdown trigger label
     if (this.hasMobileAgentLabelTarget) {
-      this.mobileAgentLabelTarget.textContent = agentName || this.hubNameValue || "No agent";
+      this.mobileAgentLabelTarget.textContent =
+        agentName || this.hubNameValue || "No agent";
     }
 
     // Show/hide agent info section
@@ -632,6 +675,7 @@ export default class extends Controller {
     if (this.selectedAgentId === message.agent_id) {
       this.selectedAgentId = null;
       this.updateSelectedLabel(null);
+      this.#pushAgentStateToTerminalView(null);
     }
     this.requestAgentList();
   }
@@ -662,7 +706,7 @@ export default class extends Controller {
     if (!agentId || !this.connection) return;
 
     // Find agent index for channel switching
-    const agentIndex = this.agents.findIndex(a => a.id === agentId);
+    const agentIndex = this.agents.findIndex((a) => a.id === agentId);
     if (agentIndex === -1) return;
 
     // Track that we initiated this selection (to avoid race condition in handleAgentSelected)
@@ -672,7 +716,9 @@ export default class extends Controller {
     this.connection.selectAgent(agentId);
 
     // Connect to the agent's PTY (sends connect_to_pty to CLI + subscribes browser-side)
-    await this.connection.connectToPty(agentIndex, 0);
+    if (this.hasTerminalConnectionOutlet) {
+      await this.terminalConnectionOutlet.connectToPty(agentIndex, 0);
+    }
   }
 
   // Action: Select existing worktree - go to step 2 for prompt
@@ -754,7 +800,9 @@ export default class extends Controller {
       return;
     }
 
-    const prompt = this.hasPromptInputTarget ? this.promptInputTarget.value?.trim() : "";
+    const prompt = this.hasPromptInputTarget
+      ? this.promptInputTarget.value?.trim()
+      : "";
 
     if (this.pendingSelection.type === "existing") {
       // Reopen existing worktree with optional prompt
@@ -795,7 +843,10 @@ export default class extends Controller {
 
   // Action: Request agent list refresh
   requestAgentList() {
-    console.log("[Agents] requestAgentList called, connection:", !!this.connection);
+    console.log(
+      "[Agents] requestAgentList called, connection:",
+      !!this.connection,
+    );
     if (this.connection) {
       console.log("[Agents] Sending requestAgents to connection");
       this.connection.requestAgents();
@@ -806,7 +857,10 @@ export default class extends Controller {
 
   // Action: Request worktree list refresh
   requestWorktrees() {
-    console.log("[Agents] requestWorktrees called, connection:", !!this.connection);
+    console.log(
+      "[Agents] requestWorktrees called, connection:",
+      !!this.connection,
+    );
     if (this.connection) {
       console.log("[Agents] Sending requestWorktrees to connection");
       this.connection.requestWorktrees();
@@ -833,7 +887,7 @@ export default class extends Controller {
     const agentId = event.currentTarget.dataset.agentId;
     if (!agentId) return;
 
-    const agent = this.agents.find(a => a.id === agentId);
+    const agent = this.agents.find((a) => a.id === agentId);
     const agentName = agent?.name || agent?.id || "this agent";
 
     // Show confirmation
@@ -846,7 +900,7 @@ export default class extends Controller {
   deleteSelectedAgent() {
     if (!this.selectedAgentId) return;
 
-    const agent = this.agents.find(a => a.id === this.selectedAgentId);
+    const agent = this.agents.find((a) => a.id === this.selectedAgentId);
     const agentName = agent?.name || agent?.id || "this agent";
 
     if (confirm(`Delete ${agentName}?\n\nThis will stop the agent process.`)) {
@@ -864,6 +918,24 @@ export default class extends Controller {
       this.selectedAgentId = null;
       this.updateSelectedLabel(null);
     }
+  }
+
+  // Private: Push agent PTY/tunnel state to the terminal-view element.
+  // Setting dataset values automatically triggers Stimulus valueChanged callbacks.
+  #pushAgentStateToTerminalView(agentData) {
+    const terminalView = document.querySelector(
+      '[data-controller~="terminal-view"]',
+    );
+    if (!terminalView) return;
+
+    terminalView.dataset.terminalViewHasServerPtyValue =
+      agentData?.has_server_pty || false;
+    terminalView.dataset.terminalViewTunnelConnectedValue =
+      agentData?.tunnel_connected ||
+      agentData?.tunnel_status === "connected" ||
+      false;
+    terminalView.dataset.terminalViewTunnelPortValue =
+      agentData?.tunnel_port || 0;
   }
 
   // Helper: Escape HTML

@@ -159,6 +159,16 @@ impl ChannelSenderHandle {
             .map_err(|_| ChannelError::SendFailed("Send channel closed".to_string()))
     }
 
+    /// Pre-register a peer so broadcasts reach it before any message is received.
+    ///
+    /// Normally peers are discovered when we receive their first encrypted message.
+    /// For channels where we need to send before receiving (e.g., scrollback on
+    /// terminal connect), call this to seed the peer set.
+    pub fn register_peer(&self, peer: PeerId) {
+        let mut peers = self.peers.write().expect("peers lock poisoned");
+        peers.insert(peer);
+    }
+
     /// Send a message to a specific peer.
     ///
     /// # Errors

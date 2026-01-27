@@ -38,8 +38,15 @@ impl ClientRegistry {
     }
 
     /// Register a client task handle.
+    ///
+    /// If a client with the same ID already exists (e.g., browser refresh),
+    /// the old task is shut down before registering the new one.
     pub fn register(&mut self, id: ClientId, handle: ClientTaskHandle) {
-        self.handles.insert(id, handle);
+        if let Some(old) = self.handles.insert(id, handle) {
+            let _ = old.cmd_tx.try_send(ClientCmd::Shutdown);
+            old.join_handle.abort();
+            log::info!("Replaced existing client task (browser reconnect)");
+        }
     }
 
     /// Unregister and return the client task handle.
