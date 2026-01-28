@@ -10,24 +10,24 @@
 <div id="hub-connection-permanent"
      data-turbo-permanent
      data-controller="hub-connection"
-     data-hub-connection-hub-id-value="<%= @hub.id %>"
+     data-hub-connection-hub-id-value="<%= Current.hub.id %>"
      data-hub-connection-security-banner-base-class="hidden lg:block shrink-0">
 </div>
 
 <div class="h-full flex flex-col overflow-hidden"
      data-controller="agents"
      data-agents-hub-connection-outlet="#hub-connection-permanent"
-     data-agents-hub-name-value="<%= @hub.repo.presence || @hub.identifier.truncate(16) %>"
-     data-agents-hub-id-value="<%= @hub.id %>">
+     data-agents-hub-name-value="<%= Current.hub.repo.presence || Current.hub.identifier.truncate(16) %>"
+     data-agents-hub-id-value="<%= Current.hub.id %>">
 
   <%# Header %>
   <div class="shrink-0 border-b border-zinc-800 bg-zinc-900/50">
     <div class="px-4 py-4 lg:py-6">
       <div class="flex items-start justify-between gap-4">
         <div class="min-w-0">
-          <h1 class="text-xl lg:text-2xl font-bold text-zinc-100 font-mono truncate"><%= @hub.device&.name || @hub.identifier.truncate(32) %></h1>
+          <h1 class="text-xl lg:text-2xl font-bold text-zinc-100 font-mono truncate"><%= Current.hub.device&.name || Current.hub.identifier.truncate(32) %></h1>
           <p class="text-sm text-zinc-500 mt-1 truncate">
-            <%= @hub.repo || "No repository" %>
+            <%= Current.hub.repo || "No repository" %>
           </p>
         </div>
 
@@ -56,24 +56,24 @@
         <dl class="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
             <dt class="text-xs text-zinc-500">Identifier</dt>
-            <dd class="text-sm text-zinc-200 font-mono mt-1 truncate"><%= @hub.identifier %></dd>
+            <dd class="text-sm text-zinc-200 font-mono mt-1 truncate"><%= Current.hub.identifier %></dd>
           </div>
           <div>
             <dt class="text-xs text-zinc-500">Repository</dt>
-            <dd class="text-sm text-zinc-200 font-mono mt-1 truncate"><%= @hub.repo || "—" %></dd>
+            <dd class="text-sm text-zinc-200 font-mono mt-1 truncate"><%= Current.hub.repo || "—" %></dd>
           </div>
           <div>
             <dt class="text-xs text-zinc-500">Status</dt>
             <dd class="text-sm mt-1 flex items-center gap-2">
-              <span class="size-2 rounded-full <%= @hub.active? ? 'bg-success-500' : 'bg-zinc-600' %>"></span>
-              <span class="text-zinc-200"><%= @hub.active? ? "Online" : "Offline" %></span>
+              <span class="size-2 rounded-full <%= Current.hub.active? ? 'bg-success-500' : 'bg-zinc-600' %>"></span>
+              <span class="text-zinc-200"><%= Current.hub.active? ? "Online" : "Offline" %></span>
             </dd>
           </div>
           <div>
             <dt class="text-xs text-zinc-500">Last Seen</dt>
             <dd class="text-sm text-zinc-200 mt-1">
-              <% if @hub.last_seen_at %>
-                <%= time_ago_in_words(@hub.last_seen_at) %> ago
+              <% if Current.hub.last_seen_at %>
+                <%= time_ago_in_words(Current.hub.last_seen_at) %> ago
               <% else %>
                 Never
               <% end %>

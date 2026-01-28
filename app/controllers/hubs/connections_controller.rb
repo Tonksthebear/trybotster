@@ -18,20 +18,20 @@ module Hubs
     # Returns device public key for Diffie-Hellman key exchange
     # ONLY if user has opted into server-assisted pairing
     def show
-      unless @hub.device
+      unless Current.hub.device
         render json: { error: "Hub has no registered device for E2E encryption" }, status: :unprocessable_entity
         return
       end
 
       render json: {
-        hub_id: @hub.id,
-        identifier: @hub.identifier,
+        hub_id: Current.hub.id,
+        identifier: Current.hub.identifier,
         server_assisted_pairing: true,
         device: {
-          id: @hub.device.id,
-          public_key: @hub.device.public_key,
-          fingerprint: @hub.device.fingerprint,
-          name: @hub.device.name
+          id: Current.hub.device.id,
+          public_key: Current.hub.device.public_key,
+          fingerprint: Current.hub.device.fingerprint,
+          name: Current.hub.device.name
         }
       }
     end
@@ -39,15 +39,15 @@ module Hubs
     private
 
     def set_hub
-      @hub = current_user.hubs.find_by(id: params[:hub_id])
-      render json: { error: "Hub not found" }, status: :not_found unless @hub
+      Current.hub = current_user.hubs.find_by(id: params[:hub_id])
+      render json: { error: "Hub not found" }, status: :not_found unless Current.hub
     end
 
     def check_server_assisted_pairing
       return if current_user.server_assisted_pairing?
 
-      device_info = if @hub&.device
-                      { fingerprint: @hub.device.fingerprint, name: @hub.device.name }
+      device_info = if Current.hub&.device
+                      { fingerprint: Current.hub.device.fingerprint, name: Current.hub.device.name }
       end
 
       render json: {
@@ -55,7 +55,7 @@ module Hubs
         message: "For security, key exchange requires scanning the QR code displayed on your CLI. " \
                  "The key is transmitted via URL fragment which never reaches the server (MITM-proof). " \
                  "To enable server-assisted pairing (less secure), update your settings.",
-        secure_connect_url: @hub ? "/hubs/#{@hub.id}" : "/hubs",
+        secure_connect_url: Current.hub ? "/hubs/#{Current.hub.id}" : "/hubs",
         enable_convenience_url: "/settings",
         device: device_info
       }, status: :forbidden

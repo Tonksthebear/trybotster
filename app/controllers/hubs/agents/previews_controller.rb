@@ -90,8 +90,8 @@ module Hubs
       private
 
       def set_hub
-        @hub = current_user.hubs.find_by(id: params[:hub_id])
-        redirect_to hubs_path, alert: "Hub not found" unless @hub
+        Current.hub = current_user.hubs.find_by(id: params[:hub_id])
+        redirect_to hubs_path, alert: "Hub not found" unless Current.hub
       end
 
       def set_indices
@@ -110,17 +110,17 @@ module Hubs
       end
 
       def render_bootstrap
-        @sw_path = hub_agent_pty_service_worker_path(@hub, @agent_index, @pty_index)
+        @sw_path = hub_agent_pty_service_worker_path(Current.hub, @agent_index, @pty_index)
         @scope = scope_path
         @sw_version = sw_version
-        @hub_id = @hub.id
+        @hub_id = Current.hub.id
         @agent_index_value = @agent_index
         @pty_index_value = @pty_index
         render template: "hubs/agents/previews/bootstrap", layout: false
       end
 
       def render_preview_shell
-        @hub_id = @hub.id
+        @hub_id = Current.hub.id
         @agent_index_value = @agent_index
         @pty_index_value = @pty_index
         @scope = scope_path
@@ -128,7 +128,7 @@ module Hubs
       end
 
       def scope_path
-        "/hubs/#{@hub.id}/agents/#{@agent_index}/#{@pty_index}/preview"
+        "/hubs/#{Current.hub.id}/agents/#{@agent_index}/#{@pty_index}/preview"
       end
     end
   end

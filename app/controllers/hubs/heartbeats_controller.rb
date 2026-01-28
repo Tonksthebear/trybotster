@@ -10,9 +10,9 @@ module Hubs
 
     # PATCH /hubs/:id/heartbeat
     def update
-      @hub.touch(:last_seen_at)
+      Current.hub.touch(:last_seen_at)
 
-      render json: { success: true, last_seen_at: @hub.last_seen_at }
+      render json: { success: true, last_seen_at: Current.hub.last_seen_at }
     end
 
     private
@@ -30,8 +30,8 @@ module Hubs
     end
 
     def set_hub
-      @hub = current_hub_user.hubs.find_by(id: params[:hub_id])
-      render json: { error: "Hub not found" }, status: :not_found unless @hub
+      Current.hub = current_hub_user.hubs.find_by(id: params[:hub_id])
+      render json: { error: "Hub not found" }, status: :not_found unless Current.hub
     end
   end
 end
