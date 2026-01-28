@@ -24,10 +24,9 @@
 //! # Module Structure
 //!
 //! - `client_routing`: Client communication (agent/worktree lists, errors)
-//! - `server_comms`: Message polling, server registration, heartbeat
+//! - `server_comms`: WebSocket command channel, notification worker, registration
 //! - `actions`: Hub action dispatch
 //! - `lifecycle`: Agent spawn/close operations
-//! - `polling`: Server polling utilities
 //! - `registration`: Device and hub registration
 //!
 //! # Usage
@@ -44,12 +43,12 @@
 pub mod actions;
 pub mod agent_handle;
 mod client_routing;
+pub mod command_channel;
 pub mod commands;
 pub mod events;
 pub mod handle_cache;
 pub mod hub_handle;
 pub mod lifecycle;
-pub mod polling;
 pub mod registration;
 pub mod run;
 mod server_comms;
@@ -155,8 +154,6 @@ pub struct Hub {
     pub quit: bool,
 
     // === Timing ===
-    /// Last time we polled for messages.
-    pub last_poll: Instant,
     /// Last time we sent a heartbeat.
     pub last_heartbeat: Instant,
 
@@ -180,14 +177,10 @@ pub struct Hub {
     pub progress_rx: std_mpsc::Receiver<AgentProgressEvent>,
 
     // === Background Workers ===
-    /// Background worker for message polling (non-blocking).
-    pub polling_worker: Option<workers::PollingWorker>,
-    /// Background worker for heartbeat sending (non-blocking).
-    pub heartbeat_worker: Option<workers::HeartbeatWorker>,
     /// Background worker for notification sending (non-blocking).
     pub notification_worker: Option<workers::NotificationWorker>,
-    /// Last agent count sent to heartbeat worker (for change detection).
-    last_heartbeat_agent_count: usize,
+    /// WebSocket command channel for real-time message delivery from Rails.
+    pub command_channel: Option<command_channel::CommandChannelHandle>,
 
     // === Command Channel (Actor Pattern) ===
     /// Sender for Hub commands (cloned for each client).
@@ -273,7 +266,7 @@ impl Hub {
             config.server_url.clone(),
         ));
 
-        // Initialize timestamps to past to trigger immediate poll/heartbeat on first tick
+        // Initialize heartbeat timestamp to past to trigger immediate heartbeat on first tick
         let past = Instant::now() - std::time::Duration::from_secs(3600);
 
         // Create channel for background agent creation results
@@ -298,7 +291,6 @@ impl Hub {
             botster_id: None,
             tokio_runtime,
             quit: false,
-            last_poll: past,
             last_heartbeat: past,
             browser: crate::relay::BrowserState::default(),
             clients: ClientRegistry::new(),
@@ -307,10 +299,8 @@ impl Hub {
             progress_tx,
             progress_rx,
             // Workers are started later via start_background_workers() after registration
-            polling_worker: None,
-            heartbeat_worker: None,
             notification_worker: None,
-            last_heartbeat_agent_count: 0,
+            command_channel: None,
             command_tx,
             command_rx,
             event_tx,
@@ -321,37 +311,13 @@ impl Hub {
     /// Start background workers for non-blocking network I/O.
     ///
     /// Call this after hub registration completes and `botster_id` is set.
-    /// Workers handle polling, heartbeat, and notifications in background threads.
+    /// Currently starts the NotificationWorker for background notification sending.
     pub fn start_background_workers(&mut self) {
-        // Detect repo for workers
-        let repo_name = match WorktreeManager::detect_current_repo() {
-            Ok((_, name)) => name,
-            Err(e) => {
-                log::warn!("Cannot start background workers: not in a git repo: {e}");
-                return;
-            }
-        };
-
         let worker_config = workers::WorkerConfig {
             server_url: self.config.server_url.clone(),
             api_key: self.config.get_api_key().to_string(),
             server_hub_id: self.server_hub_id().to_string(),
-            poll_interval: self.config.poll_interval,
-            repo_name,
-            device_id: self.device.device_id,
         };
-
-        // Start polling worker
-        if self.polling_worker.is_none() {
-            log::info!("Starting background polling worker");
-            self.polling_worker = Some(workers::PollingWorker::new(worker_config.clone()));
-        }
-
-        // Start heartbeat worker
-        if self.heartbeat_worker.is_none() {
-            log::info!("Starting background heartbeat worker");
-            self.heartbeat_worker = Some(workers::HeartbeatWorker::new(worker_config.clone()));
-        }
 
         // Start notification worker
         if self.notification_worker.is_none() {
@@ -360,14 +326,33 @@ impl Hub {
         }
     }
 
+    /// Connect to the HubCommandChannel for real-time message delivery.
+    ///
+    /// Call this after hub registration completes and `botster_id` is set.
+    /// The command channel replaces HTTP polling for message delivery.
+    pub fn connect_command_channel(&mut self) {
+        if self.command_channel.is_some() {
+            log::warn!("Command channel already connected");
+            return;
+        }
+
+        let server_url = self.config.server_url.clone();
+        let api_key = self.config.get_api_key().to_string();
+        let hub_id = self.server_hub_id().to_string();
+
+        // Start from sequence 0 on first connect (no messages acked yet)
+        let start_from = 0i64;
+
+        log::info!("Connecting command channel to {} (hub={})", server_url, hub_id);
+
+        // Must enter tokio runtime context for tokio::spawn in connect()
+        let _guard = self.tokio_runtime.enter();
+        let handle = command_channel::connect(&server_url, &api_key, &hub_id, start_from);
+        self.command_channel = Some(handle);
+    }
+
     /// Shutdown all background workers gracefully.
     pub fn shutdown_background_workers(&mut self) {
-        if let Some(worker) = self.polling_worker.take() {
-            worker.shutdown();
-        }
-        if let Some(worker) = self.heartbeat_worker.take() {
-            worker.shutdown();
-        }
         if let Some(worker) = self.notification_worker.take() {
             worker.shutdown();
         }
@@ -534,27 +519,6 @@ impl Hub {
         Ok(())
     }
 
-    /// Get seconds since last poll.
-    #[must_use]
-    pub fn seconds_since_poll(&self) -> u64 {
-        self.last_poll.elapsed().as_secs()
-    }
-
-    /// Mark that a poll just occurred.
-    pub fn mark_poll(&mut self) {
-        self.last_poll = Instant::now();
-    }
-
-    /// Get seconds since last heartbeat.
-    #[must_use]
-    pub fn seconds_since_heartbeat(&self) -> u64 {
-        self.last_heartbeat.elapsed().as_secs()
-    }
-
-    /// Mark that a heartbeat was just sent.
-    pub fn mark_heartbeat(&mut self) {
-        self.last_heartbeat = Instant::now();
-    }
 
     // === Event Loop ===
 
@@ -568,6 +532,10 @@ impl Hub {
         // Start background workers for non-blocking network I/O
         // Must be called after register_hub_with_server() sets botster_id
         self.start_background_workers();
+
+        // Connect command channel for real-time WebSocket message delivery
+        // Must be called after register_hub_with_server() sets botster_id
+        self.connect_command_channel();
 
         // Seed shared state so clients have data immediately
         if let Err(e) = self.load_available_worktrees() {
@@ -592,7 +560,13 @@ impl Hub {
 
     /// Send shutdown notification to server and cleanup resources.
     pub fn shutdown(&mut self) {
-        // Shutdown background workers first (allows pending notifications to drain)
+        // Shutdown command channel
+        if let Some(ref channel) = self.command_channel {
+            channel.shutdown();
+        }
+        self.command_channel = None;
+
+        // Shutdown background workers (allows pending notifications to drain)
         self.shutdown_background_workers();
 
         // Notify server of shutdown
@@ -675,22 +649,19 @@ impl Hub {
 
         let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel::<TuiOutput>();
 
-        // Create TuiClient with output channel
+        // Create TuiClient with output channel and hub event subscription
         let hub_handle = self.handle();
-        let mut tui_client = crate::client::TuiClient::new(hub_handle, output_tx);
+        let hub_event_rx = self.subscribe_events();
+        let mut tui_client = crate::client::TuiClient::new(hub_handle, output_tx, Some(hub_event_rx));
 
         // Wire the request channel
         tui_client.set_request_receiver(request_rx);
 
-        // Create Hub -> Client command channel
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
-
         // Spawn TuiClient as an async task on the tokio runtime
-        let join_handle = self.tokio_runtime.spawn(tui_client.run_task(cmd_rx));
+        let join_handle = self.tokio_runtime.spawn(tui_client.run_task());
 
         // Register the task handle (replaces existing if any)
         self.clients.register(ClientId::Tui, ClientTaskHandle {
-            cmd_tx,
             join_handle,
         });
 

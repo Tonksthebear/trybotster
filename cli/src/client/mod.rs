@@ -44,7 +44,7 @@
 //!
 //! All PTY operations and Hub management methods are async, using native `async fn`
 //! in traits (Rust 1.75+). Client tasks run as independent async tasks via `run_task()`,
-//! processing requests from their GUI layer and commands from Hub via `ClientCmd`.
+//! processing requests from their GUI layer and hub events via broadcast.
 //!
 //! # Data Access Pattern
 //!
@@ -74,33 +74,6 @@ pub use crate::agent::pty::PtyCommand;
 pub use crate::hub::agent_handle::{AgentHandle, PtyHandle};
 pub use crate::hub::HubHandle;
 pub use crate::relay::AgentInfo;
-
-/// Commands from Hub to client tasks.
-///
-/// Hub communicates with async client tasks via this channel instead of
-/// calling Client trait methods directly. The client task processes these
-/// commands internally using its own trait methods.
-#[derive(Debug, Clone)]
-pub enum ClientCmd {
-    /// Disconnect from a specific PTY.
-    DisconnectFromPty {
-        /// Agent index in the ordered agent list.
-        agent_index: usize,
-        /// PTY index within the agent (0=CLI, 1=Server).
-        pty_index: usize,
-    },
-    /// Connect to a specific PTY.
-    ConnectToPty {
-        /// Agent index in the ordered agent list.
-        agent_index: usize,
-        /// PTY index within the agent (0=CLI, 1=Server).
-        pty_index: usize,
-    },
-    /// Clear connection state without PTY notification (agent was deleted).
-    ClearConnection,
-    /// Shut down the client task.
-    Shutdown,
-}
 
 /// Metadata about a selected agent for UI display.
 ///
@@ -228,6 +201,16 @@ pub trait Client: Send {
     ///
     /// Used when connecting to PTY to report initial size.
     fn dims(&self) -> (u16, u16);
+
+    /// Take the Hub event broadcast receiver from this client.
+    ///
+    /// Returns the `broadcast::Receiver<HubEvent>` if it has not already been
+    /// taken. Subsequent calls return `None`. This is designed for `run_task()`
+    /// to extract the receiver once and consume it in its event loop.
+    ///
+    /// Both `TuiClient` and `BrowserClient` must implement this -- there is
+    /// no default implementation.
+    fn take_hub_event_rx(&mut self) -> Option<tokio::sync::broadcast::Receiver<crate::hub::HubEvent>>;
 
     // ============================================================
     // Required - async (clients must implement)
@@ -628,18 +611,4 @@ mod tests {
         assert_eq!(ClientId::Tui.browser_identity(), None);
     }
 
-    #[test]
-    fn test_client_cmd_debug() {
-        let cmd = ClientCmd::Shutdown;
-        assert!(format!("{:?}", cmd).contains("Shutdown"));
-
-        let cmd = ClientCmd::DisconnectFromPty { agent_index: 0, pty_index: 1 };
-        assert!(format!("{:?}", cmd).contains("DisconnectFromPty"));
-
-        let cmd = ClientCmd::ConnectToPty { agent_index: 0, pty_index: 0 };
-        assert!(format!("{:?}", cmd).contains("ConnectToPty"));
-
-        let cmd = ClientCmd::ClearConnection;
-        assert!(format!("{:?}", cmd).contains("ClearConnection"));
-    }
 }

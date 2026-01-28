@@ -107,7 +107,7 @@ export class Channel {
           onAck: (ack) => this._rawSend(ack),
           onReset: () => {
             // When receiver detects peer session reset, also reset sender
-            console.info("[Channel] Peer session reset detected, resetting sender");
+            console.debug("[Channel] Peer session reset detected, resetting sender");
             this.sender?.reset();
           },
         })
@@ -133,7 +133,7 @@ export class Channel {
     this.maintenanceTimer = setInterval(() => {
       // Send heartbeat ACK if receiver hasn't ACK'd recently
       if (this.receiver && this.receiver.shouldSendAckHeartbeat()) {
-        console.log("[Channel] Sending heartbeat ACK");
+        console.debug("[Channel] Sending heartbeat ACK");
         const ack = this.receiver.generateAck();
         this._rawSend(ack);
       }

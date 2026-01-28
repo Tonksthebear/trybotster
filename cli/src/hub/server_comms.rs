@@ -2,23 +2,16 @@
 //!
 //! This module handles all communication with the Rails server, including:
 //!
-//! - Message polling and processing
-//! - Heartbeat sending
-//! - Agent notification delivery
+//! - WebSocket command channel for real-time message delivery
+//! - Heartbeat sending via command channel
+//! - Agent notification delivery via background worker
 //! - Device and hub registration
 //!
 //! # Architecture
 //!
-//! Communication can use either background workers (non-blocking) or
-//! direct HTTP calls (blocking fallback). The `tick()` method automatically
-//! selects the appropriate mode based on worker availability.
-//!
-//! # Background Workers
-//!
-//! When available, workers handle network I/O in background threads:
-//! - `PollingWorker`: Fetches messages from server
-//! - `HeartbeatWorker`: Sends periodic heartbeats
-//! - `NotificationWorker`: Delivers agent notifications
+//! The command channel (WebSocket) is the sole path for message delivery
+//! and heartbeat. The NotificationWorker handles agent notification
+//! delivery in a background thread.
 
 // Rust guideline compliant 2025-01
 
@@ -30,87 +23,172 @@ use crate::client::ClientId;
 use crate::hub::actions::{self, HubAction};
 use crate::hub::events::HubEvent;
 use crate::hub::lifecycle::SpawnResult;
-use crate::hub::{polling, registration, workers, AgentProgressEvent, Hub, PendingAgentResult};
+use crate::hub::{command_channel, registration, workers, AgentProgressEvent, Hub, PendingAgentResult};
 use crate::server::messages::{message_to_hub_action, MessageContext, ParsedMessage};
 
 impl Hub {
-    /// Perform periodic tasks (polling, heartbeat, notifications).
+    /// Perform periodic tasks (command channel polling, heartbeat, notifications).
     ///
     /// Call this from your event loop to handle time-based operations.
-    /// This method is **non-blocking** when background workers are running.
-    ///
-    /// # Worker-based flow (non-blocking)
-    ///
-    /// When workers are active (after `setup()`):
-    /// - `poll_worker_messages()` - non-blocking try_recv from PollingWorker
-    /// - `update_heartbeat_agents()` - non-blocking send to HeartbeatWorker
-    /// - `poll_agent_notifications_async()` - non-blocking send to NotificationWorker
-    ///
-    /// # Fallback flow (blocking)
-    ///
-    /// When workers aren't available (offline mode, testing):
-    /// - Falls back to blocking HTTP calls on main thread
+    /// This method is **non-blocking** - all network I/O is handled via
+    /// the WebSocket command channel and background notification worker.
     pub fn tick(&mut self) {
-        // Process completed background agent creations (always non-blocking)
         self.poll_pending_agents();
-
-        // Process progress events from background agent creations
         self.poll_progress_events();
-
-        // Use background workers if available (non-blocking)
-        if self.polling_worker.is_some() {
-            self.poll_worker_messages();
-            self.update_heartbeat_agents();
-            self.poll_agent_notifications_async();
-        } else {
-            // Fallback to blocking calls (offline mode, testing, or before setup)
-            self.poll_messages();
-            self.send_heartbeat();
-            self.poll_agent_notifications();
-        }
+        self.poll_command_channel();
+        self.send_command_channel_heartbeat();
+        self.poll_agent_notifications_async();
     }
 
-    /// Poll for messages from background worker (non-blocking).
+    // === Command Channel (WebSocket) Methods ===
+
+    /// Poll command channel for messages (non-blocking).
     ///
-    /// Checks the polling worker's result channel for new messages
-    /// and processes them without blocking the main thread.
-    fn poll_worker_messages(&mut self) {
-        // Collect all available results first (to release borrow)
-        let results: Vec<workers::PollingResult> = {
-            let Some(ref worker) = self.polling_worker else {
+    /// Messages arrive in real-time via WebSocket instead of HTTP polling.
+    ///
+    /// Collects all pending messages first (releasing the mutable borrow on the
+    /// channel), then processes each message with full `&mut self` access.
+    fn poll_command_channel(&mut self) {
+        // Drain all pending messages first to release the mutable borrow
+        let messages: Vec<command_channel::CommandMessage> = {
+            let Some(ref mut channel) = self.command_channel else {
                 return;
             };
-
-            let mut results = Vec::new();
-            while let Some(result) = worker.try_recv() {
-                results.push(result);
+            let mut msgs = Vec::new();
+            while let Some(msg) = channel.try_recv() {
+                msgs.push(msg);
             }
-            results
+            msgs
         };
 
-        // Now process each result (borrow released)
-        for result in results {
-            match result {
-                workers::PollingResult::Messages(messages) => {
-                    if !messages.is_empty() {
-                        self.process_polled_messages(messages);
+        // Now process each message with full &mut self access
+        for msg in &messages {
+            let sequence = msg.sequence;
+
+            match msg.event_type.as_str() {
+                "browser_connected" => {
+                    // Informational only — BrowserClient creation is triggered by
+                    // BrowserEvent::Connected (relay) which fires after the Signal
+                    // handshake completes. The command channel message arrives earlier
+                    // (on HubChannel subscribe) before the E2E session is ready.
+                    let browser_identity = msg.payload
+                        .get("browser_identity")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    log::info!("Browser connected (command channel): {}", &browser_identity[..browser_identity.len().min(8)]);
+                }
+                "browser_disconnected" => {
+                    // Informational only — BrowserClient teardown is triggered by
+                    // BrowserEvent::Disconnected (relay) which fires when the E2E
+                    // session drops.
+                    let browser_identity = msg.payload
+                        .get("browser_identity")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    log::info!("Browser disconnected (command channel): {}", &browser_identity[..browser_identity.len().min(8)]);
+                }
+                "terminal_connected" => {
+                    // Browser subscribed to TerminalRelayChannel for a specific PTY.
+                    // Trigger PTY connection for the matching BrowserClient.
+                    let agent_index = msg.payload.get("agent_index").and_then(|v| v.as_u64());
+                    let pty_index = msg.payload.get("pty_index").and_then(|v| v.as_u64());
+                    let browser_identity = msg.payload
+                        .get("browser_identity")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    log::info!(
+                        "Terminal connected (command channel): browser={}, agent={:?}, pty={:?}",
+                        &browser_identity[..browser_identity.len().min(8)],
+                        agent_index,
+                        pty_index
+                    );
+
+                    if let (Some(ai), Some(pi)) = (agent_index, pty_index) {
+                        let agent_index = ai as usize;
+                        let pty_index = pi as usize;
+
+                        // Ensure agent channels are connected (preview, etc.)
+                        let agent_key = self.state.read().unwrap()
+                            .agent_keys_ordered
+                            .get(agent_index)
+                            .cloned();
+
+                        if let Some(key) = agent_key {
+                            self.connect_agent_channels(&key, agent_index);
+                        }
+
+                        // Broadcast to BrowserClient so it sets up TerminalRelayChannel.
+                        let client_id = ClientId::Browser(browser_identity.to_string());
+                        self.broadcast(HubEvent::PtyConnectionRequested {
+                            client_id,
+                            agent_index,
+                            pty_index,
+                        });
+                    } else {
+                        log::warn!(
+                            "Terminal connected missing agent_index or pty_index: {:?}",
+                            msg.payload
+                        );
                     }
                 }
-                workers::PollingResult::Skipped => {
-                    // Offline mode or similar - nothing to do
+                "terminal_disconnected" => {
+                    // Browser unsubscribed from TerminalRelayChannel for a specific PTY.
+                    // Trigger PTY disconnection for the matching BrowserClient.
+                    let agent_index = msg.payload.get("agent_index").and_then(|v| v.as_u64());
+                    let pty_index = msg.payload.get("pty_index").and_then(|v| v.as_u64());
+                    let browser_identity = msg.payload
+                        .get("browser_identity")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    log::info!(
+                        "Terminal disconnected (command channel): browser={}, agent={:?}, pty={:?}",
+                        &browser_identity[..browser_identity.len().min(8)],
+                        agent_index,
+                        pty_index
+                    );
+
+                    if let (Some(ai), Some(pi)) = (agent_index, pty_index) {
+                        let client_id = ClientId::Browser(browser_identity.to_string());
+                        self.broadcast(HubEvent::PtyDisconnectionRequested {
+                            client_id,
+                            agent_index: ai as usize,
+                            pty_index: pi as usize,
+                        });
+                    } else {
+                        log::warn!(
+                            "Terminal disconnected missing agent_index or pty_index: {:?}",
+                            msg.payload
+                        );
+                    }
                 }
-                workers::PollingResult::Error(e) => {
-                    log::debug!("Background poll error (will retry): {e}");
+                _ => {
+                    self.process_command_channel_message(msg);
                 }
+            }
+
+            // Acknowledge after processing
+            if let Some(ref channel) = self.command_channel {
+                channel.acknowledge(sequence);
             }
         }
     }
 
-    /// Process messages received from background polling.
+    /// Process a standard (non-browser) message from the command channel.
     ///
-    /// Converts messages to actions and dispatches them.
-    /// Acknowledgments are queued back to the worker thread.
-    fn process_polled_messages(&mut self, messages: Vec<crate::server::types::MessageData>) {
+    /// Converts command channel messages to the same ParsedMessage/HubAction flow
+    /// used for message processing.
+    fn process_command_channel_message(&mut self, msg: &command_channel::CommandMessage) {
+        use crate::server::types::MessageData;
+
+        // Convert CommandMessage to MessageData for compatibility with existing parsing
+        let message_data = MessageData {
+            id: msg.id,
+            event_type: msg.event_type.clone(),
+            payload: msg.payload.clone(),
+        };
+
         // Detect repo for context
         let (repo_path, repo_name) = if let Ok(repo) = std::env::var("BOTSTER_REPO") {
             (std::path::PathBuf::from("."), repo)
@@ -127,11 +205,6 @@ impl Hub {
             }
         };
 
-        log::info!(
-            "Processing {} messages from background poll",
-            messages.len()
-        );
-
         let context = MessageContext {
             repo_path,
             repo_name: repo_name.clone(),
@@ -140,79 +213,57 @@ impl Hub {
             current_agent_count: self.state.read().unwrap().agent_count(),
         };
 
-        for msg in &messages {
-            let parsed = ParsedMessage::from_message_data(msg);
+        let parsed = ParsedMessage::from_message_data(&message_data);
 
-            // Try to notify existing agent first
-            if self.try_notify_existing_agent(&parsed, &context.repo_name) {
-                self.acknowledge_message_async(msg.id);
-                continue;
+        // Try to notify existing agent first
+        if self.try_notify_existing_agent(&parsed, &context.repo_name) {
+            return;
+        }
+
+        // Convert to action and dispatch
+        match message_to_hub_action(&parsed, &context) {
+            Ok(Some(action)) => {
+                self.handle_action(action);
             }
-
-            // Convert to action and dispatch
-            match message_to_hub_action(&parsed, &context) {
-                Ok(Some(action)) => {
-                    self.handle_action(action);
-                    self.acknowledge_message_async(msg.id);
-                }
-                Ok(None) => self.acknowledge_message_async(msg.id),
-                Err(e) => {
-                    // IMPORTANT: Acknowledge even on error to prevent infinite redelivery.
-                    // The message is malformed or we can't handle it - retrying won't help.
-                    log::error!(
-                        "Failed to process message {}: {e} (acknowledging to prevent redelivery)",
-                        msg.id
-                    );
-                    self.acknowledge_message_async(msg.id);
-                }
+            Ok(None) => {}
+            Err(e) => {
+                log::error!(
+                    "Failed to process command channel message {}: {e}",
+                    msg.id
+                );
             }
         }
     }
 
-    /// Queue message acknowledgment to background worker (non-blocking).
-    fn acknowledge_message_async(&self, message_id: i64) {
-        if let Some(ref worker) = self.polling_worker {
-            worker.acknowledge(message_id);
-        } else {
-            // Fallback to blocking ack
-            self.acknowledge_message(message_id);
-        }
-    }
-
-    /// Update heartbeat worker with current agent list (non-blocking).
-    ///
-    /// Only sends updates when the agent count changes to avoid
-    /// sending redundant data every tick (60 FPS would be wasteful).
-    ///
-    /// The heartbeat worker maintains its own 30-second timer, so we just
-    /// need to keep it updated with the current agent list.
-    fn update_heartbeat_agents(&mut self) {
-        let Some(ref worker) = self.heartbeat_worker else {
+    /// Send heartbeat via command channel (non-blocking).
+    fn send_command_channel_heartbeat(&mut self) {
+        let Some(ref channel) = self.command_channel else {
             return;
         };
 
-        let state = self.state.read().unwrap();
-
-        // Only send if agent count changed (simple change detection)
-        let current_count = state.agents.len();
-        if current_count == self.last_heartbeat_agent_count {
+        // Only send every 30 seconds
+        if self.last_heartbeat.elapsed() < Duration::from_secs(30) {
             return;
         }
-        self.last_heartbeat_agent_count = current_count;
+        self.last_heartbeat = Instant::now();
 
-        // Build agent data for heartbeat
-        let agents: Vec<workers::HeartbeatAgentData> = state
+        let state = self.state.read().unwrap();
+        let agents: Vec<serde_json::Value> = state
             .agents
             .values()
-            .map(|agent| workers::HeartbeatAgentData {
-                session_key: agent.agent_id(),
-                last_invocation_url: agent.last_invocation_url.clone(),
+            .map(|agent| {
+                serde_json::json!({
+                    "session_key": agent.agent_id(),
+                    "last_invocation_url": agent.last_invocation_url
+                })
             })
             .collect();
 
-        log::debug!("Heartbeat agent list updated: {} agents", agents.len());
-        worker.update_agents(agents);
+        channel.send_heartbeat(serde_json::json!(agents));
+        log::debug!("Sent heartbeat via command channel ({} agents)", agents.len());
     }
+
+    // === Background Worker Methods ===
 
     /// Poll agents for notifications and send via background worker (non-blocking).
     ///
@@ -288,23 +339,8 @@ impl Hub {
             event.client_id
         );
 
-        // Send progress to browser clients via relay
-        if let ClientId::Browser(ref identity) = event.client_id {
-            if let Some(ref sender) = self.browser.sender {
-                let ctx = crate::relay::BrowserSendContext {
-                    sender,
-                    runtime: &self.tokio_runtime,
-                };
-                crate::relay::send_agent_progress_to(
-                    &ctx,
-                    identity,
-                    &event.identifier,
-                    event.stage,
-                );
-            }
-        }
-
-        // Broadcast progress event to all subscribers (including TUI)
+        // Broadcast progress event to all subscribers
+        // BrowserClient reacts via handle_hub_event() -> send_creation_progress()
         self.broadcast(HubEvent::AgentCreationProgress {
             identifier: event.identifier,
             stage: event.stage,
@@ -393,23 +429,6 @@ impl Hub {
             self.connect_agent_channels(&result.agent_id, idx);
         }
 
-        // Response delivery is handled via browser relay channels
-
-        // Send agent_created to browser clients via relay
-        if let ClientId::Browser(ref identity) = client_id {
-            if let Some(ref sender) = self.browser.sender {
-                let ctx = crate::relay::BrowserSendContext {
-                    sender,
-                    runtime: &self.tokio_runtime,
-                };
-                crate::relay::send_agent_created_to(&ctx, identity, &result.agent_id);
-            }
-        }
-
-        // Send updated agent list to all browsers via relay
-        // (BrowserClient::receive_agent_list is no-op, must use relay)
-        crate::relay::browser::send_agent_list(self);
-
         // Auto-select the new agent for the requesting client
         let session_key = result.agent_id.clone();
         actions::dispatch(
@@ -420,101 +439,10 @@ impl Hub {
             },
         );
 
-        // Send scrollback to browser client after auto-selection
-        // (handle_select_agent_for_client doesn't send scrollback - it's generic)
-        if let ClientId::Browser(ref identity) = client_id {
-            // Default to CLI view for new agents
-            crate::relay::browser::send_scrollback_for_agent_to_browser(
-                self,
-                identity,
-                &session_key,
-                crate::agent::PtyView::Cli,
-            );
-        }
-
-        // Broadcast AgentCreated event to all subscribers (including TUI)
+        // Broadcast AgentCreated event to all subscribers
+        // BrowserClient reacts via handle_hub_event() -> sends agent list, agent_created, scrollback
         if let Some(info) = self.state.read().unwrap().get_agent_info(&session_key) {
             self.broadcast(HubEvent::agent_created(session_key, info));
-        }
-    }
-
-    // === Server Communication ===
-
-    /// Build polling configuration from Hub state.
-    pub(crate) fn polling_config(&self) -> polling::PollingConfig<'_> {
-        polling::PollingConfig {
-            client: &self.client,
-            server_url: &self.config.server_url,
-            api_key: self.config.get_api_key(),
-            poll_interval: self.config.poll_interval,
-            server_hub_id: self.server_hub_id(),
-        }
-    }
-
-    /// Poll the server for new messages and process them.
-    ///
-    /// This method polls at the configured interval and processes any pending
-    /// messages from the server, converting them to HubActions.
-    pub fn poll_messages(&mut self) {
-        if polling::should_skip_polling(self.quit) {
-            return;
-        }
-        if self.last_poll.elapsed() < Duration::from_secs(self.config.poll_interval) {
-            return;
-        }
-        self.last_poll = Instant::now();
-
-        // Detect repo: env var > git detection > test fallback
-        let (repo_path, repo_name) = if let Ok(repo) = std::env::var("BOTSTER_REPO") {
-            // Explicit repo override (used in tests and special cases)
-            (std::path::PathBuf::from("."), repo)
-        } else {
-            match crate::git::WorktreeManager::detect_current_repo() {
-                Ok(result) => result,
-                Err(_) if crate::env::is_test_mode() => {
-                    // Test mode fallback - use dummy repo
-                    (std::path::PathBuf::from("."), "test/repo".to_string())
-                }
-                Err(e) => {
-                    log::warn!("Not in a git repository, skipping poll: {e}");
-                    return;
-                }
-            }
-        };
-
-        let messages = polling::poll_messages(&self.polling_config(), &repo_name);
-        if messages.is_empty() {
-            return;
-        }
-
-        log::info!("Polled {} messages for repo={}", messages.len(), repo_name);
-
-        let context = MessageContext {
-            repo_path,
-            repo_name: repo_name.clone(),
-            worktree_base: self.config.worktree_base.clone(),
-            max_sessions: self.config.max_sessions,
-            current_agent_count: self.state.read().unwrap().agent_count(),
-        };
-
-        for msg in &messages {
-            let parsed = ParsedMessage::from_message_data(msg);
-
-            // Try to notify existing agent first
-            if self.try_notify_existing_agent(&parsed, &context.repo_name) {
-                self.acknowledge_message(msg.id);
-                continue;
-            }
-
-            // Convert to action and dispatch
-            match message_to_hub_action(&parsed, &context) {
-                Ok(Some(action)) => {
-                    self.handle_action(action);
-                    self.acknowledge_message(msg.id);
-                }
-                Ok(None) => self.acknowledge_message(msg.id),
-                Err(e) => log::error!("Failed to process message {}: {e}", msg.id),
-            }
         }
     }
 
@@ -561,28 +489,6 @@ impl Hub {
         }
 
         true
-    }
-
-    /// Acknowledge a message to the server.
-    fn acknowledge_message(&self, message_id: i64) {
-        let config = self.polling_config();
-        polling::acknowledge_message(&config, message_id);
-    }
-
-    /// Send heartbeat to the server.
-    ///
-    /// Registers this hub instance and its active agents with the server.
-    /// Delegates to `polling::send_heartbeat_if_due()`.
-    pub fn send_heartbeat(&mut self) {
-        polling::send_heartbeat_if_due(self);
-    }
-
-    /// Poll agents for terminal notifications (OSC 9, OSC 777).
-    ///
-    /// When agents emit notifications, sends them to Rails for GitHub comments.
-    /// Delegates to `polling::poll_and_send_agent_notifications()`.
-    pub fn poll_agent_notifications(&mut self) {
-        polling::poll_and_send_agent_notifications(self);
     }
 
     // === Connection Setup ===

@@ -61,7 +61,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
 
     # Should show terminal with connection
     assert_selector "[data-terminal-display-target='container']", wait: 20
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
   end
 
   test "visiting agent URL auto-selects that agent" do
@@ -77,7 +77,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     # Visit second agent directly with bundle
     visit agent_url_with_bundle
 
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Agent at index 1 should be selected
     assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-200/, wait: 10
@@ -93,14 +93,14 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     agent_url_with_bundle = "#{hub_agent_url(@hub, 0)}##{bundle}"
 
     visit agent_url_with_bundle
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
     assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-999/, wait: 10
 
     # Refresh the page - session should restore from IndexedDB
     page.refresh
 
     # Should reconnect and auto-select the same agent
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
     assert_selector "[data-agents-target='selectedLabel']", text: /test-repo-999/, wait: 10
   end
 
@@ -112,7 +112,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Agent in sidebar should be a link
     assert_selector ".sidebar-agents-list a[href]", text: /test-repo-777/, wait: 10
@@ -125,7 +125,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     sign_in_as(@user)
     # Start at hub landing page with connection established via fragment
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Click agent link in sidebar
     within(".sidebar-agents-list") do
@@ -146,7 +146,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Wait for both agents to appear
     assert_selector ".sidebar-agents-list a", text: /test-repo-111/, wait: 10
@@ -173,12 +173,12 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Get initial connection state
     initial_session_id = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       return conn?.hubChannel?.subscription?.identifier || 'none';
     JS
@@ -189,11 +189,11 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     end
 
     # Connection should persist (same subscription)
-    assert_selector "[data-connection-target='status']", text: /connected/i
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i
 
     new_session_id = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       return conn?.hubChannel?.subscription?.identifier || 'none';
     JS
@@ -209,7 +209,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Select first agent via sidebar and wait for terminal to be active
     within(".sidebar-agents-list") do
@@ -252,7 +252,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     visit "#{hub_url(@hub)}##{bundle}"
 
     # Wait for connection to be established (agents are populated via JS after connection)
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Landing page shows agent list (duplicate of sidebar for mobile/landing context)
     assert_selector "[data-test='hub-agents-list']", wait: 10
@@ -270,7 +270,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     visit "#{hub_url(@hub)}##{bundle}"
 
     # Wait for connection to be established (agents are populated via JS after connection)
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Wait for agent link to appear, then click it
     assert_selector "[data-test='hub-agents-list'] a", text: /test-repo-700/, wait: 10
@@ -293,7 +293,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     sign_in_as(@user)
     # First establish E2E connection via bundle URL
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Wait for agent to appear in sidebar (confirms agent is registered with CLI)
     assert_selector ".sidebar-agents-list a", text: /test-repo-1/, wait: 15
@@ -319,10 +319,10 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     visit connection_url
 
     # First verify the connection element exists on the page
-    assert_selector "[data-connection-target='status']", wait: 10
+    assert_selector "[data-hub-connection-target='status']", wait: 10
 
     # Should establish connection (backwards compatible)
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
   end
 
   private

@@ -4,6 +4,8 @@ require "test_helper"
 require "minitest/mock"
 
 class Bot::MessageTest < ActiveSupport::TestCase
+  include ActionCable::TestHelper
+
   setup do
     @message_with_comment = Bot::Message.new(
       event_type: "github_mention",
@@ -251,5 +253,69 @@ class Bot::MessageTest < ActiveSupport::TestCase
     deliverable = Bot::Message.for_delivery
     assert_includes deliverable, pending_message
     refute_includes deliverable, claimed_message
+  end
+
+  # create_for_hub! tests
+  test "create_for_hub! creates message with hub association and sequence" do
+    hub = hubs(:active_hub)
+
+    msg = Bot::Message.create_for_hub!(hub,
+      event_type: "browser_connected",
+      payload: { browser_identity: "test-browser" })
+
+    assert msg.persisted?
+    assert_equal hub, msg.hub
+    assert_equal "browser_connected", msg.event_type
+    assert_equal "pending", msg.status
+    assert_not_nil msg.sequence
+    assert msg.sequence > 0
+  end
+
+  test "create_for_hub! assigns sequential sequence numbers" do
+    hub = hubs(:active_hub)
+
+    msg1 = Bot::Message.create_for_hub!(hub,
+      event_type: "browser_connected",
+      payload: { browser_identity: "b1" })
+    msg2 = Bot::Message.create_for_hub!(hub,
+      event_type: "browser_connected",
+      payload: { browser_identity: "b2" })
+    msg3 = Bot::Message.create_for_hub!(hub,
+      event_type: "browser_disconnected",
+      payload: { browser_identity: "b3" })
+
+    assert_equal msg1.sequence + 1, msg2.sequence
+    assert_equal msg2.sequence + 1, msg3.sequence
+  end
+
+  test "create_for_hub! broadcasts to hub command channel" do
+    hub = hubs(:active_hub)
+
+    assert_broadcasts("hub_command:#{hub.id}", 1) do
+      Bot::Message.create_for_hub!(hub,
+        event_type: "browser_connected",
+        payload: { browser_identity: "test-broadcast" })
+    end
+  end
+
+  # Terminal event type validation tests
+  test "accepts terminal_connected event type" do
+    hub = hubs(:active_hub)
+    msg = Bot::Message.create_for_hub!(hub,
+      event_type: "terminal_connected",
+      payload: { agent_index: 0, pty_index: 0, browser_identity: "test-browser" })
+
+    assert msg.persisted?
+    assert_equal "terminal_connected", msg.event_type
+  end
+
+  test "accepts terminal_disconnected event type" do
+    hub = hubs(:active_hub)
+    msg = Bot::Message.create_for_hub!(hub,
+      event_type: "terminal_disconnected",
+      payload: { agent_index: 0, pty_index: 0, browser_identity: "test-browser" })
+
+    assert msg.persisted?
+    assert_equal "terminal_disconnected", msg.event_type
   end
 end

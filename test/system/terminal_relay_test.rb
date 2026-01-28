@@ -35,7 +35,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     # Reaching "connected" proves the full crypto handshake worked:
     # X3DH key agreement, encrypted handshake, encrypted ACK
     begin
-      assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+      assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
     rescue Minitest::Assertion => e
       puts "\n=== CLI OUTPUT ON FAILURE ===\n#{@cli.recent_output(lines: 100)}\n=== END CLI OUTPUT ===\n"
       puts "\n=== CLI LOG FILE ===\n#{@cli.log_contents(lines: 200)}\n=== END CLI LOG ===\n"
@@ -83,7 +83,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     # If we get here without routing error, the path is valid
     # Don't need full handshake - just verify page loads
-    assert_selector "[data-connection-target='status']", wait: 10
+    assert_selector "[data-hub-connection-target='status']", wait: 10
   end
 
   test "connection fails gracefully without CLI" do
@@ -98,13 +98,13 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     page.refresh
 
     # Session restored from IndexedDB
     begin
-      assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+      assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
     rescue Minitest::Assertion => e
       # Capture debug info on failure
       puts "\n=== CLI LOG ON REFRESH FAILURE ==="
@@ -131,13 +131,13 @@ class TerminalRelayTest < ApplicationSystemTestCase
     # First browser connects normally via QR URL
     sign_in_as(@user)
     visit connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Request invite bundle via Share Hub button
     click_button "Share Hub"
 
     # Wait for clipboard to be populated (via shareStatus feedback)
-    assert_selector "[data-connection-target='shareStatus']", text: /copied/i, wait: 10
+    assert_selector "[data-hub-connection-target='shareStatus']", text: /copied/i, wait: 10
 
     # Get invite URL from clipboard
     invite_url = page.evaluate_script("navigator.clipboard.readText()")
@@ -150,13 +150,13 @@ class TerminalRelayTest < ApplicationSystemTestCase
     within_window new_window do
       sign_in_as(@user)
       visit invite_url
-      assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+      assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
     end
 
     # Both browsers should remain connected
-    assert_selector "[data-connection-target='status']", text: /connected/i
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i
     within_window new_window do
-      assert_selector "[data-connection-target='status']", text: /connected/i
+      assert_selector "[data-hub-connection-target='status']", text: /connected/i
     end
   end
 
@@ -170,7 +170,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Agent appearing proves encrypted message flow works (now rendered as links)
     assert_selector ".sidebar-agents-list a", text: /test-repo-999/, wait: 10
@@ -182,7 +182,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Select agent (navigates to agent page via Turbo)
     assert_selector ".sidebar-agents-list a", text: /test-repo-888/, wait: 10
@@ -205,7 +205,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Both visible (now as links)
     assert_selector ".sidebar-agents-list a", text: /test-repo-555/, wait: 10
@@ -231,7 +231,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Select agent (navigates to agent page via Turbo)
     assert_selector ".sidebar-agents-list a", text: /test-repo-777/, wait: 10
@@ -248,7 +248,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     page.send_keys(:enter)
 
     # Connection stays active = no crypto errors
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 5
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 5
   end
 
   test "full roundtrip: PTY output flows from CLI to browser" do
@@ -268,7 +268,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Select the agent (via link navigation in sidebar)
     within(".sidebar-agents-list") do
@@ -302,7 +302,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     end
 
     # Verify connection is still healthy after roundtrip
-    assert_selector "[data-connection-target='status']", text: /connected/i
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i
   end
 
   test "window resize flows through encrypted channel" do
@@ -311,7 +311,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Select agent via link navigation
     assert_selector ".sidebar-agents-list a", text: /test-repo-666/, wait: 10
@@ -324,7 +324,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     page.driver.browser.manage.window.resize_to(1200, 800)
 
     # Connection stays active = resize message worked
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 5
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 5
   end
 
   # === Browser-Initiated Agent Creation Tests ===
@@ -334,7 +334,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Click "New Agent" button (use first one - the + icon in agent list header)
     first("button[title='New Agent']").click
@@ -379,7 +379,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Open modal
     first("button[title='New Agent']").click
@@ -404,7 +404,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Navigate to step 2
     first("button[title='New Agent']").click
@@ -428,7 +428,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Open modal
     first("button[title='New Agent']").click
@@ -448,7 +448,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Create agent
     first("button[title='New Agent']").click
@@ -477,7 +477,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Open modal - worktrees load asynchronously after modal opens
     first("button[title='New Agent']").click
@@ -514,7 +514,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 30
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 30
 
     # Open modal
     first("button[title='New Agent']").click
@@ -537,14 +537,14 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Kill CLI
     Process.kill("KILL", @cli.pid)
     Process.wait(@cli.pid) rescue nil
 
     # UI shouldn't crash - landing page elements should still be present
-    assert_selector "[data-controller~='connection']"
+    assert_selector "[data-controller~='hub-connection']"
     assert_selector "[data-controller~='agents']"
   end
 
@@ -568,7 +568,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # INTENTIONAL TIMING TEST: Wait through 2 heartbeat intervals (2s each in test mode)
     # to verify connection remains stable. This sleep cannot be replaced with a
@@ -576,7 +576,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     sleep 3
 
     # Connection should still be alive
-    assert_selector "[data-connection-target='status']", text: /connected/i
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i
 
     # Verify heartbeats are being sent to Rails (proves polling loop is running)
     cli_log = @cli.log_contents(lines: 100)
@@ -589,7 +589,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Restart CLI (new keys)
     stop_cli(@cli)
@@ -603,7 +603,7 @@ class TerminalRelayTest < ApplicationSystemTestCase
     # New bundle works
     visit root_path
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 25
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 25
   end
 
   private

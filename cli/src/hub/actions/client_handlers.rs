@@ -5,9 +5,9 @@
 //!
 //! # Architecture
 //!
-//! Hub communicates with clients via `ClientCmd` channels, not by calling
-//! trait methods directly. Each client runs its own async task that
-//! processes commands from Hub and requests from its input source.
+//! Hub communicates with clients via HubEvent broadcasts. Each client runs
+//! its own async task that processes hub events and requests from its input
+//! source. Hub manages client task lifecycle via `ClientTaskHandle` (abort).
 //!
 //! This module handles high-level client actions:
 //!
@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::client::{BrowserClient, ClientCmd, ClientId, ClientTaskHandle, CreateAgentRequest, DeleteAgentRequest};
+use crate::client::{BrowserClient, ClientId, ClientTaskHandle, CreateAgentRequest, DeleteAgentRequest};
 use crate::client::browser::BrowserClientConfig;
 use crate::hub::{lifecycle, Hub};
 
@@ -33,7 +33,7 @@ use crate::hub::{lifecycle, Hub};
 /// TUI selection state is owned by TuiRunner, not Hub.
 /// PTY connection is handled separately:
 /// - TUI: TuiRequest::SelectAgent triggers PTY connection
-/// - Browser: Explicit BrowserEvent::ConnectToPty triggers PTY connection
+/// - Browser: terminal_connected event triggers PtyConnectionRequested broadcast
 pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_key: String) {
     log::info!(
         "handle_select_agent_for_client: client={}, agent={}",
@@ -82,16 +82,11 @@ pub fn handle_create_agent_for_client(
     client_id: ClientId,
     request: CreateAgentRequest,
 ) {
-    // Send immediate "creating" notification to browser clients
-    if let ClientId::Browser(ref identity) = client_id {
-        if let Some(ref sender) = hub.browser.sender {
-            let ctx = crate::relay::BrowserSendContext {
-                sender,
-                runtime: &hub.tokio_runtime,
-            };
-            crate::relay::send_agent_creating_to(&ctx, identity, &request.issue_or_branch);
-        }
-    }
+    // Broadcast creation progress to all subscribers (BrowserClient reacts via handle_hub_event)
+    hub.broadcast(crate::hub::HubEvent::AgentCreationProgress {
+        identifier: request.issue_or_branch.clone(),
+        stage: crate::relay::AgentCreationStage::CreatingWorktree,
+    });
 
     // Resolve dims: use request dims if provided, otherwise default (24, 80)
     let dims = request.dims.unwrap_or((24, 80));
@@ -298,20 +293,10 @@ fn spawn_agent_sync(
                 hub.connect_agent_channels(&result.agent_id, idx);
             }
 
-            // Response delivery is handled via browser relay channels
             let agent_id = result.agent_id;
 
-            // Send agent_created to browser clients via relay
-            if let ClientId::Browser(ref identity) = client_id {
-                if let Some(ref sender) = hub.browser.sender {
-                    let ctx = crate::relay::BrowserSendContext {
-                        sender,
-                        runtime: &hub.tokio_runtime,
-                    };
-                    crate::relay::send_agent_created_to(&ctx, identity, &agent_id);
-                }
-            }
-
+            // Agent list broadcast is handled via HubEvent::AgentCreated below
+            // BrowserClient reacts to this event in handle_hub_event()
             hub.broadcast_agent_list();
             handle_select_agent_for_client(hub, client_id, agent_id.clone());
 
@@ -329,31 +314,14 @@ fn spawn_agent_sync(
 /// Handle deleting an agent for a specific client.
 ///
 /// When an agent is deleted:
-/// 1. All clients are notified to disconnect from that agent's PTYs via ClientCmd
-/// 2. The agent and optionally its worktree are deleted
+/// 1. HubEvent::AgentDeleted is broadcast -- each client's handle_hub_event()
+///    disconnects from the deleted agent's PTYs.
+/// 2. The agent and optionally its worktree are deleted.
 pub fn handle_delete_agent_for_client(
     hub: &mut Hub,
     client_id: ClientId,
     request: DeleteAgentRequest,
 ) {
-    // Get agent index before deletion
-    let agent_index = hub
-        .state
-        .read()
-        .unwrap()
-        .agents
-        .keys()
-        .position(|k| k == &request.agent_id);
-
-    // Broadcast disconnect commands to all clients for this agent's PTYs
-    if let Some(idx) = agent_index {
-        // Disconnect from CLI PTY (index 0) and Server PTY (index 1)
-        for (_, handle) in hub.clients.iter() {
-            let _ = handle.cmd_tx.try_send(ClientCmd::DisconnectFromPty { agent_index: idx, pty_index: 0 });
-            let _ = handle.cmd_tx.try_send(ClientCmd::DisconnectFromPty { agent_index: idx, pty_index: 1 });
-        }
-    }
-
     // Delete the agent - release lock before continuing
     let close_result = {
         let mut state = hub.state.write().unwrap();
@@ -399,17 +367,14 @@ pub fn handle_client_connected(hub: &mut Hub, client_id: ClientId) {
         };
 
         let hub_handle = hub.handle();
-        let browser_client = BrowserClient::new(hub_handle, identity.clone(), config);
-
-        // Create Hub -> Client command channel
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
+        let hub_event_rx = hub.subscribe_events();
+        let browser_client = BrowserClient::new(hub_handle, identity.clone(), config, Some(hub_event_rx));
 
         // Spawn BrowserClient as async task
-        let join_handle = hub.tokio_runtime.spawn(browser_client.run_task(cmd_rx));
+        let join_handle = hub.tokio_runtime.spawn(browser_client.run_task());
 
         // Register the task handle
         hub.clients.register(client_id.clone(), ClientTaskHandle {
-            cmd_tx,
             join_handle,
         });
 
@@ -419,16 +384,12 @@ pub fn handle_client_connected(hub: &mut Hub, client_id: ClientId) {
 
 /// Handle client disconnected event.
 ///
-/// When a client disconnects:
-/// 1. Send Shutdown command to the client's async task
-/// 2. Abort the task and unregister from the registry
+/// When a client disconnects, abort the task and unregister from the registry.
 pub fn handle_client_disconnected(hub: &mut Hub, client_id: ClientId) {
     log::info!("Client disconnecting: {}", client_id);
 
-    // Unregister the client task handle - dropping it closes the command channel
+    // Unregister the client task handle and abort the task
     if let Some(handle) = hub.clients.unregister(&client_id) {
-        // Send shutdown command before aborting
-        let _ = handle.cmd_tx.try_send(ClientCmd::Shutdown);
         handle.join_handle.abort();
     }
 

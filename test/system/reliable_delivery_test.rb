@@ -31,12 +31,12 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Verify the receiver has a reset method
     has_reset = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       return typeof conn.hubChannel?.receiver?.reset === 'function';
     JS
@@ -47,7 +47,7 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Wait for messages to be exchanged (nextExpected advances past 1)
     # Poll until receiver has processed at least one message
@@ -55,7 +55,7 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     while Time.current < deadline
       state = page.execute_script(<<~JS)
         const conn = window.Stimulus?.getControllerForElementAndIdentifier(
-          document.querySelector('[data-controller~="connection"]'), 'connection'
+          document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
         );
         return conn?.hubChannel?.receiver?.nextExpected || 1;
       JS
@@ -66,7 +66,7 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     # Check initial receiver state
     initial_state = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       const receiver = conn.hubChannel?.receiver;
       return {
@@ -83,7 +83,7 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     # This triggers the reset detection
     reset_detected = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       const receiver = conn.hubChannel?.receiver;
 
@@ -130,12 +130,12 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Verify sender has reset method
     has_sender_reset = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       return typeof conn.hubChannel?.sender?.reset === 'function';
     JS
@@ -148,12 +148,12 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Verify exponential backoff calculation exists
     has_backoff = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       const sender = conn.hubChannel?.sender;
       return typeof sender?.calculateTimeout === 'function';
@@ -165,12 +165,12 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Verify timeout increases with attempts
     timeouts = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       const sender = conn.hubChannel?.sender;
       if (!sender?.calculateTimeout) return null;
@@ -203,12 +203,12 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Add an out-of-order message to buffer and verify it has timestamp
     buffer_entry = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       const receiver = conn.hubChannel?.receiver;
       if (!receiver) return null;
@@ -234,11 +234,11 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     has_cleanup = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       return typeof conn.hubChannel?.receiver?.cleanupStaleBuffer === 'function';
     JS
@@ -251,12 +251,12 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Test that failed messages are removed from pending
     result = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       const sender = conn.hubChannel?.sender;
       if (!sender) return { error: 'no sender' };
@@ -294,11 +294,11 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     methods_exist = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       const sender = conn.hubChannel?.sender;
       return {
@@ -317,11 +317,11 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     result = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       const sender = conn.hubChannel?.sender;
       if (!sender?.pause) return { error: 'no pause method' };
@@ -357,12 +357,12 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Check buffer is empty initially
     buffer_size = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       return conn.hubChannel?.receiver?.buffer?.size || 0;
     JS
@@ -373,7 +373,7 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # INTENTIONAL TIMING TEST: Wait through multiple heartbeat intervals (2s each in test mode)
     # to verify connection remains stable. This sleep cannot be replaced with a
@@ -381,7 +381,7 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     sleep 5
 
     # Connection should still be alive
-    assert_selector "[data-connection-target='status']", text: /connected/i
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i
 
     # CLI should have processed heartbeats during idle period
     cli_log = @cli.log_contents(lines: 100)
@@ -392,12 +392,12 @@ class ReliableDeliveryTest < ApplicationSystemTestCase
     @cli = start_cli(@hub, timeout: 20)
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Verify receiver is tracking sequence numbers correctly
     result = page.execute_script(<<~JS)
       const conn = window.Stimulus.getControllerForElementAndIdentifier(
-        document.querySelector('[data-controller~="connection"]'), 'connection'
+        document.querySelector('[data-controller~="hub-connection"]'), 'hub-connection'
       );
       const receiver = conn.hubChannel?.receiver;
       if (!receiver) return { error: 'no receiver' };

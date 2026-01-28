@@ -10,8 +10,7 @@
 //! TuiRunner (TUI thread)
 //! ├── owns: mode, menu_selected, input_buffer, vt100_parser
 //! ├── sends: TuiRequest via request_tx (to TuiClient)
-//! ├── receives: HubEvent via hub_event_rx
-//! └── receives: TuiOutput via output_rx (from TuiClient)
+//! └── receives: TuiOutput via output_rx (PTY output + HubEvents from TuiClient)
 //! ```
 //!
 //! The TuiRunner owns all TUI state and runs its own event loop. It converts

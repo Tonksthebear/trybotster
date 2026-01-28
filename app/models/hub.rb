@@ -4,6 +4,7 @@ class Hub < ApplicationRecord
   belongs_to :user
   belongs_to :device, optional: true  # The CLI device running this hub
   has_many :hub_agents, dependent: :destroy
+  has_many :bot_messages, class_name: "Bot::Message", dependent: :nullify
 
   validates :repo, presence: true
   validates :identifier, presence: true, uniqueness: true
@@ -72,6 +73,15 @@ class Hub < ApplicationRecord
     )
   rescue => e
     Rails.logger.warn "Failed to broadcast hub removal: #{e.message}"
+  end
+
+  # Atomically increment and return the next message sequence number.
+  # Uses row-level locking for safe concurrent access.
+  def next_message_sequence!
+    with_lock do
+      increment!(:message_sequence)
+      message_sequence
+    end
   end
 
   private

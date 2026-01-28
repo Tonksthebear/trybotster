@@ -6,7 +6,7 @@
 use anyhow::Result;
 use reqwest::blocking::Client;
 
-use super::types::{AgentHeartbeatInfo, HeartbeatPayload, MessageResponse, NotificationPayload};
+use super::types::{AgentHeartbeatInfo, HeartbeatPayload, NotificationPayload};
 use crate::constants;
 
 /// API client for the botster Rails server.
@@ -57,67 +57,6 @@ impl ApiClient {
     /// Returns the server URL.
     pub fn server_url(&self) -> &str {
         &self.server_url
-    }
-
-    /// Polls for pending messages for a specific repository.
-    ///
-    /// # Arguments
-    ///
-    /// * `hub_identifier` - Hub identifier for routing
-    /// * `repo` - Repository name in "owner/repo" format
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or the response cannot be parsed.
-    pub fn poll_messages(&self, hub_identifier: &str, repo: &str) -> Result<MessageResponse> {
-        let url = format!(
-            "{}/hubs/{}/messages?repo={}",
-            self.server_url, hub_identifier, repo
-        );
-
-        let response = self.client.get(&url).bearer_auth(&self.api_key).send()?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to poll messages: {}", response.status());
-        }
-
-        let message_response: MessageResponse = response.json()?;
-        Ok(message_response)
-    }
-
-    /// Acknowledges a message to trigger the eyes emoji reaction.
-    ///
-    /// # Arguments
-    ///
-    /// * `hub_identifier` - Hub identifier for routing
-    /// * `message_id` - ID of the message to acknowledge
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails.
-    pub fn acknowledge_message(&self, hub_identifier: &str, message_id: i64) -> Result<()> {
-        let url = format!(
-            "{}/hubs/{}/messages/{}",
-            self.server_url, hub_identifier, message_id
-        );
-
-        let response = self
-            .client
-            .patch(&url)
-            .bearer_auth(&self.api_key)
-            .header("Content-Type", "application/json")
-            .send()?;
-
-        if response.status().is_success() {
-            log::debug!("Acknowledged message {}", message_id);
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "Failed to acknowledge message {}: {}",
-                message_id,
-                response.status()
-            )
-        }
     }
 
     /// Sends a heartbeat to register the hub and its agents.

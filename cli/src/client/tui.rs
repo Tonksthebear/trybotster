@@ -23,7 +23,7 @@
 //!
 //! TuiClient runs as an independent async task via `run_task()`. It processes:
 //! - `TuiRequest` from TuiRunner (user actions like input, resize, agent selection)
-//! - `ClientCmd` from Hub (commands like disconnect, shutdown)
+//! - `HubEvent` from Hub broadcast (agent lifecycle, shutdown)
 //!
 //! # Event Flow
 //!
@@ -50,7 +50,7 @@ use crate::agent::pty::PtyEvent;
 use crate::hub::hub_handle::HubHandle;
 use crate::hub::AgentHandle;
 
-use super::{Client, ClientCmd, ClientId};
+use super::{Client, ClientId};
 
 /// Requests from TuiRunner to TuiClient.
 ///
@@ -204,6 +204,14 @@ pub enum TuiOutput {
         /// Exit code from the PTY process, if available.
         exit_code: Option<i32>,
     },
+
+    /// Hub event forwarded from TuiClient to TuiRunner.
+    ///
+    /// TuiClient receives hub events via broadcast channel and forwards them
+    /// to TuiRunner through the output channel. This keeps TuiRunner decoupled
+    /// from the Hub's broadcast mechanism -- all communication flows through
+    /// the TuiOutput channel.
+    HubEvent(crate::hub::HubEvent),
 }
 
 /// TUI client - I/O routing for the local terminal.
@@ -254,6 +262,12 @@ pub struct TuiClient {
     /// processed by `run_task()` in a `tokio::select!` loop. This mirrors how
     /// Browser sends requests to BrowserClient via WebSocket.
     request_rx: Option<UnboundedReceiver<TuiRequest>>,
+
+    /// Broadcast receiver for Hub events (agent created/deleted/status, shutdown).
+    ///
+    /// Taken once by `run_task()` via `take_hub_event_rx()` and consumed in the
+    /// async event loop. `None` after first take or if not provided at construction.
+    hub_event_rx: Option<tokio::sync::broadcast::Receiver<crate::hub::HubEvent>>,
 }
 
 impl TuiClient {
@@ -263,12 +277,14 @@ impl TuiClient {
     ///
     /// * `hub_handle` - Handle for Hub communication and agent queries.
     /// * `output_sink` - Channel sender for PTY output to TuiRunner.
+    /// * `hub_event_rx` - Optional broadcast receiver for Hub events.
     #[must_use]
     pub fn new(
         hub_handle: HubHandle,
         output_sink: UnboundedSender<TuiOutput>,
+        hub_event_rx: Option<tokio::sync::broadcast::Receiver<crate::hub::HubEvent>>,
     ) -> Self {
-        Self::with_dims(hub_handle, output_sink, 80, 24)
+        Self::with_dims(hub_handle, output_sink, 80, 24, hub_event_rx)
     }
 
     /// Create a new TUI client with specific dimensions.
@@ -279,12 +295,14 @@ impl TuiClient {
     /// * `output_sink` - Channel sender for PTY output to TuiRunner.
     /// * `cols` - Terminal width in columns.
     /// * `rows` - Terminal height in rows.
+    /// * `hub_event_rx` - Optional broadcast receiver for Hub events.
     #[must_use]
     pub fn with_dims(
         hub_handle: HubHandle,
         output_sink: UnboundedSender<TuiOutput>,
         cols: u16,
         rows: u16,
+        hub_event_rx: Option<tokio::sync::broadcast::Receiver<crate::hub::HubEvent>>,
     ) -> Self {
         Self {
             hub_handle,
@@ -293,6 +311,7 @@ impl TuiClient {
             output_sink,
             output_task: None,
             request_rx: None,
+            hub_event_rx,
         }
     }
 
@@ -308,16 +327,6 @@ impl TuiClient {
     /// `TuiRequest::SetDims` which carries explicit agent and PTY indices.
     pub fn update_dims(&mut self, cols: u16, rows: u16) {
         self.dims = (cols, rows);
-    }
-
-    /// Clear connection state without notifying PTY.
-    ///
-    /// Used when PTY no longer exists (agent deleted) but client state needs cleanup.
-    /// Aborts the output forwarder task.
-    pub fn clear_connection(&mut self) {
-        if let Some(task) = self.output_task.take() {
-            task.abort();
-        }
     }
 
     /// Set the request receiver for TuiRunner -> TuiClient communication.
@@ -402,12 +411,20 @@ impl TuiClient {
 
     /// Run TuiClient as an independent async task.
     ///
-    /// Processes requests from TuiRunner via `request_rx` and commands from Hub
-    /// via `cmd_rx` in a `tokio::select!` loop.
-    pub async fn run_task(mut self, mut cmd_rx: tokio::sync::mpsc::Receiver<ClientCmd>) {
+    /// Processes requests from TuiRunner via `request_rx` and hub events via
+    /// broadcast in a `tokio::select!` loop.
+    pub async fn run_task(mut self) {
         let Some(mut request_rx) = self.request_rx.take() else {
             log::error!("TuiClient has no request receiver");
             return;
+        };
+
+        // If hub_event_rx is None (tests), create a dummy channel that never sends.
+        let (_dummy_tx, mut hub_event_rx) = if let Some(rx) = self.take_hub_event_rx() {
+            (None, rx)
+        } else {
+            let (tx, rx) = tokio::sync::broadcast::channel::<crate::hub::HubEvent>(1);
+            (Some(tx), rx)
         };
 
         loop {
@@ -421,25 +438,14 @@ impl TuiClient {
                         }
                     }
                 }
-                cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(ClientCmd::DisconnectFromPty { agent_index, pty_index }) => {
-                            self.disconnect_from_pty(agent_index, pty_index).await;
+                event = hub_event_rx.recv() => {
+                    match event {
+                        Ok(hub_event) => self.handle_hub_event(hub_event).await,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            log::warn!("TuiClient lagged {} hub events", n);
                         }
-                        Some(ClientCmd::ConnectToPty { agent_index, pty_index }) => {
-                            if let Err(e) = self.connect_to_pty(agent_index, pty_index).await {
-                                log::error!("Failed to connect to PTY: {}", e);
-                            }
-                        }
-                        Some(ClientCmd::ClearConnection) => {
-                            self.clear_connection();
-                        }
-                        Some(ClientCmd::Shutdown) => {
-                            log::info!("TuiClient received shutdown command");
-                            break;
-                        }
-                        None => {
-                            log::info!("Hub command channel closed, stopping TuiClient task");
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            log::info!("Hub event channel closed, stopping TuiClient");
                             break;
                         }
                     }
@@ -448,6 +454,47 @@ impl TuiClient {
         }
 
         log::info!("TuiClient task stopped");
+    }
+
+    /// Handle a hub event broadcast.
+    ///
+    /// Most events are forwarded directly to TuiRunner via `TuiOutput::HubEvent`.
+    /// Special handling:
+    /// - `AgentDeleted`: Disconnects from the deleted agent's PTYs before forwarding,
+    ///   since the PTY handles will become invalid after Hub removes the agent.
+    /// - `Shutdown`: Not forwarded. The `run_task` loop will break when the broadcast
+    ///   channel closes, and TuiRunner detects shutdown via its own mechanisms.
+    async fn handle_hub_event(&mut self, event: crate::hub::HubEvent) {
+        use crate::hub::HubEvent;
+
+        match &event {
+            HubEvent::AgentDeleted { agent_id } => {
+                // Find the agent's index in the handle cache so we can disconnect
+                // from its PTYs before forwarding the event to TuiRunner.
+                let agent_index = self
+                    .hub_handle
+                    .get_all_agent_handles()
+                    .iter()
+                    .position(|handle| handle.agent_id() == agent_id);
+
+                if let Some(idx) = agent_index {
+                    self.disconnect_from_pty(idx, 0).await;
+                    self.disconnect_from_pty(idx, 1).await;
+                }
+                let _ = self.output_sink.send(TuiOutput::HubEvent(event));
+            }
+            HubEvent::Shutdown => {
+                log::info!("TuiClient received shutdown event");
+                // Don't forward -- run_task loop will break on Closed channel.
+            }
+            HubEvent::PtyConnectionRequested { .. }
+            | HubEvent::PtyDisconnectionRequested { .. } => {
+                // Browser-specific, TuiClient ignores.
+            }
+            _ => {
+                let _ = self.output_sink.send(TuiOutput::HubEvent(event));
+            }
+        }
     }
 }
 
@@ -471,6 +518,10 @@ impl Client for TuiClient {
 
     fn hub_handle(&self) -> &HubHandle {
         &self.hub_handle
+    }
+
+    fn take_hub_event_rx(&mut self) -> Option<tokio::sync::broadcast::Receiver<crate::hub::HubEvent>> {
+        self.hub_event_rx.take()
     }
 
     /// Connect to a PTY and start forwarding output (using pre-resolved handle).
@@ -635,7 +686,7 @@ mod tests {
     /// Returns both the client and the receiver for TuiOutput messages.
     fn test_client() -> (TuiClient, mpsc::UnboundedReceiver<TuiOutput>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let client = TuiClient::new(HubHandle::mock(), tx);
+        let client = TuiClient::new(HubHandle::mock(), tx, None);
         (client, rx)
     }
 
@@ -643,7 +694,7 @@ mod tests {
     /// Returns both the client and the receiver for TuiOutput messages.
     fn test_client_with_dims(cols: u16, rows: u16) -> (TuiClient, mpsc::UnboundedReceiver<TuiOutput>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let client = TuiClient::with_dims(HubHandle::mock(), tx, cols, rows);
+        let client = TuiClient::with_dims(HubHandle::mock(), tx, cols, rows, None);
         (client, rx)
     }
 
@@ -780,13 +831,15 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel::<TuiRequest>();
         client.set_request_receiver(rx);
 
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        // Give client a hub event receiver, then drop the sender to close the
+        // broadcast channel. run_task exits when it sees Closed on the hub
+        // event channel.
+        let (hub_event_tx, hub_event_rx) = tokio::sync::broadcast::channel::<crate::hub::HubEvent>(16);
+        client.hub_event_rx = Some(hub_event_rx);
+        drop(hub_event_tx);
 
-        // Send shutdown command
-        cmd_tx.send(ClientCmd::Shutdown).await.unwrap();
-
-        // run_task should process the shutdown and exit
-        client.run_task(cmd_rx).await;
+        // run_task should detect the closed broadcast channel and exit
+        client.run_task().await;
         // If we reach here, the task completed successfully
     }
 
@@ -796,13 +849,11 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel::<TuiRequest>();
         client.set_request_receiver(rx);
 
-        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ClientCmd>(16);
-
         // Drop the request sender to close the channel
         drop(tx);
 
         // run_task should detect the closed channel and exit
-        client.run_task(cmd_rx).await;
+        client.run_task().await;
         // If we reach here, the task completed successfully
     }
 
@@ -811,9 +862,7 @@ mod tests {
         let (client, _output_rx) = test_client();
         // Don't set request_rx - should log error and return immediately
 
-        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ClientCmd>(16);
-
-        client.run_task(cmd_rx).await;
+        client.run_task().await;
         // If we reach here, the task handled missing receiver gracefully
     }
 
@@ -898,7 +947,7 @@ mod tests {
         /// Create a TuiClient wired to the Hub's handle.
         fn create_tui_client(hub: &Hub) -> (TuiClient, mpsc::UnboundedReceiver<TuiOutput>) {
             let (tx, rx) = mpsc::unbounded_channel();
-            let client = TuiClient::new(hub.handle(), tx);
+            let client = TuiClient::new(hub.handle(), tx, None);
             (client, rx)
         }
 

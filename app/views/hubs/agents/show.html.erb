@@ -14,26 +14,20 @@
      data-turbo-permanent
      data-controller="hub-connection"
      data-hub-connection-hub-id-value="<%= @hub.id %>"
-     data-hub-connection-worker-url-value="<%= asset_path('workers/signal.js') %>"
-     data-hub-connection-wasm-js-url-value="<%= asset_path('libsignal_wasm.js') %>"
-     data-hub-connection-wasm-binary-url-value="<%= asset_path('libsignal_wasm_bg.wasm') %>"
      data-hub-connection-security-banner-base-class="hidden lg:block shrink-0">
 </div>
 
 <%# Terminal connection - manages PTY channel (data plane) %>
 <div id="terminal-connection-container"
      data-controller="terminal-connection"
-     data-terminal-connection-hub-id-value="<%= @hub.id %>"
-     data-terminal-connection-worker-url-value="<%= asset_path('workers/signal.js') %>"
-     data-terminal-connection-wasm-js-url-value="<%= asset_path('libsignal_wasm.js') %>"
-     data-terminal-connection-wasm-binary-url-value="<%= asset_path('libsignal_wasm_bg.wasm') %>"
-     data-terminal-connection-hub-connection-outlet="#hub-connection-permanent">
+     data-terminal-connection-hub-id-value="<%= @hub.id %>">
 </div>
 
 <%# Terminal view - refreshes on navigation %>
 <div class="h-full flex flex-col overflow-hidden"
      data-controller="terminal-display agents"
      data-terminal-display-terminal-connection-outlet="#terminal-connection-container"
+     data-terminal-display-hub-connection-outlet="#hub-connection-permanent"
      data-agents-hub-connection-outlet="#hub-connection-permanent"
      data-agents-terminal-connection-outlet="#terminal-connection-container"
      data-agents-hub-name-value="<%= @hub.device&.name || @hub.identifier.truncate(16) %>"

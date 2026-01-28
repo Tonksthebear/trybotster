@@ -42,6 +42,7 @@ class TerminalRelayChannel < ApplicationCable::Channel
 
     if @browser_identity.present?
       Rails.logger.info "[TerminalRelay] Browser subscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index} identity=#{@browser_identity[0..8]}..."
+      notify_cli_of_terminal_connection
     else
       Rails.logger.info "[TerminalRelay] CLI subscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
     end
@@ -50,6 +51,7 @@ class TerminalRelayChannel < ApplicationCable::Channel
   def unsubscribed
     if @browser_identity.present?
       Rails.logger.info "[TerminalRelay] Browser unsubscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
+      notify_cli_of_terminal_disconnection
     else
       Rails.logger.info "[TerminalRelay] CLI unsubscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
     end
@@ -117,5 +119,33 @@ class TerminalRelayChannel < ApplicationCable::Channel
 
   def browser_stream_name(identity)
     "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:browser:#{identity}"
+  end
+
+  def find_hub
+    current_user.hubs.find_by(identifier: @hub_id) || current_user.hubs.find_by(id: @hub_id)
+  end
+
+  def notify_cli_of_terminal_connection
+    hub = find_hub
+    return unless hub
+
+    Bot::Message.create_for_hub!(hub,
+      event_type: "terminal_connected",
+      payload: { agent_index: @agent_index, pty_index: @pty_index,
+                 browser_identity: @browser_identity })
+  rescue => e
+    Rails.logger.warn "[TerminalRelay] Failed to notify CLI of terminal connection: #{e.message}"
+  end
+
+  def notify_cli_of_terminal_disconnection
+    hub = find_hub
+    return unless hub
+
+    Bot::Message.create_for_hub!(hub,
+      event_type: "terminal_disconnected",
+      payload: { agent_index: @agent_index, pty_index: @pty_index,
+                 browser_identity: @browser_identity })
+  rescue => e
+    Rails.logger.warn "[TerminalRelay] Failed to notify CLI of terminal disconnection: #{e.message}"
   end
 end

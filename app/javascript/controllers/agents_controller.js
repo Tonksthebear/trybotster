@@ -477,6 +477,7 @@ export default class extends Controller {
         // Store agent ID for reference
         agentLink.dataset.agentId = agent.id;
         agentLink.dataset.agentIndex = index;
+        agentLink.dataset.agentButton = "";
 
         // Delete button (visible on hover)
         const deleteBtn = document.createElement("button");
@@ -718,6 +719,13 @@ export default class extends Controller {
     // Connect to the agent's PTY (sends connect_to_pty to CLI + subscribes browser-side)
     if (this.hasTerminalConnectionOutlet) {
       await this.terminalConnectionOutlet.connectToPty(agentIndex, 0);
+    }
+
+    // Navigate to agent page if not already there
+    const targetUrl = `/hubs/${this.hubIdValue}/agents/${agentIndex}`;
+    if (window.location.pathname !== targetUrl) {
+      const { visit } = await import("@hotwired/turbo");
+      visit(targetUrl);
     }
   }
 

@@ -76,16 +76,16 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to root_path
   end
 
-  test "show displays landing page with connection controller" do
+  test "show displays landing page with hub-connection controller" do
     sign_in @user
     get hub_path(@active_hub)
     assert_response :success
 
-    # Should have connection controller attached (permanent container for Turbo navigation)
-    assert_select "[data-controller~='connection']"
+    # Should have hub-connection controller attached (permanent container for Turbo navigation)
+    assert_select "[data-controller~='hub-connection']"
 
-    # Should pass hub ID to connection controller
-    assert_select "[data-connection-hub-id-value=?]", @active_hub.id.to_s
+    # Should pass hub ID to hub-connection controller
+    assert_select "[data-hub-connection-hub-id-value=?]", @active_hub.id.to_s
   end
 
   test "show displays hub info" do
@@ -139,8 +139,8 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_response :success
 
     # Landing page has connection status in header (status text, not terminal badge)
-    assert_select "[data-connection-target='status']"
-    assert_select "[data-connection-target='statusText']"
+    assert_select "[data-hub-connection-target='status']"
+    assert_select "[data-hub-connection-target='statusText']"
   end
 
   test "show displays agents section" do

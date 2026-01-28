@@ -341,6 +341,11 @@ where
                 self.error_message = Some(message);
                 self.mode = AppMode::Error;
             }
+
+            HubEvent::PtyConnectionRequested { .. }
+            | HubEvent::PtyDisconnectionRequested { .. } => {
+                // Browser-specific, TuiRunner ignores.
+            }
         }
     }
 }
