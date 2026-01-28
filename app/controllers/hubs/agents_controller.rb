@@ -21,9 +21,9 @@ module Hubs
     private
 
     def set_hub
-      @hub = current_user.hubs.find_by(id: params[:hub_id])
+      Current.hub = current_user.hubs.find_by(id: params[:hub_id])
 
-      unless @hub
+      unless Current.hub
         redirect_to hubs_path, alert: "Hub not found"
       end
     end
@@ -33,9 +33,9 @@ module Hubs
 
       # Validate agent index against known agents (if hub has agent info)
       # Note: Agent list is dynamic; this is a soft validation
-      if @hub.hub_agents.any? && @agent_index >= @hub.hub_agents.count
-        redirect_to hub_path(@hub), alert: "Agent not found"
-        return
+      if Current.hub.hub_agents.any? && @agent_index >= Current.hub.hub_agents.count
+        redirect_to hub_path(Current.hub), alert: "Agent not found"
+        nil
       end
     end
   end

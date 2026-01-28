@@ -25,7 +25,7 @@ module Hubs
     private
 
     def set_hub
-      @hub = current_api_user.hubs.find_by!(id: params[:hub_id])
+      Current.hub = current_api_user.hubs.find_by!(id: params[:hub_id])
     rescue ActiveRecord::RecordNotFound
       render json: { error: "Hub not found" }, status: :not_found
     end

@@ -19,7 +19,7 @@ class HubsController < ApplicationController
   #
   # JSON format returns status info for browser-side error handling
   def show
-    unless @hub
+    unless Current.hub
       respond_to do |format|
         format.html { redirect_to hubs_path, alert: "Hub not found" }
         format.json { render json: { error: "Hub not found" }, status: :not_found }
@@ -35,12 +35,12 @@ class HubsController < ApplicationController
         # Return hub status for browser-side error handling
         # Used by hub_connection_controller.js to show appropriate error messages
         render json: {
-          id: @hub.id,
-          identifier: @hub.identifier,
-          active: @hub.active?,
-          alive: @hub.alive?,
-          last_seen_at: @hub.last_seen_at&.iso8601,
-          seconds_since_heartbeat: @hub.last_seen_at ? (Time.current - @hub.last_seen_at).to_i : nil
+          id: Current.hub.id,
+          identifier: Current.hub.identifier,
+          active: Current.hub.active?,
+          alive: Current.hub.alive?,
+          last_seen_at: Current.hub.last_seen_at&.iso8601,
+          seconds_since_heartbeat: Current.hub.last_seen_at ? (Time.current - Current.hub.last_seen_at).to_i : nil
         }
       end
     end
@@ -72,27 +72,27 @@ class HubsController < ApplicationController
   # PUT /hubs/:id
   # CLI heartbeat: updates existing hub by Rails ID
   def update
-    unless @hub
+    unless Current.hub
       render json: { error: "Hub not found" }, status: :not_found
       return
     end
 
-    @hub.repo = params[:repo] if params[:repo].present?
-    @hub.last_seen_at = Time.current
-    @hub.alive = true
+    Current.hub.repo = params[:repo] if params[:repo].present?
+    Current.hub.last_seen_at = Time.current
+    Current.hub.alive = true
 
     if params[:device_id].present?
       device = current_hub_user.devices.find_by(id: params[:device_id])
-      @hub.device = device if device
+      Current.hub.device = device if device
     end
 
-    if @hub.save
-      @hub.sync_agents(params[:agents] || [])
-      @hub.broadcast_update!
+    if Current.hub.save
+      Current.hub.sync_agents(params[:agents] || [])
+      Current.hub.broadcast_update!
 
-      render json: { success: true, hub_id: @hub.id, e2e_enabled: @hub.e2e_enabled? }
+      render json: { success: true, hub_id: Current.hub.id, e2e_enabled: Current.hub.e2e_enabled? }
     else
-      render json: { error: @hub.errors.full_messages.join(", ") }, status: :unprocessable_entity
+      render json: { error: Current.hub.errors.full_messages.join(", ") }, status: :unprocessable_entity
     end
   end
 
@@ -101,9 +101,9 @@ class HubsController < ApplicationController
   # Sets alive=false to mark offline while preserving hub ID for reconnection.
   # Browser sessions are tied to hub ID, so destroying breaks reconnection.
   def destroy
-    if @hub
-      @hub.broadcast_removal!
-      @hub.update!(alive: false)
+    if Current.hub
+      Current.hub.broadcast_removal!
+      Current.hub.update!(alive: false)
       render json: { success: true }
     else
       render json: { success: true } # Idempotent - already gone is fine
@@ -127,6 +127,6 @@ class HubsController < ApplicationController
   end
 
   def set_hub
-    @hub = current_hub_user.hubs.find_by(id: params[:id])
+    Current.hub = current_hub_user.hubs.find_by(id: params[:id])
   end
 end
