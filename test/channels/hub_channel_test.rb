@@ -145,4 +145,56 @@ class HubChannelTest < ActionCable::Channel::TestCase
       }
     end
   end
+
+  # === Browser Connection Notification Tests ===
+  #
+  # These tests require stub_connection with a real user because
+  # notify_cli_of_browser_connection looks up the hub via current_user.
+
+  test "browser subscription creates browser_connected message" do
+    user = users(:jason)
+    hub = hubs(:active_hub)
+    stub_connection current_user: user
+
+    assert_difference "Bot::Message.count", 1 do
+      subscribe hub_id: hub.identifier, browser_identity: @browser_identity
+    end
+
+    assert subscription.confirmed?
+
+    msg = Bot::Message.last
+    assert_equal "browser_connected", msg.event_type
+    assert_equal @browser_identity, msg.payload["browser_identity"]
+    assert_equal hub.id, msg.hub_id
+  end
+
+  test "browser unsubscription creates browser_disconnected message" do
+    user = users(:jason)
+    hub = hubs(:active_hub)
+    stub_connection current_user: user
+
+    subscribe hub_id: hub.identifier, browser_identity: @browser_identity
+    assert subscription.confirmed?
+
+    assert_difference "Bot::Message.count", 1 do
+      unsubscribe
+    end
+
+    msg = Bot::Message.last
+    assert_equal "browser_disconnected", msg.event_type
+    assert_equal @browser_identity, msg.payload["browser_identity"]
+    assert_equal hub.id, msg.hub_id
+  end
+
+  test "CLI subscription does not create browser_connected message" do
+    user = users(:jason)
+    hub = hubs(:active_hub)
+    stub_connection current_user: user
+
+    assert_no_difference "Bot::Message.count" do
+      subscribe hub_id: hub.identifier
+    end
+
+    assert subscription.confirmed?
+  end
 end

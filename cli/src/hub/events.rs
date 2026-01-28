@@ -29,6 +29,7 @@
 
 // Rust guideline compliant 2026-01
 
+use crate::client::ClientId;
 use crate::relay::types::AgentInfo;
 
 /// Agent status for status change events.
@@ -119,6 +120,28 @@ pub enum HubEvent {
         /// Error message.
         message: String,
     },
+
+    /// A PTY connection was requested for a specific client.
+    /// Only the matching client should act on this.
+    PtyConnectionRequested {
+        /// Which client should connect.
+        client_id: ClientId,
+        /// Agent index to connect to.
+        agent_index: usize,
+        /// PTY index within the agent.
+        pty_index: usize,
+    },
+
+    /// A PTY disconnection was requested for a specific client.
+    /// Only the matching client should act on this.
+    PtyDisconnectionRequested {
+        /// Which client should disconnect.
+        client_id: ClientId,
+        /// Agent index to disconnect from.
+        agent_index: usize,
+        /// PTY index within the agent.
+        pty_index: usize,
+    },
 }
 
 impl HubEvent {
@@ -185,7 +208,11 @@ impl HubEvent {
             Self::AgentCreated { agent_id, .. }
             | Self::AgentDeleted { agent_id }
             | Self::AgentStatusChanged { agent_id, .. } => Some(agent_id),
-            Self::Shutdown | Self::AgentCreationProgress { .. } | Self::Error { .. } => None,
+            Self::Shutdown
+            | Self::AgentCreationProgress { .. }
+            | Self::Error { .. }
+            | Self::PtyConnectionRequested { .. }
+            | Self::PtyDisconnectionRequested { .. } => None,
         }
     }
 

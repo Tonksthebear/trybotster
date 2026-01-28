@@ -54,7 +54,7 @@ class ConnectionErrorMessagesTest < ApplicationSystemTestCase
     visit @cli.connection_url
 
     # Wait for successful connection (this caches the session)
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Stop CLI and start a new one with fresh keys
     stop_cli(@cli)
@@ -89,7 +89,7 @@ class ConnectionErrorMessagesTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     stop_cli(@cli)
     @cli = start_cli(@hub, timeout: 20)
@@ -107,7 +107,7 @@ class ConnectionErrorMessagesTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit @cli.connection_url
-    assert_selector "[data-connection-target='status']", text: /connected/i, wait: 20
+    assert_selector "[data-hub-connection-target='status']", text: /connected/i, wait: 20
 
     # Stop CLI completely (no restart) - hub becomes stale
     stop_cli(@cli)

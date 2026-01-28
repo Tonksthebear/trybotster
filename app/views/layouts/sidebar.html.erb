@@ -9,6 +9,10 @@
     <%= csrf_meta_tags %>
     <%= csp_meta_tag %>
 
+    <meta name="signal-worker-url" content="<%= asset_path('workers/signal.js') %>">
+    <meta name="signal-wasm-js-url" content="<%= asset_path('libsignal_wasm.js') %>">
+    <meta name="signal-wasm-binary-url" content="<%= asset_path('libsignal_wasm_bg.wasm') %>">
+
     <%= yield :head %>
 
     <link rel="preconnect" href="https://fonts.googleapis.com">

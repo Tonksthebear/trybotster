@@ -1,7 +1,9 @@
 class Bot::Message < ApplicationRecord
+  belongs_to :hub, optional: true
+
   # Validations
   validates :event_type, presence: true, inclusion: {
-    in: %w[github_mention manual_trigger system_notification agent_cleanup],
+    in: %w[github_mention manual_trigger system_notification agent_cleanup browser_connected browser_disconnected terminal_connected terminal_disconnected],
     message: "%{value} is not a valid event type"
   }
   validates :payload, presence: true
@@ -19,9 +21,19 @@ class Bot::Message < ApplicationRecord
   scope :claimed, -> { where.not(claimed_at: nil) }
   scope :for_delivery, -> { pending.unclaimed.order(created_at: :asc) }
   scope :stale, -> { sent.where("sent_at < ?", 5.minutes.ago).where(acknowledged_at: nil) }
+  scope :for_hub, ->(hub) { where(hub: hub) }
+  scope :for_hub_from_sequence, ->(hub, seq) { for_hub(hub).where("sequence > ?", seq).order(sequence: :asc) }
+
+  # Create a message associated with a hub, with an atomically assigned sequence number.
+  # Broadcasts to HubCommandChannel after creation via callback.
+  def self.create_for_hub!(hub, event_type:, payload:)
+    seq = hub.next_message_sequence!
+    create!(hub: hub, event_type: event_type, payload: payload, sequence: seq, status: "pending")
+  end
 
   # Callbacks
   before_create :set_default_status
+  after_create_commit :broadcast_to_hub_command_channel, if: -> { hub_id.present? }
 
   # Custom error for already claimed messages
   class AlreadyClaimedError < StandardError; end
@@ -148,5 +160,19 @@ class Bot::Message < ApplicationRecord
 
   def set_default_status
     self.status ||= "pending"
+  end
+
+  def broadcast_to_hub_command_channel
+    ActionCable.server.broadcast(
+      "hub_command:#{hub_id}",
+      {
+        type: "message",
+        sequence: sequence,
+        id: id,
+        event_type: event_type,
+        payload: payload,
+        created_at: created_at.iso8601
+      }
+    )
   end
 end

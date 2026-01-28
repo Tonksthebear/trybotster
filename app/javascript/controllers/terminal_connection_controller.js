@@ -1,10 +1,5 @@
-import ConnectionController, {
-  ConnectionState,
-  ConnectionError,
-  SignalSession,
-  consumer,
-  Channel,
-} from "controllers/connection_controller";
+import { Controller } from "@hotwired/stimulus";
+import { loadSession, open, getHubIdFromPath } from "channels/secure_channel";
 
 /**
  * Terminal Connection Controller
@@ -12,320 +7,133 @@ import ConnectionController, {
  * Manages the terminal channel (data plane) — PTY I/O, resize events,
  * and PTY stream switching. One instance per agent terminal view.
  *
- * Uses a hub-connection outlet to:
- * - Send connect_to_pty commands (control plane, goes over hub channel)
- * - Wait for hub handshake completion before subscribing
- *
- * Loads its own Signal session independently from IndexedDB.
+ * Loads its own Signal session independently via SecureChannel.
+ * No base class, no hub-connection outlet — fully self-contained.
  */
-export default class extends ConnectionController {
+export default class extends Controller {
   static targets = ["terminalBadge"];
 
   static values = {
     hubId: String,
-    workerUrl: String,
-    wasmJsUrl: String,
-    wasmBinaryUrl: String,
   };
 
-  static outlets = ["hub-connection"];
+  #terminalHandle = null;
+  #retryTimer = null;
+  #pendingConnect = null;
 
   connect() {
-    super.connect();
-
-    this.terminalChannel = null;
-    this.terminalSubscription = null;
+    this.listeners = new Map();
+    this.session = null;
+    this.identityKey = null;
+    this.connected = false;
+    this.hubId = getHubIdFromPath() || this.hubIdValue;
     this.currentAgentIndex = null;
     this.currentPtyIndex = 0;
-    this.pendingConnectToPty = null;
-
-    // Don't initialize until hub connection is ready
-    // (session may not exist in IndexedDB until hub processes QR scan)
+    this.ptyConnecting = false;
+    this.#initializeSession();
   }
 
   disconnect() {
-    super.disconnect();
+    clearTimeout(this.#retryTimer);
+    this.#terminalHandle?.close();
+    this.#terminalHandle = null;
+    this.listeners?.clear();
   }
 
-  // ========== Hub Connection Outlet ==========
+  // ========== Session Initialization ==========
 
-  hubConnectionOutletConnected(outlet) {
-    // Register as listener on hub connection to know when it's connected.
-    // registerListener fires onConnected immediately if hub is already connected,
-    // so no explicit isConnected() check needed.
-    outlet.registerListener(this, {
-      onConnected: () => this.handleHubConnected(),
-      onDisconnected: () => this.handleHubDisconnected(),
-      onStateChange: (state) => {
-        // Mirror hub state for terminal badge until we have our own connection
-        if (!this.connected) {
-          this.state = state;
-          this.updateTerminalBadge();
-        }
-      },
-    });
-  }
+  async #initializeSession() {
+    try {
+      this.session = await loadSession(this.hubId);
+      if (!this.session) {
+        this.#retryTimer = setTimeout(() => this.#initializeSession(), 2000);
+        return;
+      }
+      this.identityKey = await this.session.getIdentityKey();
+      this.connected = true;
+      this.#updateTerminalBadge();
+      this.notifyListeners("connected", this);
 
-  hubConnectionOutletDisconnected(outlet) {
-    outlet.unregisterListener(this);
-  }
-
-  async handleHubConnected() {
-    // Guard against duplicate initialization
-    if (this.connected) return;
-
-    // Hub is connected — now we can initialize our session
-    const success = await this.initSession();
-    if (!success) return;
-
-    this.connected = true;
-    this.setState(ConnectionState.CONNECTED);
-    this.updateTerminalBadge();
-
-    // Notify our listeners (terminal_display, terminal_view)
-    this.notifyListeners("connected", this);
-
-    // Drain any queued connectToPty call that arrived before session was ready
-    if (this.pendingConnectToPty) {
-      const { agentIndex, ptyIndex } = this.pendingConnectToPty;
-      this.pendingConnectToPty = null;
-      console.log(
-        `[TerminalConnection] Draining queued connectToPty: agent ${agentIndex}, pty ${ptyIndex}`,
-      );
-      await this.connectToPty(agentIndex, ptyIndex);
-    }
-  }
-
-  handleHubDisconnected() {
-    this.connected = false;
-    this.setState(ConnectionState.DISCONNECTED);
-    this.updateTerminalBadge();
-    this.notifyListeners("disconnected");
-  }
-
-  /**
-   * Override: Terminal connection always loads from IndexedDB, never from URL fragment.
-   * The QR scan bundle is consumed by HubConnection.
-   */
-  async setupSignalSession() {
-    this.signalSession = await SignalSession.load(this.hubId);
-  }
-
-  // ========== Terminal Channel ==========
-
-  subscribeToTerminalChannel(
-    agentIndex = this.currentAgentIndex,
-    ptyIndex = this.currentPtyIndex,
-  ) {
-    return new Promise((resolve, reject) => {
-      let initialConnectionResolved = false;
-
-      this.terminalSubscription = consumer.subscriptions.create(
-        {
-          channel: "TerminalRelayChannel",
-          hub_id: this.hubId,
-          agent_index: agentIndex,
-          pty_index: ptyIndex,
-          browser_identity: this.ourIdentityKey,
-        },
-        {
-          connected: () => {
-            console.log(
-              `[TerminalConnection] TerminalRelayChannel connected to agent ${agentIndex} pty ${ptyIndex}`,
-            );
-
-            if (this.terminalChannel) {
-              this.terminalChannel.destroy();
-            }
-
-            this.terminalChannel = Channel.builder(this.terminalSubscription)
-              .session(this.signalSession)
-              .reliable(true)
-              .onMessage((msg) => this.handleDecryptedMessage(msg))
-              .onConnect(() =>
-                console.log("[TerminalConnection] Terminal channel ready"),
-              )
-              .onDisconnect(() =>
-                console.log(
-                  "[TerminalConnection] Terminal channel disconnected",
-                ),
-              )
-              .onError((err) => this.handleChannelError(err))
-              .build();
-            this.terminalChannel.markConnected();
-            this.currentAgentIndex = agentIndex;
-            this.currentPtyIndex = ptyIndex;
-
-            if (!initialConnectionResolved) {
-              initialConnectionResolved = true;
-              resolve();
-            }
-          },
-          disconnected: () => {
-            console.log(
-              "[TerminalConnection] TerminalRelayChannel disconnected",
-            );
-            if (this.terminalChannel) {
-              this.terminalChannel.destroy();
-              this.terminalChannel = null;
-            }
-          },
-          rejected: () => {
-            console.error(
-              "[TerminalConnection] TerminalRelayChannel subscription rejected",
-            );
-            reject(new Error("Terminal subscription rejected"));
-          },
-          received: async (data) => {
-            if (data.sender_key_distribution) {
-              await this.signalSession?.processSenderKeyDistribution(
-                data.sender_key_distribution,
-              );
-              return;
-            }
-            if (data.error) {
-              this.setError(ConnectionError.WEBSOCKET_ERROR, data.error);
-              return;
-            }
-            if (this.terminalChannel) {
-              await this.terminalChannel.receive(data);
-            }
-          },
-        },
-      );
-    });
-  }
-
-  // ========== Message Handling ==========
-
-  handleDecryptedMessage(message) {
-    // Route terminal messages to listeners
-    this.notifyListeners("message", message);
-  }
-
-  handleChannelError(error) {
-    console.error("[TerminalConnection] Channel error:", error);
-
-    if (error.type === "session_invalid") {
-      this.clearSessionAndShowError(error.message);
-    } else {
-      this.setError(
-        ConnectionError.WEBSOCKET_ERROR,
-        error.message || "Channel error",
-      );
+      if (this.#pendingConnect) {
+        const { agentIndex, ptyIndex } = this.#pendingConnect;
+        this.#pendingConnect = null;
+        await this.connectToPty(agentIndex, ptyIndex);
+      }
+    } catch (error) {
+      console.error("[TerminalConnection] Session init failed:", error);
+      this.#retryTimer = setTimeout(() => this.#initializeSession(), 2000);
     }
   }
 
   // ========== PTY Operations ==========
 
   /**
-   * Switch to a different PTY stream.
-   * @param {number} agentIndex - Index of the agent
-   * @param {number} ptyIndex - Index of the PTY (0=CLI, 1=Server)
-   */
-  async switchToPtyStream(agentIndex, ptyIndex) {
-    if (
-      this.terminalSubscription &&
-      agentIndex === this.currentAgentIndex &&
-      ptyIndex === this.currentPtyIndex
-    ) {
-      return true;
-    }
-
-    if (!this.signalSession || !this.connected) {
-      console.warn("[TerminalConnection] Cannot switch PTY - not connected");
-      return false;
-    }
-
-    console.log(
-      `[TerminalConnection] Switching from agent ${this.currentAgentIndex} pty ${this.currentPtyIndex} to agent ${agentIndex} pty ${ptyIndex}`,
-    );
-
-    const prevAgentIndex = this.currentAgentIndex;
-    const prevPtyIndex = this.currentPtyIndex;
-
-    if (this.terminalChannel) {
-      this.terminalChannel.destroy();
-      this.terminalChannel = null;
-    }
-    if (this.terminalSubscription) {
-      this.terminalSubscription.unsubscribe();
-      this.terminalSubscription = null;
-    }
-
-    try {
-      await this.subscribeToTerminalChannel(agentIndex, ptyIndex);
-
-      this.notifyListeners("message", {
-        type: "pty_channel_switched",
-        agent_index: agentIndex,
-        pty_index: ptyIndex,
-      });
-
-      return true;
-    } catch (error) {
-      console.error(
-        `[TerminalConnection] Failed to switch to agent ${agentIndex} pty ${ptyIndex}:`,
-        error,
-      );
-      try {
-        await this.subscribeToTerminalChannel(prevAgentIndex, prevPtyIndex);
-      } catch (reconnectError) {
-        console.error(
-          "[TerminalConnection] Failed to reconnect to previous PTY:",
-          reconnectError,
-        );
-      }
-      return false;
-    }
-  }
-
-  /**
    * Connect to a specific agent's PTY.
-   * Sends connect_to_pty to CLI via hub channel, then subscribes to terminal channel.
+   * Subscribes to TerminalRelayChannel for data-plane I/O.
    * @param {number} agentIndex - Index of the agent
    * @param {number} ptyIndex - Index of the PTY (0=CLI, 1=Server)
    */
   async connectToPty(agentIndex, ptyIndex = 0) {
-    if (!this.connected || !this.signalSession) {
-      // Queue for when session is ready (race: agents_controller calls before initSession completes)
-      console.log(
-        `[TerminalConnection] Queuing connectToPty (not ready): agent ${agentIndex}, pty ${ptyIndex}`,
-      );
-      this.pendingConnectToPty = { agentIndex, ptyIndex };
+    if (!this.session) {
+      this.#pendingConnect = { agentIndex, ptyIndex };
       return false;
     }
 
-    console.log(
-      `[TerminalConnection] Connecting to PTY: agent ${agentIndex}, pty ${ptyIndex}`,
-    );
-
-    // 1. Tell CLI to establish its side via hub channel (control plane)
-    if (this.hasHubConnectionOutlet) {
-      await this.hubConnectionOutlet.send("connect_to_pty", {
-        agent_index: agentIndex,
-        pty_index: ptyIndex,
-      });
+    if (
+      agentIndex === this.currentAgentIndex &&
+      ptyIndex === this.currentPtyIndex &&
+      this.#terminalHandle
+    ) {
+      return true;
     }
 
-    // 2. Subscribe browser-side to terminal channel (data plane)
-    await this.switchToPtyStream(agentIndex, ptyIndex);
+    this.#terminalHandle?.close();
 
-    // 3. Update URL
-    this.updateUrlForPty(ptyIndex);
+    this.ptyConnecting = true;
+    this.#updateTerminalBadge();
 
+    this.#terminalHandle = await open({
+      channel: "TerminalRelayChannel",
+      params: {
+        hub_id: this.hubId,
+        agent_index: agentIndex,
+        pty_index: ptyIndex,
+        browser_identity: this.identityKey,
+      },
+      session: this.session,
+      onMessage: (msg) => {
+        if (this.ptyConnecting) {
+          this.ptyConnecting = false;
+          this.#updateTerminalBadge();
+        }
+        this.notifyListeners("message", msg);
+      },
+      onDisconnect: () => this.#handleTerminalDisconnect(),
+      onError: (err) => this.#handleChannelError(err),
+    });
+
+    this.currentAgentIndex = agentIndex;
+    this.currentPtyIndex = ptyIndex;
+    this.#updateUrlForPty(ptyIndex);
+    this.notifyListeners("message", {
+      type: "pty_channel_switched",
+      agent_index: agentIndex,
+      pty_index: ptyIndex,
+    });
     return true;
   }
 
-  updateUrlForPty(ptyIndex) {
-    const url = new URL(window.location);
-    if (ptyIndex > 0) {
-      url.searchParams.set("pty", ptyIndex);
-    } else {
-      url.searchParams.delete("pty");
-    }
-    history.replaceState(null, "", url);
+  // ========== Terminal I/O ==========
+
+  async sendInput(data) {
+    return this.#terminalHandle?.send({ type: "input", data }) ?? false;
   }
+
+  async sendResize(cols, rows) {
+    return this.#terminalHandle?.send({ type: "resize", cols, rows }) ?? false;
+  }
+
+  // ========== Public Getters ==========
 
   getCurrentAgentIndex() {
     return this.currentAgentIndex;
@@ -335,50 +143,74 @@ export default class extends ConnectionController {
     return this.currentPtyIndex;
   }
 
-  // ========== Hub Channel Proxy ==========
+  getHubId() {
+    return this.hubId;
+  }
+
+  // ========== Listener Registration API ==========
 
   /**
-   * Proxy send to hub connection for control-plane messages.
-   * Allows downstream controllers to call send() without knowing about hub connection.
+   * Register a controller to receive connection callbacks.
+   * If already connected, onConnected is called immediately.
    */
-  async send(type, data = {}) {
-    if (this.hasHubConnectionOutlet) {
-      return this.hubConnectionOutlet.send(type, data);
+  registerListener(controller, callbacks) {
+    if (!this.listeners) {
+      this.listeners = new Map();
     }
-    console.warn("[TerminalConnection] Cannot send - no hub connection outlet");
-    return false;
-  }
+    this.listeners.set(controller, callbacks);
 
-  // ========== Terminal I/O ==========
-
-  async sendInput(inputData) {
-    return this.sendTerminalMessage({ data: inputData });
-  }
-
-  async sendResize(cols, rows) {
-    return this.sendTerminalMessage({ type: "resize", cols, rows });
-  }
-
-  async sendTerminalMessage(message) {
-    if (!this.terminalChannel) {
-      console.warn(
-        "[TerminalConnection] Cannot send terminal message - no terminal channel",
-      );
-      return false;
-    }
-
-    try {
-      const msg = { type: message.type || "input", ...message };
-      return await this.terminalChannel.send(msg);
-    } catch (error) {
-      console.error("[TerminalConnection] Terminal send failed:", error);
-      return false;
+    if (this.connected && this.session) {
+      callbacks.onConnected?.(this);
     }
   }
 
-  // ========== Terminal Badge UI ==========
+  /**
+   * Unregister a controller from receiving callbacks.
+   */
+  unregisterListener(controller) {
+    this.listeners?.delete(controller);
+  }
 
-  updateTerminalBadge() {
+  /**
+   * Notify all listeners of an event.
+   */
+  notifyListeners(event, data) {
+    if (!this.listeners) return;
+    for (const [, callbacks] of this.listeners) {
+      switch (event) {
+        case "connected":
+          callbacks.onConnected?.(data);
+          break;
+        case "disconnected":
+          callbacks.onDisconnected?.();
+          break;
+        case "message":
+          callbacks.onMessage?.(data);
+          break;
+        case "error":
+          callbacks.onError?.(data);
+          break;
+      }
+    }
+  }
+
+  // ========== Private: Disconnect / Error Handling ==========
+
+  #handleTerminalDisconnect() {
+    console.debug("[TerminalConnection] Terminal channel disconnected");
+    this.connected = false;
+    this.#updateTerminalBadge();
+    this.notifyListeners("disconnected");
+  }
+
+  #handleChannelError(error) {
+    console.error("[TerminalConnection] Channel error:", error);
+    this.notifyListeners("error", error);
+  }
+
+  // ========== Private: UI ==========
+
+  #updateTerminalBadge() {
     const terminalBadge = this.hasTerminalBadgeTarget
       ? this.terminalBadgeTarget
       : document.querySelector(
@@ -393,46 +225,33 @@ export default class extends ConnectionController {
     const unlockIcon = `<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
     </svg>`;
+    const spinnerIcon = `<svg class="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+      <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+      <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+    </svg>`;
 
-    switch (this.state) {
-      case ConnectionState.CONNECTED:
-        terminalBadge.className =
-          "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-emerald-500/10 text-emerald-400 rounded";
-        terminalBadge.innerHTML = `${lockIcon}<span>E2E Encrypted</span>`;
-        break;
-
-      case ConnectionState.ERROR:
-        terminalBadge.className =
-          "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-red-500/10 text-red-400 rounded";
-        terminalBadge.innerHTML = `${unlockIcon}<span>Not Connected</span>`;
-        break;
-
-      case ConnectionState.CHANNEL_CONNECTED:
-      case ConnectionState.HANDSHAKE_SENT:
-        terminalBadge.className =
-          "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-amber-500/10 text-amber-400 rounded";
-        terminalBadge.innerHTML = `${unlockIcon}<span>Handshaking...</span>`;
-        break;
-
-      default:
-        terminalBadge.className =
-          "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-zinc-700/50 text-zinc-500 rounded";
-        terminalBadge.innerHTML = `${unlockIcon}<span>Connecting...</span>`;
-        break;
+    if (this.connected && this.ptyConnecting) {
+      terminalBadge.className =
+        "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-amber-500/10 text-amber-400 rounded";
+      terminalBadge.innerHTML = `${spinnerIcon}<span>Connecting to PTY...</span>`;
+    } else if (this.connected && this.#terminalHandle) {
+      terminalBadge.className =
+        "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-emerald-500/10 text-emerald-400 rounded";
+      terminalBadge.innerHTML = `${lockIcon}<span>E2E Encrypted</span>`;
+    } else {
+      terminalBadge.className =
+        "inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-zinc-700/50 text-zinc-500 rounded";
+      terminalBadge.innerHTML = `${unlockIcon}<span>Connecting...</span>`;
     }
   }
 
-  // ========== Cleanup ==========
-
-  cleanup() {
-    if (this.terminalChannel) {
-      this.terminalChannel.destroy();
-      this.terminalChannel = null;
+  #updateUrlForPty(ptyIndex) {
+    const url = new URL(window.location);
+    if (ptyIndex > 0) {
+      url.searchParams.set("pty", ptyIndex);
+    } else {
+      url.searchParams.delete("pty");
     }
-    if (this.terminalSubscription) {
-      this.terminalSubscription.unsubscribe();
-      this.terminalSubscription = null;
-    }
-    super.cleanup();
+    history.replaceState(null, "", url);
   }
 }

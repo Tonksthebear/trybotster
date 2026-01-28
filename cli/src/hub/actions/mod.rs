@@ -249,21 +249,21 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         }
 
         HubAction::RequestAgentList { client_id } => {
-            // For browser clients, use targeted send via relay
-            if let Some(identity) = client_id.browser_identity() {
-                crate::relay::browser::send_agent_list_to_browser(hub, identity);
-            } else {
-                hub.send_agent_list_to(&client_id);
-            }
+            // Browser clients handle ListAgents directly in BrowserClient::handle_browser_command().
+            // TUI clients read agent list from hub state.
+            log::debug!(
+                "RequestAgentList from {} (handled client-side)",
+                client_id
+            );
         }
 
         HubAction::RequestWorktreeList { client_id } => {
-            // For browser clients, use targeted send via relay
-            if let Some(identity) = client_id.browser_identity() {
-                crate::relay::browser::send_worktree_list_to_browser(hub, identity);
-            } else {
-                hub.send_worktree_list_to(&client_id);
-            }
+            // Browser clients handle ListWorktrees directly in BrowserClient::handle_browser_command().
+            // TUI clients read worktree list from hub state.
+            log::debug!(
+                "RequestWorktreeList from {} (handled client-side)",
+                client_id
+            );
         }
 
         HubAction::ClientConnected { client_id } => {

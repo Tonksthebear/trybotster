@@ -1,9 +1,5 @@
-import ConnectionController, {
-  ConnectionState,
-  ConnectionError,
-  consumer,
-  Channel,
-} from "controllers/connection_controller";
+import { Controller } from "@hotwired/stimulus";
+import { loadSession, open, getHubIdFromPath } from "channels/secure_channel";
 
 /**
  * Hub Connection Controller
@@ -12,16 +8,29 @@ import ConnectionController, {
  * and connection status UI. One instance per browser session, persists
  * across Turbo navigations via data-turbo-permanent.
  *
+ * Uses SecureChannel module for all encryption and channel mechanics.
+ * WASM URLs come from <meta> tags — no stimulus values needed.
+ *
  * Connection Flow:
- * 1. LOADING_WASM - Loading Signal Protocol WASM module
- * 2. CREATING_SESSION - Setting up encryption from QR bundle
- * 3. SUBSCRIBING - Connecting to HubChannel (control plane)
- * 4. CHANNEL_CONNECTED - HubChannel confirmed (CLI is reachable)
- * 5. HANDSHAKE_SENT - Sent encrypted handshake, waiting for CLI ACK
- * 6. CONNECTED - CLI acknowledged, E2E encryption active
+ * 1. Load Signal session (WASM + IndexedDB / QR fragment)
+ * 2. Open encrypted HubChannel via SecureChannel
+ * 3. Send handshake, wait for CLI ACK
+ * 4. CONNECTED — E2E encryption active
  */
 
 const HANDSHAKE_TIMEOUT_MS = 8000;
+
+// Internal state constants
+const State = {
+  DISCONNECTED: "disconnected",
+  LOADING_WASM: "loading_wasm",
+  CREATING_SESSION: "creating_session",
+  SUBSCRIBING: "subscribing",
+  CHANNEL_CONNECTED: "channel_connected",
+  HANDSHAKE_SENT: "handshake_sent",
+  CONNECTED: "connected",
+  ERROR: "error",
+};
 
 // SVG icons for status display
 const ICONS = {
@@ -94,7 +103,7 @@ const STATUS_CONFIG = {
   },
 };
 
-export default class extends ConnectionController {
+export default class extends Controller {
   static targets = [
     "status",
     "statusContainer",
@@ -113,144 +122,130 @@ export default class extends ConnectionController {
 
   static values = {
     hubId: String,
-    workerUrl: String,
-    wasmJsUrl: String,
-    wasmBinaryUrl: String,
+    connectionState: { type: String, default: "disconnected" },
   };
 
   static classes = ["securityBannerBase"];
 
-  connect() {
-    super.connect();
+  // -- Turbo permanent lifecycle -----------------------------------------
+  // data-turbo-permanent means the same DOM element (and controller instance)
+  // survives page navigations. Turbo calls disconnect() then connect() on
+  // the same instance during reinserts. We schedule cleanup on turbo:load
+  // so the channel survives the disconnect/connect cycle. If connect() fires
+  // before turbo:load, we cancel the cleanup. If turbo:load fires and the
+  // element is no longer in the DOM, we know the user navigated away.
 
-    this.hubChannel = null;
-    this.hubSubscription = null;
+  #handle = null;
+  #turboCleanup = null;
+  #beforeUnloadHandler = null;
+
+  connect() {
+    // Cancel any pending turbo:load cleanup from a previous disconnect
+    if (this.#turboCleanup) {
+      document.removeEventListener("turbo:load", this.#turboCleanup);
+      this.#turboCleanup = null;
+    }
+
+    // Turbo permanent reinsert: same instance, connection still alive
+    if (this.connectionStateValue !== "disconnected" && this.#handle) {
+      this.#refreshStatusUI();
+      return;
+    }
+
+    // First mount or after real cleanup
+    this.listeners = this.listeners || new Map();
+    this.session = null;
+    this.identityKey = null;
+    this.connected = false;
+    this.state = State.DISCONNECTED;
+    this.connectionStateValue = "disconnected";
+    this.errorReason = null;
     this.handshakeTimer = null;
     this.hasCompletedInitialSetup = false;
+    this.hubId = getHubIdFromPath() || this.hubIdValue;
 
-    this.initializeConnection();
+    // Ensure explicit cleanup on hard page refresh / tab close.
+    // beforeunload does NOT fire during Turbo navigation — only real page unloads.
+    // This guarantees the ActionCable subscription is explicitly unsubscribed,
+    // giving the CLI time to tear down the BrowserClient before a new connection arrives.
+    if (!this.#beforeUnloadHandler) {
+      this.#beforeUnloadHandler = () => this.#cleanup();
+      window.addEventListener("beforeunload", this.#beforeUnloadHandler);
+    }
+
+    this.#initializeConnection();
   }
 
   disconnect() {
-    super.disconnect();
+    // Don't destroy the connection immediately — Turbo permanent elements
+    // get disconnect()/connect() during navigation. Schedule a check after
+    // the new page renders to see if the element was truly removed.
+    this.#turboCleanup = () => {
+      this.#turboCleanup = null;
+      if (!this.element.isConnected) {
+        this.#cleanup();
+      }
+    };
+    document.addEventListener("turbo:load", this.#turboCleanup, { once: true });
   }
 
   // ========== Connection Flow ==========
 
-  async initializeConnection() {
+  async #initializeConnection() {
     try {
-      // Step 1-2: WASM + session (base class)
+      this.#setState(State.LOADING_WASM);
       this.updateStatus("Loading encryption...", "Initializing Signal Protocol");
-      const success = await this.initSession();
-      if (!success) {
-        this.updateStatus("Connection failed", this.errorReason);
+
+      this.session = await loadSession(this.hubId, { fromFragment: true });
+      if (!this.session) {
+        this.showError("Not paired. Press Ctrl+P in CLI to show QR code.");
         return;
       }
 
-      // Step 3: Subscribe to hub channel
-      this.setState(ConnectionState.SUBSCRIBING);
+      this.#setState(State.CREATING_SESSION);
+      this.identityKey = await this.session.getIdentityKey();
+
+      this.#setState(State.SUBSCRIBING);
       this.updateStatus("Connecting to server...", "Establishing secure channel");
 
-      try {
-        await this.subscribeToHubChannel();
-      } catch (subError) {
-        this.setError(
-          ConnectionError.SUBSCRIBE_REJECTED,
-          `Connection rejected: ${subError.message}`,
-        );
-        this.updateStatus("Connection failed", subError.message);
-        return;
-      }
+      this.#handle = await open({
+        channel: "HubChannel",
+        params: { hub_id: this.hubId, browser_identity: this.identityKey },
+        session: this.session,
+        reliable: true,
+        onMessage: (msg) => this.#handleMessage(msg),
+        onDisconnect: () => this.#handleDisconnect(),
+        onError: (err) => this.#handleChannelError(err),
+      });
 
-      // Step 4-5: Handshake
-      this.setState(ConnectionState.CHANNEL_CONNECTED);
+      this.#setState(State.CHANNEL_CONNECTED);
       this.updateStatus("CLI reachable", "Sending encrypted handshake...");
 
-      this.setState(ConnectionState.HANDSHAKE_SENT);
-      await this.sendHandshakeWithTimeout();
+      this.#setState(State.HANDSHAKE_SENT);
+      await this.#sendHandshake();
     } catch (error) {
       console.error("[HubConnection] Failed to initialize:", error);
-      this.setError(
-        ConnectionError.WEBSOCKET_ERROR,
-        `Connection error: ${error.message}`,
-      );
+      this.#setError("websocket_error", `Connection error: ${error.message}`);
       this.updateStatus("Connection failed", error.message);
     }
   }
 
-  // ========== Hub Channel ==========
-
-  subscribeToHubChannel() {
-    return new Promise((resolve, reject) => {
-      let initialConnectionResolved = false;
-
-      this.hubSubscription = consumer.subscriptions.create(
-        {
-          channel: "HubChannel",
-          hub_id: this.hubId,
-          browser_identity: this.ourIdentityKey,
-        },
-        {
-          connected: () => {
-            console.log("[HubConnection] HubChannel connected");
-
-            if (this.hubChannel) {
-              this.hubChannel.destroy();
-            }
-
-            this.hubChannel = Channel.builder(this.hubSubscription)
-              .session(this.signalSession)
-              .reliable(true)
-              .onMessage((msg) => this.handleDecryptedMessage(msg))
-              .onConnect(() => console.log("[HubConnection] Hub channel ready"))
-              .onDisconnect(() => this.handleDisconnect())
-              .onError((err) => this.handleChannelError(err))
-              .build();
-            this.hubChannel.markConnected();
-
-            if (!initialConnectionResolved) {
-              initialConnectionResolved = true;
-              resolve();
-            } else if (this.hasCompletedInitialSetup) {
-              console.log("[HubConnection] HubChannel reconnected, restarting handshake");
-              this.restartHandshake();
-            }
-          },
-          disconnected: () => {
-            console.log("[HubConnection] HubChannel disconnected");
-            if (this.hubChannel) {
-              this.hubChannel.destroy();
-              this.hubChannel = null;
-            }
-            this.handleDisconnect();
-          },
-          rejected: () => {
-            console.error("[HubConnection] HubChannel subscription rejected");
-            reject(new Error("Hub subscription rejected - hub may be offline"));
-          },
-          received: async (data) => {
-            if (this.hubChannel) {
-              await this.hubChannel.receive(data);
-            }
-          },
-        },
-      );
-    });
-  }
-
   // ========== Handshake ==========
 
-  async sendHandshakeWithTimeout() {
+  async #sendHandshake() {
     const handshake = {
       type: "connected",
-      device_name: this.getDeviceName(),
+      device_name: this.#getDeviceName(),
       timestamp: Date.now(),
     };
 
-    const sent = await this.sendEncrypted(handshake);
+    const sent = await this.send("connected", {
+      device_name: handshake.device_name,
+      timestamp: handshake.timestamp,
+    });
 
     if (!sent) {
-      this.setError(ConnectionError.HANDSHAKE_FAILED, "Failed to send handshake");
+      this.#setError("handshake_failed", "Failed to send handshake");
       this.updateStatus("Connection failed", "Failed to send handshake");
       return;
     }
@@ -258,14 +253,14 @@ export default class extends ConnectionController {
     this.updateStatus("Handshake sent", "Waiting for CLI acknowledgment...");
 
     this.handshakeTimer = setTimeout(async () => {
-      if (this.state === ConnectionState.HANDSHAKE_SENT) {
+      if (this.state === State.HANDSHAKE_SENT) {
         console.warn("[HubConnection] Handshake timeout - no ACK from CLI");
-        await this.handleHandshakeTimeout();
+        await this.#handleHandshakeTimeout();
       }
     }, HANDSHAKE_TIMEOUT_MS);
   }
 
-  async handleHandshakeTimeout() {
+  async #handleHandshakeTimeout() {
     try {
       const response = await fetch(`/hubs/${this.hubId}.json`, {
         credentials: "same-origin",
@@ -278,48 +273,48 @@ export default class extends ConnectionController {
                            status.seconds_since_heartbeat < 30;
 
         if (isCliOnline) {
-          this.setError(
-            ConnectionError.SESSION_INVALID,
+          this.#setError(
+            "session_invalid",
             "Session expired. Re-scan QR code from CLI (Ctrl+P).",
           );
         } else {
-          this.setError(
-            ConnectionError.HANDSHAKE_TIMEOUT,
+          this.#setError(
+            "handshake_timeout",
             "CLI not responding. Is botster-hub running?",
           );
         }
       } else {
-        this.setError(
-          ConnectionError.HANDSHAKE_TIMEOUT,
+        this.#setError(
+          "handshake_timeout",
           "CLI did not respond. Is botster-hub running?",
         );
       }
     } catch (error) {
-      this.setError(
-        ConnectionError.HANDSHAKE_TIMEOUT,
+      this.#setError(
+        "handshake_timeout",
         "CLI did not respond. Is botster-hub running?",
       );
     }
     this.updateStatus("Connection failed", this.errorReason);
   }
 
-  async restartHandshake() {
-    if (!this.signalSession) return;
-    if (!this.hubChannel) return;
+  async #restartHandshake() {
+    if (!this.session) return;
+    if (!this.#handle) return;
 
     if (this.handshakeTimer) {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;
     }
 
-    this.setState(ConnectionState.CHANNEL_CONNECTED);
+    this.#setState(State.CHANNEL_CONNECTED);
     this.updateStatus("Reconnected", "Re-establishing secure connection...");
 
-    this.setState(ConnectionState.HANDSHAKE_SENT);
-    await this.sendHandshakeWithTimeout();
+    this.#setState(State.HANDSHAKE_SENT);
+    await this.#sendHandshake();
   }
 
-  getDeviceName() {
+  #getDeviceName() {
     const ua = navigator.userAgent;
     if (ua.includes("iPhone")) return "iPhone";
     if (ua.includes("iPad")) return "iPad";
@@ -332,10 +327,10 @@ export default class extends ConnectionController {
 
   // ========== Message Handling ==========
 
-  handleDecryptedMessage(message) {
+  #handleMessage(message) {
     // Handle handshake acknowledgment
     if (message.type === "handshake_ack") {
-      console.log("[HubConnection] Received handshake ACK from CLI");
+      console.debug("[HubConnection] Received handshake ACK from CLI");
 
       if (this.handshakeTimer) {
         clearTimeout(this.handshakeTimer);
@@ -344,7 +339,7 @@ export default class extends ConnectionController {
 
       this.connected = true;
       this.hasCompletedInitialSetup = true;
-      this.setState(ConnectionState.CONNECTED);
+      this.#setState(State.CONNECTED);
       this.updateStatus(
         "Connected",
         `E2E encrypted to ${this.hubId.substring(0, 8)}...`,
@@ -356,7 +351,7 @@ export default class extends ConnectionController {
 
     // Handle invite bundle response
     if (message.type === "invite_bundle") {
-      console.log("[HubConnection] Received invite bundle from CLI");
+      console.debug("[HubConnection] Received invite bundle from CLI");
       this.handleInviteBundle(message);
       return;
     }
@@ -365,50 +360,38 @@ export default class extends ConnectionController {
     this.notifyListeners("message", message);
   }
 
-  handleDisconnect() {
+  #handleDisconnect() {
     this.connected = false;
-    this.setState(ConnectionState.DISCONNECTED);
+    this.#setState(State.DISCONNECTED);
     this.updateStatus("Disconnected", "Connection lost");
     this.notifyListeners("disconnected");
   }
 
-  handleChannelError(error) {
+  #handleChannelError(error) {
     console.error("[HubConnection] Channel error:", error);
 
     if (error.type === "session_invalid") {
       this.clearSessionAndShowError(error.message);
     } else {
-      this.setError(ConnectionError.WEBSOCKET_ERROR, error.message || "Channel error");
+      this.#setError("websocket_error", error.message || "Channel error");
     }
     this.updateStatus("Connection failed", error.message || "Channel error");
   }
 
-  // ========== Hub Commands ==========
+  // ========== Hub Commands (Public API) ==========
 
   /**
    * Send a JSON message to CLI (encrypted) via hub channel.
+   * Used by outlets (agents, terminal-connection, preview).
    */
   async send(type, data = {}) {
-    if (!this.connected || !this.signalSession) {
-      console.warn("[HubConnection] Cannot send - not connected");
-      return false;
-    }
-
-    const message = { type, ...data };
-    return await this.sendEncrypted(message);
-  }
-
-  /**
-   * Send encrypted message via hub channel with reliable delivery.
-   */
-  async sendEncrypted(message) {
-    if (!this.hubChannel) {
-      console.warn("[HubConnection] Cannot send encrypted - no hub channel");
+    if (!this.#handle) {
+      console.warn("[HubConnection] Cannot send - no channel handle");
       return false;
     }
 
     try {
-      return await this.hubChannel.send(message);
+      return await this.#handle.send({ type, ...data });
     } catch (error) {
       console.error("[HubConnection] Send failed:", error);
       return false;
@@ -437,10 +420,10 @@ export default class extends ConnectionController {
   // ========== Reconnect ==========
 
   async reconnect() {
-    console.log("[HubConnection] Manual reconnect requested");
+    console.debug("[HubConnection] Manual reconnect requested");
 
-    if (this.signalSession && this.hubChannel) {
-      await this.restartHandshake();
+    if (this.session && this.#handle) {
+      await this.#restartHandshake();
       return;
     }
 
@@ -450,25 +433,20 @@ export default class extends ConnectionController {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;
     }
-    if (this.hubChannel) {
-      this.hubChannel.destroy();
-      this.hubChannel = null;
-    }
-    if (this.hubSubscription) {
-      this.hubSubscription.unsubscribe();
-      this.hubSubscription = null;
-    }
+    this.#handle?.close();
+    this.#handle = null;
     this.connected = false;
     this.hasCompletedInitialSetup = false;
 
     this.listeners = savedListeners;
-    await this.initializeConnection();
+    this.hubId = getHubIdFromPath() || this.hubIdValue;
+    await this.#initializeConnection();
   }
 
   // ========== Share Hub ==========
 
   async requestInviteBundle() {
-    if (!this.connected || !this.signalSession) {
+    if (!this.connected || !this.session) {
       console.warn("[HubConnection] Cannot request invite - not connected");
       this.updateShareStatus("Not connected", "error");
       return;
@@ -483,7 +461,7 @@ export default class extends ConnectionController {
   }
 
   async handleInviteBundle(message) {
-    const { url, bundle } = message;
+    const { url } = message;
 
     if (!url) {
       this.updateShareStatus("Invalid response", "error");
@@ -541,39 +519,176 @@ export default class extends ConnectionController {
     }
   }
 
-  // ========== Override State Management ==========
+  // ========== Listener Registration API ==========
 
-  setError(reason, message) {
-    super.setError(reason, message);
+  /**
+   * Register a controller to receive connection callbacks.
+   * If already connected, onConnected is called immediately.
+   */
+  registerListener(controller, callbacks) {
+    if (!this.listeners) {
+      this.listeners = new Map();
+    }
+    this.listeners.set(controller, callbacks);
+
+    // If already connected, immediately notify
+    if (this.connected && this.session) {
+      callbacks.onConnected?.(this);
+    }
+
+    // Notify of current state
+    callbacks.onStateChange?.(this.state, this.errorReason);
+  }
+
+  /**
+   * Unregister a controller from receiving callbacks.
+   */
+  unregisterListener(controller) {
+    this.listeners?.delete(controller);
+  }
+
+  /**
+   * Notify all listeners of an event.
+   */
+  notifyListeners(event, data) {
+    if (!this.listeners) return;
+    for (const [, callbacks] of this.listeners) {
+      switch (event) {
+        case "connected":
+          callbacks.onConnected?.(data);
+          break;
+        case "disconnected":
+          callbacks.onDisconnected?.();
+          break;
+        case "message":
+          callbacks.onMessage?.(data);
+          break;
+        case "error":
+          callbacks.onError?.(data);
+          break;
+        case "stateChange":
+          callbacks.onStateChange?.(data.state, data.reason);
+          break;
+      }
+    }
+  }
+
+  // ========== State Management ==========
+
+  #setState(newState) {
+    const prevState = this.state;
+    this.state = newState;
+    this.connectionStateValue = newState; // Persist in DOM for Turbo survival
+    if (newState !== State.ERROR) {
+      this.errorReason = null;
+    }
+    console.debug(`[HubConnection] State: ${prevState} -> ${newState}`);
+    this.notifyListeners("stateChange", { state: newState, reason: this.errorReason });
+  }
+
+  #setError(reason, message) {
+    this.errorReason = reason;
+    this.#setState(State.ERROR);
+    console.error(`[HubConnection] Error (${reason}): ${message}`);
+    this.notifyListeners("error", { reason, message });
     this.updateStatus("Connection failed", message);
+  }
+
+  // ========== Public API (used by outlets) ==========
+
+  isConnected() {
+    return this.connected;
+  }
+
+  getHubId() {
+    return this.hubId;
+  }
+
+  getState() {
+    return this.state;
+  }
+
+  getErrorReason() {
+    return this.errorReason;
+  }
+
+  async resetSession() {
+    if (this.session) {
+      await this.session.clear();
+      this.session = null;
+    }
+    this.#cleanup();
+    this.#setError(
+      "session_create_failed",
+      "Session cleared. Scan QR code to reconnect.",
+    );
+  }
+
+  /**
+   * Clear the cached Signal session and show an error prompting user to re-scan QR.
+   */
+  async clearSessionAndShowError(message) {
+    console.debug("[HubConnection] Clearing stale session for hub:", this.hubId);
+
+    if (this.session) {
+      try {
+        await this.session.clear();
+      } catch (err) {
+        console.error("[HubConnection] Failed to clear session:", err);
+      }
+      this.session = null;
+    }
+
+    this.#cleanup();
+    this.#setError(
+      "session_invalid",
+      message || "Session expired. Please re-scan the QR code.",
+    );
+  }
+
+  /**
+   * Show an error in the status UI. Called from #initializeConnection when
+   * loadSession returns null (not paired).
+   */
+  showError(message) {
+    this.#setError("no_bundle", message);
   }
 
   // ========== Cleanup ==========
 
-  cleanup() {
+  #cleanup() {
     if (this.handshakeTimer) {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;
     }
-    if (this.hubChannel) {
-      this.hubChannel.destroy();
-      this.hubChannel = null;
-    }
-    if (this.hubSubscription) {
-      this.hubSubscription.unsubscribe();
-      this.hubSubscription = null;
-    }
+    this.#handle?.close();
+    this.#handle = null;
+    this.session = null;
+    this.connected = false;
     this.hasCompletedInitialSetup = false;
-    super.cleanup();
+    this.connectionStateValue = "disconnected";
+    if (this.#beforeUnloadHandler) {
+      window.removeEventListener("beforeunload", this.#beforeUnloadHandler);
+      this.#beforeUnloadHandler = null;
+    }
+    this.listeners?.clear();
   }
 
+  /**
+   * Stimulus action: data-action="hub-connection#disconnectAction"
+   */
   disconnectAction() {
-    this.cleanup();
+    this.#cleanup();
     this.updateStatus("Disconnected", "");
     this.notifyListeners("disconnected");
   }
 
   // ========== Status UI ==========
+
+  #refreshStatusUI() {
+    const config = STATUS_CONFIG[this.state] || STATUS_CONFIG.disconnected;
+    this.updateStatus(config.text);
+  }
 
   updateStatus(text, detail = "") {
     const config = STATUS_CONFIG[this.state] || STATUS_CONFIG.disconnected;
@@ -600,9 +715,9 @@ export default class extends ConnectionController {
       : document.querySelector("[data-hub-connection-target='statusDetail']");
     if (statusDetail) {
       statusDetail.textContent = detail;
-      if (this.state === ConnectionState.ERROR) {
+      if (this.state === State.ERROR) {
         statusDetail.className = "text-xs text-red-400/80 font-mono max-w-xs text-right";
-      } else if (this.state === ConnectionState.CONNECTED) {
+      } else if (this.state === State.CONNECTED) {
         statusDetail.className = "text-xs text-emerald-400/60 font-mono";
       } else {
         statusDetail.className = "text-xs text-zinc-500 font-mono";
@@ -636,7 +751,7 @@ export default class extends ConnectionController {
       ? this.disconnectBtnTarget
       : document.querySelector("[data-hub-connection-target='disconnectBtn']");
     if (disconnectBtn) {
-      if (this.state === ConnectionState.CONNECTED) {
+      if (this.state === State.CONNECTED) {
         disconnectBtn.classList.remove("hidden");
       } else {
         disconnectBtn.classList.add("hidden");
@@ -674,7 +789,7 @@ export default class extends ConnectionController {
       : "";
 
     switch (this.state) {
-      case ConnectionState.CONNECTED:
+      case State.CONNECTED:
         securityBanner.className = `${baseClasses} border-b border-emerald-500/20 bg-emerald-500/5 transition-colors duration-300`;
         if (securityIcon) {
           securityIcon.innerHTML = lockIcon;
@@ -688,7 +803,7 @@ export default class extends ConnectionController {
         }
         break;
 
-      case ConnectionState.ERROR:
+      case State.ERROR:
         securityBanner.className = `${baseClasses} border-b border-red-500/20 bg-red-500/5 transition-colors duration-300`;
         if (securityIcon) {
           securityIcon.innerHTML = errorIcon;
@@ -702,8 +817,8 @@ export default class extends ConnectionController {
         }
         break;
 
-      case ConnectionState.CHANNEL_CONNECTED:
-      case ConnectionState.HANDSHAKE_SENT:
+      case State.CHANNEL_CONNECTED:
+      case State.HANDSHAKE_SENT:
         securityBanner.className = `${baseClasses} border-b border-amber-500/20 bg-amber-500/5 transition-colors duration-300`;
         if (securityIcon) {
           securityIcon.innerHTML = unlockIcon;

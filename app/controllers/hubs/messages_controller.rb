@@ -7,50 +7,6 @@ module Hubs
     before_action :authenticate_with_api_key!
     before_action :set_hub
 
-    # GET /hubs/:id/messages
-    # Returns pending, unclaimed messages for this hub's repo
-    def index
-      # Get all pending, unclaimed messages for this hub's repo
-      messages = Bot::Message.for_delivery
-        .where("payload->>'repo' = ?", @hub.repo)
-        .limit(50)
-
-      # Filter messages by repo access authorization
-      authorized_messages = []
-
-      messages.each do |msg|
-        repo = msg.repo
-
-        if repo.blank?
-          # No repo in payload, allow it through
-          authorized_messages << msg
-        elsif current_api_user.has_github_repo_access?(repo)
-          # User has access to this repo
-          authorized_messages << msg
-        end
-        # Skip messages the user doesn't have access to
-      end
-
-      # Claim authorized messages for this user's daemon
-      authorized_messages.each do |msg|
-        msg.claim!(current_api_user.id)
-      end
-
-      render json: {
-        messages: authorized_messages.map do |msg|
-          {
-            id: msg.id,
-            event_type: msg.event_type,
-            payload: msg.payload,
-            created_at: msg.created_at,
-            sent_at: msg.sent_at,
-            claimed_at: msg.claimed_at
-          }
-        end,
-        count: authorized_messages.count
-      }
-    end
-
     # PATCH/PUT /hubs/:id/messages/:id
     # Acknowledges a message
     def update

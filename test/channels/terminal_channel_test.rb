@@ -289,4 +289,74 @@ class TerminalChannelTest < ActionCable::Channel::TestCase
       }
     end
   end
+
+  # === Terminal Connection Notification Tests ===
+  #
+  # These tests require stub_connection with a real user because
+  # notify_cli_of_terminal_connection looks up the hub via current_user.
+
+  test "browser subscription creates terminal_connected message" do
+    user = users(:jason)
+    hub = hubs(:active_hub)
+    stub_connection current_user: user
+
+    assert_difference "Bot::Message.count", 1 do
+      subscribe hub_id: hub.identifier, agent_index: @agent_index, pty_index: @pty_index, browser_identity: @browser_identity
+    end
+
+    assert subscription.confirmed?
+
+    msg = Bot::Message.last
+    assert_equal "terminal_connected", msg.event_type
+    assert_equal @agent_index, msg.payload["agent_index"]
+    assert_equal @pty_index, msg.payload["pty_index"]
+    assert_equal @browser_identity, msg.payload["browser_identity"]
+    assert_equal hub.id, msg.hub_id
+  end
+
+  test "browser unsubscription creates terminal_disconnected message" do
+    user = users(:jason)
+    hub = hubs(:active_hub)
+    stub_connection current_user: user
+
+    subscribe hub_id: hub.identifier, agent_index: @agent_index, pty_index: @pty_index, browser_identity: @browser_identity
+    assert subscription.confirmed?
+
+    assert_difference "Bot::Message.count", 1 do
+      unsubscribe
+    end
+
+    msg = Bot::Message.last
+    assert_equal "terminal_disconnected", msg.event_type
+    assert_equal @agent_index, msg.payload["agent_index"]
+    assert_equal @pty_index, msg.payload["pty_index"]
+    assert_equal @browser_identity, msg.payload["browser_identity"]
+    assert_equal hub.id, msg.hub_id
+  end
+
+  test "CLI subscription does not create terminal_connected message" do
+    user = users(:jason)
+    hub = hubs(:active_hub)
+    stub_connection current_user: user
+
+    assert_no_difference "Bot::Message.count" do
+      subscribe hub_id: hub.identifier, agent_index: @agent_index, pty_index: @pty_index
+    end
+
+    assert subscription.confirmed?
+  end
+
+  test "terminal_connected message includes agent and pty indices" do
+    user = users(:jason)
+    hub = hubs(:active_hub)
+    stub_connection current_user: user
+
+    subscribe hub_id: hub.identifier, agent_index: 2, pty_index: 1, browser_identity: @browser_identity
+    assert subscription.confirmed?
+
+    msg = Bot::Message.last
+    assert_equal "terminal_connected", msg.event_type
+    assert_equal 2, msg.payload["agent_index"]
+    assert_equal 1, msg.payload["pty_index"]
+  end
 end

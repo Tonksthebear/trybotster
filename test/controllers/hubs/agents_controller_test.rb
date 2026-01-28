@@ -25,14 +25,17 @@ module Hubs
       get hub_agent_path(@active_hub, 0)
       assert_response :success
 
-      # Should have connection controller attached
-      assert_select "[data-controller~='connection']"
+      # Should have hub-connection controller attached (permanent container)
+      assert_select "[data-controller~='hub-connection']"
 
-      # Should pass hub ID to connection controller
-      assert_select "[data-connection-hub-id-value=?]", @active_hub.id.to_s
+      # Should pass hub ID to hub-connection controller
+      assert_select "[data-hub-connection-hub-id-value=?]", @active_hub.id.to_s
 
-      # Should pass agent index to connection controller
-      assert_select "[data-connection-agent-index-value=?]", "0"
+      # Should have terminal-connection controller attached
+      assert_select "[data-controller~='terminal-connection']"
+
+      # Should pass hub ID to terminal-connection controller
+      assert_select "[data-terminal-connection-hub-id-value=?]", @active_hub.id.to_s
     end
 
     test "show displays terminal elements" do
@@ -41,8 +44,8 @@ module Hubs
       assert_response :success
 
       # Terminal view has terminal badge and security banner
-      assert_select "[data-connection-target='terminalBadge']"
-      assert_select "[data-connection-target='securityBanner']"
+      assert_select "[data-terminal-connection-target='terminalBadge']"
+      assert_select "[data-hub-connection-target='securityBanner']"
     end
 
     test "show displays terminal display controller" do

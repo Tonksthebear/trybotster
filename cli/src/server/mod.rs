@@ -3,7 +3,6 @@
 //! This module provides the API client and related types for communicating
 //! with the Rails server. It handles:
 //!
-//! - Message polling and acknowledgment
 //! - Heartbeat registration
 //! - Agent notification forwarding
 //! - Message parsing and dispatch to Hub actions
@@ -12,6 +11,7 @@
 //!
 //! The [`ApiClient`] struct encapsulates all server communication, providing
 //! a clean interface for the TUI application to interact with the backend.
+//! Message delivery is handled by the WebSocket command channel, not HTTP polling.
 //!
 //! # Modules
 //!
@@ -27,4 +27,4 @@ pub mod types;
 
 pub use client::ApiClient;
 pub use messages::{message_to_hub_action, MessageContext, MessageError, ParsedMessage};
-pub use types::{AgentHeartbeatInfo, MessageData, MessageResponse};
+pub use types::{AgentHeartbeatInfo, MessageData};

@@ -1,48 +1,37 @@
-//! Browser event handling for the Hub.
+//! Browser relay event handling.
 //!
-//! This module provides browser event processing functions that are called from
-//! the Hub's event loop. Functions take `&mut Hub` to access state and dispatch actions.
+//! This module handles relay-level events from the browser WebSocket relay.
+//! Bootstrap events (Connected, Disconnected) update BrowserState and drive
+//! client lifecycle (ClientConnected/ClientDisconnected). These events fire
+//! after the Signal Protocol handshake completes, guaranteeing the E2E
+//! session exists before BrowserClient is created.
+//! Command events (SelectAgent, CreateAgent, Scroll, etc.) are converted
+//! to HubActions and dispatched to the Hub.
 //!
 //! # Architecture
 //!
-//! Browser events flow from the relay connection to these handlers:
-//!
 //! ```text
-//! WebSocket → BrowserEvent → browser::poll_events() → Hub state changes
-//!                                                   → HubAction dispatch
-//!                                                   → Browser responses
+//! WebSocket → BrowserEvent → browser::poll_events() → Bootstrap state changes
+//!                                                    → HubAction dispatch
 //! ```
 //!
-//! # Functions
-//!
-//! - [`poll_events`] - Main event loop integration point (TUI mode)
-//! - [`poll_events_headless`] - Main event loop integration point (headless mode)
-//! - [`send_agent_list`] - Send agent list to browser
-//! - [`send_worktree_list`] - Send worktree list to browser
+//! BrowserClient also handles events independently via its own hub channel
+//! subscription and BrowserRequest processing in its async task.
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-01
 
 use anyhow::Result;
 
-use crate::client::ClientId;
 use crate::hub::{actions, Hub};
-use crate::relay::{events::browser_event_to_client_action, BrowserEvent, BrowserSendContext};
+use crate::relay::BrowserEvent;
 
-/// Get browser send context if browser is connected.
-fn browser_ctx(hub: &Hub) -> Option<BrowserSendContext<'_>> {
-    hub.browser
-        .sender
-        .as_ref()
-        .map(|sender| BrowserSendContext {
-            sender,
-            runtime: &hub.tokio_runtime,
-        })
-}
-
-/// Poll and handle browser events from the terminal relay.
+/// Poll and handle browser relay events from the terminal relay.
 ///
 /// This is the main integration point between the browser relay and the Hub.
 /// Called from the Hub's event loop to process incoming browser events.
+///
+/// Only handles bootstrap events (Connected, Disconnected, BundleRegenerated).
+/// All command routing is handled by BrowserClient's async task.
 ///
 /// # Arguments
 ///
@@ -59,13 +48,14 @@ pub fn poll_events(
     poll_events_headless(hub)
 }
 
-/// Poll and handle browser events in headless mode.
+/// Poll and handle browser relay events in headless mode.
 ///
 /// Same as `poll_events` but doesn't require a terminal reference.
 /// Used by headless mode where no TUI is available.
 ///
-/// Events are now client-scoped via `browser_event_to_client_action`, enabling
-/// independent selection and routing per browser client.
+/// Handles all browser events:
+/// - Bootstrap/lifecycle: Connected, Disconnected, BundleRegenerated
+/// - Command routing: SelectAgent, CreateAgent, DeleteAgent, Scroll, etc.
 ///
 /// # Errors
 ///
@@ -74,85 +64,24 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
     let browser_events = hub.browser.drain_events();
 
     for (event, browser_identity) in browser_events {
-        // Try to convert to client-scoped action first
-        if let Some(action) = browser_event_to_client_action(&event, &browser_identity) {
-            actions::dispatch(hub, action);
-
-            // Handle additional side effects based on event type
-            // Some events need to update BrowserState in addition to client state
-            match &event {
-                BrowserEvent::Connected { device_name, .. } => {
-                    // Update shared BrowserState for backwards compatibility
-                    hub.browser.handle_connected(device_name);
-                    // Send initial data to THIS browser only (not broadcast)
-                    send_agent_list_to_browser(hub, &browser_identity);
-                    send_worktree_list_to_browser(hub, &browser_identity);
-                }
-                BrowserEvent::Disconnected => {
-                    hub.browser.handle_disconnected();
-                }
-                BrowserEvent::SelectAgent { id } => {
-                    hub.browser.invalidate_screen();
-                    send_agent_selected_to_browser(hub, &browser_identity, id);
-                }
-                BrowserEvent::DeleteAgent { .. } => {
-                    hub.browser.invalidate_screen();
-                    // All browsers need to know agent was deleted
-                    send_agent_list(hub);
-                }
-                BrowserEvent::CreateAgent { .. } | BrowserEvent::ReopenWorktree { .. } => {
-                    hub.browser.invalidate_screen();
-                    // Agent creation is async - agent_list, selection, and scrollback
-                    // are sent from handle_pending_agent_result when the agent is ready
-                }
-                BrowserEvent::TogglePtyView
-                | BrowserEvent::Scroll { .. }
-                | BrowserEvent::ScrollToTop
-                | BrowserEvent::ScrollToBottom => {
-                    hub.browser.invalidate_screen();
-                }
-                _ => {}
-            }
-            continue;
-        }
-
-        // Handle events not covered by client-scoped actions
         match event {
-            // ConnectToPty: wire up agent channels and send command to BrowserClient
-            BrowserEvent::ConnectToPty { agent_index, pty_index } => {
-                let agent_key = hub.state.read().unwrap()
-                    .agent_keys_ordered
-                    .get(agent_index)
-                    .cloned();
+            // === Bootstrap Events ===
 
-                if let Some(key) = agent_key {
-                    hub.connect_agent_channels(&key, agent_index);
-
-                    let client_id = ClientId::Browser(browser_identity.clone());
-                    if let Some(handle) = hub.clients.get(&client_id) {
-                        let _ = handle.cmd_tx.try_send(
-                            crate::client::ClientCmd::ConnectToPty {
-                                agent_index,
-                                pty_index,
-                            },
-                        );
-                    }
-                } else {
-                    log::warn!("ConnectToPty: agent at index {} not found", agent_index);
-                }
+            BrowserEvent::Connected { ref device_name, .. } => {
+                hub.browser.handle_connected(device_name);
+                // Create BrowserClient after Signal handshake completes.
+                // The command channel browser_connected message arrives earlier
+                // (on HubChannel subscribe), but the Signal session isn't ready yet.
+                let client_id = crate::client::ClientId::Browser(browser_identity.clone());
+                actions::dispatch(hub, crate::hub::HubAction::ClientConnected { client_id });
             }
 
-            // SetMode updates shared BrowserState mode
-            BrowserEvent::SetMode { mode } => {
-                hub.browser.handle_set_mode(&mode);
+            BrowserEvent::Disconnected => {
+                hub.browser.handle_disconnected();
+                let client_id = crate::client::ClientId::Browser(browser_identity.clone());
+                actions::dispatch(hub, crate::hub::HubAction::ClientDisconnected { client_id });
             }
 
-            // GenerateInvite is handled directly in relay connection.rs
-            BrowserEvent::GenerateInvite => {
-                log::warn!("GenerateInvite reached Hub - should be handled in relay");
-            }
-
-            // BundleRegenerated - new PreKeyBundle was generated
             BrowserEvent::BundleRegenerated { bundle } => {
                 log::info!("Received regenerated PreKeyBundle");
                 hub.browser.signal_bundle = Some(bundle);
@@ -170,130 +99,110 @@ pub fn poll_events_headless(hub: &mut Hub) -> Result<()> {
                 }
             }
 
-            // All other events are handled by client-scoped actions above
-            _ => {}
+            // === Command Events — convert to HubActions and dispatch ===
+
+            BrowserEvent::SelectAgent { ref id } => {
+                let client_id = crate::client::ClientId::Browser(browser_identity.clone());
+                actions::dispatch(hub, crate::hub::HubAction::SelectAgentForClient {
+                    client_id,
+                    agent_key: id.clone(),
+                });
+            }
+
+            BrowserEvent::CreateAgent { ref issue_or_branch, ref prompt } => {
+                let client_id = crate::client::ClientId::Browser(browser_identity.clone());
+                let request = crate::client::CreateAgentRequest {
+                    issue_or_branch: issue_or_branch.clone().unwrap_or_default(),
+                    prompt: prompt.clone(),
+                    from_worktree: None,
+                    dims: None, // Hub will use defaults
+                };
+                actions::dispatch(hub, crate::hub::HubAction::CreateAgentForClient {
+                    client_id,
+                    request,
+                });
+            }
+
+            BrowserEvent::ReopenWorktree { ref path, ref branch, ref prompt } => {
+                let client_id = crate::client::ClientId::Browser(browser_identity.clone());
+                let request = crate::client::CreateAgentRequest {
+                    issue_or_branch: branch.clone(),
+                    prompt: prompt.clone(),
+                    from_worktree: Some(std::path::PathBuf::from(path)),
+                    dims: None,
+                };
+                actions::dispatch(hub, crate::hub::HubAction::CreateAgentForClient {
+                    client_id,
+                    request,
+                });
+            }
+
+            BrowserEvent::DeleteAgent { ref id, delete_worktree } => {
+                let client_id = crate::client::ClientId::Browser(browser_identity.clone());
+                let request = crate::client::DeleteAgentRequest {
+                    agent_id: id.clone(),
+                    delete_worktree,
+                };
+                actions::dispatch(hub, crate::hub::HubAction::DeleteAgentForClient {
+                    client_id,
+                    request,
+                });
+            }
+
+            BrowserEvent::Scroll { ref direction, lines } => {
+                let client_id = crate::client::ClientId::Browser(browser_identity.clone());
+                let scroll = if direction == "up" {
+                    crate::hub::actions::ScrollDirection::Up(lines as usize)
+                } else {
+                    crate::hub::actions::ScrollDirection::Down(lines as usize)
+                };
+                actions::dispatch(hub, crate::hub::HubAction::ScrollForClient { client_id, scroll });
+            }
+
+            BrowserEvent::ScrollToTop => {
+                let client_id = crate::client::ClientId::Browser(browser_identity.clone());
+                actions::dispatch(hub, crate::hub::HubAction::ScrollForClient {
+                    client_id,
+                    scroll: crate::hub::actions::ScrollDirection::ToTop,
+                });
+            }
+
+            BrowserEvent::ScrollToBottom => {
+                let client_id = crate::client::ClientId::Browser(browser_identity.clone());
+                actions::dispatch(hub, crate::hub::HubAction::ScrollForClient {
+                    client_id,
+                    scroll: crate::hub::actions::ScrollDirection::ToBottom,
+                });
+            }
+
+            BrowserEvent::TogglePtyView => {
+                let client_id = crate::client::ClientId::Browser(browser_identity.clone());
+                actions::dispatch(hub, crate::hub::HubAction::TogglePtyViewForClient { client_id });
+            }
+
+            BrowserEvent::SetMode { .. } => {
+                // Mode is browser-local state, no Hub action needed.
+                log::debug!("Browser SetMode event (handled client-side)");
+            }
+
+            BrowserEvent::ListAgents | BrowserEvent::ListWorktrees => {
+                // These are handled by BrowserClient when it loads initial data.
+                log::debug!("Browser list request (handled by BrowserClient on connect)");
+            }
+
+            BrowserEvent::Input(_) | BrowserEvent::Resize(_) => {
+                // Input and resize are per-PTY events handled by BrowserClient's
+                // TerminalRelayChannel, not the bootstrap relay.
+                log::trace!("Browser PTY event (handled by BrowserClient TerminalRelayChannel)");
+            }
+
+            BrowserEvent::GenerateInvite => {
+                log::warn!("GenerateInvite reached Hub - should be handled in relay");
+            }
         }
     }
 
     Ok(())
-}
-
-/// Send agent list to browser.
-///
-/// Collects agent information and sends it to the connected browser client.
-pub fn send_agent_list(hub: &Hub) {
-    let Some(ctx) = browser_ctx(hub) else { return };
-
-    let state = hub.state.read().unwrap();
-    let agents = state
-        .agent_keys_ordered
-        .iter()
-        .filter_map(|id| state.agents.get(id).map(|a| (id, a)))
-        .map(|(id, a)| crate::relay::build_agent_info(id, a, &hub.hub_identifier))
-        .collect();
-
-    crate::relay::send_agent_list(&ctx, agents);
-}
-
-/// Send worktree list to browser.
-///
-/// Loads and sends available worktree information to the connected browser client.
-pub fn send_worktree_list(hub: &mut Hub) {
-    // Load worktrees fresh (they may not have been loaded yet)
-    if let Err(e) = hub.load_available_worktrees() {
-        log::warn!("Failed to load worktrees: {}", e);
-    }
-
-    // Get browser context after loading worktrees (borrow checker)
-    let Some(ctx) = browser_ctx(hub) else { return };
-
-    let worktrees = hub
-        .state
-        .read()
-        .unwrap()
-        .available_worktrees
-        .iter()
-        .map(|(path, branch)| crate::relay::build_worktree_info(path, branch))
-        .collect();
-
-    crate::relay::send_worktree_list(&ctx, worktrees);
-}
-
-// === Targeted send functions (per-client routing) ===
-
-/// Send agent list to a specific browser (not broadcast).
-pub fn send_agent_list_to_browser(hub: &Hub, browser_identity: &str) {
-    let Some(ctx) = browser_ctx(hub) else { return };
-
-    let state = hub.state.read().unwrap();
-    let agents = state
-        .agent_keys_ordered
-        .iter()
-        .filter_map(|id| state.agents.get(id).map(|a| (id, a)))
-        .map(|(id, a)| crate::relay::build_agent_info(id, a, &hub.hub_identifier))
-        .collect();
-
-    crate::relay::send_agent_list_to(&ctx, browser_identity, agents);
-}
-
-/// Send worktree list to a specific browser (not broadcast).
-pub fn send_worktree_list_to_browser(hub: &mut Hub, browser_identity: &str) {
-    // Load worktrees fresh (they may not have been loaded yet)
-    if let Err(e) = hub.load_available_worktrees() {
-        log::warn!("Failed to load worktrees: {}", e);
-    }
-
-    // Get browser context after loading worktrees (borrow checker)
-    let Some(ctx) = browser_ctx(hub) else { return };
-
-    let worktrees = hub
-        .state
-        .read()
-        .unwrap()
-        .available_worktrees
-        .iter()
-        .map(|(path, branch)| crate::relay::build_worktree_info(path, branch))
-        .collect();
-
-    crate::relay::send_worktree_list_to(&ctx, browser_identity, worktrees);
-}
-
-/// Send agent selected notification to a specific browser (not broadcast).
-fn send_agent_selected_to_browser(hub: &Hub, browser_identity: &str, agent_id: &str) {
-    let Some(ctx) = browser_ctx(hub) else { return };
-    crate::relay::send_agent_selected_to(&ctx, browser_identity, agent_id);
-}
-
-/// Send scrollback history to a specific browser (not broadcast).
-///
-/// # Arguments
-///
-/// * `hub` - Hub reference for agent and relay access
-/// * `browser_identity` - Signal identity of the target browser
-/// * `agent_id` - The agent ID to get scrollback from
-/// * `view` - Which PTY view to get scrollback from
-pub fn send_scrollback_for_agent_to_browser(
-    hub: &Hub,
-    browser_identity: &str,
-    agent_id: &str,
-    view: crate::agent::PtyView,
-) {
-    let Some(ctx) = browser_ctx(hub) else { return };
-    let state = hub.state.read().unwrap();
-    let Some(agent) = state.agents.get(agent_id) else {
-        log::warn!("Cannot send scrollback for unknown agent: {}", agent_id);
-        return;
-    };
-
-    let bytes = agent.get_scrollback_snapshot(view);
-    log::info!(
-        "Sending {} scrollback bytes to browser {} for agent {} ({:?})",
-        bytes.len(),
-        &browser_identity[..8.min(browser_identity.len())],
-        agent_id,
-        view
-    );
-    crate::relay::send_scrollback_to(&ctx, browser_identity, bytes);
 }
 
 #[cfg(test)]

@@ -41,6 +41,7 @@ class HubChannel < ApplicationCable::Channel
 
     if @browser_identity.present?
       Rails.logger.info "[HubChannel] Browser subscribed: hub=#{@hub_id} identity=#{@browser_identity[0..8]}..."
+      notify_cli_of_browser_connection
     else
       Rails.logger.info "[HubChannel] CLI subscribed: hub=#{@hub_id}"
     end
@@ -49,6 +50,7 @@ class HubChannel < ApplicationCable::Channel
   def unsubscribed
     if @browser_identity.present?
       Rails.logger.info "[HubChannel] Browser unsubscribed: hub=#{@hub_id}"
+      notify_cli_of_browser_disconnection
     else
       Rails.logger.info "[HubChannel] CLI unsubscribed: hub=#{@hub_id}"
     end
@@ -116,5 +118,27 @@ class HubChannel < ApplicationCable::Channel
 
   def browser_stream_name(identity)
     "hub:#{@hub_id}:browser:#{identity}"
+  end
+
+  def notify_cli_of_browser_connection
+    hub = current_user.hubs.find_by(identifier: @hub_id) || current_user.hubs.find_by(id: @hub_id)
+    return unless hub
+
+    Bot::Message.create_for_hub!(hub,
+      event_type: "browser_connected",
+      payload: { browser_identity: @browser_identity })
+  rescue => e
+    Rails.logger.warn "[HubChannel] Failed to notify CLI of browser connection: #{e.message}"
+  end
+
+  def notify_cli_of_browser_disconnection
+    hub = current_user.hubs.find_by(identifier: @hub_id) || current_user.hubs.find_by(id: @hub_id)
+    return unless hub
+
+    Bot::Message.create_for_hub!(hub,
+      event_type: "browser_disconnected",
+      payload: { browser_identity: @browser_identity })
+  rescue => e
+    Rails.logger.warn "[HubChannel] Failed to notify CLI of browser disconnection: #{e.message}"
   end
 end

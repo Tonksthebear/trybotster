@@ -503,13 +503,6 @@ impl HubRelay {
             },
             BrowserCommand::ScrollToBottom => BrowserEvent::ScrollToBottom,
             BrowserCommand::ScrollToTop => BrowserEvent::ScrollToTop,
-            BrowserCommand::ConnectToPty {
-                agent_index,
-                pty_index,
-            } => BrowserEvent::ConnectToPty {
-                agent_index,
-                pty_index,
-            },
             BrowserCommand::Resize { cols, rows } => {
                 BrowserEvent::Resize(BrowserResize { cols, rows })
             }

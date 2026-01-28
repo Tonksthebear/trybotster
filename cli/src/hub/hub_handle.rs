@@ -183,6 +183,26 @@ impl HubHandle {
         self.handle_cache.get_agent(index)
     }
 
+    /// Get all agent handles from the cache (non-blocking).
+    ///
+    /// Returns a snapshot of all cached `AgentHandle` instances in display order.
+    /// Useful for searching agents by ID without knowing their index.
+    ///
+    /// **NOTE**: Reads directly from HandleCache without sending commands to Hub.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handles = handle.get_all_agent_handles();
+    /// if let Some(idx) = handles.iter().position(|h| h.agent_id() == "target-id") {
+    ///     // Found the agent at index `idx`
+    /// }
+    /// ```
+    #[must_use]
+    pub fn get_all_agent_handles(&self) -> Vec<AgentHandle> {
+        self.handle_cache.get_all_agents()
+    }
+
     /// Request agent creation (fire-and-forget).
     ///
     /// Sends a request to create a new agent. This method returns immediately

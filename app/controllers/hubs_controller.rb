@@ -33,7 +33,7 @@ class HubsController < ApplicationController
       end
       format.json do
         # Return hub status for browser-side error handling
-        # Used by connection_controller.js to show appropriate error messages
+        # Used by hub_connection_controller.js to show appropriate error messages
         render json: {
           id: @hub.id,
           identifier: @hub.identifier,

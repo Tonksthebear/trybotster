@@ -45,7 +45,7 @@ export async function initSignal(workerUrl, wasmJsUrl, wasmBinaryUrl) {
       await sendToWorker("init", { wasmJsUrl, wasmBinaryUrl });
 
       workerReady = true;
-      console.log("[Signal] Worker initialized");
+      console.debug("[Signal] Worker initialized");
     } catch (error) {
       console.error("[Signal] Failed to initialize worker:", error);
       initPromise = null;
@@ -212,24 +212,24 @@ function parseBinaryBundle(bytes) {
  */
 export function parseBundleFromFragment() {
   const hash = window.location.hash;
-  console.log("[Signal] Parsing fragment, hash length:", hash?.length || 0);
+  console.debug("[Signal] Parsing fragment, hash length:", hash?.length || 0);
 
   if (!hash) {
-    console.log("[Signal] No hash in URL");
+    console.debug("[Signal] No hash in URL (using cached session)");
     return null;
   }
 
   const base32Data = hash.startsWith("#") ? hash.slice(1) : hash;
   if (!base32Data || base32Data.length < 100) {
-    console.log("[Signal] No valid bundle in hash");
+    console.debug("[Signal] No valid bundle in hash");
     return null;
   }
 
-  console.log("[Signal] Found bundle, Base32 length:", base32Data.length);
+  console.debug("[Signal] Found bundle, Base32 length:", base32Data.length);
 
   try {
     const bytes = base32Decode(base32Data);
-    console.log("[Signal] Decoded to", bytes.length, "bytes");
+    console.debug("[Signal] Decoded to", bytes.length, "bytes");
 
     const bundle = parseBinaryBundle(bytes);
 
@@ -237,7 +237,7 @@ export function parseBundleFromFragment() {
     bundle.hub_id = hubMatch ? hubMatch[1] : "";
     bundle.device_id = 1;
 
-    console.log(
+    console.debug(
       "[Signal] Successfully parsed binary bundle, version:",
       bundle.version,
       "hub:",
@@ -296,11 +296,11 @@ export class SignalSession {
   static async loadOrCreate(bundleJson, hubId) {
     const existing = await SignalSession.load(hubId);
     if (existing) {
-      console.log("[Signal] Restored existing session for hub:", hubId);
+      console.debug("[Signal] Restored existing session for hub:", hubId);
       return existing;
     }
 
-    console.log("[Signal] Creating new session for hub:", hubId);
+    console.debug("[Signal] Creating new session for hub:", hubId);
     return SignalSession.create(bundleJson, hubId);
   }
 

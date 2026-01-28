@@ -24,7 +24,7 @@
 //!
 //! BrowserClient runs as an independent async task via `run_task()`. It processes:
 //! - `BrowserRequest` from background input receiver tasks (keyboard input, resize)
-//! - `ClientCmd` from Hub (commands like disconnect, shutdown)
+//! - `HubEvent` from Hub broadcast (agent lifecycle, shutdown)
 //!
 //! # PTY I/O Routing
 //!
@@ -54,12 +54,17 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::agent::pty::PtyEvent;
-use crate::channel::{ActionCableChannel, Channel, ChannelConfig, PeerId};
+use crate::channel::{
+    ActionCableChannel, Channel, ChannelConfig, ChannelSenderHandle, PeerId,
+};
 use crate::hub::HubHandle;
 use crate::relay::crypto_service::CryptoServiceHandle;
-use crate::relay::{build_scrollback_message, BrowserCommand, TerminalMessage};
+use crate::relay::{
+    build_scrollback_message, build_worktree_info, AgentCreationStage, BrowserCommand,
+    TerminalMessage, WorktreeInfo,
+};
 
-use super::{Client, ClientCmd, ClientId};
+use super::{Client, ClientId, CreateAgentRequest, DeleteAgentRequest};
 
 /// Requests from Browser to BrowserClient.
 ///
@@ -183,6 +188,21 @@ pub struct BrowserClient {
     /// Browser can have multiple simultaneous connections (one per tab).
     terminal_channels: HashMap<(usize, usize), TerminalChannel>,
 
+    /// Per-browser ActionCableChannel for hub-level control plane communication.
+    ///
+    /// Created and connected in `run_task()` via `connect_hub_channel()` before
+    /// the event loop starts. Separate from per-PTY terminal channels -- this
+    /// carries commands like ListAgents, SelectAgent, CreateAgent, etc.
+    /// `None` until `connect_hub_channel()` succeeds, or in tests.
+    hub_channel: Option<ActionCableChannel>,
+
+    /// Sender handle for outgoing hub-level control messages to the browser.
+    ///
+    /// Extracted from `hub_channel` after connection. Used by Phase 2.2 send
+    /// methods to push agent lists, status updates, and error messages.
+    /// `None` if `hub_channel` is not connected.
+    hub_sender: Option<ChannelSenderHandle>,
+
     /// Sender for browser background tasks to route operations through Client trait.
     ///
     /// Cloned and passed to each `spawn_pty_input_receiver` task. Each task sends
@@ -195,6 +215,12 @@ pub struct BrowserClient {
     /// Consumed by `run_task()` which processes requests in a `tokio::select!` loop.
     /// All input receiver tasks (one per PTY connection) share the single `request_tx` sender.
     request_rx: Option<UnboundedReceiver<BrowserRequest>>,
+
+    /// Broadcast receiver for Hub events (agent created/deleted/status, shutdown).
+    ///
+    /// Taken once by `run_task()` via `take_hub_event_rx()` and consumed in the
+    /// async event loop. `None` after first take or if not provided at construction.
+    hub_event_rx: Option<tokio::sync::broadcast::Receiver<crate::hub::HubEvent>>,
 }
 
 impl BrowserClient {
@@ -205,11 +231,13 @@ impl BrowserClient {
     /// * `hub_handle` - Handle for Hub communication and agent queries.
     /// * `identity` - Signal identity key from browser handshake.
     /// * `config` - Connection config for ActionCable channels.
+    /// * `hub_event_rx` - Optional broadcast receiver for Hub events.
     #[must_use]
     pub fn new(
         hub_handle: HubHandle,
         identity: String,
         config: BrowserClientConfig,
+        hub_event_rx: Option<tokio::sync::broadcast::Receiver<crate::hub::HubEvent>>,
     ) -> Self {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
 
@@ -221,8 +249,11 @@ impl BrowserClient {
             hub_handle,
             config,
             terminal_channels: HashMap::new(),
+            hub_channel: None,
+            hub_sender: None,
             request_tx,
             request_rx: Some(request_rx),
+            hub_event_rx,
         }
     }
 
@@ -250,14 +281,6 @@ impl BrowserClient {
         self.terminal_channels.keys().copied()
     }
 
-    /// Clear all connection state without notifying PTYs.
-    ///
-    /// Used when the agent is deleted and PTYs no longer exist.
-    /// Drops all terminal channels, aborting their tasks.
-    pub fn clear_connection(&mut self) {
-        self.terminal_channels.clear();
-    }
-
     /// Handle a single request from a browser background task.
     ///
     /// Routes the request to the appropriate Client trait method. Unlike
@@ -279,15 +302,361 @@ impl BrowserClient {
         }
     }
 
+    /// Handle a browser command received via the hub channel.
+    ///
+    /// Parses the incoming JSON payload as a [`BrowserCommand`] and dispatches
+    /// to the appropriate Client trait method or local handler. This is the
+    /// Phase 2.3 direct handling path -- browser commands arrive over the
+    /// per-browser hub channel and are processed here without going through
+    /// the relay/browser.rs layer.
+    ///
+    /// # Command Routing
+    ///
+    /// - **Agent management** (`CreateAgent`, `DeleteAgent`, `SelectAgent`) -- use Client trait
+    /// - **View commands** (`Scroll`, `ScrollToTop`, `ScrollToBottom`, `TogglePtyView`, `SetMode`)
+    ///   -- browser-side state, logged here
+    /// - **Data queries** (`ListAgents`, `ListWorktrees`) -- send via hub channel
+    /// - **Input/Resize** -- arrive via TerminalRelayChannel, not here
+    /// - **PTY connections** -- handled via `PtyConnectionRequested` HubEvent, not commands
+    /// - **GenerateInvite** -- handled by bootstrap relay, not BrowserClient
+    async fn handle_browser_command(&mut self, payload: &[u8]) {
+        let command: BrowserCommand = match serde_json::from_slice(payload) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                log::warn!(
+                    "BrowserClient {}: failed to parse browser command: {}",
+                    &self.identity[..8.min(self.identity.len())],
+                    e
+                );
+                return;
+            }
+        };
+
+        match command {
+            BrowserCommand::SelectAgent { id } => {
+                log::info!(
+                    "BrowserClient {}: SelectAgent {}",
+                    &self.identity[..8.min(self.identity.len())],
+                    &id[..8.min(id.len())]
+                );
+                // Find the agent index by scanning the handle cache.
+                let mut agent_index = None;
+                for i in 0.. {
+                    match self.hub_handle.get_agent(i) {
+                        Some(handle) if handle.agent_id() == id => {
+                            agent_index = Some(i);
+                            break;
+                        }
+                        Some(_) => continue,
+                        None => break,
+                    }
+                }
+
+                if let Some(index) = agent_index {
+                    match self.select_agent(index).await {
+                        Ok(_metadata) => {
+                            self.send_agent_selected(&id).await;
+                            log::info!(
+                                "BrowserClient {}: agent {} selected successfully",
+                                &self.identity[..8.min(self.identity.len())],
+                                &id[..8.min(id.len())]
+                            );
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Failed to select agent {}: {}",
+                                &id[..8.min(id.len())],
+                                e
+                            );
+                            self.send_error_to_browser(&e).await;
+                        }
+                    }
+                } else {
+                    log::warn!(
+                        "BrowserClient {}: agent {} not found",
+                        &self.identity[..8.min(self.identity.len())],
+                        &id[..8.min(id.len())]
+                    );
+                    self.send_error_to_browser("Agent not found").await;
+                }
+            }
+
+            BrowserCommand::CreateAgent {
+                issue_or_branch,
+                prompt,
+            } => {
+                let identifier = issue_or_branch.clone().unwrap_or_default();
+                log::info!(
+                    "BrowserClient {}: CreateAgent '{}'",
+                    &self.identity[..8.min(self.identity.len())],
+                    &identifier
+                );
+                let request = CreateAgentRequest {
+                    issue_or_branch: identifier,
+                    prompt,
+                    from_worktree: None,
+                    dims: Some(self.dims),
+                };
+                if let Err(e) = self.create_agent(request).await {
+                    log::error!("Failed to create agent: {}", e);
+                    self.send_error_to_browser(&e).await;
+                }
+            }
+
+            BrowserCommand::ReopenWorktree {
+                path,
+                branch,
+                prompt,
+            } => {
+                log::info!(
+                    "BrowserClient {}: ReopenWorktree '{}' branch '{}'",
+                    &self.identity[..8.min(self.identity.len())],
+                    &path,
+                    &branch
+                );
+                let request = CreateAgentRequest {
+                    issue_or_branch: branch,
+                    prompt,
+                    from_worktree: Some(std::path::PathBuf::from(&path)),
+                    dims: Some(self.dims),
+                };
+                if let Err(e) = self.create_agent(request).await {
+                    log::error!("Failed to reopen worktree '{}': {}", &path, e);
+                    self.send_error_to_browser(&e).await;
+                }
+            }
+
+            BrowserCommand::DeleteAgent {
+                id,
+                delete_worktree,
+            } => {
+                log::info!(
+                    "BrowserClient {}: DeleteAgent {} (delete_worktree={})",
+                    &self.identity[..8.min(self.identity.len())],
+                    &id[..8.min(id.len())],
+                    delete_worktree.unwrap_or(false)
+                );
+                let request = DeleteAgentRequest {
+                    agent_id: id.clone(),
+                    delete_worktree: delete_worktree.unwrap_or(false),
+                };
+                if let Err(e) = self.delete_agent(request).await {
+                    log::error!(
+                        "Failed to delete agent {}: {}",
+                        &id[..8.min(id.len())],
+                        e
+                    );
+                    self.send_error_to_browser(&e).await;
+                }
+            }
+
+            BrowserCommand::Resize { cols, rows } => {
+                log::debug!(
+                    "BrowserClient {}: Resize {}x{}",
+                    &self.identity[..8.min(self.identity.len())],
+                    cols,
+                    rows
+                );
+                self.dims = (cols, rows);
+                // Resize all currently connected PTYs to the new dimensions.
+                let connected: Vec<(usize, usize)> =
+                    self.terminal_channels.keys().copied().collect();
+                for (agent_index, pty_index) in connected {
+                    if let Err(e) = self.resize_pty(agent_index, pty_index, rows, cols).await {
+                        log::debug!(
+                            "Failed to resize PTY ({}, {}): {}",
+                            agent_index,
+                            pty_index,
+                            e
+                        );
+                    }
+                }
+            }
+
+            BrowserCommand::SetMode { mode } => {
+                log::info!(
+                    "BrowserClient {}: SetMode '{}'",
+                    &self.identity[..8.min(self.identity.len())],
+                    mode
+                );
+                // Mode state is managed by the browser. The old relay path updates
+                // BrowserState on Hub, but BrowserClient doesn't own that state.
+                // TODO Phase 2.4: consider whether BrowserClient needs mode tracking.
+            }
+
+            BrowserCommand::Scroll {
+                direction,
+                lines,
+            } => {
+                log::debug!(
+                    "BrowserClient {}: Scroll {} {} lines",
+                    &self.identity[..8.min(self.identity.len())],
+                    direction,
+                    lines.unwrap_or(10)
+                );
+                // Scroll is browser-side view state. The browser's xterm.js handles
+                // scrolling directly. No server-side action needed.
+            }
+
+            BrowserCommand::ScrollToTop => {
+                log::debug!(
+                    "BrowserClient {}: ScrollToTop",
+                    &self.identity[..8.min(self.identity.len())]
+                );
+                // Browser-side view state, no server action needed.
+            }
+
+            BrowserCommand::ScrollToBottom => {
+                log::debug!(
+                    "BrowserClient {}: ScrollToBottom",
+                    &self.identity[..8.min(self.identity.len())]
+                );
+                // Browser-side view state, no server action needed.
+            }
+
+            BrowserCommand::TogglePtyView => {
+                log::info!(
+                    "BrowserClient {}: TogglePtyView",
+                    &self.identity[..8.min(self.identity.len())]
+                );
+                // PTY view toggle is browser-side state. The browser decides which
+                // PTY (CLI vs Server) to display and connects accordingly.
+                // TODO Phase 2.4: may need to coordinate PTY connections here.
+            }
+
+            BrowserCommand::Input { data } => {
+                // Input should arrive via TerminalRelayChannel (per-PTY channels),
+                // not the hub control channel. Log if received here.
+                log::debug!(
+                    "BrowserClient {}: Input received on hub channel ({} bytes) -- expected on PTY channel",
+                    &self.identity[..8.min(self.identity.len())],
+                    data.len()
+                );
+            }
+
+            BrowserCommand::ListAgents => {
+                log::info!(
+                    "BrowserClient {}: ListAgents",
+                    &self.identity[..8.min(self.identity.len())]
+                );
+                self.send_agent_list_to_browser().await;
+            }
+
+            BrowserCommand::ListWorktrees => {
+                log::info!(
+                    "BrowserClient {}: ListWorktrees",
+                    &self.identity[..8.min(self.identity.len())]
+                );
+                self.send_worktree_list_to_browser().await;
+            }
+
+            BrowserCommand::GenerateInvite => {
+                // GenerateInvite is handled by the bootstrap relay connection,
+                // not by individual BrowserClients.
+                log::warn!(
+                    "BrowserClient {}: GenerateInvite received on hub channel -- should be handled by bootstrap relay",
+                    &self.identity[..8.min(self.identity.len())]
+                );
+            }
+
+            BrowserCommand::Handshake { device_name, .. } => {
+                // Handshake is handled during connection setup in the relay layer,
+                // not by BrowserClient's hub channel. Log if received here.
+                log::debug!(
+                    "BrowserClient {}: Handshake from '{}' received on hub channel -- expected during connection setup",
+                    &self.identity[..8.min(self.identity.len())],
+                    device_name
+                );
+            }
+        }
+    }
+
+    /// Connect the per-browser hub channel for control plane communication.
+    ///
+    /// Builds an `ActionCableChannel` via the builder pattern, connects to the
+    /// `HubChannel` (same channel name as the shared bootstrap channel, but a
+    /// separate WebSocket connection owned by this `BrowserClient`), and stores
+    /// the sender handle for future use.
+    ///
+    /// Called early in `run_task()` before the event loop. If connection fails,
+    /// the caller logs the error but continues -- the browser can reconnect later.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the channel fails to connect.
+    async fn connect_hub_channel(&mut self) -> Result<(), String> {
+        let mut channel = ActionCableChannel::builder()
+            .server_url(&self.config.server_url)
+            .api_key(&self.config.api_key)
+            .crypto_service(self.config.crypto_service.clone())
+            .reliable(true)
+            .build();
+
+        channel
+            .connect(ChannelConfig {
+                channel_name: "HubChannel".to_string(),
+                hub_id: self.config.server_hub_id.clone(),
+                agent_index: None,
+                pty_index: None,
+                encrypt: true,
+                compression_threshold: Some(4096),
+            })
+            .await
+            .map_err(|e| format!("Hub channel connect failed: {}", e))?;
+
+        self.hub_sender = channel.get_sender_handle();
+        if let Some(ref sender) = self.hub_sender {
+            sender.register_peer(PeerId(self.identity.clone()));
+        }
+        self.hub_channel = Some(channel);
+
+        log::info!(
+            "BrowserClient {} connected hub channel",
+            &self.identity[..8.min(self.identity.len())]
+        );
+
+        Ok(())
+    }
+
     /// Run BrowserClient as an independent async task.
     ///
     /// Processes requests from browser input receiver tasks via `request_rx`
-    /// and commands from Hub via `cmd_rx` in a `tokio::select!` loop.
-    pub async fn run_task(mut self, mut cmd_rx: tokio::sync::mpsc::Receiver<ClientCmd>) {
+    /// and hub events via broadcast in a `tokio::select!` loop.
+    pub async fn run_task(mut self) {
         let Some(mut request_rx) = self.request_rx.take() else {
             log::error!("BrowserClient has no request receiver");
             return;
         };
+
+        // If hub_event_rx is None (tests), create a dummy channel that never sends.
+        let (_dummy_tx, mut hub_event_rx) = if let Some(rx) = self.take_hub_event_rx() {
+            (None, rx)
+        } else {
+            let (tx, rx) = tokio::sync::broadcast::channel::<crate::hub::HubEvent>(1);
+            (Some(tx), rx)
+        };
+
+        // Connect per-browser hub channel for control plane communication.
+        // Non-fatal: if this fails, browser can reconnect later. The hub channel
+        // receiver branch in the select loop simply stays inert (pending forever).
+        if let Err(e) = self.connect_hub_channel().await {
+            log::error!(
+                "BrowserClient {} failed to connect hub channel: {}",
+                &self.identity[..8.min(self.identity.len())],
+                e
+            );
+        }
+
+        // Take the receiver handle from the hub channel (if connected).
+        // This must happen after connect_hub_channel() populates self.hub_channel.
+        let mut hub_channel_rx = self
+            .hub_channel
+            .as_mut()
+            .and_then(|ch| ch.take_receiver_handle());
+
+        // Send initial data to browser after hub channel connects.
+        self.send_agent_list_to_browser().await;
+        self.send_worktree_list_to_browser().await;
 
         loop {
             tokio::select! {
@@ -300,25 +669,42 @@ impl BrowserClient {
                         }
                     }
                 }
-                cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(ClientCmd::DisconnectFromPty { agent_index, pty_index }) => {
-                            self.disconnect_from_pty(agent_index, pty_index).await;
+                event = hub_event_rx.recv() => {
+                    match event {
+                        Ok(hub_event) => self.handle_hub_event(hub_event).await,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            log::warn!("BrowserClient lagged {} hub events", n);
                         }
-                        Some(ClientCmd::ConnectToPty { agent_index, pty_index }) => {
-                            if let Err(e) = self.connect_to_pty(agent_index, pty_index).await {
-                                log::error!("Failed to connect to PTY: {}", e);
-                            }
-                        }
-                        Some(ClientCmd::ClearConnection) => {
-                            self.clear_connection();
-                        }
-                        Some(ClientCmd::Shutdown) => {
-                            log::info!("BrowserClient received shutdown command");
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            log::info!("Hub event channel closed, stopping BrowserClient");
                             break;
                         }
+                    }
+                }
+                // Per-browser hub channel: receives control messages from the browser
+                // (ListAgents, SelectAgent, CreateAgent, etc.). If the channel was not
+                // connected, this branch never resolves (pending forever).
+                msg = async {
+                    match hub_channel_rx {
+                        Some(ref mut rx) => rx.recv().await,
                         None => {
-                            log::info!("Hub command channel closed, stopping BrowserClient task");
+                            // No channel connected -- sleep forever so this branch
+                            // never fires and the other select branches run normally.
+                            std::future::pending::<Option<crate::channel::IncomingMessage>>().await
+                        }
+                    }
+                } => {
+                    match msg {
+                        Some(incoming) => {
+                            log::debug!(
+                                "BrowserClient received hub channel message ({} bytes) from {}",
+                                incoming.payload.len(),
+                                incoming.sender,
+                            );
+                            self.handle_browser_command(&incoming.payload).await;
+                        }
+                        None => {
+                            log::warn!("Hub channel closed, stopping BrowserClient");
                             break;
                         }
                     }
@@ -327,6 +713,258 @@ impl BrowserClient {
         }
 
         log::info!("BrowserClient task stopped");
+    }
+
+    // ========================================================================
+    // Hub channel send methods
+    //
+    // These methods send control-plane messages to the browser via the
+    // per-browser hub channel. They use the exact TerminalMessage JSON format
+    // that the browser JavaScript expects.
+    // ========================================================================
+
+    /// Send serialized data to the browser via the hub channel.
+    ///
+    /// Logs a warning and returns gracefully if the hub channel is not connected.
+    /// This is the low-level helper used by all other send methods.
+    async fn send_to_browser(&self, data: &[u8]) {
+        if let Some(ref sender) = self.hub_sender {
+            if let Err(e) = sender.send(data).await {
+                log::warn!("Failed to send to browser: {}", e);
+            }
+        }
+    }
+
+    /// Send a serialized [`TerminalMessage`] to the browser.
+    ///
+    /// Serializes the message to JSON and sends it via [`send_to_browser()`].
+    /// Logs and returns on serialization or send failure.
+    async fn send_terminal_message(&self, message: &TerminalMessage) {
+        match serde_json::to_string(message) {
+            Ok(json) => self.send_to_browser(json.as_bytes()).await,
+            Err(e) => log::warn!("Failed to serialize TerminalMessage: {}", e),
+        }
+    }
+
+    /// Send the current agent list to the browser.
+    ///
+    /// Reads cached agent handles from [`HubHandle`] (non-blocking via
+    /// `HandleCache`) and sends them as a [`TerminalMessage::Agents`] message.
+    /// Uses the standard [`TerminalMessage::Agents`] JSON format.
+    ///
+    /// The `hub_identifier` field on each [`AgentInfo`] is populated from
+    /// [`BrowserClientConfig::server_hub_id`] to match what Hub's
+    /// `build_agent_list()` produces.
+    async fn send_agent_list_to_browser(&self) {
+        let handles = self.hub_handle.get_all_agent_handles();
+        let hub_id = &self.config.server_hub_id;
+
+        let agents: Vec<_> = handles
+            .iter()
+            .map(|h| {
+                let mut info = h.info().clone();
+                // Ensure hub_identifier is set (cached info may have None).
+                if info.hub_identifier.is_none() {
+                    info.hub_identifier = Some(hub_id.clone());
+                }
+                info
+            })
+            .collect();
+
+        let message = TerminalMessage::Agents { agents };
+        self.send_terminal_message(&message).await;
+    }
+
+    /// Send the current worktree list to the browser.
+    ///
+    /// Reads cached worktrees from [`HubHandle`] (non-blocking via
+    /// `HandleCache`) and sends them as a [`TerminalMessage::Worktrees`]
+    /// message. Uses the standard [`TerminalMessage::Worktrees`] JSON format.
+    async fn send_worktree_list_to_browser(&self) {
+        let worktrees_raw = match self.hub_handle.list_worktrees() {
+            Ok(wt) => wt,
+            Err(e) => {
+                log::warn!("Failed to list worktrees: {}", e);
+                return;
+            }
+        };
+
+        let worktrees: Vec<WorktreeInfo> = worktrees_raw
+            .iter()
+            .map(|(path, branch)| build_worktree_info(path, branch))
+            .collect();
+
+        let repo = crate::WorktreeManager::detect_current_repo()
+            .map(|(_, name)| name)
+            .ok();
+
+        let message = TerminalMessage::Worktrees { worktrees, repo };
+        self.send_terminal_message(&message).await;
+    }
+
+    /// Send agent selection confirmation to the browser.
+    ///
+    /// Sends a [`TerminalMessage::AgentSelected`] message matching the format
+    /// previously provided by the now-removed relay send functions.
+    async fn send_agent_selected(&self, agent_id: &str) {
+        let message = TerminalMessage::AgentSelected {
+            id: agent_id.to_string(),
+        };
+        self.send_terminal_message(&message).await;
+    }
+
+    /// Send agent creation progress to the browser.
+    ///
+    /// Sends a [`TerminalMessage::AgentCreatingProgress`] message matching
+    /// the standard [`TerminalMessage::AgentCreatingProgress`] format.
+    async fn send_creation_progress(&self, identifier: &str, stage: &AgentCreationStage) {
+        let message = TerminalMessage::AgentCreatingProgress {
+            identifier: identifier.to_string(),
+            stage: *stage,
+            message: stage.description().to_string(),
+        };
+        self.send_terminal_message(&message).await;
+    }
+
+    /// Send agent created confirmation to the browser.
+    ///
+    /// Sends a [`TerminalMessage::AgentCreated`] message matching the format
+    /// the standard [`TerminalMessage::AgentCreated`] format.
+    async fn send_agent_created(&self, agent_id: &str) {
+        let message = TerminalMessage::AgentCreated {
+            id: agent_id.to_string(),
+        };
+        self.send_terminal_message(&message).await;
+    }
+
+    /// Send an error message to the browser.
+    ///
+    /// Sends a [`TerminalMessage::Error`] message matching the format used
+    /// throughout the relay protocol.
+    async fn send_error_to_browser(&self, error_message: &str) {
+        let message = TerminalMessage::Error {
+            message: error_message.to_string(),
+        };
+        self.send_terminal_message(&message).await;
+    }
+
+    // ========================================================================
+    // Hub event handling
+    // ========================================================================
+
+    /// Handle a hub event broadcast.
+    ///
+    /// Routes hub-level events to browser-specific actions. Sends updated
+    /// state to the browser via the per-browser hub channel and disconnects
+    /// PTYs on agent deletion.
+    ///
+    /// # Event Handling
+    ///
+    /// - `AgentCreated` / `AgentDeleted` / `AgentStatusChanged` - Send updated agent list
+    /// - `AgentDeleted` - Also disconnects PTYs for the deleted agent
+    /// - `AgentCreationProgress` - Forward progress updates to browser
+    /// - `Shutdown` - Log; run_task loop handles actual shutdown via channel close
+    /// - `Error` - Forward error message to browser
+    async fn handle_hub_event(&mut self, event: crate::hub::HubEvent) {
+        use crate::hub::HubEvent;
+        match event {
+            HubEvent::AgentCreated { ref agent_id, .. } => {
+                log::info!(
+                    "BrowserClient: agent created {}, sending agent list + confirmation",
+                    &agent_id[..8.min(agent_id.len())]
+                );
+                self.send_agent_list_to_browser().await;
+                self.send_agent_created(agent_id).await;
+                // Scrollback is available when the browser connects to the PTY
+                // via PtyConnectionRequested, which subscribes to live output events.
+            }
+            HubEvent::AgentDeleted { ref agent_id } => {
+                log::info!(
+                    "BrowserClient: agent deleted {}, disconnecting PTYs",
+                    &agent_id[..8.min(agent_id.len())]
+                );
+
+                // Find the agent's index by scanning cached handles.
+                // Must be done before the cache is updated (Hub broadcasts before removal).
+                let mut agent_index = None;
+                for i in 0.. {
+                    match self.hub_handle.get_agent(i) {
+                        Some(handle) if handle.agent_id() == agent_id => {
+                            agent_index = Some(i);
+                            break;
+                        }
+                        Some(_) => continue,
+                        None => break,
+                    }
+                }
+
+                if let Some(idx) = agent_index {
+                    // Disconnect both CLI PTY (index 0) and Server PTY (index 1).
+                    self.disconnect_from_pty(idx, 0).await;
+                    self.disconnect_from_pty(idx, 1).await;
+                } else {
+                    log::warn!(
+                        "BrowserClient: could not find index for deleted agent {}",
+                        &agent_id[..8.min(agent_id.len())]
+                    );
+                }
+
+                self.send_agent_list_to_browser().await;
+            }
+            HubEvent::AgentStatusChanged { ref agent_id, .. } => {
+                log::info!(
+                    "BrowserClient: agent status changed {}",
+                    &agent_id[..8.min(agent_id.len())]
+                );
+                self.send_agent_list_to_browser().await;
+            }
+            HubEvent::AgentCreationProgress {
+                ref identifier,
+                ref stage,
+            } => {
+                log::info!(
+                    "BrowserClient: creation progress for {} - {:?}",
+                    identifier,
+                    stage
+                );
+                self.send_creation_progress(identifier, stage).await;
+            }
+            HubEvent::Shutdown => {
+                log::info!("BrowserClient received shutdown event");
+                // run_task loop will break on Closed channel or we handle here
+            }
+            HubEvent::Error { ref message } => {
+                log::info!("BrowserClient: error event: {}", message);
+                self.send_error_to_browser(message).await;
+            }
+            HubEvent::PtyConnectionRequested { ref client_id, agent_index, pty_index } => {
+                // Only handle if this is for us.
+                if client_id == &self.id {
+                    log::info!(
+                        "BrowserClient {}: PtyConnectionRequested({}, {})",
+                        &self.identity[..8.min(self.identity.len())],
+                        agent_index,
+                        pty_index
+                    );
+                    if let Err(e) = self.connect_to_pty(agent_index, pty_index).await {
+                        log::error!("Failed to connect to PTY ({}, {}): {}", agent_index, pty_index, e);
+                        self.send_error_to_browser(&e).await;
+                    }
+                }
+            }
+            HubEvent::PtyDisconnectionRequested { ref client_id, agent_index, pty_index } => {
+                // Only handle if this is for us.
+                if client_id == &self.id {
+                    log::info!(
+                        "BrowserClient {}: PtyDisconnectionRequested({}, {})",
+                        &self.identity[..8.min(self.identity.len())],
+                        agent_index,
+                        pty_index
+                    );
+                    self.disconnect_from_pty(agent_index, pty_index).await;
+                }
+            }
+        }
     }
 }
 
@@ -341,6 +979,10 @@ impl Client for BrowserClient {
 
     fn dims(&self) -> (u16, u16) {
         self.dims
+    }
+
+    fn take_hub_event_rx(&mut self) -> Option<tokio::sync::broadcast::Receiver<crate::hub::HubEvent>> {
+        self.hub_event_rx.take()
     }
 
     async fn connect_to_pty_with_handle(
@@ -741,6 +1383,7 @@ mod tests {
             HubHandle::mock(),
             identity.to_string(),
             mock_config(),
+            None,
         )
     }
 
@@ -945,15 +1588,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_task_shutdown() {
-        let client = test_client("test");
+        let mut client = test_client("test");
 
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        // Give client a hub event receiver, then drop the sender to close the channel.
+        // The broadcast channel closing causes run_task to exit.
+        let (hub_event_tx, hub_event_rx) = tokio::sync::broadcast::channel::<crate::hub::HubEvent>(16);
+        client.hub_event_rx = Some(hub_event_rx);
 
-        // Send shutdown command
-        cmd_tx.send(ClientCmd::Shutdown).await.unwrap();
+        // Send Shutdown event; run_task handles it by not forwarding but the
+        // sender drop will close the channel causing the Closed branch to fire.
+        drop(hub_event_tx);
 
-        // run_task should process the shutdown and exit
-        client.run_task(cmd_rx).await;
+        // run_task should detect the closed broadcast channel and exit
+        client.run_task().await;
         // If we reach here, the task completed successfully
     }
 
@@ -1019,6 +1666,7 @@ mod tests {
                 hub_handle,
                 "test-browser-identity-12345678".to_string(),
                 browser_config,
+                None,
             );
 
             (hub, client)

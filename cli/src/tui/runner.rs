@@ -12,17 +12,15 @@
 //! ├── mode, menu_selected, input_buffer  - UI state
 //! ├── agents, selected_agent  - agent state cache
 //! ├── request_tx  - send requests to TuiClient
-//! ├── hub_event_rx  - receive broadcasts from Hub
-//! └── pty_rx  - receive PTY output for selected agent
+//! └── output_rx  - receive PTY output and HubEvents from TuiClient
 //! ```
 //!
 //! # Event Loop
 //!
 //! The TuiRunner event loop:
 //! 1. Polls for keyboard/mouse input
-//! 2. Polls for Hub broadcast events
-//! 3. Polls for PTY output (if agent selected)
-//! 4. Renders the UI
+//! 2. Polls for PTY output and HubEvents (via TuiClient output channel)
+//! 3. Renders the UI
 //!
 //! All communication with Hub is non-blocking via channels.
 //!
@@ -38,6 +36,18 @@
 //! - [`super::runner_handlers`] - `handle_tui_action()`, `handle_hub_event()`
 //! - [`super::runner_agent`] - Agent navigation (`request_select_next()`, etc.)
 //! - [`super::runner_input`] - Input handlers (`handle_menu_select()`, etc.)
+//!
+//! # Event Flow (Phase 1.6+)
+//!
+//! Hub broadcast events flow through TuiClient, not directly to TuiRunner:
+//!
+//! ```text
+//! Hub broadcasts HubEvent
+//!   → TuiClient receives via broadcast::Receiver
+//!   → TuiClient forwards as TuiOutput::HubEvent
+//!   → TuiRunner receives via output_rx in poll_pty_events()
+//!   → TuiRunner calls handle_hub_event()
+//! ```
 
 // Rust guideline compliant 2026-01
 
@@ -51,7 +61,6 @@ use anyhow::Result;
 use crossterm::event::{self, Event};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
-use tokio::sync::broadcast;
 use vt100::Parser;
 
 use ratatui::backend::CrosstermBackend;
@@ -60,7 +69,7 @@ use crate::agent::PtyView;
 use crate::app::AppMode;
 use crate::client::{TuiOutput, TuiRequest};
 use crate::constants;
-use crate::hub::{Hub, HubEvent};
+use crate::hub::Hub;
 use crate::relay::{browser, AgentInfo};
 use crate::tui::layout::terminal_widget_inner_area;
 
@@ -145,9 +154,6 @@ pub struct TuiRunner<B: Backend> {
     /// TuiRunner Hub-agnostic - it only knows about TuiRequest.
     pub(super) request_tx: tokio::sync::mpsc::UnboundedSender<TuiRequest>,
 
-    /// Hub event receiver (broadcasts).
-    hub_event_rx: broadcast::Receiver<HubEvent>,
-
     /// Whether the current agent has a server PTY (for view toggling).
     ///
     /// Updated when selecting an agent via `TuiRequest::SelectAgent`.
@@ -223,8 +229,7 @@ where
     ///
     /// * `terminal` - The ratatui terminal (ownership transferred to runner)
     /// * `request_tx` - Sender for requests to TuiClient
-    /// * `hub_event_rx` - Receiver for Hub broadcasts
-    /// * `output_rx` - Receiver for PTY output from Hub's TuiClient
+    /// * `output_rx` - Receiver for PTY output and HubEvents from TuiClient
     /// * `shutdown` - Shared shutdown flag
     /// * `terminal_dims` - Initial terminal dimensions (rows, cols)
     ///
@@ -234,7 +239,6 @@ where
     pub fn new(
         terminal: Terminal<B>,
         request_tx: tokio::sync::mpsc::UnboundedSender<TuiRequest>,
-        hub_event_rx: broadcast::Receiver<HubEvent>,
         output_rx: tokio::sync::mpsc::UnboundedReceiver<TuiOutput>,
         shutdown: Arc<AtomicBool>,
         terminal_dims: (u16, u16),
@@ -258,7 +262,6 @@ where
             pending_issue_or_branch: None,
             agents: Vec::new(),
             request_tx,
-            hub_event_rx,
             has_server_pty: false,
             selected_agent: None,
             active_pty_view: PtyView::default(),
@@ -325,10 +328,7 @@ where
                 break;
             }
 
-            // 2. Poll Hub events (broadcasts)
-            self.poll_hub_events();
-
-            // 3. Poll PTY events (if agent selected)
+            // 2. Poll PTY events and HubEvents (via TuiClient output channel)
             self.poll_pty_events();
 
             // 4. Render
@@ -416,27 +416,7 @@ where
         }
     }
 
-    /// Poll Hub broadcast events.
-    fn poll_hub_events(&mut self) {
-        // Process up to 100 events per tick
-        for _ in 0..100 {
-            match self.hub_event_rx.try_recv() {
-                Ok(event) => self.handle_hub_event(event),
-                Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    log::warn!("TUI lagged {} hub events", n);
-                    continue;
-                }
-                Err(broadcast::error::TryRecvError::Closed) => {
-                    log::info!("Hub event channel closed, quitting");
-                    self.quit = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Poll PTY output from channel and feed to parser.
+    /// Poll PTY output and HubEvents from TuiClient output channel.
     ///
     /// TuiClient sends `TuiOutput` messages through the channel when connected
     /// to a PTY. TuiRunner receives and processes them here (feeding to vt100
@@ -464,6 +444,11 @@ where
                 Ok(TuiOutput::ProcessExited { exit_code }) => {
                     log::info!("PTY process exited with code {:?}", exit_code);
                     // Process exited - we remain connected for any final output
+                }
+                Ok(TuiOutput::HubEvent(event)) => {
+                    // Hub events flow: Hub broadcast → TuiClient → TuiOutput::HubEvent → here.
+                    // This is the sole path for HubEvent delivery to TuiRunner.
+                    self.handle_hub_event(event);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -681,14 +666,12 @@ pub fn run_with_hub(
     // Hub spawns TuiClient as an async task and registers the task handle.
     let output_rx = hub.register_tui_client_with_request_channel(request_rx);
 
-    let hub_event_rx = hub.subscribe_events();
     let shutdown = Arc::new(AtomicBool::new(false));
     let tui_shutdown = Arc::clone(&shutdown);
 
     let mut tui_runner = TuiRunner::new(
         terminal,
         request_tx,
-        hub_event_rx,
         output_rx,
         tui_shutdown,
         terminal_dims,
@@ -753,7 +736,7 @@ mod tests {
     //! 1. Keyboard events through `process_event()` -> `handle_input_event()` -> `handle_tui_action()`
     //! 2. Verification of commands sent through channels
     //! 3. Real PTY event polling through `poll_pty_events()`
-    //! 4. Real Hub event flow through `poll_hub_events()`
+    //! 4. HubEvent delivery through TuiOutput channel (same path as production)
     //!
     //! # Test Infrastructure
     //!
@@ -762,15 +745,15 @@ mod tests {
     //! 1. **`create_test_runner()`**: Simple tests that don't need Hub responses.
     //!    Uses a mock HubHandle where operations gracefully fail.
     //!
-    //! 2. **`create_test_runner_with_real_hub()`**: Integration tests that need both
+    //! 2. **`create_test_runner_with_mock_client()`**: Integration tests that need both
     //!    command responses AND event flow. Uses a real Hub for channels but spawns
-    //!    a command responder thread that provides deterministic test data.
+    //!    a command responder thread that provides deterministic test data. Returns
+    //!    an `output_tx` for sending HubEvents via `TuiOutput::HubEvent`.
     //!
     //! The real Hub pattern gives us proper integration testing:
-    //! - Real Hub event channels (for proper pub/sub)
     //! - Real Hub handles (for proper client communication)
     //! - Controlled command responses (for deterministic tests)
-    //! - Ability to broadcast events and verify TUI receives them
+    //! - HubEvent delivery via TuiOutput channel (mirrors production flow)
     //!
     //! # M-DESIGN-FOR-AI Compliance
     //!
@@ -778,6 +761,7 @@ mod tests {
 
     use super::*;
     use crate::client::{CreateAgentRequest, DeleteAgentRequest};
+    use crate::hub::HubEvent;
     use crate::tui::actions::TuiAction;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
@@ -802,7 +786,6 @@ mod tests {
 
         let (request_tx, request_rx) = mpsc::unbounded_channel::<TuiRequest>();
 
-        let (_hub_tx, hub_rx) = broadcast::channel::<HubEvent>(16);
         // Create output channel (TuiClient would send here, but we don't have one in tests)
         let (_output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -810,7 +793,6 @@ mod tests {
         let runner = TuiRunner::new(
             terminal,
             request_tx,
-            hub_rx,
             output_rx,
             shutdown,
             (24, 80), // rows, cols
@@ -839,40 +821,22 @@ mod tests {
     /// - Real TuiRequest channel (for proper TuiRunner -> TuiClient communication)
     /// - Controlled responses (for deterministic tests)
     /// - Request verification (via passthrough channel)
+    /// - Output channel sender for delivering HubEvents via `TuiOutput::HubEvent`
     ///
     /// # Returns
     ///
     /// - `TuiRunner` connected to mock TuiClient
-    /// - `Hub` for broadcasting events and verification (real Hub for event channels)
+    /// - `mpsc::UnboundedSender<TuiOutput>` for sending HubEvents to TuiRunner (mirrors TuiClient)
     /// - `mpsc::UnboundedReceiver` for inspecting requests
     /// - `Arc<AtomicBool>` to signal shutdown to the responder thread
     fn create_test_runner_with_mock_client(
         config: TestClientConfig,
     ) -> (
         TuiRunner<TestBackend>,
-        crate::hub::Hub,
+        mpsc::UnboundedSender<TuiOutput>,
         mpsc::UnboundedReceiver<TuiRequest>,
         Arc<AtomicBool>,
     ) {
-        use crate::config::Config;
-        use std::path::PathBuf;
-
-        // Create test config
-        let hub_config = Config {
-            server_url: "http://localhost:3000".to_string(),
-            token: "btstr_test-key".to_string(),
-            poll_interval: 10,
-            agent_timeout: 300,
-            max_sessions: 10,
-            worktree_base: PathBuf::from("/tmp/test-worktrees"),
-        };
-
-        // Create real Hub (without setup() to avoid network calls) - for event channels
-        let hub = Hub::new(hub_config).expect("Failed to create Hub");
-
-        // Subscribe to Hub's event channel
-        let hub_event_rx = hub.subscribe_events();
-
         // Create our own request channel that we control
         // TuiRunner sends requests here, and the responder handles them
         let (request_tx, mut request_rx) = mpsc::unbounded_channel::<TuiRequest>();
@@ -953,19 +917,19 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let terminal = Terminal::new(backend).expect("Failed to create test terminal");
 
-        // Create output channel (in real code, Hub.register_tui_client_with_request_channel() does this)
-        let (_output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Create output channel - tests send TuiOutput::HubEvent through output_tx
+        // to mirror how TuiClient delivers HubEvents in production
+        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let runner = TuiRunner::new(
             terminal,
             request_tx,
-            hub_event_rx,
             output_rx,
             Arc::clone(&shutdown),
             (24, 80),
         );
 
-        (runner, hub, passthrough_rx, shutdown)
+        (runner, output_tx, passthrough_rx, shutdown)
     }
 
     /// Builds an `InputContext` from the current runner state.
@@ -1441,7 +1405,7 @@ mod tests {
     /// CloseAgent when no agent is selected.
 
     // =========================================================================
-    // E2E Agent Creation Flow Tests (with Real Hub)
+    // E2E Agent Creation Flow Tests
     // =========================================================================
 
     /// Verifies full agent creation flow: menu -> worktree select -> issue input -> prompt -> create.
@@ -1451,10 +1415,9 @@ mod tests {
     ///
     /// # Test Strategy
     ///
-    /// 1. Uses real Hub channels for proper event integration
-    /// 2. Controlled TuiRequest responses for deterministic tests
-    /// 3. Verifies request is sent with correct parameters
-    /// 4. Broadcasts AgentCreated event to verify TUI transitions
+    /// 1. Controlled TuiRequest responses for deterministic tests
+    /// 2. Verifies request is sent with correct parameters
+    /// 3. Sends AgentCreated event via TuiOutput channel to verify TUI transitions
     #[test]
     fn test_e2e_new_agent_full_flow() {
         use crate::tui::menu::MenuAction;
@@ -1463,7 +1426,7 @@ mod tests {
             worktrees: vec![("/path/worktree-1".to_string(), "feature-1".to_string())],
             connection_code: None,
         };
-        let (mut runner, hub, mut request_rx, shutdown) = create_test_runner_with_mock_client(config);
+        let (mut runner, output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client(config);
 
         // 1. Open menu and navigate to New Agent using dynamic lookup
         process_key(&mut runner, make_key_ctrl(KeyCode::Char('p')));
@@ -1542,8 +1505,8 @@ mod tests {
             "creating_agent should track the correct identifier"
         );
 
-        // === Verify event flow using real Hub ===
-        // Broadcast AgentCreated event (simulates what Hub does after spawn)
+        // === Verify event flow via TuiOutput channel (mirrors production path) ===
+        // Send AgentCreated event through output channel (simulates TuiClient forwarding)
         let agent_info = AgentInfo {
             id: "agent-issue-42".to_string(),
             repo: None,
@@ -1558,10 +1521,10 @@ mod tests {
             scroll_offset: None,
             hub_identifier: None,
         };
-        hub.broadcast(HubEvent::agent_created("agent-issue-42", agent_info));
+        output_tx.send(TuiOutput::HubEvent(HubEvent::agent_created("agent-issue-42", agent_info))).unwrap();
 
-        // Poll hub events - TUI should receive AgentCreated
-        runner.poll_hub_events();
+        // Poll output channel - TUI should receive AgentCreated via TuiOutput::HubEvent
+        runner.poll_pty_events();
 
         // Mode stays Normal (was already Normal)
         assert_eq!(runner.mode(), AppMode::Normal);
@@ -1594,9 +1557,9 @@ mod tests {
     ///
     /// # Test Strategy
     ///
-    /// 1. Uses real Hub channels for proper event integration
+    /// 1. Controlled TuiRequest responses for deterministic tests
     /// 2. Verifies request includes from_worktree path
-    /// 3. Broadcasts AgentCreated event to verify TUI transitions
+    /// 3. Sends AgentCreated event via TuiOutput channel to verify TUI transitions
     #[test]
     fn test_e2e_reopen_existing_worktree() {
         use crate::tui::menu::MenuAction;
@@ -1608,7 +1571,7 @@ mod tests {
             ],
             connection_code: None,
         };
-        let (mut runner, hub, mut request_rx, shutdown) = create_test_runner_with_mock_client(config);
+        let (mut runner, output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client(config);
 
         // Open menu and navigate to New Agent using dynamic lookup
         process_key(&mut runner, make_key_ctrl(KeyCode::Char('p')));
@@ -1665,8 +1628,8 @@ mod tests {
         }
         assert!(found_create, "CreateAgent request should be sent");
 
-        // === Verify event flow using real Hub ===
-        // Broadcast AgentCreated event (simulates what Hub does after spawn)
+        // === Verify event flow via TuiOutput channel (mirrors production path) ===
+        // Send AgentCreated event through output channel (simulates TuiClient forwarding)
         let agent_info = AgentInfo {
             id: "agent-feature-branch".to_string(),
             repo: None,
@@ -1681,10 +1644,10 @@ mod tests {
             scroll_offset: None,
             hub_identifier: None,
         };
-        hub.broadcast(HubEvent::agent_created("agent-feature-branch", agent_info));
+        output_tx.send(TuiOutput::HubEvent(HubEvent::agent_created("agent-feature-branch", agent_info))).unwrap();
 
-        // Poll hub events - TUI should receive AgentCreated
-        runner.poll_hub_events();
+        // Poll output channel - TUI should receive AgentCreated via TuiOutput::HubEvent
+        runner.poll_pty_events();
 
         // Mode stays Normal (was already Normal)
         assert_eq!(runner.mode(), AppMode::Normal);
@@ -2034,56 +1997,31 @@ mod tests {
     // - Creation failures are observable to the user
     // - Async completion path works end-to-end
 
-    /// Verifies agent appears in list after creation via Hub events.
+    /// Verifies agent appears in list after creation via TuiOutput::HubEvent.
     ///
-    /// This test uses a real Hub to verify the end-to-end flow:
-    /// 1. Create a real Hub (without calling setup() to avoid network calls)
-    /// 2. Subscribe the TuiRunner to Hub's event channel
-    /// 3. Manually inject an agent into Hub state
-    /// 4. Hub broadcasts `HubEvent::AgentCreated`
-    /// 5. TuiRunner receives the event and adds agent to `runner.agents`
+    /// This test verifies the production event flow:
+    /// 1. Create a TuiRunner with an output channel
+    /// 2. Send `TuiOutput::HubEvent(AgentCreated)` through the output channel
+    /// 3. TuiRunner receives it via `poll_pty_events()` and adds agent to `runner.agents`
     ///
     /// # Test Strategy
     ///
     /// Rather than going through the full UI flow (which requires worktree operations),
-    /// this test verifies the critical path: Hub broadcasts AgentCreated -> TUI receives it.
-    /// This is the exact gap that MockHubResponder didn't cover.
+    /// this test verifies the critical path: TuiOutput::HubEvent(AgentCreated) -> TUI updates.
     #[test]
     fn test_agent_appears_in_list_after_creation() {
-        use crate::config::Config;
-        use std::path::PathBuf;
-
-        // Create test config
-        let config = Config {
-            server_url: "http://localhost:3000".to_string(),
-            token: "btstr_test-key".to_string(),
-            poll_interval: 10,
-            agent_timeout: 300,
-            max_sessions: 10,
-            worktree_base: PathBuf::from("/tmp/test-worktrees"),
-        };
-
-        // Create real Hub (without setup() to avoid network calls)
-        // BOTSTER_ENV=test is automatically set in test mode
-        let hub = Hub::new(config).expect("Failed to create Hub");
-
-        // Get Hub's event channel for TuiRunner to subscribe to
-        let hub_event_rx = hub.subscribe_events();
-
         // Create TuiRequest channel (TuiRunner -> TuiClient communication)
         let (request_tx, _request_rx) = mpsc::unbounded_channel::<TuiRequest>();
 
-        // Create TuiRunner connected to real Hub's event channel
+        // Create TuiRunner with output channel for HubEvent delivery
         let backend = TestBackend::new(80, 24);
         let terminal = Terminal::new(backend).expect("Failed to create test terminal");
         let shutdown = Arc::new(AtomicBool::new(false));
-        // Create output channel (in real code, Hub.register_tui_client_with_request_channel() does this)
-        let (_output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mut runner = TuiRunner::new(
             terminal,
             request_tx,
-            hub_event_rx,
             output_rx,
             shutdown.clone(),
             (24, 80),
@@ -2108,16 +2046,18 @@ mod tests {
             hub_identifier: None,
         };
 
-        // Broadcast AgentCreated event from Hub (simulates what happens after spawn)
-        hub.broadcast(HubEvent::agent_created("test-repo-42", test_agent_info.clone()));
+        // Send AgentCreated via TuiOutput channel (mirrors TuiClient forwarding in production)
+        output_tx.send(TuiOutput::HubEvent(
+            HubEvent::agent_created("test-repo-42", test_agent_info.clone()),
+        )).unwrap();
 
-        // Poll hub events - TuiRunner should receive the AgentCreated event
-        runner.poll_hub_events();
+        // Poll output channel - TuiRunner receives HubEvent via TuiOutput::HubEvent
+        runner.poll_pty_events();
 
         // Agent should now appear in the list
         assert!(
             !runner.agents.is_empty(),
-            "Agent should appear in list after Hub broadcasts AgentCreated"
+            "Agent should appear in list after TuiOutput::HubEvent(AgentCreated)"
         );
 
         assert_eq!(
@@ -2224,11 +2164,13 @@ mod tests {
 
         let (request_tx, mut mock_rx) = mpsc::unbounded_channel::<TuiRequest>();
 
-        let (hub_event_tx, hub_event_rx) = broadcast::channel::<HubEvent>(16);
+        // Create output channel - mock thread sends TuiOutput::HubEvent to simulate
+        // the production path: Hub broadcast → TuiClient → TuiOutput::HubEvent → TuiRunner
+        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel::<TuiOutput>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mock_shutdown = Arc::clone(&shutdown);
 
-        // Spawn mock that simulates the FULL async path
+        // Spawn mock that simulates the FULL async path via TuiOutput channel
         thread::spawn(move || {
             while !mock_shutdown.load(Ordering::Relaxed) {
                 match mock_rx.try_recv() {
@@ -2238,19 +2180,19 @@ mod tests {
                                 let _ = response_tx.send(vec![]);
                             }
                             TuiRequest::CreateAgent { request } => {
-                                // Simulate the async path with progress events
-                                let _ = hub_event_tx.send(HubEvent::AgentCreationProgress {
+                                // Simulate the async path with progress events via TuiOutput
+                                let _ = output_tx.send(TuiOutput::HubEvent(HubEvent::AgentCreationProgress {
                                     identifier: request.issue_or_branch.clone(),
                                     stage: AgentCreationStage::CreatingWorktree,
-                                });
+                                }));
 
                                 // Simulate background work
                                 thread::sleep(Duration::from_millis(10));
 
-                                let _ = hub_event_tx.send(HubEvent::AgentCreationProgress {
+                                let _ = output_tx.send(TuiOutput::HubEvent(HubEvent::AgentCreationProgress {
                                     identifier: request.issue_or_branch.clone(),
                                     stage: AgentCreationStage::SpawningAgent,
-                                });
+                                }));
 
                                 thread::sleep(Duration::from_millis(10));
 
@@ -2269,10 +2211,10 @@ mod tests {
                                     scroll_offset: None,
                                     hub_identifier: None,
                                 };
-                                let _ = hub_event_tx.send(HubEvent::AgentCreated {
+                                let _ = output_tx.send(TuiOutput::HubEvent(HubEvent::AgentCreated {
                                     agent_id: info.id.clone(),
                                     info,
-                                });
+                                }));
                             }
                             _ => {}
                         }
@@ -2285,13 +2227,9 @@ mod tests {
             }
         });
 
-        // Create output channel (in real code, Hub.register_tui_client_with_request_channel() does this)
-        let (_output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
-
         let mut runner = TuiRunner::new(
             terminal,
             request_tx,
-            hub_event_rx,
             output_rx,
             Arc::clone(&shutdown),
             (24, 80),
@@ -2599,7 +2537,7 @@ mod tests {
     #[test]
     fn test_select_next_agent_sends_request() {
         let config = TestClientConfig::default();
-        let (mut runner, _hub, _request_rx, shutdown) =
+        let (mut runner, _output_tx, _request_rx, shutdown) =
             create_test_runner_with_mock_client(config);
 
         // Setup: 3 agents, agent 0 selected
@@ -2647,7 +2585,7 @@ mod tests {
     #[test]
     fn test_select_previous_agent_wraps_around() {
         let config = TestClientConfig::default();
-        let (mut runner, _hub, _request_rx, shutdown) =
+        let (mut runner, _output_tx, _request_rx, shutdown) =
             create_test_runner_with_mock_client(config);
 
         // Setup: 3 agents, agent 0 selected
@@ -2677,7 +2615,7 @@ mod tests {
     #[test]
     fn test_select_next_wraps_around() {
         let config = TestClientConfig::default();
-        let (mut runner, _hub, _request_rx, shutdown) =
+        let (mut runner, _output_tx, _request_rx, shutdown) =
             create_test_runner_with_mock_client(config);
 
         // Setup: 3 agents, last agent selected

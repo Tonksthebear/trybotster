@@ -5,13 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Response from the messages polling endpoint.
-#[derive(Debug, Clone, Deserialize)]
-pub struct MessageResponse {
-    /// List of pending messages for this hub.
-    pub messages: Vec<MessageData>,
-}
-
 /// Individual message data from the server.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageData {

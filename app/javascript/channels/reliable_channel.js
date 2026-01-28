@@ -108,7 +108,7 @@ export class ReliableSender {
       this.retransmitTimer = null;
     }
     this.paused = false;
-    console.info("[Reliable] Sender reset");
+    console.debug("[Reliable] Sender reset");
   }
 
   /**
@@ -130,7 +130,7 @@ export class ReliableSender {
       clearTimeout(this.retransmitTimer);
       this.retransmitTimer = null;
     }
-    console.info("[Reliable] Sender paused");
+    console.debug("[Reliable] Sender paused");
   }
 
   /**
@@ -139,7 +139,7 @@ export class ReliableSender {
   resume() {
     this.paused = false;
     this.scheduleRetransmit();
-    console.info("[Reliable] Sender resumed");
+    console.debug("[Reliable] Sender resumed");
   }
 
   /**
@@ -257,7 +257,7 @@ export class ReliableSender {
 
       const retransmits = this.getRetransmits();
       for (const msg of retransmits) {
-        console.log(`[Reliable] Retransmitting seq=${msg.seq}, attempt=${this.pending.get(msg.seq)?.attempts}`);
+        console.debug(`[Reliable] Retransmitting seq=${msg.seq}, attempt=${this.pending.get(msg.seq)?.attempts}`);
         this.onSend(msg);
       }
 
@@ -302,7 +302,7 @@ export class ReliableReceiver {
     this.received.clear();
     this.nextExpected = 1;
     this.buffer.clear();
-    console.info("[Reliable] Receiver reset");
+    console.debug("[Reliable] Receiver reset");
   }
 
   /**
@@ -316,7 +316,7 @@ export class ReliableReceiver {
 
     for (const [seq, entry] of this.buffer) {
       if (entry.receivedAt < staleThreshold) {
-        console.warn(`[Reliable] Evicting stale buffered seq=${seq}`);
+        console.debug(`[Reliable] Evicting stale buffered seq=${seq}`);
         this.buffer.delete(seq);
         evicted++;
       }
@@ -338,7 +338,7 @@ export class ReliableReceiver {
     // Session reset detection: if we receive seq=1 when we expected higher,
     // the peer has restarted. Reset our state to sync.
     if (seq === 1 && this.nextExpected > 1) {
-      console.info(`[Reliable] Session reset detected: got seq=1, expected=${this.nextExpected}`);
+      console.debug(`[Reliable] Session reset detected: got seq=1, expected=${this.nextExpected}`);
       this.reset();
       this.onReset(); // Notify channel to reset sender too
     }
@@ -348,7 +348,7 @@ export class ReliableReceiver {
 
     // Duplicate check
     if (this.received.has(seq)) {
-      console.log(`[Reliable] Duplicate seq=${seq}, ignoring`);
+      console.debug(`[Reliable] Duplicate seq=${seq}, ignoring`);
       return [];
     }
 
@@ -389,7 +389,7 @@ export class ReliableReceiver {
       return deliverable;
     } else if (seq > this.nextExpected) {
       // Out of order - buffer for later with timestamp for TTL
-      console.log(`[Reliable] Out of order: got seq=${seq}, expected=${this.nextExpected}, buffering`);
+      console.debug(`[Reliable] Out of order: got seq=${seq}, expected=${this.nextExpected}, buffering`);
       this.buffer.set(seq, { payload, receivedAt: Date.now() });
       return [];
     } else {

@@ -15,12 +15,13 @@ const FitAddon =
  */
 export default class extends Controller {
   static targets = ["container"];
-  static outlets = ["terminal-connection"];
+  static outlets = ["terminal-connection", "hub-connection"];
 
   // Private fields
   #terminal = null;
   #fitAddon = null;
   #connection = null;
+  #hubConnection = null;
   #touchOverlay = null;
   #keyboardHandler = null;
   #boundHandleResize = null;
@@ -75,6 +76,14 @@ export default class extends Controller {
   terminalConnectionOutletDisconnected(outlet) {
     outlet.unregisterListener(this);
     this.#connection = null;
+  }
+
+  hubConnectionOutletConnected(outlet) {
+    this.#hubConnection = outlet;
+  }
+
+  hubConnectionOutletDisconnected() {
+    this.#hubConnection = null;
   }
 
   // Public actions for touch control buttons
@@ -352,7 +361,7 @@ export default class extends Controller {
     this.#terminal.writeln(`[Connected to hub: ${hubId.substring(0, 8)}...]`);
     this.#terminal.writeln("[Signal E2E encryption active]");
     this.#terminal.writeln("");
-    this.#connection.send("set_mode", { mode: "gui" });
+    this.#hubConnection?.send("set_mode", { mode: "gui" });
     // Send initial dimensions via hub channel so CLI knows browser size
     // before any agent is selected. This ensures agents are spawned with
     // correct dimensions from the start.
