@@ -73,6 +73,7 @@ pub use types::{CreateAgentRequest, DeleteAgentRequest, Response};
 pub use crate::agent::pty::PtyCommand;
 pub use crate::hub::agent_handle::{AgentHandle, PtyHandle};
 pub use crate::hub::HubHandle;
+pub use crate::relay::signal::PreKeyBundleData;
 pub use crate::relay::AgentInfo;
 
 /// Metadata about a selected agent for UI display.
@@ -567,6 +568,17 @@ pub trait Client: Send {
             crate::hub::HubAction::CopyConnectionUrl,
         ).await
     }
+
+    /// Regenerate the PreKeyBundle with a fresh PreKey.
+    ///
+    /// Used when the user wants a new QR code for browser connection.
+    /// The bundle is generated via the crypto service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the crypto service is not available or
+    /// bundle generation fails.
+    async fn regenerate_prekey_bundle(&self) -> Result<PreKeyBundleData, String>;
 }
 
 #[cfg(test)]

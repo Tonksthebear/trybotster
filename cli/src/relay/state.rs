@@ -15,18 +15,10 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use flate2::{write::GzEncoder, Compression};
 use std::io::Write;
-use tokio::sync::mpsc;
 
-use super::connection::HubSender;
 use super::crypto_service::CryptoServiceHandle;
 use super::signal::PreKeyBundleData;
-use super::types::BrowserEvent;
 use crate::{AgentInfo, TerminalMessage, WorktreeInfo};
-
-/// Browser event with identity attached.
-///
-/// Tuple of (event, browser_identity) for client-scoped action routing.
-pub type IdentifiedBrowserEvent = (BrowserEvent, String);
 
 /// Browser connection state.
 ///
@@ -34,10 +26,6 @@ pub type IdentifiedBrowserEvent = (BrowserEvent, String);
 /// (mode, scroll, selection) is tracked by each BrowserClient independently.
 #[derive(Default)]
 pub struct BrowserState {
-    /// Terminal output sender for encrypted relay.
-    pub sender: Option<HubSender>,
-    /// Browser event receiver (events include browser identity).
-    pub event_rx: Option<mpsc::Receiver<IdentifiedBrowserEvent>>,
     /// Whether a browser is currently connected.
     pub connected: bool,
     /// Signal PreKeyBundle data for QR code generation.
@@ -46,7 +34,7 @@ pub struct BrowserState {
     /// When true, the QR code should be regenerated before pairing additional devices.
     pub bundle_used: bool,
     /// Shared crypto service handle for E2E encryption.
-    /// Used by HubRelay and agent channels for Signal Protocol operations.
+    /// Used by BrowserClient and agent channels for Signal Protocol operations.
     pub crypto_service: Option<CryptoServiceHandle>,
     /// Whether the relay WebSocket connection is established.
     ///
@@ -67,14 +55,7 @@ impl std::fmt::Debug for BrowserState {
 impl BrowserState {
     /// Check if browser is connected and ready.
     pub fn is_connected(&self) -> bool {
-        self.connected && self.sender.is_some()
-    }
-
-    /// Set connection established with sender and receiver.
-    pub fn set_connected(&mut self, sender: HubSender, rx: mpsc::Receiver<IdentifiedBrowserEvent>) {
-        self.sender = Some(sender);
-        self.event_rx = Some(rx);
-        self.connected = false; // Will be true after Connected event
+        self.connected && self.relay_connected
     }
 
     /// Handle browser connected event.
@@ -93,21 +74,6 @@ impl BrowserState {
     pub fn handle_disconnected(&mut self) {
         log::info!("Browser disconnected");
         self.connected = false;
-    }
-
-    /// Drain pending events from receiver.
-    ///
-    /// Returns events with their browser identity attached for client-scoped routing.
-    pub fn drain_events(&mut self) -> Vec<IdentifiedBrowserEvent> {
-        let Some(ref mut rx) = self.event_rx else {
-            return Vec::new();
-        };
-
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        events
     }
 }
 
@@ -211,10 +177,8 @@ mod tests {
         // Simulate failed relay connection scenario:
         // - signal_bundle should be None (cleared on failure)
         // - relay_connected should be false
-        // - sender should be None
         assert!(state.signal_bundle.is_none());
         assert!(!state.relay_connected);
-        assert!(state.sender.is_none());
 
         // The is_connected() check should also return false
         assert!(!state.is_connected());

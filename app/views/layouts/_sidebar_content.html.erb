@@ -2,9 +2,7 @@
   <%# Logo %>
   <div class="shrink-0 flex items-center gap-2 px-4 py-4 border-b border-zinc-800">
     <%= link_to root_path, class: "flex items-center gap-2 text-primary-400 hover:text-primary-300 transition-colors" do %>
-      <svg class="size-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-      </svg>
+      <%= icon "command-line", class: "size-6" %>
       <span class="font-mono font-bold text-lg tracking-tight">botster</span>
     <% end %>
   </div>
@@ -12,39 +10,76 @@
   <%# Scrollable content %>
   <div class="flex-1 flex flex-col min-h-0 overflow-hidden">
     <%# Hubs Section %>
-    <% if user_signed_in? %>
-      <%= turbo_stream_from "user_#{current_user.id}_hubs" %>
-    <% end %>
-    <div class="flex flex-col min-h-0" data-controller="sidebar-hubs" data-sidebar-hubs-current-hub-value="<%= Current.hub&.id %>">
+    <div class="flex flex-col min-h-0">
       <div class="shrink-0 flex items-center justify-between px-4 py-3">
         <h2 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Hubs</h2>
         <%= link_to new_users_hub_path, class: "p-1 text-zinc-500 hover:text-primary-400 transition-colors", title: "Connect Hub" do %>
-          <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-          </svg>
+          <%= icon "plus", class: "size-4" %>
         <% end %>
       </div>
-      <div id="sidebar_hubs_list" class="flex-1 overflow-y-auto px-2 pb-2" data-sidebar-hubs-target="list">
-        <%= render "layouts/sidebar_hubs", hubs: @sidebar_hubs || [] %>
+      <div class="flex-1 overflow-y-auto px-2 pb-2">
+        <% Current.user.hubs.each do |hub| %>
+          <%= link_to hub_path(hub),
+                class: "#{dom_id(hub, :sidebar)} group flex items-center gap-2 px-2 py-1.5 rounded text-sm transition-colors text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200",
+                data: { active: hub.active? } do %>
+              <span class="shrink-0 size-2 rounded-full group-data-[active=true]:bg-success-500 bg-zinc-600"></span>
+              <span class="truncate font-mono text-xs"><%= hub.repo.presence || hub.identifier.truncate(20) %></span>
+            <% end %>
+        <% end %>
+        <p class="not-only:hidden px-2 py-4 text-center text-xs text-zinc-600">No hubs connected</p>
       </div>
     </div>
 
     <%# Agents Section - only shown when hub is selected %>
     <% if Current.hub %>
-      <div class="flex flex-col min-h-0 border-t border-zinc-800">
+      <div class="flex flex-col min-h-0 border-t border-zinc-800"
+           data-controller="agent-list"
+           data-agent-list-hub-id-value="<%= Current.hub.id %>"
+           data-agent-list-agents-value="[]"
+           data-turbo-permanent
+           id="sidebar-agent-list-<%= local_assigns[:sidebar_id] || 'default' %>">
         <div class="shrink-0 flex items-center justify-between px-4 py-3">
           <h2 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Agents</h2>
           <button type="button"
-                  class="p-1 text-zinc-500 hover:text-primary-400 transition-colors"
+                  data-controller="requires-connection"
+                  data-requires-connection-key-value="<%= Current.hub.id %>"
+                  class="p-1 text-zinc-500 hover:text-primary-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-500"
                   title="New Agent"
                   command="show-modal"
-                  commandfor="new-agent-modal">
-            <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-            </svg>
+                  commandfor="new-agent-modal"
+                  disabled>
+            <%= icon "plus", class: "size-4" %>
           </button>
         </div>
-        <div class="sidebar-agents-list flex-1 overflow-y-auto px-2 pb-2">
+
+        <%# Template for each agent item %>
+        <template data-agent-list-target="template">
+          <div class="group flex items-center gap-1 rounded transition-colors hover:bg-zinc-800/50 data-[selected=true]:bg-primary-500/20">
+            <a data-href="/hubs/{hubId}/agents/{index}"
+               data-agent-id
+               class="flex-1 text-left px-2 py-1.5 min-w-0 text-zinc-400 hover:text-zinc-200 data-[selected=true]:text-primary-400 data-[selected=true]:font-medium">
+              <span data-field="name" class="truncate font-mono text-xs block"></span>
+            </a>
+            <button type="button"
+                    data-agent-id
+                    data-action="agent-list#delete"
+                    class="shrink-0 p-1.5 text-zinc-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                    title="Delete agent">
+              <%= icon "trash", class: "size-3.5" %>
+            </button>
+          </div>
+        </template>
+
+        <%# List container %>
+        <div data-agent-list-target="list" class="flex-1 overflow-y-auto px-2 pb-2 space-y-1"></div>
+
+        <%# Empty state %>
+        <div data-agent-list-target="empty" class="hidden px-2 pb-2">
+          <p class="px-2 py-4 text-center text-xs text-zinc-600">No agents running</p>
+        </div>
+
+        <%# Loading state %>
+        <div data-agent-list-target="loading" class="px-2 pb-2">
           <p class="px-2 py-4 text-center text-xs text-zinc-600">Connecting...</p>
         </div>
       </div>
@@ -56,35 +91,28 @@
     <%# Settings %>
     <%= link_to settings_path,
         class: "flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
-      <svg class="size-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-      </svg>
+        <%= icon "cog-6-tooth", class: "size-5" %>
       <span>Settings</span>
     <% end %>
 
     <%# User dropdown %>
-    <% if user_signed_in? %>
-      <%= render Elements::DropdownComponent.new(
-        anchor: "top start",
-        class: "block",
-        panel: "w-(--button-width) rounded-md bg-zinc-800 shadow-lg outline-1 -outline-offset-1 outline-white/10"
-      ) do |dropdown| %>
-        <% dropdown.with_button class: "w-full flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
-          <div class="size-8 rounded-full bg-zinc-800 flex items-center justify-center text-xs font-medium text-zinc-300">
-            <%= current_user.username&.first&.upcase || "?" %>
-          </div>
-          <span class="flex-1 text-left truncate font-mono text-xs"><%= current_user.username || "User" %></span>
-          <svg class="size-4 text-zinc-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l4-4 4 4m0 6l-4 4-4-4" />
-          </svg>
-        <% end %>
+    <%= render Elements::DropdownComponent.new(
+      anchor: "top start",
+      class: "block",
+      panel: "w-(--button-width) rounded-md bg-zinc-800 shadow-lg outline-1 -outline-offset-1 outline-white/10"
+    ) do |dropdown| %>
+      <% dropdown.with_button class: "w-full flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
+        <div class="size-8 rounded-full bg-zinc-800 flex items-center justify-center text-xs font-medium text-zinc-300">
+          <%= current_user.username&.first&.upcase || "?" %>
+        </div>
+        <span class="flex-1 text-left truncate font-mono text-xs"><%= current_user.username || "User" %></span>
+        <%= icon "chevron-up-down", class: "size-4 text-zinc-600" %>
+      <% end %>
 
-        <%= link_to destroy_user_session_path,
-            data: { turbo_method: :delete },
-            class: "block px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-700 rounded-md transition-colors" do %>
-          Logout
-        <% end %>
+      <%= link_to destroy_user_session_path,
+          data: { turbo_method: :delete },
+          class: "block px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-700 rounded-md transition-colors" do %>
+        Logout
       <% end %>
     <% end %>
   </div>

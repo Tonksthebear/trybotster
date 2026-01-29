@@ -122,7 +122,7 @@ class TerminalRelayChannel < ApplicationCable::Channel
   end
 
   def find_hub
-    current_user.hubs.find_by(identifier: @hub_id) || current_user.hubs.find_by(id: @hub_id)
+    current_user.hubs.find_by(id: @hub_id)
   end
 
   def notify_cli_of_terminal_connection

@@ -13,7 +13,7 @@
 //! and heartbeat. The NotificationWorker handles agent notification
 //! delivery in a background thread.
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-01-29
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,25 +67,46 @@ impl Hub {
 
             match msg.event_type.as_str() {
                 "browser_connected" => {
-                    // Informational only — BrowserClient creation is triggered by
-                    // BrowserEvent::Connected (relay) which fires after the Signal
-                    // handshake completes. The command channel message arrives earlier
-                    // (on HubChannel subscribe) before the E2E session is ready.
+                    // Browser subscribed to HubChannel - create BrowserClient to pair with it.
+                    // The BrowserClient will subscribe to HubChannel with the same identity,
+                    // establishing the per-browser bidirectional stream.
                     let browser_identity = msg.payload
                         .get("browser_identity")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    log::info!("Browser connected (command channel): {}", &browser_identity[..browser_identity.len().min(8)]);
+                        .map(String::from);
+
+                    if let Some(identity) = browser_identity {
+                        log::info!(
+                            "Browser connected (command channel): {} - dispatching ClientConnected",
+                            &identity[..identity.len().min(8)]
+                        );
+                        // Dispatch action to create BrowserClient
+                        self.handle_action(HubAction::ClientConnected {
+                            client_id: ClientId::Browser(identity),
+                        });
+                    } else {
+                        log::warn!("Browser connected event missing browser_identity");
+                    }
                 }
                 "browser_disconnected" => {
-                    // Informational only — BrowserClient teardown is triggered by
-                    // BrowserEvent::Disconnected (relay) which fires when the E2E
-                    // session drops.
+                    // Browser unsubscribed from HubChannel - clean up BrowserClient.
                     let browser_identity = msg.payload
                         .get("browser_identity")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    log::info!("Browser disconnected (command channel): {}", &browser_identity[..browser_identity.len().min(8)]);
+                        .map(String::from);
+
+                    if let Some(identity) = browser_identity {
+                        log::info!(
+                            "Browser disconnected (command channel): {} - dispatching ClientDisconnected",
+                            &identity[..identity.len().min(8)]
+                        );
+                        // Dispatch action to clean up BrowserClient
+                        self.handle_action(HubAction::ClientDisconnected {
+                            client_id: ClientId::Browser(identity),
+                        });
+                    } else {
+                        log::warn!("Browser disconnected event missing browser_identity");
+                    }
                 }
                 "terminal_connected" => {
                     // Browser subscribed to TerminalRelayChannel for a specific PTY.
@@ -162,6 +183,21 @@ impl Hub {
                             msg.payload
                         );
                     }
+                }
+                "browser_wants_preview" => {
+                    // Browser subscribed to PreviewChannel - start tunnel on demand.
+                    let agent_index = msg.payload
+                        .get("agent_index")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize);
+
+                    log::info!(
+                        "[CommandChannel] Browser wants preview for agent {:?}",
+                        agent_index
+                    );
+
+                    // Start tunnel if not already running
+                    self.ensure_tunnel_connected();
                 }
                 _ => {
                     self.process_command_channel_message(msg);
@@ -519,24 +555,48 @@ impl Hub {
         registration::start_tunnel(&self.tunnel_manager, &self.tokio_runtime);
     }
 
-    /// Connect to hub relay for browser communication (Signal E2E encryption).
+    /// Ensure tunnel is connected, starting it if not already running.
     ///
-    /// The hub relay handles hub-level commands and broadcasts. Terminal I/O
-    /// goes through agent-owned channels, not this relay.
-    pub fn connect_hub_relay(&mut self) {
+    /// Called on-demand when browser requests preview. This avoids eager
+    /// tunnel connection at startup when it may not be needed.
+    pub fn ensure_tunnel_connected(&self) {
+        use crate::tunnel::TunnelStatus;
+
+        if self.tunnel_manager.get_status() == TunnelStatus::Disconnected {
+            log::info!("Starting tunnel connection (on-demand for preview)");
+            registration::start_tunnel(&self.tunnel_manager, &self.tokio_runtime);
+        }
+    }
+
+    /// Initialize Signal Protocol CryptoService for E2E encryption.
+    ///
+    /// Starts the CryptoService only. PreKeyBundle generation is deferred until
+    /// the connection URL is first requested (lazy initialization via
+    /// `get_or_generate_connection_url()`).
+    pub fn init_signal_protocol(&mut self) {
+        registration::init_signal_protocol(&mut self.browser, &self.hub_identifier);
+    }
+
+    /// Get or generate the connection URL (lazy bundle generation).
+    ///
+    /// On first call, generates the PreKeyBundle and writes the URL to disk.
+    /// Subsequent calls return the cached bundle unless it was used.
+    ///
+    /// # Returns
+    ///
+    /// The connection URL string, or an error message.
+    pub fn get_or_generate_connection_url(&mut self) -> Result<String, String> {
         // Extract values before mutable borrow of browser
-        let server_id = self.server_hub_id().to_string();
+        let server_hub_id = self.server_hub_id().to_string();
         let local_id = self.hub_identifier.clone();
         let server_url = self.config.server_url.clone();
-        let api_key = self.config.get_api_key().to_string();
 
-        registration::connect_hub_relay(
+        registration::write_connection_url_lazy(
             &mut self.browser,
-            &server_id,
+            &self.tokio_runtime,
+            &server_hub_id,
             &local_id,
             &server_url,
-            &api_key,
-            &self.tokio_runtime,
-        );
+        )
     }
 }

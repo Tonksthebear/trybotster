@@ -15,8 +15,42 @@
 // WASM module (loaded on init)
 let wasmModule = null;
 
-// In-memory session cache (hubId -> SignalSession)
+// In-memory session cache (hubId -> { session, instanceId })
 const sessions = new Map();
+let sessionInstanceCounter = 0;
+
+// Mutex to serialize encrypt/decrypt operations per hub
+// This prevents race conditions where multiple operations interleave
+const operationQueues = new Map(); // hubId -> Promise chain
+
+async function withMutex(hubId, operation) {
+  const queue = operationQueues.get(hubId) || Promise.resolve();
+
+  // Create a deferred promise for this operation's result
+  let resolve, reject;
+  const resultPromise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+
+  // Chain onto the queue - always wait for previous to complete before starting ours
+  const newQueue = queue.then(async () => {
+    try {
+      const result = await operation();
+      resolve(result);
+    } catch (error) {
+      reject(error);
+    }
+  });
+
+  // Update the queue (swallow errors so chain continues)
+  operationQueues.set(
+    hubId,
+    newQueue.catch(() => {}),
+  );
+
+  return resultPromise;
+}
 
 // IndexedDB config
 const DB_NAME = "botster_signal";
@@ -52,10 +86,16 @@ self.onmessage = async (event) => {
         result = await handleHasSession(params.hubId);
         break;
       case "encrypt":
-        result = await handleEncrypt(params.hubId, params.message);
+        // Serialize encrypt operations to prevent counter race conditions
+        result = await withMutex(params.hubId, () =>
+          handleEncrypt(params.hubId, params.message),
+        );
         break;
       case "decrypt":
-        result = await handleDecrypt(params.hubId, params.envelope);
+        // Serialize decrypt operations to prevent session state races
+        result = await withMutex(params.hubId, () =>
+          handleDecrypt(params.hubId, params.envelope),
+        );
         break;
       case "getIdentityKey":
         result = await handleGetIdentityKey(params.hubId);
@@ -66,7 +106,7 @@ self.onmessage = async (event) => {
       case "processSenderKeyDistribution":
         result = await handleProcessSenderKeyDistribution(
           params.hubId,
-          params.distributionB64
+          params.distributionB64,
         );
         break;
       default:
@@ -99,6 +139,10 @@ async function handleInit(wasmJsUrl, wasmBinaryUrl) {
 async function handleCreateSession(bundleJson, hubId) {
   if (!wasmModule) throw new Error("WASM not initialized");
 
+  console.debug(
+    `[SignalWorker] createSession: CREATING NEW session for ${hubId}`,
+  );
+
   // Clear any existing session
   await deleteSessionFromStorage(hubId);
   sessions.delete(hubId);
@@ -116,18 +160,31 @@ async function handleCreateSession(bundleJson, hubId) {
 
   // Return identity key for the main thread
   const identityKey = await wasmSession.get_identity_key();
+  console.debug(
+    `[SignalWorker] createSession: session created for ${hubId}, identityKey=${identityKey.substring(0, 20)}...`,
+  );
   return { created: true, identityKey };
 }
 
 async function handleLoadSession(hubId) {
   // Check memory cache first
   if (sessions.has(hubId)) {
+    console.debug(
+      `[SignalWorker] loadSession: returning CACHED session for ${hubId}`,
+    );
     return { loaded: true, fromCache: true };
   }
+
+  console.debug(
+    `[SignalWorker] loadSession: no cache, loading from IndexedDB for ${hubId}`,
+  );
 
   // Try loading from IndexedDB
   const pickled = await loadSessionFromStorage(hubId);
   if (!pickled) {
+    console.debug(
+      `[SignalWorker] loadSession: no session in IndexedDB for ${hubId}`,
+    );
     return { loaded: false };
   }
 
@@ -136,6 +193,9 @@ async function handleLoadSession(hubId) {
   try {
     const wasmSession = wasmModule.SignalSession.from_pickle(pickled);
     sessions.set(hubId, wasmSession);
+    console.debug(
+      `[SignalWorker] loadSession: RESTORED session from IndexedDB for ${hubId}`,
+    );
     return { loaded: true, fromCache: false };
   } catch (error) {
     console.warn("[SignalWorker] Failed to restore session:", error);
@@ -153,16 +213,74 @@ async function handleHasSession(hubId) {
   return { hasSession: !!pickled };
 }
 
+let encryptCounter = 0;
+
+// djb2 hash for envelope fingerprinting - produces unique 8-char hex for different content
+function quickHash(str) {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) + str.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function envelopeFingerprint(envelope) {
+  if (!envelope) return "null";
+  const str = typeof envelope === 'string' ? envelope : JSON.stringify(envelope);
+  return quickHash(str);
+}
+
 async function handleEncrypt(hubId, message) {
   const session = sessions.get(hubId);
   if (!session) throw new Error(`No session for hub ${hubId}`);
 
+  const encryptId = ++encryptCounter;
+  const messageType = typeof message === "object" ? message.type : "unknown";
+  const messageSeq = typeof message === "object" ? message.seq : "N/A";
+
+  // Log session identity to detect if we're somehow using different session objects
+  const sessionId =
+    session._debugId ||
+    (session._debugId = Math.random().toString(36).slice(2, 8));
+
+  // Try to get Signal counter BEFORE encryption (if available via WASM)
+  let counterBefore = "unavailable";
+  try {
+    if (session.get_sending_chain_counter) {
+      counterBefore = await session.get_sending_chain_counter();
+    }
+  } catch (e) {
+    // Method may not exist
+  }
+
+  console.debug(
+    `[SignalWorker] encrypt #${encryptId} START: hub=${hubId}, session=${sessionId}, msgType=${messageType}, seq=${messageSeq}, counterBEFORE=${counterBefore}`,
+  );
+
   const messageStr =
     typeof message === "string" ? message : JSON.stringify(message);
+
   const envelope = await session.encrypt(messageStr);
+
+  // Try to get Signal counter AFTER encryption
+  let counterAfter = "unavailable";
+  try {
+    if (session.get_sending_chain_counter) {
+      counterAfter = await session.get_sending_chain_counter();
+    }
+  } catch (e) {
+    // Method may not exist
+  }
+
+  // Log envelope fingerprint to detect duplicates
+  const fingerprint = envelopeFingerprint(envelope);
+  console.debug(
+    `[SignalWorker] encrypt #${encryptId} DONE: seq=${messageSeq}, counterAFTER=${counterAfter}, envelope=${fingerprint}`,
+  );
 
   // Persist after encryption (Double Ratchet state changed)
   await persistSession(hubId, session);
+  console.debug(`[SignalWorker] encrypt #${encryptId} persisted: seq=${messageSeq}`);
 
   return { envelope };
 }
@@ -259,7 +377,7 @@ async function getOrCreateWrappingKey() {
   const newKey = await crypto.subtle.generateKey(
     { name: "AES-GCM", length: 256 },
     false, // NON-EXTRACTABLE - XSS cannot export this
-    ["encrypt", "decrypt"]
+    ["encrypt", "decrypt"],
   );
 
   // Store the CryptoKey object directly (IndexedDB supports structured clone)
@@ -283,7 +401,7 @@ async function encryptWithWrappingKey(plaintext) {
   const ciphertext = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     key,
-    encoded
+    encoded,
   );
 
   return { iv, ciphertext };
@@ -295,14 +413,18 @@ async function decryptWithWrappingKey(iv, ciphertext) {
   const decrypted = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv },
     key,
-    ciphertext
+    ciphertext,
   );
 
   return new TextDecoder().decode(decrypted);
 }
 
+let persistCounter = 0;
+
 async function persistSession(hubId, wasmSession) {
+  const persistId = ++persistCounter;
   try {
+    console.debug(`[SignalWorker] persist #${persistId} START for ${hubId}`);
     const pickled = wasmSession.pickle();
     const { iv, ciphertext } = await encryptWithWrappingKey(pickled);
     const db = await openDatabase();
@@ -319,8 +441,12 @@ async function persistSession(hubId, wasmSession) {
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve();
     });
+    console.debug(`[SignalWorker] persist #${persistId} SUCCESS for ${hubId}`);
   } catch (error) {
-    console.warn("[SignalWorker] Failed to persist session:", error);
+    console.error(
+      `[SignalWorker] persist #${persistId} FAILED for ${hubId}:`,
+      error,
+    );
   }
 }
 

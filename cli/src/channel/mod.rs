@@ -67,11 +67,18 @@ pub struct ChannelConfig {
     pub agent_index: Option<usize>,
     /// PTY index within the agent (0=CLI, 1=Server).
     pub pty_index: Option<usize>,
+    /// Browser identity for browser-specific streams (HubChannel only).
+    /// When set, subscribes to `hub:{hub_id}:browser:{identity}` instead of CLI stream.
+    pub browser_identity: Option<String>,
     /// Whether to encrypt messages using Signal Protocol.
     pub encrypt: bool,
     /// Compression threshold in bytes. None disables compression.
     /// Payloads exceeding this size are gzip-compressed.
     pub compression_threshold: Option<usize>,
+    /// Whether this is a CLI subscription (HubChannel per-browser streams).
+    /// When true with browser_identity, subscribes to `hub:{id}:browser:{identity}:cli`
+    /// instead of the browser stream `hub:{id}:browser:{identity}`.
+    pub cli_subscription: bool,
 }
 
 /// Connection state for a channel.

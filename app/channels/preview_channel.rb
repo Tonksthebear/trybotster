@@ -37,6 +37,7 @@ class PreviewChannel < ApplicationCable::Channel
 
     if @browser_identity.present?
       Rails.logger.info "[Preview] Browser subscribed: hub=#{@hub_id} agent=#{@agent_index} identity=#{truncate_identity(@browser_identity)}"
+      notify_cli_of_preview_request
     else
       Rails.logger.info "[Preview] Agent subscribed: hub=#{@hub_id} agent=#{@agent_index}"
     end
@@ -102,5 +103,20 @@ class PreviewChannel < ApplicationCable::Channel
     return "nil" unless identity.present?
 
     identity.length > 8 ? "#{identity[0..8]}..." : identity
+  end
+
+  def find_hub
+    current_user.hubs.find_by(id: @hub_id)
+  end
+
+  def notify_cli_of_preview_request
+    hub = find_hub
+    return unless hub
+
+    Bot::Message.create_for_hub!(hub,
+      event_type: "browser_wants_preview",
+      payload: { agent_index: @agent_index, browser_identity: @browser_identity })
+  rescue => e
+    Rails.logger.warn "[Preview] Failed to notify CLI of preview request: #{e.message}"
   end
 end

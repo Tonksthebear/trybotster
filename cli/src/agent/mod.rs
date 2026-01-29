@@ -518,8 +518,10 @@ impl Agent {
                     hub_id: hub_id.to_string(),
                     agent_index: Some(agent_index),
                     pty_index: None, // Preview channel doesn't use PTY index
+                    browser_identity: None,
                     encrypt: true,
                     compression_threshold: Some(4096),
+                    cli_subscription: false,
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("Preview channel connect failed: {}", e))?;

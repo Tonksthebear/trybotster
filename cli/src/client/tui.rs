@@ -632,6 +632,17 @@ impl Client for TuiClient {
     // NOTE: get_agent, send_input, resize_pty, select_agent, quit, create_agent,
     // delete_agent, regenerate_connection_code, copy_connection_url, list_worktrees,
     // get_connection_code all use DEFAULT IMPLEMENTATIONS from the trait
+
+    async fn regenerate_prekey_bundle(&self) -> Result<crate::relay::signal::PreKeyBundleData, String> {
+        let crypto_service = self.hub_handle
+            .crypto_service()
+            .ok_or_else(|| "Crypto service not available".to_string())?;
+        let next_id = crypto_service.next_prekey_id().await.unwrap_or(1);
+        crypto_service
+            .get_prekey_bundle(next_id)
+            .await
+            .map_err(|e| format!("Failed to regenerate bundle: {}", e))
+    }
 }
 
 /// Background task that forwards PTY output to TuiRunner via channel.

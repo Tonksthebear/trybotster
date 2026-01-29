@@ -12,11 +12,10 @@ class HubChannelTest < ActionCable::Channel::TestCase
 
   # === Subscription Tests ===
 
-  test "CLI subscribes to hub CLI stream (no browser_identity)" do
+  test "rejects subscription without browser_identity" do
     subscribe hub_id: @hub_id
 
-    assert subscription.confirmed?
-    assert_has_stream "hub:#{@hub_id}:cli"
+    assert subscription.rejected?
   end
 
   test "browser subscribes to hub browser stream" do
@@ -24,6 +23,13 @@ class HubChannelTest < ActionCable::Channel::TestCase
 
     assert subscription.confirmed?
     assert_has_stream "hub:#{@hub_id}:browser:#{@browser_identity}"
+  end
+
+  test "CLI subscribes to hub CLI stream for specific browser" do
+    subscribe hub_id: @hub_id, browser_identity: @browser_identity, cli_subscription: true
+
+    assert subscription.confirmed?
+    assert_has_stream "hub:#{@hub_id}:browser:#{@browser_identity}:cli"
   end
 
   test "rejects subscription without hub_id" do
@@ -38,34 +44,20 @@ class HubChannelTest < ActionCable::Channel::TestCase
     assert subscription.rejected?
   end
 
-  # === Routing Tests (Server-Side Routing) ===
+  test "rejects subscription with blank browser_identity" do
+    subscribe hub_id: @hub_id, browser_identity: ""
 
-  test "relay routes to browser stream when recipient_identity present" do
-    subscribe hub_id: @hub_id
-    browser_stream = "hub:#{@hub_id}:browser:#{@browser_identity}"
-    cli_stream = "hub:#{@hub_id}:cli"
-
-    # Message with recipient_identity goes to that browser's stream
-    assert_broadcasts(browser_stream, 1) do
-      assert_no_broadcasts(cli_stream) do
-        perform :relay, recipient_identity: @browser_identity, envelope: {
-          version: 4,
-          message_type: 2,
-          ciphertext: "base64_encrypted_data",
-          sender_identity: "cli_identity_key",
-          registration_id: 12345,
-          device_id: 1
-        }
-      end
-    end
+    assert subscription.rejected?
   end
 
-  test "relay routes to CLI stream when no recipient_identity" do
+  # === Routing Tests (Per-Browser Bidirectional Streams) ===
+
+  test "browser relay routes to CLI stream for same browser" do
     subscribe hub_id: @hub_id, browser_identity: @browser_identity
     browser_stream = "hub:#{@hub_id}:browser:#{@browser_identity}"
-    cli_stream = "hub:#{@hub_id}:cli"
+    cli_stream = "hub:#{@hub_id}:browser:#{@browser_identity}:cli"
 
-    # Message without recipient_identity goes to CLI stream
+    # Browser message goes to CLI stream for this browser
     assert_broadcasts(cli_stream, 1) do
       assert_no_broadcasts(browser_stream) do
         perform :relay, envelope: {
@@ -80,11 +72,31 @@ class HubChannelTest < ActionCable::Channel::TestCase
     end
   end
 
+  test "CLI relay routes to browser stream for same browser" do
+    subscribe hub_id: @hub_id, browser_identity: @browser_identity, cli_subscription: true
+    browser_stream = "hub:#{@hub_id}:browser:#{@browser_identity}"
+    cli_stream = "hub:#{@hub_id}:browser:#{@browser_identity}:cli"
+
+    # CLI message goes to browser stream for this browser
+    assert_broadcasts(browser_stream, 1) do
+      assert_no_broadcasts(cli_stream) do
+        perform :relay, envelope: {
+          version: 4,
+          message_type: 2,
+          ciphertext: "base64_encrypted_data",
+          sender_identity: "cli_identity_key",
+          registration_id: 12345,
+          device_id: 1
+        }
+      end
+    end
+  end
+
   # === Relay Format Tests ===
 
   test "relay does NOT broadcast when envelope wrapper is missing" do
-    subscribe hub_id: @hub_id
-    cli_stream = "hub:#{@hub_id}:cli"
+    subscribe hub_id: @hub_id, browser_identity: @browser_identity
+    cli_stream = "hub:#{@hub_id}:browser:#{@browser_identity}:cli"
 
     # Wrong format: envelope fields at top level
     assert_no_broadcasts(cli_stream) do
@@ -99,8 +111,8 @@ class HubChannelTest < ActionCable::Channel::TestCase
   end
 
   test "relay does NOT broadcast with nil envelope" do
-    subscribe hub_id: @hub_id
-    cli_stream = "hub:#{@hub_id}:cli"
+    subscribe hub_id: @hub_id, browser_identity: @browser_identity
+    cli_stream = "hub:#{@hub_id}:browser:#{@browser_identity}:cli"
 
     assert_no_broadcasts(cli_stream) do
       perform :relay, envelope: nil
@@ -109,9 +121,9 @@ class HubChannelTest < ActionCable::Channel::TestCase
 
   # === SenderKey Distribution Tests ===
 
-  test "distribute_sender_key broadcasts to CLI stream" do
+  test "distribute_sender_key broadcasts to CLI stream for browser" do
     subscribe hub_id: @hub_id, browser_identity: @browser_identity
-    cli_stream = "hub:#{@hub_id}:cli"
+    cli_stream = "hub:#{@hub_id}:browser:#{@browser_identity}:cli"
 
     assert_broadcasts(cli_stream, 1) do
       perform :distribute_sender_key, distribution: "base64_sender_key_distribution_message"
@@ -119,8 +131,8 @@ class HubChannelTest < ActionCable::Channel::TestCase
   end
 
   test "distribute_sender_key does NOT broadcast without distribution" do
-    subscribe hub_id: @hub_id
-    cli_stream = "hub:#{@hub_id}:cli"
+    subscribe hub_id: @hub_id, browser_identity: @browser_identity
+    cli_stream = "hub:#{@hub_id}:browser:#{@browser_identity}:cli"
 
     assert_no_broadcasts(cli_stream) do
       perform :distribute_sender_key, distribution: nil
@@ -129,13 +141,13 @@ class HubChannelTest < ActionCable::Channel::TestCase
 
   # === Hub-Level Message Tests ===
 
-  test "hub channel handles agent list updates" do
-    subscribe hub_id: @hub_id
+  test "CLI hub channel handles agent list updates to browser" do
+    subscribe hub_id: @hub_id, browser_identity: @browser_identity, cli_subscription: true
     browser_stream = "hub:#{@hub_id}:browser:#{@browser_identity}"
 
     # CLI sends agent list to specific browser
     assert_broadcasts(browser_stream, 1) do
-      perform :relay, recipient_identity: @browser_identity, envelope: {
+      perform :relay, envelope: {
         version: 4,
         message_type: 2,
         ciphertext: "encrypted_agent_list",
@@ -157,7 +169,7 @@ class HubChannelTest < ActionCable::Channel::TestCase
     stub_connection current_user: user
 
     assert_difference "Bot::Message.count", 1 do
-      subscribe hub_id: hub.identifier, browser_identity: @browser_identity
+      subscribe hub_id: hub.id, browser_identity: @browser_identity
     end
 
     assert subscription.confirmed?
@@ -173,7 +185,7 @@ class HubChannelTest < ActionCable::Channel::TestCase
     hub = hubs(:active_hub)
     stub_connection current_user: user
 
-    subscribe hub_id: hub.identifier, browser_identity: @browser_identity
+    subscribe hub_id: hub.id, browser_identity: @browser_identity
     assert subscription.confirmed?
 
     assert_difference "Bot::Message.count", 1 do
@@ -191,10 +203,25 @@ class HubChannelTest < ActionCable::Channel::TestCase
     hub = hubs(:active_hub)
     stub_connection current_user: user
 
+    # CLI subscriptions (with cli_subscription: true) don't create notifications
     assert_no_difference "Bot::Message.count" do
-      subscribe hub_id: hub.identifier
+      subscribe hub_id: hub.id, browser_identity: @browser_identity, cli_subscription: true
     end
 
     assert subscription.confirmed?
+  end
+
+  test "CLI unsubscription does not create browser_disconnected message" do
+    user = users(:jason)
+    hub = hubs(:active_hub)
+    stub_connection current_user: user
+
+    subscribe hub_id: hub.id, browser_identity: @browser_identity, cli_subscription: true
+    assert subscription.confirmed?
+
+    # CLI unsubscriptions don't create notifications either
+    assert_no_difference "Bot::Message.count" do
+      unsubscribe
+    end
   end
 end
