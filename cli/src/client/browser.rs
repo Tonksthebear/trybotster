@@ -560,13 +560,16 @@ impl BrowserClient {
             }
 
             BrowserCommand::Handshake { device_name, .. } => {
-                // Handshake is handled during connection setup in the relay layer,
-                // not by BrowserClient's hub channel. Log if received here.
-                log::debug!(
-                    "BrowserClient {}: Handshake from '{}' received on hub channel -- expected during connection setup",
+                log::info!(
+                    "BrowserClient {}: Handshake from '{}', sending ack",
                     &self.identity[..8.min(self.identity.len())],
                     device_name
                 );
+                // Send handshake acknowledgment to complete E2E session establishment.
+                self.send_handshake_ack().await;
+                // Also send initial data so browser has agents/worktrees immediately.
+                self.send_agent_list_to_browser().await;
+                self.send_worktree_list_to_browser().await;
             }
         }
     }
@@ -574,9 +577,13 @@ impl BrowserClient {
     /// Connect the per-browser hub channel for control plane communication.
     ///
     /// Builds an `ActionCableChannel` via the builder pattern, connects to the
-    /// `HubChannel` (same channel name as the shared bootstrap channel, but a
-    /// separate WebSocket connection owned by this `BrowserClient`), and stores
-    /// the sender handle for future use.
+    /// `HubChannel` with both `browser_identity` and `cli_subscription: true` to
+    /// indicate this is the CLI side of the per-browser bidirectional stream.
+    ///
+    /// The browser subscribes first (without cli_subscription), listening on
+    /// `hub:{id}:browser:{identity}`. This BrowserClient subscribes with
+    /// `cli_subscription: true`, listening on `hub:{id}:browser:{identity}:cli`.
+    /// Rails routes messages between the paired streams.
     ///
     /// Called early in `run_task()` before the event loop. If connection fails,
     /// the caller logs the error but continues -- the browser can reconnect later.
@@ -590,6 +597,7 @@ impl BrowserClient {
             .api_key(&self.config.api_key)
             .crypto_service(self.config.crypto_service.clone())
             .reliable(true)
+            .cli_subscription(true) // Mark as CLI side of per-browser stream
             .build();
 
         channel
@@ -598,8 +606,10 @@ impl BrowserClient {
                 hub_id: self.config.server_hub_id.clone(),
                 agent_index: None,
                 pty_index: None,
+                browser_identity: Some(self.identity.clone()),
                 encrypt: true,
                 compression_threshold: Some(4096),
+                cli_subscription: true, // CLI side of per-browser stream
             })
             .await
             .map_err(|e| format!("Hub channel connect failed: {}", e))?;
@@ -611,7 +621,7 @@ impl BrowserClient {
         self.hub_channel = Some(channel);
 
         log::info!(
-            "BrowserClient {} connected hub channel",
+            "BrowserClient {} connected hub channel (CLI side)",
             &self.identity[..8.min(self.identity.len())]
         );
 
@@ -848,6 +858,15 @@ impl BrowserClient {
         self.send_terminal_message(&message).await;
     }
 
+    /// Send handshake acknowledgment to the browser.
+    ///
+    /// Completes the E2E session establishment. Browser waits for this
+    /// before considering the connection fully established.
+    async fn send_handshake_ack(&self) {
+        let message = TerminalMessage::HandshakeAck;
+        self.send_terminal_message(&message).await;
+    }
+
     // ========================================================================
     // Hub event handling
     // ========================================================================
@@ -1030,9 +1049,11 @@ impl Client for BrowserClient {
                 hub_id,
                 agent_index: Some(agent_index),
                 pty_index: Some(pty_index),
+                browser_identity: Some(self.identity.clone()),
                 encrypt: true,
                 // Threshold for gzip compression (4KB)
                 compression_threshold: Some(4096),
+                cli_subscription: false,
             })
             .await
             .map_err(|e| format!("Failed to connect channel: {}", e))?;
@@ -1164,6 +1185,14 @@ impl Client for BrowserClient {
     // NOTE: get_agent, send_input, resize_pty, select_agent, quit, create_agent,
     // delete_agent, regenerate_connection_code, copy_connection_url, list_worktrees,
     // get_connection_code all use DEFAULT IMPLEMENTATIONS from the trait
+
+    async fn regenerate_prekey_bundle(&self) -> Result<crate::relay::signal::PreKeyBundleData, String> {
+        let next_id = self.config.crypto_service.next_prekey_id().await.unwrap_or(1);
+        self.config.crypto_service
+            .get_prekey_bundle(next_id)
+            .await
+            .map_err(|e| format!("Failed to regenerate bundle: {}", e))
+    }
 }
 
 /// Background task that forwards PTY output to browser via ActionCableChannel.

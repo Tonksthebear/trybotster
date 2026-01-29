@@ -7,7 +7,6 @@
 //!
 //! - [`TerminalMessage`] - CLI → Browser messages (output, agent lists, etc.)
 //! - [`BrowserCommand`] - Browser → CLI commands (input, actions)
-//! - [`BrowserEvent`] - Parsed browser events for Hub consumption
 //!
 //! # Transport
 //!
@@ -149,6 +148,12 @@ pub enum TerminalMessage {
         /// Exit code from the PTY process, if available.
         exit_code: Option<i32>,
     },
+    /// Handshake acknowledgment (CLI -> Browser).
+    ///
+    /// Sent in response to browser's `connected` message to complete
+    /// the E2E session establishment.
+    #[serde(rename = "handshake_ack")]
+    HandshakeAck,
 }
 
 /// Agent info for list response.
@@ -330,86 +335,6 @@ pub struct BrowserResize {
     pub cols: u16,
     /// Terminal height in rows.
     pub rows: u16,
-}
-
-/// Events received from the browser via the relay.
-///
-/// These events are parsed from [`BrowserCommand`]s and enriched with
-/// connection state (e.g., Connected/Disconnected events).
-#[derive(Debug, Clone)]
-pub enum BrowserEvent {
-    /// Browser connected and sent its public key.
-    Connected {
-        /// Browser's public key for encryption.
-        public_key: String,
-        /// Name of the connected device.
-        device_name: String,
-    },
-    /// Browser disconnected.
-    Disconnected,
-    /// Terminal input from browser (already decrypted).
-    Input(String),
-    /// Browser resized terminal.
-    Resize(BrowserResize),
-    /// Set display mode (tui/gui).
-    SetMode {
-        /// Display mode ("tui" or "gui").
-        mode: String,
-    },
-    /// List all agents.
-    ListAgents,
-    /// List available worktrees.
-    ListWorktrees,
-    /// Select an agent.
-    SelectAgent {
-        /// Agent session key to select.
-        id: String,
-    },
-    /// Create a new agent.
-    CreateAgent {
-        /// Issue number or branch name.
-        issue_or_branch: Option<String>,
-        /// Initial prompt for the agent.
-        prompt: Option<String>,
-    },
-    /// Reopen an existing worktree.
-    ReopenWorktree {
-        /// Path to the worktree.
-        path: String,
-        /// Branch name.
-        branch: String,
-        /// Initial prompt for the agent.
-        prompt: Option<String>,
-    },
-    /// Delete an agent.
-    DeleteAgent {
-        /// Agent session key to delete.
-        id: String,
-        /// Whether to delete the worktree as well.
-        delete_worktree: bool,
-    },
-    /// Toggle PTY view (CLI/Server).
-    TogglePtyView,
-    /// Scroll terminal.
-    Scroll {
-        /// Scroll direction ("up" or "down").
-        direction: String,
-        /// Number of lines to scroll.
-        lines: u32,
-    },
-    /// Scroll to bottom (return to live).
-    ScrollToBottom,
-    /// Scroll to top.
-    ScrollToTop,
-    /// Request invite bundle for sharing.
-    /// Handled directly in relay, not forwarded to Hub.
-    GenerateInvite,
-    /// New PreKeyBundle was generated (response to RegenerateBundle command).
-    /// Sent from relay to hub when bundle regeneration is requested.
-    BundleRegenerated {
-        /// The new PreKeyBundle data.
-        bundle: super::signal::PreKeyBundleData,
-    },
 }
 
 #[cfg(test)]

@@ -24,7 +24,6 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::hub::Hub;
-use crate::relay::browser;
 
 /// Run the Hub event loop without TUI (headless mode).
 ///
@@ -50,14 +49,11 @@ pub fn run_headless_loop(hub: &mut Hub, shutdown_flag: &AtomicBool) -> Result<()
             break;
         }
 
-        // 2. Poll and handle browser events
-        browser::poll_events_headless(hub)?;
-
-        // 3. Poll pending agents and progress events
+        // 2. Poll pending agents and progress events
         hub.poll_pending_agents();
         hub.poll_progress_events();
 
-        // 4. Periodic tasks
+        // 3. Periodic tasks
         hub.tick();
 
         // Sleep to prevent CPU spinning

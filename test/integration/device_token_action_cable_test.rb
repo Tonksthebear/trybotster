@@ -70,8 +70,8 @@ class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
     # Verify hub belongs to user
     assert_equal @user.id, @hub.user_id
 
-    # Verify the lookup works
-    hub = @user.hubs.find_by(identifier: @hub.identifier)
+    # Verify the lookup works (channels use id, not identifier)
+    hub = @user.hubs.find_by(id: @hub.id)
     assert_not_nil hub
     assert_equal @hub.id, hub.id
   end

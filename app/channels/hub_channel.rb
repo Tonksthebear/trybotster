@@ -12,14 +12,15 @@
 # Terminal I/O (PTY output/input) is handled by agent-owned channels.
 #
 # Architecture:
-# - CLI subscribes with hub_id only
-# - Browsers subscribe with hub_id + browser_identity
-# - Server routes messages to appropriate streams
-# - All encryption/decryption happens at endpoints
+# - Per-browser bidirectional streams: both browser AND CLI provide browser_identity
+# - Browser subscribes first, listens on `hub:{id}:browser:{identity}`
+# - CLI receives browser_connected event, creates BrowserClient
+# - BrowserClient subscribes with same identity, listens on `hub:{id}:browser:{identity}:cli`
+# - Server routes messages between the paired streams
 #
 # Streams:
-# - CLI:     hub:{hub_id}:cli
 # - Browser: hub:{hub_id}:browser:{identity}
+# - CLI:     hub:{hub_id}:browser:{identity}:cli
 #
 # Security:
 # - Server never sees plaintext content
@@ -36,31 +37,44 @@ class HubChannel < ApplicationCable::Channel
       return
     end
 
+    # Both browser AND CLI must provide browser_identity for per-browser streams
+    unless @browser_identity.present?
+      Rails.logger.warn "[HubChannel] Missing browser_identity - rejecting subscription"
+      reject
+      return
+    end
+
+    # Determine if this is a CLI subscription (has cli_subscription param)
+    @is_cli = params[:cli_subscription].present?
+
     # Subscribe to appropriate stream based on client type
     stream_from my_stream_name
 
-    if @browser_identity.present?
+    if @is_cli
+      Rails.logger.info "[HubChannel] CLI subscribed for browser: hub=#{@hub_id} identity=#{@browser_identity[0..8]}..."
+    else
       Rails.logger.info "[HubChannel] Browser subscribed: hub=#{@hub_id} identity=#{@browser_identity[0..8]}..."
       notify_cli_of_browser_connection
-    else
-      Rails.logger.info "[HubChannel] CLI subscribed: hub=#{@hub_id}"
     end
   end
 
   def unsubscribed
-    if @browser_identity.present?
+    if @is_cli
+      Rails.logger.info "[HubChannel] CLI unsubscribed for browser: hub=#{@hub_id}"
+    else
       Rails.logger.info "[HubChannel] Browser unsubscribed: hub=#{@hub_id}"
       notify_cli_of_browser_disconnection
-    else
-      Rails.logger.info "[HubChannel] CLI unsubscribed: hub=#{@hub_id}"
     end
   end
 
-  # Relay encrypted message to appropriate recipient
+  # Relay encrypted message to the paired stream
+  #
+  # Per-browser bidirectional streams mean each subscription knows its browser_identity.
+  # Browser sends -> routed to CLI stream for that browser
+  # CLI sends -> routed to browser stream for that browser
   #
   # @param data [Hash] Contains encrypted SignalEnvelope
   # @option data [String] :envelope The encrypted SignalEnvelope JSON
-  # @option data [String] :recipient_identity Target browser (CLI->browser only)
   def relay(data)
     envelope = data["envelope"]
 
@@ -69,17 +83,16 @@ class HubChannel < ApplicationCable::Channel
       return
     end
 
-    recipient_identity = data["recipient_identity"]
-
-    if recipient_identity.present?
-      # CLI -> specific browser: route to that browser's stream
-      target_stream = browser_stream_name(recipient_identity)
+    if @is_cli
+      # CLI -> browser: route to the browser's stream
+      target_stream = browser_stream_name
       ActionCable.server.broadcast(target_stream, { envelope: envelope })
-      Rails.logger.debug "[HubChannel] Routed to browser: #{recipient_identity[0..8]}..."
+      Rails.logger.debug "[HubChannel] CLI->Browser: #{@browser_identity[0..8]}..."
     else
-      # Browser -> CLI: route to CLI stream
-      ActionCable.server.broadcast(cli_stream_name, { envelope: envelope })
-      Rails.logger.debug "[HubChannel] Routed to CLI"
+      # Browser -> CLI: route to CLI stream for this browser
+      target_stream = cli_stream_name
+      ActionCable.server.broadcast(target_stream, { envelope: envelope })
+      Rails.logger.debug "[HubChannel] Browser->CLI: #{@browser_identity[0..8]}..."
     end
   end
 
@@ -105,23 +118,25 @@ class HubChannel < ApplicationCable::Channel
 
   # Stream this client subscribes to
   def my_stream_name
-    if @browser_identity.present?
-      browser_stream_name(@browser_identity)
-    else
+    if @is_cli
       cli_stream_name
+    else
+      browser_stream_name
     end
   end
 
+  # CLI stream for this browser identity
   def cli_stream_name
-    "hub:#{@hub_id}:cli"
+    "hub:#{@hub_id}:browser:#{@browser_identity}:cli"
   end
 
-  def browser_stream_name(identity)
-    "hub:#{@hub_id}:browser:#{identity}"
+  # Browser stream for this browser identity
+  def browser_stream_name
+    "hub:#{@hub_id}:browser:#{@browser_identity}"
   end
 
   def notify_cli_of_browser_connection
-    hub = current_user.hubs.find_by(identifier: @hub_id) || current_user.hubs.find_by(id: @hub_id)
+    hub = current_user.hubs.find_by(id: @hub_id)
     return unless hub
 
     Bot::Message.create_for_hub!(hub,
@@ -132,7 +147,7 @@ class HubChannel < ApplicationCable::Channel
   end
 
   def notify_cli_of_browser_disconnection
-    hub = current_user.hubs.find_by(identifier: @hub_id) || current_user.hubs.find_by(id: @hub_id)
+    hub = current_user.hubs.find_by(id: @hub_id)
     return unless hub
 
     Bot::Message.create_for_hub!(hub,

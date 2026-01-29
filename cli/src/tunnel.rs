@@ -261,10 +261,11 @@ impl TunnelManager {
                             warn!("[Tunnel] Failed to notify agent tunnel: {}", e);
                         }
                     } else {
-                        debug!("[Tunnel] Skipping registration (not connected yet): {}",
+                        // Not connected - just drop this notification.
+                        // The agent is already in agent_ports, so it will be
+                        // registered when the tunnel connects (see confirm_subscription handler).
+                        debug!("[Tunnel] Not connected, skipping registration for {} (will register on connect)",
                             registration.session_key);
-                        // Re-queue for later
-                        let _ = self.pending_tx.send(registration);
                     }
                 }
             }

@@ -439,8 +439,10 @@ impl Hub {
                         hub_id,
                         agent_index: Some(agent_index),
                         pty_index: None, // Preview channel doesn't use PTY index
+                        browser_identity: None,
                         encrypt: true,
                         compression_threshold: Some(4096),
+                        cli_subscription: false,
                     })
                     .await
             });
@@ -523,11 +525,14 @@ impl Hub {
     // === Event Loop ===
 
     /// Perform all initial setup steps.
+    ///
+    /// Note: Signal Protocol bundle generation is deferred until the connection
+    /// URL is first requested (TUI QR display, external automation, etc.).
+    /// This avoids blocking boot for up to 10 seconds on bundle generation.
     pub fn setup(&mut self) {
         self.register_device();
         self.register_hub_with_server();
-        self.start_tunnel();
-        self.connect_hub_relay();
+        self.init_signal_protocol();
 
         // Start background workers for non-blocking network I/O
         // Must be called after register_hub_with_server() sets botster_id
@@ -541,8 +546,12 @@ impl Hub {
         if let Err(e) = self.load_available_worktrees() {
             log::warn!("Failed to load initial worktrees: {}", e);
         }
-        let connection_result = self.generate_connection_url();
-        self.handle_cache.set_connection_url(connection_result);
+
+        // Bundle generation is deferred - don't call generate_connection_url() here.
+        // The bundle will be generated lazily when:
+        // 1. TUI requests QR code display (GetConnectionCode command)
+        // 2. External automation requests the connection URL
+        // This avoids blocking boot for up to 10 seconds.
     }
 
     /// Run the Hub event loop without TUI.
@@ -871,103 +880,28 @@ impl Hub {
         }
     }
 
-    /// Generate the connection URL from the current Signal bundle.
+    /// Generate connection URL, lazily generating bundle if needed.
     ///
     /// Format: `{server_url}/hubs/{id}#{base32_binary_bundle}`
     /// - URL portion: byte mode (any case allowed)
     /// - Bundle (after #): alphanumeric mode (uppercase Base32)
     ///
-    /// This is the canonical source for connection URLs.
-    pub(crate) fn generate_connection_url(&self) -> Result<String, String> {
-        let bundle = self
-            .browser
-            .signal_bundle
-            .as_ref()
-            .ok_or_else(|| "Signal bundle not initialized".to_string())?;
-
-        let bytes = bundle
-            .to_binary()
-            .map_err(|e| format!("Cannot serialize PreKeyBundle: {}", e))?;
-
-        let encoded = data_encoding::BASE32_NOPAD.encode(&bytes);
-        let url = format!(
-            "{}/hubs/{}#{}",
-            self.config.server_url,
-            self.server_hub_id(),
-            encoded
-        );
-
-        log::debug!(
-            "Generated connection URL: {} chars (QR alphanumeric capacity: 4296)",
-            url.len()
-        );
-
-        Ok(url)
+    /// On first call, this generates the PreKeyBundle (lazy initialization).
+    /// Subsequent calls return the cached bundle unless it was used.
+    pub(crate) fn generate_connection_url(&mut self) -> Result<String, String> {
+        // Delegate to the lazy generation function which handles caching
+        self.get_or_generate_connection_url()
     }
 
-    /// Request bundle regeneration from relay and return the new connection URL.
+    /// Regenerate the PreKeyBundle and return the new connection URL.
     ///
-    /// This is a blocking operation that:
-    /// 1. Requests bundle regeneration from the relay
-    /// 2. Waits for the new bundle to arrive
-    /// 3. Returns the new connection URL
+    /// Forces bundle regeneration even if a cached bundle exists.
     fn refresh_and_get_connection_url(&mut self) -> Result<String, String> {
-        use std::time::Duration;
+        // Mark bundle as used to force regeneration
+        self.browser.bundle_used = true;
 
-        // Check if relay is connected
-        let sender = self
-            .browser
-            .sender
-            .as_ref()
-            .ok_or_else(|| "Relay not connected".to_string())?
-            .clone();
-
-        // Get original bundle bytes for comparison (if any)
-        let original_bytes = self
-            .browser
-            .signal_bundle
-            .as_ref()
-            .and_then(|b| b.to_binary().ok());
-
-        // Request bundle regeneration
-        self.tokio_runtime.block_on(async {
-            sender
-                .request_bundle_regeneration()
-                .await
-                .map_err(|e| format!("Failed to request bundle regeneration: {}", e))
-        })?;
-
-        log::info!("Requested bundle regeneration, waiting for new bundle...");
-
-        // Wait for new bundle (with timeout)
-        // Bundle regeneration timeout: 10 seconds should be plenty
-        const BUNDLE_TIMEOUT: Duration = Duration::from_secs(10);
-        const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-        let start = Instant::now();
-
-        while start.elapsed() < BUNDLE_TIMEOUT {
-            // Process relay events to receive the new bundle
-            self.tokio_runtime.block_on(async {
-                tokio::time::sleep(POLL_INTERVAL).await;
-            });
-
-            // Check if bundle changed by comparing binary representation
-            if let Some(ref bundle) = self.browser.signal_bundle {
-                if let Ok(new_bytes) = bundle.to_binary() {
-                    let changed = match &original_bytes {
-                        Some(orig) => &new_bytes != orig,
-                        None => true, // Had no bundle before, now we do
-                    };
-                    if changed {
-                        log::info!("New bundle received");
-                        return self.generate_connection_url();
-                    }
-                }
-            }
-        }
-
-        Err("Timeout waiting for new bundle".to_string())
+        // Delegate to lazy generation (will regenerate due to bundle_used flag)
+        self.get_or_generate_connection_url()
     }
 }
 

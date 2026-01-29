@@ -8,8 +8,11 @@ Rails.application.config.after_initialize do
     # Override the default origin checking to allow DeviceToken authenticated requests
     def allow_request_origin?
       # If request has a valid DeviceToken, skip origin check (CLI connections)
-      if request.params[:api_key].present?
-        device_token = DeviceToken.find_by(token: request.params[:api_key])
+      # Check Authorization header (Bearer token) - same pattern as ApplicationCable::Connection
+      auth_header = request.headers["Authorization"] || env["HTTP_AUTHORIZATION"]
+      if auth_header.present? && auth_header.start_with?("Bearer ")
+        token = auth_header.sub("Bearer ", "")
+        device_token = DeviceToken.find_by(token: token)
         return true if device_token.present?
       end
 

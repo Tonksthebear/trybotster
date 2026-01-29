@@ -15,6 +15,8 @@ class Hub < ApplicationRecord
   scope :stale, -> { where(alive: false).or(where("last_seen_at <= ?", 2.minutes.ago)) }
   scope :with_device, -> { where.not(device_id: nil) }
 
+  after_update_commit :update_sidebar
+
   # Check if this hub supports E2E encrypted terminal access
   def e2e_enabled?
     device.present?
@@ -92,5 +94,15 @@ class Hub < ApplicationRecord
 
   def turbo_stream_name
     "user_#{user_id}_hubs"
+  end
+
+  def update_sidebar
+    Turbo::StreamsChannel.broadcast_action_to [ user, :hubs ],
+      action: :update_attribute,
+      targets: ".#{dom_id(self, :sidebar)}",
+      content: active?.to_s,
+      attributes: {
+        attribute: "data-active"
+      }
   end
 end

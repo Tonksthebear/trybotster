@@ -28,6 +28,21 @@
 // Default retransmission timeout in milliseconds
 const DEFAULT_RETRANSMIT_TIMEOUT_MS = 3000;
 
+// djb2 hash for envelope fingerprinting - produces unique 8-char hex for different content
+function quickHash(str) {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) + str.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function envelopeFingerprint(envelope) {
+  if (!envelope) return "null";
+  const str = typeof envelope === 'string' ? envelope : JSON.stringify(envelope);
+  return quickHash(str);
+}
+
 // Maximum retransmission timeout (cap for exponential backoff)
 const MAX_RETRANSMIT_TIMEOUT_MS = 30000;
 
@@ -89,9 +104,13 @@ function rangesToSet(ranges) {
 export class ReliableSender {
   constructor(options = {}) {
     this.nextSeq = 1; // Start at 1, 0 is reserved
-    this.pending = new Map(); // seq -> { payload, firstSentAt, lastSentAt, attempts }
-    this.retransmitTimeout = options.retransmitTimeout || DEFAULT_RETRANSMIT_TIMEOUT_MS;
-    this.onSend = options.onSend || (() => {}); // Callback to actually send
+    this.pending = new Map(); // seq -> { payload, encryptedEnvelope, firstSentAt, lastSentAt, attempts }
+    this.retransmitTimeout =
+      options.retransmitTimeout || DEFAULT_RETRANSMIT_TIMEOUT_MS;
+    // onSend: encrypts and sends, returns encrypted envelope for caching
+    this.onSend = options.onSend || (async () => null);
+    // onRetransmit: sends pre-encrypted envelope (no re-encryption)
+    this.onRetransmit = options.onRetransmit || (() => {});
     this.onMessageFailed = options.onMessageFailed || (() => {}); // Callback for failed messages
     this.retransmitTimer = null;
     this.paused = false; // Connection-aware: pause retransmits when disconnected
@@ -148,22 +167,22 @@ export class ReliableSender {
    *
    * The payload is serialized to JSON bytes (array of numbers) to match
    * the Rust protocol which expects `payload: Vec<u8>`.
+   *
+   * IMPORTANT: onSend is expected to encrypt and return the encrypted envelope.
+   * We cache this envelope for retransmission to avoid re-encrypting (which would
+   * advance Signal counters and cause decryption failures on the receiver).
    */
-  send(payload) {
+  async send(payload) {
     const seq = this.nextSeq++;
     const now = Date.now();
+    console.debug(
+      `[Reliable] Sender.send() START: seq=${seq}, type=${payload?.type}, nextSeq will be=${this.nextSeq}`,
+    );
 
     // Serialize payload to JSON bytes (matches Rust Vec<u8> format)
     const payloadBytes = Array.from(
-      new TextEncoder().encode(JSON.stringify(payload))
+      new TextEncoder().encode(JSON.stringify(payload)),
     );
-
-    this.pending.set(seq, {
-      payloadBytes, // Store bytes for retransmit
-      firstSentAt: now,
-      lastSentAt: now,
-      attempts: 1,
-    });
 
     const message = {
       type: "data",
@@ -171,8 +190,32 @@ export class ReliableSender {
       payload: payloadBytes,
     };
 
-    this.onSend(message);
+    console.debug(
+      `[Reliable] Sender.send() calling onSend for seq=${seq}`,
+    );
+
+    // Encrypt and send - onSend returns the encrypted envelope for caching
+    const encryptedEnvelope = await this.onSend(message);
+
+    // Log the envelope fingerprint for correlation with SignalWorker logs
+    const fingerprint = envelopeFingerprint(encryptedEnvelope);
+    console.debug(
+      `[Reliable] Sender.send() CACHING: seq=${seq}, envelope=${fingerprint}`,
+    );
+
+    this.pending.set(seq, {
+      payloadBytes, // Keep for debugging
+      encryptedEnvelope, // Cache encrypted form for retransmit
+      firstSentAt: now,
+      lastSentAt: now,
+      attempts: 1,
+    });
+
     this.scheduleRetransmit();
+
+    console.debug(
+      `[Reliable] Sender.send() DONE: seq=${seq}, pending.size=${this.pending.size}`,
+    );
 
     return seq;
   }
@@ -204,6 +247,7 @@ export class ReliableSender {
   /**
    * Get messages that need retransmission.
    * Uses exponential backoff and removes messages that exceed max attempts.
+   * Returns cached encrypted envelopes (not plaintext) to avoid re-encryption.
    */
   getRetransmits() {
     const now = Date.now();
@@ -212,7 +256,9 @@ export class ReliableSender {
 
     for (const [seq, entry] of this.pending) {
       if (entry.attempts >= MAX_RETRANSMIT_ATTEMPTS) {
-        console.error(`[Reliable] Message seq=${seq} exceeded max retransmits, removing`);
+        console.error(
+          `[Reliable] Message seq=${seq} exceeded max retransmits, removing`,
+        );
         failedSeqs.push(seq);
         this.onMessageFailed(seq, entry.payloadBytes);
         continue;
@@ -224,10 +270,13 @@ export class ReliableSender {
       if (now - entry.lastSentAt >= timeout) {
         entry.lastSentAt = now;
         entry.attempts++;
+        console.debug(
+          `[Reliable] RETRANSMIT seq=${seq}, attempt=${entry.attempts}, pending=${this.pending.size}`,
+        );
+        // Return the cached encrypted envelope for retransmission
         retransmits.push({
-          type: "data",
           seq,
-          payload: entry.payloadBytes,
+          encryptedEnvelope: entry.encryptedEnvelope,
         });
       }
     }
@@ -256,9 +305,12 @@ export class ReliableSender {
       if (this.paused) return;
 
       const retransmits = this.getRetransmits();
-      for (const msg of retransmits) {
-        console.debug(`[Reliable] Retransmitting seq=${msg.seq}, attempt=${this.pending.get(msg.seq)?.attempts}`);
-        this.onSend(msg);
+      for (const { seq, encryptedEnvelope } of retransmits) {
+        console.debug(
+          `[Reliable] Retransmitting seq=${seq}, attempt=${this.pending.get(seq)?.attempts}`,
+        );
+        // Use onRetransmit for pre-encrypted envelopes (no re-encryption)
+        this.onRetransmit(encryptedEnvelope);
       }
 
       // Reschedule if still have pending
@@ -335,21 +387,41 @@ export class ReliableReceiver {
    * Note: This method is async because decompression may be required for gzip payloads.
    */
   async receive(seq, payloadBytes) {
+    console.debug(
+      `[Reliable] Receiver got seq=${seq}, nextExpected=${this.nextExpected}, received.size=${this.received.size}`,
+    );
+
     // Session reset detection: if we receive seq=1 when we expected higher,
-    // the peer has restarted. Reset our state to sync.
+    // the peer has restarted their reliable channel. Reset only our receiver
+    // to accept their new sequence numbers, but do NOT reset our sender.
+    // Resetting sender would cause Signal counter desync (sender uses counters
+    // that peer has already seen).
     if (seq === 1 && this.nextExpected > 1) {
-      console.debug(`[Reliable] Session reset detected: got seq=1, expected=${this.nextExpected}`);
+      console.debug(
+        `[Reliable] Peer reset detected: got seq=1, expected=${this.nextExpected}. Resetting receiver only.`,
+      );
       this.reset();
-      this.onReset(); // Notify channel to reset sender too
+      // Note: NOT calling onReset() - sender keeps its sequence numbers
     }
 
     // Cleanup stale buffered messages periodically
     this.cleanupStaleBuffer();
 
-    // Duplicate check
+    // Duplicate check with reset detection
     if (this.received.has(seq)) {
-      console.debug(`[Reliable] Duplicate seq=${seq}, ignoring`);
-      return [];
+      // If seq is low (< 10) and we've advanced well past it, peer likely reset
+      // True duplicates from retransmission would match recent sequences
+      if (seq < 10 && this.nextExpected > seq + 5) {
+        console.debug(
+          `[Reliable] Probable peer reset: got seq=${seq}, nextExpected=${this.nextExpected}. Resetting receiver only.`,
+        );
+        this.reset();
+        // Note: NOT calling onReset() - sender keeps its sequence numbers
+        // Continue processing this message after reset
+      } else {
+        console.debug(`[Reliable] Duplicate seq=${seq}, ignoring`);
+        return [];
+      }
     }
 
     // Record as received
@@ -389,7 +461,9 @@ export class ReliableReceiver {
       return deliverable;
     } else if (seq > this.nextExpected) {
       // Out of order - buffer for later with timestamp for TTL
-      console.debug(`[Reliable] Out of order: got seq=${seq}, expected=${this.nextExpected}, buffering`);
+      console.debug(
+        `[Reliable] Out of order: got seq=${seq}, expected=${this.nextExpected}, buffering`,
+      );
       this.buffer.set(seq, { payload, receivedAt: Date.now() });
       return [];
     } else {

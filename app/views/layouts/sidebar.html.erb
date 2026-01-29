@@ -27,10 +27,13 @@
     <%= javascript_importmap_tags %>
   </head>
 
-  <body class="bg-zinc-950 text-zinc-100 h-dvh font-sans antialiased flex flex-col">
+  <body class="bg-zinc-950 text-zinc-100 h-dvh font-sans antialiased flex flex-col" data-controller="hub" data-hub>
     <%= render Elements::SidebarComponent.new(class: "flex-1 min-h-0 flex flex-col overflow-y-auto") do |layout| %>
-      <% layout.with_sidebar do %>
-        <%= render "layouts/sidebar_content" %>
+      <% layout.with_desktop_sidebar do %>
+        <%= render "layouts/sidebar_content", sidebar_id: "desktop" %>
+      <% end %>
+      <% layout.with_mobile_sidebar do %>
+        <%= render "layouts/sidebar_content", sidebar_id: "mobile" %>
       <% end %>
 
       <% layout.with_header do %>

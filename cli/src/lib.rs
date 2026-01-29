@@ -60,7 +60,7 @@ pub use git::WorktreeManager;
 pub use notifications::{NotificationSender, NotificationType};
 pub use process::{get_parent_pid, kill_orphaned_processes};
 pub use prompt::PromptManager;
-pub use relay::{AgentInfo, BrowserEvent, BrowserResize, HubSender, TerminalMessage, WorktreeInfo};
+pub use relay::{AgentInfo, BrowserResize, TerminalMessage, WorktreeInfo};
 pub use terminal_widget::TerminalWidget;
 pub use tunnel::{allocate_tunnel_port, TunnelManager, TunnelStatus};
 

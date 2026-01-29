@@ -4,15 +4,18 @@
 //! communication with connected browser clients via Action Cable. It manages:
 //!
 //! - E2E encrypted communication (Signal Protocol)
-//! - Browser event to Hub action conversion
 //! - Terminal output streaming
 //!
 //! # Architecture
 //!
 //! ```text
-//! Browser ◄──WebSocket──► Rails Action Cable ◄──WebSocket──► Relay
+//! Browser ◄──WebSocket──► Rails Action Cable ◄──WebSocket──► CLI
 //!                                                              │
-//!                              Hub ◄─── BrowserEvent → HubAction
+//!                              Hub ◄─── HubCommandChannel (hub-level events)
+//!                              │
+//!                     BrowserClient (per-browser commands)
+//!                              │
+//!                    TerminalRelayChannel (per-PTY I/O)
 //! ```
 //!
 //! # Encryption
@@ -41,18 +44,16 @@
 //!
 //! # Modules
 //!
-//! - [`connection`] - WebSocket transport and Signal encryption
-//! - [`events`] - Browser event to Hub action conversion
+//! - [`crypto_service`] - Thread-safe Signal Protocol operations
 //! - [`signal`] - Signal Protocol E2E encryption
 //! - [`signal_stores`] - Signal Protocol store implementations
 //! - [`persistence`] - Encrypted storage for Signal state
 //! - [`state`] - Browser connection state management
 //! - [`types`] - Protocol message types
+//! - [`http_proxy`] - HTTP proxy for preview tunneling
+//! - [`preview_types`] - Preview proxy message types
 
-pub mod browser;
-pub mod connection;
 pub mod crypto_service;
-pub mod events;
 pub mod http_proxy;
 pub mod persistence;
 pub mod preview_types;
@@ -61,28 +62,18 @@ pub mod signal_stores;
 pub mod state;
 pub mod types;
 
-pub use state::{
-    build_agent_info, build_scrollback_message, build_worktree_info, BrowserState,
-    IdentifiedBrowserEvent,
-};
+pub use state::{build_agent_info, build_scrollback_message, build_worktree_info, BrowserState};
 
 pub use types::{
-    AgentCreationStage, AgentInfo, BrowserCommand, BrowserEvent, BrowserResize, TerminalMessage,
+    AgentCreationStage, AgentInfo, BrowserCommand, BrowserResize, TerminalMessage,
     WorktreeInfo,
 };
-
-pub use connection::{HubRelay, HubSender};
-
-// Note: OutputMessage is pub(crate) and only used internally for testing.
-// Tests within the relay module can use connection::OutputMessage directly.
 
 pub use signal::{
     binary_format, PreKeyBundleData, SignalEnvelope, SignalProtocolManager, SIGNAL_PROTOCOL_VERSION,
 };
 
 pub use persistence::{delete_connection_url, read_connection_url, write_connection_url};
-
-pub use browser::poll_events_headless;
 
 pub use preview_types::{
     HttpRequest, HttpResponse, PreviewCommand, PreviewEvent, PreviewMessage, ProxyConfig,

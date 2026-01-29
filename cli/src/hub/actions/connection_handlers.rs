@@ -25,19 +25,40 @@ pub fn handle_copy_connection_url(hub: &mut Hub) {
 
 /// Handle regenerating the connection code.
 ///
-/// Requests a new PreKeyBundle from the relay. The new bundle will arrive
-/// asynchronously via a BundleRegenerated event.
+/// Regenerates the PreKeyBundle directly via CryptoService and updates Hub state.
 pub fn handle_regenerate_connection_code(hub: &mut Hub) {
-    // Request a new PreKeyBundle from the relay
-    if let Some(ref sender) = hub.browser.sender {
-        let sender = sender.clone();
-        hub.tokio_runtime.spawn(async move {
-            if let Err(e) = sender.request_bundle_regeneration().await {
-                log::error!("Failed to request bundle regeneration: {}", e);
+    // Get crypto service from browser state
+    let Some(crypto_service) = hub.browser.crypto_service.clone() else {
+        log::warn!("Cannot regenerate bundle: crypto service not initialized");
+        return;
+    };
+
+    // Regenerate bundle directly via crypto service
+    let result = hub.tokio_runtime.block_on(async {
+        let next_id = crypto_service.next_prekey_id().await.unwrap_or(1);
+        crypto_service.get_prekey_bundle(next_id).await
+    });
+
+    match result {
+        Ok(bundle) => {
+            log::info!(
+                "New PreKeyBundle generated with PreKey {}",
+                bundle.prekey_id.unwrap_or(0)
+            );
+            hub.browser.signal_bundle = Some(bundle);
+            hub.browser.bundle_used = false;
+
+            // Update cached connection URL with new bundle
+            let url_result = hub.generate_connection_url();
+            hub.handle_cache.set_connection_url(url_result.clone());
+            if let Ok(ref url) = url_result {
+                // Write to file for external access
+                let _ = crate::relay::write_connection_url(&hub.hub_identifier, url);
+                log::info!("Connection URL updated with new bundle");
             }
-        });
-        log::info!("Requested bundle regeneration");
-    } else {
-        log::warn!("Cannot regenerate bundle: relay not connected");
+        }
+        Err(e) => {
+            log::error!("Failed to regenerate PreKeyBundle: {}", e);
+        }
     }
 }

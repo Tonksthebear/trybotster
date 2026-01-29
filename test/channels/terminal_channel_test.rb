@@ -301,7 +301,7 @@ class TerminalChannelTest < ActionCable::Channel::TestCase
     stub_connection current_user: user
 
     assert_difference "Bot::Message.count", 1 do
-      subscribe hub_id: hub.identifier, agent_index: @agent_index, pty_index: @pty_index, browser_identity: @browser_identity
+      subscribe hub_id: hub.id, agent_index: @agent_index, pty_index: @pty_index, browser_identity: @browser_identity
     end
 
     assert subscription.confirmed?
@@ -319,7 +319,7 @@ class TerminalChannelTest < ActionCable::Channel::TestCase
     hub = hubs(:active_hub)
     stub_connection current_user: user
 
-    subscribe hub_id: hub.identifier, agent_index: @agent_index, pty_index: @pty_index, browser_identity: @browser_identity
+    subscribe hub_id: hub.id, agent_index: @agent_index, pty_index: @pty_index, browser_identity: @browser_identity
     assert subscription.confirmed?
 
     assert_difference "Bot::Message.count", 1 do
@@ -340,7 +340,7 @@ class TerminalChannelTest < ActionCable::Channel::TestCase
     stub_connection current_user: user
 
     assert_no_difference "Bot::Message.count" do
-      subscribe hub_id: hub.identifier, agent_index: @agent_index, pty_index: @pty_index
+      subscribe hub_id: hub.id, agent_index: @agent_index, pty_index: @pty_index
     end
 
     assert subscription.confirmed?
@@ -351,7 +351,7 @@ class TerminalChannelTest < ActionCable::Channel::TestCase
     hub = hubs(:active_hub)
     stub_connection current_user: user
 
-    subscribe hub_id: hub.identifier, agent_index: 2, pty_index: 1, browser_identity: @browser_identity
+    subscribe hub_id: hub.id, agent_index: 2, pty_index: 1, browser_identity: @browser_identity
     assert subscription.confirmed?
 
     msg = Bot::Message.last

@@ -76,6 +76,11 @@ struct ChannelIdentifier {
     agent_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pty_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    browser_identity: Option<String>,
+    /// CLI subscription flag for per-browser HubChannel streams.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    cli_subscription: bool,
 }
 
 /// Incoming Action Cable message.
@@ -221,6 +226,9 @@ pub struct ActionCableChannel {
     /// Whether reliable delivery is enabled.
     reliable: bool,
 
+    /// Whether this is a CLI subscription for per-browser HubChannel streams.
+    cli_subscription: bool,
+
     /// Per-peer reliable sessions (only if reliable=true).
     /// Each peer has independent sequence number spaces.
     reliable_sessions: Arc<RwLock<HashMap<String, ReliableSession>>>,
@@ -248,6 +256,7 @@ pub struct ActionCableChannelBuilder {
     api_key: Option<String>,
     crypto_service: Option<CryptoServiceHandle>,
     reliable: bool,
+    cli_subscription: bool,
 }
 
 impl ActionCableChannelBuilder {
@@ -290,6 +299,17 @@ impl ActionCableChannelBuilder {
         self
     }
 
+    /// Mark as CLI subscription for per-browser HubChannel streams.
+    ///
+    /// When enabled, the subscription includes `cli_subscription: true` which
+    /// tells Rails to subscribe to `hub:{id}:browser:{identity}:cli` instead
+    /// of the browser stream.
+    #[must_use]
+    pub fn cli_subscription(mut self, enable: bool) -> Self {
+        self.cli_subscription = enable;
+        self
+    }
+
     /// Build the channel.
     ///
     /// # Panics
@@ -304,6 +324,7 @@ impl ActionCableChannelBuilder {
             server_url: self.server_url.expect("server_url is required"),
             api_key: self.api_key.expect("api_key is required"),
             reliable: self.reliable,
+            cli_subscription: self.cli_subscription,
             reliable_sessions: Arc::new(RwLock::new(HashMap::new())),
             send_tx: None,
             recv_rx: None,
@@ -422,7 +443,9 @@ impl ActionCableChannel {
     /// }
     /// ```
     pub fn take_receiver_handle(&mut self) -> Option<ChannelReceiverHandle> {
-        self.recv_rx.take().map(|rx| ChannelReceiverHandle { recv_rx: rx })
+        self.recv_rx
+            .take()
+            .map(|rx| ChannelReceiverHandle { recv_rx: rx })
     }
 
     /// Non-blocking drain of all available incoming messages.
@@ -627,6 +650,8 @@ impl ActionCableChannel {
             hub_id: config.hub_id.clone(),
             agent_index: config.agent_index,
             pty_index: config.pty_index,
+            browser_identity: config.browser_identity.clone(),
+            cli_subscription: config.cli_subscription,
         };
         let identifier_json = serde_json::to_string(&identifier).expect("identifier serializable");
 
@@ -1046,10 +1071,13 @@ impl ActionCableChannel {
                         .or_insert_with(ReliableSession::new);
                     let (messages, reset_occurred) = session.receiver.receive(seq, decompressed);
 
-                    // If peer reset their session, also reset our sender
+                    // Log peer reset but do NOT reset our sender.
+                    // Resetting sender would cause Signal counter desync because our
+                    // sender would use seq numbers (and thus ratchet forward) with
+                    // counters the peer has already seen.
                     if reset_occurred {
-                        log::info!("Resetting sender for peer {} due to session reset", sender);
-                        session.sender.reset();
+                        log::info!("Peer {} reset their reliable channel, receiver reset to accept new seq numbers", sender);
+                        // Note: NOT resetting sender - it keeps its sequence numbers
                     }
 
                     messages
@@ -1504,6 +1532,7 @@ mod tests {
             server_url: "http://test".to_string(),
             api_key: "key".to_string(),
             reliable: false,
+            cli_subscription: false,
             reliable_sessions: Arc::new(RwLock::new(HashMap::new())),
             send_tx: None,
             recv_rx: Some(recv_rx),

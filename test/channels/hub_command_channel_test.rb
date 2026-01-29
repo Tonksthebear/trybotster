@@ -13,14 +13,7 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
 
   # === Subscription Tests ===
 
-  test "subscribes with valid hub identifier and streams from correct channel" do
-    subscribe hub_id: @hub.identifier
-
-    assert subscription.confirmed?
-    assert_has_stream "hub_command:#{@hub.id}"
-  end
-
-  test "subscribes with valid hub numeric id" do
+  test "subscribes with valid hub id and streams from correct channel" do
     subscribe hub_id: @hub.id
 
     assert subscription.confirmed?
@@ -50,7 +43,7 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
     # Acknowledge the first message so it should not be replayed
     msg1.acknowledge!
 
-    subscribe hub_id: @hub.identifier, start_from: 0
+    subscribe hub_id: @hub.id, start_from: 0
 
     assert subscription.confirmed?
 
@@ -66,7 +59,7 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
     msg3 = Bot::Message.create_for_hub!(@hub, event_type: "browser_disconnected", payload: { browser_identity: "b3" })
 
     # Subscribe with start_from at msg2's sequence, so only msg3 should replay
-    subscribe hub_id: @hub.identifier, start_from: msg2.sequence
+    subscribe hub_id: @hub.id, start_from: msg2.sequence
 
     assert subscription.confirmed?
 
@@ -79,7 +72,7 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
   test "ack action acknowledges a message" do
     msg = Bot::Message.create_for_hub!(@hub, event_type: "browser_connected", payload: { browser_identity: "b1" })
 
-    subscribe hub_id: @hub.identifier
+    subscribe hub_id: @hub.id
     assert subscription.confirmed?
 
     perform :ack, sequence: msg.sequence
@@ -94,7 +87,7 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
   test "heartbeat action updates hub last_seen_at and alive" do
     @hub.update!(alive: false, last_seen_at: 10.minutes.ago)
 
-    subscribe hub_id: @hub.identifier
+    subscribe hub_id: @hub.id
     assert subscription.confirmed?
 
     perform :heartbeat, agents: []

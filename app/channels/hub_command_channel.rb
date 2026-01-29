@@ -29,6 +29,7 @@ class HubCommandChannel < ApplicationCable::Channel
   end
 
   def unsubscribed
+    @hub&.update(active: false)
     Rails.logger.info "[HubCommandChannel] CLI unsubscribed: hub=#{@hub&.id}"
   end
 
@@ -55,8 +56,7 @@ class HubCommandChannel < ApplicationCable::Channel
   private
 
   def find_hub
-    current_user.hubs.find_by(identifier: params[:hub_id]) ||
-      current_user.hubs.find_by(id: params[:hub_id])
+    current_user.hubs.find_by(id: params[:hub_id])
   end
 
   def replay_messages(start_from)

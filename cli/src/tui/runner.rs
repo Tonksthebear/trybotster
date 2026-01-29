@@ -70,7 +70,7 @@ use crate::app::AppMode;
 use crate::client::{TuiOutput, TuiRequest};
 use crate::constants;
 use crate::hub::Hub;
-use crate::relay::{browser, AgentInfo};
+use crate::relay::AgentInfo;
 use crate::tui::layout::terminal_widget_inner_area;
 
 use super::actions::InputResult;
@@ -699,10 +699,7 @@ pub fn run_with_hub(
             break;
         }
 
-        // 3. Poll and handle browser events (HubRelay - hub-level commands)
-        browser::poll_events_headless(hub)?;
-
-        // 4. Poll pending agents and progress events
+        // 2. Poll pending agents and progress events
         hub.poll_pending_agents();
         hub.poll_progress_events();
 

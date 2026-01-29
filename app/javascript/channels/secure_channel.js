@@ -47,9 +47,12 @@ import {
 
 function getSignalConfig() {
   return {
-    workerUrl: document.querySelector('meta[name="signal-worker-url"]')?.content,
-    wasmJsUrl: document.querySelector('meta[name="signal-wasm-js-url"]')?.content,
-    wasmBinaryUrl: document.querySelector('meta[name="signal-wasm-binary-url"]')?.content,
+    workerUrl: document.querySelector('meta[name="signal-worker-url"]')
+      ?.content,
+    wasmJsUrl: document.querySelector('meta[name="signal-wasm-js-url"]')
+      ?.content,
+    wasmBinaryUrl: document.querySelector('meta[name="signal-wasm-binary-url"]')
+      ?.content,
   };
 }
 
@@ -140,19 +143,23 @@ export function open(options) {
       { channel: channelName, ...params },
       {
         connected: () => {
-          // Tear down previous Channel wrapper on reconnect
-          if (wrapped) wrapped.destroy();
+          if (wrapped) {
+            // Reconnect: resume without resetting
+            // Reliable channel handles retransmission of pending messages
+            wrapped.markConnected(false);
+          } else {
+            // First connect: create Channel
+            wrapped = Channel.builder(subscription)
+              .session(session)
+              .reliable(reliable)
+              .onMessage(onMessage)
+              .onConnect(onConnect)
+              .onDisconnect(onDisconnect)
+              .onError(onError)
+              .build();
 
-          wrapped = Channel.builder(subscription)
-            .session(session)
-            .reliable(reliable)
-            .onMessage(onMessage)
-            .onConnect(onConnect)
-            .onDisconnect(onDisconnect)
-            .onError(onError)
-            .build();
-
-          wrapped.markConnected();
+            wrapped.markConnected();
+          }
 
           if (!resolved) {
             resolved = true;
@@ -161,9 +168,13 @@ export function open(options) {
         },
 
         disconnected: () => {
+          // Don't destroy the Channel - just mark disconnected.
+          // This preserves reliable channel state (seq numbers) and
+          // allows proper resumption when ActionCable reconnects.
+          // Destroying would reset seq numbers but not Signal counters,
+          // causing decryption failures on reconnect.
           if (wrapped) {
-            wrapped.destroy();
-            wrapped = null;
+            wrapped.markDisconnected();
           }
           onDisconnect();
         },
