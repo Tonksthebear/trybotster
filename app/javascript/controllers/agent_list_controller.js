@@ -46,7 +46,6 @@ export default class extends Controller {
   };
 
   connect() {
-    console.debug("[agent-list] connect(), hubIdValue:", this.hubIdValue);
     if (!this.hubIdValue) return;
 
     // Track unsubscribe functions for cleanup
@@ -55,17 +54,10 @@ export default class extends Controller {
     // agentsValueChanged fires automatically on connect if value differs from default,
     // so persisted data from turbo-permanent renders without explicit call
 
-    console.debug("[agent-list] calling acquire...");
     ConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
       fromFragment: true,
     }).then((hub) => {
-      console.debug(
-        "[agent-list] acquire resolved, hub:",
-        hub,
-        "isConnected:",
-        hub?.isConnected?.(),
-      );
       this.hub = hub;
 
       this.unsubscribers.push(
@@ -90,11 +82,7 @@ export default class extends Controller {
       // Request agents when connected - onConnected fires immediately if already connected
       this.unsubscribers.push(
         this.hub.onConnected(() => {
-          console.debug(
-            "[agent-list] onConnected callback fired, requesting agents",
-          );
-          const result = this.hub.requestAgents();
-          console.debug("[agent-list] requestAgents returned:", result);
+          this.hub.requestAgents();
         }),
       );
     });
@@ -111,10 +99,6 @@ export default class extends Controller {
 
   // Stimulus: called when agentsValue changes
   agentsValueChanged() {
-    console.debug(
-      "[agent-list] agentsValueChanged, count:",
-      this.agentsValue?.length,
-    );
     this.#render();
   }
 

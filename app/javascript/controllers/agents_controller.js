@@ -102,20 +102,12 @@ export default class extends Controller {
 
   // Called by Stimulus when hub-connection outlet becomes available
   hubConnectionOutletConnected(outlet) {
-    console.log("[Agents] hubConnectionOutletConnected called");
-    console.log(
-      "[Agents] Outlet state:",
-      outlet?.state,
-      "connected:",
-      outlet?.connected,
-    );
     outlet.registerListener(this, {
       onConnected: (outlet) => this.handleConnected(outlet),
       onDisconnected: () => this.handleDisconnected(),
       onMessage: (message) => this.handleMessage(message),
       onError: (error) => this.handleError(error),
     });
-    console.log("[Agents] Registered listener with hub-connection outlet");
   }
 
   // Called by Stimulus when hub-connection outlet is removed
@@ -126,16 +118,13 @@ export default class extends Controller {
 
   // Handle connection established
   handleConnected(outlet) {
-    console.log("[Agents] handleConnected called, outlet:", !!outlet);
     this.connection = outlet;
-    console.log("[Agents] Requesting agent list and worktrees...");
     this.requestAgentList();
     this.requestWorktrees();
 
     // Check if we should auto-select an agent from URL
     const agentIndex = this.#getAgentIndexFromUrl();
     if (agentIndex !== null) {
-      console.log("[Agents] Will auto-select agent at index:", agentIndex);
       const ptyIndex = this.#getPtyIndexFromUrl();
       this.pendingAutoSelect = { agentIndex, ptyIndex: ptyIndex || 0 };
     }
@@ -168,13 +157,10 @@ export default class extends Controller {
 
   // Handle decrypted messages from CLI
   handleMessage(message) {
-    console.log("[Agents] Received message:", message.type, message);
-
     switch (message.type) {
       case "agents":
       case "agent_list":
         this.hideCreatingState();
-        console.log("[Agents] Updating agent list with:", message.agents);
         this.updateAgentList(message.agents || []);
 
         // Auto-select agent from URL if pending
@@ -186,10 +172,6 @@ export default class extends Controller {
           if (this.pendingAutoSelect.agentIndex < agents.length) {
             const agent = agents[this.pendingAutoSelect.agentIndex];
             const ptyIndex = this.pendingAutoSelect.ptyIndex;
-            console.log(
-              `[Agents] Auto-selecting agent at index ${this.pendingAutoSelect.agentIndex}:`,
-              agent.id,
-            );
             this.selectedAgentId = agent.id;
             this.updateSelectedLabel(agent.name || agent.id);
             this.updateMobileAgentUI(agent.name || agent.id);
@@ -851,30 +833,12 @@ export default class extends Controller {
 
   // Action: Request agent list refresh
   requestAgentList() {
-    console.log(
-      "[Agents] requestAgentList called, connection:",
-      !!this.connection,
-    );
-    if (this.connection) {
-      console.log("[Agents] Sending requestAgents to connection");
-      this.connection.requestAgents();
-    } else {
-      console.warn("[Agents] No connection available for requestAgentList");
-    }
+    this.connection?.requestAgents();
   }
 
   // Action: Request worktree list refresh
   requestWorktrees() {
-    console.log(
-      "[Agents] requestWorktrees called, connection:",
-      !!this.connection,
-    );
-    if (this.connection) {
-      console.log("[Agents] Sending requestWorktrees to connection");
-      this.connection.requestWorktrees();
-    } else {
-      console.warn("[Agents] No connection available for requestWorktrees");
-    }
+    this.connection?.requestWorktrees();
   }
 
   // Action: Prepare for new agent creation (called alongside command="show-modal")

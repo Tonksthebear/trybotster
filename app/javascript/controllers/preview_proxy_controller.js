@@ -1,10 +1,6 @@
 import { Controller } from "@hotwired/stimulus";
 import consumer from "channels/consumer";
-import {
-  initSignal,
-  SignalSession,
-  getHubIdFromPath,
-} from "signal";
+import { initSignal, SignalSession, getHubIdFromPath } from "signal";
 import { Channel } from "channels/channel";
 
 /**
@@ -42,14 +38,20 @@ export default class extends Controller {
     this.pendingRequests = new Map();
 
     // Listen for messages from service worker
-    navigator.serviceWorker.addEventListener("message", this.handleSwMessage.bind(this));
+    navigator.serviceWorker.addEventListener(
+      "message",
+      this.handleSwMessage.bind(this),
+    );
 
     // Initialize connection
     await this.initializeConnection();
   }
 
   disconnect() {
-    navigator.serviceWorker.removeEventListener("message", this.handleSwMessage.bind(this));
+    navigator.serviceWorker.removeEventListener(
+      "message",
+      this.handleSwMessage.bind(this),
+    );
     this.cleanup();
   }
 
@@ -61,7 +63,7 @@ export default class extends Controller {
       await initSignal(
         this.workerUrlValue,
         this.wasmJsUrlValue,
-        this.wasmBinaryUrlValue
+        this.wasmBinaryUrlValue,
       );
 
       this.updateStatus("Setting up session...");
@@ -71,7 +73,10 @@ export default class extends Controller {
       this.signalSession = await SignalSession.load(hubId);
 
       if (!this.signalSession) {
-        this.updateStatus("No session. Open terminal first to connect.", "error");
+        this.updateStatus(
+          "No session. Open terminal first to connect.",
+          "error",
+        );
         return;
       }
 
@@ -84,7 +89,6 @@ export default class extends Controller {
 
       this.updateStatus("Connected - Preview ready", "connected");
       this.connected = true;
-
     } catch (error) {
       console.error("[PreviewProxy] Connection error:", error);
       this.updateStatus(`Error: ${error.message}`, "error");
@@ -103,8 +107,6 @@ export default class extends Controller {
         },
         {
           connected: () => {
-            console.log("[PreviewProxy] Channel connected");
-
             this.channel = Channel.builder(this.subscription)
               .session(this.signalSession)
               .reliable(true)
@@ -117,7 +119,6 @@ export default class extends Controller {
             resolve();
           },
           disconnected: () => {
-            console.log("[PreviewProxy] Channel disconnected");
             this.handleDisconnect();
           },
           rejected: () => {
@@ -125,14 +126,16 @@ export default class extends Controller {
           },
           received: async (data) => {
             if (data.sender_key_distribution) {
-              await this.signalSession?.processSenderKeyDistribution(data.sender_key_distribution);
+              await this.signalSession?.processSenderKeyDistribution(
+                data.sender_key_distribution,
+              );
               return;
             }
             if (this.channel) {
               await this.channel.receive(data);
             }
           },
-        }
+        },
       );
     });
   }

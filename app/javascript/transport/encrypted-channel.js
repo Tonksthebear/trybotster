@@ -225,15 +225,15 @@ export class EncryptedChannel {
     return new Promise((resolve, reject) => {
       this.subscription = consumer.subscriptions.create(params, {
         connected: () => {
-          console.log(`[EncryptedChannel] ${this.channelName} connected`);
           resolve();
         },
         disconnected: () => {
-          console.log(`[EncryptedChannel] ${this.channelName} disconnected`);
           this.handleDisconnect();
         },
         rejected: () => {
-          console.error(`[EncryptedChannel] ${this.channelName} subscription rejected`);
+          console.error(
+            `[EncryptedChannel] ${this.channelName} subscription rejected`,
+          );
           reject(new Error("Subscription rejected"));
         },
         received: async (data) => {
@@ -247,28 +247,26 @@ export class EncryptedChannel {
    * Handle received data from channel.
    */
   async handleReceived(data) {
-    console.log(`[EncryptedChannel] ${this.channelName} received data:`, {
-      hasEnvelope: !!data.envelope,
-      hasError: !!data.error,
-      keys: Object.keys(data),
-    });
     try {
       if (data.envelope) {
         // Decrypt Signal envelope
-        console.log(`[EncryptedChannel] ${this.channelName} decrypting envelope...`);
         const decrypted = await this.signal.decrypt(data.envelope);
-        console.log(`[EncryptedChannel] ${this.channelName} decrypted:`, decrypted?.type || "unknown type");
         this.onMessage(decrypted);
       } else if (data.error) {
-        console.error(`[EncryptedChannel] ${this.channelName} server error:`, data.error);
+        console.error(
+          `[EncryptedChannel] ${this.channelName} server error:`,
+          data.error,
+        );
         this.onError({ type: "server_error", error: data.error });
       } else {
         // Pass through unencrypted messages (e.g., control messages)
-        console.log(`[EncryptedChannel] ${this.channelName} unencrypted message:`, data);
         this.onMessage(data);
       }
     } catch (error) {
-      console.error(`[EncryptedChannel] ${this.channelName} decryption failed:`, error);
+      console.error(
+        `[EncryptedChannel] ${this.channelName} decryption failed:`,
+        error,
+      );
       this.onError({ type: "decryption_failed", error });
     }
   }
@@ -309,14 +307,11 @@ export class EncryptedChannel {
     // Exponential backoff with jitter
     const baseDelay = Math.min(
       this.config.reconnectMinDelay * Math.pow(2, this.reconnectAttempt),
-      this.config.reconnectMaxDelay
+      this.config.reconnectMaxDelay,
     );
-    const jitter = baseDelay * this.config.reconnectJitter * (Math.random() * 2 - 1);
+    const jitter =
+      baseDelay * this.config.reconnectJitter * (Math.random() * 2 - 1);
     const delay = Math.max(this.config.reconnectMinDelay, baseDelay + jitter);
-
-    console.log(
-      `[EncryptedChannel] Reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempt + 1})`
-    );
 
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectAttempt++;
@@ -443,7 +438,10 @@ export class PreviewChannel extends EncryptedChannel {
   handleHttpResponse(response) {
     const pending = this.pendingRequests.get(response.request_id);
     if (!pending) {
-      console.warn("[PreviewChannel] Received response for unknown request:", response.request_id);
+      console.warn(
+        "[PreviewChannel] Received response for unknown request:",
+        response.request_id,
+      );
       return;
     }
 

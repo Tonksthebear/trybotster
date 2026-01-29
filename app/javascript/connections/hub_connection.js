@@ -87,7 +87,6 @@ export class HubConnection extends Connection {
    * Handle hub-specific messages.
    */
   handleMessage(message) {
-    console.debug("[HubConnection] handleMessage:", message.type, message);
     switch (message.type) {
       case "handshake_ack":
         this.#handleHandshakeAck(message);
@@ -95,7 +94,6 @@ export class HubConnection extends Connection {
 
       case "agents":
       case "agent_list":
-        console.debug("[HubConnection] Emitting agentList:", message.agents);
         this.emit("agentList", message.agents || []);
         break;
 
@@ -128,7 +126,6 @@ export class HubConnection extends Connection {
    * Request list of agents from CLI.
    */
   requestAgents() {
-    console.debug("[HubConnection] requestAgents called, state:", this.state);
     return this.send("list_agents");
   }
 
@@ -207,12 +204,7 @@ export class HubConnection extends Connection {
    */
   onConnected(callback) {
     // If already connected, fire immediately
-    console.debug(
-      "[HubConnection] onConnected called, isConnected:",
-      this.isConnected(),
-    );
     if (this.isConnected()) {
-      console.debug("[HubConnection] firing callback immediately");
       callback(this);
     }
     return this.on("connected", callback);
@@ -277,8 +269,6 @@ export class HubConnection extends Connection {
   }
 
   #handleHandshakeAck(message) {
-    console.debug("[HubConnection] Handshake ACK received");
-
     if (this.handshakeTimer) {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;

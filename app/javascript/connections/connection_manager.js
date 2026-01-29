@@ -47,33 +47,23 @@ class ConnectionManagerSingleton {
     let entry = this.connections.get(key);
     if (entry) {
       entry.refCount++;
-      console.debug(
-        `[ConnectionManager] Reusing ${key} (refCount: ${entry.refCount})`,
-      );
       return entry.wrapper;
     }
 
     // Check for in-progress creation (prevents race condition)
     const pending = this.pendingCreation.get(key);
     if (pending) {
-      console.debug(
-        `[ConnectionManager] Waiting for pending creation of ${key}`,
-      );
       const wrapper = await pending;
       // Now it should exist in connections
       entry = this.connections.get(key);
       if (entry) {
         entry.refCount++;
-        console.debug(
-          `[ConnectionManager] Reusing ${key} after wait (refCount: ${entry.refCount})`,
-        );
         return entry.wrapper;
       }
       // Fallback: pending creation failed, try creating again
     }
 
     // Create new connection
-    console.debug(`[ConnectionManager] Creating ${key}`);
     const creationPromise = this.#createConnection(
       ConnectionClass,
       key,
@@ -110,13 +100,9 @@ class ConnectionManagerSingleton {
     if (!entry) return;
 
     entry.refCount--;
-    console.debug(
-      `[ConnectionManager] Released ${key} (refCount: ${entry.refCount})`,
-    );
 
     if (entry.refCount <= 0) {
       this.pendingDeletion.add(key);
-      console.debug(`[ConnectionManager] Queued ${key} for deletion`);
     }
   }
 
@@ -212,7 +198,6 @@ class ConnectionManagerSingleton {
     const entry = this.connections.get(key);
     if (!entry) return;
 
-    console.debug(`[ConnectionManager] Destroying ${key}`);
     entry.wrapper.destroy();
     this.connections.delete(key);
     this.pendingDeletion.delete(key);
