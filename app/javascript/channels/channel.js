@@ -23,21 +23,6 @@ import { ReliableSender, ReliableReceiver } from "channels/reliable_channel";
 const MARKER_UNCOMPRESSED = 0x00;
 const MARKER_GZIP = 0x1f;
 
-// djb2 hash for envelope fingerprinting - produces unique 8-char hex for different content
-function quickHash(str) {
-  let hash = 5381;
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) + hash) + str.charCodeAt(i);
-  }
-  return (hash >>> 0).toString(16).padStart(8, '0');
-}
-
-function envelopeFingerprint(envelope) {
-  if (!envelope) return "null";
-  const str = typeof envelope === 'string' ? envelope : JSON.stringify(envelope);
-  return quickHash(str);
-}
-
 // How often to check for heartbeat ACKs (should match CLI's HEALTH_CHECK_INTERVAL_SECS)
 const MAINTENANCE_INTERVAL_MS = 5000;
 
@@ -131,9 +116,6 @@ export class Channel {
           onAck: (ack) => this._rawSend(ack),
           onReset: () => {
             // When receiver detects peer session reset, also reset sender
-            console.debug(
-              "[Channel] Peer session reset detected, resetting sender",
-            );
             this.sender?.reset();
           },
         })
@@ -159,7 +141,6 @@ export class Channel {
     this.maintenanceTimer = setInterval(() => {
       // Send heartbeat ACK if receiver hasn't ACK'd recently
       if (this.receiver && this.receiver.shouldSendAckHeartbeat()) {
-        console.debug("[Channel] Sending heartbeat ACK");
         const ack = this.receiver.generateAck();
         this._rawSend(ack);
       }
@@ -323,7 +304,6 @@ export class Channel {
     if (this.receiver) {
       this.receiver.reset();
     }
-    console.debug("[Channel] Reliable state reset");
   }
 
   /**
@@ -349,20 +329,13 @@ export class Channel {
    */
   async _rawSend(message) {
     if (!this.subscription) {
-      console.warn("[Channel] Cannot send - no subscription");
       return false;
     }
 
     try {
-      console.debug(
-        `[Channel] _rawSend type=${message.type}, seq=${message.seq || "N/A"}`,
-      );
       if (this.session) {
         // Encrypt before sending
         const envelope = await this.session.encrypt(message);
-        console.debug(
-          `[Channel] _rawSend encrypted, envelope length=${envelope?.length || "N/A"}`,
-        );
         this.subscription.perform("relay", { envelope });
       } else {
         // Unencrypted
@@ -381,40 +354,21 @@ export class Channel {
    */
   async _encryptAndSend(message) {
     if (!this.subscription) {
-      console.warn("[Channel] Cannot send - no subscription");
       return null;
     }
 
-    const seq = message.seq || "N/A";
-
     try {
-      console.debug(
-        `[Channel] _encryptAndSend START: seq=${seq}, type=${message.type}`,
-      );
       if (this.session) {
-        console.debug(
-          `[Channel] _encryptAndSend calling session.encrypt for seq=${seq}`,
-        );
         const envelope = await this.session.encrypt(message);
-        const fingerprint = envelopeFingerprint(envelope);
-        console.debug(
-          `[Channel] _encryptAndSend ENCRYPTED: seq=${seq}, envelope=${fingerprint}`,
-        );
         this.subscription.perform("relay", { envelope });
-        console.debug(
-          `[Channel] _encryptAndSend SENT to ActionCable: seq=${seq}, envelope=${fingerprint}`,
-        );
         return envelope; // Return for caching
       } else {
         // Unencrypted - no envelope to cache
-        console.debug(
-          `[Channel] _encryptAndSend (unencrypted) sending seq=${seq}`,
-        );
         this.subscription.perform("relay", { data: message });
         return null;
       }
     } catch (error) {
-      console.error(`[Channel] _encryptAndSend FAILED: seq=${seq}`, error);
+      console.error("[Channel] _encryptAndSend failed:", error);
       return null;
     }
   }
@@ -424,19 +378,10 @@ export class Channel {
    * Does NOT re-encrypt - uses cached envelope directly.
    */
   _sendPreEncrypted(envelope) {
-    if (!this.subscription) {
-      console.warn("[Channel] Cannot retransmit - no subscription");
+    if (!this.subscription || !envelope) {
       return;
     }
 
-    if (!envelope) {
-      console.warn("[Channel] Cannot retransmit - no cached envelope");
-      return;
-    }
-
-    console.debug(
-      `[Channel] _sendPreEncrypted (retransmit), envelope length=${envelope?.length || "N/A"}`,
-    );
     this.subscription.perform("relay", { envelope });
   }
 }

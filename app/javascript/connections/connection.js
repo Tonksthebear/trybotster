@@ -157,18 +157,12 @@ export class Connection {
    * @returns {Promise<boolean>}
    */
   async send(type, data = {}) {
-    console.debug(
-      `[${this.constructor.name}] send() type=${type}, hasHandle=${!!this.handle}`,
-    );
     if (!this.handle) {
-      console.warn(`[${this.constructor.name}] Cannot send - no handle`);
       return false;
     }
 
     try {
-      const result = await this.handle.send({ type, ...data });
-      console.debug(`[${this.constructor.name}] send() result:`, result);
-      return result;
+      return await this.handle.send({ type, ...data });
     } catch (error) {
       console.error(`[${this.constructor.name}] Send failed:`, error);
       return false;
@@ -233,17 +227,10 @@ export class Connection {
    */
   emit(event, data) {
     const callbacks = this.subscribers.get(event);
-    console.debug(
-      `[${this.constructor.name}] emit(${event}), subscribers:`,
-      callbacks?.size ?? 0,
-    );
     if (!callbacks) return;
 
     for (const callback of callbacks) {
       try {
-        console.debug(
-          `[${this.constructor.name}] calling callback for ${event}`,
-        );
         callback(data);
       } catch (error) {
         console.error(`[${this.constructor.name}] Event handler error:`, error);
@@ -254,7 +241,6 @@ export class Connection {
   // ========== Private ==========
 
   #onMessage(message) {
-    console.debug(`[${this.constructor.name}] #onMessage received:`, message);
     // Let subclass handle domain-specific routing
     this.handleMessage(message);
   }
@@ -281,10 +267,6 @@ export class Connection {
     if (newState !== ConnectionState.ERROR) {
       this.errorReason = null;
     }
-
-    console.debug(
-      `[${this.constructor.name}] ${this.key}: ${prevState} -> ${newState}`,
-    );
 
     const stateInfo = { state: newState, prevState, error: this.errorReason };
     this.emit("stateChange", stateInfo);

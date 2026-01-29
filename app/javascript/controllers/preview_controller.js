@@ -179,7 +179,6 @@ export default class extends Controller {
 
     this.serviceWorker =
       registration.active || registration.waiting || registration.installing;
-    console.log("[Preview] Service worker registered");
   }
 
   /**
@@ -256,8 +255,6 @@ export default class extends Controller {
    * Handle message from preview channel.
    */
   handleMessage(message) {
-    console.log("[Preview] Received message:", message.type);
-
     // Most messages are HTTP responses handled by PreviewChannel internally
     // But we might receive control messages here
     if (message.type === "preview_error") {
@@ -269,8 +266,6 @@ export default class extends Controller {
    * Handle channel state changes.
    */
   handleStateChange(state) {
-    console.log("[Preview] Channel state:", state);
-
     switch (state) {
       case ChannelState.CONNECTED:
         this.updateStatus("Preview connected", "success");

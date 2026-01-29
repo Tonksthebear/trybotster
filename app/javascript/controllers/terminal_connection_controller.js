@@ -197,7 +197,6 @@ export default class extends Controller {
   // ========== Private: Disconnect / Error Handling ==========
 
   #handleTerminalDisconnect() {
-    console.debug("[TerminalConnection] Terminal channel disconnected");
     this.connected = false;
     this.#updateTerminalBadge();
     this.notifyListeners("disconnected");

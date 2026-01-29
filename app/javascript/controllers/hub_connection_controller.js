@@ -119,8 +119,6 @@ export default class extends Controller {
   #handleMessage(message) {
     // Handle handshake acknowledgment
     if (message.type === "handshake_ack") {
-      console.debug("[HubConnection] Received handshake ACK from CLI");
-
       if (this.handshakeTimer) {
         clearTimeout(this.handshakeTimer);
         this.handshakeTimer = null;
@@ -140,7 +138,6 @@ export default class extends Controller {
 
     // Handle invite bundle response
     if (message.type === "invite_bundle") {
-      console.debug("[HubConnection] Received invite bundle from CLI");
       this.handleInviteBundle(message);
       return;
     }
@@ -175,7 +172,6 @@ export default class extends Controller {
     if (newState !== State.ERROR) {
       this.errorReason = null;
     }
-    console.debug(`[HubConnection] State: ${prevState} -> ${newState}`);
     this.notifyListeners("stateChange", {
       state: newState,
       reason: this.errorReason,
@@ -194,7 +190,6 @@ export default class extends Controller {
     const stillPresent = document.querySelector(
       `[data-controller~="${this.identifier}"][data-turbo-permanent]`,
     );
-    console.log("PRESENCE", !!stillPresent);
     return stillPresent;
   }
 }

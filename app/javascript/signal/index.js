@@ -45,7 +45,6 @@ export async function initSignal(workerUrl, wasmJsUrl, wasmBinaryUrl) {
       await sendToWorker("init", { wasmJsUrl, wasmBinaryUrl });
 
       workerReady = true;
-      console.debug("[Signal] Worker initialized");
     } catch (error) {
       console.error("[Signal] Failed to initialize worker:", error);
       initPromise = null;
@@ -212,37 +211,24 @@ function parseBinaryBundle(bytes) {
  */
 export function parseBundleFromFragment() {
   const hash = window.location.hash;
-  console.debug("[Signal] Parsing fragment, hash length:", hash?.length || 0);
 
   if (!hash) {
-    console.debug("[Signal] No hash in URL (using cached session)");
     return null;
   }
 
   const base32Data = hash.startsWith("#") ? hash.slice(1) : hash;
   if (!base32Data || base32Data.length < 100) {
-    console.debug("[Signal] No valid bundle in hash");
     return null;
   }
 
-  console.debug("[Signal] Found bundle, Base32 length:", base32Data.length);
-
   try {
     const bytes = base32Decode(base32Data);
-    console.debug("[Signal] Decoded to", bytes.length, "bytes");
-
     const bundle = parseBinaryBundle(bytes);
 
     const hubMatch = window.location.pathname.match(/\/hubs\/([^\/]+)/);
     bundle.hub_id = hubMatch ? hubMatch[1] : "";
     bundle.device_id = 1;
 
-    console.debug(
-      "[Signal] Successfully parsed binary bundle, version:",
-      bundle.version,
-      "hub:",
-      bundle.hub_id,
-    );
     return bundle;
   } catch (error) {
     console.error("[Signal] Failed to parse bundle from fragment:", error);
@@ -296,11 +282,9 @@ export class SignalSession {
   static async loadOrCreate(bundleJson, hubId) {
     const existing = await SignalSession.load(hubId);
     if (existing) {
-      console.debug("[Signal] Restored existing session for hub:", hubId);
       return existing;
     }
 
-    console.debug("[Signal] Creating new session for hub:", hubId);
     return SignalSession.create(bundleJson, hubId);
   }
 
