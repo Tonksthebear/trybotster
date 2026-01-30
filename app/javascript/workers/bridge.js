@@ -17,6 +17,7 @@ class WorkerBridge {
   #initPromise = null
   #eventListeners = new Map() // eventName -> Set<callback>
   #subscriptionListeners = new Map() // subscriptionId -> Set<callback>
+  #subscriptionMessageBuffer = new Map() // subscriptionId -> Array<message> (for race condition)
 
   /**
    * Get the singleton instance
@@ -145,7 +146,7 @@ class WorkerBridge {
     // Dispatch subscription messages to subscription listeners
     if (event === "subscription:message" && subscriptionId) {
       const subListeners = this.#subscriptionListeners.get(subscriptionId)
-      if (subListeners) {
+      if (subListeners && subListeners.size > 0) {
         for (const callback of subListeners) {
           try {
             callback(data.message)
@@ -153,6 +154,13 @@ class WorkerBridge {
             console.error(`[WorkerBridge] Subscription listener error:`, e)
           }
         }
+      } else {
+        // Buffer message - listener might be registered soon (race condition during subscribe)
+        if (!this.#subscriptionMessageBuffer.has(subscriptionId)) {
+          this.#subscriptionMessageBuffer.set(subscriptionId, [])
+        }
+        this.#subscriptionMessageBuffer.get(subscriptionId).push(data.message)
+        console.log(`[WorkerBridge] Buffered message for ${subscriptionId} (no listener yet)`)
       }
     }
   }
@@ -229,6 +237,23 @@ class WorkerBridge {
     }
     this.#subscriptionListeners.get(subscriptionId).add(callback)
 
+    // Deliver any buffered messages (handles race condition during subscribe)
+    const buffered = this.#subscriptionMessageBuffer.get(subscriptionId)
+    if (buffered && buffered.length > 0) {
+      console.log(`[WorkerBridge] Delivering ${buffered.length} buffered messages for ${subscriptionId}`)
+      this.#subscriptionMessageBuffer.delete(subscriptionId)
+      // Deliver async to avoid re-entrancy issues
+      setTimeout(() => {
+        for (const message of buffered) {
+          try {
+            callback(message)
+          } catch (e) {
+            console.error(`[WorkerBridge] Buffered message delivery error:`, e)
+          }
+        }
+      }, 0)
+    }
+
     // Return unsubscribe function
     return () => {
       const listeners = this.#subscriptionListeners.get(subscriptionId)
@@ -246,6 +271,7 @@ class WorkerBridge {
    */
   clearSubscriptionListeners(subscriptionId) {
     this.#subscriptionListeners.delete(subscriptionId)
+    this.#subscriptionMessageBuffer.delete(subscriptionId) // Clear any buffered messages too
   }
 
   /**

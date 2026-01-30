@@ -37,14 +37,22 @@ export default class extends Controller {
     // Acquire connection to get worktree list and send commands
     ConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
-    }).then((hub) => {
+    }).then(async (hub) => {
       this.hub = hub;
       this.hub.on("worktreeList", (worktrees) => {
         this.worktrees = worktrees;
         this.#renderWorktreeList();
       });
+
+      // If hub is connected but not subscribed (reusing after navigation), subscribe
+      if (this.hub.isHubConnected() && !this.hub.isSubscribed()) {
+        await this.hub.subscribe();
+      }
+
       // Request fresh worktree list
-      this.hub.send("request_worktrees");
+      if (this.hub.isConnected()) {
+        this.hub.send("request_worktrees");
+      }
     });
 
     // Reset form state when dialog opens
@@ -52,7 +60,11 @@ export default class extends Controller {
   }
 
   disconnect() {
-    this.hub?.release();
+    const hub = this.hub;
+    this.hub = null;
+    // Just release - don't unsubscribe. HubConnection is shared and
+    // the subscription can be reused by other controllers after navigation.
+    hub?.release();
   }
 
   // Action: Select an existing worktree

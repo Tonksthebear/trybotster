@@ -1013,58 +1013,18 @@ async function handleDisconnect(portId, hubId) {
 // =============================================================================
 
 async function handleSubscribe(portId, hubId, channelName, channelParams, reliable = false) {
+  console.log(`[SignalWorker] handleSubscribe: hubId=${hubId}, channel=${channelName}, portId=${portId}`);
+
   const conn = connections.get(hubId);
   if (!conn) {
     throw new Error(`No connection to hub ${hubId}`);
   }
 
   const subscriptionId = generateSubscriptionId();
+  console.log(`[SignalWorker] Creating subscription ${subscriptionId}`);
   const portState = ports.get(portId);
 
-  // Create the ActionCable subscription
-  const subscription = conn.cable.subscriptions.create(
-    { channel: channelName, ...channelParams },
-    {
-      connected: () => {
-        // Emit subscription:confirmed to owning port
-        if (portState) {
-          try {
-            portState.port.postMessage({
-              event: "subscription:confirmed",
-              subscriptionId
-            });
-          } catch (e) {}
-        }
-      },
-
-      rejected: () => {
-        // Emit subscription:rejected to owning port
-        if (portState) {
-          try {
-            portState.port.postMessage({
-              event: "subscription:rejected",
-              subscriptionId,
-              reason: "Subscription rejected by server"
-            });
-          } catch (e) {}
-        }
-      },
-
-      received: async (data) => {
-        await processIncomingMessage(subscriptionId, hubId, data);
-      },
-
-      disconnected: () => {
-        // Connection lost - reliable sender will pause automatically
-        const subEntry = findSubscriptionById(subscriptionId);
-        if (subEntry?.sender) {
-          subEntry.sender.pause();
-        }
-      }
-    }
-  );
-
-  // Create reliable sender/receiver if enabled
+  // Create reliable sender/receiver if enabled (before subscription so they're ready)
   let sender = null;
   let receiver = null;
 
@@ -1072,10 +1032,10 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
     sender = new ReliableSender({
       retransmitTimeout: 3000,
       onSend: async (msg) => {
-        return await encryptAndSend(hubId, subscription, msg);
+        return await encryptAndSend(hubId, subEntry.subscription, msg);
       },
       onRetransmit: (envelope) => {
-        sendPreEncrypted(subscription, envelope);
+        sendPreEncrypted(subEntry.subscription, envelope);
       }
     });
 
@@ -1094,14 +1054,14 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
       },
       onAck: async (ack) => {
         // Send ACK through encrypted channel
-        await encryptAndSend(hubId, subscription, ack);
+        await encryptAndSend(hubId, subEntry.subscription, ack);
       }
     });
   }
 
-  // Track subscription in connection
-  conn.subscriptions.set(subscriptionId, {
-    subscription,
+  // Pre-create the subscription entry so sender/receiver can reference it
+  const subEntry = {
+    subscription: null, // Will be set after create()
     portId,
     hubId,
     reliable,
@@ -1109,19 +1069,95 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
     receiver,
     decryptionFailureCount: 0,
     maxDecryptionFailures: 3
-  });
+  };
+  conn.subscriptions.set(subscriptionId, subEntry);
 
   // Track subscription in port
   if (portState) {
     portState.subscriptions.add(subscriptionId);
   }
 
-  return { subscriptionId };
+  // Wait for server to confirm subscription before returning
+  // This prevents the race condition where caller sends messages before subscription exists
+  return new Promise((resolve, reject) => {
+    const SUBSCRIBE_TIMEOUT = 10000; // 10 second timeout
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Clean up on timeout
+      conn.subscriptions.delete(subscriptionId);
+      if (portState) portState.subscriptions.delete(subscriptionId);
+      reject(new Error(`Subscription timeout for ${channelName}`));
+    }, SUBSCRIBE_TIMEOUT);
+
+    const subscription = conn.cable.subscriptions.create(
+      { channel: channelName, ...channelParams },
+      {
+        connected: () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          console.log(`[SignalWorker] Subscription ${subscriptionId} confirmed by server`);
+          // Emit subscription:confirmed to owning port
+          if (portState) {
+            try {
+              portState.port.postMessage({
+                event: "subscription:confirmed",
+                subscriptionId
+              });
+            } catch (e) {}
+          }
+          resolve({ subscriptionId });
+        },
+
+        rejected: () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          // Clean up on rejection
+          conn.subscriptions.delete(subscriptionId);
+          if (portState) portState.subscriptions.delete(subscriptionId);
+          // Emit subscription:rejected to owning port
+          if (portState) {
+            try {
+              portState.port.postMessage({
+                event: "subscription:rejected",
+                subscriptionId,
+                reason: "Subscription rejected by server"
+              });
+            } catch (e) {}
+          }
+          reject(new Error(`Subscription rejected for ${channelName}`));
+        },
+
+        received: async (data) => {
+          console.log(`[SignalWorker] Received message on ${subscriptionId}`, data?.type || data?.envelope ? "(encrypted)" : data);
+          await processIncomingMessage(subscriptionId, hubId, data);
+        },
+
+        disconnected: () => {
+          // Connection lost - reliable sender will pause automatically
+          const entry = findSubscriptionById(subscriptionId);
+          if (entry?.sender) {
+            entry.sender.pause();
+          }
+        }
+      }
+    );
+
+    // Store subscription reference
+    subEntry.subscription = subscription;
+  });
 }
 
 async function handleUnsubscribe(portId, subscriptionId) {
+  console.log(`[SignalWorker] handleUnsubscribe: subscriptionId=${subscriptionId}, portId=${portId}`);
+
   const subInfo = findSubscriptionById(subscriptionId);
   if (!subInfo) {
+    console.log(`[SignalWorker] Subscription ${subscriptionId} not found`);
     return { unsubscribed: false, reason: "Subscription not found" };
   }
 
@@ -1133,6 +1169,7 @@ async function handleUnsubscribe(portId, subscriptionId) {
 
   // Unsubscribe from ActionCable
   subscription.unsubscribe();
+  console.log(`[SignalWorker] Unsubscribed ${subscriptionId} from ActionCable`);
 
   // Remove from connection
   conn.subscriptions.delete(subscriptionId);

@@ -57,7 +57,7 @@ export default class extends Controller {
     ConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
       fromFragment: true,
-    }).then((hub) => {
+    }).then(async (hub) => {
       this.hub = hub;
 
       this.unsubscribers.push(
@@ -85,6 +85,11 @@ export default class extends Controller {
           this.hub.requestAgents();
         }),
       );
+
+      // If hub is connected but not subscribed (reusing after navigation), subscribe
+      if (this.hub.isHubConnected() && !this.hub.isSubscribed()) {
+        await this.hub.subscribe();
+      }
     });
   }
 
@@ -93,8 +98,11 @@ export default class extends Controller {
     this.unsubscribers?.forEach((unsub) => unsub());
     this.unsubscribers = null;
 
-    this.hub?.release();
+    // Just release - don't unsubscribe. HubConnection is shared and
+    // the subscription can be reused by other controllers after navigation.
+    const hub = this.hub;
     this.hub = null;
+    hub?.release();
   }
 
   // Stimulus: called when agentsValue changes
