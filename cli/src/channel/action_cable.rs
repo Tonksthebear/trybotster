@@ -1054,6 +1054,13 @@ impl ActionCableChannel {
 
         match reliable_msg {
             ReliableMessage::Data { seq, payload } => {
+                log::info!(
+                    "[Reliable] Received Data seq={} from {} (payload {} bytes)",
+                    seq,
+                    &sender.0[..8.min(sender.0.len())],
+                    payload.len()
+                );
+
                 // Decompress the payload
                 let decompressed = match maybe_decompress(&payload) {
                     Ok(d) => d,
@@ -1063,13 +1070,25 @@ impl ActionCableChannel {
                     }
                 };
 
+                log::debug!(
+                    "[Reliable] Decompressed to {} bytes",
+                    decompressed.len()
+                );
+
                 // Process through receiver, which handles reordering
                 let deliverable = {
                     let mut sessions = reliable_sessions.write().await;
                     let session = sessions
                         .entry(sender.0.clone())
                         .or_insert_with(ReliableSession::new);
+                    let next_expected_before = session.receiver.next_expected();
                     let (messages, reset_occurred) = session.receiver.receive(seq, decompressed);
+                    log::info!(
+                        "[Reliable] Receiver: next_expected {} -> {}, delivered {} messages",
+                        next_expected_before,
+                        session.receiver.next_expected(),
+                        messages.len()
+                    );
 
                     // Log peer reset but do NOT reset our sender.
                     // Resetting sender would cause Signal counter desync because our
@@ -1094,13 +1113,20 @@ impl ActionCableChannel {
                 .await;
 
                 // Convert deliverable payloads to RawIncoming
-                deliverable
+                let result: Vec<RawIncoming> = deliverable
                     .into_iter()
-                    .map(|payload| RawIncoming {
-                        payload,
-                        sender: sender.clone(),
+                    .map(|payload| {
+                        log::info!(
+                            "[Reliable] Delivering message to receiver queue ({} bytes)",
+                            payload.len()
+                        );
+                        RawIncoming {
+                            payload,
+                            sender: sender.clone(),
+                        }
                     })
-                    .collect()
+                    .collect();
+                result
             }
             ReliableMessage::Ack { ranges } => {
                 // Process ACK - remove acknowledged messages from pending

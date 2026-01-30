@@ -11,12 +11,12 @@ import { ConnectionManager, HubConnection } from "connections";
  * same Signal Protocol session as the terminal.
  *
  * Architecture:
- * 1. Controller establishes PreviewChannel (encrypted WebSocket)
- * 2. Registers service worker to intercept fetch requests
- * 3. Service worker communicates with controller via MessageChannel
- * 4. Controller encrypts requests, sends via PreviewChannel
+ * 1. Service worker is already registered by bootstrap page
+ * 2. SW intercepts fetch requests and sends via client.postMessage()
+ * 3. This controller receives requests via navigator.serviceWorker message events
+ * 4. Controller encrypts requests, sends via PreviewChannel WebSocket
  * 5. Agent receives, forwards to local dev server, returns encrypted response
- * 6. Controller decrypts response, sends to service worker
+ * 6. Controller decrypts response, sends to SW via navigator.serviceWorker.controller.postMessage()
  * 7. Service worker returns response to iframe's fetch
  *
  * Usage:
@@ -24,8 +24,8 @@ import { ConnectionManager, HubConnection } from "connections";
  * <div data-controller="preview"
  *      data-preview-hub-id-value="123"
  *      data-preview-agent-index-value="0"
- *      data-preview-service-worker-url-value="<%= asset_path('preview/service-worker.js') %>">
- *   <iframe data-preview-target="iframe" src="/__preview__/"></iframe>
+ *      data-preview-scope-value="/hubs/123/agents/0/1/preview">
+ *   <iframe data-preview-target="iframe"></iframe>
  *   <div data-preview-target="status"></div>
  * </div>
  * ```
@@ -36,17 +36,16 @@ export default class extends Controller {
   static values = {
     hubId: String,
     agentIndex: Number,
-    serviceWorkerUrl: String,
+    scope: String,
     initialUrl: { type: String, default: "/" },
   };
 
   #hub = null;
   #unsubscribers = [];
+  #swMessageHandler = null;
 
   connect() {
     this.channel = null;
-    this.serviceWorker = null;
-    this.messageChannel = null;
     this.signalSession = null;
 
     this.#initConnection();
@@ -86,7 +85,8 @@ export default class extends Controller {
   }
 
   /**
-   * Initialize the preview channel and service worker.
+   * Initialize the preview channel and service worker communication.
+   * Note: SW is already registered by bootstrap page.
    */
   async initialize() {
     try {
@@ -100,8 +100,8 @@ export default class extends Controller {
         return;
       }
 
-      // Register service worker
-      await this.registerServiceWorker();
+      // Set up SW message listener (SW already registered by bootstrap)
+      this.setupServiceWorkerListener();
 
       // Create preview channel
       this.channel = new PreviewChannel({
@@ -116,12 +116,9 @@ export default class extends Controller {
       // Connect channel
       await this.channel.connect();
 
-      // Set up service worker communication
-      this.setupServiceWorkerChannel();
-
-      // Load initial URL in iframe
-      if (this.hasIframeTarget) {
-        this.iframeTarget.src = `/__preview__${this.initialUrlValue}`;
+      // Load initial URL in iframe (use dynamic scope path)
+      if (this.hasIframeTarget && this.scopeValue) {
+        this.iframeTarget.src = `${this.scopeValue}${this.initialUrlValue}`;
       }
 
       this.updateStatus("Preview connected", "success");
@@ -149,77 +146,33 @@ export default class extends Controller {
   }
 
   /**
-   * Register the preview service worker.
+   * Set up listener for messages from service worker.
+   * SW sends http_request via client.postMessage(), we reply via controller.postMessage().
    */
-  async registerServiceWorker() {
-    if (!("serviceWorker" in navigator)) {
-      throw new Error("Service workers not supported");
-    }
+  setupServiceWorkerListener() {
+    // Remove any existing listener
+    this.removeServiceWorkerListener();
 
-    const swUrl = this.serviceWorkerUrlValue;
-    if (!swUrl) {
-      throw new Error("Service worker URL not configured");
-    }
-
-    // Register with preview scope
-    const registration = await navigator.serviceWorker.register(swUrl, {
-      scope: "/__preview__/",
-    });
-
-    // Wait for activation
-    if (registration.installing) {
-      await new Promise((resolve) => {
-        registration.installing.addEventListener("statechange", (e) => {
-          if (e.target.state === "activated") resolve();
-        });
-      });
-    } else if (registration.waiting) {
-      registration.waiting.postMessage({ type: "skipWaiting" });
-      await new Promise((resolve) => {
-        navigator.serviceWorker.addEventListener("controllerchange", resolve, {
-          once: true,
-        });
-      });
-    }
-
-    this.serviceWorker =
-      registration.active || registration.waiting || registration.installing;
-  }
-
-  /**
-   * Set up MessageChannel for service worker communication.
-   */
-  setupServiceWorkerChannel() {
-    this.messageChannel = new MessageChannel();
-
-    // Get client ID for service worker
-    const clientId = this.getClientId();
-
-    // Send port to service worker
-    this.serviceWorker.postMessage(
-      {
-        type: "connect",
-        clientId,
-        port: this.messageChannel.port2,
-      },
-      [this.messageChannel.port2],
-    );
-
-    // Listen for requests from service worker
-    this.messageChannel.port1.onmessage = (event) => {
+    // Create bound handler
+    this.#swMessageHandler = (event) => {
       this.handleServiceWorkerMessage(event.data);
     };
-    this.messageChannel.port1.start();
+
+    // Listen for messages from service worker
+    navigator.serviceWorker.addEventListener("message", this.#swMessageHandler);
   }
 
   /**
-   * Get unique client ID for service worker routing.
+   * Remove service worker message listener.
    */
-  getClientId() {
-    if (!this._clientId) {
-      this._clientId = `preview-${this.hubIdValue}-${this.agentIndexValue}-${Date.now()}`;
+  removeServiceWorkerListener() {
+    if (this.#swMessageHandler) {
+      navigator.serviceWorker.removeEventListener(
+        "message",
+        this.#swMessageHandler,
+      );
+      this.#swMessageHandler = null;
     }
-    return this._clientId;
   }
 
   /**
@@ -231,28 +184,41 @@ export default class extends Controller {
         // Send through encrypted channel
         const response = await this.channel.fetch({
           method: data.method,
-          url: data.url,
+          url: data.path,
           headers: data.headers,
           body: data.body,
         });
 
         // Send response back to service worker
-        this.messageChannel.port1.postMessage({
+        this.sendToServiceWorker({
           type: "http_response",
-          request_id: data.request_id,
-          status: response.status,
-          status_text: response.statusText,
-          headers: this.headersToObject(response.headers),
-          body: response.body ? this.arrayToBase64(response.body) : null,
+          requestId: data.requestId,
+          response: {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+            body: response.body ? this.arrayToBase64(response.body) : null,
+          },
         });
       } catch (error) {
         console.error("[Preview] Request failed:", error);
-        this.messageChannel.port1.postMessage({
-          type: "http_error",
-          request_id: data.request_id,
+        this.sendToServiceWorker({
+          type: "http_response",
+          requestId: data.requestId,
           error: error.message,
         });
       }
+    }
+  }
+
+  /**
+   * Send message to service worker.
+   */
+  sendToServiceWorker(message) {
+    if (navigator.serviceWorker.controller) {
+      navigator.serviceWorker.controller.postMessage(message);
+    } else {
+      console.warn("[Preview] No service worker controller to send to");
     }
   }
 
@@ -320,8 +286,8 @@ export default class extends Controller {
    * Navigate to a URL in the preview.
    */
   navigate(url) {
-    if (this.hasIframeTarget && this.channel?.isConnected()) {
-      this.iframeTarget.src = `/__preview__${url}`;
+    if (this.hasIframeTarget && this.channel?.isConnected() && this.scopeValue) {
+      this.iframeTarget.src = `${this.scopeValue}${url}`;
     }
   }
 
@@ -329,22 +295,11 @@ export default class extends Controller {
    * Clean up resources.
    */
   cleanup() {
-    if (this.messageChannel) {
-      this.messageChannel.port1.close();
-      this.messageChannel = null;
-    }
+    this.removeServiceWorkerListener();
 
     if (this.channel) {
       this.channel.disconnect();
       this.channel = null;
-    }
-
-    // Notify service worker of disconnect
-    if (this.serviceWorker) {
-      this.serviceWorker.postMessage({
-        type: "disconnect",
-        clientId: this.getClientId(),
-      });
     }
   }
 
@@ -358,16 +313,16 @@ export default class extends Controller {
   }
 
   statusClasses(type) {
-    const base = "text-xs px-2 py-1 rounded";
+    const base = "status-text";
     switch (type) {
       case "success":
-        return `${base} bg-emerald-500/10 text-emerald-400`;
+        return `${base} text-emerald-400`;
       case "warning":
-        return `${base} bg-amber-500/10 text-amber-400`;
+        return `${base} text-amber-400`;
       case "error":
-        return `${base} bg-red-500/10 text-red-400`;
+        return `${base} text-red-400`;
       default:
-        return `${base} bg-zinc-500/10 text-zinc-400`;
+        return `${base} text-zinc-400`;
     }
   }
 
@@ -386,18 +341,6 @@ export default class extends Controller {
   }
 
   // === Utility Methods ===
-
-  headersToObject(headers) {
-    const obj = {};
-    if (headers instanceof Headers) {
-      headers.forEach((value, key) => {
-        obj[key] = value;
-      });
-    } else if (headers) {
-      Object.assign(obj, headers);
-    }
-    return obj;
-  }
 
   arrayToBase64(array) {
     if (!array) return null;

@@ -15,7 +15,6 @@
 
 // Rust guideline compliant 2026-01-29
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::agent::AgentNotification;
@@ -185,19 +184,34 @@ impl Hub {
                     }
                 }
                 "browser_wants_preview" => {
-                    // Browser subscribed to PreviewChannel - start tunnel on demand.
-                    let agent_index = msg.payload
-                        .get("agent_index")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as usize);
+                    // Browser subscribed to PreviewChannel - notify BrowserClient to create HttpChannel.
+                    let agent_index = msg.payload.get("agent_index").and_then(|v| v.as_u64());
+                    let browser_identity = msg.payload
+                        .get("browser_identity")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
 
                     log::info!(
-                        "[CommandChannel] Browser wants preview for agent {:?}",
+                        "[CommandChannel] Browser wants preview: browser={}, agent={:?}",
+                        &browser_identity[..browser_identity.len().min(8)],
                         agent_index
                     );
 
-                    // Start tunnel if not already running
-                    self.ensure_tunnel_connected();
+                    if let Some(ai) = agent_index {
+                        let client_id = ClientId::Browser(browser_identity.to_string());
+                        // Hardcode pty_index=1 for server PTY (per architecture spec)
+                        self.broadcast(HubEvent::HttpConnectionRequested {
+                            client_id,
+                            agent_index: ai as usize,
+                            pty_index: 1,
+                            browser_identity: browser_identity.to_string(),
+                        });
+                    } else {
+                        log::warn!(
+                            "Browser wants preview missing agent_index: {:?}",
+                            msg.payload
+                        );
+                    }
                 }
                 _ => {
                     self.process_command_channel_message(msg);
@@ -401,11 +415,14 @@ impl Hub {
                 // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
                 let _runtime_guard = self.tokio_runtime.enter();
 
+                // Allocate a unique port for HTTP forwarding (before spawning)
+                let port = self.allocate_unique_port();
+
                 // Spawn agent (fast - just PTY creation) - release lock after spawning
                 // Dims are carried in pending.config from the requesting client
                 let spawn_result = {
                     let mut state = self.state.write().unwrap();
-                    lifecycle::spawn_agent(&mut state, &pending.config)
+                    lifecycle::spawn_agent(&mut state, &pending.config, port)
                 };
 
                 match spawn_result {
@@ -443,16 +460,7 @@ impl Hub {
         // Sync handle cache for thread-safe agent access
         self.sync_handle_cache();
 
-        // Register tunnel if port assigned
-        if let Some(port) = result.tunnel_port {
-            let tm = Arc::clone(&self.tunnel_manager);
-            let key = result.agent_id.clone();
-            self.tokio_runtime.spawn(async move {
-                tm.register_agent(key, port).await;
-            });
-        }
-
-        // Connect agent's channels (terminal + preview if tunnel exists)
+        // Connect agent's channels (terminal + preview if port assigned)
         let agent_index = self
             .state
             .read()
@@ -548,24 +556,6 @@ impl Hub {
         );
         // Store server-assigned ID (used for all server communication)
         self.botster_id = Some(botster_id);
-    }
-
-    /// Start the tunnel connection in background.
-    pub fn start_tunnel(&self) {
-        registration::start_tunnel(&self.tunnel_manager, &self.tokio_runtime);
-    }
-
-    /// Ensure tunnel is connected, starting it if not already running.
-    ///
-    /// Called on-demand when browser requests preview. This avoids eager
-    /// tunnel connection at startup when it may not be needed.
-    pub fn ensure_tunnel_connected(&self) {
-        use crate::tunnel::TunnelStatus;
-
-        if self.tunnel_manager.get_status() == TunnelStatus::Disconnected {
-            log::info!("Starting tunnel connection (on-demand for preview)");
-            registration::start_tunnel(&self.tunnel_manager, &self.tokio_runtime);
-        }
     }
 
     /// Initialize Signal Protocol CryptoService for E2E encryption.

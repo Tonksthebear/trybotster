@@ -1,7 +1,6 @@
 //! Agent lifecycle handlers - spawn and close operations.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::hub::{lifecycle, Hub};
 
@@ -61,20 +60,15 @@ pub fn handle_spawn_agent(
     // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
     let _runtime_guard = hub.tokio_runtime.enter();
 
-    match lifecycle::spawn_agent(&mut hub.state.write().unwrap(), &config) {
+    // Allocate a unique port for HTTP forwarding (before spawning)
+    let port = hub.allocate_unique_port();
+
+    match lifecycle::spawn_agent(&mut hub.state.write().unwrap(), &config, port) {
         Ok(result) => {
             log::info!("Spawned agent: {}", result.agent_id);
 
             // Sync handle cache for thread-safe agent access
             hub.sync_handle_cache();
-
-            if let Some(port) = result.tunnel_port {
-                let tm = Arc::clone(&hub.tunnel_manager);
-                let key = result.agent_id.clone();
-                hub.tokio_runtime.spawn(async move {
-                    tm.register_agent(key, port).await;
-                });
-            }
         }
         Err(e) => log::error!("Failed to spawn agent: {}", e),
     }

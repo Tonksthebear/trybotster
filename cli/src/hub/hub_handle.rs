@@ -603,7 +603,7 @@ mod tests {
                         branch_name: Some("botster-issue-42".to_string()),
                         name: None,
                         status: Some("Running".to_string()),
-                        tunnel_port: None,
+                        port: None,
                         server_running: None,
                         has_server_pty: None,
                         active_pty_view: None,

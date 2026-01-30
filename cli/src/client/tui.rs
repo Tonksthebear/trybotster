@@ -488,7 +488,8 @@ impl TuiClient {
                 // Don't forward -- run_task loop will break on Closed channel.
             }
             HubEvent::PtyConnectionRequested { .. }
-            | HubEvent::PtyDisconnectionRequested { .. } => {
+            | HubEvent::PtyDisconnectionRequested { .. }
+            | HubEvent::HttpConnectionRequested { .. } => {
                 // Browser-specific, TuiClient ignores.
             }
             _ => {

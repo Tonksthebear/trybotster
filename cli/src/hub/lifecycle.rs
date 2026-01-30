@@ -30,7 +30,6 @@ use crate::agent::Agent;
 use crate::agents::AgentSpawnConfig;
 use crate::keyring::Credentials;
 use crate::process::kill_orphaned_processes;
-use crate::tunnel::allocate_tunnel_port;
 
 use super::HubState;
 
@@ -39,8 +38,8 @@ use super::HubState;
 pub struct SpawnResult {
     /// The agent ID for the spawned agent.
     pub agent_id: String,
-    /// The allocated tunnel port, if any.
-    pub tunnel_port: Option<u16>,
+    /// The allocated HTTP forwarding port, if any.
+    pub port: Option<u16>,
     /// Whether a server PTY was spawned.
     pub has_server_pty: bool,
 }
@@ -53,13 +52,14 @@ pub struct SpawnResult {
 /// 3. Writes the prompt file
 /// 4. Copies the init script
 /// 5. Spawns the CLI PTY
-/// 6. Optionally spawns a server PTY
+/// 6. Optionally spawns a server PTY (with allocated port stored on PtySession)
 /// 7. Registers the agent with HubState
 ///
 /// # Arguments
 ///
 /// * `state` - Mutable reference to the Hub state
 /// * `config` - Agent spawn configuration (includes dims for PTY sizing)
+/// * `port` - Pre-allocated port for HTTP forwarding (from Hub.allocate_unique_port())
 ///
 /// # Returns
 ///
@@ -74,6 +74,7 @@ pub struct SpawnResult {
 pub fn spawn_agent(
     state: &mut HubState,
     config: &AgentSpawnConfig,
+    port: Option<u16>,
 ) -> Result<SpawnResult> {
     let id = uuid::Uuid::new_v4();
     let mut agent = Agent::new_with_dims(
@@ -111,10 +112,9 @@ pub fn spawn_agent(
     // Build environment variables
     let env_vars = build_spawn_environment(config);
 
-    // Allocate a tunnel port for this agent
-    let tunnel_port = allocate_tunnel_port();
-    if let Some(port) = tunnel_port {
-        log::info!("Allocated tunnel port {port} for agent");
+    // Log the HTTP forwarding port (already allocated by Hub)
+    if let Some(p) = port {
+        log::info!("Using HTTP forwarding port {p} for agent");
     }
 
     // Kill any existing orphaned processes for this worktree
@@ -122,19 +122,17 @@ pub fn spawn_agent(
 
     // Spawn the agent with init commands
     let mut spawn_env = env_vars;
-    if let Some(port) = tunnel_port {
-        spawn_env.insert("BOTSTER_TUNNEL_PORT".to_string(), port.to_string());
+    if let Some(p) = port {
+        spawn_env.insert("BOTSTER_TUNNEL_PORT".to_string(), p.to_string());
     }
 
     let init_commands = vec!["source .botster_init".to_string()];
     agent.spawn("bash", "", init_commands, &spawn_env)?;
 
-    // Store tunnel port on the agent
-    agent.tunnel_port = tunnel_port;
-
-    // Spawn server PTY if tunnel port is allocated and .botster_server exists
-    let has_server_pty = if let Some(port) = tunnel_port {
-        spawn_server_pty_if_exists(&mut agent, &config.worktree_path, port)
+    // Spawn server PTY if port is allocated and .botster_server exists
+    // The port is stored on the server PtySession via set_port()
+    let has_server_pty = if let Some(p) = port {
+        spawn_server_pty_if_exists(&mut agent, &config.worktree_path, p)
     } else {
         false
     };
@@ -148,7 +146,7 @@ pub fn spawn_agent(
 
     Ok(SpawnResult {
         agent_id,
-        tunnel_port,
+        port,
         has_server_pty,
     })
 }
@@ -244,6 +242,9 @@ fn build_spawn_environment(config: &AgentSpawnConfig) -> HashMap<String, String>
 
 /// Spawn a server PTY if .botster_server exists.
 ///
+/// After spawning, stores the allocated port on the server PtySession via `set_port()`.
+/// This allows HttpChannel to query the port when needed for preview proxying.
+///
 /// Returns true if a server PTY was successfully spawned.
 fn spawn_server_pty_if_exists(agent: &mut Agent, worktree_path: &Path, port: u16) -> bool {
     let server_script = worktree_path.join(".botster_server");
@@ -261,7 +262,14 @@ fn spawn_server_pty_if_exists(agent: &mut Agent, worktree_path: &Path, port: u16
     );
 
     match agent.spawn_server_pty(".botster_server", &server_env) {
-        Ok(()) => true,
+        Ok(()) => {
+            // Store the port on the server PtySession for HttpChannel to query
+            if let Some(ref mut server_pty) = agent.server_pty {
+                server_pty.set_port(port);
+                log::debug!("Set port {port} on server PTY");
+            }
+            true
+        }
         Err(e) => {
             log::warn!("Failed to spawn server PTY: {e}");
             false

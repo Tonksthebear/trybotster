@@ -17,7 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState},
     Terminal,
 };
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, mpsc};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -668,7 +668,7 @@ fn test_pty_broadcast_to_multiple_subscribers() {
     let session = PtySession::new(24, 80);
 
     // Get multiple subscribers
-    let (event_tx, _cmd_tx) = session.get_channels();
+    let (event_tx, _cmd_tx, _port) = session.get_channels();
     let mut rx1 = event_tx.subscribe();
     let mut rx2 = event_tx.subscribe();
     let mut rx3 = event_tx.subscribe();
@@ -696,13 +696,13 @@ fn test_pty_input_via_command_channel() {
     let session = PtySession::new(24, 80);
 
     // Get command channel
-    let (_event_tx, cmd_tx) = session.get_channels();
+    let (_event_tx, cmd_tx, _port) = session.get_channels();
 
     // Create tokio runtime for async send
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
 
     // Send input command (even without spawned process, channel should accept)
-    let result = runtime.block_on(async { cmd_tx.send(PtyCommand::Input(b"test input".to_vec())).await });
+    let result: Result<(), tokio::sync::mpsc::error::SendError<PtyCommand>> = runtime.block_on(async { cmd_tx.send(PtyCommand::Input(b"test input".to_vec())).await });
 
     // Command should be accepted (channel is open)
     assert!(result.is_ok(), "Command channel should accept input");
@@ -717,13 +717,13 @@ fn test_pty_resize_via_command_channel() {
     use botster_hub::client::{ClientId, PtyCommand};
 
     let session = PtySession::new(24, 80);
-    let (_event_tx, cmd_tx) = session.get_channels();
+    let (_event_tx, cmd_tx, _port) = session.get_channels();
 
     // Create tokio runtime for async send
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
 
     // Send resize command with client_id
-    let result = runtime.block_on(async {
+    let result: Result<(), tokio::sync::mpsc::error::SendError<PtyCommand>> = runtime.block_on(async {
         cmd_tx
             .send(PtyCommand::Resize {
                 client_id: ClientId::Tui,

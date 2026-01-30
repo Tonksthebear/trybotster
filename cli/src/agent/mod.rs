@@ -39,8 +39,6 @@ pub use crate::tui::screen::ScreenInfo;
 pub use notification::{detect_notifications, AgentNotification, AgentStatus};
 pub use pty::PtySession;
 
-use crate::channel::{ActionCableChannel, Channel, ChannelConfig};
-use crate::relay::crypto_service::CryptoServiceHandle;
 use anyhow::Result;
 use std::{
     collections::{HashMap, VecDeque},
@@ -102,8 +100,6 @@ pub struct Agent {
     pub status: AgentStatus,
     /// GitHub URL where this agent was last invoked from.
     pub last_invocation_url: Option<String>,
-    /// Port for HTTP tunnel forwarding.
-    pub tunnel_port: Option<u16>,
     /// macOS Terminal window ID for focusing.
     pub terminal_window_id: Option<String>,
 
@@ -114,11 +110,6 @@ pub struct Agent {
 
     /// Secondary PTY (Server - runs dev server).
     pub server_pty: Option<PtySession>,
-
-    /// Preview channel for encrypted HTTP proxying.
-    /// Only created if `tunnel_port` is set.
-    /// Note: Terminal channels are owned by PtySession, not Agent.
-    pub preview_channel: Option<ActionCableChannel>,
 
     notification_rx: Option<Receiver<AgentNotification>>,
 }
@@ -196,11 +187,9 @@ impl Agent {
             start_time: chrono::Utc::now(),
             status: AgentStatus::Initializing,
             last_invocation_url: None,
-            tunnel_port: None,
             terminal_window_id: None,
             cli_pty: PtySession::new(rows, cols),
             server_pty: None,
-            preview_channel: None,
             notification_rx: None,
         }
     }
@@ -267,12 +256,12 @@ impl Agent {
     /// ```
     #[must_use]
     pub fn get_pty_handle(&self, pty_index: usize) -> Option<crate::hub::agent_handle::PtyHandle> {
-        let (event_tx, command_tx) = match pty_index {
+        let (event_tx, command_tx, port) = match pty_index {
             0 => self.cli_pty.get_channels(),
             1 => self.server_pty.as_ref()?.get_channels(),
             _ => return None,
         };
-        Some(crate::hub::agent_handle::PtyHandle::new(event_tx, command_tx))
+        Some(crate::hub::agent_handle::PtyHandle::new(event_tx, command_tx, port))
     }
 
     /// Get the current PTY size (rows, cols).
@@ -396,21 +385,35 @@ impl Agent {
     }
 
     /// Check if the dev server is running.
+    ///
+    /// Queries the server PTY's allocated port and checks if a TCP connection
+    /// can be established. Returns false if no server PTY or no port assigned.
     #[must_use]
     pub fn is_server_running(&self) -> bool {
-        if let Some(port) = self.tunnel_port {
-            use std::net::TcpStream;
+        let Some(ref server_pty) = self.server_pty else {
+            return false;
+        };
+        let Some(port) = server_pty.port() else {
+            return false;
+        };
 
-            TcpStream::connect_timeout(
-                &format!("127.0.0.1:{port}")
-                    .parse()
-                    .expect("valid socket addr"),
-                Duration::from_millis(50),
-            )
-            .is_ok()
-        } else {
-            false
-        }
+        use std::net::TcpStream;
+        TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}")
+                .parse()
+                .expect("valid socket addr"),
+            Duration::from_millis(50),
+        )
+        .is_ok()
+    }
+
+    /// Get the HTTP forwarding port for this agent's dev server.
+    ///
+    /// Returns the port allocated to the server PTY, if one exists.
+    /// This is the port where the dev server listens for HTTP requests.
+    #[must_use]
+    pub fn port(&self) -> Option<u16> {
+        self.server_pty.as_ref().and_then(|pty| pty.port())
     }
 
     // =========================================================================
@@ -479,77 +482,6 @@ impl Agent {
         ScreenInfo { rows, cols }
     }
 
-    // =========================================================================
-    // Channel Management
-    // =========================================================================
-
-    /// Connect this agent's preview channel (if tunnel_port is set).
-    ///
-    /// Note: Terminal channels are managed by BrowserClient, not Agent.
-    /// Agent only manages the preview channel for HTTP proxying.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if channel connection fails.
-    pub async fn connect_preview_channel(
-        &mut self,
-        crypto_service: CryptoServiceHandle,
-        server_url: &str,
-        api_key: &str,
-        hub_id: &str,
-        agent_index: usize,
-    ) -> Result<()> {
-        // Only create preview channel if tunnel_port is set
-        if self.tunnel_port.is_some() {
-            log::info!(
-                "Agent {} connecting preview channel (agent_index={})",
-                self.agent_id(),
-                agent_index
-            );
-
-            let mut preview = ActionCableChannel::encrypted(
-                crypto_service,
-                server_url.to_string(),
-                api_key.to_string(),
-            );
-            preview
-                .connect(ChannelConfig {
-                    channel_name: "PreviewChannel".into(),
-                    hub_id: hub_id.to_string(),
-                    agent_index: Some(agent_index),
-                    pty_index: None, // Preview channel doesn't use PTY index
-                    browser_identity: None,
-                    encrypt: true,
-                    compression_threshold: Some(4096),
-                    cli_subscription: false,
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("Preview channel connect failed: {}", e))?;
-
-            self.preview_channel = Some(preview);
-            log::info!("Agent {} preview channel connected", self.agent_id());
-        }
-
-        Ok(())
-    }
-
-    /// Check if this agent has a connected preview channel.
-    #[must_use]
-    pub fn has_preview_channel(&self) -> bool {
-        self.preview_channel.is_some()
-    }
-
-    /// Disconnect this agent's preview channel.
-    ///
-    /// Note: Terminal channels are managed by BrowserClient, not Agent.
-    pub async fn disconnect_preview_channel(&mut self) {
-        let agent_id = self.agent_id().to_string();
-        if let Some(ref mut ch) = self.preview_channel {
-            log::info!("Agent {} disconnecting preview channel", agent_id);
-            ch.disconnect().await;
-        }
-        self.preview_channel = None;
-    }
 }
 
 impl Drop for Agent {
@@ -558,12 +490,6 @@ impl Drop for Agent {
             "Agent {} dropping - cleaning up PTY sessions",
             self.agent_id()
         );
-
-        // Preview channel cleans up via its own Drop
-        if self.preview_channel.is_some() {
-            log::info!("Agent {} dropping preview channel", self.agent_id());
-        }
-
         // PTY child processes are killed by PtySession's Drop
         // which is called when Agent is dropped
     }

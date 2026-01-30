@@ -44,10 +44,11 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Pass through the preview shell page itself (exact scope path or with just query string)
-  // This allows the shell page to load from Rails
   const scopePath = SCOPE;
-  if (url.pathname === scopePath || url.pathname === scopePath + '/') {
+
+  // Pass through the preview shell page itself (exact scope path, no trailing slash)
+  // This allows the shell page to load from Rails
+  if (url.pathname === scopePath) {
     return;
   }
 
@@ -57,12 +58,14 @@ self.addEventListener('fetch', (event) => {
   }
 
   // Pass through Rails assets and other non-preview paths
+  // Anything not starting with scopePath/ is not ours to proxy
   if (!url.pathname.startsWith(scopePath + '/')) {
     return;
   }
 
   // Extract the path relative to the preview scope
   // e.g., /hubs/123/agents/0/1/preview/api/users -> /api/users
+  // e.g., /hubs/123/agents/0/1/preview/ -> /
   const relativePath = url.pathname.slice(scopePath.length) || '/';
 
   event.respondWith(proxyRequest(event.request, relativePath, url.search));

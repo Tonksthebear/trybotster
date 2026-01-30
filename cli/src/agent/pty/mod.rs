@@ -145,6 +145,7 @@ impl std::fmt::Debug for SharedPtyState {
 /// - A raw byte scrollback buffer for history replay
 /// - A broadcast channel for event distribution to clients
 /// - A list of connected clients with their dimensions
+/// - An optional port for HTTP forwarding (used by server PTY for dev server preview)
 ///
 /// # Event Broadcasting
 ///
@@ -175,6 +176,13 @@ impl std::fmt::Debug for SharedPtyState {
 /// The scrollback buffer and shared state are wrapped in `Arc<Mutex<>>` to allow
 /// concurrent access from the PTY reader thread, command processor task, and main
 /// event loop.
+///
+/// # Port Field
+///
+/// The `port` field stores the HTTP forwarding port for preview functionality.
+/// This is primarily used by server PTYs (pty_index=1) running dev servers.
+/// When set, the port value is also passed via `BOTSTER_TUNNEL_PORT` env var
+/// to the PTY process at spawn time.
 pub struct PtySession {
     /// Shared mutable state accessed by the command processor task.
     ///
@@ -216,6 +224,16 @@ pub struct PtySession {
 
     /// Channel for sending detected notifications.
     pub notification_tx: Option<Sender<AgentNotification>>,
+
+    /// Allocated port for HTTP forwarding.
+    ///
+    /// Used by server PTYs (pty_index=1) to expose the dev server port for
+    /// preview proxying. The port is set via [`set_port()`](Self::set_port)
+    /// and queried via [`port()`](Self::port).
+    ///
+    /// When spawning the PTY process, the caller should also pass this port
+    /// via the `BOTSTER_TUNNEL_PORT` environment variable.
+    port: Option<u16>,
 }
 
 impl std::fmt::Debug for PtySession {
@@ -266,6 +284,7 @@ impl PtySession {
             command_tx,
             command_rx: Some(command_rx),
             notification_tx: None,
+            port: None,
         }
     }
 
@@ -298,6 +317,26 @@ impl PtySession {
             .writer = Some(writer);
     }
 
+    /// Set the HTTP forwarding port for this PTY.
+    ///
+    /// Called after spawning to record the allocated port. This is primarily
+    /// used for server PTYs (pty_index=1) running dev servers.
+    ///
+    /// Note: The port should also be passed via `BOTSTER_TUNNEL_PORT` env var
+    /// when spawning the PTY process.
+    pub fn set_port(&mut self, port: u16) {
+        self.port = Some(port);
+    }
+
+    /// Get the HTTP forwarding port for this PTY.
+    ///
+    /// Returns the port allocated for HTTP preview proxying, or `None` if
+    /// no port has been assigned.
+    #[must_use]
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
     /// Get a clone of the shared state Arc for the command processor.
     ///
     /// Used internally by `spawn_command_processor()`.
@@ -305,13 +344,13 @@ impl PtySession {
         Arc::clone(&self.shared_state)
     }
 
-    /// Get the event and command channel senders for this PTY.
+    /// Get the event and command channel senders for this PTY, along with the port.
     ///
-    /// Returns a tuple of (event_tx, command_tx) that can be used to create
+    /// Returns a tuple of (event_tx, command_tx, port) that can be used to create
     /// a `PtyHandle` for client access.
     #[must_use]
-    pub fn get_channels(&self) -> (broadcast::Sender<PtyEvent>, mpsc::Sender<PtyCommand>) {
-        (self.event_tx.clone(), self.command_tx.clone())
+    pub fn get_channels(&self) -> (broadcast::Sender<PtyEvent>, mpsc::Sender<PtyCommand>, Option<u16>) {
+        (self.event_tx.clone(), self.command_tx.clone(), self.port)
     }
 
     /// Take the command receiver from this PTY session.
@@ -1004,6 +1043,23 @@ mod tests {
         assert!(session.connected_clients().is_empty());
         assert!(session.size_owner().is_none());
         assert_eq!(session.dimensions(), (24, 80));
+        assert!(session.port().is_none());
+    }
+
+    #[test]
+    fn test_pty_session_port() {
+        let mut session = PtySession::new(24, 80);
+
+        // Initially no port
+        assert!(session.port().is_none());
+
+        // Set port
+        session.set_port(8080);
+        assert_eq!(session.port(), Some(8080));
+
+        // get_channels returns the port
+        let (_, _, port) = session.get_channels();
+        assert_eq!(port, Some(8080));
     }
 
     #[test]

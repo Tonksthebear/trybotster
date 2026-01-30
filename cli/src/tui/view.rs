@@ -23,7 +23,6 @@
 use crate::agent::PtyView;
 use crate::app::AppMode;
 use crate::hub::HubState;
-use crate::tunnel::TunnelStatus;
 
 /// Snapshot of state needed for TUI rendering.
 ///
@@ -51,8 +50,6 @@ pub struct ViewState {
     pub worktree_selected: usize,
     /// Current text input buffer.
     pub input_buffer: String,
-    /// Tunnel connection status.
-    pub tunnel_status: TunnelStatus,
     /// Connection URL for QR code display.
     pub connection_url: Option<String>,
     /// Error message for Error mode.
@@ -81,7 +78,6 @@ impl ViewState {
             available_worktrees: hub_state.available_worktrees.clone(),
             worktree_selected: context.worktree_selected,
             input_buffer: context.input_buffer,
-            tunnel_status: context.tunnel_status,
             connection_url: context.connection_url,
             error_message: context.error_message,
             bundle_used: context.bundle_used,
@@ -127,8 +123,6 @@ pub struct ViewContext {
     pub worktree_selected: usize,
     /// Text input buffer.
     pub input_buffer: String,
-    /// Tunnel status.
-    pub tunnel_status: TunnelStatus,
     /// Connection URL for QR code.
     pub connection_url: Option<String>,
     /// Error message for Error mode.
@@ -147,7 +141,6 @@ impl Default for ViewContext {
             menu_selected: 0,
             worktree_selected: 0,
             input_buffer: String::new(),
-            tunnel_status: TunnelStatus::Disconnected,
             connection_url: None,
             error_message: None,
             bundle_used: false,
@@ -163,8 +156,8 @@ impl Default for ViewContext {
 pub struct AgentDisplayInfo {
     /// Display label for the agent.
     pub label: String,
-    /// Tunnel port if assigned.
-    pub tunnel_port: Option<u16>,
+    /// HTTP forwarding port if assigned.
+    pub port: Option<u16>,
     /// Whether the server is running.
     pub server_running: bool,
     /// Which PTY view is being displayed (client's current view).
@@ -194,7 +187,7 @@ impl AgentDisplayInfo {
 
         Self {
             label,
-            tunnel_port: agent.tunnel_port,
+            port: agent.port(),
             server_running: agent.is_server_running(),
             active_view: view,
             is_scrolled,
@@ -204,7 +197,7 @@ impl AgentDisplayInfo {
     /// Format the full display string with server status.
     #[must_use]
     pub fn display_string(&self) -> String {
-        if let Some(port) = self.tunnel_port {
+        if let Some(port) = self.port {
             let server_icon = if self.server_running { "▶" } else { "○" };
             format!("{} {}:{}", self.label, server_icon, port)
         } else {
@@ -220,16 +213,6 @@ pub fn format_poll_status(seconds_since_poll: u64) -> &'static str {
         "●"
     } else {
         "○"
-    }
-}
-
-/// Format the tunnel status indicator.
-#[must_use]
-pub fn format_tunnel_status(status: TunnelStatus) -> &'static str {
-    match status {
-        TunnelStatus::Connected => "⬤",
-        TunnelStatus::Connecting => "◐",
-        TunnelStatus::Disconnected => "○",
     }
 }
 
@@ -298,7 +281,7 @@ mod tests {
         // Pass view and is_scrolled as parameters - caller tracks these
         let info = AgentDisplayInfo::from_agent(&agent, PtyView::Cli, false);
         assert_eq!(info.label, "owner/repo#42");
-        assert!(info.tunnel_port.is_none());
+        assert!(info.port.is_none());
         assert!(!info.server_running);
         assert_eq!(info.active_view, PtyView::Cli);
         assert!(!info.is_scrolled);
@@ -338,7 +321,7 @@ mod tests {
     fn test_agent_display_string() {
         let info = AgentDisplayInfo {
             label: "owner/repo#42".to_string(),
-            tunnel_port: Some(3000),
+            port: Some(3000),
             server_running: true,
             active_view: PtyView::Cli,
             is_scrolled: false,
@@ -348,7 +331,7 @@ mod tests {
 
         let info_no_port = AgentDisplayInfo {
             label: "owner/repo#42".to_string(),
-            tunnel_port: None,
+            port: None,
             server_running: false,
             active_view: PtyView::Cli,
             is_scrolled: false,
@@ -361,12 +344,5 @@ mod tests {
     fn test_format_poll_status() {
         assert_eq!(format_poll_status(0), "●");
         assert_eq!(format_poll_status(5), "○");
-    }
-
-    #[test]
-    fn test_format_tunnel_status() {
-        assert_eq!(format_tunnel_status(TunnelStatus::Connected), "⬤");
-        assert_eq!(format_tunnel_status(TunnelStatus::Connecting), "◐");
-        assert_eq!(format_tunnel_status(TunnelStatus::Disconnected), "○");
     }
 }

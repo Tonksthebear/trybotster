@@ -171,8 +171,8 @@ pub struct AgentInfo {
     pub name: Option<String>,
     /// Current agent status (e.g., "Running", "Idle").
     pub status: Option<String>,
-    /// Port number for the agent's HTTP tunnel.
-    pub tunnel_port: Option<u16>,
+    /// Port number for the agent's HTTP forwarding.
+    pub port: Option<u16>,
     /// Whether a dev server is running.
     pub server_running: Option<bool>,
     /// Whether a server PTY exists.
@@ -363,7 +363,7 @@ mod tests {
                 branch_name: Some("botster-issue-42".to_string()),
                 name: None,
                 status: Some("Running".to_string()),
-                tunnel_port: Some(3000),
+                port: Some(3000),
                 server_running: Some(true),
                 has_server_pty: Some(true),
                 active_pty_view: Some("cli".to_string()),

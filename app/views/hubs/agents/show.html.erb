@@ -9,7 +9,6 @@
   - terminal-display: xterm.js rendering, acquires TerminalConnection via ConnectionManager
   - hub-status: Connection state (CSS-driven)
   - terminal-status: Terminal connection state (CSS-driven)
-  - terminal-header: Tab switching, preview link
   - agent-list: Sidebar agent list (uses template)
 %>
 
@@ -136,12 +135,7 @@
   </div>
 
   <%# Terminal Panel %>
-  <div class="flex-1 min-h-0 flex flex-col"
-       data-controller="terminal-header"
-       data-terminal-header-hub-id-value="<%= Current.hub.id %>"
-       data-terminal-header-agent-index-value="<%= Current.agent_index %>"
-       data-terminal-header-tunnel-connected-value="false"
-       class="group/terminal">
+  <div class="flex-1 min-h-0 flex flex-col">
 
     <div class="flex-1 flex flex-col min-h-0 bg-zinc-950 overflow-hidden">
       <%# Terminal header bar %>
@@ -171,13 +165,13 @@
         </div>
 
         <div class="flex items-center gap-2 lg:gap-3">
-          <%# Preview link - shown when tunnel is connected (CSS driven) %>
-          <a href="#"
-             data-terminal-header-target="previewLink"
-             class="hidden group-data-[terminal-header-tunnel-connected-value=true]/terminal:inline-flex items-center gap-1.5 px-2 py-1 text-xs font-medium bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 rounded transition-colors">
-            <%= icon "arrow-top-right-on-square", class: "size-3" %>
+          <%# Preview button - opens preview page (tunnel created on-demand) %>
+          <%= link_to hub_agent_pty_preview_path(Current.hub, Current.agent_index, 1),
+                      class: "inline-flex items-center gap-1.5 px-2 py-1 text-xs font-medium bg-zinc-700/50 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 rounded transition-colors",
+                      target: "_blank" do %>
+            <%= icon "eye", class: "size-3" %>
             <span class="hidden sm:inline">Preview</span>
-          </a>
+          <% end %>
 
           <span class="text-xs text-zinc-600 hidden lg:inline">scroll: mouse wheel</span>
 

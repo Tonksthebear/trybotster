@@ -18,7 +18,6 @@
 // Rust guideline compliant 2026-01
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::client::{BrowserClient, ClientId, ClientTaskHandle, CreateAgentRequest, DeleteAgentRequest};
 use crate::client::browser::BrowserClientConfig;
@@ -210,7 +209,7 @@ pub fn handle_create_agent_for_client(
             result: Ok(crate::hub::SpawnResult {
                 // Placeholder - actual spawn happens on main thread
                 agent_id: String::new(),
-                tunnel_port: None,
+                port: None,
                 has_server_pty: false,
             }),
             config,
@@ -258,10 +257,13 @@ fn spawn_agent_sync(
     // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
     let _runtime_guard = hub.tokio_runtime.enter();
 
+    // Allocate a unique port for HTTP forwarding (before spawning)
+    let port = hub.allocate_unique_port();
+
     // Spawn agent - release lock before continuing
     let spawn_result = {
         let mut state = hub.state.write().unwrap();
-        lifecycle::spawn_agent(&mut state, &config)
+        lifecycle::spawn_agent(&mut state, &config, port)
     };
 
     match spawn_result {
@@ -271,16 +273,7 @@ fn spawn_agent_sync(
             // Sync handle cache for thread-safe agent access
             hub.sync_handle_cache();
 
-            // Register tunnel for HTTP forwarding if tunnel port allocated
-            if let Some(port) = result.tunnel_port {
-                let tm = Arc::clone(&hub.tunnel_manager);
-                let key = result.agent_id.clone();
-                hub.tokio_runtime.spawn(async move {
-                    tm.register_agent(key, port).await;
-                });
-            }
-
-            // Connect agent's channels (terminal + preview if tunnel exists)
+            // Connect agent's channels (terminal + preview if port assigned)
             let agent_index = hub
                 .state
                 .read()
