@@ -1,21 +1,20 @@
 # frozen_string_literal: true
 
 module Hubs
-  # Displays terminal view for a specific agent by index.
+  # Agent resource - redirects to default PTY view.
   #
   # URL: /hubs/:hub_id/agents/:index
+  # Redirects to: /hubs/:hub_id/agents/:index/ptys/0
   #
-  # The agent index corresponds to the position in the CLI's agent list.
-  # Note: indices can shift if agents are removed mid-session.
+  # The actual terminal view is handled by Agents::PtysController.
   class AgentsController < ApplicationController
     before_action :authenticate_user!
     before_action :set_hub
-    before_action :set_agent_index
 
     # GET /hubs/:hub_id/agents/:index
-    # Terminal view for a specific agent
+    # Redirects to PTY 0 (CLI terminal)
     def show
-      @browser_device = current_user.devices.browser_devices.order(last_seen_at: :desc).first
+      redirect_to hub_agent_pty_path(Current.hub, params[:index], 0)
     end
 
     private
@@ -25,17 +24,6 @@ module Hubs
 
       unless Current.hub
         redirect_to hubs_path, alert: "Hub not found"
-      end
-    end
-
-    def set_agent_index
-      @agent_index = params[:index].to_i
-
-      # Validate agent index against known agents (if hub has agent info)
-      # Note: Agent list is dynamic; this is a soft validation
-      if Current.hub.hub_agents.any? && @agent_index >= Current.hub.hub_agents.count
-        redirect_to hub_path(Current.hub), alert: "Agent not found"
-        nil
       end
     end
   end

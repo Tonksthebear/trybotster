@@ -1,10 +1,8 @@
 /**
  * TerminalConnection - Typed wrapper for terminal data plane.
  *
- * Manages:
- *   - PTY I/O (input/output streams)
- *   - Terminal resize events
- *   - PTY channel switching between agents
+ * Manages PTY I/O (input/output streams) and terminal resize events.
+ * Uses the shared Signal session from IndexedDB (same as HubConnection).
  *
  * Events:
  *   - connected - Channel established
@@ -12,23 +10,23 @@
  *   - stateChange - { state, prevState, error }
  *   - error - { reason, message }
  *   - output - PTY output data (string)
- *   - ptySwitch - { agentIndex, ptyIndex }
  *
- * Key differences from HubConnection:
- *   - No handshake required
- *   - Key includes agent/pty indices: "hubId:agentIndex:ptyIndex"
- *   - Lower-level I/O (raw terminal data)
+ * Flow:
+ *   1. Loads Signal session from IndexedDB (same session as HubConnection)
+ *   2. Subscribes to TerminalRelayChannel
+ *   3. Rails notifies CLI via Bot::Message when browser subscribes
+ *   4. CLI subscribes to its stream, bidirectional channel established
  *
  * Usage:
- *   const key = `${hubId}:${agentIndex}:${ptyIndex}`;
+ *   const key = TerminalConnection.key(hubId, agentIndex, ptyIndex);
  *   const term = await ConnectionManager.acquire(TerminalConnection, key, {
  *     hubId, agentIndex, ptyIndex
  *   });
- *   term.on("output", (data) => xterm.write(data));
+ *   term.onOutput((data) => xterm.write(data));
  *   term.sendInput("ls -la\n");
  */
 
-import { Connection, ConnectionState } from "connections/connection";
+import { Connection } from "connections/connection";
 
 export class TerminalConnection extends Connection {
   constructor(key, options, manager) {
@@ -44,6 +42,8 @@ export class TerminalConnection extends Connection {
   }
 
   channelParams() {
+    // Each browser has dedicated streams with CLI (like TUI has dedicated I/O)
+    // Browser subscribes to: terminal_relay:{hub}:{agent}:{pty}:{browser_identity}
     return {
       hub_id: this.getHubId(),
       agent_index: this.agentIndex,
@@ -52,34 +52,11 @@ export class TerminalConnection extends Connection {
     };
   }
 
-  /**
-   * Terminal connections are connected as soon as channel opens.
-   * No handshake required.
-   */
-  async initialize() {
-    await super.initialize();
-
-    // Emit connected immediately on successful channel open
-    if (this.state === ConnectionState.CONNECTED) {
-      this.emit("connected", this);
-    }
-  }
-
-  /**
-   * Handle terminal-specific messages.
-   */
   handleMessage(message) {
     switch (message.type) {
       case "output":
-        // PTY output data
-        this.emit("output", message.data);
-        break;
-
-      case "pty_channel_switched":
-        this.emit("ptySwitch", {
-          agentIndex: message.agent_index,
-          ptyIndex: message.pty_index,
-        });
+      case "scrollback":
+        this.#emitOutput(message.data, message.compressed);
         break;
 
       case "pty_closed":
@@ -94,103 +71,82 @@ export class TerminalConnection extends Connection {
         break;
 
       default:
-        // Emit as generic message
         this.emit("message", message);
     }
   }
 
   // ========== Terminal Commands ==========
 
-  /**
-   * Send input to the PTY.
-   * @param {string} data - Raw terminal input
-   */
   sendInput(data) {
     return this.send("input", { data });
   }
 
-  /**
-   * Send resize event to the PTY.
-   * @param {number} cols - Number of columns
-   * @param {number} rows - Number of rows
-   */
   sendResize(cols, rows) {
     return this.send("resize", { cols, rows });
   }
 
   // ========== Getters ==========
 
-  /**
-   * Get current agent index.
-   */
   getAgentIndex() {
     return this.agentIndex;
   }
 
-  /**
-   * Get current PTY index (0=CLI, 1=Server, etc).
-   */
   getPtyIndex() {
     return this.ptyIndex;
   }
 
-  // ========== Convenience event helpers ==========
+  // ========== Private helpers ==========
 
-  /**
-   * Subscribe to PTY output.
-   */
+  async #emitOutput(data, compressed) {
+    if (!data) return;
+
+    try {
+      const text = compressed ? await this.#decompress(data) : data;
+      this.emit("output", text);
+    } catch (error) {
+      console.error("[TerminalConnection] Failed to decompress:", error);
+      this.emit("output", data);
+    }
+  }
+
+  async #decompress(base64Data) {
+    const binaryString = atob(base64Data);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    const stream = new Blob([bytes])
+      .stream()
+      .pipeThrough(new DecompressionStream("gzip"));
+    return new Response(stream).text();
+  }
+
+  // ========== Event helpers ==========
+
   onOutput(callback) {
     return this.on("output", callback);
   }
 
-  /**
-   * Subscribe to connection established.
-   */
   onConnected(callback) {
-    if (this.isConnected()) {
-      callback(this);
-    }
+    if (this.isConnected()) callback(this);
     return this.on("connected", callback);
   }
 
-  /**
-   * Subscribe to disconnection.
-   */
   onDisconnected(callback) {
     return this.on("disconnected", callback);
   }
 
-  /**
-   * Subscribe to state changes.
-   */
   onStateChange(callback) {
     callback({ state: this.state, prevState: null, error: this.errorReason });
     return this.on("stateChange", callback);
   }
 
-  /**
-   * Subscribe to errors.
-   */
   onError(callback) {
     return this.on("error", callback);
   }
 
-  /**
-   * Subscribe to PTY switch events.
-   */
-  onPtySwitch(callback) {
-    return this.on("ptySwitch", callback);
-  }
-
   // ========== Static helper ==========
 
-  /**
-   * Generate a connection key from components.
-   * @param {string} hubId
-   * @param {number} agentIndex
-   * @param {number} ptyIndex
-   * @returns {string}
-   */
   static key(hubId, agentIndex, ptyIndex = 0) {
     return `terminal:${hubId}:${agentIndex}:${ptyIndex}`;
   }

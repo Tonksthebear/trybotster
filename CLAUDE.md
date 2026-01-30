@@ -13,12 +13,14 @@ GitHub webhook → Rails server → Message queue → Rust daemon polls
 ```
 
 **Rails server** (trybotster.com):
+
 - Receives GitHub webhooks, creates `Bot::Message` records
 - VPN coordination via `WireguardCoordinator` (key exchange, IP allocation)
 - MCP tools for agents (GitHub operations)
 - User auth via GitHub OAuth
 
 **Rust daemon** (botster-hub):
+
 - TUI with ratatui
 - Polls Rails for messages, manages agent lifecycle
 - Creates/deletes git worktrees per issue
@@ -44,6 +46,7 @@ cli/src/git.rs       # Worktree operations
 ## VPN Architecture
 
 WireGuard VPN replaces WebSocket tunnels:
+
 1. CLI generates WireGuard keypair locally
 2. Registers with Rails (`POST /api/vpn/register`)
 3. Rails allocates VPN IP (10.100.x.x), returns server config
@@ -53,6 +56,7 @@ WireGuard VPN replaces WebSocket tunnels:
 ## Running Tests
 
 **Rust CLI:** Always use the test script, never `cargo test` directly:
+
 ```bash
 cd cli
 ./test.sh              # Run all tests
@@ -67,3 +71,5 @@ This ensures `BOTSTER_ENV=test` is set, preventing macOS keyring prompts.
 ## Patterns
 
 See `.claude/skills/rails-backend-guidelines/` - fat models, no service objects, POROs.
+
+**NEVER PRECOMPILE ASSETS IN RAILS**

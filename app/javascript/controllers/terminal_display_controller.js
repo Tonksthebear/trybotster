@@ -1,6 +1,7 @@
 import { Controller } from "@hotwired/stimulus";
 import * as xterm from "@xterm/xterm";
 import * as xtermFit from "@xterm/addon-fit";
+import { ConnectionManager, TerminalConnection } from "connections";
 
 const Terminal = xterm.Terminal || xterm.default?.Terminal || xterm.default;
 const FitAddon =
@@ -12,16 +13,23 @@ const FitAddon =
  * Handles xterm.js rendering with custom touch scrolling for mobile.
  * xterm.js lacks proper touch support, so we overlay a transparent div
  * to capture touch events. See: https://github.com/xtermjs/xterm.js/issues/5377
+ *
+ * Uses ConnectionManager to acquire connections directly.
  */
 export default class extends Controller {
   static targets = ["container"];
-  static outlets = ["terminal-connection", "hub-connection"];
+
+  static values = {
+    hubId: String,
+    agentIndex: Number,
+    ptyIndex: { type: Number, default: 0 },
+  };
 
   // Private fields
   #terminal = null;
   #fitAddon = null;
-  #connection = null;
-  #hubConnection = null;
+  #terminalConn = null;
+  #unsubscribers = [];
   #touchOverlay = null;
   #keyboardHandler = null;
   #boundHandleResize = null;
@@ -34,6 +42,7 @@ export default class extends Controller {
     this.#boundHandleResize = this.#handleResize.bind(this);
     window.addEventListener("resize", this.#boundHandleResize);
     this.#initTerminal();
+    this.#initConnections();
   }
 
   disconnect() {
@@ -59,31 +68,65 @@ export default class extends Controller {
       this.#keyboardHandler = null;
     }
 
+    this.#unsubscribers.forEach((unsub) => unsub());
+    this.#unsubscribers = [];
+
+    this.#terminalConn?.release();
+    this.#terminalConn = null;
+
     this.#terminal?.dispose();
     this.#terminal = null;
   }
 
-  // Stimulus outlet callbacks
-  terminalConnectionOutletConnected(outlet) {
-    outlet.registerListener(this, {
-      onConnected: (o) => this.#handleConnected(o),
-      onDisconnected: () => this.#handleDisconnected(),
-      onMessage: (msg) => this.#handleMessage(msg),
-      onError: (err) => this.#handleError(err),
-    });
-  }
+  async #initConnections() {
+    if (!this.hubIdValue) return;
 
-  terminalConnectionOutletDisconnected(outlet) {
-    outlet.unregisterListener(this);
-    this.#connection = null;
-  }
+    // Acquire terminal connection (it handles HubConnection internally)
+    const termKey = TerminalConnection.key(
+      this.hubIdValue,
+      this.agentIndexValue,
+      this.ptyIndexValue,
+    );
 
-  hubConnectionOutletConnected(outlet) {
-    this.#hubConnection = outlet;
-  }
+    this.#terminalConn = await ConnectionManager.acquire(
+      TerminalConnection,
+      termKey,
+      {
+        hubId: this.hubIdValue,
+        agentIndex: this.agentIndexValue,
+        ptyIndex: this.ptyIndexValue,
+      },
+    );
 
-  hubConnectionOutletDisconnected() {
-    this.#hubConnection = null;
+    // Subscribe to terminal events
+    this.#unsubscribers.push(
+      this.#terminalConn.onOutput((data) => {
+        this.#handleMessage({ type: "output", data });
+      }),
+    );
+
+    this.#unsubscribers.push(
+      this.#terminalConn.onConnected(() => {
+        this.#handleConnected();
+      }),
+    );
+
+    this.#unsubscribers.push(
+      this.#terminalConn.onDisconnected(() => {
+        this.#handleDisconnected();
+      }),
+    );
+
+    this.#unsubscribers.push(
+      this.#terminalConn.onError((err) => {
+        this.#handleError(err);
+      }),
+    );
+
+    // If already connected, handle it
+    if (this.#terminalConn.isConnected()) {
+      this.#handleConnected();
+    }
   }
 
   // Public actions for touch control buttons
@@ -173,15 +216,6 @@ export default class extends Controller {
     this.#setupTouchScroll();
     this.#setupKeyboardHandler();
     this.#setupMobileAutocorrect();
-
-    this.#terminal.writeln("Secure Terminal (Signal Protocol E2E Encryption)");
-    this.#terminal.writeln("Connecting...");
-    this.#terminal.writeln("");
-
-    // If connection was established before terminal initialized, write greeting now
-    if (this.#connection) {
-      this.#writeConnectionGreeting();
-    }
   }
 
   // Touch scrolling with momentum
@@ -342,29 +376,14 @@ export default class extends Controller {
   }
 
   // Connection handlers
-  #handleConnected(outlet) {
-    this.#connection = outlet;
+  #handleConnected() {
+    // Terminal may not be initialized yet
+    if (!this.#terminal) return;
 
-    // Terminal may not be initialized yet (outlet callbacks can fire before connect())
-    if (!this.#terminal) {
-      // Store connection, will write greeting when terminal initializes
-      return;
-    }
+    // Clear any previous content and prepare for PTY output
+    this.#terminal.clear();
 
-    this.#writeConnectionGreeting();
-  }
-
-  #writeConnectionGreeting() {
-    if (!this.#connection || !this.#terminal) return;
-
-    const hubId = this.#connection.getHubId();
-    this.#terminal.writeln(`[Connected to hub: ${hubId.substring(0, 8)}...]`);
-    this.#terminal.writeln("[Signal E2E encryption active]");
-    this.#terminal.writeln("");
-    this.#hubConnection?.send("set_mode", { mode: "gui" });
-    // Send initial dimensions via hub channel so CLI knows browser size
-    // before any agent is selected. This ensures agents are spawned with
-    // correct dimensions from the start.
+    // Send initial dimensions so CLI knows browser size
     requestAnimationFrame(() => {
       this.#fitAddon?.fit();
       this.#sendResize();
@@ -374,22 +393,14 @@ export default class extends Controller {
 
   #handleDisconnected() {
     this.#terminal?.writeln("\r\n[Disconnected]");
-    this.#connection = null;
   }
 
   #handleMessage(message) {
     switch (message.type) {
       case "output":
-        // Decode base64 output from CLI (terminal output is base64 encoded for JSON transport)
-        try {
-          const bytes = Uint8Array.from(atob(message.data), (c) =>
-            c.charCodeAt(0),
-          );
-          this.#terminal?.write(bytes);
-        } catch (e) {
-          // Fallback: write as string if not base64 (backwards compatibility)
-          this.#terminal?.write(message.data);
-        }
+        // Write terminal output directly - it's already a string
+        // (TerminalConnection handles decompression if needed)
+        this.#terminal?.write(message.data);
         break;
       case "clear":
         this.#terminal?.clear();
@@ -404,9 +415,6 @@ export default class extends Controller {
           this.#sendResize();
         });
         break;
-      case "scrollback":
-        this.#writeScrollback(message.data, message.compressed);
-        break;
     }
   }
 
@@ -419,39 +427,18 @@ export default class extends Controller {
     this.#terminal?.writeln(`\r\n[Error: ${message}]`);
   }
 
-  // Scrollback decompression
-  async #writeScrollback(data, compressed) {
-    if (!this.#terminal || !data) return;
-
-    try {
-      const text = compressed ? await this.#decompress(data) : data;
-      this.#terminal.write(text);
-    } catch (error) {
-      console.error("Failed to decompress scrollback:", error);
-      this.#terminal.write(data);
-    }
-  }
-
-  async #decompress(base64Data) {
-    const binaryString = atob(base64Data);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
-    const stream = new Blob([bytes])
-      .stream()
-      .pipeThrough(new DecompressionStream("gzip"));
-    return new Response(stream).text();
-  }
-
   // I/O helpers
   #sendInput(data) {
-    this.#connection?.sendInput(data);
+    if (!this.#terminalConn) {
+      console.warn("[TerminalDisplay] No connection, dropping input");
+      return;
+    }
+    this.#terminalConn.sendInput(data);
   }
 
   #sendResize() {
-    if (this.#connection && this.#terminal) {
-      this.#connection.sendResize(this.#terminal.cols, this.#terminal.rows);
+    if (this.#terminalConn && this.#terminal) {
+      this.#terminalConn.sendResize(this.#terminal.cols, this.#terminal.rows);
     }
   }
 
@@ -472,6 +459,12 @@ export default class extends Controller {
   //    so we find the last word in the textarea and delete that many chars
   //
   #setupMobileAutocorrect() {
+    // Only enable on mobile/touch devices
+    const isMobile =
+      /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+      ("ontouchstart" in window && navigator.maxTouchPoints > 0);
+    if (!isMobile) return;
+
     const textarea = this.#terminal?.element?.querySelector(
       ".xterm-helper-textarea",
     );
