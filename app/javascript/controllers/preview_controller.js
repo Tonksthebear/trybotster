@@ -1,6 +1,7 @@
 import { Controller } from "@hotwired/stimulus";
 import { PreviewChannel, ChannelState } from "transport/encrypted-channel";
 import { SignalSession } from "signal";
+import { ConnectionManager, HubConnection } from "connections";
 
 /**
  * Preview Controller - E2E Encrypted HTTP Tunnel for Agent Dev Server
@@ -39,7 +40,8 @@ export default class extends Controller {
     initialUrl: { type: String, default: "/" },
   };
 
-  static outlets = ["hub-connection"];
+  #hub = null;
+  #unsubscribers = [];
 
   connect() {
     this.channel = null;
@@ -47,33 +49,39 @@ export default class extends Controller {
     this.messageChannel = null;
     this.signalSession = null;
 
-    // Initialize when connection outlet is ready
-    if (this.hasHubConnectionOutlet && this.hubConnectionOutlet.isConnected()) {
-      this.initialize();
-    } else {
-      // Wait for connection
-      this.hubConnectionOutletConnected =
-        this.hubConnectionOutletConnected.bind(this);
-    }
+    this.#initConnection();
   }
 
   disconnect() {
     this.cleanup();
+    this.#unsubscribers.forEach((unsub) => unsub());
+    this.#unsubscribers = [];
+    this.#hub?.release();
+    this.#hub = null;
   }
 
-  /**
-   * Called when connection outlet becomes available.
-   */
-  hubConnectionOutletConnected(outlet) {
-    if (outlet.isConnected()) {
+  async #initConnection() {
+    if (!this.hubIdValue) return;
+
+    this.#hub = await ConnectionManager.acquire(
+      HubConnection,
+      this.hubIdValue,
+      { hubId: this.hubIdValue },
+    );
+
+    this.#unsubscribers.push(this.#hub.onConnected(() => this.initialize()));
+
+    this.#unsubscribers.push(
+      this.#hub.onDisconnected(() => this.handleConnectionLost()),
+    );
+
+    this.#unsubscribers.push(
+      this.#hub.onError((error) => this.handleError(error)),
+    );
+
+    // If already connected, initialize now
+    if (this.#hub.isConnected()) {
       this.initialize();
-    } else {
-      // Register for connection events
-      outlet.registerListener(this, {
-        onConnected: () => this.initialize(),
-        onDisconnected: () => this.handleConnectionLost(),
-        onError: (error) => this.handleError(error),
-      });
     }
   }
 
@@ -124,15 +132,12 @@ export default class extends Controller {
   }
 
   /**
-   * Get Signal session (reuse from connection controller if available).
+   * Get Signal session (reuse from hub connection if available).
    */
   async getSignalSession() {
-    // Try to get from connection outlet
-    if (this.hasHubConnectionOutlet) {
-      const hubId = this.hubIdValue || this.hubConnectionOutlet.getHubId();
-      if (hubId) {
-        return await SignalSession.load(hubId);
-      }
+    // Reuse session from hub connection
+    if (this.#hub?.session) {
+      return this.#hub.session;
     }
 
     // Fall back to loading directly

@@ -54,9 +54,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::agent::pty::PtyEvent;
-use crate::channel::{
-    ActionCableChannel, Channel, ChannelConfig, ChannelSenderHandle, PeerId,
-};
+use crate::channel::{ActionCableChannel, Channel, ChannelConfig, ChannelSenderHandle, PeerId};
 use crate::hub::HubHandle;
 use crate::relay::crypto_service::CryptoServiceHandle;
 use crate::relay::{
@@ -288,15 +286,34 @@ impl BrowserClient {
     /// because Browser supports multiple simultaneous connections.
     async fn handle_request(&mut self, request: BrowserRequest) {
         match request {
-            BrowserRequest::SendInput { agent_index, pty_index, data } => {
+            BrowserRequest::SendInput {
+                agent_index,
+                pty_index,
+                data,
+            } => {
                 if let Err(e) = self.send_input(agent_index, pty_index, &data).await {
-                    log::error!("Failed to send input to PTY ({}, {}): {}", agent_index, pty_index, e);
+                    log::error!(
+                        "Failed to send input to PTY ({}, {}): {}",
+                        agent_index,
+                        pty_index,
+                        e
+                    );
                 }
             }
-            BrowserRequest::Resize { agent_index, pty_index, rows, cols } => {
+            BrowserRequest::Resize {
+                agent_index,
+                pty_index,
+                rows,
+                cols,
+            } => {
                 self.dims = (cols, rows);
                 if let Err(e) = self.resize_pty(agent_index, pty_index, rows, cols).await {
-                    log::error!("Failed to resize PTY ({}, {}): {}", agent_index, pty_index, e);
+                    log::error!(
+                        "Failed to resize PTY ({}, {}): {}",
+                        agent_index,
+                        pty_index,
+                        e
+                    );
                 }
             }
         }
@@ -363,11 +380,7 @@ impl BrowserClient {
                             );
                         }
                         Err(e) => {
-                            log::error!(
-                                "Failed to select agent {}: {}",
-                                &id[..8.min(id.len())],
-                                e
-                            );
+                            log::error!("Failed to select agent {}: {}", &id[..8.min(id.len())], e);
                             self.send_error_to_browser(&e).await;
                         }
                     }
@@ -441,11 +454,7 @@ impl BrowserClient {
                     delete_worktree: delete_worktree.unwrap_or(false),
                 };
                 if let Err(e) = self.delete_agent(request).await {
-                    log::error!(
-                        "Failed to delete agent {}: {}",
-                        &id[..8.min(id.len())],
-                        e
-                    );
+                    log::error!("Failed to delete agent {}: {}", &id[..8.min(id.len())], e);
                     self.send_error_to_browser(&e).await;
                 }
             }
@@ -484,10 +493,7 @@ impl BrowserClient {
                 // TODO Phase 2.4: consider whether BrowserClient needs mode tracking.
             }
 
-            BrowserCommand::Scroll {
-                direction,
-                lines,
-            } => {
+            BrowserCommand::Scroll { direction, lines } => {
                 log::debug!(
                     "BrowserClient {}: Scroll {} {} lines",
                     &self.identity[..8.min(self.identity.len())],
@@ -956,7 +962,11 @@ impl BrowserClient {
                 log::info!("BrowserClient: error event: {}", message);
                 self.send_error_to_browser(message).await;
             }
-            HubEvent::PtyConnectionRequested { ref client_id, agent_index, pty_index } => {
+            HubEvent::PtyConnectionRequested {
+                ref client_id,
+                agent_index,
+                pty_index,
+            } => {
                 // Only handle if this is for us.
                 if client_id == &self.id {
                     log::info!(
@@ -966,12 +976,21 @@ impl BrowserClient {
                         pty_index
                     );
                     if let Err(e) = self.connect_to_pty(agent_index, pty_index).await {
-                        log::error!("Failed to connect to PTY ({}, {}): {}", agent_index, pty_index, e);
+                        log::error!(
+                            "Failed to connect to PTY ({}, {}): {}",
+                            agent_index,
+                            pty_index,
+                            e
+                        );
                         self.send_error_to_browser(&e).await;
                     }
                 }
             }
-            HubEvent::PtyDisconnectionRequested { ref client_id, agent_index, pty_index } => {
+            HubEvent::PtyDisconnectionRequested {
+                ref client_id,
+                agent_index,
+                pty_index,
+            } => {
                 // Only handle if this is for us.
                 if client_id == &self.id {
                     log::info!(
@@ -1000,7 +1019,9 @@ impl Client for BrowserClient {
         self.dims
     }
 
-    fn take_hub_event_rx(&mut self) -> Option<tokio::sync::broadcast::Receiver<crate::hub::HubEvent>> {
+    fn take_hub_event_rx(
+        &mut self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::hub::HubEvent>> {
         self.hub_event_rx.take()
     }
 
@@ -1043,6 +1064,9 @@ impl Client for BrowserClient {
             .build();
 
         // Connect to TerminalRelayChannel (already in async context).
+        // Each browser has dedicated streams (like TUI has dedicated I/O).
+        // CLI subscribes to: terminal_relay:{hub}:{agent}:{pty}:{browser}:cli
+        // Browser subscribes to: terminal_relay:{hub}:{agent}:{pty}:{browser}
         channel
             .connect(ChannelConfig {
                 channel_name: "TerminalRelayChannel".into(),
@@ -1053,7 +1077,7 @@ impl Client for BrowserClient {
                 encrypt: true,
                 // Threshold for gzip compression (4KB)
                 compression_threshold: Some(4096),
-                cli_subscription: false,
+                cli_subscription: true, // Subscribe to CLI stream (receives from browser)
             })
             .await
             .map_err(|e| format!("Failed to connect channel: {}", e))?;
@@ -1145,7 +1169,11 @@ impl Client for BrowserClient {
         pty_index: usize,
     ) {
         // Remove channel from map - dropping it cleans up tasks.
-        if self.terminal_channels.remove(&(agent_index, pty_index)).is_some() {
+        if self
+            .terminal_channels
+            .remove(&(agent_index, pty_index))
+            .is_some()
+        {
             // Notify PTY of disconnection.
             let pty = pty.clone();
             let client_id = self.id.clone();
@@ -1186,9 +1214,17 @@ impl Client for BrowserClient {
     // delete_agent, regenerate_connection_code, copy_connection_url, list_worktrees,
     // get_connection_code all use DEFAULT IMPLEMENTATIONS from the trait
 
-    async fn regenerate_prekey_bundle(&self) -> Result<crate::relay::signal::PreKeyBundleData, String> {
-        let next_id = self.config.crypto_service.next_prekey_id().await.unwrap_or(1);
-        self.config.crypto_service
+    async fn regenerate_prekey_bundle(
+        &self,
+    ) -> Result<crate::relay::signal::PreKeyBundleData, String> {
+        let next_id = self
+            .config
+            .crypto_service
+            .next_prekey_id()
+            .await
+            .unwrap_or(1);
+        self.config
+            .crypto_service
             .get_prekey_bundle(next_id)
             .await
             .map_err(|e| format!("Failed to regenerate bundle: {}", e))
@@ -1351,23 +1387,29 @@ async fn spawn_pty_input_receiver(
         match command {
             BrowserCommand::Input { data } => {
                 // Send input request through channel to BrowserClient.
-                if request_tx.send(BrowserRequest::SendInput {
-                    agent_index,
-                    pty_index,
-                    data: data.into_bytes(),
-                }).is_err() {
+                if request_tx
+                    .send(BrowserRequest::SendInput {
+                        agent_index,
+                        pty_index,
+                        data: data.into_bytes(),
+                    })
+                    .is_err()
+                {
                     log::debug!("BrowserRequest channel closed, stopping input receiver");
                     break;
                 }
             }
             BrowserCommand::Resize { cols, rows } => {
                 // Send resize request through channel to BrowserClient.
-                if request_tx.send(BrowserRequest::Resize {
-                    agent_index,
-                    pty_index,
-                    rows,
-                    cols,
-                }).is_err() {
+                if request_tx
+                    .send(BrowserRequest::Resize {
+                        agent_index,
+                        pty_index,
+                        rows,
+                        cols,
+                    })
+                    .is_err()
+                {
                     log::debug!("BrowserRequest channel closed, stopping input receiver");
                     break;
                 }
@@ -1408,12 +1450,7 @@ mod tests {
 
     /// Helper to create a BrowserClient with mock dependencies for testing.
     fn test_client(identity: &str) -> BrowserClient {
-        BrowserClient::new(
-            HubHandle::mock(),
-            identity.to_string(),
-            mock_config(),
-            None,
-        )
+        BrowserClient::new(HubHandle::mock(), identity.to_string(), mock_config(), None)
     }
 
     // ========== Unit Tests (No Async) ==========
@@ -1465,10 +1502,7 @@ mod tests {
         let debug = format!("{:?}", client);
 
         // These fields SHOULD exist.
-        assert!(
-            debug.contains("id:"),
-            "BrowserClient should have id field"
-        );
+        assert!(debug.contains("id:"), "BrowserClient should have id field");
         assert!(
             debug.contains("dims:"),
             "BrowserClient should have dims field"
@@ -1541,11 +1575,14 @@ mod tests {
     fn test_request_channel_created_at_construction() {
         let client = test_client("test");
         // Channel is created at construction - tx can send without error.
-        assert!(client.request_tx.send(BrowserRequest::SendInput {
-            agent_index: 0,
-            pty_index: 0,
-            data: vec![b'x'],
-        }).is_ok());
+        assert!(client
+            .request_tx
+            .send(BrowserRequest::SendInput {
+                agent_index: 0,
+                pty_index: 0,
+                data: vec![b'x'],
+            })
+            .is_ok());
     }
 
     #[tokio::test]
@@ -1553,11 +1590,13 @@ mod tests {
         let mut client = test_client("test");
 
         // Send input request (will fail since mock hub has no agents, but should not panic).
-        client.handle_request(BrowserRequest::SendInput {
-            agent_index: 0,
-            pty_index: 0,
-            data: vec![b'h', b'i'],
-        }).await;
+        client
+            .handle_request(BrowserRequest::SendInput {
+                agent_index: 0,
+                pty_index: 0,
+                data: vec![b'h', b'i'],
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1565,12 +1604,14 @@ mod tests {
         let mut client = test_client("test");
 
         // Send resize request (will fail since mock hub has no agents, but should not panic).
-        client.handle_request(BrowserRequest::Resize {
-            agent_index: 0,
-            pty_index: 0,
-            rows: 40,
-            cols: 120,
-        }).await;
+        client
+            .handle_request(BrowserRequest::Resize {
+                agent_index: 0,
+                pty_index: 0,
+                rows: 40,
+                cols: 120,
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1578,22 +1619,28 @@ mod tests {
         let mut client = test_client("test");
 
         // Send multiple requests from different PTYs.
-        client.handle_request(BrowserRequest::SendInput {
-            agent_index: 0,
-            pty_index: 0,
-            data: vec![b'a'],
-        }).await;
-        client.handle_request(BrowserRequest::Resize {
-            agent_index: 1,
-            pty_index: 0,
-            rows: 24,
-            cols: 80,
-        }).await;
-        client.handle_request(BrowserRequest::SendInput {
-            agent_index: 0,
-            pty_index: 1,
-            data: vec![b'b'],
-        }).await;
+        client
+            .handle_request(BrowserRequest::SendInput {
+                agent_index: 0,
+                pty_index: 0,
+                data: vec![b'a'],
+            })
+            .await;
+        client
+            .handle_request(BrowserRequest::Resize {
+                agent_index: 1,
+                pty_index: 0,
+                rows: 24,
+                cols: 80,
+            })
+            .await;
+        client
+            .handle_request(BrowserRequest::SendInput {
+                agent_index: 0,
+                pty_index: 1,
+                data: vec![b'b'],
+            })
+            .await;
     }
 
     #[test]
@@ -1621,7 +1668,8 @@ mod tests {
 
         // Give client a hub event receiver, then drop the sender to close the channel.
         // The broadcast channel closing causes run_task to exit.
-        let (hub_event_tx, hub_event_rx) = tokio::sync::broadcast::channel::<crate::hub::HubEvent>(16);
+        let (hub_event_tx, hub_event_rx) =
+            tokio::sync::broadcast::channel::<crate::hub::HubEvent>(16);
         client.hub_event_rx = Some(hub_event_rx);
 
         // Send Shutdown event; run_task handles it by not forwarding but the
@@ -1732,11 +1780,13 @@ mod tests {
 
             // Process SendInput request (async, must run on Hub's runtime)
             hub.tokio_runtime.block_on(async {
-                client.handle_request(BrowserRequest::SendInput {
-                    agent_index: 0,
-                    pty_index: 0,
-                    data: b"echo hello\n".to_vec(),
-                }).await;
+                client
+                    .handle_request(BrowserRequest::SendInput {
+                        agent_index: 0,
+                        pty_index: 0,
+                        data: b"echo hello\n".to_vec(),
+                    })
+                    .await;
             });
 
             // Verify the input command arrived at the PTY.
@@ -1779,12 +1829,14 @@ mod tests {
 
             // Process Resize request (async, must run on Hub's runtime)
             hub.tokio_runtime.block_on(async {
-                client.handle_request(BrowserRequest::Resize {
-                    agent_index: 0,
-                    pty_index: 0,
-                    rows: 40,
-                    cols: 120,
-                }).await;
+                client
+                    .handle_request(BrowserRequest::Resize {
+                        agent_index: 0,
+                        pty_index: 0,
+                        rows: 40,
+                        cols: 120,
+                    })
+                    .await;
             });
 
             // Process PTY commands to apply the resize
@@ -1846,18 +1898,22 @@ mod tests {
             // Process async requests on Hub's runtime
             hub.tokio_runtime.block_on(async {
                 // Send input to agent 0
-                client.handle_request(BrowserRequest::SendInput {
-                    agent_index: 0,
-                    pty_index: 0,
-                    data: b"agent-0-input\n".to_vec(),
-                }).await;
+                client
+                    .handle_request(BrowserRequest::SendInput {
+                        agent_index: 0,
+                        pty_index: 0,
+                        data: b"agent-0-input\n".to_vec(),
+                    })
+                    .await;
 
                 // Send input to agent 1
-                client.handle_request(BrowserRequest::SendInput {
-                    agent_index: 1,
-                    pty_index: 0,
-                    data: b"agent-1-input\n".to_vec(),
-                }).await;
+                client
+                    .handle_request(BrowserRequest::SendInput {
+                        agent_index: 1,
+                        pty_index: 0,
+                        data: b"agent-1-input\n".to_vec(),
+                    })
+                    .await;
             });
 
             // Verify agent 0's PTY received its command
@@ -1906,11 +1962,13 @@ mod tests {
             // Send input (should be gracefully handled - error logged, no crash)
             // (async, must run on Hub's runtime)
             hub.tokio_runtime.block_on(async {
-                client.handle_request(BrowserRequest::SendInput {
-                    agent_index: 0,
-                    pty_index: 0,
-                    data: b"echo hello\n".to_vec(),
-                }).await;
+                client
+                    .handle_request(BrowserRequest::SendInput {
+                        agent_index: 0,
+                        pty_index: 0,
+                        data: b"echo hello\n".to_vec(),
+                    })
+                    .await;
             });
 
             // If we got here without panic, the test passes.

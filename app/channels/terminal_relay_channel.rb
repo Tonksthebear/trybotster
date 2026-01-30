@@ -7,14 +7,18 @@
 # it only forwards encrypted blobs.
 #
 # Architecture:
-# - Each agent subscribes with hub_id + agent_index + pty_index (no browser_identity)
-# - Each browser subscribes with hub_id + agent_index + pty_index + browser_identity
-# - Server routes messages to appropriate streams based on recipient_identity
-# - All encryption/decryption happens at endpoints
+# Each browser has dedicated bidirectional streams with the CLI (like TUI).
+# This is required because each browser has its own Signal session.
 #
-# Streams (per-agent, per-PTY):
-# - CLI:     terminal_relay:{hub_id}:{agent_index}:{pty_index}:cli
-# - Browser: terminal_relay:{hub_id}:{agent_index}:{pty_index}:browser:{identity}
+# Streams per (hub, agent, pty, browser):
+# - Browser stream: terminal_relay:{hub}:{agent}:{pty}:{browser_identity}
+# - CLI stream:     terminal_relay:{hub}:{agent}:{pty}:{browser_identity}:cli
+#
+# Routing:
+# - Browser subscribes to browser stream, receives from CLI
+# - CLI subscribes to CLI stream, receives from browser
+# - Browser -> CLI: routed to CLI stream
+# - CLI -> Browser: routed to browser stream
 #
 # PTY indices:
 # - 0: CLI PTY (Claude agent terminal)
@@ -22,46 +26,44 @@
 #
 # Security:
 # - Server never sees plaintext terminal content
-# - Double Ratchet provides forward secrecy
-# - Post-quantum security via Kyber/PQXDH
+# - E2E encryption via Signal Protocol (per-browser sessions)
 class TerminalRelayChannel < ApplicationCable::Channel
   def subscribed
     @hub_id = params[:hub_id]
     @agent_index = params[:agent_index] || 0
-    @pty_index = params[:pty_index] || 0  # 0=CLI, 1=Server
+    @pty_index = params[:pty_index] || 0
     @browser_identity = params[:browser_identity]
+    @is_cli = params[:cli_subscription] == true
 
-    unless @hub_id.present?
-      Rails.logger.warn "[TerminalRelay] Missing hub_id"
+    unless @hub_id.present? && @browser_identity.present?
+      Rails.logger.warn "[TerminalRelay] Missing hub_id or browser_identity"
       reject
       return
     end
 
-    # Subscribe to appropriate stream based on client type
     stream_from my_stream_name
 
-    if @browser_identity.present?
+    if @is_cli
+      Rails.logger.info "[TerminalRelay] CLI subscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index} browser=#{@browser_identity[0..8]}..."
+    else
       Rails.logger.info "[TerminalRelay] Browser subscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index} identity=#{@browser_identity[0..8]}..."
       notify_cli_of_terminal_connection
-    else
-      Rails.logger.info "[TerminalRelay] CLI subscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
     end
   end
 
   def unsubscribed
-    if @browser_identity.present?
+    if @is_cli
+      Rails.logger.info "[TerminalRelay] CLI unsubscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
+    else
       Rails.logger.info "[TerminalRelay] Browser unsubscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
       notify_cli_of_terminal_disconnection
-    else
-      Rails.logger.info "[TerminalRelay] CLI unsubscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
     end
   end
 
-  # Relay encrypted message to appropriate recipient
+  # Relay encrypted message to the other party
   #
   # @param data [Hash] Contains encrypted SignalEnvelope
   # @option data [String] :envelope The encrypted SignalEnvelope JSON
-  # @option data [String] :recipient_identity Target browser (CLI->browser only)
   def relay(data)
     envelope = data["envelope"]
 
@@ -70,55 +72,25 @@ class TerminalRelayChannel < ApplicationCable::Channel
       return
     end
 
-    recipient_identity = data["recipient_identity"]
+    # Route to the other party's stream
+    target_stream = @is_cli ? browser_stream_name : cli_stream_name
+    ActionCable.server.broadcast(target_stream, { envelope: envelope })
 
-    if recipient_identity.present?
-      # CLI -> specific browser: route to that browser's stream
-      target_stream = browser_stream_name(recipient_identity)
-      ActionCable.server.broadcast(target_stream, { envelope: envelope })
-      Rails.logger.debug "[TerminalRelay] Routed to browser: #{recipient_identity[0..8]}..."
-    else
-      # Browser -> CLI: route to CLI stream
-      ActionCable.server.broadcast(cli_stream_name, { envelope: envelope })
-      Rails.logger.debug "[TerminalRelay] Routed to CLI"
-    end
-  end
-
-  # Relay SenderKey distribution (for group messaging)
-  #
-  # @param data [Hash] Contains SenderKey distribution message
-  # @option data [String] :distribution Base64 SenderKeyDistributionMessage
-  def distribute_sender_key(data)
-    distribution = data["distribution"]
-
-    unless distribution.present?
-      Rails.logger.warn "[TerminalRelay] Missing distribution in distribute_sender_key"
-      return
-    end
-
-    # SenderKey distribution goes to CLI (which then redistributes to browsers)
-    ActionCable.server.broadcast(cli_stream_name, { sender_key_distribution: distribution })
-
-    Rails.logger.debug "[TerminalRelay] Distributed SenderKey for hub=#{@hub_id}"
+    Rails.logger.debug "[TerminalRelay] Relayed to #{@is_cli ? 'browser' : 'CLI'}"
   end
 
   private
 
-  # Stream this client subscribes to
   def my_stream_name
-    if @browser_identity.present?
-      browser_stream_name(@browser_identity)
-    else
-      cli_stream_name
-    end
+    @is_cli ? cli_stream_name : browser_stream_name
+  end
+
+  def browser_stream_name
+    "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:#{@browser_identity}"
   end
 
   def cli_stream_name
-    "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:cli"
-  end
-
-  def browser_stream_name(identity)
-    "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:browser:#{identity}"
+    "terminal_relay:#{@hub_id}:#{@agent_index}:#{@pty_index}:#{@browser_identity}:cli"
   end
 
   def find_hub

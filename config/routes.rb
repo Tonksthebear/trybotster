@@ -34,8 +34,12 @@ Rails.application.routes.draw do
       resources :notifications, only: [ :create ]
       resource :connection, only: [ :show ]
       # Agent terminal view by index
+      # /hubs/:hub_id/agents/:index - agent overview (redirects to PTY 0)
+      # /hubs/:hub_id/agents/:index/ptys/:pty_index - specific PTY terminal
       resources :agents, only: [ :show ], param: :index do
-        # PTY preview - proxied through E2E WebSocket by service worker
+        resources :ptys, only: [ :show ], param: :index, controller: "agents/ptys"
+
+        # Preview - for PTYs with port forwarding
         get ":pty_index/preview/sw.js", to: "agents/previews#service_worker", as: :pty_service_worker
         get ":pty_index/preview", to: "agents/previews#show", as: :pty_preview, defaults: { path: "" }
         get ":pty_index/preview/*path", to: "agents/previews#show", format: false
