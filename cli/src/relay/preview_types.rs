@@ -32,6 +32,12 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PreviewMessage {
+    /// CLI is ready to receive HTTP requests.
+    ///
+    /// Sent after HttpChannel subscribes to PreviewChannel. Browser should
+    /// wait for this before sending requests to avoid message loss.
+    #[serde(rename = "preview_ready")]
+    Ready,
     /// HTTP response from agent's dev server.
     #[serde(rename = "http_response")]
     HttpResponse(HttpResponse),
@@ -277,6 +283,13 @@ mod tests {
         assert!(json.contains(r#""type":"preview_error""#));
         assert!(json.contains(r#""request_id":42"#));
         assert!(json.contains(r#""error":"Server not running""#));
+    }
+
+    #[test]
+    fn test_preview_message_ready_serialization() {
+        let msg = PreviewMessage::Ready;
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"preview_ready""#));
     }
 
     #[test]

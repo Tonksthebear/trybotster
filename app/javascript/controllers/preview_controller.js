@@ -1,171 +1,127 @@
-import { Controller } from "@hotwired/stimulus";
-import { PreviewChannel, ChannelState } from "transport/encrypted-channel";
-import { SignalSession } from "signal";
-import { ConnectionManager, HubConnection } from "connections";
-
 /**
- * Preview Controller - E2E Encrypted HTTP Tunnel for Agent Dev Server
+ * Preview Controller - HTTP preview tunneling via Service Worker.
  *
- * This controller manages the preview iframe that displays an agent's
- * dev server output. All HTTP traffic is E2E encrypted using the
- * same Signal Protocol session as the terminal.
+ * Bridges the Service Worker (which intercepts fetch requests in the iframe)
+ * with the PreviewConnection (E2E encrypted channel to CLI's dev server).
  *
  * Architecture:
- * 1. Service worker is already registered by bootstrap page
- * 2. SW intercepts fetch requests and sends via client.postMessage()
- * 3. This controller receives requests via navigator.serviceWorker message events
- * 4. Controller encrypts requests, sends via PreviewChannel WebSocket
- * 5. Agent receives, forwards to local dev server, returns encrypted response
- * 6. Controller decrypts response, sends to SW via navigator.serviceWorker.controller.postMessage()
- * 7. Service worker returns response to iframe's fetch
+ *   1. SW intercepts fetch requests in preview iframe
+ *   2. SW sends http_request via client.postMessage() to this page
+ *   3. This controller receives request via navigator.serviceWorker message event
+ *   4. Controller proxies request through PreviewConnection to CLI
+ *   5. CLI forwards to localhost dev server, returns encrypted response
+ *   6. Controller sends response back to SW via controller.postMessage()
+ *   7. SW resolves the fetch with the proxied response
  *
  * Usage:
- * ```erb
- * <div data-controller="preview"
- *      data-preview-hub-id-value="123"
- *      data-preview-agent-index-value="0"
- *      data-preview-scope-value="/hubs/123/agents/0/1/preview">
- *   <iframe data-preview-target="iframe"></iframe>
- *   <div data-preview-target="status"></div>
- * </div>
- * ```
+ *   <div data-controller="preview"
+ *        data-preview-hub-id-value="123"
+ *        data-preview-agent-index-value="0"
+ *        data-preview-scope-value="/hubs/123/agents/0/1/preview">
+ *     <iframe data-preview-target="iframe"></iframe>
+ *     <span data-preview-target="status"></span>
+ *   </div>
  */
+
+import { Controller } from "@hotwired/stimulus";
+import { ConnectionManager, PreviewConnection } from "connections";
+
 export default class extends Controller {
   static targets = ["iframe", "status", "error"];
-
   static values = {
     hubId: String,
     agentIndex: Number,
+    ptyIndex: { type: Number, default: 1 },
     scope: String,
     initialUrl: { type: String, default: "/" },
   };
 
-  #hub = null;
-  #unsubscribers = [];
+  #connection = null;
   #swMessageHandler = null;
+  #unsubscribers = [];
 
   connect() {
-    this.channel = null;
-    this.signalSession = null;
-
-    this.#initConnection();
+    this.#initialize();
   }
 
   disconnect() {
-    this.cleanup();
-    this.#unsubscribers.forEach((unsub) => unsub());
-    this.#unsubscribers = [];
-    this.#hub?.release();
-    this.#hub = null;
+    this.#cleanup();
   }
 
-  async #initConnection() {
-    if (!this.hubIdValue) return;
+  // ========== Initialization ==========
 
-    this.#hub = await ConnectionManager.acquire(
-      HubConnection,
-      this.hubIdValue,
-      { hubId: this.hubIdValue },
-    );
-
-    this.#unsubscribers.push(this.#hub.onConnected(() => this.initialize()));
-
-    this.#unsubscribers.push(
-      this.#hub.onDisconnected(() => this.handleConnectionLost()),
-    );
-
-    this.#unsubscribers.push(
-      this.#hub.onError((error) => this.handleError(error)),
-    );
-
-    // If already connected, initialize now
-    if (this.#hub.isConnected()) {
-      this.initialize();
-    }
-  }
-
-  /**
-   * Initialize the preview channel and service worker communication.
-   * Note: SW is already registered by bootstrap page.
-   */
-  async initialize() {
+  async #initialize() {
     try {
-      this.updateStatus("Initializing preview...");
+      this.#updateStatus("Connecting...", "default");
 
-      // Get Signal session from connection controller or load existing
-      this.signalSession = await this.getSignalSession();
+      // Acquire preview connection via ConnectionManager
+      const key = PreviewConnection.key(
+        this.hubIdValue,
+        this.agentIndexValue,
+        this.ptyIndexValue,
+      );
 
-      if (!this.signalSession) {
-        this.showError("No encryption session. Please scan QR code first.");
-        return;
+      this.#connection = await ConnectionManager.acquire(
+        PreviewConnection,
+        key,
+        {
+          hubId: this.hubIdValue,
+          agentIndex: this.agentIndexValue,
+          ptyIndex: this.ptyIndexValue,
+        },
+      );
+
+      // Set up connection event handlers
+      this.#unsubscribers.push(
+        this.#connection.onStateChange((state) =>
+          this.#handleStateChange(state),
+        ),
+        this.#connection.onError((error) => this.#handleError(error)),
+      );
+
+      // Set up SW message listener
+      this.#setupServiceWorkerListener();
+
+      // Load initial URL in iframe once connected
+      if (this.#connection.isConnected()) {
+        this.#loadIframe();
+        this.#updateStatus("Connected", "success");
       }
-
-      // Set up SW message listener (SW already registered by bootstrap)
-      this.setupServiceWorkerListener();
-
-      // Create preview channel
-      this.channel = new PreviewChannel({
-        hubId: this.hubIdValue,
-        agentIndex: this.agentIndexValue,
-        signal: this.signalSession,
-        onMessage: (msg) => this.handleMessage(msg),
-        onStateChange: (state) => this.handleStateChange(state),
-        onError: (error) => this.handleError(error),
-      });
-
-      // Connect channel
-      await this.channel.connect();
-
-      // Load initial URL in iframe (use dynamic scope path)
-      if (this.hasIframeTarget && this.scopeValue) {
-        this.iframeTarget.src = `${this.scopeValue}${this.initialUrlValue}`;
-      }
-
-      this.updateStatus("Preview connected", "success");
     } catch (error) {
       console.error("[Preview] Initialization failed:", error);
-      this.showError(`Preview initialization failed: ${error.message}`);
+      this.#updateStatus("Connection failed", "error");
+      this.#showError(error.message);
     }
   }
 
-  /**
-   * Get Signal session (reuse from hub connection if available).
-   */
-  async getSignalSession() {
-    // Reuse session from hub connection
-    if (this.#hub?.session) {
-      return this.#hub.session;
-    }
+  #cleanup() {
+    // Remove SW message listener
+    this.#removeServiceWorkerListener();
 
-    // Fall back to loading directly
-    if (this.hubIdValue) {
-      return await SignalSession.load(this.hubIdValue);
+    // Unsubscribe from connection events
+    for (const unsub of this.#unsubscribers) {
+      unsub();
     }
+    this.#unsubscribers = [];
 
-    return null;
+    // Release connection
+    this.#connection?.release();
+    this.#connection = null;
   }
 
-  /**
-   * Set up listener for messages from service worker.
-   * SW sends http_request via client.postMessage(), we reply via controller.postMessage().
-   */
-  setupServiceWorkerListener() {
-    // Remove any existing listener
-    this.removeServiceWorkerListener();
+  // ========== Service Worker Communication ==========
 
-    // Create bound handler
+  #setupServiceWorkerListener() {
+    this.#removeServiceWorkerListener();
+
     this.#swMessageHandler = (event) => {
-      this.handleServiceWorkerMessage(event.data);
+      this.#handleServiceWorkerMessage(event.data);
     };
 
-    // Listen for messages from service worker
     navigator.serviceWorker.addEventListener("message", this.#swMessageHandler);
   }
 
-  /**
-   * Remove service worker message listener.
-   */
-  removeServiceWorkerListener() {
+  #removeServiceWorkerListener() {
     if (this.#swMessageHandler) {
       navigator.serviceWorker.removeEventListener(
         "message",
@@ -175,144 +131,98 @@ export default class extends Controller {
     }
   }
 
-  /**
-   * Handle message from service worker (HTTP request to proxy).
-   */
-  async handleServiceWorkerMessage(data) {
-    if (data.type === "http_request") {
-      try {
-        // Send through encrypted channel
-        const response = await this.channel.fetch({
-          method: data.method,
-          url: data.path,
-          headers: data.headers,
-          body: data.body,
-        });
+  async #handleServiceWorkerMessage(data) {
+    if (data.type !== "http_request") return;
 
-        // Send response back to service worker
-        this.sendToServiceWorker({
-          type: "http_response",
-          requestId: data.requestId,
-          response: {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers,
-            body: response.body ? this.arrayToBase64(response.body) : null,
-          },
-        });
-      } catch (error) {
-        console.error("[Preview] Request failed:", error);
-        this.sendToServiceWorker({
-          type: "http_response",
-          requestId: data.requestId,
-          error: error.message,
-        });
-      }
+    try {
+      // Proxy request through PreviewConnection
+      const response = await this.#connection.fetch({
+        method: data.method,
+        path: data.path,
+        headers: data.headers,
+        body: data.body,
+      });
+
+      // Send response back to SW
+      this.#sendToServiceWorker({
+        type: "http_response",
+        requestId: data.requestId,
+        response: {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+          body: response.body ? this.#encodeBody(response.body) : null,
+        },
+      });
+    } catch (error) {
+      console.error("[Preview] Request failed:", error);
+      this.#sendToServiceWorker({
+        type: "http_response",
+        requestId: data.requestId,
+        error: error.message,
+      });
     }
   }
 
-  /**
-   * Send message to service worker.
-   */
-  sendToServiceWorker(message) {
+  #sendToServiceWorker(message) {
     if (navigator.serviceWorker.controller) {
       navigator.serviceWorker.controller.postMessage(message);
     } else {
-      console.warn("[Preview] No service worker controller to send to");
+      console.warn("[Preview] No service worker controller available");
     }
   }
 
-  /**
-   * Handle message from preview channel.
-   */
-  handleMessage(message) {
-    // Most messages are HTTP responses handled by PreviewChannel internally
-    // But we might receive control messages here
-    if (message.type === "preview_error") {
-      this.showError(message.error);
-    }
-  }
+  // ========== Connection Event Handlers ==========
 
-  /**
-   * Handle channel state changes.
-   */
-  handleStateChange(state) {
+  #handleStateChange({ state }) {
     switch (state) {
-      case ChannelState.CONNECTED:
-        this.updateStatus("Preview connected", "success");
-        this.clearError();
+      case "connected":
+        this.#updateStatus("Connected", "success");
+        this.#loadIframe();
         break;
-      case ChannelState.CONNECTING:
-        this.updateStatus("Connecting preview...");
+      case "connecting":
+        this.#updateStatus("Connecting...", "default");
         break;
-      case ChannelState.RECONNECTING:
-        this.updateStatus("Reconnecting preview...", "warning");
+      case "loading":
+        this.#updateStatus("Loading session...", "default");
         break;
-      case ChannelState.DISCONNECTED:
-        this.updateStatus("Preview disconnected", "error");
+      case "disconnected":
+        this.#updateStatus("Disconnected", "warning");
         break;
-      case ChannelState.ERROR:
-        this.updateStatus("Preview error", "error");
+      case "error":
+        this.#updateStatus("Connection error", "error");
         break;
     }
   }
 
-  /**
-   * Handle errors.
-   */
-  handleError(error) {
-    console.error("[Preview] Error:", error);
-    this.showError(error.message || error.error || "Unknown error");
+  #handleError(error) {
+    console.error("[Preview] Connection error:", error);
+    this.#showError(error.message);
   }
 
-  /**
-   * Handle connection lost from main terminal connection.
-   */
-  handleConnectionLost() {
-    this.updateStatus("Connection lost", "error");
-    this.cleanup();
-  }
+  // ========== UI Helpers ==========
 
-  /**
-   * Refresh the preview iframe.
-   */
-  refresh() {
-    if (this.hasIframeTarget && this.channel?.isConnected()) {
-      this.iframeTarget.contentWindow.location.reload();
+  #loadIframe() {
+    if (this.hasIframeTarget && this.scopeValue) {
+      this.iframeTarget.src = `${this.scopeValue}${this.initialUrlValue}`;
     }
   }
 
-  /**
-   * Navigate to a URL in the preview.
-   */
-  navigate(url) {
-    if (this.hasIframeTarget && this.channel?.isConnected() && this.scopeValue) {
-      this.iframeTarget.src = `${this.scopeValue}${url}`;
-    }
-  }
-
-  /**
-   * Clean up resources.
-   */
-  cleanup() {
-    this.removeServiceWorkerListener();
-
-    if (this.channel) {
-      this.channel.disconnect();
-      this.channel = null;
-    }
-  }
-
-  // === UI Helpers ===
-
-  updateStatus(text, type = "info") {
+  #updateStatus(text, type) {
     if (this.hasStatusTarget) {
       this.statusTarget.textContent = text;
-      this.statusTarget.className = this.statusClasses(type);
+      this.statusTarget.className = this.#statusClasses(type);
     }
   }
 
-  statusClasses(type) {
+  #showError(message) {
+    if (this.hasErrorTarget) {
+      this.errorTarget.textContent = message;
+      this.errorTarget.classList.remove("hidden");
+    }
+  }
+
+  #statusClasses(type) {
     const base = "status-text";
     switch (type) {
       case "success":
@@ -326,29 +236,35 @@ export default class extends Controller {
     }
   }
 
-  showError(message) {
-    if (this.hasErrorTarget) {
-      this.errorTarget.textContent = message;
-      this.errorTarget.classList.remove("hidden");
-    }
-  }
+  // ========== Utility ==========
 
-  clearError() {
-    if (this.hasErrorTarget) {
-      this.errorTarget.textContent = "";
-      this.errorTarget.classList.add("hidden");
-    }
-  }
+  #encodeBody(body) {
+    if (!body) return null;
 
-  // === Utility Methods ===
-
-  arrayToBase64(array) {
-    if (!array) return null;
-    let binary = "";
-    const bytes = array instanceof Uint8Array ? array : new Uint8Array(array);
-    for (let i = 0; i < bytes.length; i++) {
-      binary += String.fromCharCode(bytes[i]);
+    // Handle compressed response from PreviewConnection
+    if (body.compressed && body.bytes) {
+      // Return as-is, SW will handle decompression
+      let binary = "";
+      for (let i = 0; i < body.bytes.length; i++) {
+        binary += String.fromCharCode(body.bytes[i]);
+      }
+      return btoa(binary);
     }
-    return btoa(binary);
+
+    // Handle Uint8Array
+    if (body instanceof Uint8Array) {
+      let binary = "";
+      for (let i = 0; i < body.length; i++) {
+        binary += String.fromCharCode(body[i]);
+      }
+      return btoa(binary);
+    }
+
+    // Handle string
+    if (typeof body === "string") {
+      return btoa(body);
+    }
+
+    return null;
   }
 }

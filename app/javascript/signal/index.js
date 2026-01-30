@@ -12,10 +12,12 @@
  * - XSS can use the session while tab is open, but cannot steal it
  */
 
-// Worker instance (initialized on first use)
+// Worker instance (SharedWorker preferred, fallback to Worker)
 let worker = null;
+let workerPort = null;
 let workerReady = false;
 let initPromise = null;
+let usingSharedWorker = false;
 
 // Pending request callbacks (id -> {resolve, reject})
 const pendingRequests = new Map();
@@ -23,6 +25,10 @@ let nextRequestId = 1;
 
 /**
  * Initialize the Signal worker with WASM module.
+ *
+ * Prefers SharedWorker to ensure all tabs share a single Signal session state,
+ * preventing ratchet desync when multiple tabs encrypt/decrypt.
+ * Falls back to regular Worker if SharedWorker is not available.
  *
  * @param {string} workerUrl - URL to workers/signal.js (from asset_path)
  * @param {string} wasmJsUrl - URL to libsignal_wasm.js (from asset_path)
@@ -34,16 +40,34 @@ export async function initSignal(workerUrl, wasmJsUrl, wasmBinaryUrl) {
 
   initPromise = (async () => {
     try {
-      // Spawn worker
-      worker = new Worker(workerUrl, { type: "module" });
+      // Try SharedWorker first (shared across all tabs)
+      if (typeof SharedWorker !== "undefined") {
+        try {
+          worker = new SharedWorker(workerUrl, { type: "module", name: "signal" });
+          workerPort = worker.port;
+          workerPort.onmessage = handleWorkerMessage;
+          workerPort.onmessageerror = (e) => console.error("[Signal] Message error:", e);
+          worker.onerror = (e) => console.error("[Signal] Worker error:", e);
+          workerPort.start();
+          usingSharedWorker = true;
+        } catch (sharedError) {
+          console.warn("[Signal] SharedWorker failed, falling back:", sharedError);
+          worker = null;
+          workerPort = null;
+        }
+      }
 
-      // Set up message handler
-      worker.onmessage = handleWorkerMessage;
-      worker.onerror = (e) => console.error("[Signal] Worker error:", e);
+      // Fallback to regular Worker (single tab only)
+      if (!workerPort) {
+        console.warn("[Signal] Using regular Worker - multi-tab may desync");
+        worker = new Worker(workerUrl, { type: "module" });
+        workerPort = worker;
+        worker.onmessage = handleWorkerMessage;
+        worker.onerror = (e) => console.error("[Signal] Worker error:", e);
+        usingSharedWorker = false;
+      }
 
-      // Initialize WASM in worker
       await sendToWorker("init", { wasmJsUrl, wasmBinaryUrl });
-
       workerReady = true;
     } catch (error) {
       console.error("[Signal] Failed to initialize worker:", error);
@@ -62,10 +86,7 @@ function handleWorkerMessage(event) {
   const { id, success, result, error } = event.data;
 
   const pending = pendingRequests.get(id);
-  if (!pending) {
-    console.warn("[Signal] Received response for unknown request:", id);
-    return;
-  }
+  if (!pending) return;
 
   pendingRequests.delete(id);
 
@@ -77,13 +98,33 @@ function handleWorkerMessage(event) {
 }
 
 /**
- * Send a request to the worker and wait for response.
+ * Send a request to the SharedWorker and wait for response.
  */
-function sendToWorker(action, params = {}) {
+function sendToWorker(action, params = {}, timeout = 10000) {
   return new Promise((resolve, reject) => {
+    if (!workerPort) {
+      reject(new Error("Worker not initialized"));
+      return;
+    }
     const id = nextRequestId++;
-    pendingRequests.set(id, { resolve, reject });
-    worker.postMessage({ id, action, ...params });
+
+    const timer = setTimeout(() => {
+      pendingRequests.delete(id);
+      reject(new Error(`Worker timeout: ${action}`));
+    }, timeout);
+
+    pendingRequests.set(id, {
+      resolve: (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    });
+
+    workerPort.postMessage({ id, action, ...params });
   });
 }
 

@@ -186,24 +186,29 @@ impl Hub {
                 "browser_wants_preview" => {
                     // Browser subscribed to PreviewChannel - notify BrowserClient to create HttpChannel.
                     let agent_index = msg.payload.get("agent_index").and_then(|v| v.as_u64());
+                    let pty_index = msg
+                        .payload
+                        .get("pty_index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1); // Default to server PTY
                     let browser_identity = msg.payload
                         .get("browser_identity")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
 
                     log::info!(
-                        "[CommandChannel] Browser wants preview: browser={}, agent={:?}",
+                        "[CommandChannel] Browser wants preview: browser={}, agent={:?}, pty={}",
                         &browser_identity[..browser_identity.len().min(8)],
-                        agent_index
+                        agent_index,
+                        pty_index
                     );
 
                     if let Some(ai) = agent_index {
                         let client_id = ClientId::Browser(browser_identity.to_string());
-                        // Hardcode pty_index=1 for server PTY (per architecture spec)
                         self.broadcast(HubEvent::HttpConnectionRequested {
                             client_id,
                             agent_index: ai as usize,
-                            pty_index: 1,
+                            pty_index: pty_index as usize,
                             browser_identity: browser_identity.to_string(),
                         });
                     } else {

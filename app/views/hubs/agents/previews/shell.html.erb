@@ -6,6 +6,9 @@
   <title>Preview</title>
   <%= csrf_meta_tags %>
   <%= csp_meta_tag %>
+  <meta name="signal-worker-url" content="<%= asset_path('workers/signal.js') %>">
+  <meta name="signal-wasm-js-url" content="<%= asset_path('libsignal_wasm.js') %>">
+  <meta name="signal-wasm-binary-url" content="<%= asset_path('libsignal_wasm_bg.wasm') %>">
   <%= stylesheet_link_tag "application", "data-turbo-track": "reload" %>
   <%= javascript_importmap_tags %>
   <style>
@@ -59,15 +62,16 @@
   <%# Connection container - establishes E2E WebSocket %>
   <div id="preview-connection"
        data-controller="preview"
-       data-preview-hub-id-value="<%= @hub_id %>"
-       data-preview-agent-index-value="<%= @agent_index_value %>"
+       data-preview-hub-id-value="<%= Current.hub.id %>"
+       data-preview-agent-index-value="<%= Current.agent_index %>"
+       data-preview-pty-index-value="<%= Current.pty_index %>"
        data-preview-scope-value="<%= @scope %>"
        data-preview-initial-url-value="/">
 
     <%# Status bar %>
     <div class="status-bar">
       <span data-preview-target="status" class="status-text">Connecting...</span>
-      <a href="<%= hub_agent_path(@hub_id, @agent_index_value) %>"
+      <a href="<%= hub_agent_path(Current.hub, Current.agent_index) %>"
          class="text-zinc-500 hover:text-zinc-300 text-xs">
         Back to Terminal
       </a>

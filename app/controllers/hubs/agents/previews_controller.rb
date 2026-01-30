@@ -56,27 +56,26 @@ module Hubs
     # 5. Messages flow over the same E2E encrypted channel as terminal I/O
     #
     class PreviewsController < ApplicationController
-      skip_forgery_protection only: [ :show, :service_worker ]
+      skip_forgery_protection only: [ :bootstrap, :shell, :service_worker ]
 
       before_action :authenticate_user!
       before_action :set_hub
       before_action :set_indices
 
       # GET /hubs/:hub_id/agents/:index/:pty_index/preview
-      # GET /hubs/:hub_id/agents/:index/:pty_index/preview/*path
       #
-      # First request: serves bootstrap page to register service worker
-      # Second request (after SW registered): serves preview shell with WebSocket connection
-      # Subsequent requests: service worker intercepts and proxies via WebSocket
-      def show
-        if service_worker_ready?
-          # SW is registered - serve the preview shell page
-          # This page establishes WebSocket and relays requests from SW
-          render_preview_shell
-        else
-          # No SW yet - serve bootstrap to register it
-          render_bootstrap
-        end
+      # Entry point - serves bootstrap page to register service worker.
+      # After SW is registered, bootstrap navigates to /preview/shell.
+      def bootstrap
+        render_bootstrap
+      end
+
+      # GET /hubs/:hub_id/agents/:index/:pty_index/preview/shell
+      #
+      # Shell page - establishes WebSocket, relays requests from SW.
+      # Loaded after SW is registered. Under SW scope, so controlled.
+      def shell
+        render_preview_shell
       end
 
       # GET /hubs/:hub_id/agents/:index/:pty_index/preview/sw.js
@@ -95,12 +94,8 @@ module Hubs
       end
 
       def set_indices
-        @agent_index = params[:index].to_i
-        @pty_index = params[:pty_index].to_i
-      end
-
-      def service_worker_ready?
-        cookies[:preview_sw] == sw_version
+        Current.agent_index = params[:index].to_i
+        Current.pty_index = params[:pty_index].to_i
       end
 
       def sw_version
@@ -110,25 +105,20 @@ module Hubs
       end
 
       def render_bootstrap
-        @sw_path = hub_agent_pty_service_worker_path(Current.hub, @agent_index, @pty_index)
+        @sw_path = hub_agent_pty_service_worker_path(Current.hub, Current.agent_index, Current.pty_index)
         @scope = scope_path
+        @shell_path = "#{scope_path}/shell"
         @sw_version = sw_version
-        @hub_id = Current.hub.id
-        @agent_index_value = @agent_index
-        @pty_index_value = @pty_index
         render template: "hubs/agents/previews/bootstrap", layout: false
       end
 
       def render_preview_shell
-        @hub_id = Current.hub.id
-        @agent_index_value = @agent_index
-        @pty_index_value = @pty_index
         @scope = scope_path
         render template: "hubs/agents/previews/shell", layout: false
       end
 
       def scope_path
-        "/hubs/#{Current.hub.id}/agents/#{@agent_index}/#{@pty_index}/preview"
+        "/hubs/#{Current.hub.id}/agents/#{Current.agent_index}/#{Current.pty_index}/preview"
       end
     end
   end
