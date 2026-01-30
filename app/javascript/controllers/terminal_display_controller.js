@@ -39,6 +39,7 @@ export default class extends Controller {
   #isHandlingAutocorrect = false;
 
   connect() {
+    console.log("[TerminalDisplay] connect() - hubId:", this.hubIdValue, "agentIndex:", this.agentIndexValue, "ptyIndex:", this.ptyIndexValue);
     this.#boundHandleResize = this.#handleResize.bind(this);
     window.addEventListener("resize", this.#boundHandleResize);
     this.#initTerminal();
@@ -46,6 +47,8 @@ export default class extends Controller {
   }
 
   disconnect() {
+    console.log("[TerminalDisplay] disconnect() called");
+
     window.removeEventListener("resize", this.#boundHandleResize);
 
     this.#touchOverlay?.remove();
@@ -71,6 +74,9 @@ export default class extends Controller {
     this.#unsubscribers.forEach((unsub) => unsub());
     this.#unsubscribers = [];
 
+    // Just release - keep subscription alive for potential reuse
+    // Multiple PTY sessions (Agent pty:0, Server pty:1) should coexist
+    console.log("[TerminalDisplay] Releasing connection");
     this.#terminalConn?.release();
     this.#terminalConn = null;
 
@@ -88,6 +94,8 @@ export default class extends Controller {
       this.ptyIndexValue,
     );
 
+    console.log("[TerminalDisplay] Acquiring connection:", termKey);
+
     this.#terminalConn = await ConnectionManager.acquire(
       TerminalConnection,
       termKey,
@@ -98,15 +106,22 @@ export default class extends Controller {
       },
     );
 
-    // Subscribe to terminal events
+    console.log("[TerminalDisplay] Acquired, state:", this.#terminalConn.getState(),
+      "hubConnected:", this.#terminalConn.isHubConnected(),
+      "subscribed:", this.#terminalConn.isSubscribed());
+
+    // Subscribe to terminal events (these are on the wrapper, not the channel)
     this.#unsubscribers.push(
       this.#terminalConn.onOutput((data) => {
         this.#handleMessage({ type: "output", data });
       }),
     );
 
+    // Don't use onConnected's immediate callback - we handle initialization explicitly below
+    // Just subscribe for future connected events (e.g., reconnection after disconnect)
     this.#unsubscribers.push(
-      this.#terminalConn.onConnected(() => {
+      this.#terminalConn.on("connected", () => {
+        console.log("[TerminalDisplay] connected event received");
         this.#handleConnected();
       }),
     );
@@ -123,9 +138,24 @@ export default class extends Controller {
       }),
     );
 
-    // If already connected, handle it
-    if (this.#terminalConn.isConnected()) {
-      this.#handleConnected();
+    // Always subscribe with force:true to get fresh CLI handshake/scrollback
+    // This ensures we get scrollback even when reusing a wrapper
+    if (this.#terminalConn.getState() === "error") {
+      this.#handleError({ message: this.#terminalConn.getError() });
+    } else if (this.#terminalConn.isHubConnected()) {
+      console.log("[TerminalDisplay] Hub connected, calling subscribe(force: true)");
+      try {
+        await this.#terminalConn.subscribe({ force: true });
+        console.log("[TerminalDisplay] Subscribe completed, state:", this.#terminalConn.getState());
+        // onConnected callback will fire from subscribe()'s emit
+      } catch (e) {
+        console.error("[TerminalDisplay] Subscribe failed:", e);
+        this.#handleError({ message: e.message });
+      }
+    } else {
+      console.log("[TerminalDisplay] Hub not ready, waiting for initialize to complete");
+      // Hub not ready yet, wait for initialize() to complete
+      // and onConnected callback to fire
     }
   }
 
@@ -377,13 +407,20 @@ export default class extends Controller {
 
   // Connection handlers
   #handleConnected() {
+    console.log("[TerminalDisplay] #handleConnected called, ptyIndex:", this.ptyIndexValue);
+
     // Terminal may not be initialized yet
-    if (!this.#terminal) return;
+    if (!this.#terminal) {
+      console.log("[TerminalDisplay] No terminal yet, skipping");
+      return;
+    }
 
     // Clear any previous content and prepare for PTY output
+    console.log("[TerminalDisplay] Clearing terminal and sending resize");
     this.#terminal.clear();
 
     // Send initial dimensions so CLI knows browser size
+    // CLI will send scrollback as part of the subscription handshake
     requestAnimationFrame(() => {
       this.#fitAddon?.fit();
       this.#sendResize();
@@ -400,6 +437,7 @@ export default class extends Controller {
       case "output":
         // Write terminal output directly - it's already a string
         // (TerminalConnection handles decompression if needed)
+        console.log("[TerminalDisplay] Received output, length:", message.data?.length);
         this.#terminal?.write(message.data);
         break;
       case "clear":
@@ -428,17 +466,28 @@ export default class extends Controller {
   }
 
   // I/O helpers
-  #sendInput(data) {
+  async #sendInput(data) {
     if (!this.#terminalConn) {
       console.warn("[TerminalDisplay] No connection, dropping input");
       return;
     }
-    this.#terminalConn.sendInput(data);
+    const sent = await this.#terminalConn.sendInput(data);
+    if (!sent) {
+      console.warn("[TerminalDisplay] Failed to send input - connection not ready");
+    }
   }
 
-  #sendResize() {
+  async #sendResize() {
     if (this.#terminalConn && this.#terminal) {
-      this.#terminalConn.sendResize(this.#terminal.cols, this.#terminal.rows);
+      const cols = this.#terminal.cols;
+      const rows = this.#terminal.rows;
+      console.log("[TerminalDisplay] Sending resize:", cols, "x", rows);
+      const sent = await this.#terminalConn.sendResize(cols, rows);
+      if (!sent) {
+        console.warn("[TerminalDisplay] Failed to send resize - connection not ready");
+      }
+    } else {
+      console.warn("[TerminalDisplay] Cannot send resize - no connection or terminal");
     }
   }
 

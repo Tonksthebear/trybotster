@@ -26,9 +26,9 @@ class ConnectionManagerSingleton {
   constructor() {
     this.connections = new Map(); // key -> { wrapper, refCount }
     this.pendingCreation = new Map(); // key -> Promise<wrapper> (prevents race conditions)
-    this.pendingDeletion = new Set();
     this.subscribers = new Map(); // key -> Set<callback>
-    this.#setupTurboListeners();
+    // Note: No turbo:render cleanup needed - SharedWorker handles connection
+    // lifecycle with grace periods and port heartbeat TTL
   }
 
   /**
@@ -40,13 +40,12 @@ class ConnectionManagerSingleton {
    * @returns {Promise<Connection>} - The typed connection wrapper
    */
   async acquire(ConnectionClass, key, options = {}) {
-    // Cancel any pending deletion
-    this.pendingDeletion.delete(key);
-
     // Check for existing connection
     let entry = this.connections.get(key);
     if (entry) {
       entry.refCount++;
+      // Tell worker we're reacquiring (cancels any pending grace period)
+      await entry.wrapper.reacquire();
       return entry.wrapper;
     }
 
@@ -91,7 +90,8 @@ class ConnectionManagerSingleton {
 
   /**
    * Release a connection (called by wrapper.release()).
-   * Decrements ref count and queues for deletion if zero.
+   * Decrements ref count. When zero, tells worker to start grace period.
+   * Worker handles actual cleanup after grace period expires.
    *
    * @param {string} key - Connection key
    */
@@ -101,8 +101,11 @@ class ConnectionManagerSingleton {
 
     entry.refCount--;
 
+    // When refCount hits 0, notify worker to start grace period
+    // Worker will close connection if not reacquired within grace period
+    // We keep the wrapper around for potential reuse
     if (entry.refCount <= 0) {
-      this.pendingDeletion.add(key);
+      entry.wrapper.notifyIdle();
     }
   }
 
@@ -200,7 +203,6 @@ class ConnectionManagerSingleton {
 
     entry.wrapper.destroy();
     this.connections.delete(key);
-    this.pendingDeletion.delete(key);
   }
 
   /**
@@ -210,31 +212,6 @@ class ConnectionManagerSingleton {
     for (const [key] of this.connections) {
       this.destroy(key);
     }
-  }
-
-  // ========== Private ==========
-
-  #setupTurboListeners() {
-    // After Turbo renders the new page, clean up unreferenced connections
-    document.addEventListener("turbo:render", () => {
-      this.#cleanupPending();
-    });
-
-    // On hard page unload, destroy everything
-    window.addEventListener("beforeunload", () => {
-      this.destroyAll();
-    });
-  }
-
-  #cleanupPending() {
-    for (const key of this.pendingDeletion) {
-      const entry = this.connections.get(key);
-      // Double-check ref count in case someone acquired between queue and render
-      if (entry && entry.refCount <= 0) {
-        this.destroy(key);
-      }
-    }
-    this.pendingDeletion.clear();
   }
 }
 

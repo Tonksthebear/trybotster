@@ -7,6 +7,12 @@
  *   - Event subscription (typed subclasses add domain-specific events)
  *   - State tracking
  *
+ * Lifecycle:
+ *   - initialize() establishes hub connection (WebSocket + Signal session)
+ *   - subscribe() creates channel subscription (triggers CLI handshake)
+ *   - unsubscribe() removes channel subscription (keeps hub alive)
+ *   - destroy() tears down everything
+ *
  * Subclasses implement:
  *   - channelName() - ActionCable channel class name
  *   - channelParams() - Subscription params
@@ -19,13 +25,17 @@ import { ensureSignalReady, parseBundleFromFragment } from "signal"
 export const ConnectionState = {
   DISCONNECTED: "disconnected",
   LOADING: "loading",
-  CONNECTING: "connecting",
-  CONNECTED: "connected",
+  CONNECTING: "connecting",  // Hub connected, not subscribed
+  CONNECTED: "connected",    // Hub connected AND subscribed
   ERROR: "error",
 }
 
 export class Connection {
   #unsubscribers = []
+  #subscriptionUnsubscribers = []
+  #hubConnected = false
+  #subscribing = false  // Lock to prevent concurrent subscribe/unsubscribe
+  #subscriptionGeneration = 0  // Tracks which subscription is "current"
 
   constructor(key, options, manager) {
     this.key = key
@@ -46,7 +56,7 @@ export class Connection {
 
   /**
    * Initialize the connection. Called by ConnectionManager.acquire().
-   * Ensures worker is ready, connects to hub, and subscribes to channel.
+   * Establishes hub connection (WebSocket + Signal session) and subscribes.
    */
   async initialize() {
     try {
@@ -58,41 +68,127 @@ export class Connection {
       const wasmBinaryUrl = document.querySelector('meta[name="signal-wasm-binary-url"]')?.content
       await ensureSignalReady(workerUrl, wasmJsUrl, wasmBinaryUrl)
 
-      this.#setState(ConnectionState.CONNECTING)
+      // Connect to hub
+      await this.#connectHub()
+      if (this.state === ConnectionState.ERROR) return
 
-      // Get cable URL and ActionCable module URL
-      const cableUrl = document.querySelector('meta[name="action-cable-url"]')?.content || "/cable"
-      const actionCableModuleUrl = document.querySelector('meta[name="actioncable-module-url"]')?.content
+      // Subscribe to channel
+      await this.subscribe()
+    } catch (error) {
+      console.error(`[${this.constructor.name}] Initialize failed:`, error)
+      this.#setError("init_failed", error.message)
+    }
+  }
 
-      // Parse session bundle from fragment if requested
-      let sessionBundle = this.options.sessionBundle || null
-      if (!sessionBundle && this.options.fromFragment) {
-        sessionBundle = parseBundleFromFragment()
-        if (sessionBundle) {
-          // Strip the fragment so the bundle isn't reprocessed on reload
-          history.replaceState(null, "", location.pathname + location.search)
-        }
+  /**
+   * Connect to the hub (WebSocket + Signal session).
+   * Called by initialize() or can be used to reconnect.
+   */
+  async #connectHub() {
+    if (this.#hubConnected) return
+
+    this.#setState(ConnectionState.CONNECTING)
+
+    // Get cable URL and ActionCable module URL
+    const cableUrl = document.querySelector('meta[name="action-cable-url"]')?.content || "/cable"
+    const actionCableModuleUrl = document.querySelector('meta[name="actioncable-module-url"]')?.content
+
+    // Parse session bundle from fragment if requested
+    let sessionBundle = this.options.sessionBundle || null
+    if (!sessionBundle && this.options.fromFragment) {
+      sessionBundle = parseBundleFromFragment()
+      if (sessionBundle) {
+        // Strip the fragment so the bundle isn't reprocessed on reload
+        history.replaceState(null, "", location.pathname + location.search)
+      }
+    }
+
+    // Connect to hub (creates or reuses connection, may create session from bundle)
+    const hubId = this.getHubId()
+    console.log("[Connection] Connecting to hub:", hubId, { cableUrl, actionCableModuleUrl, hasBundle: !!sessionBundle })
+    const connectResult = await bridge.send("connect", {
+      hubId,
+      cableUrl,
+      actionCableModuleUrl,
+      sessionBundle
+    })
+    console.log("[Connection] Connect result:", connectResult)
+
+    if (!connectResult.sessionExists) {
+      this.#setError("no_session", "No session available. Scan QR code to pair.")
+      return
+    }
+
+    // Get identity key for channel params
+    const keyResult = await bridge.send("getIdentityKey", { hubId })
+    this.identityKey = keyResult.identityKey
+    this.#hubConnected = true
+
+    // Set up hub-level event listeners (connection state, session invalid)
+    this.#setupHubEventListeners()
+  }
+
+  /**
+   * Subscribe to the channel. Creates a new subscription in the worker,
+   * which triggers Rails subscribed callback and CLI handshake.
+   *
+   * @param {Object} options
+   * @param {boolean} options.force - If true, unsubscribe existing subscription first
+   *                                  to get fresh handshake. Default false.
+   */
+  async subscribe({ force = false } = {}) {
+    console.log(`[${this.constructor.name}] subscribe() called, hubConnected:`, this.#hubConnected, "existing subscriptionId:", this.subscriptionId, "force:", force)
+
+    if (!this.#hubConnected) {
+      throw new Error("Cannot subscribe: hub not connected")
+    }
+
+    // If already subscribed and not forcing refresh, just emit connected and return
+    if (this.subscriptionId && !force) {
+      console.log(`[${this.constructor.name}] Already subscribed, reusing existing subscription`)
+      this.#setState(ConnectionState.CONNECTED)
+      this.emit("connected", this)
+      return
+    }
+
+    // Acquire the subscribing lock using a promise-based mutex
+    // This prevents TOCTOU races between checking #subscribing and setting it
+    if (this.#subscribing) {
+      console.log(`[${this.constructor.name}] Waiting for existing subscribe/unsubscribe to complete...`)
+      // Wait for existing operation, then re-check conditions
+      while (this.#subscribing) {
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      // Re-check after waiting - someone else might have subscribed
+      if (this.subscriptionId && !force) {
+        console.log(`[${this.constructor.name}] Already subscribed after waiting, reusing`)
+        this.#setState(ConnectionState.CONNECTED)
+        this.emit("connected", this)
+        return
+      }
+    }
+
+    // Set lock immediately (synchronous) to prevent races
+    this.#subscribing = true
+    this.#subscriptionGeneration++  // Mark this as the current owner
+    const myGeneration = this.#subscriptionGeneration
+    console.log(`[${this.constructor.name}] Subscribe starting, generation:`, myGeneration)
+
+    try {
+      // Unsubscribe first if forcing refresh and we have an existing subscription
+      if (this.subscriptionId && force) {
+        console.log(`[${this.constructor.name}] Unsubscribing existing subscription first (force refresh)`)
+        await this.#doUnsubscribe()
       }
 
-      // Connect to hub (creates or reuses connection, may create session from bundle)
-      const hubId = this.getHubId()
-      console.log("[Connection] Connecting to hub:", hubId, { cableUrl, actionCableModuleUrl, hasBundle: !!sessionBundle })
-      const connectResult = await bridge.send("connect", {
-        hubId,
-        cableUrl,
-        actionCableModuleUrl,
-        sessionBundle
-      })
-      console.log("[Connection] Connect result:", connectResult)
-
-      if (!connectResult.sessionExists) {
-        this.#setError("no_session", "No session available. Scan QR code to pair.")
+      // Check we're still the current owner (another subscribe might have started)
+      if (this.#subscriptionGeneration !== myGeneration) {
+        console.log(`[${this.constructor.name}] Subscribe superseded (gen ${myGeneration} vs ${this.#subscriptionGeneration}), aborting`)
         return
       }
 
-      // Get identity key for channel params
-      const keyResult = await bridge.send("getIdentityKey", { hubId })
-      this.identityKey = keyResult.identityKey
+      const hubId = this.getHubId()
+      console.log(`[${this.constructor.name}] Subscribing to channel:`, this.channelName())
 
       // Subscribe to channel
       const subscribeResult = await bridge.send("subscribe", {
@@ -103,58 +199,105 @@ export class Connection {
       })
 
       this.subscriptionId = subscribeResult.subscriptionId
+      console.log(`[${this.constructor.name}] Subscribed, id:`, this.subscriptionId)
 
-      // Listen for subscription events
-      this.#setupEventListeners()
+      // Listen for subscription-specific events
+      this.#setupSubscriptionEventListeners()
 
       this.#setState(ConnectionState.CONNECTED)
+      console.log(`[${this.constructor.name}] Emitting connected event`)
       this.emit("connected", this)
-    } catch (error) {
-      console.error(`[${this.constructor.name}] Initialize failed:`, error)
-      this.#setError("init_failed", error.message)
+    } finally {
+      this.#subscribing = false
     }
   }
 
   /**
-   * Set up listeners for worker events related to this connection.
+   * Unsubscribe from the channel. Keeps hub connection alive.
+   * Call this when controller disconnects during navigation.
+   * Uses generation tracking to avoid unsubscribing a newer subscription.
    */
-  #setupEventListeners() {
-    const hubId = this.getHubId()
+  async unsubscribe() {
+    // Capture current generation - we only unsubscribe if it still matches
+    const myGeneration = this.#subscriptionGeneration
 
-    // Listen for subscription messages
-    const unsubMsg = bridge.onSubscriptionMessage(this.subscriptionId, (message) => {
-      this.handleMessage(message)
-    })
-    this.#unsubscribers.push(unsubMsg)
+    // Wait for any in-progress subscribe to complete
+    while (this.#subscribing) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+
+    // Check if a newer subscribe happened while we waited
+    if (this.#subscriptionGeneration !== myGeneration) {
+      console.log(`[${this.constructor.name}] Unsubscribe skipped - newer subscription exists`)
+      return
+    }
+
+    if (!this.subscriptionId) return
+
+    this.#subscribing = true
+    try {
+      // Double-check generation after acquiring lock
+      if (this.#subscriptionGeneration !== myGeneration) {
+        console.log(`[${this.constructor.name}] Unsubscribe skipped - newer subscription exists`)
+        return
+      }
+      await this.#doUnsubscribe()
+    } finally {
+      this.#subscribing = false
+    }
+  }
+
+  /**
+   * Internal unsubscribe implementation (no locking).
+   */
+  async #doUnsubscribe() {
+    if (!this.subscriptionId) return
+
+    console.log(`[${this.constructor.name}] Unsubscribing from channel`)
+
+    // Capture and clear subscriptionId FIRST to prevent race conditions
+    // where send() tries to use it while we're unsubscribing
+    const oldSubscriptionId = this.subscriptionId
+    this.subscriptionId = null
+
+    // Back to CONNECTING state (hub still connected, but not subscribed)
+    this.#setState(ConnectionState.CONNECTING)
+
+    // Clean up subscription event listeners
+    this.#clearSubscriptionEventListeners()
+
+    // Unsubscribe in worker
+    try {
+      await bridge.send("unsubscribe", { subscriptionId: oldSubscriptionId })
+    } catch (e) {
+      console.warn(`[${this.constructor.name}] Unsubscribe error (ignored):`, e)
+    }
+
+    bridge.clearSubscriptionListeners(oldSubscriptionId)
+  }
+
+  /**
+   * Set up listeners for hub-level events (connection state, session invalid).
+   * These persist across subscribe/unsubscribe cycles.
+   */
+  #setupHubEventListeners() {
+    const hubId = this.getHubId()
 
     // Listen for connection state changes
     const unsubState = bridge.on("connection:state", (event) => {
       if (event.hubId !== hubId) return
 
       if (event.state === "disconnected") {
+        this.#hubConnected = false
         this.#setState(ConnectionState.DISCONNECTED)
         this.emit("disconnected")
-      } else if (event.state === "connected" && this.state === ConnectionState.DISCONNECTED) {
-        // Reconnected - restore to connected state
-        this.#setState(ConnectionState.CONNECTED)
+      } else if (event.state === "connected" && !this.#hubConnected) {
+        this.#hubConnected = true
+        // Don't auto-transition to CONNECTED - need to resubscribe
         this.emit("reconnected")
       }
     })
     this.#unsubscribers.push(unsubState)
-
-    // Listen for subscription confirmed
-    const unsubConfirmed = bridge.on("subscription:confirmed", (event) => {
-      if (event.subscriptionId !== this.subscriptionId) return
-      // Already in CONNECTED state from initialize, but subclasses may use this
-    })
-    this.#unsubscribers.push(unsubConfirmed)
-
-    // Listen for subscription rejected
-    const unsubRejected = bridge.on("subscription:rejected", (event) => {
-      if (event.subscriptionId !== this.subscriptionId) return
-      this.#setError("subscription_rejected", event.reason || "Subscription rejected")
-    })
-    this.#unsubscribers.push(unsubRejected)
 
     // Listen for session invalid
     const unsubSession = bridge.on("session:invalid", (event) => {
@@ -165,42 +308,75 @@ export class Connection {
   }
 
   /**
-   * Destroy the connection. Called by ConnectionManager.destroy().
-   * Unsubscribes from channel, cleans up listeners, notifies subscribers.
+   * Set up listeners for subscription-specific events.
+   * These are cleared on unsubscribe().
    */
-  async destroy() {
-    // Cleanup event listeners
+  #setupSubscriptionEventListeners() {
+    // Listen for subscription messages
+    const unsubMsg = bridge.onSubscriptionMessage(this.subscriptionId, (message) => {
+      this.handleMessage(message)
+    })
+    this.#subscriptionUnsubscribers.push(unsubMsg)
+
+    // Listen for subscription confirmed
+    const unsubConfirmed = bridge.on("subscription:confirmed", (event) => {
+      if (event.subscriptionId !== this.subscriptionId) return
+      // Subclasses may use this
+    })
+    this.#subscriptionUnsubscribers.push(unsubConfirmed)
+
+    // Listen for subscription rejected
+    const unsubRejected = bridge.on("subscription:rejected", (event) => {
+      if (event.subscriptionId !== this.subscriptionId) return
+      this.#setError("subscription_rejected", event.reason || "Subscription rejected")
+    })
+    this.#subscriptionUnsubscribers.push(unsubRejected)
+  }
+
+  #clearSubscriptionEventListeners() {
+    for (const unsub of this.#subscriptionUnsubscribers) {
+      unsub()
+    }
+    this.#subscriptionUnsubscribers = []
+  }
+
+  /**
+   * Destroy the connection. Called by ConnectionManager.destroy().
+   * Unsubscribes from channel, disconnects hub, cleans up everything.
+   * NOTE: Cleanup is done asynchronously to avoid blocking other operations.
+   */
+  destroy() {
+    // Clear state immediately to prevent any new operations
+    const oldSubscriptionId = this.subscriptionId
+    const hubId = this.getHubId()
+    const wasHubConnected = this.#hubConnected
+
+    this.subscriptionId = null
+    this.#hubConnected = false
+    this.identityKey = null
+    this.session = null
+
+    // Cleanup hub event listeners
     for (const unsub of this.#unsubscribers) {
       unsub()
     }
     this.#unsubscribers = []
+    this.#clearSubscriptionEventListeners()
 
-    // Unsubscribe from channel
-    if (this.subscriptionId) {
-      try {
-        await bridge.send("unsubscribe", { subscriptionId: this.subscriptionId })
-      } catch (e) {
-        // Ignore errors during cleanup
-      }
-      bridge.clearSubscriptionListeners(this.subscriptionId)
-      this.subscriptionId = null
-    }
-
-    // Disconnect from hub (decrements ref count in worker)
-    const hubId = this.getHubId()
-    if (hubId) {
-      try {
-        await bridge.send("disconnect", { hubId })
-      } catch (e) {
-        // Ignore errors during cleanup
-      }
-    }
-
-    this.identityKey = null
-    this.session = null
     this.#setState(ConnectionState.DISCONNECTED)
     this.emit("destroyed")
     this.subscribers.clear()
+
+    // Async cleanup - fire and forget to avoid blocking
+    // The worker will clean up orphaned subscriptions
+    if (oldSubscriptionId) {
+      bridge.send("unsubscribe", { subscriptionId: oldSubscriptionId }).catch(() => {})
+      bridge.clearSubscriptionListeners(oldSubscriptionId)
+    }
+
+    if (hubId && wasHubConnected) {
+      bridge.send("disconnect", { hubId }).catch(() => {})
+    }
   }
 
   /**
@@ -209,6 +385,52 @@ export class Connection {
    */
   release() {
     this.manager.release(this.key)
+  }
+
+  /**
+   * Notify worker that this connection is idle (refCount hit 0).
+   * Worker will start grace period and close if not reacquired.
+   * Called by ConnectionManager.release() when refCount becomes 0.
+   */
+  notifyIdle() {
+    const hubId = this.getHubId()
+    if (hubId && this.#hubConnected) {
+      // Tell worker to start grace period for this hub connection
+      // Fire and forget - worker handles the timing
+      bridge.send("disconnect", { hubId }).catch(() => {})
+    }
+  }
+
+  /**
+   * Notify worker that this connection is being reacquired.
+   * Cancels any pending grace period in the worker.
+   * Called by ConnectionManager.acquire() when reusing a wrapper.
+   */
+  async reacquire() {
+    const hubId = this.getHubId()
+    if (!hubId) return
+
+    // Tell worker we're reacquiring - this cancels any pending close timer
+    // and reconnects if the connection was closed during grace period
+    const cableUrl = document.querySelector('meta[name="action-cable-url"]')?.content || "/cable"
+    const actionCableModuleUrl = document.querySelector('meta[name="actioncable-module-url"]')?.content
+
+    const result = await bridge.send("connect", {
+      hubId,
+      cableUrl,
+      actionCableModuleUrl
+    })
+
+    // If worker had to create a new connection (old one was closed),
+    // we need to resubscribe
+    if (!this.#hubConnected || !result.sessionExists) {
+      // Connection was lost, need to reinitialize
+      this.#hubConnected = result.sessionExists
+      if (this.subscriptionId) {
+        // Our subscription is gone, clear it so subscribe() creates a new one
+        this.subscriptionId = null
+      }
+    }
   }
 
   // ========== Abstract methods (override in subclasses) ==========
@@ -280,11 +502,27 @@ export class Connection {
   }
 
   /**
-   * Check if connected.
+   * Check if connected (hub connected AND subscribed to channel).
    * @returns {boolean}
    */
   isConnected() {
     return this.state === ConnectionState.CONNECTED
+  }
+
+  /**
+   * Check if hub is connected (WebSocket alive, can subscribe).
+   * @returns {boolean}
+   */
+  isHubConnected() {
+    return this.#hubConnected
+  }
+
+  /**
+   * Check if subscribed to channel.
+   * @returns {boolean}
+   */
+  isSubscribed() {
+    return this.subscriptionId !== null
   }
 
   /**

@@ -82,8 +82,11 @@ export default class extends Controller {
       // Set up SW message listener
       this.#setupServiceWorkerListener();
 
-      // Load initial URL in iframe once connected
-      if (this.#connection.isConnected()) {
+      // If hub is connected but not subscribed (reusing after navigation), subscribe
+      if (this.#connection.isHubConnected() && !this.#connection.isSubscribed()) {
+        await this.#connection.subscribe();
+      } else if (this.#connection.isConnected()) {
+        // Already connected from initialize()
         this.#loadIframe();
         this.#updateStatus("Connected", "success");
       }
@@ -104,9 +107,13 @@ export default class extends Controller {
     }
     this.#unsubscribers = [];
 
-    // Release connection
-    this.#connection?.release();
+    // Unsubscribe from channel then release connection ref
+    // Fire and forget - the wrapper tracks its own state
+    const conn = this.#connection;
     this.#connection = null;
+    if (conn) {
+      conn.unsubscribe().finally(() => conn.release());
+    }
   }
 
   // ========== Service Worker Communication ==========

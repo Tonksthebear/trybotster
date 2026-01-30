@@ -37,7 +37,7 @@ export default class extends Controller {
     ConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
       fromFragment: true,
-    }).then((hub) => {
+    }).then(async (hub) => {
       this.hub = hub;
 
       this.hub.onStateChange(({ state, error }) => {
@@ -47,12 +47,20 @@ export default class extends Controller {
       this.hub.onError(({ message }) => {
         this.errorValue = message;
       });
+
+      // If hub is connected but not subscribed (reusing after navigation), subscribe
+      if (this.hub.isHubConnected() && !this.hub.isSubscribed()) {
+        await this.hub.subscribe();
+      }
     });
   }
 
   disconnect() {
-    this.hub?.release();
+    const hub = this.hub;
     this.hub = null;
+    // Just release - don't unsubscribe. HubConnection is shared and
+    // the subscription can be reused by other controllers after navigation.
+    hub?.release();
   }
 
   // Action: manual reconnect
