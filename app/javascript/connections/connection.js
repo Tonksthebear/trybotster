@@ -104,14 +104,12 @@ export class Connection {
 
     // Connect to hub (creates or reuses connection, may create session from bundle)
     const hubId = this.getHubId()
-    console.log("[Connection] Connecting to hub:", hubId, { cableUrl, actionCableModuleUrl, hasBundle: !!sessionBundle })
     const connectResult = await bridge.send("connect", {
       hubId,
       cableUrl,
       actionCableModuleUrl,
       sessionBundle
     })
-    console.log("[Connection] Connect result:", connectResult)
 
     if (!connectResult.sessionExists) {
       this.#setError("no_session", "No session available. Scan QR code to pair.")
@@ -136,52 +134,39 @@ export class Connection {
    *                                  to get fresh handshake. Default false.
    */
   async subscribe({ force = false } = {}) {
-    console.log(`[${this.constructor.name}] subscribe() called, hubConnected:`, this.#hubConnected, "existing subscriptionId:", this.subscriptionId, "force:", force)
-
     if (!this.#hubConnected) {
       throw new Error("Cannot subscribe: hub not connected")
     }
 
     // If already subscribed and not forcing refresh, just emit connected and return
     if (this.subscriptionId && !force) {
-      console.log(`[${this.constructor.name}] Already subscribed, reusing existing subscription`)
       this.#setState(ConnectionState.CONNECTED)
       this.emit("connected", this)
       return
     }
 
-    // Acquire the subscribing lock using a promise-based mutex
-    // This prevents TOCTOU races between checking #subscribing and setting it
-    if (this.#subscribing) {
-      console.log(`[${this.constructor.name}] Waiting for existing subscribe/unsubscribe to complete...`)
-      // Wait for existing operation, then re-check conditions
-      while (this.#subscribing) {
-        await new Promise(resolve => setTimeout(resolve, 10))
-      }
-      // Re-check after waiting - someone else might have subscribed
-      if (this.subscriptionId && !force) {
-        console.log(`[${this.constructor.name}] Already subscribed after waiting, reusing`)
-        this.#setState(ConnectionState.CONNECTED)
-        this.emit("connected", this)
-        return
-      }
+    // Wait for any in-progress subscribe/unsubscribe
+    while (this.#subscribing) {
+      await new Promise(resolve => setTimeout(resolve, 10))
     }
 
-    // Set lock immediately (synchronous) to prevent races
+    // Re-check after waiting - another caller might have subscribed
+    if (this.subscriptionId && !force) {
+      this.#setState(ConnectionState.CONNECTED)
+      this.emit("connected", this)
+      return
+    }
+
     this.#subscribing = true
-    console.log(`[${this.constructor.name}] Subscribe starting`)
 
     try {
-      // Unsubscribe first if forcing refresh and we have an existing subscription
+      // Unsubscribe first if forcing refresh
       if (this.subscriptionId && force) {
-        console.log(`[${this.constructor.name}] Unsubscribing existing subscription first (force refresh)`)
         await this.#doUnsubscribe()
       }
 
       const hubId = this.getHubId()
-      console.log(`[${this.constructor.name}] Subscribing to channel:`, this.channelName())
 
-      // Subscribe to channel
       const subscribeResult = await bridge.send("subscribe", {
         hubId,
         channel: this.channelName(),
@@ -190,13 +175,9 @@ export class Connection {
       })
 
       this.subscriptionId = subscribeResult.subscriptionId
-      console.log(`[${this.constructor.name}] Subscribed, id:`, this.subscriptionId)
-
-      // Listen for subscription-specific events
       this.#setupSubscriptionEventListeners()
 
       this.#setState(ConnectionState.CONNECTED)
-      console.log(`[${this.constructor.name}] Emitting connected event`)
       this.emit("connected", this)
     } finally {
       this.#subscribing = false
@@ -228,8 +209,6 @@ export class Connection {
    */
   async #doUnsubscribe() {
     if (!this.subscriptionId) return
-
-    console.log(`[${this.constructor.name}] Unsubscribing from channel`)
 
     // Capture and clear subscriptionId FIRST to prevent race conditions
     // where send() tries to use it while we're unsubscribing
