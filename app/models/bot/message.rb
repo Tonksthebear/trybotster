@@ -3,7 +3,7 @@ class Bot::Message < ApplicationRecord
 
   # Validations
   validates :event_type, presence: true, inclusion: {
-    in: %w[github_mention manual_trigger system_notification agent_cleanup browser_connected browser_disconnected terminal_connected terminal_disconnected],
+    in: %w[github_mention manual_trigger system_notification agent_cleanup browser_connected browser_disconnected terminal_connected terminal_disconnected browser_wants_preview],
     message: "%{value} is not a valid event type"
   }
   validates :payload, presence: true

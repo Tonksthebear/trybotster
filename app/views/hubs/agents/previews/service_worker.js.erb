@@ -46,9 +46,9 @@ self.addEventListener('fetch', (event) => {
 
   const scopePath = SCOPE;
 
-  // Pass through the preview shell page itself (exact scope path, no trailing slash)
-  // This allows the shell page to load from Rails
-  if (url.pathname === scopePath) {
+  // Pass through the shell page (/preview/shell) and bootstrap (/preview)
+  // Shell is at a distinct path so /preview/ can proxy to dev server root
+  if (url.pathname === scopePath || url.pathname === scopePath + '/shell') {
     return;
   }
 

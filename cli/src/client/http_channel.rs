@@ -178,12 +178,23 @@ impl HttpChannel {
         // Spawn input task: receives encrypted requests, proxies, sends encrypted responses
         let input_task = tokio::spawn(spawn_http_request_handler(
             receiver_handle,
-            sender_handle,
+            sender_handle.clone(),
             task_proxy,
             browser_identity.clone(),
             agent_index,
             pty_index,
         ));
+
+        // Send "ready" message so browser knows we're listening
+        // This prevents message loss from requests sent before we subscribed
+        let ready_msg = PreviewMessage::Ready;
+        if let Ok(json) = serde_json::to_string(&ready_msg) {
+            if let Err(e) = sender_handle.send(json.as_bytes()).await {
+                log::warn!("HttpChannel: failed to send ready message: {}", e);
+            } else {
+                log::info!("HttpChannel: sent preview_ready to browser");
+            }
+        }
 
         // Output task is a placeholder - no server-initiated messages yet
         let output_task = tokio::spawn(async {

@@ -42,10 +42,8 @@
     (function() {
       const SW_PATH = '<%= @sw_path %>';
       const SCOPE = '<%= @scope %>';
+      const SHELL_PATH = '<%= @shell_path %>';
       const SW_VERSION = '<%= @sw_version %>';
-      const HUB_ID = '<%= @hub_id %>';
-      const AGENT_INDEX = <%= @agent_index_value %>;
-      const PTY_INDEX = <%= @pty_index_value %>;
 
       if (!('serviceWorker' in navigator)) {
         showError('Service Workers not supported in this browser');
@@ -69,12 +67,10 @@
           const sw = registration.installing || registration.waiting || registration.active;
 
           if (sw.state === 'activated') {
-            await waitForControlled();
             onReady();
           } else {
             sw.addEventListener('statechange', async function() {
               if (sw.state === 'activated') {
-                await waitForControlled();
                 onReady();
               }
             });
@@ -85,22 +81,9 @@
         }
       }
 
-      async function waitForControlled() {
-        if (navigator.serviceWorker.controller) {
-          return;
-        }
-        return new Promise(resolve => {
-          navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
-        });
-      }
-
       function onReady() {
-        // Set cookie with version to track SW state
-        const cookiePath = SCOPE;
-        document.cookie = 'preview_sw=' + SW_VERSION + '; path=' + cookiePath + '; SameSite=Strict';
-
-        // Reload to let SW intercept and serve the actual preview shell
-        location.reload();
+        // Navigate to shell page (under SW scope, so controlled by SW)
+        location.href = SHELL_PATH;
       }
 
       function showError(message) {

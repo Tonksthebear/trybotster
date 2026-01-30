@@ -1,5 +1,8 @@
 /**
- * Signal Protocol Web Worker
+ * Signal Protocol SharedWorker
+ *
+ * SharedWorker ensures all tabs share a single Signal session state.
+ * This prevents ratchet desync when multiple tabs encrypt/decrypt.
  *
  * Isolates all sensitive cryptographic operations:
  * - Non-extractable AES-GCM wrapping key (cannot be exported, even by XSS)
@@ -15,9 +18,11 @@
 // WASM module (loaded on init)
 let wasmModule = null;
 
-// In-memory session cache (hubId -> { session, instanceId })
+// In-memory session cache (hubId -> wasmSession)
 const sessions = new Map();
-let sessionInstanceCounter = 0;
+
+// Connected ports (for potential broadcasting)
+const connectedPorts = new Set();
 
 // Mutex to serialize encrypt/decrypt operations per hub
 // This prevents race conditions where multiple operations interleave
@@ -53,8 +58,9 @@ async function withMutex(hubId, operation) {
 }
 
 // IndexedDB config
-const DB_NAME = "botster_signal";
-const DB_VERSION = 2;
+// Note: Keys stored as JWK (not CryptoKey) for Safari SharedWorker compatibility (WebKit #177350)
+const DB_NAME = "botster";
+const DB_VERSION = 1;
 const STORE_NAME = "sessions";
 const KEY_STORE_NAME = "encryption_keys";
 const WRAPPING_KEY_ID = "session_wrapping_key";
@@ -63,10 +69,10 @@ const WRAPPING_KEY_ID = "session_wrapping_key";
 let wrappingKeyCache = null;
 
 // =============================================================================
-// Message Handler
+// Message Handler (shared between SharedWorker and regular Worker)
 // =============================================================================
 
-self.onmessage = async (event) => {
+async function handleMessage(event, replyFn) {
   const { id, action, ...params } = event.data;
 
   try {
@@ -80,6 +86,7 @@ self.onmessage = async (event) => {
         result = await handleCreateSession(params.bundleJson, params.hubId);
         break;
       case "loadSession":
+        // Use the proper handleLoadSession now that getOrCreateWrappingKey is fixed
         result = await handleLoadSession(params.hubId);
         break;
       case "hasSession":
@@ -113,11 +120,38 @@ self.onmessage = async (event) => {
         throw new Error(`Unknown action: ${action}`);
     }
 
-    self.postMessage({ id, success: true, result });
+    replyFn({ id, success: true, result });
   } catch (error) {
-    console.error("[SignalWorker] Error:", error);
-    self.postMessage({ id, success: false, error: error.message });
+    console.error("[SignalWorker] Error:", action, error);
+    replyFn({ id, success: false, error: error.message });
   }
+}
+
+// =============================================================================
+// SharedWorker Connection Handler
+// =============================================================================
+
+self.onconnect = (event) => {
+  const port = event.ports[0];
+  connectedPorts.add(port);
+
+  port.onmessage = (msgEvent) => {
+    handleMessage(msgEvent, (msg) => port.postMessage(msg));
+  };
+
+  port.onmessageerror = () => {
+    connectedPorts.delete(port);
+  };
+
+  port.start();
+};
+
+// =============================================================================
+// Regular Worker Fallback (for browsers without SharedWorker support)
+// =============================================================================
+
+self.onmessage = (event) => {
+  handleMessage(event, (msg) => self.postMessage(msg));
 };
 
 // =============================================================================
@@ -125,9 +159,10 @@ self.onmessage = async (event) => {
 // =============================================================================
 
 async function handleInit(wasmJsUrl, wasmBinaryUrl) {
-  if (wasmModule) return { alreadyInitialized: true };
+  if (wasmModule) {
+    return { alreadyInitialized: true };
+  }
 
-  // Import WASM JS glue code and initialize with binary
   const module = await import(wasmJsUrl);
   await module.default({ module_or_path: wasmBinaryUrl });
   wasmModule = module;
@@ -165,19 +200,26 @@ async function handleLoadSession(hubId) {
   }
 
   // Try loading from IndexedDB
-  const pickled = await loadSessionFromStorage(hubId);
+  let pickled;
+  try {
+    pickled = await loadSessionFromStorage(hubId);
+  } catch (idbError) {
+    return { loaded: false, error: idbError.message };
+  }
+
   if (!pickled) {
     return { loaded: false };
   }
 
-  if (!wasmModule) throw new Error("WASM not initialized");
+  if (!wasmModule) {
+    throw new Error("WASM not initialized");
+  }
 
   try {
     const wasmSession = wasmModule.SignalSession.from_pickle(pickled);
     sessions.set(hubId, wasmSession);
     return { loaded: true, fromCache: false };
   } catch (error) {
-    console.warn("[SignalWorker] Failed to restore session:", error);
     await deleteSessionFromStorage(hubId);
     return { loaded: false, error: error.message };
   }
@@ -279,32 +321,52 @@ async function getOrCreateWrappingKey() {
 
   const db = await openDatabase();
 
-  // Try to load existing key
-  const existingKey = await new Promise((resolve, reject) => {
+  // Try to load existing key (stored as JWK for Safari SharedWorker compatibility)
+  const record = await new Promise((resolve, reject) => {
     const tx = db.transaction(KEY_STORE_NAME, "readonly");
     const store = tx.objectStore(KEY_STORE_NAME);
     const request = store.get(WRAPPING_KEY_ID);
     request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result?.key || null);
+    request.onsuccess = () => resolve(request.result);
   });
 
-  if (existingKey) {
-    wrappingKeyCache = existingKey;
-    return existingKey;
+  if (record?.jwk) {
+    // Import JWK as non-extractable CryptoKey
+    const key = await crypto.subtle.importKey(
+      "jwk",
+      record.jwk,
+      { name: "AES-GCM", length: 256 },
+      false, // non-extractable
+      ["encrypt", "decrypt"]
+    );
+    wrappingKeyCache = key;
+    return key;
   }
 
-  // Generate new non-extractable key
-  const newKey = await crypto.subtle.generateKey(
+  // Generate new key
+  const tempKey = await crypto.subtle.generateKey(
+    { name: "AES-GCM", length: 256 },
+    true, // extractable for JWK export
+    ["encrypt", "decrypt"],
+  );
+
+  // Export to JWK for storage (Safari SharedWorker can't read CryptoKey from IndexedDB)
+  const jwk = await crypto.subtle.exportKey("jwk", tempKey);
+
+  // Re-import as non-extractable for actual use
+  const newKey = await crypto.subtle.importKey(
+    "jwk",
+    jwk,
     { name: "AES-GCM", length: 256 },
     false, // NON-EXTRACTABLE - XSS cannot export this
     ["encrypt", "decrypt"],
   );
 
-  // Store the CryptoKey object directly (IndexedDB supports structured clone)
+  // Store JWK
   await new Promise((resolve, reject) => {
     const tx = db.transaction(KEY_STORE_NAME, "readwrite");
     const store = tx.objectStore(KEY_STORE_NAME);
-    const request = store.put({ id: WRAPPING_KEY_ID, key: newKey });
+    const request = store.put({ id: WRAPPING_KEY_ID, jwk });
     request.onerror = () => reject(request.error);
     request.onsuccess = () => resolve();
   });
@@ -329,13 +391,11 @@ async function encryptWithWrappingKey(plaintext) {
 
 async function decryptWithWrappingKey(iv, ciphertext) {
   const key = await getOrCreateWrappingKey();
-
   const decrypted = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv },
     key,
     ciphertext,
   );
-
   return new TextDecoder().decode(decrypted);
 }
 
@@ -373,13 +433,14 @@ async function loadSessionFromStorage(hubId) {
     request.onsuccess = () => resolve(request.result);
   });
 
-  if (!record) return null;
+  if (!record) {
+    return null;
+  }
 
   try {
     const iv = new Uint8Array(record.iv);
     return await decryptWithWrappingKey(iv, record.ciphertext);
   } catch (error) {
-    console.error("[SignalWorker] Failed to decrypt session:", error);
     await deleteSessionFromStorage(hubId);
     return null;
   }

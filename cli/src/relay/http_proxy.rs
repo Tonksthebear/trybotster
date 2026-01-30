@@ -163,6 +163,16 @@ impl HttpProxy {
                     Ok(body) => {
                         let (body_b64, compressed) = self.encode_body(&body, &headers);
 
+                        // If we compressed the body, add Content-Encoding header
+                        // so the browser knows to decompress it
+                        let mut response_headers = headers;
+                        if compressed {
+                            response_headers.insert(
+                                "content-encoding".to_string(),
+                                "gzip".to_string(),
+                            );
+                        }
+
                         log::debug!(
                             "[HttpProxy] Response: {} {} ({} bytes, compressed={})",
                             status,
@@ -175,7 +185,7 @@ impl HttpProxy {
                             request_id: request.request_id,
                             status,
                             status_text,
-                            headers,
+                            headers: response_headers,
                             body: body_b64,
                             compressed,
                         })

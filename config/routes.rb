@@ -40,9 +40,12 @@ Rails.application.routes.draw do
         resources :ptys, only: [ :show ], param: :index, controller: "agents/ptys"
 
         # Preview - for PTYs with port forwarding
+        # Shell page at /preview/shell (under SW scope, so controlled)
+        # SW.js at /preview/sw.js
+        # Proxied content at /preview/* (except shell and sw.js)
         get ":pty_index/preview/sw.js", to: "agents/previews#service_worker", as: :pty_service_worker
-        get ":pty_index/preview", to: "agents/previews#show", as: :pty_preview, defaults: { path: "" }
-        get ":pty_index/preview/*path", to: "agents/previews#show", format: false
+        get ":pty_index/preview/shell", to: "agents/previews#shell", as: :pty_preview_shell
+        get ":pty_index/preview", to: "agents/previews#bootstrap", as: :pty_preview
       end
     end
   end
