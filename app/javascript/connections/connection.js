@@ -35,7 +35,6 @@ export class Connection {
   #subscriptionUnsubscribers = []
   #hubConnected = false
   #subscribing = false  // Lock to prevent concurrent subscribe/unsubscribe
-  #subscriptionGeneration = 0  // Tracks which subscription is "current"
 
   constructor(key, options, manager) {
     this.key = key
@@ -170,21 +169,13 @@ export class Connection {
 
     // Set lock immediately (synchronous) to prevent races
     this.#subscribing = true
-    this.#subscriptionGeneration++  // Mark this as the current owner
-    const myGeneration = this.#subscriptionGeneration
-    console.log(`[${this.constructor.name}] Subscribe starting, generation:`, myGeneration)
+    console.log(`[${this.constructor.name}] Subscribe starting`)
 
     try {
       // Unsubscribe first if forcing refresh and we have an existing subscription
       if (this.subscriptionId && force) {
         console.log(`[${this.constructor.name}] Unsubscribing existing subscription first (force refresh)`)
         await this.#doUnsubscribe()
-      }
-
-      // Check we're still the current owner (another subscribe might have started)
-      if (this.#subscriptionGeneration !== myGeneration) {
-        console.log(`[${this.constructor.name}] Subscribe superseded (gen ${myGeneration} vs ${this.#subscriptionGeneration}), aborting`)
-        return
       }
 
       const hubId = this.getHubId()
@@ -215,32 +206,17 @@ export class Connection {
   /**
    * Unsubscribe from the channel. Keeps hub connection alive.
    * Call this when controller disconnects during navigation.
-   * Uses generation tracking to avoid unsubscribing a newer subscription.
    */
   async unsubscribe() {
-    // Capture current generation - we only unsubscribe if it still matches
-    const myGeneration = this.#subscriptionGeneration
-
     // Wait for any in-progress subscribe to complete
     while (this.#subscribing) {
       await new Promise(resolve => setTimeout(resolve, 10))
-    }
-
-    // Check if a newer subscribe happened while we waited
-    if (this.#subscriptionGeneration !== myGeneration) {
-      console.log(`[${this.constructor.name}] Unsubscribe skipped - newer subscription exists`)
-      return
     }
 
     if (!this.subscriptionId) return
 
     this.#subscribing = true
     try {
-      // Double-check generation after acquiring lock
-      if (this.#subscriptionGeneration !== myGeneration) {
-        console.log(`[${this.constructor.name}] Unsubscribe skipped - newer subscription exists`)
-        return
-      }
       await this.#doUnsubscribe()
     } finally {
       this.#subscribing = false
