@@ -41,10 +41,10 @@ module WaitHelper
     end
 
     msg = case message
-          when Proc then message.call
-          when String then message
-          else "Condition not met within #{timeout}s"
-          end
+    when Proc then message.call
+    when String then message
+    else "Condition not met within #{timeout}s"
+    end
 
     raise TimeoutError, msg
   end

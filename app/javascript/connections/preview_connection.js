@@ -308,20 +308,20 @@ export class PreviewConnection extends Connection {
 
   // ========== Cleanup ==========
 
-  destroy() {
+  async destroy() {
     // Reject all pending requests
     for (const [requestId, pending] of this.pendingRequests) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error("Connection destroyed"));
+      clearTimeout(pending.timer)
+      pending.reject(new Error("Connection destroyed"))
     }
-    this.pendingRequests.clear();
+    this.pendingRequests.clear()
 
     // Reset ready state
-    this.cliReady = false;
-    this.readyPromise = null;
-    this.readyResolve = null;
+    this.cliReady = false
+    this.readyPromise = null
+    this.readyResolve = null
 
-    super.destroy();
+    await super.destroy()
   }
 
   // ========== Static helper ==========
