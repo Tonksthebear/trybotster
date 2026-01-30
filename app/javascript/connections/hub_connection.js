@@ -68,12 +68,12 @@ export class HubConnection extends Connection {
     }
   }
 
-  destroy() {
+  async destroy() {
     if (this.handshakeTimer) {
-      clearTimeout(this.handshakeTimer);
-      this.handshakeTimer = null;
+      clearTimeout(this.handshakeTimer)
+      this.handshakeTimer = null
     }
-    super.destroy();
+    await super.destroy()
   }
 
   /**

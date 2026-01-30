@@ -35,7 +35,7 @@
 import consumer from "channels/consumer";
 import { Channel } from "channels/channel";
 import {
-  initSignal,
+  ensureSignalReady,
   SignalSession,
   parseBundleFromFragment,
   getHubIdFromPath,
@@ -61,7 +61,7 @@ let _wasmReady = false;
 async function ensureWasm() {
   if (_wasmReady) return;
   const { workerUrl, wasmJsUrl, wasmBinaryUrl } = getSignalConfig();
-  await initSignal(workerUrl, wasmJsUrl, wasmBinaryUrl);
+  await ensureSignalReady(workerUrl, wasmJsUrl, wasmBinaryUrl);
   _wasmReady = true;
 }
 

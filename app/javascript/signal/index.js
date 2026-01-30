@@ -1,7 +1,7 @@
 /**
  * Signal Protocol E2E Encryption - Main Thread Proxy
  *
- * This module provides a proxy to the Signal Web Worker.
+ * This module provides a proxy to the Signal Web Worker via WorkerBridge.
  * All sensitive operations (crypto keys, session state) are isolated
  * in the worker to protect against XSS attacks.
  *
@@ -12,120 +12,14 @@
  * - XSS can use the session while tab is open, but cannot steal it
  */
 
-// Worker instance (SharedWorker preferred, fallback to Worker)
-let worker = null;
-let workerPort = null;
-let workerReady = false;
-let initPromise = null;
-let usingSharedWorker = false;
-
-// Pending request callbacks (id -> {resolve, reject})
-const pendingRequests = new Map();
-let nextRequestId = 1;
+import bridge from "workers/bridge"
 
 /**
- * Initialize the Signal worker with WASM module.
- *
- * Prefers SharedWorker to ensure all tabs share a single Signal session state,
- * preventing ratchet desync when multiple tabs encrypt/decrypt.
- * Falls back to regular Worker if SharedWorker is not available.
- *
- * @param {string} workerUrl - URL to workers/signal.js (from asset_path)
- * @param {string} wasmJsUrl - URL to libsignal_wasm.js (from asset_path)
- * @param {string} wasmBinaryUrl - URL to libsignal_wasm_bg.wasm (from asset_path)
+ * Ensure the worker bridge is initialized.
+ * Call this before using SignalSession.
  */
-export async function initSignal(workerUrl, wasmJsUrl, wasmBinaryUrl) {
-  if (workerReady) return;
-  if (initPromise) return initPromise;
-
-  initPromise = (async () => {
-    try {
-      // Try SharedWorker first (shared across all tabs)
-      if (typeof SharedWorker !== "undefined") {
-        try {
-          worker = new SharedWorker(workerUrl, { type: "module", name: "signal" });
-          workerPort = worker.port;
-          workerPort.onmessage = handleWorkerMessage;
-          workerPort.onmessageerror = (e) => console.error("[Signal] Message error:", e);
-          worker.onerror = (e) => console.error("[Signal] Worker error:", e);
-          workerPort.start();
-          usingSharedWorker = true;
-        } catch (sharedError) {
-          console.warn("[Signal] SharedWorker failed, falling back:", sharedError);
-          worker = null;
-          workerPort = null;
-        }
-      }
-
-      // Fallback to regular Worker (single tab only)
-      if (!workerPort) {
-        console.warn("[Signal] Using regular Worker - multi-tab may desync");
-        worker = new Worker(workerUrl, { type: "module" });
-        workerPort = worker;
-        worker.onmessage = handleWorkerMessage;
-        worker.onerror = (e) => console.error("[Signal] Worker error:", e);
-        usingSharedWorker = false;
-      }
-
-      await sendToWorker("init", { wasmJsUrl, wasmBinaryUrl });
-      workerReady = true;
-    } catch (error) {
-      console.error("[Signal] Failed to initialize worker:", error);
-      initPromise = null;
-      throw error;
-    }
-  })();
-
-  return initPromise;
-}
-
-/**
- * Handle messages from the worker.
- */
-function handleWorkerMessage(event) {
-  const { id, success, result, error } = event.data;
-
-  const pending = pendingRequests.get(id);
-  if (!pending) return;
-
-  pendingRequests.delete(id);
-
-  if (success) {
-    pending.resolve(result);
-  } else {
-    pending.reject(new Error(error));
-  }
-}
-
-/**
- * Send a request to the SharedWorker and wait for response.
- */
-function sendToWorker(action, params = {}, timeout = 10000) {
-  return new Promise((resolve, reject) => {
-    if (!workerPort) {
-      reject(new Error("Worker not initialized"));
-      return;
-    }
-    const id = nextRequestId++;
-
-    const timer = setTimeout(() => {
-      pendingRequests.delete(id);
-      reject(new Error(`Worker timeout: ${action}`));
-    }, timeout);
-
-    pendingRequests.set(id, {
-      resolve: (result) => {
-        clearTimeout(timer);
-        resolve(result);
-      },
-      reject: (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    });
-
-    workerPort.postMessage({ id, action, ...params });
-  });
+export async function ensureSignalReady(workerUrl, wasmJsUrl, wasmBinaryUrl) {
+  await bridge.init({ workerUrl, wasmJsUrl, wasmBinaryUrl })
 }
 
 /**
@@ -288,21 +182,24 @@ export function getHubIdFromPath() {
 /**
  * Signal Protocol session proxy.
  *
- * This class proxies all operations to the Web Worker.
+ * This class proxies all operations to the Web Worker via WorkerBridge.
  * The actual session state never exists in the main thread.
  */
 export class SignalSession {
+  #hubId
+  #identityKey
+
   constructor(hubId, identityKey) {
-    this._hubId = hubId;
-    this._identityKey = identityKey;
+    this.#hubId = hubId
+    this.#identityKey = identityKey
   }
 
   /**
    * Create a new session from a PreKeyBundle.
    */
   static async create(bundleJson, hubId) {
-    const result = await sendToWorker("createSession", { bundleJson, hubId });
-    return new SignalSession(hubId, result.identityKey);
+    const result = await bridge.send("createSession", { bundleJson, hubId })
+    return new SignalSession(hubId, result.identityKey)
   }
 
   /**
@@ -310,84 +207,81 @@ export class SignalSession {
    * Returns null if no session exists.
    */
   static async load(hubId) {
-    const result = await sendToWorker("loadSession", { hubId });
-    if (!result.loaded) return null;
+    const result = await bridge.send("loadSession", { hubId })
+    if (!result.loaded) return null
 
-    const keyResult = await sendToWorker("getIdentityKey", { hubId });
-    return new SignalSession(hubId, keyResult.identityKey);
+    const keyResult = await bridge.send("getIdentityKey", { hubId })
+    return new SignalSession(hubId, keyResult.identityKey)
   }
 
   /**
    * Load existing session or create new from bundle.
    */
   static async loadOrCreate(bundleJson, hubId) {
-    const existing = await SignalSession.load(hubId);
-    if (existing) {
-      return existing;
-    }
-
-    return SignalSession.create(bundleJson, hubId);
+    const existing = await SignalSession.load(hubId)
+    if (existing) return existing
+    return SignalSession.create(bundleJson, hubId)
   }
 
   /**
    * Check if a session exists for a hub.
    */
   static async hasSession(hubId) {
-    const result = await sendToWorker("hasSession", { hubId });
-    return result.hasSession;
+    const result = await bridge.send("hasSession", { hubId })
+    return result.hasSession
   }
 
   /**
    * Encrypt a message for the CLI.
    */
   async encrypt(message) {
-    const result = await sendToWorker("encrypt", {
-      hubId: this._hubId,
+    const result = await bridge.send("encrypt", {
+      hubId: this.#hubId,
       message,
-    });
-    return result.envelope;
+    })
+    return result.envelope
   }
 
   /**
    * Decrypt a message from the CLI.
    */
   async decrypt(envelope) {
-    const result = await sendToWorker("decrypt", {
-      hubId: this._hubId,
+    const result = await bridge.send("decrypt", {
+      hubId: this.#hubId,
       envelope,
-    });
-    return result.plaintext;
+    })
+    return result.plaintext
   }
 
   /**
    * Process a SenderKey distribution message from CLI.
    */
   async processSenderKeyDistribution(distributionB64) {
-    await sendToWorker("processSenderKeyDistribution", {
-      hubId: this._hubId,
+    await bridge.send("processSenderKeyDistribution", {
+      hubId: this.#hubId,
       distributionB64,
-    });
+    })
   }
 
   /**
    * Get our identity public key (base64).
    */
   async getIdentityKey() {
-    return this._identityKey;
+    return this.#identityKey
   }
 
   /**
    * Get the hub ID this session is connected to.
    */
   getHubId() {
-    return this._hubId;
+    return this.#hubId
   }
 
   /**
    * Clear session from storage.
    */
   async clear() {
-    await sendToWorker("clearSession", { hubId: this._hubId });
+    await bridge.send("clearSession", { hubId: this.#hubId })
   }
 }
 
@@ -403,7 +297,7 @@ export const ConnectionState = {
   HANDSHAKE_SENT: "handshake_sent",
   CONNECTED: "connected",
   ERROR: "error",
-};
+}
 
 /**
  * Error reasons for connection failures.
@@ -418,13 +312,13 @@ export const ConnectionError = {
   DECRYPT_FAILED: "decrypt_failed",
   WEBSOCKET_ERROR: "websocket_error",
   SESSION_INVALID: "session_invalid", // CLI restarted, keys don't match
-};
+}
 
 export default {
-  initSignal,
+  ensureSignalReady,
   parseBundleFromFragment,
   getHubIdFromPath,
   SignalSession,
   ConnectionState,
   ConnectionError,
-};
+}
