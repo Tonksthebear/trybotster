@@ -19,7 +19,6 @@
 //! - [`app`] - TUI state types and input handling
 //! - [`server`] - Rails API client
 //! - [`config`] - Configuration loading/saving
-//! - [`tunnel`] - HTTP tunnel forwarding
 
 // Library modules
 pub mod agent;
@@ -48,7 +47,6 @@ pub mod prompt;
 pub mod render;
 pub mod server;
 pub mod terminal_widget;
-pub mod tunnel;
 
 // Re-export commonly used types
 pub use agent::{Agent, AgentNotification, AgentStatus, PtyView, ScreenInfo};
@@ -62,7 +60,6 @@ pub use process::{get_parent_pid, kill_orphaned_processes};
 pub use prompt::PromptManager;
 pub use relay::{AgentInfo, BrowserResize, TerminalMessage, WorktreeInfo};
 pub use terminal_widget::TerminalWidget;
-pub use tunnel::{allocate_tunnel_port, TunnelManager, TunnelStatus};
 
 // Re-export Channel types
 pub use channel::{

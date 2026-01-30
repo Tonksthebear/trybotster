@@ -470,7 +470,6 @@ where
     /// Render the TUI.
     fn render(&mut self) -> Result<()> {
         use super::render::{render, AgentRenderInfo, RenderContext};
-        use crate::tunnel::TunnelStatus;
 
         // Build agent render info from cached agents
         let agent_render_info: Vec<AgentRenderInfo> = self
@@ -481,7 +480,7 @@ where
                 repo: info.repo.clone().unwrap_or_default(),
                 issue_number: info.issue_number.map(|n| n as u32),
                 branch_name: info.branch_name.clone().unwrap_or_default(),
-                tunnel_port: info.tunnel_port,
+                port: info.port,
                 server_running: info.server_running.unwrap_or(false),
                 has_server_pty: info.has_server_pty.unwrap_or(false),
             })
@@ -560,7 +559,6 @@ where
             // Status Indicators - TuiRunner doesn't track these, use defaults
             seconds_since_poll: 0,
             poll_interval: 10,
-            tunnel_status: TunnelStatus::Disconnected,
             vpn_status: None,
         };
 
@@ -1511,7 +1509,7 @@ mod tests {
             branch_name: Some("issue-42".to_string()),
             name: None,
             status: Some("Running".to_string()),
-            tunnel_port: None,
+            port: None,
             server_running: None,
             has_server_pty: None,
             active_pty_view: None,
@@ -1634,7 +1632,7 @@ mod tests {
             branch_name: Some("feature-branch".to_string()),
             name: None,
             status: Some("Running".to_string()),
-            tunnel_port: None,
+            port: None,
             server_running: None,
             has_server_pty: None,
             active_pty_view: None,
@@ -2035,7 +2033,7 @@ mod tests {
             branch_name: Some("test-branch".to_string()),
             name: None,
             status: Some("Running".to_string()),
-            tunnel_port: None,
+            port: None,
             server_running: None,
             has_server_pty: None,
             active_pty_view: None,
@@ -2201,7 +2199,7 @@ mod tests {
                                     branch_name: Some(request.issue_or_branch.clone()),
                                     name: None,
                                     status: Some("Running".to_string()),
-                                    tunnel_port: None,
+                                    port: None,
                                     server_running: None,
                                     has_server_pty: None,
                                     active_pty_view: None,
@@ -2514,7 +2512,7 @@ mod tests {
                 branch_name: Some(format!("branch-{}", i)),
                 name: None,
                 status: Some("Running".to_string()),
-                tunnel_port: None,
+                port: None,
                 server_running: None,
                 has_server_pty: None,
                 active_pty_view: None,

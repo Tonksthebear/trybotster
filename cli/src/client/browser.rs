@@ -62,6 +62,7 @@ use crate::relay::{
     TerminalMessage, WorktreeInfo,
 };
 
+use super::http_channel::HttpChannel;
 use super::{Client, ClientId, CreateAgentRequest, DeleteAgentRequest};
 
 /// Requests from Browser to BrowserClient.
@@ -186,6 +187,12 @@ pub struct BrowserClient {
     /// Browser can have multiple simultaneous connections (one per tab).
     terminal_channels: HashMap<(usize, usize), TerminalChannel>,
 
+    /// HTTP channels for preview proxying, keyed by (agent_index, pty_index).
+    ///
+    /// Created on-demand when the browser requests a preview connection.
+    /// Dropped when the agent is deleted or browser disconnects.
+    http_channels: HashMap<(usize, usize), HttpChannel>,
+
     /// Per-browser ActionCableChannel for hub-level control plane communication.
     ///
     /// Created and connected in `run_task()` via `connect_hub_channel()` before
@@ -247,6 +254,7 @@ impl BrowserClient {
             hub_handle,
             config,
             terminal_channels: HashMap::new(),
+            http_channels: HashMap::new(),
             hub_channel: None,
             hub_sender: None,
             request_tx,
@@ -291,12 +299,24 @@ impl BrowserClient {
                 pty_index,
                 data,
             } => {
+                log::info!(
+                    "[BrowserClient] Received SendInput request: agent={}, pty={}, data_len={}",
+                    agent_index,
+                    pty_index,
+                    data.len()
+                );
                 if let Err(e) = self.send_input(agent_index, pty_index, &data).await {
                     log::error!(
                         "Failed to send input to PTY ({}, {}): {}",
                         agent_index,
                         pty_index,
                         e
+                    );
+                } else {
+                    log::info!(
+                        "[BrowserClient] Successfully sent input to PTY ({}, {})",
+                        agent_index,
+                        pty_index
                     );
                 }
             }
@@ -927,6 +947,22 @@ impl BrowserClient {
                     // Disconnect both CLI PTY (index 0) and Server PTY (index 1).
                     self.disconnect_from_pty(idx, 0).await;
                     self.disconnect_from_pty(idx, 1).await;
+
+                    // Remove any HTTP channels for this agent.
+                    if self.http_channels.remove(&(idx, 0)).is_some() {
+                        log::info!(
+                            "BrowserClient {}: removed HttpChannel ({}, 0) on agent delete",
+                            &self.identity[..8.min(self.identity.len())],
+                            idx
+                        );
+                    }
+                    if self.http_channels.remove(&(idx, 1)).is_some() {
+                        log::info!(
+                            "BrowserClient {}: removed HttpChannel ({}, 1) on agent delete",
+                            &self.identity[..8.min(self.identity.len())],
+                            idx
+                        );
+                    }
                 } else {
                     log::warn!(
                         "BrowserClient: could not find index for deleted agent {}",
@@ -1000,6 +1036,95 @@ impl BrowserClient {
                         pty_index
                     );
                     self.disconnect_from_pty(agent_index, pty_index).await;
+                }
+            }
+            HubEvent::HttpConnectionRequested {
+                ref client_id,
+                agent_index,
+                pty_index,
+                ref browser_identity,
+            } => {
+                // Only handle if this is for us.
+                if client_id == &self.id {
+                    log::info!(
+                        "BrowserClient {}: HttpConnectionRequested({}, {}, {})",
+                        &self.identity[..8.min(self.identity.len())],
+                        agent_index,
+                        pty_index,
+                        &browser_identity[..8.min(browser_identity.len())]
+                    );
+
+                    // Check if we already have an HttpChannel for this agent/pty
+                    let key = (agent_index, pty_index);
+                    if self.http_channels.contains_key(&key) {
+                        log::debug!(
+                            "BrowserClient {}: HttpChannel already exists for ({}, {})",
+                            &self.identity[..8.min(self.identity.len())],
+                            agent_index,
+                            pty_index
+                        );
+                        return;
+                    }
+
+                    // Get agent handle via hub_handle
+                    let agent_handle = match self.hub_handle.get_agent(agent_index) {
+                        Some(handle) => handle,
+                        None => {
+                            log::error!(
+                                "BrowserClient {}: agent {} not found for HttpConnectionRequested",
+                                &self.identity[..8.min(self.identity.len())],
+                                agent_index
+                            );
+                            self.send_error_to_browser("Agent not found for preview").await;
+                            return;
+                        }
+                    };
+
+                    // Get PtyHandle from agent
+                    let pty_handle = match agent_handle.get_pty(pty_index) {
+                        Some(handle) => handle.clone(),
+                        None => {
+                            log::error!(
+                                "BrowserClient {}: PTY {} not found on agent {}",
+                                &self.identity[..8.min(self.identity.len())],
+                                pty_index,
+                                agent_index
+                            );
+                            self.send_error_to_browser("PTY not found for preview").await;
+                            return;
+                        }
+                    };
+
+                    // Create HttpChannel
+                    match HttpChannel::new(
+                        agent_index,
+                        pty_index,
+                        &pty_handle,
+                        &self.config,
+                        browser_identity.clone(),
+                    )
+                    .await
+                    {
+                        Ok(http_channel) => {
+                            self.http_channels.insert(key, http_channel);
+                            log::info!(
+                                "BrowserClient {}: HttpChannel created for ({}, {})",
+                                &self.identity[..8.min(self.identity.len())],
+                                agent_index,
+                                pty_index
+                            );
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "BrowserClient {}: failed to create HttpChannel for ({}, {}): {}",
+                                &self.identity[..8.min(self.identity.len())],
+                                agent_index,
+                                pty_index,
+                                e
+                            );
+                            self.send_error_to_browser(&format!("Failed to create preview channel: {}", e)).await;
+                        }
+                    }
                 }
             }
         }
@@ -1354,7 +1479,15 @@ async fn spawn_pty_input_receiver(
         pty_index
     );
 
+    let mut message_count = 0u64;
     while let Some(incoming) = receiver.recv().await {
+        message_count += 1;
+        log::info!(
+            "[PTY Input] Received message #{} from {} ({} bytes)",
+            message_count,
+            &incoming.sender.0[..8.min(incoming.sender.0.len())],
+            incoming.payload.len()
+        );
         // Parse the incoming payload as JSON.
         let payload_str = match String::from_utf8(incoming.payload.clone()) {
             Ok(s) => s,
@@ -1386,6 +1519,10 @@ async fn spawn_pty_input_receiver(
 
         match command {
             BrowserCommand::Input { data } => {
+                log::info!(
+                    "[PTY Input] Parsed Input command: {} bytes of data",
+                    data.len()
+                );
                 // Send input request through channel to BrowserClient.
                 if request_tx
                     .send(BrowserRequest::SendInput {
@@ -1398,6 +1535,7 @@ async fn spawn_pty_input_receiver(
                     log::debug!("BrowserRequest channel closed, stopping input receiver");
                     break;
                 }
+                log::info!("[PTY Input] Sent to BrowserClient request channel");
             }
             BrowserCommand::Resize { cols, rows } => {
                 // Send resize request through channel to BrowserClient.

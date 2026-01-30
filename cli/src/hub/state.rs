@@ -9,7 +9,7 @@
 //! See `crate::client` for the `TuiClient` and `BrowserClient` implementations.
 //! This module only manages the agent registry itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use crate::agent::Agent;
@@ -81,6 +81,13 @@ pub struct HubState {
 
     /// Git worktree manager for creating/deleting worktrees.
     pub git_manager: WorktreeManager,
+
+    /// Ports currently allocated to agents, tracked to prevent duplicates.
+    ///
+    /// When an agent is spawned, its port is added here. When deleted, removed.
+    /// This ensures we don't allocate the same port to multiple agents even if
+    /// the first hasn't bound to it yet.
+    pub allocated_ports: HashSet<u16>,
 }
 
 impl std::fmt::Debug for HubState {
@@ -100,6 +107,7 @@ impl HubState {
             agent_keys_ordered: Vec::new(),
             available_worktrees: Vec::new(),
             git_manager: WorktreeManager::new(worktree_base),
+            allocated_ports: HashSet::new(),
         }
     }
 
@@ -209,13 +217,13 @@ impl HubState {
         let mut ptys = Vec::with_capacity(2);
 
         // CLI PTY is always present (index 0)
-        let (cli_event_tx, cli_cmd_tx) = agent.cli_pty.get_channels();
-        ptys.push(PtyHandle::new(cli_event_tx, cli_cmd_tx));
+        let (cli_event_tx, cli_cmd_tx, cli_port) = agent.cli_pty.get_channels();
+        ptys.push(PtyHandle::new(cli_event_tx, cli_cmd_tx, cli_port));
 
         // Server PTY if available (index 1)
         if let Some(ref server_pty) = agent.server_pty {
-            let (server_event_tx, server_cmd_tx) = server_pty.get_channels();
-            ptys.push(PtyHandle::new(server_event_tx, server_cmd_tx));
+            let (server_event_tx, server_cmd_tx, server_port) = server_pty.get_channels();
+            ptys.push(PtyHandle::new(server_event_tx, server_cmd_tx, server_port));
         }
 
         Some(AgentHandle::new(agent_id, info, ptys, index))
@@ -240,7 +248,7 @@ impl HubState {
             branch_name: Some(agent.branch_name.clone()),
             name: None,
             status: Some(format!("{:?}", agent.status)),
-            tunnel_port: agent.tunnel_port,
+            port: agent.port(),
             server_running: Some(agent.is_server_running()),
             has_server_pty: Some(agent.has_server_pty()),
             active_pty_view: None, // Client-owned state, not agent state

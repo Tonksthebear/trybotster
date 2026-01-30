@@ -444,7 +444,7 @@ async fn test_pty_input_receiver_routes_input_command() {
 
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<PtyCommand>(16);
-    let pty_handle = PtyHandle::new(event_tx, cmd_tx);
+    let pty_handle = PtyHandle::new(event_tx, cmd_tx, None);
 
     let input_cmd = BrowserCommand::Input {
         data: "ls -la\n".to_string(),
@@ -480,7 +480,7 @@ async fn test_pty_input_receiver_routes_resize_command() {
 
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<PtyCommand>(16);
-    let pty_handle = PtyHandle::new(event_tx, cmd_tx);
+    let pty_handle = PtyHandle::new(event_tx, cmd_tx, None);
 
     let resize_cmd = BrowserCommand::Resize { cols: 120, rows: 40 };
     let resize_json = serde_json::to_vec(&resize_cmd).unwrap();

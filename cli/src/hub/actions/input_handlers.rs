@@ -2,16 +2,13 @@
 //!
 //! Helper to spawn an agent and connect its channels (used by TUI menu flow).
 
-use std::sync::Arc;
-
 use crate::client::ClientId;
 use crate::hub::{lifecycle, Hub};
 
 /// Helper to spawn an agent and connect its channels.
 ///
 /// This is used by TUI's "New Agent" menu flow. After spawning:
-/// - Registers tunnel if port assigned
-/// - Connects agent's channels (terminal + preview if tunnel exists)
+/// - Connects agent's channels (terminal + preview if port assigned)
 /// - Auto-selects the new agent for TUI (consistent with browser behavior)
 pub fn spawn_agent_with_tunnel(
     hub: &mut Hub,
@@ -20,22 +17,16 @@ pub fn spawn_agent_with_tunnel(
     // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
     let _runtime_guard = hub.tokio_runtime.enter();
 
-    // Dims are carried in config from the requesting client
-    let result = lifecycle::spawn_agent(&mut hub.state.write().unwrap(), config)?;
+    // Allocate a unique port for HTTP forwarding (before spawning)
+    let port = hub.allocate_unique_port();
 
-    // Clone agent_id before moving into async
+    // Dims are carried in config from the requesting client
+    let result = lifecycle::spawn_agent(&mut hub.state.write().unwrap(), config, port)?;
+
+    // Clone agent_id before connecting channels
     let agent_id = result.agent_id.clone();
 
-    // Register tunnel for HTTP forwarding if tunnel port allocated
-    if let Some(port) = result.tunnel_port {
-        let tm = Arc::clone(&hub.tunnel_manager);
-        let key = result.agent_id.clone();
-        hub.tokio_runtime.spawn(async move {
-            tm.register_agent(key, port).await;
-        });
-    }
-
-    // Connect agent's channels (terminal always, preview if tunnel_port set)
+    // Connect agent's channels (terminal always, preview if port assigned)
     let agent_index = hub
         .state
         .read()

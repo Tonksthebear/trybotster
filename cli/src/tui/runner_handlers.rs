@@ -264,6 +264,7 @@ where
     /// - `AgentCreationProgress` - Creation stage updates
     /// - `Error` - Hub error occurred
     /// - `Shutdown` - Hub is shutting down
+    /// - `PtyConnectionRequested` / `PtyDisconnectionRequested` / `HttpConnectionRequested` - Browser-specific, ignored
     pub fn handle_hub_event(&mut self, event: HubEvent) {
         use crate::app::AppMode;
 
@@ -343,7 +344,8 @@ where
             }
 
             HubEvent::PtyConnectionRequested { .. }
-            | HubEvent::PtyDisconnectionRequested { .. } => {
+            | HubEvent::PtyDisconnectionRequested { .. }
+            | HubEvent::HttpConnectionRequested { .. } => {
                 // Browser-specific, TuiRunner ignores.
             }
         }

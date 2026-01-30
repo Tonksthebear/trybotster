@@ -10,6 +10,9 @@
 //! - [`HubEvent::AgentDeleted`] - Agent was deleted
 //! - [`HubEvent::AgentStatusChanged`] - Agent status changed
 //! - [`HubEvent::Shutdown`] - Hub is shutting down
+//! - [`HubEvent::PtyConnectionRequested`] - Browser requested PTY connection
+//! - [`HubEvent::PtyDisconnectionRequested`] - Browser requested PTY disconnection
+//! - [`HubEvent::HttpConnectionRequested`] - Browser requested HTTP preview connection
 //!
 //! # Usage
 //!
@@ -142,6 +145,19 @@ pub enum HubEvent {
         /// PTY index within the agent.
         pty_index: usize,
     },
+
+    /// Browser requested HTTP preview connection.
+    /// Only the matching client should act on this.
+    HttpConnectionRequested {
+        /// Which client should connect.
+        client_id: ClientId,
+        /// Agent index to connect to.
+        agent_index: usize,
+        /// PTY index within the agent.
+        pty_index: usize,
+        /// Browser identity for the preview channel.
+        browser_identity: String,
+    },
 }
 
 impl HubEvent {
@@ -212,7 +228,8 @@ impl HubEvent {
             | Self::AgentCreationProgress { .. }
             | Self::Error { .. }
             | Self::PtyConnectionRequested { .. }
-            | Self::PtyDisconnectionRequested { .. } => None,
+            | Self::PtyDisconnectionRequested { .. }
+            | Self::HttpConnectionRequested { .. } => None,
         }
     }
 
@@ -237,7 +254,7 @@ mod tests {
             branch_name: Some("botster-issue-42".to_string()),
             name: None,
             status: Some("Running".to_string()),
-            tunnel_port: None,
+            port: None,
             server_running: None,
             has_server_pty: None,
             active_pty_view: None,

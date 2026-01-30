@@ -60,11 +60,13 @@
 // Rust guideline compliant 2026-01
 
 pub mod browser;
+pub mod http_channel;
 mod registry;
 mod tui;
 mod types;
 
 pub use browser::{BrowserClient, BrowserClientConfig, BrowserRequest};
+pub use http_channel::HttpChannel;
 pub use registry::{ClientRegistry, ClientTaskHandle};
 pub use tui::{TuiAgentMetadata, TuiClient, TuiOutput, TuiRequest};
 pub use types::{CreateAgentRequest, DeleteAgentRequest, Response};

@@ -993,7 +993,7 @@ mod tests {
                 branch_name: None,
                 name: None,
                 status: None,
-                tunnel_port: None,
+                port: None,
                 server_running: None,
                 has_server_pty: None,
                 active_pty_view: None,

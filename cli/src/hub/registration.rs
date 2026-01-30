@@ -7,7 +7,6 @@
 //!
 //! - Device identity registration (E2E encryption keypairs)
 //! - Hub registration for message routing
-//! - Tunnel connection for HTTP forwarding
 //! - Signal Protocol initialization for E2E encryption (lazy bundle generation)
 //!
 //! # Lazy Bundle Generation
@@ -25,14 +24,12 @@
 
 // Rust guideline compliant 2026-01-29
 
-use std::sync::Arc;
 
 use reqwest::blocking::Client;
 
 use crate::config::Config;
 use crate::device::Device;
 use crate::relay::{BrowserState, CryptoService};
-use crate::tunnel::TunnelManager;
 
 /// Register the device with the server if not already registered.
 ///
@@ -127,21 +124,6 @@ pub fn register_hub_with_server(
     // Fallback to local identifier if registration fails
     log::info!("Using local identifier as fallback: {local_identifier}");
     local_identifier.to_string()
-}
-
-/// Start the tunnel connection in background.
-///
-/// The tunnel provides HTTP forwarding for agent dev servers.
-pub fn start_tunnel(tunnel_manager: &Arc<TunnelManager>, runtime: &tokio::runtime::Runtime) {
-    let tm = Arc::clone(tunnel_manager);
-    runtime.spawn(async move {
-        loop {
-            if let Err(e) = tm.connect().await {
-                log::warn!("Tunnel connection error: {e}, reconnecting in 5s...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            }
-        }
-    });
 }
 
 /// Initialize Signal Protocol CryptoService for E2E encryption.

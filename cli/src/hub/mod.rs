@@ -66,6 +66,7 @@ pub use hub_handle::HubHandle;
 pub use lifecycle::{close_agent, spawn_agent, SpawnResult};
 pub use state::{HubState, SharedHubState};
 
+use std::net::TcpListener;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -74,12 +75,11 @@ use reqwest::blocking::Client;
 
 use sha2::{Digest, Sha256};
 
-use crate::channel::{ActionCableChannel, Channel, ChannelConfig};
+// ActionCable channel imports removed - preview channels now managed by BrowserClient
 use crate::client::{ClientId, ClientRegistry, ClientTaskHandle};
 use crate::config::Config;
 use crate::device::Device;
 use crate::git::WorktreeManager;
-use crate::tunnel::TunnelManager;
 
 /// Progress event during agent creation.
 ///
@@ -140,13 +140,11 @@ pub struct Hub {
     pub device: Device,
 
     // === Runtime ===
-    /// HTTP tunnel manager for dev server forwarding.
-    pub tunnel_manager: Arc<TunnelManager>,
     /// Local identifier for this hub session (used for config directories).
     pub hub_identifier: String,
     /// Server-assigned ID for server communication (set after registration).
     pub botster_id: Option<String>,
-    /// Async runtime for relay and tunnel operations.
+    /// Async runtime for relay and preview channel operations.
     pub tokio_runtime: tokio::runtime::Runtime,
 
     // === Control Flags ===
@@ -259,13 +257,6 @@ impl Hub {
         let device = Device::load_or_create()?;
         log::info!("Device fingerprint: {}", device.fingerprint);
 
-        // Create tunnel manager
-        let tunnel_manager = Arc::new(TunnelManager::new(
-            hub_identifier.clone(),
-            config.get_api_key().to_string(),
-            config.server_url.clone(),
-        ));
-
         // Initialize heartbeat timestamp to past to trigger immediate heartbeat on first tick
         let past = Instant::now() - std::time::Duration::from_secs(3600);
 
@@ -286,7 +277,6 @@ impl Hub {
             config,
             client,
             device,
-            tunnel_manager,
             hub_identifier,
             botster_id: None,
             tokio_runtime,
@@ -386,86 +376,24 @@ impl Hub {
         self.botster_id.as_deref().unwrap_or(&self.hub_identifier)
     }
 
-    /// Connect an agent's preview channel for HTTP proxying.
+    /// Connect agent channels after spawn.
     ///
-    /// Terminal relay is handled separately (PtySession broadcasts events,
-    /// clients subscribe via relay module).
+    /// NOTE: Preview channels are now managed by BrowserClient, not Agent.
+    /// HttpChannel is created on-demand when a browser requests preview.
+    /// Terminal channels are handled by PtySession broadcasts + browser relay.
     ///
-    /// # Arguments
-    ///
-    /// * `session_key` - The agent's session key
-    /// * `agent_index` - Index of the agent for channel routing
+    /// This method is kept for backwards compatibility but is now a no-op.
+    /// The spawning code still calls this, but there's nothing to connect here.
+    #[allow(unused_variables)]
     pub fn connect_agent_channels(&mut self, session_key: &str, agent_index: usize) {
-        // Check if crypto service is available
-        let Some(crypto_service) = self.browser.crypto_service.clone() else {
-            log::debug!(
-                "No crypto service available, deferring channel connection for {}",
-                session_key
-            );
-            return;
-        };
-
-        let hub_id = self.server_hub_id().to_string();
-        let server_url = self.config.server_url.clone();
-        let api_key = self.config.get_api_key().to_string();
-
-        // Get tunnel_port from agent
-        let tunnel_port = self
-            .state
-            .read()
-            .unwrap()
-            .agents
-            .get(session_key)
-            .and_then(|a| a.tunnel_port);
-
-        log::info!(
-            "Connecting channels for agent {} (index={})",
+        log::debug!(
+            "connect_agent_channels called for {} (index={}) - channels managed by BrowserClient",
             session_key,
             agent_index
         );
-
-        // Terminal channels are now managed by PtySession broadcasting + browser relay.
-        // See relay/browser.rs for PTY event routing to browsers.
-
-        // Connect preview channel if tunnel_port is set (owned by agent)
-        if let Some(port) = tunnel_port {
-            let mut preview_channel =
-                ActionCableChannel::encrypted(crypto_service, server_url, api_key);
-
-            let preview_result = self.tokio_runtime.block_on(async {
-                preview_channel
-                    .connect(ChannelConfig {
-                        channel_name: "PreviewChannel".into(),
-                        hub_id,
-                        agent_index: Some(agent_index),
-                        pty_index: None, // Preview channel doesn't use PTY index
-                        browser_identity: None,
-                        encrypt: true,
-                        compression_threshold: Some(4096),
-                        cli_subscription: false,
-                    })
-                    .await
-            });
-
-            if let Err(e) = preview_result {
-                log::error!(
-                    "Failed to connect preview channel for {}: {}",
-                    session_key,
-                    e
-                );
-                return;
-            }
-
-            // Store preview channel on agent
-            if let Some(agent) = self.state.write().unwrap().agents.get_mut(session_key) {
-                agent.preview_channel = Some(preview_channel);
-                log::info!(
-                    "Preview channel connected for {} (port {})",
-                    session_key,
-                    port
-                );
-            }
-        }
+        // Preview channels (HttpChannel) are now created lazily by BrowserClient
+        // when a browser_wants_preview message is received.
+        // See: cli/src/client/http_channel.rs
     }
 
     /// Get the number of active agents.
@@ -485,6 +413,71 @@ impl Hub {
             .filter_map(|i| state.get_agent_handle(i))
             .collect();
         self.handle_cache.set_all(handles);
+    }
+
+    // === Port Allocation ===
+
+    /// Starting port for allocation (3000 is often used by Rails).
+    const PORT_RANGE_START: u16 = 3001;
+    /// Maximum port to try before giving up.
+    const PORT_RANGE_END: u16 = 4000;
+
+    /// Allocate a unique port for an agent's dev server.
+    ///
+    /// Finds an available port by:
+    /// 1. Checking it's not already allocated to another agent
+    /// 2. Verifying it's actually open via `TcpListener::bind`
+    ///
+    /// Ports are scanned starting from 3001 (avoiding 3000 which Rails commonly uses).
+    ///
+    /// # Returns
+    ///
+    /// - `Some(port)` if an available port was found and reserved
+    /// - `None` if no port available after scanning the range
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if let Some(port) = hub.allocate_unique_port() {
+    ///     log::info!("Allocated port {} for dev server", port);
+    ///     // Port is now tracked in hub.state.allocated_ports
+    /// }
+    /// ```
+    #[must_use]
+    pub fn allocate_unique_port(&self) -> Option<u16> {
+        let mut state = self.state.write().unwrap();
+
+        for port in Self::PORT_RANGE_START..=Self::PORT_RANGE_END {
+            // Skip if already allocated to another agent
+            if state.allocated_ports.contains(&port) {
+                continue;
+            }
+
+            // Check if port is actually available
+            if TcpListener::bind(format!("127.0.0.1:{port}")).is_ok() {
+                state.allocated_ports.insert(port);
+                log::debug!("Allocated port {port} (total allocated: {})", state.allocated_ports.len());
+                return Some(port);
+            }
+        }
+
+        log::warn!(
+            "No available ports in range {}-{}",
+            Self::PORT_RANGE_START,
+            Self::PORT_RANGE_END
+        );
+        None
+    }
+
+    /// Release a previously allocated port.
+    ///
+    /// Call this when an agent is deleted to return its port to the pool.
+    /// Safe to call with a port that wasn't allocated (no-op).
+    pub fn release_port(&self, port: u16) {
+        let mut state = self.state.write().unwrap();
+        if state.allocated_ports.remove(&port) {
+            log::debug!("Released port {port} (total allocated: {})", state.allocated_ports.len());
+        }
     }
 
     /// Check if the hub should quit.
@@ -1240,5 +1233,82 @@ mod tests {
             assert_eq!(cached_agents[0].agent_id(), &keys[3]);
             assert_eq!(cached_agents[1].agent_id(), &keys[4]);
         }, Duration::from_secs(5));
+    }
+
+    // === Port Allocation Tests ===
+
+    #[test]
+    fn test_allocate_unique_port_returns_port() {
+        let config = test_config();
+        let hub = Hub::new(config).unwrap();
+
+        let port = hub.allocate_unique_port();
+        assert!(port.is_some(), "Should allocate a port");
+
+        let port = port.unwrap();
+        assert!(
+            port >= Hub::PORT_RANGE_START && port <= Hub::PORT_RANGE_END,
+            "Port {} should be in range {}-{}",
+            port,
+            Hub::PORT_RANGE_START,
+            Hub::PORT_RANGE_END
+        );
+    }
+
+    #[test]
+    fn test_allocate_unique_port_tracks_allocation() {
+        let config = test_config();
+        let hub = Hub::new(config).unwrap();
+
+        let port1 = hub.allocate_unique_port().unwrap();
+        let port2 = hub.allocate_unique_port().unwrap();
+
+        assert_ne!(port1, port2, "Should allocate different ports");
+
+        // Verify both are tracked
+        let state = hub.state.read().unwrap();
+        assert!(state.allocated_ports.contains(&port1));
+        assert!(state.allocated_ports.contains(&port2));
+        assert_eq!(state.allocated_ports.len(), 2);
+    }
+
+    #[test]
+    fn test_release_port() {
+        let config = test_config();
+        let hub = Hub::new(config).unwrap();
+
+        let port = hub.allocate_unique_port().unwrap();
+        assert!(hub.state.read().unwrap().allocated_ports.contains(&port));
+
+        hub.release_port(port);
+        assert!(!hub.state.read().unwrap().allocated_ports.contains(&port));
+    }
+
+    #[test]
+    fn test_release_port_allows_reallocation() {
+        let config = test_config();
+        let hub = Hub::new(config).unwrap();
+
+        let port1 = hub.allocate_unique_port().unwrap();
+        hub.release_port(port1);
+
+        // The released port should be available again (assuming no other process grabbed it)
+        let port2 = hub.allocate_unique_port().unwrap();
+
+        // port2 could be port1 or another port - we just verify allocation works
+        assert!(
+            port2 >= Hub::PORT_RANGE_START && port2 <= Hub::PORT_RANGE_END,
+            "Should allocate a valid port after release"
+        );
+    }
+
+    #[test]
+    fn test_release_unallocated_port_is_noop() {
+        let config = test_config();
+        let hub = Hub::new(config).unwrap();
+
+        // Should not panic or error
+        hub.release_port(9999);
+        assert!(hub.state.read().unwrap().allocated_ports.is_empty());
     }
 }

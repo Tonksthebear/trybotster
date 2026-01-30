@@ -93,7 +93,7 @@ pub fn build_agent_info(id: &str, agent: &crate::Agent, hub_identifier: &str) ->
         branch_name: Some(agent.branch_name.clone()),
         name: None,
         status: Some(format!("{:?}", agent.status)),
-        tunnel_port: agent.tunnel_port,
+        port: agent.port(),
         server_running: Some(agent.is_server_running()),
         has_server_pty: Some(agent.has_server_pty()),
         // View and scroll are client-scoped - browser tracks its own state

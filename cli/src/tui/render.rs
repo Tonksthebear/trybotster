@@ -33,7 +33,6 @@ use ratatui::{
 use vt100::Parser;
 
 use crate::app::{buffer_to_ansi, centered_rect, AppMode};
-use crate::tunnel::TunnelStatus;
 
 use super::menu::{build_menu, MenuContext, MenuItem};
 use crate::{BrowserDimensions, PtyView, VpnStatus};
@@ -65,8 +64,8 @@ pub struct AgentRenderInfo {
     pub issue_number: Option<u32>,
     /// Branch name.
     pub branch_name: String,
-    /// Tunnel port if assigned.
-    pub tunnel_port: Option<u16>,
+    /// HTTP forwarding port if assigned.
+    pub port: Option<u16>,
     /// Whether the server is running.
     pub server_running: bool,
     /// Whether this agent has a server PTY.
@@ -125,8 +124,6 @@ pub struct RenderContext<'a> {
     pub seconds_since_poll: u64,
     /// Poll interval in seconds.
     pub poll_interval: u64,
-    /// Tunnel connection status.
-    pub tunnel_status: TunnelStatus,
     /// VPN connection status.
     pub vpn_status: Option<VpnStatus>,
 }
@@ -142,7 +139,6 @@ impl<'a> std::fmt::Debug for RenderContext<'a> {
             .field("active_pty_view", &self.active_pty_view)
             .field("scroll_offset", &self.scroll_offset)
             .field("is_scrolled", &self.is_scrolled)
-            .field("tunnel_status", &self.tunnel_status)
             .finish_non_exhaustive()
     }
 }
@@ -388,14 +384,14 @@ fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect) {
             format!("{}/{}", agent.repo, agent.branch_name)
         };
 
-        // Add server status indicator if tunnel port is assigned
-        let server_info = if let Some(port) = agent.tunnel_port {
+        // Add server status indicator if HTTP forwarding port is assigned
+        let server_info = if let Some(p) = agent.port {
             let server_icon = if agent.server_running {
                 ">" // Server running
             } else {
                 "o" // Server not running
             };
-            format!(" {}:{}", server_icon, port)
+            format!(" {}:{}", server_icon, p)
         } else {
             String::new()
         };
@@ -417,13 +413,6 @@ fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect) {
         "o"
     };
 
-    // Add tunnel status indicator
-    let tunnel_indicator = match ctx.tunnel_status {
-        TunnelStatus::Connected => "*",    // Filled circle = connected
-        TunnelStatus::Connecting => "~",   // Half circle = connecting
-        TunnelStatus::Disconnected => "o", // Empty circle = disconnected
-    };
-
     // Add VPN status indicator (if VPN manager is available)
     let vpn_indicator = match ctx.vpn_status {
         Some(VpnStatus::Connected) => "*",    // Filled = connected
@@ -434,11 +423,10 @@ fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect) {
     };
 
     let agent_title = format!(
-        " Agents ({}) {} {}s T:{} V:{} ",
+        " Agents ({}) {} {}s V:{} ",
         ctx.agents.len(),
         poll_status,
         ctx.poll_interval - ctx.seconds_since_poll.min(ctx.poll_interval),
-        tunnel_indicator,
         vpn_indicator
     );
 
@@ -910,7 +898,7 @@ mod tests {
                 repo: "test/repo".to_string(),
                 issue_number: Some(1),
                 branch_name: "botster-issue-1".to_string(),
-                tunnel_port: None,
+                port: None,
                 server_running: false,
                 has_server_pty: false,
             },
@@ -919,7 +907,7 @@ mod tests {
                 repo: "test/repo".to_string(),
                 issue_number: Some(2),
                 branch_name: "botster-issue-2".to_string(),
-                tunnel_port: Some(3000),
+                port: Some(3000),
                 server_running: true,
                 has_server_pty: true,
             },
@@ -945,7 +933,6 @@ mod tests {
             is_scrolled: false,
             seconds_since_poll: 0,
             poll_interval: 10,
-            tunnel_status: TunnelStatus::Connected,
             vpn_status: None,
         };
 
@@ -962,7 +949,7 @@ mod tests {
             repo: "test/repo".to_string(),
             issue_number: Some(1),
             branch_name: "botster-issue-1".to_string(),
-            tunnel_port: None,
+            port: None,
             server_running: false,
             has_server_pty: true,
         }];
@@ -987,7 +974,6 @@ mod tests {
             is_scrolled: false,
             seconds_since_poll: 5,
             poll_interval: 10,
-            tunnel_status: TunnelStatus::Disconnected,
             vpn_status: None,
         };
 

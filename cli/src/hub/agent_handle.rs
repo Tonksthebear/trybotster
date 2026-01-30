@@ -191,6 +191,7 @@ impl AgentHandle {
 /// - `write_input()` to send input to the PTY
 /// - `resize()` to notify PTY of client resize
 /// - `connect()` / `disconnect()` for client lifecycle
+/// - `port()` to get the HTTP forwarding port (if assigned)
 ///
 /// # Example
 ///
@@ -211,6 +212,11 @@ impl AgentHandle {
 ///         // ...
 ///     }
 /// }
+///
+/// // Get the HTTP forwarding port (for server PTY)
+/// if let Some(port) = pty.port() {
+///     println!("Dev server on port {}", port);
+/// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct PtyHandle {
@@ -223,18 +229,32 @@ pub struct PtyHandle {
     ///
     /// Sends input, resize, connect/disconnect commands to PtySession.
     command_tx: mpsc::Sender<PtyCommand>,
+
+    /// HTTP forwarding port for preview proxying.
+    ///
+    /// Primarily used by server PTYs (pty_index=1) to expose the dev server
+    /// port for HTTP preview. `None` for CLI PTYs or if no port assigned.
+    port: Option<u16>,
 }
 
 impl PtyHandle {
     /// Create a new PTY handle.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_tx` - Broadcast sender for receiving PTY events
+    /// * `command_tx` - Command channel for sending PTY operations
+    /// * `port` - HTTP forwarding port (for server PTYs), or `None`
     #[must_use]
     pub fn new(
         event_tx: broadcast::Sender<PtyEvent>,
         command_tx: mpsc::Sender<PtyCommand>,
+        port: Option<u16>,
     ) -> Self {
         Self {
             event_tx,
             command_tx,
+            port,
         }
     }
 
@@ -390,6 +410,25 @@ impl PtyHandle {
     pub fn subscriber_count(&self) -> usize {
         self.event_tx.receiver_count()
     }
+
+    /// Get the HTTP forwarding port for this PTY.
+    ///
+    /// Returns the port allocated for HTTP preview proxying, or `None` if
+    /// no port has been assigned. This is primarily used for server PTYs
+    /// (pty_index=1) running dev servers.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let server_pty = agent_handle.get_pty(1).unwrap();
+    /// if let Some(port) = server_pty.port() {
+    ///     // Proxy HTTP requests to localhost:port
+    /// }
+    /// ```
+    #[must_use]
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
 }
 
 #[cfg(test)]
@@ -404,7 +443,7 @@ mod tests {
             branch_name: Some("botster-issue-42".to_string()),
             name: None,
             status: Some("Running".to_string()),
-            tunnel_port: None,
+            port: None,
             server_running: None,
             has_server_pty: None,
             active_pty_view: None,
@@ -413,11 +452,16 @@ mod tests {
         }
     }
 
-    /// Helper to create a PTY handle for testing.
+    /// Helper to create a PTY handle for testing (no port).
     fn create_test_pty() -> PtyHandle {
+        create_test_pty_with_port(None)
+    }
+
+    /// Helper to create a PTY handle for testing with a specific port.
+    fn create_test_pty_with_port(port: Option<u16>) -> PtyHandle {
         let (event_tx, _) = broadcast::channel(16);
         let (cmd_tx, _) = mpsc::channel(16);
-        PtyHandle::new(event_tx, cmd_tx)
+        PtyHandle::new(event_tx, cmd_tx, port)
     }
 
     #[test]
@@ -493,7 +537,7 @@ mod tests {
     fn test_pty_handle_subscribe() {
         let (event_tx, _) = broadcast::channel(16);
         let (cmd_tx, _) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx.clone(), cmd_tx);
+        let handle = PtyHandle::new(event_tx.clone(), cmd_tx, None);
 
         // Subscribe creates a new receiver
         let _rx = handle.subscribe();
@@ -508,7 +552,7 @@ mod tests {
     async fn test_pty_handle_receives_events() {
         let (event_tx, _) = broadcast::channel(16);
         let (cmd_tx, _) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx.clone(), cmd_tx);
+        let handle = PtyHandle::new(event_tx.clone(), cmd_tx, None);
         let mut rx = handle.subscribe();
 
         // Send an event
@@ -526,7 +570,7 @@ mod tests {
     async fn test_pty_handle_write_input() {
         let (event_tx, _) = broadcast::channel(16);
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx, cmd_tx);
+        let handle = PtyHandle::new(event_tx, cmd_tx, None);
 
         // Write input
         handle.write_input(b"hello").await.unwrap();
@@ -543,7 +587,7 @@ mod tests {
     async fn test_pty_handle_resize() {
         let (event_tx, _) = broadcast::channel(16);
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx, cmd_tx);
+        let handle = PtyHandle::new(event_tx, cmd_tx, None);
 
         // Resize
         handle.resize(ClientId::Tui, 24, 80).await.unwrap();
@@ -568,7 +612,7 @@ mod tests {
     async fn test_pty_handle_connect_disconnect() {
         let (event_tx, _) = broadcast::channel(16);
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx, cmd_tx);
+        let handle = PtyHandle::new(event_tx, cmd_tx, None);
 
         // Spawn a task to handle the connect command and send response
         let connect_handle = tokio::spawn(async move {
@@ -600,7 +644,7 @@ mod tests {
     async fn test_pty_handle_disconnect() {
         let (event_tx, _) = broadcast::channel(16);
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx, cmd_tx);
+        let handle = PtyHandle::new(event_tx, cmd_tx, None);
 
         // Disconnect
         handle.disconnect(ClientId::Tui).await.unwrap();
@@ -611,5 +655,16 @@ mod tests {
             }
             _ => panic!("Expected Disconnect command"),
         }
+    }
+
+    #[test]
+    fn test_pty_handle_port() {
+        // Without port
+        let handle = create_test_pty();
+        assert!(handle.port().is_none());
+
+        // With port
+        let handle_with_port = create_test_pty_with_port(Some(8080));
+        assert_eq!(handle_with_port.port(), Some(8080));
     }
 }
