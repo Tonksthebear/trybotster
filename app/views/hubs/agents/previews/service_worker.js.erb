@@ -22,6 +22,12 @@ let requestIdCounter = 0;
 self.addEventListener('message', (event) => {
   const { type, requestId, response, error } = event.data;
 
+  // Handle skip waiting request from bootstrap
+  if (type === 'SKIP_WAITING') {
+    self.skipWaiting();
+    return;
+  }
+
   if (type === 'http_response') {
     const pending = pendingRequests.get(requestId);
     if (pending) {
@@ -57,16 +63,27 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Pass through Rails assets and other non-preview paths
-  // Anything not starting with scopePath/ is not ours to proxy
-  if (!url.pathname.startsWith(scopePath + '/')) {
+  // Check if this is a preview-scoped request OR an asset request from the preview iframe
+  let relativePath;
+
+  if (url.pathname.startsWith(scopePath + '/')) {
+    // Preview-scoped request: /hubs/123/agents/0/1/preview/api/users -> /api/users
+    relativePath = url.pathname.slice(scopePath.length) || '/';
+  } else if (url.pathname.startsWith('/assets/')) {
+    // Asset request - only proxy if from proxied iframe content, NOT from shell page
+    const referrer = event.request.referrer;
+    // Shell page assets should NOT be proxied (they're from trybotster.com)
+    // Only proxy assets when referrer is proxied content (not /shell)
+    if (referrer && referrer.includes(scopePath) && !referrer.endsWith('/shell')) {
+      relativePath = url.pathname;
+    } else {
+      // Shell page assets or no referrer - don't proxy
+      return;
+    }
+  } else {
+    // Not ours to proxy
     return;
   }
-
-  // Extract the path relative to the preview scope
-  // e.g., /hubs/123/agents/0/1/preview/api/users -> /api/users
-  // e.g., /hubs/123/agents/0/1/preview/ -> /
-  const relativePath = url.pathname.slice(scopePath.length) || '/';
 
   event.respondWith(proxyRequest(event.request, relativePath, url.search));
 });
@@ -141,7 +158,24 @@ async function proxyRequest(request, path, queryString) {
         for (let i = 0; i < binaryString.length; i++) {
           bytes[i] = binaryString.charCodeAt(i);
         }
-        responseBody = bytes;
+
+        // Decompress gzip if needed (browser won't auto-decompress programmatic Response)
+        const contentEncoding = (response.headers || {})['content-encoding'] || '';
+        if (contentEncoding.includes('gzip')) {
+          try {
+            const ds = new DecompressionStream('gzip');
+            const decompressed = new Response(bytes).body.pipeThrough(ds);
+            responseBody = await new Response(decompressed).arrayBuffer();
+            responseBody = new Uint8Array(responseBody);
+            // Remove content-encoding since we decompressed
+            delete response.headers['content-encoding'];
+          } catch (decompressErr) {
+            console.warn('[SW] Decompression failed, using raw bytes:', decompressErr);
+            responseBody = bytes;
+          }
+        } else {
+          responseBody = bytes;
+        }
       } catch (e) {
         // Plain text fallback
         responseBody = response.body;
