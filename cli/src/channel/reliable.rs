@@ -62,6 +62,11 @@ const ACK_HEARTBEAT_INTERVAL_MS: u64 = 5000;
 /// TTL for buffered out-of-order messages in milliseconds (30 seconds).
 const BUFFER_TTL_MS: u64 = 30000;
 
+/// Window size for duplicate detection.
+/// Keeps received seqs from (next_expected - WINDOW) to (next_expected + WINDOW).
+/// Older sequences are pruned to prevent unbounded growth.
+const DUPLICATE_WINDOW: u64 = 1000;
+
 /// A reliable message wrapper.
 ///
 /// All messages are wrapped in this enum before transmission.
@@ -222,18 +227,48 @@ impl ReliableSender {
 
     /// Process an ACK, removing acknowledged messages from pending.
     ///
-    /// Returns the number of messages acknowledged.
-    pub fn process_ack(&mut self, ranges: &[(u64, u64)]) -> usize {
+    /// Returns a tuple of:
+    /// - Number of messages acknowledged
+    /// - Messages that should be immediately retransmitted (inferred lost from gaps)
+    ///
+    /// When ACK indicates receiver has seq N but we have unacked seq < N pending,
+    /// that lower seq is likely lost and should be retransmitted immediately
+    /// instead of waiting for timeout.
+    pub fn process_ack(&mut self, ranges: &[(u64, u64)]) -> (usize, Vec<ReliableMessage>) {
         let acked = ReliableMessage::ranges_to_set(ranges);
         let mut count = 0;
 
-        for seq in acked {
-            if self.pending.remove(&seq).is_some() {
+        // Find highest acked sequence
+        let max_acked = acked.iter().copied().max().unwrap_or(0);
+
+        for seq in &acked {
+            if self.pending.remove(seq).is_some() {
                 count += 1;
             }
         }
 
-        count
+        // Find pending messages with seq < max_acked that weren't acked (gaps)
+        // These are inferred lost and should be retransmitted immediately.
+        // When peer explicitly tells us via SACK they have higher seqs but not this one,
+        // we should retransmit right away - the peer is waiting for this message.
+        let mut immediate_retransmits = Vec::new();
+        let now = Instant::now();
+
+        for (seq, pending) in self.pending.iter_mut() {
+            if *seq < max_acked {
+                // This message wasn't acked but receiver has higher seqs - it's lost
+                pending.last_sent_at = now;
+                pending.attempts += 1;
+                immediate_retransmits.push(ReliableMessage::data(*seq, pending.payload.clone()));
+                log::info!(
+                    "[Reliable] Immediate retransmit seq={} (gap detected, receiver has up to {})",
+                    seq,
+                    max_acked
+                );
+            }
+        }
+
+        (count, immediate_retransmits)
     }
 
     /// Get messages that need retransmission.
@@ -321,6 +356,9 @@ pub struct ReliableReceiver {
     buffer: BTreeMap<u64, BufferedMessage>,
     /// Last time we sent an ACK.
     last_ack_sent: Instant,
+    /// Flag indicating a gap was detected and immediate SACK should be sent.
+    /// Set when receiving out-of-order message, cleared when ACK is generated.
+    needs_immediate_ack: bool,
 }
 
 impl Default for ReliableReceiver {
@@ -337,6 +375,7 @@ impl ReliableReceiver {
             next_expected: 1,
             buffer: BTreeMap::new(),
             last_ack_sent: Instant::now(),
+            needs_immediate_ack: false,
         }
     }
 
@@ -389,6 +428,12 @@ impl ReliableReceiver {
                 self.next_expected += 1;
             }
 
+            // Prune received set periodically to prevent unbounded growth
+            // Do this after advancing next_expected, every ~100 messages
+            if self.next_expected % 100 == 0 {
+                self.prune_received_set();
+            }
+
             deliverable
         } else if seq > self.next_expected {
             // Out of order - buffer for later with timestamp for TTL
@@ -399,6 +444,8 @@ impl ReliableReceiver {
                     received_at: Instant::now(),
                 },
             );
+            // Gap detected - request immediate SACK so sender knows what's missing
+            self.needs_immediate_ack = true;
             Vec::new()
         } else {
             // seq < next_expected: old duplicate, ignore
@@ -428,6 +475,20 @@ impl ReliableReceiver {
         stale_seqs.len()
     }
 
+    /// Prune old entries from the received set to prevent unbounded growth.
+    ///
+    /// Keeps sequences >= (next_expected - DUPLICATE_WINDOW).
+    /// Returns the number of pruned entries.
+    fn prune_received_set(&mut self) -> usize {
+        let min_keep = self.next_expected.saturating_sub(DUPLICATE_WINDOW);
+        let before = self.received.len();
+
+        // BTreeSet makes this efficient - remove all seqs < min_keep
+        self.received = self.received.split_off(&min_keep);
+
+        before - self.received.len()
+    }
+
     /// Get the timestamp when a buffer entry was received (for testing).
     #[cfg(test)]
     pub fn get_buffer_entry_time(&self, seq: u64) -> Option<Instant> {
@@ -443,9 +504,16 @@ impl ReliableReceiver {
     }
 
     /// Generate an ACK message for currently received sequences.
+    /// Clears the `needs_immediate_ack` flag.
     pub fn generate_ack(&mut self) -> ReliableMessage {
         self.last_ack_sent = Instant::now();
+        self.needs_immediate_ack = false;
         ReliableMessage::ack_from_set(&self.received)
+    }
+
+    /// Check if an immediate ACK should be sent (gap detected).
+    pub fn needs_immediate_ack(&self) -> bool {
+        self.needs_immediate_ack
     }
 
     /// Check if we should send an ACK heartbeat.
@@ -470,6 +538,7 @@ impl ReliableReceiver {
         self.received.clear();
         self.next_expected = 1;
         self.buffer.clear();
+        self.needs_immediate_ack = false;
         // Don't reset last_ack_sent - keep ACK timing consistent
     }
 }
@@ -589,18 +658,21 @@ mod tests {
         assert_eq!(sender.pending_count(), 5);
 
         // ACK 1-3
-        let acked = sender.process_ack(&[(1, 3)]);
+        let (acked, retransmits) = sender.process_ack(&[(1, 3)]);
         assert_eq!(acked, 3);
+        assert!(retransmits.is_empty()); // No gaps
         assert_eq!(sender.pending_count(), 2);
 
         // ACK 5 only (gap at 4)
-        let acked = sender.process_ack(&[(5, 5)]);
+        let (acked, retransmits) = sender.process_ack(&[(5, 5)]);
         assert_eq!(acked, 1);
+        assert_eq!(retransmits.len(), 1); // seq=4 should be retransmitted
         assert_eq!(sender.pending_count(), 1);
 
         // ACK 4
-        let acked = sender.process_ack(&[(4, 4)]);
+        let (acked, retransmits) = sender.process_ack(&[(4, 4)]);
         assert_eq!(acked, 1);
+        assert!(retransmits.is_empty());
         assert_eq!(sender.pending_count(), 0);
     }
 
@@ -763,7 +835,7 @@ mod tests {
         // B sends ACK back to A
         let ack = session_b.receiver.generate_ack();
         if let ReliableMessage::Ack { ranges } = ack {
-            let acked = session_a.sender.process_ack(&ranges);
+            let (acked, _retransmits) = session_a.sender.process_ack(&ranges);
             assert_eq!(acked, 1);
             assert_eq!(session_a.sender.pending_count(), 0);
         } else {
@@ -798,7 +870,7 @@ mod tests {
         // Single ACK clears all pending
         let ack = receiver.generate_ack();
         if let ReliableMessage::Ack { ranges } = ack {
-            let acked = sender.process_ack(&ranges);
+            let (acked, _retransmits) = sender.process_ack(&ranges);
             assert_eq!(acked, 100);
             assert_eq!(sender.pending_count(), 0);
         }
@@ -843,13 +915,16 @@ mod tests {
         assert_eq!(sender.pending_count(), 10);
 
         // ACK only odd sequences (1, 3, 5, 7, 9)
-        let acked = sender.process_ack(&[(1, 1), (3, 3), (5, 5), (7, 7), (9, 9)]);
+        let (acked, retransmits) = sender.process_ack(&[(1, 1), (3, 3), (5, 5), (7, 7), (9, 9)]);
         assert_eq!(acked, 5);
+        // Even sequences (2, 4, 6, 8) are gaps and should be retransmitted
+        assert_eq!(retransmits.len(), 4);
         assert_eq!(sender.pending_count(), 5);
 
         // ACK the rest (2, 4, 6, 8, 10)
-        let acked = sender.process_ack(&[(2, 2), (4, 4), (6, 6), (8, 8), (10, 10)]);
+        let (acked, retransmits) = sender.process_ack(&[(2, 2), (4, 4), (6, 6), (8, 8), (10, 10)]);
         assert_eq!(acked, 5);
+        assert!(retransmits.is_empty());
         assert_eq!(sender.pending_count(), 0);
     }
 
@@ -903,9 +978,9 @@ mod tests {
         sender.prepare_send(b"test".to_vec());
 
         // ACK same seq multiple times
-        let acked1 = sender.process_ack(&[(1, 1)]);
-        let acked2 = sender.process_ack(&[(1, 1)]);
-        let acked3 = sender.process_ack(&[(1, 1)]);
+        let (acked1, _) = sender.process_ack(&[(1, 1)]);
+        let (acked2, _) = sender.process_ack(&[(1, 1)]);
+        let (acked3, _) = sender.process_ack(&[(1, 1)]);
 
         // Only first ACK should count
         assert_eq!(acked1, 1);

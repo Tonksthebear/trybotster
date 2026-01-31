@@ -252,7 +252,11 @@ export class Channel {
       } else if (decrypted.type === "ack" && decrypted.ranges) {
         // ACK message - update sender's pending set
         if (this.sender) {
-          this.sender.processAck(decrypted.ranges);
+          const { immediateRetransmits } = this.sender.processAck(decrypted.ranges);
+          // Send immediate retransmits for detected gaps
+          for (const { encryptedEnvelope } of immediateRetransmits) {
+            this.sender.onRetransmit(encryptedEnvelope);
+          }
         }
       } else {
         // Non-reliable message (backwards compat or control messages)

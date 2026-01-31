@@ -970,14 +970,34 @@ impl ActionCableChannel {
             }
 
             // Decrypt via CryptoServiceHandle
-            log::debug!("Decrypting message from {}", sender);
+            log::info!(
+                "[INPUT-TRACE] Received encrypted message from {} (msg_type={}, reg_id={}, device_id={})",
+                &sender.0[..8.min(sender.0.len())],
+                envelope.message_type,
+                envelope.registration_id,
+                envelope.device_id
+            );
+            let decrypt_start = std::time::Instant::now();
             let plaintext = match cs.decrypt(&envelope).await {
                 Ok(p) => {
-                    log::debug!("Decrypted {} bytes from {}", p.len(), sender);
+                    log::info!(
+                        "[INPUT-TRACE] Decrypted {} bytes from {} in {:?}",
+                        p.len(),
+                        &sender.0[..8.min(sender.0.len())],
+                        decrypt_start.elapsed()
+                    );
                     p
                 }
                 Err(e) => {
-                    log::warn!("Decryption failed for {}: {}", sender, e);
+                    log::error!(
+                        "[INPUT-TRACE] DECRYPTION FAILED for {} after {:?}: {} (msg_type={}, reg_id={}, device_id={})",
+                        &sender.0[..8.min(sender.0.len())],
+                        decrypt_start.elapsed(),
+                        e,
+                        envelope.message_type,
+                        envelope.registration_id,
+                        envelope.device_id
+                    );
                     return Vec::new();
                 }
             };
@@ -1055,7 +1075,7 @@ impl ActionCableChannel {
         match reliable_msg {
             ReliableMessage::Data { seq, payload } => {
                 log::info!(
-                    "[Reliable] Received Data seq={} from {} (payload {} bytes)",
+                    "[INPUT-TRACE] Reliable Data seq={} from {} ({} bytes compressed)",
                     seq,
                     &sender.0[..8.min(sender.0.len())],
                     payload.len()
@@ -1083,12 +1103,22 @@ impl ActionCableChannel {
                         .or_insert_with(ReliableSession::new);
                     let next_expected_before = session.receiver.next_expected();
                     let (messages, reset_occurred) = session.receiver.receive(seq, decompressed);
-                    log::info!(
-                        "[Reliable] Receiver: next_expected {} -> {}, delivered {} messages",
-                        next_expected_before,
-                        session.receiver.next_expected(),
-                        messages.len()
-                    );
+                    let buffered = session.receiver.buffered_count();
+                    if messages.is_empty() {
+                        log::warn!(
+                            "[INPUT-TRACE] BUFFERED seq={} (waiting for seq={}, {} buffered)",
+                            seq,
+                            session.receiver.next_expected(),
+                            buffered
+                        );
+                    } else {
+                        log::info!(
+                            "[INPUT-TRACE] DELIVERED {} messages (next_expected: {} -> {})",
+                            messages.len(),
+                            next_expected_before,
+                            session.receiver.next_expected()
+                        );
+                    }
 
                     // Log peer reset but do NOT reset our sender.
                     // Resetting sender would cause Signal counter desync because our
@@ -1130,18 +1160,37 @@ impl ActionCableChannel {
             }
             ReliableMessage::Ack { ranges } => {
                 // Process ACK - remove acknowledged messages from pending
-                let mut sessions = reliable_sessions.write().await;
-                if let Some(session) = sessions.get_mut(&sender.0) {
-                    let acked = session.sender.process_ack(&ranges);
-                    if acked > 0 {
-                        log::debug!(
-                            "Received ACK for {} messages from {}, {} pending",
-                            acked,
-                            sender,
-                            session.sender.pending_count()
-                        );
+                // Also get immediate retransmits for any gaps detected
+                let immediate_retransmits = {
+                    let mut sessions = reliable_sessions.write().await;
+                    if let Some(session) = sessions.get_mut(&sender.0) {
+                        let (acked, retransmits) = session.sender.process_ack(&ranges);
+                        if acked > 0 {
+                            log::debug!(
+                                "Received ACK for {} messages from {}, {} pending",
+                                acked,
+                                sender,
+                                session.sender.pending_count()
+                            );
+                        }
+                        retransmits
+                    } else {
+                        Vec::new()
                     }
+                };
+
+                // Send immediate retransmits for gaps (outside lock)
+                for msg in immediate_retransmits {
+                    Self::send_reliable_message(
+                        sender,
+                        &msg,
+                        crypto_service,
+                        identifier_json,
+                        write,
+                    )
+                    .await;
                 }
+
                 Vec::new() // ACKs don't deliver data
             }
         }

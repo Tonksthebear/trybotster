@@ -33,9 +33,22 @@ export class TerminalConnection extends Connection {
     super(key, options, manager);
     this.agentIndex = options.agentIndex;
     this.ptyIndex = options.ptyIndex ?? 0;
+
+    // Input buffering until CLI signals ready.
+    // Prevents race condition where browser sends input before CLI subscribes,
+    // causing seq=1 to be lost and a 3-7 second delay waiting for retransmit.
+    this.cliReady = false;
+    this.inputBuffer = [];
   }
 
   // ========== Connection overrides ==========
+
+  async subscribe(options = {}) {
+    // Reset ready state on new subscription - need fresh handshake from CLI
+    this.cliReady = false;
+    this.inputBuffer = [];
+    return super.subscribe(options);
+  }
 
   channelName() {
     return "TerminalRelayChannel";
@@ -54,6 +67,11 @@ export class TerminalConnection extends Connection {
 
   handleMessage(message) {
     switch (message.type) {
+      case "input_ready":
+        // CLI is subscribed and ready to receive input - flush buffer
+        this.#handleCliReady();
+        break;
+
       case "raw_output":
         // Raw bytes from CLI - pass directly to xterm
         this.emit("output", message.data);
@@ -83,10 +101,18 @@ export class TerminalConnection extends Connection {
   // ========== Terminal Commands ==========
 
   sendInput(data) {
+    if (!this.cliReady) {
+      this.inputBuffer.push({ type: "input", data: { data } });
+      return Promise.resolve(true);
+    }
     return this.send("input", { data });
   }
 
   sendResize(cols, rows) {
+    if (!this.cliReady) {
+      this.inputBuffer.push({ type: "resize", data: { cols, rows } });
+      return Promise.resolve(true);
+    }
     return this.send("resize", { cols, rows });
   }
 
@@ -101,6 +127,21 @@ export class TerminalConnection extends Connection {
   }
 
   // ========== Private helpers ==========
+
+  #handleCliReady() {
+    if (this.cliReady) return; // Already ready, ignore duplicate
+
+    this.cliReady = true;
+    console.log(`[TerminalConnection] CLI ready, flushing ${this.inputBuffer.length} buffered messages`);
+
+    // Flush buffered input
+    for (const { type, data } of this.inputBuffer) {
+      this.send(type, data);
+    }
+    this.inputBuffer = [];
+
+    this.emit("cliReady");
+  }
 
   async #emitOutput(data, compressed) {
     if (!data) return;

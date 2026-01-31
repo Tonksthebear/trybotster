@@ -118,7 +118,7 @@ impl Hub {
                         .unwrap_or("unknown");
 
                     log::info!(
-                        "Terminal connected (command channel): browser={}, agent={:?}, pty={:?}",
+                        "[INPUT-TRACE] Hub received terminal_connected: browser={}, agent={:?}, pty={:?}",
                         &browser_identity[..browser_identity.len().min(8)],
                         agent_index,
                         pty_index
@@ -140,6 +140,11 @@ impl Hub {
 
                         // Broadcast to BrowserClient so it sets up TerminalRelayChannel.
                         let client_id = ClientId::Browser(browser_identity.to_string());
+                        log::info!(
+                            "[INPUT-TRACE] Broadcasting PtyConnectionRequested for agent={} pty={}",
+                            agent_index,
+                            pty_index
+                        );
                         self.broadcast(HubEvent::PtyConnectionRequested {
                             client_id,
                             agent_index,

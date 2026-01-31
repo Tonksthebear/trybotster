@@ -277,6 +277,7 @@ const BACKOFF_FACTOR = 1.5
 const MAX_RETRANSMIT_ATTEMPTS = 10
 const ACK_HEARTBEAT_INTERVAL_MS = 5000
 const BUFFER_TTL_MS = 30000
+const DUPLICATE_WINDOW = 1000
 
 /**
  * Reliable sender state.
@@ -345,17 +346,38 @@ class ReliableSender {
   processAck(ranges) {
     const acked = rangesToSet(ranges)
     let count = 0
+
+    // Find highest acked sequence
+    const maxAcked = Math.max(...acked, 0)
+
     for (const seq of acked) {
       if (this.pending.has(seq)) {
         this.pending.delete(seq)
         count++
       }
     }
+
+    // Find pending messages with seq < maxAcked that weren't acked (gaps)
+    // These are inferred lost and should be retransmitted immediately.
+    // When peer explicitly tells us via SACK they have higher seqs but not this one,
+    // we should retransmit right away - the peer is waiting for this message.
+    const immediateRetransmits = []
+    const now = Date.now()
+
+    for (const [seq, entry] of this.pending) {
+      if (seq < maxAcked) {
+        entry.lastSentAt = now
+        entry.attempts++
+        immediateRetransmits.push({ seq, encryptedEnvelope: entry.encryptedEnvelope })
+        console.log(`[Reliable] Immediate retransmit seq=${seq} (gap detected)`)
+      }
+    }
+
     if (this.pending.size === 0 && this.retransmitTimer) {
       clearTimeout(this.retransmitTimer)
       this.retransmitTimer = null
     }
-    return count
+    return { count, immediateRetransmits }
   }
 
   getRetransmits() {
@@ -439,6 +461,15 @@ class ReliableReceiver {
     }
   }
 
+  pruneReceivedSet() {
+    const minKeep = Math.max(1, this.nextExpected - DUPLICATE_WINDOW)
+    for (const seq of this.received) {
+      if (seq < minKeep) {
+        this.received.delete(seq)
+      }
+    }
+  }
+
   async receive(seq, payloadBytes) {
     if (seq === 1 && this.nextExpected > 1) {
       this.reset()
@@ -469,6 +500,11 @@ class ReliableReceiver {
         deliverable.push(entry.payload)
         this.buffer.delete(this.nextExpected)
         this.nextExpected++
+      }
+
+      // Prune received set periodically to prevent unbounded growth
+      if (this.nextExpected % 100 === 0) {
+        this.pruneReceivedSet()
       }
 
       for (const p of deliverable) {
@@ -1316,7 +1352,11 @@ async function processIncomingMessage(subscriptionId, hubId, data) {
       await receiver.receive(decrypted.seq, decrypted.payload);
     } else if (decrypted.type === "ack" && decrypted.ranges) {
       if (subInfo.sender) {
-        subInfo.sender.processAck(decrypted.ranges);
+        const { immediateRetransmits } = subInfo.sender.processAck(decrypted.ranges);
+        // Send immediate retransmits for detected gaps
+        for (const { encryptedEnvelope } of immediateRetransmits) {
+          subInfo.sender.onRetransmit(encryptedEnvelope);
+        }
       }
     } else {
       // Non-reliable message, deliver directly
