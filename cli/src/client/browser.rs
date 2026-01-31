@@ -1360,6 +1360,10 @@ impl Client for BrowserClient {
 ///
 /// Subscribes to PTY events and sends `Output` events through the channel.
 /// Exits when the PTY closes or channel disconnects.
+///
+/// Uses a UTF-8 streaming decoder to handle multi-byte characters that may be
+/// split across PTY read chunks. Without this, box-drawing characters and other
+/// multi-byte UTF-8 sequences could be corrupted into replacement characters.
 async fn spawn_pty_output_forwarder(
     mut pty_rx: broadcast::Receiver<PtyEvent>,
     sender: crate::channel::ChannelSenderHandle,
@@ -1374,11 +1378,38 @@ async fn spawn_pty_output_forwarder(
         pty_index
     );
 
+    // Buffer for incomplete UTF-8 sequences between chunks.
+    // UTF-8 sequences are at most 4 bytes, so we only need to buffer 0-3 bytes.
+    let mut utf8_buffer: Vec<u8> = Vec::with_capacity(4);
+
     loop {
         match pty_rx.recv().await {
             Ok(PtyEvent::Output(data)) => {
-                // Convert bytes to string (lossy for non-UTF8).
-                let output_str = String::from_utf8_lossy(&data);
+                // Prepend any leftover bytes from the previous chunk.
+                let combined = if utf8_buffer.is_empty() {
+                    data
+                } else {
+                    let mut combined = std::mem::take(&mut utf8_buffer);
+                    combined.extend(data);
+                    combined
+                };
+
+                // Find the last valid UTF-8 boundary.
+                // We split at the point where everything before is valid UTF-8.
+                let (valid_end, leftover_start) = find_utf8_boundary(&combined);
+
+                // Store any incomplete sequence for the next chunk.
+                if leftover_start < combined.len() {
+                    utf8_buffer.extend(&combined[leftover_start..]);
+                }
+
+                // Skip if there's nothing valid to send.
+                if valid_end == 0 {
+                    continue;
+                }
+
+                // Convert the valid portion to string (should never produce replacement chars).
+                let output_str = String::from_utf8_lossy(&combined[..valid_end]);
 
                 // Wrap in TerminalMessage for proper parsing on browser.
                 let message = TerminalMessage::Output {
@@ -1447,6 +1478,105 @@ async fn spawn_pty_output_forwarder(
         &agent_id[..8.min(agent_id.len())],
         pty_index
     );
+}
+
+/// Find the boundary where a byte slice can be split into valid UTF-8 and leftover bytes.
+///
+/// Returns `(valid_end, leftover_start)` where:
+/// - `data[..valid_end]` is guaranteed to be valid UTF-8
+/// - `data[leftover_start..]` contains incomplete multi-byte sequences to buffer
+///
+/// For fully valid UTF-8, returns `(len, len)`.
+/// For data ending in an incomplete sequence, `leftover_start < len`.
+fn find_utf8_boundary(data: &[u8]) -> (usize, usize) {
+    let len = data.len();
+    if len == 0 {
+        return (0, 0);
+    }
+
+    // Check if the entire slice is valid UTF-8
+    if std::str::from_utf8(data).is_ok() {
+        return (len, len);
+    }
+
+    // Look backwards from the end to find incomplete sequences.
+    // UTF-8 multi-byte sequences:
+    // - 2-byte: starts with 110xxxxx (0xC0-0xDF)
+    // - 3-byte: starts with 1110xxxx (0xE0-0xEF)
+    // - 4-byte: starts with 11110xxx (0xF0-0xF7)
+    // Continuation bytes: 10xxxxxx (0x80-0xBF)
+    //
+    // We scan backwards up to 3 bytes looking for a multi-byte start byte
+    // that doesn't have enough continuation bytes after it.
+    for i in 1..=3.min(len) {
+        let idx = len - i;
+        let byte = data[idx];
+
+        // Check if this is a multi-byte start byte
+        let expected_len = if byte & 0b1111_1000 == 0b1111_0000 {
+            4 // 4-byte sequence
+        } else if byte & 0b1111_0000 == 0b1110_0000 {
+            3 // 3-byte sequence
+        } else if byte & 0b1110_0000 == 0b1100_0000 {
+            2 // 2-byte sequence
+        } else if byte & 0b1000_0000 == 0 {
+            1 // ASCII, complete
+        } else {
+            continue; // Continuation byte, keep looking
+        };
+
+        let bytes_after = len - idx;
+        if bytes_after < expected_len {
+            // Incomplete sequence found - split here
+            // Verify the portion before is valid UTF-8
+            if std::str::from_utf8(&data[..idx]).is_ok() {
+                return (idx, idx);
+            }
+        }
+    }
+
+    // Fallback: find the last valid UTF-8 boundary by scanning forward
+    // This handles cases with invalid bytes in the middle
+    let mut valid_end = 0;
+    let mut pos = 0;
+    while pos < len {
+        let byte = data[pos];
+        let char_len = if byte & 0b1000_0000 == 0 {
+            1
+        } else if byte & 0b1110_0000 == 0b1100_0000 {
+            2
+        } else if byte & 0b1111_0000 == 0b1110_0000 {
+            3
+        } else if byte & 0b1111_1000 == 0b1111_0000 {
+            4
+        } else {
+            // Invalid start byte - stop here
+            break;
+        };
+
+        if pos + char_len > len {
+            // Incomplete sequence at end
+            break;
+        }
+
+        // Verify continuation bytes
+        let mut valid = true;
+        for j in 1..char_len {
+            if data[pos + j] & 0b1100_0000 != 0b1000_0000 {
+                valid = false;
+                break;
+            }
+        }
+
+        if valid {
+            pos += char_len;
+            valid_end = pos;
+        } else {
+            break;
+        }
+    }
+
+    (valid_end, valid_end)
 }
 
 /// Background task that receives input from browser and sends BrowserRequest to BrowserClient.
@@ -1630,6 +1760,95 @@ mod tests {
         // Mock hub_handle returns None.
         assert!(client.get_agent(0).is_none());
         assert!(client.get_agent(99).is_none());
+    }
+
+    // ========== UTF-8 Boundary Tests ==========
+
+    #[test]
+    fn test_utf8_boundary_empty() {
+        let (valid, leftover) = super::find_utf8_boundary(&[]);
+        assert_eq!(valid, 0);
+        assert_eq!(leftover, 0);
+    }
+
+    #[test]
+    fn test_utf8_boundary_ascii_only() {
+        let data = b"Hello, world!";
+        let (valid, leftover) = super::find_utf8_boundary(data);
+        assert_eq!(valid, data.len());
+        assert_eq!(leftover, data.len());
+    }
+
+    #[test]
+    fn test_utf8_boundary_complete_multibyte() {
+        // Box-drawing character ─ (E2 94 80)
+        let data = b"\xe2\x94\x80";
+        let (valid, leftover) = super::find_utf8_boundary(data);
+        assert_eq!(valid, 3);
+        assert_eq!(leftover, 3);
+    }
+
+    #[test]
+    fn test_utf8_boundary_incomplete_2byte() {
+        // Start of 2-byte sequence (C2) without continuation
+        let data = b"hello\xc2";
+        let (valid, leftover) = super::find_utf8_boundary(data);
+        assert_eq!(valid, 5, "Should stop before incomplete sequence");
+        assert_eq!(leftover, 5);
+    }
+
+    #[test]
+    fn test_utf8_boundary_incomplete_3byte_1of3() {
+        // Start of 3-byte sequence (E2) without continuations
+        let data = b"hello\xe2";
+        let (valid, leftover) = super::find_utf8_boundary(data);
+        assert_eq!(valid, 5, "Should stop before incomplete 3-byte sequence");
+        assert_eq!(leftover, 5);
+    }
+
+    #[test]
+    fn test_utf8_boundary_incomplete_3byte_2of3() {
+        // 2 bytes of a 3-byte sequence (E2 94) missing final byte
+        let data = b"hello\xe2\x94";
+        let (valid, leftover) = super::find_utf8_boundary(data);
+        assert_eq!(valid, 5, "Should stop before incomplete 3-byte sequence");
+        assert_eq!(leftover, 5);
+    }
+
+    #[test]
+    fn test_utf8_boundary_incomplete_4byte() {
+        // Start of 4-byte sequence (F0) without all continuations
+        let data = b"hello\xf0\x9f";
+        let (valid, leftover) = super::find_utf8_boundary(data);
+        assert_eq!(valid, 5, "Should stop before incomplete 4-byte sequence");
+        assert_eq!(leftover, 5);
+    }
+
+    #[test]
+    fn test_utf8_boundary_mixed_valid() {
+        // Mix of ASCII and complete multi-byte: "Hi─"
+        let data = b"Hi\xe2\x94\x80";
+        let (valid, leftover) = super::find_utf8_boundary(data);
+        assert_eq!(valid, 5);
+        assert_eq!(leftover, 5);
+    }
+
+    #[test]
+    fn test_utf8_boundary_mixed_with_incomplete() {
+        // "Hi─" followed by incomplete E2
+        let data = b"Hi\xe2\x94\x80\xe2";
+        let (valid, leftover) = super::find_utf8_boundary(data);
+        assert_eq!(valid, 5, "Should include complete chars, exclude incomplete");
+        assert_eq!(leftover, 5);
+    }
+
+    #[test]
+    fn test_utf8_boundary_emoji() {
+        // Complete emoji 😀 (F0 9F 98 80)
+        let data = b"\xf0\x9f\x98\x80";
+        let (valid, leftover) = super::find_utf8_boundary(data);
+        assert_eq!(valid, 4);
+        assert_eq!(leftover, 4);
     }
 
     // ========== Debug Format Tests ==========
