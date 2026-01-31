@@ -333,7 +333,8 @@ pub fn handle_delete_agent_for_client(
             // Sync handle cache for thread-safe agent access
             hub.sync_handle_cache();
 
-            hub.broadcast_agent_list();
+            // Broadcast AgentDeleted event to all subscribers (TUI, BrowserClients)
+            hub.broadcast(crate::hub::HubEvent::agent_deleted(&request.agent_id));
 
             // Refresh worktree cache - this agent's worktree is now available
             if let Err(e) = hub.load_available_worktrees() {

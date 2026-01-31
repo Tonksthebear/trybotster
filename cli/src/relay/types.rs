@@ -98,16 +98,17 @@ pub enum TerminalMessage {
         /// Whether data is compressed (always true for new messages).
         compressed: bool,
     },
-    /// Invite bundle for sharing hub connection.
+    /// Connection code for sharing hub access.
     ///
-    /// Contains a fresh PreKeyBundle that can be shared via URL fragment.
-    /// Server never sees this - stays in `#bundle=...` URL fragment.
-    #[serde(rename = "invite_bundle")]
-    InviteBundle {
-        /// Base64-encoded PreKeyBundle JSON.
-        bundle: String,
-        /// Shareable URL with bundle in fragment.
+    /// Contains the shareable URL (with PreKeyBundle in fragment) and a
+    /// QR code PNG for easy scanning. Server never sees the bundle -
+    /// it stays in the `#...` URL fragment.
+    #[serde(rename = "connection_code")]
+    ConnectionCode {
+        /// Shareable URL with PreKeyBundle in fragment.
         url: String,
+        /// Base64-encoded QR code PNG image.
+        qr_png: String,
     },
     /// HTTP response for preview proxy (CLI -> browser).
     ///
@@ -323,9 +324,9 @@ pub enum BrowserCommand {
         /// Number of rows.
         rows: u16,
     },
-    /// Request a fresh invite bundle for sharing hub connection.
-    #[serde(rename = "generate_invite")]
-    GenerateInvite,
+    /// Request connection code for sharing hub access.
+    #[serde(rename = "get_connection_code")]
+    GetConnectionCode,
 }
 
 /// Browser resize event.

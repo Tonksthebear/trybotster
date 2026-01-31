@@ -95,8 +95,8 @@ pub struct RenderContext<'a> {
     pub qr_image_displayed: bool,
     /// Agent creation progress (identifier, stage).
     pub creating_agent: Option<(&'a str, CreationStage)>,
-    /// Current connection URL for QR code display.
-    pub connection_url: Option<&'a str>,
+    /// Connection code data (URL + QR PNG) for display.
+    pub connection_code: Option<&'a super::qr::ConnectionCodeData>,
     /// Whether the connection bundle has been used.
     pub bundle_used: bool,
 
@@ -348,7 +348,7 @@ fn render_frame(
             None
         }
         AppMode::ConnectionCode => {
-            render_connection_code_modal(f, ctx.connection_url, ctx.bundle_used)
+            render_connection_code_modal(f, ctx.connection_code, ctx.bundle_used)
         }
         AppMode::Error => {
             render_error_modal(f, ctx.error_message);
@@ -677,13 +677,17 @@ fn render_close_confirm_modal(f: &mut Frame) {
 
 fn render_connection_code_modal(
     f: &mut Frame,
-    connection_url: Option<&str>,
+    connection_code: Option<&super::qr::ConnectionCodeData>,
     bundle_used: bool,
 ) -> Option<QrImageState> {
-    use super::qr::{generate_qr_code_lines, generate_qr_kitty_image, QrRenderResult};
+    use super::qr::{build_kitty_escape_from_png, generate_qr_code_lines};
 
     let terminal = f.area();
-    let secure_url = connection_url.unwrap_or("Error: No connection URL generated");
+
+    // Get URL from connection code, or show error
+    let secure_url = connection_code
+        .map(|c| c.url.as_str())
+        .unwrap_or("Error: No connection URL generated");
 
     // Footer varies based on whether the bundle has been used
     let footer = if bundle_used {
@@ -697,13 +701,11 @@ fn render_connection_code_modal(
     let max_qr_cols = terminal.width.saturating_sub(4);
     let max_qr_rows = terminal.height.saturating_sub(8);
 
-    // Try Kitty graphics first (module_size=4 gives good balance of size/quality)
-    if let Some(QrRenderResult::KittyImage {
-        escape_sequence,
-        width_cells,
-        height_cells,
-    }) = generate_qr_kitty_image(secure_url, 4, max_qr_cols, max_qr_rows)
-    {
+    // Try Kitty graphics first using the pre-generated PNG from ConnectionCodeData
+    if let Some(code_data) = connection_code {
+        if let Some((escape_sequence, width_cells, height_cells)) =
+            build_kitty_escape_from_png(&code_data.qr_png, max_qr_cols, max_qr_rows)
+        {
         // Kitty image mode: render a compact modal sized to QR + text
         let header = if bundle_used {
             "Link used - [r] to pair new device"
@@ -765,11 +767,12 @@ fn render_connection_code_modal(
         let img_x = x + (modal_width.saturating_sub(width_cells)) / 2;
         let img_y = y + 3; // After border + header + blank line
 
-        return Some(QrImageState {
-            kitty_escape: Some(escape_sequence),
-            row: img_y,
-            col: img_x,
-        });
+            return Some(QrImageState {
+                kitty_escape: Some(escape_sequence),
+                row: img_y,
+                col: img_x,
+            });
+        }
     }
 
     // Fallback: text-based QR using Unicode half-blocks
@@ -922,7 +925,7 @@ mod tests {
             error_message: None,
             qr_image_displayed: false,
             creating_agent: None,
-            connection_url: None,
+            connection_code: None,
             bundle_used: false,
             agent_ids: &[],
             agents: &agents,
@@ -963,7 +966,7 @@ mod tests {
             error_message: None,
             qr_image_displayed: false,
             creating_agent: None,
-            connection_url: None,
+            connection_code: None,
             bundle_used: false,
             agent_ids: &[],
             agents: &agents,

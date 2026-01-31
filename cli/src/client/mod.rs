@@ -293,6 +293,22 @@ pub trait Client: Send {
         self.hub_handle().get_connection_code()
     }
 
+    /// Get connection code with QR code PNG.
+    ///
+    /// Returns both the shareable URL and a QR code PNG image. The QR code
+    /// is generated on-demand from the cached URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Signal bundle is not initialized or QR
+    /// generation fails.
+    fn get_connection_code_with_qr(&self) -> Result<crate::tui::ConnectionCodeData, String> {
+        let url = self.get_connection_code()?;
+        // Module size 4 gives good balance of quality vs size (~400x400px typical)
+        let qr_png = crate::tui::generate_qr_png(&url, 4)?;
+        Ok(crate::tui::ConnectionCodeData { url, qr_png })
+    }
+
     // ============================================================
     // Default implementations - async (PTY operations)
     // ============================================================

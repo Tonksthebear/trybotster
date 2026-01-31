@@ -451,6 +451,14 @@ impl HubHandle {
         self.handle_cache.get_connection_url()
     }
 
+    /// Get connection code, generating if needed (async).
+    ///
+    /// Unlike `get_connection_code()` which only reads from cache, this sends
+    /// a command to Hub to generate the bundle if it doesn't exist.
+    pub async fn get_connection_code_or_generate(&self) -> Result<String, String> {
+        self.command_tx.get_connection_code().await
+    }
+
     /// Request connection code refresh (fire-and-forget).
     ///
     /// Sends a command to Hub to regenerate the Signal bundle. The new URL

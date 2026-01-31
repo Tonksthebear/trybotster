@@ -79,16 +79,16 @@ export default class extends Controller {
         }),
       );
 
-      // Handle reconnection (connection dropped then recovered)
+      // Handle connection ready (initial or reconnection)
+      // Don't request immediately after subscribe - wait for connected event
       this.unsubscribers.push(
         this.hub.on("connected", () => {
           this.hub.requestAgents();
         }),
       );
 
-      // Ensure subscribed and request initial agent list
+      // Subscribe - connected event will trigger requestAgents
       await this.hub.subscribe();
-      this.hub.requestAgents();
     });
   }
 
@@ -123,7 +123,7 @@ export default class extends Controller {
     }
   }
 
-  // Action: delete an agent
+  // Action: delete an agent - opens confirmation modal
   delete(event) {
     event.preventDefault();
     event.stopPropagation();
@@ -132,8 +132,14 @@ export default class extends Controller {
     const agent = this.agentsValue.find((a) => a.id === agentId);
     const name = agent?.name || agent?.id || "this agent";
 
-    if (confirm(`Delete ${name}?`)) {
-      this.hub?.deleteAgent(agentId, false);
+    // Set pending info on modal controller element and open dialog
+    const modal = document.getElementById("delete-agent-modal");
+    if (modal) {
+      const controller = modal.querySelector("[data-controller='delete-agent-modal']");
+      if (controller) controller.dataset.agentId = agentId;
+      const nameEl = modal.querySelector("[data-agent-name]");
+      if (nameEl) nameEl.textContent = name;
+      modal.showModal();
     }
   }
 

@@ -76,6 +76,7 @@ use crate::tui::layout::terminal_widget_inner_area;
 use super::actions::InputResult;
 use super::events::CreationStage;
 use super::input::{process_event, InputContext};
+use super::qr::ConnectionCodeData;
 
 /// Default scrollback lines for VT100 parser.
 pub(super) const DEFAULT_SCROLLBACK: usize = 1000;
@@ -127,8 +128,8 @@ pub struct TuiRunner<B: Backend> {
     /// Available worktrees for agent creation.
     pub(super) available_worktrees: Vec<(String, String)>,
 
-    /// Current connection URL for QR code display.
-    pub(super) connection_url: Option<String>,
+    /// Current connection code data (URL + QR PNG) for display.
+    pub(super) connection_code: Option<ConnectionCodeData>,
 
     /// Error message to display in Error mode.
     pub(super) error_message: Option<String>,
@@ -255,7 +256,7 @@ where
             input_buffer: String::new(),
             worktree_selected: 0,
             available_worktrees: Vec::new(),
-            connection_url: None,
+            connection_code: None,
             error_message: None,
             qr_image_displayed: false,
             creating_agent: None,
@@ -506,14 +507,18 @@ where
             (offset, offset > 0)
         };
 
-        // Fetch connection URL from TuiClient when in ConnectionCode mode.
+        // Fetch connection code data from TuiClient when in ConnectionCode mode.
         // This ensures we always have the latest Kyber prekey bundle URL
-        // (~2900 chars Base32) instead of using a stale local cache.
-        let fetched_connection_url = if self.mode == AppMode::ConnectionCode {
+        // (~2900 chars Base32) plus pre-generated QR PNG instead of using stale cache.
+        let fetched_connection_code = if self.mode == AppMode::ConnectionCode {
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-            if self.request_tx.send(TuiRequest::GetConnectionCode { response_tx }).is_ok() {
+            if self
+                .request_tx
+                .send(TuiRequest::GetConnectionCodeWithQr { response_tx })
+                .is_ok()
+            {
                 match response_rx.blocking_recv() {
-                    Ok(Ok(url)) => Some(url),
+                    Ok(Ok(code_data)) => Some(code_data),
                     Ok(Err(e)) => {
                         log::error!("Failed to fetch connection code: {}", e);
                         None
@@ -542,7 +547,7 @@ where
             error_message: self.error_message.as_deref(),
             qr_image_displayed: self.qr_image_displayed,
             creating_agent: creating_agent_ref,
-            connection_url: fetched_connection_url.as_deref(),
+            connection_code: fetched_connection_code.as_ref(),
             bundle_used: false, // TuiRunner doesn't track this - would need from Hub
 
             // Agent State
@@ -573,9 +578,9 @@ where
         Ok(())
     }
 
-    /// Set the connection URL (called from Hub).
-    pub fn set_connection_url(&mut self, url: Option<String>) {
-        self.connection_url = url;
+    /// Set the connection code data (called from Hub).
+    pub fn set_connection_code(&mut self, code_data: Option<ConnectionCodeData>) {
+        self.connection_code = code_data;
         self.qr_image_displayed = false;
     }
 
@@ -804,9 +809,9 @@ mod tests {
     struct TestClientConfig {
         /// Worktrees to return for `ListWorktrees` request.
         worktrees: Vec<(String, String)>,
-        /// Connection code URL to return for `GetConnectionCode` request.
+        /// Connection code data to return for `GetConnectionCodeWithQr` request.
         /// If `None`, returns an error indicating no bundle available.
-        connection_code: Option<String>,
+        connection_code: Option<ConnectionCodeData>,
     }
 
     /// Creates a `TuiRunner` with a mock TuiClient responder for controlled responses.
@@ -867,11 +872,13 @@ mod tests {
                                 log::debug!("Test mock: SelectAgent({}) returning None", index);
                                 let _ = response_tx.send(None);
                             }
-                            TuiRequest::GetConnectionCode { response_tx } => {
-                                // Return configured connection code or error
+                            TuiRequest::GetConnectionCodeWithQr { response_tx } => {
+                                // Return configured connection code data or error
                                 let result = match &config.connection_code {
-                                    Some(url) => Ok(url.clone()),
-                                    None => Err("Test mock: no connection bundle available".to_string()),
+                                    Some(code_data) => Ok(code_data.clone()),
+                                    None => {
+                                        Err("Test mock: no connection bundle available".to_string())
+                                    }
                                 };
                                 let _ = response_tx.send(result);
                             }
