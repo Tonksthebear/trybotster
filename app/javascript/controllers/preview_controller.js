@@ -82,16 +82,8 @@ export default class extends Controller {
       // Set up SW message listener
       this.#setupServiceWorkerListener();
 
-      // If hub is connected but not subscribed (reusing after navigation), subscribe
-      if (this.#connection.isHubConnected() && !this.#connection.isSubscribed()) {
-        await this.#connection.subscribe();
-      } else if (this.#connection.isConnected()) {
-        // Already connected from initialize()
-        this.#loadIframe();
-        this.#updateStatus("Connected", "success");
-      }
+      await this.#connection.subscribe();
     } catch (error) {
-      console.error("[Preview] Initialization failed:", error);
       this.#updateStatus("Connection failed", "error");
       this.#showError(error.message);
     }
@@ -162,7 +154,6 @@ export default class extends Controller {
         },
       });
     } catch (error) {
-      console.error("[Preview] Request failed:", error);
       this.#sendToServiceWorker({
         type: "http_response",
         requestId: data.requestId,
@@ -172,11 +163,7 @@ export default class extends Controller {
   }
 
   #sendToServiceWorker(message) {
-    if (navigator.serviceWorker.controller) {
-      navigator.serviceWorker.controller.postMessage(message);
-    } else {
-      console.warn("[Preview] No service worker controller available");
-    }
+    navigator.serviceWorker.controller?.postMessage(message);
   }
 
   // ========== Connection Event Handlers ==========
@@ -203,7 +190,6 @@ export default class extends Controller {
   }
 
   #handleError(error) {
-    console.error("[Preview] Connection error:", error);
     this.#showError(error.message);
   }
 
