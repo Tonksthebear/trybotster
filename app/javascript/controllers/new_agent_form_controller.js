@@ -33,37 +33,41 @@ export default class extends Controller {
 
     this.worktrees = [];
     this.pendingSelection = null;
+    this.unsubscribers = [];
 
     // Acquire connection to get worktree list and send commands
     ConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
     }).then(async (hub) => {
       this.hub = hub;
-      this.hub.on("worktreeList", (worktrees) => {
-        this.worktrees = worktrees;
-        this.#renderWorktreeList();
-      });
 
-      // If hub is connected but not subscribed (reusing after navigation), subscribe
-      if (this.hub.isHubConnected() && !this.hub.isSubscribed()) {
-        await this.hub.subscribe();
-      }
+      this.unsubscribers.push(
+        this.hub.on("worktreeList", (worktrees) => {
+          this.worktrees = worktrees;
+          this.#renderWorktreeList();
+        }),
+      );
 
-      // Request fresh worktree list
-      if (this.hub.isConnected()) {
-        this.hub.send("request_worktrees");
-      }
+      // Request worktrees on reconnection
+      this.unsubscribers.push(
+        this.hub.on("connected", () => {
+          this.hub.requestWorktrees();
+        }),
+      );
+
+      // Ensure subscribed and request initial worktree list
+      await this.hub.subscribe();
+      this.hub.requestWorktrees();
     });
-
-    // Reset form state when dialog opens
-    this.element.addEventListener("open", () => this.#resetForm());
   }
 
   disconnect() {
+    // Clean up event subscriptions
+    this.unsubscribers?.forEach((unsub) => unsub());
+    this.unsubscribers = null;
+
     const hub = this.hub;
     this.hub = null;
-    // Just release - don't unsubscribe. HubConnection is shared and
-    // the subscription can be reused by other controllers after navigation.
     hub?.release();
   }
 
@@ -134,7 +138,7 @@ export default class extends Controller {
 
   // Action: Refresh worktree list
   refresh() {
-    this.hub?.send("request_worktrees");
+    this.hub?.requestWorktrees();
   }
 
   #goToStep2(label) {
