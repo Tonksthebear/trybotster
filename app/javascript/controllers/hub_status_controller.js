@@ -48,10 +48,7 @@ export default class extends Controller {
         this.errorValue = message;
       });
 
-      // If hub is connected but not subscribed (reusing after navigation), subscribe
-      if (this.hub.isHubConnected() && !this.hub.isSubscribed()) {
-        await this.hub.subscribe();
-      }
+      await this.hub.subscribe();
     });
   }
 

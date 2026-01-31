@@ -79,17 +79,16 @@ export default class extends Controller {
         }),
       );
 
-      // Request agents when connected - onConnected fires immediately if already connected
+      // Handle reconnection (connection dropped then recovered)
       this.unsubscribers.push(
-        this.hub.onConnected(() => {
+        this.hub.on("connected", () => {
           this.hub.requestAgents();
         }),
       );
 
-      // If hub is connected but not subscribed (reusing after navigation), subscribe
-      if (this.hub.isHubConnected() && !this.hub.isSubscribed()) {
-        await this.hub.subscribe();
-      }
+      // Ensure subscribed and request initial agent list
+      await this.hub.subscribe();
+      this.hub.requestAgents();
     });
   }
 
