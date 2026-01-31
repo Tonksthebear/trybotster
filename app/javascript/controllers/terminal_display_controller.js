@@ -1,11 +1,14 @@
 import { Controller } from "@hotwired/stimulus";
 import * as xterm from "@xterm/xterm";
 import * as xtermFit from "@xterm/addon-fit";
+import * as xtermUnicode from "@xterm/addon-unicode11";
 import { ConnectionManager, TerminalConnection } from "connections";
 
 const Terminal = xterm.Terminal || xterm.default?.Terminal || xterm.default;
 const FitAddon =
   xtermFit.FitAddon || xtermFit.default?.FitAddon || xtermFit.default;
+const Unicode11Addon =
+  xtermUnicode.Unicode11Addon || xtermUnicode.default?.Unicode11Addon || xtermUnicode.default;
 
 /**
  * Terminal Display Controller
@@ -33,6 +36,7 @@ export default class extends Controller {
   #touchOverlay = null;
   #keyboardHandler = null;
   #boundHandleResize = null;
+  #resizeDebounceTimer = null;
   #momentumAnimationId = null;
   #isComposing = false;
   #sentDuringComposition = "";
@@ -41,8 +45,7 @@ export default class extends Controller {
   connect() {
     this.#boundHandleResize = this.#handleResize.bind(this);
     window.addEventListener("resize", this.#boundHandleResize);
-    this.#initTerminal();
-    this.#initConnections();
+    this.#initTerminal().then(() => this.#initConnections());
   }
 
   disconnect() {
@@ -55,6 +58,11 @@ export default class extends Controller {
     if (this.#momentumAnimationId) {
       cancelAnimationFrame(this.#momentumAnimationId);
       this.#momentumAnimationId = null;
+    }
+
+    if (this.#resizeDebounceTimer) {
+      clearTimeout(this.#resizeDebounceTimer);
+      this.#resizeDebounceTimer = null;
     }
 
     if (this.#keyboardHandler) {
@@ -123,9 +131,10 @@ export default class extends Controller {
       }),
     );
 
-    // Always force subscribe to get fresh CLI handshake/scrollback
+    // Subscribe to get CLI handshake/scrollback
     try {
       await this.#terminalConn.subscribe({ force: true });
+      // handleConnected will send dimensions
     } catch (e) {
       this.#handleError({ message: e.message });
     }
@@ -174,13 +183,14 @@ export default class extends Controller {
       : { cols: 80, rows: 24 };
   }
 
-  // Terminal initialization
-  #initTerminal() {
+  // Terminal initialization - returns promise that resolves when terminal is fit
+  async #initTerminal() {
     this.#terminal = new Terminal({
       cursorBlink: true,
-      fontFamily: "'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
+      fontFamily: "monospace",
       fontSize: 14,
       scrollback: 10000,
+      allowProposedApi: true,
       theme: {
         background: "#09090b",
         foreground: "#d4d4d4",
@@ -192,12 +202,23 @@ export default class extends Controller {
     this.#fitAddon = new FitAddon();
     this.#terminal.loadAddon(this.#fitAddon);
 
+    // Load unicode addon for box-drawing characters
+    const unicodeAddon = new Unicode11Addon();
+    this.#terminal.loadAddon(unicodeAddon);
+    this.#terminal.unicode.activeVersion = "11";
+
     const container = this.hasContainerTarget
       ? this.containerTarget
       : this.element;
     this.#terminal.open(container);
 
-    requestAnimationFrame(() => this.#fitAddon.fit());
+    // Wait for terminal to be rendered and fit before returning
+    await new Promise((resolve) => {
+      requestAnimationFrame(() => {
+        this.#fitAddon.fit();
+        resolve();
+      });
+    });
 
     this.#terminal.onData((data) => {
       // Cancel any momentum scrolling when user starts typing
@@ -381,14 +402,9 @@ export default class extends Controller {
   #handleConnected() {
     if (!this.#terminal) return;
 
-    this.#terminal.clear();
-
-    // Send initial dimensions so CLI knows browser size
-    // CLI will send scrollback as part of the subscription handshake
-    requestAnimationFrame(() => {
-      this.#fitAddon?.fit();
-      this.#sendResize();
-    });
+    console.log("[Terminal] handleConnected - cols:", this.#terminal.cols, "rows:", this.#terminal.rows);
+    // Send dimensions immediately - terminal is already fit from #initTerminal
+    this.#sendResize();
     this.focus();
   }
 
@@ -434,13 +450,23 @@ export default class extends Controller {
 
   async #sendResize() {
     if (this.#terminalConn && this.#terminal) {
+      console.log("[Terminal] Sending resize:", this.#terminal.cols, "x", this.#terminal.rows);
       await this.#terminalConn.sendResize(this.#terminal.cols, this.#terminal.rows);
     }
   }
 
   #handleResize() {
+    // Fit terminal immediately for visual feedback
     this.#fitAddon?.fit();
-    this.#sendResize();
+
+    // Debounce sending resize to CLI - wait until resizing stops
+    if (this.#resizeDebounceTimer) {
+      clearTimeout(this.#resizeDebounceTimer);
+    }
+    this.#resizeDebounceTimer = setTimeout(() => {
+      this.#resizeDebounceTimer = null;
+      this.#sendResize();
+    }, 150);
   }
 
   // Mobile Autocorrect/Autocomplete Support (iOS and Android)

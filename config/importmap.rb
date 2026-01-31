@@ -11,6 +11,7 @@ pin_all_from "app/javascript/channels", under: "channels"
 # Using esm.sh for proper ESM exports that work with importmaps
 pin "@xterm/xterm", to: "https://esm.sh/@xterm/xterm@5.5.0"
 pin "@xterm/addon-fit", to: "https://esm.sh/@xterm/addon-fit@0.10.0"
+pin "@xterm/addon-unicode11", to: "https://esm.sh/@xterm/addon-unicode11@0.8.0"
 
 # Signal Protocol WASM for E2E encryption
 pin "signal", to: "signal/index.js"
