@@ -1,6 +1,15 @@
 @import "tailwindcss";
 @import "./theme.css";
 
+/* JetBrains Mono Nerd Font for terminal - includes Nerd Font glyphs */
+@font-face {
+  font-family: 'JetBrainsMono NF';
+  src: url('JetBrainsMonoNerdFont-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 /* Force dark mode - always apply dark: variants regardless of system preference */
 @variant dark (&);
 @source "../../../app/components";

@@ -417,9 +417,10 @@ export class ReliableReceiver {
 
   /**
    * Deserialize payload bytes (array of numbers) to a JSON object.
-   * Handles the CLI's compression marker format:
-   * - 0x00: uncompressed (strip marker, parse as JSON)
-   * - 0x1f: gzip compressed (strip marker, decompress, parse as JSON)
+   * Handles the CLI's message format:
+   * - 0x00: uncompressed JSON (strip marker, parse as JSON)
+   * - 0x01: raw terminal data (strip marker, return as Uint8Array)
+   * - 0x1f: gzip compressed JSON (strip marker, decompress, parse as JSON)
    * - other: raw JSON (backwards compatibility)
    * Returns null if deserialization fails.
    */
@@ -437,14 +438,23 @@ export class ReliableReceiver {
 
       const marker = bytes[0];
 
-      // Check for CLI compression markers (must match compression.rs)
+      // CLI's compression layer adds 0x00/0x1f prefix, so raw terminal
+      // data (0x01 prefix) arrives as [0x00, 0x01, ...] - we handle both layers.
       if (marker === 0x00) {
-        // Uncompressed - strip marker byte, parse as JSON
-        const jsonBytes = bytes.slice(1);
-        const jsonString = new TextDecoder().decode(jsonBytes);
+        // Uncompressed - strip marker byte, then check inner content
+        const innerBytes = bytes.slice(1);
+        if (innerBytes.length > 0 && innerBytes[0] === 0x01) {
+          // Raw terminal data nested inside uncompressed wrapper
+          return { type: "raw_output", data: innerBytes.slice(1) };
+        }
+        // Regular JSON
+        const jsonString = new TextDecoder().decode(innerBytes);
         return JSON.parse(jsonString);
+      } else if (marker === 0x01) {
+        // Raw terminal data (direct, no compression wrapper)
+        return { type: "raw_output", data: bytes.slice(1) };
       } else if (marker === 0x1f) {
-        // Gzip compressed - strip marker, decompress
+        // Gzip compressed JSON - strip marker, decompress
         const compressedBytes = bytes.slice(1);
         return this.decompressAndParse(compressedBytes);
       } else {
