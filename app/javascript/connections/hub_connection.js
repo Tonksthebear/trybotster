@@ -16,7 +16,7 @@
  *   - worktreeList - Array of worktrees
  *   - agentCreated - New agent data
  *   - agentDeleted - { id }
- *   - inviteBundle - { url }
+ *   - connectionCode - { url, qr_png }
  *
  * Usage:
  *   const hub = await ConnectionManager.acquire(HubConnection, hubId, { hubId });
@@ -110,8 +110,8 @@ export class HubConnection extends Connection {
         this.emit("agentDeleted", message);
         break;
 
-      case "invite_bundle":
-        this.emit("inviteBundle", message);
+      case "connection_code":
+        this.emit("connectionCode", message);
         break;
 
       default:
@@ -165,10 +165,10 @@ export class HubConnection extends Connection {
   }
 
   /**
-   * Request an invite bundle for sharing hub access.
+   * Request connection code for sharing hub access.
    */
-  requestInviteBundle() {
-    return this.send("generate_invite");
+  requestConnectionCode() {
+    return this.send("get_connection_code");
   }
 
   /**

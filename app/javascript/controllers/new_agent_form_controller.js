@@ -48,16 +48,16 @@ export default class extends Controller {
         }),
       );
 
-      // Request worktrees on reconnection
+      // Handle connection ready (initial or reconnection)
+      // Don't request immediately after subscribe - wait for connected event
       this.unsubscribers.push(
         this.hub.on("connected", () => {
           this.hub.requestWorktrees();
         }),
       );
 
-      // Ensure subscribed and request initial worktree list
+      // Subscribe - connected event will trigger requestWorktrees
       await this.hub.subscribe();
-      this.hub.requestWorktrees();
     });
   }
 

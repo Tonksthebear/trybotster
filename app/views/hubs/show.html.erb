@@ -61,7 +61,23 @@
     <div class="max-w-3xl mx-auto px-4 py-6 lg:py-8">
       <%# Hub Info Card %>
       <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6 mb-6">
-        <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-4">Hub Information</h2>
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider">Hub Information</h2>
+          <%= render Elements::ButtonComponent.new(color: :neutral, variant: :ghost, size: :sm,
+                data: {
+                  controller: "requires-connection share-hub",
+                  requires_connection_key_value: Current.hub.id,
+                  share_hub_hub_id_value: Current.hub.id,
+                  action: "share-hub#open"
+                },
+                command: "show-modal",
+                commandfor: "share-hub-modal",
+                title: "Share Hub",
+                disabled: true) do %>
+            <%= icon "share", class: "size-3.5" %>
+            <span>Share</span>
+          <% end %>
+        </div>
         <dl class="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
             <dt class="text-xs text-zinc-500">Identifier</dt>

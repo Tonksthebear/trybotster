@@ -136,9 +136,9 @@ export default class extends Controller {
       return;
     }
 
-    // Handle invite bundle response
-    if (message.type === "invite_bundle") {
-      this.handleInviteBundle(message);
+    // Handle connection code response
+    if (message.type === "connection_code") {
+      this.handleConnectionCode(message);
       return;
     }
 

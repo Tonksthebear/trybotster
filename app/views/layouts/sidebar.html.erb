@@ -46,9 +46,11 @@
       <%= yield %>
     <% end %>
 
-    <%# New Agent Modal - available on all hub-scoped pages %>
+    <%# Modals - available on all hub-scoped pages %>
     <% if Current.hub %>
       <%= render "hubs/new_agent_modal" %>
+      <%= render "hubs/delete_agent_modal" %>
+      <%= render "hubs/share_modal" %>
     <% end %>
   </body>
 </html>

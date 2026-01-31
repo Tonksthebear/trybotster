@@ -139,10 +139,10 @@ pub enum TuiRequest {
         response_tx: tokio::sync::oneshot::Sender<Vec<(String, String)>>,
     },
 
-    /// Get the current connection code URL for QR display.
-    GetConnectionCode {
-        /// Channel to receive the connection URL or error message.
-        response_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
+    /// Get the current connection code with QR PNG for display.
+    GetConnectionCodeWithQr {
+        /// Channel to receive the connection data (URL + QR PNG) or error message.
+        response_tx: tokio::sync::oneshot::Sender<Result<crate::tui::ConnectionCodeData, String>>,
     },
 
     /// Create a new agent.
@@ -398,13 +398,22 @@ impl TuiClient {
                     log::error!("Failed to copy connection URL: {}", e);
                 }
             }
+            TuiRequest::GetConnectionCodeWithQr { response_tx } => {
+                // Use async path to ensure bundle is generated (like BrowserClient).
+                // The sync trait method only reads from cache, which may be stale.
+                let result = match self.hub_handle().get_connection_code_or_generate().await {
+                    Ok(url) => {
+                        crate::tui::generate_qr_png(&url, 4)
+                            .map(|qr_png| crate::tui::ConnectionCodeData { url, qr_png })
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = response_tx.send(result);
+            }
 
             // === Sync operations (HandleCache reads) ===
             TuiRequest::ListWorktrees { response_tx } => {
                 let _ = response_tx.send(self.list_worktrees());
-            }
-            TuiRequest::GetConnectionCode { response_tx } => {
-                let _ = response_tx.send(self.get_connection_code());
             }
         }
     }

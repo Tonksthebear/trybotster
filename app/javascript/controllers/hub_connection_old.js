@@ -357,9 +357,9 @@ export default class extends Controller {
     }
 
     // Handle invite bundle response
-    if (message.type === "invite_bundle") {
+    if (message.type === "connection_code") {
       console.debug("[HubConnection] Received invite bundle from CLI");
-      this.handleInviteBundle(message);
+      this.handleConnectionCode(message);
       return;
     }
 
@@ -452,7 +452,7 @@ export default class extends Controller {
 
   // ========== Share Hub ==========
 
-  async requestInviteBundle() {
+  async requestConnectionCode() {
     if (!this.connected || !this.session) {
       console.warn("[HubConnection] Cannot request invite - not connected");
       this.updateShareStatus("Not connected", "error");
@@ -461,13 +461,13 @@ export default class extends Controller {
 
     this.updateShareStatus("Generating...", "loading");
 
-    const success = await this.send("generate_invite");
+    const success = await this.send("get_connection_code");
     if (!success) {
       this.updateShareStatus("Failed to request", "error");
     }
   }
 
-  async handleInviteBundle(message) {
+  async handleConnectionCode(message) {
     const { url } = message;
 
     if (!url) {

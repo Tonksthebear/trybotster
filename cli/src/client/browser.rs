@@ -49,6 +49,7 @@
 
 use std::collections::HashMap;
 
+use base64::Engine;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -576,13 +577,12 @@ impl BrowserClient {
                 self.send_worktree_list_to_browser().await;
             }
 
-            BrowserCommand::GenerateInvite => {
-                // GenerateInvite is handled by the bootstrap relay connection,
-                // not by individual BrowserClients.
-                log::warn!(
-                    "BrowserClient {}: GenerateInvite received on hub channel -- should be handled by bootstrap relay",
+            BrowserCommand::GetConnectionCode => {
+                log::info!(
+                    "BrowserClient {}: GetConnectionCode",
                     &self.identity[..8.min(self.identity.len())]
                 );
+                self.handle_get_connection_code().await;
             }
 
             BrowserCommand::Handshake { device_name, .. } => {
@@ -873,6 +873,17 @@ impl BrowserClient {
         self.send_terminal_message(&message).await;
     }
 
+    /// Send agent deleted confirmation to the browser.
+    ///
+    /// Sends a [`TerminalMessage::AgentDeleted`] message so the browser
+    /// knows which specific agent was removed.
+    async fn send_agent_deleted(&self, agent_id: &str) {
+        let message = TerminalMessage::AgentDeleted {
+            id: agent_id.to_string(),
+        };
+        self.send_terminal_message(&message).await;
+    }
+
     /// Send an error message to the browser.
     ///
     /// Sends a [`TerminalMessage::Error`] message matching the format used
@@ -890,6 +901,59 @@ impl BrowserClient {
     /// before considering the connection fully established.
     async fn send_handshake_ack(&self) {
         let message = TerminalMessage::HandshakeAck;
+        self.send_terminal_message(&message).await;
+    }
+
+    /// Handle `GenerateInvite` command from browser.
+    /// Handle connection code request from browser.
+    ///
+    /// Gets the connection code (generating if needed) and QR PNG, then sends
+    /// to browser. Uses async command to ensure bundle is generated.
+    async fn handle_get_connection_code(&self) {
+        // Get connection code via async command (generates if needed).
+        let url = match self.hub_handle().get_connection_code_or_generate().await {
+            Ok(url) => url,
+            Err(e) => {
+                log::error!(
+                    "BrowserClient {}: failed to get connection code: {}",
+                    &self.identity[..8.min(self.identity.len())],
+                    e
+                );
+                self.send_error_to_browser(&format!("Failed to get connection code: {}", e))
+                    .await;
+                return;
+            }
+        };
+
+        // Generate QR code from URL.
+        let qr_png = match crate::tui::generate_qr_png(&url, 4) {
+            Ok(png) => png,
+            Err(e) => {
+                log::error!(
+                    "BrowserClient {}: failed to generate QR code: {}",
+                    &self.identity[..8.min(self.identity.len())],
+                    e
+                );
+                self.send_error_to_browser(&format!("Failed to generate QR code: {}", e))
+                    .await;
+                return;
+            }
+        };
+
+        let code_data = crate::tui::ConnectionCodeData { url, qr_png };
+
+        log::info!(
+            "BrowserClient {}: sending connection code ({} byte QR PNG)",
+            &self.identity[..8.min(self.identity.len())],
+            code_data.qr_png.len()
+        );
+
+        // Send ConnectionCode response with URL and base64-encoded QR PNG.
+        let qr_png_base64 = base64::engine::general_purpose::STANDARD.encode(&code_data.qr_png);
+        let message = TerminalMessage::ConnectionCode {
+            url: code_data.url,
+            qr_png: qr_png_base64,
+        };
         self.send_terminal_message(&message).await;
     }
 
@@ -971,6 +1035,7 @@ impl BrowserClient {
                 }
 
                 self.send_agent_list_to_browser().await;
+                self.send_agent_deleted(agent_id).await;
             }
             HubEvent::AgentStatusChanged { ref agent_id, .. } => {
                 log::info!(
