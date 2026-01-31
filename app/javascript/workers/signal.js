@@ -233,6 +233,7 @@ function rangesToSet(ranges) {
 
 // Compression markers (match CLI's compression.rs)
 const MARKER_UNCOMPRESSED = 0x00
+const MARKER_RAW_TERMINAL = 0x01
 const MARKER_GZIP = 0x1f
 
 /**
@@ -489,8 +490,15 @@ class ReliableReceiver {
       const marker = bytes[0]
 
       if (marker === MARKER_UNCOMPRESSED) {
-        const jsonBytes = bytes.slice(1)
-        return JSON.parse(new TextDecoder().decode(jsonBytes))
+        const innerBytes = bytes.slice(1)
+        // Check for nested raw terminal data (CLI sends 0x01 prefix, compression wraps as 0x00 + 0x01)
+        if (innerBytes.length > 0 && innerBytes[0] === MARKER_RAW_TERMINAL) {
+          return { type: "raw_output", data: innerBytes.slice(1) }
+        }
+        return JSON.parse(new TextDecoder().decode(innerBytes))
+      } else if (marker === MARKER_RAW_TERMINAL) {
+        // Direct raw terminal data (no compression wrapper)
+        return { type: "raw_output", data: bytes.slice(1) }
       } else if (marker === MARKER_GZIP) {
         const compressedBytes = bytes.slice(1)
         const stream = new Blob([compressedBytes]).stream().pipeThrough(new DecompressionStream("gzip"))

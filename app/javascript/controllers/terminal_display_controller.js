@@ -109,6 +109,7 @@ export default class extends Controller {
     // Subscribe to terminal events
     this.#unsubscribers.push(
       this.#terminalConn.onOutput((data) => {
+        console.log("[TerminalDisplay] onOutput received, type:", typeof data, "len:", data?.length);
         this.#handleMessage({ type: "output", data });
       }),
     );
@@ -187,7 +188,7 @@ export default class extends Controller {
   async #initTerminal() {
     this.#terminal = new Terminal({
       cursorBlink: true,
-      fontFamily: "monospace",
+      fontFamily: "'JetBrainsMono NF', monospace",
       fontSize: 14,
       scrollback: 10000,
       allowProposedApi: true,

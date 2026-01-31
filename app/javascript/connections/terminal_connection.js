@@ -9,7 +9,7 @@
  *   - disconnected - Channel closed
  *   - stateChange - { state, prevState, error }
  *   - error - { reason, message }
- *   - output - PTY output data (string)
+ *   - output - PTY output data (Uint8Array for raw, string for scrollback)
  *
  * Flow:
  *   1. Loads Signal session from IndexedDB (same session as HubConnection)
@@ -54,6 +54,11 @@ export class TerminalConnection extends Connection {
 
   handleMessage(message) {
     switch (message.type) {
+      case "raw_output":
+        // Raw bytes from CLI - pass directly to xterm
+        this.emit("output", message.data);
+        break;
+
       case "output":
       case "scrollback":
         this.#emitOutput(message.data, message.compressed);
