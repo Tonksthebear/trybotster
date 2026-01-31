@@ -43,6 +43,9 @@ const ACK_HEARTBEAT_INTERVAL_MS = 5000;
 // TTL for buffered out-of-order messages (30 seconds)
 const BUFFER_TTL_MS = 30000;
 
+// Window size for duplicate detection (prevents unbounded growth of received set)
+const DUPLICATE_WINDOW = 1000;
+
 /**
  * Convert a Set of sequence numbers to ranges for efficient encoding.
  * Example: Set{1, 2, 3, 5, 7, 8} -> [[1, 3], [5, 5], [7, 8]]
@@ -187,16 +190,46 @@ export class ReliableSender {
 
   /**
    * Process an ACK message, removing acknowledged sequences from pending.
-   * Returns the number of messages acknowledged.
+   * Returns object with:
+   * - count: number of messages acknowledged
+   * - immediateRetransmits: array of cached encrypted envelopes to retransmit
+   *
+   * When ACK indicates receiver has seq N but we have unacked seq < N pending,
+   * that lower seq is likely lost and should be retransmitted immediately.
    */
   processAck(ranges) {
     const acked = rangesToSet(ranges);
     let count = 0;
 
+    // Find highest acked sequence
+    const maxAcked = Math.max(...acked, 0);
+
     for (const seq of acked) {
       if (this.pending.has(seq)) {
         this.pending.delete(seq);
         count++;
+      }
+    }
+
+    // Find pending messages with seq < maxAcked that weren't acked (gaps)
+    // These are inferred lost and should be retransmitted immediately.
+    // When peer explicitly tells us via SACK they have higher seqs but not this one,
+    // we should retransmit right away - the peer is waiting for this message.
+    const immediateRetransmits = [];
+    const now = Date.now();
+
+    for (const [seq, entry] of this.pending) {
+      if (seq < maxAcked) {
+        // This message wasn't acked but receiver has higher seqs - it's lost
+        entry.lastSentAt = now;
+        entry.attempts++;
+        immediateRetransmits.push({
+          seq,
+          encryptedEnvelope: entry.encryptedEnvelope,
+        });
+        console.log(
+          `[Reliable] Immediate retransmit seq=${seq} (gap detected, receiver has up to ${maxAcked})`
+        );
       }
     }
 
@@ -206,7 +239,7 @@ export class ReliableSender {
       this.retransmitTimer = null;
     }
 
-    return count;
+    return { count, immediateRetransmits };
   }
 
   /**
@@ -335,6 +368,19 @@ export class ReliableReceiver {
   }
 
   /**
+   * Prune old entries from received set to prevent unbounded growth.
+   * Keeps sequences >= (nextExpected - DUPLICATE_WINDOW).
+   */
+  pruneReceivedSet() {
+    const minKeep = Math.max(1, this.nextExpected - DUPLICATE_WINDOW);
+    for (const seq of this.received) {
+      if (seq < minKeep) {
+        this.received.delete(seq);
+      }
+    }
+  }
+
+  /**
    * Process a received data message.
    * Returns array of payloads that can be delivered in order.
    *
@@ -397,6 +443,11 @@ export class ReliableReceiver {
         deliverable.push(entry.payload);
         this.buffer.delete(this.nextExpected);
         this.nextExpected++;
+      }
+
+      // Prune received set periodically to prevent unbounded growth
+      if (this.nextExpected % 100 === 0) {
+        this.pruneReceivedSet();
       }
 
       // Deliver all

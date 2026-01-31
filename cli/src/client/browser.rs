@@ -618,6 +618,12 @@ impl BrowserClient {
     ///
     /// Returns an error string if the channel fails to connect.
     async fn connect_hub_channel(&mut self) -> Result<(), String> {
+        log::info!(
+            "[INPUT-TRACE] Connecting HubChannel for browser {}...",
+            &self.identity[..8.min(self.identity.len())]
+        );
+        let connect_start = std::time::Instant::now();
+
         let mut channel = ActionCableChannel::builder()
             .server_url(&self.config.server_url)
             .api_key(&self.config.api_key)
@@ -647,8 +653,8 @@ impl BrowserClient {
         self.hub_channel = Some(channel);
 
         log::info!(
-            "BrowserClient {} connected hub channel (CLI side)",
-            &self.identity[..8.min(self.identity.len())]
+            "[INPUT-TRACE] HubChannel connected in {:?}",
+            connect_start.elapsed()
         );
 
         Ok(())
@@ -1071,11 +1077,11 @@ impl BrowserClient {
                 // Only handle if this is for us.
                 if client_id == &self.id {
                     log::info!(
-                        "BrowserClient {}: PtyConnectionRequested({}, {})",
-                        &self.identity[..8.min(self.identity.len())],
+                        "[INPUT-TRACE] PtyConnectionRequested received for agent={} pty={}",
                         agent_index,
                         pty_index
                     );
+                    let pty_connect_start = std::time::Instant::now();
                     if let Err(e) = self.connect_to_pty(agent_index, pty_index).await {
                         log::error!(
                             "Failed to connect to PTY ({}, {}): {}",
@@ -1084,6 +1090,11 @@ impl BrowserClient {
                             e
                         );
                         self.send_error_to_browser(&e).await;
+                    } else {
+                        log::info!(
+                            "[INPUT-TRACE] PTY connection complete in {:?}",
+                            pty_connect_start.elapsed()
+                        );
                     }
                 }
             }
@@ -1257,6 +1268,12 @@ impl Client for BrowserClient {
         // Each browser has dedicated streams (like TUI has dedicated I/O).
         // CLI subscribes to: terminal_relay:{hub}:{agent}:{pty}:{browser}:cli
         // Browser subscribes to: terminal_relay:{hub}:{agent}:{pty}:{browser}
+        log::info!(
+            "[INPUT-TRACE] Connecting TerminalRelayChannel for agent={} pty={}...",
+            agent_index,
+            pty_index
+        );
+        let connect_start = std::time::Instant::now();
         channel
             .connect(ChannelConfig {
                 channel_name: "TerminalRelayChannel".into(),
@@ -1271,6 +1288,10 @@ impl Client for BrowserClient {
             })
             .await
             .map_err(|e| format!("Failed to connect channel: {}", e))?;
+        log::info!(
+            "[INPUT-TRACE] TerminalRelayChannel connected in {:?}",
+            connect_start.elapsed()
+        );
 
         // Get sender and receiver handles BEFORE spawning tasks.
         let sender_handle = channel
@@ -1284,6 +1305,26 @@ impl Client for BrowserClient {
         // Without this, the peer set is empty until the browser's first message
         // arrives, causing scrollback (and early output) to be silently dropped.
         sender_handle.register_peer(PeerId(self.identity.clone()));
+
+        // Send input_ready signal to browser BEFORE spawning input receiver.
+        // This tells the browser that CLI is subscribed and ready to receive input.
+        // Without this, browser might send input before CLI subscribes, causing
+        // seq=1 to be lost and a 3-7 second delay waiting for retransmit.
+        {
+            let ready_msg = serde_json::json!({"type": "input_ready"});
+            let sender_clone = sender_handle.clone();
+            if let Ok(json) = serde_json::to_string(&ready_msg) {
+                tokio::spawn(async move {
+                    if let Err(e) = sender_clone.send(json.as_bytes()).await {
+                        log::warn!("Failed to send input_ready: {}", e);
+                    }
+                });
+            }
+            log::info!(
+                "[INPUT-TRACE] Sent input_ready to browser {}",
+                &self.identity[..8.min(self.identity.len())]
+            );
+        }
 
         // Connect to PTY and get scrollback BEFORE spawning forwarder.
         // This ensures the browser receives historical output first.
@@ -1537,12 +1578,18 @@ async fn spawn_pty_input_receiver(
     );
 
     let mut message_count = 0u64;
+    let task_start = std::time::Instant::now();
+    log::info!(
+        "[INPUT-TRACE] Input receiver task READY, waiting for messages (agent={}, pty={})",
+        agent_index,
+        pty_index
+    );
     while let Some(incoming) = receiver.recv().await {
         message_count += 1;
         log::info!(
-            "[PTY Input] Received message #{} from {} ({} bytes)",
+            "[INPUT-TRACE] Input receiver got message #{} at T+{:?} ({} bytes)",
             message_count,
-            &incoming.sender.0[..8.min(incoming.sender.0.len())],
+            task_start.elapsed(),
             incoming.payload.len()
         );
         // Parse the incoming payload as JSON.
@@ -1577,8 +1624,9 @@ async fn spawn_pty_input_receiver(
         match command {
             BrowserCommand::Input { data } => {
                 log::info!(
-                    "[PTY Input] Parsed Input command: {} bytes of data",
-                    data.len()
+                    "[INPUT-TRACE] Sending to PTY: {} bytes at T+{:?}",
+                    data.len(),
+                    task_start.elapsed()
                 );
                 // Send input request through channel to BrowserClient.
                 if request_tx
