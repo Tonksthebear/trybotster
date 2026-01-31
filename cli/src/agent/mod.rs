@@ -256,12 +256,28 @@ impl Agent {
     /// ```
     #[must_use]
     pub fn get_pty_handle(&self, pty_index: usize) -> Option<crate::hub::agent_handle::PtyHandle> {
-        let (event_tx, command_tx, port) = match pty_index {
-            0 => self.cli_pty.get_channels(),
-            1 => self.server_pty.as_ref()?.get_channels(),
-            _ => return None,
-        };
-        Some(crate::hub::agent_handle::PtyHandle::new(event_tx, command_tx, port))
+        match pty_index {
+            0 => {
+                let (shared_state, scrollback, event_tx) = self.cli_pty.get_direct_access();
+                Some(crate::hub::agent_handle::PtyHandle::new(
+                    event_tx,
+                    shared_state,
+                    scrollback,
+                    self.cli_pty.port(),
+                ))
+            }
+            1 => {
+                let server_pty = self.server_pty.as_ref()?;
+                let (shared_state, scrollback, event_tx) = server_pty.get_direct_access();
+                Some(crate::hub::agent_handle::PtyHandle::new(
+                    event_tx,
+                    shared_state,
+                    scrollback,
+                    server_pty.port(),
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// Get the current PTY size (rows, cols).

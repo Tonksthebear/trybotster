@@ -113,18 +113,20 @@ pub mod pty_index {
 /// This struct holds state that needs concurrent access from both the
 /// command processor task and the main `PtySession`. All fields are
 /// wrapped in the outer `Mutex` of `PtySession::shared_state`.
-struct SharedPtyState {
+///
+/// Exposed as `pub(crate)` to allow direct sync I/O from `PtyHandle`.
+pub(crate) struct SharedPtyState {
     /// Master PTY for resizing operations.
-    master_pty: Option<Box<dyn MasterPty + Send>>,
+    pub(crate) master_pty: Option<Box<dyn MasterPty + Send>>,
 
     /// Writer for sending input to the PTY.
-    writer: Option<Box<dyn Write + Send>>,
+    pub(crate) writer: Option<Box<dyn Write + Send>>,
 
     /// Current PTY dimensions (rows, cols).
-    dimensions: (u16, u16),
+    pub(crate) dimensions: (u16, u16),
 
     /// Connected clients with their terminal dimensions.
-    connected_clients: Vec<ConnectedClient>,
+    pub(crate) connected_clients: Vec<ConnectedClient>,
 }
 
 impl std::fmt::Debug for SharedPtyState {
@@ -351,6 +353,30 @@ impl PtySession {
     #[must_use]
     pub fn get_channels(&self) -> (broadcast::Sender<PtyEvent>, mpsc::Sender<PtyCommand>, Option<u16>) {
         (self.event_tx.clone(), self.command_tx.clone(), self.port)
+    }
+
+    /// Get direct access handles for sync I/O operations.
+    ///
+    /// Returns clones of the internal Arc references for direct, synchronous
+    /// PTY access without going through the async command channel. This enables
+    /// immediate input/output with no tokio scheduling delay.
+    ///
+    /// # Returns
+    ///
+    /// Tuple of (shared_state, scrollback_buffer, event_tx) for direct access.
+    #[must_use]
+    pub fn get_direct_access(
+        &self,
+    ) -> (
+        Arc<Mutex<SharedPtyState>>,
+        Arc<Mutex<VecDeque<u8>>>,
+        broadcast::Sender<PtyEvent>,
+    ) {
+        (
+            Arc::clone(&self.shared_state),
+            Arc::clone(&self.scrollback_buffer),
+            self.event_tx.clone(),
+        )
     }
 
     /// Take the command receiver from this PTY session.
@@ -881,7 +907,9 @@ fn process_single_command(
 }
 
 /// Process a Resize command.
-fn process_resize_command(
+///
+/// Exposed as `pub(crate)` for direct sync resize from `PtyHandle`.
+pub(crate) fn process_resize_command(
     client_id: &ClientId,
     rows: u16,
     cols: u16,
@@ -919,7 +947,9 @@ fn process_resize_command(
 /// Process a Connect command.
 ///
 /// Returns the scrollback buffer snapshot for the connecting client.
-fn process_connect_command(
+///
+/// Exposed as `pub(crate)` for direct sync connect from `PtyHandle`.
+pub(crate) fn process_connect_command(
     client_id: &ClientId,
     dims: (u16, u16),
     shared_state: &Arc<Mutex<SharedPtyState>>,
@@ -957,7 +987,9 @@ fn process_connect_command(
 }
 
 /// Process a Disconnect command.
-fn process_disconnect_command(
+///
+/// Exposed as `pub(crate)` for direct sync disconnect from `PtyHandle`.
+pub(crate) fn process_disconnect_command(
     client_id: &ClientId,
     shared_state: &Arc<Mutex<SharedPtyState>>,
     event_tx: &broadcast::Sender<PtyEvent>,
@@ -1001,7 +1033,9 @@ fn process_disconnect_command(
 /// Perform PTY resize operation.
 ///
 /// Updates dimensions, resizes the PTY, and broadcasts the resize event.
-fn do_resize(
+///
+/// Exposed as `pub(crate)` for direct sync resize from `PtyHandle`.
+pub(crate) fn do_resize(
     rows: u16,
     cols: u16,
     shared_state: &Arc<Mutex<SharedPtyState>>,
