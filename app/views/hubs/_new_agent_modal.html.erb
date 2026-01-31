@@ -1,0 +1,132 @@
+<%# New Agent Modal - Two Step Flow %>
+<%= render Elements::DialogComponent.new(id: "new-agent-modal") do %>
+  <div data-controller="new-agent-form"
+       data-new-agent-form-hub-id-value="<%= Current.hub.id %>"
+       class="flex flex-col min-h-0">
+  <%# Step 1: Worktree Selection %>
+  <div data-new-agent-form-target="step1" class="flex flex-col min-h-0">
+    <%# Header %>
+    <div class="px-5 py-4 border-b border-zinc-800 bg-zinc-950/50">
+      <div class="flex items-center gap-3">
+        <span class="size-7 rounded-md bg-primary-500/20 text-primary-400 text-xs font-bold flex items-center justify-center border border-primary-500/30">1</span>
+        <div>
+          <h3 class="text-base font-semibold text-zinc-100">Select Worktree</h3>
+          <p class="text-xs text-zinc-500 mt-0.5">Choose existing or create new</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex-1 overflow-y-auto">
+      <%# Existing Worktrees Section %>
+      <div class="p-5">
+        <div class="flex items-center gap-2 mb-3">
+          <svg class="size-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path>
+          </svg>
+          <h4 class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Existing</h4>
+        </div>
+        <div data-new-agent-form-target="worktreeList" class="space-y-1.5 max-h-40 overflow-y-auto">
+          <div class="py-6 text-center">
+            <span class="text-sm text-zinc-600">No existing worktrees</span>
+          </div>
+        </div>
+      </div>
+
+      <%# Divider %>
+      <div class="px-5">
+        <div class="flex items-center gap-3">
+          <div class="flex-1 h-px bg-zinc-800"></div>
+          <span class="text-xs text-zinc-600 uppercase tracking-wider">or</span>
+          <div class="flex-1 h-px bg-zinc-800"></div>
+        </div>
+      </div>
+
+      <%# Create New Section %>
+      <div class="p-5">
+        <div class="flex items-center gap-2 mb-3">
+          <svg class="size-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+          </svg>
+          <h4 class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Create New</h4>
+        </div>
+        <div class="flex gap-2">
+          <input type="text"
+                 data-new-agent-form-target="newBranchInput"
+                 placeholder="Issue # or branch name"
+                 class="flex-1 px-3 py-2.5 bg-zinc-950 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 text-sm font-mono focus:outline-hidden focus:border-primary-500 focus:ring-1 focus:ring-primary-500/50 transition-colors"
+                 autocomplete="off"
+                 data-action="keydown.enter->new-agent-form#selectNewBranch">
+          <%= render Elements::ButtonComponent.new("Next", data: { action: "new-agent-form#selectNewBranch" }) %>
+        </div>
+      </div>
+    </div>
+
+    <%# Footer %>
+    <div class="px-5 py-4 border-t border-zinc-800 bg-zinc-950/30">
+      <%= render Elements::ButtonComponent.new("Cancel",
+        color: :neutral,
+        variant: :ghost,
+        class: "w-full",
+        command: "close",
+        commandfor: "new-agent-modal"
+      ) %>
+    </div>
+  </div>
+
+  <%# Step 2: Prompt Input %>
+  <div data-new-agent-form-target="step2" class="hidden flex flex-col min-h-0">
+    <%# Header %>
+    <div class="px-5 py-4 border-b border-zinc-800 bg-zinc-950/50">
+      <div class="flex items-center gap-3">
+        <span class="size-7 rounded-md bg-primary-500/20 text-primary-400 text-xs font-bold flex items-center justify-center border border-primary-500/30">2</span>
+        <div>
+          <h3 class="text-base font-semibold text-zinc-100">Initial Prompt</h3>
+          <p class="text-xs text-zinc-500 mt-0.5">What should the agent work on?</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex-1 overflow-y-auto p-5">
+      <%# Selection Summary %>
+      <div class="mb-4 px-3 py-2.5 bg-zinc-950 border border-zinc-800 rounded flex items-center gap-3">
+        <svg class="size-4 text-success-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+        </svg>
+        <div class="min-w-0 flex-1">
+          <span class="text-xs text-zinc-500 block">Worktree</span>
+          <span data-new-agent-form-target="selectedWorktreeLabel" class="text-sm text-zinc-200 font-mono truncate block"></span>
+        </div>
+      </div>
+
+      <%# Prompt Input %>
+      <div class="flex items-center gap-2 mb-2">
+        <svg class="size-4 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+        </svg>
+        <label class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Task</label>
+        <span class="text-xs text-zinc-600">(optional)</span>
+      </div>
+      <textarea data-new-agent-form-target="promptInput"
+                rows="4"
+                placeholder="Describe the task..."
+                class="w-full px-3 py-2.5 bg-zinc-950 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 text-sm focus:outline-hidden focus:border-primary-500 focus:ring-1 focus:ring-primary-500/50 transition-colors resize-none"></textarea>
+      <p class="text-xs text-zinc-600 mt-2">Leave blank for interactive session</p>
+    </div>
+
+    <%# Footer %>
+    <div class="px-5 py-4 border-t border-zinc-800 bg-zinc-950/30 flex gap-2">
+      <%= render Elements::ButtonComponent.new("Back",
+        color: :neutral,
+        variant: :outline,
+        class: "flex-1",
+        data: { action: "new-agent-form#goBackToStep1" }
+      ) %>
+      <%= render Elements::ButtonComponent.new("Start Agent",
+        class: "flex-1",
+        data: { action: "new-agent-form#submit" },
+        command: "close", commandfor: "new-agent-modal"
+      ) %>
+    </div>
+  </div>
+  </div>
+<% end %>

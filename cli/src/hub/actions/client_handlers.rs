@@ -293,6 +293,11 @@ fn spawn_agent_sync(
             hub.broadcast_agent_list();
             handle_select_agent_for_client(hub, client_id, agent_id.clone());
 
+            // Refresh worktree cache - this agent's worktree is now in use
+            if let Err(e) = hub.load_available_worktrees() {
+                log::warn!("Failed to refresh worktree cache after agent creation: {}", e);
+            }
+
             // Broadcast AgentCreated event to all subscribers (including TUI)
             if let Some(info) = hub.state.read().unwrap().get_agent_info(&agent_id) {
                 hub.broadcast(crate::hub::HubEvent::agent_created(agent_id, info));
@@ -329,6 +334,11 @@ pub fn handle_delete_agent_for_client(
             hub.sync_handle_cache();
 
             hub.broadcast_agent_list();
+
+            // Refresh worktree cache - this agent's worktree is now available
+            if let Err(e) = hub.load_available_worktrees() {
+                log::warn!("Failed to refresh worktree cache after agent deletion: {}", e);
+            }
         }
         Err(e) => {
             hub.send_error_to(&client_id, format!("Failed to delete agent: {}", e));

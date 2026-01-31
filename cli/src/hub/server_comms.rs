@@ -493,6 +493,11 @@ impl Hub {
         if let Some(info) = self.state.read().unwrap().get_agent_info(&session_key) {
             self.broadcast(HubEvent::agent_created(session_key, info));
         }
+
+        // Refresh worktree cache - this agent's worktree is now in use
+        if let Err(e) = self.load_available_worktrees() {
+            log::warn!("Failed to refresh worktree cache after agent creation: {}", e);
+        }
     }
 
     /// Try to send a notification to an existing agent for this issue.

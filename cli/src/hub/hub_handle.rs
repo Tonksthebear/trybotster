@@ -391,8 +391,8 @@ impl HubHandle {
 
     /// List available worktrees for agent creation (non-blocking).
     ///
-    /// Reads directly from HandleCache. Hub maintains the worktree list
-    /// on agent lifecycle changes and worktree refresh events.
+    /// Reads from HandleCache. Cache is refreshed by Hub on agent lifecycle
+    /// changes (create/delete) to exclude worktrees with active agents.
     ///
     /// Returns a list of (path, branch_name) pairs for existing worktrees
     /// that can be reopened.
