@@ -368,7 +368,9 @@ pub trait Client: Send {
             .get_pty(pty_index)
             .ok_or_else(|| format!("PTY at index {} not found", pty_index))?
             .clone();
-        pty.write_input(data).await
+
+        // Direct sync write - immediate, no async channel delay
+        pty.write_input_direct(data)
     }
 
     /// Send input to a PTY using an already-resolved handle.
@@ -384,8 +386,8 @@ pub trait Client: Send {
     ///
     /// Returns an error if the write fails.
     async fn send_input_with_handle(&mut self, pty: &PtyHandle, data: &[u8]) -> Result<(), String> {
-        let pty = pty.clone();
-        pty.write_input(data).await
+        // Direct sync write - immediate, no async channel delay
+        pty.write_input_direct(data)
     }
 
     /// Resize a specific PTY.
@@ -421,7 +423,10 @@ pub trait Client: Send {
                 .clone();
             (pty, self.id().clone())
         };
-        pty.resize(client_id, rows, cols).await
+
+        // Direct sync resize - immediate, no async channel delay
+        pty.resize_direct(client_id, rows, cols);
+        Ok(())
     }
 
     /// Resize a PTY using an already-resolved handle.
@@ -438,9 +443,11 @@ pub trait Client: Send {
     ///
     /// Returns an error if the resize fails.
     async fn resize_pty_with_handle(&mut self, pty: &PtyHandle, rows: u16, cols: u16) -> Result<(), String> {
-        let pty = pty.clone();
         let client_id = self.id().clone();
-        pty.resize(client_id, rows, cols).await
+
+        // Direct sync resize - immediate, no async channel delay
+        pty.resize_direct(client_id, rows, cols);
+        Ok(())
     }
 
     /// Disconnect from a PTY using an already-resolved handle.
@@ -460,9 +467,9 @@ pub trait Client: Send {
         agent_index: usize,
         pty_index: usize,
     ) {
-        let pty = pty.clone();
         let client_id = self.id().clone();
-        let _ = pty.disconnect(client_id).await;
+        // Direct sync disconnect - immediate, no async channel delay
+        pty.disconnect_direct(client_id);
         // Suppress unused variable warnings - these are used by overriding implementations
         let _ = (agent_index, pty_index);
     }

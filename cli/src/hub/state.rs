@@ -217,13 +217,23 @@ impl HubState {
         let mut ptys = Vec::with_capacity(2);
 
         // CLI PTY is always present (index 0)
-        let (cli_event_tx, cli_cmd_tx, cli_port) = agent.cli_pty.get_channels();
-        ptys.push(PtyHandle::new(cli_event_tx, cli_cmd_tx, cli_port));
+        let (cli_shared_state, cli_scrollback, cli_event_tx) = agent.cli_pty.get_direct_access();
+        ptys.push(PtyHandle::new(
+            cli_event_tx,
+            cli_shared_state,
+            cli_scrollback,
+            agent.cli_pty.port(),
+        ));
 
         // Server PTY if available (index 1)
         if let Some(ref server_pty) = agent.server_pty {
-            let (server_event_tx, server_cmd_tx, server_port) = server_pty.get_channels();
-            ptys.push(PtyHandle::new(server_event_tx, server_cmd_tx, server_port));
+            let (server_shared_state, server_scrollback, server_event_tx) = server_pty.get_direct_access();
+            ptys.push(PtyHandle::new(
+                server_event_tx,
+                server_shared_state,
+                server_scrollback,
+                server_pty.port(),
+            ));
         }
 
         Some(AgentHandle::new(agent_id, info, ptys, index))

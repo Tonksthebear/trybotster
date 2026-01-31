@@ -52,9 +52,16 @@
 
 // Rust guideline compliant 2026-01
 
-use tokio::sync::{broadcast, mpsc};
+use std::collections::VecDeque;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
-use crate::agent::pty::{PtyCommand, PtyEvent};
+use tokio::sync::broadcast;
+
+use crate::agent::pty::{
+    process_connect_command, process_disconnect_command, process_resize_command, PtyEvent,
+    SharedPtyState,
+};
 use crate::client::ClientId;
 use crate::relay::types::AgentInfo;
 
@@ -218,17 +225,20 @@ impl AgentHandle {
 ///     println!("Dev server on port {}", port);
 /// }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PtyHandle {
     /// Broadcast sender for PTY events.
     ///
     /// Clients subscribe via `subscribe()` to receive events.
     event_tx: broadcast::Sender<PtyEvent>,
 
-    /// Command channel for PTY operations.
+    /// Direct access to shared PTY state for sync I/O.
     ///
-    /// Sends input, resize, connect/disconnect commands to PtySession.
-    command_tx: mpsc::Sender<PtyCommand>,
+    /// Enables immediate input/connect/resize without async channel hop.
+    shared_state: Arc<Mutex<SharedPtyState>>,
+
+    /// Direct access to scrollback buffer for sync connect.
+    scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
 
     /// HTTP forwarding port for preview proxying.
     ///
@@ -237,23 +247,39 @@ pub struct PtyHandle {
     port: Option<u16>,
 }
 
+impl std::fmt::Debug for PtyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyHandle")
+            .field("port", &self.port)
+            .finish()
+    }
+}
+
 impl PtyHandle {
-    /// Create a new PTY handle.
+    /// Create a new PTY handle with direct sync access.
+    ///
+    /// Direct access enables immediate I/O operations without async channel delays:
+    /// - `write_input_direct()` - sync input, no channel hop
+    /// - `connect_direct()` - sync connect, immediate scrollback
+    /// - `resize_direct()` - sync resize
     ///
     /// # Arguments
     ///
-    /// * `event_tx` - Broadcast sender for receiving PTY events
-    /// * `command_tx` - Command channel for sending PTY operations
+    /// * `event_tx` - Broadcast sender for PTY events
+    /// * `shared_state` - Direct access to PTY writer and state
+    /// * `scrollback_buffer` - Direct access to scrollback
     /// * `port` - HTTP forwarding port (for server PTYs), or `None`
     #[must_use]
     pub fn new(
         event_tx: broadcast::Sender<PtyEvent>,
-        command_tx: mpsc::Sender<PtyCommand>,
+        shared_state: Arc<Mutex<SharedPtyState>>,
+        scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
         port: Option<u16>,
     ) -> Self {
         Self {
             event_tx,
-            command_tx,
+            shared_state,
+            scrollback_buffer,
             port,
         }
     }
@@ -274,133 +300,6 @@ impl PtyHandle {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<PtyEvent> {
         self.event_tx.subscribe()
-    }
-
-    /// Write input to the PTY.
-    ///
-    /// This is the primary method for sending user input to the terminal.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command channel is closed (PTY terminated).
-    pub async fn write_input(&self, data: &[u8]) -> Result<(), String> {
-        self.command_tx
-            .send(PtyCommand::Input(data.to_vec()))
-            .await
-            .map_err(|_| "PTY command channel closed".to_string())
-    }
-
-    /// Write input to the PTY (blocking version).
-    ///
-    /// Use this from synchronous code (e.g., TUI thread).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command channel is closed.
-    pub fn write_input_blocking(&self, data: &[u8]) -> Result<(), String> {
-        self.command_tx
-            .blocking_send(PtyCommand::Input(data.to_vec()))
-            .map_err(|_| "PTY command channel closed".to_string())
-    }
-
-    /// Notify PTY of client resize.
-    ///
-    /// If this client is the size owner, the PTY will be resized.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command channel is closed.
-    pub async fn resize(&self, client_id: ClientId, rows: u16, cols: u16) -> Result<(), String> {
-        self.command_tx
-            .send(PtyCommand::Resize {
-                client_id,
-                rows,
-                cols,
-            })
-            .await
-            .map_err(|_| "PTY command channel closed".to_string())
-    }
-
-    /// Notify PTY of client resize (blocking version).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command channel is closed.
-    pub fn resize_blocking(&self, client_id: ClientId, rows: u16, cols: u16) -> Result<(), String> {
-        self.command_tx
-            .blocking_send(PtyCommand::Resize {
-                client_id,
-                rows,
-                cols,
-            })
-            .map_err(|_| "PTY command channel closed".to_string())
-    }
-
-    /// Connect a client to this PTY.
-    ///
-    /// The PTY will track the client and may become the size owner.
-    /// Returns the scrollback buffer containing terminal history.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command channel is closed or the response fails.
-    pub async fn connect(&self, client_id: ClientId, dims: (u16, u16)) -> Result<Vec<u8>, String> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.command_tx
-            .send(PtyCommand::Connect {
-                client_id,
-                dims,
-                response_tx: tx,
-            })
-            .await
-            .map_err(|_| "PTY command channel closed".to_string())?;
-        rx.await
-            .map_err(|_| "PTY response channel closed".to_string())
-    }
-
-    /// Connect a client to this PTY (blocking version).
-    ///
-    /// Returns the scrollback buffer containing terminal history.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command channel is closed or the response fails.
-    pub fn connect_blocking(&self, client_id: ClientId, dims: (u16, u16)) -> Result<Vec<u8>, String> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.command_tx
-            .blocking_send(PtyCommand::Connect {
-                client_id,
-                dims,
-                response_tx: tx,
-            })
-            .map_err(|_| "PTY command channel closed".to_string())?;
-        rx.blocking_recv()
-            .map_err(|_| "PTY response channel closed".to_string())
-    }
-
-    /// Disconnect a client from this PTY.
-    ///
-    /// The PTY will update its client list and may change size owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command channel is closed.
-    pub async fn disconnect(&self, client_id: ClientId) -> Result<(), String> {
-        self.command_tx
-            .send(PtyCommand::Disconnect { client_id })
-            .await
-            .map_err(|_| "PTY command channel closed".to_string())
-    }
-
-    /// Disconnect a client from this PTY (blocking version).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command channel is closed.
-    pub fn disconnect_blocking(&self, client_id: ClientId) -> Result<(), String> {
-        self.command_tx
-            .blocking_send(PtyCommand::Disconnect { client_id })
-            .map_err(|_| "PTY command channel closed".to_string())
     }
 
     /// Get the number of active event subscribers.
@@ -429,11 +328,68 @@ impl PtyHandle {
     pub fn port(&self) -> Option<u16> {
         self.port
     }
+
+    // =========================================================================
+    // Direct Sync Methods - Immediate I/O without async channel
+    // =========================================================================
+
+    /// Write input directly to the PTY.
+    ///
+    /// Locks the shared state mutex and writes directly to the PTY writer.
+    /// This is the fastest path for sending input - no async channel hop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if write fails.
+    pub fn write_input_direct(&self, data: &[u8]) -> Result<(), String> {
+        let mut state = self.shared_state
+            .lock()
+            .map_err(|_| "shared_state lock poisoned")?;
+
+        if let Some(writer) = &mut state.writer {
+            writer
+                .write_all(data)
+                .map_err(|e| format!("Failed to write PTY input: {e}"))?;
+            writer
+                .flush()
+                .map_err(|e| format!("Failed to flush PTY writer: {e}"))?;
+            Ok(())
+        } else {
+            Err("PTY writer not available".to_string())
+        }
+    }
+
+    /// Connect a client directly.
+    ///
+    /// Registers the client, resizes the PTY to their dimensions, and
+    /// returns the scrollback buffer immediately.
+    pub fn connect_direct(&self, client_id: ClientId, dims: (u16, u16)) -> Result<Vec<u8>, String> {
+        Ok(process_connect_command(
+            &client_id,
+            dims,
+            &self.shared_state,
+            &self.event_tx,
+            &self.scrollback_buffer,
+        ))
+    }
+
+    /// Resize the PTY directly.
+    ///
+    /// Checks if the client is the size owner and resizes if so.
+    pub fn resize_direct(&self, client_id: ClientId, rows: u16, cols: u16) {
+        process_resize_command(&client_id, rows, cols, &self.shared_state, &self.event_tx);
+    }
+
+    /// Disconnect a client directly.
+    pub fn disconnect_direct(&self, client_id: ClientId) {
+        process_disconnect_command(&client_id, &self.shared_state, &self.event_tx);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::pty::PtySession;
 
     fn test_info() -> AgentInfo {
         AgentInfo {
@@ -459,9 +415,11 @@ mod tests {
 
     /// Helper to create a PTY handle for testing with a specific port.
     fn create_test_pty_with_port(port: Option<u16>) -> PtyHandle {
-        let (event_tx, _) = broadcast::channel(16);
-        let (cmd_tx, _) = mpsc::channel(16);
-        PtyHandle::new(event_tx, cmd_tx, port)
+        let pty_session = PtySession::new(24, 80);
+        let (shared_state, scrollback, event_tx) = pty_session.get_direct_access();
+        // Leak the session to keep the state alive for tests
+        std::mem::forget(pty_session);
+        PtyHandle::new(event_tx, shared_state, scrollback, port)
     }
 
     #[test]
@@ -535,9 +493,7 @@ mod tests {
 
     #[test]
     fn test_pty_handle_subscribe() {
-        let (event_tx, _) = broadcast::channel(16);
-        let (cmd_tx, _) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx.clone(), cmd_tx, None);
+        let handle = create_test_pty();
 
         // Subscribe creates a new receiver
         let _rx = handle.subscribe();
@@ -546,115 +502,6 @@ mod tests {
         // Multiple subscriptions
         let _rx2 = handle.subscribe();
         assert_eq!(handle.subscriber_count(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_pty_handle_receives_events() {
-        let (event_tx, _) = broadcast::channel(16);
-        let (cmd_tx, _) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx.clone(), cmd_tx, None);
-        let mut rx = handle.subscribe();
-
-        // Send an event
-        event_tx.send(PtyEvent::Output(b"hello".to_vec())).unwrap();
-
-        // Receiver gets it
-        let event = rx.recv().await.unwrap();
-        match event {
-            PtyEvent::Output(data) => assert_eq!(data, b"hello"),
-            _ => panic!("Expected Output event"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_pty_handle_write_input() {
-        let (event_tx, _) = broadcast::channel(16);
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx, cmd_tx, None);
-
-        // Write input
-        handle.write_input(b"hello").await.unwrap();
-
-        // Verify command received
-        let cmd = cmd_rx.recv().await.unwrap();
-        match cmd {
-            PtyCommand::Input(data) => assert_eq!(data, b"hello"),
-            _ => panic!("Expected Input command"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_pty_handle_resize() {
-        let (event_tx, _) = broadcast::channel(16);
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx, cmd_tx, None);
-
-        // Resize
-        handle.resize(ClientId::Tui, 24, 80).await.unwrap();
-
-        // Verify command received
-        let cmd = cmd_rx.recv().await.unwrap();
-        match cmd {
-            PtyCommand::Resize {
-                client_id,
-                rows,
-                cols,
-            } => {
-                assert_eq!(client_id, ClientId::Tui);
-                assert_eq!(rows, 24);
-                assert_eq!(cols, 80);
-            }
-            _ => panic!("Expected Resize command"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_pty_handle_connect_disconnect() {
-        let (event_tx, _) = broadcast::channel(16);
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx, cmd_tx, None);
-
-        // Spawn a task to handle the connect command and send response
-        let connect_handle = tokio::spawn(async move {
-            handle.connect(ClientId::Tui, (24, 80)).await
-        });
-
-        // Receive the command and send response
-        let cmd = cmd_rx.recv().await.unwrap();
-        match cmd {
-            PtyCommand::Connect {
-                client_id,
-                dims,
-                response_tx,
-            } => {
-                assert_eq!(client_id, ClientId::Tui);
-                assert_eq!(dims, (24, 80));
-                // Send scrollback response
-                let _ = response_tx.send(b"test scrollback".to_vec());
-            }
-            _ => panic!("Expected Connect command"),
-        }
-
-        // Verify connect returns the scrollback
-        let scrollback = connect_handle.await.unwrap().unwrap();
-        assert_eq!(scrollback, b"test scrollback");
-    }
-
-    #[tokio::test]
-    async fn test_pty_handle_disconnect() {
-        let (event_tx, _) = broadcast::channel(16);
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-        let handle = PtyHandle::new(event_tx, cmd_tx, None);
-
-        // Disconnect
-        handle.disconnect(ClientId::Tui).await.unwrap();
-        let cmd = cmd_rx.recv().await.unwrap();
-        match cmd {
-            PtyCommand::Disconnect { client_id } => {
-                assert_eq!(client_id, ClientId::Tui);
-            }
-            _ => panic!("Expected Disconnect command"),
-        }
     }
 
     #[test]
@@ -666,5 +513,36 @@ mod tests {
         // With port
         let handle_with_port = create_test_pty_with_port(Some(8080));
         assert_eq!(handle_with_port.port(), Some(8080));
+    }
+
+    #[test]
+    fn test_pty_handle_connect_direct() {
+        let handle = create_test_pty();
+
+        // Connect returns empty scrollback for new session
+        let scrollback = handle.connect_direct(ClientId::Tui, (80, 24)).unwrap();
+        assert!(scrollback.is_empty());
+    }
+
+    #[test]
+    fn test_pty_handle_resize_direct() {
+        let handle = create_test_pty();
+
+        // Connect first to become size owner
+        let _ = handle.connect_direct(ClientId::Tui, (80, 24));
+
+        // Resize should work without panic
+        handle.resize_direct(ClientId::Tui, 100, 50);
+    }
+
+    #[test]
+    fn test_pty_handle_disconnect_direct() {
+        let handle = create_test_pty();
+
+        // Connect first
+        let _ = handle.connect_direct(ClientId::Tui, (80, 24));
+
+        // Disconnect should work without panic
+        handle.disconnect_direct(ClientId::Tui);
     }
 }
