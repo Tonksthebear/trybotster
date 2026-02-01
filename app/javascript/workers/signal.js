@@ -192,6 +192,10 @@ function findSubscriptionById(subscriptionId) {
 // Reliable Delivery Helpers
 // =============================================================================
 
+// Binary message type markers (must match Rust)
+const MSG_TYPE_DATA = 0x01
+const MSG_TYPE_ACK = 0x02
+
 /**
  * Convert a Set of sequence numbers to ranges for efficient encoding.
  * Example: Set{1, 2, 3, 5, 7, 8} -> [[1, 3], [5, 5], [7, 8]]
@@ -225,6 +229,83 @@ function rangesToSet(ranges) {
     }
   }
   return set
+}
+
+/**
+ * Encode a reliable message to binary format.
+ * @param {string} type - "data" or "ack"
+ * @param {Object} msg - { seq, payload } for data, { ranges } for ack
+ * @returns {Uint8Array}
+ */
+function encodeReliableMessage(type, msg) {
+  if (type === "data") {
+    const { seq, payload } = msg
+    const buf = new Uint8Array(1 + 8 + payload.length)
+    const view = new DataView(buf.buffer)
+    buf[0] = MSG_TYPE_DATA
+    view.setUint32(1, seq & 0xffffffff, true)
+    view.setUint32(5, Math.floor(seq / 0x100000000), true)
+    buf.set(payload, 9)
+    return buf
+  } else if (type === "ack") {
+    const { ranges } = msg
+    const count = Math.min(ranges.length, 0xffff)
+    const buf = new Uint8Array(1 + 2 + count * 16)
+    const view = new DataView(buf.buffer)
+    buf[0] = MSG_TYPE_ACK
+    view.setUint16(1, count, true)
+    for (let i = 0; i < count; i++) {
+      const [start, end] = ranges[i]
+      const offset = 3 + i * 16
+      view.setUint32(offset, start & 0xffffffff, true)
+      view.setUint32(offset + 4, Math.floor(start / 0x100000000), true)
+      view.setUint32(offset + 8, end & 0xffffffff, true)
+      view.setUint32(offset + 12, Math.floor(end / 0x100000000), true)
+    }
+    return buf
+  }
+  throw new Error(`Unknown message type: ${type}`)
+}
+
+/**
+ * Decode a binary reliable message.
+ * @param {Uint8Array} bytes
+ * @returns {{ type: string, seq?: number, payload?: Uint8Array, ranges?: Array }}
+ */
+function decodeReliableMessage(bytes) {
+  if (bytes.length === 0) throw new Error("Empty message")
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+
+  switch (bytes[0]) {
+    case MSG_TYPE_DATA: {
+      if (bytes.length < 9) throw new Error(`Data message too short: ${bytes.length}`)
+      const seqLow = view.getUint32(1, true)
+      const seqHigh = view.getUint32(5, true)
+      const seq = seqLow + seqHigh * 0x100000000
+      const payload = bytes.slice(9)
+      return { type: "data", seq, payload }
+    }
+    case MSG_TYPE_ACK: {
+      if (bytes.length < 3) throw new Error(`Ack message too short: ${bytes.length}`)
+      const count = view.getUint16(1, true)
+      const expectedLen = 3 + count * 16
+      if (bytes.length < expectedLen) {
+        throw new Error(`Ack truncated: ${bytes.length} < ${expectedLen}`)
+      }
+      const ranges = []
+      for (let i = 0; i < count; i++) {
+        const offset = 3 + i * 16
+        const startLow = view.getUint32(offset, true)
+        const startHigh = view.getUint32(offset + 4, true)
+        const endLow = view.getUint32(offset + 8, true)
+        const endHigh = view.getUint32(offset + 12, true)
+        ranges.push([startLow + startHigh * 0x100000000, endLow + endHigh * 0x100000000])
+      }
+      return { type: "ack", ranges }
+    }
+    default:
+      throw new Error(`Unknown message type: 0x${bytes[0].toString(16)}`)
+  }
 }
 
 // =============================================================================
@@ -326,10 +407,12 @@ class ReliableSender {
   async send(payload) {
     const seq = this.nextSeq++
     const now = Date.now()
-    const payloadBytes = Array.from(new TextEncoder().encode(JSON.stringify(payload)))
-    const message = { type: "data", seq, payload: payloadBytes }
+    const payloadBytes = new TextEncoder().encode(JSON.stringify(payload))
 
-    const encryptedEnvelope = await this.onSend(message)
+    // Encode as binary: [0x01][seq 8B LE][payload bytes]
+    const binaryMessage = encodeReliableMessage("data", { seq, payload: payloadBytes })
+
+    const encryptedEnvelope = await this.onSend(binaryMessage)
 
     this.pending.set(seq, {
       payloadBytes,
@@ -551,7 +634,8 @@ class ReliableReceiver {
 
   generateAck() {
     this.lastAckSent = Date.now()
-    return { type: "ack", ranges: setToRanges(this.received) }
+    // Return binary-encoded ACK
+    return encodeReliableMessage("ack", { ranges: setToRanges(this.received) })
   }
 
   scheduleAck() {
@@ -1257,17 +1341,36 @@ async function handlePerform(subscriptionId, actionName, data) {
   return { performed: true };
 }
 
+
 // =============================================================================
 // Encryption Helpers for Subscriptions
 // =============================================================================
+
+/**
+ * Convert message to string for encryption.
+ * Uint8Array → Latin-1 string (each byte → char code).
+ * Objects → JSON string.
+ */
+function messageToString(message) {
+  if (message instanceof Uint8Array) {
+    // Binary data: convert to Latin-1 string (byte values 0-255 → char codes)
+    return String.fromCharCode.apply(null, message);
+  } else if (typeof message === 'string') {
+    return message;
+  } else {
+    return JSON.stringify(message);
+  }
+}
 
 async function encryptAndSend(hubId, subscription, message) {
   const session = sessions.get(hubId);
 
   if (session) {
+    // Convert to string (handles Uint8Array binary messages)
+    const messageStr = messageToString(message);
+
     // Encrypt using mutex to prevent counter race
     const envelope = await withMutex(hubId, async () => {
-      const messageStr = typeof message === 'string' ? message : JSON.stringify(message);
       const result = await session.encrypt(messageStr);
       await persistSession(hubId, session);
       return result;
@@ -1307,13 +1410,7 @@ async function processIncomingMessage(subscriptionId, hubId, data) {
             : JSON.stringify(data.envelope);
           const plaintext = await session.decrypt(envelopeStr);
           await persistSession(hubId, session);
-
-          // Try to parse as JSON
-          try {
-            return JSON.parse(plaintext);
-          } catch {
-            return plaintext;
-          }
+          return plaintext; // Keep as string for binary processing
         });
         subInfo.decryptionFailureCount = 0;
       } catch (error) {
@@ -1336,6 +1433,36 @@ async function processIncomingMessage(subscriptionId, hubId, data) {
     }
   }
 
+  // Check if this is a binary reliable message
+  if (reliable && receiver) {
+    const bytes = getBytes(decrypted);
+    if (bytes && bytes.length > 0) {
+      const msgType = bytes[0];
+      if (msgType === MSG_TYPE_DATA || msgType === MSG_TYPE_ACK) {
+        try {
+          const decoded = decodeReliableMessage(bytes);
+          if (decoded.type === "data") {
+            // Reliable data message - receiver handles payload deserialization
+            await receiver.receive(decoded.seq, decoded.payload);
+          } else if (decoded.type === "ack") {
+            // ACK message - update sender's pending set
+            if (subInfo.sender) {
+              const { immediateRetransmits } = subInfo.sender.processAck(decoded.ranges);
+              for (const { encryptedEnvelope } of immediateRetransmits) {
+                subInfo.sender.onRetransmit(encryptedEnvelope);
+              }
+            }
+          }
+          return;
+        } catch (error) {
+          console.error("[SignalWorker] Failed to decode binary reliable message:", error);
+          // Fall through to non-reliable handling
+        }
+      }
+    }
+  }
+
+  // Handle non-reliable messages (or fallback)
   // Decompress if needed (string with compression marker)
   if (typeof decrypted === 'string') {
     try {
@@ -1346,42 +1473,26 @@ async function processIncomingMessage(subscriptionId, hubId, data) {
     }
   }
 
-  // Process through reliable layer if enabled
-  if (reliable && receiver) {
-    if (decrypted.type === "data" && decrypted.seq != null) {
-      await receiver.receive(decrypted.seq, decrypted.payload);
-    } else if (decrypted.type === "ack" && decrypted.ranges) {
-      if (subInfo.sender) {
-        const { immediateRetransmits } = subInfo.sender.processAck(decrypted.ranges);
-        // Send immediate retransmits for detected gaps
-        for (const { encryptedEnvelope } of immediateRetransmits) {
-          subInfo.sender.onRetransmit(encryptedEnvelope);
-        }
-      }
-    } else {
-      // Non-reliable message, deliver directly
-      if (portState) {
-        try {
-          portState.port.postMessage({
-            event: "subscription:message",
-            subscriptionId,
-            message: decrypted
-          });
-        } catch (e) {}
-      }
-    }
-  } else {
-    // Non-reliable: deliver directly
-    if (portState) {
-      try {
-        portState.port.postMessage({
-          event: "subscription:message",
-          subscriptionId,
-          message: decrypted
-        });
-      } catch (e) {}
-    }
+  // Deliver directly
+  if (portState) {
+    try {
+      portState.port.postMessage({
+        event: "subscription:message",
+        subscriptionId,
+        message: decrypted
+      });
+    } catch (e) {}
   }
+}
+
+/**
+ * Convert data to Uint8Array for binary parsing.
+ */
+function getBytes(data) {
+  if (data instanceof Uint8Array) return data;
+  if (typeof data === 'string') return new TextEncoder().encode(data);
+  if (Array.isArray(data)) return new Uint8Array(data);
+  return null;
 }
 
 // =============================================================================

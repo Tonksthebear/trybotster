@@ -400,23 +400,26 @@ impl PreKeyBundleData {
     }
 }
 
-/// Encrypted Signal message envelope (protocol v4).
+/// Encrypted Signal message envelope (minimal format).
+///
+/// Uses short keys to minimize wire size:
+/// - t: message_type (1=PreKey, 2=Signal, 3=SenderKey)
+/// - c: ciphertext (base64)
+/// - s: sender_identity (base64)
+/// - d: device_id
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalEnvelope {
-    /// Protocol version (4 for Signal).
-    pub version: u8,
-    /// Message type:
-    /// - 1 = PreKeySignalMessage (initial, contains PreKey info)
-    /// - 2 = SignalMessage (regular Double Ratchet message)
-    /// - 3 = SenderKeyMessage (group broadcast)
+    /// Message type: 1=PreKey, 2=Signal, 3=SenderKey
+    #[serde(rename = "t")]
     pub message_type: u8,
     /// Base64-encoded ciphertext.
+    #[serde(rename = "c")]
     pub ciphertext: String,
     /// Sender's identity public key (base64).
+    #[serde(rename = "s")]
     pub sender_identity: String,
-    /// Sender's registration ID.
-    pub registration_id: u32,
-    /// Sender's device ID.
+    /// Sender's device ID (CLI=1, browser=2).
+    #[serde(rename = "d")]
     pub device_id: u32,
 }
 
@@ -821,21 +824,14 @@ impl SignalProtocolManager {
             .get_identity_key_pair()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get identity: {e}"))?;
-        let registration_id = self
-            .store
-            .get_local_registration_id()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get registration ID: {e}"))?;
 
         // Persist session after encryption (ratchet advanced)
         self.store.persist(&self.hub_id).await?;
 
         Ok(SignalEnvelope {
-            version: SIGNAL_PROTOCOL_VERSION,
             message_type,
             ciphertext: BASE64.encode(ciphertext.serialize()),
             sender_identity: BASE64.encode(identity.public_key().serialize()),
-            registration_id,
             device_id: CLI_DEVICE_ID,
         })
     }
@@ -957,18 +953,11 @@ impl SignalProtocolManager {
             .get_identity_key_pair()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get identity: {e}"))?;
-        let registration_id = self
-            .store
-            .get_local_registration_id()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get registration ID: {e}"))?;
 
         Ok(SignalEnvelope {
-            version: SIGNAL_PROTOCOL_VERSION,
             message_type: SignalEnvelope::MSG_TYPE_SENDER_KEY,
             ciphertext: BASE64.encode(ciphertext.serialized()),
             sender_identity: BASE64.encode(identity.public_key().serialize()),
-            registration_id,
             device_id: CLI_DEVICE_ID,
         })
     }

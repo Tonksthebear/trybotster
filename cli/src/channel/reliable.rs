@@ -4,7 +4,19 @@
 //! Uses sequence numbers, selective acknowledgments (SACK), reorder buffers, and
 //! automatic retransmission to ensure no messages are lost.
 //!
-//! # Protocol
+//! # Binary Wire Protocol
+//!
+//! Messages are encoded as compact binary for minimal overhead:
+//!
+//! ```text
+//! Data message: [0x01][seq: 8B LE][payload bytes...]
+//! Ack message:  [0x02][count: 2B LE][ranges: (start: 8B LE, end: 8B LE)...]
+//! ```
+//!
+//! - Data overhead: 9 bytes (vs ~40+ bytes for JSON)
+//! - Ack overhead: 3 + 16*N bytes (vs ~20+ bytes per range for JSON)
+//!
+//! # Protocol Flow
 //!
 //! ```text
 //! Sender                              Receiver
@@ -42,7 +54,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result};
 
 /// Default retransmission timeout in milliseconds.
 const DEFAULT_RETRANSMIT_TIMEOUT_MS: u64 = 3000;
@@ -67,11 +79,15 @@ const BUFFER_TTL_MS: u64 = 30000;
 /// Older sequences are pruned to prevent unbounded growth.
 const DUPLICATE_WINDOW: u64 = 1000;
 
+/// Binary message type markers.
+const MSG_TYPE_DATA: u8 = 0x01;
+const MSG_TYPE_ACK: u8 = 0x02;
+
 /// A reliable message wrapper.
 ///
 /// All messages are wrapped in this enum before transmission.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Uses compact binary encoding for minimal wire overhead.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReliableMessage {
     /// Data message with sequence number.
     Data {
@@ -133,6 +149,97 @@ impl ReliableMessage {
             }
         }
         set
+    }
+
+    /// Encode message to compact binary format.
+    ///
+    /// Binary wire format:
+    /// - Data: `[0x01][seq: 8B LE][payload bytes...]`
+    /// - Ack:  `[0x02][count: 2B LE][ranges: (start: 8B LE, end: 8B LE)...]`
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Data { seq, payload } => {
+                // 1 byte type + 8 bytes seq + payload
+                let mut buf = Vec::with_capacity(1 + 8 + payload.len());
+                buf.push(MSG_TYPE_DATA);
+                buf.extend_from_slice(&seq.to_le_bytes());
+                buf.extend_from_slice(payload);
+                buf
+            }
+            Self::Ack { ranges } => {
+                // 1 byte type + 2 bytes count + 16 bytes per range
+                let count = ranges.len().min(u16::MAX as usize) as u16;
+                let mut buf = Vec::with_capacity(1 + 2 + (count as usize) * 16);
+                buf.push(MSG_TYPE_ACK);
+                buf.extend_from_slice(&count.to_le_bytes());
+                for (start, end) in ranges.iter().take(count as usize) {
+                    buf.extend_from_slice(&start.to_le_bytes());
+                    buf.extend_from_slice(&end.to_le_bytes());
+                }
+                buf
+            }
+        }
+    }
+
+    /// Decode message from compact binary format.
+    ///
+    /// Returns error if the bytes don't represent a valid message.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() {
+            anyhow::bail!("Empty message");
+        }
+
+        match bytes[0] {
+            MSG_TYPE_DATA => {
+                if bytes.len() < 9 {
+                    anyhow::bail!("Data message too short: {} bytes", bytes.len());
+                }
+                let seq = u64::from_le_bytes(
+                    bytes[1..9]
+                        .try_into()
+                        .context("Failed to read seq bytes")?,
+                );
+                let payload = bytes[9..].to_vec();
+                Ok(Self::Data { seq, payload })
+            }
+            MSG_TYPE_ACK => {
+                if bytes.len() < 3 {
+                    anyhow::bail!("Ack message too short: {} bytes", bytes.len());
+                }
+                let count = u16::from_le_bytes(
+                    bytes[1..3]
+                        .try_into()
+                        .context("Failed to read count bytes")?,
+                ) as usize;
+
+                let expected_len = 3 + count * 16;
+                if bytes.len() < expected_len {
+                    anyhow::bail!(
+                        "Ack message truncated: {} bytes, expected {}",
+                        bytes.len(),
+                        expected_len
+                    );
+                }
+
+                let mut ranges = Vec::with_capacity(count);
+                for i in 0..count {
+                    let offset = 3 + i * 16;
+                    let start = u64::from_le_bytes(
+                        bytes[offset..offset + 8]
+                            .try_into()
+                            .context("Failed to read range start")?,
+                    );
+                    let end = u64::from_le_bytes(
+                        bytes[offset + 8..offset + 16]
+                            .try_into()
+                            .context("Failed to read range end")?,
+                    );
+                    ranges.push((start, end));
+                }
+                Ok(Self::Ack { ranges })
+            }
+            other => anyhow::bail!("Unknown message type: 0x{:02x}", other),
+        }
     }
 }
 
@@ -614,18 +721,57 @@ mod tests {
     }
 
     #[test]
-    fn test_message_serialization() {
+    fn test_message_binary_round_trip() {
+        // Test Data message
         let msg = ReliableMessage::data(42, b"hello".to_vec());
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ReliableMessage = serde_json::from_str(&json).unwrap();
+        let bytes = msg.to_bytes();
+        let parsed = ReliableMessage::from_bytes(&bytes).unwrap();
         assert_eq!(msg, parsed);
 
+        // Verify binary format: [0x01][seq 8B LE][payload]
+        assert_eq!(bytes[0], 0x01); // MSG_TYPE_DATA
+        assert_eq!(u64::from_le_bytes(bytes[1..9].try_into().unwrap()), 42);
+        assert_eq!(&bytes[9..], b"hello");
+
+        // Test Ack message
         let ack = ReliableMessage::Ack {
             ranges: vec![(1, 5), (10, 12)],
         };
-        let json = serde_json::to_string(&ack).unwrap();
-        let parsed: ReliableMessage = serde_json::from_str(&json).unwrap();
+        let bytes = ack.to_bytes();
+        let parsed = ReliableMessage::from_bytes(&bytes).unwrap();
         assert_eq!(ack, parsed);
+
+        // Verify binary format: [0x02][count 2B LE][ranges 16B each]
+        assert_eq!(bytes[0], 0x02); // MSG_TYPE_ACK
+        assert_eq!(u16::from_le_bytes(bytes[1..3].try_into().unwrap()), 2);
+        assert_eq!(bytes.len(), 3 + 2 * 16); // header + 2 ranges
+    }
+
+    #[test]
+    fn test_binary_encoding_size() {
+        // Verify binary is much smaller than JSON would be
+        let payload = vec![0u8; 100];
+        let msg = ReliableMessage::data(1, payload);
+        let bytes = msg.to_bytes();
+
+        // Binary: 1 + 8 + 100 = 109 bytes
+        // JSON would be: {"type":"data","seq":1,"payload":[0,0,0,...]} = 400+ chars
+        assert_eq!(bytes.len(), 109);
+    }
+
+    #[test]
+    fn test_binary_decoding_errors() {
+        // Empty message
+        assert!(ReliableMessage::from_bytes(&[]).is_err());
+
+        // Unknown message type
+        assert!(ReliableMessage::from_bytes(&[0xFF]).is_err());
+
+        // Truncated Data message
+        assert!(ReliableMessage::from_bytes(&[0x01, 0, 0, 0]).is_err());
+
+        // Truncated Ack message
+        assert!(ReliableMessage::from_bytes(&[0x02, 1, 0]).is_err()); // claims 1 range but no data
     }
 
     // ========== ReliableSender Tests ==========

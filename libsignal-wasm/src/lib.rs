@@ -93,14 +93,26 @@ pub struct PreKeyBundleData {
     pub kyber_prekey_signature: String,
 }
 
-/// Encrypted Signal message envelope.
+/// Encrypted Signal message envelope (minimal format).
+///
+/// Uses short keys to minimize wire size:
+/// - t: message_type (1=PreKey, 2=Signal, 3=SenderKey)
+/// - c: ciphertext (base64)
+/// - s: sender_identity (base64)
+/// - d: device_id
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalEnvelope {
-    pub version: u8,
+    /// Message type: 1=PreKey, 2=Signal, 3=SenderKey
+    #[serde(rename = "t")]
     pub message_type: u8,
+    /// Base64-encoded ciphertext
+    #[serde(rename = "c")]
     pub ciphertext: String,
+    /// Sender's identity public key (base64)
+    #[serde(rename = "s")]
     pub sender_identity: String,
-    pub registration_id: u32,
+    /// Sender's device ID (CLI=1, browser=2)
+    #[serde(rename = "d")]
     pub device_id: u32,
 }
 
@@ -260,11 +272,9 @@ impl SignalSession {
             .map_err(|e| SignalError::Encryption(format!("get reg id: {e}")))?;
 
         let envelope = SignalEnvelope {
-            version: SIGNAL_PROTOCOL_VERSION,
             message_type,
             ciphertext: BASE64.encode(ciphertext.serialize()),
             sender_identity: BASE64.encode(identity.public_key().serialize()),
-            registration_id,
             device_id: BROWSER_DEVICE_ID,
         };
 

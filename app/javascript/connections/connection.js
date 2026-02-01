@@ -34,7 +34,8 @@ export class Connection {
   #unsubscribers = []
   #subscriptionUnsubscribers = []
   #hubConnected = false
-  #subscribing = false  // Lock to prevent concurrent subscribe/unsubscribe
+  #subscribing = false      // Lock to prevent concurrent subscribe/unsubscribe
+  #resubscribing = false    // Lock to prevent concurrent resubscribe on stale send
 
   constructor(key, options, manager) {
     this.key = key
@@ -259,8 +260,22 @@ export class Connection {
         this.emit("disconnected")
       } else if (event.state === "connected" && !this.#hubConnected) {
         this.#hubConnected = true
-        // Don't auto-transition to CONNECTED - need to resubscribe
         this.emit("reconnected")
+
+        // Auto-resubscribe after reconnection - old subscription is stale
+        if (this.subscriptionId) {
+          console.log(`[${this.constructor.name}] Auto-resubscribing after reconnect`)
+          // Clear stale subscription ID and resubscribe
+          const oldSubId = this.subscriptionId
+          this.subscriptionId = null
+          this.#clearSubscriptionEventListeners()
+          bridge.clearSubscriptionListeners(oldSubId)
+
+          this.subscribe().catch(err => {
+            console.error(`[${this.constructor.name}] Resubscribe failed:`, err)
+            this.#setError("resubscribe_failed", err.message)
+          })
+        }
       }
     })
     this.#unsubscribers.push(unsubState)
@@ -462,6 +477,7 @@ export class Connection {
   /**
    * Send a message through the secure channel.
    * Buffers messages until CLI signals ready to prevent race conditions.
+   * Auto-resubscribes if subscription is stale (e.g., after wake from sleep).
    * @param {string} type - Message type
    * @param {Object} data - Message payload
    * @returns {Promise<boolean>}
@@ -484,6 +500,34 @@ export class Connection {
       })
       return true
     } catch (error) {
+      // Stale subscription (e.g., SharedWorker restarted during sleep)
+      // Resubscribe and retry once
+      if (error.message?.includes("not found") && !this.#resubscribing) {
+        console.log(`[${this.constructor.name}] Subscription stale, resubscribing...`)
+        this.#resubscribing = true
+
+        try {
+          const oldSubId = this.subscriptionId
+          this.subscriptionId = null
+          this.#clearSubscriptionEventListeners()
+          bridge.clearSubscriptionListeners(oldSubId)
+
+          await this.subscribe()
+
+          // Retry the send
+          await bridge.send("send", {
+            subscriptionId: this.subscriptionId,
+            message: { type, ...data }
+          })
+          return true
+        } catch (retryError) {
+          console.error(`[${this.constructor.name}] Resubscribe/retry failed:`, retryError)
+          return false
+        } finally {
+          this.#resubscribing = false
+        }
+      }
+
       console.error(`[${this.constructor.name}] Send failed:`, error)
       return false
     }
@@ -632,4 +676,5 @@ export class Connection {
     this.#setState(ConnectionState.ERROR)
     this.emit("error", { reason, message })
   }
+
 }

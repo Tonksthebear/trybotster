@@ -5,11 +5,12 @@
  * Uses sequence numbers, selective acknowledgments (SACK), reorder buffers,
  * and automatic retransmission to ensure no messages are lost.
  *
- * Protocol:
- * - Sender assigns monotonically increasing sequence numbers to each message
- * - Receiver buffers out-of-order messages and delivers in sequence
- * - Receiver sends SACK (selective ACK) with ranges of received sequences
- * - Sender retransmits unacked messages after timeout
+ * Binary Wire Protocol:
+ * - Data: [0x01][seq: 8B LE][payload bytes...]
+ * - Ack:  [0x02][count: 2B LE][ranges: (start: 8B LE, end: 8B LE)...]
+ *
+ * Data overhead: 9 bytes (vs ~40+ bytes for JSON)
+ * Ack overhead: 3 + 16*N bytes (vs ~20+ bytes per range for JSON)
  *
  * These components are used internally by Channel (see channel.js) when
  * reliability is enabled via the builder pattern:
@@ -24,6 +25,10 @@
  *
  *   channel.send(payload);
  */
+
+// Binary message type markers (must match Rust)
+const MSG_TYPE_DATA = 0x01;
+const MSG_TYPE_ACK = 0x02;
 
 // Default retransmission timeout in milliseconds
 const DEFAULT_RETRANSMIT_TIMEOUT_MS = 3000;
@@ -83,6 +88,110 @@ function rangesToSet(ranges) {
     }
   }
   return set;
+}
+
+// =============================================================================
+// Binary Encoding/Decoding
+// =============================================================================
+
+/**
+ * Encode a reliable message to binary format.
+ *
+ * @param {string} type - "data" or "ack"
+ * @param {Object} msg - { seq, payload } for data, { ranges } for ack
+ * @returns {Uint8Array} - Binary encoded message
+ */
+function encodeReliableMessage(type, msg) {
+  if (type === "data") {
+    const { seq, payload } = msg;
+    // payload is already Uint8Array
+    const buf = new Uint8Array(1 + 8 + payload.length);
+    const view = new DataView(buf.buffer);
+
+    buf[0] = MSG_TYPE_DATA;
+    // Write seq as 64-bit LE (split into two 32-bit writes for browser compat)
+    view.setUint32(1, seq & 0xffffffff, true); // low 32 bits
+    view.setUint32(5, Math.floor(seq / 0x100000000), true); // high 32 bits
+    buf.set(payload, 9);
+
+    return buf;
+  } else if (type === "ack") {
+    const { ranges } = msg;
+    const count = Math.min(ranges.length, 0xffff);
+    const buf = new Uint8Array(1 + 2 + count * 16);
+    const view = new DataView(buf.buffer);
+
+    buf[0] = MSG_TYPE_ACK;
+    view.setUint16(1, count, true);
+
+    for (let i = 0; i < count; i++) {
+      const [start, end] = ranges[i];
+      const offset = 3 + i * 16;
+      // Write start as 64-bit LE
+      view.setUint32(offset, start & 0xffffffff, true);
+      view.setUint32(offset + 4, Math.floor(start / 0x100000000), true);
+      // Write end as 64-bit LE
+      view.setUint32(offset + 8, end & 0xffffffff, true);
+      view.setUint32(offset + 12, Math.floor(end / 0x100000000), true);
+    }
+
+    return buf;
+  }
+  throw new Error(`Unknown message type: ${type}`);
+}
+
+/**
+ * Decode a binary reliable message.
+ *
+ * @param {Uint8Array} bytes - Binary encoded message
+ * @returns {{ type: string, seq?: number, payload?: Uint8Array, ranges?: Array }}
+ */
+function decodeReliableMessage(bytes) {
+  if (bytes.length === 0) {
+    throw new Error("Empty message");
+  }
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+  switch (bytes[0]) {
+    case MSG_TYPE_DATA: {
+      if (bytes.length < 9) {
+        throw new Error(`Data message too short: ${bytes.length} bytes`);
+      }
+      // Read seq as 64-bit LE (combine two 32-bit reads)
+      const seqLow = view.getUint32(1, true);
+      const seqHigh = view.getUint32(5, true);
+      const seq = seqLow + seqHigh * 0x100000000;
+      const payload = bytes.slice(9);
+      return { type: "data", seq, payload };
+    }
+    case MSG_TYPE_ACK: {
+      if (bytes.length < 3) {
+        throw new Error(`Ack message too short: ${bytes.length} bytes`);
+      }
+      const count = view.getUint16(1, true);
+      const expectedLen = 3 + count * 16;
+      if (bytes.length < expectedLen) {
+        throw new Error(
+          `Ack message truncated: ${bytes.length} bytes, expected ${expectedLen}`,
+        );
+      }
+      const ranges = [];
+      for (let i = 0; i < count; i++) {
+        const offset = 3 + i * 16;
+        const startLow = view.getUint32(offset, true);
+        const startHigh = view.getUint32(offset + 4, true);
+        const endLow = view.getUint32(offset + 8, true);
+        const endHigh = view.getUint32(offset + 12, true);
+        const start = startLow + startHigh * 0x100000000;
+        const end = endLow + endHigh * 0x100000000;
+        ranges.push([start, end]);
+      }
+      return { type: "ack", ranges };
+    }
+    default:
+      throw new Error(`Unknown message type: 0x${bytes[0].toString(16)}`);
+  }
 }
 
 /**
@@ -150,8 +259,8 @@ export class ReliableSender {
    * Prepare and send a message with reliability.
    * Returns the assigned sequence number.
    *
-   * The payload is serialized to JSON bytes (array of numbers) to match
-   * the Rust protocol which expects `payload: Vec<u8>`.
+   * The payload is serialized to JSON, then encoded as binary with the
+   * reliable message header for minimal wire overhead.
    *
    * IMPORTANT: onSend is expected to encrypt and return the encrypted envelope.
    * We cache this envelope for retransmission to avoid re-encrypting (which would
@@ -161,19 +270,14 @@ export class ReliableSender {
     const seq = this.nextSeq++;
     const now = Date.now();
 
-    // Serialize payload to JSON bytes (matches Rust Vec<u8> format)
-    const payloadBytes = Array.from(
-      new TextEncoder().encode(JSON.stringify(payload)),
-    );
+    // Serialize payload to JSON bytes
+    const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
 
-    const message = {
-      type: "data",
-      seq,
-      payload: payloadBytes,
-    };
+    // Encode as binary reliable message: [0x01][seq 8B LE][payload]
+    const binaryMessage = encodeReliableMessage("data", { seq, payload: payloadBytes });
 
     // Encrypt and send - onSend returns the encrypted envelope for caching
-    const encryptedEnvelope = await this.onSend(message);
+    const encryptedEnvelope = await this.onSend(binaryMessage);
 
     this.pending.set(seq, {
       payloadBytes, // Keep for debugging
@@ -538,13 +642,12 @@ export class ReliableReceiver {
 
   /**
    * Generate an ACK message for currently received sequences.
+   * Returns binary-encoded ACK message.
    */
   generateAck() {
     this.lastAckSent = Date.now();
-    return {
-      type: "ack",
-      ranges: setToRanges(this.received),
-    };
+    const ranges = setToRanges(this.received);
+    return encodeReliableMessage("ack", { ranges });
   }
 
   /**
@@ -579,5 +682,12 @@ export class ReliableReceiver {
   }
 }
 
-// Export utilities for testing
-export { setToRanges, rangesToSet };
+// Export utilities for channel.js and testing
+export {
+  setToRanges,
+  rangesToSet,
+  encodeReliableMessage,
+  decodeReliableMessage,
+  MSG_TYPE_DATA,
+  MSG_TYPE_ACK,
+};

@@ -839,13 +839,14 @@ impl ActionCableChannel {
         // Send to each target (wrapped in reliable envelope if enabled, then encrypted)
         for target in targets {
             // Wrap in reliable message if enabled (per-peer sequence numbers)
+            // Uses binary encoding: [0x01][seq 8B LE][payload]
             let to_encrypt = if reliable {
                 let mut sessions = reliable_sessions.write().await;
                 let session = sessions
                     .entry(target.0.clone())
                     .or_insert_with(ReliableSession::new);
                 let reliable_msg = session.sender.prepare_send(compressed.clone());
-                serde_json::to_vec(&reliable_msg).expect("reliable message serializable")
+                reliable_msg.to_bytes()
             } else {
                 compressed.clone()
             };
@@ -854,17 +855,11 @@ impl ActionCableChannel {
                 // Encrypt via CryptoServiceHandle (message passing, no lock needed)
                 match cs.encrypt(&to_encrypt, target.as_ref()).await {
                     Ok(envelope) => {
+                        // Use serde to serialize envelope with short keys (t, c, s, d)
                         serde_json::json!({
                             "action": "relay",
                             "recipient_identity": target.as_ref(),
-                            "envelope": {
-                                "version": envelope.version,
-                                "message_type": envelope.message_type,
-                                "ciphertext": envelope.ciphertext,
-                                "sender_identity": envelope.sender_identity,
-                                "registration_id": envelope.registration_id,
-                                "device_id": envelope.device_id,
-                            }
+                            "envelope": envelope,
                         })
                     }
                     Err(e) => {
@@ -937,7 +932,7 @@ impl ActionCableChannel {
                             peers_guard.insert(peer.clone());
                         }
 
-                        // Send input_ready message via reliable layer
+                        // Send input_ready message via reliable layer (binary encoded)
                         let ready_msg = serde_json::json!({"type": "input_ready"});
                         if let Ok(json) = serde_json::to_string(&ready_msg) {
                             let msg = {
@@ -945,6 +940,7 @@ impl ActionCableChannel {
                                 let session = sessions
                                     .entry(browser_identity.clone())
                                     .or_insert_with(ReliableSession::new);
+                                // prepare_send wraps in binary Data message
                                 session.sender.prepare_send(json.as_bytes().to_vec())
                             };
                             Self::send_reliable_message(
@@ -1008,10 +1004,9 @@ impl ActionCableChannel {
 
             // Decrypt via CryptoServiceHandle
             log::info!(
-                "[INPUT-TRACE] Received encrypted message from {} (msg_type={}, reg_id={}, device_id={})",
+                "[INPUT-TRACE] Received encrypted message from {} (msg_type={}, device_id={})",
                 &sender.0[..8.min(sender.0.len())],
                 envelope.message_type,
-                envelope.registration_id,
                 envelope.device_id
             );
             let decrypt_start = std::time::Instant::now();
@@ -1027,12 +1022,11 @@ impl ActionCableChannel {
                 }
                 Err(e) => {
                     log::error!(
-                        "[INPUT-TRACE] DECRYPTION FAILED for {} after {:?}: {} (msg_type={}, reg_id={}, device_id={})",
+                        "[INPUT-TRACE] DECRYPTION FAILED for {} after {:?}: {} (msg_type={}, device_id={})",
                         &sender.0[..8.min(sender.0.len())],
                         decrypt_start.elapsed(),
                         e,
                         envelope.message_type,
-                        envelope.registration_id,
                         envelope.device_id
                     );
                     return Vec::new();
@@ -1103,9 +1097,9 @@ impl ActionCableChannel {
             Message,
         >,
     ) -> Vec<RawIncoming> {
-        // Parse as reliable message
-        let Ok(reliable_msg) = serde_json::from_slice::<ReliableMessage>(plaintext) else {
-            log::warn!("Failed to parse reliable message");
+        // Parse binary reliable message: [type][seq 8B LE][payload] or [type][count 2B LE][ranges]
+        let Ok(reliable_msg) = ReliableMessage::from_bytes(plaintext) else {
+            log::warn!("Failed to parse binary reliable message");
             return Vec::new();
         };
 
@@ -1303,6 +1297,7 @@ impl ActionCableChannel {
     }
 
     /// Send a reliable message (data or ack) to a specific peer.
+    /// Uses binary encoding for minimal wire overhead.
     async fn send_reliable_message(
         peer: &PeerId,
         msg: &ReliableMessage,
@@ -1315,22 +1310,16 @@ impl ActionCableChannel {
             Message,
         >,
     ) {
-        let msg_bytes = serde_json::to_vec(msg).expect("reliable message serializable");
+        let msg_bytes = msg.to_bytes();
 
         let envelope_data = if let Some(ref cs) = crypto_service {
             match cs.encrypt(&msg_bytes, peer.as_ref()).await {
                 Ok(envelope) => {
+                    // Use serde to serialize envelope with short keys (t, c, s, d)
                     serde_json::json!({
                         "action": "relay",
                         "recipient_identity": peer.as_ref(),
-                        "envelope": {
-                            "version": envelope.version,
-                            "message_type": envelope.message_type,
-                            "ciphertext": envelope.ciphertext,
-                            "sender_identity": envelope.sender_identity,
-                            "registration_id": envelope.registration_id,
-                            "device_id": envelope.device_id,
-                        }
+                        "envelope": envelope,
                     })
                 }
                 Err(e) => {
@@ -1374,33 +1363,24 @@ impl ActionCableChannel {
             Message,
         >,
     ) {
-        // Generate ACK from receiver state
-        let ack_msg = {
+        // Generate ACK from receiver state and encode as binary
+        let ack_bytes = {
             let mut sessions = reliable_sessions.write().await;
             let Some(session) = sessions.get_mut(&peer.0) else {
                 return;
             };
-            session.receiver.generate_ack()
+            session.receiver.generate_ack().to_bytes()
         };
-
-        // Serialize ACK
-        let ack_bytes = serde_json::to_vec(&ack_msg).expect("ack serializable");
 
         // Encrypt if needed
         let envelope_data = if let Some(ref cs) = crypto_service {
             match cs.encrypt(&ack_bytes, peer.as_ref()).await {
                 Ok(envelope) => {
+                    // Use serde to serialize envelope with short keys (t, c, s, d)
                     serde_json::json!({
                         "action": "relay",
                         "recipient_identity": peer.as_ref(),
-                        "envelope": {
-                            "version": envelope.version,
-                            "message_type": envelope.message_type,
-                            "ciphertext": envelope.ciphertext,
-                            "sender_identity": envelope.sender_identity,
-                            "registration_id": envelope.registration_id,
-                            "device_id": envelope.device_id,
-                        }
+                        "envelope": envelope,
                     })
                 }
                 Err(e) => {
