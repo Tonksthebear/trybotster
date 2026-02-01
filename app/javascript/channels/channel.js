@@ -17,11 +17,19 @@
  *   await channel.send(message);
  */
 
-import { ReliableSender, ReliableReceiver } from "channels/reliable_channel";
+import {
+  ReliableSender,
+  ReliableReceiver,
+  decodeReliableMessage,
+} from "channels/reliable_channel";
 
 // Compression marker bytes (must match CLI's compression.rs)
 const MARKER_UNCOMPRESSED = 0x00;
 const MARKER_GZIP = 0x1f;
+
+// Binary reliable message type markers (must match reliable_channel.js)
+const MSG_TYPE_DATA = 0x01;
+const MSG_TYPE_ACK = 0x02;
 
 // How often to check for heartbeat ACKs (should match CLI's HEALTH_CHECK_INTERVAL_SECS)
 const MAINTENANCE_INTERVAL_MS = 5000;
@@ -196,6 +204,10 @@ export class Channel {
    * Call this from the subscription's received callback.
    * Handles decryption and reliable delivery processing.
    *
+   * Binary reliable messages:
+   * - Data: [0x01][seq: 8B LE][payload bytes...]
+   * - Ack:  [0x02][count: 2B LE][ranges...]
+   *
    * @param {Object} data - Raw data from ActionCable
    */
   async receive(data) {
@@ -230,8 +242,39 @@ export class Channel {
       }
     }
 
-    // Handle case where decrypt returns a string (needs decompression + JSON parsing)
-    // The CLI prepends a compression marker byte (0x00 = uncompressed, 0x1f = gzip)
+    // Check if this is a binary reliable message (starts with 0x01 or 0x02)
+    // Decrypted content can be string (from WASM) or bytes (from Uint8Array)
+    if (this.reliable && this.receiver) {
+      const bytes = this._getBytes(decrypted);
+      if (bytes && bytes.length > 0) {
+        const msgType = bytes[0];
+        if (msgType === MSG_TYPE_DATA || msgType === MSG_TYPE_ACK) {
+          try {
+            const decoded = decodeReliableMessage(bytes);
+            if (decoded.type === "data") {
+              // Reliable data message - receiver.receive() handles payload deserialization
+              await this.receiver.receive(decoded.seq, decoded.payload);
+            } else if (decoded.type === "ack") {
+              // ACK message - update sender's pending set
+              if (this.sender) {
+                const { immediateRetransmits } = this.sender.processAck(decoded.ranges);
+                // Send immediate retransmits for detected gaps
+                for (const { encryptedEnvelope } of immediateRetransmits) {
+                  this.sender.onRetransmit(encryptedEnvelope);
+                }
+              }
+            }
+            return;
+          } catch (error) {
+            console.error("[Channel] Failed to decode binary reliable message:", error);
+            // Fall through to non-reliable handling
+          }
+        }
+      }
+    }
+
+    // Handle non-reliable messages (or fallback for non-binary)
+    // Decompress if needed (string with compression marker)
     if (typeof decrypted === "string") {
       try {
         decrypted = await decompressMessage(decrypted);
@@ -244,28 +287,25 @@ export class Channel {
       }
     }
 
-    // Process through reliable layer if enabled
-    if (this.reliable && this.receiver) {
-      if (decrypted.type === "data" && decrypted.seq != null) {
-        // Reliable data message - receiver.receive() is async (decompression may be needed)
-        await this.receiver.receive(decrypted.seq, decrypted.payload);
-      } else if (decrypted.type === "ack" && decrypted.ranges) {
-        // ACK message - update sender's pending set
-        if (this.sender) {
-          const { immediateRetransmits } = this.sender.processAck(decrypted.ranges);
-          // Send immediate retransmits for detected gaps
-          for (const { encryptedEnvelope } of immediateRetransmits) {
-            this.sender.onRetransmit(encryptedEnvelope);
-          }
-        }
-      } else {
-        // Non-reliable message (backwards compat or control messages)
-        this.onMessage(decrypted);
-      }
-    } else {
-      // Non-reliable: deliver directly
-      this.onMessage(decrypted);
+    // Deliver directly
+    this.onMessage(decrypted);
+  }
+
+  /**
+   * Convert decrypted data to Uint8Array for binary parsing.
+   * @private
+   */
+  _getBytes(data) {
+    if (data instanceof Uint8Array) {
+      return data;
     }
+    if (typeof data === "string") {
+      return new TextEncoder().encode(data);
+    }
+    if (Array.isArray(data)) {
+      return new Uint8Array(data);
+    }
+    return null;
   }
 
   /**
@@ -330,6 +370,7 @@ export class Channel {
    * Internal: Send raw message through ActionCable.
    * Encrypts if session is available.
    * Used for non-reliable messages (e.g., ACKs).
+   * Handles both JSON objects and Uint8Array binary data.
    */
   async _rawSend(message) {
     if (!this.subscription) {
@@ -337,13 +378,16 @@ export class Channel {
     }
 
     try {
+      // Convert message to string for encryption
+      const msgStr = this._messageToString(message);
+
       if (this.session) {
         // Encrypt before sending
-        const envelope = await this.session.encrypt(message);
+        const envelope = await this.session.encrypt(msgStr);
         this.subscription.perform("relay", { envelope });
       } else {
         // Unencrypted
-        this.subscription.perform("relay", { data: message });
+        this.subscription.perform("relay", { data: msgStr });
       }
       return true;
     } catch (error) {
@@ -355,6 +399,7 @@ export class Channel {
   /**
    * Internal: Encrypt and send a message, returning the encrypted envelope.
    * Used for reliable messages - the envelope is cached for retransmission.
+   * Handles both JSON objects and Uint8Array binary data.
    */
   async _encryptAndSend(message) {
     if (!this.subscription) {
@@ -362,18 +407,39 @@ export class Channel {
     }
 
     try {
+      // Convert message to string for encryption
+      const msgStr = this._messageToString(message);
+
       if (this.session) {
-        const envelope = await this.session.encrypt(message);
+        const envelope = await this.session.encrypt(msgStr);
         this.subscription.perform("relay", { envelope });
         return envelope; // Return for caching
       } else {
         // Unencrypted - no envelope to cache
-        this.subscription.perform("relay", { data: message });
+        this.subscription.perform("relay", { data: msgStr });
         return null;
       }
     } catch (error) {
       console.error("[Channel] _encryptAndSend failed:", error);
       return null;
+    }
+  }
+
+  /**
+   * Convert message to string for encryption.
+   * Uint8Array is converted to Latin-1 string (each byte → char code).
+   * Objects are JSON stringified.
+   * @private
+   */
+  _messageToString(message) {
+    if (message instanceof Uint8Array) {
+      // Binary data: convert to Latin-1 string (byte values 0-255 → char codes)
+      // This preserves the exact bytes through encryption/decryption
+      return String.fromCharCode.apply(null, message);
+    } else if (typeof message === "string") {
+      return message;
+    } else {
+      return JSON.stringify(message);
     }
   }
 
