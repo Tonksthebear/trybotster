@@ -49,6 +49,13 @@ export class Connection {
 
     // Event subscribers: Map<eventName, Set<callback>>
     this.subscribers = new Map()
+
+    // CLI ready signal handling.
+    // Prevents race condition where browser sends before CLI subscribes,
+    // causing seq=1 to be lost and multi-second delays.
+    // Only enabled for channels that override requiresCliReady() to return true.
+    this.cliReady = !this.requiresCliReady() // Start ready if not required
+    this.inputBuffer = []
   }
 
   // ========== Lifecycle (called by ConnectionManager) ==========
@@ -164,6 +171,10 @@ export class Connection {
       if (this.subscriptionId && force) {
         await this.#doUnsubscribe()
       }
+
+      // Reset CLI ready state - need fresh handshake (only if required)
+      this.cliReady = !this.requiresCliReady()
+      this.inputBuffer = []
 
       const hubId = this.getHubId()
 
@@ -423,10 +434,25 @@ export class Connection {
   }
 
   /**
+   * Whether this channel requires CLI ready signal before sending.
+   * Override in subclasses that need to wait for CLI subscription.
+   * Default false - most channels can send immediately.
+   * @returns {boolean}
+   */
+  requiresCliReady() {
+    return false
+  }
+
+  /**
    * Handle a decrypted message. Subclasses route to domain-specific events.
+   * Base class handles input_ready; subclasses handle domain-specific messages.
    * @param {Object} message
    */
   handleMessage(message) {
+    // Handle CLI ready signal first
+    if (this.processMessage(message)) {
+      return
+    }
     // Default: emit as generic message
     this.emit("message", message)
   }
@@ -435,6 +461,7 @@ export class Connection {
 
   /**
    * Send a message through the secure channel.
+   * Buffers messages until CLI signals ready to prevent race conditions.
    * @param {string} type - Message type
    * @param {Object} data - Message payload
    * @returns {Promise<boolean>}
@@ -442,6 +469,12 @@ export class Connection {
   async send(type, data = {}) {
     if (!this.subscriptionId) {
       return false
+    }
+
+    // Buffer if CLI not ready yet (prevents race condition on channel startup)
+    if (!this.cliReady) {
+      this.inputBuffer.push({ type, data })
+      return true
     }
 
     try {
@@ -454,6 +487,42 @@ export class Connection {
       console.error(`[${this.constructor.name}] Send failed:`, error)
       return false
     }
+  }
+
+  /**
+   * Handle CLI ready signal - flush buffered messages.
+   * Called when CLI sends input_ready after subscribing.
+   */
+  #handleCliReady() {
+    if (this.cliReady) return // Already ready
+
+    this.cliReady = true
+    console.log(`[${this.constructor.name}] CLI ready, flushing ${this.inputBuffer.length} buffered messages`)
+
+    // Flush buffered messages
+    for (const { type, data } of this.inputBuffer) {
+      bridge.send("send", {
+        subscriptionId: this.subscriptionId,
+        message: { type, ...data }
+      }).catch(err => console.error(`[${this.constructor.name}] Flush failed:`, err))
+    }
+    this.inputBuffer = []
+
+    this.emit("cliReady")
+  }
+
+  /**
+   * Process incoming message, handling CLI ready signal before subclass routing.
+   * Subclasses should call super.processMessage(message) or handle input_ready themselves.
+   * @param {Object} message - Decrypted message
+   * @returns {boolean} - True if message was handled (input_ready), false otherwise
+   */
+  processMessage(message) {
+    if (message.type === "input_ready") {
+      this.#handleCliReady()
+      return true
+    }
+    return false
   }
 
   /**

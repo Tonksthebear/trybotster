@@ -1304,27 +1304,9 @@ impl Client for BrowserClient {
         // Pre-register the browser as a peer so broadcast works immediately.
         // Without this, the peer set is empty until the browser's first message
         // arrives, causing scrollback (and early output) to be silently dropped.
+        // Note: input_ready is now sent automatically by ActionCableChannel
+        // when subscription confirms, so we don't need to send it here.
         sender_handle.register_peer(PeerId(self.identity.clone()));
-
-        // Send input_ready signal to browser BEFORE spawning input receiver.
-        // This tells the browser that CLI is subscribed and ready to receive input.
-        // Without this, browser might send input before CLI subscribes, causing
-        // seq=1 to be lost and a 3-7 second delay waiting for retransmit.
-        {
-            let ready_msg = serde_json::json!({"type": "input_ready"});
-            let sender_clone = sender_handle.clone();
-            if let Ok(json) = serde_json::to_string(&ready_msg) {
-                tokio::spawn(async move {
-                    if let Err(e) = sender_clone.send(json.as_bytes()).await {
-                        log::warn!("Failed to send input_ready: {}", e);
-                    }
-                });
-            }
-            log::info!(
-                "[INPUT-TRACE] Sent input_ready to browser {}",
-                &self.identity[..8.min(self.identity.len())]
-            );
-        }
 
         // Connect to PTY and get scrollback BEFORE spawning forwarder.
         // This ensures the browser receives historical output first.

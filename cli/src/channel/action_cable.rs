@@ -923,7 +923,44 @@ impl ActionCableChannel {
             match msg_type.as_str() {
                 "welcome" => log::debug!("Welcome received"),
                 "confirm_subscription" => {
-                    log::info!("{} subscription confirmed", config.channel_name)
+                    log::info!("{} subscription confirmed", config.channel_name);
+
+                    // Send input_ready to browser if we have browser identity.
+                    // This signals that CLI is subscribed and ready to receive input,
+                    // preventing race conditions where browser sends before CLI subscribes.
+                    if let Some(ref browser_identity) = config.browser_identity {
+                        let peer = PeerId(browser_identity.clone());
+
+                        // Register peer so we can send to them
+                        {
+                            let mut peers_guard = peers.write().unwrap();
+                            peers_guard.insert(peer.clone());
+                        }
+
+                        // Send input_ready message via reliable layer
+                        let ready_msg = serde_json::json!({"type": "input_ready"});
+                        if let Ok(json) = serde_json::to_string(&ready_msg) {
+                            let msg = {
+                                let mut sessions = reliable_sessions.write().await;
+                                let session = sessions
+                                    .entry(browser_identity.clone())
+                                    .or_insert_with(ReliableSession::new);
+                                session.sender.prepare_send(json.as_bytes().to_vec())
+                            };
+                            Self::send_reliable_message(
+                                &peer,
+                                &msg,
+                                crypto_service,
+                                identifier_json,
+                                write,
+                            )
+                            .await;
+                            log::info!(
+                                "[INPUT-TRACE] Sent input_ready to browser {}",
+                                &browser_identity[..8.min(browser_identity.len())]
+                            );
+                        }
+                    }
                 }
                 "ping" => {}
                 _ => {}
