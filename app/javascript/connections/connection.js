@@ -22,13 +22,38 @@
 import bridge from "workers/bridge"
 import { ensureSignalReady, parseBundleFromFragment } from "signal"
 
+// Connection state (combines browser subscription + CLI handshake status)
 export const ConnectionState = {
   DISCONNECTED: "disconnected",
   LOADING: "loading",
-  CONNECTING: "connecting",  // Hub connected, not subscribed
-  CONNECTED: "connected",    // Hub connected AND subscribed
+  CONNECTING: "connecting",
+  CONNECTED: "connected",
+  CLI_DISCONNECTED: "cli_disconnected",
   ERROR: "error",
 }
+
+// Browser → Rails WebSocket status
+export const BrowserStatus = {
+  DISCONNECTED: "disconnected",
+  CONNECTING: "connecting",
+  SUBSCRIBING: "subscribing",
+  SUBSCRIBED: "subscribed",
+  ERROR: "error",
+}
+
+// CLI → Rails WebSocket status (for this channel)
+export const CliStatus = {
+  UNKNOWN: "unknown",           // Initial state, waiting for health message
+  OFFLINE: "offline",           // CLI not connected to Rails at all
+  ONLINE: "online",             // CLI connected to Rails, but not yet on this E2E channel
+  NOTIFIED: "notified",         // Bot::Message sent to tell CLI about browser
+  CONNECTING: "connecting",     // CLI connecting to this channel
+  CONNECTED: "connected",       // CLI connected to this channel, ready for handshake
+  DISCONNECTED: "disconnected", // CLI was connected but disconnected
+}
+
+// Handshake timeout in milliseconds
+const HANDSHAKE_TIMEOUT_MS = 8000
 
 export class Connection {
   #unsubscribers = []
@@ -43,19 +68,23 @@ export class Connection {
     this.manager = manager
 
     this.subscriptionId = null      // Worker subscription ID
-    this.session = null             // Kept for backward compatibility
     this.identityKey = null
     this.state = ConnectionState.DISCONNECTED
     this.errorReason = null
 
+    // Two-sided status tracking
+    this.browserStatus = BrowserStatus.DISCONNECTED
+    this.cliStatus = CliStatus.UNKNOWN
+
     // Event subscribers: Map<eventName, Set<callback>>
     this.subscribers = new Map()
 
-    // CLI ready signal handling.
-    // Prevents race condition where browser sends before CLI subscribes,
-    // causing seq=1 to be lost and multi-second delays.
-    // Only enabled for channels that override requiresCliReady() to return true.
-    this.cliReady = !this.requiresCliReady() // Start ready if not required
+    // Unified handshake state.
+    // Both sides send handshake when they detect the other, ack confirms.
+    // Buffer messages until handshake completes to prevent race conditions.
+    this.handshakeComplete = false
+    this.handshakeSent = false
+    this.handshakeTimer = null
     this.inputBuffer = []
   }
 
@@ -94,6 +123,7 @@ export class Connection {
   async #connectHub() {
     if (this.#hubConnected) return
 
+    this.#setBrowserStatus(BrowserStatus.CONNECTING)
     this.#setState(ConnectionState.CONNECTING)
 
     // Get cable URL and ActionCable module URL
@@ -146,10 +176,9 @@ export class Connection {
       throw new Error("Cannot subscribe: hub not connected")
     }
 
-    // If already subscribed and not forcing refresh, just emit connected and return
+    // If already subscribed and not forcing refresh, ensure status is correct and return
     if (this.subscriptionId && !force) {
-      this.#setState(ConnectionState.CONNECTED)
-      this.emit("connected", this)
+      this.#ensureSubscribedStatus()
       return
     }
 
@@ -160,12 +189,12 @@ export class Connection {
 
     // Re-check after waiting - another caller might have subscribed
     if (this.subscriptionId && !force) {
-      this.#setState(ConnectionState.CONNECTED)
-      this.emit("connected", this)
+      this.#ensureSubscribedStatus()
       return
     }
 
     this.#subscribing = true
+    this.#setBrowserStatus(BrowserStatus.SUBSCRIBING)
 
     try {
       // Unsubscribe first if forcing refresh
@@ -173,8 +202,14 @@ export class Connection {
         await this.#doUnsubscribe()
       }
 
-      // Reset CLI ready state - need fresh handshake (only if required)
-      this.cliReady = !this.requiresCliReady()
+      // Reset handshake state - need fresh handshake
+      this.handshakeComplete = false
+      this.handshakeSent = false
+      if (this.handshakeTimer) {
+        clearTimeout(this.handshakeTimer)
+        this.handshakeTimer = null
+      }
+      this.cliStatus = CliStatus.UNKNOWN
       this.inputBuffer = []
 
       const hubId = this.getHubId()
@@ -189,8 +224,18 @@ export class Connection {
       this.subscriptionId = subscribeResult.subscriptionId
       this.#setupSubscriptionEventListeners()
 
+      // Request current health status now that listener is set up
+      // (initial transmit during subscription is lost due to race condition)
+      await this.#requestHealth()
+
+      this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
       this.#setState(ConnectionState.CONNECTED)
-      this.emit("connected", this)
+      this.emit("subscribed", this)
+
+      // If CLI is already connected, we're "last" - initiate handshake
+      if (this.cliStatus === CliStatus.CONNECTED) {
+        this.#sendHandshake()
+      }
     } finally {
       this.#subscribing = false
     }
@@ -228,6 +273,7 @@ export class Connection {
     this.subscriptionId = null
 
     // Back to CONNECTING state (hub still connected, but not subscribed)
+    this.#setBrowserStatus(BrowserStatus.CONNECTING)
     this.#setState(ConnectionState.CONNECTING)
 
     // Clean up subscription event listeners
@@ -256,6 +302,7 @@ export class Connection {
 
       if (event.state === "disconnected") {
         this.#hubConnected = false
+        this.#setBrowserStatus(BrowserStatus.DISCONNECTED)
         this.#setState(ConnectionState.DISCONNECTED)
         this.emit("disconnected")
       } else if (event.state === "connected" && !this.#hubConnected) {
@@ -335,7 +382,6 @@ export class Connection {
     this.subscriptionId = null
     this.#hubConnected = false
     this.identityKey = null
-    this.session = null
 
     // Cleanup hub event listeners
     for (const unsub of this.#unsubscribers) {
@@ -344,6 +390,8 @@ export class Connection {
     this.#unsubscribers = []
     this.#clearSubscriptionEventListeners()
 
+    this.browserStatus = BrowserStatus.DISCONNECTED
+    this.cliStatus = CliStatus.UNKNOWN
     this.#setState(ConnectionState.DISCONNECTED)
     this.emit("destroyed")
     this.subscribers.clear()
@@ -449,22 +497,12 @@ export class Connection {
   }
 
   /**
-   * Whether this channel requires CLI ready signal before sending.
-   * Override in subclasses that need to wait for CLI subscription.
-   * Default false - most channels can send immediately.
-   * @returns {boolean}
-   */
-  requiresCliReady() {
-    return false
-  }
-
-  /**
    * Handle a decrypted message. Subclasses route to domain-specific events.
-   * Base class handles input_ready; subclasses handle domain-specific messages.
+   * Base class handles handshake protocol; subclasses handle domain-specific messages.
    * @param {Object} message
    */
   handleMessage(message) {
-    // Handle CLI ready signal first
+    // Handle handshake/health messages first
     if (this.processMessage(message)) {
       return
     }
@@ -476,7 +514,7 @@ export class Connection {
 
   /**
    * Send a message through the secure channel.
-   * Buffers messages until CLI signals ready to prevent race conditions.
+   * Buffers messages until handshake completes to prevent race conditions.
    * Auto-resubscribes if subscription is stale (e.g., after wake from sleep).
    * @param {string} type - Message type
    * @param {Object} data - Message payload
@@ -487,8 +525,9 @@ export class Connection {
       return false
     }
 
-    // Buffer if CLI not ready yet (prevents race condition on channel startup)
-    if (!this.cliReady) {
+    // Buffer if handshake not complete yet (prevents race condition on channel startup)
+    // Exception: allow handshake messages (connected, ack) through immediately
+    if (!this.handshakeComplete && type !== "connected" && type !== "ack") {
       this.inputBuffer.push({ type, data })
       return true
     }
@@ -534,14 +573,119 @@ export class Connection {
   }
 
   /**
-   * Handle CLI ready signal - flush buffered messages.
-   * Called when CLI sends input_ready after subscribing.
+   * Process incoming message, handling health/status/handshake messages before subclass routing.
+   * Subclasses should call super.processMessage(message) or handle these themselves.
+   * @param {Object} message - Decrypted message
+   * @returns {boolean} - True if message was handled, false otherwise
    */
-  #handleCliReady() {
-    if (this.cliReady) return // Already ready
+  processMessage(message) {
+    if (message.type === "health") {
+      console.debug(`[${this.constructor.name}] Received health message:`, message)
+      this.#handleHealthMessage(message)
+      return true
+    }
+    if (message.type === "connected") {
+      // CLI sent handshake - respond with ack
+      console.log(`[${this.constructor.name}] Received handshake from CLI:`, message.device_name)
+      this.#handleIncomingHandshake(message)
+      return true
+    }
+    if (message.type === "ack") {
+      // CLI acknowledged our handshake
+      this.#handleHandshakeAck(message)
+      return true
+    }
+    if (message.type === "cli_disconnected") {
+      this.#handleCliDisconnected()
+      return true
+    }
+    return false
+  }
 
-    this.cliReady = true
-    console.log(`[${this.constructor.name}] CLI ready, flushing ${this.inputBuffer.length} buffered messages`)
+  // ========== Handshake Protocol ==========
+
+  /**
+   * Send handshake to CLI indicating browser is ready.
+   * Called when browser detects CLI is connected (browser is "last").
+   */
+  #sendHandshake() {
+    if (this.handshakeSent || this.handshakeComplete) {
+      console.log(`[${this.constructor.name}] Skipping handshake - already sent or complete`)
+      return
+    }
+
+    this.handshakeSent = true
+    console.log(`[${this.constructor.name}] Sending handshake`)
+
+    // Send handshake directly (bypasses buffer since handshake isn't complete yet)
+    bridge.send("send", {
+      subscriptionId: this.subscriptionId,
+      message: {
+        type: "connected",
+        device_name: this.#getDeviceName(),
+        timestamp: Date.now()
+      }
+    }).catch(err => {
+      console.error(`[${this.constructor.name}] Handshake send failed:`, err)
+      this.handshakeSent = false
+    })
+
+    // Start timeout
+    this.handshakeTimer = setTimeout(() => {
+      if (!this.handshakeComplete) {
+        console.warn(`[${this.constructor.name}] Handshake timeout`)
+        this.emit("error", {
+          reason: "handshake_timeout",
+          message: "CLI did not respond to handshake"
+        })
+      }
+    }, HANDSHAKE_TIMEOUT_MS)
+  }
+
+  /**
+   * Handle incoming handshake from CLI.
+   * CLI was "last" to connect, respond with ack.
+   */
+  #handleIncomingHandshake(message) {
+    console.log(`[${this.constructor.name}] Received handshake from CLI`)
+
+    // Send ack back
+    bridge.send("send", {
+      subscriptionId: this.subscriptionId,
+      message: { type: "ack", timestamp: Date.now() }
+    }).catch(err => console.error(`[${this.constructor.name}] Ack send failed:`, err))
+
+    // Mark complete and flush buffer
+    this.#completeHandshake()
+  }
+
+  /**
+   * Handle handshake acknowledgment from CLI.
+   * CLI confirmed our handshake.
+   */
+  #handleHandshakeAck(message) {
+    console.log(`[${this.constructor.name}] Received handshake ack from CLI`)
+
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer)
+      this.handshakeTimer = null
+    }
+
+    this.#completeHandshake()
+  }
+
+  /**
+   * Complete handshake - flush buffer and emit connected event.
+   */
+  #completeHandshake() {
+    if (this.handshakeComplete) return
+
+    this.handshakeComplete = true
+    console.log(`[${this.constructor.name}] Handshake complete, flushing ${this.inputBuffer.length} buffered messages`)
+
+    // Update legacy state to CONNECTED now that E2E is established
+    this.#setState(ConnectionState.CONNECTED)
+    this.#emitHealthChange()
 
     // Flush buffered messages
     for (const { type, data } of this.inputBuffer) {
@@ -552,29 +696,121 @@ export class Connection {
     }
     this.inputBuffer = []
 
-    this.emit("cliReady")
+    this.emit("connected", this)
   }
 
   /**
-   * Process incoming message, handling CLI ready signal before subclass routing.
-   * Subclasses should call super.processMessage(message) or handle input_ready themselves.
-   * @param {Object} message - Decrypted message
-   * @returns {boolean} - True if message was handled (input_ready), false otherwise
+   * Get device name for handshake.
    */
-  processMessage(message) {
-    if (message.type === "input_ready") {
-      this.#handleCliReady()
-      return true
-    }
-    return false
+  #getDeviceName() {
+    const ua = navigator.userAgent
+    if (ua.includes("iPhone")) return "iPhone"
+    if (ua.includes("iPad")) return "iPad"
+    if (ua.includes("Android")) return "Android"
+    if (ua.includes("Mac")) return "Mac Browser"
+    if (ua.includes("Windows")) return "Windows Browser"
+    if (ua.includes("Linux")) return "Linux Browser"
+    return "Browser"
   }
 
   /**
-   * Check if connected (hub connected AND subscribed to channel).
+   * Handle health message from Rails - updates CLI status.
+   * Hub-wide: { type: "health", cli: "online" | "offline" } - CLI connected to Rails
+   * Per-browser: { type: "health", cli: "connected" | "disconnected" } - CLI on E2E channel
+   */
+  #handleHealthMessage(message) {
+    const cliStatusMap = {
+      offline: CliStatus.OFFLINE,
+      online: CliStatus.ONLINE,
+      notified: CliStatus.NOTIFIED,
+      connecting: CliStatus.CONNECTING,
+      connected: CliStatus.CONNECTED,
+      disconnected: CliStatus.DISCONNECTED,
+    }
+
+    const newCliStatus = cliStatusMap[message.cli] || this.cliStatus
+    if (newCliStatus !== this.cliStatus) {
+      const prevStatus = this.cliStatus
+      this.cliStatus = newCliStatus
+      console.log(`[${this.constructor.name}] CLI status: ${prevStatus} → ${newCliStatus}`)
+
+      this.emit("cliStatusChange", { status: newCliStatus, prevStatus })
+      this.#emitHealthChange()
+
+      // If CLI just connected to E2E channel, initiate handshake (browser is "last")
+      if (newCliStatus === CliStatus.CONNECTED && prevStatus !== CliStatus.CONNECTED) {
+        console.log(`[${this.constructor.name}] CLI connected, initiating handshake`)
+        this.emit("cliConnected")
+        this.#sendHandshake()
+      }
+
+      // If CLI just disconnected, reset handshake state for fresh start on reconnect
+      if ((newCliStatus === CliStatus.DISCONNECTED || newCliStatus === CliStatus.OFFLINE) &&
+          prevStatus !== CliStatus.DISCONNECTED && prevStatus !== CliStatus.OFFLINE) {
+        console.log(`[${this.constructor.name}] CLI disconnected, resetting handshake state`)
+        this.handshakeComplete = false
+        this.handshakeSent = false
+        if (this.handshakeTimer) {
+          clearTimeout(this.handshakeTimer)
+          this.handshakeTimer = null
+        }
+        // Reset reliable delivery state so next CLI connection starts fresh
+        if (this.subscriptionId) {
+          bridge.send("resetReliable", { subscriptionId: this.subscriptionId })
+            .catch(err => console.warn(`[${this.constructor.name}] resetReliable failed:`, err))
+        }
+        this.emit("cliDisconnected")
+      }
+    }
+
+    // Also update legacy state for backward compatibility
+    if (message.cli === "disconnected" || message.cli === "offline") {
+      this.#setState(ConnectionState.CLI_DISCONNECTED)
+    }
+  }
+
+  /**
+   * Handle CLI disconnection - server notifies us when CLI unsubscribes.
+   */
+  #handleCliDisconnected() {
+    console.log(`[${this.constructor.name}] CLI disconnected`)
+    // Reset handshake state
+    this.handshakeComplete = false
+    this.handshakeSent = false
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer)
+      this.handshakeTimer = null
+    }
+    this.cliStatus = CliStatus.DISCONNECTED
+    this.#setState(ConnectionState.CLI_DISCONNECTED)
+    this.emit("cliStatusChange", { status: CliStatus.DISCONNECTED, prevStatus: this.cliStatus })
+    this.#emitHealthChange()
+    this.emit("cliDisconnected")
+  }
+
+  /**
+   * Emit combined health change event with both browser and CLI status.
+   * Also includes current state so passive subscribers can react to it.
+   */
+  #emitHealthChange() {
+    this.emit("healthChange", {
+      browser: this.browserStatus,
+      cli: this.cliStatus,
+    })
+    this.manager.notifySubscribers(this.key, {
+      type: "health",
+      state: this.state,
+      browser: this.browserStatus,
+      cli: this.cliStatus,
+    })
+  }
+
+  /**
+   * Check if fully connected (subscribed AND handshake complete).
    * @returns {boolean}
    */
   isConnected() {
-    return this.state === ConnectionState.CONNECTED
+    return this.state === ConnectionState.CONNECTED && this.handshakeComplete
   }
 
   /**
@@ -673,8 +909,51 @@ export class Connection {
 
   #setError(reason, message) {
     this.errorReason = message
+    this.#setBrowserStatus(BrowserStatus.ERROR)
     this.#setState(ConnectionState.ERROR)
     this.emit("error", { reason, message })
   }
 
+  #setBrowserStatus(newStatus) {
+    const prevStatus = this.browserStatus
+    if (newStatus === prevStatus) return
+
+    this.browserStatus = newStatus
+    console.log(`[${this.constructor.name}] Browser status: ${prevStatus} → ${newStatus}`)
+
+    this.emit("browserStatusChange", { status: newStatus, prevStatus })
+    this.#emitHealthChange()
+  }
+
+  /**
+   * Ensure browser status reflects subscribed state.
+   * Called on early return from subscribe() when already subscribed.
+   */
+  #ensureSubscribedStatus() {
+    if (this.browserStatus !== BrowserStatus.SUBSCRIBED) {
+      this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
+    }
+    // Always emit health change so new listeners get current state
+    this.#emitHealthChange()
+  }
+
+  /**
+   * Request current health status from server.
+   * Called after subscription to work around race condition where
+   * initial transmit is lost before listener is set up.
+   */
+  async #requestHealth() {
+    if (!this.subscriptionId) return
+
+    try {
+      await bridge.send("perform", {
+        subscriptionId: this.subscriptionId,
+        actionName: "request_health",
+        data: {}
+      })
+    } catch (error) {
+      // Non-fatal - health will update via broadcasts
+      console.debug(`[${this.constructor.name}] request_health failed:`, error)
+    }
+  }
 }

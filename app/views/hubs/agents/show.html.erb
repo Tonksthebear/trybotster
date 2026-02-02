@@ -7,8 +7,7 @@
 
   Controllers:
   - terminal-display: xterm.js rendering, acquires TerminalConnection via ConnectionManager
-  - hub-status: Connection state (CSS-driven)
-  - terminal-status: Terminal connection state (CSS-driven)
+  - connection-status: Unified connection state display (three-column view)
   - agent-list: Sidebar agent list (uses template)
 %>
 
@@ -24,50 +23,17 @@
     <%# Mobile header - compact %>
     <div class="lg:hidden px-3 py-2">
       <div class="flex items-center justify-between gap-2">
-        <%# Hub status indicator + agent dropdown %>
-        <div class="flex items-center gap-2 min-w-0"
-             data-controller="hub-status"
-             data-hub-status-hub-id-value="<%= Current.hub.id %>"
-             data-hub-status-state-value="disconnected"
-             class="group">
+        <%# Hub/Agent label %>
+        <span class="text-sm font-mono text-zinc-300 truncate min-w-0">
+          <%= Current.hub.device&.name || Current.hub.identifier.truncate(16) %>
+        </span>
 
-          <%# Status icon - CSS driven %>
-          <span class="shrink-0">
-            <%# Disconnected %>
-            <span class="hidden group-data-[hub-status-state-value=disconnected]:block">
-              <%= icon "signal-slash", class: "size-3 text-zinc-500" %>
-            </span>
-            <%# Loading/Connecting %>
-            <span class="hidden group-data-[hub-status-state-value=loading]:block group-data-[hub-status-state-value=connecting]:block group-data-[hub-status-state-value=handshake]:block">
-              <%= icon "arrow-path", class: "size-3 text-cyan-400 animate-spin" %>
-            </span>
-            <%# Connected %>
-            <span class="hidden group-data-[hub-status-state-value=connected]:block">
-              <%= icon "lock-closed", variant: :solid, class: "size-3 text-emerald-400" %>
-            </span>
-            <%# Error %>
-            <span class="hidden group-data-[hub-status-state-value=error]:block">
-              <%= icon "exclamation-circle", class: "size-3 text-red-400" %>
-            </span>
-          </span>
-
-          <%# Hub/Agent label %>
-          <span class="text-sm font-mono text-zinc-300 truncate">
-            <%= Current.hub.device&.name || Current.hub.identifier.truncate(16) %>
-          </span>
-        </div>
-
-        <%# Mobile status text %>
-        <div data-controller="hub-status"
-             data-hub-status-hub-id-value="<%= Current.hub.id %>"
-             data-hub-status-state-value="disconnected"
-             class="group text-xs shrink-0">
-          <span class="hidden group-data-[hub-status-state-value=disconnected]:inline text-zinc-500">Offline</span>
-          <span class="hidden group-data-[hub-status-state-value=loading]:inline group-data-[hub-status-state-value=connecting]:inline text-zinc-500">Connecting...</span>
-          <span class="hidden group-data-[hub-status-state-value=handshake]:inline text-amber-400">Waiting for CLI...</span>
-          <span class="hidden group-data-[hub-status-state-value=connected]:inline text-emerald-400">Connected</span>
-          <span class="hidden group-data-[hub-status-state-value=error]:inline text-red-400">Error</span>
-        </div>
+        <%# Connection status %>
+        <%= render "shared/connection_status",
+                   hub: Current.hub,
+                   connection_type: "terminal",
+                   agent_index: Current.agent_index,
+                   pty_index: Current.pty_index %>
       </div>
     </div>
 
@@ -85,51 +51,12 @@
           </div>
         </div>
 
-        <%# Connection status - CSS driven %>
-        <div data-controller="hub-status"
-             data-hub-status-hub-id-value="<%= Current.hub.id %>"
-             data-hub-status-state-value="disconnected"
-             class="group flex items-center gap-2 shrink-0">
-
-          <%# Status indicator %>
-          <div class="flex items-center gap-2 text-sm font-medium">
-            <%# Disconnected %>
-            <span class="hidden group-data-[hub-status-state-value=disconnected]:flex items-center gap-2 text-zinc-500">
-              <%= icon "signal-slash", class: "size-4" %>
-              <span>Disconnected</span>
-            </span>
-
-            <%# Loading %>
-            <span class="hidden group-data-[hub-status-state-value=loading]:flex items-center gap-2 text-cyan-400">
-              <%= icon "arrow-path", class: "size-4 animate-spin" %>
-              <span class="text-zinc-400">Loading...</span>
-            </span>
-
-            <%# Connecting %>
-            <span class="hidden group-data-[hub-status-state-value=connecting]:flex items-center gap-2 text-cyan-400">
-              <%= icon "arrow-path", class: "size-4 animate-spin" %>
-              <span class="text-zinc-400">Connecting...</span>
-            </span>
-
-            <%# Handshake %>
-            <span class="hidden group-data-[hub-status-state-value=handshake]:flex items-center gap-2 text-amber-400">
-              <%= icon "arrow-path", class: "size-4 animate-spin" %>
-              <span>Waiting for CLI...</span>
-            </span>
-
-            <%# Connected %>
-            <span class="hidden group-data-[hub-status-state-value=connected]:flex items-center gap-2 text-emerald-400">
-              <%= icon "lock-closed", variant: :solid, class: "size-4" %>
-              <span>Connected</span>
-            </span>
-
-            <%# Error %>
-            <span class="hidden group-data-[hub-status-state-value=error]:flex items-center gap-2 text-red-400">
-              <%= icon "exclamation-circle", class: "size-4" %>
-              <span>Connection failed</span>
-            </span>
-          </div>
-        </div>
+<%# Connection status - three-column view %>
+        <%= render "shared/connection_status",
+                   hub: Current.hub,
+                   connection_type: "terminal",
+                   agent_index: Current.agent_index,
+                   pty_index: Current.pty_index %>
       </div>
     </div>
   </div>
@@ -174,30 +101,6 @@
           <% end %>
 
           <span class="text-xs text-zinc-600 hidden lg:inline">scroll: mouse wheel</span>
-
-          <%# Terminal encryption badge - CSS driven via terminal-status %>
-          <div data-controller="terminal-status"
-               data-terminal-status-hub-id-value="<%= Current.hub.id %>"
-               data-terminal-status-agent-index-value="<%= Current.agent_index %>"
-               data-terminal-status-pty-index-value="<%= Current.pty_index %>"
-               data-terminal-status-state-value="disconnected"
-               class="group/badge">
-            <%# Connecting %>
-            <span class="hidden group-data-[terminal-status-state-value=disconnected]/badge:inline-flex group-data-[terminal-status-state-value=loading]/badge:inline-flex group-data-[terminal-status-state-value=connecting]/badge:inline-flex items-center gap-1 px-1.5 lg:px-2 py-0.5 text-xs font-medium bg-zinc-700/50 text-zinc-500 rounded">
-              <%= icon "lock-open", class: "size-3" %>
-              <span class="hidden sm:inline">Connecting...</span>
-            </span>
-            <%# Connected %>
-            <span class="hidden group-data-[terminal-status-state-value=connected]/badge:inline-flex items-center gap-1 px-1.5 lg:px-2 py-0.5 text-xs font-medium bg-emerald-500/10 text-emerald-400 rounded">
-              <%= icon "lock-closed", variant: :solid, class: "size-3" %>
-              <span class="hidden sm:inline">E2E Encrypted</span>
-            </span>
-            <%# Error %>
-            <span class="hidden group-data-[terminal-status-state-value=error]/badge:inline-flex items-center gap-1 px-1.5 lg:px-2 py-0.5 text-xs font-medium bg-red-500/10 text-red-400 rounded">
-              <%= icon "exclamation-triangle", class: "size-3" %>
-              <span class="hidden sm:inline">Error</span>
-            </span>
-          </div>
         </div>
       </div>
 

@@ -1,0 +1,109 @@
+<%# Connection Status Partial - shows [Browser → Server] | [E2E Channel] | [CLI → Server] %>
+<% connection_type ||= "hub" %>
+<% agent_index ||= 0 %>
+<% pty_index ||= 0 %>
+
+<div data-controller="connection-status"
+     data-connection-status-hub-id-value="<%= hub.id %>"
+     data-connection-status-type-value="<%= connection_type %>"
+     data-connection-status-agent-index-value="<%= agent_index %>"
+     data-connection-status-pty-index-value="<%= pty_index %>"
+     class="flex items-center gap-2 text-xs font-medium">
+
+  <%# Browser → Server %>
+  <div class="flex items-center gap-1.5 group/browser"
+       data-connection-status-target="browserSection"
+       data-browser-state="disconnected">
+    <%# Status dot %>
+    <span class="size-1.5 rounded-full transition-colors
+                 group-data-[browser-state=disconnected]/browser:bg-zinc-600
+                 group-data-[browser-state=connecting]/browser:bg-amber-500 group-data-[browser-state=connecting]/browser:animate-pulse
+                 group-data-[browser-state=connected]/browser:bg-emerald-500
+                 group-data-[browser-state=error]/browser:bg-red-500"
+          data-connection-status-target="browserDot"></span>
+    <%# Status text %>
+    <span class="text-zinc-500 transition-colors
+                 group-data-[browser-state=connected]/browser:text-zinc-400"
+          data-connection-status-target="browserText">
+      <span class="group-data-[browser-state=disconnected]/browser:inline hidden">Disconnected</span>
+      <span class="group-data-[browser-state=connecting]/browser:inline hidden">Connecting...</span>
+      <span class="group-data-[browser-state=connected]/browser:inline hidden">Browser</span>
+      <span class="group-data-[browser-state=error]/browser:inline hidden">Error</span>
+    </span>
+  </div>
+
+  <%# E2E Channel - Middle Graphic %>
+  <div class="flex items-center gap-0.5 group/channel"
+       data-connection-status-target="channelSection"
+       data-channel-state="disconnected">
+    <%# Left arrow (browser → server) %>
+    <svg class="size-3 transition-colors
+                group-data-[channel-state=disconnected]/channel:text-zinc-700
+                group-data-[channel-state=connecting]/channel:text-amber-500
+                group-data-[channel-state=handshake]/channel:text-amber-500 group-data-[channel-state=handshake]/channel:animate-pulse
+                group-data-[channel-state=connected]/channel:text-emerald-500
+                group-data-[channel-state=expired]/channel:text-red-500
+                group-data-[channel-state=cli-offline]/channel:text-zinc-600"
+         viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M5 12h14M12 5l7 7-7 7"/>
+    </svg>
+
+    <%# Center icon %>
+    <div class="relative size-5 flex items-center justify-center">
+      <%# Disconnected %>
+      <span class="group-data-[channel-state=disconnected]/channel:block hidden text-zinc-700">
+        <%= icon "minus-circle", class: "size-4" %>
+      </span>
+      <%# Connecting %>
+      <span class="group-data-[channel-state=connecting]/channel:block hidden text-amber-500">
+        <%= icon "arrow-path", class: "size-4 animate-spin" %>
+      </span>
+      <%# Handshake %>
+      <span class="group-data-[channel-state=handshake]/channel:block hidden text-amber-500">
+        <%= icon "hand-raised", class: "size-4 animate-pulse" %>
+      </span>
+      <%# Connected (encrypted) %>
+      <span class="group-data-[channel-state=connected]/channel:block hidden text-emerald-500">
+        <%= icon "lock-closed", variant: :solid, class: "size-4" %>
+      </span>
+      <%# Expired session %>
+      <span class="group-data-[channel-state=expired]/channel:block hidden text-red-500">
+        <%= icon "exclamation-triangle", class: "size-4" %>
+      </span>
+      <%# CLI Offline %>
+      <span class="group-data-[channel-state=cli-offline]/channel:block hidden text-zinc-600">
+        <%= icon "link-slash", class: "size-4" %>
+      </span>
+    </div>
+
+    <%# Right arrow (server ← CLI) %>
+    <svg class="size-3 rotate-180 transition-colors
+                group-data-[channel-state=disconnected]/channel:text-zinc-700
+                group-data-[channel-state=connecting]/channel:text-amber-500
+                group-data-[channel-state=handshake]/channel:text-amber-500 group-data-[channel-state=handshake]/channel:animate-pulse
+                group-data-[channel-state=connected]/channel:text-emerald-500
+                group-data-[channel-state=expired]/channel:text-red-500
+                group-data-[channel-state=cli-offline]/channel:text-zinc-600"
+         viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M5 12h14M12 5l7 7-7 7"/>
+    </svg>
+  </div>
+
+  <%# CLI → Server %>
+  <div class="flex items-center gap-1.5 group/cli"
+       data-connection-status-target="cliSection"
+       data-cli-online="false">
+    <%# Status text %>
+    <span class="text-zinc-500 transition-colors
+                 group-data-[cli-online=true]/cli:text-zinc-400"
+          data-connection-status-target="cliText">
+      <span class="group-data-[cli-online=false]/cli:inline hidden">CLI Offline</span>
+      <span class="group-data-[cli-online=true]/cli:inline hidden">CLI</span>
+    </span>
+    <%# Status dot %>
+    <span class="size-1.5 rounded-full transition-colors
+                 group-data-[cli-online=false]/cli:bg-zinc-600
+                 group-data-[cli-online=true]/cli:bg-emerald-500"
+          data-connection-status-target="cliDot"></span>
+  </div>
+</div>

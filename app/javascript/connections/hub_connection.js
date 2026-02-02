@@ -2,10 +2,11 @@
  * HubConnection - Typed wrapper for hub control plane.
  *
  * Manages:
- *   - Handshake with CLI (browser identity verification)
  *   - Agent lifecycle (list, create, select, delete)
  *   - Worktree operations
  *   - Invite/share functionality
+ *
+ * Handshake is handled by base Connection class.
  *
  * Events:
  *   - connected - Handshake completed, E2E active
@@ -25,24 +26,9 @@
  *   hub.requestAgents();
  */
 
-import { Connection, ConnectionState } from "connections/connection";
-
-const HANDSHAKE_TIMEOUT_MS = 8000;
-
-// Hub-specific states (extends base states)
-export const HubState = {
-  ...ConnectionState,
-  HANDSHAKE_SENT: "handshake_sent",
-  HANDSHAKE_TIMEOUT: "handshake_timeout",
-};
+import { Connection } from "connections/connection";
 
 export class HubConnection extends Connection {
-  constructor(key, options, manager) {
-    super(key, options, manager);
-    this.handshakeTimer = null;
-    this.handshakeComplete = false;
-  }
-
   // ========== Connection overrides ==========
 
   channelName() {
@@ -57,41 +43,15 @@ export class HubConnection extends Connection {
   }
 
   /**
-   * Override initialize to add handshake step.
-   */
-  async initialize() {
-    await super.initialize();
-
-    // If base connection succeeded, send handshake
-    if (this.state === ConnectionState.CONNECTED) {
-      await this.#sendHandshake();
-    }
-  }
-
-  async destroy() {
-    if (this.handshakeTimer) {
-      clearTimeout(this.handshakeTimer)
-      this.handshakeTimer = null
-    }
-    await super.destroy()
-  }
-
-  /**
-   * Override isConnected to require handshake completion.
-   */
-  isConnected() {
-    return super.isConnected() && this.handshakeComplete;
-  }
-
-  /**
    * Handle hub-specific messages.
    */
   handleMessage(message) {
-    switch (message.type) {
-      case "handshake_ack":
-        this.#handleHandshakeAck(message);
-        break;
+    // Let base class handle handshake and health messages
+    if (this.processMessage(message)) {
+      return;
+    }
 
+    switch (message.type) {
       case "agents":
       case "agent_list":
         this.emit("agentList", message.agents || []);
@@ -171,18 +131,6 @@ export class HubConnection extends Connection {
     return this.send("get_connection_code");
   }
 
-  /**
-   * Manually trigger reconnect/re-handshake.
-   */
-  async reconnect() {
-    if (this.handshakeTimer) {
-      clearTimeout(this.handshakeTimer);
-      this.handshakeTimer = null;
-    }
-    this.handshakeComplete = false;
-    await this.#sendHandshake();
-  }
-
   // ========== Convenience event helpers ==========
 
   /**
@@ -201,9 +149,9 @@ export class HubConnection extends Connection {
 
   /**
    * Subscribe to connection established (handshake complete).
+   * Fires immediately if already connected.
    */
   onConnected(callback) {
-    // If already connected, fire immediately
     if (this.isConnected()) {
       callback(this);
     }
@@ -231,112 +179,5 @@ export class HubConnection extends Connection {
    */
   onError(callback) {
     return this.on("error", callback);
-  }
-
-  // ========== Private: Handshake ==========
-
-  async #sendHandshake() {
-    const prevState = this.state;
-    this.state = HubState.HANDSHAKE_SENT;
-
-    const stateInfo = {
-      state: HubState.HANDSHAKE_SENT,
-      prevState,
-      error: null,
-    };
-    this.emit("stateChange", stateInfo);
-    this.manager.notifySubscribers(this.key, stateInfo);
-
-    const sent = await this.send("connected", {
-      device_name: this.#getDeviceName(),
-      timestamp: Date.now(),
-    });
-
-    if (!sent) {
-      this.emit("error", {
-        reason: "handshake_failed",
-        message: "Failed to send handshake",
-      });
-      return;
-    }
-
-    // Start timeout
-    this.handshakeTimer = setTimeout(() => {
-      if (!this.handshakeComplete) {
-        this.#handleHandshakeTimeout();
-      }
-    }, HANDSHAKE_TIMEOUT_MS);
-  }
-
-  #handleHandshakeAck(message) {
-    if (this.handshakeTimer) {
-      clearTimeout(this.handshakeTimer);
-      this.handshakeTimer = null;
-    }
-
-    this.handshakeComplete = true;
-    const prevState = this.state;
-    this.state = ConnectionState.CONNECTED;
-
-    const stateInfo = {
-      state: ConnectionState.CONNECTED,
-      prevState,
-      error: null,
-    };
-    this.emit("stateChange", stateInfo);
-    this.manager.notifySubscribers(this.key, stateInfo);
-    this.emit("connected", this);
-  }
-
-  async #handleHandshakeTimeout() {
-    console.warn("[HubConnection] Handshake timeout");
-
-    // Check if CLI is online via HTTP
-    try {
-      const response = await fetch(`/hubs/${this.getHubId()}.json`, {
-        credentials: "same-origin",
-        headers: { Accept: "application/json" },
-      });
-
-      if (response.ok) {
-        const status = await response.json();
-        const isCliOnline =
-          status.seconds_since_heartbeat !== null &&
-          status.seconds_since_heartbeat < 30;
-
-        if (isCliOnline) {
-          this.emit("error", {
-            reason: "session_invalid",
-            message: "Session expired. Re-scan QR code from CLI (Ctrl+P).",
-          });
-        } else {
-          this.emit("error", {
-            reason: "handshake_timeout",
-            message: "CLI not responding. Is botster-hub running?",
-          });
-        }
-      } else {
-        this.emit("error", {
-          reason: "handshake_timeout",
-          message: "CLI did not respond. Is botster-hub running?",
-        });
-      }
-    } catch (error) {
-      this.emit("error", {
-        reason: "handshake_timeout",
-        message: "CLI did not respond. Is botster-hub running?",
-      });
-    }
-  }
-
-  #getDeviceName() {
-    const ua = navigator.userAgent;
-    if (ua.includes("iPhone")) return "iPhone";
-    if (ua.includes("iPad")) return "iPad";
-    if (ua.includes("Android")) return "Android";
-    if (ua.includes("Mac")) return "Mac Browser";
-    if (ua.includes("Windows")) return "Windows Browser";
-    if (ua.includes("Linux")) return "Linux Browser";
-    return "Browser";
   }
 }

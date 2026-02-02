@@ -10,48 +10,8 @@
           </p>
         </div>
 
-        <%# Connection status - CSS-driven via data attributes %>
-        <div data-controller="hub-status"
-             data-hub-status-hub-id-value="<%= Current.hub.id %>"
-             data-hub-status-state-value="disconnected"
-             class="group flex items-center gap-2 shrink-0 text-sm font-medium">
-
-          <%# Disconnected %>
-          <span class="hidden group-data-[hub-status-state-value=disconnected]:flex items-center gap-2 text-zinc-500">
-            <%= icon "signal-slash", class: "size-4" %>
-            <span>Disconnected</span>
-          </span>
-
-          <%# Loading (WASM/session) %>
-          <span class="hidden group-data-[hub-status-state-value=loading]:flex items-center gap-2 text-cyan-400">
-            <%= icon "arrow-path", class: "size-4 animate-spin" %>
-            <span class="text-zinc-400">Loading encryption...</span>
-          </span>
-
-          <%# Connecting (channel) %>
-          <span class="hidden group-data-[hub-status-state-value=connecting]:flex items-center gap-2 text-cyan-400">
-            <%= icon "arrow-path", class: "size-4 animate-spin" %>
-            <span class="text-zinc-400">Connecting...</span>
-          </span>
-
-          <%# Handshake (waiting for CLI) %>
-          <span class="hidden group-data-[hub-status-state-value=handshake]:flex items-center gap-2 text-amber-400">
-            <%= icon "arrow-path", class: "size-4 animate-spin" %>
-            <span>Waiting for CLI...</span>
-          </span>
-
-          <%# Connected %>
-          <span class="hidden group-data-[hub-status-state-value=connected]:flex items-center gap-2 text-emerald-400">
-            <%= icon "lock-closed", variant: :solid, class: "size-4" %>
-            <span>Connected</span>
-          </span>
-
-          <%# Error %>
-          <span class="hidden group-data-[hub-status-state-value=error]:flex items-center gap-2 text-red-400">
-            <%= icon "exclamation-circle", class: "size-4" %>
-            <span>Connection failed</span>
-          </span>
-        </div>
+        <%# Connection status - three-column view %>
+        <%= render "shared/connection_status", hub: Current.hub, connection_type: "hub" %>
       </div>
     </div>
   </div>

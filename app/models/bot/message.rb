@@ -11,6 +11,8 @@ class Bot::Message < ApplicationRecord
     in: %w[pending sent acknowledged failed],
     message: "%{value} is not a valid status"
   }
+  # Removed: uniqueness validation was blocking legitimate reconnection attempts
+  # CLI can handle duplicate messages - it's idempotent
 
   # Scopes
   scope :pending, -> { where(status: "pending") }
@@ -161,6 +163,7 @@ class Bot::Message < ApplicationRecord
   def set_default_status
     self.status ||= "pending"
   end
+
 
   def broadcast_to_hub_command_channel
     ActionCable.server.broadcast(

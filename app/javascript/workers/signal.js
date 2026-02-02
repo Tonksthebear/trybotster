@@ -779,6 +779,9 @@ async function handleMessage(event, portId, replyFn) {
       case "perform":
         result = await handlePerform(params.subscriptionId, params.actionName, params.data);
         break;
+      case "resetReliable":
+        result = handleResetReliable(params.subscriptionId);
+        break;
       default:
         throw new Error(`Unknown action: ${action}`);
     }
@@ -1170,6 +1173,7 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
     receiver = new ReliableReceiver({
       onDeliver: (payload) => {
         // Route decrypted, in-order message to owning port
+        console.log(`[SignalWorker] Delivering message type=${payload?.type}, size=${JSON.stringify(payload)?.length}`);
         if (portState) {
           try {
             portState.port.postMessage({
@@ -1177,7 +1181,9 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
               subscriptionId,
               message: payload
             });
-          } catch (e) {}
+          } catch (e) {
+            console.error(`[SignalWorker] Failed to post message:`, e);
+          }
         }
       },
       onAck: async (ack) => {
@@ -1339,6 +1345,28 @@ async function handlePerform(subscriptionId, actionName, data) {
   const { subscription } = subInfo;
   subscription.perform(actionName, data);
   return { performed: true };
+}
+
+/**
+ * Reset reliable delivery state for a subscription.
+ * Called when CLI disconnects so next connection starts fresh.
+ */
+function handleResetReliable(subscriptionId) {
+  const subInfo = findSubscriptionById(subscriptionId);
+  if (!subInfo) {
+    throw new Error(`Subscription ${subscriptionId} not found`);
+  }
+
+  const { sender, receiver } = subInfo;
+  if (sender) {
+    console.log(`[SignalWorker] Resetting reliable sender for ${subscriptionId}`);
+    sender.reset();
+  }
+  if (receiver) {
+    console.log(`[SignalWorker] Resetting reliable receiver for ${subscriptionId}`);
+    receiver.reset();
+  }
+  return { reset: true };
 }
 
 

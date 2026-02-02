@@ -4,18 +4,21 @@
  * Manages PTY I/O (input/output streams) and terminal resize events.
  * Uses the shared Signal session from IndexedDB (same as HubConnection).
  *
+ * Handshake is handled by base Connection class.
+ *
  * Events:
- *   - connected - Channel established
+ *   - connected - Handshake completed, E2E active
  *   - disconnected - Channel closed
  *   - stateChange - { state, prevState, error }
  *   - error - { reason, message }
  *   - output - PTY output data (Uint8Array for raw, string for scrollback)
  *
  * Flow:
- *   1. Loads Signal session from IndexedDB (same session as HubConnection)
- *   2. Subscribes to TerminalRelayChannel
- *   3. Rails notifies CLI via Bot::Message when browser subscribes
- *   4. CLI subscribes to its stream, bidirectional channel established
+ *   1. Browser subscribes to TerminalRelayChannel
+ *   2. Rails notifies CLI via Bot::Message
+ *   3. CLI subscribes → health broadcast → browser knows CLI is there
+ *   4. Whoever is "last" sends handshake, other side acks
+ *   5. Browser emits "connected" event
  *
  * Usage:
  *   const key = TerminalConnection.key(hubId, agentIndex, ptyIndex);
@@ -41,14 +44,6 @@ export class TerminalConnection extends Connection {
     return "TerminalRelayChannel";
   }
 
-  /**
-   * Terminal connections require CLI ready signal before sending input.
-   * This prevents the race condition where browser sends before CLI subscribes.
-   */
-  requiresCliReady() {
-    return true;
-  }
-
   channelParams() {
     // Each browser has dedicated streams with CLI (like TUI has dedicated I/O)
     // Browser subscribes to: terminal_relay:{hub}:{agent}:{pty}:{browser_identity}
@@ -61,14 +56,17 @@ export class TerminalConnection extends Connection {
   }
 
   handleMessage(message) {
-    // Let base class handle input_ready
+    // Let base class handle handshake and health messages
     if (this.processMessage(message)) {
       return;
     }
 
+    console.log(`[TerminalConnection] handleMessage:`, message.type, message.data?.length || message);
+
     switch (message.type) {
       case "raw_output":
         // Raw bytes from CLI - pass directly to xterm
+        console.log(`[TerminalConnection] Emitting raw_output, ${message.data?.length} bytes`);
         this.emit("output", message.data);
         break;
 
@@ -146,6 +144,7 @@ export class TerminalConnection extends Connection {
   }
 
   onConnected(callback) {
+    // Fire immediately if already fully connected
     if (this.isConnected()) callback(this);
     return this.on("connected", callback);
   }

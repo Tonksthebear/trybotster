@@ -592,10 +592,18 @@ impl BrowserClient {
                     device_name
                 );
                 // Send handshake acknowledgment to complete E2E session establishment.
-                self.send_handshake_ack().await;
+                self.send_ack().await;
                 // Also send initial data so browser has agents/worktrees immediately.
                 self.send_agent_list_to_browser().await;
                 self.send_worktree_list_to_browser().await;
+            }
+
+            BrowserCommand::Ack { .. } => {
+                // Browser acknowledged our handshake - E2E session is fully established.
+                log::info!(
+                    "BrowserClient {}: Received ack, handshake complete",
+                    &self.identity[..8.min(self.identity.len())]
+                );
             }
         }
     }
@@ -665,6 +673,7 @@ impl BrowserClient {
     /// Processes requests from browser input receiver tasks via `request_rx`
     /// and hub events via broadcast in a `tokio::select!` loop.
     pub async fn run_task(mut self) {
+        log::info!("BrowserClient::run_task starting for {}", &self.identity[..8.min(self.identity.len())]);
         let Some(mut request_rx) = self.request_rx.take() else {
             log::error!("BrowserClient has no request receiver");
             return;
@@ -901,12 +910,15 @@ impl BrowserClient {
         self.send_terminal_message(&message).await;
     }
 
-    /// Send handshake acknowledgment to the browser.
+    /// Send ack to browser in response to their handshake.
     ///
-    /// Completes the E2E session establishment. Browser waits for this
-    /// before considering the connection fully established.
-    async fn send_handshake_ack(&self) {
-        let message = TerminalMessage::HandshakeAck;
+    /// Completes E2E session establishment when browser initiated.
+    async fn send_ack(&self) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .ok();
+        let message = TerminalMessage::Ack { timestamp };
         self.send_terminal_message(&message).await;
     }
 
@@ -1304,8 +1316,8 @@ impl Client for BrowserClient {
         // Pre-register the browser as a peer so broadcast works immediately.
         // Without this, the peer set is empty until the browser's first message
         // arrives, causing scrollback (and early output) to be silently dropped.
-        // Note: input_ready is now sent automatically by ActionCableChannel
-        // when subscription confirms, so we don't need to send it here.
+        // The handshake message is sent automatically by ActionCableChannel
+        // when subscription confirms - browser then responds with ack.
         sender_handle.register_peer(PeerId(self.identity.clone()));
 
         // Connect to PTY and get scrollback BEFORE spawning forwarder.
@@ -1333,6 +1345,9 @@ impl Client for BrowserClient {
         let browser_identity = self.identity.clone();
         let agent_id = agent_handle.agent_id().to_string();
 
+        // Clone sender_handle for input receiver (output forwarder also needs one).
+        let sender_for_input = sender_handle.clone();
+
         // Spawn output forwarder: PTY -> Browser.
         let output_task = tokio::spawn(spawn_pty_output_forwarder(
             pty_rx,
@@ -1343,9 +1358,11 @@ impl Client for BrowserClient {
         ));
 
         // Spawn input receiver: Browser -> BrowserRequest channel -> Client trait.
+        // Also handles handshake acknowledgment for terminal channels.
         let request_tx = self.request_tx.clone();
         let input_task = tokio::spawn(spawn_pty_input_receiver(
             receiver_handle,
+            sender_for_input,
             request_tx,
             agent_index,
             pty_index,
@@ -1481,6 +1498,8 @@ async fn spawn_pty_output_forwarder(
                         e
                     );
                     break;
+                } else {
+                    log::trace!("[OUTPUT] Sent {} bytes to browser", data.len());
                 }
             }
             Ok(PtyEvent::ProcessExited { exit_code }) => {
@@ -1540,12 +1559,14 @@ async fn spawn_pty_output_forwarder(
 ///
 /// # Message Types
 ///
+/// - `BrowserCommand::Handshake` -> Responds with `ack`
 /// - `BrowserCommand::Input { data }` -> `BrowserRequest::SendInput`
 /// - `BrowserCommand::Resize { cols, rows }` -> `BrowserRequest::Resize`
 ///
 /// Other `BrowserCommand` variants should go through the main hub channel.
 async fn spawn_pty_input_receiver(
     mut receiver: crate::channel::ChannelReceiverHandle,
+    sender: ChannelSenderHandle,
     request_tx: UnboundedSender<BrowserRequest>,
     agent_index: usize,
     pty_index: usize,
@@ -1604,6 +1625,36 @@ async fn spawn_pty_input_receiver(
         };
 
         match command {
+            BrowserCommand::Handshake { device_name, .. } => {
+                // Browser is completing E2E handshake on terminal channel.
+                // Respond with ack to confirm the session is established.
+                log::info!(
+                    "[TerminalRelay] Handshake from '{}' on PTY ({}, {}), sending ack",
+                    device_name,
+                    agent_index,
+                    pty_index
+                );
+                let ack = serde_json::json!({"type": "ack", "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)});
+                if let Ok(json) = serde_json::to_string(&ack) {
+                    if let Err(e) = sender.send(json.as_bytes()).await {
+                        log::warn!(
+                            "[TerminalRelay] Failed to send ack: {}",
+                            e
+                        );
+                    }
+                }
+            }
+            BrowserCommand::Ack { .. } => {
+                // Browser acknowledged our handshake - E2E session is fully established.
+                log::info!(
+                    "[TerminalRelay] Received ack on PTY ({}, {}), handshake complete",
+                    agent_index,
+                    pty_index
+                );
+            }
             BrowserCommand::Input { data } => {
                 log::info!(
                     "[INPUT-TRACE] Sending to PTY: {} bytes at T+{:?}",

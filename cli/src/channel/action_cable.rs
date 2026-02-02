@@ -920,9 +920,9 @@ impl ActionCableChannel {
                 "confirm_subscription" => {
                     log::info!("{} subscription confirmed", config.channel_name);
 
-                    // Send input_ready to browser if we have browser identity.
-                    // This signals that CLI is subscribed and ready to receive input,
-                    // preventing race conditions where browser sends before CLI subscribes.
+                    // Send handshake to browser if we have browser identity.
+                    // CLI is "last" to connect (browser subscribes first, notifies CLI via Bot::Message).
+                    // This initiates the E2E handshake; browser responds with "ack".
                     if let Some(ref browser_identity) = config.browser_identity {
                         let peer = PeerId(browser_identity.clone());
 
@@ -932,9 +932,16 @@ impl ActionCableChannel {
                             peers_guard.insert(peer.clone());
                         }
 
-                        // Send input_ready message via reliable layer (binary encoded)
-                        let ready_msg = serde_json::json!({"type": "input_ready"});
-                        if let Ok(json) = serde_json::to_string(&ready_msg) {
+                        // Send handshake message via reliable layer
+                        let handshake_msg = serde_json::json!({
+                            "type": "connected",
+                            "device_name": "CLI",
+                            "timestamp": std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0)
+                        });
+                        if let Ok(json) = serde_json::to_string(&handshake_msg) {
                             let msg = {
                                 let mut sessions = reliable_sessions.write().await;
                                 let session = sessions
@@ -952,7 +959,8 @@ impl ActionCableChannel {
                             )
                             .await;
                             log::info!(
-                                "[INPUT-TRACE] Sent input_ready to browser {}",
+                                "[HANDSHAKE] Sent connected handshake on {} to browser {}",
+                                config.channel_name,
                                 &browser_identity[..8.min(browser_identity.len())]
                             );
                         }
@@ -1323,7 +1331,7 @@ impl ActionCableChannel {
                     })
                 }
                 Err(e) => {
-                    log::error!("Failed to encrypt retransmit: {}", e);
+                    log::error!("Failed to encrypt message to {}: {}", peer, e);
                     return;
                 }
             }
@@ -1347,6 +1355,8 @@ impl ActionCableChannel {
             .await
         {
             log::warn!("Failed to send reliable message to {}: {}", peer, e);
+        } else {
+            log::debug!("[RELAY] Sent encrypted message to {}", peer);
         }
     }
 
