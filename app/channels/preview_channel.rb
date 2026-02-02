@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "concerns/health_status"
+
 # Preview Channel - E2E Encrypted HTTP Tunnel for Agent Server Preview
 #
 # This channel relays encrypted HTTP requests/responses between browser
@@ -11,7 +13,8 @@
 # This is required because each browser has its own Signal session.
 #
 # Streams per (hub, agent, pty, browser):
-# - Browser stream: preview:{hub}:{agent}:{pty}:{browser_identity}
+# - Browser stream: preview:{hub}:{agent}:{pty}:{browser_identity} (E2E messages)
+# - Browser stream: hub:{hub_id}:health (health updates, shared across all channels)
 # - CLI stream:     preview:{hub}:{agent}:{pty}:{browser_identity}:cli
 #
 # Routing:
@@ -40,20 +43,42 @@ class PreviewChannel < ApplicationCable::Channel
 
     stream_from my_stream_name
 
+    # Browsers also subscribe to hub-wide health stream
+    unless @is_cli
+      stream_from health_stream_name do |message|
+        handle_health_broadcast(message)
+        transmit(message)
+      end
+    end
+
     if @is_cli
       Rails.logger.info "[Preview] CLI subscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index} browser=#{truncate_identity(@browser_identity)}"
+      # Notify THIS browser that CLI is on their E2E channel
+      ActionCable.server.broadcast(browser_stream_name, HealthStatus.message(HealthStatus::CONNECTED))
     else
       Rails.logger.info "[Preview] Browser subscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index} identity=#{truncate_identity(@browser_identity)}"
-      notify_cli_of_preview_request
+      # Notify CLI about this preview (don't transmit initial health - browser will request it)
+      notify_cli_of_preview
     end
   end
 
   def unsubscribed
     if @is_cli
-      Rails.logger.info "[Preview] CLI unsubscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
+      # Notify THIS browser that CLI left their E2E channel
+      ActionCable.server.broadcast(browser_stream_name, HealthStatus.message(HealthStatus::DISCONNECTED))
+      Rails.logger.info "[Preview] CLI unsubscribed from browser: hub=#{@hub_id} identity=#{truncate_identity(@browser_identity)}"
     else
       Rails.logger.info "[Preview] Browser unsubscribed: hub=#{@hub_id} agent=#{@agent_index} pty=#{@pty_index}"
     end
+  end
+
+  # Request current health status (called after subscription confirmed)
+  def request_health
+    return if @is_cli
+
+    hub = find_hub
+    cli_status = hub&.active? ? HealthStatus::ONLINE : HealthStatus::OFFLINE
+    transmit({ type: "health", cli: cli_status })
   end
 
   # Relay encrypted message to the other party
@@ -89,9 +114,13 @@ class PreviewChannel < ApplicationCable::Channel
     "preview:#{@hub_id}:#{@agent_index}:#{@pty_index}:#{@browser_identity}:cli"
   end
 
+  # Hub-wide health stream (all browsers for this hub)
+  def health_stream_name
+    "hub:#{@hub_id}:health"
+  end
+
   def truncate_identity(identity)
     return "nil" unless identity.present?
-
     identity.length > 8 ? "#{identity[0..8]}..." : identity
   end
 
@@ -99,14 +128,29 @@ class PreviewChannel < ApplicationCable::Channel
     current_user.hubs.find_by(id: @hub_id)
   end
 
-  def notify_cli_of_preview_request
+  # Handle health broadcasts from HubCommandChannel (CLI online/offline)
+  def handle_health_broadcast(message)
+    # Message arrives as JSON string from stream_from block
+    parsed = message.is_a?(String) ? JSON.parse(message) : message
+    cli_status = parsed["cli"] || parsed[:cli]
+    return unless cli_status == HealthStatus::ONLINE
+
+    # CLI just came online - notify it about this preview
+    notify_cli_of_preview
+  end
+
+  # Create Bot::Message to tell CLI about this preview.
+  # Uses DB unique constraint to prevent duplicates atomically.
+  def notify_cli_of_preview
     hub = find_hub
     return unless hub
 
     Bot::Message.create_for_hub!(hub,
       event_type: "browser_wants_preview",
       payload: { agent_index: @agent_index, pty_index: @pty_index, browser_identity: @browser_identity })
+  rescue ActiveRecord::RecordNotUnique
+    Rails.logger.info "[Preview] Skipping duplicate browser_wants_preview (constraint)"
   rescue => e
-    Rails.logger.warn "[Preview] Failed to notify CLI of preview request: #{e.message}"
+    Rails.logger.warn "[Preview] Failed to notify CLI: #{e.message}"
   end
 end

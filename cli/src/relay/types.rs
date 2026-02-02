@@ -153,8 +153,12 @@ pub enum TerminalMessage {
     ///
     /// Sent in response to browser's `connected` message to complete
     /// the E2E session establishment.
-    #[serde(rename = "handshake_ack")]
-    HandshakeAck,
+    #[serde(rename = "ack")]
+    Ack {
+        /// Timestamp of acknowledgment (optional).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<u64>,
+    },
 }
 
 /// Agent info for list response.
@@ -240,12 +244,20 @@ impl AgentCreationStage {
 #[serde(tag = "type")]
 pub enum BrowserCommand {
     /// Handshake message for session establishment/reconnection.
-    /// Browser sends this after establishing Signal session.
+    /// Sent by whichever side connects "last" to initiate E2E handshake.
     #[serde(rename = "connected")]
     Handshake {
-        /// Browser's device name.
+        /// Device name of the sender.
         device_name: String,
         /// Timestamp of connection (optional).
+        #[serde(default)]
+        timestamp: Option<u64>,
+    },
+    /// Handshake acknowledgment.
+    /// Confirms the other side received the handshake and E2E is ready.
+    #[serde(rename = "ack")]
+    Ack {
+        /// Timestamp of acknowledgment (optional).
         #[serde(default)]
         timestamp: Option<u64>,
     },

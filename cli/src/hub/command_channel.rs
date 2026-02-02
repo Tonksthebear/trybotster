@@ -505,6 +505,7 @@ async fn handle_text_message(
                 if message.get("type").and_then(|t| t.as_str()) == Some("message") {
                     match serde_json::from_value::<CommandMessage>(message.clone()) {
                         Ok(cmd_msg) => {
+                            log::info!("[CommandChannel] Received message seq={} type={}", cmd_msg.sequence, cmd_msg.event_type);
                             if message_tx.send(cmd_msg).await.is_err() {
                                 log::warn!("[CommandChannel] Message receiver dropped");
                                 return TextMessageResult::ReceiverDropped;

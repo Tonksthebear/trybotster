@@ -115,7 +115,7 @@ export default class extends Controller {
     );
 
     this.#unsubscribers.push(
-      this.#terminalConn.on("connected", () => {
+      this.#terminalConn.onConnected(() => {
         this.#handleConnected();
       }),
     );
@@ -132,13 +132,8 @@ export default class extends Controller {
       }),
     );
 
-    // Subscribe to get CLI handshake/scrollback
-    try {
-      await this.#terminalConn.subscribe({ force: true });
-      // handleConnected will send dimensions
-    } catch (e) {
-      this.#handleError({ message: e.message });
-    }
+    // Connection is already subscribed via ConnectionManager.acquire() → initialize()
+    // Just wait for CLI to connect and complete handshake
   }
 
   // Public actions for touch control buttons

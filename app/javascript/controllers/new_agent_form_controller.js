@@ -49,14 +49,14 @@ export default class extends Controller {
       );
 
       // Handle connection ready (initial or reconnection)
-      // Don't request immediately after subscribe - wait for connected event
+      // Use onConnected which fires immediately if already connected
       this.unsubscribers.push(
-        this.hub.on("connected", () => {
+        this.hub.onConnected(() => {
           this.hub.requestWorktrees();
         }),
       );
 
-      // Subscribe - connected event will trigger requestWorktrees
+      // Subscribe if not already subscribed
       await this.hub.subscribe();
     });
   }

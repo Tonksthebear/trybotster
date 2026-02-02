@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "concerns/health_status"
+
 # Hub Command Channel - Reliable plaintext message delivery to CLI
 #
 # Delivers Bot::Messages to the CLI in real-time with ordered replay-on-reconnect.
@@ -21,7 +23,13 @@ class HubCommandChannel < ApplicationCable::Channel
     reject and return unless hub
 
     @hub = hub
+    @hub.update!(alive: true, last_seen_at: Time.current)
+    @hub.broadcast_update!
     stream_from "hub_command:#{@hub.id}"
+
+    # Notify all browsers that CLI is now online
+    # Each browser channel's health stream handler will re-notify CLI if needed
+    broadcast_hub_health(HealthStatus::ONLINE)
 
     replay_messages(params[:start_from].to_i)
 
@@ -29,8 +37,21 @@ class HubCommandChannel < ApplicationCable::Channel
   end
 
   def unsubscribed
-    @hub&.update(active: false)
-    Rails.logger.info "[HubCommandChannel] CLI unsubscribed: hub=#{@hub&.id}"
+    return unless @hub
+
+    @hub.update!(alive: false)
+    @hub.broadcast_update!
+
+    # Notify all browsers that CLI is now offline
+    broadcast_hub_health(HealthStatus::OFFLINE)
+
+    Rails.logger.info "[HubCommandChannel] CLI unsubscribed: hub=#{@hub.id}"
+  end
+
+  # Touch last_seen_at on any channel action
+  def perform_action(data)
+    @hub&.touch(:last_seen_at)
+    super
   end
 
   def ack(data)
@@ -43,7 +64,6 @@ class HubCommandChannel < ApplicationCable::Channel
   end
 
   def heartbeat(data)
-    @hub.touch(:last_seen_at)
     @hub.update!(alive: true)
 
     if data["agents"].present?
@@ -57,6 +77,17 @@ class HubCommandChannel < ApplicationCable::Channel
 
   def find_hub
     current_user.hubs.find_by(id: params[:hub_id])
+  end
+
+  # Hub-wide health stream (all browsers for this hub)
+  def health_stream_name
+    "hub:#{@hub.id}:health"
+  end
+
+  # Broadcast health to ALL browsers subscribed to this hub (any channel type)
+  def broadcast_hub_health(cli_status)
+    ActionCable.server.broadcast(health_stream_name, HealthStatus.message(cli_status))
+    Rails.logger.debug "[HubCommandChannel] Broadcast hub health: cli=#{cli_status}"
   end
 
   def replay_messages(start_from)
