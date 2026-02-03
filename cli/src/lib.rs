@@ -29,6 +29,7 @@ pub mod channel;
 pub mod client;
 pub mod commands;
 pub mod hub;
+pub mod lua;
 pub mod relay;
 pub mod tui;
 
@@ -70,6 +71,9 @@ pub use channel::{
 // Re-export Hub types
 pub use agents::AgentSpawnConfig;
 pub use hub::{Hub, HubAction, HubState};
+
+// Re-export Lua runtime
+pub use lua::LuaRuntime;
 
 // Re-export Client types
 pub use client::{

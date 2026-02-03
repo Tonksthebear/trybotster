@@ -40,6 +40,12 @@ clap = { version = "4.5.51", features = ["derive"] }
 # Performance - global allocator (M-MIMALLOC-APPS)
 mimalloc = "0.1"
 
+# Lua scripting runtime
+mlua = { version = "0.10", features = ["lua54", "async", "serialize"] }
+
+# File watching for Lua hot-reload
+notify = "6"
+
 # Error handling & utilities
 anyhow = "1.0"
 log = "0.4"

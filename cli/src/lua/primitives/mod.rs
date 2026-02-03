@@ -1,0 +1,133 @@
+//! Lua primitive functions exposed to scripts.
+//!
+//! This module provides the built-in functions available to Lua scripts.
+//! Primitives are registered when the Lua runtime is created.
+//!
+//! # Available Primitives
+//!
+//! - `log` - Logging functions (info, warn, error, debug)
+//! - `webrtc` - WebRTC peer connection and messaging
+//! - `pty` - PTY terminal operations (forwarders, input, resize)
+//! - `hub` - Hub state queries and operations (agents, worktrees)
+//! - `events` - Event subscription system for agent lifecycle events
+//!
+//! # Adding New Primitives
+//!
+//! 1. Create a new module (e.g., `foo.rs`)
+//! 2. Implement a `register(lua: &Lua) -> Result<()>` function
+//! 3. Add `pub mod foo;` here
+//! 4. Call `foo::register(lua)?;` in `register_all`
+
+pub mod events;
+pub mod hub;
+pub mod log;
+pub mod pty;
+pub mod webrtc;
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use mlua::Lua;
+
+use crate::hub::handle_cache::HandleCache;
+
+pub use events::{
+    new_event_callbacks, EventCallbackId, EventCallbacks, SharedEventCallbacks,
+};
+pub use hub::{new_request_queue as new_hub_queue, HubRequest, HubRequestQueue};
+pub use pty::{
+    new_request_queue as new_pty_queue, CreateForwarderRequest, PtyForwarder, PtyOutputContext,
+    PtyRequest, PtyRequestQueue,
+};
+pub use webrtc::{new_send_queue, WebRtcSendQueue, WebRtcSendRequest};
+
+/// Register all primitive functions with the Lua state.
+///
+/// Called during `LuaRuntime::new()` to set up the runtime environment.
+/// Note: WebRTC and PTY primitives are registered separately via
+/// `register_webrtc()` and `register_pty()` because they require queue references.
+///
+/// # Errors
+///
+/// Returns an error if any primitive registration fails.
+pub fn register_all(lua: &Lua) -> Result<()> {
+    log::register(lua)?;
+    Ok(())
+}
+
+/// Register WebRTC primitives with a send queue.
+///
+/// Call this after `register_all()` to set up WebRTC message handling.
+/// The send queue is drained by Hub after Lua callbacks return.
+///
+/// # Arguments
+///
+/// * `lua` - The Lua state to register primitives in
+/// * `send_queue` - Shared queue for outgoing WebRTC messages
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub fn register_webrtc(lua: &Lua, send_queue: WebRtcSendQueue) -> Result<()> {
+    webrtc::register(lua, send_queue)?;
+    Ok(())
+}
+
+/// Register PTY primitives with a request queue.
+///
+/// Call this after `register_all()` to set up PTY operations.
+/// The request queue is drained by Hub after Lua callbacks return.
+///
+/// # Arguments
+///
+/// * `lua` - The Lua state to register primitives in
+/// * `request_queue` - Shared queue for PTY operations
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub fn register_pty(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
+    pty::register(lua, request_queue)?;
+    Ok(())
+}
+
+/// Register Hub state primitives with a request queue and handle cache.
+///
+/// Call this after `register_all()` to set up Hub state queries and operations.
+/// The request queue is drained by Hub after Lua callbacks return.
+///
+/// # Arguments
+///
+/// * `lua` - The Lua state to register primitives in
+/// * `request_queue` - Shared queue for Hub operations
+/// * `handle_cache` - Thread-safe cache of agent handles for queries
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub fn register_hub(
+    lua: &Lua,
+    request_queue: HubRequestQueue,
+    handle_cache: Arc<HandleCache>,
+) -> Result<()> {
+    hub::register(lua, request_queue, handle_cache)?;
+    Ok(())
+}
+
+/// Register event system primitives.
+///
+/// Call this after `register_all()` to set up the event subscription system.
+/// The callback storage is used by LuaRuntime to fire events.
+///
+/// # Arguments
+///
+/// * `lua` - The Lua state to register primitives in
+/// * `callbacks` - Shared callback storage
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub fn register_events(lua: &Lua, callbacks: SharedEventCallbacks) -> Result<()> {
+    events::register(lua, callbacks)?;
+    Ok(())
+}
