@@ -17,9 +17,16 @@ import bridge from "workers/bridge"
 /**
  * Ensure the worker bridge is initialized.
  * Call this before using SignalSession.
+ *
+ * @param {string} workerUrl - URL to ActionCable transport worker (signal.js)
+ * @param {string} cryptoWorkerUrl - URL to crypto SharedWorker (signal_crypto.js)
+ * @param {string} wasmJsUrl - URL to libsignal_wasm.js
+ * @param {string} wasmBinaryUrl - URL to libsignal_wasm_bg.wasm
+ * @param {string} webrtcWorkerUrl - URL to WebRTC transport worker (webrtc.js), optional
+ * @param {string} transport - Transport type: "actioncable" (default) or "webrtc"
  */
-export async function ensureSignalReady(workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl) {
-  await bridge.init({ workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl })
+export async function ensureSignalReady(workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl, webrtcWorkerUrl = null, transport = "actioncable") {
+  await bridge.init({ workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl, webrtcWorkerUrl, transport })
 }
 
 /**

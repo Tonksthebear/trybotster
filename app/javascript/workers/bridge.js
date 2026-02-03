@@ -4,10 +4,12 @@
  * Architecture:
  * - Main thread (bridge.js) proxies all crypto operations
  * - Crypto Worker (signal_crypto.js) - SharedWorker handling Signal Protocol
- * - Transport Worker (signal.js) - regular Worker handling ActionCable (no crypto)
+ * - Transport Worker - regular Worker handling transport (no crypto)
+ *   - signal.js for ActionCable WebSocket transport
+ *   - webrtc.js for WebRTC DataChannel transport
  *
  * The main thread talks directly to crypto SharedWorker for encrypt/decrypt,
- * and to transport Worker for ActionCable send/receive.
+ * and to transport Worker for send/receive.
  */
 
 // Singleton instance
@@ -19,6 +21,7 @@ class WorkerBridge {
   #workerPort = null
   #pendingRequests = new Map()
   #requestId = 0
+  #transport = "actioncable" // "actioncable" or "webrtc"
 
   // Crypto SharedWorker
   #cryptoWorker = null
@@ -44,21 +47,25 @@ class WorkerBridge {
   /**
    * Initialize the workers (idempotent)
    * @param {Object} options
-   * @param {string} options.workerUrl - URL to the transport Worker script (signal.js)
+   * @param {string} options.workerUrl - URL to ActionCable transport Worker (signal.js)
+   * @param {string} options.webrtcWorkerUrl - URL to WebRTC transport Worker (webrtc.js)
    * @param {string} options.cryptoWorkerUrl - URL to the crypto SharedWorker (signal_crypto.js)
    * @param {string} options.wasmJsUrl - URL to libsignal_wasm.js
    * @param {string} options.wasmBinaryUrl - URL to libsignal_wasm_bg.wasm
+   * @param {string} options.transport - Transport type: "actioncable" (default) or "webrtc"
    */
-  async init({ workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl }) {
+  async init({ workerUrl, webrtcWorkerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl, transport = "actioncable" }) {
     if (this.#initialized) return
     if (this.#initPromise) return this.#initPromise
 
-    this.#initPromise = this.#doInit({ workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl })
+    this.#initPromise = this.#doInit({ workerUrl, webrtcWorkerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl, transport })
     return this.#initPromise
   }
 
-  async #doInit({ workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl }) {
+  async #doInit({ workerUrl, webrtcWorkerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl, transport }) {
     try {
+      this.#transport = transport
+
       // 1. Create crypto SharedWorker first and initialize WASM
       this.#cryptoWorker = new SharedWorker(cryptoWorkerUrl, { type: "module", name: "signal-crypto" })
       this.#cryptoWorkerPort = this.#cryptoWorker.port
@@ -68,14 +75,17 @@ class WorkerBridge {
       // Initialize WASM via crypto worker
       await this.sendCrypto("init", { wasmJsUrl, wasmBinaryUrl })
 
-      // 2. Create transport Worker (no crypto knowledge)
-      this.#worker = new Worker(workerUrl, { type: "module" })
+      // 2. Create transport Worker based on transport type
+      const transportUrl = transport === "webrtc" ? webrtcWorkerUrl : workerUrl
+      console.log(`[WorkerBridge] Using ${transport} transport: ${transportUrl}`)
+
+      this.#worker = new Worker(transportUrl, { type: "module" })
       this.#workerPort = this.#worker
       this.#worker.onmessage = (e) => this.#handleMessage(e)
       this.#worker.onerror = (e) =>
         console.error("[WorkerBridge] Transport worker error:", e)
 
-      // Initialize transport worker (just ActionCable, no crypto)
+      // Initialize transport worker
       await this.send("init", {})
 
       this.#initialized = true
@@ -84,6 +94,14 @@ class WorkerBridge {
       this.#initPromise = null
       throw error
     }
+  }
+
+  /**
+   * Get the current transport type
+   * @returns {string} - "actioncable" or "webrtc"
+   */
+  get transport() {
+    return this.#transport
   }
 
   /**
@@ -411,6 +429,36 @@ class WorkerBridge {
    */
   get isInitialized() {
     return this.#initialized
+  }
+
+  // ===========================================================================
+  // WebRTC signaling methods (only used when transport is "webrtc")
+  // ===========================================================================
+
+  /**
+   * Handle an incoming WebRTC answer from CLI
+   * @param {string} hubId - The hub ID
+   * @param {string} sdp - The SDP answer
+   */
+  async handleWebRTCAnswer(hubId, sdp) {
+    if (this.#transport !== "webrtc") {
+      console.warn("[WorkerBridge] handleWebRTCAnswer called but transport is not webrtc")
+      return
+    }
+    return this.send("handleAnswer", { hubId, sdp })
+  }
+
+  /**
+   * Handle an incoming ICE candidate from CLI
+   * @param {string} hubId - The hub ID
+   * @param {Object} candidate - The ICE candidate
+   */
+  async handleWebRTCIce(hubId, candidate) {
+    if (this.#transport !== "webrtc") {
+      console.warn("[WorkerBridge] handleWebRTCIce called but transport is not webrtc")
+      return
+    }
+    return this.send("handleIce", { hubId, candidate })
   }
 }
 
