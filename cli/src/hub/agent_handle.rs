@@ -17,7 +17,7 @@
 //! HubHandle::get_agent(idx) → HandleCache → Option<AgentHandle>
 //! ```
 //!
-//! Use this from TuiClient, BrowserClient, or any code on Hub's thread.
+//! Use this from TuiClient or any code on Hub's thread.
 //!
 //! ## 2. Via GetAgentByIndex command (TuiRunner only)
 //!

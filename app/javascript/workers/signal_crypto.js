@@ -2,12 +2,12 @@
  * Signal Crypto SharedWorker
  *
  * Pure cryptographic operations for Signal Protocol sessions.
- * Extracted from signal.js - this worker handles only:
+ * This worker handles:
  * - WASM module loading
  * - Session creation/loading/persistence
  * - Encrypt/decrypt operations
  *
- * No ActionCable, no reliable delivery, no subscriptions.
+ * Transport is handled separately by WebRTCTransport in the main thread.
  */
 
 // WASM module (loaded on init)

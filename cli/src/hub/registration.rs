@@ -132,7 +132,7 @@ pub fn register_hub_with_server(
 /// the connection URL is first requested (lazy initialization). This avoids
 /// blocking boot for up to 10 seconds on bundle generation.
 ///
-/// Browser command handling is done by BrowserClient (via HubChannel subscription).
+/// Browser command handling is done directly via WebRTC in server_comms.rs.
 /// Hub-level events are handled by HubCommandChannel.
 ///
 /// # Usage

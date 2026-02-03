@@ -27,7 +27,7 @@ impl Hub {
     /// Browser clients receive agent list updates via HubEvent::AgentCreated/AgentDeleted
     /// in their handle_hub_event() methods. TUI reads directly from hub state.
     /// This method is retained for compatibility but is effectively a no-op
-    /// now that BrowserClient handles updates via event subscription.
+    /// now that browser updates are handled via WebRTC in server_comms.rs.
     pub fn broadcast_agent_list(&mut self) {
         // Browser clients react to HubEvent broadcasts (AgentCreated, AgentDeleted)
         // TUI reads directly from hub state

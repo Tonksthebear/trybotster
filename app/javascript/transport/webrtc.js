@@ -121,7 +121,7 @@ class WebRTCTransport {
     // Set up connection state handling
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState
-      console.log(`[WebRTCTransport] Connection state: ${state}`)
+      console.debug(`[WebRTCTransport] Connection state: ${state}`)
 
       if (state === "connected") {
         conn.state = TransportState.CONNECTED
@@ -392,10 +392,10 @@ class WebRTCTransport {
 
           for (const signal of signals) {
             if (signal.type === "answer") {
-              console.log("[WebRTCTransport] Received answer")
+              console.debug("[WebRTCTransport] Received answer")
               await this.#handleAnswer(hubId, signal.sdp)
             } else if (signal.type === "ice") {
-              console.log("[WebRTCTransport] Received ICE candidate")
+              console.debug("[WebRTCTransport] Received ICE candidate")
               await this.#handleIceCandidate(hubId, signal.candidate)
             }
           }
@@ -427,7 +427,7 @@ class WebRTCTransport {
 
     // Skip if we've already processed an answer (connection is stable or connected)
     if (conn.pc.signalingState === "stable") {
-      console.log("[WebRTCTransport] Ignoring stale answer (already in stable state)")
+      console.debug("[WebRTCTransport] Ignoring stale answer (already in stable state)")
       return
     }
 
@@ -458,7 +458,7 @@ class WebRTCTransport {
     dataChannel.binaryType = "arraybuffer"
 
     dataChannel.onopen = () => {
-      console.log(`[WebRTCTransport] DataChannel open for hub ${hubId}`)
+      console.debug(`[WebRTCTransport] DataChannel open for hub ${hubId}`)
       const conn = this.#connections.get(hubId)
       if (conn) {
         conn.state = TransportState.CONNECTED
@@ -468,7 +468,7 @@ class WebRTCTransport {
     }
 
     dataChannel.onclose = () => {
-      console.log(`[WebRTCTransport] DataChannel closed for hub ${hubId}`)
+      console.debug(`[WebRTCTransport] DataChannel closed for hub ${hubId}`)
       this.#emit("connection:state", { hubId, state: "disconnected" })
     }
 
@@ -494,73 +494,22 @@ class WebRTCTransport {
       const parsed = typeof textData === "string" ? JSON.parse(textData) : textData
 
       // Check if this is a Signal envelope (encrypted message from CLI)
-      // Signal envelopes have short keys: t (type), c (ciphertext), s (sender), d (device)
+      // Signal envelopes have short keys: t (type), c (ciphertext), s (sender)
+      // All CLI messages are encrypted - decrypt first, then route
       let msg = parsed
       if (parsed.t !== undefined && parsed.c && parsed.s) {
-        // Decrypt using bridge
-        try {
-          // Ensure hubId is a string
-          const hubIdStr = String(hubId)
-          const { plaintext } = await bridge.decrypt(hubIdStr, parsed)
-
-          // Plaintext is base64-encoded (for UTF-8 safety through Signal WASM).
-          // Decode to get the compressed/uncompressed bytes, then decompress if needed.
-          let bytes
-          try {
-            const binaryString = atob(plaintext)
-            bytes = new Uint8Array(binaryString.length)
-            for (let i = 0; i < binaryString.length; i++) {
-              bytes[i] = binaryString.charCodeAt(i)
-            }
-          } catch (b64Err) {
-            console.error("[WebRTCTransport] Base64 decode failed:", b64Err)
-            return
-          }
-
-          // Handle compression marker:
-          // 0x00 = uncompressed (strip marker, rest is JSON)
-          // 0x1f = gzip compressed (decompress, then JSON)
-          let jsonStr
-          const marker = bytes[0]
-          if (marker === 0x00) {
-            // Uncompressed - strip marker and decode as UTF-8
-            jsonStr = new TextDecoder().decode(bytes.slice(1))
-          } else if (marker === 0x1f) {
-            // Gzip compressed - decompress
-            try {
-              const stream = new Blob([bytes.slice(1)])
-                .stream()
-                .pipeThrough(new DecompressionStream("gzip"))
-              jsonStr = await new Response(stream).text()
-            } catch (decompressErr) {
-              console.error("[WebRTCTransport] Gzip decompression failed:", decompressErr)
-              return
-            }
-          } else {
-            // No recognized marker - try as raw UTF-8
-            jsonStr = new TextDecoder().decode(bytes)
-          }
-
-          msg = JSON.parse(jsonStr)
-        } catch (decryptErr) {
-          console.error("[WebRTCTransport] Decryption failed:", decryptErr.message || decryptErr)
-          // Log envelope details for debugging
-          console.error("[WebRTCTransport] Failed envelope:", {
-            type: parsed.t,
-            senderPrefix: parsed.s?.substring(0, 20),
-            ciphertextLength: parsed.c?.length,
-          })
-          return
-        }
+        msg = await this.#decryptEnvelope(hubId, parsed)
+        if (!msg) return // decryption failed
       }
 
-      // Handle subscription confirmation from CLI (control message, not encrypted)
+      // Handle subscription confirmation (control message, decrypted)
       if (msg.type === "subscribed" && msg.subscriptionId) {
         this.#handleSubscriptionConfirmed(msg.subscriptionId)
         return
       }
 
       if (msg.subscriptionId) {
+        // Message with subscription routing (decrypted)
         // Check for raw binary data (base64-encoded PTY output)
         if (msg.raw) {
           // Decode base64 to Uint8Array
@@ -581,7 +530,7 @@ class WebRTCTransport {
           })
         }
       } else if (msg.type === "health") {
-        // Broadcast to all subscriptions for this hub
+        // Health messages - broadcast to all subscriptions for this hub
         const conn = this.#connections.get(hubId)
         if (conn) {
           for (const subId of conn.subscriptions.keys()) {
@@ -594,6 +543,43 @@ class WebRTCTransport {
       }
     } catch (e) {
       console.error("[WebRTCTransport] Failed to parse message:", e)
+    }
+  }
+
+  /**
+   * Decrypt a Signal envelope and decompress the payload.
+   * @returns {object|null} Decrypted message object, or null on failure
+   */
+  async #decryptEnvelope(hubId, envelope) {
+    try {
+      const { plaintext } = await bridge.decrypt(String(hubId), envelope)
+
+      // Plaintext is base64-encoded, decode to bytes
+      const binaryString = atob(plaintext)
+      const bytes = new Uint8Array(binaryString.length)
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i)
+      }
+
+      // Handle compression marker: 0x00 = uncompressed, 0x1f = gzip
+      const marker = bytes[0]
+      let jsonStr
+      if (marker === 0x00) {
+        jsonStr = new TextDecoder().decode(bytes.slice(1))
+      } else if (marker === 0x1f) {
+        const stream = new Blob([bytes.slice(1)])
+          .stream()
+          .pipeThrough(new DecompressionStream("gzip"))
+        jsonStr = await new Response(stream).text()
+      } else {
+        // No marker - try as raw UTF-8
+        jsonStr = new TextDecoder().decode(bytes)
+      }
+
+      return JSON.parse(jsonStr)
+    } catch (err) {
+      console.error("[WebRTCTransport] Decryption failed:", err.message || err)
+      return null
     }
   }
 
@@ -643,7 +629,7 @@ class WebRTCTransport {
   #handleSubscriptionConfirmed(subscriptionId) {
     const pending = this.#pendingSubscriptions.get(subscriptionId)
     if (pending) {
-      console.log(`[WebRTCTransport] Subscription confirmed: ${subscriptionId}`)
+      console.debug(`[WebRTCTransport] Subscription confirmed: ${subscriptionId}`)
       pending.resolve()
     }
   }

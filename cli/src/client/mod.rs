@@ -1,9 +1,9 @@
-//! Client abstraction for TUI and browser connections.
+//! Client abstraction for TUI connections.
 //!
-//! This module provides a unified interface for all client types (TUI, Browser).
-//! The `Client` trait uses **index-based routing** - all PTY operations take explicit
-//! `(agent_index, pty_index)` parameters. "Current" PTY state belongs in the GUI layer
-//! (TuiRunner for TUI, JavaScript for Browser), NOT in Client implementations.
+//! This module provides a unified interface for TUI clients. The `Client` trait uses
+//! **index-based routing** - all PTY operations take explicit `(agent_index, pty_index)`
+//! parameters. "Current" PTY state belongs in the GUI layer (TuiRunner for TUI,
+//! JavaScript for Browser), NOT in Client implementations.
 //!
 //! # Architecture
 //!
@@ -12,13 +12,11 @@
 //!   │
 //!   └── HubHandle (thread-safe access to Hub operations)
 //!         │
-//!         └── Clients (store HubHandle, implement trait methods)
-//!               ├── TuiClient
-//!               │     └── hub_handle: HubHandle
-//!               │
-//!               └── BrowserClient
-//!                     └── hub_handle: HubHandle
+//!         └── TuiClient (stores HubHandle, implements Client trait)
 //! ```
+//!
+//! Browser communication is handled directly via WebRTC in `hub/server_comms.rs`,
+//! bypassing the Client trait entirely.
 //!
 //! **Key insight**: Clients access Hub data through `hub_handle()`. PTY operations
 //! like `send_input` and `resize_pty` look up agents/PTYs via `HubHandle` on each
@@ -34,11 +32,6 @@
 //! client.send_input(agent_idx, pty_idx, data).await    // Send to specific PTY
 //! client.resize_pty(agent_idx, pty_idx, r, c).await    // Resize specific PTY
 //! ```
-//!
-//! This design:
-//! - Makes TUI and Browser implementations symmetric
-//! - Allows multiple simultaneous PTY connections (Browser can have multiple tabs)
-//! - Keeps "current" state in the GUI where it belongs
 //!
 //! # Async Design
 //!
@@ -59,14 +52,12 @@
 
 // Rust guideline compliant 2026-01
 
-pub mod browser;
 pub mod http_channel;
 mod registry;
 mod tui;
 mod types;
 
-pub use browser::{BrowserClient, BrowserClientConfig, BrowserRequest};
-pub use http_channel::HttpChannel;
+pub use http_channel::{HttpChannel, HttpChannelConfig};
 pub use registry::{ClientRegistry, ClientTaskHandle};
 pub use tui::{TuiAgentMetadata, TuiClient, TuiOutput, TuiRequest};
 pub use types::{CreateAgentRequest, DeleteAgentRequest, Response};
@@ -138,14 +129,14 @@ impl std::fmt::Display for ClientId {
 
 /// The Client trait - async API layer for Hub/PTY interaction.
 ///
-/// Both TUI and Browser implement this identically. Thread safety is hidden
-/// behind handles. UI state (selection, scroll, vt100) is NOT on this trait -
-/// each implementation manages its own.
+/// TUI implements this trait. Thread safety is hidden behind handles.
+/// UI state (selection, scroll, vt100) is NOT on this trait - each
+/// implementation manages its own.
 ///
 /// # Design Principles
 ///
 /// 1. **Index-based routing** - All PTY ops take `(agent_index, pty_index)` explicitly
-/// 2. **GUI owns "current"** - Which PTY is active lives in TuiRunner/JavaScript
+/// 2. **GUI owns "current"** - Which PTY is active lives in TuiRunner
 /// 3. **HubHandle for data** - All data access goes through `hub_handle()`
 /// 4. **Async operations** - All PTY and Hub management methods are async, using
 ///    native `async fn` in traits (Rust 1.75+)
@@ -182,7 +173,7 @@ impl std::fmt::Display for ClientId {
 ///
 /// # What's NOT on this trait (GUI state)
 ///
-/// - Current agent/PTY selection (TuiRunner/JavaScript manages)
+/// - Current agent/PTY selection (TuiRunner manages)
 /// - Scroll position (TuiRunner manages)
 /// - vt100 parser state (TuiRunner owns)
 pub trait Client: Send {
@@ -210,9 +201,6 @@ pub trait Client: Send {
     /// Returns the `broadcast::Receiver<HubEvent>` if it has not already been
     /// taken. Subsequent calls return `None`. This is designed for `run_task()`
     /// to extract the receiver once and consume it in its event loop.
-    ///
-    /// Both `TuiClient` and `BrowserClient` must implement this -- there is
-    /// no default implementation.
     fn take_hub_event_rx(&mut self) -> Option<tokio::sync::broadcast::Receiver<crate::hub::HubEvent>>;
 
     // ============================================================

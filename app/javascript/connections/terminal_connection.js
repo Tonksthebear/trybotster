@@ -2,23 +2,20 @@
  * TerminalConnection - Typed wrapper for terminal data plane.
  *
  * Manages PTY I/O (input/output streams) and terminal resize events.
- * Uses the shared Signal session from IndexedDB (same as HubConnection).
- *
- * Handshake is handled by base Connection class.
+ * Uses WebRTC DataChannel for E2E encrypted communication with CLI.
  *
  * Events:
- *   - connected - Handshake completed, E2E active
+ *   - connected - WebRTC DataChannel open, ready for I/O
  *   - disconnected - Channel closed
  *   - stateChange - { state, prevState, error }
  *   - error - { reason, message }
  *   - output - PTY output data (Uint8Array for raw, string for scrollback)
  *
  * Flow:
- *   1. Browser subscribes to TerminalRelayChannel
- *   2. Rails notifies CLI via Bot::Message
- *   3. CLI subscribes → health broadcast → browser knows CLI is there
- *   4. Whoever is "last" sends handshake, other side acks
- *   5. Browser emits "connected" event
+ *   1. Browser establishes WebRTC peer connection with CLI
+ *   2. Browser subscribes with channel="TerminalRelayChannel" (virtual routing)
+ *   3. CLI sets up PTY output forwarder for this subscription
+ *   4. Browser receives raw PTY output via DataChannel
  *
  * Usage:
  *   const key = TerminalConnection.key(hubId, agentIndex, ptyIndex);
@@ -45,8 +42,8 @@ export class TerminalConnection extends Connection {
   }
 
   channelParams() {
-    // Each browser tab has dedicated streams with CLI (like TUI has dedicated I/O)
-    // Browser subscribes to: terminal_relay:{hub}:{agent}:{pty}:{browser_identity}
+    // WebRTC subscription params - used by CLI to route PTY I/O
+    // CLI keys forwarders by (browser_identity, agent_index, pty_index)
     return {
       hub_id: this.getHubId(),
       agent_index: this.agentIndex,

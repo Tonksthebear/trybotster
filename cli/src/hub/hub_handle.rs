@@ -16,7 +16,7 @@
 //!
 //! `get_agent()` reads from `HandleCache` directly - it does NOT send a
 //! blocking command. This is critical for avoiding deadlocks when called
-//! from Hub's thread (TuiClient, BrowserClient).
+//! from Hub's thread (TuiClient).
 //!
 //! TuiRunner runs on a separate thread and uses `GetAgentByIndex` command
 //! instead (see `runner_agent.rs`).
@@ -34,7 +34,7 @@
 //! // Get handle from Hub
 //! let handle = hub.handle();
 //!
-//! // TuiClient/BrowserClient on Hub's thread
+//! // TuiClient on Hub's thread
 //! if let Some(agent_handle) = handle.get_agent(0) {
 //!     // Safe - reads from cache, no blocking command
 //!     let pty = agent_handle.get_pty(0).expect("CLI PTY always present");
@@ -483,7 +483,7 @@ impl HubHandle {
     /// Get the crypto service handle for E2E encryption.
     ///
     /// Returns `None` if crypto service is not initialized (no browser connected).
-    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    /// Used for ActionCable channel setup.
     #[must_use]
     pub fn crypto_service(&self) -> Option<crate::relay::crypto_service::CryptoServiceHandle> {
         self.command_tx.get_crypto_service_blocking().ok().flatten()
@@ -492,7 +492,7 @@ impl HubHandle {
     /// Get the server hub ID.
     ///
     /// Returns `None` if hub ID is not set.
-    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    /// Used for ActionCable channel setup.
     #[must_use]
     pub fn server_hub_id(&self) -> Option<String> {
         self.command_tx.get_server_hub_id_blocking().ok().flatten()
@@ -501,7 +501,7 @@ impl HubHandle {
     /// Get the server URL.
     ///
     /// Returns the server URL from Hub config.
-    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    /// Used for ActionCable channel setup.
     #[must_use]
     pub fn server_url(&self) -> String {
         self.command_tx
@@ -512,7 +512,7 @@ impl HubHandle {
     /// Get the API key.
     ///
     /// Returns the API key from Hub config.
-    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    /// Used for ActionCable channel setup.
     #[must_use]
     pub fn api_key(&self) -> String {
         self.command_tx.get_api_key_blocking().unwrap_or_default()
@@ -521,7 +521,7 @@ impl HubHandle {
     /// Get a handle to the tokio runtime.
     ///
     /// Returns `None` if the runtime is not available.
-    /// Used by `BrowserClient::connect_to_pty()` for async task spawning.
+    /// Used for async task spawning.
     #[must_use]
     pub fn tokio_runtime(&self) -> Option<tokio::runtime::Handle> {
         self.command_tx.get_tokio_runtime_blocking().ok().flatten()

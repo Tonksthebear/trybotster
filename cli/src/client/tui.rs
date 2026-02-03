@@ -1,23 +1,24 @@
 //! TUI client implementation for the local terminal interface.
 //!
-//! `TuiClient` handles I/O routing for the local terminal, analogous to how
-//! `BrowserClient` routes I/O to the web browser. The actual terminal emulation
-//! (vt100 parsing) happens in `TuiRunner`, just as the web browser handles
-//! its own terminal rendering.
+//! `TuiClient` handles I/O routing for the local terminal. The actual terminal
+//! emulation (vt100 parsing) happens in `TuiRunner`, keeping this module focused
+//! on I/O routing only.
 //!
 //! # Architecture
 //!
 //! ```text
-//! TuiClient (I/O routing)          BrowserClient (I/O routing)
-//!   ├── hub_handle                   ├── hub_handle
-//!   ├── dims                         ├── dims
-//!   ├── output_sink                  └── terminal_channels
-//!   └── output_task                        │
-//!          │                               ▼
-//!          ▼                         Web Browser (rendering)
-//! TuiRunner (rendering)               └── xterm.js
+//! TuiClient (I/O routing)
+//!   ├── hub_handle
+//!   ├── dims
+//!   ├── output_sink
+//!   └── output_task
+//!          │
+//!          ▼
+//! TuiRunner (rendering)
 //!   └── vt100_parser
 //! ```
+//!
+//! Browser communication is handled directly via WebRTC in `hub/server_comms.rs`.
 //!
 //! # Async Task Model
 //!
@@ -37,8 +38,8 @@
 //!
 //! # Why No Parser Here
 //!
-//! TuiClient is like BrowserClient - it routes bytes, it doesn't parse them.
-//! TuiRunner owns the vt100 parser, just as the web browser owns xterm.js.
+//! TuiClient routes bytes, it doesn't parse them.
+//! TuiRunner owns the vt100 parser.
 
 // Rust guideline compliant 2026-01
 
@@ -54,7 +55,6 @@ use super::{Client, ClientId};
 
 /// Requests from TuiRunner to TuiClient.
 ///
-/// Symmetric with how Browser sends requests to BrowserClient via WebSocket.
 /// Every variant maps to exactly one Client trait method call in `handle_request()`.
 ///
 /// # Design Principle
@@ -181,7 +181,7 @@ pub struct TuiAgentMetadata {
 
 /// Output messages sent from TuiClient to TuiRunner.
 ///
-/// Mirrors `TerminalMessage` used by BrowserClient. TuiRunner receives these
+/// Messages sent from TuiClient to TuiRunner. TuiRunner receives these
 /// through the channel and processes them (feeding to vt100 parser, handling
 /// process exit, etc.).
 #[derive(Debug, Clone)]
@@ -216,8 +216,7 @@ pub enum TuiOutput {
 
 /// TUI client - I/O routing for the local terminal.
 ///
-/// Routes PTY events to TuiRunner via a channel, analogous to how BrowserClient
-/// routes to the browser via WebSocket. Does NOT parse terminal output - that's
+/// Routes PTY events to TuiRunner via a channel. Does NOT parse terminal output - that's
 /// TuiRunner's job.
 ///
 /// # What's Here (I/O Routing)
@@ -252,15 +251,14 @@ pub struct TuiClient {
     /// Handle to the output forwarder task.
     ///
     /// Spawned by `connect_to_pty()`, aborted by `disconnect_from_pty()`.
-    /// Unlike BrowserClient's `terminal_channels` (which supports multiple
-    /// simultaneous connections), TUI only connects to one PTY at a time.
+    /// TUI only connects to one PTY at a time.
     output_task: Option<JoinHandle<()>>,
 
     /// Channel for receiving requests from TuiRunner.
     ///
     /// TuiRunner sends `TuiRequest` messages through this channel, which are
     /// processed by `run_task()` in a `tokio::select!` loop. This mirrors how
-    /// Browser sends requests to BrowserClient via WebSocket.
+    /// TuiRunner sends requests through this channel.
     request_rx: Option<UnboundedReceiver<TuiRequest>>,
 
     /// Broadcast receiver for Hub events (agent created/deleted/status, shutdown).
@@ -399,7 +397,7 @@ impl TuiClient {
                 }
             }
             TuiRequest::GetConnectionCodeWithQr { response_tx } => {
-                // Use async path to ensure bundle is generated (like BrowserClient).
+                // Use async path to ensure bundle is generated.
                 // The sync trait method only reads from cache, which may be stale.
                 let result = match self.hub_handle().get_connection_code_or_generate().await {
                     Ok(url) => {
@@ -554,7 +552,7 @@ impl Client for TuiClient {
         agent_index: usize,
         pty_index: usize,
     ) -> Result<(), String> {
-        // Abort previous output task if any (like BrowserClient removes old channel).
+        // Abort previous output task if any.
         if let Some(task) = self.output_task.take() {
             task.abort();
         }

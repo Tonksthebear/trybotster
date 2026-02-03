@@ -423,8 +423,7 @@ where
     /// to a PTY. TuiRunner receives and processes them here (feeding to vt100
     /// parser, handling process exit, etc.).
     ///
-    /// This mirrors Browser architecture: BrowserClient sends output through
-    /// WebSocket, web browser (xterm.js) does the parsing/rendering.
+    /// TuiClient sends output through channel, TuiRunner does the parsing/rendering.
     fn poll_pty_events(&mut self) {
         use tokio::sync::mpsc::error::TryRecvError;
 

@@ -390,8 +390,8 @@ trybotster/
 │   │   └── user.rb                  # User auth
 │   │
 │   ├── channels/
-│   │   ├── terminal_relay_channel.rb  # E2E encrypted terminal relay
-│   │   └── tunnel_channel.rb          # HTTP tunneling for previews
+│   │   ├── hub_command_channel.rb     # Hub command channel (signaling)
+│   │   └── preview_channel.rb         # Preview relay (legacy ActionCable)
 │   │
 │   ├── controllers/
 │   │   ├── hubs_controller.rb              # Hub management

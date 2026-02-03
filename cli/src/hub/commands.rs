@@ -17,7 +17,7 @@
 //!
 //! ## 1. Via HandleCache (clients on Hub's thread)
 //!
-//! Clients using `HubHandle` (TuiClient, BrowserClient) read from the cache directly:
+//! Clients using `HubHandle` (TuiClient) read from the cache directly:
 //!
 //! ```text
 //! HubHandle::get_agent(idx) → HandleCache → Option<AgentHandle>
@@ -201,7 +201,7 @@ pub enum HubCommand {
     ///
     /// # When NOT to Use
     ///
-    /// Clients on Hub's thread (TuiClient, BrowserClient) should use
+    /// Clients on Hub's thread (TuiClient) should use
     /// `HubHandle::get_agent()` instead, which reads from HandleCache directly.
     /// Using blocking commands from Hub's thread causes deadlocks.
     GetAgentByIndex {
@@ -751,7 +751,7 @@ impl HubCommandSender {
 
     /// Get the crypto service handle (blocking).
     ///
-    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    /// Used for ActionCable channel setup.
     ///
     /// # Errors
     ///
@@ -769,7 +769,7 @@ impl HubCommandSender {
 
     /// Get the server hub ID (blocking).
     ///
-    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    /// Used for ActionCable channel setup.
     ///
     /// # Errors
     ///
@@ -785,7 +785,7 @@ impl HubCommandSender {
 
     /// Get the server URL (blocking).
     ///
-    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    /// Used for ActionCable channel setup.
     ///
     /// # Errors
     ///
@@ -801,7 +801,7 @@ impl HubCommandSender {
 
     /// Get the API key (blocking).
     ///
-    /// Used by `BrowserClient::connect_to_pty()` for ActionCable channel setup.
+    /// Used for ActionCable channel setup.
     ///
     /// # Errors
     ///
@@ -817,7 +817,7 @@ impl HubCommandSender {
 
     /// Get the tokio runtime handle (blocking).
     ///
-    /// Used by `BrowserClient::connect_to_pty()` for async task spawning.
+    /// Used for async task spawning.
     ///
     /// # Errors
     ///

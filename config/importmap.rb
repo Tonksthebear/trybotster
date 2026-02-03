@@ -14,7 +14,7 @@ pin "@xterm/addon-fit", to: "https://esm.sh/@xterm/addon-fit@0.10.0"
 pin "@xterm/addon-unicode11", to: "https://esm.sh/@xterm/addon-unicode11@0.8.0"
 
 # Signal Protocol WASM for E2E encryption
-pin "signal", to: "signal/index.js"
+pin "signal", to: "signal/bundle.js"
 pin_all_from "app/javascript/workers", under: "workers"
 
 # Connection management (global, Turbo-aware)

@@ -545,8 +545,8 @@ mod tests {
 
     /// Test that session state is shared across handle clones.
     ///
-    /// This simulates session reuse between BrowserClient and agent channels:
-    /// - BrowserClient uses handle1 to check/create sessions
+    /// This simulates session reuse between WebRTC and agent channels:
+    /// - WebRTC uses handle1 to check/create sessions
     /// - Agent channels use handle clones and should see same sessions
     #[tokio::test]
     async fn test_crypto_service_session_shared_across_clones() {
