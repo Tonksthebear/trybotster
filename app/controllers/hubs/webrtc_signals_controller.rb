@@ -97,14 +97,21 @@ module Hubs
       Rails.cache.write(offer_key, params[:sdp], expires_in: SIGNAL_TTL.seconds)
 
       # Also broadcast via ActionCable for CLI that's already listening
+      # Use same format as Bot::Message broadcasts for CLI compatibility
       ActionCable.server.broadcast(
         "hub_command:#{@hub.id}",
         {
-          type: "webrtc_offer",
-          browser_identity: browser_identity,
-          agent_index: params[:agent_index],
-          pty_index: params[:pty_index],
-          sdp: params[:sdp]
+          type: "message",
+          sequence: 0,
+          id: 0,
+          event_type: "webrtc_offer",
+          payload: {
+            browser_identity: browser_identity,
+            agent_index: params[:agent_index],
+            pty_index: params[:pty_index],
+            sdp: params[:sdp]
+          },
+          created_at: Time.current.iso8601
         }
       )
 
