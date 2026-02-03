@@ -109,6 +109,19 @@ pub struct WebRtcSubscription {
     pub pty_index: Option<usize>,
 }
 
+/// Queued PTY output message for WebRTC delivery.
+///
+/// Spawned forwarder tasks queue these messages; the main loop drains and sends.
+#[derive(Debug)]
+pub struct WebRtcPtyOutput {
+    /// Subscription ID for routing on the browser side.
+    pub subscription_id: String,
+    /// Browser identity for encryption.
+    pub browser_identity: String,
+    /// Raw PTY data (already prefixed with 0x01 for terminal output).
+    pub data: Vec<u8>,
+}
+
 /// Result of a background agent creation task.
 ///
 /// Sent from the background thread to the main loop when agent creation completes.
@@ -208,6 +221,18 @@ pub struct Hub {
     /// Used to route incoming DataChannel messages to the correct handler.
     pub webrtc_subscriptions: std::collections::HashMap<String, WebRtcSubscription>,
 
+    /// Sender for PTY output messages from forwarder tasks.
+    ///
+    /// Forwarder tasks send PTY output here; main loop drains and sends via WebRTC.
+    pub webrtc_pty_output_tx: tokio::sync::mpsc::UnboundedSender<WebRtcPtyOutput>,
+    /// Receiver for PTY output messages.
+    pub webrtc_pty_output_rx: tokio::sync::mpsc::UnboundedReceiver<WebRtcPtyOutput>,
+
+    /// Active PTY forwarder task handles for cleanup on unsubscribe.
+    ///
+    /// Maps subscriptionId -> JoinHandle for the forwarder task.
+    webrtc_pty_forwarders: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+
     // === Command Channel (Actor Pattern) ===
     /// Sender for Hub commands (cloned for each client).
     command_tx: tokio::sync::mpsc::Sender<HubCommand>,
@@ -301,6 +326,8 @@ impl Hub {
         let handle_cache = Arc::new(handle_cache::HandleCache::new());
         // Create event broadcast channel for pub/sub
         let (event_tx, webrtc_event_rx) = tokio::sync::broadcast::channel(64);
+        // Create channel for WebRTC PTY output from forwarder tasks
+        let (webrtc_pty_output_tx, webrtc_pty_output_rx) = tokio::sync::mpsc::unbounded_channel();
 
         Ok(Self {
             state,
@@ -328,6 +355,9 @@ impl Hub {
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
             webrtc_subscriptions: std::collections::HashMap::new(),
+            webrtc_pty_output_tx,
+            webrtc_pty_output_rx,
+            webrtc_pty_forwarders: std::collections::HashMap::new(),
         })
     }
 

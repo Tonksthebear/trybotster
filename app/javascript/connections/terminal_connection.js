@@ -65,9 +65,26 @@ export class TerminalConnection extends Connection {
 
     switch (message.type) {
       case "raw_output":
-        // Raw bytes from CLI - pass directly to xterm
-        console.log(`[TerminalConnection] Emitting raw_output, ${message.data?.length} bytes`);
-        this.emit("output", message.data);
+        // Raw bytes from CLI (Uint8Array with 0x01 prefix) - pass to xterm
+        // Strip the 0x01 prefix byte before emitting
+        if (message.data && message.data.length > 0) {
+          const prefix = message.data[0];
+          if (prefix === 0x01) {
+            // Raw terminal data - strip prefix
+            const terminalData = message.data.slice(1);
+            console.log(`[TerminalConnection] Emitting raw_output, ${terminalData.length} bytes (stripped 0x01 prefix)`);
+            this.emit("output", terminalData);
+          } else {
+            // JSON control message (0x00 prefix) - parse and handle
+            const jsonData = new TextDecoder().decode(message.data.slice(1));
+            try {
+              const parsed = JSON.parse(jsonData);
+              this.handleMessage(parsed);
+            } catch (e) {
+              console.error(`[TerminalConnection] Failed to parse control message:`, e);
+            }
+          }
+        }
         break;
 
       case "output":

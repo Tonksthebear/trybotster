@@ -23,6 +23,7 @@
 //! Rust guideline compliant 2025-01
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -335,10 +336,14 @@ impl WebRtcChannel {
     /// Set up event handlers for the peer connection.
     fn setup_peer_connection_handlers(&self, pc: &Arc<RTCPeerConnection>) {
         let state = Arc::clone(&self.state);
+        let data_channel = Arc::clone(&self.data_channel);
+        let peer_connection = Arc::clone(&self.peer_connection);
 
         // Connection state change handler
         pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             let state = Arc::clone(&state);
+            let data_channel = Arc::clone(&data_channel);
+            let peer_connection = Arc::clone(&peer_connection);
             Box::pin(async move {
                 log::info!("[WebRTC] Connection state changed: {s}");
                 match s {
@@ -347,9 +352,14 @@ impl WebRtcChannel {
                     }
                     RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed => {
                         state.set(ConnectionState::Disconnected).await;
+                        // Clear data channel and peer connection so new offers can be accepted
+                        *data_channel.lock().await = None;
+                        *peer_connection.lock().await = None;
                     }
                     RTCPeerConnectionState::Closed => {
                         state.set(ConnectionState::Disconnected).await;
+                        *data_channel.lock().await = None;
+                        *peer_connection.lock().await = None;
                     }
                     _ => {}
                 }
@@ -442,22 +452,26 @@ impl WebRtcChannel {
         // Get or create peer connection
         let mut pc_guard = self.peer_connection.lock().await;
 
-        if pc_guard.is_none() {
-            // Fetch ICE config and create peer connection
-            let config_guard = self.config.lock().await;
-            let hub_id = config_guard
-                .as_ref()
-                .map(|c| c.hub_id.clone())
-                .unwrap_or_default();
-            drop(config_guard);
-
-            let ice_servers = self.fetch_ice_config(&hub_id).await?;
-            let pc = self.create_peer_connection(ice_servers).await?;
-            self.setup_peer_connection_handlers(&pc);
-            *pc_guard = Some(pc);
+        // If we already have a peer connection, we've already processed an offer.
+        // Don't process another one - it would create new ICE credentials that mismatch.
+        // Wait for the connection to either succeed or fail before accepting new offers.
+        if pc_guard.is_some() {
+            log::info!("[WebRTC] Ignoring duplicate offer (peer connection already exists)");
+            return Err(ChannelError::ConnectionFailed("Connection in progress".to_string()));
         }
 
-        let pc = pc_guard.as_ref().expect("peer connection exists");
+        // Fetch ICE config and create peer connection
+        let config_guard = self.config.lock().await;
+        let hub_id = config_guard
+            .as_ref()
+            .map(|c| c.hub_id.clone())
+            .unwrap_or_default();
+        drop(config_guard);
+
+        let ice_servers = self.fetch_ice_config(&hub_id).await?;
+        let pc = self.create_peer_connection(ice_servers).await?;
+        self.setup_peer_connection_handlers(&pc);
+        *pc_guard = Some(pc.clone());
 
         // Set remote description (offer)
         let offer = RTCSessionDescription::offer(sdp.to_string())
@@ -741,10 +755,15 @@ impl Channel for WebRtcChannel {
         // Encrypt if we have a crypto service
         // Browser identity format is "identityKey:tabId" - extract just the identity key
         // for Signal encryption (sessions are keyed by identity key only)
+        //
+        // Base64 encode the compressed bytes before encryption because the Signal
+        // WASM library expects UTF-8 strings. Gzip-compressed data contains invalid
+        // UTF-8 sequences. Base64 is lossless - browser decodes to get exact bytes.
         let to_send = if let Some(ref cs) = self.crypto_service {
             let identity_key = peer.as_ref().split(':').next().unwrap_or(peer.as_ref());
+            let b64_payload = BASE64.encode(&compressed);
             let envelope = cs
-                .encrypt(&compressed, identity_key)
+                .encrypt(b64_payload.as_bytes(), identity_key)
                 .await
                 .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
 

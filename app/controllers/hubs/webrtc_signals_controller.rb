@@ -92,6 +92,10 @@ module Hubs
 
       browser_identity = params[:browser_identity]
 
+      # Clear any stale ICE candidates from previous offer (different peer connection)
+      ice_key = signal_key("ice_from_browser", browser_identity)
+      Rails.cache.delete(ice_key)
+
       # Store offer in cache for CLI to poll
       offer_key = signal_key("offer", browser_identity)
       Rails.cache.write(offer_key, params[:sdp], expires_in: SIGNAL_TTL.seconds)
@@ -125,6 +129,10 @@ module Hubs
       end
 
       browser_identity = params[:browser_identity]
+
+      # Clear any stale ICE candidates from previous answer (different peer connection)
+      ice_key = signal_key("ice_from_cli", browser_identity)
+      Rails.cache.delete(ice_key)
 
       # Store answer in cache for browser to poll
       answer_key = signal_key("answer", browser_identity)
