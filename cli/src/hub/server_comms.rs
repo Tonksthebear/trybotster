@@ -824,6 +824,14 @@ impl Hub {
                     // Get PTY handle from cache
                     if let Some(agent_handle) = self.handle_cache.get_agent(ai) {
                         if let Some(pty_handle) = agent_handle.get_pty(pi) {
+                            // Key forwarders by (browser, agent, pty) to prevent duplicates.
+                            // When browser reconnects with new subscription, abort old forwarder.
+                            let forwarder_key = format!("{}:{}:{}", browser_identity, ai, pi);
+                            if let Some(old_task) = self.webrtc_pty_forwarders.remove(&forwarder_key) {
+                                old_task.abort();
+                                log::info!("[WebRTC] Aborted old PTY forwarder for {}", forwarder_key);
+                            }
+
                             // Subscribe to PTY events
                             let pty_rx = pty_handle.subscribe();
 
@@ -842,8 +850,8 @@ impl Hub {
                                 pi,
                             ));
 
-                            // Store task handle for cleanup
-                            self.webrtc_pty_forwarders.insert(sub_id, task);
+                            // Store task handle for cleanup (keyed by browser:agent:pty)
+                            self.webrtc_pty_forwarders.insert(forwarder_key, task);
 
                             // Send scrollback
                             let scrollback = pty_handle.get_scrollback();
@@ -884,9 +892,12 @@ impl Hub {
 
             // If this was a terminal subscription, abort the forwarder task
             if sub.channel_name == "TerminalRelayChannel" {
-                if let Some(task) = self.webrtc_pty_forwarders.remove(subscription_id) {
-                    task.abort();
-                    log::debug!("[WebRTC] Aborted PTY forwarder for {}", subscription_id);
+                if let (Some(ai), Some(pi)) = (sub.agent_index, sub.pty_index) {
+                    let forwarder_key = format!("{}:{}:{}", sub.browser_identity, ai, pi);
+                    if let Some(task) = self.webrtc_pty_forwarders.remove(&forwarder_key) {
+                        task.abort();
+                        log::debug!("[WebRTC] Aborted PTY forwarder for {}", forwarder_key);
+                    }
                 }
             }
         }
