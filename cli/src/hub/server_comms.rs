@@ -37,6 +37,7 @@ impl Hub {
         self.poll_progress_events();
         self.poll_command_channel();
         self.poll_webrtc_channels();
+        self.poll_webrtc_pty_output();
         self.poll_hub_events_for_webrtc();
         self.send_command_channel_heartbeat();
         self.poll_agent_notifications_async();
@@ -805,18 +806,49 @@ impl Hub {
             "TerminalRelayChannel" => {
                 if let (Some(ai), Some(pi)) = (agent_index, pty_index) {
                     log::info!(
-                        "[WebRTC] Terminal subscription for agent={} pty={}, triggering PTY connection",
+                        "[WebRTC] Terminal subscription for agent={} pty={}, spawning PTY forwarder",
                         ai,
                         pi
                     );
 
-                    // Broadcast to BrowserClient so it sets up terminal I/O
-                    let client_id = crate::client::ClientId::Browser(browser_identity.to_string());
-                    self.broadcast(crate::hub::HubEvent::PtyConnectionRequested {
-                        client_id,
-                        agent_index: ai,
-                        pty_index: pi,
-                    });
+                    // Get PTY handle from cache
+                    if let Some(agent_handle) = self.handle_cache.get_agent(ai) {
+                        if let Some(pty_handle) = agent_handle.get_pty(pi) {
+                            // Subscribe to PTY events
+                            let pty_rx = pty_handle.subscribe();
+
+                            // Spawn forwarder task
+                            let sub_id = subscription_id.clone();
+                            let browser_id = browser_identity.to_string();
+                            let output_tx = self.webrtc_pty_output_tx.clone();
+
+                            let _guard = self.tokio_runtime.enter();
+                            let task = tokio::spawn(spawn_webrtc_pty_forwarder(
+                                pty_rx,
+                                output_tx,
+                                sub_id.clone(),
+                                browser_id,
+                                ai,
+                                pi,
+                            ));
+
+                            // Store task handle for cleanup
+                            self.webrtc_pty_forwarders.insert(sub_id, task);
+
+                            // Send scrollback
+                            let scrollback = pty_handle.get_scrollback();
+                            if !scrollback.is_empty() {
+                                let mut msg = Vec::with_capacity(1 + scrollback.len());
+                                msg.push(0x01); // Raw terminal data prefix
+                                msg.extend(&scrollback);
+                                self.send_webrtc_raw(&subscription_id, browser_identity, msg);
+                            }
+                        } else {
+                            log::warn!("[WebRTC] No PTY at index {} for agent {}", pi, ai);
+                        }
+                    } else {
+                        log::warn!("[WebRTC] No agent at index {}", ai);
+                    }
                 }
             }
             _ => {}
@@ -840,15 +872,11 @@ impl Hub {
                 sub.channel_name
             );
 
-            // If this was a terminal subscription, trigger PTY disconnection
+            // If this was a terminal subscription, abort the forwarder task
             if sub.channel_name == "TerminalRelayChannel" {
-                if let (Some(ai), Some(pi)) = (sub.agent_index, sub.pty_index) {
-                    let client_id = crate::client::ClientId::Browser(sub.browser_identity);
-                    self.broadcast(crate::hub::HubEvent::PtyDisconnectionRequested {
-                        client_id,
-                        agent_index: ai,
-                        pty_index: pi,
-                    });
+                if let Some(task) = self.webrtc_pty_forwarders.remove(subscription_id) {
+                    task.abort();
+                    log::debug!("[WebRTC] Aborted PTY forwarder for {}", subscription_id);
                 }
             }
         }
@@ -1246,6 +1274,58 @@ impl Hub {
         self.send_webrtc_message(subscription_id, browser_identity, json);
     }
 
+    /// Send raw bytes to a WebRTC subscription (for PTY output).
+    ///
+    /// Unlike `send_webrtc_message`, this sends raw bytes without JSON wrapping.
+    /// The browser distinguishes raw terminal data by the 0x01 prefix byte.
+    fn send_webrtc_raw(
+        &self,
+        subscription_id: &str,
+        browser_identity: &str,
+        data: Vec<u8>,
+    ) {
+        let Some(channel) = self.webrtc_channels.get(browser_identity) else {
+            log::warn!(
+                "[WebRTC] No channel for browser {} when sending raw data",
+                &browser_identity[..browser_identity.len().min(8)]
+            );
+            return;
+        };
+
+        // Wrap raw data with subscriptionId for routing on browser side
+        // Format: { "subscriptionId": "...", "raw": <base64 encoded bytes> }
+        // Browser detects "raw" key and decodes base64 to pass to xterm
+        let message = serde_json::json!({
+            "subscriptionId": subscription_id,
+            "raw": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data)
+        });
+
+        let payload = match serde_json::to_vec(&message) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[WebRTC] Failed to serialize raw message: {e}");
+                return;
+            }
+        };
+
+        // Send via WebRTC DataChannel with Signal Protocol E2E encryption
+        let peer = crate::channel::PeerId(browser_identity.to_string());
+        let _guard = self.tokio_runtime.enter();
+        if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&payload, &peer)) {
+            log::warn!("[WebRTC] Failed to send raw data: {e}");
+        }
+    }
+
+    /// Poll for queued PTY output and send via WebRTC.
+    ///
+    /// Forwarder tasks queue `WebRtcPtyOutput` messages; this drains and sends them.
+    fn poll_webrtc_pty_output(&mut self) {
+        // Drain all pending PTY output messages
+        while let Ok(msg) = self.webrtc_pty_output_rx.try_recv() {
+            self.send_webrtc_raw(&msg.subscription_id, &msg.browser_identity, msg.data);
+        }
+    }
+
     // === WebRTC Signaling ===
 
     /// Handle incoming WebRTC offer from browser.
@@ -1505,4 +1585,97 @@ impl Hub {
             &server_url,
         )
     }
+}
+
+/// Background task that forwards PTY output to WebRTC via the output queue.
+///
+/// Subscribes to PTY events and sends raw bytes (with 0x01 prefix) to the
+/// output queue. The main loop drains and sends via WebRTC DataChannel.
+///
+/// Exits when the PTY closes or the task is aborted on unsubscribe.
+async fn spawn_webrtc_pty_forwarder(
+    mut pty_rx: tokio::sync::broadcast::Receiver<crate::agent::pty::PtyEvent>,
+    output_tx: tokio::sync::mpsc::UnboundedSender<crate::hub::WebRtcPtyOutput>,
+    subscription_id: String,
+    browser_identity: String,
+    agent_index: usize,
+    pty_index: usize,
+) {
+    use crate::agent::pty::PtyEvent;
+    use crate::relay::TerminalMessage;
+
+    log::info!(
+        "[WebRTC] Started PTY forwarder for browser {} agent {} pty {}",
+        &browser_identity[..browser_identity.len().min(8)],
+        agent_index,
+        pty_index
+    );
+
+    loop {
+        match pty_rx.recv().await {
+            Ok(PtyEvent::Output(data)) => {
+                // Send raw bytes with 0x01 prefix (no JSON, no UTF-8 conversion).
+                // Browser detects prefix and passes bytes directly to xterm.
+                let mut raw_message = Vec::with_capacity(1 + data.len());
+                raw_message.push(0x01); // Raw terminal data prefix
+                raw_message.extend(&data);
+
+                // Queue for main loop to send
+                if output_tx
+                    .send(crate::hub::WebRtcPtyOutput {
+                        subscription_id: subscription_id.clone(),
+                        browser_identity: browser_identity.clone(),
+                        data: raw_message,
+                    })
+                    .is_err()
+                {
+                    log::debug!("[WebRTC] PTY output queue closed, stopping forwarder");
+                    break;
+                }
+            }
+            Ok(PtyEvent::ProcessExited { exit_code }) => {
+                log::info!(
+                    "[WebRTC] PTY process exited (code={:?}) for agent {} pty {}",
+                    exit_code,
+                    agent_index,
+                    pty_index
+                );
+                // Send exit notification
+                let message = TerminalMessage::ProcessExited { exit_code };
+                if let Ok(json) = serde_json::to_string(&message) {
+                    let _ = output_tx.send(crate::hub::WebRtcPtyOutput {
+                        subscription_id: subscription_id.clone(),
+                        browser_identity: browser_identity.clone(),
+                        data: json.into_bytes(),
+                    });
+                }
+            }
+            Ok(_other_event) => {
+                // Ignore other events (Resized, OwnerChanged).
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                log::warn!(
+                    "[WebRTC] PTY forwarder lagged by {} events for agent {} pty {}",
+                    n,
+                    agent_index,
+                    pty_index
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                log::info!(
+                    "[WebRTC] PTY channel closed for agent {} pty {}",
+                    agent_index,
+                    pty_index
+                );
+                break;
+            }
+        }
+    }
+
+    log::info!(
+        "[WebRTC] Stopped PTY forwarder for browser {} agent {} pty {}",
+        &browser_identity[..browser_identity.len().min(8)],
+        agent_index,
+        pty_index
+    );
 }

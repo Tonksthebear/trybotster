@@ -384,6 +384,15 @@ export class Connection {
   #setupSubscriptionEventListeners() {
     // Listen for subscription messages (decrypt if needed)
     const unsubMsg = bridge.onSubscriptionMessage(this.subscriptionId, async (message) => {
+      // Check if this is raw binary data (Uint8Array) - already decrypted
+      // This comes from WebRTC PTY output (base64 decoded in webrtc_transport.js)
+      if (message instanceof Uint8Array) {
+        // Pass raw bytes directly to handleMessage
+        // The 0x01 prefix is inside the bytes - terminal handlers will process it
+        this.handleMessage({ type: "raw_output", data: message })
+        return
+      }
+
       // Check if message is encrypted (has envelope field)
       if (message && message.envelope) {
         try {

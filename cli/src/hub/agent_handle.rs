@@ -329,6 +329,17 @@ impl PtyHandle {
         self.port
     }
 
+    /// Get a copy of the current scrollback buffer.
+    ///
+    /// Returns the accumulated terminal output for replay on connect.
+    #[must_use]
+    pub fn get_scrollback(&self) -> Vec<u8> {
+        self.scrollback_buffer
+            .lock()
+            .map(|buf| buf.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     // =========================================================================
     // Direct Sync Methods - Immediate I/O without async channel
     // =========================================================================

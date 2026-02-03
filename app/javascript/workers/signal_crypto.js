@@ -334,7 +334,33 @@ async function handleDecrypt(hubId, envelope) {
 
   const envelopeStr =
     typeof envelope === "string" ? envelope : JSON.stringify(envelope);
-  const plaintext = await session.decrypt(envelopeStr);
+
+  // Parse envelope to check sender
+  const envelopeObj = typeof envelope === "string" ? JSON.parse(envelope) : envelope;
+
+  let plaintext;
+  try {
+    plaintext = await session.decrypt(envelopeStr);
+  } catch (decryptError) {
+    // Try to get session's expected remote identity for comparison
+    let expectedRemote = "unknown";
+    try {
+      expectedRemote = await session.get_remote_identity_key();
+    } catch (e) {
+      // Method might not exist
+    }
+
+    // Log detailed error info for debugging
+    console.error("[SignalCrypto] Decrypt failed:", {
+      hubId,
+      error: decryptError.message || decryptError.toString(),
+      envelopeType: envelopeObj.t,
+      senderPrefix: envelopeObj.s?.substring(0, 30),
+      expectedRemotePrefix: expectedRemote?.substring?.(0, 30) || expectedRemote,
+      ciphertextLength: envelopeObj.c?.length,
+    });
+    throw new Error(`Decrypt failed: ${decryptError.message || decryptError.toString()}`);
+  }
 
   // Persist after decryption (Double Ratchet state changed)
   await persistSession(hubId, session);
@@ -353,6 +379,15 @@ async function handleGetIdentityKey(hubId) {
 
   const identityKey = await session.get_identity_key();
   return { identityKey };
+}
+
+async function handleGetRemoteIdentityKey(hubId) {
+  const session = sessions.get(hubId);
+  if (!session) throw new Error(`No session for hub ${hubId}`);
+
+  // Get the remote (CLI) identity key that this session expects
+  const remoteKey = await session.get_remote_identity_key();
+  return { remoteIdentityKey: remoteKey };
 }
 
 async function handleClearSession(hubId) {
@@ -419,6 +454,9 @@ async function handleMessage(event, portId, replyFn) {
         break;
       case "clearSession":
         result = await handleClearSession(params.hubId);
+        break;
+      case "getRemoteIdentityKey":
+        result = await handleGetRemoteIdentityKey(params.hubId);
         break;
       case "processSenderKeyDistribution":
         result = await handleProcessSenderKeyDistribution(
