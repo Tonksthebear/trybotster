@@ -271,6 +271,11 @@ class WorkerBridge {
         return webrtcTransport.unsubscribe(params.subscriptionId)
       case "sendRaw":
         return webrtcTransport.sendRaw(params.subscriptionId, params.message)
+      case "perform":
+        // ActionCable-style perform: send action via DataChannel
+        // For now, just log and return - CLI health is handled differently with WebRTC
+        console.log(`[WorkerBridge] WebRTC perform: ${params.action}`, params)
+        return { performed: true }
       default:
         throw new Error(`Unknown WebRTC action: ${action}`)
     }
