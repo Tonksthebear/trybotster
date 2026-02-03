@@ -38,9 +38,19 @@ impl Hub {
         self.poll_command_channel();
         self.poll_webrtc_channels();
         self.poll_webrtc_pty_output();
-        self.poll_hub_events_for_webrtc();
         self.send_command_channel_heartbeat();
         self.poll_agent_notifications_async();
+        self.poll_lua_file_changes();
+    }
+
+    /// Poll for Lua file changes and hot-reload modified modules.
+    ///
+    /// This is a no-op if file watching is not enabled.
+    fn poll_lua_file_changes(&self) {
+        let reloaded = self.lua.poll_and_reload();
+        if reloaded > 0 {
+            log::info!("Hot-reloaded {} Lua module(s)", reloaded);
+        }
     }
 
     // === Command Channel (WebSocket) Methods ===
@@ -464,7 +474,12 @@ impl Hub {
 
         // Broadcast AgentCreated event to all subscribers (WebRTC, TUI)
         if let Some(info) = self.state.read().unwrap().get_agent_info(&session_key) {
-            self.broadcast(HubEvent::agent_created(session_key, info));
+            self.broadcast(HubEvent::agent_created(session_key.clone(), info.clone()));
+
+            // Fire Lua event for agent_created
+            if let Err(e) = self.lua.fire_agent_created(&session_key, &info) {
+                log::warn!("Lua agent_created event error: {}", e);
+            }
         }
 
         // Refresh worktree cache - this agent's worktree is now in use
@@ -558,136 +573,11 @@ impl Hub {
         }
     }
 
-    /// Poll hub events and forward to WebRTC HubChannel subscribers.
-    ///
-    /// Receives hub events (AgentCreated, AgentDeleted, etc.) and broadcasts
-    /// them to all browsers with active HubChannel subscriptions via WebRTC.
-    fn poll_hub_events_for_webrtc(&mut self) {
-        // Take receiver temporarily to avoid borrow issues
-        let Some(mut rx) = self.webrtc_event_rx.take() else {
-            return;
-        };
-
-        // Process all pending events
-        loop {
-            match rx.try_recv() {
-                Ok(event) => {
-                    log::trace!("[WebRTC] Hub event received: {:?}", event);
-                    self.broadcast_hub_event_to_webrtc(&event);
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                    log::warn!("[WebRTC] Lagged {} hub events", n);
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                    log::info!("[WebRTC] Hub event channel closed");
-                    return; // Don't restore rx since channel is closed
-                }
-            }
-        }
-
-        // Restore receiver
-        self.webrtc_event_rx = Some(rx);
-    }
-
-    /// Broadcast a hub event to all WebRTC HubChannel subscribers.
-    fn broadcast_hub_event_to_webrtc(&self, event: &HubEvent) {
-        use crate::relay::TerminalMessage;
-
-        // Find all HubChannel subscriptions
-        let hub_subs: Vec<(String, String)> = self
-            .webrtc_subscriptions
-            .iter()
-            .filter(|(_, sub)| sub.channel_name == "HubChannel")
-            .map(|(sub_id, sub)| (sub_id.clone(), sub.browser_identity.clone()))
-            .collect();
-
-        if hub_subs.is_empty() {
-            return;
-        }
-
-        match event {
-            HubEvent::AgentCreated { agent_id, info: _ } => {
-                log::info!(
-                    "[WebRTC] Broadcasting AgentCreated to {} subscribers",
-                    hub_subs.len()
-                );
-
-                // Send updated agent list
-                for (sub_id, browser_id) in &hub_subs {
-                    self.send_webrtc_agent_list(sub_id, browser_id);
-                }
-
-                // Send agent_created event
-                let message = TerminalMessage::AgentCreated {
-                    id: agent_id.clone(),
-                };
-                if let Ok(json) = serde_json::to_value(&message) {
-                    for (sub_id, browser_id) in &hub_subs {
-                        self.send_webrtc_message(sub_id, browser_id, json.clone());
-                    }
-                }
-            }
-            HubEvent::AgentDeleted { agent_id } => {
-                log::info!(
-                    "[WebRTC] Broadcasting AgentDeleted to {} subscribers",
-                    hub_subs.len()
-                );
-
-                // Send updated agent list
-                for (sub_id, browser_id) in &hub_subs {
-                    self.send_webrtc_agent_list(sub_id, browser_id);
-                }
-
-                // Send agent_deleted event
-                let message = TerminalMessage::AgentDeleted {
-                    id: agent_id.clone(),
-                };
-                if let Ok(json) = serde_json::to_value(&message) {
-                    for (sub_id, browser_id) in &hub_subs {
-                        self.send_webrtc_message(sub_id, browser_id, json.clone());
-                    }
-                }
-            }
-            HubEvent::AgentStatusChanged { .. } => {
-                // Send updated agent list
-                for (sub_id, browser_id) in &hub_subs {
-                    self.send_webrtc_agent_list(sub_id, browser_id);
-                }
-            }
-            HubEvent::AgentCreationProgress { identifier, stage } => {
-                let message = TerminalMessage::AgentCreatingProgress {
-                    identifier: identifier.clone(),
-                    stage: *stage,
-                    message: stage.description().to_string(),
-                };
-                if let Ok(json) = serde_json::to_value(&message) {
-                    for (sub_id, browser_id) in &hub_subs {
-                        self.send_webrtc_message(sub_id, browser_id, json.clone());
-                    }
-                }
-            }
-            HubEvent::Error { message } => {
-                let msg = TerminalMessage::Error {
-                    message: message.clone(),
-                };
-                if let Ok(json) = serde_json::to_value(&msg) {
-                    for (sub_id, browser_id) in &hub_subs {
-                        self.send_webrtc_message(sub_id, browser_id, json.clone());
-                    }
-                }
-            }
-            _ => {
-                // Other events not relevant for WebRTC broadcast
-            }
-        }
-    }
-
     /// Handle a message received from a WebRTC DataChannel.
     ///
-    /// Messages arrive in two forms:
-    /// 1. Control messages: type="subscribe"/"unsubscribe" (also have subscriptionId)
-    /// 2. Data messages: type="input"/"resize"/etc with subscriptionId
+    /// All message handling is delegated to Lua. The message is passed to Lua's
+    /// on_message callback which routes to the appropriate handler (subscribe,
+    /// unsubscribe, terminal data, hub commands, etc.).
     ///
     /// Note: Signal envelope decryption happens inside WebRtcChannel.try_recv(),
     /// so we receive plaintext JSON here.
@@ -700,618 +590,282 @@ impl Hub {
             }
         };
 
-        // Check message type first - control messages take priority
-        if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
-            match msg_type {
-                "subscribe" => {
-                    self.handle_webrtc_subscribe(browser_identity, &msg);
-                    return;
-                }
-                "unsubscribe" => {
-                    self.handle_webrtc_unsubscribe(&msg);
-                    return;
-                }
-                _ => {
-                    // Other types (input, resize, etc.) fall through to data handling
-                }
-            }
-        }
-
-        // Data messages have subscriptionId and a command type (input, resize, etc.)
-        if let Some(subscription_id) = msg.get("subscriptionId").and_then(|s| s.as_str()) {
-            self.handle_webrtc_data(subscription_id, &msg);
-        } else {
-            log::trace!("[WebRTC] Message without subscriptionId: {:?}", msg);
-        }
+        // Delegate all message handling to Lua
+        self.call_lua_webrtc_message(browser_identity, msg);
     }
 
-    /// Handle WebRTC subscribe message - create virtual subscription.
-    fn handle_webrtc_subscribe(&mut self, browser_identity: &str, msg: &serde_json::Value) {
-        let subscription_id = match msg.get("subscriptionId").and_then(|s| s.as_str()) {
-            Some(id) => id.to_string(),
-            None => {
-                log::warn!("[WebRTC] Subscribe missing subscriptionId");
-                return;
-            }
-        };
+    /// Call Lua WebRTC message handler and process any queued sends.
+    ///
+    /// Passes the decrypted message to Lua's on_message callback (if registered).
+    /// After the callback returns, drains any messages that Lua queued via
+    /// webrtc.send() and sends them to the appropriate peers, and also processes
+    /// any PTY requests that Lua queued.
+    fn call_lua_webrtc_message(&mut self, browser_identity: &str, msg: serde_json::Value) {
+        // Call Lua callback
+        if let Err(e) = self.lua.call_webrtc_message(browser_identity, msg) {
+            log::warn!("[WebRTC] Lua message callback error: {e}");
+        }
 
-        let channel_name = msg
-            .get("channel")
-            .and_then(|c| c.as_str())
-            .unwrap_or("unknown")
-            .to_string();
+        // Process any sends and PTY requests that Lua queued
+        self.process_lua_webrtc_sends();
+        self.process_lua_pty_requests();
+    }
 
-        let params = msg.get("params").cloned().unwrap_or(serde_json::Value::Null);
-        let agent_index = params.get("agent_index").and_then(|a| a.as_u64()).map(|a| a as usize);
-        let pty_index = params.get("pty_index").and_then(|p| p.as_u64()).map(|p| p as usize);
+    /// Process WebRTC send requests queued by Lua callbacks.
+    ///
+    /// Drains the Lua send queue and sends each message to the target peer.
+    /// Called after any Lua callback that might queue messages.
+    fn process_lua_webrtc_sends(&mut self) {
+        use crate::lua::primitives::WebRtcSendRequest;
 
-        log::debug!(
-            "[WebRTC] Subscribe: {} -> {} (agent={:?}, pty={:?})",
-            &subscription_id[..subscription_id.len().min(16)],
-            channel_name,
-            agent_index,
-            pty_index
-        );
-
-        // Store subscription mapping
-        self.webrtc_subscriptions.insert(
-            subscription_id.clone(),
-            crate::hub::WebRtcSubscription {
-                browser_identity: browser_identity.to_string(),
-                channel_name,
-                agent_index,
-                pty_index,
-            },
-        );
-
-        // Send subscription confirmation to browser immediately after registering.
-        // Browser waits for this before allowing input to prevent race condition.
-        self.send_webrtc_subscription_confirmed(&subscription_id, browser_identity);
-
-        // Handle channel-specific subscription setup
-        let sub = self.webrtc_subscriptions.get(&subscription_id).unwrap().clone();
-        match sub.channel_name.as_str() {
-            "HubChannel" => {
-                // Send initial agent and worktree lists
-                log::info!("[WebRTC] HubChannel subscription, sending initial data");
-                self.send_webrtc_agent_list(&subscription_id, browser_identity);
-                self.send_webrtc_worktree_list(&subscription_id, browser_identity);
-            }
-            "TerminalRelayChannel" => {
-                if let (Some(ai), Some(pi)) = (agent_index, pty_index) {
-                    log::debug!(
-                        "[WebRTC] Terminal subscription for agent={} pty={}, spawning PTY forwarder",
-                        ai,
-                        pi
-                    );
-
-                    // Get PTY handle from cache
-                    if let Some(agent_handle) = self.handle_cache.get_agent(ai) {
-                        if let Some(pty_handle) = agent_handle.get_pty(pi) {
-                            // Key forwarders by (browser, agent, pty) to prevent duplicates.
-                            // When browser reconnects with new subscription, abort old forwarder.
-                            let forwarder_key = format!("{}:{}:{}", browser_identity, ai, pi);
-                            if let Some(old_task) = self.webrtc_pty_forwarders.remove(&forwarder_key) {
-                                old_task.abort();
-                                log::debug!("[WebRTC] Aborted old PTY forwarder for {}", forwarder_key);
+        for send_req in self.lua.drain_webrtc_sends() {
+            match send_req {
+                WebRtcSendRequest::Json { peer_id, data } => {
+                    // Find the HubChannel subscription for this peer (if any)
+                    // For Lua sends, we send directly without subscription wrapping
+                    // since Lua handles its own message framing.
+                    if let Some(channel) = self.webrtc_channels.get(&peer_id) {
+                        let payload = match serde_json::to_vec(&data) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::warn!("[WebRTC] Lua send failed to serialize: {e}");
+                                continue;
                             }
+                        };
 
-                            // Subscribe to PTY events
-                            let pty_rx = pty_handle.subscribe();
-
-                            // Spawn forwarder task
-                            let sub_id = subscription_id.clone();
-                            let browser_id = browser_identity.to_string();
-                            let output_tx = self.webrtc_pty_output_tx.clone();
-
-                            let _guard = self.tokio_runtime.enter();
-                            let task = tokio::spawn(spawn_webrtc_pty_forwarder(
-                                pty_rx,
-                                output_tx,
-                                sub_id.clone(),
-                                browser_id,
-                                ai,
-                                pi,
-                            ));
-
-                            // Store task handle for cleanup (keyed by browser:agent:pty)
-                            self.webrtc_pty_forwarders.insert(forwarder_key, task);
-
-                            // Send scrollback
-                            let scrollback = pty_handle.get_scrollback();
-                            if !scrollback.is_empty() {
-                                let mut msg = Vec::with_capacity(1 + scrollback.len());
-                                msg.push(0x01); // Raw terminal data prefix
-                                msg.extend(&scrollback);
-                                self.send_webrtc_raw(&subscription_id, browser_identity, msg);
-                            }
-                        } else {
-                            log::warn!("[WebRTC] No PTY at index {} for agent {}", pi, ai);
+                        let peer = crate::channel::PeerId(peer_id.clone());
+                        let _guard = self.tokio_runtime.enter();
+                        if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&payload, &peer)) {
+                            log::warn!("[WebRTC] Lua send failed: {e}");
                         }
                     } else {
-                        log::warn!("[WebRTC] No agent at index {}", ai);
+                        log::debug!("[WebRTC] Lua send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
                     }
                 }
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle WebRTC unsubscribe message - remove virtual subscription.
-    fn handle_webrtc_unsubscribe(&mut self, msg: &serde_json::Value) {
-        let subscription_id = match msg.get("subscriptionId").and_then(|s| s.as_str()) {
-            Some(id) => id,
-            None => {
-                log::warn!("[WebRTC] Unsubscribe missing subscriptionId");
-                return;
-            }
-        };
-
-        if let Some(sub) = self.webrtc_subscriptions.remove(subscription_id) {
-            log::info!(
-                "[WebRTC] Unsubscribe: {} (was {})",
-                &subscription_id[..subscription_id.len().min(16)],
-                sub.channel_name
-            );
-
-            // If this was a terminal subscription, abort the forwarder task
-            if sub.channel_name == "TerminalRelayChannel" {
-                if let (Some(ai), Some(pi)) = (sub.agent_index, sub.pty_index) {
-                    let forwarder_key = format!("{}:{}:{}", sub.browser_identity, ai, pi);
-                    if let Some(task) = self.webrtc_pty_forwarders.remove(&forwarder_key) {
-                        task.abort();
-                        log::trace!("[WebRTC] Aborted PTY forwarder for {}", forwarder_key);
+                WebRtcSendRequest::Binary { peer_id, data } => {
+                    if let Some(channel) = self.webrtc_channels.get(&peer_id) {
+                        let peer = crate::channel::PeerId(peer_id.clone());
+                        let _guard = self.tokio_runtime.enter();
+                        if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&data, &peer)) {
+                            log::warn!("[WebRTC] Lua binary send failed: {e}");
+                        }
+                    } else {
+                        log::debug!("[WebRTC] Lua binary send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
                     }
                 }
             }
         }
     }
 
-    /// Handle WebRTC data message - route to appropriate handler.
+    /// Process PTY requests queued by Lua callbacks.
     ///
-    /// Messages come in two formats:
-    /// 1. From encrypted sendEnvelope: command at top level
-    ///    `{ subscriptionId, type: "input", data: "ls" }`
-    /// 2. From plaintext sendRaw: command nested under data
-    ///    `{ subscriptionId, data: { type: "input", data: "ls" } }`
-    fn handle_webrtc_data(&mut self, subscription_id: &str, msg: &serde_json::Value) {
-        let sub = match self.webrtc_subscriptions.get(subscription_id) {
-            Some(s) => s.clone(),
-            None => {
-                log::debug!("[WebRTC] Data for unknown subscription: {}", subscription_id);
-                return;
-            }
-        };
+    /// Drains the Lua PTY request queue and processes each request.
+    /// Called after any Lua callback that might queue PTY operations.
+    pub fn process_lua_pty_requests(&mut self) {
+        use crate::lua::PtyRequest;
 
-        // Determine if command is at top level (encrypted flow) or nested under "data" (plaintext flow).
-        // Encrypted messages have `type` at top level (e.g., "input", "resize").
-        // Plaintext messages have `data` containing the command object.
-        let command = if msg.get("type").is_some() && msg.get("type").and_then(|t| t.as_str()) != Some("subscribe") {
-            // Command at top level (encrypted flow) - use whole message
-            msg.clone()
-        } else if let Some(data) = msg.get("data") {
-            // Nested under "data" (plaintext flow)
-            data.clone()
-        } else {
-            log::trace!("[WebRTC] Data message has no command: {:?}", msg);
-            return;
-        };
-
-        match sub.channel_name.as_str() {
-            "TerminalRelayChannel" => {
-                if let (Some(ai), Some(pi)) = (sub.agent_index, sub.pty_index) {
-                    self.handle_webrtc_terminal_data(&sub.browser_identity, ai, pi, &command);
+        for request in self.lua.drain_pty_requests() {
+            match request {
+                PtyRequest::CreateForwarder(req) => {
+                    self.create_lua_pty_forwarder(req);
                 }
-            }
-            "HubChannel" => {
-                self.handle_webrtc_hub_data(&sub.browser_identity, &command);
-            }
-            "PreviewChannel" => {
-                // Preview data handled separately via HTTP proxying
-                log::trace!("[WebRTC] Preview data received (handled via HTTP proxy)");
-            }
-            _ => {
-                log::debug!("[WebRTC] Data for unknown channel: {}", sub.channel_name);
-            }
-        }
-    }
-
-    /// Handle terminal input data from WebRTC DataChannel.
-    fn handle_webrtc_terminal_data(
-        &mut self,
-        browser_identity: &str,
-        agent_index: usize,
-        pty_index: usize,
-        data: &serde_json::Value,
-    ) {
-        use crate::agent::PtyView;
-
-        // Convert pty_index to PtyView (0=Cli, 1=Server)
-        let view = if pty_index == 0 {
-            PtyView::Cli
-        } else {
-            PtyView::Server
-        };
-
-        // Parse the terminal command (Input, Resize, etc.)
-        let command: crate::relay::BrowserCommand = match serde_json::from_value(data.clone()) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                log::debug!("[WebRTC] Failed to parse terminal command: {e}");
-                return;
-            }
-        };
-
-        // Get agent handle and write input
-        let state = self.state.read().unwrap();
-        let agent_key = state.agent_keys_ordered.get(agent_index).cloned();
-        drop(state);
-
-        let Some(key) = agent_key else {
-            log::warn!("[WebRTC] No agent at index {agent_index}");
-            return;
-        };
-
-        match command {
-            crate::relay::BrowserCommand::Input { data } => {
-                let mut state = self.state.write().unwrap();
-                if let Some(agent) = state.agents.get_mut(&key) {
-                    if let Err(e) = agent.write_input(view, data.as_bytes()) {
-                        log::warn!("[WebRTC] Failed to write input: {e}");
-                    }
+                PtyRequest::StopForwarder { forwarder_id } => {
+                    self.stop_lua_pty_forwarder(&forwarder_id);
                 }
-            }
-            crate::relay::BrowserCommand::Resize { cols, rows } => {
-                let mut state = self.state.write().unwrap();
-                if let Some(agent) = state.agents.get_mut(&key) {
-                    agent.resize_pty(view, rows, cols);
-                }
-            }
-            crate::relay::BrowserCommand::Handshake { .. } => {
-                log::trace!(
-                    "[WebRTC] Handshake from browser {} for agent {} pty {}",
-                    &browser_identity[..browser_identity.len().min(8)],
+                PtyRequest::WritePty {
                     agent_index,
-                    pty_index
-                );
-                // TODO: Send handshake ack back via WebRTC DataChannel
-            }
-            _ => {
-                log::debug!("[WebRTC] Unhandled terminal command: {:?}", command);
-            }
-        }
-    }
-
-    /// Handle hub control data from WebRTC DataChannel.
-    fn handle_webrtc_hub_data(&mut self, browser_identity: &str, data: &serde_json::Value) {
-        // Check if data contains an encrypted envelope
-        let decrypted_data = if let Some(envelope_val) = data.get("envelope") {
-            let envelope: crate::relay::signal::SignalEnvelope = match serde_json::from_value(envelope_val.clone()) {
-                Ok(env) => env,
-                Err(e) => {
-                    log::debug!("[WebRTC] Failed to parse envelope: {e}");
-                    return;
+                    pty_index,
+                    data,
+                } => {
+                    if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
+                        if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
+                            if let Err(e) = pty_handle.write_input_direct(&data) {
+                                log::warn!("[Lua] PTY write failed: {e}");
+                            }
+                        } else {
+                            log::debug!("[Lua] No PTY at index {} for agent {}", pty_index, agent_index);
+                        }
+                    } else {
+                        log::debug!("[Lua] No agent at index {}", agent_index);
+                    }
                 }
-            };
-
-            // Decrypt using crypto service
-            let Some(ref crypto_service) = self.browser.crypto_service else {
-                log::warn!("[WebRTC] No crypto service for decryption");
-                return;
-            };
-
-            let _guard = self.tokio_runtime.enter();
-            let plaintext = match self.tokio_runtime.block_on(crypto_service.decrypt(&envelope)) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::warn!("[WebRTC] Decryption failed: {e}");
-                    return;
+                PtyRequest::ResizePty {
+                    agent_index,
+                    pty_index,
+                    rows,
+                    cols,
+                } => {
+                    if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
+                        if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
+                            // For Lua-initiated resize, use a synthetic client ID
+                            pty_handle.resize_direct(crate::client::ClientId::Internal, rows, cols);
+                        } else {
+                            log::debug!("[Lua] No PTY at index {} for agent {}", pty_index, agent_index);
+                        }
+                    } else {
+                        log::debug!("[Lua] No agent at index {}", agent_index);
+                    }
                 }
-            };
-
-            // Strip compression marker (0x00 = uncompressed)
-            let plaintext = if !plaintext.is_empty() && plaintext[0] == 0x00 {
-                &plaintext[1..]
-            } else {
-                &plaintext[..]
-            };
-
-            match serde_json::from_slice::<serde_json::Value>(plaintext) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::debug!("[WebRTC] Failed to parse decrypted data: {e}");
-                    return;
-                }
-            }
-        } else {
-            // Plaintext data (e.g., from older clients or control messages)
-            data.clone()
-        };
-
-        // Parse as BrowserCommand and dispatch
-        let command: crate::relay::BrowserCommand = match serde_json::from_value(decrypted_data) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                log::debug!("[WebRTC] Failed to parse hub command: {e}");
-                return;
-            }
-        };
-
-        log::trace!(
-            "[WebRTC] Hub command from {}: {:?}",
-            &browser_identity[..browser_identity.len().min(8)],
-            command
-        );
-
-        // Route to existing command handling
-        // Find the subscription ID for this browser's HubChannel
-        let subscription_id = self
-            .webrtc_subscriptions
-            .iter()
-            .find(|(_, sub)| {
-                sub.browser_identity == browser_identity && sub.channel_name == "HubChannel"
-            })
-            .map(|(id, _)| id.clone());
-
-        match command {
-            crate::relay::BrowserCommand::ListAgents => {
-                if let Some(sub_id) = &subscription_id {
-                    self.send_webrtc_agent_list(sub_id, browser_identity);
-                }
-            }
-            crate::relay::BrowserCommand::ListWorktrees => {
-                if let Some(sub_id) = &subscription_id {
-                    self.send_webrtc_worktree_list(sub_id, browser_identity);
-                }
-            }
-            crate::relay::BrowserCommand::SelectAgent { id } => {
-                let client_id = crate::client::ClientId::Browser(browser_identity.to_string());
-                self.handle_action(crate::hub::HubAction::SelectAgentForClient {
-                    client_id,
-                    agent_key: id,
-                });
-            }
-            crate::relay::BrowserCommand::CreateAgent {
-                issue_or_branch,
-                prompt,
-            } => {
-                let client_id = crate::client::ClientId::Browser(browser_identity.to_string());
-                let request = crate::client::CreateAgentRequest {
-                    issue_or_branch: issue_or_branch.unwrap_or_default(),
-                    prompt,
-                    from_worktree: None,
-                    dims: Some((80, 24)), // Default terminal size for browser
-                };
-                log::info!(
-                    "[WebRTC] CreateAgent from {}: {:?}",
-                    &browser_identity[..browser_identity.len().min(8)],
-                    request.issue_or_branch
-                );
-                self.handle_action(crate::hub::HubAction::CreateAgentForClient {
-                    client_id,
-                    request,
-                });
-            }
-            crate::relay::BrowserCommand::ReopenWorktree {
-                path,
-                branch,
-                prompt,
-            } => {
-                let client_id = crate::client::ClientId::Browser(browser_identity.to_string());
-                let request = crate::client::CreateAgentRequest {
-                    issue_or_branch: branch,
-                    prompt,
-                    from_worktree: Some(std::path::PathBuf::from(&path)),
-                    dims: Some((80, 24)),
-                };
-                log::info!(
-                    "[WebRTC] ReopenWorktree from {}: {}",
-                    &browser_identity[..browser_identity.len().min(8)],
-                    &path
-                );
-                self.handle_action(crate::hub::HubAction::CreateAgentForClient {
-                    client_id,
-                    request,
-                });
-            }
-            crate::relay::BrowserCommand::DeleteAgent { id, delete_worktree } => {
-                let client_id = crate::client::ClientId::Browser(browser_identity.to_string());
-                let request = crate::client::DeleteAgentRequest {
-                    agent_id: id.clone(),
-                    delete_worktree: delete_worktree.unwrap_or(false),
-                };
-                log::info!(
-                    "[WebRTC] DeleteAgent from {}: {}",
-                    &browser_identity[..browser_identity.len().min(8)],
-                    &id
-                );
-                self.handle_action(crate::hub::HubAction::DeleteAgentForClient {
-                    client_id,
-                    request,
-                });
-            }
-            crate::relay::BrowserCommand::Handshake { device_name, .. } => {
-                log::info!(
-                    "[WebRTC] Handshake from {}: device={}",
-                    &browser_identity[..browser_identity.len().min(8)],
-                    device_name
-                );
-                // Send Ack to complete handshake - browser buffers commands until it receives this
-                if let Some(sub_id) = &subscription_id {
-                    let ack = crate::relay::TerminalMessage::Ack {
-                        timestamp: Some(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0),
-                        ),
+                PtyRequest::GetScrollback {
+                    agent_index,
+                    pty_index,
+                    response_key,
+                } => {
+                    let scrollback = if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
+                        if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
+                            pty_handle.get_scrollback()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
                     };
-                    let data = serde_json::to_value(&ack).unwrap_or_default();
-                    self.send_webrtc_message(sub_id, browser_identity, data);
-                    log::trace!("[WebRTC] Sent Ack to {}", &browser_identity[..browser_identity.len().min(8)]);
+                    // Store response for Lua to retrieve
+                    self.lua.set_scrollback_response(&response_key, scrollback);
                 }
-            }
-            crate::relay::BrowserCommand::Ack { .. } => {
-                // Browser acknowledged our message - nothing to do
-                log::trace!("[WebRTC] Received Ack from {}", &browser_identity[..browser_identity.len().min(8)]);
-            }
-            _ => {
-                log::debug!("[WebRTC] Unhandled hub command: {:?}", command);
             }
         }
     }
 
-    // === WebRTC Send Methods ===
-
-    /// Send a message to a WebRTC subscription.
+    /// Create a PTY forwarder requested by Lua.
     ///
-    /// Wraps the data with the subscriptionId and sends via DataChannel.
-    /// Uses plaintext since control messages don't need E2E encryption
-    /// (DTLS provides transport security).
-    fn send_webrtc_message(
-        &self,
-        subscription_id: &str,
-        browser_identity: &str,
-        data: serde_json::Value,
-    ) {
-        let Some(channel) = self.webrtc_channels.get(browser_identity) else {
-            log::warn!(
-                "[WebRTC] No channel for browser {} when sending message",
-                &browser_identity[..browser_identity.len().min(8)]
-            );
+    /// Spawns a new forwarder task that streams PTY output to WebRTC.
+    fn create_lua_pty_forwarder(&mut self, req: crate::lua::CreateForwarderRequest) {
+        let forwarder_key = format!("{}:{}:{}", req.peer_id, req.agent_index, req.pty_index);
+
+        // Check if agent and PTY exist
+        let Some(agent_handle) = self.handle_cache.get_agent(req.agent_index) else {
+            log::warn!("[Lua] Cannot create forwarder: no agent at index {}", req.agent_index);
+            // Mark forwarder as inactive
+            *req.active_flag.lock().unwrap() = false;
             return;
         };
 
-        // Wrap data with subscriptionId for routing on browser side
-        let message = serde_json::json!({
-            "subscriptionId": subscription_id,
-            "data": data
-        });
-
-        let payload = match serde_json::to_vec(&message) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("[WebRTC] Failed to serialize message: {e}");
-                return;
-            }
-        };
-
-        // Send via WebRTC DataChannel with Signal Protocol E2E encryption
-        let peer = crate::channel::PeerId(browser_identity.to_string());
-        let _guard = self.tokio_runtime.enter();
-        if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&payload, &peer)) {
-            log::warn!("[WebRTC] Failed to send message: {e}");
-        }
-    }
-
-    /// Send subscription confirmation to browser.
-    ///
-    /// Browser waits for this before allowing input, preventing race condition
-    /// where input arrives before CLI has registered the subscription.
-    fn send_webrtc_subscription_confirmed(&self, subscription_id: &str, browser_identity: &str) {
-        let Some(channel) = self.webrtc_channels.get(browser_identity) else {
+        let Some(pty_handle) = agent_handle.get_pty(req.pty_index) else {
             log::warn!(
-                "[WebRTC] No channel for browser {} when sending subscription confirmation",
-                &browser_identity[..browser_identity.len().min(8)]
+                "[Lua] Cannot create forwarder: no PTY at index {} for agent {}",
+                req.pty_index,
+                req.agent_index
             );
+            *req.active_flag.lock().unwrap() = false;
             return;
         };
 
-        let message = serde_json::json!({
-            "type": "subscribed",
-            "subscriptionId": subscription_id
+        // Abort any existing forwarder for this key
+        if let Some(old_task) = self.webrtc_pty_forwarders.remove(&forwarder_key) {
+            old_task.abort();
+            log::debug!("[Lua] Aborted existing PTY forwarder for {}", forwarder_key);
+        }
+
+        // Subscribe to PTY events
+        let pty_rx = pty_handle.subscribe();
+
+        // Spawn forwarder task
+        let output_tx = self.webrtc_pty_output_tx.clone();
+        let peer_id = req.peer_id.clone();
+        let agent_index = req.agent_index;
+        let pty_index = req.pty_index;
+        let prefix = req.prefix.unwrap_or_else(|| vec![0x01]);
+        let active_flag = req.active_flag;
+
+        // Generate a subscription ID for this forwarder
+        // (In practice, Lua should provide this, but for now we generate one)
+        let subscription_id = forwarder_key.clone();
+
+        let _guard = self.tokio_runtime.enter();
+        let task = tokio::spawn(async move {
+            use crate::agent::pty::PtyEvent;
+            use crate::hub::WebRtcPtyOutput;
+
+            log::info!(
+                "[Lua] Started PTY forwarder for peer {} agent {} pty {}",
+                &peer_id[..peer_id.len().min(8)],
+                agent_index,
+                pty_index
+            );
+
+            let mut pty_rx = pty_rx;
+            loop {
+                // Check if forwarder was stopped by Lua
+                {
+                    let active = active_flag.lock().unwrap();
+                    if !*active {
+                        log::debug!("[Lua] PTY forwarder stopped by Lua");
+                        break;
+                    }
+                }
+
+                match pty_rx.recv().await {
+                    Ok(PtyEvent::Output(data)) => {
+                        // Send raw bytes with prefix
+                        let mut raw_message = Vec::with_capacity(prefix.len() + data.len());
+                        raw_message.extend(&prefix);
+                        raw_message.extend(&data);
+
+                        if output_tx
+                            .send(WebRtcPtyOutput {
+                                subscription_id: subscription_id.clone(),
+                                browser_identity: peer_id.clone(),
+                                data: raw_message,
+                            })
+                            .is_err()
+                        {
+                            log::trace!("[Lua] PTY output queue closed, stopping forwarder");
+                            break;
+                        }
+                    }
+                    Ok(PtyEvent::ProcessExited { exit_code }) => {
+                        log::info!(
+                            "[Lua] PTY process exited (code={:?}) for agent {} pty {}",
+                            exit_code,
+                            agent_index,
+                            pty_index
+                        );
+                        // Could send exit notification here
+                        break;
+                    }
+                    Ok(_other_event) => {
+                        // Ignore other events
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!(
+                            "[Lua] PTY forwarder lagged by {} events for agent {} pty {}",
+                            n,
+                            agent_index,
+                            pty_index
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        log::info!(
+                            "[Lua] PTY channel closed for agent {} pty {}",
+                            agent_index,
+                            pty_index
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // Mark forwarder as inactive
+            *active_flag.lock().unwrap() = false;
+
+            log::info!(
+                "[Lua] Stopped PTY forwarder for peer {} agent {} pty {}",
+                &peer_id[..peer_id.len().min(8)],
+                agent_index,
+                pty_index
+            );
         });
 
-        let payload = match serde_json::to_vec(&message) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("[WebRTC] Failed to serialize subscription confirmation: {e}");
-                return;
-            }
-        };
+        self.webrtc_pty_forwarders.insert(forwarder_key, task);
+    }
 
-        log::trace!(
-            "[WebRTC] Sending subscription confirmation for {} to {}",
-            &subscription_id[..subscription_id.len().min(16)],
-            &browser_identity[..browser_identity.len().min(8)]
-        );
-
-        // Send unencrypted - this is a control message
-        let peer = crate::channel::PeerId(browser_identity.to_string());
-        let _guard = self.tokio_runtime.enter();
-        if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&payload, &peer)) {
-            log::warn!("[WebRTC] Failed to send subscription confirmation: {e}");
+    /// Stop a PTY forwarder by ID.
+    fn stop_lua_pty_forwarder(&mut self, forwarder_id: &str) {
+        if let Some(task) = self.webrtc_pty_forwarders.remove(forwarder_id) {
+            task.abort();
+            log::debug!("[Lua] Stopped PTY forwarder {}", forwarder_id);
         }
-    }
-
-    /// Send agent list to a WebRTC subscription.
-    fn send_webrtc_agent_list(&self, subscription_id: &str, browser_identity: &str) {
-        use crate::relay::TerminalMessage;
-
-        let handles = self.handle_cache.get_all_agents();
-        let hub_id = self.server_hub_id();
-
-        let agents: Vec<crate::relay::AgentInfo> = handles
-            .iter()
-            .map(|h| {
-                let mut info = h.info().clone();
-                if info.hub_identifier.is_none() {
-                    info.hub_identifier = Some(hub_id.to_string());
-                }
-                info
-            })
-            .collect();
-
-        log::info!(
-            "[WebRTC] Sending agent list ({} agents) to subscription {}",
-            agents.len(),
-            &subscription_id[..subscription_id.len().min(16)]
-        );
-
-        let message = TerminalMessage::Agents { agents };
-        let json = match serde_json::to_value(&message) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("[WebRTC] Failed to serialize agent list: {e}");
-                return;
-            }
-        };
-
-        self.send_webrtc_message(subscription_id, browser_identity, json);
-    }
-
-    /// Send worktree list to a WebRTC subscription.
-    fn send_webrtc_worktree_list(&self, subscription_id: &str, browser_identity: &str) {
-        use crate::relay::{state::build_worktree_info, TerminalMessage};
-
-        // HandleCache stores worktrees as (path, branch) tuples
-        let worktrees_raw = self.handle_cache.get_worktrees();
-
-        let worktrees: Vec<_> = worktrees_raw
-            .iter()
-            .map(|(path, branch)| build_worktree_info(path, branch))
-            .collect();
-
-        let repo = crate::git::WorktreeManager::detect_current_repo()
-            .map(|(_, name)| name)
-            .ok();
-
-        log::info!(
-            "[WebRTC] Sending worktree list ({} worktrees) to subscription {}",
-            worktrees.len(),
-            &subscription_id[..subscription_id.len().min(16)]
-        );
-
-        let message = TerminalMessage::Worktrees { worktrees, repo };
-        let json = match serde_json::to_value(&message) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("[WebRTC] Failed to serialize worktree list: {e}");
-                return;
-            }
-        };
-
-        self.send_webrtc_message(subscription_id, browser_identity, json);
     }
 
     /// Send raw bytes to a WebRTC subscription (for PTY output).
@@ -1401,7 +955,9 @@ impl Hub {
         );
 
         // Get or create WebRTC channel for this browser
-        if !self.webrtc_channels.contains_key(&browser_identity) {
+        let is_new_connection = !self.webrtc_channels.contains_key(&browser_identity);
+
+        if is_new_connection {
             let mut channel = WebRtcChannel::builder()
                 .server_url(&server_url)
                 .api_key(&api_key)
@@ -1428,6 +984,13 @@ impl Hub {
             }
 
             self.webrtc_channels.insert(browser_identity.clone(), channel);
+
+            // Notify Lua of peer connection
+            if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
+                log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
+            }
+            self.process_lua_webrtc_sends();
+            self.process_lua_pty_requests();
         }
 
         // Handle the offer and get the answer
@@ -1569,6 +1132,9 @@ impl Hub {
         }
 
         log::info!("[WebRTC] ICE candidate polling complete for browser {}", &browser_identity[..8]);
+
+        // NOTE: Lua peer_connected callback is called from handle_webrtc_offer after channel creation.
+        // We can't call it here because spawn_ice_candidate_poller borrows self immutably.
     }
 
     // === Connection Setup ===
@@ -1625,97 +1191,4 @@ impl Hub {
             &server_url,
         )
     }
-}
-
-/// Background task that forwards PTY output to WebRTC via the output queue.
-///
-/// Subscribes to PTY events and sends raw bytes (with 0x01 prefix) to the
-/// output queue. The main loop drains and sends via WebRTC DataChannel.
-///
-/// Exits when the PTY closes or the task is aborted on unsubscribe.
-async fn spawn_webrtc_pty_forwarder(
-    mut pty_rx: tokio::sync::broadcast::Receiver<crate::agent::pty::PtyEvent>,
-    output_tx: tokio::sync::mpsc::UnboundedSender<crate::hub::WebRtcPtyOutput>,
-    subscription_id: String,
-    browser_identity: String,
-    agent_index: usize,
-    pty_index: usize,
-) {
-    use crate::agent::pty::PtyEvent;
-    use crate::relay::TerminalMessage;
-
-    log::info!(
-        "[WebRTC] Started PTY forwarder for browser {} agent {} pty {}",
-        &browser_identity[..browser_identity.len().min(8)],
-        agent_index,
-        pty_index
-    );
-
-    loop {
-        match pty_rx.recv().await {
-            Ok(PtyEvent::Output(data)) => {
-                // Send raw bytes with 0x01 prefix (no JSON, no UTF-8 conversion).
-                // Browser detects prefix and passes bytes directly to xterm.
-                let mut raw_message = Vec::with_capacity(1 + data.len());
-                raw_message.push(0x01); // Raw terminal data prefix
-                raw_message.extend(&data);
-
-                // Queue for main loop to send
-                if output_tx
-                    .send(crate::hub::WebRtcPtyOutput {
-                        subscription_id: subscription_id.clone(),
-                        browser_identity: browser_identity.clone(),
-                        data: raw_message,
-                    })
-                    .is_err()
-                {
-                    log::trace!("[WebRTC] PTY output queue closed, stopping forwarder");
-                    break;
-                }
-            }
-            Ok(PtyEvent::ProcessExited { exit_code }) => {
-                log::info!(
-                    "[WebRTC] PTY process exited (code={:?}) for agent {} pty {}",
-                    exit_code,
-                    agent_index,
-                    pty_index
-                );
-                // Send exit notification
-                let message = TerminalMessage::ProcessExited { exit_code };
-                if let Ok(json) = serde_json::to_string(&message) {
-                    let _ = output_tx.send(crate::hub::WebRtcPtyOutput {
-                        subscription_id: subscription_id.clone(),
-                        browser_identity: browser_identity.clone(),
-                        data: json.into_bytes(),
-                    });
-                }
-            }
-            Ok(_other_event) => {
-                // Ignore other events (Resized, OwnerChanged).
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                log::warn!(
-                    "[WebRTC] PTY forwarder lagged by {} events for agent {} pty {}",
-                    n,
-                    agent_index,
-                    pty_index
-                );
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                log::info!(
-                    "[WebRTC] PTY channel closed for agent {} pty {}",
-                    agent_index,
-                    pty_index
-                );
-                break;
-            }
-        }
-    }
-
-    log::info!(
-        "[WebRTC] Stopped PTY forwarder for browser {} agent {} pty {}",
-        &browser_identity[..browser_identity.len().min(8)],
-        agent_index,
-        pty_index
-    );
 }

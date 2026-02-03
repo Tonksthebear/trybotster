@@ -80,6 +80,7 @@ use crate::client::{ClientId, ClientRegistry, ClientTaskHandle};
 use crate::config::Config;
 use crate::device::Device;
 use crate::git::WorktreeManager;
+use crate::lua::LuaRuntime;
 
 /// Progress event during agent creation.
 ///
@@ -92,21 +93,6 @@ pub struct AgentProgressEvent {
     pub identifier: String,
     /// Current creation stage.
     pub stage: crate::relay::AgentCreationStage,
-}
-
-/// WebRTC virtual subscription for routing DataChannel messages.
-///
-/// Tracks which channel type and PTY coordinates a browser subscription maps to.
-#[derive(Debug, Clone)]
-pub struct WebRtcSubscription {
-    /// Browser identity that owns this subscription.
-    pub browser_identity: String,
-    /// Channel name (e.g., "TerminalRelayChannel", "HubChannel").
-    pub channel_name: String,
-    /// Agent index if this is a PTY subscription.
-    pub agent_index: Option<usize>,
-    /// PTY index if this is a PTY subscription.
-    pub pty_index: Option<usize>,
 }
 
 /// Queued PTY output message for WebRTC delivery.
@@ -215,12 +201,6 @@ pub struct Hub {
     /// The connection persists to keep the DataChannel alive.
     pub webrtc_channels: std::collections::HashMap<String, crate::channel::WebRtcChannel>,
 
-    /// WebRTC virtual subscriptions tracking.
-    ///
-    /// Maps subscriptionId -> (browser_identity, channel_name, agent_index, pty_index).
-    /// Used to route incoming DataChannel messages to the correct handler.
-    pub webrtc_subscriptions: std::collections::HashMap<String, WebRtcSubscription>,
-
     /// Sender for PTY output messages from forwarder tasks.
     ///
     /// Forwarder tasks send PTY output here; main loop drains and sends via WebRTC.
@@ -242,8 +222,6 @@ pub struct Hub {
     // === Event Broadcast ===
     /// Sender for Hub events (clients subscribe via `subscribe_events()`).
     event_tx: tokio::sync::broadcast::Sender<HubEvent>,
-    /// Receiver for forwarding hub events to WebRTC subscribers.
-    webrtc_event_rx: Option<tokio::sync::broadcast::Receiver<HubEvent>>,
 
     // === Handle Cache ===
     /// Thread-safe cache of agent handles for non-blocking client access.
@@ -252,6 +230,10 @@ pub struct Hub {
     /// `HubHandle.get_agent()` reads from this cache directly, allowing clients
     /// to access agent handles without blocking commands - safe from any thread.
     pub handle_cache: Arc<handle_cache::HandleCache>,
+
+    // === Lua Scripting ===
+    /// Lua scripting runtime for hot-reloadable behavior customization.
+    pub lua: LuaRuntime,
 }
 
 impl std::fmt::Debug for Hub {
@@ -325,9 +307,12 @@ impl Hub {
         // Create handle cache for thread-safe agent handle access
         let handle_cache = Arc::new(handle_cache::HandleCache::new());
         // Create event broadcast channel for pub/sub
-        let (event_tx, webrtc_event_rx) = tokio::sync::broadcast::channel(64);
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(64);
         // Create channel for WebRTC PTY output from forwarder tasks
         let (webrtc_pty_output_tx, webrtc_pty_output_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Initialize Lua scripting runtime
+        let lua = LuaRuntime::new()?;
 
         Ok(Self {
             state,
@@ -351,13 +336,12 @@ impl Hub {
             command_tx,
             command_rx,
             event_tx,
-            webrtc_event_rx: Some(webrtc_event_rx),
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
-            webrtc_subscriptions: std::collections::HashMap::new(),
             webrtc_pty_output_tx,
             webrtc_pty_output_rx,
             webrtc_pty_forwarders: std::collections::HashMap::new(),
+            lua,
         })
     }
 
@@ -603,11 +587,83 @@ impl Hub {
             log::warn!("Failed to load initial worktrees: {}", e);
         }
 
+        // Register Hub primitives with Lua runtime (must happen before loading init script)
+        if let Err(e) = self.lua.register_hub_primitives(Arc::clone(&self.handle_cache)) {
+            log::warn!("Failed to register Hub Lua primitives: {}", e);
+        }
+
+        // Load Lua init script and start file watching for hot-reload
+        self.load_lua_init();
+        self.start_lua_file_watching();
+
         // Bundle generation is deferred - don't call generate_connection_url() here.
         // The bundle will be generated lazily when:
         // 1. TUI requests QR code display (GetConnectionCode command)
         // 2. External automation requests the connection URL
         // This avoids blocking boot for up to 10 seconds.
+    }
+
+    /// Load the Lua initialization script.
+    ///
+    /// Attempts to load `core/init.lua` from the configured Lua path.
+    /// If the file doesn't exist, falls back to the embedded init script
+    /// bundled with the CLI and updates package.path to enable require() calls.
+    fn load_lua_init(&self) {
+        use std::path::Path;
+
+        // Compute the embedded fallback path (from CARGO_MANIFEST_DIR)
+        let embedded_lua_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("lua");
+        let embedded_init_path = embedded_lua_dir.join("core").join("init.lua");
+
+        // Check if user has their own Lua files
+        let user_init_path = self.lua.base_path().join("core").join("init.lua");
+
+        if user_init_path.exists() {
+            // User has their own Lua files - try to load them
+            let init_path = Path::new("core/init.lua");
+            if let Err(e) = self.lua.load_file(init_path) {
+                log::warn!("Failed to load user init.lua: {}", e);
+            } else {
+                log::info!("Loaded Lua from user path: {}", user_init_path.display());
+                return;
+            }
+        }
+
+        // Fall back to embedded Lua files
+        if embedded_init_path.exists() {
+            log::info!(
+                "Using embedded Lua files from: {}",
+                embedded_lua_dir.display()
+            );
+
+            // Update package.path to include the embedded directory
+            // so require() calls inside init.lua can find modules
+            if let Err(e) = self.lua.update_package_path(&embedded_lua_dir) {
+                log::warn!("Failed to update package.path for embedded Lua: {}", e);
+            }
+
+            // Load the embedded init.lua
+            if let Err(e) = self.lua.load_file_absolute(&embedded_init_path) {
+                log::warn!("Failed to load embedded init.lua: {}", e);
+            }
+        } else {
+            log::warn!(
+                "No Lua files found at user path ({}) or embedded path ({})",
+                user_init_path.display(),
+                embedded_init_path.display()
+            );
+        }
+    }
+
+    /// Start Lua file watching for hot-reload support.
+    ///
+    /// If the Lua base path exists, this enables automatic reloading of
+    /// modified Lua scripts during the event loop.
+    fn start_lua_file_watching(&mut self) {
+        if let Err(e) = self.lua.start_file_watching() {
+            log::warn!("Failed to start Lua file watching: {}", e);
+        }
     }
 
     /// Run the Hub event loop without TUI.
@@ -625,6 +681,11 @@ impl Hub {
 
     /// Send shutdown notification to server and cleanup resources.
     pub fn shutdown(&mut self) {
+        // Fire Lua shutdown event (before any cleanup)
+        if let Err(e) = self.lua.fire_shutdown() {
+            log::warn!("Lua shutdown event error: {}", e);
+        }
+
         // Shutdown command channel
         if let Some(ref channel) = self.command_channel {
             channel.shutdown();

@@ -91,6 +91,11 @@ pub enum ClientId {
     Tui,
     /// A browser client, identified by Signal identity key.
     Browser(String),
+    /// Internal operations (Lua scripts, background tasks).
+    ///
+    /// Used for operations that don't have a specific client identity,
+    /// like Lua-initiated PTY resizes.
+    Internal,
 }
 
 impl ClientId {
@@ -113,7 +118,7 @@ impl ClientId {
     pub fn browser_identity(&self) -> Option<&str> {
         match self {
             ClientId::Browser(id) => Some(id),
-            ClientId::Tui => None,
+            ClientId::Tui | ClientId::Internal => None,
         }
     }
 }
@@ -123,6 +128,7 @@ impl std::fmt::Display for ClientId {
         match self {
             ClientId::Tui => write!(f, "tui"),
             ClientId::Browser(id) => write!(f, "browser:{}", &id[..8.min(id.len())]),
+            ClientId::Internal => write!(f, "internal"),
         }
     }
 }
