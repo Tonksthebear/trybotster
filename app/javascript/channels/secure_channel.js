@@ -49,6 +49,8 @@ function getSignalConfig() {
   return {
     workerUrl: document.querySelector('meta[name="signal-worker-url"]')
       ?.content,
+    cryptoWorkerUrl: document.querySelector('meta[name="signal-crypto-worker-url"]')
+      ?.content,
     wasmJsUrl: document.querySelector('meta[name="signal-wasm-js-url"]')
       ?.content,
     wasmBinaryUrl: document.querySelector('meta[name="signal-wasm-binary-url"]')
@@ -60,8 +62,8 @@ let _wasmReady = false;
 
 async function ensureWasm() {
   if (_wasmReady) return;
-  const { workerUrl, wasmJsUrl, wasmBinaryUrl } = getSignalConfig();
-  await ensureSignalReady(workerUrl, wasmJsUrl, wasmBinaryUrl);
+  const { workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl } = getSignalConfig();
+  await ensureSignalReady(workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl);
   _wasmReady = true;
 }
 

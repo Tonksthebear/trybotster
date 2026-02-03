@@ -18,8 +18,8 @@ import bridge from "workers/bridge"
  * Ensure the worker bridge is initialized.
  * Call this before using SignalSession.
  */
-export async function ensureSignalReady(workerUrl, wasmJsUrl, wasmBinaryUrl) {
-  await bridge.init({ workerUrl, wasmJsUrl, wasmBinaryUrl })
+export async function ensureSignalReady(workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl) {
+  await bridge.init({ workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl })
 }
 
 /**

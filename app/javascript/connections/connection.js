@@ -100,9 +100,10 @@ export class Connection {
 
       // Ensure worker is initialized
       const workerUrl = document.querySelector('meta[name="signal-worker-url"]')?.content
+      const cryptoWorkerUrl = document.querySelector('meta[name="signal-crypto-worker-url"]')?.content
       const wasmJsUrl = document.querySelector('meta[name="signal-wasm-js-url"]')?.content
       const wasmBinaryUrl = document.querySelector('meta[name="signal-wasm-binary-url"]')?.content
-      await ensureSignalReady(workerUrl, wasmJsUrl, wasmBinaryUrl)
+      await ensureSignalReady(workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl)
 
       // Connect to hub
       await this.#connectHub()
@@ -126,10 +127,9 @@ export class Connection {
     this.#setBrowserStatus(BrowserStatus.CONNECTING)
     this.#setState(ConnectionState.CONNECTING)
 
-    // Get cable URL and ActionCable module URL
-    const cableUrl = document.querySelector('meta[name="action-cable-url"]')?.content || "/cable"
-    const actionCableModuleUrl = document.querySelector('meta[name="actioncable-module-url"]')?.content
+    const hubId = this.getHubId()
 
+    // 1. Handle Signal session via crypto worker
     // Parse session bundle from fragment if requested
     let sessionBundle = this.options.sessionBundle || null
     if (!sessionBundle && this.options.fromFragment) {
@@ -140,23 +140,36 @@ export class Connection {
       }
     }
 
-    // Connect to hub (creates or reuses connection, may create session from bundle)
-    const hubId = this.getHubId()
-    const connectResult = await bridge.send("connect", {
-      hubId,
-      cableUrl,
-      actionCableModuleUrl,
-      sessionBundle
-    })
-
-    if (!connectResult.sessionExists) {
-      this.#setError("no_session", "No session available. Scan QR code to pair.")
-      return
+    // Create or load session via crypto worker
+    if (sessionBundle) {
+      // Check if session already exists
+      const { hasSession } = await bridge.hasSession(hubId)
+      if (!hasSession) {
+        await bridge.createSession(hubId, sessionBundle)
+      }
+    } else {
+      // Try to load existing session
+      const loadResult = await bridge.loadSession(hubId)
+      if (!loadResult.loaded) {
+        this.#setError("no_session", "No session available. Scan QR code to pair.")
+        return
+      }
     }
 
     // Get identity key for channel params
-    const keyResult = await bridge.send("getIdentityKey", { hubId })
+    const keyResult = await bridge.getIdentityKey(hubId)
     this.identityKey = keyResult.identityKey
+
+    // 2. Connect transport (ActionCable) via transport worker
+    const cableUrl = document.querySelector('meta[name="action-cable-url"]')?.content || "/cable"
+    const actionCableModuleUrl = document.querySelector('meta[name="actioncable-module-url"]')?.content
+
+    await bridge.send("connect", {
+      hubId,
+      cableUrl,
+      actionCableModuleUrl
+    })
+
     this.#hubConnected = true
 
     // Set up hub-level event listeners (connection state, session invalid)
@@ -340,9 +353,25 @@ export class Connection {
    * These are cleared on unsubscribe().
    */
   #setupSubscriptionEventListeners() {
-    // Listen for subscription messages
-    const unsubMsg = bridge.onSubscriptionMessage(this.subscriptionId, (message) => {
-      this.handleMessage(message)
+    // Listen for subscription messages (decrypt if needed)
+    const unsubMsg = bridge.onSubscriptionMessage(this.subscriptionId, async (message) => {
+      // Check if message is encrypted (has envelope field)
+      if (message && message.envelope) {
+        try {
+          const hubId = this.getHubId()
+          const { plaintext } = await bridge.decrypt(hubId, message.envelope)
+          // Decrypt returns parsed JSON if valid, otherwise raw string
+          const decrypted = await this.#decompressIfNeeded(plaintext)
+          if (decrypted !== null) {
+            this.handleMessage(decrypted)
+          }
+        } catch (err) {
+          console.error(`[${this.constructor.name}] Decrypt failed:`, err)
+        }
+      } else {
+        // Plaintext message (e.g., health messages from Rails)
+        this.handleMessage(message)
+      }
     })
     this.#subscriptionUnsubscribers.push(unsubMsg)
 
@@ -439,22 +468,23 @@ export class Connection {
     const hubId = this.getHubId()
     if (!hubId) return
 
-    // Tell worker we're reacquiring - this cancels any pending close timer
+    // Check if session exists via crypto worker
+    const { hasSession } = await bridge.hasSession(hubId)
+
+    // Tell transport worker we're reacquiring - this cancels any pending close timer
     // and reconnects if the connection was closed during grace period
     const cableUrl = document.querySelector('meta[name="action-cable-url"]')?.content || "/cable"
     const actionCableModuleUrl = document.querySelector('meta[name="actioncable-module-url"]')?.content
 
-    const result = await bridge.send("connect", {
+    await bridge.send("connect", {
       hubId,
       cableUrl,
       actionCableModuleUrl
     })
 
-    // If worker had to create a new connection (old one was closed),
-    // we need to resubscribe
-    if (!this.#hubConnected || !result.sessionExists) {
-      // Connection was lost, need to reinitialize
-      this.#hubConnected = result.sessionExists
+    // If session is gone or we weren't connected, need to reinitialize
+    if (!this.#hubConnected || !hasSession) {
+      this.#hubConnected = hasSession
       if (this.subscriptionId) {
         // Our subscription is gone, clear it so subscribe() creates a new one
         this.subscriptionId = null
@@ -510,7 +540,80 @@ export class Connection {
     this.emit("message", message)
   }
 
+  // ========== Compression Helpers ==========
+
+  /**
+   * Decompress message if needed (handles reliable delivery + compression from CLI).
+   * @private
+   */
+  async #decompressIfNeeded(data) {
+    // If already an object (crypto worker parsed JSON), return as-is
+    if (typeof data === 'object' && data !== null) {
+      return data
+    }
+
+    // If string, convert to bytes for processing
+    if (typeof data !== 'string') {
+      return data
+    }
+
+    // Convert string to byte array
+    const bytes = new Uint8Array(data.length)
+    for (let i = 0; i < data.length; i++) {
+      bytes[i] = data.charCodeAt(i)
+    }
+
+    let payload = bytes
+    const firstByte = bytes[0]
+
+    // Check for reliable delivery header (0x01 = data, 0x02 = ack)
+    if (firstByte === 0x01 || firstByte === 0x02) {
+      if (firstByte === 0x02) {
+        // ACK message - ignore for now (reliable delivery not active in main thread)
+        console.log(`[${this.constructor.name}] Ignoring ACK message`)
+        return null
+      }
+      // Data message: skip 9 bytes header (1 type + 8 seq number)
+      payload = bytes.slice(9)
+    }
+
+    // Now check compression marker on the payload
+    const marker = payload[0]
+
+    if (marker === 0x00) {
+      // Uncompressed: strip marker and parse JSON
+      const jsonStr = new TextDecoder().decode(payload.slice(1))
+      return JSON.parse(jsonStr)
+    } else if (marker === 0x1f) {
+      // Gzip compressed: decompress and parse
+      const compressedBytes = payload.slice(1)
+      const stream = new Blob([compressedBytes])
+        .stream()
+        .pipeThrough(new DecompressionStream("gzip"))
+      const decompressed = await new Response(stream).text()
+      return JSON.parse(decompressed)
+    } else {
+      // No marker, try parsing as JSON directly
+      const jsonStr = new TextDecoder().decode(payload)
+      return JSON.parse(jsonStr)
+    }
+  }
+
   // ========== Public API ==========
+
+  /**
+   * Send an encrypted message through the transport worker.
+   * Encrypts via crypto worker, then sends raw encrypted envelope.
+   * @private
+   */
+  async #sendEncrypted(message) {
+    const hubId = this.getHubId()
+    const { envelope } = await bridge.encrypt(hubId, message)
+    await bridge.send("sendRaw", {
+      subscriptionId: this.subscriptionId,
+      message: { envelope }
+    })
+  }
 
   /**
    * Send a message through the secure channel.
@@ -533,10 +636,7 @@ export class Connection {
     }
 
     try {
-      await bridge.send("send", {
-        subscriptionId: this.subscriptionId,
-        message: { type, ...data }
-      })
+      await this.#sendEncrypted({ type, ...data })
       return true
     } catch (error) {
       // Stale subscription (e.g., SharedWorker restarted during sleep)
@@ -554,10 +654,7 @@ export class Connection {
           await this.subscribe()
 
           // Retry the send
-          await bridge.send("send", {
-            subscriptionId: this.subscriptionId,
-            message: { type, ...data }
-          })
+          await this.#sendEncrypted({ type, ...data })
           return true
         } catch (retryError) {
           console.error(`[${this.constructor.name}] Resubscribe/retry failed:`, retryError)
@@ -618,13 +715,10 @@ export class Connection {
     console.log(`[${this.constructor.name}] Sending handshake`)
 
     // Send handshake directly (bypasses buffer since handshake isn't complete yet)
-    bridge.send("send", {
-      subscriptionId: this.subscriptionId,
-      message: {
-        type: "connected",
-        device_name: this.#getDeviceName(),
-        timestamp: Date.now()
-      }
+    this.#sendEncrypted({
+      type: "connected",
+      device_name: this.#getDeviceName(),
+      timestamp: Date.now()
     }).catch(err => {
       console.error(`[${this.constructor.name}] Handshake send failed:`, err)
       this.handshakeSent = false
@@ -650,10 +744,8 @@ export class Connection {
     console.log(`[${this.constructor.name}] Received handshake from CLI`)
 
     // Send ack back
-    bridge.send("send", {
-      subscriptionId: this.subscriptionId,
-      message: { type: "ack", timestamp: Date.now() }
-    }).catch(err => console.error(`[${this.constructor.name}] Ack send failed:`, err))
+    this.#sendEncrypted({ type: "ack", timestamp: Date.now() })
+      .catch(err => console.error(`[${this.constructor.name}] Ack send failed:`, err))
 
     // Mark complete and flush buffer
     this.#completeHandshake()
@@ -689,10 +781,8 @@ export class Connection {
 
     // Flush buffered messages
     for (const { type, data } of this.inputBuffer) {
-      bridge.send("send", {
-        subscriptionId: this.subscriptionId,
-        message: { type, ...data }
-      }).catch(err => console.error(`[${this.constructor.name}] Flush failed:`, err))
+      this.#sendEncrypted({ type, ...data })
+        .catch(err => console.error(`[${this.constructor.name}] Flush failed:`, err))
     }
     this.inputBuffer = []
 
