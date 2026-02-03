@@ -4,16 +4,19 @@
  * Architecture:
  * - Main thread (bridge.js) proxies all crypto operations
  * - Crypto Worker (signal_crypto.js) - SharedWorker handling Signal Protocol
- * - Transport Worker - regular Worker handling transport (no crypto)
- *   - signal.js for ActionCable WebSocket transport
- *   - webrtc.js for WebRTC DataChannel transport
+ * - Transport:
+ *   - ActionCable: signal.js Worker
+ *   - WebRTC: WebRTCTransport in main thread (RTCPeerConnection not available in Workers)
  *
  * The main thread talks directly to crypto SharedWorker for encrypt/decrypt,
- * and to transport Worker for send/receive.
+ * and to transport (Worker or WebRTCTransport) for send/receive.
  */
 
 // Singleton instance
 let instance = null
+
+// WebRTC transport (lazily imported)
+let webrtcTransport = null
 
 class WorkerBridge {
   // Transport worker
@@ -75,18 +78,29 @@ class WorkerBridge {
       // Initialize WASM via crypto worker
       await this.sendCrypto("init", { wasmJsUrl, wasmBinaryUrl })
 
-      // 2. Create transport Worker based on transport type
-      const transportUrl = transport === "webrtc" ? webrtcWorkerUrl : workerUrl
-      console.log(`[WorkerBridge] Using ${transport} transport: ${transportUrl}`)
+      // 2. Create transport based on transport type
+      if (transport === "webrtc") {
+        // WebRTC runs in main thread (RTCPeerConnection not available in Workers)
+        console.log(`[WorkerBridge] Using WebRTC transport (main thread)`)
+        const { default: transport } = await import("transport/webrtc_transport")
+        webrtcTransport = transport
 
-      this.#worker = new Worker(transportUrl, { type: "module" })
-      this.#workerPort = this.#worker
-      this.#worker.onmessage = (e) => this.#handleMessage(e)
-      this.#worker.onerror = (e) =>
-        console.error("[WorkerBridge] Transport worker error:", e)
+        // Wire up event forwarding from WebRTCTransport
+        webrtcTransport.on("connection:state", (data) => this.#dispatchEvent(data))
+        webrtcTransport.on("subscription:message", (data) => this.#dispatchEvent({ event: "subscription:message", ...data }))
+        webrtcTransport.on("subscription:confirmed", (data) => this.#dispatchEvent({ event: "subscription:confirmed", ...data }))
+      } else {
+        // ActionCable uses Worker
+        console.log(`[WorkerBridge] Using ActionCable transport: ${workerUrl}`)
+        this.#worker = new Worker(workerUrl, { type: "module" })
+        this.#workerPort = this.#worker
+        this.#worker.onmessage = (e) => this.#handleMessage(e)
+        this.#worker.onerror = (e) =>
+          console.error("[WorkerBridge] Transport worker error:", e)
 
-      // Initialize transport worker
-      await this.send("init", {})
+        // Initialize transport worker
+        await this.send("init", {})
+      }
 
       this.#initialized = true
     } catch (error) {
@@ -198,13 +212,20 @@ class WorkerBridge {
   }
 
   /**
-   * Send a request to the transport worker and wait for response
+   * Send a request to the transport and wait for response
+   * Routes to WebRTCTransport (main thread) or Worker based on transport type.
    * @param {string} action - The action to perform
    * @param {Object} params - Parameters for the action
    * @param {number} timeout - Timeout in milliseconds (default: 10000)
-   * @returns {Promise<any>} - The result from the worker
+   * @returns {Promise<any>} - The result from the transport
    */
   send(action, params = {}, timeout = 10000) {
+    // WebRTC: route to main thread transport
+    if (this.#transport === "webrtc" && webrtcTransport) {
+      return this.#sendToWebRTC(action, params)
+    }
+
+    // ActionCable: route to Worker
     return new Promise((resolve, reject) => {
       if (!this.#workerPort) {
         reject(new Error("Transport worker not initialized"))
@@ -231,6 +252,28 @@ class WorkerBridge {
 
       this.#workerPort.postMessage({ id, action, ...params })
     })
+  }
+
+  /**
+   * Route action to WebRTCTransport
+   */
+  async #sendToWebRTC(action, params) {
+    switch (action) {
+      case "init":
+        return { initialized: true }
+      case "connect":
+        return webrtcTransport.connect(params.hubId, params.browserIdentity)
+      case "disconnect":
+        return webrtcTransport.disconnect(params.hubId)
+      case "subscribe":
+        return webrtcTransport.subscribe(params.hubId, params.channel, params.params)
+      case "unsubscribe":
+        return webrtcTransport.unsubscribe(params.subscriptionId)
+      case "sendRaw":
+        return webrtcTransport.sendRaw(params.subscriptionId, params.message)
+      default:
+        throw new Error(`Unknown WebRTC action: ${action}`)
+    }
   }
 
   /**
@@ -370,7 +413,7 @@ class WorkerBridge {
   }
 
   /**
-   * Subscribe to worker events
+   * Subscribe to transport events
    * @param {string} eventName - Event name (e.g., "connection:state", "subscription:message")
    * @param {Function} callback - Callback function receiving the event data
    * @returns {Function} - Unsubscribe function
@@ -381,6 +424,12 @@ class WorkerBridge {
     }
     this.#eventListeners.get(eventName).add(callback)
 
+    // Also register with WebRTCTransport if using webrtc
+    let webrtcUnsub = null
+    if (this.#transport === "webrtc" && webrtcTransport) {
+      webrtcUnsub = webrtcTransport.on(eventName, callback)
+    }
+
     // Return unsubscribe function
     return () => {
       const listeners = this.#eventListeners.get(eventName)
@@ -390,6 +439,7 @@ class WorkerBridge {
           this.#eventListeners.delete(eventName)
         }
       }
+      if (webrtcUnsub) webrtcUnsub()
     }
   }
 
@@ -405,6 +455,12 @@ class WorkerBridge {
     }
     this.#subscriptionListeners.get(subscriptionId).add(callback)
 
+    // Also register with WebRTCTransport if using webrtc
+    let webrtcUnsub = null
+    if (this.#transport === "webrtc" && webrtcTransport) {
+      webrtcUnsub = webrtcTransport.onSubscriptionMessage(subscriptionId, callback)
+    }
+
     // Return unsubscribe function
     return () => {
       const listeners = this.#subscriptionListeners.get(subscriptionId)
@@ -414,6 +470,7 @@ class WorkerBridge {
           this.#subscriptionListeners.delete(subscriptionId)
         }
       }
+      if (webrtcUnsub) webrtcUnsub()
     }
   }
 
@@ -422,6 +479,9 @@ class WorkerBridge {
    */
   clearSubscriptionListeners(subscriptionId) {
     this.#subscriptionListeners.delete(subscriptionId)
+    if (this.#transport === "webrtc" && webrtcTransport) {
+      webrtcTransport.clearSubscriptionListeners(subscriptionId)
+    }
   }
 
   /**
