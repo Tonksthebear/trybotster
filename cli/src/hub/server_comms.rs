@@ -15,7 +15,6 @@
 
 // Rust guideline compliant 2026-01-29
 
-use std::io::Read as _;
 use std::time::{Duration, Instant};
 
 use crate::agent::AgentNotification;
@@ -726,11 +725,12 @@ impl Hub {
 
     /// Handle a message received from a WebRTC DataChannel.
     ///
-    /// Parses the JSON message and routes based on type:
-    /// - Signal envelope (t, c, s fields): Decrypt and extract subscriptionId
-    /// - `subscribe`: Creates a virtual subscription
-    /// - `unsubscribe`: Removes a virtual subscription
-    /// - data with subscriptionId: Routes to terminal/preview handler
+    /// Messages arrive in two forms:
+    /// 1. Already decrypted by WebRtcChannel (has subscriptionId + type like "input"/"resize")
+    /// 2. Control messages (type="subscribe"/"unsubscribe", no subscriptionId)
+    ///
+    /// Note: Signal envelope decryption happens inside WebRtcChannel.try_recv(),
+    /// so we receive plaintext JSON here.
     fn handle_webrtc_message(&mut self, browser_identity: &str, payload: &[u8]) {
         let msg: serde_json::Value = match serde_json::from_slice(payload) {
             Ok(v) => v,
@@ -740,147 +740,25 @@ impl Hub {
             }
         };
 
-        // Check if this is a Signal envelope (encrypted from browser).
-        // Signal envelopes have short keys: t (type), c (ciphertext), s (sender).
-        if msg.get("t").is_some() && msg.get("c").is_some() && msg.get("s").is_some() {
-            self.handle_webrtc_encrypted_message(browser_identity, &msg);
+        // Data messages have subscriptionId - route these first.
+        // These come from browser's Connection.send() which encrypts { subscriptionId, type, ... }
+        // WebRtcChannel decrypts and we get the plaintext JSON here.
+        if let Some(subscription_id) = msg.get("subscriptionId").and_then(|s| s.as_str()) {
+            self.handle_webrtc_data(subscription_id, &msg);
             return;
         }
 
-        // Handle plaintext message based on type
+        // Control messages without subscriptionId (subscribe, unsubscribe)
         if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
             match msg_type {
                 "subscribe" => self.handle_webrtc_subscribe(browser_identity, &msg),
                 "unsubscribe" => self.handle_webrtc_unsubscribe(&msg),
                 _ => {
-                    log::debug!("[WebRTC] Unknown message type: {msg_type}");
+                    log::debug!("[WebRTC] Unknown control message type: {msg_type}");
                 }
             }
-        } else if let Some(subscription_id) = msg.get("subscriptionId").and_then(|s| s.as_str()) {
-            // Data message with subscriptionId
-            self.handle_webrtc_data(subscription_id, &msg);
         } else {
             log::debug!("[WebRTC] Message without type or subscriptionId: {:?}", msg);
-        }
-    }
-
-    /// Handle an encrypted Signal envelope from WebRTC DataChannel.
-    ///
-    /// Decrypts the envelope to get the plaintext JSON containing subscriptionId
-    /// and the command, then routes to the appropriate handler.
-    fn handle_webrtc_encrypted_message(&mut self, browser_identity: &str, envelope_json: &serde_json::Value) {
-        // Parse as SignalEnvelope
-        let envelope: crate::relay::signal::SignalEnvelope = match serde_json::from_value(envelope_json.clone()) {
-            Ok(env) => env,
-            Err(e) => {
-                log::debug!("[WebRTC] Failed to parse Signal envelope: {e}");
-                return;
-            }
-        };
-
-        // Decrypt using crypto service
-        let Some(ref crypto_service) = self.browser.crypto_service else {
-            log::warn!("[WebRTC] No crypto service for decryption");
-            return;
-        };
-
-        let _guard = self.tokio_runtime.enter();
-        let plaintext = match self.tokio_runtime.block_on(crypto_service.decrypt(&envelope)) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("[WebRTC] Decryption failed: {e}");
-                return;
-            }
-        };
-
-        // Strip compression marker (0x00 = uncompressed, 0x1f = gzip)
-        let json_bytes = if !plaintext.is_empty() {
-            if plaintext[0] == 0x00 {
-                &plaintext[1..]
-            } else if plaintext[0] == 0x1f {
-                // Gzip compressed - decompress
-                match flate2::read::GzDecoder::new(&plaintext[1..]).bytes().collect::<Result<Vec<u8>, _>>() {
-                    Ok(decompressed) => {
-                        // Handle decompressed data - need to move to a local variable
-                        // because we can't return a reference to it
-                        let decrypted_msg: serde_json::Value = match serde_json::from_slice(&decompressed) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log::debug!("[WebRTC] Failed to parse decompressed data: {e}");
-                                return;
-                            }
-                        };
-                        return self.route_decrypted_webrtc_message(browser_identity, &decrypted_msg);
-                    }
-                    Err(e) => {
-                        log::warn!("[WebRTC] Gzip decompression failed: {e}");
-                        return;
-                    }
-                }
-            } else {
-                &plaintext[..]
-            }
-        } else {
-            &plaintext[..]
-        };
-
-        // Parse decrypted JSON
-        let decrypted_msg: serde_json::Value = match serde_json::from_slice(json_bytes) {
-            Ok(v) => v,
-            Err(e) => {
-                log::debug!("[WebRTC] Failed to parse decrypted data: {e}");
-                return;
-            }
-        };
-
-        self.route_decrypted_webrtc_message(browser_identity, &decrypted_msg);
-    }
-
-    /// Route a decrypted WebRTC message to the appropriate handler.
-    fn route_decrypted_webrtc_message(&mut self, browser_identity: &str, msg: &serde_json::Value) {
-        // Extract subscriptionId from decrypted message
-        let subscription_id = match msg.get("subscriptionId").and_then(|s| s.as_str()) {
-            Some(id) => id.to_string(),
-            None => {
-                log::debug!("[WebRTC] Decrypted message missing subscriptionId: {:?}", msg);
-                return;
-            }
-        };
-
-        // Get subscription info
-        let sub = match self.webrtc_subscriptions.get(&subscription_id) {
-            Some(s) => s.clone(),
-            None => {
-                log::debug!("[WebRTC] Decrypted message for unknown subscription: {}", subscription_id);
-                return;
-            }
-        };
-
-        // Extract the command type from the message
-        let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-        log::debug!(
-            "[WebRTC] Decrypted {} from {} for subscription {} ({})",
-            msg_type,
-            &browser_identity[..browser_identity.len().min(8)],
-            &subscription_id[..subscription_id.len().min(16)],
-            sub.channel_name
-        );
-
-        // Route based on channel type
-        match sub.channel_name.as_str() {
-            "TerminalRelayChannel" => {
-                if let (Some(ai), Some(pi)) = (sub.agent_index, sub.pty_index) {
-                    // The message itself is the command (type, data, etc.)
-                    self.handle_webrtc_terminal_data(browser_identity, ai, pi, msg);
-                }
-            }
-            "HubChannel" => {
-                self.handle_webrtc_hub_data(browser_identity, msg);
-            }
-            _ => {
-                log::debug!("[WebRTC] Decrypted message for unknown channel: {}", sub.channel_name);
-            }
         }
     }
 
@@ -1012,6 +890,12 @@ impl Hub {
     }
 
     /// Handle WebRTC data message - route to appropriate handler.
+    ///
+    /// Messages come in two formats:
+    /// 1. From encrypted sendEnvelope: command at top level
+    ///    `{ subscriptionId, type: "input", data: "ls" }`
+    /// 2. From plaintext sendRaw: command nested under data
+    ///    `{ subscriptionId, data: { type: "input", data: "ls" } }`
     fn handle_webrtc_data(&mut self, subscription_id: &str, msg: &serde_json::Value) {
         let sub = match self.webrtc_subscriptions.get(subscription_id) {
             Some(s) => s.clone(),
@@ -1021,18 +905,28 @@ impl Hub {
             }
         };
 
-        let data = msg.get("data");
+        // Determine if command is at top level (encrypted flow) or nested under "data" (plaintext flow).
+        // Encrypted messages have `type` at top level (e.g., "input", "resize").
+        // Plaintext messages have `data` containing the command object.
+        let command = if msg.get("type").is_some() && msg.get("type").and_then(|t| t.as_str()) != Some("subscribe") {
+            // Command at top level (encrypted flow) - use whole message
+            msg.clone()
+        } else if let Some(data) = msg.get("data") {
+            // Nested under "data" (plaintext flow)
+            data.clone()
+        } else {
+            log::debug!("[WebRTC] Data message has no command: {:?}", msg);
+            return;
+        };
 
         match sub.channel_name.as_str() {
             "TerminalRelayChannel" => {
-                if let (Some(ai), Some(pi), Some(data)) = (sub.agent_index, sub.pty_index, data) {
-                    self.handle_webrtc_terminal_data(&sub.browser_identity, ai, pi, data);
+                if let (Some(ai), Some(pi)) = (sub.agent_index, sub.pty_index) {
+                    self.handle_webrtc_terminal_data(&sub.browser_identity, ai, pi, &command);
                 }
             }
             "HubChannel" => {
-                if let Some(data) = data {
-                    self.handle_webrtc_hub_data(&sub.browser_identity, data);
-                }
+                self.handle_webrtc_hub_data(&sub.browser_identity, &command);
             }
             "PreviewChannel" => {
                 // Preview data handled separately via HTTP proxying
