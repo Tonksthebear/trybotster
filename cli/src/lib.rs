@@ -73,7 +73,7 @@ pub use hub::{Hub, HubAction, HubState};
 
 // Re-export Client types
 pub use client::{
-    BrowserClient, Client, ClientId, ClientRegistry, CreateAgentRequest, DeleteAgentRequest,
+    Client, ClientId, ClientRegistry, CreateAgentRequest, DeleteAgentRequest,
     Response, TuiClient,
 };
 

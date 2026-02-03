@@ -6,7 +6,10 @@ require "application_system_test_case"
 #
 # Verifies the architecture:
 # - HubChannel: hub-level commands (list agents, select, create) - subscribed on page load
-# - TerminalRelayChannel: PTY I/O (input, output, resize) - subscribed on demand via connectToPty()
+# - Terminal channel: PTY I/O (input, output, resize) - subscribed on demand via connectToPty()
+#
+# All channels use WebRTC DataChannel for transport. Channel names are virtual
+# identifiers for CLI routing ("TerminalRelayChannel", "HubChannel").
 #
 # This ensures PTY I/O doesn't route through the hub channel which
 # would be architecturally wrong (hub should not be in the PTY data path).

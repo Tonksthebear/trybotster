@@ -1,9 +1,8 @@
 //! HTTP channel for preview proxying.
 //!
 //! `HttpChannel` handles E2E encrypted HTTP request/response communication
-//! between a browser and an agent's dev server. It is structurally similar
-//! to `TerminalChannel` in [`browser.rs`](super::browser) but handles HTTP
-//! request/response instead of terminal I/O.
+//! between a browser and an agent's dev server. It handles HTTP request/response
+//! for dev server preview functionality.
 //!
 //! # Architecture
 //!
@@ -43,18 +42,33 @@ use crate::hub::agent_handle::PtyHandle;
 use crate::relay::http_proxy::HttpProxy;
 use crate::relay::preview_types::{PreviewCommand, PreviewMessage, ProxyConfig};
 
-use super::browser::BrowserClientConfig;
+use crate::relay::crypto_service::CryptoServiceHandle;
+
+/// Configuration needed for ActionCable channel connections.
+///
+/// Used by HttpChannel for preview proxying. Contains the connection
+/// details needed to establish ActionCable channels with the server.
+#[derive(Debug, Clone)]
+pub struct HttpChannelConfig {
+    /// Crypto service handle for E2E encryption.
+    pub crypto_service: CryptoServiceHandle,
+    /// Server URL for ActionCable WebSocket connections.
+    pub server_url: String,
+    /// API key for authentication.
+    pub api_key: String,
+    /// Server-assigned hub ID for channel routing.
+    pub server_hub_id: String,
+}
 
 /// HTTP channel for preview proxying.
 ///
-/// Similar to `TerminalChannel` but handles HTTP request/response instead of
-/// terminal I/O. Owns an `ActionCableChannel` subscribed to the `PreviewChannel`
-/// (agent side, without `browser_identity`) and an `HttpProxy` configured with
-/// the port from `PtyHandle`.
+/// Handles HTTP request/response for dev server preview functionality.
+/// Owns an `ActionCableChannel` subscribed to the `PreviewChannel` (agent side)
+/// and an `HttpProxy` configured with the port from `PtyHandle`.
 ///
 /// # Lifecycle
 ///
-/// Created by `BrowserClient` when handling `HubEvent::HttpConnectionRequested`.
+/// Created when handling `HubEvent::HttpConnectionRequested`.
 /// Dropped when the browser disconnects or the agent is deleted, which aborts
 /// the background tasks and disconnects the channel.
 #[derive(Debug)]
@@ -112,7 +126,7 @@ impl HttpChannel {
         agent_index: usize,
         pty_index: usize,
         pty_handle: &PtyHandle,
-        config: &BrowserClientConfig,
+        config: &HttpChannelConfig,
         browser_identity: String,
     ) -> Result<Self, String> {
         // Query the port from PtyHandle

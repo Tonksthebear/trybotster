@@ -1011,7 +1011,7 @@ impl ActionCableChannel {
             }
 
             // Decrypt via CryptoServiceHandle
-            log::info!(
+            log::trace!(
                 "[INPUT-TRACE] Received encrypted message from {} (msg_type={}, device_id={})",
                 &sender.0[..8.min(sender.0.len())],
                 envelope.message_type,
@@ -1020,7 +1020,7 @@ impl ActionCableChannel {
             let decrypt_start = std::time::Instant::now();
             let plaintext = match cs.decrypt(&envelope).await {
                 Ok(p) => {
-                    log::info!(
+                    log::trace!(
                         "[INPUT-TRACE] Decrypted {} bytes from {} in {:?}",
                         p.len(),
                         &sender.0[..8.min(sender.0.len())],
@@ -1113,7 +1113,7 @@ impl ActionCableChannel {
 
         match reliable_msg {
             ReliableMessage::Data { seq, payload } => {
-                log::info!(
+                log::trace!(
                     "[INPUT-TRACE] Reliable Data seq={} from {} ({} bytes compressed)",
                     seq,
                     &sender.0[..8.min(sender.0.len())],
@@ -1151,7 +1151,7 @@ impl ActionCableChannel {
                             buffered
                         );
                     } else {
-                        log::info!(
+                        log::debug!(
                             "[INPUT-TRACE] DELIVERED {} messages (next_expected: {} -> {})",
                             messages.len(),
                             next_expected_before,

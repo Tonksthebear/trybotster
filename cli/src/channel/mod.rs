@@ -1,36 +1,35 @@
-//! Channel abstraction for ActionCable communication.
+//! Channel abstraction for browser communication.
 //!
-//! This module provides a unified `Channel` trait for WebSocket communication
-//! via ActionCable, with optional Signal Protocol encryption and gzip compression.
+//! This module provides a unified `Channel` trait for WebRTC DataChannel
+//! communication with Signal Protocol E2E encryption and gzip compression.
 //!
 //! # Architecture
 //!
 //! ```text
 //! Channel (trait)
 //!     │
-//!     ├── ActionCableChannel (encrypted)
-//!     │   └── Uses SignalProtocolManager for E2E encryption
-//!     │
-//!     └── ActionCableChannel (unencrypted)
-//!         └── Raw message relay
+//!     └── WebRtcChannel (E2E encrypted via Signal Protocol)
+//!         └── DataChannel transport with DTLS + Signal encryption
 //! ```
 //!
 //! # Usage
 //!
 //! ```ignore
-//! // Encrypted channel (terminal, preview)
-//! let channel = ActionCableChannel::encrypted(signal_manager.clone());
+//! // WebRTC channel (terminal, preview, hub commands)
+//! let channel = WebRtcChannel::builder()
+//!     .server_url(&server_url)
+//!     .api_key(&api_key)
+//!     .crypto_service(crypto_service.clone())
+//!     .build();
+//!
 //! channel.connect(ChannelConfig {
-//!     channel_name: "TerminalRelayChannel".into(),
+//!     channel_name: "TerminalRelayChannel".into(), // Virtual channel for routing
 //!     hub_id: "hub-123".into(),
 //!     agent_index: None,
 //!     pty_index: Some(0), // 0=CLI, 1=Server
 //!     encrypt: true,
 //!     compression_threshold: Some(4096),
 //! }).await?;
-//!
-//! // Send to all peers
-//! channel.send(b"hello").await?;
 //!
 //! // Send to specific peer
 //! channel.send_to(b"hello", &peer_id).await?;
@@ -60,7 +59,7 @@ use tokio::sync::RwLock;
 /// Configuration for establishing a channel connection.
 #[derive(Clone, Debug)]
 pub struct ChannelConfig {
-    /// ActionCable channel name (e.g., "TerminalRelayChannel", "PreviewChannel").
+    /// Virtual channel name for routing (e.g., "TerminalRelayChannel", "HubChannel").
     pub channel_name: String,
     /// Hub identifier for routing.
     pub hub_id: String,

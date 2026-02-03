@@ -2,7 +2,7 @@
 //!
 //! Tests for the E2E encryption layer between CLI and browser clients.
 //! These tests verify:
-//! - Message format correctness (critical for Rails relay compatibility)
+//! - Message format correctness (critical for WebRTC relay compatibility)
 //! - Signal store persistence across restarts
 //! - PreKey management and rotation
 //! - Encryption/decryption roundtrips
@@ -62,10 +62,10 @@ fn test_relay_message_format_has_envelope_wrapper() {
     );
 }
 
-/// Test that the message format matches what Rails TerminalRelayChannel expects.
-/// Rails does: envelope = data["envelope"], then broadcasts { envelope: envelope }
+/// Test that the message format matches what the CLI relay expects.
+/// CLI parses: envelope = data["envelope"], then decrypts and routes.
 #[test]
-fn test_relay_message_matches_rails_expectation() {
+fn test_relay_message_matches_cli_expectation() {
     let envelope_data = json!({
         "version": 4,
         "message_type": 1,
@@ -80,12 +80,12 @@ fn test_relay_message_matches_rails_expectation() {
         "envelope": envelope_data.clone()
     });
 
-    // Simulate what Rails does in TerminalRelayChannel#relay
-    let rails_envelope = relay_message.get("envelope");
-    assert!(rails_envelope.is_some(), "Rails expects data['envelope']");
+    // Simulate what CLI does when receiving relay message
+    let cli_envelope = relay_message.get("envelope");
+    assert!(cli_envelope.is_some(), "CLI expects data['envelope']");
     assert!(
-        rails_envelope.unwrap().get("ciphertext").is_some(),
-        "Rails needs envelope.ciphertext"
+        cli_envelope.unwrap().get("ciphertext").is_some(),
+        "CLI needs envelope.ciphertext"
     );
 }
 
@@ -127,45 +127,6 @@ fn test_all_message_types_format() {
             description, msg_type
         );
     }
-}
-
-/// Test Action Cable message wrapping format
-#[test]
-fn test_action_cable_message_format() {
-    // The CLI wraps messages in Action Cable protocol format
-    let envelope = json!({
-        "version": 4,
-        "message_type": 2,
-        "ciphertext": "encrypted_data",
-        "sender_identity": "identity_key",
-        "registration_id": 12345,
-        "device_id": 1
-    });
-
-    let relay_data = json!({
-        "action": "relay",
-        "envelope": envelope
-    });
-
-    // Action Cable message structure
-    let cable_message = json!({
-        "command": "message",
-        "identifier": "{\"channel\":\"TerminalRelayChannel\",\"hub_identifier\":\"test-hub\"}",
-        "data": relay_data.to_string()
-    });
-
-    assert_eq!(cable_message["command"], "message");
-    assert!(cable_message["identifier"]
-        .as_str()
-        .unwrap()
-        .contains("TerminalRelayChannel"));
-
-    // Parse the data field and verify envelope structure
-    let data: Value = serde_json::from_str(cable_message["data"].as_str().unwrap()).unwrap();
-    assert!(
-        data.get("envelope").is_some(),
-        "Parsed data must have envelope"
-    );
 }
 
 // === PreKeyBundle Format Tests ===

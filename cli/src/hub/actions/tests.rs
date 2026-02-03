@@ -37,10 +37,15 @@ fn test_hub() -> Hub {
 }
 
 // === Client lifecycle tests ===
+//
+// NOTE: ClientConnected and ClientDisconnected are now no-ops.
+// Browser communication happens directly via WebRTC in server_comms.rs,
+// bypassing the Client trait and ClientRegistry entirely.
+// These tests verify the no-op behavior.
 
-/// Test that ClientConnected registers a BrowserClient.
+/// Test that ClientConnected is a no-op (does not register anything).
 #[test]
-fn test_client_connected_registers_browser_client() {
+fn test_client_connected_is_noop() {
     let mut hub = test_hub();
 
     let browser_id = ClientId::Browser("test-browser-identity".to_string());
@@ -48,7 +53,7 @@ fn test_client_connected_registers_browser_client() {
     // Initially no browser client
     assert!(!hub.clients.contains(&browser_id));
 
-    // Dispatch ClientConnected
+    // Dispatch ClientConnected - should be a no-op
     dispatch(
         &mut hub,
         HubAction::ClientConnected {
@@ -56,36 +61,33 @@ fn test_client_connected_registers_browser_client() {
         },
     );
 
-    // Browser client should now be registered
-    assert!(hub.clients.contains(&browser_id));
+    // Browser client should still NOT be registered (no-op behavior)
+    assert!(!hub.clients.contains(&browser_id));
 }
 
-/// Test that ClientDisconnected unregisters a BrowserClient.
+/// Test that ClientDisconnected is a no-op.
 #[test]
-fn test_client_disconnected_unregisters_browser_client() {
+fn test_client_disconnected_is_noop() {
     let mut hub = test_hub();
 
     let browser_id = ClientId::Browser("test-browser-identity".to_string());
 
-    // Connect then disconnect
-    dispatch(
-        &mut hub,
-        HubAction::ClientConnected {
-            client_id: browser_id.clone(),
-        },
-    );
-    assert!(hub.clients.contains(&browser_id));
-
+    // Dispatch ClientDisconnected - should be a no-op (nothing to disconnect)
     dispatch(
         &mut hub,
         HubAction::ClientDisconnected {
             client_id: browser_id.clone(),
         },
     );
+
+    // Hub should still be functional
     assert!(!hub.clients.contains(&browser_id));
 }
 
-/// Test: Selection dispatch works with browser client.
+/// Test: Selection dispatch works with browser client ID.
+///
+/// Note: ClientConnected is a no-op, but SelectAgentForClient still works
+/// because it doesn't require a registered client.
 #[test]
 fn test_selection_dispatch_works() {
     use crate::agent::Agent;
@@ -108,16 +110,9 @@ fn test_selection_dispatch_works() {
         .unwrap()
         .add_agent("agent-1".to_string(), agent);
 
-    // Browser connects
+    // Browser selects the agent directly - should not panic
+    // (Browser connections are now handled via WebRTC, not ClientRegistry)
     let browser_id = ClientId::Browser("browser-1".to_string());
-    dispatch(
-        &mut hub,
-        HubAction::ClientConnected {
-            client_id: browser_id.clone(),
-        },
-    );
-
-    // Browser selects the agent - should not panic
     dispatch(
         &mut hub,
         HubAction::SelectAgentForClient {
@@ -166,16 +161,9 @@ fn test_switching_agents_does_not_crash() {
         .unwrap()
         .add_agent("agent-2".to_string(), agent2);
 
-    // Browser connects
+    // Select agent-1 then agent-2 with browser client ID -- should not crash
+    // (Browser connections are now handled via WebRTC, not ClientRegistry)
     let browser_id = ClientId::Browser("browser-1".to_string());
-    dispatch(
-        &mut hub,
-        HubAction::ClientConnected {
-            client_id: browser_id.clone(),
-        },
-    );
-
-    // Select agent-1 then agent-2 -- should not crash
     dispatch(
         &mut hub,
         HubAction::SelectAgentForClient {
@@ -204,15 +192,9 @@ fn test_switching_agents_does_not_crash() {
 fn test_delete_nonexistent_agent_is_graceful() {
     let mut hub = test_hub();
 
-    let browser_id = ClientId::Browser("browser-1".to_string());
-    dispatch(
-        &mut hub,
-        HubAction::ClientConnected {
-            client_id: browser_id.clone(),
-        },
-    );
-
     // Attempt to delete an agent that doesn't exist - should not panic
+    // (Browser connections are now handled via WebRTC, not ClientRegistry)
+    let browser_id = ClientId::Browser("browser-1".to_string());
     dispatch(
         &mut hub,
         HubAction::DeleteAgentForClient {
@@ -224,8 +206,8 @@ fn test_delete_nonexistent_agent_is_graceful() {
         },
     );
 
-    // Hub should still be functional
-    assert!(hub.clients.contains(&browser_id));
+    // Hub should still be functional - no panic occurred
+    assert!(hub.state.read().unwrap().agents.is_empty());
 }
 
 // === Request Routing Tests ===
@@ -271,23 +253,9 @@ fn setup_hub_with_two_agents() -> (Hub, tempfile::TempDir, tempfile::TempDir) {
 fn test_request_agent_list_targets_requesting_browser() {
     let (mut hub, _td1, _td2) = setup_hub_with_two_agents();
 
-    // Two browsers connect
-    let browser_a = ClientId::Browser("browser-a".to_string());
-    let browser_b = ClientId::Browser("browser-b".to_string());
-    dispatch(
-        &mut hub,
-        HubAction::ClientConnected {
-            client_id: browser_a.clone(),
-        },
-    );
-    dispatch(
-        &mut hub,
-        HubAction::ClientConnected {
-            client_id: browser_b.clone(),
-        },
-    );
-
     // Browser A requests agent list - should not panic
+    // (Browser connections are now handled via WebRTC, not ClientRegistry)
+    let browser_a = ClientId::Browser("browser-a".to_string());
     dispatch(
         &mut hub,
         HubAction::RequestAgentList {
@@ -301,23 +269,9 @@ fn test_request_agent_list_targets_requesting_browser() {
 fn test_request_worktree_list_targets_requesting_browser() {
     let (mut hub, _td1, _td2) = setup_hub_with_two_agents();
 
-    // Two browsers connect
+    // Browser A requests worktree list - should not panic
+    // (Browser connections are now handled via WebRTC, not ClientRegistry)
     let browser_a = ClientId::Browser("browser-a".to_string());
-    let browser_b = ClientId::Browser("browser-b".to_string());
-    dispatch(
-        &mut hub,
-        HubAction::ClientConnected {
-            client_id: browser_a.clone(),
-        },
-    );
-    dispatch(
-        &mut hub,
-        HubAction::ClientConnected {
-            client_id: browser_b.clone(),
-        },
-    );
-
-    // Browser A requests worktree list
     dispatch(
         &mut hub,
         HubAction::RequestWorktreeList {

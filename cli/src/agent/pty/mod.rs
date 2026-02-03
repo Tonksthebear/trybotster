@@ -1733,7 +1733,7 @@ mod tests {
     #[test]
     fn test_hot_path_connect_returns_working_subscription() {
         // Tests that connect() returns a subscription that receives events.
-        // This is how TuiClient and BrowserClient get their event streams.
+        // This is how TuiClient gets its event stream.
         let session = PtySession::new(24, 80);
 
         // Connect returns a subscription + scrollback (via connect, not subscribe)

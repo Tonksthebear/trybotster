@@ -8,19 +8,19 @@
  *   - State tracking
  *
  * Lifecycle:
- *   - initialize() establishes hub connection (WebSocket + Signal session)
- *   - subscribe() creates channel subscription (triggers CLI handshake)
- *   - unsubscribe() removes channel subscription (keeps hub alive)
+ *   - initialize() establishes hub connection (WebRTC + Signal session)
+ *   - subscribe() creates virtual channel subscription (CLI routing)
+ *   - unsubscribe() removes channel subscription (keeps peer connection alive)
  *   - destroy() tears down everything
  *
  * Subclasses implement:
- *   - channelName() - ActionCable channel class name
+ *   - channelName() - Virtual channel name for CLI routing (e.g., "TerminalRelayChannel")
  *   - channelParams() - Subscription params
  *   - handleMessage(msg) - Domain-specific message routing
  */
 
 import bridge from "workers/bridge"
-import { ensureSignalReady, parseBundleFromFragment } from "signal"
+import { ensureSignalReady, parseBundleFromFragment } from "signal/bundle"
 
 // Connection state (combines browser subscription + CLI handshake status)
 export const ConnectionState = {
@@ -32,7 +32,7 @@ export const ConnectionState = {
   ERROR: "error",
 }
 
-// Browser → Rails WebSocket status
+// Browser connection status (from this tab's perspective)
 export const BrowserStatus = {
   DISCONNECTED: "disconnected",
   CONNECTING: "connecting",
@@ -41,7 +41,7 @@ export const BrowserStatus = {
   ERROR: "error",
 }
 
-// CLI → Rails WebSocket status (for this channel)
+// CLI connection status (reported by Rails via health messages)
 export const CliStatus = {
   UNKNOWN: "unknown",           // Initial state, waiting for health message
   OFFLINE: "offline",           // CLI not connected to Rails at all
@@ -99,21 +99,18 @@ export class Connection {
 
   /**
    * Initialize the connection. Called by ConnectionManager.acquire().
-   * Establishes hub connection (WebSocket/WebRTC + Signal session) and subscribes.
+   * Establishes hub connection (WebRTC + Signal session) and subscribes.
    */
   async initialize() {
     try {
       this.#setState(ConnectionState.LOADING)
 
-      // Ensure worker is initialized with transport selection
-      const workerUrl = document.querySelector('meta[name="signal-worker-url"]')?.content
+      // Ensure worker is initialized
       const cryptoWorkerUrl = document.querySelector('meta[name="signal-crypto-worker-url"]')?.content
       const wasmJsUrl = document.querySelector('meta[name="signal-wasm-js-url"]')?.content
       const wasmBinaryUrl = document.querySelector('meta[name="signal-wasm-binary-url"]')?.content
-      const webrtcWorkerUrl = document.querySelector('meta[name="webrtc-worker-url"]')?.content
-      const transport = document.querySelector('meta[name="transport"]')?.content || "actioncable"
 
-      await ensureSignalReady(workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl, webrtcWorkerUrl, transport)
+      await ensureSignalReady(cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl)
 
       // Connect to hub
       await this.#connectHub()
@@ -128,7 +125,7 @@ export class Connection {
   }
 
   /**
-   * Connect to the hub (WebSocket + Signal session).
+   * Connect to the hub (WebRTC + Signal session).
    * Called by initialize() or can be used to reconnect.
    */
   async #connectHub() {
@@ -173,28 +170,13 @@ export class Connection {
     // Multiple tabs share the same Signal session but need separate WebRTC connections.
     this.browserIdentity = `${this.identityKey}:${Connection.tabId}`
 
-    // 2. Connect transport via transport worker
-    const transport = bridge.transport
-
-    if (transport === "webrtc") {
-      // WebRTC: pass signaling URL and browser identity
-      const signalingUrl = window.location.origin
-      await bridge.send("connect", {
-        hubId,
-        signalingUrl,
-        browserIdentity: this.browserIdentity
-      })
-    } else {
-      // ActionCable: pass cable URL and module URL
-      const cableUrl = document.querySelector('meta[name="action-cable-url"]')?.content || "/cable"
-      const actionCableModuleUrl = document.querySelector('meta[name="actioncable-module-url"]')?.content
-
-      await bridge.send("connect", {
-        hubId,
-        cableUrl,
-        actionCableModuleUrl
-      })
-    }
+    // 2. Connect transport via WebRTC
+    const signalingUrl = window.location.origin
+    await bridge.send("connect", {
+      hubId,
+      signalingUrl,
+      browserIdentity: this.browserIdentity
+    })
 
     this.#hubConnected = true
 
@@ -257,27 +239,17 @@ export class Connection {
         hubId,
         channel: this.channelName(),
         params: this.channelParams(),
-        reliable: this.isReliable()
       })
 
       this.subscriptionId = subscribeResult.subscriptionId
       this.#setupSubscriptionEventListeners()
 
-      // Request current health status now that listener is set up
-      // (initial transmit during subscription is lost due to race condition)
-      await this.#requestHealth()
-
       this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
       this.#setState(ConnectionState.CONNECTED)
       this.emit("subscribed", this)
 
-      // For WebRTC: DataChannel open = ready, skip handshake ceremony
-      if (bridge.transport === "webrtc") {
-        this.#completeHandshake()
-      } else if (this.cliStatus === CliStatus.CONNECTED) {
-        // For ActionCable: wait for health message, then handshake
-        this.#sendHandshake()
-      }
+      // WebRTC: DataChannel open = ready, skip handshake ceremony
+      this.#completeHandshake()
     } finally {
       this.#subscribing = false
     }
@@ -353,7 +325,7 @@ export class Connection {
 
         // Auto-resubscribe after reconnection - old subscription is stale
         if (this.subscriptionId) {
-          console.log(`[${this.constructor.name}] Auto-resubscribing after reconnect`)
+          console.debug(`[${this.constructor.name}] Auto-resubscribing after reconnect`)
           // Clear stale subscription ID and resubscribe
           const oldSubId = this.subscriptionId
           this.subscriptionId = null
@@ -382,34 +354,17 @@ export class Connection {
    * These are cleared on unsubscribe().
    */
   #setupSubscriptionEventListeners() {
-    // Listen for subscription messages (decrypt if needed)
+    // Listen for subscription messages
+    // Transport layer handles decryption - we receive plaintext here
     const unsubMsg = bridge.onSubscriptionMessage(this.subscriptionId, async (message) => {
-      // Check if this is raw binary data (Uint8Array) - already decrypted
-      // This comes from WebRTC PTY output (base64 decoded in webrtc_transport.js)
+      // Raw binary data (Uint8Array) from PTY output
       if (message instanceof Uint8Array) {
-        // Pass raw bytes directly to handleMessage
-        // The 0x01 prefix is inside the bytes - terminal handlers will process it
         this.handleMessage({ type: "raw_output", data: message })
         return
       }
 
-      // Check if message is encrypted (has envelope field)
-      if (message && message.envelope) {
-        try {
-          const hubId = this.getHubId()
-          const { plaintext } = await bridge.decrypt(hubId, message.envelope)
-          // Decrypt returns parsed JSON if valid, otherwise raw string
-          const decrypted = await this.#decompressIfNeeded(plaintext)
-          if (decrypted !== null) {
-            this.handleMessage(decrypted)
-          }
-        } catch (err) {
-          console.error(`[${this.constructor.name}] Decrypt failed:`, err)
-        }
-      } else {
-        // Plaintext message (e.g., health messages from Rails)
-        this.handleMessage(message)
-      }
+      // Decrypted message from transport
+      this.handleMessage(message)
     })
     this.#subscriptionUnsubscribers.push(unsubMsg)
 
@@ -512,13 +467,11 @@ export class Connection {
 
     // Tell transport worker we're reacquiring - this cancels any pending close timer
     // and reconnects if the connection was closed during grace period
-    const cableUrl = document.querySelector('meta[name="action-cable-url"]')?.content || "/cable"
-    const actionCableModuleUrl = document.querySelector('meta[name="actioncable-module-url"]')?.content
-
+    const signalingUrl = window.location.origin
     await bridge.send("connect", {
       hubId,
-      cableUrl,
-      actionCableModuleUrl
+      signalingUrl,
+      browserIdentity: this.browserIdentity
     })
 
     // If session is gone or we weren't connected, need to reinitialize
@@ -534,7 +487,7 @@ export class Connection {
   // ========== Abstract methods (override in subclasses) ==========
 
   /**
-   * ActionCable channel class name.
+   * Virtual channel name for CLI routing (e.g., "TerminalRelayChannel", "HubChannel").
    * @returns {string}
    */
   channelName() {
@@ -558,14 +511,6 @@ export class Connection {
   }
 
   /**
-   * Whether to use reliable delivery. Default true.
-   * @returns {boolean}
-   */
-  isReliable() {
-    return true
-  }
-
-  /**
    * Handle a decrypted message. Subclasses route to domain-specific events.
    * Base class handles handshake protocol; subclasses handle domain-specific messages.
    * @param {Object} message
@@ -577,65 +522,6 @@ export class Connection {
     }
     // Default: emit as generic message
     this.emit("message", message)
-  }
-
-  // ========== Compression Helpers ==========
-
-  /**
-   * Decompress message if needed (handles reliable delivery + compression from CLI).
-   * @private
-   */
-  async #decompressIfNeeded(data) {
-    // If already an object (crypto worker parsed JSON), return as-is
-    if (typeof data === 'object' && data !== null) {
-      return data
-    }
-
-    // If string, convert to bytes for processing
-    if (typeof data !== 'string') {
-      return data
-    }
-
-    // Convert string to byte array
-    const bytes = new Uint8Array(data.length)
-    for (let i = 0; i < data.length; i++) {
-      bytes[i] = data.charCodeAt(i)
-    }
-
-    let payload = bytes
-    const firstByte = bytes[0]
-
-    // Check for reliable delivery header (0x01 = data, 0x02 = ack)
-    if (firstByte === 0x01 || firstByte === 0x02) {
-      if (firstByte === 0x02) {
-        // ACK message - ignore for now (reliable delivery not active in main thread)
-        console.log(`[${this.constructor.name}] Ignoring ACK message`)
-        return null
-      }
-      // Data message: skip 9 bytes header (1 type + 8 seq number)
-      payload = bytes.slice(9)
-    }
-
-    // Now check compression marker on the payload
-    const marker = payload[0]
-
-    if (marker === 0x00) {
-      // Uncompressed: strip marker and parse JSON
-      const jsonStr = new TextDecoder().decode(payload.slice(1))
-      return JSON.parse(jsonStr)
-    } else if (marker === 0x1f) {
-      // Gzip compressed: decompress and parse
-      const compressedBytes = payload.slice(1)
-      const stream = new Blob([compressedBytes])
-        .stream()
-        .pipeThrough(new DecompressionStream("gzip"))
-      const decompressed = await new Response(stream).text()
-      return JSON.parse(decompressed)
-    } else {
-      // No marker, try parsing as JSON directly
-      const jsonStr = new TextDecoder().decode(payload)
-      return JSON.parse(jsonStr)
-    }
   }
 
   // ========== Public API ==========
@@ -683,7 +569,7 @@ export class Connection {
       // Stale subscription (e.g., SharedWorker restarted during sleep)
       // Resubscribe and retry once
       if (error.message?.includes("not found") && !this.#resubscribing) {
-        console.log(`[${this.constructor.name}] Subscription stale, resubscribing...`)
+        console.debug(`[${this.constructor.name}] Subscription stale, resubscribing`)
         this.#resubscribing = true
 
         try {
@@ -724,7 +610,7 @@ export class Connection {
     }
     if (message.type === "connected") {
       // CLI sent handshake - respond with ack
-      console.log(`[${this.constructor.name}] Received handshake from CLI:`, message.device_name)
+      console.debug(`[${this.constructor.name}] Received handshake from CLI:`, message.device_name)
       this.#handleIncomingHandshake(message)
       return true
     }
@@ -748,12 +634,11 @@ export class Connection {
    */
   #sendHandshake() {
     if (this.handshakeSent || this.handshakeComplete) {
-      console.log(`[${this.constructor.name}] Skipping handshake - already sent or complete`)
       return
     }
 
     this.handshakeSent = true
-    console.log(`[${this.constructor.name}] Sending handshake`)
+    console.debug(`[${this.constructor.name}] Sending handshake`)
 
     // Send handshake directly (bypasses buffer since handshake isn't complete yet)
     this.#sendEncrypted({
@@ -782,7 +667,6 @@ export class Connection {
    * CLI was "last" to connect, respond with ack.
    */
   #handleIncomingHandshake(message) {
-    console.log(`[${this.constructor.name}] Received handshake from CLI`)
 
     // Send ack back
     this.#sendEncrypted({ type: "ack", timestamp: Date.now() })
@@ -797,7 +681,6 @@ export class Connection {
    * CLI confirmed our handshake.
    */
   #handleHandshakeAck(message) {
-    console.log(`[${this.constructor.name}] Received handshake ack from CLI`)
 
     if (this.handshakeTimer) {
       clearTimeout(this.handshakeTimer)
@@ -814,7 +697,7 @@ export class Connection {
     if (this.handshakeComplete) return
 
     this.handshakeComplete = true
-    console.log(`[${this.constructor.name}] Handshake complete, flushing ${this.inputBuffer.length} buffered messages`)
+    console.debug(`[${this.constructor.name}] Handshake complete, flushing ${this.inputBuffer.length} buffered messages`)
 
     // Update legacy state to CONNECTED now that E2E is established
     this.#setState(ConnectionState.CONNECTED)
@@ -863,14 +746,13 @@ export class Connection {
     if (newCliStatus !== this.cliStatus) {
       const prevStatus = this.cliStatus
       this.cliStatus = newCliStatus
-      console.log(`[${this.constructor.name}] CLI status: ${prevStatus} → ${newCliStatus}`)
+      console.debug(`[${this.constructor.name}] CLI status: ${prevStatus} → ${newCliStatus}`)
 
       this.emit("cliStatusChange", { status: newCliStatus, prevStatus })
       this.#emitHealthChange()
 
       // If CLI just connected to E2E channel, initiate handshake (browser is "last")
       if (newCliStatus === CliStatus.CONNECTED && prevStatus !== CliStatus.CONNECTED) {
-        console.log(`[${this.constructor.name}] CLI connected, initiating handshake`)
         this.emit("cliConnected")
         this.#sendHandshake()
       }
@@ -878,17 +760,11 @@ export class Connection {
       // If CLI just disconnected, reset handshake state for fresh start on reconnect
       if ((newCliStatus === CliStatus.DISCONNECTED || newCliStatus === CliStatus.OFFLINE) &&
           prevStatus !== CliStatus.DISCONNECTED && prevStatus !== CliStatus.OFFLINE) {
-        console.log(`[${this.constructor.name}] CLI disconnected, resetting handshake state`)
         this.handshakeComplete = false
         this.handshakeSent = false
         if (this.handshakeTimer) {
           clearTimeout(this.handshakeTimer)
           this.handshakeTimer = null
-        }
-        // Reset reliable delivery state so next CLI connection starts fresh
-        if (this.subscriptionId) {
-          bridge.send("resetReliable", { subscriptionId: this.subscriptionId })
-            .catch(err => console.warn(`[${this.constructor.name}] resetReliable failed:`, err))
         }
         this.emit("cliDisconnected")
       }
@@ -904,7 +780,6 @@ export class Connection {
    * Handle CLI disconnection - server notifies us when CLI unsubscribes.
    */
   #handleCliDisconnected() {
-    console.log(`[${this.constructor.name}] CLI disconnected`)
     // Reset handshake state
     this.handshakeComplete = false
     this.handshakeSent = false
@@ -945,7 +820,7 @@ export class Connection {
   }
 
   /**
-   * Check if hub is connected (WebSocket alive, can subscribe).
+   * Check if hub is connected (WebRTC DataChannel open, can subscribe).
    * @returns {boolean}
    */
   isHubConnected() {
@@ -1050,7 +925,7 @@ export class Connection {
     if (newStatus === prevStatus) return
 
     this.browserStatus = newStatus
-    console.log(`[${this.constructor.name}] Browser status: ${prevStatus} → ${newStatus}`)
+    console.debug(`[${this.constructor.name}] Browser status: ${prevStatus} → ${newStatus}`)
 
     this.emit("browserStatusChange", { status: newStatus, prevStatus })
     this.#emitHealthChange()
@@ -1066,25 +941,5 @@ export class Connection {
     }
     // Always emit health change so new listeners get current state
     this.#emitHealthChange()
-  }
-
-  /**
-   * Request current health status from server.
-   * Called after subscription to work around race condition where
-   * initial transmit is lost before listener is set up.
-   */
-  async #requestHealth() {
-    if (!this.subscriptionId) return
-
-    try {
-      await bridge.send("perform", {
-        subscriptionId: this.subscriptionId,
-        actionName: "request_health",
-        data: {}
-      })
-    } catch (error) {
-      // Non-fatal - health will update via broadcasts
-      console.debug(`[${this.constructor.name}] request_health failed:`, error)
-    }
   }
 }

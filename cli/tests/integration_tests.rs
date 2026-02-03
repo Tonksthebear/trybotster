@@ -620,7 +620,7 @@ fn test_rapid_scroll_parser_no_deadlock() {
 // - Task #1: Removed "active PTY" concept, explicit routing only
 // - Task #2: PTY channels stored in ClientRegistry, created on agent selection
 // - Task #3: Output forwarding tasks spawn per-channel, input routes via BrowserCommand
-// - Task #4: Input/resize use TerminalRelayChannel, not HubChannel
+// - Task #4: Input/resize use terminal subscriptions (WebRTC), not hub channel
 
 /// Test that Agent provides PTY handle for event subscription.
 ///

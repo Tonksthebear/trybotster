@@ -7,8 +7,8 @@
 //! # Architecture
 //!
 //! `BrowserState` tracks relay-level connection state. Per-browser view state
-//! (mode, selection, scroll) is managed by each `BrowserClient` independently.
-//! Builder functions here are pure helpers used by `BrowserClient`'s send methods.
+//! (mode, selection, scroll) is managed independently by the browser.
+//! Builder functions here are pure helpers used by WebRTC send methods.
 
 // Rust guideline compliant 2026-01
 
@@ -23,7 +23,7 @@ use crate::{AgentInfo, TerminalMessage, WorktreeInfo};
 /// Browser connection state.
 ///
 /// Consolidates relay-level browser connection state. Per-browser view state
-/// (mode, scroll, selection) is tracked by each BrowserClient independently.
+/// (mode, scroll, selection) is tracked by the browser independently.
 #[derive(Default)]
 pub struct BrowserState {
     /// Whether a browser is currently connected.
@@ -34,7 +34,7 @@ pub struct BrowserState {
     /// When true, the QR code should be regenerated before pairing additional devices.
     pub bundle_used: bool,
     /// Shared crypto service handle for E2E encryption.
-    /// Used by BrowserClient and agent channels for Signal Protocol operations.
+    /// Used by WebRTC and agent channels for Signal Protocol operations.
     pub crypto_service: Option<CryptoServiceHandle>,
     /// Whether the relay WebSocket connection is established.
     ///

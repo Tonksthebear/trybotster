@@ -249,7 +249,7 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         }
 
         HubAction::RequestAgentList { client_id } => {
-            // Browser clients handle ListAgents directly in BrowserClient::handle_browser_command().
+            // Browser clients handle ListAgents directly via WebRTC.
             // TUI clients read agent list from hub state.
             log::debug!(
                 "RequestAgentList from {} (handled client-side)",
@@ -258,7 +258,7 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
         }
 
         HubAction::RequestWorktreeList { client_id } => {
-            // Browser clients handle ListWorktrees directly in BrowserClient::handle_browser_command().
+            // Browser clients handle ListWorktrees directly via WebRTC.
             // TUI clients read worktree list from hub state.
             log::debug!(
                 "RequestWorktreeList from {} (handled client-side)",

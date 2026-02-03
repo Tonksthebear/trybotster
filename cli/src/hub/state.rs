@@ -6,7 +6,7 @@
 //! # Selection Model
 //!
 //! Agent selection is now per-client, managed by the client abstraction layer.
-//! See `crate::client` for the `TuiClient` and `BrowserClient` implementations.
+//! See `crate::client` for the `TuiClient` implementation.
 //! This module only manages the agent registry itself.
 
 use std::collections::{HashMap, HashSet};

@@ -5,22 +5,21 @@
 //!
 //! # Architecture
 //!
-//! Hub communicates with clients via HubEvent broadcasts. Each client runs
-//! its own async task that processes hub events and requests from its input
-//! source. Hub manages client task lifecycle via `ClientTaskHandle` (abort).
+//! Hub communicates with TUI via HubEvent broadcasts. Browser communication
+//! happens directly via WebRTC in `server_comms.rs`, bypassing the Client
+//! trait entirely.
 //!
 //! This module handles high-level client actions:
 //!
 //! - Agent selection: `handle_select_agent_for_client()`
 //! - Agent creation/deletion: `handle_create_agent_for_client()`, `handle_delete_agent_for_client()`
-//! - Client lifecycle: `handle_client_connected()`, `handle_client_disconnected()`
+//! - Client lifecycle: `handle_client_connected()`, `handle_client_disconnected()` (legacy no-ops)
 
 // Rust guideline compliant 2026-01
 
 use std::path::PathBuf;
 
-use crate::client::{BrowserClient, ClientId, ClientTaskHandle, CreateAgentRequest, DeleteAgentRequest};
-use crate::client::browser::BrowserClientConfig;
+use crate::client::{ClientId, CreateAgentRequest, DeleteAgentRequest};
 use crate::hub::{lifecycle, Hub};
 
 /// Handle selecting an agent for a specific client.
@@ -81,7 +80,7 @@ pub fn handle_create_agent_for_client(
     client_id: ClientId,
     request: CreateAgentRequest,
 ) {
-    // Broadcast creation progress to all subscribers (BrowserClient reacts via handle_hub_event)
+    // Broadcast creation progress to all subscribers (WebRTC, TUI)
     hub.broadcast(crate::hub::HubEvent::AgentCreationProgress {
         identifier: request.issue_or_branch.clone(),
         stage: crate::relay::AgentCreationStage::CreatingWorktree,
@@ -289,7 +288,7 @@ fn spawn_agent_sync(
             let agent_id = result.agent_id;
 
             // Agent list broadcast is handled via HubEvent::AgentCreated below
-            // BrowserClient reacts to this event in handle_hub_event()
+            // WebRTC and TUI react to this event
             hub.broadcast_agent_list();
             handle_select_agent_for_client(hub, client_id, agent_id.clone());
 
@@ -333,7 +332,7 @@ pub fn handle_delete_agent_for_client(
             // Sync handle cache for thread-safe agent access
             hub.sync_handle_cache();
 
-            // Broadcast AgentDeleted event to all subscribers (TUI, BrowserClients)
+            // Broadcast AgentDeleted event to all subscribers (TUI, WebRTC)
             hub.broadcast(crate::hub::HubEvent::agent_deleted(&request.agent_id));
 
             // Refresh worktree cache - this agent's worktree is now available
@@ -349,53 +348,25 @@ pub fn handle_delete_agent_for_client(
 
 /// Handle client connected event.
 ///
-/// For browser clients, creates a BrowserClient, spawns it as an async task,
-/// and registers the task handle in the client registry.
+/// This is a legacy handler for browser_connected events that are no longer sent.
+/// Browser communication now happens directly via WebRTC in `server_comms.rs`,
+/// bypassing the Client trait and ClientRegistry entirely.
+///
+/// This handler is retained for backward compatibility but is effectively a no-op.
 pub fn handle_client_connected(hub: &mut Hub, client_id: ClientId) {
-    log::info!("Client connected: {}", client_id);
-
-    // For browser clients, create and register BrowserClient as async task
-    if let ClientId::Browser(ref identity) = client_id {
-        // Get crypto service - required for BrowserClient
-        let Some(crypto_service) = hub.browser.crypto_service.clone() else {
-            log::error!("Cannot create BrowserClient: crypto service not initialized");
-            return;
-        };
-
-        // Build config from Hub's direct access (avoid hub_handle commands that would deadlock)
-        let config = BrowserClientConfig {
-            crypto_service,
-            server_url: hub.config.server_url.clone(),
-            api_key: hub.config.get_api_key().to_string(),
-            server_hub_id: hub.server_hub_id().to_string(),
-        };
-
-        let hub_handle = hub.handle();
-        let hub_event_rx = hub.subscribe_events();
-        let browser_client = BrowserClient::new(hub_handle, identity.clone(), config, Some(hub_event_rx));
-
-        // Spawn BrowserClient as async task
-        let join_handle = hub.tokio_runtime.spawn(browser_client.run_task());
-
-        // Register the task handle
-        hub.clients.register(client_id.clone(), ClientTaskHandle {
-            join_handle,
-        });
-
-        log::info!("Registered BrowserClient task for {}", identity);
-    }
+    log::info!("Client connected: {} (no-op - WebRTC handles browser connections directly)", client_id);
+    // Suppress unused variable warning
+    let _ = hub;
 }
 
 /// Handle client disconnected event.
 ///
-/// When a client disconnects, abort the task and unregister from the registry.
+/// This is a legacy handler for browser_disconnected events that are no longer sent.
+/// Browser communication now happens directly via WebRTC in `server_comms.rs`.
+///
+/// This handler is retained for backward compatibility but is effectively a no-op.
 pub fn handle_client_disconnected(hub: &mut Hub, client_id: ClientId) {
-    log::info!("Client disconnecting: {}", client_id);
-
-    // Unregister the client task handle and abort the task
-    if let Some(handle) = hub.clients.unregister(&client_id) {
-        handle.join_handle.abort();
-    }
-
-    log::info!("Client disconnected: {}", client_id);
+    log::info!("Client disconnected: {} (no-op - WebRTC handles browser connections directly)", client_id);
+    // Suppress unused variable warning
+    let _ = hub;
 }

@@ -1,21 +1,21 @@
-//! Relay - Browser WebSocket adapter.
+//! Relay - Browser communication adapter.
 //!
-//! This module provides the browser relay functionality, handling WebSocket
-//! communication with connected browser clients via Action Cable. It manages:
+//! This module provides the browser relay functionality, handling WebRTC
+//! DataChannel communication with connected browser clients. It manages:
 //!
-//! - E2E encrypted communication (Signal Protocol)
+//! - E2E encrypted communication (Signal Protocol over DTLS)
 //! - Terminal output streaming
 //!
 //! # Architecture
 //!
 //! ```text
-//! Browser ◄──WebSocket──► Rails Action Cable ◄──WebSocket──► CLI
-//!                                                              │
-//!                              Hub ◄─── HubCommandChannel (hub-level events)
+//! Browser ◄──WebRTC DataChannel (E2E encrypted)──► CLI
+//!                                                    │
+//!                              Hub ◄─── HubCommandChannel (signaling via Rails)
 //!                              │
-//!                     BrowserClient (per-browser commands)
+//!                WebRtcSubscriptions (virtual channel routing)
 //!                              │
-//!                    TerminalRelayChannel (per-PTY I/O)
+//!                    TerminalRelayChannel (PTY I/O subscription type)
 //! ```
 //!
 //! # Encryption

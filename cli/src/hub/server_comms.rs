@@ -69,51 +69,13 @@ impl Hub {
             let sequence = msg.sequence;
 
             match msg.event_type.as_str() {
-                "browser_connected" => {
-                    // Browser subscribed to HubChannel - create BrowserClient to pair with it.
-                    // The BrowserClient will subscribe to HubChannel with the same identity,
-                    // establishing the per-browser bidirectional stream.
-                    let browser_identity = msg.payload
-                        .get("browser_identity")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-
-                    if let Some(identity) = browser_identity {
-                        log::info!(
-                            "Browser connected (command channel): {} - dispatching ClientConnected",
-                            &identity[..identity.len().min(8)]
-                        );
-                        // Dispatch action to create BrowserClient
-                        self.handle_action(HubAction::ClientConnected {
-                            client_id: ClientId::Browser(identity),
-                        });
-                    } else {
-                        log::warn!("Browser connected event missing browser_identity");
-                    }
-                }
-                "browser_disconnected" => {
-                    // Browser unsubscribed from HubChannel - clean up BrowserClient.
-                    let browser_identity = msg.payload
-                        .get("browser_identity")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-
-                    if let Some(identity) = browser_identity {
-                        log::info!(
-                            "Browser disconnected (command channel): {} - dispatching ClientDisconnected",
-                            &identity[..identity.len().min(8)]
-                        );
-                        // Dispatch action to clean up BrowserClient
-                        self.handle_action(HubAction::ClientDisconnected {
-                            client_id: ClientId::Browser(identity),
-                        });
-                    } else {
-                        log::warn!("Browser disconnected event missing browser_identity");
-                    }
-                }
+                // Note: "browser_connected" and "browser_disconnected" events are no longer
+                // sent by Rails since HubChannel was deleted. Browser communication now
+                // happens directly via WebRTC (see handle_webrtc_* methods below).
+                // These event types remain in Bot::Message validation for legacy compatibility.
                 "terminal_connected" => {
-                    // Browser subscribed to TerminalRelayChannel for a specific PTY.
-                    // Trigger PTY connection for the matching BrowserClient.
+                    // Browser wants terminal I/O for a specific PTY (legacy notification path).
+                    // WebRTC browsers now subscribe directly via DataChannel.
                     let agent_index = msg.payload.get("agent_index").and_then(|v| v.as_u64());
                     let pty_index = msg.payload.get("pty_index").and_then(|v| v.as_u64());
                     let browser_identity = msg.payload
@@ -121,7 +83,7 @@ impl Hub {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
 
-                    log::info!(
+                    log::debug!(
                         "[INPUT-TRACE] Hub received terminal_connected: browser={}, agent={:?}, pty={:?}",
                         &browser_identity[..browser_identity.len().min(8)],
                         agent_index,
@@ -142,9 +104,9 @@ impl Hub {
                             self.connect_agent_channels(&key, agent_index);
                         }
 
-                        // Broadcast to BrowserClient so it sets up TerminalRelayChannel.
+                        // Broadcast event so WebRTC can set up PTY forwarding.
                         let client_id = ClientId::Browser(browser_identity.to_string());
-                        log::info!(
+                        log::debug!(
                             "[INPUT-TRACE] Broadcasting PtyConnectionRequested for agent={} pty={}",
                             agent_index,
                             pty_index
@@ -162,8 +124,8 @@ impl Hub {
                     }
                 }
                 "terminal_disconnected" => {
-                    // Browser unsubscribed from TerminalRelayChannel for a specific PTY.
-                    // Trigger PTY disconnection for the matching BrowserClient.
+                    // Browser no longer wants terminal I/O (legacy notification path).
+                    // WebRTC browsers unsubscribe directly via DataChannel.
                     let agent_index = msg.payload.get("agent_index").and_then(|v| v.as_u64());
                     let pty_index = msg.payload.get("pty_index").and_then(|v| v.as_u64());
                     let browser_identity = msg.payload
@@ -171,7 +133,7 @@ impl Hub {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
 
-                    log::info!(
+                    log::debug!(
                         "Terminal disconnected (command channel): browser={}, agent={:?}, pty={:?}",
                         &browser_identity[..browser_identity.len().min(8)],
                         agent_index,
@@ -193,7 +155,7 @@ impl Hub {
                     }
                 }
                 "browser_wants_preview" => {
-                    // Browser subscribed to PreviewChannel - notify BrowserClient to create HttpChannel.
+                    // Browser subscribed to PreviewChannel - notify to create HttpChannel.
                     let agent_index = msg.payload.get("agent_index").and_then(|v| v.as_u64());
                     let pty_index = msg
                         .payload
@@ -205,7 +167,7 @@ impl Hub {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
 
-                    log::info!(
+                    log::debug!(
                         "[CommandChannel] Browser wants preview: browser={}, agent={:?}, pty={}",
                         &browser_identity[..browser_identity.len().min(8)],
                         agent_index,
@@ -407,8 +369,7 @@ impl Hub {
             event.client_id
         );
 
-        // Broadcast progress event to all subscribers
-        // BrowserClient reacts via handle_hub_event() -> send_creation_progress()
+        // Broadcast progress event to all subscribers (WebRTC, TUI)
         self.broadcast(HubEvent::AgentCreationProgress {
             identifier: event.identifier,
             stage: event.stage,
@@ -501,8 +462,7 @@ impl Hub {
             },
         );
 
-        // Broadcast AgentCreated event to all subscribers
-        // BrowserClient reacts via handle_hub_event() -> sends agent list, agent_created, scrollback
+        // Broadcast AgentCreated event to all subscribers (WebRTC, TUI)
         if let Some(info) = self.state.read().unwrap().get_agent_info(&session_key) {
             self.broadcast(HubEvent::agent_created(session_key, info));
         }
@@ -785,7 +745,7 @@ impl Hub {
         let agent_index = params.get("agent_index").and_then(|a| a.as_u64()).map(|a| a as usize);
         let pty_index = params.get("pty_index").and_then(|p| p.as_u64()).map(|p| p as usize);
 
-        log::info!(
+        log::debug!(
             "[WebRTC] Subscribe: {} -> {} (agent={:?}, pty={:?})",
             &subscription_id[..subscription_id.len().min(16)],
             channel_name,
@@ -819,7 +779,7 @@ impl Hub {
             }
             "TerminalRelayChannel" => {
                 if let (Some(ai), Some(pi)) = (agent_index, pty_index) {
-                    log::info!(
+                    log::debug!(
                         "[WebRTC] Terminal subscription for agent={} pty={}, spawning PTY forwarder",
                         ai,
                         pi
@@ -833,7 +793,7 @@ impl Hub {
                             let forwarder_key = format!("{}:{}:{}", browser_identity, ai, pi);
                             if let Some(old_task) = self.webrtc_pty_forwarders.remove(&forwarder_key) {
                                 old_task.abort();
-                                log::info!("[WebRTC] Aborted old PTY forwarder for {}", forwarder_key);
+                                log::debug!("[WebRTC] Aborted old PTY forwarder for {}", forwarder_key);
                             }
 
                             // Subscribe to PTY events
@@ -1084,7 +1044,6 @@ impl Hub {
         );
 
         // Route to existing command handling
-        // This mirrors what BrowserClient::handle_browser_command does
         // Find the subscription ID for this browser's HubChannel
         let subscription_id = self
             .webrtc_subscriptions

@@ -6,13 +6,9 @@
   <title>Preview</title>
   <%= csrf_meta_tags %>
   <%= csp_meta_tag %>
-  <meta name="signal-worker-url" content="<%= asset_path('workers/signal.js') %>">
   <meta name="signal-crypto-worker-url" content="<%= asset_path('workers/signal_crypto.js') %>">
   <meta name="signal-wasm-js-url" content="<%= asset_path('libsignal_wasm.js') %>">
   <meta name="signal-wasm-binary-url" content="<%= asset_path('libsignal_wasm_bg.wasm') %>">
-  <meta name="actioncable-module-url" content="<%= asset_path('actioncable.esm.js') %>">
-  <meta name="webrtc-worker-url" content="<%= asset_path('workers/webrtc.js') %>">
-  <meta name="transport" content="webrtc">
   <%= stylesheet_link_tag "application", "data-turbo-track": "reload" %>
   <%= javascript_importmap_tags %>
   <style>

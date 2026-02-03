@@ -6,7 +6,7 @@
 //!
 //! # Why This Exists
 //!
-//! Clients (TuiClient, BrowserClient) run on Hub's thread. If they used
+//! Clients (TuiClient) run on Hub's thread. If they used
 //! blocking commands like `GetAgentByIndex` to get agent handles, they
 //! would deadlock (Hub can't process commands while blocked).
 //!
@@ -15,7 +15,7 @@
 //!
 //! # Who Uses What
 //!
-//! - **TuiClient/BrowserClient**: Use `HubHandle::get_agent()` → reads from cache
+//! - **TuiClient**: Use `HubHandle::get_agent()` → reads from cache
 //! - **TuiRunner**: Uses `GetAgentByIndex` command (safe - runs on different thread)
 //!
 //! # Design Principle

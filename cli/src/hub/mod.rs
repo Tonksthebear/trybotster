@@ -75,7 +75,7 @@ use reqwest::blocking::Client;
 
 use sha2::{Digest, Sha256};
 
-// ActionCable channel imports removed - preview channels now managed by BrowserClient
+// ActionCable channel imports removed - preview channels managed separately
 use crate::client::{ClientId, ClientRegistry, ClientTaskHandle};
 use crate::config::Config;
 use crate::device::Device;
@@ -441,7 +441,7 @@ impl Hub {
 
     /// Connect agent channels after spawn.
     ///
-    /// NOTE: Preview channels are now managed by BrowserClient, not Agent.
+    /// NOTE: Preview channels are managed separately via HttpChannel.
     /// HttpChannel is created on-demand when a browser requests preview.
     /// Terminal channels are handled by PtySession broadcasts + browser relay.
     ///
@@ -450,12 +450,12 @@ impl Hub {
     #[allow(unused_variables)]
     pub fn connect_agent_channels(&mut self, session_key: &str, agent_index: usize) {
         log::debug!(
-            "connect_agent_channels called for {} (index={}) - channels managed by BrowserClient",
+            "connect_agent_channels called for {} (index={}) - channels managed via WebRTC",
             session_key,
             agent_index
         );
-        // Preview channels (HttpChannel) are now created lazily by BrowserClient
-        // when a browser_wants_preview message is received.
+        // Preview channels (HttpChannel) are created lazily when a
+        // browser_wants_preview message is received.
         // See: cli/src/client/http_channel.rs
     }
 
@@ -925,8 +925,8 @@ impl Hub {
                 pty_index: _,
                 data: _,
             } => {
-                // Browser PTY input now flows through BrowserClient's run_task()
-                // via BrowserRequest channel, not through Hub commands.
+                // Browser PTY input flows directly through WebRTC in server_comms.rs,
+                // not through Hub commands.
                 log::debug!(
                     "BrowserPtyInput received for {} (routed via client task)",
                     client_id
@@ -1151,8 +1151,8 @@ mod tests {
     /// that the RwLock-based HandleCache doesn't deadlock or panic under
     /// concurrent access.
     ///
-    /// This exercises the production pattern where TuiClient/BrowserClient
-    /// read from HandleCache (via HubHandle) while Hub mutates it on agent
+    /// This exercises the production pattern where TuiClient reads from
+    /// HandleCache (via HubHandle) while Hub mutates it on agent
     /// lifecycle events.
     #[test]
     fn test_handle_cache_concurrent_read_write() {
