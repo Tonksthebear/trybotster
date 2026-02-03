@@ -251,6 +251,24 @@ class WebRTCTransport {
   }
 
   /**
+   * Send a pre-encrypted Signal envelope directly through the DataChannel.
+   * Used for browser → CLI communication where encryption happens in
+   * Connection.#sendEncrypted via the bridge.
+   */
+  async sendEnvelope(hubId, envelope) {
+    const conn = this.#connections.get(hubId)
+    if (!conn) {
+      throw new Error(`No connection for hub ${hubId}`)
+    }
+    if (conn.dataChannel?.readyState !== "open") {
+      throw new Error("DataChannel not open")
+    }
+
+    conn.dataChannel.send(JSON.stringify(envelope))
+    return { sent: true }
+  }
+
+  /**
    * Subscribe to events
    */
   on(eventName, callback) {

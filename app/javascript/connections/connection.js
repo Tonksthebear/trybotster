@@ -642,18 +642,18 @@ export class Connection {
 
   /**
    * Send an encrypted message through the transport worker.
-   * Encrypts via crypto worker, then sends raw encrypted envelope.
+   * Encrypts via crypto worker, then sends envelope directly.
    * @private
    */
   async #sendEncrypted(message) {
     const hubId = this.getHubId()
-    const { envelope } = await bridge.encrypt(hubId, message)
+    // Include subscriptionId in the encrypted payload for CLI routing
+    const fullMessage = { subscriptionId: this.subscriptionId, ...message }
+    const { envelope } = await bridge.encrypt(hubId, fullMessage)
     // Crypto worker may return envelope as JSON string - ensure it's an object
     const envelopeObj = typeof envelope === "string" ? JSON.parse(envelope) : envelope
-    await bridge.send("sendRaw", {
-      subscriptionId: this.subscriptionId,
-      message: { envelope: envelopeObj }
-    })
+    // Send envelope directly (CLI decrypts and finds subscriptionId inside)
+    await bridge.send("sendEnvelope", { hubId, envelope: envelopeObj })
   }
 
   /**

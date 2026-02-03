@@ -271,6 +271,8 @@ class WorkerBridge {
         return webrtcTransport.unsubscribe(params.subscriptionId)
       case "sendRaw":
         return webrtcTransport.sendRaw(params.subscriptionId, params.message)
+      case "sendEnvelope":
+        return webrtcTransport.sendEnvelope(params.hubId, params.envelope)
       case "perform":
         // ActionCable-style perform: send action via DataChannel
         // For now, just log and return - CLI health is handled differently with WebRTC
