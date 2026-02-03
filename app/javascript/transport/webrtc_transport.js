@@ -30,6 +30,7 @@ class WebRTCTransport {
   #connectPromises = new Map() // hubId -> Promise (pending connection)
   #eventListeners = new Map() // eventName -> Set<callback>
   #subscriptionListeners = new Map() // subscriptionId -> Set<callback>
+  #pendingSubscriptions = new Map() // subscriptionId -> { resolve, reject, timeout }
   #subscriptionIdCounter = 0
   #pollingTimers = new Map() // hubId -> timer
 
@@ -207,6 +208,10 @@ class WebRTCTransport {
       params,
     })
     conn.dataChannel.send(msg)
+
+    // Wait for CLI to confirm subscription before allowing input.
+    // This prevents race condition where input arrives before CLI registers subscription.
+    await this.#waitForSubscriptionConfirmed(subscriptionId)
 
     this.#emit("subscription:confirmed", { subscriptionId })
 
@@ -555,6 +560,12 @@ class WebRTCTransport {
         }
       }
 
+      // Handle subscription confirmation from CLI (control message, not encrypted)
+      if (msg.type === "subscribed" && msg.subscriptionId) {
+        this.#handleSubscriptionConfirmed(msg.subscriptionId)
+        return
+      }
+
       if (msg.subscriptionId) {
         // Check for raw binary data (base64-encoded PTY output)
         if (msg.raw) {
@@ -606,6 +617,41 @@ class WebRTCTransport {
 
       dataChannel.addEventListener("open", onOpen)
     })
+  }
+
+  /**
+   * Wait for CLI to confirm subscription registration.
+   * Resolves when CLI sends { type: "subscribed", subscriptionId }.
+   */
+  async #waitForSubscriptionConfirmed(subscriptionId) {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.#pendingSubscriptions.delete(subscriptionId)
+        reject(new Error(`Subscription confirmation timeout for ${subscriptionId}`))
+      }, 10000)
+
+      this.#pendingSubscriptions.set(subscriptionId, {
+        resolve: () => {
+          clearTimeout(timeout)
+          this.#pendingSubscriptions.delete(subscriptionId)
+          resolve()
+        },
+        reject,
+        timeout,
+      })
+    })
+  }
+
+  /**
+   * Handle subscription confirmation from CLI.
+   * Called when receiving { type: "subscribed", subscriptionId }.
+   */
+  #handleSubscriptionConfirmed(subscriptionId) {
+    const pending = this.#pendingSubscriptions.get(subscriptionId)
+    if (pending) {
+      console.log(`[WebRTCTransport] Subscription confirmed: ${subscriptionId}`)
+      pending.resolve()
+    }
   }
 }
 

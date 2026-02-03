@@ -804,6 +804,10 @@ impl Hub {
             },
         );
 
+        // Send subscription confirmation to browser immediately after registering.
+        // Browser waits for this before allowing input to prevent race condition.
+        self.send_webrtc_subscription_confirmed(&subscription_id, browser_identity);
+
         // Handle channel-specific subscription setup
         let sub = self.webrtc_subscriptions.get(&subscription_id).unwrap().clone();
         match sub.channel_name.as_str() {
@@ -1238,6 +1242,46 @@ impl Hub {
         let _guard = self.tokio_runtime.enter();
         if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&payload, &peer)) {
             log::warn!("[WebRTC] Failed to send message: {e}");
+        }
+    }
+
+    /// Send subscription confirmation to browser.
+    ///
+    /// Browser waits for this before allowing input, preventing race condition
+    /// where input arrives before CLI has registered the subscription.
+    fn send_webrtc_subscription_confirmed(&self, subscription_id: &str, browser_identity: &str) {
+        let Some(channel) = self.webrtc_channels.get(browser_identity) else {
+            log::warn!(
+                "[WebRTC] No channel for browser {} when sending subscription confirmation",
+                &browser_identity[..browser_identity.len().min(8)]
+            );
+            return;
+        };
+
+        let message = serde_json::json!({
+            "type": "subscribed",
+            "subscriptionId": subscription_id
+        });
+
+        let payload = match serde_json::to_vec(&message) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[WebRTC] Failed to serialize subscription confirmation: {e}");
+                return;
+            }
+        };
+
+        log::debug!(
+            "[WebRTC] Sending subscription confirmation for {} to {}",
+            &subscription_id[..subscription_id.len().min(16)],
+            &browser_identity[..browser_identity.len().min(8)]
+        );
+
+        // Send unencrypted - this is a control message
+        let peer = crate::channel::PeerId(browser_identity.to_string());
+        let _guard = self.tokio_runtime.enter();
+        if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&payload, &peer)) {
+            log::warn!("[WebRTC] Failed to send subscription confirmation: {e}");
         }
     }
 
