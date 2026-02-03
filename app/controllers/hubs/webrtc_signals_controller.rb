@@ -186,7 +186,7 @@ module Hubs
       @hub = if current_user
                current_user.hubs.find_by(id: params[:hub_id])
       elsif current_device
-               current_device.hub
+               current_device.hubs.find_by(id: params[:hub_id])
       end
 
       render json: { error: "Hub not found" }, status: :not_found unless @hub
