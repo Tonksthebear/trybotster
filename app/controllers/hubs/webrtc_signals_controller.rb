@@ -128,7 +128,8 @@ module Hubs
 
     def relay_ice
       browser_identity = params[:browser_identity]
-      candidate = params[:candidate]
+      # Convert to plain hash for cache serialization
+      candidate = params[:candidate].to_unsafe_h
 
       if current_user
         # Browser -> CLI: append to ICE candidates list
