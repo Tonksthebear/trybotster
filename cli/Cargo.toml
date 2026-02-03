@@ -73,6 +73,9 @@ aes-gcm = "0.10"               # AES-GCM for encrypting Signal state at rest
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 
+# WebRTC for peer-to-peer communication
+webrtc = "0.12"
+
 # QR code generation for browser connection (qrcodegen supports alphanumeric mode for smaller QR)
 qrcodegen = "1.8"
 

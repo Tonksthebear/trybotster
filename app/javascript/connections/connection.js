@@ -92,18 +92,21 @@ export class Connection {
 
   /**
    * Initialize the connection. Called by ConnectionManager.acquire().
-   * Establishes hub connection (WebSocket + Signal session) and subscribes.
+   * Establishes hub connection (WebSocket/WebRTC + Signal session) and subscribes.
    */
   async initialize() {
     try {
       this.#setState(ConnectionState.LOADING)
 
-      // Ensure worker is initialized
+      // Ensure worker is initialized with transport selection
       const workerUrl = document.querySelector('meta[name="signal-worker-url"]')?.content
       const cryptoWorkerUrl = document.querySelector('meta[name="signal-crypto-worker-url"]')?.content
       const wasmJsUrl = document.querySelector('meta[name="signal-wasm-js-url"]')?.content
       const wasmBinaryUrl = document.querySelector('meta[name="signal-wasm-binary-url"]')?.content
-      await ensureSignalReady(workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl)
+      const webrtcWorkerUrl = document.querySelector('meta[name="webrtc-worker-url"]')?.content
+      const transport = document.querySelector('meta[name="transport"]')?.content || "actioncable"
+
+      await ensureSignalReady(workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl, webrtcWorkerUrl, transport)
 
       // Connect to hub
       await this.#connectHub()
@@ -160,19 +163,32 @@ export class Connection {
     const keyResult = await bridge.getIdentityKey(hubId)
     this.identityKey = keyResult.identityKey
 
-    // 2. Connect transport (ActionCable) via transport worker
-    const cableUrl = document.querySelector('meta[name="action-cable-url"]')?.content || "/cable"
-    const actionCableModuleUrl = document.querySelector('meta[name="actioncable-module-url"]')?.content
+    // 2. Connect transport via transport worker
+    const transport = bridge.transport
 
-    await bridge.send("connect", {
-      hubId,
-      cableUrl,
-      actionCableModuleUrl
-    })
+    if (transport === "webrtc") {
+      // WebRTC: pass signaling URL and browser identity
+      const signalingUrl = window.location.origin
+      await bridge.send("connect", {
+        hubId,
+        signalingUrl,
+        browserIdentity: this.identityKey
+      })
+    } else {
+      // ActionCable: pass cable URL and module URL
+      const cableUrl = document.querySelector('meta[name="action-cable-url"]')?.content || "/cable"
+      const actionCableModuleUrl = document.querySelector('meta[name="actioncable-module-url"]')?.content
+
+      await bridge.send("connect", {
+        hubId,
+        cableUrl,
+        actionCableModuleUrl
+      })
+    }
 
     this.#hubConnected = true
 
-    // Set up hub-level event listeners (connection state, session invalid)
+    // Set up hub-level event listeners (connection state, session invalid, WebRTC signaling)
     this.#setupHubEventListeners()
   }
 
