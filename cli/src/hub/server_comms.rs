@@ -585,7 +585,7 @@ impl Hub {
 
                 match msg {
                     Some(m) => {
-                        log::info!(
+                        log::trace!(
                             "[WebRTC] Received message from {} ({} bytes)",
                             &browser_identity[..browser_identity.len().min(8)],
                             m.payload.len()
@@ -612,7 +612,7 @@ impl Hub {
         loop {
             match rx.try_recv() {
                 Ok(event) => {
-                    log::debug!("[WebRTC] Hub event received: {:?}", event);
+                    log::trace!("[WebRTC] Hub event received: {:?}", event);
                     self.broadcast_hub_event_to_webrtc(&event);
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
@@ -761,7 +761,7 @@ impl Hub {
         if let Some(subscription_id) = msg.get("subscriptionId").and_then(|s| s.as_str()) {
             self.handle_webrtc_data(subscription_id, &msg);
         } else {
-            log::debug!("[WebRTC] Message without subscriptionId: {:?}", msg);
+            log::trace!("[WebRTC] Message without subscriptionId: {:?}", msg);
         }
     }
 
@@ -900,7 +900,7 @@ impl Hub {
                     let forwarder_key = format!("{}:{}:{}", sub.browser_identity, ai, pi);
                     if let Some(task) = self.webrtc_pty_forwarders.remove(&forwarder_key) {
                         task.abort();
-                        log::debug!("[WebRTC] Aborted PTY forwarder for {}", forwarder_key);
+                        log::trace!("[WebRTC] Aborted PTY forwarder for {}", forwarder_key);
                     }
                 }
             }
@@ -933,7 +933,7 @@ impl Hub {
             // Nested under "data" (plaintext flow)
             data.clone()
         } else {
-            log::debug!("[WebRTC] Data message has no command: {:?}", msg);
+            log::trace!("[WebRTC] Data message has no command: {:?}", msg);
             return;
         };
 
@@ -948,7 +948,7 @@ impl Hub {
             }
             "PreviewChannel" => {
                 // Preview data handled separately via HTTP proxying
-                log::debug!("[WebRTC] Preview data received (handled via HTTP proxy)");
+                log::trace!("[WebRTC] Preview data received (handled via HTTP proxy)");
             }
             _ => {
                 log::debug!("[WebRTC] Data for unknown channel: {}", sub.channel_name);
@@ -1008,7 +1008,7 @@ impl Hub {
                 }
             }
             crate::relay::BrowserCommand::Handshake { .. } => {
-                log::debug!(
+                log::trace!(
                     "[WebRTC] Handshake from browser {} for agent {} pty {}",
                     &browser_identity[..browser_identity.len().min(8)],
                     agent_index,
@@ -1077,7 +1077,7 @@ impl Hub {
             }
         };
 
-        log::debug!(
+        log::trace!(
             "[WebRTC] Hub command from {}: {:?}",
             &browser_identity[..browser_identity.len().min(8)],
             command
@@ -1189,12 +1189,12 @@ impl Hub {
                     };
                     let data = serde_json::to_value(&ack).unwrap_or_default();
                     self.send_webrtc_message(sub_id, browser_identity, data);
-                    log::debug!("[WebRTC] Sent Ack to {}", &browser_identity[..browser_identity.len().min(8)]);
+                    log::trace!("[WebRTC] Sent Ack to {}", &browser_identity[..browser_identity.len().min(8)]);
                 }
             }
             crate::relay::BrowserCommand::Ack { .. } => {
                 // Browser acknowledged our message - nothing to do
-                log::debug!("[WebRTC] Received Ack from {}", &browser_identity[..browser_identity.len().min(8)]);
+                log::trace!("[WebRTC] Received Ack from {}", &browser_identity[..browser_identity.len().min(8)]);
             }
             _ => {
                 log::debug!("[WebRTC] Unhandled hub command: {:?}", command);
@@ -1271,7 +1271,7 @@ impl Hub {
             }
         };
 
-        log::debug!(
+        log::trace!(
             "[WebRTC] Sending subscription confirmation for {} to {}",
             &subscription_id[..subscription_id.len().min(16)],
             &browser_identity[..browser_identity.len().min(8)]
@@ -1589,7 +1589,7 @@ impl Hub {
                             .and_then(|i| i.as_u64())
                             .map(|i| i as u16);
 
-                        log::debug!("[WebRTC] Received ICE candidate from browser (poll {})", i);
+                        log::trace!("[WebRTC] Received ICE candidate from browser (poll {})", i);
 
                         // Add candidate to peer connection
                         let _guard = self.tokio_runtime.enter();
@@ -1604,7 +1604,7 @@ impl Hub {
 
             // If no signals for a while, stop polling
             if signals.signals.is_empty() && i > 3 {
-                log::debug!("[WebRTC] No more ICE candidates, stopping poll");
+                log::trace!("[WebRTC] No more ICE candidates, stopping poll");
                 break;
             }
         }
@@ -1710,7 +1710,7 @@ async fn spawn_webrtc_pty_forwarder(
                     })
                     .is_err()
                 {
-                    log::debug!("[WebRTC] PTY output queue closed, stopping forwarder");
+                    log::trace!("[WebRTC] PTY output queue closed, stopping forwarder");
                     break;
                 }
             }

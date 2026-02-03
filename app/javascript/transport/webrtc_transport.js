@@ -485,23 +485,18 @@ class WebRTCTransport {
 
   async #handleDataChannelMessage(hubId, data) {
     try {
-      console.log("[WebRTCTransport] Received raw data:", typeof data, data instanceof ArrayBuffer ? `ArrayBuffer(${data.byteLength})` : (typeof data === "string" ? data.substring(0, 100) : data))
-
       // Handle binary data (ArrayBuffer)
       let textData = data
       if (data instanceof ArrayBuffer) {
         textData = new TextDecoder().decode(data)
-        console.log("[WebRTCTransport] Decoded ArrayBuffer to text:", textData.substring(0, 100))
       }
 
       const parsed = typeof textData === "string" ? JSON.parse(textData) : textData
-      console.log("[WebRTCTransport] Parsed message keys:", Object.keys(parsed))
 
       // Check if this is a Signal envelope (encrypted message from CLI)
       // Signal envelopes have short keys: t (type), c (ciphertext), s (sender), d (device)
       let msg = parsed
       if (parsed.t !== undefined && parsed.c && parsed.s) {
-        console.log("[WebRTCTransport] Detected Signal envelope, decrypting for hub:", hubId, typeof hubId)
         // Decrypt using bridge
         try {
           // Ensure hubId is a string
@@ -547,7 +542,6 @@ class WebRTCTransport {
           }
 
           msg = JSON.parse(jsonStr)
-          console.log("[WebRTCTransport] Decrypted message:", msg.subscriptionId, msg.raw ? `(raw ${msg.raw.length} chars)` : Object.keys(msg.data || {}))
         } catch (decryptErr) {
           console.error("[WebRTCTransport] Decryption failed:", decryptErr.message || decryptErr)
           // Log envelope details for debugging
