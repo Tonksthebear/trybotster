@@ -180,6 +180,13 @@ pub struct Hub {
     /// WebSocket command channel for real-time message delivery from Rails.
     pub command_channel: Option<command_channel::CommandChannelHandle>,
 
+    // === WebRTC Channels ===
+    /// WebRTC peer connections indexed by browser identity.
+    ///
+    /// Each browser that connects via WebRTC gets its own peer connection.
+    /// The connection persists to keep the DataChannel alive.
+    pub webrtc_channels: std::collections::HashMap<String, crate::channel::WebRtcChannel>,
+
     // === Command Channel (Actor Pattern) ===
     /// Sender for Hub commands (cloned for each client).
     command_tx: tokio::sync::mpsc::Sender<HubCommand>,
@@ -295,6 +302,7 @@ impl Hub {
             command_rx,
             event_tx,
             handle_cache,
+            webrtc_channels: std::collections::HashMap::new(),
         })
     }
 

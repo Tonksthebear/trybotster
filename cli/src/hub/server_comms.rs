@@ -18,6 +18,7 @@
 use std::time::{Duration, Instant};
 
 use crate::agent::AgentNotification;
+use crate::channel::Channel;
 use crate::client::ClientId;
 use crate::hub::actions::{self, HubAction};
 use crate::hub::events::HubEvent;
@@ -222,6 +223,10 @@ impl Hub {
                             msg.payload
                         );
                     }
+                }
+                "webrtc_offer" => {
+                    // Browser sent WebRTC SDP offer - create answer and send back
+                    self.handle_webrtc_offer(&msg.payload);
                 }
                 _ => {
                     self.process_command_channel_message(msg);
@@ -548,6 +553,211 @@ impl Hub {
         }
 
         true
+    }
+
+    // === WebRTC Signaling ===
+
+    /// Handle incoming WebRTC offer from browser.
+    ///
+    /// Creates or reuses a WebRTC peer connection for the browser, processes
+    /// the SDP offer, and sends the answer back via the signaling endpoint.
+    fn handle_webrtc_offer(&mut self, payload: &serde_json::Value) {
+        use crate::channel::{ChannelConfig, WebRtcChannel};
+
+        let sdp = match payload.get("sdp").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                log::warn!("[WebRTC] Offer missing SDP");
+                return;
+            }
+        };
+
+        let browser_identity = match payload.get("browser_identity").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                log::warn!("[WebRTC] Offer missing browser_identity");
+                return;
+            }
+        };
+
+        let hub_id = self.server_hub_id().to_string();
+        let server_url = self.config.server_url.clone();
+        let api_key = self.config.get_api_key().to_string();
+
+        log::info!(
+            "[WebRTC] Received offer from browser {}",
+            &browser_identity[..browser_identity.len().min(8)]
+        );
+
+        // Get or create WebRTC channel for this browser
+        if !self.webrtc_channels.contains_key(&browser_identity) {
+            let mut channel = WebRtcChannel::builder()
+                .server_url(&server_url)
+                .api_key(&api_key)
+                .crypto_service(self.browser.crypto_service.clone().expect("crypto service required"))
+                .build();
+
+            // Configure the channel with hub_id
+            let config = ChannelConfig {
+                channel_name: "WebRtcChannel".to_string(),
+                hub_id: hub_id.clone(),
+                agent_index: None,
+                pty_index: None,
+                browser_identity: Some(browser_identity.clone()),
+                encrypt: true,
+                compression_threshold: Some(4096),
+                cli_subscription: false,
+            };
+
+            // Connect the channel (sets up config, this is sync-safe)
+            let _guard = self.tokio_runtime.enter();
+            if let Err(e) = self.tokio_runtime.block_on(channel.connect(config)) {
+                log::error!("[WebRTC] Failed to configure channel: {e}");
+                return;
+            }
+
+            self.webrtc_channels.insert(browser_identity.clone(), channel);
+        }
+
+        // Handle the offer and get the answer
+        let channel = self.webrtc_channels.get(&browser_identity).unwrap();
+        let _guard = self.tokio_runtime.enter();
+
+        match self.tokio_runtime.block_on(channel.handle_sdp_offer(&sdp, &browser_identity)) {
+            Ok(answer_sdp) => {
+                log::info!(
+                    "[WebRTC] Created answer for browser {}",
+                    &browser_identity[..browser_identity.len().min(8)]
+                );
+
+                // Send answer back via signaling endpoint
+                let url = format!("{}/hubs/{}/webrtc_signals", server_url, hub_id);
+                let client = reqwest::blocking::Client::new();
+
+                let body = serde_json::json!({
+                    "signal_type": "answer",
+                    "browser_identity": browser_identity,
+                    "sdp": answer_sdp,
+                });
+
+                match client.post(&url).bearer_auth(&api_key).json(&body).send() {
+                    Ok(resp) if resp.status().is_success() => {
+                        log::info!("[WebRTC] Answer sent successfully");
+                        // Spawn background task to poll for browser's ICE candidates
+                        self.spawn_ice_candidate_poller(
+                            browser_identity.clone(),
+                            hub_id.clone(),
+                            server_url.clone(),
+                            api_key.clone(),
+                        );
+                    }
+                    Ok(resp) => {
+                        log::error!("[WebRTC] Failed to send answer: {}", resp.status());
+                    }
+                    Err(e) => {
+                        log::error!("[WebRTC] Failed to send answer: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("[WebRTC] Failed to handle offer: {e}");
+            }
+        }
+    }
+
+    /// Spawn a background task to poll for ICE candidates from the browser.
+    ///
+    /// Polls the signaling endpoint periodically to collect trickle ICE candidates.
+    /// The task runs for a limited time (enough for typical ICE gathering).
+    fn spawn_ice_candidate_poller(
+        &self,
+        browser_identity: String,
+        hub_id: String,
+        server_url: String,
+        api_key: String,
+    ) {
+        // Get reference to the WebRTC channel
+        let Some(channel) = self.webrtc_channels.get(&browser_identity) else {
+            log::warn!("[WebRTC] No channel for browser {} during ICE polling", &browser_identity[..8]);
+            return;
+        };
+
+        // Clone necessary references for the async task
+        // We need to be careful here - WebRtcChannel has async methods
+        // For now, we'll use a separate HTTP client and call handle_ice_candidate
+
+        // Since WebRtcChannel is not Clone, we spawn a task that:
+        // 1. Polls for ICE candidates via HTTP
+        // 2. The candidates will be applied when we call handle_ice_candidate
+        // For this initial implementation, we'll do synchronous polling
+
+        log::info!("[WebRTC] Starting ICE candidate polling for browser {}", &browser_identity[..8]);
+
+        let url = format!(
+            "{}/hubs/{}/webrtc_signals?browser_identity={}",
+            server_url, hub_id, browser_identity
+        );
+
+        // Poll a few times with delays (blocking, but quick)
+        let client = reqwest::blocking::Client::new();
+        for i in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+
+            let response = match client.get(&url).bearer_auth(&api_key).send() {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("[WebRTC] ICE poll request failed: {e}");
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                continue;
+            }
+
+            #[derive(serde::Deserialize)]
+            struct SignalResponse {
+                signals: Vec<serde_json::Value>,
+            }
+
+            let signals: SignalResponse = match response.json() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            for signal in &signals.signals {
+                if signal.get("type").and_then(|t| t.as_str()) == Some("ice") {
+                    if let Some(candidate_obj) = signal.get("candidate") {
+                        let candidate = candidate_obj.get("candidate")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+                        let sdp_mid = candidate_obj.get("sdpMid")
+                            .and_then(|m| m.as_str());
+                        let sdp_mline_index = candidate_obj.get("sdpMLineIndex")
+                            .and_then(|i| i.as_u64())
+                            .map(|i| i as u16);
+
+                        log::debug!("[WebRTC] Received ICE candidate from browser (poll {})", i);
+
+                        // Add candidate to peer connection
+                        let _guard = self.tokio_runtime.enter();
+                        if let Err(e) = self.tokio_runtime.block_on(
+                            channel.handle_ice_candidate(candidate, sdp_mid, sdp_mline_index)
+                        ) {
+                            log::warn!("[WebRTC] Failed to add ICE candidate: {e}");
+                        }
+                    }
+                }
+            }
+
+            // If no signals for a while, stop polling
+            if signals.signals.is_empty() && i > 3 {
+                log::debug!("[WebRTC] No more ICE candidates, stopping poll");
+                break;
+            }
+        }
+
+        log::info!("[WebRTC] ICE candidate polling complete for browser {}", &browser_identity[..8]);
     }
 
     // === Connection Setup ===
