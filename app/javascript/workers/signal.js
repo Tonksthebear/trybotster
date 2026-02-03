@@ -1,18 +1,15 @@
 /**
- * Signal Protocol SharedWorker
+ * Signal Transport Worker
  *
- * SharedWorker ensures all tabs share a single Signal session state.
- * This prevents ratchet desync when multiple tabs encrypt/decrypt.
+ * Regular Worker that handles ActionCable connections and message routing.
+ * NO cryptographic operations - all crypto is handled by the main thread via
+ * the crypto SharedWorker.
  *
- * Isolates all sensitive cryptographic operations:
- * - Non-extractable AES-GCM wrapping key (cannot be exported, even by XSS)
- * - Signal session state (decrypted pickles never leave this worker)
- * - WASM module instance
- *
- * Security model:
- * - XSS in main thread can send encrypt/decrypt requests
- * - XSS CANNOT steal session state for use elsewhere
- * - Main thread only ever sees encrypted envelopes and decrypted messages
+ * This worker handles:
+ * - ActionCable connections and subscriptions
+ * - Reliable delivery (retransmits, ordering, acks)
+ * - Sending raw messages (no encryption)
+ * - Receiving raw messages and forwarding to main thread (no decryption)
  */
 
 // =============================================================================
@@ -21,7 +18,7 @@
 // 1. document.visibilityState - for connection monitoring
 // 2. document.createElement("a") - for URL parsing
 // 3. document.head.querySelector() - for reading meta tags
-// In a SharedWorker, we stub these to avoid ReferenceErrors.
+// In a Worker, we stub these to avoid ReferenceErrors.
 // =============================================================================
 
 if (typeof document === "undefined") {
@@ -87,26 +84,15 @@ async function getCreateConsumer(actionCableUrl) {
   return actionCableModule.createConsumer
 }
 
-// WASM module (loaded on init)
-let wasmModule = null;
+// =============================================================================
+// Connection Pool
+// =============================================================================
 
-// In-memory session cache (hubId -> wasmSession)
-const sessions = new Map();
-
-// Port registry: portId -> { port, lastPong, hubRefs, subscriptions }
-const ports = new Map();
-
-// Connection pool: hubId -> { cable, state, refCount, portRefs, subscriptions, closeTimer }
+// Connection pool: hubId -> { cable, state, refCount, subscriptions, closeTimer }
 const connections = new Map();
 
 // Grace period before closing idle connections (handles Turbo navigation)
 const CONNECTION_CLOSE_DELAY_MS = 2000;
-
-// Port ID counter
-let portIdCounter = 0;
-function generatePortId() {
-  return `port_${++portIdCounter}_${Date.now()}`;
-}
 
 // Subscription ID counter
 let subscriptionIdCounter = 0;
@@ -114,65 +100,9 @@ function generateSubscriptionId() {
   return `sub_${++subscriptionIdCounter}_${Date.now()}`;
 }
 
-// Mutex to serialize encrypt/decrypt operations per hub
-// This prevents race conditions where multiple operations interleave
-const operationQueues = new Map(); // hubId -> Promise chain
-
-async function withMutex(hubId, operation) {
-  const queue = operationQueues.get(hubId) || Promise.resolve();
-
-  // Create a deferred promise for this operation's result
-  let resolve, reject;
-  const resultPromise = new Promise((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-
-  // Chain onto the queue - always wait for previous to complete before starting ours
-  const newQueue = queue.then(async () => {
-    try {
-      const result = await operation();
-      resolve(result);
-    } catch (error) {
-      reject(error);
-    }
-  });
-
-  // Update the queue (swallow errors so chain continues)
-  operationQueues.set(
-    hubId,
-    newQueue.catch(() => {}),
-  );
-
-  return resultPromise;
-}
-
-// IndexedDB config
-// Note: Keys stored as JWK (not CryptoKey) for Safari SharedWorker compatibility (WebKit #177350)
-const DB_NAME = "botster";
-const DB_VERSION = 1;
-const STORE_NAME = "sessions";
-const KEY_STORE_NAME = "encryption_keys";
-const WRAPPING_KEY_ID = "session_wrapping_key";
-
-// Cached wrapping key (non-extractable CryptoKey)
-let wrappingKeyCache = null;
-
 // =============================================================================
 // Helper Functions
 // =============================================================================
-
-function emitToHubPorts(hubId, event) {
-  for (const [portId, portState] of ports) {
-    if (portState.hubRefs.has(hubId)) {
-      try {
-        portState.port.postMessage(event);
-      } catch (e) {
-        // Port closed, will be cleaned up by heartbeat
-      }
-    }
-  }
-}
 
 function getConnection(hubId) {
   return connections.get(hubId);
@@ -363,6 +293,7 @@ const DUPLICATE_WINDOW = 1000
 /**
  * Reliable sender state.
  * Tracks pending (unacked) messages and handles retransmission.
+ * Caches raw messages (no encryption knowledge).
  */
 class ReliableSender {
   constructor(options = {}) {
@@ -412,11 +343,12 @@ class ReliableSender {
     // Encode as binary: [0x01][seq 8B LE][payload bytes]
     const binaryMessage = encodeReliableMessage("data", { seq, payload: payloadBytes })
 
-    const encryptedEnvelope = await this.onSend(binaryMessage)
+    // Send raw message (no encryption - main thread handles that)
+    const cachedMsg = await this.onSend(binaryMessage)
 
     this.pending.set(seq, {
       payloadBytes,
-      encryptedEnvelope,
+      cachedMsg,  // Cache the raw message for retransmits
       firstSentAt: now,
       lastSentAt: now,
       attempts: 1,
@@ -451,7 +383,7 @@ class ReliableSender {
       if (seq < maxAcked) {
         entry.lastSentAt = now
         entry.attempts++
-        immediateRetransmits.push({ seq, encryptedEnvelope: entry.encryptedEnvelope })
+        immediateRetransmits.push({ seq, cachedMsg: entry.cachedMsg })
         console.log(`[Reliable] Immediate retransmit seq=${seq} (gap detected)`)
       }
     }
@@ -477,7 +409,7 @@ class ReliableSender {
       if (now - entry.lastSentAt >= timeout) {
         entry.lastSentAt = now
         entry.attempts++
-        retransmits.push({ seq, encryptedEnvelope: entry.encryptedEnvelope })
+        retransmits.push({ seq, cachedMsg: entry.cachedMsg })
       }
     }
 
@@ -495,8 +427,8 @@ class ReliableSender {
       if (this.paused) return
 
       const retransmits = this.getRetransmits()
-      for (const { encryptedEnvelope } of retransmits) {
-        this.onRetransmit(encryptedEnvelope)
+      for (const { cachedMsg } of retransmits) {
+        this.onRetransmit(cachedMsg)
       }
 
       if (this.pending.size > 0) {
@@ -660,63 +592,14 @@ class ReliableReceiver {
 }
 
 // =============================================================================
-// Port Cleanup
+// Message Handler
 // =============================================================================
 
-function cleanupPort(portId) {
-  const state = ports.get(portId);
-  if (!state) return;
-
-  // Clean up subscriptions owned by this port
-  for (const subscriptionId of state.subscriptions) {
-    const subInfo = findSubscriptionById(subscriptionId);
-    if (subInfo) {
-      const { subscription, sender, receiver, conn } = subInfo;
-      if (sender) sender.destroy();
-      if (receiver) receiver.destroy();
-      subscription.unsubscribe();
-      conn.subscriptions.delete(subscriptionId);
-    }
-  }
-
-  // Release all hub connection refs for this port
-  for (const hubId of state.hubRefs) {
-    const conn = connections.get(hubId);
-    if (conn) {
-      const portRefs = conn.portRefs.get(portId) || 0;
-      conn.refCount -= portRefs;
-      conn.portRefs.delete(portId);
-
-      // Close connection if no refs remain (no grace period needed - port is dead)
-      if (conn.refCount <= 0) {
-        if (conn.closeTimer) {
-          clearTimeout(conn.closeTimer);
-          conn.closeTimer = null;
-        }
-        conn.cable.disconnect();
-        connections.delete(hubId);
-        console.log(`[SignalWorker] Closed connection to hub ${hubId}`);
-      }
-    }
-  }
-
-  ports.delete(portId);
-  console.log(`[SignalWorker] Cleaned up port ${portId}, ${ports.size} ports remaining`);
-}
-
-// =============================================================================
-// Message Handler (shared between SharedWorker and regular Worker)
-// =============================================================================
-
-async function handleMessage(event, portId, replyFn) {
+async function handleMessage(event) {
   const { id, action, ...params } = event.data;
 
-  // Handle pong (heartbeat response)
+  // Handle pong (heartbeat response from main thread)
   if (action === "pong") {
-    const portState = ports.get(portId);
-    if (portState) {
-      portState.lastPong = Date.now();
-    }
     return; // No reply needed for pong
   }
 
@@ -725,56 +608,23 @@ async function handleMessage(event, portId, replyFn) {
 
     switch (action) {
       case "init":
-        result = await handleInit(params.wasmJsUrl, params.wasmBinaryUrl);
-        break;
-      case "createSession":
-        result = await handleCreateSession(params.bundleJson, params.hubId);
-        break;
-      case "loadSession":
-        // Use the proper handleLoadSession now that getOrCreateWrappingKey is fixed
-        result = await handleLoadSession(params.hubId);
-        break;
-      case "hasSession":
-        result = await handleHasSession(params.hubId);
-        break;
-      case "encrypt":
-        // Serialize encrypt operations to prevent counter race conditions
-        result = await withMutex(params.hubId, () =>
-          handleEncrypt(params.hubId, params.message),
-        );
-        break;
-      case "decrypt":
-        // Serialize decrypt operations to prevent session state races
-        result = await withMutex(params.hubId, () =>
-          handleDecrypt(params.hubId, params.envelope),
-        );
-        break;
-      case "getIdentityKey":
-        result = await handleGetIdentityKey(params.hubId);
-        break;
-      case "clearSession":
-        result = await handleClearSession(params.hubId);
-        break;
-      case "processSenderKeyDistribution":
-        result = await handleProcessSenderKeyDistribution(
-          params.hubId,
-          params.distributionB64,
-        );
+        // Just initialize (ActionCable is loaded on demand during connect)
+        result = { initialized: true };
         break;
       case "connect":
-        result = await handleConnect(portId, params.hubId, params.cableUrl, params.actionCableModuleUrl, params.sessionBundle);
+        result = await handleConnect(params.hubId, params.cableUrl, params.actionCableModuleUrl);
         break;
       case "disconnect":
-        result = await handleDisconnect(portId, params.hubId);
+        result = await handleDisconnect(params.hubId);
         break;
       case "subscribe":
-        result = await handleSubscribe(portId, params.hubId, params.channel, params.params, params.reliable);
+        result = await handleSubscribe(params.hubId, params.channel, params.params, params.reliable);
         break;
       case "unsubscribe":
-        result = await handleUnsubscribe(portId, params.subscriptionId);
+        result = await handleUnsubscribe(params.subscriptionId);
         break;
-      case "send":
-        result = await handleSend(params.subscriptionId, params.message);
+      case "sendRaw":
+        result = await handleSendRaw(params.subscriptionId, params.message);
         break;
       case "perform":
         result = await handlePerform(params.subscriptionId, params.actionName, params.data);
@@ -786,214 +636,24 @@ async function handleMessage(event, portId, replyFn) {
         throw new Error(`Unknown action: ${action}`);
     }
 
-    replyFn({ id, success: true, result });
+    self.postMessage({ id, success: true, result });
   } catch (error) {
-    console.error("[SignalWorker] Error:", action, error);
-    replyFn({ id, success: false, error: error.message });
+    console.error("[TransportWorker] Error:", action, error);
+    self.postMessage({ id, success: false, error: error.message });
   }
 }
 
 // =============================================================================
-// SharedWorker Connection Handler
+// Worker Entry Point
 // =============================================================================
 
-self.onconnect = (event) => {
-  const port = event.ports[0];
-  const portId = generatePortId();
-
-  ports.set(portId, {
-    port,
-    lastPong: Date.now(),
-    hubRefs: new Set(), // Will track which hubs this port has connected to
-    subscriptions: new Set(), // Will track subscription IDs owned by this port
-  });
-
-  port.onmessage = (msgEvent) => {
-    handleMessage(msgEvent, portId, (msg) => port.postMessage(msg));
-  };
-
-  port.onmessageerror = () => {
-    cleanupPort(portId);
-  };
-
-  port.start();
-};
-
-// =============================================================================
-// Heartbeat: ping all ports every 5 seconds, cleanup dead ones after 21 seconds
-// =============================================================================
-
-const HEARTBEAT_INTERVAL = 5000;
-const PORT_TTL = 21000;
-
-setInterval(() => {
-  const now = Date.now();
-
-  for (const [portId, state] of ports) {
-    // Check for dead ports
-    if (now - state.lastPong > PORT_TTL) {
-      console.log(`[SignalWorker] Port ${portId} timed out, cleaning up`);
-      cleanupPort(portId);
-      continue;
-    }
-
-    // Send ping
-    try {
-      state.port.postMessage({ event: "ping" });
-    } catch (e) {
-      // Port likely closed, clean up
-      console.log(`[SignalWorker] Port ${portId} unreachable, cleaning up`);
-      cleanupPort(portId);
-    }
-  }
-}, HEARTBEAT_INTERVAL);
-
-// =============================================================================
-// Regular Worker Fallback (for browsers without SharedWorker support)
-// =============================================================================
-
-self.onmessage = (event) => {
-  handleMessage(event, null, (msg) => self.postMessage(msg));
-};
+self.onmessage = handleMessage;
 
 // =============================================================================
 // Action Handlers
 // =============================================================================
 
-async function handleInit(wasmJsUrl, wasmBinaryUrl) {
-  if (wasmModule) {
-    return { alreadyInitialized: true };
-  }
-
-  const module = await import(wasmJsUrl);
-  await module.default({ module_or_path: wasmBinaryUrl });
-  wasmModule = module;
-
-  return { initialized: true };
-}
-
-async function handleCreateSession(bundleJson, hubId) {
-  if (!wasmModule) throw new Error("WASM not initialized");
-
-  // Clear any existing session
-  await deleteSessionFromStorage(hubId);
-  sessions.delete(hubId);
-
-  // Create new WASM session
-  const bundleStr =
-    typeof bundleJson === "string" ? bundleJson : JSON.stringify(bundleJson);
-  const wasmSession = await new wasmModule.SignalSession(bundleStr);
-
-  // Store in memory
-  sessions.set(hubId, wasmSession);
-
-  // Persist encrypted
-  await persistSession(hubId, wasmSession);
-
-  // Return identity key for the main thread
-  const identityKey = await wasmSession.get_identity_key();
-  return { created: true, identityKey };
-}
-
-async function handleLoadSession(hubId) {
-  // Check memory cache first
-  if (sessions.has(hubId)) {
-    return { loaded: true, fromCache: true };
-  }
-
-  // Try loading from IndexedDB
-  let pickled;
-  try {
-    pickled = await loadSessionFromStorage(hubId);
-  } catch (idbError) {
-    return { loaded: false, error: idbError.message };
-  }
-
-  if (!pickled) {
-    return { loaded: false };
-  }
-
-  if (!wasmModule) {
-    throw new Error("WASM not initialized");
-  }
-
-  try {
-    const wasmSession = wasmModule.SignalSession.from_pickle(pickled);
-    sessions.set(hubId, wasmSession);
-    return { loaded: true, fromCache: false };
-  } catch (error) {
-    await deleteSessionFromStorage(hubId);
-    return { loaded: false, error: error.message };
-  }
-}
-
-async function handleHasSession(hubId) {
-  if (sessions.has(hubId)) {
-    return { hasSession: true };
-  }
-
-  const pickled = await loadSessionFromStorage(hubId);
-  return { hasSession: !!pickled };
-}
-
-async function handleEncrypt(hubId, message) {
-  const session = sessions.get(hubId);
-  if (!session) throw new Error(`No session for hub ${hubId}`);
-
-  const messageStr =
-    typeof message === "string" ? message : JSON.stringify(message);
-
-  const envelope = await session.encrypt(messageStr);
-
-  // Persist after encryption (Double Ratchet state changed)
-  await persistSession(hubId, session);
-
-  return { envelope };
-}
-
-async function handleDecrypt(hubId, envelope) {
-  const session = sessions.get(hubId);
-  if (!session) throw new Error(`No session for hub ${hubId}`);
-
-  const envelopeStr =
-    typeof envelope === "string" ? envelope : JSON.stringify(envelope);
-  const plaintext = await session.decrypt(envelopeStr);
-
-  // Persist after decryption (Double Ratchet state changed)
-  await persistSession(hubId, session);
-
-  // Try to parse as JSON
-  try {
-    return { plaintext: JSON.parse(plaintext) };
-  } catch {
-    return { plaintext };
-  }
-}
-
-async function handleGetIdentityKey(hubId) {
-  const session = sessions.get(hubId);
-  if (!session) throw new Error(`No session for hub ${hubId}`);
-
-  const identityKey = await session.get_identity_key();
-  return { identityKey };
-}
-
-async function handleClearSession(hubId) {
-  sessions.delete(hubId);
-  await deleteSessionFromStorage(hubId);
-  return { cleared: true };
-}
-
-async function handleProcessSenderKeyDistribution(hubId, distributionB64) {
-  const session = sessions.get(hubId);
-  if (!session) throw new Error(`No session for hub ${hubId}`);
-
-  await session.process_sender_key_distribution(distributionB64);
-  await persistSession(hubId, session);
-  return { processed: true };
-}
-
-async function handleConnect(portId, hubId, cableUrl, actionCableModuleUrl, sessionBundle) {
+async function handleConnect(hubId, cableUrl, actionCableModuleUrl) {
   // Get or create connection
   let conn = connections.get(hubId);
 
@@ -1002,34 +662,14 @@ async function handleConnect(portId, hubId, cableUrl, actionCableModuleUrl, sess
     if (conn.closeTimer) {
       clearTimeout(conn.closeTimer);
       conn.closeTimer = null;
-      console.log(`[SignalWorker] Cancelled pending close for hub ${hubId} (reconnected)`);
+      console.log(`[TransportWorker] Cancelled pending close for hub ${hubId} (reconnected)`);
     }
 
-    // Increment ref count for this port
-    const portRefs = conn.portRefs.get(portId) || 0;
-    conn.portRefs.set(portId, portRefs + 1);
+    // Increment ref count
     conn.refCount++;
-
-    // Track hub ref on port
-    const portState = ports.get(portId);
-    if (portState) {
-      portState.hubRefs.add(hubId);
-    }
-
-    // Handle session: create from bundle or load from storage
-    if (sessionBundle) {
-      const hasSession = sessions.has(hubId) || (await loadSessionFromStorage(hubId));
-      if (!hasSession) {
-        await handleCreateSession(sessionBundle, hubId);
-      }
-    } else if (!sessions.has(hubId)) {
-      // Try to load existing session from IndexedDB
-      await handleLoadSession(hubId);
-    }
 
     return {
       state: conn.state,
-      sessionExists: sessions.has(hubId),
       refCount: conn.refCount
     };
   }
@@ -1042,16 +682,9 @@ async function handleConnect(portId, hubId, cableUrl, actionCableModuleUrl, sess
     cable,
     state: "connecting",
     refCount: 1,
-    portRefs: new Map([[portId, 1]]),
     subscriptions: new Map()
   };
   connections.set(hubId, conn);
-
-  // Track hub ref on port
-  const portState = ports.get(portId);
-  if (portState) {
-    portState.hubRefs.add(hubId);
-  }
 
   // Set up connection state monitoring
   // ActionCable connection object exposes these callbacks
@@ -1061,7 +694,7 @@ async function handleConnect(portId, hubId, cableUrl, actionCableModuleUrl, sess
   cable.connection.events.open = () => {
     if (originalOpen) originalOpen();
     conn.state = "connected";
-    emitToHubPorts(hubId, {
+    self.postMessage({
       event: "connection:state",
       hubId,
       state: "connected"
@@ -1071,7 +704,7 @@ async function handleConnect(portId, hubId, cableUrl, actionCableModuleUrl, sess
   cable.connection.events.close = (event) => {
     if (originalClose) originalClose(event);
     conn.state = "disconnected";
-    emitToHubPorts(hubId, {
+    self.postMessage({
       event: "connection:state",
       hubId,
       state: "disconnected",
@@ -1079,38 +712,16 @@ async function handleConnect(portId, hubId, cableUrl, actionCableModuleUrl, sess
     });
   };
 
-  // Handle session: create from bundle or load from storage
-  if (sessionBundle) {
-    await handleCreateSession(sessionBundle, hubId);
-  } else if (!sessions.has(hubId)) {
-    // Try to load existing session from IndexedDB
-    await handleLoadSession(hubId);
-  }
-
   return {
     state: conn.state,
-    sessionExists: sessions.has(hubId),
     refCount: conn.refCount
   };
 }
 
-async function handleDisconnect(portId, hubId) {
+async function handleDisconnect(hubId) {
   const conn = connections.get(hubId);
   if (!conn) {
     return { refCount: 0, closed: false };
-  }
-
-  // Decrement port's ref count
-  const portRefs = conn.portRefs.get(portId) || 0;
-  if (portRefs > 1) {
-    conn.portRefs.set(portId, portRefs - 1);
-  } else {
-    conn.portRefs.delete(portId);
-    // Remove hub from port's hubRefs
-    const portState = ports.get(portId);
-    if (portState) {
-      portState.hubRefs.delete(hubId);
-    }
   }
 
   conn.refCount--;
@@ -1127,7 +738,7 @@ async function handleDisconnect(portId, hubId) {
       // Re-check refCount - might have reconnected during grace period
       const currentConn = connections.get(hubId);
       if (currentConn && currentConn.refCount <= 0) {
-        console.log(`[SignalWorker] Closing idle connection to hub ${hubId}`);
+        console.log(`[TransportWorker] Closing idle connection to hub ${hubId}`);
         currentConn.cable.disconnect();
         connections.delete(hubId);
       }
@@ -1143,8 +754,8 @@ async function handleDisconnect(portId, hubId) {
 // Subscription Handlers
 // =============================================================================
 
-async function handleSubscribe(portId, hubId, channelName, channelParams, reliable = false) {
-  console.log(`[SignalWorker] handleSubscribe: hubId=${hubId}, channel=${channelName}, portId=${portId}`);
+async function handleSubscribe(hubId, channelName, channelParams, reliable = false) {
+  console.log(`[TransportWorker] handleSubscribe: hubId=${hubId}, channel=${channelName}`);
 
   const conn = connections.get(hubId);
   if (!conn) {
@@ -1152,8 +763,7 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
   }
 
   const subscriptionId = generateSubscriptionId();
-  console.log(`[SignalWorker] Creating subscription ${subscriptionId}`);
-  const portState = ports.get(portId);
+  console.log(`[TransportWorker] Creating subscription ${subscriptionId}`);
 
   // Create reliable sender/receiver if enabled (before subscription so they're ready)
   let sender = null;
@@ -1163,32 +773,32 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
     sender = new ReliableSender({
       retransmitTimeout: 3000,
       onSend: async (msg) => {
-        return await encryptAndSend(hubId, subEntry.subscription, msg);
+        // Send raw message (no encryption - main thread handles that)
+        return await sendRaw(subEntry.subscription, msg);
       },
-      onRetransmit: (envelope) => {
-        sendPreEncrypted(subEntry.subscription, envelope);
+      onRetransmit: (cachedMsg) => {
+        // Retransmit the cached raw message
+        sendRawDirect(subEntry.subscription, cachedMsg);
       }
     });
 
     receiver = new ReliableReceiver({
       onDeliver: (payload) => {
-        // Route decrypted, in-order message to owning port
-        console.log(`[SignalWorker] Delivering message type=${payload?.type}, size=${JSON.stringify(payload)?.length}`);
-        if (portState) {
-          try {
-            portState.port.postMessage({
-              event: "subscription:message",
-              subscriptionId,
-              message: payload
-            });
-          } catch (e) {
-            console.error(`[SignalWorker] Failed to post message:`, e);
-          }
+        // Route in-order message to main thread
+        console.log(`[TransportWorker] Delivering message type=${payload?.type}, size=${JSON.stringify(payload)?.length}`);
+        try {
+          self.postMessage({
+            event: "subscription:message",
+            subscriptionId,
+            message: payload
+          });
+        } catch (e) {
+          console.error(`[TransportWorker] Failed to post message:`, e);
         }
       },
       onAck: async (ack) => {
-        // Send ACK through encrypted channel
-        await encryptAndSend(hubId, subEntry.subscription, ack);
+        // Send ACK raw (no encryption)
+        await sendRaw(subEntry.subscription, ack);
       }
     });
   }
@@ -1196,20 +806,12 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
   // Pre-create the subscription entry so sender/receiver can reference it
   const subEntry = {
     subscription: null, // Will be set after create()
-    portId,
     hubId,
     reliable,
     sender,
-    receiver,
-    decryptionFailureCount: 0,
-    maxDecryptionFailures: 3
+    receiver
   };
   conn.subscriptions.set(subscriptionId, subEntry);
-
-  // Track subscription in port
-  if (portState) {
-    portState.subscriptions.add(subscriptionId);
-  }
 
   // Wait for server to confirm subscription before returning
   // This prevents the race condition where caller sends messages before subscription exists
@@ -1222,7 +824,6 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
       settled = true;
       // Clean up on timeout
       conn.subscriptions.delete(subscriptionId);
-      if (portState) portState.subscriptions.delete(subscriptionId);
       reject(new Error(`Subscription timeout for ${channelName}`));
     }, SUBSCRIBE_TIMEOUT);
 
@@ -1233,16 +834,14 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
           if (settled) return;
           settled = true;
           clearTimeout(timeout);
-          console.log(`[SignalWorker] Subscription ${subscriptionId} confirmed by server`);
-          // Emit subscription:confirmed to owning port
-          if (portState) {
-            try {
-              portState.port.postMessage({
-                event: "subscription:confirmed",
-                subscriptionId
-              });
-            } catch (e) {}
-          }
+          console.log(`[TransportWorker] Subscription ${subscriptionId} confirmed by server`);
+          // Emit subscription:confirmed to main thread
+          try {
+            self.postMessage({
+              event: "subscription:confirmed",
+              subscriptionId
+            });
+          } catch (e) {}
           resolve({ subscriptionId });
         },
 
@@ -1252,22 +851,19 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
           clearTimeout(timeout);
           // Clean up on rejection
           conn.subscriptions.delete(subscriptionId);
-          if (portState) portState.subscriptions.delete(subscriptionId);
-          // Emit subscription:rejected to owning port
-          if (portState) {
-            try {
-              portState.port.postMessage({
-                event: "subscription:rejected",
-                subscriptionId,
-                reason: "Subscription rejected by server"
-              });
-            } catch (e) {}
-          }
+          // Emit subscription:rejected to main thread
+          try {
+            self.postMessage({
+              event: "subscription:rejected",
+              subscriptionId,
+              reason: "Subscription rejected by server"
+            });
+          } catch (e) {}
           reject(new Error(`Subscription rejected for ${channelName}`));
         },
 
         received: async (data) => {
-          console.log(`[SignalWorker] Received message on ${subscriptionId}`, data?.type || data?.envelope ? "(encrypted)" : data);
+          console.log(`[TransportWorker] Received raw message on ${subscriptionId}`);
           await processIncomingMessage(subscriptionId, hubId, data);
         },
 
@@ -1286,12 +882,12 @@ async function handleSubscribe(portId, hubId, channelName, channelParams, reliab
   });
 }
 
-async function handleUnsubscribe(portId, subscriptionId) {
-  console.log(`[SignalWorker] handleUnsubscribe: subscriptionId=${subscriptionId}, portId=${portId}`);
+async function handleUnsubscribe(subscriptionId) {
+  console.log(`[TransportWorker] handleUnsubscribe: subscriptionId=${subscriptionId}`);
 
   const subInfo = findSubscriptionById(subscriptionId);
   if (!subInfo) {
-    console.log(`[SignalWorker] Subscription ${subscriptionId} not found`);
+    console.log(`[TransportWorker] Subscription ${subscriptionId} not found`);
     return { unsubscribed: false, reason: "Subscription not found" };
   }
 
@@ -1303,35 +899,29 @@ async function handleUnsubscribe(portId, subscriptionId) {
 
   // Unsubscribe from ActionCable
   subscription.unsubscribe();
-  console.log(`[SignalWorker] Unsubscribed ${subscriptionId} from ActionCable`);
+  console.log(`[TransportWorker] Unsubscribed ${subscriptionId} from ActionCable`);
 
   // Remove from connection
   conn.subscriptions.delete(subscriptionId);
 
-  // Remove from port
-  const portState = ports.get(portId);
-  if (portState) {
-    portState.subscriptions.delete(subscriptionId);
-  }
-
   return { unsubscribed: true };
 }
 
-async function handleSend(subscriptionId, message) {
+async function handleSendRaw(subscriptionId, message) {
   const subInfo = findSubscriptionById(subscriptionId);
   if (!subInfo) {
     throw new Error(`Subscription ${subscriptionId} not found`);
   }
 
-  const { subscription, sender, reliable, hubId } = subInfo;
+  const { subscription, sender, reliable } = subInfo;
 
   if (reliable && sender) {
-    // Use reliable sender (handles encryption + caching)
+    // Use reliable sender (handles caching for retransmits)
     const seq = await sender.send(message);
     return { seq };
   } else {
-    // Direct send with encryption
-    await encryptAndSend(hubId, subscription, message);
+    // Direct send raw (no encryption - main thread handles that)
+    await sendRaw(subscription, message);
     return { sent: true };
   }
 }
@@ -1359,11 +949,11 @@ function handleResetReliable(subscriptionId) {
 
   const { sender, receiver } = subInfo;
   if (sender) {
-    console.log(`[SignalWorker] Resetting reliable sender for ${subscriptionId}`);
+    console.log(`[TransportWorker] Resetting reliable sender for ${subscriptionId}`);
     sender.reset();
   }
   if (receiver) {
-    console.log(`[SignalWorker] Resetting reliable receiver for ${subscriptionId}`);
+    console.log(`[TransportWorker] Resetting reliable receiver for ${subscriptionId}`);
     receiver.reset();
   }
   return { reset: true };
@@ -1371,99 +961,47 @@ function handleResetReliable(subscriptionId) {
 
 
 // =============================================================================
-// Encryption Helpers for Subscriptions
+// Raw Send Helpers (no encryption - main thread handles crypto)
 // =============================================================================
 
 /**
- * Convert message to string for encryption.
- * Uint8Array → Latin-1 string (each byte → char code).
- * Objects → JSON string.
+ * Send a raw message via the subscription.
+ * Returns the message for caching (used by reliable sender for retransmits).
+ * @param {Object} subscription - ActionCable subscription
+ * @param {Uint8Array|Object} message - Raw message to send
+ * @returns {Promise<Uint8Array|Object>} - The sent message (for caching)
  */
-function messageToString(message) {
-  if (message instanceof Uint8Array) {
-    // Binary data: convert to Latin-1 string (byte values 0-255 → char codes)
-    return String.fromCharCode.apply(null, message);
-  } else if (typeof message === 'string') {
-    return message;
-  } else {
-    return JSON.stringify(message);
-  }
+async function sendRaw(subscription, message) {
+  // Convert Uint8Array to array for JSON serialization
+  const data = message instanceof Uint8Array ? Array.from(message) : message;
+  subscription.perform("relay", { data });
+  return message;
 }
 
-async function encryptAndSend(hubId, subscription, message) {
-  const session = sessions.get(hubId);
-
-  if (session) {
-    // Convert to string (handles Uint8Array binary messages)
-    const messageStr = messageToString(message);
-
-    // Encrypt using mutex to prevent counter race
-    const envelope = await withMutex(hubId, async () => {
-      const result = await session.encrypt(messageStr);
-      await persistSession(hubId, session);
-      return result;
-    });
-    subscription.perform("relay", { envelope });
-    return envelope;
-  } else {
-    // No session, send unencrypted
-    subscription.perform("relay", { data: message });
-    return null;
-  }
-}
-
-function sendPreEncrypted(subscription, envelope) {
-  if (envelope) {
-    subscription.perform("relay", { envelope });
-  }
+/**
+ * Send a raw message directly (for retransmits).
+ * @param {Object} subscription - ActionCable subscription
+ * @param {Uint8Array|Object} message - Cached raw message
+ */
+function sendRawDirect(subscription, message) {
+  const data = message instanceof Uint8Array ? Array.from(message) : message;
+  subscription.perform("relay", { data });
 }
 
 async function processIncomingMessage(subscriptionId, hubId, data) {
   const subInfo = findSubscriptionById(subscriptionId);
   if (!subInfo) return;
 
-  const { receiver, reliable, portId } = subInfo;
-  const portState = ports.get(portId);
+  const { receiver, reliable } = subInfo;
 
-  let decrypted = data;
-
-  // Decrypt if we have a session and data has envelope
-  if (data.envelope) {
-    const session = sessions.get(hubId);
-    if (session) {
-      try {
-        decrypted = await withMutex(hubId, async () => {
-          const envelopeStr = typeof data.envelope === 'string'
-            ? data.envelope
-            : JSON.stringify(data.envelope);
-          const plaintext = await session.decrypt(envelopeStr);
-          await persistSession(hubId, session);
-          return plaintext; // Keep as string for binary processing
-        });
-        subInfo.decryptionFailureCount = 0;
-      } catch (error) {
-        subInfo.decryptionFailureCount++;
-        console.error(`[SignalWorker] Decryption failed (${subInfo.decryptionFailureCount}/${subInfo.maxDecryptionFailures}):`, error);
-
-        if (subInfo.decryptionFailureCount >= subInfo.maxDecryptionFailures) {
-          if (portState) {
-            try {
-              portState.port.postMessage({
-                event: "session:invalid",
-                hubId,
-                message: "Encryption session expired. Please re-scan the QR code to reconnect."
-              });
-            } catch (e) {}
-          }
-        }
-        return;
-      }
-    }
-  }
+  // Forward raw data to main thread - main thread handles decryption
+  // For reliable delivery, we still need to handle the reliable protocol here
 
   // Check if this is a binary reliable message
   if (reliable && receiver) {
-    const bytes = getBytes(decrypted);
+    // Get bytes from data (could be array, Uint8Array, or object with data field)
+    const rawData = data.data || data;
+    const bytes = getBytes(rawData);
     if (bytes && bytes.length > 0) {
       const msgType = bytes[0];
       if (msgType === MSG_TYPE_DATA || msgType === MSG_TYPE_ACK) {
@@ -1476,41 +1014,28 @@ async function processIncomingMessage(subscriptionId, hubId, data) {
             // ACK message - update sender's pending set
             if (subInfo.sender) {
               const { immediateRetransmits } = subInfo.sender.processAck(decoded.ranges);
-              for (const { encryptedEnvelope } of immediateRetransmits) {
-                subInfo.sender.onRetransmit(encryptedEnvelope);
+              for (const { cachedMsg } of immediateRetransmits) {
+                subInfo.sender.onRetransmit(cachedMsg);
               }
             }
           }
           return;
         } catch (error) {
-          console.error("[SignalWorker] Failed to decode binary reliable message:", error);
+          console.error("[TransportWorker] Failed to decode binary reliable message:", error);
           // Fall through to non-reliable handling
         }
       }
     }
   }
 
-  // Handle non-reliable messages (or fallback)
-  // Decompress if needed (string with compression marker)
-  if (typeof decrypted === 'string') {
-    try {
-      decrypted = await decompressMessage(decrypted);
-    } catch (error) {
-      console.error("[SignalWorker] Decompression failed:", error);
-      return;
-    }
-  }
-
-  // Deliver directly
-  if (portState) {
-    try {
-      portState.port.postMessage({
-        event: "subscription:message",
-        subscriptionId,
-        message: decrypted
-      });
-    } catch (e) {}
-  }
+  // Forward raw message to main thread (main thread handles decryption)
+  try {
+    self.postMessage({
+      event: "subscription:message",
+      subscriptionId,
+      message: data
+    });
+  } catch (e) {}
 }
 
 /**
@@ -1521,170 +1046,4 @@ function getBytes(data) {
   if (typeof data === 'string') return new TextEncoder().encode(data);
   if (Array.isArray(data)) return new Uint8Array(data);
   return null;
-}
-
-// =============================================================================
-// IndexedDB + Encryption
-// =============================================================================
-
-function openDatabase() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result);
-
-    request.onupgradeneeded = (event) => {
-      const db = event.target.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME, { keyPath: "hubId" });
-      }
-      if (!db.objectStoreNames.contains(KEY_STORE_NAME)) {
-        db.createObjectStore(KEY_STORE_NAME, { keyPath: "id" });
-      }
-    };
-  });
-}
-
-async function getOrCreateWrappingKey() {
-  if (wrappingKeyCache) {
-    return wrappingKeyCache;
-  }
-
-  const db = await openDatabase();
-
-  // Try to load existing key (stored as JWK for Safari SharedWorker compatibility)
-  const record = await new Promise((resolve, reject) => {
-    const tx = db.transaction(KEY_STORE_NAME, "readonly");
-    const store = tx.objectStore(KEY_STORE_NAME);
-    const request = store.get(WRAPPING_KEY_ID);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result);
-  });
-
-  if (record?.jwk) {
-    // Import JWK as non-extractable CryptoKey
-    const key = await crypto.subtle.importKey(
-      "jwk",
-      record.jwk,
-      { name: "AES-GCM", length: 256 },
-      false, // non-extractable
-      ["encrypt", "decrypt"]
-    );
-    wrappingKeyCache = key;
-    return key;
-  }
-
-  // Generate new key
-  const tempKey = await crypto.subtle.generateKey(
-    { name: "AES-GCM", length: 256 },
-    true, // extractable for JWK export
-    ["encrypt", "decrypt"],
-  );
-
-  // Export to JWK for storage (Safari SharedWorker can't read CryptoKey from IndexedDB)
-  const jwk = await crypto.subtle.exportKey("jwk", tempKey);
-
-  // Re-import as non-extractable for actual use
-  const newKey = await crypto.subtle.importKey(
-    "jwk",
-    jwk,
-    { name: "AES-GCM", length: 256 },
-    false, // NON-EXTRACTABLE - XSS cannot export this
-    ["encrypt", "decrypt"],
-  );
-
-  // Store JWK
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction(KEY_STORE_NAME, "readwrite");
-    const store = tx.objectStore(KEY_STORE_NAME);
-    const request = store.put({ id: WRAPPING_KEY_ID, jwk });
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve();
-  });
-
-  wrappingKeyCache = newKey;
-  return newKey;
-}
-
-async function encryptWithWrappingKey(plaintext) {
-  const key = await getOrCreateWrappingKey();
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = new TextEncoder().encode(plaintext);
-
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    key,
-    encoded,
-  );
-
-  return { iv, ciphertext };
-}
-
-async function decryptWithWrappingKey(iv, ciphertext) {
-  const key = await getOrCreateWrappingKey();
-  const decrypted = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv },
-    key,
-    ciphertext,
-  );
-  return new TextDecoder().decode(decrypted);
-}
-
-async function persistSession(hubId, wasmSession) {
-  try {
-    const pickled = wasmSession.pickle();
-    const { iv, ciphertext } = await encryptWithWrappingKey(pickled);
-    const db = await openDatabase();
-
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, "readwrite");
-      const store = tx.objectStore(STORE_NAME);
-      const request = store.put({
-        hubId,
-        iv: Array.from(iv),
-        ciphertext: ciphertext,
-        updatedAt: Date.now(),
-      });
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
-    });
-  } catch (error) {
-    console.error(`[SignalWorker] persistSession failed for ${hubId}:`, error);
-  }
-}
-
-async function loadSessionFromStorage(hubId) {
-  const db = await openDatabase();
-
-  const record = await new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readonly");
-    const store = tx.objectStore(STORE_NAME);
-    const request = store.get(hubId);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result);
-  });
-
-  if (!record) {
-    return null;
-  }
-
-  try {
-    const iv = new Uint8Array(record.iv);
-    return await decryptWithWrappingKey(iv, record.ciphertext);
-  } catch (error) {
-    await deleteSessionFromStorage(hubId);
-    return null;
-  }
-}
-
-async function deleteSessionFromStorage(hubId) {
-  const db = await openDatabase();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite");
-    const store = tx.objectStore(STORE_NAME);
-    const request = store.delete(hubId);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve();
-  });
 }

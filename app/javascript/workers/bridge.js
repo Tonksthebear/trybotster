@@ -1,18 +1,31 @@
 /**
- * WorkerBridge - Single point of contact with the SharedWorker
+ * WorkerBridge - Single point of contact with Workers
  *
- * Handles all communication with the consolidated SharedWorker that manages
- * both Signal encryption and ActionCable connections.
+ * Architecture:
+ * - Main thread (bridge.js) proxies all crypto operations
+ * - Crypto Worker (signal_crypto.js) - SharedWorker handling Signal Protocol
+ * - Transport Worker (signal.js) - regular Worker handling ActionCable (no crypto)
+ *
+ * The main thread talks directly to crypto SharedWorker for encrypt/decrypt,
+ * and to transport Worker for ActionCable send/receive.
  */
 
 // Singleton instance
 let instance = null
 
 class WorkerBridge {
+  // Transport worker
   #worker = null
   #workerPort = null
   #pendingRequests = new Map()
   #requestId = 0
+
+  // Crypto SharedWorker
+  #cryptoWorker = null
+  #cryptoWorkerPort = null
+  #pendingCryptoRequests = new Map()
+  #cryptoRequestId = 0
+
   #initialized = false
   #initPromise = null
   #eventListeners = new Map() // eventName -> Set<callback>
@@ -29,60 +42,42 @@ class WorkerBridge {
   }
 
   /**
-   * Initialize the worker (idempotent)
+   * Initialize the workers (idempotent)
    * @param {Object} options
-   * @param {string} options.workerUrl - URL to the SharedWorker script
+   * @param {string} options.workerUrl - URL to the transport Worker script (signal.js)
+   * @param {string} options.cryptoWorkerUrl - URL to the crypto SharedWorker (signal_crypto.js)
    * @param {string} options.wasmJsUrl - URL to libsignal_wasm.js
    * @param {string} options.wasmBinaryUrl - URL to libsignal_wasm_bg.wasm
    */
-  async init({ workerUrl, wasmJsUrl, wasmBinaryUrl }) {
+  async init({ workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl }) {
     if (this.#initialized) return
     if (this.#initPromise) return this.#initPromise
 
-    this.#initPromise = this.#doInit({ workerUrl, wasmJsUrl, wasmBinaryUrl })
+    this.#initPromise = this.#doInit({ workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl })
     return this.#initPromise
   }
 
-  async #doInit({ workerUrl, wasmJsUrl, wasmBinaryUrl }) {
+  async #doInit({ workerUrl, cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl }) {
     try {
-      // Try SharedWorker first
-      if (typeof SharedWorker !== "undefined") {
-        try {
-          this.#worker = new SharedWorker(workerUrl, {
-            type: "module",
-            name: "signal",
-          })
-          this.#workerPort = this.#worker.port
-          this.#workerPort.onmessage = (e) => this.#handleMessage(e)
-          this.#workerPort.onmessageerror = (e) =>
-            console.error("[WorkerBridge] Message error:", e)
-          this.#worker.onerror = (e) =>
-            console.error("[WorkerBridge] Worker error:", e)
-          this.#workerPort.start()
-        } catch (sharedError) {
-          console.warn(
-            "[WorkerBridge] SharedWorker failed, falling back:",
-            sharedError
-          )
-          this.#worker = null
-          this.#workerPort = null
-        }
-      }
+      // 1. Create crypto SharedWorker first and initialize WASM
+      this.#cryptoWorker = new SharedWorker(cryptoWorkerUrl, { type: "module", name: "signal-crypto" })
+      this.#cryptoWorkerPort = this.#cryptoWorker.port
+      this.#cryptoWorkerPort.onmessage = (e) => this.#handleCryptoMessage(e)
+      this.#cryptoWorkerPort.start()
 
-      // Fallback to regular Worker
-      if (!this.#workerPort) {
-        console.warn(
-          "[WorkerBridge] Using regular Worker - multi-tab features disabled"
-        )
-        this.#worker = new Worker(workerUrl, { type: "module" })
-        this.#workerPort = this.#worker
-        this.#worker.onmessage = (e) => this.#handleMessage(e)
-        this.#worker.onerror = (e) =>
-          console.error("[WorkerBridge] Worker error:", e)
-      }
+      // Initialize WASM via crypto worker
+      await this.sendCrypto("init", { wasmJsUrl, wasmBinaryUrl })
 
-      // Initialize WASM
-      await this.send("init", { wasmJsUrl, wasmBinaryUrl })
+      // 2. Create transport Worker (no crypto knowledge)
+      this.#worker = new Worker(workerUrl, { type: "module" })
+      this.#workerPort = this.#worker
+      this.#worker.onmessage = (e) => this.#handleMessage(e)
+      this.#worker.onerror = (e) =>
+        console.error("[WorkerBridge] Transport worker error:", e)
+
+      // Initialize transport worker (just ActionCable, no crypto)
+      await this.send("init", {})
+
       this.#initialized = true
     } catch (error) {
       console.error("[WorkerBridge] Failed to initialize:", error)
@@ -92,7 +87,7 @@ class WorkerBridge {
   }
 
   /**
-   * Handle messages from the worker
+   * Handle messages from the transport worker
    */
   #handleMessage(messageEvent) {
     const data = messageEvent.data
@@ -115,6 +110,33 @@ class WorkerBridge {
       if (!pending) return
 
       this.#pendingRequests.delete(data.id)
+
+      if (data.success) {
+        pending.resolve(data.result)
+      } else {
+        pending.reject(new Error(data.error))
+      }
+    }
+  }
+
+  /**
+   * Handle messages from the crypto SharedWorker
+   */
+  #handleCryptoMessage(messageEvent) {
+    const data = messageEvent.data
+
+    // Handle ping (heartbeat) - respond with pong
+    if (data.event === "ping") {
+      this.#cryptoWorkerPort.postMessage({ action: "pong" })
+      return
+    }
+
+    // Handle request/response (has id)
+    if (data.id !== undefined) {
+      const pending = this.#pendingCryptoRequests.get(data.id)
+      if (!pending) return
+
+      this.#pendingCryptoRequests.delete(data.id)
 
       if (data.success) {
         pending.resolve(data.result)
@@ -158,7 +180,7 @@ class WorkerBridge {
   }
 
   /**
-   * Send a request to the worker and wait for response
+   * Send a request to the transport worker and wait for response
    * @param {string} action - The action to perform
    * @param {Object} params - Parameters for the action
    * @param {number} timeout - Timeout in milliseconds (default: 10000)
@@ -167,7 +189,7 @@ class WorkerBridge {
   send(action, params = {}, timeout = 10000) {
     return new Promise((resolve, reject) => {
       if (!this.#workerPort) {
-        reject(new Error("Worker not initialized"))
+        reject(new Error("Transport worker not initialized"))
         return
       }
 
@@ -175,7 +197,7 @@ class WorkerBridge {
 
       const timer = setTimeout(() => {
         this.#pendingRequests.delete(id)
-        reject(new Error(`Worker timeout: ${action}`))
+        reject(new Error(`Transport worker timeout: ${action}`))
       }, timeout)
 
       this.#pendingRequests.set(id, {
@@ -191,6 +213,142 @@ class WorkerBridge {
 
       this.#workerPort.postMessage({ id, action, ...params })
     })
+  }
+
+  /**
+   * Send a request to the crypto SharedWorker and wait for response
+   * @param {string} action - The action to perform
+   * @param {Object} params - Parameters for the action
+   * @param {number} timeout - Timeout in milliseconds (default: 10000)
+   * @returns {Promise<any>} - The result from the crypto worker
+   */
+  sendCrypto(action, params = {}, timeout = 10000) {
+    return new Promise((resolve, reject) => {
+      if (!this.#cryptoWorkerPort) {
+        reject(new Error("Crypto worker not initialized"))
+        return
+      }
+
+      const id = ++this.#cryptoRequestId
+
+      const timer = setTimeout(() => {
+        this.#pendingCryptoRequests.delete(id)
+        reject(new Error(`Crypto worker timeout: ${action}`))
+      }, timeout)
+
+      this.#pendingCryptoRequests.set(id, {
+        resolve: (result) => {
+          clearTimeout(timer)
+          resolve(result)
+        },
+        reject: (error) => {
+          clearTimeout(timer)
+          reject(error)
+        },
+      })
+
+      this.#cryptoWorkerPort.postMessage({ id, action, ...params })
+    })
+  }
+
+  // ===========================================================================
+  // Crypto convenience methods (delegate to crypto SharedWorker)
+  // ===========================================================================
+
+  /**
+   * Create a new Signal session from a bundle
+   * @param {string} hubId - The hub ID
+   * @param {Object|string} bundleJson - The session bundle
+   * @returns {Promise<{created: boolean, identityKey: string}>}
+   */
+  async createSession(hubId, bundleJson) {
+    return this.sendCrypto("createSession", { hubId, bundleJson })
+  }
+
+  /**
+   * Load an existing session from storage
+   * @param {string} hubId - The hub ID
+   * @returns {Promise<{loaded: boolean, fromCache?: boolean, error?: string}>}
+   */
+  async loadSession(hubId) {
+    return this.sendCrypto("loadSession", { hubId })
+  }
+
+  /**
+   * Check if a session exists for a hub
+   * @param {string} hubId - The hub ID
+   * @returns {Promise<{hasSession: boolean}>}
+   */
+  async hasSession(hubId) {
+    return this.sendCrypto("hasSession", { hubId })
+  }
+
+  /**
+   * Encrypt a message for a hub
+   * @param {string} hubId - The hub ID
+   * @param {string|Uint8Array|Object} message - The message to encrypt
+   * @returns {Promise<{envelope: string}>}
+   */
+  async encrypt(hubId, message) {
+    // Convert to string if needed (handles Uint8Array binary messages)
+    const messageStr = this.#messageToString(message)
+    return this.sendCrypto("encrypt", { hubId, message: messageStr })
+  }
+
+  /**
+   * Decrypt an envelope from a hub
+   * @param {string} hubId - The hub ID
+   * @param {string|Object} envelope - The encrypted envelope
+   * @returns {Promise<{plaintext: any}>}
+   */
+  async decrypt(hubId, envelope) {
+    const envelopeStr = typeof envelope === "string" ? envelope : JSON.stringify(envelope)
+    return this.sendCrypto("decrypt", { hubId, envelope: envelopeStr })
+  }
+
+  /**
+   * Get the identity key for a session
+   * @param {string} hubId - The hub ID
+   * @returns {Promise<{identityKey: string}>}
+   */
+  async getIdentityKey(hubId) {
+    return this.sendCrypto("getIdentityKey", { hubId })
+  }
+
+  /**
+   * Clear a session
+   * @param {string} hubId - The hub ID
+   * @returns {Promise<{cleared: boolean}>}
+   */
+  async clearSession(hubId) {
+    return this.sendCrypto("clearSession", { hubId })
+  }
+
+  /**
+   * Process a sender key distribution message
+   * @param {string} hubId - The hub ID
+   * @param {string} distributionB64 - The distribution message in base64
+   * @returns {Promise<{processed: boolean}>}
+   */
+  async processSenderKeyDistribution(hubId, distributionB64) {
+    return this.sendCrypto("processSenderKeyDistribution", { hubId, distributionB64 })
+  }
+
+  /**
+   * Convert message to string for encryption.
+   * Uint8Array -> Latin-1 string (each byte -> char code).
+   * Objects -> JSON string.
+   * @private
+   */
+  #messageToString(message) {
+    if (message instanceof Uint8Array) {
+      // Binary data: convert to Latin-1 string (byte values 0-255 -> char codes)
+      return String.fromCharCode.apply(null, message)
+    } else if (typeof message === "string") {
+      return message
+    } else {
+      return JSON.stringify(message)
+    }
   }
 
   /**
