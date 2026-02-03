@@ -463,11 +463,10 @@ class WorkerBridge {
     }
     this.#subscriptionListeners.get(subscriptionId).add(callback)
 
-    // Also register with WebRTCTransport if using webrtc
-    let webrtcUnsub = null
-    if (this.#transport === "webrtc" && webrtcTransport) {
-      webrtcUnsub = webrtcTransport.onSubscriptionMessage(subscriptionId, callback)
-    }
+    // NOTE: For WebRTC, messages are already forwarded via the
+    // webrtcTransport.on("subscription:message") listener set up in constructor.
+    // Do NOT also register with webrtcTransport.onSubscriptionMessage() here,
+    // as that would cause duplicate message delivery.
 
     // Return unsubscribe function
     return () => {
@@ -478,7 +477,6 @@ class WorkerBridge {
           this.#subscriptionListeners.delete(subscriptionId)
         }
       }
-      if (webrtcUnsub) webrtcUnsub()
     }
   }
 
