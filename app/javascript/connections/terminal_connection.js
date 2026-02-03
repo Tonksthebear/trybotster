@@ -45,13 +45,13 @@ export class TerminalConnection extends Connection {
   }
 
   channelParams() {
-    // Each browser has dedicated streams with CLI (like TUI has dedicated I/O)
+    // Each browser tab has dedicated streams with CLI (like TUI has dedicated I/O)
     // Browser subscribes to: terminal_relay:{hub}:{agent}:{pty}:{browser_identity}
     return {
       hub_id: this.getHubId(),
       agent_index: this.agentIndex,
       pty_index: this.ptyIndex,
-      browser_identity: this.identityKey,
+      browser_identity: this.browserIdentity,
     };
   }
 

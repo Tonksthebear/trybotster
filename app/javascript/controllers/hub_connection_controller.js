@@ -7,7 +7,12 @@ export default class extends Controller {
     id: Number,
   };
 
-  connect() {}
+  connect() {
+    // Generate a unique tab ID for this browser tab.
+    // This allows multiple tabs to have separate WebRTC connections
+    // while sharing the same Signal Protocol session.
+    this.tabId = crypto.randomUUID()
+  }
 
   disconnect() {
     if (this.subscription) {
@@ -90,12 +95,14 @@ export default class extends Controller {
 
       this.stateValue = "Setting up encryption";
       this.identityKey = await this.session.getIdentityKey();
+      // Combine Signal identity with tab-unique ID for routing
+      this.browserIdentity = `${this.identityKey}:${this.tabId}`
 
       this.stateValue = "Connecting to server";
 
       this.connection = await open({
         channel: "HubChannel",
-        params: { hub_id: this.idValue, browser_identity: this.identityKey },
+        params: { hub_id: this.idValue, browser_identity: this.browserIdentity },
         session: this.session,
         reliable: true,
         onMessage: (msg) => this.#handleMessage(msg),

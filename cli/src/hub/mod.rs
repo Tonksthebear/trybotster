@@ -94,6 +94,21 @@ pub struct AgentProgressEvent {
     pub stage: crate::relay::AgentCreationStage,
 }
 
+/// WebRTC virtual subscription for routing DataChannel messages.
+///
+/// Tracks which channel type and PTY coordinates a browser subscription maps to.
+#[derive(Debug, Clone)]
+pub struct WebRtcSubscription {
+    /// Browser identity that owns this subscription.
+    pub browser_identity: String,
+    /// Channel name (e.g., "TerminalRelayChannel", "HubChannel").
+    pub channel_name: String,
+    /// Agent index if this is a PTY subscription.
+    pub agent_index: Option<usize>,
+    /// PTY index if this is a PTY subscription.
+    pub pty_index: Option<usize>,
+}
+
 /// Result of a background agent creation task.
 ///
 /// Sent from the background thread to the main loop when agent creation completes.
@@ -187,6 +202,12 @@ pub struct Hub {
     /// The connection persists to keep the DataChannel alive.
     pub webrtc_channels: std::collections::HashMap<String, crate::channel::WebRtcChannel>,
 
+    /// WebRTC virtual subscriptions tracking.
+    ///
+    /// Maps subscriptionId -> (browser_identity, channel_name, agent_index, pty_index).
+    /// Used to route incoming DataChannel messages to the correct handler.
+    pub webrtc_subscriptions: std::collections::HashMap<String, WebRtcSubscription>,
+
     // === Command Channel (Actor Pattern) ===
     /// Sender for Hub commands (cloned for each client).
     command_tx: tokio::sync::mpsc::Sender<HubCommand>,
@@ -196,6 +217,8 @@ pub struct Hub {
     // === Event Broadcast ===
     /// Sender for Hub events (clients subscribe via `subscribe_events()`).
     event_tx: tokio::sync::broadcast::Sender<HubEvent>,
+    /// Receiver for forwarding hub events to WebRTC subscribers.
+    webrtc_event_rx: Option<tokio::sync::broadcast::Receiver<HubEvent>>,
 
     // === Handle Cache ===
     /// Thread-safe cache of agent handles for non-blocking client access.
@@ -277,7 +300,7 @@ impl Hub {
         // Create handle cache for thread-safe agent handle access
         let handle_cache = Arc::new(handle_cache::HandleCache::new());
         // Create event broadcast channel for pub/sub
-        let (event_tx, _) = tokio::sync::broadcast::channel(64);
+        let (event_tx, webrtc_event_rx) = tokio::sync::broadcast::channel(64);
 
         Ok(Self {
             state,
@@ -301,8 +324,10 @@ impl Hub {
             command_tx,
             command_rx,
             event_tx,
+            webrtc_event_rx: Some(webrtc_event_rx),
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
+            webrtc_subscriptions: std::collections::HashMap::new(),
         })
     }
 

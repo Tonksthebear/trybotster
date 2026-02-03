@@ -517,19 +517,29 @@ impl WebRtcChannel {
                     Box::pin(async move {
                         let data = msg.data.to_vec();
 
-                        // Decrypt if we have a crypto service
+                        log::debug!(
+                            "[WebRTC] Received message ({} bytes) from DataChannel",
+                            data.len()
+                        );
+
+                        // Try to decrypt if we have a crypto service and it looks like an envelope
+                        // Control messages (subscribe/unsubscribe) may be plaintext
                         let decrypted = if let Some(ref cs) = crypto_service {
                             match serde_json::from_slice::<SignalEnvelope>(&data) {
                                 Ok(envelope) => match cs.decrypt(&envelope).await {
-                                    Ok(plaintext) => plaintext,
+                                    Ok(plaintext) => {
+                                        log::debug!("[WebRTC] Decrypted message successfully");
+                                        plaintext
+                                    }
                                     Err(e) => {
                                         log::error!("[WebRTC] Decryption failed: {e}");
                                         return;
                                     }
                                 },
-                                Err(e) => {
-                                    log::error!("[WebRTC] Failed to parse envelope: {e}");
-                                    return;
+                                Err(_) => {
+                                    // Not a Signal envelope - treat as plaintext control message
+                                    log::debug!("[WebRTC] Message is plaintext (not Signal envelope)");
+                                    data
                                 }
                             }
                         } else {
@@ -562,12 +572,18 @@ impl WebRtcChannel {
 
                         // Send to receive queue
                         if let Some(tx) = recv_tx.lock().await.as_ref() {
+                            log::info!(
+                                "[WebRTC] Queuing message ({} bytes) for processing",
+                                decompressed.len()
+                            );
                             let _ = tx
                                 .send(RawIncoming {
                                     payload: decompressed,
                                     sender: PeerId(browser_identity.clone()),
                                 })
                                 .await;
+                        } else {
+                            log::warn!("[WebRTC] recv_tx is None, cannot queue message");
                         }
                     })
                 }));
@@ -723,9 +739,12 @@ impl Channel for WebRtcChannel {
         drop(config_guard);
 
         // Encrypt if we have a crypto service
+        // Browser identity format is "identityKey:tabId" - extract just the identity key
+        // for Signal encryption (sessions are keyed by identity key only)
         let to_send = if let Some(ref cs) = self.crypto_service {
+            let identity_key = peer.as_ref().split(':').next().unwrap_or(peer.as_ref());
             let envelope = cs
-                .encrypt(&compressed, peer.as_ref())
+                .encrypt(&compressed, identity_key)
                 .await
                 .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
 
@@ -766,6 +785,27 @@ impl Channel for WebRtcChannel {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(async { self.peers.read().await.contains(peer) })
+        })
+    }
+}
+
+impl WebRtcChannel {
+    /// Try to receive a message without blocking.
+    ///
+    /// Returns `Some(message)` if a message is available, `None` otherwise.
+    /// Must be called from within a tokio runtime context (use `runtime.enter()`).
+    pub fn try_recv(&self, runtime: &tokio::runtime::Runtime) -> Option<IncomingMessage> {
+        runtime.block_on(async {
+            let mut recv_guard = self.recv_rx.lock().await;
+            let recv_rx = recv_guard.as_mut()?;
+
+            match recv_rx.try_recv() {
+                Ok(raw) => Some(IncomingMessage {
+                    payload: raw.payload,
+                    sender: raw.sender,
+                }),
+                Err(_) => None,
+            }
         })
     }
 }

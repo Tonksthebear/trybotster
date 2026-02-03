@@ -55,7 +55,13 @@ export const CliStatus = {
 // Handshake timeout in milliseconds
 const HANDSHAKE_TIMEOUT_MS = 8000
 
+// Tab-unique identifier (generated once per page load).
+// Used to distinguish multiple browser tabs sharing the same Signal session.
+const TAB_ID = crypto.randomUUID()
+
 export class Connection {
+  // Static tab identifier shared by all connections in this tab
+  static tabId = TAB_ID
   #unsubscribers = []
   #subscriptionUnsubscribers = []
   #hubConnected = false
@@ -68,7 +74,8 @@ export class Connection {
     this.manager = manager
 
     this.subscriptionId = null      // Worker subscription ID
-    this.identityKey = null
+    this.identityKey = null         // Signal Protocol identity key (shared across tabs)
+    this.browserIdentity = null     // Tab-unique identity for routing (identityKey:tabId)
     this.state = ConnectionState.DISCONNECTED
     this.errorReason = null
 
@@ -162,6 +169,9 @@ export class Connection {
     // Get identity key for channel params
     const keyResult = await bridge.getIdentityKey(hubId)
     this.identityKey = keyResult.identityKey
+    // Generate tab-unique browser identity for routing.
+    // Multiple tabs share the same Signal session but need separate WebRTC connections.
+    this.browserIdentity = `${this.identityKey}:${Connection.tabId}`
 
     // 2. Connect transport via transport worker
     const transport = bridge.transport
@@ -172,7 +182,7 @@ export class Connection {
       await bridge.send("connect", {
         hubId,
         signalingUrl,
-        browserIdentity: this.identityKey
+        browserIdentity: this.browserIdentity
       })
     } else {
       // ActionCable: pass cable URL and module URL
@@ -261,8 +271,11 @@ export class Connection {
       this.#setState(ConnectionState.CONNECTED)
       this.emit("subscribed", this)
 
-      // If CLI is already connected, we're "last" - initiate handshake
-      if (this.cliStatus === CliStatus.CONNECTED) {
+      // For WebRTC: DataChannel open = ready, skip handshake ceremony
+      if (bridge.transport === "webrtc") {
+        this.#completeHandshake()
+      } else if (this.cliStatus === CliStatus.CONNECTED) {
+        // For ActionCable: wait for health message, then handshake
         this.#sendHandshake()
       }
     } finally {
@@ -427,6 +440,7 @@ export class Connection {
     this.subscriptionId = null
     this.#hubConnected = false
     this.identityKey = null
+    this.browserIdentity = null
 
     // Cleanup hub event listeners
     for (const unsub of this.#unsubscribers) {
@@ -625,9 +639,11 @@ export class Connection {
   async #sendEncrypted(message) {
     const hubId = this.getHubId()
     const { envelope } = await bridge.encrypt(hubId, message)
+    // Crypto worker may return envelope as JSON string - ensure it's an object
+    const envelopeObj = typeof envelope === "string" ? JSON.parse(envelope) : envelope
     await bridge.send("sendRaw", {
       subscriptionId: this.subscriptionId,
-      message: { envelope }
+      message: { envelope: envelopeObj }
     })
   }
 

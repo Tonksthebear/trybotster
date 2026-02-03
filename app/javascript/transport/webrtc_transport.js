@@ -402,13 +402,58 @@ class WebRTCTransport {
     }
 
     dataChannel.onmessage = (event) => {
-      this.#handleDataChannelMessage(hubId, event.data)
+      this.#handleDataChannelMessage(hubId, event.data).catch(err => {
+        console.error("[WebRTCTransport] Message handler error:", err)
+      })
     }
   }
 
-  #handleDataChannelMessage(hubId, data) {
+  async #handleDataChannelMessage(hubId, data) {
     try {
-      const msg = typeof data === "string" ? JSON.parse(data) : data
+      console.log("[WebRTCTransport] Received raw data:", typeof data, data instanceof ArrayBuffer ? `ArrayBuffer(${data.byteLength})` : (typeof data === "string" ? data.substring(0, 100) : data))
+
+      // Handle binary data (ArrayBuffer)
+      let textData = data
+      if (data instanceof ArrayBuffer) {
+        textData = new TextDecoder().decode(data)
+        console.log("[WebRTCTransport] Decoded ArrayBuffer to text:", textData.substring(0, 100))
+      }
+
+      const parsed = typeof textData === "string" ? JSON.parse(textData) : textData
+      console.log("[WebRTCTransport] Parsed message keys:", Object.keys(parsed))
+
+      // Check if this is a Signal envelope (encrypted message from CLI)
+      // Signal envelopes have short keys: t (type), c (ciphertext), s (sender), d (device)
+      let msg = parsed
+      if (parsed.t !== undefined && parsed.c && parsed.s) {
+        console.log("[WebRTCTransport] Detected Signal envelope, decrypting for hub:", hubId, typeof hubId)
+        // Decrypt using bridge
+        try {
+          // Ensure hubId is a string
+          const hubIdStr = String(hubId)
+          const { plaintext } = await bridge.decrypt(hubIdStr, parsed)
+          // Handle compression marker bytes:
+          // 0x00 = uncompressed (just strip the marker)
+          // 0x1f = gzip compressed (would need decompression)
+          let cleanPlaintext = plaintext
+          if (typeof plaintext === "string" && plaintext.length > 0) {
+            const marker = plaintext.charCodeAt(0)
+            if (marker === 0x00) {
+              // Uncompressed - strip marker
+              cleanPlaintext = plaintext.slice(1)
+            } else if (marker === 0x1f) {
+              // Gzip compressed - for now, log warning (shouldn't happen with small messages)
+              console.warn("[WebRTCTransport] Received gzip compressed message, decompression not implemented")
+              return
+            }
+          }
+          msg = typeof cleanPlaintext === "string" ? JSON.parse(cleanPlaintext) : cleanPlaintext
+          console.log("[WebRTCTransport] Decrypted message:", msg)
+        } catch (decryptErr) {
+          console.error("[WebRTCTransport] Decryption failed:", decryptErr, decryptErr.stack)
+          return
+        }
+      }
 
       if (msg.subscriptionId) {
         this.#emit("subscription:message", {
