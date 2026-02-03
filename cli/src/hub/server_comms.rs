@@ -726,8 +726,8 @@ impl Hub {
     /// Handle a message received from a WebRTC DataChannel.
     ///
     /// Messages arrive in two forms:
-    /// 1. Already decrypted by WebRtcChannel (has subscriptionId + type like "input"/"resize")
-    /// 2. Control messages (type="subscribe"/"unsubscribe", no subscriptionId)
+    /// 1. Control messages: type="subscribe"/"unsubscribe" (also have subscriptionId)
+    /// 2. Data messages: type="input"/"resize"/etc with subscriptionId
     ///
     /// Note: Signal envelope decryption happens inside WebRtcChannel.try_recv(),
     /// so we receive plaintext JSON here.
@@ -740,25 +740,28 @@ impl Hub {
             }
         };
 
-        // Data messages have subscriptionId - route these first.
-        // These come from browser's Connection.send() which encrypts { subscriptionId, type, ... }
-        // WebRtcChannel decrypts and we get the plaintext JSON here.
-        if let Some(subscription_id) = msg.get("subscriptionId").and_then(|s| s.as_str()) {
-            self.handle_webrtc_data(subscription_id, &msg);
-            return;
-        }
-
-        // Control messages without subscriptionId (subscribe, unsubscribe)
+        // Check message type first - control messages take priority
         if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
             match msg_type {
-                "subscribe" => self.handle_webrtc_subscribe(browser_identity, &msg),
-                "unsubscribe" => self.handle_webrtc_unsubscribe(&msg),
+                "subscribe" => {
+                    self.handle_webrtc_subscribe(browser_identity, &msg);
+                    return;
+                }
+                "unsubscribe" => {
+                    self.handle_webrtc_unsubscribe(&msg);
+                    return;
+                }
                 _ => {
-                    log::debug!("[WebRTC] Unknown control message type: {msg_type}");
+                    // Other types (input, resize, etc.) fall through to data handling
                 }
             }
+        }
+
+        // Data messages have subscriptionId and a command type (input, resize, etc.)
+        if let Some(subscription_id) = msg.get("subscriptionId").and_then(|s| s.as_str()) {
+            self.handle_webrtc_data(subscription_id, &msg);
         } else {
-            log::debug!("[WebRTC] Message without type or subscriptionId: {:?}", msg);
+            log::debug!("[WebRTC] Message without subscriptionId: {:?}", msg);
         }
     }
 
