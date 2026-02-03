@@ -38,7 +38,7 @@ export class HubConnection extends Connection {
   channelParams() {
     return {
       hub_id: this.getHubId(),
-      browser_identity: this.identityKey,
+      browser_identity: this.browserIdentity,
     };
   }
 

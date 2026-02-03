@@ -369,6 +369,7 @@ class WorkerBridge {
    */
   async decrypt(hubId, envelope) {
     const envelopeStr = typeof envelope === "string" ? envelope : JSON.stringify(envelope)
+    console.log("[WorkerBridge] decrypt - hubId:", hubId, "envelope (first 100 chars):", envelopeStr.substring(0, 100))
     return this.sendCrypto("decrypt", { hubId, envelope: envelopeStr })
   }
 

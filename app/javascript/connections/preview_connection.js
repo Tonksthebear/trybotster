@@ -56,7 +56,7 @@ export class PreviewConnection extends Connection {
       hub_id: this.getHubId(),
       agent_index: this.agentIndex,
       pty_index: this.ptyIndex,
-      browser_identity: this.identityKey,
+      browser_identity: this.browserIdentity,
     };
   }
 
