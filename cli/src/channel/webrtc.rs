@@ -11,14 +11,14 @@
 //!     |-- RTCDataChannel (SCTP - reliable ordered)
 //!     |-- Signal encryption (via CryptoServiceHandle)
 //!     |-- Gzip compression (via compression module)
-//!     `-- Signaling via HTTP to Rails
+//!     `-- Signaling via ActionCable (encrypted envelopes)
 //! ```
 //!
 //! # Key Differences from ActionCable
 //!
 //! - No custom reliable delivery needed (SCTP provides it natively)
 //! - Peer-to-peer when possible, TURN relay as fallback
-//! - Signaling happens via HTTP, not WebSocket
+//! - Signaling (offer/answer/ICE) via ActionCable, encrypted with Signal Protocol
 //!
 //! Rust guideline compliant 2025-01
 
@@ -57,6 +57,21 @@ struct RawIncoming {
     sender: PeerId,
 }
 
+/// Outgoing signal destined for a browser, sent via ActionCable relay.
+///
+/// Produced by async WebRTC callbacks (e.g., `on_ice_candidate`), drained
+/// by `server_comms` tick loop, and forwarded through `CommandChannelHandle::perform`.
+#[derive(Debug)]
+pub enum OutgoingSignal {
+    /// Encrypted ICE candidate for a specific browser.
+    Ice {
+        /// Target browser identity (`identityKey:tabId`).
+        browser_identity: String,
+        /// Encrypted Signal Protocol envelope (opaque to Rails).
+        envelope: serde_json::Value,
+    },
+}
+
 /// Configuration for WebRTC signaling.
 #[derive(Clone, Debug)]
 pub struct WebRtcConfig {
@@ -75,11 +90,32 @@ pub struct WebRtcConfig {
 }
 
 /// Builder for `WebRtcChannel`.
-#[derive(Debug, Default)]
 pub struct WebRtcChannelBuilder {
     server_url: Option<String>,
     api_key: Option<String>,
     crypto_service: Option<CryptoServiceHandle>,
+    signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
+}
+
+impl std::fmt::Debug for WebRtcChannelBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebRtcChannelBuilder")
+            .field("server_url", &self.server_url)
+            .field("crypto_service", &self.crypto_service.is_some())
+            .field("signal_tx", &self.signal_tx.is_some())
+            .finish()
+    }
+}
+
+impl Default for WebRtcChannelBuilder {
+    fn default() -> Self {
+        Self {
+            server_url: None,
+            api_key: None,
+            crypto_service: None,
+            signal_tx: None,
+        }
+    }
 }
 
 impl WebRtcChannelBuilder {
@@ -110,6 +146,13 @@ impl WebRtcChannelBuilder {
         self
     }
 
+    /// Set the outgoing signal sender for ICE candidate relay via ActionCable.
+    #[must_use]
+    pub fn signal_tx(mut self, tx: mpsc::UnboundedSender<OutgoingSignal>) -> Self {
+        self.signal_tx = Some(tx);
+        self
+    }
+
     /// Build the channel.
     ///
     /// # Panics
@@ -121,6 +164,7 @@ impl WebRtcChannelBuilder {
             server_url: self.server_url.expect("server_url required"),
             api_key: self.api_key.expect("api_key required"),
             crypto_service: self.crypto_service,
+            signal_tx: self.signal_tx,
             peer_connection: Arc::new(Mutex::new(None)),
             data_channel: Arc::new(Mutex::new(None)),
             state: SharedConnectionState::new(),
@@ -143,6 +187,8 @@ pub struct WebRtcChannel {
     api_key: String,
     /// Optional crypto service for E2E encryption.
     crypto_service: Option<CryptoServiceHandle>,
+    /// Sender for outgoing signals (ICE candidates) to relay via ActionCable.
+    signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
     /// WebRTC peer connection.
     peer_connection: Arc<Mutex<Option<Arc<RTCPeerConnection>>>>,
     /// WebRTC data channel.
@@ -166,6 +212,7 @@ impl std::fmt::Debug for WebRtcChannel {
         f.debug_struct("WebRtcChannel")
             .field("server_url", &self.server_url)
             .field("crypto_service", &self.crypto_service.is_some())
+            .field("signal_tx", &self.signal_tx.is_some())
             .finish()
     }
 }
@@ -298,7 +345,7 @@ impl WebRtcChannel {
 
     /// Handle incoming SDP offer from browser and create answer.
     ///
-    /// Called when CLI receives a `webrtc_offer` via `HubCommandChannel`.
+    /// Called when CLI receives an encrypted offer via ActionCable signal channel.
     pub async fn handle_sdp_offer(&self, sdp: &str, browser_identity: &str) -> Result<String, ChannelError> {
         // Get or create peer connection
         let mut pc_guard = self.peer_connection.lock().await;
@@ -450,46 +497,65 @@ impl WebRtcChannel {
             })
         }));
 
-        // Set up ICE candidate handler to trickle candidates
-        let server_url = self.server_url.clone();
-        let api_key = self.api_key.clone();
-        let config_guard = self.config.lock().await;
-        let hub_id = config_guard
-            .as_ref()
-            .map(|c| c.hub_id.clone())
-            .unwrap_or_default();
-        drop(config_guard);
+        // Set up ICE candidate handler — encrypt and send via mpsc for ActionCable relay.
+        // server_comms tick loop drains these and forwards through CommandChannelHandle::perform.
+        let ice_crypto = self.crypto_service.clone();
+        let ice_signal_tx = self.signal_tx.clone();
         let browser_id = browser_identity.to_string();
 
         pc.on_ice_candidate(Box::new(move |candidate| {
-            let server_url = server_url.clone();
-            let api_key = api_key.clone();
-            let hub_id = hub_id.clone();
+            let crypto = ice_crypto.clone();
+            let signal_tx = ice_signal_tx.clone();
             let browser_id = browser_id.clone();
 
             Box::pin(async move {
-                if let Some(c) = candidate {
-                    let candidate_json = match c.to_json() {
-                        Ok(j) => j,
+                let Some(c) = candidate else { return };
+
+                let candidate_json = match c.to_json() {
+                    Ok(j) => j,
+                    Err(e) => {
+                        log::error!("[WebRTC] Failed to serialize ICE candidate: {e}");
+                        return;
+                    }
+                };
+
+                // Build the plaintext payload — browser decrypts to discover type
+                let payload = serde_json::json!({
+                    "type": "ice",
+                    "candidate": candidate_json,
+                });
+
+                // Encrypt with Signal Protocol if crypto service available
+                let envelope = if let Some(ref cs) = crypto {
+                    // Extract identity key from browser_identity ("identityKey:tabId")
+                    let identity_key = browser_id.split(':').next().unwrap_or(&browser_id);
+                    let plaintext = serde_json::to_vec(&payload).unwrap_or_default();
+                    match cs.encrypt(&plaintext, identity_key).await {
+                        Ok(env) => match serde_json::to_value(&env) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log::error!("[WebRTC] Failed to serialize ICE envelope: {e}");
+                                return;
+                            }
+                        },
                         Err(e) => {
-                            log::error!("[WebRTC] Failed to serialize ICE candidate: {e}");
+                            log::error!("[WebRTC] Failed to encrypt ICE candidate: {e}");
                             return;
                         }
-                    };
+                    }
+                } else {
+                    // No encryption — send plaintext (shouldn't happen in production)
+                    payload
+                };
 
-                    // Send ICE candidate to browser
-                    let url = format!("{}/hubs/{}/webrtc_signals", server_url, hub_id);
-                    let client = reqwest::Client::new();
-                    let _ = client
-                        .post(&url)
-                        .bearer_auth(&api_key)
-                        .json(&serde_json::json!({
-                            "signal_type": "ice",
-                            "browser_identity": browser_id,
-                            "candidate": candidate_json,
-                        }))
-                        .send()
-                        .await;
+                // Send via mpsc for ActionCable relay
+                if let Some(ref tx) = signal_tx {
+                    let _ = tx.send(OutgoingSignal::Ice {
+                        browser_identity: browser_id.clone(),
+                        envelope,
+                    });
+                } else {
+                    log::warn!("[WebRTC] No signal_tx — cannot relay ICE candidate");
                 }
             })
         }));

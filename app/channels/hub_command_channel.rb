@@ -16,7 +16,7 @@ require_relative "concerns/health_status"
 #
 # Stream: hub_command:{hub_id}
 #
-# Auth: DeviceToken Bearer (CLI only — browsers use HubChannel for E2E relay)
+# Auth: DeviceToken Bearer (CLI only — browsers use HubSignalingChannel for E2E relay)
 class HubCommandChannel < ApplicationCable::Channel
   def subscribed
     hub = find_hub
@@ -71,6 +71,17 @@ class HubCommandChannel < ApplicationCable::Channel
     end
 
     Rails.logger.debug "[HubCommandChannel] Heartbeat from hub=#{@hub.id}"
+  end
+
+  # Relay opaque encrypted envelope from CLI → specific browser
+  def signal(data)
+    browser_identity = data["browser_identity"]
+    return unless browser_identity.present?
+
+    ActionCable.server.broadcast(
+      "hub:#{@hub.id}:signal:#{browser_identity}",
+      { type: "signal", envelope: data["envelope"] }
+    )
   end
 
   private

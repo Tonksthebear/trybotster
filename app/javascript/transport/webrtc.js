@@ -13,13 +13,17 @@
  * Architecture:
  * - Main thread: WebRTCTransport (this) handles RTCPeerConnection, DataChannel
  * - SharedWorker: signal_crypto.js handles encryption/decryption
- * - Signaling: HTTP polling to Rails
+ * - Signaling: ActionCable push via HubSignalingChannel (encrypted envelopes)
+ *   Rails is a dumb pipe — envelopes are opaque, only browser/CLI can decrypt.
  */
 
 import bridge from "workers/bridge"
 
 // Singleton instance
 let instance = null
+
+// ActionCable consumer (lazy singleton, shared across all connections)
+let cableConsumer = null
 
 // Connection states
 export const TransportState = {
@@ -39,7 +43,7 @@ class WebRTCTransport {
   #subscriptionListeners = new Map() // subscriptionId -> Set<callback>
   #pendingSubscriptions = new Map() // subscriptionId -> { resolve, reject, timeout }
   #subscriptionIdCounter = 0
-  #pollingTimers = new Map() // hubId -> timer
+  #cableSubscriptions = new Map() // hubId -> ActionCable subscription
   #graceTimers = new Map() // hubId -> timer (pending disconnects)
 
   constructor() {
@@ -52,6 +56,12 @@ class WebRTCTransport {
         clearTimeout(timer)
       }
       this.#graceTimers.clear()
+
+      // Clean up ActionCable signaling subscriptions
+      for (const sub of this.#cableSubscriptions.values()) {
+        sub.unsubscribe()
+      }
+      this.#cableSubscriptions.clear()
 
       for (const [hubId, conn] of this.#connections) {
         if (conn.dataChannel) conn.dataChannel.close()
@@ -103,10 +113,11 @@ class WebRTCTransport {
   }
 
   /**
-   * Internal: Actually establish the WebRTC connection
+   * Internal: Actually establish the WebRTC connection.
+   * Signaling flows through ActionCable with encrypted envelopes.
    */
   async #doConnect(hubId, browserIdentity) {
-    // Fetch ICE server configuration
+    // Fetch ICE server configuration (HTTP GET — just config, not signaling)
     const iceConfig = await this.#fetchIceConfig(hubId)
 
     // Create peer connection
@@ -123,13 +134,21 @@ class WebRTCTransport {
     }
     this.#connections.set(hubId, conn)
 
-    // Set up ICE candidate handling
+    // Subscribe to ActionCable signaling channel FIRST (to receive answer/ICE/health)
+    const subscription = await this.#createSignalingChannel(hubId, browserIdentity)
+
+    // ICE candidate handler — encrypt and send via ActionCable
     pc.onicecandidate = async (event) => {
       if (event.candidate) {
-        await this.#sendSignal(hubId, browserIdentity, {
-          signal_type: "ice",
-          candidate: event.candidate.toJSON(),
-        })
+        try {
+          const envelope = await this.#encryptSignal(hubId, {
+            type: "ice",
+            candidate: event.candidate.toJSON(),
+          })
+          subscription.perform("signal", { envelope })
+        } catch (e) {
+          console.error("[WebRTCTransport] Failed to send ICE candidate:", e)
+        }
       }
     }
 
@@ -144,7 +163,6 @@ class WebRTCTransport {
       } else if (state === "failed" || state === "disconnected" || state === "closed") {
         conn.state = TransportState.DISCONNECTED
         this.#emit("connection:state", { hubId, state: "disconnected" })
-        this.#stopPolling(hubId)
         // Clean up so reconnect can create fresh connection
         if (conn.dataChannel) {
           conn.dataChannel.close()
@@ -159,17 +177,15 @@ class WebRTCTransport {
     conn.dataChannel = dataChannel
     this.#setupDataChannel(hubId, dataChannel)
 
-    // Create and send offer
+    // Create offer, encrypt, and send via ActionCable
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
 
-    await this.#sendSignal(hubId, browserIdentity, {
-      signal_type: "offer",
+    const envelope = await this.#encryptSignal(hubId, {
+      type: "offer",
       sdp: offer.sdp,
     })
-
-    // Start polling for answer
-    this.#startPolling(hubId, browserIdentity)
+    subscription.perform("signal", { envelope })
 
     return { state: TransportState.CONNECTING }
   }
@@ -218,7 +234,12 @@ class WebRTCTransport {
 
     console.debug(`[WebRTCTransport] Closing connection for hub ${hubId}`)
 
-    this.#stopPolling(hubId)
+    // Unsubscribe ActionCable signaling channel
+    const cableSub = this.#cableSubscriptions.get(hubId)
+    if (cableSub) {
+      cableSub.unsubscribe()
+      this.#cableSubscriptions.delete(hubId)
+    }
 
     if (conn.dataChannel) {
       conn.dataChannel.close()
@@ -417,71 +438,105 @@ class WebRTCTransport {
     return response.json()
   }
 
-  async #sendSignal(hubId, browserIdentity, signal) {
-    const response = await fetch(`/hubs/${hubId}/webrtc_signals`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({
-        ...signal,
-        browser_identity: browserIdentity,
-      }),
-    })
+  // ========== ActionCable Signaling ==========
 
-    if (!response.ok) {
-      throw new Error(`Failed to send signal: ${response.status}`)
+  /**
+   * Lazily create ActionCable consumer (shared across all hub connections).
+   */
+  async #getConsumer() {
+    if (!cableConsumer) {
+      const { createConsumer } = await import("@rails/actioncable")
+      cableConsumer = createConsumer()
     }
+    return cableConsumer
   }
 
-  #startPolling(hubId, browserIdentity) {
-    if (this.#pollingTimers.has(hubId)) return
+  /**
+   * Subscribe to HubSignalingChannel via ActionCable.
+   * Resolves when subscription is confirmed (connected callback fires).
+   * Receives encrypted signal envelopes and health status messages.
+   */
+  async #createSignalingChannel(hubId, browserIdentity) {
+    const consumer = await this.#getConsumer()
 
-    const poll = async () => {
-      const conn = this.#connections.get(hubId)
-      if (!conn || conn.state === TransportState.CONNECTED) {
-        this.#stopPolling(hubId)
-        return
-      }
+    return new Promise((resolve) => {
+      const subscription = consumer.subscriptions.create(
+        { channel: "HubSignalingChannel", hub_id: hubId, browser_identity: browserIdentity },
+        {
+          received: (data) => {
+            this.#handleSignalingMessage(hubId, data)
+          },
+          connected: () => {
+            console.debug(`[WebRTCTransport] Signaling channel connected for hub ${hubId}`)
+            this.#cableSubscriptions.set(hubId, subscription)
+            resolve(subscription)
+          },
+          disconnected: () => {
+            console.debug(`[WebRTCTransport] Signaling channel disconnected for hub ${hubId}`)
+          },
+        }
+      )
+    })
+  }
 
+  /**
+   * Handle incoming ActionCable message from HubSignalingChannel.
+   * Health messages are emitted directly. Signal envelopes are decrypted
+   * and routed by their decrypted type (answer, ice).
+   */
+  async #handleSignalingMessage(hubId, data) {
+    if (data.type === "health") {
+      this.#emit("health", { hubId, ...data })
+      return
+    }
+
+    if (data.type === "signal") {
       try {
-        const response = await fetch(
-          `/hubs/${hubId}/webrtc_signals?browser_identity=${encodeURIComponent(browserIdentity)}`,
-          { credentials: "include" }
-        )
+        const decrypted = await this.#decryptSignalEnvelope(hubId, data.envelope)
+        if (!decrypted) return
 
-        if (response.ok) {
-          const { signals } = await response.json()
-
-          for (const signal of signals) {
-            if (signal.type === "answer") {
-              console.debug("[WebRTCTransport] Received answer")
-              await this.#handleAnswer(hubId, signal.sdp)
-            } else if (signal.type === "ice") {
-              console.debug("[WebRTCTransport] Received ICE candidate")
-              await this.#handleIceCandidate(hubId, signal.candidate)
-            }
-          }
+        if (decrypted.type === "answer") {
+          console.debug("[WebRTCTransport] Received answer via ActionCable")
+          await this.#handleAnswer(hubId, decrypted.sdp)
+        } else if (decrypted.type === "ice") {
+          console.debug("[WebRTCTransport] Received ICE candidate via ActionCable")
+          await this.#handleIceCandidate(hubId, decrypted.candidate)
         }
       } catch (e) {
-        console.warn("[WebRTCTransport] Poll error:", e)
-      }
-
-      // Continue polling
-      if (this.#connections.has(hubId)) {
-        this.#pollingTimers.set(hubId, setTimeout(poll, 1000))
+        console.error("[WebRTCTransport] Signal decryption/handling error:", e)
       }
     }
-
-    poll()
   }
 
-  #stopPolling(hubId) {
-    const timer = this.#pollingTimers.get(hubId)
-    if (timer) {
-      clearTimeout(timer)
-      this.#pollingTimers.delete(hubId)
+  /**
+   * Decrypt a signal envelope (offer, answer, ICE) from ActionCable.
+   *
+   * Unlike #decryptEnvelope (used for DataChannel messages which are
+   * base64-encoded and optionally compressed), signaling payloads are
+   * raw JSON — no base64, no compression.
+   *
+   * @returns {object|null} Decrypted signal payload, or null on failure
+   */
+  async #decryptSignalEnvelope(hubId, envelope) {
+    try {
+      const { plaintext } = await bridge.decrypt(String(hubId), envelope)
+      return typeof plaintext === "string" ? JSON.parse(plaintext) : plaintext
+    } catch (err) {
+      console.error("[WebRTCTransport] Signal decryption failed:", err.message || err)
+      return null
     }
   }
+
+  /**
+   * Encrypt a signaling payload (offer, answer, ICE) for transmission.
+   * Returns the envelope object ready for ActionCable perform.
+   */
+  async #encryptSignal(hubId, payload) {
+    const { envelope } = await bridge.encrypt(String(hubId), payload)
+    return typeof envelope === "string" ? JSON.parse(envelope) : envelope
+  }
+
+  // ========== WebRTC Signal Handling ==========
 
   async #handleAnswer(hubId, sdp) {
     const conn = this.#connections.get(hubId)
@@ -525,7 +580,6 @@ class WebRTCTransport {
       if (conn) {
         conn.state = TransportState.CONNECTED
       }
-      this.#stopPolling(hubId)
       this.#emit("connection:state", { hubId, state: "connected" })
     }
 
@@ -600,7 +654,7 @@ class WebRTCTransport {
           })
         }
       } else if (msg.type === "health") {
-        // Health messages - broadcast to all subscriptions for this hub
+        // Health messages via DataChannel (fallback — primary path is ActionCable)
         const conn = this.#connections.get(hubId)
         if (conn) {
           for (const subId of conn.subscriptions.keys()) {

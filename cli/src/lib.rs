@@ -77,8 +77,7 @@ pub use lua::LuaRuntime;
 
 // Re-export Client types
 pub use client::{
-    Client, ClientId, ClientRegistry, CreateAgentRequest, DeleteAgentRequest,
-    Response, TuiClient,
+    ClientId, CreateAgentRequest, DeleteAgentRequest, Response,
 };
 
 // Re-export PTY event types (for pub/sub integration)

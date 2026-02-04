@@ -6,16 +6,14 @@
 //! # Architecture
 //!
 //! Hub communicates with TUI via HubEvent broadcasts. Browser communication
-//! happens directly via WebRTC in `server_comms.rs`, bypassing the Client
-//! trait entirely.
+//! happens directly via WebRTC + Lua in `server_comms.rs`.
 //!
 //! This module handles high-level client actions:
 //!
 //! - Agent selection: `handle_select_agent_for_client()`
 //! - Agent creation/deletion: `handle_create_agent_for_client()`, `handle_delete_agent_for_client()`
-//! - Client lifecycle: `handle_client_connected()`, `handle_client_disconnected()` (legacy no-ops)
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-02
 
 use std::path::PathBuf;
 
@@ -41,7 +39,7 @@ pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_
 
     // Validate agent exists
     if !hub.state.read().unwrap().agents.contains_key(&agent_key) {
-        hub.send_error_to(&client_id, "Agent not found".to_string());
+        log::error!("Agent not found for client {}: {}", client_id, &agent_key[..8.min(agent_key.len())]);
         return;
     }
 
@@ -115,7 +113,7 @@ pub fn handle_create_agent_for_client(
     let (repo_path, repo_name) = match crate::git::WorktreeManager::detect_current_repo() {
         Ok(info) => info,
         Err(e) => {
-            hub.send_error_to(&client_id, format!("Failed to detect repo: {}", e));
+            log::error!("Failed to detect repo for client {}: {}", client_id, e);
             return;
         }
     };
@@ -229,7 +227,7 @@ fn spawn_agent_sync(
     let (repo_path, repo_name) = match crate::git::WorktreeManager::detect_current_repo() {
         Ok(info) => info,
         Err(e) => {
-            hub.send_error_to(&client_id, format!("Failed to detect repo: {}", e));
+            log::error!("Failed to detect repo for client {}: {}", client_id, e);
             return;
         }
     };
@@ -287,9 +285,6 @@ fn spawn_agent_sync(
 
             let agent_id = result.agent_id;
 
-            // Agent list broadcast is handled via HubEvent::AgentCreated below
-            // WebRTC and TUI react to this event
-            hub.broadcast_agent_list();
             handle_select_agent_for_client(hub, client_id, agent_id.clone());
 
             // Refresh worktree cache - this agent's worktree is now in use
@@ -312,7 +307,7 @@ fn spawn_agent_sync(
             }
         }
         Err(e) => {
-            hub.send_error_to(&client_id, format!("Failed to spawn agent: {}", e));
+            log::error!("Failed to spawn agent for client {}: {}", client_id, e);
         }
     }
 }
@@ -320,8 +315,8 @@ fn spawn_agent_sync(
 /// Handle deleting an agent for a specific client.
 ///
 /// When an agent is deleted:
-/// 1. HubEvent::AgentDeleted is broadcast -- each client's handle_hub_event()
-///    disconnects from the deleted agent's PTYs.
+/// 1. HubEvent::AgentDeleted is broadcast — Lua clients disconnect from
+///    the deleted agent's PTYs via their own event handling.
 /// 2. The agent and optionally its worktree are deleted.
 pub fn handle_delete_agent_for_client(
     hub: &mut Hub,
@@ -356,32 +351,7 @@ pub fn handle_delete_agent_for_client(
             }
         }
         Err(e) => {
-            hub.send_error_to(&client_id, format!("Failed to delete agent: {}", e));
+            log::error!("Failed to delete agent for client {}: {}", client_id, e);
         }
     }
-}
-
-/// Handle client connected event.
-///
-/// This is a legacy handler for browser_connected events that are no longer sent.
-/// Browser communication now happens directly via WebRTC in `server_comms.rs`,
-/// bypassing the Client trait and ClientRegistry entirely.
-///
-/// This handler is retained for backward compatibility but is effectively a no-op.
-pub fn handle_client_connected(hub: &mut Hub, client_id: ClientId) {
-    log::info!("Client connected: {} (no-op - WebRTC handles browser connections directly)", client_id);
-    // Suppress unused variable warning
-    let _ = hub;
-}
-
-/// Handle client disconnected event.
-///
-/// This is a legacy handler for browser_disconnected events that are no longer sent.
-/// Browser communication now happens directly via WebRTC in `server_comms.rs`.
-///
-/// This handler is retained for backward compatibility but is effectively a no-op.
-pub fn handle_client_disconnected(hub: &mut Hub, client_id: ClientId) {
-    log::info!("Client disconnected: {} (no-op - WebRTC handles browser connections directly)", client_id);
-    // Suppress unused variable warning
-    let _ = hub;
 }

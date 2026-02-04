@@ -6,7 +6,7 @@
 -- Module layout:
 --   core/     - Protected modules (never reloaded): state, hooks, loader
 --   lib/      - Library modules (hot-reloadable): client, utils
---   handlers/ - Handler modules (hot-reloadable): connections, webrtc
+--   handlers/ - Handler modules (hot-reloadable): connections, webrtc, tui
 
 log.info("=== Botster Lua Runtime ===")
 
@@ -45,8 +45,9 @@ end
 -- Load connection registry (shared client management for all transports)
 safe_require("handlers.connections")
 
--- Load WebRTC transport handler (registers peer/message callbacks)
+-- Load transport handlers (register peer/message callbacks)
 safe_require("handlers.webrtc")
+safe_require("handlers.tui")
 
 -- ============================================================================
 -- Event Subscriptions (Logging)

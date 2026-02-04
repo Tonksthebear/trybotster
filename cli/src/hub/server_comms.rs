@@ -4,6 +4,7 @@
 //!
 //! - WebSocket command channel for real-time message delivery
 //! - Heartbeat sending via command channel
+//! - WebRTC signaling via ActionCable (encrypted with Signal Protocol)
 //! - Agent notification delivery via background worker
 //! - Device and hub registration
 //!
@@ -36,25 +37,32 @@ impl Hub {
         self.poll_pending_agents();
         self.poll_progress_events();
         self.poll_command_channel();
+        self.poll_signal_channel();
+        self.poll_outgoing_signals();
         self.poll_webrtc_channels();
         self.poll_webrtc_pty_output();
+        self.poll_tui_requests();
+        self.poll_tui_hub_events();
         self.send_command_channel_heartbeat();
         self.poll_agent_notifications_async();
         self.poll_lua_file_changes();
-        // Flush any Lua-queued operations (WebRTC sends, PTY requests, Hub requests)
+        // Flush any Lua-queued operations (WebRTC sends, TUI sends, PTY requests, Hub requests)
         // This catches any events fired outside the normal message flow
         self.flush_lua_queues();
     }
 
     /// Flush all Lua-queued operations.
     ///
-    /// Processes WebRTC sends, PTY requests, and Hub requests that Lua callbacks
-    /// may have queued. Called automatically in `tick()` to ensure all queued
-    /// operations are processed without requiring manual calls after each Lua event.
+    /// Processes WebRTC sends, TUI sends, PTY requests, and Hub requests that Lua
+    /// callbacks may have queued. Called automatically in `tick()` to ensure all
+    /// queued operations are processed without requiring manual calls after each
+    /// Lua event.
     pub fn flush_lua_queues(&mut self) {
         self.process_lua_webrtc_sends();
+        self.process_lua_tui_sends();
         self.process_lua_pty_requests();
         self.process_lua_hub_requests();
+        self.process_lua_connection_requests();
     }
 
     /// Poll for Lua file changes and hot-reload modified modules.
@@ -212,10 +220,6 @@ impl Hub {
                             msg.payload
                         );
                     }
-                }
-                "webrtc_offer" => {
-                    // Browser sent WebRTC SDP offer - create answer and send back
-                    self.handle_webrtc_offer(&msg.payload);
                 }
                 _ => {
                     self.process_command_channel_message(msg);
@@ -433,11 +437,7 @@ impl Hub {
                         self.handle_successful_spawn(result, &pending.client_id);
                     }
                     Err(e) => {
-                        log::error!("Failed to spawn agent: {}", e);
-                        self.send_error_to(
-                            &pending.client_id,
-                            format!("Failed to spawn agent: {}", e),
-                        );
+                        log::error!("Failed to spawn agent for {}: {}", pending.client_id, e);
                     }
                 }
             }
@@ -447,7 +447,7 @@ impl Hub {
                     pending.client_id,
                     e
                 );
-                self.send_error_to(&pending.client_id, format!("Failed to create agent: {}", e));
+                // Error already logged above
             }
         }
     }
@@ -708,6 +708,9 @@ impl Hub {
                 PtyRequest::CreateForwarder(req) => {
                     self.create_lua_pty_forwarder(req);
                 }
+                PtyRequest::CreateTuiForwarder(req) => {
+                    self.create_lua_tui_pty_forwarder(req);
+                }
                 PtyRequest::StopForwarder { forwarder_id } => {
                     self.stop_lua_pty_forwarder(&forwarder_id);
                 }
@@ -826,6 +829,23 @@ impl Hub {
                             request,
                         },
                     );
+                }
+            }
+        }
+    }
+
+    /// Process connection requests queued by Lua callbacks.
+    ///
+    /// Drains the Lua connection request queue and processes each request.
+    /// Called after any Lua callback that might queue connection operations.
+    pub fn process_lua_connection_requests(&mut self) {
+        use crate::lua::primitives::ConnectionRequest;
+
+        for request in self.lua.drain_connection_requests() {
+            match request {
+                ConnectionRequest::Regenerate => {
+                    log::info!("[Lua] Processing connection.regenerate() request");
+                    actions::dispatch(self, HubAction::RegenerateConnectionCode);
                 }
             }
         }
@@ -992,6 +1012,130 @@ impl Hub {
         self.webrtc_pty_forwarders.insert(forwarder_key, task);
     }
 
+    /// Create a TUI PTY forwarder requested by Lua.
+    ///
+    /// Spawns a forwarder task that streams PTY output to TUI via `tui_output_tx`.
+    /// Unlike the WebRTC forwarder, no encryption or subscription wrapping is needed.
+    fn create_lua_tui_pty_forwarder(&mut self, req: crate::lua::primitives::CreateTuiForwarderRequest) {
+        use crate::client::TuiOutput;
+
+        let forwarder_key = format!("tui:{}:{}", req.agent_index, req.pty_index);
+
+        // Check if agent and PTY exist
+        let Some(agent_handle) = self.handle_cache.get_agent(req.agent_index) else {
+            log::warn!("[Lua-TUI] Cannot create forwarder: no agent at index {}", req.agent_index);
+            *req.active_flag.lock().unwrap() = false;
+            return;
+        };
+
+        let Some(pty_handle) = agent_handle.get_pty(req.pty_index) else {
+            log::warn!(
+                "[Lua-TUI] Cannot create forwarder: no PTY at index {} for agent {}",
+                req.pty_index, req.agent_index
+            );
+            *req.active_flag.lock().unwrap() = false;
+            return;
+        };
+
+        let Some(ref output_tx) = self.tui_output_tx else {
+            log::warn!("[Lua-TUI] Cannot create forwarder: no TUI output channel");
+            *req.active_flag.lock().unwrap() = false;
+            return;
+        };
+
+        // Abort any existing forwarder for this key
+        if let Some(old_task) = self.webrtc_pty_forwarders.remove(&forwarder_key) {
+            old_task.abort();
+            log::debug!("[Lua-TUI] Aborted existing PTY forwarder for {}", forwarder_key);
+        }
+
+        // Subscribe to PTY events
+        let pty_rx = pty_handle.subscribe();
+
+        // Get scrollback buffer to send initially
+        let scrollback = pty_handle.get_scrollback();
+
+        let sink = output_tx.clone();
+        let agent_index = req.agent_index;
+        let pty_index = req.pty_index;
+        let active_flag = req.active_flag;
+
+        let _guard = self.tokio_runtime.enter();
+        let task = tokio::spawn(async move {
+            use crate::agent::pty::PtyEvent;
+
+            log::info!(
+                "[Lua-TUI] Started PTY forwarder for agent {} pty {}",
+                agent_index, pty_index
+            );
+
+            // Send scrollback buffer first (if any)
+            if !scrollback.is_empty() {
+                log::debug!(
+                    "[Lua-TUI] Sending {} bytes of scrollback for agent {} pty {}",
+                    scrollback.len(), agent_index, pty_index
+                );
+                if sink.send(TuiOutput::Scrollback(scrollback)).is_err() {
+                    log::trace!("[Lua-TUI] Output channel closed before scrollback sent");
+                    return;
+                }
+            }
+
+            let mut pty_rx = pty_rx;
+            loop {
+                // Check if forwarder was stopped by Lua
+                {
+                    let active = active_flag.lock().unwrap();
+                    if !*active {
+                        log::debug!("[Lua-TUI] PTY forwarder stopped by Lua");
+                        break;
+                    }
+                }
+
+                match pty_rx.recv().await {
+                    Ok(PtyEvent::Output(data)) => {
+                        if sink.send(TuiOutput::Output(data)).is_err() {
+                            log::trace!("[Lua-TUI] Output channel closed, stopping forwarder");
+                            break;
+                        }
+                    }
+                    Ok(PtyEvent::ProcessExited { exit_code }) => {
+                        log::info!(
+                            "[Lua-TUI] PTY process exited (code={:?}) for agent {} pty {}",
+                            exit_code, agent_index, pty_index
+                        );
+                        let _ = sink.send(TuiOutput::ProcessExited { exit_code });
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!(
+                            "[Lua-TUI] PTY forwarder lagged by {} events for agent {} pty {}",
+                            n, agent_index, pty_index
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        log::info!(
+                            "[Lua-TUI] PTY channel closed for agent {} pty {}",
+                            agent_index, pty_index
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // Mark forwarder as inactive
+            *active_flag.lock().unwrap() = false;
+
+            log::info!(
+                "[Lua-TUI] Stopped PTY forwarder for agent {} pty {}",
+                agent_index, pty_index
+            );
+        });
+
+        self.webrtc_pty_forwarders.insert(forwarder_key, task);
+    }
+
     /// Stop a PTY forwarder by ID.
     fn stop_lua_pty_forwarder(&mut self, forwarder_id: &str) {
         if let Some(task) = self.webrtc_pty_forwarders.remove(forwarder_id) {
@@ -1052,30 +1196,502 @@ impl Hub {
         }
     }
 
-    // === WebRTC Signaling ===
+    // === TUI via Lua (Hub-side Processing) ===
 
-    /// Handle incoming WebRTC offer from browser.
+    /// Poll TUI requests from TuiRunner (non-blocking).
+    ///
+    /// Drains all pending `TuiRequest` messages and handles each one directly.
+    /// Hub processes TUI requests synchronously instead of delegating to a
+    /// `TuiClient` async task, allowing Lua to participate in the pipeline.
+    fn poll_tui_requests(&mut self) {
+        let Some(ref mut rx) = self.tui_request_rx else {
+            return;
+        };
+
+        let mut requests = Vec::new();
+        while let Ok(req) = rx.try_recv() {
+            requests.push(req);
+        }
+
+        for request in requests {
+            self.handle_tui_request(request);
+        }
+    }
+
+    /// Poll Hub events and forward to TuiRunner (non-blocking).
+    ///
+    /// Receives Hub events via broadcast channel and sends them to TuiRunner
+    /// as `TuiOutput::HubEvent`. Filters browser-specific and Shutdown events
+    /// (matching `TuiClient::handle_hub_event` behavior).
+    ///
+    /// Events are drained into a Vec first to release the mutable borrow on
+    /// `tui_hub_event_rx` before calling `handle_tui_disconnect_from_pty`.
+    fn poll_tui_hub_events(&mut self) {
+        use crate::client::TuiOutput;
+
+        // Drain events into a Vec to release the mutable borrow
+        let events: Vec<HubEvent> = {
+            let Some(ref mut rx) = self.tui_hub_event_rx else {
+                return;
+            };
+
+            let mut events = Vec::new();
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                        log::warn!("[TUI] Hub event receiver lagged by {} events", n);
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                }
+            }
+            events
+        };
+
+        if events.is_empty() {
+            return;
+        }
+
+        // Clone the sender to avoid borrow conflict with &mut self methods
+        let tx = match self.tui_output_tx.clone() {
+            Some(tx) => tx,
+            None => return,
+        };
+
+        for event in events {
+            match &event {
+                HubEvent::AgentDeleted { agent_id } => {
+                    // Disconnect from deleted agent's PTYs before forwarding
+                    let agent_index = self
+                        .handle_cache
+                        .get_all_agents()
+                        .iter()
+                        .position(|h| h.agent_id() == agent_id);
+
+                    if let Some(idx) = agent_index {
+                        self.handle_tui_disconnect_from_pty(idx, 0);
+                        self.handle_tui_disconnect_from_pty(idx, 1);
+                    }
+                    let _ = tx.send(TuiOutput::HubEvent(event));
+                }
+                HubEvent::Shutdown => {
+                    // Don't forward - TuiRunner detects shutdown via its own mechanisms
+                }
+                HubEvent::PtyConnectionRequested { .. }
+                | HubEvent::PtyDisconnectionRequested { .. }
+                | HubEvent::HttpConnectionRequested { .. } => {
+                    // Browser-specific events, TUI ignores
+                }
+                _ => {
+                    let _ = tx.send(TuiOutput::HubEvent(event));
+                }
+            }
+        }
+    }
+
+    /// Process TUI send requests queued by Lua callbacks.
+    ///
+    /// Drains JSON and binary messages queued by `tui.send()` in Lua.
+    /// JSON messages are logged and discarded (TuiRunner speaks `TuiOutput`,
+    /// not JSON subscription protocol). Binary messages are forwarded as
+    /// `TuiOutput::Output` (raw terminal data).
+    fn process_lua_tui_sends(&mut self) {
+        use crate::client::TuiOutput;
+        use crate::lua::primitives::TuiSendRequest;
+
+        let Some(ref tx) = self.tui_output_tx else {
+            // No TUI connected, drain and discard
+            let _ = self.lua.drain_tui_sends();
+            return;
+        };
+
+        for send_req in self.lua.drain_tui_sends() {
+            match send_req {
+                TuiSendRequest::Json { data } => {
+                    // TuiRunner doesn't speak JSON subscription protocol.
+                    // These are subscription confirmations and Lua hub broadcasts.
+                    log::trace!("[TUI-LUA] Discarding JSON send: {}", data);
+                }
+                TuiSendRequest::Binary { data } => {
+                    // Binary data = raw terminal output, forward to TuiRunner
+                    let _ = tx.send(TuiOutput::Output(data));
+                }
+            }
+        }
+    }
+
+    /// Handle a single TUI request from TuiRunner.
+    ///
+    /// Processes the request synchronously on the Hub main thread. PTY operations
+    /// use `HandleCache` for direct access. Agent lifecycle operations dispatch
+    /// `HubAction`s through the standard action pipeline.
+    fn handle_tui_request(&mut self, request: crate::client::TuiRequest) {
+        use crate::client::TuiRequest;
+
+        match request {
+            // === PTY I/O (direct HandleCache access) ===
+            TuiRequest::SendInput { agent_index, pty_index, data } => {
+                if let Some(agent) = self.handle_cache.get_agent(agent_index) {
+                    if let Some(pty) = agent.get_pty(pty_index) {
+                        if let Err(e) = pty.write_input_direct(&data) {
+                            log::error!("[TUI] Failed to send input: {}", e);
+                        }
+                    }
+                }
+            }
+            TuiRequest::SetDims { agent_index, pty_index, cols, rows } => {
+                self.tui_dims = (cols, rows);
+                if let Some(agent) = self.handle_cache.get_agent(agent_index) {
+                    if let Some(pty) = agent.get_pty(pty_index) {
+                        pty.resize_direct(ClientId::Tui, rows, cols);
+                    }
+                }
+            }
+
+            // === Agent Selection / PTY Connection ===
+            TuiRequest::SelectAgent { index, response_tx } => {
+                let result = self.handle_tui_select_agent(index);
+                let _ = response_tx.send(result);
+            }
+            TuiRequest::ConnectToPty { agent_index, pty_index } => {
+                self.handle_tui_connect_to_pty(agent_index, pty_index);
+            }
+            TuiRequest::DisconnectFromPty { agent_index, pty_index } => {
+                self.handle_tui_disconnect_from_pty(agent_index, pty_index);
+            }
+
+            // === Hub Lifecycle ===
+            TuiRequest::Quit => {
+                self.quit = true;
+                self.broadcast(HubEvent::shutdown());
+            }
+            TuiRequest::ListWorktrees { response_tx } => {
+                if let Err(e) = self.load_available_worktrees() {
+                    log::error!("[TUI] Failed to load worktrees: {}", e);
+                }
+                let worktrees = self.state.read().unwrap().available_worktrees.clone();
+                let _ = response_tx.send(worktrees);
+            }
+            TuiRequest::GetConnectionCodeWithQr { response_tx } => {
+                let result = self.generate_connection_url().and_then(|url| {
+                    // Cache the URL so connection.get_url() works from Lua
+                    self.handle_cache.set_connection_url(Ok(url.clone()));
+                    crate::tui::generate_qr_png(&url, 4)
+                        .map(|qr_png| crate::tui::ConnectionCodeData { url, qr_png })
+                });
+                let _ = response_tx.send(result);
+            }
+            TuiRequest::CreateAgent { request } => {
+                actions::dispatch(
+                    self,
+                    HubAction::CreateAgentForClient {
+                        client_id: ClientId::Tui,
+                        request,
+                    },
+                );
+            }
+            TuiRequest::DeleteAgent { request } => {
+                actions::dispatch(
+                    self,
+                    HubAction::DeleteAgentForClient {
+                        client_id: ClientId::Tui,
+                        request,
+                    },
+                );
+            }
+            TuiRequest::RegenerateConnectionCode => {
+                actions::dispatch(self, HubAction::RegenerateConnectionCode);
+            }
+            TuiRequest::CopyConnectionUrl => {
+                actions::dispatch(self, HubAction::CopyConnectionUrl);
+            }
+        }
+    }
+
+    /// Select an agent for TUI and connect to its CLI PTY.
+    ///
+    /// Dispatches `SelectAgentForClient` action and connects to the CLI PTY
+    /// (index 0). Returns metadata for TuiRunner, or `None` if the agent
+    /// doesn't exist at the given index.
+    fn handle_tui_select_agent(
+        &mut self,
+        index: usize,
+    ) -> Option<crate::client::TuiAgentMetadata> {
+        let agent = self.handle_cache.get_agent(index)?;
+        let agent_id = agent.agent_id().to_string();
+        let has_server_pty = agent.get_pty(1).is_some();
+
+        // Notify Hub of selection
+        actions::dispatch(
+            self,
+            HubAction::SelectAgentForClient {
+                client_id: ClientId::Tui,
+                agent_key: agent_id.clone(),
+            },
+        );
+
+        // Connect to CLI PTY (index 0)
+        self.handle_tui_connect_to_pty(index, 0);
+
+        Some(crate::client::TuiAgentMetadata {
+            agent_id,
+            agent_index: index,
+            has_server_pty,
+        })
+    }
+
+    /// Connect TUI to a specific PTY and start output forwarding.
+    ///
+    /// Aborts any existing forwarder task, connects to the PTY (getting scrollback),
+    /// subscribes to PTY events, and spawns a new forwarder task that routes
+    /// `PtyEvent::Output` to `TuiOutput::Output`.
+    fn handle_tui_connect_to_pty(&mut self, agent_index: usize, pty_index: usize) {
+        use crate::client::TuiOutput;
+
+        // Abort existing forwarder
+        if let Some(task) = self.tui_output_task.take() {
+            task.abort();
+        }
+
+        let Some(agent) = self.handle_cache.get_agent(agent_index) else {
+            log::warn!("[TUI] No agent at index {}", agent_index);
+            return;
+        };
+
+        let Some(pty) = agent.get_pty(pty_index) else {
+            log::warn!("[TUI] No PTY at index {} for agent {}", pty_index, agent_index);
+            return;
+        };
+
+        // Connect and get scrollback
+        let scrollback = match pty.connect_direct(ClientId::Tui, self.tui_dims) {
+            Ok(sb) => sb,
+            Err(e) => {
+                log::error!("[TUI] Failed to connect to PTY: {}", e);
+                return;
+            }
+        };
+
+        let Some(ref output_tx) = self.tui_output_tx else {
+            log::warn!("[TUI] No output channel for PTY connection");
+            return;
+        };
+
+        // Send scrollback
+        if !scrollback.is_empty() {
+            let _ = output_tx.send(TuiOutput::Scrollback(scrollback));
+        }
+
+        // Subscribe and spawn forwarder
+        let pty_rx = pty.subscribe();
+        let sink = output_tx.clone();
+
+        let _guard = self.tokio_runtime.enter();
+        self.tui_output_task = Some(tokio::spawn(async move {
+            use crate::agent::pty::PtyEvent;
+
+            let mut pty_rx = pty_rx;
+            loop {
+                match pty_rx.recv().await {
+                    Ok(PtyEvent::Output(data)) => {
+                        if sink.send(TuiOutput::Output(data)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(PtyEvent::ProcessExited { exit_code }) => {
+                        let _ = sink.send(TuiOutput::ProcessExited { exit_code });
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("[TUI] Output forwarder lagged by {} events", n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        }));
+
+        log::info!("[TUI] Connected to PTY ({}, {})", agent_index, pty_index);
+    }
+
+    /// Disconnect TUI from a specific PTY.
+    ///
+    /// Aborts the output forwarder task and notifies the PTY of disconnection.
+    fn handle_tui_disconnect_from_pty(&mut self, agent_index: usize, pty_index: usize) {
+        // Abort forwarder
+        if let Some(task) = self.tui_output_task.take() {
+            task.abort();
+        }
+
+        // Notify PTY
+        if let Some(agent) = self.handle_cache.get_agent(agent_index) {
+            if let Some(pty) = agent.get_pty(pty_index) {
+                pty.disconnect_direct(ClientId::Tui);
+            }
+        }
+
+        log::info!("[TUI] Disconnected from PTY ({}, {})", agent_index, pty_index);
+    }
+
+    // === WebRTC Signaling (ActionCable + Signal Protocol) ===
+
+    /// Poll command channel for incoming encrypted signal envelopes (non-blocking).
+    ///
+    /// Signals arrive via ActionCable (`HubSignalingChannel` -> `HubCommandChannel`
+    /// relay). Each envelope is encrypted with Signal Protocol -- Rails never sees
+    /// the plaintext. After decryption, routes by `type` field:
+    /// - `"offer"` -> create peer connection + encrypted answer
+    /// - `"ice"` -> add ICE candidate to existing peer connection
+    fn poll_signal_channel(&mut self) {
+        use crate::relay::signal::SignalEnvelope;
+
+        let signals: Vec<command_channel::SignalMessage> = {
+            let Some(ref mut channel) = self.command_channel else {
+                return;
+            };
+            let mut sigs = Vec::new();
+            while let Some(sig) = channel.try_recv_signal() {
+                sigs.push(sig);
+            }
+            sigs
+        };
+
+        if signals.is_empty() {
+            return;
+        }
+
+        let crypto = match self.browser.crypto_service.clone() {
+            Some(cs) => cs,
+            None => {
+                log::warn!("[Signal] No crypto service -- cannot decrypt signal envelopes");
+                return;
+            }
+        };
+
+        let _guard = self.tokio_runtime.enter();
+
+        for signal in signals {
+            // Deserialize envelope to SignalEnvelope for decryption
+            let envelope: SignalEnvelope = match serde_json::from_value(signal.envelope.clone()) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("[Signal] Failed to parse signal envelope: {e}");
+                    continue;
+                }
+            };
+
+            // Decrypt the envelope
+            let plaintext = match self.tokio_runtime.block_on(crypto.decrypt(&envelope)) {
+                Ok(pt) => pt,
+                Err(e) => {
+                    log::error!(
+                        "[Signal] Failed to decrypt signal from {}: {e}",
+                        &signal.browser_identity[..signal.browser_identity.len().min(8)]
+                    );
+                    continue;
+                }
+            };
+
+            // Parse decrypted plaintext as JSON
+            let payload: serde_json::Value = match serde_json::from_slice(&plaintext) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("[Signal] Failed to parse decrypted signal payload: {e}");
+                    continue;
+                }
+            };
+
+            let signal_type = payload.get("type").and_then(|t| t.as_str());
+
+            match signal_type {
+                Some("offer") => {
+                    let sdp = payload.get("sdp").and_then(|v| v.as_str()).unwrap_or("");
+                    if sdp.is_empty() {
+                        log::warn!("[Signal] Offer missing SDP");
+                        continue;
+                    }
+                    self.handle_webrtc_offer(sdp, &signal.browser_identity);
+                }
+                Some("ice") => {
+                    if let Some(candidate_obj) = payload.get("candidate") {
+                        let candidate = candidate_obj
+                            .get("candidate")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+                        let sdp_mid = candidate_obj.get("sdpMid").and_then(|m| m.as_str());
+                        let sdp_mline_index = candidate_obj
+                            .get("sdpMLineIndex")
+                            .and_then(|i| i.as_u64())
+                            .map(|i| i as u16);
+
+                        if let Some(channel) =
+                            self.webrtc_channels.get(&signal.browser_identity)
+                        {
+                            if let Err(e) = self.tokio_runtime.block_on(
+                                channel.handle_ice_candidate(candidate, sdp_mid, sdp_mline_index),
+                            ) {
+                                log::warn!("[Signal] Failed to add ICE candidate: {e}");
+                            }
+                        } else {
+                            log::warn!(
+                                "[Signal] ICE candidate for unknown browser {}",
+                                &signal.browser_identity
+                                    [..signal.browser_identity.len().min(8)]
+                            );
+                        }
+                    }
+                }
+                other => {
+                    log::trace!("[Signal] Unknown signal type: {:?}", other);
+                }
+            }
+        }
+    }
+
+    /// Drain outgoing signals (encrypted ICE candidates) and relay via ActionCable.
+    ///
+    /// WebRTC `on_ice_candidate` callbacks encrypt candidates and push them to
+    /// `webrtc_outgoing_signal_rx`. This method drains them and sends each via
+    /// `CommandChannelHandle::perform("signal", ...)` for ActionCable relay to browser.
+    fn poll_outgoing_signals(&mut self) {
+        use crate::channel::webrtc::OutgoingSignal;
+
+        let Some(ref command_channel) = self.command_channel else {
+            // Drain and discard if no command channel
+            while self.webrtc_outgoing_signal_rx.try_recv().is_ok() {}
+            return;
+        };
+
+        while let Ok(signal) = self.webrtc_outgoing_signal_rx.try_recv() {
+            match signal {
+                OutgoingSignal::Ice {
+                    browser_identity,
+                    envelope,
+                } => {
+                    command_channel.perform(
+                        "signal",
+                        serde_json::json!({
+                            "browser_identity": browser_identity,
+                            "envelope": envelope,
+                        }),
+                    );
+                    log::debug!(
+                        "[Signal] Relayed ICE candidate to browser {}",
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Handle incoming WebRTC offer from browser (decrypted).
     ///
     /// Creates or reuses a WebRTC peer connection for the browser, processes
-    /// the SDP offer, and sends the answer back via the signaling endpoint.
-    fn handle_webrtc_offer(&mut self, payload: &serde_json::Value) {
+    /// the SDP offer, encrypts the answer, and sends it back via ActionCable.
+    fn handle_webrtc_offer(&mut self, sdp: &str, browser_identity: &str) {
         use crate::channel::{ChannelConfig, WebRtcChannel};
-
-        let sdp = match payload.get("sdp").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => {
-                log::warn!("[WebRTC] Offer missing SDP");
-                return;
-            }
-        };
-
-        let browser_identity = match payload.get("browser_identity").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => {
-                log::warn!("[WebRTC] Offer missing browser_identity");
-                return;
-            }
-        };
 
         let hub_id = self.server_hub_id().to_string();
         let server_url = self.config.server_url.clone();
@@ -1087,13 +1703,19 @@ impl Hub {
         );
 
         // Get or create WebRTC channel for this browser
-        let is_new_connection = !self.webrtc_channels.contains_key(&browser_identity);
+        let is_new_connection = !self.webrtc_channels.contains_key(browser_identity);
 
         if is_new_connection {
             let mut channel = WebRtcChannel::builder()
                 .server_url(&server_url)
                 .api_key(&api_key)
-                .crypto_service(self.browser.crypto_service.clone().expect("crypto service required"))
+                .crypto_service(
+                    self.browser
+                        .crypto_service
+                        .clone()
+                        .expect("crypto service required"),
+                )
+                .signal_tx(self.webrtc_outgoing_signal_tx.clone())
                 .build();
 
             // Configure the channel with hub_id
@@ -1102,7 +1724,7 @@ impl Hub {
                 hub_id: hub_id.clone(),
                 agent_index: None,
                 pty_index: None,
-                browser_identity: Some(browser_identity.clone()),
+                browser_identity: Some(browser_identity.to_string()),
                 encrypt: true,
                 compression_threshold: Some(4096),
                 cli_subscription: false,
@@ -1115,10 +1737,11 @@ impl Hub {
                 return;
             }
 
-            self.webrtc_channels.insert(browser_identity.clone(), channel);
+            self.webrtc_channels
+                .insert(browser_identity.to_string(), channel);
 
             // Notify Lua of peer connection
-            if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
+            if let Err(e) = self.lua.call_peer_connected(browser_identity) {
                 log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
             }
             self.process_lua_webrtc_sends();
@@ -1127,42 +1750,69 @@ impl Hub {
         }
 
         // Handle the offer and get the answer
-        let channel = self.webrtc_channels.get(&browser_identity).unwrap();
+        let channel = self.webrtc_channels.get(browser_identity).unwrap();
         let _guard = self.tokio_runtime.enter();
 
-        match self.tokio_runtime.block_on(channel.handle_sdp_offer(&sdp, &browser_identity)) {
+        match self
+            .tokio_runtime
+            .block_on(channel.handle_sdp_offer(sdp, browser_identity))
+        {
             Ok(answer_sdp) => {
                 log::info!(
                     "[WebRTC] Created answer for browser {}",
                     &browser_identity[..browser_identity.len().min(8)]
                 );
 
-                // Send answer back via signaling endpoint
-                let url = format!("{}/hubs/{}/webrtc_signals", server_url, hub_id);
-                let client = reqwest::blocking::Client::new();
+                // Encrypt the answer with Signal Protocol
+                let crypto = self
+                    .browser
+                    .crypto_service
+                    .clone()
+                    .expect("crypto service required");
 
-                let body = serde_json::json!({
-                    "signal_type": "answer",
-                    "browser_identity": browser_identity,
+                let answer_payload = serde_json::json!({
+                    "type": "answer",
                     "sdp": answer_sdp,
                 });
+                let plaintext = serde_json::to_vec(&answer_payload).unwrap_or_default();
 
-                match client.post(&url).bearer_auth(&api_key).json(&body).send() {
-                    Ok(resp) if resp.status().is_success() => {
-                        log::info!("[WebRTC] Answer sent successfully");
-                        // Spawn background task to poll for browser's ICE candidates
-                        self.spawn_ice_candidate_poller(
-                            browser_identity.clone(),
-                            hub_id.clone(),
-                            server_url.clone(),
-                            api_key.clone(),
-                        );
-                    }
-                    Ok(resp) => {
-                        log::error!("[WebRTC] Failed to send answer: {}", resp.status());
+                // Extract identity key from browser_identity ("identityKey:tabId")
+                let identity_key = browser_identity
+                    .split(':')
+                    .next()
+                    .unwrap_or(browser_identity);
+
+                match self
+                    .tokio_runtime
+                    .block_on(crypto.encrypt(&plaintext, identity_key))
+                {
+                    Ok(envelope) => {
+                        let envelope_value = match serde_json::to_value(&envelope) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log::error!(
+                                    "[WebRTC] Failed to serialize answer envelope: {e}"
+                                );
+                                return;
+                            }
+                        };
+
+                        // Send via ActionCable (CommandChannel perform)
+                        if let Some(ref cmd_channel) = self.command_channel {
+                            cmd_channel.perform(
+                                "signal",
+                                serde_json::json!({
+                                    "browser_identity": browser_identity,
+                                    "envelope": envelope_value,
+                                }),
+                            );
+                            log::info!("[WebRTC] Encrypted answer sent via ActionCable");
+                        } else {
+                            log::error!("[WebRTC] No command channel for answer relay");
+                        }
                     }
                     Err(e) => {
-                        log::error!("[WebRTC] Failed to send answer: {e}");
+                        log::error!("[WebRTC] Failed to encrypt answer: {e}");
                     }
                 }
             }
@@ -1170,104 +1820,6 @@ impl Hub {
                 log::error!("[WebRTC] Failed to handle offer: {e}");
             }
         }
-    }
-
-    /// Spawn a background task to poll for ICE candidates from the browser.
-    ///
-    /// Polls the signaling endpoint periodically to collect trickle ICE candidates.
-    /// The task runs for a limited time (enough for typical ICE gathering).
-    fn spawn_ice_candidate_poller(
-        &self,
-        browser_identity: String,
-        hub_id: String,
-        server_url: String,
-        api_key: String,
-    ) {
-        // Get reference to the WebRTC channel
-        let Some(channel) = self.webrtc_channels.get(&browser_identity) else {
-            log::warn!("[WebRTC] No channel for browser {} during ICE polling", &browser_identity[..8]);
-            return;
-        };
-
-        // Clone necessary references for the async task
-        // We need to be careful here - WebRtcChannel has async methods
-        // For now, we'll use a separate HTTP client and call handle_ice_candidate
-
-        // Since WebRtcChannel is not Clone, we spawn a task that:
-        // 1. Polls for ICE candidates via HTTP
-        // 2. The candidates will be applied when we call handle_ice_candidate
-        // For this initial implementation, we'll do synchronous polling
-
-        log::info!("[WebRTC] Starting ICE candidate polling for browser {}", &browser_identity[..8]);
-
-        let url = format!(
-            "{}/hubs/{}/webrtc_signals?browser_identity={}",
-            server_url, hub_id, browser_identity
-        );
-
-        // Poll a few times with delays (blocking, but quick)
-        let client = reqwest::blocking::Client::new();
-        for i in 0..10 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-
-            let response = match client.get(&url).bearer_auth(&api_key).send() {
-                Ok(r) => r,
-                Err(e) => {
-                    log::warn!("[WebRTC] ICE poll request failed: {e}");
-                    continue;
-                }
-            };
-
-            if !response.status().is_success() {
-                continue;
-            }
-
-            #[derive(serde::Deserialize)]
-            struct SignalResponse {
-                signals: Vec<serde_json::Value>,
-            }
-
-            let signals: SignalResponse = match response.json() {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            for signal in &signals.signals {
-                if signal.get("type").and_then(|t| t.as_str()) == Some("ice") {
-                    if let Some(candidate_obj) = signal.get("candidate") {
-                        let candidate = candidate_obj.get("candidate")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("");
-                        let sdp_mid = candidate_obj.get("sdpMid")
-                            .and_then(|m| m.as_str());
-                        let sdp_mline_index = candidate_obj.get("sdpMLineIndex")
-                            .and_then(|i| i.as_u64())
-                            .map(|i| i as u16);
-
-                        log::trace!("[WebRTC] Received ICE candidate from browser (poll {})", i);
-
-                        // Add candidate to peer connection
-                        let _guard = self.tokio_runtime.enter();
-                        if let Err(e) = self.tokio_runtime.block_on(
-                            channel.handle_ice_candidate(candidate, sdp_mid, sdp_mline_index)
-                        ) {
-                            log::warn!("[WebRTC] Failed to add ICE candidate: {e}");
-                        }
-                    }
-                }
-            }
-
-            // If no signals for a while, stop polling
-            if signals.signals.is_empty() && i > 3 {
-                log::trace!("[WebRTC] No more ICE candidates, stopping poll");
-                break;
-            }
-        }
-
-        log::info!("[WebRTC] ICE candidate polling complete for browser {}", &browser_identity[..8]);
-
-        // NOTE: Lua peer_connected callback is called from handle_webrtc_offer after channel creation.
-        // We can't call it here because spawn_ice_candidate_poller borrows self immutably.
     }
 
     // === Connection Setup ===

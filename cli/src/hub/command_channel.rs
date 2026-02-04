@@ -38,6 +38,30 @@ pub struct CommandMessage {
     pub created_at: Option<String>,
 }
 
+/// Signal envelope received from browser via Rails ActionCable relay.
+///
+/// Rails is a dumb pipe — it relays opaque envelopes without inspecting content.
+/// The CLI decrypts the envelope to discover the signal type (offer, ice, etc.).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignalMessage {
+    /// Browser tab identity (`identityKey:tabId`).
+    pub browser_identity: String,
+    /// Opaque encrypted envelope from browser.
+    pub envelope: serde_json::Value,
+}
+
+/// An outgoing ActionCable perform request.
+///
+/// Sent from the main thread to the background WebSocket task to execute
+/// an ActionCable channel action (e.g., `signal` on `HubCommandChannel`).
+#[derive(Debug)]
+pub struct PerformRequest {
+    /// ActionCable action name (e.g., "signal").
+    pub action: String,
+    /// Action data (serialized as JSON string in the perform command).
+    pub data: serde_json::Value,
+}
+
 /// Handle for interacting with the command channel from the main thread.
 ///
 /// Provides non-blocking message reception, acknowledgment, heartbeat,
@@ -46,12 +70,16 @@ pub struct CommandMessage {
 pub struct CommandChannelHandle {
     /// Receiver for incoming messages.
     message_rx: mpsc::Receiver<CommandMessage>,
+    /// Receiver for incoming signal envelopes (from browser via Rails relay).
+    signal_rx: mpsc::Receiver<SignalMessage>,
     /// Last acknowledged sequence (shared with background task for reconnection).
     last_acked_sequence: Arc<AtomicI64>,
     /// Sender for ack requests to the background task.
     ack_tx: mpsc::UnboundedSender<i64>,
     /// Sender for heartbeat data to the background task.
     heartbeat_tx: mpsc::UnboundedSender<serde_json::Value>,
+    /// Sender for outgoing ActionCable perform commands.
+    perform_tx: mpsc::UnboundedSender<PerformRequest>,
     /// Shutdown flag.
     shutdown: Arc<AtomicBool>,
 }
@@ -80,9 +108,24 @@ impl CommandChannelHandle {
         let _ = self.ack_tx.send(sequence);
     }
 
+    /// Try to receive the next signal message (non-blocking).
+    pub fn try_recv_signal(&mut self) -> Option<SignalMessage> {
+        self.signal_rx.try_recv().ok()
+    }
+
     /// Send heartbeat data (agent list).
     pub fn send_heartbeat(&self, agents: serde_json::Value) {
         let _ = self.heartbeat_tx.send(agents);
+    }
+
+    /// Send an ActionCable perform command to the channel.
+    ///
+    /// Used to relay encrypted signal envelopes back to browsers via Rails.
+    pub fn perform(&self, action: &str, data: serde_json::Value) {
+        let _ = self.perform_tx.send(PerformRequest {
+            action: action.to_string(),
+            data,
+        });
     }
 
     /// Shut down the command channel.
@@ -119,8 +162,10 @@ pub fn connect(
     start_from: i64,
 ) -> CommandChannelHandle {
     let (message_tx, message_rx) = mpsc::channel(256);
+    let (signal_tx, signal_rx) = mpsc::channel(64);
     let (ack_tx, ack_rx) = mpsc::unbounded_channel();
     let (heartbeat_tx, heartbeat_rx) = mpsc::unbounded_channel();
+    let (perform_tx, perform_rx) = mpsc::unbounded_channel();
     let last_acked_sequence = Arc::new(AtomicI64::new(start_from));
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -132,13 +177,17 @@ pub fn connect(
         shutdown: Arc::clone(&shutdown),
     };
 
-    tokio::spawn(run_connection_loop(config, message_tx, ack_rx, heartbeat_rx));
+    tokio::spawn(run_connection_loop(
+        config, message_tx, signal_tx, ack_rx, heartbeat_rx, perform_rx,
+    ));
 
     CommandChannelHandle {
         message_rx,
+        signal_rx,
         last_acked_sequence,
         ack_tx,
         heartbeat_tx,
+        perform_tx,
         shutdown,
     }
 }
@@ -183,8 +232,10 @@ fn channel_identifier(hub_id: &str, start_from: i64) -> String {
 async fn run_connection_loop(
     config: ConnectionConfig,
     message_tx: mpsc::Sender<CommandMessage>,
+    signal_tx: mpsc::Sender<SignalMessage>,
     mut ack_rx: mpsc::UnboundedReceiver<i64>,
     mut heartbeat_rx: mpsc::UnboundedReceiver<serde_json::Value>,
+    mut perform_rx: mpsc::UnboundedReceiver<PerformRequest>,
 ) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite;
@@ -281,8 +332,10 @@ async fn run_connection_loop(
             &mut ws_sink,
             &mut ws_stream_rx,
             &message_tx,
+            &signal_tx,
             &mut ack_rx,
             &mut heartbeat_rx,
+            &mut perform_rx,
         )
         .await;
 
@@ -361,8 +414,10 @@ async fn run_message_loop<S, St>(
     ws_sink: &mut S,
     ws_stream_rx: &mut St,
     message_tx: &mpsc::Sender<CommandMessage>,
+    signal_tx: &mpsc::Sender<SignalMessage>,
     ack_rx: &mut mpsc::UnboundedReceiver<i64>,
     heartbeat_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+    perform_rx: &mut mpsc::UnboundedReceiver<PerformRequest>,
 ) -> ConnectionLoopExit
 where
     S: futures_util::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
@@ -391,7 +446,7 @@ where
             msg = ws_stream_rx.next() => {
                 match msg {
                     Some(Ok(tungstenite::Message::Text(text))) => {
-                        match handle_text_message(&text, &mut subscribed, message_tx).await {
+                        match handle_text_message(&text, &mut subscribed, message_tx, signal_tx).await {
                             TextMessageResult::Continue => {}
                             TextMessageResult::Break => return ConnectionLoopExit::Disconnected,
                             TextMessageResult::ReceiverDropped => return ConnectionLoopExit::Shutdown,
@@ -451,6 +506,26 @@ where
                     }
                 }
             }
+
+            // Process outgoing perform requests (e.g., signal relay to browser)
+            Some(request) = perform_rx.recv() => {
+                if subscribed {
+                    let perform_cmd = serde_json::json!({
+                        "command": "message",
+                        "identifier": identifier,
+                        "data": serde_json::json!({
+                            "action": request.action,
+                            "browser_identity": request.data["browser_identity"],
+                            "envelope": request.data["envelope"],
+                        }).to_string()
+                    });
+                    if let Err(e) = ws_sink.send(tungstenite::Message::Text(perform_cmd.to_string())).await {
+                        log::warn!("[CommandChannel] Failed to send perform '{}': {}", request.action, e);
+                        return ConnectionLoopExit::Disconnected;
+                    }
+                    log::debug!("[CommandChannel] Sent perform '{}'", request.action);
+                }
+            }
         }
     }
 }
@@ -473,6 +548,7 @@ async fn handle_text_message(
     text: &str,
     subscribed: &mut bool,
     message_tx: &mpsc::Sender<CommandMessage>,
+    signal_tx: &mpsc::Sender<SignalMessage>,
 ) -> TextMessageResult {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
         return TextMessageResult::Continue;
@@ -501,19 +577,44 @@ async fn handle_text_message(
         _ if json.get("message").is_some() && *subscribed => {
             // Data message from channel
             if let Some(message) = json.get("message") {
-                // Check if it's a command channel message
-                if message.get("type").and_then(|t| t.as_str()) == Some("message") {
-                    match serde_json::from_value::<CommandMessage>(message.clone()) {
-                        Ok(cmd_msg) => {
-                            log::info!("[CommandChannel] Received message seq={} type={}", cmd_msg.sequence, cmd_msg.event_type);
-                            if message_tx.send(cmd_msg).await.is_err() {
-                                log::warn!("[CommandChannel] Message receiver dropped");
-                                return TextMessageResult::ReceiverDropped;
+                let msg_type = message.get("type").and_then(|t| t.as_str());
+
+                match msg_type {
+                    Some("message") => {
+                        // Command channel message (Bot::Message)
+                        match serde_json::from_value::<CommandMessage>(message.clone()) {
+                            Ok(cmd_msg) => {
+                                log::info!("[CommandChannel] Received message seq={} type={}", cmd_msg.sequence, cmd_msg.event_type);
+                                if message_tx.send(cmd_msg).await.is_err() {
+                                    log::warn!("[CommandChannel] Message receiver dropped");
+                                    return TextMessageResult::ReceiverDropped;
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("[CommandChannel] Failed to parse message: {}", e);
                             }
                         }
-                        Err(e) => {
-                            log::warn!("[CommandChannel] Failed to parse message: {}", e);
+                    }
+                    Some("signal") => {
+                        // Encrypted signal envelope from browser (relayed by Rails)
+                        match serde_json::from_value::<SignalMessage>(message.clone()) {
+                            Ok(signal_msg) => {
+                                log::debug!(
+                                    "[CommandChannel] Received signal from browser={}",
+                                    signal_msg.browser_identity
+                                );
+                                if signal_tx.send(signal_msg).await.is_err() {
+                                    log::warn!("[CommandChannel] Signal receiver dropped");
+                                    return TextMessageResult::ReceiverDropped;
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("[CommandChannel] Failed to parse signal: {}", e);
+                            }
                         }
+                    }
+                    _ => {
+                        log::trace!("[CommandChannel] Unknown message type: {:?}", msg_type);
                     }
                 }
             }
@@ -567,6 +668,20 @@ mod tests {
         assert_eq!(msg.id, 42);
         assert_eq!(msg.event_type, "github_mention");
         assert_eq!(msg.payload["repo"], "owner/repo");
+    }
+
+    #[test]
+    fn test_signal_message_deserialize() {
+        let json = serde_json::json!({
+            "type": "signal",
+            "browser_identity": "abc123key:tab42",
+            "envelope": { "t": 3, "c": "encrypted_blob", "s": "sender_key", "d": 1 }
+        });
+
+        let msg: SignalMessage = serde_json::from_value(json).expect("valid SignalMessage");
+        assert_eq!(msg.browser_identity, "abc123key:tab42");
+        assert_eq!(msg.envelope["t"], 3);
+        assert_eq!(msg.envelope["c"], "encrypted_blob");
     }
 
     #[test]
