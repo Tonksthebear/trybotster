@@ -4,7 +4,11 @@
  * Singleton that manages WebRTC peer connections in the main thread.
  * RTCPeerConnection is not available in Workers, so this must run in main thread.
  *
- * Persists across Turbo navigation via singleton pattern.
+ * Persists across Turbo navigation:
+ * - Connections survive Turbo link clicks (no cleanup on turbo:before-visit)
+ * - When controllers release connections, a 3s grace period starts
+ * - If reacquired before grace period expires, connection is reused instantly
+ * - Only closes on actual page unload (beforeunload)
  *
  * Architecture:
  * - Main thread: WebRTCTransport (this) handles RTCPeerConnection, DataChannel
@@ -25,6 +29,9 @@ export const TransportState = {
   ERROR: "error",
 }
 
+// Grace period before closing idle connections (ms)
+const DISCONNECT_GRACE_PERIOD_MS = 3000
+
 class WebRTCTransport {
   #connections = new Map() // hubId -> { pc, dataChannel, state, subscriptions }
   #connectPromises = new Map() // hubId -> Promise (pending connection)
@@ -33,21 +40,26 @@ class WebRTCTransport {
   #pendingSubscriptions = new Map() // subscriptionId -> { resolve, reject, timeout }
   #subscriptionIdCounter = 0
   #pollingTimers = new Map() // hubId -> timer
+  #graceTimers = new Map() // hubId -> timer (pending disconnects)
 
   constructor() {
-    // Clean up connections on page unload to prevent zombie ICE packets
-    const cleanup = () => {
+    // Clean up connections on actual page unload only.
+    // Turbo navigation preserves connections - they're cleaned up via grace periods
+    // when controllers release them.
+    window.addEventListener("beforeunload", () => {
+      // Cancel all grace timers and close immediately
+      for (const timer of this.#graceTimers.values()) {
+        clearTimeout(timer)
+      }
+      this.#graceTimers.clear()
+
       for (const [hubId, conn] of this.#connections) {
         if (conn.dataChannel) conn.dataChannel.close()
         if (conn.pc) conn.pc.close()
       }
       this.#connections.clear()
       this.#connectPromises.clear()
-    }
-
-    window.addEventListener("beforeunload", cleanup)
-    // Also handle Turbo navigation
-    document.addEventListener("turbo:before-visit", cleanup)
+    })
   }
 
   static get instance() {
@@ -63,6 +75,9 @@ class WebRTCTransport {
    * the pending connection or return the existing one.
    */
   async connect(hubId, browserIdentity) {
+    // Cancel any pending grace period disconnect for this hub
+    this.#cancelGracePeriod(hubId)
+
     // If already connected, return existing connection
     let conn = this.#connections.get(hubId)
     if (conn) {
@@ -160,11 +175,48 @@ class WebRTCTransport {
   }
 
   /**
-   * Disconnect from a hub
+   * Disconnect from a hub with grace period.
+   * Connection stays alive for DISCONNECT_GRACE_PERIOD_MS to allow reacquisition
+   * during Turbo navigation. Call connect() to cancel the grace period.
    */
   async disconnect(hubId) {
     const conn = this.#connections.get(hubId)
     if (!conn) return
+
+    // If grace timer already pending, don't restart it
+    if (this.#graceTimers.has(hubId)) return
+
+    console.debug(`[WebRTCTransport] Starting ${DISCONNECT_GRACE_PERIOD_MS}ms grace period for hub ${hubId}`)
+
+    const timer = setTimeout(() => {
+      this.#graceTimers.delete(hubId)
+      this.#closeConnection(hubId)
+    }, DISCONNECT_GRACE_PERIOD_MS)
+
+    this.#graceTimers.set(hubId, timer)
+  }
+
+  /**
+   * Cancel a pending grace period disconnect.
+   * Called when a connection is reacquired before the grace period expires.
+   */
+  #cancelGracePeriod(hubId) {
+    const timer = this.#graceTimers.get(hubId)
+    if (timer) {
+      console.debug(`[WebRTCTransport] Cancelled grace period for hub ${hubId} (reacquired)`)
+      clearTimeout(timer)
+      this.#graceTimers.delete(hubId)
+    }
+  }
+
+  /**
+   * Actually close a connection (called after grace period or on page unload).
+   */
+  #closeConnection(hubId) {
+    const conn = this.#connections.get(hubId)
+    if (!conn) return
+
+    console.debug(`[WebRTCTransport] Closing connection for hub ${hubId}`)
 
     this.#stopPolling(hubId)
 
@@ -181,14 +233,19 @@ class WebRTCTransport {
 
   /**
    * Subscribe to a channel (maps to DataChannel usage)
+   * @param {string} hubId - Hub identifier
+   * @param {string} channelName - Channel name (e.g., "terminal", "hub", "preview")
+   * @param {Object} params - Subscription params
+   * @param {string} [providedSubscriptionId] - Optional semantic subscription ID
    */
-  async subscribe(hubId, channelName, params) {
+  async subscribe(hubId, channelName, params, providedSubscriptionId = null, encryptedEnvelope = null) {
     const conn = this.#connections.get(hubId)
     if (!conn) {
       throw new Error(`No connection for hub ${hubId}`)
     }
 
-    const subscriptionId = `sub_${++this.#subscriptionIdCounter}_${Date.now()}`
+    // Use provided semantic ID or fall back to generated unique ID
+    const subscriptionId = providedSubscriptionId || `sub_${++this.#subscriptionIdCounter}_${Date.now()}`
 
     conn.subscriptions.set(subscriptionId, {
       channelName,
@@ -200,14 +257,19 @@ class WebRTCTransport {
       await this.#waitForDataChannel(conn.dataChannel)
     }
 
-    // Send subscribe message through data channel
-    const msg = JSON.stringify({
-      type: "subscribe",
-      subscriptionId,
-      channel: channelName,
-      params,
-    })
-    conn.dataChannel.send(msg)
+    // Send subscribe message through data channel.
+    // When an encrypted envelope is provided, the subscribe message is inside it
+    // as a PreKeySignalMessage — establishing the Signal session on the CLI side.
+    if (encryptedEnvelope) {
+      conn.dataChannel.send(JSON.stringify(encryptedEnvelope))
+    } else {
+      conn.dataChannel.send(JSON.stringify({
+        type: "subscribe",
+        subscriptionId,
+        channel: channelName,
+        params,
+      }))
+    }
 
     // Wait for CLI to confirm subscription before allowing input.
     // This prevents race condition where input arrives before CLI registers subscription.
@@ -495,7 +557,8 @@ class WebRTCTransport {
 
       // Check if this is a Signal envelope (encrypted message from CLI)
       // Signal envelopes have short keys: t (type), c (ciphertext), s (sender)
-      // All CLI messages are encrypted - decrypt first, then route
+      // Control messages (subscribed, agent_list) may be plaintext during bootstrap
+      // before the Signal session is established via PreKeySignalMessage
       let msg = parsed
       if (parsed.t !== undefined && parsed.c && parsed.s) {
         msg = await this.#decryptEnvelope(hubId, parsed)
@@ -505,6 +568,13 @@ class WebRTCTransport {
       // Handle subscription confirmation (control message, decrypted)
       if (msg.type === "subscribed" && msg.subscriptionId) {
         this.#handleSubscriptionConfirmed(msg.subscriptionId)
+        return
+      }
+
+      // Handle session invalid (plaintext from CLI when decryption repeatedly fails)
+      if (msg.type === "session_invalid") {
+        console.warn("[WebRTCTransport] Session invalid:", msg.reason)
+        this.#emit("session:invalid", { hubId, message: msg.message || msg.reason || "Session invalid" })
         return
       }
 

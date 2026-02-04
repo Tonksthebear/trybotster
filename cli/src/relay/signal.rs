@@ -520,23 +520,37 @@ impl SignalProtocolManager {
     /// Ensure keys are ready for bundle generation.
     ///
     /// Generates PreKeys, SignedPreKey, and KyberPreKey if not already present.
+    /// Also regenerates one-time PreKeys if all have been consumed by browser
+    /// session establishments (`message_decrypt_prekey` removes used PreKeys).
+    ///
     /// This is called lazily when the first connection code is requested.
     pub async fn ensure_keys_ready(&mut self) -> Result<()> {
-        // Check if we already have keys
-        if self
+        let has_signed = self
             .store
             .get_signed_pre_key(SignedPreKeyId::from(1))
             .await
-            .is_ok()
-        {
+            .is_ok();
+
+        if !has_signed {
+            // First run — generate all keys (identity exists from store creation)
+            log::info!("Generating Signal Protocol keys (first connection code request)...");
+            self.generate_prekeys().await?;
+            self.store.persist(&self.hub_id).await?;
+            return Ok(());
+        }
+
+        // SignedPreKey and KyberPreKey exist, but one-time PreKeys may be exhausted
+        if self.store.get_available_prekey_id().await.is_some() {
             log::debug!("Signal keys already present");
             return Ok(());
         }
 
-        log::info!("Generating Signal Protocol keys (first connection code request)...");
-        self.generate_prekeys().await?;
-
-        // Persist the new keys so they survive CLI restarts
+        // All one-time PreKeys consumed — regenerate batch
+        log::info!(
+            "All one-time PreKeys consumed, regenerating {} PreKeys...",
+            Self::PREKEY_COUNT
+        );
+        self.regenerate_one_time_prekeys().await?;
         self.store.persist(&self.hub_id).await?;
 
         Ok(())
@@ -637,6 +651,24 @@ impl SignalProtocolManager {
             Self::PREKEY_COUNT,
             start.elapsed()
         );
+        Ok(())
+    }
+
+    /// Regenerate only one-time PreKeys (not SignedPreKey or KyberPreKey).
+    ///
+    /// Called when all one-time PreKeys have been consumed by browser session
+    /// establishments. SignedPreKey and KyberPreKey are long-lived and reusable,
+    /// so they don't need regeneration.
+    async fn regenerate_one_time_prekeys(&mut self) -> Result<()> {
+        for id in 1..=Self::PREKEY_COUNT {
+            let key_pair = KeyPair::generate(&mut rand::rngs::StdRng::from_os_rng());
+            let record = PreKeyRecord::new(PreKeyId::from(id), &key_pair);
+            self.store
+                .save_pre_key(PreKeyId::from(id), &record)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to save PreKey: {e}"))?;
+        }
+        log::info!("Regenerated {} one-time PreKeys", Self::PREKEY_COUNT);
         Ok(())
     }
 
@@ -825,8 +857,9 @@ impl SignalProtocolManager {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get identity: {e}"))?;
 
-        // Persist session after encryption (ratchet advanced)
-        self.store.persist(&self.hub_id).await?;
+        // Note: Session state changes on every encrypt (ratchet advance).
+        // Persistence is deferred to periodic flush or shutdown to avoid
+        // ~60-200ms disk I/O per message.
 
         Ok(SignalEnvelope {
             message_type,
@@ -908,8 +941,9 @@ impl SignalProtocolManager {
             other => anyhow::bail!("Unknown message type: {other}"),
         };
 
-        // Persist session after decryption (ratchet advanced)
-        self.store.persist(&self.hub_id).await?;
+        // Note: Session state changes on every decrypt (ratchet advance).
+        // Persistence is deferred to periodic flush or shutdown to avoid
+        // ~60-200ms disk I/O per message.
 
         Ok(plaintext)
     }

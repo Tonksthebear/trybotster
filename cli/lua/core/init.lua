@@ -6,7 +6,7 @@
 -- Module layout:
 --   core/     - Protected modules (never reloaded): state, hooks, loader
 --   lib/      - Library modules (hot-reloadable): client, utils
---   handlers/ - Handler modules (hot-reloadable): webrtc
+--   handlers/ - Handler modules (hot-reloadable): connections, webrtc
 
 log.info("=== Botster Lua Runtime ===")
 
@@ -42,15 +42,17 @@ local function safe_require(module_name)
     end
 end
 
--- Load WebRTC handler (registers peer/message callbacks)
--- This is the main handler that routes browser messages to Client instances
+-- Load connection registry (shared client management for all transports)
+safe_require("handlers.connections")
+
+-- Load WebRTC transport handler (registers peer/message callbacks)
 safe_require("handlers.webrtc")
 
 -- ============================================================================
 -- Event Subscriptions (Logging)
 -- ============================================================================
 -- Register for Hub lifecycle events for logging purposes.
--- The actual event handling and broadcasting is done in handlers/webrtc.lua
+-- The actual event handling and broadcasting is done in handlers/connections.lua
 
 events.on("shutdown", function()
     log.info("Hub shutting down - Lua cleanup")

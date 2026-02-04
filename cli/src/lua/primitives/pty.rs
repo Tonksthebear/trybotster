@@ -111,6 +111,12 @@ pub struct CreateForwarderRequest {
     pub pty_index: usize,
     /// Optional prefix byte for raw terminal data (typically 0x01).
     pub prefix: Option<Vec<u8>>,
+    /// Browser-generated subscription ID for message routing.
+    ///
+    /// The browser generates this ID when subscribing (e.g., "sub_2_1770164017").
+    /// All messages sent back to the browser must include this exact ID so the
+    /// browser's subscriptionHandlers map can route them correctly.
+    pub subscription_id: String,
     /// Shared active flag for the forwarder handle.
     pub active_flag: Arc<Mutex<bool>>,
 }
@@ -235,7 +241,7 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
         .get("webrtc")
         .unwrap_or_else(|_| lua.create_table().unwrap());
 
-    // webrtc.create_pty_forwarder({ peer_id, agent_index, pty_index, prefix? })
+    // webrtc.create_pty_forwarder({ peer_id, agent_index, pty_index, subscription_id, prefix? })
     let queue = request_queue.clone();
     let create_forwarder_fn = lua
         .create_function(move |_lua, opts: LuaTable| {
@@ -248,6 +254,9 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
             let pty_index: usize = opts
                 .get("pty_index")
                 .map_err(|_| LuaError::runtime("pty_index is required"))?;
+            let subscription_id: String = opts
+                .get("subscription_id")
+                .map_err(|_| LuaError::runtime("subscription_id is required"))?;
             let prefix: Option<LuaString> = opts.get("prefix").ok();
 
             let forwarder_id = format!("{}:{}:{}", peer_id, agent_index, pty_index);
@@ -262,6 +271,7 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
                     agent_index,
                     pty_index,
                     prefix: prefix.map(|p| p.as_bytes().to_vec()),
+                    subscription_id,
                     active_flag: Arc::clone(&active_flag),
                 }));
             }
@@ -435,6 +445,7 @@ mod tests {
                 peer_id = "browser-123",
                 agent_index = 0,
                 pty_index = 1,
+                subscription_id = "sub_1_1234567890",
             })
         "#,
         )
@@ -451,6 +462,7 @@ mod tests {
                 assert_eq!(req.peer_id, "browser-123");
                 assert_eq!(req.agent_index, 0);
                 assert_eq!(req.pty_index, 1);
+                assert_eq!(req.subscription_id, "sub_1_1234567890");
                 assert!(req.prefix.is_none());
             }
             _ => panic!("Expected CreateForwarder request"),
@@ -474,6 +486,7 @@ mod tests {
                 peer_id = "browser-456",
                 agent_index = 1,
                 pty_index = 0,
+                subscription_id = "sub_2_9876543210",
                 prefix = "\x01",
             })
         "#,
@@ -486,6 +499,7 @@ mod tests {
         match &requests[0] {
             PtyRequest::CreateForwarder(req) => {
                 assert_eq!(req.prefix, Some(vec![0x01]));
+                assert_eq!(req.subscription_id, "sub_2_9876543210");
             }
             _ => panic!("Expected CreateForwarder request"),
         }
@@ -593,7 +607,7 @@ mod tests {
 
         lua.load(
             r#"
-            webrtc.create_pty_forwarder({ peer_id = "p1", agent_index = 0, pty_index = 0 })
+            webrtc.create_pty_forwarder({ peer_id = "p1", agent_index = 0, pty_index = 0, subscription_id = "sub_1" })
             hub.write_pty(0, 0, "test")
             hub.resize_pty(0, 0, 24, 80)
         "#,
@@ -640,7 +654,7 @@ mod tests {
         let result: mlua::Result<()> = lua
             .load(
                 r#"
-            webrtc.create_pty_forwarder({ peer_id = "test", pty_index = 0 })
+            webrtc.create_pty_forwarder({ peer_id = "test", pty_index = 0, subscription_id = "sub_1" })
         "#,
             )
             .exec();
@@ -650,6 +664,30 @@ mod tests {
         assert!(
             err_msg.contains("agent_index"),
             "Error should mention agent_index: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_create_forwarder_requires_subscription_id() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        let result: mlua::Result<()> = lua
+            .load(
+                r#"
+            webrtc.create_pty_forwarder({ peer_id = "test", agent_index = 0, pty_index = 0 })
+        "#,
+            )
+            .exec();
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("subscription_id"),
+            "Error should mention subscription_id: {}",
             err_msg
         );
     }

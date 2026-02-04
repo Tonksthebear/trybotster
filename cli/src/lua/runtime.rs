@@ -261,6 +261,14 @@ impl LuaRuntime {
         &self.base_path
     }
 
+    /// Set the base path for Lua scripts.
+    ///
+    /// Updates the base path used for file watching. Call this when loading
+    /// from an alternate directory (e.g., embedded Lua files during development).
+    pub fn set_base_path(&mut self, path: PathBuf) {
+        self.base_path = path;
+    }
+
     /// Load and execute a Lua file relative to the base path.
     ///
     /// The file path is resolved relative to the configured base path
@@ -333,6 +341,92 @@ impl LuaRuntime {
                 }
             }
         }
+    }
+
+    /// Load and execute Lua code from a string.
+    ///
+    /// Used for loading embedded Lua files in release builds.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Name for error messages (e.g., "core/init.lua")
+    /// * `source` - The Lua source code
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Lua code fails to parse or execute.
+    pub fn load_string(&self, name: &str, source: &str) -> Result<()> {
+        match self.load_string_internal(name, source) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.strict {
+                    Err(e)
+                } else {
+                    log::warn!("Lua error ({}): {}", name, e);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Internal string loading that always returns errors.
+    fn load_string_internal(&self, name: &str, source: &str) -> Result<()> {
+        self.lua
+            .load(source)
+            .set_name(name)
+            .exec()
+            .map_err(|e| anyhow!("Failed to execute Lua {}: {}", name, e))?;
+
+        log::debug!("Loaded Lua: {}", name);
+        Ok(())
+    }
+
+    /// Load all embedded Lua files.
+    ///
+    /// Iterates through all files embedded at compile time and loads them
+    /// in dependency order (core modules first, then lib, then handlers).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any embedded file fails to load.
+    pub fn load_embedded(&self) -> Result<()> {
+        use super::embedded;
+
+        // Get all embedded files
+        let files = embedded::all();
+        if files.is_empty() {
+            log::warn!("No embedded Lua files found");
+            return Ok(());
+        }
+
+        log::info!("Loading {} embedded Lua file(s)", files.len());
+
+        // Sort files by load order: core/ first, then lib/, then handlers/
+        let mut sorted: Vec<_> = files.iter().collect();
+        sorted.sort_by(|(a, _), (b, _)| {
+            let order = |p: &str| -> u8 {
+                if p.starts_with("core/") {
+                    0
+                } else if p.starts_with("lib/") {
+                    1
+                } else if p.starts_with("handlers/") {
+                    2
+                } else {
+                    3
+                }
+            };
+            order(a).cmp(&order(b)).then_with(|| a.cmp(b))
+        });
+
+        // Load core/init.lua first - it bootstraps everything else
+        if let Some(init_content) = embedded::get("core/init.lua") {
+            self.load_string("core/init.lua", init_content)?;
+        } else {
+            return Err(anyhow!("Missing embedded core/init.lua"));
+        }
+
+        log::info!("Embedded Lua loaded successfully");
+        Ok(())
     }
 
     /// Call a global Lua function.
@@ -1575,6 +1669,7 @@ mod tests {
                 peer_id = "test-browser",
                 agent_index = 0,
                 pty_index = 0,
+                subscription_id = "sub_1_test",
             })
         "#).exec().unwrap();
 
@@ -1586,6 +1681,7 @@ mod tests {
                 assert_eq!(req.peer_id, "test-browser");
                 assert_eq!(req.agent_index, 0);
                 assert_eq!(req.pty_index, 0);
+                assert_eq!(req.subscription_id, "sub_1_test");
             }
             _ => panic!("Expected CreateForwarder request"),
         }
@@ -1600,6 +1696,7 @@ mod tests {
                 peer_id = "browser-xyz",
                 agent_index = 2,
                 pty_index = 1,
+                subscription_id = "sub_2_test",
             })
         "#).exec().unwrap();
 
