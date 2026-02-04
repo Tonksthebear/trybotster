@@ -77,6 +77,7 @@ export class Connection {
     this.identityKey = null         // Signal Protocol identity key (shared across tabs)
     this.browserIdentity = null     // Tab-unique identity for routing (identityKey:tabId)
     this.state = ConnectionState.DISCONNECTED
+    this.errorCode = null
     this.errorReason = null
 
     // Two-sided status tracking
@@ -86,13 +87,12 @@ export class Connection {
     // Event subscribers: Map<eventName, Set<callback>>
     this.subscribers = new Map()
 
-    // Unified handshake state.
-    // Both sides send handshake when they detect the other, ack confirms.
-    // Buffer messages until handshake completes to prevent race conditions.
+    // Handshake state - tracks E2E connection confirmation.
+    // With WebRTC, subscription confirmation is sufficient for readiness.
+    // Handshake is kept for E2E encryption verification and UI status.
     this.handshakeComplete = false
     this.handshakeSent = false
     this.handshakeTimer = null
-    this.inputBuffer = []
   }
 
   // ========== Lifecycle (called by ConnectionManager) ==========
@@ -149,11 +149,9 @@ export class Connection {
 
     // Create or load session via crypto worker
     if (sessionBundle) {
-      // Check if session already exists
-      const { hasSession } = await bridge.hasSession(hubId)
-      if (!hasSession) {
-        await bridge.createSession(hubId, sessionBundle)
-      }
+      // Always create fresh session from new QR bundle.
+      // createSession() deletes any stale session before establishing the new one.
+      await bridge.createSession(hubId, sessionBundle)
     } else {
       // Try to load existing session
       const loadResult = await bridge.loadSession(hubId)
@@ -223,7 +221,7 @@ export class Connection {
         await this.#doUnsubscribe()
       }
 
-      // Reset handshake state - need fresh handshake
+      // Reset handshake state for fresh connection
       this.handshakeComplete = false
       this.handshakeSent = false
       if (this.handshakeTimer) {
@@ -231,25 +229,30 @@ export class Connection {
         this.handshakeTimer = null
       }
       this.cliStatus = CliStatus.UNKNOWN
-      this.inputBuffer = []
 
       const hubId = this.getHubId()
+
+      // Compute semantic subscription ID from channel + params
+      // This allows both sides to derive the same ID independently
+      const subscriptionId = this.computeSubscriptionId()
 
       const subscribeResult = await bridge.send("subscribe", {
         hubId,
         channel: this.channelName(),
         params: this.channelParams(),
+        subscriptionId,
       })
 
-      this.subscriptionId = subscribeResult.subscriptionId
+      this.subscriptionId = subscriptionId
       this.#setupSubscriptionEventListeners()
+
+      // WebRTC: DataChannel open = ready, complete handshake FIRST
+      // so input isn't buffered when listeners fire
+      this.#completeHandshake()
 
       this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
       this.#setState(ConnectionState.CONNECTED)
       this.emit("subscribed", this)
-
-      // WebRTC: DataChannel open = ready, skip handshake ceremony
-      this.#completeHandshake()
     } finally {
       this.#subscribing = false
     }
@@ -316,6 +319,10 @@ export class Connection {
 
       if (event.state === "disconnected") {
         this.#hubConnected = false
+        // Preserve session_invalid error state — user must re-pair, not auto-reconnect
+        if (this.state === ConnectionState.ERROR && this.errorCode === "session_invalid") {
+          return
+        }
         this.#setBrowserStatus(BrowserStatus.DISCONNECTED)
         this.#setState(ConnectionState.DISCONNECTED)
         this.emit("disconnected")
@@ -341,9 +348,10 @@ export class Connection {
     })
     this.#unsubscribers.push(unsubState)
 
-    // Listen for session invalid
+    // Listen for session invalid (Signal session desync detected by CLI)
     const unsubSession = bridge.on("session:invalid", (event) => {
       if (event.hubId !== hubId) return
+      console.warn(`[${this.constructor.name}] Session invalid:`, event.message)
       this.#setError("session_invalid", event.message)
     })
     this.#unsubscribers.push(unsubSession)
@@ -440,15 +448,15 @@ export class Connection {
   }
 
   /**
-   * Notify worker that this connection is idle (refCount hit 0).
-   * Worker will start grace period and close if not reacquired.
+   * Notify transport that this connection is idle (refCount hit 0).
+   * Starts a grace period - connection closes after ~3s if not reacquired.
    * Called by ConnectionManager.release() when refCount becomes 0.
    */
   notifyIdle() {
     const hubId = this.getHubId()
     if (hubId && this.#hubConnected) {
-      // Tell worker to start grace period for this hub connection
-      // Fire and forget - worker handles the timing
+      // Tell transport to start grace period for this hub connection.
+      // If reacquired before grace period expires, connection is reused.
       bridge.send("disconnect", { hubId }).catch(() => {})
     }
   }
@@ -503,6 +511,16 @@ export class Connection {
   }
 
   /**
+   * Compute semantic subscription ID from channel + params.
+   * Override in subclasses for domain-specific IDs.
+   * Default: channel name (works for singleton subscriptions like hub).
+   * @returns {string}
+   */
+  computeSubscriptionId() {
+    return this.channelName()
+  }
+
+  /**
    * Extract hubId from options. Override if hubId comes from elsewhere.
    * @returns {string}
    */
@@ -535,16 +553,26 @@ export class Connection {
     const hubId = this.getHubId()
     // Include subscriptionId in the encrypted payload for CLI routing
     const fullMessage = { subscriptionId: this.subscriptionId, ...message }
+
+    const t0 = performance.now()
     const { envelope } = await bridge.encrypt(hubId, fullMessage)
+    const t1 = performance.now()
+
     // Crypto worker may return envelope as JSON string - ensure it's an object
     const envelopeObj = typeof envelope === "string" ? JSON.parse(envelope) : envelope
     // Send envelope directly (CLI decrypts and finds subscriptionId inside)
     await bridge.send("sendEnvelope", { hubId, envelope: envelopeObj })
+    const t2 = performance.now()
+
+    const encryptTime = t1 - t0
+    const sendTime = t2 - t1
+    if (encryptTime > 20 || sendTime > 20) {
+      console.debug(`[${this.constructor.name}] send timing: encrypt=${encryptTime.toFixed(1)}ms, send=${sendTime.toFixed(1)}ms`)
+    }
   }
 
   /**
    * Send a message through the secure channel.
-   * Buffers messages until handshake completes to prevent race conditions.
    * Auto-resubscribes if subscription is stale (e.g., after wake from sleep).
    * @param {string} type - Message type
    * @param {Object} data - Message payload
@@ -553,13 +581,6 @@ export class Connection {
   async send(type, data = {}) {
     if (!this.subscriptionId) {
       return false
-    }
-
-    // Buffer if handshake not complete yet (prevents race condition on channel startup)
-    // Exception: allow handshake messages (connected, ack) through immediately
-    if (!this.handshakeComplete && type !== "connected" && type !== "ack") {
-      this.inputBuffer.push({ type, data })
-      return true
     }
 
     try {
@@ -691,24 +712,17 @@ export class Connection {
   }
 
   /**
-   * Complete handshake - flush buffer and emit connected event.
+   * Complete handshake - mark E2E as verified and emit connected event.
    */
   #completeHandshake() {
     if (this.handshakeComplete) return
 
     this.handshakeComplete = true
-    console.debug(`[${this.constructor.name}] Handshake complete, flushing ${this.inputBuffer.length} buffered messages`)
+    console.debug(`[${this.constructor.name}] Handshake complete`)
 
-    // Update legacy state to CONNECTED now that E2E is established
+    // Update state to CONNECTED now that E2E is established
     this.#setState(ConnectionState.CONNECTED)
     this.#emitHealthChange()
-
-    // Flush buffered messages
-    for (const { type, data } of this.inputBuffer) {
-      this.#sendEncrypted({ type, ...data })
-        .catch(err => console.error(`[${this.constructor.name}] Flush failed:`, err))
-    }
-    this.inputBuffer = []
 
     this.emit("connected", this)
   }
@@ -903,6 +917,7 @@ export class Connection {
     this.state = newState
 
     if (newState !== ConnectionState.ERROR) {
+      this.errorCode = null
       this.errorReason = null
     }
 
@@ -914,6 +929,7 @@ export class Connection {
   }
 
   #setError(reason, message) {
+    this.errorCode = reason
     this.errorReason = message
     this.#setBrowserStatus(BrowserStatus.ERROR)
     this.#setState(ConnectionState.ERROR)

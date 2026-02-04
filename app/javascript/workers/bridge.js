@@ -163,8 +163,19 @@ class WorkerBridge {
         return webrtcTransport.connect(params.hubId, params.browserIdentity)
       case "disconnect":
         return webrtcTransport.disconnect(params.hubId)
-      case "subscribe":
-        return webrtcTransport.subscribe(params.hubId, params.channel, params.params)
+      case "subscribe": {
+        // Encrypt the subscribe message so the browser's first message is a
+        // PreKeySignalMessage — establishes the Signal session on the CLI side.
+        const subscribeMsg = {
+          type: "subscribe",
+          subscriptionId: params.subscriptionId,
+          channel: params.channel,
+          params: params.params,
+        }
+        const { envelope } = await this.encrypt(params.hubId, subscribeMsg)
+        const envelopeObj = typeof envelope === "string" ? JSON.parse(envelope) : envelope
+        return webrtcTransport.subscribe(params.hubId, params.channel, params.params, params.subscriptionId, envelopeObj)
+      }
       case "unsubscribe":
         return webrtcTransport.unsubscribe(params.subscriptionId)
       case "sendRaw":

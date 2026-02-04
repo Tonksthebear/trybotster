@@ -25,6 +25,7 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -127,6 +128,7 @@ impl WebRtcChannelBuilder {
             config: Arc::new(Mutex::new(None)),
             recv_rx: Arc::new(Mutex::new(None)),
             recv_tx: Arc::new(Mutex::new(None)),
+            decrypt_failures: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -155,6 +157,8 @@ pub struct WebRtcChannel {
     recv_rx: Arc<Mutex<Option<mpsc::Receiver<RawIncoming>>>>,
     /// Send side of receive queue.
     recv_tx: Arc<Mutex<Option<mpsc::Sender<RawIncoming>>>>,
+    /// Consecutive decryption failure count for session health monitoring.
+    decrypt_failures: Arc<AtomicU32>,
 }
 
 impl std::fmt::Debug for WebRtcChannel {
@@ -346,6 +350,7 @@ impl WebRtcChannel {
         let config = Arc::clone(&self.config);
         let browser_id = browser_identity.to_string();
         let data_channel = Arc::clone(&self.data_channel);
+        let decrypt_failures = Arc::clone(&self.decrypt_failures);
 
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let recv_tx = Arc::clone(&recv_tx);
@@ -354,6 +359,7 @@ impl WebRtcChannel {
             let config = Arc::clone(&config);
             let browser_id = browser_id.clone();
             let data_channel = Arc::clone(&data_channel);
+            let decrypt_failures = Arc::clone(&decrypt_failures);
 
             Box::pin(async move {
                 log::info!("[WebRTC] Data channel opened: {}", dc.label());
@@ -367,6 +373,7 @@ impl WebRtcChannel {
                 let crypto_inner = crypto_service.clone();
                 let config_inner = Arc::clone(&config);
                 let browser_inner = browser_id.clone();
+                let decrypt_failures_inner = Arc::clone(&decrypt_failures);
 
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     let recv_tx = Arc::clone(&recv_tx_inner);
@@ -374,14 +381,10 @@ impl WebRtcChannel {
                     let crypto_service = crypto_inner.clone();
                     let config = Arc::clone(&config_inner);
                     let browser_identity = browser_inner.clone();
+                    let decrypt_failures = Arc::clone(&decrypt_failures_inner);
 
                     Box::pin(async move {
                         let data = msg.data.to_vec();
-
-                        log::debug!(
-                            "[WebRTC] Received message ({} bytes) from DataChannel",
-                            data.len()
-                        );
 
                         // Try to decrypt if we have a crypto service and it looks like an envelope
                         // Control messages (subscribe/unsubscribe) may be plaintext
@@ -389,17 +392,17 @@ impl WebRtcChannel {
                             match serde_json::from_slice::<SignalEnvelope>(&data) {
                                 Ok(envelope) => match cs.decrypt(&envelope).await {
                                     Ok(plaintext) => {
-                                        log::debug!("[WebRTC] Decrypted message successfully");
+                                        decrypt_failures.store(0, Ordering::Relaxed);
                                         plaintext
                                     }
                                     Err(e) => {
-                                        log::error!("[WebRTC] Decryption failed: {e}");
+                                        decrypt_failures.fetch_add(1, Ordering::Relaxed);
+                                        log::error!("[WebRTC-DC] Decryption FAILED: {e}");
                                         return;
                                     }
                                 },
                                 Err(_) => {
                                     // Not a Signal envelope - treat as plaintext control message
-                                    log::debug!("[WebRTC] Message is plaintext (not Signal envelope)");
                                     data
                                 }
                             }
@@ -433,10 +436,6 @@ impl WebRtcChannel {
 
                         // Send to receive queue
                         if let Some(tx) = recv_tx.lock().await.as_ref() {
-                            log::info!(
-                                "[WebRTC] Queuing message ({} bytes) for processing",
-                                decompressed.len()
-                            );
                             let _ = tx
                                 .send(RawIncoming {
                                     payload: decompressed,
@@ -444,7 +443,7 @@ impl WebRtcChannel {
                                 })
                                 .await;
                         } else {
-                            log::warn!("[WebRTC] recv_tx is None, cannot queue message");
+                            log::error!("[WebRTC-DC] recv_tx is None! Cannot queue message");
                         }
                     })
                 }));
@@ -599,13 +598,12 @@ impl Channel for WebRtcChannel {
             };
         drop(config_guard);
 
-        // Encrypt if we have a crypto service
-        // Browser identity format is "identityKey:tabId" - extract just the identity key
-        // for Signal encryption (sessions are keyed by identity key only)
+        // Encrypt if we have a crypto service.
+        // Browser identity format is "identityKey:tabId" — extract identity key
+        // for Signal encryption (sessions are keyed by identity key only).
         //
-        // Base64 encode the compressed bytes before encryption because the Signal
-        // WASM library expects UTF-8 strings. Gzip-compressed data contains invalid
-        // UTF-8 sequences. Base64 is lossless - browser decodes to get exact bytes.
+        // Base64 encode compressed bytes before encryption because the Signal WASM
+        // library expects UTF-8 strings. Gzip-compressed data contains invalid UTF-8.
         let to_send = if let Some(ref cs) = self.crypto_service {
             let identity_key = peer.as_ref().split(':').next().unwrap_or(peer.as_ref());
             let b64_payload = BASE64.encode(&compressed);
@@ -614,7 +612,8 @@ impl Channel for WebRtcChannel {
                 .await
                 .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
 
-            serde_json::to_vec(&envelope).map_err(|e| ChannelError::EncryptionError(e.to_string()))?
+            serde_json::to_vec(&envelope)
+                .map_err(|e| ChannelError::EncryptionError(e.to_string()))?
         } else {
             compressed
         };
@@ -673,5 +672,32 @@ impl WebRtcChannel {
                 Err(_) => None,
             }
         })
+    }
+
+    /// Get consecutive decryption failure count.
+    pub fn decrypt_failure_count(&self) -> u32 {
+        self.decrypt_failures.load(Ordering::Relaxed)
+    }
+
+    /// Reset decryption failure counter.
+    pub fn reset_decrypt_failures(&self) {
+        self.decrypt_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Send a plaintext message through the DataChannel, bypassing encryption.
+    ///
+    /// Used for session recovery: when encryption is broken, we need to notify
+    /// the browser without going through the (broken) Signal session.
+    pub async fn send_plaintext(&self, msg: &[u8]) -> Result<(), ChannelError> {
+        let dc_guard = self.data_channel.lock().await;
+        let dc = dc_guard
+            .as_ref()
+            .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
+
+        dc.send(&bytes::Bytes::from(msg.to_vec()))
+            .await
+            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
+
+        Ok(())
     }
 }

@@ -605,22 +605,16 @@ impl Hub {
 
     /// Load the Lua initialization script.
     ///
-    /// Attempts to load `core/init.lua` from the configured Lua path.
-    /// If the file doesn't exist, falls back to the embedded init script
-    /// bundled with the CLI and updates package.path to enable require() calls.
-    fn load_lua_init(&self) {
+    /// Loading priority:
+    /// 1. User overrides in `~/.botster/lua/` - filesystem with hot-reload
+    /// 2. Dev mode (debug build) - `cli/lua/` filesystem with hot-reload
+    /// 3. Release mode - embedded files from binary (no hot-reload)
+    fn load_lua_init(&mut self) {
         use std::path::Path;
 
-        // Compute the embedded fallback path (from CARGO_MANIFEST_DIR)
-        let embedded_lua_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("lua");
-        let embedded_init_path = embedded_lua_dir.join("core").join("init.lua");
-
-        // Check if user has their own Lua files
+        // Check if user has their own Lua files (always takes priority)
         let user_init_path = self.lua.base_path().join("core").join("init.lua");
-
         if user_init_path.exists() {
-            // User has their own Lua files - try to load them
             let init_path = Path::new("core/init.lua");
             if let Err(e) = self.lua.load_file(init_path) {
                 log::warn!("Failed to load user init.lua: {}", e);
@@ -630,29 +624,47 @@ impl Hub {
             }
         }
 
-        // Fall back to embedded Lua files
-        if embedded_init_path.exists() {
-            log::info!(
-                "Using embedded Lua files from: {}",
-                embedded_lua_dir.display()
-            );
+        // In debug builds, use source directory for hot-reload during development
+        #[cfg(debug_assertions)]
+        {
+            let dev_lua_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua");
+            let dev_init_path = dev_lua_dir.join("core").join("init.lua");
 
-            // Update package.path to include the embedded directory
-            // so require() calls inside init.lua can find modules
-            if let Err(e) = self.lua.update_package_path(&embedded_lua_dir) {
-                log::warn!("Failed to update package.path for embedded Lua: {}", e);
-            }
+            if dev_init_path.exists() {
+                log::info!("Dev mode: using Lua files from {}", dev_lua_dir.display());
 
-            // Load the embedded init.lua
-            if let Err(e) = self.lua.load_file_absolute(&embedded_init_path) {
-                log::warn!("Failed to load embedded init.lua: {}", e);
+                // Update base path so file watcher monitors this directory
+                self.lua.set_base_path(dev_lua_dir.clone());
+
+                // Update package.path for require() calls
+                if let Err(e) = self.lua.update_package_path(&dev_lua_dir) {
+                    log::warn!("Failed to update package.path: {}", e);
+                }
+
+                // Load the init script
+                if let Err(e) = self.lua.load_file_absolute(&dev_init_path) {
+                    log::warn!("Failed to load dev init.lua: {}", e);
+                }
+                return;
             }
-        } else {
-            log::warn!(
-                "No Lua files found at user path ({}) or embedded path ({})",
-                user_init_path.display(),
-                embedded_init_path.display()
-            );
+        }
+
+        // Release mode: use embedded files (no hot-reload possible)
+        #[cfg(not(debug_assertions))]
+        {
+            log::info!("Release mode: using embedded Lua files");
+            if let Err(e) = self.lua.load_embedded() {
+                log::warn!("Failed to load embedded Lua: {}", e);
+            }
+        }
+
+        // Fallback for debug builds where dev directory doesn't exist
+        #[cfg(debug_assertions)]
+        {
+            log::info!("Dev directory not found, using embedded Lua files");
+            if let Err(e) = self.lua.load_embedded() {
+                log::warn!("Failed to load embedded Lua: {}", e);
+            }
         }
     }
 
@@ -694,6 +706,14 @@ impl Hub {
 
         // Shutdown background workers (allows pending notifications to drain)
         self.shutdown_background_workers();
+
+        // Shutdown CryptoService (persists Signal session state to disk)
+        if let Some(ref cs) = self.browser.crypto_service {
+            let _guard = self.tokio_runtime.enter();
+            if let Err(e) = self.tokio_runtime.block_on(cs.shutdown()) {
+                log::warn!("CryptoService shutdown failed: {e}");
+            }
+        }
 
         // Notify server of shutdown
         registration::shutdown(

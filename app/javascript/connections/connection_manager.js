@@ -27,8 +27,8 @@ class ConnectionManagerSingleton {
     this.connections = new Map(); // key -> { wrapper, refCount }
     this.pendingCreation = new Map(); // key -> Promise<wrapper> (prevents race conditions)
     this.subscribers = new Map(); // key -> Set<callback>
-    // Note: No turbo:render cleanup needed - SharedWorker handles connection
-    // lifecycle with grace periods and port heartbeat TTL
+    // No turbo:render cleanup needed - WebRTCTransport handles connection
+    // lifecycle with grace periods. Connections persist across Turbo navigation.
   }
 
   /**

@@ -298,10 +298,14 @@ fn spawn_agent_sync(
             }
 
             // Broadcast AgentCreated event to all subscribers (including TUI)
-            if let Some(info) = hub.state.read().unwrap().get_agent_info(&agent_id) {
+            // Get info and release lock before calling methods that need &mut hub
+            let info = hub.state.read().unwrap().get_agent_info(&agent_id);
+
+            if let Some(info) = info {
                 hub.broadcast(crate::hub::HubEvent::agent_created(agent_id.clone(), info.clone()));
 
                 // Fire Lua event for agent_created
+                // Note: Queued WebRTC sends are flushed automatically in tick()
                 if let Err(e) = hub.lua.fire_agent_created(&agent_id, &info) {
                     log::warn!("Lua agent_created event error: {}", e);
                 }
@@ -337,17 +341,18 @@ pub fn handle_delete_agent_for_client(
             // Sync handle cache for thread-safe agent access
             hub.sync_handle_cache();
 
+            // Refresh worktree cache BEFORE firing events so Lua sees updated state
+            if let Err(e) = hub.load_available_worktrees() {
+                log::warn!("Failed to refresh worktree cache after agent deletion: {}", e);
+            }
+
             // Broadcast AgentDeleted event to all subscribers (TUI, WebRTC)
             hub.broadcast(crate::hub::HubEvent::agent_deleted(&request.agent_id));
 
             // Fire Lua event for agent_deleted
+            // Note: Queued WebRTC sends are flushed automatically in tick()
             if let Err(e) = hub.lua.fire_agent_deleted(&request.agent_id) {
                 log::warn!("Lua agent_deleted event error: {}", e);
-            }
-
-            // Refresh worktree cache - this agent's worktree is now available
-            if let Err(e) = hub.load_available_worktrees() {
-                log::warn!("Failed to refresh worktree cache after agent deletion: {}", e);
             }
         }
         Err(e) => {

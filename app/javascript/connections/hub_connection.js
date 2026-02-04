@@ -32,7 +32,15 @@ export class HubConnection extends Connection {
   // ========== Connection overrides ==========
 
   channelName() {
-    return "HubChannel";
+    return "hub";
+  }
+
+  /**
+   * Compute semantic subscription ID.
+   * Hub is singleton per connection, so just "hub".
+   */
+  computeSubscriptionId() {
+    return "hub";
   }
 
   channelParams() {
@@ -129,6 +137,16 @@ export class HubConnection extends Connection {
    */
   requestConnectionCode() {
     return this.send("get_connection_code");
+  }
+
+  /**
+   * Update client terminal dimensions.
+   * Resizes all active PTY sessions for this client.
+   * @param {number} cols - Number of columns
+   * @param {number} rows - Number of rows
+   */
+  sendResize(cols, rows) {
+    return this.send("resize", { cols, rows });
   }
 
   // ========== Convenience event helpers ==========

@@ -44,6 +44,7 @@
 //! lua.poll_and_reload();
 //! ```
 
+pub mod embedded;
 pub mod file_watcher;
 pub mod primitives;
 pub mod runtime;

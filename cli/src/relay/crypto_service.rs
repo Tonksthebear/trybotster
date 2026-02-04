@@ -378,82 +378,143 @@ impl CryptoService {
     }
 
     /// Main service loop - processes requests until shutdown.
+    ///
+    /// Hybrid persist strategy: session state is persisted when any of:
+    /// 1. Operation count reaches 200 (handles high-throughput bursts)
+    /// 2. Timer fires every 30s with dirty state (catches low-throughput drift)
+    /// 3. Shutdown (ensures clean exit)
+    ///
+    /// On crash, worst case loses 200 ops of ratchet state. Session
+    /// re-establishment is cheap (~1 RTT for new SDP offer + Signal handshake).
     async fn run_service(hub_id: &str, mut rx: mpsc::Receiver<CryptoRequest>) -> Result<()> {
         // Load or create the Signal protocol manager
         let mut manager = SignalProtocolManager::load_or_create(hub_id).await?;
+        let mut dirty = false;
+        let mut ops_since_persist: u32 = 0;
+        let mut persist_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        persist_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         log::debug!("Crypto service ready, waiting for requests");
 
-        while let Some(request) = rx.recv().await {
-            match request {
-                CryptoRequest::Encrypt {
-                    plaintext,
-                    peer_identity,
-                    reply,
-                } => {
-                    let result = manager.encrypt(&plaintext, &peer_identity).await;
-                    let _ = reply.send(result);
-                }
+        loop {
+            tokio::select! {
+                request = rx.recv() => {
+                    let Some(request) = request else { break; };
+                    match request {
+                        CryptoRequest::Encrypt {
+                            plaintext,
+                            peer_identity,
+                            reply,
+                        } => {
+                            let result = manager.encrypt(&plaintext, &peer_identity).await;
+                            if result.is_ok() {
+                                dirty = true;
+                                ops_since_persist += 1;
+                            }
+                            let _ = reply.send(result);
+                        }
 
-                CryptoRequest::Decrypt { envelope, reply } => {
-                    let result = manager.decrypt(&envelope).await;
-                    let _ = reply.send(result);
-                }
+                        CryptoRequest::Decrypt { envelope, reply } => {
+                            let result = manager.decrypt(&envelope).await;
+                            if result.is_ok() {
+                                dirty = true;
+                                ops_since_persist += 1;
+                            }
+                            let _ = reply.send(result);
+                        }
 
-                CryptoRequest::HasSession {
-                    peer_identity,
-                    reply,
-                } => {
-                    let result = manager.has_session(&peer_identity).await;
-                    let _ = reply.send(result);
-                }
+                        CryptoRequest::HasSession {
+                            peer_identity,
+                            reply,
+                        } => {
+                            let result = manager.has_session(&peer_identity).await;
+                            let _ = reply.send(result);
+                        }
 
-                CryptoRequest::GetPreKeyBundle {
-                    preferred_prekey_id,
-                    reply,
-                } => {
-                    let result = manager.build_prekey_bundle_data(preferred_prekey_id).await;
-                    let _ = reply.send(result);
-                }
+                        CryptoRequest::GetPreKeyBundle {
+                            preferred_prekey_id,
+                            reply,
+                        } => {
+                            let result = manager.build_prekey_bundle_data(preferred_prekey_id).await;
+                            let _ = reply.send(result);
+                        }
 
-                CryptoRequest::GetIdentityKey { reply } => {
-                    let result = manager.identity_key().await;
-                    let _ = reply.send(result);
-                }
+                        CryptoRequest::GetIdentityKey { reply } => {
+                            let result = manager.identity_key().await;
+                            let _ = reply.send(result);
+                        }
 
-                CryptoRequest::GetRegistrationId { reply } => {
-                    let result = manager.registration_id().await;
-                    let _ = reply.send(result);
-                }
+                        CryptoRequest::GetRegistrationId { reply } => {
+                            let result = manager.registration_id().await;
+                            let _ = reply.send(result);
+                        }
 
-                CryptoRequest::NextPreKeyId { reply } => {
-                    let result = manager.next_prekey_id().await;
-                    let _ = reply.send(result);
-                }
+                        CryptoRequest::NextPreKeyId { reply } => {
+                            let result = manager.next_prekey_id().await;
+                            let _ = reply.send(result);
+                        }
 
-                CryptoRequest::CreateSenderKeyDistribution { reply } => {
-                    let result = manager.create_sender_key_distribution().await;
-                    let _ = reply.send(result);
-                }
+                        CryptoRequest::CreateSenderKeyDistribution { reply } => {
+                            let result = manager.create_sender_key_distribution().await;
+                            let _ = reply.send(result);
+                        }
 
-                CryptoRequest::GroupEncrypt { plaintext, reply } => {
-                    let result = manager.group_encrypt(&plaintext).await;
-                    let _ = reply.send(result);
-                }
+                        CryptoRequest::GroupEncrypt { plaintext, reply } => {
+                            let result = manager.group_encrypt(&plaintext).await;
+                            let _ = reply.send(result);
+                        }
 
-                CryptoRequest::Persist { reply } => {
-                    let result = manager.persist().await;
-                    let _ = reply.send(result);
-                }
+                        CryptoRequest::Persist { reply } => {
+                            let result = manager.persist().await;
+                            if result.is_ok() {
+                                dirty = false;
+                                ops_since_persist = 0;
+                            }
+                            let _ = reply.send(result);
+                        }
 
-                CryptoRequest::Shutdown => {
-                    log::info!("Crypto service shutting down");
-                    // Persist before shutdown
-                    if let Err(e) = manager.persist().await {
-                        log::warn!("Failed to persist on shutdown: {e}");
+                        CryptoRequest::Shutdown => {
+                            log::info!("Crypto service shutting down");
+                            // Persist before shutdown
+                            if let Err(e) = manager.persist().await {
+                                log::warn!("Failed to persist on shutdown: {e}");
+                            }
+                            break;
+                        }
                     }
-                    break;
+
+                    // Persist immediately if operation count threshold reached
+                    if ops_since_persist >= 200 {
+                        if let Err(e) = manager.persist().await {
+                            log::warn!("Op-count persist failed: {e}");
+                        } else {
+                            dirty = false;
+                            ops_since_persist = 0;
+                            log::debug!("Op-count persist completed (200 ops)");
+                        }
+                    }
                 }
+                _ = persist_interval.tick() => {
+                    if dirty {
+                        if let Err(e) = manager.persist().await {
+                            log::warn!("Periodic persist failed: {e}");
+                        } else {
+                            dirty = false;
+                            ops_since_persist = 0;
+                            log::debug!("Periodic persist completed");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Final persist on exit — catches channel closure (Hub dropped) without
+        // explicit Shutdown request. Harmless double-persist if Shutdown already ran.
+        if dirty {
+            if let Err(e) = manager.persist().await {
+                log::warn!("Final persist on service exit failed: {e}");
+            } else {
+                log::info!("Final persist completed on service exit");
             }
         }
 

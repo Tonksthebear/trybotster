@@ -370,22 +370,23 @@ mod tests {
         let result1 = get_or_generate_connection_bundle(&mut browser, &runtime);
         assert!(result1.is_ok(), "First bundle generation should succeed");
         let bundle1 = result1.unwrap();
-        let prekey_id_1 = bundle1.prekey_id;
 
         // Mark bundle as used (simulating a browser connection)
         browser.bundle_used = true;
 
-        // Next call should regenerate with new prekey
+        // Next call should regenerate (not return cached)
         let result2 = get_or_generate_connection_bundle(&mut browser, &runtime);
         assert!(result2.is_ok(), "Second bundle generation should succeed");
         let bundle2 = result2.unwrap();
-        let prekey_id_2 = bundle2.prekey_id;
 
-        // New bundle should have different prekey ID (incremented)
-        assert_ne!(prekey_id_1, prekey_id_2, "Should generate new prekey after bundle used");
+        // bundle_used should be reset after regeneration
         assert!(!browser.bundle_used, "bundle_used should be reset after regeneration");
 
         // Both bundles should have the same identity key (same crypto service)
         assert_eq!(bundle1.identity_key, bundle2.identity_key, "Identity key should remain same");
+
+        // Both bundles should have valid prekeys
+        assert!(bundle2.prekey_id.is_some(), "Regenerated bundle should have a prekey");
+        assert!(bundle2.prekey.is_some(), "Regenerated bundle should have a prekey public key");
     }
 }

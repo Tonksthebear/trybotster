@@ -23,6 +23,29 @@ function M.clear(key)
     store[key] = nil
 end
 
+--- Get a persistent class metatable.
+-- Returns the same table identity across hot-reloads, with old methods
+-- cleared so renamed/deleted methods don't linger. Existing instances
+-- using this table as their __index automatically see new methods.
+--
+-- Usage:
+--   local MyClass = state.class("my_module.class")
+--   function MyClass.new(...) ... end
+--   function MyClass:some_method() ... end
+--
+-- @param key Unique key for this class (e.g., "client.class")
+-- @return The persistent class table with __index set to itself
+function M.class(key)
+    local cls = M.get(key, {})
+    for k, v in pairs(cls) do
+        if type(v) == "function" then
+            cls[k] = nil
+        end
+    end
+    cls.__index = cls
+    return cls
+end
+
 -- List all keys (for debugging)
 function M.keys()
     local result = {}

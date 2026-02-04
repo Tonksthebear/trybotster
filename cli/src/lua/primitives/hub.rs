@@ -109,55 +109,61 @@ pub fn register(
         .get("hub")
         .unwrap_or_else(|_| lua.create_table().unwrap());
 
-    // hub.get_agents() - Returns table of agent info
+    // hub.get_agents() - Returns array of agent info
+    // Uses serde serialization to ensure proper JSON array format
     let cache = Arc::clone(&handle_cache);
     let get_agents_fn = lua
         .create_function(move |lua, ()| {
             let agents = cache.get_all_agents();
-            let result = lua.create_table()?;
 
-            for (i, agent) in agents.iter().enumerate() {
-                let info = agent.info();
-                let agent_table = lua.create_table()?;
+            // Build as Vec for proper array serialization
+            let agents_data: Vec<serde_json::Value> = agents
+                .iter()
+                .enumerate()
+                .map(|(i, agent)| {
+                    let info = agent.info();
+                    let mut obj = serde_json::Map::new();
 
-                // Core identity
-                agent_table.set("index", i)?;
-                agent_table.set("id", info.id.clone())?;
+                    // Core identity
+                    obj.insert("index".to_string(), serde_json::json!(i));
+                    obj.insert("id".to_string(), serde_json::json!(info.id));
 
-                // Repository info
-                if let Some(ref repo) = info.repo {
-                    agent_table.set("repo", repo.clone())?;
-                }
-                if let Some(issue) = info.issue_number {
-                    agent_table.set("issue_number", issue)?;
-                }
-                if let Some(ref branch) = info.branch_name {
-                    agent_table.set("branch_name", branch.clone())?;
-                }
+                    // Repository info (omit if None per protocol spec)
+                    if let Some(ref repo) = info.repo {
+                        obj.insert("repo".to_string(), serde_json::json!(repo));
+                    }
+                    if let Some(issue) = info.issue_number {
+                        obj.insert("issue_number".to_string(), serde_json::json!(issue));
+                    }
+                    if let Some(ref branch) = info.branch_name {
+                        obj.insert("branch_name".to_string(), serde_json::json!(branch));
+                    }
 
-                // Status
-                if let Some(ref status) = info.status {
-                    agent_table.set("status", status.clone())?;
-                }
+                    // Status
+                    if let Some(ref status) = info.status {
+                        obj.insert("status".to_string(), serde_json::json!(status));
+                    }
 
-                // Server info
-                if let Some(port) = info.port {
-                    agent_table.set("port", port)?;
-                }
-                if let Some(server_running) = info.server_running {
-                    agent_table.set("server_running", server_running)?;
-                }
-                if let Some(has_server_pty) = info.has_server_pty {
-                    agent_table.set("has_server_pty", has_server_pty)?;
-                }
+                    // Server info
+                    if let Some(port) = info.port {
+                        obj.insert("port".to_string(), serde_json::json!(port));
+                    }
+                    if let Some(server_running) = info.server_running {
+                        obj.insert("server_running".to_string(), serde_json::json!(server_running));
+                    }
+                    if let Some(has_server_pty) = info.has_server_pty {
+                        obj.insert("has_server_pty".to_string(), serde_json::json!(has_server_pty));
+                    }
 
-                // PTY count from handle
-                agent_table.set("pty_count", agent.pty_count())?;
+                    // PTY count from handle
+                    obj.insert("pty_count".to_string(), serde_json::json!(agent.pty_count()));
 
-                result.set(i + 1, agent_table)?;
-            }
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
 
-            Ok(result)
+            // Convert to Lua - Vec serializes as array
+            lua.to_value(&agents_data)
         })
         .map_err(|e| anyhow!("Failed to create hub.get_agents function: {e}"))?;
 
@@ -226,21 +232,26 @@ pub fn register(
     hub.set("get_agent_count", get_agent_count_fn)
         .map_err(|e| anyhow!("Failed to set hub.get_agent_count: {e}"))?;
 
-    // hub.get_worktrees() - Returns available worktrees
+    // hub.get_worktrees() - Returns array of available worktrees
+    // Uses serde serialization to ensure proper JSON array format
     let cache4 = Arc::clone(&handle_cache);
     let get_worktrees_fn = lua
         .create_function(move |lua, ()| {
             let worktrees = cache4.get_worktrees();
-            let result = lua.create_table()?;
 
-            for (i, (path, branch)) in worktrees.iter().enumerate() {
-                let wt = lua.create_table()?;
-                wt.set("path", path.clone())?;
-                wt.set("branch", branch.clone())?;
-                result.set(i + 1, wt)?;
-            }
+            // Build as Vec for proper array serialization
+            let worktrees_data: Vec<serde_json::Value> = worktrees
+                .iter()
+                .map(|(path, branch)| {
+                    serde_json::json!({
+                        "path": path,
+                        "branch": branch
+                    })
+                })
+                .collect();
 
-            Ok(result)
+            // Convert to Lua - Vec serializes as array
+            lua.to_value(&worktrees_data)
         })
         .map_err(|e| anyhow!("Failed to create hub.get_worktrees function: {e}"))?;
 
@@ -361,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_worktrees_returns_empty_table() {
+    fn test_get_worktrees_returns_empty_array() {
         let lua = Lua::new();
         let (queue, cache) = create_test_queue_and_cache();
 
@@ -369,6 +380,38 @@ mod tests {
 
         let worktrees: LuaTable = lua.load("return hub.get_worktrees()").eval().unwrap();
         assert_eq!(worktrees.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_get_agents_serializes_as_json_array() {
+        let lua = Lua::new();
+        let (queue, cache) = create_test_queue_and_cache();
+
+        register(&lua, queue, cache).expect("Should register");
+
+        // Get agents and convert back to JSON to verify array format
+        let agents: LuaValue = lua.load("return hub.get_agents()").eval().unwrap();
+        let json: serde_json::Value = lua.from_value(agents).unwrap();
+
+        // Empty agents should be an array [], not an object {}
+        assert!(json.is_array(), "Empty agents should serialize as JSON array, got: {}", json);
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_get_worktrees_serializes_as_json_array() {
+        let lua = Lua::new();
+        let (queue, cache) = create_test_queue_and_cache();
+
+        register(&lua, queue, cache).expect("Should register");
+
+        // Get worktrees and convert back to JSON to verify array format
+        let worktrees: LuaValue = lua.load("return hub.get_worktrees()").eval().unwrap();
+        let json: serde_json::Value = lua.from_value(worktrees).unwrap();
+
+        // Empty worktrees should be an array [], not an object {}
+        assert!(json.is_array(), "Empty worktrees should serialize as JSON array, got: {}", json);
+        assert_eq!(json.as_array().unwrap().len(), 0);
     }
 
     #[test]

@@ -47,7 +47,15 @@ export class PreviewConnection extends Connection {
   // ========== Connection overrides ==========
 
   channelName() {
-    return "PreviewChannel";
+    return "preview";
+  }
+
+  /**
+   * Compute semantic subscription ID.
+   * Format: preview_{agentIndex}_{ptyIndex}
+   */
+  computeSubscriptionId() {
+    return `preview_${this.agentIndex}_${this.ptyIndex}`;
   }
 
   channelParams() {

@@ -2,7 +2,7 @@ import { Controller } from "@hotwired/stimulus";
 import * as xterm from "@xterm/xterm";
 import * as xtermFit from "@xterm/addon-fit";
 import * as xtermUnicode from "@xterm/addon-unicode11";
-import { ConnectionManager, TerminalConnection } from "connections";
+import { ConnectionManager, TerminalConnection, HubConnection } from "connections";
 
 const Terminal = xterm.Terminal || xterm.default?.Terminal || xterm.default;
 const FitAddon =
@@ -32,6 +32,7 @@ export default class extends Controller {
   #terminal = null;
   #fitAddon = null;
   #terminalConn = null;
+  #hubConn = null;
   #unsubscribers = [];
   #touchOverlay = null;
   #keyboardHandler = null;
@@ -83,12 +84,22 @@ export default class extends Controller {
     this.#terminalConn?.release();
     this.#terminalConn = null;
 
+    this.#hubConn?.release();
+    this.#hubConn = null;
+
     this.#terminal?.dispose();
     this.#terminal = null;
   }
 
   async #initConnections() {
     if (!this.hubIdValue) return;
+
+    // Acquire hub connection for control plane (resize updates client dims centrally)
+    this.#hubConn = await ConnectionManager.acquire(
+      HubConnection,
+      this.hubIdValue,
+      { hubId: this.hubIdValue },
+    );
 
     const termKey = TerminalConnection.key(
       this.hubIdValue,
@@ -217,6 +228,7 @@ export default class extends Controller {
     });
 
     this.#terminal.onData((data) => {
+      console.log(`[Terminal] onData fired, len=${data.length}, autocorrect=${this.#isHandlingAutocorrect}, composing=${this.#isComposing}`);
       // Cancel any momentum scrolling when user starts typing
       if (this.#momentumAnimationId) {
         cancelAnimationFrame(this.#momentumAnimationId);
@@ -440,15 +452,27 @@ export default class extends Controller {
 
   // I/O helpers
   async #sendInput(data) {
-    if (!this.#terminalConn) return;
+    console.log(`[Terminal] sendInput called, data len=${data.length}, terminalConn=${!!this.#terminalConn}`);
+    if (!this.#terminalConn) {
+      console.warn(`[Terminal] sendInput: no terminal connection!`);
+      return;
+    }
+    const start = performance.now();
     await this.#terminalConn.sendInput(data);
+    const elapsed = performance.now() - start;
+    console.log(`[Terminal] sendInput completed in ${elapsed.toFixed(1)}ms`);
   }
 
   async #sendResize() {
-    if (this.#terminalConn && this.#terminal) {
-      console.log("[Terminal] Sending resize:", this.#terminal.cols, "x", this.#terminal.rows);
-      await this.#terminalConn.sendResize(this.#terminal.cols, this.#terminal.rows);
-    }
+    if (!this.#terminal || !this.#hubConn) return;
+
+    const cols = this.#terminal.cols;
+    const rows = this.#terminal.rows;
+    console.log("[Terminal] Sending resize:", cols, "x", rows);
+
+    // Send resize via hub connection to update client dims centrally.
+    // Hub's update_dims() resizes all PTYs for this client.
+    this.#hubConn.sendResize(cols, rows);
   }
 
   #handleResize() {

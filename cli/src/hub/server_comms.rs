@@ -41,6 +41,20 @@ impl Hub {
         self.send_command_channel_heartbeat();
         self.poll_agent_notifications_async();
         self.poll_lua_file_changes();
+        // Flush any Lua-queued operations (WebRTC sends, PTY requests, Hub requests)
+        // This catches any events fired outside the normal message flow
+        self.flush_lua_queues();
+    }
+
+    /// Flush all Lua-queued operations.
+    ///
+    /// Processes WebRTC sends, PTY requests, and Hub requests that Lua callbacks
+    /// may have queued. Called automatically in `tick()` to ensure all queued
+    /// operations are processed without requiring manual calls after each Lua event.
+    pub fn flush_lua_queues(&mut self) {
+        self.process_lua_webrtc_sends();
+        self.process_lua_pty_requests();
+        self.process_lua_hub_requests();
     }
 
     /// Poll for Lua file changes and hot-reload modified modules.
@@ -472,19 +486,23 @@ impl Hub {
             },
         );
 
+        // Refresh worktree cache BEFORE firing events so Lua sees updated state
+        if let Err(e) = self.load_available_worktrees() {
+            log::warn!("Failed to refresh worktree cache after agent creation: {}", e);
+        }
+
         // Broadcast AgentCreated event to all subscribers (WebRTC, TUI)
-        if let Some(info) = self.state.read().unwrap().get_agent_info(&session_key) {
+        // Get info and release lock before calling methods that need &mut self
+        let info = self.state.read().unwrap().get_agent_info(&session_key);
+
+        if let Some(info) = info {
             self.broadcast(HubEvent::agent_created(session_key.clone(), info.clone()));
 
             // Fire Lua event for agent_created
+            // Note: Queued WebRTC sends are flushed automatically in tick()
             if let Err(e) = self.lua.fire_agent_created(&session_key, &info) {
                 log::warn!("Lua agent_created event error: {}", e);
             }
-        }
-
-        // Refresh worktree cache - this agent's worktree is now in use
-        if let Err(e) = self.load_available_worktrees() {
-            log::warn!("Failed to refresh worktree cache after agent creation: {}", e);
         }
     }
 
@@ -546,7 +564,7 @@ impl Hub {
         let browser_ids: Vec<String> = self.webrtc_channels.keys().cloned().collect();
 
         if !browser_ids.is_empty() {
-            log::trace!("[WebRTC] Polling {} channels", browser_ids.len());
+            log::trace!("[WebRTC-POLL] Polling {} channels", browser_ids.len());
         }
 
         for browser_identity in browser_ids {
@@ -560,14 +578,34 @@ impl Hub {
 
                 match msg {
                     Some(m) => {
-                        log::trace!(
-                            "[WebRTC] Received message from {} ({} bytes)",
-                            &browser_identity[..browser_identity.len().min(8)],
-                            m.payload.len()
-                        );
                         self.handle_webrtc_message(&browser_identity, &m.payload);
                     }
                     None => break,
+                }
+            }
+
+            // Check for repeated decryption failures (session desync)
+            if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
+                let failures = channel.decrypt_failure_count();
+                if failures >= 3 {
+                    log::warn!(
+                        "[WebRTC] {} consecutive decryption failures for {}, sending session_invalid",
+                        failures,
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
+                    channel.reset_decrypt_failures();
+
+                    let msg = serde_json::json!({
+                        "type": "session_invalid",
+                        "reason": "decryption_failed",
+                        "message": "Signal session out of sync. Please re-pair.",
+                    });
+                    if let Ok(payload) = serde_json::to_vec(&msg) {
+                        let _guard = self.tokio_runtime.enter();
+                        if let Err(e) = self.tokio_runtime.block_on(channel.send_plaintext(&payload)) {
+                            log::warn!("[WebRTC] Failed to send session_invalid: {e}");
+                        }
+                    }
                 }
             }
         }
@@ -582,10 +620,10 @@ impl Hub {
     /// Note: Signal envelope decryption happens inside WebRtcChannel.try_recv(),
     /// so we receive plaintext JSON here.
     fn handle_webrtc_message(&mut self, browser_identity: &str, payload: &[u8]) {
-        let msg: serde_json::Value = match serde_json::from_slice(payload) {
+        let msg: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(payload) {
             Ok(v) => v,
             Err(e) => {
-                log::warn!("[WebRTC] Failed to parse message: {e}");
+                log::error!("[WebRTC-MSG] JSON parse failed: {e}");
                 return;
             }
         };
@@ -603,19 +641,20 @@ impl Hub {
     fn call_lua_webrtc_message(&mut self, browser_identity: &str, msg: serde_json::Value) {
         // Call Lua callback
         if let Err(e) = self.lua.call_webrtc_message(browser_identity, msg) {
-            log::warn!("[WebRTC] Lua message callback error: {e}");
+            log::error!("[WebRTC-LUA] Lua callback error: {e}");
         }
 
-        // Process any sends and PTY requests that Lua queued
+        // Process any sends, PTY requests, and Hub requests that Lua queued
         self.process_lua_webrtc_sends();
         self.process_lua_pty_requests();
+        self.process_lua_hub_requests();
     }
 
     /// Process WebRTC send requests queued by Lua callbacks.
     ///
     /// Drains the Lua send queue and sends each message to the target peer.
     /// Called after any Lua callback that might queue messages.
-    fn process_lua_webrtc_sends(&mut self) {
+    pub fn process_lua_webrtc_sends(&mut self) {
         use crate::lua::primitives::WebRtcSendRequest;
 
         for send_req in self.lua.drain_webrtc_sends() {
@@ -680,13 +719,13 @@ impl Hub {
                     if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
                         if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
                             if let Err(e) = pty_handle.write_input_direct(&data) {
-                                log::warn!("[Lua] PTY write failed: {e}");
+                                log::error!("[PTY-WRITE] Write failed: {e}");
                             }
                         } else {
-                            log::debug!("[Lua] No PTY at index {} for agent {}", pty_index, agent_index);
+                            log::warn!("[PTY-WRITE] No PTY at index {} for agent {}", pty_index, agent_index);
                         }
                     } else {
-                        log::debug!("[Lua] No agent at index {}", agent_index);
+                        log::warn!("[PTY-WRITE] No agent at index {}", agent_index);
                     }
                 }
                 PtyRequest::ResizePty {
@@ -727,6 +766,71 @@ impl Hub {
         }
     }
 
+    /// Process Hub requests queued by Lua callbacks.
+    ///
+    /// Drains the Lua Hub request queue and processes each request.
+    /// Called after any Lua callback that might queue agent lifecycle operations.
+    pub fn process_lua_hub_requests(&mut self) {
+        use crate::client::{CreateAgentRequest, DeleteAgentRequest};
+        use crate::lua::primitives::HubRequest;
+
+        for request in self.lua.drain_hub_requests() {
+            match request {
+                HubRequest::CreateAgent {
+                    issue_or_branch,
+                    prompt,
+                    from_worktree,
+                    response_key,
+                } => {
+                    log::info!(
+                        "[Lua] Processing create_agent request: {} (key: {})",
+                        issue_or_branch,
+                        &response_key[..response_key.len().min(24)]
+                    );
+
+                    let request = CreateAgentRequest {
+                        issue_or_branch,
+                        prompt,
+                        from_worktree: from_worktree.map(std::path::PathBuf::from),
+                        dims: None, // Lua doesn't provide dims currently
+                    };
+
+                    // Use Internal client ID since this is from Lua
+                    actions::dispatch(
+                        self,
+                        HubAction::CreateAgentForClient {
+                            client_id: ClientId::Internal,
+                            request,
+                        },
+                    );
+                }
+                HubRequest::DeleteAgent {
+                    agent_id,
+                    delete_worktree,
+                } => {
+                    log::info!(
+                        "[Lua] Processing delete_agent request: {} (delete_worktree: {})",
+                        agent_id,
+                        delete_worktree
+                    );
+
+                    let request = DeleteAgentRequest {
+                        agent_id,
+                        delete_worktree,
+                    };
+
+                    actions::dispatch(
+                        self,
+                        HubAction::DeleteAgentForClient {
+                            client_id: ClientId::Internal,
+                            request,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     /// Create a PTY forwarder requested by Lua.
     ///
     /// Spawns a new forwarder task that streams PTY output to WebRTC.
@@ -760,6 +864,9 @@ impl Hub {
         // Subscribe to PTY events
         let pty_rx = pty_handle.subscribe();
 
+        // Get scrollback buffer to send initially
+        let scrollback = pty_handle.get_scrollback();
+
         // Spawn forwarder task
         let output_tx = self.webrtc_pty_output_tx.clone();
         let peer_id = req.peer_id.clone();
@@ -768,9 +875,8 @@ impl Hub {
         let prefix = req.prefix.unwrap_or_else(|| vec![0x01]);
         let active_flag = req.active_flag;
 
-        // Generate a subscription ID for this forwarder
-        // (In practice, Lua should provide this, but for now we generate one)
-        let subscription_id = forwarder_key.clone();
+        // Use browser-provided subscription ID for message routing
+        let subscription_id = req.subscription_id;
 
         let _guard = self.tokio_runtime.enter();
         let task = tokio::spawn(async move {
@@ -783,6 +889,32 @@ impl Hub {
                 agent_index,
                 pty_index
             );
+
+            // Send scrollback buffer first (if any)
+            if !scrollback.is_empty() {
+                let mut raw_message = Vec::with_capacity(prefix.len() + scrollback.len());
+                raw_message.extend(&prefix);
+                raw_message.extend(&scrollback);
+
+                log::debug!(
+                    "[Lua] Sending {} bytes of scrollback for agent {} pty {}",
+                    scrollback.len(),
+                    agent_index,
+                    pty_index
+                );
+
+                if output_tx
+                    .send(WebRtcPtyOutput {
+                        subscription_id: subscription_id.clone(),
+                        browser_identity: peer_id.clone(),
+                        data: raw_message,
+                    })
+                    .is_err()
+                {
+                    log::trace!("[Lua] PTY output queue closed before scrollback sent");
+                    return;
+                }
+            }
 
             let mut pty_rx = pty_rx;
             loop {
@@ -991,6 +1123,7 @@ impl Hub {
             }
             self.process_lua_webrtc_sends();
             self.process_lua_pty_requests();
+            self.process_lua_hub_requests();
         }
 
         // Handle the offer and get the answer

@@ -38,7 +38,15 @@ export class TerminalConnection extends Connection {
   // ========== Connection overrides ==========
 
   channelName() {
-    return "TerminalRelayChannel";
+    return "terminal";
+  }
+
+  /**
+   * Compute semantic subscription ID.
+   * Format: terminal_{agentIndex}_{ptyIndex}
+   */
+  computeSubscriptionId() {
+    return `terminal_${this.agentIndex}_${this.ptyIndex}`;
   }
 
   channelParams() {
