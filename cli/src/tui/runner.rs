@@ -664,9 +664,9 @@ pub fn run_with_hub(
     // Create TuiRequest channel for TuiRunner -> TuiClient communication
     let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<TuiRequest>();
 
-    // Register TuiClient in Hub and get the output receiver.
-    // Hub spawns TuiClient as an async task and registers the task handle.
-    let output_rx = hub.register_tui_client_with_request_channel(request_rx);
+    // Register TUI via Lua for Hub-side request processing.
+    // Hub processes TuiRequests directly in its tick loop (no TuiClient async task).
+    let output_rx = hub.register_tui_via_lua(request_rx);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let tui_shutdown = Arc::clone(&shutdown);

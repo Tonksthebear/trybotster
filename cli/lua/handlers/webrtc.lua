@@ -12,11 +12,15 @@ local connections = require("handlers.connections")
 
 --- Create a WebRTC transport for a given peer.
 -- @param peer_id The peer identifier for routing messages
--- @return Transport table with send() and send_binary() methods
+-- @return Transport table with send(), send_binary(), and create_pty_forwarder() methods
 local function make_webrtc_transport(peer_id)
     return {
         send = function(msg) webrtc.send(peer_id, msg) end,
         send_binary = function(data) webrtc.send_binary(peer_id, data) end,
+        create_pty_forwarder = function(opts)
+            opts.peer_id = peer_id
+            return webrtc.create_pty_forwarder(opts)
+        end,
     }
 end
 

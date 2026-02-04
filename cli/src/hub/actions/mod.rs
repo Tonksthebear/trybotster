@@ -165,18 +165,6 @@ pub enum HubAction {
         client_id: ClientId,
     },
 
-    // === Client Lifecycle ===
-    /// A client has connected (browser handshake completed).
-    ClientConnected {
-        /// ID of the connected client.
-        client_id: ClientId,
-    },
-
-    /// A client has disconnected.
-    ClientDisconnected {
-        /// ID of the disconnected client.
-        client_id: ClientId,
-    },
 }
 
 
@@ -264,14 +252,6 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
                 "RequestWorktreeList from {} (handled client-side)",
                 client_id
             );
-        }
-
-        HubAction::ClientConnected { client_id } => {
-            client_handlers::handle_client_connected(hub, client_id);
-        }
-
-        HubAction::ClientDisconnected { client_id } => {
-            client_handlers::handle_client_disconnected(hub, client_id);
         }
 
         HubAction::ScrollForClient { client_id, scroll } => {

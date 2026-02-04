@@ -16,8 +16,12 @@ use crate::relay::types::AgentInfo;
 use super::file_watcher::LuaFileWatcher;
 use super::primitives;
 use super::primitives::events::SharedEventCallbacks;
+use super::primitives::connection::{ConnectionRequest, ConnectionRequestQueue};
 use super::primitives::hub::{HubRequest, HubRequestQueue};
 use super::primitives::pty::{PtyOutputContext, PtyRequest, PtyRequestQueue};
+use super::primitives::tui::{
+    registry_keys as tui_registry_keys, TuiSendQueue, TuiSendRequest,
+};
 use super::primitives::webrtc::{registry_keys, WebRtcSendQueue, WebRtcSendRequest};
 
 /// Lua scripting runtime for the botster hub.
@@ -58,10 +62,14 @@ pub struct LuaRuntime {
     file_watcher: Option<LuaFileWatcher>,
     /// Queue for outgoing WebRTC messages from Lua callbacks.
     webrtc_send_queue: WebRtcSendQueue,
+    /// Queue for outgoing TUI messages from Lua callbacks.
+    tui_send_queue: TuiSendQueue,
     /// Queue for PTY operations from Lua callbacks.
     pty_request_queue: PtyRequestQueue,
     /// Queue for Hub operations from Lua callbacks.
     hub_request_queue: HubRequestQueue,
+    /// Queue for connection operations from Lua callbacks.
+    connection_request_queue: ConnectionRequestQueue,
     /// Event callbacks registered by Lua scripts.
     event_callbacks: SharedEventCallbacks,
 }
@@ -69,16 +77,20 @@ pub struct LuaRuntime {
 impl std::fmt::Debug for LuaRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let webrtc_queue_len = self.webrtc_send_queue.lock().map(|q| q.len()).unwrap_or(0);
+        let tui_queue_len = self.tui_send_queue.lock().map(|q| q.len()).unwrap_or(0);
         let pty_queue_len = self.pty_request_queue.lock().map(|q| q.len()).unwrap_or(0);
         let hub_queue_len = self.hub_request_queue.lock().map(|q| q.len()).unwrap_or(0);
+        let conn_queue_len = self.connection_request_queue.lock().map(|q| q.len()).unwrap_or(0);
         let event_cb_count = self.event_callbacks.lock().map(|c| c.callback_count()).unwrap_or(0);
         f.debug_struct("LuaRuntime")
             .field("base_path", &self.base_path)
             .field("strict", &self.strict)
             .field("file_watching", &self.file_watcher.is_some())
             .field("webrtc_queue_len", &webrtc_queue_len)
+            .field("tui_queue_len", &tui_queue_len)
             .field("pty_queue_len", &pty_queue_len)
             .field("hub_queue_len", &hub_queue_len)
+            .field("connection_queue_len", &conn_queue_len)
             .field("event_callback_count", &event_cb_count)
             .finish_non_exhaustive()
     }
@@ -114,11 +126,17 @@ impl LuaRuntime {
         // Create WebRTC send queue
         let webrtc_send_queue = primitives::new_send_queue();
 
+        // Create TUI send queue
+        let tui_send_queue = primitives::new_tui_queue();
+
         // Create PTY request queue
         let pty_request_queue = primitives::new_pty_queue();
 
         // Create Hub request queue
         let hub_request_queue = primitives::new_hub_queue();
+
+        // Create connection request queue
+        let connection_request_queue = primitives::new_connection_queue();
 
         // Create event callback storage
         let event_callbacks = primitives::new_event_callbacks();
@@ -130,6 +148,10 @@ impl LuaRuntime {
         primitives::register_webrtc(&lua, Arc::clone(&webrtc_send_queue))
             .context("Failed to register WebRTC primitives")?;
 
+        // Register TUI primitives with the send queue
+        primitives::register_tui(&lua, Arc::clone(&tui_send_queue))
+            .context("Failed to register TUI primitives")?;
+
         // Register PTY primitives with the request queue
         primitives::register_pty(&lua, Arc::clone(&pty_request_queue))
             .context("Failed to register PTY primitives")?;
@@ -138,8 +160,8 @@ impl LuaRuntime {
         primitives::register_events(&lua, Arc::clone(&event_callbacks))
             .context("Failed to register event primitives")?;
 
-        // Note: Hub primitives are registered later via register_hub_primitives()
-        // because they need a HandleCache reference from Hub
+        // Note: Hub and connection primitives are registered later via
+        // register_hub_primitives() because they need a HandleCache reference from Hub
 
         // Configure package.path to include the base path for require()
         Self::setup_package_path(&lua, &base_path)?;
@@ -156,8 +178,10 @@ impl LuaRuntime {
             strict,
             file_watcher: None,
             webrtc_send_queue,
+            tui_send_queue,
             pty_request_queue,
             hub_request_queue,
+            connection_request_queue,
             event_callbacks,
         })
     }
@@ -894,6 +918,172 @@ impl LuaRuntime {
     }
 
     // =========================================================================
+    // TUI Callback Methods
+    // =========================================================================
+
+    /// Call the TUI on_connected callback if registered.
+    ///
+    /// Called by Hub when the TUI is ready to receive messages.
+    ///
+    /// # Errors
+    ///
+    /// In strict mode, returns errors from Lua callback execution.
+    /// In non-strict mode, logs errors and returns Ok.
+    pub fn call_tui_connected(&self) -> Result<()> {
+        match self.call_tui_connected_internal() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.strict {
+                    Err(e)
+                } else {
+                    log::warn!("Lua tui_connected callback error: {}", e);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn call_tui_connected_internal(&self) -> Result<()> {
+        let key_result: mlua::Result<mlua::RegistryKey> = self
+            .lua
+            .named_registry_value(tui_registry_keys::ON_CONNECTED);
+
+        if let Ok(key) = key_result {
+            let callback: mlua::Function = self
+                .lua
+                .registry_value(&key)
+                .map_err(|e| anyhow!("Failed to get tui_connected callback: {e}"))?;
+
+            callback
+                .call::<()>(())
+                .map_err(|e| anyhow!("tui_connected callback failed: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// Call the TUI on_disconnected callback if registered.
+    ///
+    /// Called by Hub when the TUI is shutting down.
+    ///
+    /// # Errors
+    ///
+    /// In strict mode, returns errors from Lua callback execution.
+    /// In non-strict mode, logs errors and returns Ok.
+    pub fn call_tui_disconnected(&self) -> Result<()> {
+        match self.call_tui_disconnected_internal() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.strict {
+                    Err(e)
+                } else {
+                    log::warn!("Lua tui_disconnected callback error: {}", e);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn call_tui_disconnected_internal(&self) -> Result<()> {
+        let key_result: mlua::Result<mlua::RegistryKey> = self
+            .lua
+            .named_registry_value(tui_registry_keys::ON_DISCONNECTED);
+
+        if let Ok(key) = key_result {
+            let callback: mlua::Function = self
+                .lua
+                .registry_value(&key)
+                .map_err(|e| anyhow!("Failed to get tui_disconnected callback: {e}"))?;
+
+            callback
+                .call::<()>(())
+                .map_err(|e| anyhow!("tui_disconnected callback failed: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// Call the TUI on_message callback with a JSON value.
+    ///
+    /// Called by Hub when a message is received from the TUI.
+    /// The JSON value is converted to a Lua table using mlua's serialize feature.
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - The JSON message to pass to Lua
+    ///
+    /// # Errors
+    ///
+    /// In strict mode, returns errors from Lua callback execution.
+    /// In non-strict mode, logs errors and returns Ok.
+    pub fn call_tui_message(&self, message: serde_json::Value) -> Result<()> {
+        match self.call_tui_message_internal(message) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.strict {
+                    Err(e)
+                } else {
+                    log::warn!("Lua tui_message callback error: {}", e);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn call_tui_message_internal(&self, message: serde_json::Value) -> Result<()> {
+        let key_result: mlua::Result<mlua::RegistryKey> = self
+            .lua
+            .named_registry_value(tui_registry_keys::ON_MESSAGE);
+
+        if let Ok(key) = key_result {
+            let callback: mlua::Function = self
+                .lua
+                .registry_value(&key)
+                .map_err(|e| anyhow!("Failed to get tui_message callback: {e}"))?;
+
+            let lua_value = self
+                .lua
+                .to_value(&message)
+                .map_err(|e| anyhow!("Failed to convert JSON to Lua value: {e}"))?;
+
+            callback
+                .call::<()>(lua_value)
+                .map_err(|e| anyhow!("tui_message callback failed: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// Drain pending TUI send requests.
+    ///
+    /// Returns all messages queued by Lua's `tui.send()` and `tui.send_binary()`
+    /// calls since the last drain. The queue is cleared after this call.
+    ///
+    /// Hub should call this after invoking Lua callbacks to process any
+    /// outgoing TUI messages.
+    #[must_use]
+    pub fn drain_tui_sends(&self) -> Vec<TuiSendRequest> {
+        let mut queue = self
+            .tui_send_queue
+            .lock()
+            .expect("TUI send queue mutex poisoned");
+        std::mem::take(&mut *queue)
+    }
+
+    /// Check if any TUI callbacks are registered.
+    ///
+    /// Returns true if at least one of on_connected, on_disconnected,
+    /// or on_message is registered.
+    #[must_use]
+    pub fn has_tui_callbacks(&self) -> bool {
+        let has_connected = self.has_callback_registered(tui_registry_keys::ON_CONNECTED);
+        let has_disconnected = self.has_callback_registered(tui_registry_keys::ON_DISCONNECTED);
+        let has_message = self.has_callback_registered(tui_registry_keys::ON_MESSAGE);
+
+        has_connected || has_disconnected || has_message
+    }
+
+    // =========================================================================
     // PTY Operations
     // =========================================================================
 
@@ -1047,14 +1237,15 @@ impl LuaRuntime {
     // Hub State Primitives
     // =========================================================================
 
-    /// Register Hub state primitives with the HandleCache.
+    /// Register Hub state and connection primitives with the HandleCache.
     ///
-    /// Call this after runtime creation to enable Hub state queries in Lua.
-    /// Hub calls this during setup to wire the HandleCache.
+    /// Call this after runtime creation to enable Hub state queries and
+    /// connection URL access in Lua. Hub calls this during setup to wire
+    /// the HandleCache.
     ///
     /// # Arguments
     ///
-    /// * `handle_cache` - Thread-safe cache of agent handles for queries
+    /// * `handle_cache` - Thread-safe cache of agent handles and connection URL
     ///
     /// # Errors
     ///
@@ -1063,9 +1254,17 @@ impl LuaRuntime {
         primitives::register_hub(
             &self.lua,
             Arc::clone(&self.hub_request_queue),
-            handle_cache,
+            Arc::clone(&handle_cache),
         )
         .context("Failed to register Hub primitives")?;
+
+        primitives::register_connection(
+            &self.lua,
+            Arc::clone(&self.connection_request_queue),
+            handle_cache,
+        )
+        .context("Failed to register connection primitives")?;
+
         Ok(())
     }
 
@@ -1097,6 +1296,22 @@ impl LuaRuntime {
     pub fn drain_hub_requests(&self) -> Vec<HubRequest> {
         let mut queue = self.hub_request_queue.lock()
             .expect("Hub request queue mutex poisoned");
+        std::mem::take(&mut *queue)
+    }
+
+    /// Drain pending connection requests.
+    ///
+    /// Returns all connection operations queued by Lua's `connection.regenerate()`
+    /// calls since the last drain. The queue is cleared after this call.
+    ///
+    /// Hub should call this after invoking Lua callbacks to process any
+    /// connection operations.
+    #[must_use]
+    pub fn drain_connection_requests(&self) -> Vec<ConnectionRequest> {
+        let mut queue = self
+            .connection_request_queue
+            .lock()
+            .expect("Connection request queue mutex poisoned");
         std::mem::take(&mut *queue)
     }
 
@@ -2019,5 +2234,139 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let requests = runtime.drain_hub_requests();
         assert!(requests.is_empty());
+    }
+
+    // =========================================================================
+    // TUI Callback Tests
+    // =========================================================================
+
+    #[test]
+    fn test_tui_table_registered() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+        let globals = runtime.lua().globals();
+        let tui_table: mlua::Result<mlua::Table> = globals.get("tui");
+        assert!(tui_table.is_ok(), "tui table should be registered");
+    }
+
+    #[test]
+    fn test_has_tui_callbacks_false_initially() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+        assert!(!runtime.has_tui_callbacks());
+    }
+
+    #[test]
+    fn test_has_tui_callbacks_true_after_registration() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        runtime.lua().load(r#"
+            tui.on_message(function(msg) end)
+        "#).exec().unwrap();
+
+        assert!(runtime.has_tui_callbacks());
+    }
+
+    #[test]
+    fn test_call_tui_connected_invokes_callback() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        runtime.lua().load(r#"
+            tui_connected = false
+            tui.on_connected(function()
+                tui_connected = true
+            end)
+        "#).exec().unwrap();
+
+        runtime.call_tui_connected().expect("Should call callback");
+
+        let result: bool = runtime.lua().globals().get("tui_connected").unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_call_tui_disconnected_invokes_callback() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        runtime.lua().load(r#"
+            tui_disconnected = false
+            tui.on_disconnected(function()
+                tui_disconnected = true
+            end)
+        "#).exec().unwrap();
+
+        runtime.call_tui_disconnected().expect("Should call callback");
+
+        let result: bool = runtime.lua().globals().get("tui_disconnected").unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_call_tui_message_invokes_callback_with_json() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        runtime.lua().load(r#"
+            received_tui_type = nil
+            received_tui_value = nil
+            tui.on_message(function(msg)
+                received_tui_type = msg.type
+                received_tui_value = msg.value
+            end)
+        "#).exec().unwrap();
+
+        let msg = serde_json::json!({
+            "type": "resize",
+            "value": 80
+        });
+
+        runtime.call_tui_message(msg).expect("Should call callback");
+
+        let msg_type: String = runtime.lua().globals().get("received_tui_type").unwrap();
+        let value: i64 = runtime.lua().globals().get("received_tui_value").unwrap();
+
+        assert_eq!(msg_type, "resize");
+        assert_eq!(value, 80);
+    }
+
+    #[test]
+    fn test_drain_tui_sends_returns_queued_messages() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        runtime.lua().load(r#"
+            tui.send({ type = "agent_list" })
+            tui.send({ type = "status" })
+        "#).exec().unwrap();
+
+        let sends = runtime.drain_tui_sends();
+        assert_eq!(sends.len(), 2);
+
+        // Queue should be empty after drain
+        let sends2 = runtime.drain_tui_sends();
+        assert!(sends2.is_empty());
+    }
+
+    #[test]
+    fn test_tui_callback_can_send_response() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        runtime.lua().load(r#"
+            tui.on_message(function(msg)
+                if msg.type == "list_agents" then
+                    tui.send({ type = "agent_list", count = 0 })
+                end
+            end)
+        "#).exec().unwrap();
+
+        let msg = serde_json::json!({ "type": "list_agents" });
+        runtime.call_tui_message(msg).expect("Should call callback");
+
+        let sends = runtime.drain_tui_sends();
+        assert_eq!(sends.len(), 1);
+
+        match &sends[0] {
+            TuiSendRequest::Json { data } => {
+                assert_eq!(data["type"], "agent_list");
+                assert_eq!(data["count"], 0);
+            }
+            _ => panic!("Expected Json request"),
+        }
     }
 }

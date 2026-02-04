@@ -154,7 +154,8 @@ function Client:handle_subscribe(msg)
 end
 
 --- Set up terminal subscription with PTY forwarder.
--- Creates a forwarder that streams PTY output to the browser.
+-- Creates a transport-agnostic forwarder that streams PTY output to the client.
+-- Each transport (WebRTC, TUI) provides its own create_pty_forwarder().
 -- @param sub_id The subscription ID (browser-generated, e.g., "sub_2_1770164017")
 -- @param agent_index The agent index
 -- @param pty_index The PTY index (0=CLI, 1=Server)
@@ -164,10 +165,10 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
         return
     end
 
-    -- Create PTY forwarder (Rust handles the actual streaming)
-    -- subscription_id is critical: browser routes messages by this ID
-    local forwarder = webrtc.create_pty_forwarder({
-        peer_id = self.peer_id,
+    -- Create PTY forwarder via transport (Rust handles the actual streaming).
+    -- WebRTC transport adds peer_id and routes through WebRTC DataChannel.
+    -- TUI transport routes through tui_output_tx directly.
+    local forwarder = self.transport.create_pty_forwarder({
         agent_index = agent_index,
         pty_index = pty_index,
         subscription_id = sub_id,
@@ -371,6 +372,28 @@ function Client:handle_hub_data(sub_id, command)
     elseif cmd_type == "select_agent" then
         -- Agent selection for UI state
         log.debug(string.format("Select agent: %s", tostring(command.id or command.agent_index)))
+
+    elseif cmd_type == "get_connection_code" then
+        -- Request connection URL from cache
+        local url, err = connection.get_url()
+        if url then
+            self:send({
+                subscriptionId = sub_id,
+                type = "connection_code",
+                url = url,
+            })
+        else
+            self:send({
+                subscriptionId = sub_id,
+                type = "connection_code_error",
+                error = err or "Connection code not available",
+            })
+        end
+
+    elseif cmd_type == "regenerate_connection_code" then
+        -- Queue a connection code regeneration request
+        connection.regenerate()
+        log.info("Connection code regeneration requested")
 
     elseif cmd_type == "resize" then
         -- Client resize - update stored dims and resize any active PTY forwarders

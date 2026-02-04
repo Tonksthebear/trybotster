@@ -168,7 +168,11 @@ export class Connection {
     // Multiple tabs share the same Signal session but need separate WebRTC connections.
     this.browserIdentity = `${this.identityKey}:${Connection.tabId}`
 
-    // 2. Connect transport via WebRTC
+    // Set up hub-level event listeners BEFORE connecting transport
+    // so we catch the initial health transmit from HubSignalingChannel
+    this.#setupHubEventListeners()
+
+    // 2. Connect transport via WebRTC (also subscribes to ActionCable signaling)
     const signalingUrl = window.location.origin
     await bridge.send("connect", {
       hubId,
@@ -177,9 +181,6 @@ export class Connection {
     })
 
     this.#hubConnected = true
-
-    // Set up hub-level event listeners (connection state, session invalid, WebRTC signaling)
-    this.#setupHubEventListeners()
   }
 
   /**
@@ -347,6 +348,14 @@ export class Connection {
       }
     })
     this.#unsubscribers.push(unsubState)
+
+    // Listen for health events from ActionCable signaling channel
+    // Health messages arrive via HubSignalingChannel → WebRTCTransport → bridge
+    const unsubHealth = bridge.on("health", (event) => {
+      if (event.hubId !== hubId) return
+      this.#handleHealthMessage(event)
+    })
+    this.#unsubscribers.push(unsubHealth)
 
     // Listen for session invalid (Signal session desync detected by CLI)
     const unsubSession = bridge.on("session:invalid", (event) => {

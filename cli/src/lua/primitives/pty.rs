@@ -121,6 +121,22 @@ pub struct CreateForwarderRequest {
     pub active_flag: Arc<Mutex<bool>>,
 }
 
+/// Request to create a TUI PTY forwarder (queued for Hub to process).
+///
+/// Unlike `CreateForwarderRequest`, this doesn't need a peer_id (single TUI)
+/// and routes output through `tui_output_tx` instead of WebRTC.
+#[derive(Debug, Clone)]
+pub struct CreateTuiForwarderRequest {
+    /// Agent index in Hub's agent list.
+    pub agent_index: usize,
+    /// PTY index within the agent (0=CLI, 1=Server).
+    pub pty_index: usize,
+    /// Subscription ID for tracking (Lua-generated).
+    pub subscription_id: String,
+    /// Shared active flag for the forwarder handle.
+    pub active_flag: Arc<Mutex<bool>>,
+}
+
 /// PTY operations queued from Lua.
 ///
 /// These are processed by Hub in its event loop after Lua callbacks return.
@@ -128,6 +144,9 @@ pub struct CreateForwarderRequest {
 pub enum PtyRequest {
     /// Create a new PTY forwarder for streaming to WebRTC.
     CreateForwarder(CreateForwarderRequest),
+
+    /// Create a new PTY forwarder for streaming to TUI.
+    CreateTuiForwarder(CreateTuiForwarderRequest),
 
     /// Stop an existing PTY forwarder.
     StopForwarder {
@@ -173,6 +192,7 @@ impl Clone for PtyRequest {
     fn clone(&self) -> Self {
         match self {
             Self::CreateForwarder(req) => Self::CreateForwarder(req.clone()),
+            Self::CreateTuiForwarder(req) => Self::CreateTuiForwarder(req.clone()),
             Self::StopForwarder { forwarder_id } => Self::StopForwarder {
                 forwarder_id: forwarder_id.clone(),
             },
@@ -298,6 +318,66 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
     lua.globals()
         .set("webrtc", webrtc)
         .map_err(|e| anyhow!("Failed to register webrtc table globally: {e}"))?;
+
+    // Get or create the tui table (may already be created by tui.rs)
+    let tui: LuaTable = lua
+        .globals()
+        .get("tui")
+        .unwrap_or_else(|_| lua.create_table().unwrap());
+
+    // tui.create_pty_forwarder({ agent_index, pty_index, subscription_id })
+    //
+    // Like webrtc.create_pty_forwarder but routes output through TUI send queue.
+    // No peer_id needed — there's only one TUI client.
+    let queue_tui = request_queue.clone();
+    let create_tui_forwarder_fn = lua
+        .create_function(move |_lua, opts: LuaTable| {
+            let agent_index: usize = opts
+                .get("agent_index")
+                .map_err(|_| LuaError::runtime("agent_index is required"))?;
+            let pty_index: usize = opts
+                .get("pty_index")
+                .map_err(|_| LuaError::runtime("pty_index is required"))?;
+            let subscription_id: String = opts
+                .get("subscription_id")
+                .map_err(|_| LuaError::runtime("subscription_id is required"))?;
+
+            let forwarder_id = format!("tui:{}:{}", agent_index, pty_index);
+            let active_flag = Arc::new(Mutex::new(true));
+
+            // Queue the request for Hub to process
+            {
+                let mut q = queue_tui
+                    .lock()
+                    .expect("PTY request queue mutex poisoned");
+                q.push(PtyRequest::CreateTuiForwarder(CreateTuiForwarderRequest {
+                    agent_index,
+                    pty_index,
+                    subscription_id,
+                    active_flag: Arc::clone(&active_flag),
+                }));
+            }
+
+            // Return forwarder handle immediately
+            let forwarder = PtyForwarder {
+                id: forwarder_id,
+                peer_id: "tui".to_string(),
+                agent_index,
+                pty_index,
+                active: active_flag,
+            };
+
+            Ok(forwarder)
+        })
+        .map_err(|e| anyhow!("Failed to create tui.create_pty_forwarder function: {e}"))?;
+
+    tui.set("create_pty_forwarder", create_tui_forwarder_fn)
+        .map_err(|e| anyhow!("Failed to set tui.create_pty_forwarder: {e}"))?;
+
+    // Ensure tui table is globally registered
+    lua.globals()
+        .set("tui", tui)
+        .map_err(|e| anyhow!("Failed to register tui table globally: {e}"))?;
 
     // Get or create the hub table
     let hub: LuaTable = lua
@@ -690,5 +770,135 @@ mod tests {
             "Error should mention subscription_id: {}",
             err_msg
         );
+    }
+
+    // =========================================================================
+    // TUI PTY Forwarder Tests
+    // =========================================================================
+
+    #[test]
+    fn test_tui_create_pty_forwarder_exists() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        // Register TUI table stub first (pty.rs appends to it)
+        lua.globals()
+            .set("tui", lua.create_table().unwrap())
+            .unwrap();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        let tui: mlua::Table = lua.globals().get("tui").expect("tui should exist");
+        let _: mlua::Function = tui
+            .get("create_pty_forwarder")
+            .expect("tui.create_pty_forwarder should exist");
+    }
+
+    #[test]
+    fn test_tui_create_pty_forwarder_queues_request() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        lua.globals()
+            .set("tui", lua.create_table().unwrap())
+            .unwrap();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        lua.load(
+            r#"
+            forwarder = tui.create_pty_forwarder({
+                agent_index = 0,
+                pty_index = 1,
+                subscription_id = "tui_term_1",
+            })
+        "#,
+        )
+        .exec()
+        .expect("Should create TUI forwarder");
+
+        let requests = queue
+            .lock()
+            .expect("PTY request queue mutex poisoned");
+        assert_eq!(requests.len(), 1);
+
+        match &requests[0] {
+            PtyRequest::CreateTuiForwarder(req) => {
+                assert_eq!(req.agent_index, 0);
+                assert_eq!(req.pty_index, 1);
+                assert_eq!(req.subscription_id, "tui_term_1");
+            }
+            _ => panic!("Expected CreateTuiForwarder request"),
+        }
+
+        // Verify forwarder handle
+        let id: String = lua.load("return forwarder:id()").eval().unwrap();
+        assert_eq!(id, "tui:0:1");
+
+        let peer: String = lua.load("return forwarder:peer_id()").eval().unwrap();
+        assert_eq!(peer, "tui");
+
+        let active: bool = lua.load("return forwarder:is_active()").eval().unwrap();
+        assert!(active);
+    }
+
+    #[test]
+    fn test_tui_create_pty_forwarder_requires_agent_index() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        lua.globals()
+            .set("tui", lua.create_table().unwrap())
+            .unwrap();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        let result: mlua::Result<()> = lua
+            .load(
+                r#"
+            tui.create_pty_forwarder({ pty_index = 0, subscription_id = "sub_1" })
+        "#,
+            )
+            .exec();
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("agent_index"),
+            "Error should mention agent_index: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_tui_forwarder_stop_sets_inactive() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        lua.globals()
+            .set("tui", lua.create_table().unwrap())
+            .unwrap();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        lua.load(
+            r#"
+            fwd = tui.create_pty_forwarder({
+                agent_index = 0,
+                pty_index = 0,
+                subscription_id = "sub_tui",
+            })
+        "#,
+        )
+        .exec()
+        .unwrap();
+
+        let active: bool = lua.load("return fwd:is_active()").eval().unwrap();
+        assert!(active);
+
+        lua.load("fwd:stop()").exec().unwrap();
+
+        let active: bool = lua.load("return fwd:is_active()").eval().unwrap();
+        assert!(!active);
     }
 }

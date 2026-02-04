@@ -34,7 +34,6 @@ Rails.application.routes.draw do
       resources :notifications, only: [ :create ]
       resource :connection, only: [ :show ]
       resource :webrtc, only: [ :show ], controller: :webrtc  # GET config
-      resources :webrtc_signals, only: [ :index, :create ]    # GET poll, POST signal
       # Agent terminal view by index
       # /hubs/:hub_id/agents/:index - agent overview (redirects to PTY 0)
       # /hubs/:hub_id/agents/:index/ptys/:pty_index - specific PTY terminal

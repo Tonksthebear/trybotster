@@ -42,7 +42,6 @@
 
 pub mod actions;
 pub mod agent_handle;
-mod client_routing;
 pub mod command_channel;
 pub mod commands;
 pub mod events;
@@ -76,7 +75,7 @@ use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 
 // ActionCable channel imports removed - preview channels managed separately
-use crate::client::{ClientId, ClientRegistry, ClientTaskHandle};
+use crate::client::ClientId;
 use crate::config::Config;
 use crate::device::Device;
 use crate::git::WorktreeManager;
@@ -173,11 +172,6 @@ pub struct Hub {
     /// Browser connection state and communication.
     pub browser: crate::relay::BrowserState,
 
-    // === Client Registry ===
-    /// Registry of all connected clients (TUI, browsers).
-    /// Each client can independently select and view different agents.
-    pub clients: ClientRegistry,
-
     // === Background Task Channels ===
     /// Sender for pending agent creation results (cloned for each background task).
     pub pending_agent_tx: std_mpsc::Sender<PendingAgentResult>,
@@ -213,6 +207,15 @@ pub struct Hub {
     /// Maps subscriptionId -> JoinHandle for the forwarder task.
     webrtc_pty_forwarders: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
 
+    /// Sender for outgoing WebRTC signals (ICE candidates) from async callbacks.
+    ///
+    /// Cloned for each new WebRTC channel. The async `on_ice_candidate` callback
+    /// encrypts the candidate and sends it here. `poll_outgoing_signals()` drains
+    /// the receiver and relays via `CommandChannelHandle::perform("signal", ...)`.
+    pub webrtc_outgoing_signal_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::OutgoingSignal>,
+    /// Receiver for outgoing WebRTC signals. Drained in `tick()`.
+    webrtc_outgoing_signal_rx: tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::OutgoingSignal>,
+
     // === Command Channel (Actor Pattern) ===
     /// Sender for Hub commands (cloned for each client).
     command_tx: tokio::sync::mpsc::Sender<HubCommand>,
@@ -234,6 +237,31 @@ pub struct Hub {
     // === Lua Scripting ===
     /// Lua scripting runtime for hot-reloadable behavior customization.
     pub lua: LuaRuntime,
+
+    // === TUI via Lua (Hub-side Processing) ===
+    /// Sender for TUI output messages to TuiRunner.
+    ///
+    /// Set by `register_tui_via_lua()`. Hub sends `TuiOutput` messages
+    /// through this channel instead of through a TuiClient intermediary.
+    tui_output_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::client::TuiOutput>>,
+    /// Receiver for TUI requests from TuiRunner.
+    ///
+    /// Set by `register_tui_via_lua()`. Polled by `poll_tui_requests()`.
+    tui_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::TuiRequest>>,
+    /// Hub event receiver for forwarding to TuiRunner.
+    ///
+    /// Set by `register_tui_via_lua()`. Polled by `poll_tui_hub_events()`.
+    tui_hub_event_rx: Option<tokio::sync::broadcast::Receiver<HubEvent>>,
+    /// Active PTY output forwarder task for TUI.
+    ///
+    /// Only one at a time (TUI connects to one PTY at a time).
+    /// Aborted on disconnect and re-created on connect.
+    tui_output_task: Option<tokio::task::JoinHandle<()>>,
+    /// Current TUI terminal dimensions (cols, rows).
+    ///
+    /// Updated by `SetDims` requests from TuiRunner. Used when
+    /// connecting to PTYs via `connect_direct()`.
+    tui_dims: (u16, u16),
 }
 
 impl std::fmt::Debug for Hub {
@@ -310,6 +338,8 @@ impl Hub {
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(64);
         // Create channel for WebRTC PTY output from forwarder tasks
         let (webrtc_pty_output_tx, webrtc_pty_output_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Create channel for outgoing WebRTC signals (ICE candidates from async callbacks)
+        let (webrtc_outgoing_signal_tx, webrtc_outgoing_signal_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Initialize Lua scripting runtime
         let lua = LuaRuntime::new()?;
@@ -325,7 +355,6 @@ impl Hub {
             quit: false,
             last_heartbeat: past,
             browser: crate::relay::BrowserState::default(),
-            clients: ClientRegistry::new(),
             pending_agent_tx,
             pending_agent_rx,
             progress_tx,
@@ -341,7 +370,14 @@ impl Hub {
             webrtc_pty_output_tx,
             webrtc_pty_output_rx,
             webrtc_pty_forwarders: std::collections::HashMap::new(),
+            webrtc_outgoing_signal_tx,
+            webrtc_outgoing_signal_rx,
             lua,
+            tui_output_tx: None,
+            tui_request_rx: None,
+            tui_hub_event_rx: None,
+            tui_output_task: None,
+            tui_dims: (80, 24),
         })
     }
 
@@ -693,6 +729,16 @@ impl Hub {
 
     /// Send shutdown notification to server and cleanup resources.
     pub fn shutdown(&mut self) {
+        // Abort TUI output forwarder task
+        if let Some(task) = self.tui_output_task.take() {
+            task.abort();
+        }
+
+        // Notify Lua that TUI is disconnecting
+        if let Err(e) = self.lua.call_tui_disconnected() {
+            log::warn!("Lua tui_disconnected callback error: {}", e);
+        }
+
         // Fire Lua shutdown event (before any cleanup)
         if let Err(e) = self.lua.fire_shutdown() {
             log::warn!("Lua shutdown event error: {}", e);
@@ -773,12 +819,13 @@ impl Hub {
         hub_handle::HubHandle::new(self.command_sender(), Arc::clone(&self.handle_cache))
     }
 
-    /// Register TuiClient with output channel and request channel.
+    /// Register TUI with Hub-side request processing.
     ///
-    /// Creates a TuiClient, wires the request channel, spawns it as an async
-    /// task via `run_task()`, and registers a `ClientTaskHandle` in the registry.
-    /// TuiRunner sends `TuiRequest` messages through the request channel,
-    /// TuiClient processes them in its async task loop.
+    /// Hub processes TUI requests directly in its tick loop (no async task)
+    /// and forwards Hub events to TuiRunner.
+    ///
+    /// Notifies Lua that the TUI is connected, registering it in the shared
+    /// connection registry alongside browser clients.
     ///
     /// # Arguments
     ///
@@ -787,7 +834,7 @@ impl Hub {
     /// # Returns
     ///
     /// Receiver for TuiOutput messages to TuiRunner.
-    pub fn register_tui_client_with_request_channel(
+    pub fn register_tui_via_lua(
         &mut self,
         request_rx: tokio::sync::mpsc::UnboundedReceiver<crate::client::TuiRequest>,
     ) -> tokio::sync::mpsc::UnboundedReceiver<crate::client::TuiOutput> {
@@ -795,21 +842,21 @@ impl Hub {
 
         let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel::<TuiOutput>();
 
-        // Create TuiClient with output channel and hub event subscription
-        let hub_handle = self.handle();
+        // Subscribe to hub events for forwarding to TuiRunner
         let hub_event_rx = self.subscribe_events();
-        let mut tui_client = crate::client::TuiClient::new(hub_handle, output_tx, Some(hub_event_rx));
 
-        // Wire the request channel
-        tui_client.set_request_receiver(request_rx);
+        // Store channels for Hub-side processing
+        self.tui_output_tx = Some(output_tx);
+        self.tui_request_rx = Some(request_rx);
+        self.tui_hub_event_rx = Some(hub_event_rx);
 
-        // Spawn TuiClient as an async task on the tokio runtime
-        let join_handle = self.tokio_runtime.spawn(tui_client.run_task());
+        // Notify Lua that TUI is connected (registers in connection registry)
+        if let Err(e) = self.lua.call_tui_connected() {
+            log::warn!("Lua tui_connected callback error: {}", e);
+        }
+        self.flush_lua_queues();
 
-        // Register the task handle (replaces existing if any)
-        self.clients.register(ClientId::Tui, ClientTaskHandle {
-            join_handle,
-        });
+        log::info!("TUI registered via Lua (Hub-side processing)");
 
         output_rx
     }
