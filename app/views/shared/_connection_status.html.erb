@@ -58,13 +58,19 @@
       <span class="group-data-[state=connecting]/connection:flex hidden items-center text-amber-500">
         <%= icon "arrow-path", class: "size-4 animate-spin" %>
       </span>
-      <%# Direct (P2P) %>
-      <span class="group-data-[state=direct]/connection:flex hidden items-center text-emerald-500">
+      <%# Direct (P2P) - with lock badge for E2E %>
+      <span class="group-data-[state=direct]/connection:flex hidden items-center text-emerald-500 relative">
         <%= icon "bolt", variant: :solid, class: "size-4" %>
+        <span class="absolute -bottom-0.5 -right-0.5 bg-zinc-900 rounded-full p-px">
+          <%= icon "lock-closed", variant: :micro, class: "size-2 text-emerald-400" %>
+        </span>
       </span>
-      <%# Relay (TURN) %>
-      <span class="group-data-[state=relay]/connection:flex hidden items-center text-sky-500">
+      <%# Relay (TURN) - with lock badge for E2E %>
+      <span class="group-data-[state=relay]/connection:flex hidden items-center text-sky-500 relative">
         <%= icon "cloud", variant: :solid, class: "size-4" %>
+        <span class="absolute -bottom-0.5 -right-0.5 bg-zinc-900 rounded-full p-px">
+          <%= icon "lock-closed", variant: :micro, class: "size-2 text-emerald-400" %>
+        </span>
       </span>
     </div>
 
@@ -90,7 +96,7 @@
   <%# Hub - CLI health status %>
   <div class="flex items-center gap-1 px-2 py-1 rounded-r-md group/hub"
        data-connection-status-target="hubSection"
-       data-status="offline"
+       data-status="<%= hub.active? ? 'online' : 'offline' %>"
        title="Hub CLI status">
     <%# Label %>
     <span class="text-zinc-400 hidden sm:inline">Hub</span>

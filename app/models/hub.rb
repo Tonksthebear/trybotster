@@ -16,6 +16,7 @@ class Hub < ApplicationRecord
   scope :with_device, -> { where.not(device_id: nil) }
 
   after_update_commit :update_sidebar
+  after_update_commit :broadcast_health_status, if: :health_status_changed?
 
   # Check if this hub supports E2E encrypted terminal access
   def e2e_enabled?
@@ -104,5 +105,28 @@ class Hub < ApplicationRecord
       attributes: {
         attribute: "data-active"
       }
+  end
+
+  # Only broadcast when active? status actually transitions
+  def health_status_changed?
+    return true if saved_change_to_alive?
+    return false unless saved_change_to_last_seen_at?
+
+    # Check if last_seen_at change caused an active? transition
+    old_last_seen, new_last_seen = saved_change_to_last_seen_at
+    threshold = 2.minutes.ago
+
+    was_active = alive? && old_last_seen.present? && old_last_seen > threshold
+    is_active = alive? && new_last_seen.present? && new_last_seen > threshold
+
+    was_active != is_active
+  end
+
+  # Broadcast hub health status to ActionCable health stream
+  # JavaScript connections listen for these via hub:{id}:health stream
+  def broadcast_health_status
+    status = active? ? "online" : "offline"
+    ActionCable.server.broadcast("hub:#{id}:health", { type: "health", cli: status })
+    Rails.logger.debug "[Hub] Broadcast health transition: #{status}"
   end
 end
