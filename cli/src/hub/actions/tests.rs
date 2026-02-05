@@ -1,5 +1,7 @@
 //! Tests for hub actions.
 
+use std::path::PathBuf;
+
 use super::*;
 use crate::config::Config;
 
@@ -30,126 +32,6 @@ fn test_hub() -> Hub {
     hub.browser.crypto_service = Some(crypto_service);
 
     hub
-}
-
-/// Test: Selection dispatch works with browser client ID.
-#[test]
-fn test_selection_dispatch_works() {
-    use crate::agent::Agent;
-    use tempfile::TempDir;
-    use uuid::Uuid;
-
-    let mut hub = test_hub();
-
-    // Create an agent
-    let temp_dir = TempDir::new().unwrap();
-    let agent = Agent::new(
-        Uuid::new_v4(),
-        "test/repo".to_string(),
-        Some(1),
-        "test-branch".to_string(),
-        temp_dir.path().to_path_buf(),
-    );
-    hub.state
-        .write()
-        .unwrap()
-        .add_agent("agent-1".to_string(), agent);
-
-    // Browser selects the agent directly - should not panic
-    let browser_id = ClientId::Browser("browser-1".to_string());
-    dispatch(
-        &mut hub,
-        HubAction::SelectAgentForClient {
-            client_id: browser_id.clone(),
-            agent_key: "agent-1".to_string(),
-        },
-    );
-
-    // Agent still exists
-    assert!(hub.state.read().unwrap().agents.contains_key("agent-1"));
-}
-
-/// Test: Switching between agents does not crash.
-#[test]
-fn test_switching_agents_does_not_crash() {
-    use crate::agent::Agent;
-    use tempfile::TempDir;
-    use uuid::Uuid;
-
-    let mut hub = test_hub();
-
-    // Create two agents
-    let temp_dir1 = TempDir::new().unwrap();
-    let agent1 = Agent::new(
-        Uuid::new_v4(),
-        "test/repo".to_string(),
-        Some(1),
-        "branch-1".to_string(),
-        temp_dir1.path().to_path_buf(),
-    );
-    hub.state
-        .write()
-        .unwrap()
-        .add_agent("agent-1".to_string(), agent1);
-
-    let temp_dir2 = TempDir::new().unwrap();
-    let agent2 = Agent::new(
-        Uuid::new_v4(),
-        "test/repo".to_string(),
-        Some(2),
-        "branch-2".to_string(),
-        temp_dir2.path().to_path_buf(),
-    );
-    hub.state
-        .write()
-        .unwrap()
-        .add_agent("agent-2".to_string(), agent2);
-
-    // Select agent-1 then agent-2 with browser client ID -- should not crash
-    let browser_id = ClientId::Browser("browser-1".to_string());
-    dispatch(
-        &mut hub,
-        HubAction::SelectAgentForClient {
-            client_id: browser_id.clone(),
-            agent_key: "agent-1".to_string(),
-        },
-    );
-    dispatch(
-        &mut hub,
-        HubAction::SelectAgentForClient {
-            client_id: browser_id.clone(),
-            agent_key: "agent-2".to_string(),
-        },
-    );
-
-    // Both agents still exist
-    let state = hub.state.read().unwrap();
-    assert!(state.agents.contains_key("agent-1"));
-    assert!(state.agents.contains_key("agent-2"));
-}
-
-// === DeleteAgentForClient tests ===
-
-/// Test that deleting non-existent agent is handled gracefully.
-#[test]
-fn test_delete_nonexistent_agent_is_graceful() {
-    let mut hub = test_hub();
-
-    // Attempt to delete an agent that doesn't exist - should not panic
-    let browser_id = ClientId::Browser("browser-1".to_string());
-    dispatch(
-        &mut hub,
-        HubAction::DeleteAgentForClient {
-            client_id: browser_id.clone(),
-            request: crate::client::DeleteAgentRequest {
-                agent_id: "nonexistent-agent".to_string(),
-                delete_worktree: false,
-            },
-        },
-    );
-
-    // Hub should still be functional - no panic occurred
-    assert!(hub.state.read().unwrap().agents.is_empty());
 }
 
 // === Connection URL Tests ===

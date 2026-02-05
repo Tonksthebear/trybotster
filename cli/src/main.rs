@@ -193,10 +193,6 @@ fn run_headless() -> Result<()> {
         // Poll for messages and send heartbeats
         hub.tick();
 
-        // Poll pending agents and progress
-        hub.poll_pending_agents();
-        hub.poll_progress_events();
-
         // Sleep to avoid busy-looping (100ms = 10 ticks/sec is plenty for headless)
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -458,43 +454,3 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use botster_hub::AgentSpawnConfig;
-
-    // Test AgentSpawnConfig invocation_url handling
-    #[test]
-    fn test_agent_spawn_config_has_invocation_url_field() {
-        let config = AgentSpawnConfig {
-            issue_number: Some(42),
-            branch_name: "botster-issue-42".to_string(),
-            worktree_path: std::path::PathBuf::from("/tmp/worktree"),
-            repo_path: std::path::PathBuf::from("/tmp/repo"),
-            repo_name: "owner/repo".to_string(),
-            prompt: "Test prompt".to_string(),
-            message_id: None,
-            invocation_url: Some("https://github.com/owner/repo/issues/42".to_string()),
-            dims: (24, 80),
-        };
-        assert_eq!(
-            config.invocation_url,
-            Some("https://github.com/owner/repo/issues/42".to_string())
-        );
-    }
-
-    #[test]
-    fn test_agent_spawn_config_invocation_url_can_be_none() {
-        let config = AgentSpawnConfig {
-            issue_number: Some(42),
-            branch_name: "botster-issue-42".to_string(),
-            worktree_path: std::path::PathBuf::from("/tmp/worktree"),
-            repo_path: std::path::PathBuf::from("/tmp/repo"),
-            repo_name: "owner/repo".to_string(),
-            prompt: "Test prompt".to_string(),
-            message_id: None,
-            invocation_url: None,
-            dims: (24, 80),
-        };
-        assert!(config.invocation_url.is_none());
-    }
-}

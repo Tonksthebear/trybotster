@@ -7,14 +7,26 @@
 -- - Transport for sending messages back to the peer
 --
 -- Transport-agnostic: works with any transport that provides send(msg)
--- and send_binary(data) methods. Currently used with WebRTC transport;
--- will support TUI transport in the future.
+-- and send_binary(data) methods. Currently supports WebRTC and TUI transports.
 --
 -- This module is hot-reloadable; state is persisted via core.state.
 -- Uses state.class() for persistent metatable — existing instances
 -- automatically see new/changed methods after hot-reload.
 
 local state = require("core.state")
+local Agent = require("lib.agent")
+
+-- Lazy-load handlers.agents to avoid circular dependency at require-time.
+-- client.lua is a lib module loaded before handlers, so handlers.agents
+-- may not exist yet when this file first loads. The accessor defers the
+-- require() to first use, which is always after init.lua finishes loading.
+local _agents_handler
+local function get_agents_handler()
+    if not _agents_handler then
+        _agents_handler = require("handlers.agents")
+    end
+    return _agents_handler
+end
 
 local Client = state.class("client")
 
@@ -108,7 +120,7 @@ function Client:on_message(msg)
 end
 
 --- Handle subscribe message - create virtual subscription.
--- Mirrors Rust's handle_webrtc_subscribe behavior.
+-- Handles WebRTC subscribe requests for PTY output streaming.
 -- @param msg The subscribe message
 function Client:handle_subscribe(msg)
     local sub_id = msg.subscriptionId
@@ -155,7 +167,10 @@ end
 
 --- Set up terminal subscription with PTY forwarder.
 -- Creates a transport-agnostic forwarder that streams PTY output to the client.
--- Each transport (WebRTC, TUI) provides its own create_pty_forwarder().
+--
+-- For TUI clients, uses direct session access (tui.forward_session) which
+-- bypasses HandleCache. For WebRTC clients, uses index-based lookup.
+--
 -- @param sub_id The subscription ID (browser-generated, e.g., "sub_2_1770164017")
 -- @param agent_index The agent index
 -- @param pty_index The PTY index (0=CLI, 1=Server)
@@ -165,9 +180,37 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
         return
     end
 
-    -- Create PTY forwarder via transport (Rust handles the actual streaming).
-    -- WebRTC transport adds peer_id and routes through WebRTC DataChannel.
-    -- TUI transport routes through tui_output_tx directly.
+    -- Map pty_index to session name
+    local session_name = pty_index == 0 and "cli" or "server"
+
+    -- Get agent from Lua registry by index
+    local agents = Agent.list()
+    local agent = agents[agent_index + 1]  -- Lua 1-indexed
+
+    if agent and self.transport.type == "tui" then
+        -- TUI: Use direct session access (no HandleCache needed)
+        local session = agent.sessions[session_name]
+        if session then
+            local forwarder = tui.forward_session({
+                agent_key = agent:agent_key(),
+                session_name = session_name,
+                session = session,
+                subscription_id = sub_id,
+            })
+            self.forwarders[sub_id] = forwarder
+
+            -- Resize PTY to client's current dimensions using direct session method
+            session:resize(self.rows, self.cols)
+
+            log.info(string.format("Terminal subscription %s: %s:%s (%dx%d) [direct]",
+                sub_id:sub(1, 16), agent:agent_key(), session_name, self.cols, self.rows))
+            return
+        else
+            log.warn(string.format("No session '%s' on agent %s", session_name, agent:agent_key()))
+        end
+    end
+
+    -- Fallback: Use index-based lookup (for WebRTC or if agent not found)
     local forwarder = self.transport.create_pty_forwarder({
         agent_index = agent_index,
         pty_index = pty_index,
@@ -178,11 +221,9 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
     self.forwarders[sub_id] = forwarder
 
     -- Resize PTY to client's current dimensions
-    -- Client dims are updated via hub channel resize messages
     hub.resize_pty(agent_index, pty_index, self.rows, self.cols)
 
     -- Request scrollback buffer
-    -- Hub will process this and send scrollback via the forwarder
     hub.get_scrollback(agent_index, pty_index)
 
     log.info(string.format("Terminal subscription %s: agent=%d, pty=%d (%dx%d)",
@@ -190,13 +231,13 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
 end
 
 --- Send agent list to a HubChannel subscription.
+-- Uses Agent registry for rich metadata (repo, issue, branch, status, etc.).
 -- @param sub_id The subscription ID to send to
 function Client:send_agent_list(sub_id)
-    local agents = hub.get_agents()
     self:send({
         subscriptionId = sub_id,
         type = "agent_list",
-        agents = agents,
+        agents = Agent.all_info(),
     })
 end
 
@@ -312,7 +353,6 @@ end
 -- @param command The hub command
 function Client:handle_hub_data(sub_id, command)
     -- Field name inconsistency: command type may be in "type" or "command" field.
-    -- TODO: Consolidate on single field name for cleaner future refactoring.
     local cmd_type = command.type or command.command
     log.debug(string.format("handle_hub_data: type=%s", tostring(cmd_type)))
 
@@ -328,12 +368,7 @@ function Client:handle_hub_data(sub_id, command)
         local from_worktree = command.from_worktree
 
         if issue_or_branch then
-            hub.create_agent({
-                issue_or_branch = issue_or_branch,
-                prompt = prompt,
-                from_worktree = from_worktree,
-            })
-            -- Response will come via agent_created event
+            get_agents_handler().handle_create_agent(issue_or_branch, prompt, from_worktree, self)
             log.info(string.format("Create agent request: %s", issue_or_branch))
         else
             log.warn("create_agent missing issue_or_branch")
@@ -345,11 +380,7 @@ function Client:handle_hub_data(sub_id, command)
         local prompt = command.prompt
 
         if path then
-            hub.create_agent({
-                issue_or_branch = branch,
-                prompt = prompt,
-                from_worktree = path,
-            })
+            get_agents_handler().handle_create_agent(branch, prompt, path, self)
             log.info(string.format("Reopen worktree request: %s", path))
         else
             log.warn("reopen_worktree missing path")
@@ -357,20 +388,18 @@ function Client:handle_hub_data(sub_id, command)
 
     elseif cmd_type == "delete_agent" then
         -- Field name inconsistency: agent ID may be in "id", "agent_id", or "session_key".
-        -- TODO: Consolidate on single field name for cleaner future refactoring.
         local agent_id = command.id or command.agent_id or command.session_key
         local delete_worktree = command.delete_worktree or false
 
         if agent_id then
-            hub.delete_agent(agent_id, delete_worktree)
-            -- Response will come via agent_deleted event
+            get_agents_handler().handle_delete_agent(agent_id, delete_worktree)
             log.info(string.format("Delete agent request: %s", agent_id))
         else
             log.warn("delete_agent missing agent_id")
         end
 
     elseif cmd_type == "select_agent" then
-        -- Agent selection for UI state
+        -- No backend action needed; agent selection is client-side UI state
         log.debug(string.format("Select agent: %s", tostring(command.id or command.agent_index)))
 
     elseif cmd_type == "get_connection_code" then
@@ -433,6 +462,9 @@ end
 
 -- Lifecycle hooks for hot-reload
 function Client._before_reload()
+    -- Clear cached handler reference so next call picks up the fresh module.
+    -- Handles the case where handlers.agents was reloaded independently.
+    _agents_handler = nil
     log.info("client.lua reloading (persistent metatable — instances auto-upgrade)")
 end
 

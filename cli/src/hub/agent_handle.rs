@@ -1,9 +1,8 @@
-//! Agent handle for client-to-agent communication.
+//! Agent handle for client-to-agent PTY access.
 //!
-//! `AgentHandle` provides a clean interface for clients to interact with agents.
-//! Clients obtain handles and use them to:
-//! - Get agent info
-//! - Access PTY sessions (subscribe, send input, resize)
+//! `AgentHandle` provides thread-safe access to an agent's PTY sessions.
+//! It is a lightweight wrapper around PTY handles -- agent metadata (repo,
+//! issue, status, etc.) is now managed by Lua, not Rust.
 //!
 //! # How to Get Agent Handles
 //!
@@ -18,7 +17,7 @@
 //!
 //! ```text
 //! AgentHandle
-//!   ├── info() → AgentInfo
+//!   ├── agent_key() → &str
 //!   ├── get_pty(0) → Option<&PtyHandle>  (CLI PTY)
 //!   └── get_pty(1) → Option<&PtyHandle>  (Server PTY)
 //!
@@ -44,20 +43,16 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
-use crate::agent::pty::{
-    process_connect_command, process_disconnect_command, process_resize_command, PtyEvent,
-    SharedPtyState,
-};
+use crate::agent::pty::{process_resize_command, PtyEvent, SharedPtyState};
 use crate::client::ClientId;
-use crate::relay::types::AgentInfo;
 
-/// Handle for interacting with an agent.
+/// Handle for interacting with an agent's PTY sessions.
 ///
 /// Clients obtain this via `HandleCache::get_agent()`, which reads
 /// directly from the cache (non-blocking, safe from any thread).
 ///
-/// The handle provides access to agent info and PTY sessions without
-/// exposing internal state.
+/// Agent metadata (repo, issue, status, etc.) is managed by Lua.
+/// This handle only provides PTY access for I/O operations.
 ///
 /// # Thread Safety
 ///
@@ -71,11 +66,8 @@ use crate::relay::types::AgentInfo;
 /// - Index 1: Server PTY (present when server is running)
 #[derive(Debug, Clone)]
 pub struct AgentHandle {
-    /// Agent identifier.
-    agent_id: String,
-
-    /// Agent info snapshot at time of handle creation.
-    info: AgentInfo,
+    /// Agent session key (e.g., "owner-repo-42").
+    agent_key: String,
 
     /// PTY handles for this agent.
     ///
@@ -96,8 +88,7 @@ impl AgentHandle {
     ///
     /// # Arguments
     ///
-    /// * `agent_id` - Unique agent identifier
-    /// * `info` - Agent info snapshot
+    /// * `agent_key` - Agent session key (e.g., "owner-repo-42")
     /// * `ptys` - Vector of PTY handles (index 0 = CLI, index 1 = Server if present)
     /// * `agent_index` - Index of this agent in the Hub's ordered agent list
     ///
@@ -106,34 +97,23 @@ impl AgentHandle {
     /// Panics if `ptys` is empty. At minimum, the CLI PTY must be present.
     #[must_use]
     pub fn new(
-        agent_id: impl Into<String>,
-        info: AgentInfo,
+        agent_key: impl Into<String>,
         ptys: Vec<PtyHandle>,
         agent_index: usize,
     ) -> Self {
         assert!(!ptys.is_empty(), "AgentHandle requires at least one PTY (CLI PTY)");
 
         Self {
-            agent_id: agent_id.into(),
-            info,
+            agent_key: agent_key.into(),
             ptys,
             agent_index,
         }
     }
 
-    /// Get the agent ID.
+    /// Get the agent session key.
     #[must_use]
-    pub fn agent_id(&self) -> &str {
-        &self.agent_id
-    }
-
-    /// Get agent info snapshot.
-    ///
-    /// Note: This is a snapshot from when the handle was created.
-    /// For live status, re-fetch via `GetAgent` command.
-    #[must_use]
-    pub fn info(&self) -> &AgentInfo {
-        &self.info
+    pub fn agent_key(&self) -> &str {
+        &self.agent_key
     }
 
     /// Get the agent's index in the Hub's ordered agent list.
@@ -182,7 +162,6 @@ impl AgentHandle {
 /// - `subscribe()` to receive PTY events (output, resize, exit)
 /// - `write_input()` to send input to the PTY
 /// - `resize()` to notify PTY of client resize
-/// - `connect()` / `disconnect()` for client lifecycle
 /// - `port()` to get the HTTP forwarding port (if assigned)
 ///
 /// # Example
@@ -245,7 +224,6 @@ impl PtyHandle {
     ///
     /// Direct access enables immediate I/O operations without async channel delays:
     /// - `write_input_direct()` - sync input, no channel hop
-    /// - `connect_direct()` - sync connect, immediate scrollback
     /// - `resize_direct()` - sync resize
     ///
     /// # Arguments
@@ -285,14 +263,6 @@ impl PtyHandle {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<PtyEvent> {
         self.event_tx.subscribe()
-    }
-
-    /// Get the number of active event subscribers.
-    ///
-    /// Useful for debugging and monitoring.
-    #[must_use]
-    pub fn subscriber_count(&self) -> usize {
-        self.event_tx.receiver_count()
     }
 
     /// Get the HTTP forwarding port for this PTY.
@@ -355,30 +325,11 @@ impl PtyHandle {
         }
     }
 
-    /// Connect a client directly.
-    ///
-    /// Registers the client, resizes the PTY to their dimensions, and
-    /// returns the scrollback buffer immediately.
-    pub fn connect_direct(&self, client_id: ClientId, dims: (u16, u16)) -> Result<Vec<u8>, String> {
-        Ok(process_connect_command(
-            &client_id,
-            dims,
-            &self.shared_state,
-            &self.event_tx,
-            &self.scrollback_buffer,
-        ))
-    }
-
     /// Resize the PTY directly.
     ///
     /// Checks if the client is the size owner and resizes if so.
     pub fn resize_direct(&self, client_id: ClientId, rows: u16, cols: u16) {
         process_resize_command(&client_id, rows, cols, &self.shared_state, &self.event_tx);
-    }
-
-    /// Disconnect a client directly.
-    pub fn disconnect_direct(&self, client_id: ClientId) {
-        process_disconnect_command(&client_id, &self.shared_state, &self.event_tx);
     }
 }
 
@@ -386,23 +337,6 @@ impl PtyHandle {
 mod tests {
     use super::*;
     use crate::agent::pty::PtySession;
-
-    fn test_info() -> AgentInfo {
-        AgentInfo {
-            id: "test-agent".to_string(),
-            repo: Some("owner/repo".to_string()),
-            issue_number: Some(42),
-            branch_name: Some("botster-issue-42".to_string()),
-            name: None,
-            status: Some("Running".to_string()),
-            port: None,
-            server_running: None,
-            has_server_pty: None,
-            active_pty_view: None,
-            scroll_offset: None,
-            hub_identifier: None,
-        }
-    }
 
     /// Helper to create a PTY handle for testing (no port).
     fn create_test_pty() -> PtyHandle {
@@ -421,10 +355,9 @@ mod tests {
     #[test]
     fn test_agent_handle_creation() {
         let ptys = vec![create_test_pty()];
-        let handle = AgentHandle::new("agent-123", test_info(), ptys, 0);
+        let handle = AgentHandle::new("agent-123", ptys, 0);
 
-        assert_eq!(handle.agent_id(), "agent-123");
-        assert_eq!(handle.info().id, "test-agent");
+        assert_eq!(handle.agent_key(), "agent-123");
         assert_eq!(handle.agent_index(), 0);
         assert_eq!(handle.pty_count(), 1);
     }
@@ -432,7 +365,7 @@ mod tests {
     #[test]
     fn test_agent_handle_with_server_pty() {
         let ptys = vec![create_test_pty(), create_test_pty()];
-        let handle = AgentHandle::new("agent-123", test_info(), ptys, 0);
+        let handle = AgentHandle::new("agent-123", ptys, 0);
 
         assert_eq!(handle.pty_count(), 2);
         assert!(handle.get_pty(0).is_some());
@@ -442,7 +375,7 @@ mod tests {
     #[test]
     fn test_get_pty_index_based_access() {
         let ptys = vec![create_test_pty()];
-        let handle = AgentHandle::new("agent-123", test_info(), ptys, 0);
+        let handle = AgentHandle::new("agent-123", ptys, 0);
 
         // Index 0 is CLI PTY (always present)
         assert!(handle.get_pty(0).is_some());
@@ -458,7 +391,7 @@ mod tests {
     #[test]
     fn test_get_pty_with_server() {
         let ptys = vec![create_test_pty(), create_test_pty()];
-        let handle = AgentHandle::new("agent-123", test_info(), ptys, 0);
+        let handle = AgentHandle::new("agent-123", ptys, 0);
 
         // Both PTYs present
         assert!(handle.get_pty(0).is_some());
@@ -470,12 +403,12 @@ mod tests {
     fn test_pty_count() {
         // Without server PTY
         let ptys = vec![create_test_pty()];
-        let handle = AgentHandle::new("agent-123", test_info(), ptys, 0);
+        let handle = AgentHandle::new("agent-123", ptys, 0);
         assert_eq!(handle.pty_count(), 1);
 
         // With server PTY
         let ptys = vec![create_test_pty(), create_test_pty()];
-        let handle = AgentHandle::new("agent-456", test_info(), ptys, 1);
+        let handle = AgentHandle::new("agent-456", ptys, 1);
         assert_eq!(handle.pty_count(), 2);
         assert_eq!(handle.agent_index(), 1);
     }
@@ -484,20 +417,7 @@ mod tests {
     #[should_panic(expected = "AgentHandle requires at least one PTY")]
     fn test_agent_handle_panics_on_empty_ptys() {
         let ptys: Vec<PtyHandle> = vec![];
-        let _ = AgentHandle::new("agent-123", test_info(), ptys, 0);
-    }
-
-    #[test]
-    fn test_pty_handle_subscribe() {
-        let handle = create_test_pty();
-
-        // Subscribe creates a new receiver
-        let _rx = handle.subscribe();
-        assert_eq!(handle.subscriber_count(), 1);
-
-        // Multiple subscriptions
-        let _rx2 = handle.subscribe();
-        assert_eq!(handle.subscriber_count(), 2);
+        let _ = AgentHandle::new("agent-123", ptys, 0);
     }
 
     #[test]
@@ -511,34 +431,4 @@ mod tests {
         assert_eq!(handle_with_port.port(), Some(8080));
     }
 
-    #[test]
-    fn test_pty_handle_connect_direct() {
-        let handle = create_test_pty();
-
-        // Connect returns empty scrollback for new session
-        let scrollback = handle.connect_direct(ClientId::Tui, (80, 24)).unwrap();
-        assert!(scrollback.is_empty());
-    }
-
-    #[test]
-    fn test_pty_handle_resize_direct() {
-        let handle = create_test_pty();
-
-        // Connect first to become size owner
-        let _ = handle.connect_direct(ClientId::Tui, (80, 24));
-
-        // Resize should work without panic
-        handle.resize_direct(ClientId::Tui, 100, 50);
-    }
-
-    #[test]
-    fn test_pty_handle_disconnect_direct() {
-        let handle = create_test_pty();
-
-        // Connect first
-        let _ = handle.connect_direct(ClientId::Tui, (80, 24));
-
-        // Disconnect should work without panic
-        handle.disconnect_direct(ClientId::Tui);
-    }
 }

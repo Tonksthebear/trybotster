@@ -3,7 +3,7 @@
 -- Shared client registry for all transports (WebRTC, TUI, future).
 -- Manages client lifecycle, broadcasts hub events to all connected clients.
 --
--- Each transport handler (webrtc.lua, future tui.lua) registers clients here.
+-- Each transport handler (webrtc.lua, tui.lua) registers clients here.
 -- State is persisted in core.state across hot-reloads.
 
 local state = require("core.state")

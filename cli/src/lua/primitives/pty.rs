@@ -1,7 +1,8 @@
 //! PTY primitives for Lua scripts.
 //!
 //! Exposes PTY terminal handling to Lua, allowing scripts to create forwarders,
-//! send input, resize terminals, and optionally intercept PTY output via hooks.
+//! spawn PTY sessions, send input, resize terminals, and optionally intercept
+//! PTY output via hooks.
 //!
 //! # Design Principle: "Lua controls. Rust streams."
 //!
@@ -9,7 +10,43 @@
 //! - **Default (fast path)**: Rust streams directly to WebRTC, no Lua in data path
 //! - **Optional (slow path)**: If "pty_output" hooks are registered, call them
 //!
-//! # Usage in Lua
+//! # PTY Session Handles
+//!
+//! Lua can spawn PTY sessions directly via `pty.spawn()`, receiving a
+//! `PtySessionHandle` userdata that provides full control over the PTY:
+//!
+//! ```lua
+//! local session = pty.spawn({
+//!     worktree_path = "/path/to/worktree",
+//!     command = "bash",
+//!     rows = 24,
+//!     cols = 80,
+//!     detect_notifications = true,
+//! })
+//!
+//! -- Write input to the PTY
+//! session:write("ls -la\n")
+//!
+//! -- Resize the terminal
+//! session:resize(40, 120)
+//!
+//! -- Get current dimensions
+//! local rows, cols = session:dimensions()
+//!
+//! -- Read scrollback buffer
+//! local scrollback = session:get_scrollback()
+//!
+//! -- Check forwarding port
+//! local port = session:port()  -- number or nil
+//!
+//! -- Poll for OSC notifications
+//! local notifications = session:poll_notifications()
+//!
+//! -- Kill the session
+//! session:kill()
+//! ```
+//!
+//! # PTY Forwarders
 //!
 //! ```lua
 //! -- Create a PTY forwarder (Rust handles the streaming)
@@ -46,10 +83,238 @@
 //! end)
 //! ```
 
+use std::collections::{HashMap, VecDeque};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+use crate::agent::notification::AgentNotification;
+use crate::agent::pty::{PtySession, SharedPtyState};
+use crate::agent::spawn::PtySpawnConfig;
+use tokio::sync::broadcast;
 
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
+
+use crate::agent::pty::events::PtyEvent;
+
+// =============================================================================
+// PtySessionHandle - Lua-facing handle to a spawned PtySession
+// =============================================================================
+
+/// Lua-facing handle to a spawned PTY session.
+///
+/// Wraps the thread-safe components of a [`PtySession`], allowing Lua to
+/// interact with the PTY (write input, resize, read scrollback, poll
+/// notifications, etc.) without holding a direct reference to the session.
+///
+/// The `_session` field keeps the `PtySession` alive via `Arc` -- dropping
+/// the last reference triggers `PtySession::drop()` which kills the child
+/// process and aborts the command processor task.
+///
+/// # Thread Safety
+///
+/// All fields are `Send + Sync` as required by [`LuaUserData`]. The
+/// `notification_rx` field wraps `std::sync::mpsc::Receiver` (which is
+/// `!Sync`) in `Arc<Mutex<>>` to satisfy this constraint.
+///
+/// # Example (Lua)
+///
+/// ```lua
+/// local session = pty.spawn({
+///     worktree_path = "/tmp/work",
+///     command = "bash",
+///     rows = 24,
+///     cols = 80,
+/// })
+/// session:write("echo hello\n")
+/// local rows, cols = session:dimensions()
+/// session:kill()
+/// ```
+pub struct PtySessionHandle {
+    /// Keep `PtySession` alive -- its `Drop` impl kills the child process
+    /// and aborts the command processor task.
+    _session: Arc<Mutex<PtySession>>,
+
+    /// Shared state for direct write/resize operations.
+    shared_state: Arc<Mutex<SharedPtyState>>,
+
+    /// Scrollback buffer for session replay.
+    scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
+
+    /// Event broadcast sender for subscribing to PTY output.
+    #[allow(dead_code)]
+    event_tx: broadcast::Sender<PtyEvent>,
+
+    /// Forwarding port (if configured).
+    port: Option<u16>,
+
+    /// Whether notifications are enabled on this session.
+    has_notifications: bool,
+
+    /// Notification receiver (moved out of `PtySession`, owned by handle).
+    ///
+    /// Wrapped in `Arc<Mutex<>>` to satisfy `LuaUserData`'s `Send + Sync`
+    /// requirements (`std::sync::mpsc::Receiver` is `!Sync`).
+    notification_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<AgentNotification>>>>,
+}
+
+impl std::fmt::Debug for PtySessionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtySessionHandle")
+            .field("port", &self.port)
+            .field("has_notifications", &self.has_notifications)
+            .field("has_notification_rx", &self.notification_rx.is_some())
+            .finish()
+    }
+}
+
+impl PtySessionHandle {
+    /// Create a `PtyHandle` from this session handle.
+    ///
+    /// Used to register Lua-created PTY sessions with `HandleCache` for
+    /// access by Rust-side PTY operations (forwarders, write, resize).
+    #[must_use]
+    pub fn to_pty_handle(&self) -> crate::hub::agent_handle::PtyHandle {
+        crate::hub::agent_handle::PtyHandle::new(
+            self.event_tx.clone(),
+            Arc::clone(&self.shared_state),
+            Arc::clone(&self.scrollback_buffer),
+            self.port,
+        )
+    }
+}
+
+impl LuaUserData for PtySessionHandle {
+    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        // session:write(data) - Write bytes/string to the PTY.
+        methods.add_method("write", |_, this, data: LuaString| {
+            let bytes = data.as_bytes().to_vec();
+            let mut state = this
+                .shared_state
+                .lock()
+                .expect("PtySessionHandle shared_state lock poisoned");
+            if let Some(writer) = &mut state.writer {
+                writer
+                    .write_all(&bytes)
+                    .map_err(|e| LuaError::runtime(format!("Failed to write to PTY: {e}")))?;
+                writer
+                    .flush()
+                    .map_err(|e| LuaError::runtime(format!("Failed to flush PTY writer: {e}")))?;
+            }
+            Ok(())
+        });
+
+        // session:resize(rows, cols) - Resize the PTY.
+        methods.add_method("resize", |_, this, (rows, cols): (u16, u16)| {
+            let mut state = this
+                .shared_state
+                .lock()
+                .expect("PtySessionHandle shared_state lock poisoned");
+
+            state.dimensions = (rows, cols);
+
+            if let Some(master_pty) = &state.master_pty {
+                if let Err(e) = master_pty.resize(portable_pty::PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                }) {
+                    return Err(LuaError::runtime(format!("Failed to resize PTY: {e}")));
+                }
+            }
+            Ok(())
+        });
+
+        // session:dimensions() -> rows, cols
+        methods.add_method("dimensions", |_, this, ()| {
+            let state = this
+                .shared_state
+                .lock()
+                .expect("PtySessionHandle shared_state lock poisoned");
+            let (rows, cols) = state.dimensions;
+            Ok((rows, cols))
+        });
+
+        // session:get_scrollback() -> string (raw bytes)
+        methods.add_method("get_scrollback", |lua, this, ()| {
+            let buffer = this
+                .scrollback_buffer
+                .lock()
+                .expect("PtySessionHandle scrollback_buffer lock poisoned");
+            let bytes: Vec<u8> = buffer.iter().copied().collect();
+            lua.create_string(&bytes)
+        });
+
+        // session:port() -> number or nil
+        methods.add_method("port", |_, this, ()| Ok(this.port));
+
+        // session:is_alive() -> boolean
+        //
+        // Checks whether the PTY writer is still available, which indicates
+        // the session has been spawned and hasn't been killed.
+        methods.add_method("is_alive", |_, this, ()| {
+            let state = this
+                .shared_state
+                .lock()
+                .expect("PtySessionHandle shared_state lock poisoned");
+            Ok(state.writer.is_some())
+        });
+
+        // session:poll_notifications() -> table of notifications
+        //
+        // Drains all pending notifications from the channel. Returns an
+        // array-like table where each entry is a table with:
+        //   { type = "osc9", message = "..." }
+        //   { type = "osc777", title = "...", body = "..." }
+        methods.add_method("poll_notifications", |lua, this, ()| {
+            let table = lua.create_table()?;
+
+            if !this.has_notifications {
+                return Ok(table);
+            }
+
+            if let Some(ref rx_arc) = this.notification_rx {
+                let rx = rx_arc
+                    .lock()
+                    .expect("PtySessionHandle notification_rx lock poisoned");
+                let mut idx = 1;
+                while let Ok(notif) = rx.try_recv() {
+                    let entry = lua.create_table()?;
+                    match notif {
+                        AgentNotification::Osc9(msg) => {
+                            entry.set("type", "osc9")?;
+                            entry.set("message", msg)?;
+                        }
+                        AgentNotification::Osc777 { title, body } => {
+                            entry.set("type", "osc777")?;
+                            entry.set("title", title)?;
+                            entry.set("body", body)?;
+                        }
+                    }
+                    table.set(idx, entry)?;
+                    idx += 1;
+                }
+            }
+
+            Ok(table)
+        });
+
+        // session:kill() - Kill the child process.
+        //
+        // Locks the PtySession and calls kill_child(). After this call,
+        // is_alive() will return false and write() will be a no-op.
+        methods.add_method("kill", |_, this, ()| {
+            let mut session = this
+                ._session
+                .lock()
+                .expect("PtySessionHandle session lock poisoned");
+            session.kill_child();
+            Ok(())
+        });
+    }
+}
 
 /// Forwarder handle returned to Lua as userdata.
 ///
@@ -127,7 +392,7 @@ pub struct CreateForwarderRequest {
 /// and routes output through `tui_output_tx` instead of WebRTC.
 #[derive(Debug, Clone)]
 pub struct CreateTuiForwarderRequest {
-    /// Agent index in Hub's agent list.
+    /// Agent index in Hub's agent list (legacy, for forwarder ID).
     pub agent_index: usize,
     /// PTY index within the agent (0=CLI, 1=Server).
     pub pty_index: usize,
@@ -135,6 +400,39 @@ pub struct CreateTuiForwarderRequest {
     pub subscription_id: String,
     /// Shared active flag for the forwarder handle.
     pub active_flag: Arc<Mutex<bool>>,
+}
+
+/// Request to create a TUI PTY forwarder with direct session access.
+///
+/// This variant takes the PTY components directly from Lua's PtySessionHandle,
+/// avoiding the need to register agents with HandleCache.
+#[derive(Clone)]
+pub struct CreateTuiForwarderDirectRequest {
+    /// Agent key for identification.
+    pub agent_key: String,
+    /// Session name (e.g., "cli", "server").
+    pub session_name: String,
+    /// Subscription ID for tracking.
+    pub subscription_id: String,
+    /// Shared active flag for the forwarder handle.
+    pub active_flag: Arc<Mutex<bool>>,
+    /// Event sender from the PTY session (for subscribing).
+    pub event_tx: broadcast::Sender<PtyEvent>,
+    /// Scrollback buffer for initial replay.
+    pub scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
+    /// HTTP port if this is a server session.
+    pub port: Option<u16>,
+}
+
+impl std::fmt::Debug for CreateTuiForwarderDirectRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateTuiForwarderDirectRequest")
+            .field("agent_key", &self.agent_key)
+            .field("session_name", &self.session_name)
+            .field("subscription_id", &self.subscription_id)
+            .field("port", &self.port)
+            .finish()
+    }
 }
 
 /// PTY operations queued from Lua.
@@ -145,8 +443,11 @@ pub enum PtyRequest {
     /// Create a new PTY forwarder for streaming to WebRTC.
     CreateForwarder(CreateForwarderRequest),
 
-    /// Create a new PTY forwarder for streaming to TUI.
+    /// Create a new PTY forwarder for streaming to TUI (legacy index-based).
     CreateTuiForwarder(CreateTuiForwarderRequest),
+
+    /// Create a new PTY forwarder for streaming to TUI (direct session access).
+    CreateTuiForwarderDirect(CreateTuiForwarderDirectRequest),
 
     /// Stop an existing PTY forwarder.
     StopForwarder {
@@ -193,6 +494,7 @@ impl Clone for PtyRequest {
         match self {
             Self::CreateForwarder(req) => Self::CreateForwarder(req.clone()),
             Self::CreateTuiForwarder(req) => Self::CreateTuiForwarder(req.clone()),
+            Self::CreateTuiForwarderDirect(req) => Self::CreateTuiForwarderDirect(req.clone()),
             Self::StopForwarder { forwarder_id } => Self::StopForwarder {
                 forwarder_id: forwarder_id.clone(),
             },
@@ -241,7 +543,9 @@ pub fn new_request_queue() -> PtyRequestQueue {
 /// Register PTY primitives with the Lua state.
 ///
 /// Adds the following functions:
+/// - `pty.spawn(config)` - Spawn a PTY session, returns `PtySessionHandle` userdata
 /// - `webrtc.create_pty_forwarder(opts)` - Create a PTY-to-WebRTC forwarder
+/// - `tui.create_pty_forwarder(opts)` - Create a PTY-to-TUI forwarder
 /// - `hub.write_pty(agent_index, pty_index, data)` - Write input to PTY
 /// - `hub.resize_pty(agent_index, pty_index, rows, cols)` - Resize PTY
 /// - `hub.get_scrollback(agent_index, pty_index)` - Get scrollback buffer
@@ -374,6 +678,74 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
     tui.set("create_pty_forwarder", create_tui_forwarder_fn)
         .map_err(|e| anyhow!("Failed to set tui.create_pty_forwarder: {e}"))?;
 
+    // tui.forward_session({ agent_key, session_name, session, subscription_id })
+    //
+    // Create a PTY forwarder by passing the session handle directly.
+    // This is the preferred method - no HandleCache registration needed.
+    //
+    // Arguments:
+    //   agent_key: string - Agent key for identification
+    //   session_name: string - Session name (e.g., "cli", "server")
+    //   session: PtySessionHandle - The session userdata from pty.spawn()
+    //   subscription_id: string - Subscription ID for message routing
+    let queue_direct = request_queue.clone();
+    let forward_session_fn = lua
+        .create_function(move |_lua, opts: LuaTable| {
+            let agent_key: String = opts
+                .get("agent_key")
+                .map_err(|_| LuaError::runtime("agent_key is required"))?;
+            let session_name: String = opts
+                .get("session_name")
+                .map_err(|_| LuaError::runtime("session_name is required"))?;
+            let subscription_id: String = opts
+                .get("subscription_id")
+                .map_err(|_| LuaError::runtime("subscription_id is required"))?;
+
+            // Extract the PtySessionHandle userdata
+            let session_ud: LuaAnyUserData = opts
+                .get("session")
+                .map_err(|_| LuaError::runtime("session is required"))?;
+            let session_handle = session_ud
+                .borrow::<PtySessionHandle>()
+                .map_err(|e| LuaError::runtime(format!("session must be a PtySessionHandle: {e}")))?;
+
+            let forwarder_id = format!("tui:{}:{}", agent_key, session_name);
+            let active_flag = Arc::new(Mutex::new(true));
+
+            // Queue the request with direct PTY access
+            {
+                let mut q = queue_direct
+                    .lock()
+                    .expect("PTY request queue mutex poisoned");
+                q.push(PtyRequest::CreateTuiForwarderDirect(CreateTuiForwarderDirectRequest {
+                    agent_key: agent_key.clone(),
+                    session_name: session_name.clone(),
+                    subscription_id,
+                    active_flag: Arc::clone(&active_flag),
+                    event_tx: session_handle.event_tx.clone(),
+                    scrollback_buffer: Arc::clone(&session_handle.scrollback_buffer),
+                    port: session_handle.port,
+                }));
+            }
+
+            log::info!("[Lua] Queued TUI forwarder for {}:{}", agent_key, session_name);
+
+            // Return forwarder handle immediately
+            let forwarder = PtyForwarder {
+                id: forwarder_id,
+                peer_id: "tui".to_string(),
+                agent_index: 0, // Not used for direct forwarders
+                pty_index: 0,
+                active: active_flag,
+            };
+
+            Ok(forwarder)
+        })
+        .map_err(|e| anyhow!("Failed to create tui.forward_session function: {e}"))?;
+
+    tui.set("forward_session", forward_session_fn)
+        .map_err(|e| anyhow!("Failed to set tui.forward_session: {e}"))?;
+
     // Ensure tui table is globally registered
     lua.globals()
         .set("tui", tui)
@@ -453,6 +825,117 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
     lua.globals()
         .set("hub", hub)
         .map_err(|e| anyhow!("Failed to register hub table globally: {e}"))?;
+
+    // =========================================================================
+    // pty.spawn() - Spawn a PTY session, returns PtySessionHandle userdata
+    // =========================================================================
+
+    // Get or create the pty table
+    let pty_table: LuaTable = lua
+        .globals()
+        .get("pty")
+        .unwrap_or_else(|_| lua.create_table().unwrap());
+
+    // pty.spawn(config_table) -> PtySessionHandle
+    //
+    // config_table fields:
+    //   worktree_path: string (required) - Working directory
+    //   command: string (default "bash") - Command to run
+    //   env: table<string, string> (default {}) - Environment variables
+    //   init_commands: table<string> (default {}) - Commands to run after spawn
+    //   detect_notifications: boolean (default false) - Enable OSC detection
+    //   port: number (optional) - HTTP forwarding port
+    //   context: string (default "") - Context written before init commands
+    //   rows: number (default 24) - Initial rows
+    //   cols: number (default 80) - Initial cols
+    let spawn_fn = lua
+        .create_function(|_lua, opts: LuaTable| {
+            // Parse required fields
+            let worktree_path: String = opts
+                .get("worktree_path")
+                .map_err(|_| LuaError::runtime("worktree_path is required"))?;
+
+            // Parse optional fields with defaults
+            let command: String = opts.get("command").unwrap_or_else(|_| "bash".to_string());
+            let rows: u16 = opts.get("rows").unwrap_or(24);
+            let cols: u16 = opts.get("cols").unwrap_or(80);
+            let detect_notifications: bool =
+                opts.get("detect_notifications").unwrap_or(false);
+            let port: Option<u16> = opts.get("port").ok();
+            let context: String = opts.get("context").unwrap_or_default();
+
+            // Parse env table
+            let mut env = HashMap::new();
+            if let Ok(env_table) = opts.get::<LuaTable>("env") {
+                for pair in env_table.pairs::<String, String>() {
+                    if let Ok((k, v)) = pair {
+                        env.insert(k, v);
+                    }
+                }
+            }
+
+            // Parse init_commands array
+            let mut init_commands = Vec::new();
+            if let Ok(cmds_table) = opts.get::<LuaTable>("init_commands") {
+                for pair in cmds_table.pairs::<i64, String>() {
+                    if let Ok((_, cmd)) = pair {
+                        init_commands.push(cmd);
+                    }
+                }
+            }
+
+            // Build the spawn config
+            let config = PtySpawnConfig {
+                worktree_path: PathBuf::from(worktree_path),
+                command,
+                env,
+                init_commands,
+                detect_notifications,
+                port,
+                context,
+            };
+
+            // Create and spawn the PtySession
+            let mut session = PtySession::new(rows, cols);
+            session.spawn(config).map_err(|e| {
+                LuaError::runtime(format!("Failed to spawn PTY session: {e}"))
+            })?;
+
+            // Extract direct access handles before wrapping in Arc
+            let (shared_state, scrollback_buffer, event_tx) = session.get_direct_access();
+            let session_port = session.port();
+            let has_notifications = session.notification_tx.is_some();
+
+            // Take the notification_rx from the session and wrap for thread safety
+            let notification_rx = session.take_notification_rx().map(|rx| {
+                Arc::new(Mutex::new(rx))
+            });
+
+            // Wrap session in Arc<Mutex<>> to keep it alive (Drop kills child)
+            let session_arc = Arc::new(Mutex::new(session));
+
+            let handle = PtySessionHandle {
+                _session: session_arc,
+                shared_state,
+                scrollback_buffer,
+                event_tx,
+                port: session_port,
+                has_notifications,
+                notification_rx,
+            };
+
+            Ok(handle)
+        })
+        .map_err(|e| anyhow!("Failed to create pty.spawn function: {e}"))?;
+
+    pty_table
+        .set("spawn", spawn_fn)
+        .map_err(|e| anyhow!("Failed to set pty.spawn: {e}"))?;
+
+    // Ensure pty table is globally registered
+    lua.globals()
+        .set("pty", pty_table)
+        .map_err(|e| anyhow!("Failed to register pty table globally: {e}"))?;
 
     Ok(())
 }
@@ -900,5 +1383,529 @@ mod tests {
 
         let active: bool = lua.load("return fwd:is_active()").eval().unwrap();
         assert!(!active);
+    }
+
+    // =========================================================================
+    // PtySessionHandle Tests
+    // =========================================================================
+
+    /// Helper to create a PtySessionHandle for testing without spawning a real
+    /// process. Uses the direct PtySession constructor and sets up shared state
+    /// manually.
+    fn create_test_session_handle(with_notifications: bool) -> PtySessionHandle {
+        let session = PtySession::new(24, 80);
+        let (shared_state, scrollback_buffer, event_tx) = session.get_direct_access();
+        let session_arc = Arc::new(Mutex::new(session));
+
+        let notification_rx = if with_notifications {
+            let (tx, rx) = std::sync::mpsc::channel();
+            // Send a test notification
+            tx.send(AgentNotification::Osc9(Some("test".to_string())))
+                .unwrap();
+            drop(tx);
+            Some(Arc::new(Mutex::new(rx)))
+        } else {
+            None
+        };
+
+        PtySessionHandle {
+            _session: session_arc,
+            shared_state,
+            scrollback_buffer,
+            event_tx,
+            port: None,
+            has_notifications: with_notifications,
+            notification_rx,
+        }
+    }
+
+    #[test]
+    fn test_pty_session_handle_dimensions() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle(false);
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // Test dimensions method
+        let result: (u16, u16) = lua
+            .load("return session:dimensions()")
+            .eval()
+            .expect("dimensions should work");
+        assert_eq!(result, (24, 80));
+    }
+
+    #[test]
+    fn test_pty_session_handle_resize() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle(false);
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // Resize and verify dimensions change
+        lua.load("session:resize(40, 120)")
+            .exec()
+            .expect("resize should work");
+
+        let result: (u16, u16) = lua
+            .load("return session:dimensions()")
+            .eval()
+            .expect("dimensions should work after resize");
+        assert_eq!(result, (40, 120));
+    }
+
+    #[test]
+    fn test_pty_session_handle_get_scrollback_empty() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle(false);
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // Empty scrollback returns empty string
+        let result: LuaString = lua
+            .load("return session:get_scrollback()")
+            .eval()
+            .expect("get_scrollback should work");
+        assert_eq!(result.as_bytes(), b"");
+    }
+
+    #[test]
+    fn test_pty_session_handle_get_scrollback_with_data() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle(false);
+
+        // Add data to scrollback buffer directly
+        {
+            let mut buffer = handle
+                .scrollback_buffer
+                .lock()
+                .expect("scrollback lock");
+            buffer.extend(b"hello world".iter());
+        }
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        let result: LuaString = lua
+            .load("return session:get_scrollback()")
+            .eval()
+            .expect("get_scrollback should work");
+        assert_eq!(result.as_bytes(), b"hello world");
+    }
+
+    #[test]
+    fn test_pty_session_handle_port_nil() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle(false);
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // No port configured -> nil
+        let result: LuaValue = lua
+            .load("return session:port()")
+            .eval()
+            .expect("port should work");
+        assert!(result.is_nil());
+    }
+
+    #[test]
+    fn test_pty_session_handle_port_with_value() {
+        let lua = Lua::new();
+        let mut handle = create_test_session_handle(false);
+        handle.port = Some(8080);
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        let result: u16 = lua
+            .load("return session:port()")
+            .eval()
+            .expect("port should return number");
+        assert_eq!(result, 8080);
+    }
+
+    #[test]
+    fn test_pty_session_handle_is_alive_no_writer() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle(false);
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // No writer set -> not alive
+        let result: bool = lua
+            .load("return session:is_alive()")
+            .eval()
+            .expect("is_alive should work");
+        assert!(!result, "Session without writer should not be alive");
+    }
+
+    #[test]
+    fn test_pty_session_handle_write_no_writer_is_noop() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle(false);
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // Write with no writer should not error (just no-op)
+        lua.load(r#"session:write("test")"#)
+            .exec()
+            .expect("write with no writer should not error");
+    }
+
+    #[test]
+    fn test_pty_session_handle_poll_notifications_empty() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle(false);
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // No notifications configured -> empty table
+        let result: LuaTable = lua
+            .load("return session:poll_notifications()")
+            .eval()
+            .expect("poll_notifications should work");
+        assert_eq!(result.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_pty_session_handle_poll_notifications_with_data() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle(true);
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // Should have one notification (from create_test_session_handle)
+        let count: i64 = lua
+            .load(
+                r#"
+                local notifs = session:poll_notifications()
+                return #notifs
+            "#,
+            )
+            .eval()
+            .expect("poll_notifications should work");
+        assert_eq!(count, 1);
+
+        // Second poll should be empty (drained)
+        let count2: i64 = lua
+            .load(
+                r#"
+                local notifs = session:poll_notifications()
+                return #notifs
+            "#,
+            )
+            .eval()
+            .expect("second poll should work");
+        assert_eq!(count2, 0);
+    }
+
+    #[test]
+    fn test_pty_session_handle_poll_notifications_osc9_fields() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle(true);
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // Verify notification fields
+        let (notif_type, message): (String, String) = lua
+            .load(
+                r#"
+                local notifs = session:poll_notifications()
+                return notifs[1].type, notifs[1].message
+            "#,
+            )
+            .eval()
+            .expect("notification fields should work");
+        assert_eq!(notif_type, "osc9");
+        assert_eq!(message, "test");
+    }
+
+    #[test]
+    fn test_pty_session_handle_poll_notifications_osc777() {
+        let lua = Lua::new();
+
+        // Create handle with osc777 notification
+        let session = PtySession::new(24, 80);
+        let (shared_state, scrollback_buffer, event_tx) = session.get_direct_access();
+        let session_arc = Arc::new(Mutex::new(session));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(AgentNotification::Osc777 {
+            title: "Build".to_string(),
+            body: "Complete".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let handle = PtySessionHandle {
+            _session: session_arc,
+            shared_state,
+            scrollback_buffer,
+            event_tx,
+            port: None,
+            has_notifications: true,
+            notification_rx: Some(Arc::new(Mutex::new(rx))),
+        };
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        let (notif_type, title, body): (String, String, String) = lua
+            .load(
+                r#"
+                local notifs = session:poll_notifications()
+                return notifs[1].type, notifs[1].title, notifs[1].body
+            "#,
+            )
+            .eval()
+            .expect("osc777 fields should work");
+        assert_eq!(notif_type, "osc777");
+        assert_eq!(title, "Build");
+        assert_eq!(body, "Complete");
+    }
+
+    #[test]
+    fn test_pty_session_handle_kill() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle(false);
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // Kill should not panic even with no child process
+        lua.load("session:kill()")
+            .exec()
+            .expect("kill should not error");
+    }
+
+    #[tokio::test]
+    async fn test_pty_spawn_function_exists() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        let pty: mlua::Table = lua.globals().get("pty").expect("pty table should exist");
+        let _: mlua::Function = pty
+            .get("spawn")
+            .expect("pty.spawn should exist");
+    }
+
+    #[tokio::test]
+    async fn test_pty_spawn_requires_worktree_path() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        let result: mlua::Result<()> = lua
+            .load(
+                r#"
+                pty.spawn({ command = "echo hello" })
+            "#,
+            )
+            .exec();
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("worktree_path"),
+            "Error should mention worktree_path: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pty_spawn_basic() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+
+        lua.globals()
+            .set("temp_path", temp_path)
+            .expect("Failed to set temp_path");
+
+        // Spawn a session and verify basic methods work
+        lua.load(
+            r#"
+                session = pty.spawn({
+                    worktree_path = temp_path,
+                    command = "echo hello",
+                    rows = 30,
+                    cols = 100,
+                })
+            "#,
+        )
+        .exec()
+        .expect("pty.spawn should work");
+
+        // Verify dimensions
+        let (rows, cols): (u16, u16) = lua
+            .load("return session:dimensions()")
+            .eval()
+            .expect("dimensions should work");
+        assert_eq!(rows, 30);
+        assert_eq!(cols, 100);
+
+        // Verify is_alive (should be true since we spawned a process)
+        let alive: bool = lua
+            .load("return session:is_alive()")
+            .eval()
+            .expect("is_alive should work");
+        assert!(alive, "Spawned session should be alive");
+
+        // Verify port is nil (not configured)
+        let port: LuaValue = lua
+            .load("return session:port()")
+            .eval()
+            .expect("port should work");
+        assert!(port.is_nil());
+    }
+
+    #[tokio::test]
+    async fn test_pty_spawn_with_port() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+
+        lua.globals()
+            .set("temp_path", temp_path)
+            .expect("Failed to set temp_path");
+
+        lua.load(
+            r#"
+                session = pty.spawn({
+                    worktree_path = temp_path,
+                    command = "echo hello",
+                    port = 9090,
+                })
+            "#,
+        )
+        .exec()
+        .expect("pty.spawn with port should work");
+
+        let port: u16 = lua
+            .load("return session:port()")
+            .eval()
+            .expect("port should return number");
+        assert_eq!(port, 9090);
+    }
+
+    #[tokio::test]
+    async fn test_pty_spawn_with_notifications() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+
+        lua.globals()
+            .set("temp_path", temp_path)
+            .expect("Failed to set temp_path");
+
+        lua.load(
+            r#"
+                session = pty.spawn({
+                    worktree_path = temp_path,
+                    command = "echo hello",
+                    detect_notifications = true,
+                })
+            "#,
+        )
+        .exec()
+        .expect("pty.spawn with notifications should work");
+
+        // poll_notifications should work (returns empty table, no OSC in output)
+        let count: i64 = lua
+            .load(
+                r#"
+                local notifs = session:poll_notifications()
+                return #notifs
+            "#,
+            )
+            .eval()
+            .expect("poll_notifications should work");
+        // May be 0 or more depending on timing, just verify no crash
+        assert!(count >= 0);
+    }
+
+    #[tokio::test]
+    async fn test_pty_spawn_write_and_scrollback() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+
+        lua.globals()
+            .set("temp_path", temp_path)
+            .expect("Failed to set temp_path");
+
+        lua.load(
+            r#"
+                session = pty.spawn({
+                    worktree_path = temp_path,
+                    command = "bash",
+                })
+            "#,
+        )
+        .exec()
+        .expect("pty.spawn should work");
+
+        // Write input should not error
+        lua.load(r#"session:write("echo test\n")"#)
+            .exec()
+            .expect("write should work");
+
+        // Give the PTY a moment to process
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Scrollback should have some data (at least the shell prompt)
+        let scrollback: LuaString = lua
+            .load("return session:get_scrollback()")
+            .eval()
+            .expect("get_scrollback should work");
+        assert!(
+            !scrollback.as_bytes().is_empty(),
+            "Scrollback should have data after writing"
+        );
+
+        // Kill the session
+        lua.load("session:kill()")
+            .exec()
+            .expect("kill should work");
     }
 }

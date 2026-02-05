@@ -16,6 +16,7 @@
 //!            ├── webrtc (peer events, messaging)
 //!            ├── pty (terminal operations)
 //!            ├── hub (state queries, agent ops)
+//!            ├── worktree (git worktree queries, create, delete)
 //!            └── events (lifecycle subscriptions)
 //! ```
 //!
@@ -57,6 +58,8 @@ pub use primitives::{
     WebRtcSendQueue, WebRtcSendRequest,
     // Hub state primitives
     HubRequest, HubRequestQueue,
+    // Worktree primitives
+    WorktreeRequest, WorktreeRequestQueue,
     // Event system primitives
     EventCallbackId, EventCallbacks, SharedEventCallbacks,
 };

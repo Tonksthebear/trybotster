@@ -11,13 +11,13 @@ use anyhow::{anyhow, Context, Result};
 use mlua::{IntoLuaMulti, Lua, LuaSerdeExt};
 
 use crate::hub::handle_cache::HandleCache;
-use crate::relay::types::AgentInfo;
 
 use super::file_watcher::LuaFileWatcher;
 use super::primitives;
 use super::primitives::events::SharedEventCallbacks;
 use super::primitives::connection::{ConnectionRequest, ConnectionRequestQueue};
 use super::primitives::hub::{HubRequest, HubRequestQueue};
+use super::primitives::worktree::{WorktreeRequest, WorktreeRequestQueue};
 use super::primitives::pty::{PtyOutputContext, PtyRequest, PtyRequestQueue};
 use super::primitives::tui::{
     registry_keys as tui_registry_keys, TuiSendQueue, TuiSendRequest,
@@ -70,6 +70,8 @@ pub struct LuaRuntime {
     hub_request_queue: HubRequestQueue,
     /// Queue for connection operations from Lua callbacks.
     connection_request_queue: ConnectionRequestQueue,
+    /// Queue for worktree operations from Lua callbacks.
+    worktree_request_queue: WorktreeRequestQueue,
     /// Event callbacks registered by Lua scripts.
     event_callbacks: SharedEventCallbacks,
 }
@@ -81,6 +83,7 @@ impl std::fmt::Debug for LuaRuntime {
         let pty_queue_len = self.pty_request_queue.lock().map(|q| q.len()).unwrap_or(0);
         let hub_queue_len = self.hub_request_queue.lock().map(|q| q.len()).unwrap_or(0);
         let conn_queue_len = self.connection_request_queue.lock().map(|q| q.len()).unwrap_or(0);
+        let wt_queue_len = self.worktree_request_queue.lock().map(|q| q.len()).unwrap_or(0);
         let event_cb_count = self.event_callbacks.lock().map(|c| c.callback_count()).unwrap_or(0);
         f.debug_struct("LuaRuntime")
             .field("base_path", &self.base_path)
@@ -91,6 +94,7 @@ impl std::fmt::Debug for LuaRuntime {
             .field("pty_queue_len", &pty_queue_len)
             .field("hub_queue_len", &hub_queue_len)
             .field("connection_queue_len", &conn_queue_len)
+            .field("worktree_queue_len", &wt_queue_len)
             .field("event_callback_count", &event_cb_count)
             .finish_non_exhaustive()
     }
@@ -138,6 +142,9 @@ impl LuaRuntime {
         // Create connection request queue
         let connection_request_queue = primitives::new_connection_queue();
 
+        // Create worktree request queue
+        let worktree_request_queue = primitives::new_worktree_queue();
+
         // Create event callback storage
         let event_callbacks = primitives::new_event_callbacks();
 
@@ -160,7 +167,7 @@ impl LuaRuntime {
         primitives::register_events(&lua, Arc::clone(&event_callbacks))
             .context("Failed to register event primitives")?;
 
-        // Note: Hub and connection primitives are registered later via
+        // Note: Hub, connection, and worktree primitives are registered later via
         // register_hub_primitives() because they need a HandleCache reference from Hub
 
         // Configure package.path to include the base path for require()
@@ -182,6 +189,7 @@ impl LuaRuntime {
             pty_request_queue,
             hub_request_queue,
             connection_request_queue,
+            worktree_request_queue,
             event_callbacks,
         })
     }
@@ -1246,11 +1254,16 @@ impl LuaRuntime {
     /// # Arguments
     ///
     /// * `handle_cache` - Thread-safe cache of agent handles and connection URL
+    /// * `worktree_base` - Base directory for worktree storage
     ///
     /// # Errors
     ///
     /// Returns an error if registration fails.
-    pub fn register_hub_primitives(&self, handle_cache: Arc<HandleCache>) -> Result<()> {
+    pub fn register_hub_primitives(
+        &self,
+        handle_cache: Arc<HandleCache>,
+        worktree_base: PathBuf,
+    ) -> Result<()> {
         primitives::register_hub(
             &self.lua,
             Arc::clone(&self.hub_request_queue),
@@ -1261,9 +1274,17 @@ impl LuaRuntime {
         primitives::register_connection(
             &self.lua,
             Arc::clone(&self.connection_request_queue),
-            handle_cache,
+            Arc::clone(&handle_cache),
         )
         .context("Failed to register connection primitives")?;
+
+        primitives::register_worktree(
+            &self.lua,
+            Arc::clone(&self.worktree_request_queue),
+            handle_cache,
+            worktree_base,
+        )
+        .context("Failed to register worktree primitives")?;
 
         Ok(())
     }
@@ -1280,14 +1301,10 @@ impl LuaRuntime {
     /// # Example
     ///
     /// ```ignore
-    /// // After calling Lua callback
     /// for request in lua.drain_hub_requests() {
     ///     match request {
-    ///         HubRequest::CreateAgent { issue_or_branch, prompt, .. } => {
-    ///             hub.create_agent_async(issue_or_branch, prompt);
-    ///         }
-    ///         HubRequest::DeleteAgent { agent_id, delete_worktree } => {
-    ///             hub.delete_agent(&agent_id, delete_worktree);
+    ///         HubRequest::Quit => {
+    ///             hub.quit = true;
     ///         }
     ///     }
     /// }
@@ -1312,6 +1329,39 @@ impl LuaRuntime {
             .connection_request_queue
             .lock()
             .expect("Connection request queue mutex poisoned");
+        std::mem::take(&mut *queue)
+    }
+
+    /// Drain pending worktree requests.
+    ///
+    /// Returns all worktree operations queued by Lua's `worktree.create_async()`
+    /// and `worktree.delete()` calls since the last drain. The queue is cleared
+    /// after this call.
+    ///
+    /// Hub should call this after invoking Lua callbacks to process any
+    /// worktree operations.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // After calling Lua callback
+    /// for request in lua.drain_worktree_requests() {
+    ///     match request {
+    ///         WorktreeRequest::CreateAsync { branch, response_key } => {
+    ///             hub.create_worktree_async(branch, response_key);
+    ///         }
+    ///         WorktreeRequest::Delete { path, branch } => {
+    ///             hub.delete_worktree(&path, &branch);
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub fn drain_worktree_requests(&self) -> Vec<WorktreeRequest> {
+        let mut queue = self
+            .worktree_request_queue
+            .lock()
+            .expect("Worktree request queue mutex poisoned");
         std::mem::take(&mut *queue)
     }
 
@@ -1392,90 +1442,6 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Fire the "agent_created" event with agent info.
-    ///
-    /// Called by Hub when an agent is created successfully.
-    ///
-    /// # Arguments
-    ///
-    /// * `agent_id` - The agent's session key
-    /// * `info` - Full agent information
-    pub fn fire_agent_created(&self, agent_id: &str, info: &AgentInfo) -> Result<()> {
-        if !self.has_event_callbacks("agent_created") {
-            return Ok(());
-        }
-
-        let agent_id = agent_id.to_string();
-        let info = info.clone();
-
-        self.fire_event("agent_created", |lua| {
-            let t = lua.create_table().map_err(|e| anyhow!("create_table: {e}"))?;
-            t.set("id", agent_id.clone()).map_err(|e| anyhow!("set id: {e}"))?;
-
-            if let Some(ref repo) = info.repo {
-                t.set("repo", repo.clone()).map_err(|e| anyhow!("set repo: {e}"))?;
-            }
-            if let Some(issue) = info.issue_number {
-                t.set("issue_number", issue).map_err(|e| anyhow!("set issue_number: {e}"))?;
-            }
-            if let Some(ref branch) = info.branch_name {
-                t.set("branch_name", branch.clone()).map_err(|e| anyhow!("set branch_name: {e}"))?;
-            }
-            if let Some(ref status) = info.status {
-                t.set("status", status.clone()).map_err(|e| anyhow!("set status: {e}"))?;
-            }
-            if let Some(port) = info.port {
-                t.set("port", port).map_err(|e| anyhow!("set port: {e}"))?;
-            }
-
-            Ok(mlua::Value::Table(t))
-        })
-    }
-
-    /// Fire the "agent_deleted" event.
-    ///
-    /// Called by Hub when an agent is deleted.
-    ///
-    /// # Arguments
-    ///
-    /// * `agent_id` - The deleted agent's session key
-    pub fn fire_agent_deleted(&self, agent_id: &str) -> Result<()> {
-        if !self.has_event_callbacks("agent_deleted") {
-            return Ok(());
-        }
-
-        let agent_id = agent_id.to_string();
-
-        self.fire_event("agent_deleted", |lua| {
-            let s = lua.create_string(&agent_id).map_err(|e| anyhow!("create_string: {e}"))?;
-            Ok(mlua::Value::String(s))
-        })
-    }
-
-    /// Fire the "agent_status_changed" event.
-    ///
-    /// Called by Hub when an agent's status changes.
-    ///
-    /// # Arguments
-    ///
-    /// * `agent_id` - The agent's session key
-    /// * `status` - The new status string
-    pub fn fire_agent_status_changed(&self, agent_id: &str, status: &str) -> Result<()> {
-        if !self.has_event_callbacks("agent_status_changed") {
-            return Ok(());
-        }
-
-        let agent_id = agent_id.to_string();
-        let status = status.to_string();
-
-        self.fire_event("agent_status_changed", |lua| {
-            let t = lua.create_table().map_err(|e| anyhow!("create_table: {e}"))?;
-            t.set("agent_id", agent_id.clone()).map_err(|e| anyhow!("set agent_id: {e}"))?;
-            t.set("status", status.clone()).map_err(|e| anyhow!("set status: {e}"))?;
-            Ok(mlua::Value::Table(t))
-        })
-    }
-
     /// Fire the "connection_code_ready" event with URL and QR PNG.
     ///
     /// Called by Hub when a connection URL is generated or regenerated.
@@ -1523,6 +1489,29 @@ impl LuaRuntime {
         self.fire_event("connection_code_error", |lua| {
             let s = lua.create_string(&error).map_err(|e| anyhow!("create_string: {e}"))?;
             Ok(mlua::Value::String(s))
+        })
+    }
+
+    /// Fire the "command_message" event with the full message payload.
+    ///
+    /// Called by Hub when a command channel message should be handled by Lua.
+    /// Lua handlers (e.g., `handlers/agents.lua`) listen for this event and
+    /// route `create_agent`, `delete_agent`, etc. to their respective handlers.
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - The message payload as a JSON value. Lua receives it as
+    ///   a table with fields like `type`, `issue_or_branch`, `prompt`, etc.
+    pub fn fire_command_message(&self, message: &serde_json::Value) -> Result<()> {
+        if !self.has_event_callbacks("command_message") {
+            return Ok(());
+        }
+
+        let message = message.clone();
+
+        self.fire_event("command_message", |lua| {
+            let lua_value = lua.to_value(&message).map_err(|e| anyhow!("to_value: {e}"))?;
+            Ok(lua_value)
         })
     }
 
@@ -2161,105 +2150,6 @@ mod tests {
 
         let count: i32 = runtime.lua().globals().get("call_count").unwrap();
         assert_eq!(count, 3);
-    }
-
-    #[test]
-    fn test_fire_agent_created_no_callbacks_is_noop() {
-        let runtime = LuaRuntime::new().expect("Should create runtime");
-
-        let info = AgentInfo {
-            id: "test-agent".to_string(),
-            repo: Some("owner/repo".to_string()),
-            issue_number: Some(42),
-            branch_name: Some("botster-issue-42".to_string()),
-            name: None,
-            status: Some("Running".to_string()),
-            port: None,
-            server_running: None,
-            has_server_pty: None,
-            active_pty_view: None,
-            scroll_offset: None,
-            hub_identifier: None,
-        };
-
-        // Should not panic even with no callbacks
-        runtime.fire_agent_created("test-agent", &info).expect("Should succeed");
-    }
-
-    #[test]
-    fn test_fire_agent_created_invokes_callback_with_info() {
-        let runtime = LuaRuntime::new().expect("Should create runtime");
-
-        runtime.lua().load(r#"
-            received_info = nil
-            events.on("agent_created", function(info)
-                received_info = info
-            end)
-        "#).exec().unwrap();
-
-        let info = AgentInfo {
-            id: "test-agent-123".to_string(),
-            repo: Some("owner/repo".to_string()),
-            issue_number: Some(42),
-            branch_name: Some("botster-issue-42".to_string()),
-            name: None,
-            status: Some("Running".to_string()),
-            port: Some(3001),
-            server_running: None,
-            has_server_pty: None,
-            active_pty_view: None,
-            scroll_offset: None,
-            hub_identifier: None,
-        };
-
-        runtime.fire_agent_created("test-agent-123", &info).expect("Should fire event");
-
-        let id: String = runtime.lua().load("return received_info.id").eval().unwrap();
-        let repo: String = runtime.lua().load("return received_info.repo").eval().unwrap();
-        let issue: u64 = runtime.lua().load("return received_info.issue_number").eval().unwrap();
-        let port: u16 = runtime.lua().load("return received_info.port").eval().unwrap();
-
-        assert_eq!(id, "test-agent-123");
-        assert_eq!(repo, "owner/repo");
-        assert_eq!(issue, 42);
-        assert_eq!(port, 3001);
-    }
-
-    #[test]
-    fn test_fire_agent_deleted_invokes_callback() {
-        let runtime = LuaRuntime::new().expect("Should create runtime");
-
-        runtime.lua().load(r#"
-            deleted_agent_id = nil
-            events.on("agent_deleted", function(agent_id)
-                deleted_agent_id = agent_id
-            end)
-        "#).exec().unwrap();
-
-        runtime.fire_agent_deleted("deleted-agent-456").expect("Should fire event");
-
-        let deleted: String = runtime.lua().globals().get("deleted_agent_id").unwrap();
-        assert_eq!(deleted, "deleted-agent-456");
-    }
-
-    #[test]
-    fn test_fire_agent_status_changed_invokes_callback() {
-        let runtime = LuaRuntime::new().expect("Should create runtime");
-
-        runtime.lua().load(r#"
-            status_info = nil
-            events.on("agent_status_changed", function(info)
-                status_info = info
-            end)
-        "#).exec().unwrap();
-
-        runtime.fire_agent_status_changed("agent-789", "Running").expect("Should fire event");
-
-        let agent_id: String = runtime.lua().load("return status_info.agent_id").eval().unwrap();
-        let status: String = runtime.lua().load("return status_info.status").eval().unwrap();
-
-        assert_eq!(agent_id, "agent-789");
-        assert_eq!(status, "Running");
     }
 
     #[test]

@@ -17,9 +17,10 @@ local TUI_PEER_ID = "tui"
 
 --- Create a TUI transport.
 -- Unlike WebRTC, no peer_id needed — there's only one TUI.
--- @return Transport table with send(), send_binary(), and create_pty_forwarder() methods
+-- @return Transport table with send(), send_binary(), create_pty_forwarder(), and type
 local function make_tui_transport()
     return {
+        type = "tui",
         send = function(msg) tui.send(msg) end,
         send_binary = function(data) tui.send_binary(data) end,
         create_pty_forwarder = function(opts)

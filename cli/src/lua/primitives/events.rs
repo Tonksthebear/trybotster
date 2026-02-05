@@ -193,6 +193,7 @@ pub fn new_event_callbacks() -> SharedEventCallbacks {
 /// - `events.on(event_name, callback)` -> subscription_id
 /// - `events.off(subscription_id)` - Unsubscribe
 /// - `events.has(event_name)` -> bool - Check if callbacks exist
+/// - `events.emit(event_name, data)` -> number - Fire event, invoke all callbacks
 ///
 /// # Arguments
 ///
@@ -240,7 +241,7 @@ pub fn register(lua: &Lua, callbacks: SharedEventCallbacks) -> Result<()> {
         .map_err(|e| anyhow!("Failed to set events.off: {e}"))?;
 
     // events.has(event_name) -> bool
-    let cb3 = callbacks;
+    let cb3 = Arc::clone(&callbacks);
     let has_fn = lua
         .create_function(move |_, event: String| {
             let cbs = cb3.lock()
@@ -252,6 +253,36 @@ pub fn register(lua: &Lua, callbacks: SharedEventCallbacks) -> Result<()> {
     events
         .set("has", has_fn)
         .map_err(|e| anyhow!("Failed to set events.has: {e}"))?;
+
+    // events.emit(event_name, data) -> number of callbacks invoked
+    let cb4 = callbacks;
+    let emit_fn = lua
+        .create_function(move |lua, (event, data): (String, LuaValue)| {
+            // Get callback functions while holding the lock
+            let functions: Vec<LuaFunction> = {
+                let cbs = cb4.lock().expect("Event callbacks mutex poisoned");
+                cbs.get_callbacks(&event)
+                    .iter()
+                    .filter_map(|key| lua.registry_value::<LuaFunction>(*key).ok())
+                    .collect()
+            };
+            // Lock released here
+
+            let mut invoked = 0;
+            for callback in functions {
+                match callback.call::<()>(data.clone()) {
+                    Ok(()) => invoked += 1,
+                    Err(e) => log::warn!("Event callback for '{}' failed: {}", event, e),
+                }
+            }
+
+            Ok(invoked)
+        })
+        .map_err(|e| anyhow!("Failed to create events.emit function: {e}"))?;
+
+    events
+        .set("emit", emit_fn)
+        .map_err(|e| anyhow!("Failed to set events.emit: {e}"))?;
 
     lua.globals()
         .set("events", events)
@@ -359,6 +390,7 @@ mod tests {
         assert!(events.contains_key("on").unwrap());
         assert!(events.contains_key("off").unwrap());
         assert!(events.contains_key("has").unwrap());
+        assert!(events.contains_key("emit").unwrap());
     }
 
     #[test]
@@ -484,5 +516,133 @@ mod tests {
 
         assert!(called);
         assert_eq!(arg, "test_value");
+    }
+
+    #[test]
+    fn test_events_emit_invokes_callbacks() {
+        let lua = Lua::new();
+        let callbacks = new_event_callbacks();
+
+        register(&lua, callbacks).expect("Should register");
+
+        let count: i32 = lua
+            .load(
+                r#"
+            callback_called = false
+            callback_arg = nil
+            events.on("test_event", function(arg)
+                callback_called = true
+                callback_arg = arg
+            end)
+            return events.emit("test_event", "hello")
+        "#,
+            )
+            .eval()
+            .unwrap();
+
+        assert_eq!(count, 1);
+
+        let called: bool = lua.globals().get("callback_called").unwrap();
+        let arg: String = lua.globals().get("callback_arg").unwrap();
+
+        assert!(called);
+        assert_eq!(arg, "hello");
+    }
+
+    #[test]
+    fn test_events_emit_invokes_multiple_callbacks() {
+        let lua = Lua::new();
+        let callbacks = new_event_callbacks();
+
+        register(&lua, callbacks).expect("Should register");
+
+        let count: i32 = lua
+            .load(
+                r#"
+            call_count = 0
+            events.on("test_event", function() call_count = call_count + 1 end)
+            events.on("test_event", function() call_count = call_count + 1 end)
+            events.on("test_event", function() call_count = call_count + 1 end)
+            return events.emit("test_event", nil)
+        "#,
+            )
+            .eval()
+            .unwrap();
+
+        assert_eq!(count, 3);
+
+        let call_count: i32 = lua.globals().get("call_count").unwrap();
+        assert_eq!(call_count, 3);
+    }
+
+    #[test]
+    fn test_events_emit_returns_zero_for_no_callbacks() {
+        let lua = Lua::new();
+        let callbacks = new_event_callbacks();
+
+        register(&lua, callbacks).expect("Should register");
+
+        let count: i32 = lua
+            .load(r#"return events.emit("nonexistent_event", "data")"#)
+            .eval()
+            .unwrap();
+
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_events_emit_with_table_data() {
+        let lua = Lua::new();
+        let callbacks = new_event_callbacks();
+
+        register(&lua, callbacks).expect("Should register");
+
+        let count: i32 = lua
+            .load(
+                r#"
+            received_data = nil
+            events.on("test_event", function(data)
+                received_data = data
+            end)
+            return events.emit("test_event", { id = "agent-1", status = "running" })
+        "#,
+            )
+            .eval()
+            .unwrap();
+
+        assert_eq!(count, 1);
+
+        let id: String = lua.load(r#"return received_data.id"#).eval().unwrap();
+        let status: String = lua.load(r#"return received_data.status"#).eval().unwrap();
+
+        assert_eq!(id, "agent-1");
+        assert_eq!(status, "running");
+    }
+
+    #[test]
+    fn test_events_emit_continues_on_callback_error() {
+        let lua = Lua::new();
+        let callbacks = new_event_callbacks();
+
+        register(&lua, callbacks).expect("Should register");
+
+        // First callback errors, second should still run
+        let count: i32 = lua
+            .load(
+                r#"
+            second_called = false
+            events.on("test_event", function() error("intentional error") end)
+            events.on("test_event", function() second_called = true end)
+            return events.emit("test_event", nil)
+        "#,
+            )
+            .eval()
+            .unwrap();
+
+        // First failed, second succeeded
+        assert_eq!(count, 1);
+
+        let second_called: bool = lua.globals().get("second_called").unwrap();
+        assert!(second_called);
     }
 }

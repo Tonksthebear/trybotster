@@ -356,20 +356,6 @@ impl WorktreeManager {
             anyhow::bail!("Failed to create worktree: {}", stderr);
         }
 
-        // Mark as trusted for Claude
-        let claude_dir = worktree_path.join(".claude");
-        fs::create_dir_all(&claude_dir)?;
-
-        // Create settings.local.json to pre-authorize the directory
-        let settings = serde_json::json!({
-            "allowedDirectories": [worktree_path.to_str().expect("path is valid UTF-8")],
-            "permissionMode": "acceptEdits"
-        });
-        fs::write(
-            claude_dir.join("settings.local.json"),
-            serde_json::to_string_pretty(&settings)?,
-        )?;
-
         // Copy files matching .botster_copy patterns
         Self::copy_botster_files(&repo_path, &worktree_path)?;
 

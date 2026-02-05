@@ -1,41 +1,42 @@
 //! Hub state primitives for Lua scripts.
 //!
 //! Exposes Hub state queries and operations to Lua, allowing scripts to
-//! inspect agents, worktrees, and request agent lifecycle operations.
+//! inspect agent PTY handles, worktrees, and request agent lifecycle operations.
 //!
 //! # Design Principle: "Query freely. Mutate via queue."
 //!
 //! - **State queries** (get_agents, get_agent, get_worktrees) read directly from
 //!   HandleCache - non-blocking, thread-safe snapshots
-//! - **Operations** (create_agent, delete_agent) queue requests for Hub to process
-//!   asynchronously after Lua callbacks return
+//! - **Operations** (quit) queue requests for Hub to process asynchronously
+//!   after Lua callbacks return
+//!
+//! # Lua Migration
+//!
+//! Agent metadata (repo, issue, status, etc.) is now managed by Lua.
+//! The `hub.get_agents()` and `hub.get_agent()` functions return PTY-level
+//! information (agent_key, pty_count, index). Lua enriches this with its
+//! own agent registry data.
 //!
 //! # Usage in Lua
 //!
 //! ```lua
-//! -- Query agents (non-blocking, reads from cache)
+//! -- Query agent handles (non-blocking, reads from cache)
 //! local agents = hub.get_agents()
 //! for i, agent in ipairs(agents) do
-//!     log.info(string.format("Agent %d: %s (%s)", i, agent.id, agent.status))
+//!     log.info(string.format("Agent %d: %s (ptys: %d)", i, agent.key, agent.pty_count))
 //! end
 //!
-//! -- Get single agent by index
+//! -- Get single agent handle by index
 //! local agent = hub.get_agent(0)
 //! if agent then
-//!     log.info("First agent: " .. agent.id)
+//!     log.info("First agent: " .. agent.key)
 //! end
 //!
 //! -- Get available worktrees
 //! local worktrees = hub.get_worktrees()
 //!
-//! -- Request agent creation (async - returns request key)
-//! local key = hub.create_agent({
-//!     issue_or_branch = "42",
-//!     prompt = "Fix the bug",
-//! })
-//!
-//! -- Request agent deletion (async)
-//! hub.delete_agent("owner-repo-42", true)  -- true = delete worktree
+//! -- Request Hub shutdown
+//! hub.quit()
 //! ```
 
 use std::sync::{Arc, Mutex};
@@ -50,24 +51,6 @@ use crate::hub::handle_cache::HandleCache;
 /// These are processed by Hub in its event loop after Lua callbacks return.
 #[derive(Debug, Clone)]
 pub enum HubRequest {
-    /// Create a new agent.
-    CreateAgent {
-        /// Issue number or branch name.
-        issue_or_branch: String,
-        /// Optional prompt for the agent.
-        prompt: Option<String>,
-        /// Optional worktree path for reopening existing worktree.
-        from_worktree: Option<String>,
-        /// Response key for tracking the request.
-        response_key: String,
-    },
-    /// Delete an agent.
-    DeleteAgent {
-        /// Agent ID (session key) to delete.
-        agent_id: String,
-        /// Whether to also delete the worktree.
-        delete_worktree: bool,
-    },
     /// Request Hub shutdown.
     Quit,
 }
@@ -84,12 +67,11 @@ pub fn new_request_queue() -> HubRequestQueue {
 /// Register Hub state primitives with the Lua state.
 ///
 /// Adds the following functions to the `hub` table:
-/// - `hub.get_agents()` - Get all agents as a table
-/// - `hub.get_agent(index)` - Get single agent by index
+/// - `hub.get_agents()` - Get all agent PTY handles (key, index, pty_count)
+/// - `hub.get_agent(index)` - Get single agent PTY handle by index
 /// - `hub.get_agent_count()` - Get number of agents
 /// - `hub.get_worktrees()` - Get available worktrees
-/// - `hub.create_agent(opts)` - Request agent creation (async)
-/// - `hub.delete_agent(agent_id, delete_worktree?)` - Request agent deletion (async)
+/// - `hub.quit()` - Request Hub shutdown
 ///
 /// # Arguments
 ///
@@ -111,8 +93,9 @@ pub fn register(
         .get("hub")
         .unwrap_or_else(|_| lua.create_table().unwrap());
 
-    // hub.get_agents() - Returns array of agent info
-    // Uses serde serialization to ensure proper JSON array format
+    // hub.get_agents() - Returns array of agent PTY handle info
+    // Agent metadata (repo, issue, status) is managed by Lua's own registry.
+    // This returns PTY-level data: key, index, pty_count.
     let cache = Arc::clone(&handle_cache);
     let get_agents_fn = lua
         .create_function(move |lua, ()| {
@@ -123,39 +106,11 @@ pub fn register(
                 .iter()
                 .enumerate()
                 .map(|(i, agent)| {
-                    let info = agent.info();
                     let mut obj = serde_json::Map::new();
 
-                    // Core identity
+                    // Core identity from handle
                     obj.insert("index".to_string(), serde_json::json!(i));
-                    obj.insert("id".to_string(), serde_json::json!(info.id));
-
-                    // Repository info (omit if None per protocol spec)
-                    if let Some(ref repo) = info.repo {
-                        obj.insert("repo".to_string(), serde_json::json!(repo));
-                    }
-                    if let Some(issue) = info.issue_number {
-                        obj.insert("issue_number".to_string(), serde_json::json!(issue));
-                    }
-                    if let Some(ref branch) = info.branch_name {
-                        obj.insert("branch_name".to_string(), serde_json::json!(branch));
-                    }
-
-                    // Status
-                    if let Some(ref status) = info.status {
-                        obj.insert("status".to_string(), serde_json::json!(status));
-                    }
-
-                    // Server info
-                    if let Some(port) = info.port {
-                        obj.insert("port".to_string(), serde_json::json!(port));
-                    }
-                    if let Some(server_running) = info.server_running {
-                        obj.insert("server_running".to_string(), serde_json::json!(server_running));
-                    }
-                    if let Some(has_server_pty) = info.has_server_pty {
-                        obj.insert("has_server_pty".to_string(), serde_json::json!(has_server_pty));
-                    }
+                    obj.insert("key".to_string(), serde_json::json!(agent.agent_key()));
 
                     // PTY count from handle
                     obj.insert("pty_count".to_string(), serde_json::json!(agent.pty_count()));
@@ -172,45 +127,18 @@ pub fn register(
     hub.set("get_agents", get_agents_fn)
         .map_err(|e| anyhow!("Failed to set hub.get_agents: {e}"))?;
 
-    // hub.get_agent(index) - Returns single agent info or nil
+    // hub.get_agent(index) - Returns single agent PTY handle info or nil
+    // Agent metadata is managed by Lua's own registry.
     let cache2 = Arc::clone(&handle_cache);
     let get_agent_fn = lua
         .create_function(move |lua, index: usize| {
             match cache2.get_agent(index) {
                 Some(agent) => {
-                    let info = agent.info();
                     let agent_table = lua.create_table()?;
 
-                    // Core identity
+                    // Core identity from handle
                     agent_table.set("index", index)?;
-                    agent_table.set("id", info.id.clone())?;
-
-                    // Repository info
-                    if let Some(ref repo) = info.repo {
-                        agent_table.set("repo", repo.clone())?;
-                    }
-                    if let Some(issue) = info.issue_number {
-                        agent_table.set("issue_number", issue)?;
-                    }
-                    if let Some(ref branch) = info.branch_name {
-                        agent_table.set("branch_name", branch.clone())?;
-                    }
-
-                    // Status
-                    if let Some(ref status) = info.status {
-                        agent_table.set("status", status.clone())?;
-                    }
-
-                    // Server info
-                    if let Some(port) = info.port {
-                        agent_table.set("port", port)?;
-                    }
-                    if let Some(server_running) = info.server_running {
-                        agent_table.set("server_running", server_running)?;
-                    }
-                    if let Some(has_server_pty) = info.has_server_pty {
-                        agent_table.set("has_server_pty", has_server_pty)?;
-                    }
+                    agent_table.set("key", agent.agent_key().to_string())?;
 
                     // PTY count from handle
                     agent_table.set("pty_count", agent.pty_count())?;
@@ -260,50 +188,101 @@ pub fn register(
     hub.set("get_worktrees", get_worktrees_fn)
         .map_err(|e| anyhow!("Failed to set hub.get_worktrees: {e}"))?;
 
-    // hub.create_agent({ issue_or_branch, prompt?, from_worktree? }) -> response_key
-    let queue = Arc::clone(&request_queue);
-    let create_agent_fn = lua
-        .create_function(move |_, opts: LuaTable| {
-            let issue_or_branch: String = opts
-                .get("issue_or_branch")
-                .map_err(|_| LuaError::runtime("issue_or_branch is required"))?;
-            let prompt: Option<String> = opts.get("prompt").ok();
-            let from_worktree: Option<String> = opts.get("from_worktree").ok();
+    // hub.register_agent(agent_key, sessions) - Register agent PTY handles
+    //
+    // Called by Lua Agent class to register PTY session handles with
+    // HandleCache, enabling Rust-side PTY operations (forwarders, write, resize).
+    //
+    // Arguments:
+    //   agent_key: string - Agent key (e.g., "owner-repo-42")
+    //   sessions: table - Map of session name to PtySessionHandle userdata
+    //                     e.g., { cli = <PtySessionHandle>, server = <PtySessionHandle> }
+    //
+    // The order of PTYs in HandleCache is: cli first (index 0), then server (index 1).
+    let cache5 = Arc::clone(&handle_cache);
+    let register_agent_fn = lua
+        .create_function(move |_, (agent_key, sessions): (String, LuaTable)| {
+            use crate::hub::agent_handle::{AgentHandle, PtyHandle};
+            use crate::lua::primitives::pty::PtySessionHandle;
 
-            let response_key = format!("create_agent:{}", uuid::Uuid::new_v4());
+            let mut pty_handles: Vec<PtyHandle> = Vec::new();
 
-            let mut q = queue.lock()
-                .expect("Hub request queue mutex poisoned");
-            q.push(HubRequest::CreateAgent {
-                issue_or_branch,
-                prompt,
-                from_worktree,
-                response_key: response_key.clone(),
-            });
+            // Extract CLI session first (index 0)
+            // Use AnyUserData and borrow for more robust type handling
+            if let Ok(cli_ud) = sessions.get::<LuaAnyUserData>("cli") {
+                match cli_ud.borrow::<PtySessionHandle>() {
+                    Ok(cli_handle) => {
+                        pty_handles.push(cli_handle.to_pty_handle());
+                        log::debug!("[Lua] Extracted CLI PTY handle for '{}'", agent_key);
+                    }
+                    Err(e) => {
+                        log::warn!("[Lua] Failed to borrow CLI session as PtySessionHandle: {}", e);
+                    }
+                }
+            } else {
+                log::debug!("[Lua] No 'cli' session found for agent '{}'", agent_key);
+            }
 
-            Ok(response_key)
+            // Extract server session second (index 1)
+            if let Ok(server_ud) = sessions.get::<LuaAnyUserData>("server") {
+                match server_ud.borrow::<PtySessionHandle>() {
+                    Ok(server_handle) => {
+                        pty_handles.push(server_handle.to_pty_handle());
+                        log::debug!("[Lua] Extracted server PTY handle for '{}'", agent_key);
+                    }
+                    Err(e) => {
+                        log::warn!("[Lua] Failed to borrow server session as PtySessionHandle: {}", e);
+                    }
+                }
+            }
+
+            if pty_handles.is_empty() {
+                log::error!(
+                    "[Lua] register_agent '{}' failed: no valid PTY sessions found in table",
+                    agent_key
+                );
+                return Err(LuaError::runtime(
+                    "register_agent requires at least one PTY session (cli or server)"
+                ));
+            }
+
+            // Capture count before moving
+            let pty_count = pty_handles.len();
+
+            // Determine index (will be updated by add_agent)
+            let agent_index = cache5.len();
+            let handle = AgentHandle::new(agent_key.clone(), pty_handles, agent_index);
+
+            match cache5.add_agent(handle) {
+                Some(idx) => {
+                    log::info!("[Lua] Registered agent '{}' at index {} with {} PTY(s)",
+                        agent_key, idx, pty_count);
+                    Ok(idx)
+                }
+                None => Err(LuaError::runtime("Failed to register agent with HandleCache")),
+            }
         })
-        .map_err(|e| anyhow!("Failed to create hub.create_agent function: {e}"))?;
+        .map_err(|e| anyhow!("Failed to create hub.register_agent function: {e}"))?;
 
-    hub.set("create_agent", create_agent_fn)
-        .map_err(|e| anyhow!("Failed to set hub.create_agent: {e}"))?;
+    hub.set("register_agent", register_agent_fn)
+        .map_err(|e| anyhow!("Failed to set hub.register_agent: {e}"))?;
 
-    // hub.delete_agent(agent_id, delete_worktree?)
-    let queue2 = Arc::clone(&request_queue);
-    let delete_agent_fn = lua
-        .create_function(move |_, (agent_id, delete_worktree): (String, Option<bool>)| {
-            let mut q = queue2.lock()
-                .expect("Hub request queue mutex poisoned");
-            q.push(HubRequest::DeleteAgent {
-                agent_id,
-                delete_worktree: delete_worktree.unwrap_or(false),
-            });
-            Ok(())
+    // hub.unregister_agent(agent_key) - Unregister agent PTY handles
+    //
+    // Called by Lua when an agent is closed to remove it from HandleCache.
+    let cache6 = Arc::clone(&handle_cache);
+    let unregister_agent_fn = lua
+        .create_function(move |_, agent_key: String| {
+            let removed = cache6.remove_agent(&agent_key);
+            if removed {
+                log::info!("[Lua] Unregistered agent '{}'", agent_key);
+            }
+            Ok(removed)
         })
-        .map_err(|e| anyhow!("Failed to create hub.delete_agent function: {e}"))?;
+        .map_err(|e| anyhow!("Failed to create hub.unregister_agent function: {e}"))?;
 
-    hub.set("delete_agent", delete_agent_fn)
-        .map_err(|e| anyhow!("Failed to set hub.delete_agent: {e}"))?;
+    hub.set("unregister_agent", unregister_agent_fn)
+        .map_err(|e| anyhow!("Failed to set hub.unregister_agent: {e}"))?;
 
     // hub.quit() - Request Hub shutdown
     let queue3 = request_queue;
@@ -347,8 +326,6 @@ mod tests {
         assert!(hub.contains_key("get_agent").unwrap());
         assert!(hub.contains_key("get_agent_count").unwrap());
         assert!(hub.contains_key("get_worktrees").unwrap());
-        assert!(hub.contains_key("create_agent").unwrap());
-        assert!(hub.contains_key("delete_agent").unwrap());
         assert!(hub.contains_key("quit").unwrap());
     }
 
@@ -386,6 +363,34 @@ mod tests {
 
         let count: usize = lua.load("return hub.get_agent_count()").eval().unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_get_agents_returns_key_and_pty_count() {
+        let lua = Lua::new();
+        let (queue, cache) = create_test_queue_and_cache();
+
+        // Populate cache with a test handle
+        use crate::agent::pty::PtySession;
+        use crate::hub::agent_handle::{AgentHandle, PtyHandle};
+
+        let pty_session = PtySession::new(24, 80);
+        let (shared_state, scrollback, event_tx) = pty_session.get_direct_access();
+        std::mem::forget(pty_session);
+        let pty = PtyHandle::new(event_tx, shared_state, scrollback, None);
+        let handle = AgentHandle::new("test-key", vec![pty], 0);
+        cache.set_all(vec![handle]);
+
+        register(&lua, queue, cache).expect("Should register");
+
+        let agents: LuaTable = lua.load("return hub.get_agents()").eval().unwrap();
+        assert_eq!(agents.len().unwrap(), 1);
+
+        let first: LuaTable = agents.get(1).unwrap();
+        let key: String = first.get("key").unwrap();
+        let pty_count: usize = first.get("pty_count").unwrap();
+        assert_eq!(key, "test-key");
+        assert_eq!(pty_count, 1);
     }
 
     #[test]
@@ -429,179 +434,6 @@ mod tests {
         // Empty worktrees should be an array [], not an object {}
         assert!(json.is_array(), "Empty worktrees should serialize as JSON array, got: {}", json);
         assert_eq!(json.as_array().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_create_agent_queues_request() {
-        let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
-
-        register(&lua, Arc::clone(&queue), cache).expect("Should register");
-
-        let key: String = lua
-            .load(
-                r#"
-            return hub.create_agent({
-                issue_or_branch = "42",
-                prompt = "Fix the bug",
-            })
-        "#,
-            )
-            .eval()
-            .expect("Should create agent");
-
-        assert!(key.starts_with("create_agent:"), "Key should have prefix");
-
-        let requests = queue.lock()
-            .expect("Hub request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-
-        match &requests[0] {
-            HubRequest::CreateAgent {
-                issue_or_branch,
-                prompt,
-                from_worktree,
-                response_key,
-            } => {
-                assert_eq!(issue_or_branch, "42");
-                assert_eq!(prompt, &Some("Fix the bug".to_string()));
-                assert!(from_worktree.is_none());
-                assert_eq!(response_key, &key);
-            }
-            _ => panic!("Expected CreateAgent request"),
-        }
-    }
-
-    #[test]
-    fn test_create_agent_requires_issue_or_branch() {
-        let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
-
-        register(&lua, queue, cache).expect("Should register");
-
-        let result: mlua::Result<String> = lua
-            .load(
-                r#"
-            return hub.create_agent({
-                prompt = "No issue or branch",
-            })
-        "#,
-            )
-            .eval();
-
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("issue_or_branch"),
-            "Error should mention issue_or_branch: {}",
-            err_msg
-        );
-    }
-
-    #[test]
-    fn test_create_agent_with_from_worktree() {
-        let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
-
-        register(&lua, Arc::clone(&queue), cache).expect("Should register");
-
-        lua.load(
-            r#"
-            hub.create_agent({
-                issue_or_branch = "feature-branch",
-                from_worktree = "/path/to/worktree",
-            })
-        "#,
-        )
-        .exec()
-        .expect("Should create agent");
-
-        let requests = queue.lock()
-            .expect("Hub request queue mutex poisoned");
-        match &requests[0] {
-            HubRequest::CreateAgent {
-                from_worktree, ..
-            } => {
-                assert_eq!(from_worktree, &Some("/path/to/worktree".to_string()));
-            }
-            _ => panic!("Expected CreateAgent request"),
-        }
-    }
-
-    #[test]
-    fn test_delete_agent_queues_request() {
-        let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
-
-        register(&lua, Arc::clone(&queue), cache).expect("Should register");
-
-        lua.load(r#"hub.delete_agent("owner-repo-42", true)"#)
-            .exec()
-            .expect("Should delete agent");
-
-        let requests = queue.lock()
-            .expect("Hub request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-
-        match &requests[0] {
-            HubRequest::DeleteAgent {
-                agent_id,
-                delete_worktree,
-            } => {
-                assert_eq!(agent_id, "owner-repo-42");
-                assert!(*delete_worktree);
-            }
-            _ => panic!("Expected DeleteAgent request"),
-        }
-    }
-
-    #[test]
-    fn test_delete_agent_defaults_delete_worktree_to_false() {
-        let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
-
-        register(&lua, Arc::clone(&queue), cache).expect("Should register");
-
-        lua.load(r#"hub.delete_agent("owner-repo-42")"#)
-            .exec()
-            .expect("Should delete agent");
-
-        let requests = queue.lock()
-            .expect("Hub request queue mutex poisoned");
-        match &requests[0] {
-            HubRequest::DeleteAgent {
-                delete_worktree, ..
-            } => {
-                assert!(!*delete_worktree);
-            }
-            _ => panic!("Expected DeleteAgent request"),
-        }
-    }
-
-    #[test]
-    fn test_multiple_requests_queue_in_order() {
-        let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
-
-        register(&lua, Arc::clone(&queue), cache).expect("Should register");
-
-        lua.load(
-            r#"
-            hub.create_agent({ issue_or_branch = "1" })
-            hub.delete_agent("agent-1")
-            hub.create_agent({ issue_or_branch = "2" })
-        "#,
-        )
-        .exec()
-        .expect("Should queue multiple requests");
-
-        let requests = queue.lock()
-            .expect("Hub request queue mutex poisoned");
-        assert_eq!(requests.len(), 3);
-
-        assert!(matches!(requests[0], HubRequest::CreateAgent { .. }));
-        assert!(matches!(requests[1], HubRequest::DeleteAgent { .. }));
-        assert!(matches!(requests[2], HubRequest::CreateAgent { .. }));
     }
 
     #[test]
