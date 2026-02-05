@@ -63,26 +63,60 @@ module Hubs
       ]
 
       turn = turn_credentials
-      servers << turn if turn
+      servers.concat(Array(turn))
 
       servers
     end
 
-    # Generate time-limited TURN credentials (RFC 5389)
+    # TURN credentials
+    # Supports two modes:
+    # 1. Metered.co API: METERED_DOMAIN + METERED_SECRET_KEY (generates temp credentials)
+    # 2. Time-limited credentials (RFC 5389, coturn style): TURN_SERVER_URL + TURN_SECRET
+    # Returns array of servers (may be empty)
     def turn_credentials
-      return nil unless ENV["TURN_SERVER_URL"].present? && ENV["TURN_SECRET"].present?
+      if ENV["METERED_DOMAIN"].present? && ENV["METERED_SECRET_KEY"].present?
+        fetch_metered_credentials
+      elsif ENV["TURN_SERVER_URL"].present? && ENV["TURN_SECRET"].present?
+        # Time-limited credentials (RFC 5389, self-hosted coturn)
+        timestamp = 24.hours.from_now.to_i
+        username = "#{timestamp}:#{@hub.id}"
+        password = Base64.strict_encode64(
+          OpenSSL::HMAC.digest("SHA1", ENV["TURN_SECRET"], username)
+        )
+        [{
+          urls: ENV["TURN_SERVER_URL"],
+          username: username,
+          credential: password
+        }]
+      else
+        []
+      end
+    end
 
-      timestamp = 24.hours.from_now.to_i
-      username = "#{timestamp}:#{@hub.id}"
-      password = Base64.strict_encode64(
-        OpenSSL::HMAC.digest("SHA1", ENV["TURN_SECRET"], username)
+    # Fetch temporary TURN credentials from metered.co API
+    # Returns array of all STUN/TURN servers (metered returns multiple)
+    def fetch_metered_credentials
+      response = Net::HTTP.get_response(
+        URI("https://#{ENV['METERED_DOMAIN']}/api/v1/turn/credentials?apiKey=#{ENV['METERED_SECRET_KEY']}")
       )
 
-      {
-        urls: ENV["TURN_SERVER_URL"],
-        username: username,
-        credential: password
-      }
+      return [] unless response.is_a?(Net::HTTPSuccess)
+
+      credentials = JSON.parse(response.body)
+      return [] if credentials.empty?
+
+      # Metered returns array of server configs (STUN + multiple TURN variants)
+      # Map all of them to ice_server format
+      credentials.map do |cred|
+        {
+          urls: cred["urls"] || cred["url"],
+          username: cred["username"],
+          credential: cred["credential"]
+        }.compact
+      end
+    rescue StandardError => e
+      Rails.logger.error "[WebRTC] Failed to fetch metered.co credentials: #{e.message}"
+      []
     end
   end
 end

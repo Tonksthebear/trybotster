@@ -61,6 +61,7 @@ use reqwest::blocking::Client;
 
 use sha2::{Digest, Sha256};
 
+use crate::channel::Channel;
 use crate::config::Config;
 use crate::device::Device;
 use crate::git::WorktreeManager;
@@ -143,6 +144,13 @@ pub struct Hub {
     /// Each browser that connects via WebRTC gets its own peer connection.
     /// The connection persists to keep the DataChannel alive.
     pub webrtc_channels: std::collections::HashMap<String, crate::channel::WebRtcChannel>,
+
+    /// Tracks when WebRTC connections were initiated.
+    ///
+    /// Used to timeout connections stuck in "Connecting" state (e.g., ICE
+    /// negotiation that never completes due to network issues).
+    /// Connections that don't reach "Connected" within 30 seconds are cleaned up.
+    webrtc_connection_started: std::collections::HashMap<String, Instant>,
 
     /// Sender for PTY output messages from forwarder tasks.
     ///
@@ -276,6 +284,7 @@ impl Hub {
             command_channel: None,
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
+            webrtc_connection_started: std::collections::HashMap::new(),
             webrtc_pty_output_tx,
             webrtc_pty_output_rx,
             webrtc_pty_forwarders: std::collections::HashMap::new(),
@@ -552,6 +561,19 @@ impl Hub {
 
         // Shutdown background workers (allows pending notifications to drain)
         self.shutdown_background_workers();
+
+        // Abort all PTY forwarder tasks
+        for (_key, task) in self.webrtc_pty_forwarders.drain() {
+            task.abort();
+        }
+
+        // Disconnect all WebRTC channels (fire-and-forget to avoid deadlock)
+        for (_id, mut channel) in self.webrtc_channels.drain() {
+            self.tokio_runtime.spawn(async move {
+                channel.disconnect().await;
+            });
+        }
+        self.webrtc_connection_started.clear();
 
         // Shutdown CryptoService (persists crypto session state to disk)
         if let Some(ref cs) = self.browser.crypto_service {
