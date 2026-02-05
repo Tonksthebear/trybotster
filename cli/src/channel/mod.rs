@@ -1,15 +1,15 @@
 //! Channel abstraction for browser communication.
 //!
 //! This module provides a unified `Channel` trait for WebRTC DataChannel
-//! communication with Signal Protocol E2E encryption and gzip compression.
+//! communication with E2E encryption (Matrix Olm/Megolm) and gzip compression.
 //!
 //! # Architecture
 //!
 //! ```text
 //! Channel (trait)
 //!     │
-//!     └── WebRtcChannel (E2E encrypted via Signal Protocol)
-//!         └── DataChannel transport with DTLS + Signal encryption
+//!     └── WebRtcChannel (E2E encrypted via Matrix Olm)
+//!         └── DataChannel transport with DTLS + E2E encryption
 //! ```
 //!
 //! # Usage
@@ -70,7 +70,7 @@ pub struct ChannelConfig {
     /// Browser identity for browser-specific streams (HubChannel only).
     /// When set, subscribes to `hub:{hub_id}:browser:{identity}` instead of CLI stream.
     pub browser_identity: Option<String>,
-    /// Whether to encrypt messages using Signal Protocol.
+    /// Whether to encrypt messages using E2E encryption.
     pub encrypt: bool,
     /// Compression threshold in bytes. None disables compression.
     /// Payloads exceeding this size are gzip-compressed.
@@ -112,11 +112,11 @@ impl Default for ConnectionState {
 pub struct IncomingMessage {
     /// Decrypted and decompressed payload.
     pub payload: Vec<u8>,
-    /// Sender's peer identity (browser's Signal identity key).
+    /// Sender's peer identity (browser's crypto identity key).
     pub sender: PeerId,
 }
 
-/// Peer identifier (browser's Signal identity key).
+/// Peer identifier (browser's crypto identity key).
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct PeerId(pub String);
 
@@ -189,8 +189,8 @@ impl std::error::Error for ChannelError {}
 
 /// A bidirectional communication channel with optional encryption and compression.
 ///
-/// Implementors handle the underlying transport (WebSocket), optional Signal
-/// Protocol encryption, and optional gzip compression transparently.
+/// Implementors handle the underlying transport (WebSocket), optional E2E
+/// encryption, and optional gzip compression transparently.
 #[async_trait]
 pub trait Channel: Send + Sync {
     /// Connect to the ActionCable channel.
@@ -243,7 +243,7 @@ pub trait Channel: Send + Sync {
 
     /// Get the list of connected peers.
     ///
-    /// For encrypted channels, this returns peers with active Signal sessions.
+    /// For encrypted channels, this returns peers with active crypto sessions.
     fn peers(&self) -> Vec<PeerId>;
 
     /// Check if a peer has an active session.

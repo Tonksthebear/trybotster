@@ -3,12 +3,12 @@
  *
  * Provides common functionality:
  *   - WorkerBridge communication for encrypted channels
- *   - Signal session lifecycle (via SharedWorker)
+ *   - Olm session lifecycle (via SharedWorker)
  *   - Event subscription (typed subclasses add domain-specific events)
  *   - State tracking
  *
  * Lifecycle:
- *   - initialize() establishes hub connection (WebRTC + Signal session)
+ *   - initialize() establishes hub connection (WebRTC + Olm session)
  *   - subscribe() creates virtual channel subscription (CLI routing)
  *   - unsubscribe() removes channel subscription (keeps peer connection alive)
  *   - destroy() tears down everything
@@ -20,7 +20,7 @@
  */
 
 import bridge from "workers/bridge"
-import { ensureSignalReady, parseBundleFromFragment } from "signal/bundle"
+import { ensureMatrixReady, parseBundleFromFragment } from "matrix/bundle"
 
 // Connection state (combines browser subscription + CLI handshake status)
 export const ConnectionState = {
@@ -56,7 +56,7 @@ export const CliStatus = {
 const HANDSHAKE_TIMEOUT_MS = 8000
 
 // Tab-unique identifier (generated once per page load).
-// Used to distinguish multiple browser tabs sharing the same Signal session.
+// Used to distinguish multiple browser tabs sharing the same Olm session.
 const TAB_ID = crypto.randomUUID()
 
 export class Connection {
@@ -74,7 +74,7 @@ export class Connection {
     this.manager = manager
 
     this.subscriptionId = null      // Worker subscription ID
-    this.identityKey = null         // Signal Protocol identity key (shared across tabs)
+    this.identityKey = null         // E2E identity key (shared across tabs)
     this.browserIdentity = null     // Tab-unique identity for routing (identityKey:tabId)
     this.state = ConnectionState.DISCONNECTED
     this.errorCode = null
@@ -99,18 +99,17 @@ export class Connection {
 
   /**
    * Initialize the connection. Called by ConnectionManager.acquire().
-   * Establishes hub connection (WebRTC + Signal session) and subscribes.
+   * Establishes hub connection (WebRTC + Olm session) and subscribes.
    */
   async initialize() {
     try {
       this.#setState(ConnectionState.LOADING)
 
-      // Ensure worker is initialized
-      const cryptoWorkerUrl = document.querySelector('meta[name="signal-crypto-worker-url"]')?.content
-      const wasmJsUrl = document.querySelector('meta[name="signal-wasm-js-url"]')?.content
-      const wasmBinaryUrl = document.querySelector('meta[name="signal-wasm-binary-url"]')?.content
+      // Ensure crypto worker is initialized
+      const cryptoWorkerUrl = document.querySelector('meta[name="crypto-worker-url"]')?.content
+      const wasmJsUrl = document.querySelector('meta[name="crypto-wasm-js-url"]')?.content
 
-      await ensureSignalReady(cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl)
+      await ensureMatrixReady(cryptoWorkerUrl, wasmJsUrl)
 
       // Connect to hub
       await this.#connectHub()
@@ -125,7 +124,7 @@ export class Connection {
   }
 
   /**
-   * Connect to the hub (WebRTC + Signal session).
+   * Connect to the hub (WebRTC + Olm session).
    * Called by initialize() or can be used to reconnect.
    */
   async #connectHub() {
@@ -136,7 +135,7 @@ export class Connection {
 
     const hubId = this.getHubId()
 
-    // 1. Handle Signal session via crypto worker
+    // 1. Handle Olm session via crypto worker
     // Parse session bundle from fragment if requested
     let sessionBundle = this.options.sessionBundle || null
     if (!sessionBundle && this.options.fromFragment) {
@@ -165,7 +164,7 @@ export class Connection {
     const keyResult = await bridge.getIdentityKey(hubId)
     this.identityKey = keyResult.identityKey
     // Generate tab-unique browser identity for routing.
-    // Multiple tabs share the same Signal session but need separate WebRTC connections.
+    // Multiple tabs share the same Olm session but need separate WebRTC connections.
     this.browserIdentity = `${this.identityKey}:${Connection.tabId}`
 
     // Set up hub-level event listeners BEFORE connecting transport
@@ -357,7 +356,7 @@ export class Connection {
     })
     this.#unsubscribers.push(unsubHealth)
 
-    // Listen for session invalid (Signal session desync detected by CLI)
+    // Listen for session invalid (Olm session desync detected by CLI)
     const unsubSession = bridge.on("session:invalid", (event) => {
       if (event.hubId !== hubId) return
       console.warn(`[${this.constructor.name}] Session invalid:`, event.message)

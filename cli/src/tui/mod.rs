@@ -64,7 +64,7 @@ pub use layout::terminal_widget_inner_area;
 #[doc(inline)]
 pub use menu::{build_menu, MenuAction, MenuContext, MenuItem};
 #[doc(inline)]
-pub use qr::{build_kitty_escape_from_png, generate_qr_code_lines, generate_qr_png, ConnectionCodeData};
+pub use qr::{generate_qr_code_lines, ConnectionCodeData};
 #[doc(inline)]
 pub use render::{render, AgentRenderInfo, RenderContext, RenderResult};
 #[doc(inline)]

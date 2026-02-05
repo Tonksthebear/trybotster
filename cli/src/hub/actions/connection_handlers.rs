@@ -6,10 +6,10 @@ use crate::hub::Hub;
 
 /// Handle copying connection URL to clipboard.
 ///
-/// Generates the connection URL fresh from the current Signal bundle rather than
+/// Generates the connection URL fresh from the current device key bundle rather than
 /// using a cache. This ensures the copied URL always contains the current bundle.
 pub fn handle_copy_connection_url(hub: &mut Hub) {
-    // Generate URL fresh from current Signal bundle (canonical source)
+    // Generate URL fresh from current device key bundle (canonical source)
     match hub.generate_connection_url() {
         Ok(url) => match arboard::Clipboard::new() {
             Ok(mut clipboard) => {
@@ -25,7 +25,7 @@ pub fn handle_copy_connection_url(hub: &mut Hub) {
 
 /// Handle regenerating the connection code.
 ///
-/// Force-regenerates the PreKeyBundle via CryptoService, updates Hub state,
+/// Force-regenerates the DeviceKeyBundle via CryptoService, updates Hub state,
 /// caches the new URL (via `generate_connection_url()`), and fires a Lua
 /// event so all hub subscribers receive the fresh URL.
 pub fn handle_regenerate_connection_code(hub: &mut Hub) {
@@ -37,17 +37,16 @@ pub fn handle_regenerate_connection_code(hub: &mut Hub) {
 
     // Regenerate bundle directly via crypto service
     let result = hub.tokio_runtime.block_on(async {
-        let next_id = crypto_service.next_prekey_id().await.unwrap_or(1);
-        crypto_service.get_prekey_bundle(next_id).await
+        crypto_service.get_device_key_bundle().await
     });
 
     match result {
         Ok(bundle) => {
             log::info!(
-                "New PreKeyBundle generated with PreKey {}",
-                bundle.prekey_id.unwrap_or(0)
+                "New DeviceKeyBundle generated with key_id {}",
+                bundle.key_id
             );
-            hub.browser.signal_bundle = Some(bundle);
+            hub.browser.device_key_bundle = Some(bundle);
             hub.browser.bundle_used = false;
 
             // generate_connection_url() handles both caching and file writing
@@ -68,7 +67,7 @@ pub fn handle_regenerate_connection_code(hub: &mut Hub) {
             }
         }
         Err(e) => {
-            log::error!("Failed to regenerate PreKeyBundle: {}", e);
+            log::error!("Failed to regenerate DeviceKeyBundle: {}", e);
         }
     }
 }

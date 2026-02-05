@@ -16,7 +16,7 @@
 //!
 //! # Encryption
 //!
-//! All messages are encrypted using Signal Protocol (same session as terminal).
+//! All messages are E2E encrypted (same session as terminal).
 //! The Rails server cannot inspect HTTP content.
 //!
 //! # Compression

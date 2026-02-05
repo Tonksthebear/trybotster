@@ -31,7 +31,7 @@ pub fn run(skip_confirm: bool) -> Result<()> {
     println!("    - Device registration (if reachable)");
     println!();
     println!("  Keyring:");
-    println!("    - botster/credentials (API token, MCP token, signing key, Signal keys)");
+    println!("    - botster/credentials (API token, MCP token, signing key, crypto keys)");
     println!();
 
     if let Some(ref dir) = config_dir {

@@ -1,22 +1,22 @@
-//! Signal Protocol session persistence for surviving CLI restarts.
+//! Crypto session persistence for surviving CLI restarts.
 //!
-//! This module handles saving and loading Signal Protocol store state
+//! This module handles saving and loading Matrix crypto store state
 //! so that browser connections can survive CLI restarts.
 //!
 //! # Security
 //!
 //! All data is encrypted at rest using AES-256-GCM with a key stored in the
 //! consolidated keyring entry. This follows industry best practice
-//! (Signal, Matrix/Element) for protecting E2E encryption session state.
+//! (Matrix/Element) for protecting E2E encryption session state.
 //!
 //! # Storage structure
 //!
 //! ```text
 //! ~/.config/botster/hubs/{hub_id}/
-//!     signal_store.enc    # AES-GCM encrypted store state
+//!     matrix_store.enc    # AES-GCM encrypted Matrix crypto state
 //!
 //! OS Keyring (consolidated):
-//!     botster/credentials  # Contains signal_keys[hub_id] = base64 AES key
+//!     botster/credentials  # Contains crypto_keys[hub_id] = base64 AES key
 //! ```
 //!
 //! Rust guideline compliant 2025-01
@@ -57,29 +57,6 @@ struct EncryptedData {
     ciphertext: String,
     /// Version identifier for the encrypted data format.
     version: u8,
-}
-
-/// Serializable Signal Protocol store state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignalStoreState {
-    /// Identity key pair (serialized).
-    pub identity_key_pair: Vec<u8>,
-    /// Registration ID.
-    pub registration_id: u32,
-    /// Known identities (address -> identity key bytes).
-    pub identities: HashMap<String, Vec<u8>>,
-    /// Sessions (address -> session record bytes).
-    pub sessions: HashMap<String, Vec<u8>>,
-    /// PreKeys (id -> record bytes).
-    pub pre_keys: HashMap<u32, Vec<u8>>,
-    /// Signed PreKeys (id -> record bytes).
-    pub signed_pre_keys: HashMap<u32, Vec<u8>>,
-    /// Kyber PreKeys (id -> record bytes).
-    pub kyber_pre_keys: HashMap<u32, Vec<u8>>,
-    /// Sender keys (composite key -> record bytes).
-    pub sender_keys: HashMap<String, Vec<u8>>,
-    /// Used PreKey IDs (for tracking consumption).
-    pub used_pre_keys: Vec<u32>,
 }
 
 /// Check if we're in test mode (for deterministic key generation).
@@ -148,7 +125,7 @@ fn hub_state_dir(hub_id: &str) -> Result<PathBuf> {
 fn get_or_create_encryption_key(hub_id: &str) -> Result<[u8; 32]> {
     if is_test_mode() {
         // Test mode: use deterministic key derived from hub_id
-        let hash = Sha256::digest(format!("test-signal-key-{hub_id}").as_bytes());
+        let hash = Sha256::digest(format!("test-crypto-key-{hub_id}").as_bytes());
         let mut key = [0u8; 32];
         key.copy_from_slice(&hash[..32]);
         return Ok(key);
@@ -166,14 +143,14 @@ fn get_or_create_encryption_key(hub_id: &str) -> Result<[u8; 32]> {
     let mut creds = Credentials::load().unwrap_or_default();
 
     // Try to load existing key for this hub
-    let key = if let Some(key_b64) = creds.signal_key(hub_id) {
+    let key = if let Some(key_b64) = creds.crypto_key(hub_id) {
         let key_bytes = BASE64
             .decode(key_b64)
             .context("Invalid encryption key encoding in credentials")?;
         let key: [u8; 32] = key_bytes
             .try_into()
             .map_err(|_| anyhow::anyhow!("Invalid encryption key length in credentials"))?;
-        log::debug!("Loaded Signal encryption key from consolidated credentials");
+        log::debug!("Loaded encryption key from consolidated credentials");
         key
     } else {
         // Generate new key
@@ -182,10 +159,10 @@ fn get_or_create_encryption_key(hub_id: &str) -> Result<[u8; 32]> {
 
         // Store in consolidated credentials
         let key_b64 = BASE64.encode(key);
-        creds.set_signal_key(hub_id.to_string(), key_b64);
+        creds.set_crypto_key(hub_id.to_string(), key_b64);
         creds.save()?;
 
-        log::info!("Generated and stored new Signal encryption key in consolidated credentials");
+        log::info!("Generated and stored new encryption key in consolidated credentials");
         key
     };
 
@@ -196,27 +173,6 @@ fn get_or_create_encryption_key(hub_id: &str) -> Result<[u8; 32]> {
     }
 
     Ok(key)
-}
-
-/// Encrypt data using AES-256-GCM.
-fn encrypt_data(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedData> {
-    let cipher = Aes256Gcm::new_from_slice(key).expect("valid key length");
-
-    // Generate random nonce
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    rand::rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    // Encrypt
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
-
-    Ok(EncryptedData {
-        nonce: BASE64.encode(nonce_bytes),
-        ciphertext: BASE64.encode(ciphertext),
-        version: 4, // Signal Protocol version
-    })
 }
 
 /// Decrypt data using AES-256-GCM.
@@ -239,78 +195,105 @@ fn decrypt_data(key: &[u8; 32], encrypted: &EncryptedData) -> Result<Vec<u8>> {
     Ok(plaintext)
 }
 
-/// Load a Signal Protocol store from encrypted storage.
-pub fn load_signal_store(hub_id: &str) -> Result<SignalStoreState> {
+// ============================================================================
+// Matrix Crypto Persistence
+// ============================================================================
+
+use super::matrix_crypto::MatrixCryptoState;
+
+/// Encrypt data using AES-256-GCM with Matrix version marker.
+fn encrypt_data_matrix(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedData> {
+    let cipher = Aes256Gcm::new_from_slice(key).expect("valid key length");
+
+    // Generate random nonce
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
+    rand::rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    // Encrypt
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
+
+    Ok(EncryptedData {
+        nonce: BASE64.encode(nonce_bytes),
+        ciphertext: BASE64.encode(ciphertext),
+        version: 5, // Matrix crypto version
+    })
+}
+
+/// Load a Matrix crypto store from encrypted storage.
+pub fn load_matrix_crypto_store(hub_id: &str) -> Result<MatrixCryptoState> {
     let state_dir = hub_state_dir(hub_id)?;
-    let store_path = state_dir.join("signal_store.enc");
+    let store_path = state_dir.join("matrix_store.enc");
 
     if !store_path.exists() {
         anyhow::bail!(
-            "Signal store not found for hub {}",
+            "Matrix crypto store not found for hub {}",
             &hub_id[..hub_id.len().min(8)]
         );
     }
 
     let key = get_or_create_encryption_key(hub_id)?;
 
-    let content = fs::read_to_string(&store_path).context("Failed to read Signal store file")?;
+    let content = fs::read_to_string(&store_path).context("Failed to read Matrix store file")?;
     let encrypted: EncryptedData =
-        serde_json::from_str(&content).context("Failed to parse Signal store file")?;
+        serde_json::from_str(&content).context("Failed to parse Matrix store file")?;
 
     let plaintext = decrypt_data(&key, &encrypted)?;
-    let state: SignalStoreState =
-        serde_json::from_slice(&plaintext).context("Failed to deserialize Signal store")?;
+    let state: MatrixCryptoState =
+        serde_json::from_slice(&plaintext).context("Failed to deserialize Matrix store")?;
 
     log::info!(
-        "Loaded Signal store (encrypted) for hub {}",
+        "Loaded Matrix crypto store (encrypted) for hub {}",
         &hub_id[..hub_id.len().min(8)]
     );
     Ok(state)
 }
 
-/// Save a Signal Protocol store to encrypted storage.
-pub fn save_signal_store(hub_id: &str, state: &SignalStoreState) -> Result<()> {
+/// Save a Matrix crypto store to encrypted storage.
+pub fn save_matrix_crypto_store(hub_id: &str, state: &MatrixCryptoState) -> Result<()> {
     let key = get_or_create_encryption_key(hub_id)?;
     let state_dir = hub_state_dir(hub_id)?;
-    let store_path = state_dir.join("signal_store.enc");
+    let store_path = state_dir.join("matrix_store.enc");
 
-    let plaintext = serde_json::to_vec(state).context("Failed to serialize Signal store")?;
-    let encrypted = encrypt_data(&key, &plaintext)?;
+    let plaintext = serde_json::to_vec(state).context("Failed to serialize Matrix store")?;
+    let encrypted = encrypt_data_matrix(&key, &plaintext)?;
 
     let content =
         serde_json::to_string_pretty(&encrypted).context("Failed to serialize encrypted store")?;
 
-    fs::write(&store_path, content).context("Failed to write Signal store file")?;
+    fs::write(&store_path, content).context("Failed to write Matrix store file")?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(0o600);
         fs::set_permissions(&store_path, perms)
-            .context("Failed to set Signal store file permissions")?;
+            .context("Failed to set Matrix store file permissions")?;
     }
 
-    log::debug!("Saved encrypted Signal store to {:?}", store_path);
+    log::debug!("Saved encrypted Matrix store to {:?}", store_path);
     Ok(())
 }
 
-/// Delete all Signal state for a hub.
-pub fn delete_signal_store(hub_id: &str) -> Result<()> {
+/// Delete all Matrix crypto state for a hub.
+pub fn delete_matrix_crypto_store(hub_id: &str) -> Result<()> {
     let state_dir = hub_state_dir(hub_id)?;
-    let store_path = state_dir.join("signal_store.enc");
+    let store_path = state_dir.join("matrix_store.enc");
 
     if store_path.exists() {
-        fs::remove_file(&store_path).context("Failed to delete Signal store file")?;
-        log::info!("Deleted Signal store file");
+        fs::remove_file(&store_path).context("Failed to delete Matrix store file")?;
+        log::info!("Deleted Matrix crypto store file");
     }
 
     Ok(())
 }
 
-/// Check if a Signal store exists for a hub.
-pub fn signal_store_exists(hub_id: &str) -> bool {
+/// Check if a Matrix crypto store exists for a hub.
+pub fn matrix_crypto_store_exists(hub_id: &str) -> bool {
     hub_state_dir(hub_id)
-        .map(|dir| dir.join("signal_store.enc").exists())
+        .map(|dir| dir.join("matrix_store.enc").exists())
         .unwrap_or(false)
 }
 
@@ -377,39 +360,57 @@ mod tests {
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let key = [0u8; 32]; // Test key
-        let plaintext = b"Hello, Signal Protocol!";
+        let plaintext = b"Hello, Matrix crypto!";
 
-        let encrypted = encrypt_data(&key, plaintext).unwrap();
+        let encrypted = encrypt_data_matrix(&key, plaintext).unwrap();
         let decrypted = decrypt_data(&key, &encrypted).unwrap();
 
         assert_eq!(decrypted, plaintext);
-        assert_eq!(encrypted.version, 4);
+        assert_eq!(encrypted.version, 5);
     }
 
     #[test]
-    fn test_signal_store_persistence_roundtrip() {
-        let hub_id = "test-hub-signal-store";
+    fn test_matrix_crypto_store_persistence_roundtrip() {
+        let hub_id = "test-hub-matrix-store";
 
         // Create a test store state
-        let state = SignalStoreState {
-            identity_key_pair: vec![1, 2, 3, 4],
-            registration_id: 12345,
-            identities: HashMap::new(),
+        let state = MatrixCryptoState {
+            pickled_account: "test_pickled_account".to_string(),
+            hub_id: hub_id.to_string(),
+            signing_key: vec![1, 2, 3, 4],
             sessions: HashMap::new(),
-            pre_keys: HashMap::new(),
-            signed_pre_keys: HashMap::new(),
-            kyber_pre_keys: HashMap::new(),
-            sender_keys: HashMap::new(),
-            used_pre_keys: vec![],
+            used_one_time_keys: vec![],
+            outbound_group_session: None,
+            inbound_group_sessions: HashMap::new(),
         };
 
         // Save
-        save_signal_store(hub_id, &state).unwrap();
+        save_matrix_crypto_store(hub_id, &state).unwrap();
 
         // Load
-        let loaded = load_signal_store(hub_id).unwrap();
-        assert_eq!(loaded.registration_id, 12345);
-        assert_eq!(loaded.identity_key_pair, vec![1, 2, 3, 4]);
+        let loaded = load_matrix_crypto_store(hub_id).unwrap();
+        assert_eq!(loaded.hub_id, hub_id);
+        assert_eq!(loaded.pickled_account, "test_pickled_account");
+        assert_eq!(loaded.signing_key, vec![1, 2, 3, 4]);
+
+        // Cleanup
+        let state_dir = hub_state_dir(hub_id).unwrap();
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn test_matrix_crypto_store_exists() {
+        let hub_id = "test-hub-matrix-exists";
+
+        // Should not exist initially
+        assert!(!matrix_crypto_store_exists(hub_id));
+
+        // Create and save
+        let state = MatrixCryptoState::default();
+        save_matrix_crypto_store(hub_id, &state).unwrap();
+
+        // Should exist now
+        assert!(matrix_crypto_store_exists(hub_id));
 
         // Cleanup
         let state_dir = hub_state_dir(hub_id).unwrap();

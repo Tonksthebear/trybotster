@@ -13,8 +13,11 @@ pin "@xterm/xterm", to: "https://esm.sh/@xterm/xterm@5.5.0"
 pin "@xterm/addon-fit", to: "https://esm.sh/@xterm/addon-fit@0.10.0"
 pin "@xterm/addon-unicode11", to: "https://esm.sh/@xterm/addon-unicode11@0.8.0"
 
-# Signal Protocol WASM for E2E encryption
-pin "signal/bundle", to: "signal/bundle.js"
+# Matrix SDK crypto WASM for E2E encryption (Olm/Megolm)
+pin "@matrix-org/matrix-sdk-crypto-wasm", to: "@matrix-org--matrix-sdk-crypto-wasm.js" # @17.1.0
+
+# Matrix Olm/Megolm crypto for E2E encryption
+pin "matrix/bundle", to: "matrix/bundle.js"
 pin_all_from "app/javascript/workers", under: "workers"
 
 # Connection management (global, Turbo-aware)

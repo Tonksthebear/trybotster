@@ -10,7 +10,7 @@ require_relative "concerns/health_status"
 #
 # Architecture:
 # Each browser has dedicated bidirectional streams with the CLI.
-# This is required because each browser has its own Signal session.
+# This is required because each browser has its own Olm encryption session.
 #
 # Streams per (hub, agent, pty, browser):
 # - Browser stream: preview:{hub}:{agent}:{pty}:{browser_identity} (E2E messages)
@@ -25,7 +25,7 @@ require_relative "concerns/health_status"
 #
 # Security:
 # - Server never sees HTTP request/response content
-# - Reuses Signal Protocol session from TerminalRelayChannel
+# - Reuses Olm encryption session from TerminalRelayChannel
 # - Forward secrecy via Double Ratchet
 class PreviewChannel < ApplicationCable::Channel
   def subscribed

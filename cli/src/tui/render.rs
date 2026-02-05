@@ -40,18 +40,6 @@ use crate::PtyView;
 
 use super::events::CreationStage;
 
-/// State for QR image rendering via Kitty graphics protocol.
-/// This is returned from render and should be written to stdout after the frame.
-#[derive(Default, Debug)]
-pub struct QrImageState {
-    /// If set, this escape sequence should be written to stdout after the frame.
-    pub kitty_escape: Option<String>,
-    /// Row position where the image should be displayed.
-    pub row: u16,
-    /// Column position where the image should be displayed.
-    pub col: u16,
-}
-
 /// Information about an agent for rendering.
 ///
 /// Extracted subset of Agent data needed for TUI display.
@@ -90,11 +78,9 @@ pub struct RenderContext<'a> {
     pub available_worktrees: &'a [(String, String)],
     /// Error message to display in Error mode.
     pub error_message: Option<&'a str>,
-    /// Whether the QR image has been displayed (to avoid re-rendering every frame).
-    pub qr_image_displayed: bool,
     /// Agent creation progress (identifier, stage).
     pub creating_agent: Option<(&'a str, CreationStage)>,
-    /// Connection code data (URL + QR PNG) for display.
+    /// Connection code data (URL + QR ASCII) for display.
     pub connection_code: Option<&'a super::qr::ConnectionCodeData>,
     /// Whether the connection bundle has been used.
     pub bundle_used: bool,
@@ -159,8 +145,8 @@ impl<'a> RenderContext<'a> {
     }
 }
 
-/// Render result containing ANSI output and QR state.
-#[derive(Debug)]
+/// Render result containing ANSI output for browser streaming.
+#[derive(Debug, Default)]
 pub struct RenderResult {
     /// ANSI output for browser streaming.
     pub ansi_output: String,
@@ -168,19 +154,6 @@ pub struct RenderResult {
     pub rows: u16,
     /// Number of columns in the output.
     pub cols: u16,
-    /// Whether a QR image was written to stdout.
-    pub qr_image_written: bool,
-}
-
-impl Default for RenderResult {
-    fn default() -> Self {
-        Self {
-            ansi_output: String::new(),
-            rows: 0,
-            cols: 0,
-            qr_image_written: false,
-        }
-    }
 }
 
 /// Render the TUI and return ANSI output for browser streaming.
@@ -196,7 +169,7 @@ impl Default for RenderResult {
 ///
 /// # Returns
 ///
-/// A `RenderResult` with ANSI output and QR image state.
+/// A `RenderResult` with ANSI output.
 pub fn render<B>(
     terminal: &mut Terminal<B>,
     ctx: &RenderContext,
@@ -210,36 +183,10 @@ where
     let menu_items = build_menu(&ctx.menu_context());
 
     // Helper to render UI to a frame
-    let render_ui = |f: &mut Frame| -> Option<QrImageState> { render_frame(f, ctx, &menu_items) };
-
-    // Capture QR image state from render
-    let mut captured_qr_state: Option<QrImageState> = None;
+    let render_ui = |f: &mut Frame| { render_frame(f, ctx, &menu_items) };
 
     // Always render to real terminal for local display
-    terminal.draw(|f| {
-        captured_qr_state = render_ui(f);
-    })?;
-
-    // Track whether we wrote a QR image (for preventing re-rendering)
-    let mut qr_image_written = false;
-
-    // If Kitty image needs to be rendered, write it after the frame
-    // IMPORTANT: Only write if not already displayed to prevent memory leak.
-    // Writing 60 images/second causes 150GB+ memory usage in terminal emulators.
-    if let Some(qr_state) = captured_qr_state {
-        if let Some(escape_seq) = qr_state.kitty_escape {
-            if !ctx.qr_image_displayed {
-                use std::io::Write;
-                // Position cursor and write image
-                let cursor_pos = format!("\x1b[{};{}H", qr_state.row + 1, qr_state.col + 1);
-                let mut stdout = std::io::stdout();
-                let _ = stdout.write_all(cursor_pos.as_bytes());
-                let _ = stdout.write_all(escape_seq.as_bytes());
-                let _ = stdout.flush();
-                qr_image_written = true;
-            }
-        }
-    }
+    terminal.draw(render_ui)?;
 
     // For browser streaming, render to browser-sized buffer if dimensions provided
     let (ansi_output, out_rows, out_cols) = if let Some(dims) = browser_dims {
@@ -282,18 +229,13 @@ where
         ansi_output,
         rows: out_rows,
         cols: out_cols,
-        qr_image_written,
     })
 }
 
 /// Render the full TUI frame.
 ///
 /// Internal function that does the actual rendering work.
-fn render_frame(
-    f: &mut Frame,
-    ctx: &RenderContext,
-    menu_items: &[MenuItem],
-) -> Option<QrImageState> {
+fn render_frame(f: &mut Frame, ctx: &RenderContext, menu_items: &[MenuItem]) {
     let frame_area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -324,34 +266,16 @@ fn render_frame(
 
     // Render modal overlays based on mode
     match ctx.mode {
-        AppMode::Menu => {
-            render_menu_modal(f, menu_items, ctx.menu_selected);
-            None
-        }
+        AppMode::Menu => render_menu_modal(f, menu_items, ctx.menu_selected),
         AppMode::NewAgentSelectWorktree => {
             render_worktree_select_modal(f, ctx.available_worktrees, ctx.worktree_selected);
-            None
         }
-        AppMode::NewAgentCreateWorktree => {
-            render_create_worktree_modal(f, ctx.input_buffer);
-            None
-        }
-        AppMode::NewAgentPrompt => {
-            render_prompt_modal(f, ctx.input_buffer);
-            None
-        }
-        AppMode::CloseAgentConfirm => {
-            render_close_confirm_modal(f);
-            None
-        }
-        AppMode::ConnectionCode => {
-            render_connection_code_modal(f, ctx.connection_code, ctx.bundle_used)
-        }
-        AppMode::Error => {
-            render_error_modal(f, ctx.error_message);
-            None
-        }
-        AppMode::Normal => None,
+        AppMode::NewAgentCreateWorktree => render_create_worktree_modal(f, ctx.input_buffer),
+        AppMode::NewAgentPrompt => render_prompt_modal(f, ctx.input_buffer),
+        AppMode::CloseAgentConfirm => render_close_confirm_modal(f),
+        AppMode::ConnectionCode => render_connection_code_modal(f, ctx.connection_code, ctx.bundle_used),
+        AppMode::Error => render_error_modal(f, ctx.error_message),
+        AppMode::Normal => {}
     }
 }
 
@@ -660,107 +584,15 @@ fn render_connection_code_modal(
     f: &mut Frame,
     connection_code: Option<&super::qr::ConnectionCodeData>,
     bundle_used: bool,
-) -> Option<QrImageState> {
-    use super::qr::{build_kitty_escape_from_png, generate_qr_code_lines};
-
+) {
     let terminal = f.area();
 
-    // Get URL from connection code, or show error
-    let secure_url = connection_code
-        .map(|c| c.url.as_str())
-        .unwrap_or("Error: No connection URL generated");
+    // Get QR lines from connection code, or show error
+    let qr_lines: Vec<String> = connection_code
+        .map(|c| c.qr_ascii.clone())
+        .unwrap_or_else(|| vec!["Error: No connection code".to_string()]);
 
-    // Footer varies based on whether the bundle has been used
-    let footer = if bundle_used {
-        "[r] new link  [c] copy  [Esc] close"
-    } else {
-        "[r] new link  [c] copy  [Esc] close"
-    };
-
-    // Calculate available space for QR (terminal minus modal chrome)
-    // Leave room for: borders (4), header, 2 blank lines, footer
-    let max_qr_cols = terminal.width.saturating_sub(4);
-    let max_qr_rows = terminal.height.saturating_sub(8);
-
-    // Try Kitty graphics first using the pre-generated PNG from ConnectionCodeData
-    if let Some(code_data) = connection_code {
-        if let Some((escape_sequence, width_cells, height_cells)) =
-            build_kitty_escape_from_png(&code_data.qr_png, max_qr_cols, max_qr_rows)
-        {
-        // Kitty image mode: render a compact modal sized to QR + text
-        let header = if bundle_used {
-            "Link used - [r] to pair new device"
-        } else {
-            "Scan QR to connect securely"
-        };
-
-        // Modal sized to fit QR image + header/footer
-        let content_width = width_cells
-            .max(header.len() as u16)
-            .max(footer.len() as u16);
-        let modal_width = content_width + 4; // +4 for borders and padding
-        let modal_height = height_cells + 6; // header, blank, image rows, blank, footer, borders
-
-        // Center the modal
-        let x = terminal.x + (terminal.width.saturating_sub(modal_width)) / 2;
-        let y = terminal.y + (terminal.height.saturating_sub(modal_height)) / 2;
-        let area = Rect::new(
-            x,
-            y,
-            modal_width.min(terminal.width),
-            modal_height.min(terminal.height),
-        );
-
-        f.render_widget(Clear, area);
-
-        // Build text with placeholder for image
-        let mut text_lines = vec![
-            Line::from(Span::styled(
-                header,
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-        ];
-
-        // Add empty lines where image will go
-        for _ in 0..height_cells {
-            text_lines.push(Line::from(""));
-        }
-
-        text_lines.push(Line::from(""));
-        text_lines.push(Line::from(Span::styled(
-            footer,
-            Style::default().add_modifier(Modifier::DIM),
-        )));
-
-        let code_widget = Paragraph::new(text_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Secure Connection "),
-            )
-            .alignment(Alignment::Center);
-
-        f.render_widget(code_widget, area);
-
-        // Return image state - caller will write escape sequence after frame
-        // Center image within modal
-        let img_x = x + (modal_width.saturating_sub(width_cells)) / 2;
-        let img_y = y + 3; // After border + header + blank line
-
-            return Some(QrImageState {
-                kitty_escape: Some(escape_sequence),
-                row: img_y,
-                col: img_x,
-            });
-        }
-    }
-
-    // Fallback: text-based QR using Unicode half-blocks
-    let max_qr_width = terminal.width.saturating_sub(4);
-    let max_qr_height = terminal.height.saturating_sub(8);
-    let qr_lines = generate_qr_code_lines(secure_url, max_qr_width, max_qr_height);
-    let qr_fits = !qr_lines.iter().any(|l| l.contains("Terminal"));
+    let qr_fits = !qr_lines.iter().any(|l| l.contains("Terminal") || l.contains("Error"));
 
     let qr_width = qr_lines
         .iter()
@@ -774,11 +606,7 @@ fn render_connection_code_modal(
     } else {
         "Scan QR to connect securely"
     };
-    let footer = if qr_fits {
-        "[r] new link  [c] copy  [Esc] close"
-    } else {
-        "No graphics. [r] new  [c] copy  [Esc] close"
-    };
+    let footer = "[r] new link  [c] copy  [Esc] close";
 
     let content_width = qr_width.max(header.len() as u16).max(footer.len() as u16);
     let modal_width = content_width + 4;
@@ -807,16 +635,6 @@ fn render_connection_code_modal(
         text_lines.push(Line::from(qr_line.clone()));
     }
 
-    if !qr_fits {
-        text_lines.push(Line::from(format!(
-            "(Terminal: {}x{}, need {}x{})",
-            terminal.width,
-            terminal.height,
-            qr_width + 4,
-            qr_height + 6
-        )));
-    }
-
     text_lines.push(Line::from(""));
     text_lines.push(Line::from(Span::styled(
         footer,
@@ -836,8 +654,6 @@ fn render_connection_code_modal(
         .alignment(Alignment::Center);
 
     f.render_widget(code_widget, area);
-
-    None
 }
 
 /// Render an error modal.
@@ -902,8 +718,7 @@ mod tests {
             worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-            qr_image_displayed: false,
-            creating_agent: None,
+                        creating_agent: None,
             connection_code: None,
             bundle_used: false,
             agent_ids: &[],
@@ -942,8 +757,7 @@ mod tests {
             worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-            qr_image_displayed: false,
-            creating_agent: None,
+                        creating_agent: None,
             connection_code: None,
             bundle_used: false,
             agent_ids: &[],
@@ -969,6 +783,5 @@ mod tests {
         assert!(result.ansi_output.is_empty());
         assert_eq!(result.rows, 0);
         assert_eq!(result.cols, 0);
-        assert!(!result.qr_image_written);
     }
 }

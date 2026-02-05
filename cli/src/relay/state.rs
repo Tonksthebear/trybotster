@@ -17,7 +17,7 @@ use flate2::{write::GzEncoder, Compression};
 use std::io::Write;
 
 use super::crypto_service::CryptoServiceHandle;
-use super::signal::PreKeyBundleData;
+use super::matrix_crypto::DeviceKeyBundle;
 use crate::{AgentInfo, TerminalMessage, WorktreeInfo};
 
 /// Browser connection state.
@@ -28,18 +28,17 @@ use crate::{AgentInfo, TerminalMessage, WorktreeInfo};
 pub struct BrowserState {
     /// Whether a browser is currently connected.
     pub connected: bool,
-    /// Signal PreKeyBundle data for QR code generation.
-    pub signal_bundle: Option<PreKeyBundleData>,
-    /// Whether the current bundle's PreKey has been used (consumed by a connection).
+    /// Device key bundle for QR code generation.
+    pub device_key_bundle: Option<DeviceKeyBundle>,
+    /// Whether the current bundle's one-time key has been used (consumed by a connection).
     /// When true, the QR code should be regenerated before pairing additional devices.
     pub bundle_used: bool,
-    /// Shared crypto service handle for E2E encryption.
-    /// Used by WebRTC and agent channels for Signal Protocol operations.
+    /// Shared crypto service handle for E2E encryption (Matrix Olm/Megolm).
     pub crypto_service: Option<CryptoServiceHandle>,
     /// Whether the relay WebSocket connection is established.
     ///
     /// When `false`, the hub cannot receive browser handshake messages even if
-    /// a valid `signal_bundle` exists. The QR code should not be shown when
+    /// a valid device key bundle exists. The QR code should not be shown when
     /// this is `false` to avoid "CLI did not respond" errors.
     pub relay_connected: bool,
 }
@@ -168,16 +167,16 @@ mod tests {
     /// Verifies that `relay_connected` properly gates QR code visibility.
     ///
     /// When relay connection fails, we set `relay_connected = false` and
-    /// clear `signal_bundle` to prevent showing a QR code that would lead
+    /// clear `device_key_bundle` to prevent showing a QR code that would lead
     /// to "CLI did not respond" errors when browsers try to connect.
     #[test]
     fn test_relay_connected_prevents_false_positive_qr() {
         let state = BrowserState::default();
 
         // Simulate failed relay connection scenario:
-        // - signal_bundle should be None (cleared on failure)
+        // - device_key_bundle should be None (cleared on failure)
         // - relay_connected should be false
-        assert!(state.signal_bundle.is_none());
+        assert!(state.device_key_bundle.is_none());
         assert!(!state.relay_connected);
 
         // The is_connected() check should also return false

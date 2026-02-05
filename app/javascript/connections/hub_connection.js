@@ -17,7 +17,7 @@
  *   - worktreeList - Array of worktrees
  *   - agentCreated - New agent data
  *   - agentDeleted - { id }
- *   - connectionCode - { url, qr_png }
+ *   - connectionCode - { url, qr_ascii }
  *
  * Usage:
  *   const hub = await ConnectionManager.acquire(HubConnection, hubId, { hubId });
@@ -62,12 +62,14 @@ export class HubConnection extends Connection {
     switch (message.type) {
       case "agents":
       case "agent_list":
-        this.emit("agentList", message.agents || []);
+        // Handle Lua's empty table {} serializing as object instead of array
+        this.emit("agentList", Array.isArray(message.agents) ? message.agents : []);
         break;
 
       case "worktrees":
       case "worktree_list":
-        this.emit("worktreeList", message.worktrees || []);
+        // Handle Lua's empty table {} serializing as object instead of array
+        this.emit("worktreeList", Array.isArray(message.worktrees) ? message.worktrees : []);
         break;
 
       case "agent_created":

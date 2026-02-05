@@ -48,15 +48,15 @@ pub enum ConnectionRequest {
     /// - Fires `connection_code_ready` Lua event for broadcast
     Generate,
 
-    /// Force-regenerate the connection code (PreKeyBundle).
+    /// Force-regenerate the connection code (DeviceKeyBundle).
     ///
-    /// Hub will regenerate the Signal Protocol bundle unconditionally
+    /// Hub will regenerate the crypto bundle unconditionally
     /// and update the cached connection URL.
     Regenerate,
 
     /// Copy the connection URL to the system clipboard.
     ///
-    /// Hub generates the URL (fresh from current Signal bundle) and
+    /// Hub generates the URL (fresh from current crypto bundle) and
     /// copies it to clipboard via `arboard::Clipboard`.
     CopyToClipboard,
 }
@@ -245,7 +245,7 @@ mod tests {
         let (queue, cache) = create_test_queue_and_cache();
 
         // Pre-populate with an error
-        cache.set_connection_url(Err("Signal protocol init failed".to_string()));
+        cache.set_connection_url(Err("Crypto init failed".to_string()));
 
         register(&lua, queue, cache).expect("Should register");
 
@@ -255,7 +255,7 @@ mod tests {
             .unwrap();
 
         assert!(url.is_none());
-        assert_eq!(err, Some("Signal protocol init failed".to_string()));
+        assert_eq!(err, Some("Crypto init failed".to_string()));
     }
 
     #[test]

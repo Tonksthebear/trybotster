@@ -145,7 +145,7 @@ end)
 
 events.on("connection_code_ready", function(data)
     log.info("Broadcasting connection_code to hub subscribers")
-    broadcast_hub_event("connection_code", { url = data.url, qr_png = data.qr_png })
+    broadcast_hub_event("connection_code", { url = data.url, qr_ascii = data.qr_ascii })
 end)
 
 events.on("connection_code_error", function(err)

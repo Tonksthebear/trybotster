@@ -151,10 +151,10 @@ pub struct Credentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
 
-    /// Per-hub Signal encryption keys (hub_id -> base64 AES key).
-    /// Used to encrypt Signal Protocol session state at rest.
+    /// Per-hub crypto encryption keys (hub_id -> base64 AES key).
+    /// Used to encrypt Matrix crypto session state at rest.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub signal_keys: HashMap<String, String>,
+    pub crypto_keys: HashMap<String, String>,
 
     /// Schema version for future migrations.
     #[serde(default = "default_version")]
@@ -386,21 +386,21 @@ impl Credentials {
         self.fingerprint = Some(fingerprint);
     }
 
-    // === Signal key accessors ===
+    // === Crypto key accessors (Matrix crypto) ===
 
-    /// Get Signal encryption key for a hub.
-    pub fn signal_key(&self, hub_id: &str) -> Option<&str> {
-        self.signal_keys.get(hub_id).map(String::as_str)
+    /// Get crypto encryption key for a hub (Matrix crypto state at rest).
+    pub fn crypto_key(&self, hub_id: &str) -> Option<&str> {
+        self.crypto_keys.get(hub_id).map(String::as_str)
     }
 
-    /// Set Signal encryption key for a hub.
-    pub fn set_signal_key(&mut self, hub_id: String, key: String) {
-        self.signal_keys.insert(hub_id, key);
+    /// Set crypto encryption key for a hub.
+    pub fn set_crypto_key(&mut self, hub_id: String, key: String) {
+        self.crypto_keys.insert(hub_id, key);
     }
 
-    /// Remove Signal encryption key for a hub.
-    pub fn remove_signal_key(&mut self, hub_id: &str) {
-        self.signal_keys.remove(hub_id);
+    /// Remove crypto encryption key for a hub.
+    pub fn remove_crypto_key(&mut self, hub_id: &str) {
+        self.crypto_keys.remove(hub_id);
     }
 }
 
@@ -430,7 +430,7 @@ mod tests {
             mcp_token: None,
             signing_key: None,
             fingerprint: None,
-            signal_keys: HashMap::new(),
+            crypto_keys: HashMap::new(),
             version: 1,
         };
 
@@ -438,19 +438,19 @@ mod tests {
         assert!(!json.contains("mcp_token"));
         assert!(!json.contains("signing_key"));
         assert!(!json.contains("fingerprint"));
-        assert!(!json.contains("signal_keys"));
+        assert!(!json.contains("crypto_keys"));
     }
 
     #[test]
-    fn test_signal_keys_stored_and_retrieved() {
+    fn test_crypto_keys_stored_and_retrieved() {
         let mut creds = Credentials::default();
-        creds.set_signal_key("hub123".to_string(), "base64key".to_string());
+        creds.set_crypto_key("hub123".to_string(), "base64key".to_string());
 
-        assert_eq!(creds.signal_key("hub123"), Some("base64key"));
-        assert_eq!(creds.signal_key("other"), None);
+        assert_eq!(creds.crypto_key("hub123"), Some("base64key"));
+        assert_eq!(creds.crypto_key("other"), None);
 
-        creds.remove_signal_key("hub123");
-        assert_eq!(creds.signal_key("hub123"), None);
+        creds.remove_crypto_key("hub123");
+        assert_eq!(creds.crypto_key("hub123"), None);
     }
 
     // === MCP Token Tests ===

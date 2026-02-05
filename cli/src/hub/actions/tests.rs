@@ -36,34 +36,34 @@ fn test_hub() -> Hub {
 
 // === Connection URL Tests ===
 
-/// Create a test PreKeyBundleData for unit tests.
-fn create_test_prekey_bundle() -> crate::relay::PreKeyBundleData {
+/// Create a test DeviceKeyBundle for unit tests.
+fn create_test_device_key_bundle() -> crate::relay::DeviceKeyBundle {
     use base64::{engine::general_purpose::STANDARD, Engine};
 
-    crate::relay::PreKeyBundleData {
-        version: 4,
+    // Create properly sized base64 keys (32 bytes for Curve25519/Ed25519, 64 bytes for signature)
+    let curve25519_bytes = [0u8; 32];
+    let ed25519_bytes = [1u8; 32];
+    let one_time_bytes = [2u8; 32];
+    let signature_bytes = [3u8; 64];
+
+    crate::relay::DeviceKeyBundle {
+        version: 5,
         hub_id: "test-hub-123".to_string(),
-        registration_id: 12345,
-        device_id: 1,
-        identity_key: STANDARD.encode([1u8; 33]),
-        signed_prekey_id: 1,
-        signed_prekey: STANDARD.encode([2u8; 33]),
-        signed_prekey_signature: STANDARD.encode([3u8; 64]),
-        prekey_id: Some(1),
-        prekey: Some(STANDARD.encode([4u8; 33])),
-        kyber_prekey_id: 1,
-        kyber_prekey: STANDARD.encode([5u8; 1569]),
-        kyber_prekey_signature: STANDARD.encode([6u8; 64]),
+        curve25519_key: STANDARD.encode(curve25519_bytes),
+        ed25519_key: STANDARD.encode(ed25519_bytes),
+        one_time_key: STANDARD.encode(one_time_bytes),
+        key_id: "AAAAAA".to_string(),
+        signature: STANDARD.encode(signature_bytes),
     }
 }
 
-/// TEST: Copy connection URL generates URL fresh from Signal bundle.
+/// TEST: Copy connection URL generates URL fresh from device key bundle.
 #[test]
 fn test_copy_connection_url_generates_fresh_url() {
     let mut hub = test_hub();
 
-    // Set up a mock Signal bundle (required for URL generation)
-    hub.browser.signal_bundle = Some(create_test_prekey_bundle());
+    // Set up a mock device key bundle (required for URL generation)
+    hub.browser.device_key_bundle = Some(create_test_device_key_bundle());
 
     // Dispatch CopyConnectionUrl action - should not panic
     dispatch(&mut hub, HubAction::CopyConnectionUrl);
@@ -87,15 +87,15 @@ fn test_copy_connection_url_generates_fresh_url() {
     );
 }
 
-/// TEST: Copy connection URL fails gracefully when no Signal bundle is available.
+/// TEST: Copy connection URL fails gracefully when no device key bundle is available.
 #[test]
 fn test_copy_connection_url_no_bundle_no_panic() {
     let mut hub = test_hub();
 
-    // Verify no Signal bundle
+    // Verify no device key bundle
     assert!(
-        hub.browser.signal_bundle.is_none(),
-        "Should start with no Signal bundle"
+        hub.browser.device_key_bundle.is_none(),
+        "Should start with no device key bundle"
     );
 
     // This should not panic - error is logged but not propagated

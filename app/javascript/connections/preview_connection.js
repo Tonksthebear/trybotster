@@ -2,7 +2,7 @@
  * PreviewConnection - Typed wrapper for HTTP preview tunneling.
  *
  * Manages E2E encrypted HTTP proxying between browser and agent's dev server.
- * Uses the shared Signal session from IndexedDB (same as HubConnection).
+ * Uses the shared Olm session from IndexedDB (same as HubConnection).
  *
  * Events:
  *   - connected - Channel established
@@ -12,7 +12,7 @@
  *   - status - { server_running, port }
  *
  * Flow:
- *   1. Loads Signal session from IndexedDB (same session as HubConnection)
+ *   1. Loads Olm session from IndexedDB (same session as HubConnection)
  *   2. Subscribes to PreviewChannel
  *   3. Rails notifies CLI via Bot::Message when browser subscribes
  *   4. CLI creates HttpChannel, subscribes to its stream
