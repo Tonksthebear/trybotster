@@ -67,7 +67,6 @@ where
             }
             MenuAction::ShowConnectionCode => {
                 self.mode = AppMode::ConnectionCode;
-                self.qr_image_displayed = false;
                 // Request connection code via Lua protocol
                 self.send_msg(serde_json::json!({
                     "subscriptionId": "tui_hub",

@@ -3,7 +3,7 @@
  *
  * Architecture:
  * - Main thread (bridge.js) proxies all crypto operations
- * - Crypto Worker (signal_crypto.js) - SharedWorker handling Signal Protocol
+ * - Crypto Worker (matrix_crypto.js) - SharedWorker handling Matrix Olm/Megolm crypto
  * - Transport: WebRTCTransport in main thread (RTCPeerConnection not available in Workers)
  *
  * The main thread talks directly to crypto SharedWorker for encrypt/decrypt,
@@ -44,9 +44,9 @@ class WorkerBridge {
   /**
    * Initialize the workers (idempotent)
    * @param {Object} options
-   * @param {string} options.cryptoWorkerUrl - URL to the crypto SharedWorker (signal_crypto.js)
-   * @param {string} options.wasmJsUrl - URL to libsignal_wasm.js
-   * @param {string} options.wasmBinaryUrl - URL to libsignal_wasm_bg.wasm
+   * @param {string} options.cryptoWorkerUrl - URL to the crypto SharedWorker (matrix_crypto.js)
+   * @param {string} options.wasmJsUrl - URL to matrix-sdk-crypto-wasm JS
+   * @param {string} options.wasmBinaryUrl - URL to WASM binary (optional, Matrix SDK loads internally)
    */
   async init({ cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl }) {
     if (this.#initialized) return
@@ -59,7 +59,7 @@ class WorkerBridge {
   async #doInit({ cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl }) {
     try {
       // 1. Create crypto SharedWorker first and initialize WASM
-      this.#cryptoWorker = new SharedWorker(cryptoWorkerUrl, { type: "module", name: "signal-crypto" })
+      this.#cryptoWorker = new SharedWorker(cryptoWorkerUrl, { type: "module", name: "matrix-crypto" })
       this.#cryptoWorkerPort = this.#cryptoWorker.port
       this.#cryptoWorkerPort.onmessage = (e) => this.#handleCryptoMessage(e)
       this.#cryptoWorkerPort.start()
@@ -165,7 +165,7 @@ class WorkerBridge {
         return webrtcTransport.disconnect(params.hubId)
       case "subscribe": {
         // Encrypt the subscribe message so the browser's first message is a
-        // PreKeySignalMessage — establishes the Signal session on the CLI side.
+        // CryptoEnvelope - establishes the Matrix session on the CLI side.
         const subscribeMsg = {
           type: "subscribe",
           subscriptionId: params.subscriptionId,
@@ -228,9 +228,9 @@ class WorkerBridge {
   // ===========================================================================
 
   /**
-   * Create a new Signal session from a bundle
+   * Create a new Matrix session from a device key bundle
    * @param {string} hubId - The hub ID
-   * @param {Object|string} bundleJson - The session bundle
+   * @param {Object|string} bundleJson - The device key bundle (Matrix format)
    * @returns {Promise<{created: boolean, identityKey: string}>}
    */
   async createSession(hubId, bundleJson) {
@@ -259,7 +259,7 @@ class WorkerBridge {
    * Encrypt a message for a hub
    * @param {string} hubId - The hub ID
    * @param {string|Uint8Array|Object} message - The message to encrypt
-   * @returns {Promise<{envelope: string}>}
+   * @returns {Promise<{envelope: string}>} CryptoEnvelope as JSON string
    */
   async encrypt(hubId, message) {
     // Convert to string if needed (handles Uint8Array binary messages)
@@ -268,9 +268,9 @@ class WorkerBridge {
   }
 
   /**
-   * Decrypt an envelope from a hub
+   * Decrypt a CryptoEnvelope from a hub
    * @param {string} hubId - The hub ID
-   * @param {string|Object} envelope - The encrypted envelope
+   * @param {string|Object} envelope - The encrypted envelope { t, c, s, d }
    * @returns {Promise<{plaintext: any}>}
    */
   async decrypt(hubId, envelope) {
@@ -297,7 +297,7 @@ class WorkerBridge {
   }
 
   /**
-   * Process a sender key distribution message
+   * Process a sender key distribution message (for group sessions)
    * @param {string} hubId - The hub ID
    * @param {string} distributionB64 - The distribution message in base64
    * @returns {Promise<{processed: boolean}>}

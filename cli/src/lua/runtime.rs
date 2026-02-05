@@ -1442,10 +1442,10 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Fire the "connection_code_ready" event with URL and QR PNG.
+    /// Fire the "connection_code_ready" event with URL and QR ASCII art.
     ///
     /// Called by Hub when a connection URL is generated or regenerated.
-    /// Generates a QR code PNG and base64-encodes it for transport.
+    /// Generates ASCII art QR code lines for universal terminal display.
     ///
     /// # Arguments
     ///
@@ -1455,24 +1455,22 @@ impl LuaRuntime {
             return Ok(());
         }
 
-        // Generate QR PNG on the Hub side (shared by TUI and browser)
-        let qr_png_base64 = match crate::tui::generate_qr_png(url, 4) {
-            Ok(png_bytes) => {
-                use data_encoding::BASE64;
-                BASE64.encode(&png_bytes)
-            }
-            Err(e) => {
-                log::error!("Failed to generate QR PNG: {e}");
-                return Err(anyhow!("QR generation failed: {e}"));
-            }
-        };
+        // Generate ASCII QR (generous max size - clients will re-render if needed)
+        let qr_lines = crate::tui::generate_qr_code_lines(url, 200, 100);
 
         let url = url.to_string();
 
         self.fire_event("connection_code_ready", |lua| {
             let t = lua.create_table().map_err(|e| anyhow!("create_table: {e}"))?;
             t.set("url", url.clone()).map_err(|e| anyhow!("set url: {e}"))?;
-            t.set("qr_png", qr_png_base64.clone()).map_err(|e| anyhow!("set qr_png: {e}"))?;
+
+            // Convert Vec<String> to Lua array
+            let qr_array = lua.create_table().map_err(|e| anyhow!("create qr_array: {e}"))?;
+            for (i, line) in qr_lines.iter().enumerate() {
+                qr_array.set(i + 1, line.clone()).map_err(|e| anyhow!("set qr line: {e}"))?;
+            }
+            t.set("qr_ascii", qr_array).map_err(|e| anyhow!("set qr_ascii: {e}"))?;
+
             Ok(mlua::Value::Table(t))
         })
     }

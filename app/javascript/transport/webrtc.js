@@ -12,7 +12,7 @@
  *
  * Architecture:
  * - Main thread: WebRTCTransport (this) handles RTCPeerConnection, DataChannel
- * - SharedWorker: signal_crypto.js handles encryption/decryption
+ * - SharedWorker: matrix_crypto.js handles encryption/decryption
  * - Signaling: ActionCable push via HubSignalingChannel (encrypted envelopes)
  *   Rails is a dumb pipe — envelopes are opaque, only browser/CLI can decrypt.
  */
@@ -280,7 +280,7 @@ class WebRTCTransport {
 
     // Send subscribe message through data channel.
     // When an encrypted envelope is provided, the subscribe message is inside it
-    // as a PreKeySignalMessage — establishing the Signal session on the CLI side.
+    // as an Olm pre-key message — establishing the encrypted session on the CLI side.
     if (encryptedEnvelope) {
       conn.dataChannel.send(JSON.stringify(encryptedEnvelope))
     } else {
@@ -339,7 +339,7 @@ class WebRTCTransport {
   }
 
   /**
-   * Send a pre-encrypted Signal envelope directly through the DataChannel.
+   * Send a pre-encrypted crypto envelope directly through the DataChannel.
    * Used for browser → CLI communication where encryption happens in
    * Connection.#sendEncrypted via the bridge.
    */
@@ -609,10 +609,10 @@ class WebRTCTransport {
 
       const parsed = typeof textData === "string" ? JSON.parse(textData) : textData
 
-      // Check if this is a Signal envelope (encrypted message from CLI)
-      // Signal envelopes have short keys: t (type), c (ciphertext), s (sender)
+      // Check if this is a crypto envelope (encrypted message from CLI)
+      // Crypto envelopes have short keys: t (type), c (ciphertext), s (sender)
       // Control messages (subscribed, agent_list) may be plaintext during bootstrap
-      // before the Signal session is established via PreKeySignalMessage
+      // before the Olm session is established via pre-key message
       let msg = parsed
       if (parsed.t !== undefined && parsed.c && parsed.s) {
         msg = await this.#decryptEnvelope(hubId, parsed)
@@ -671,7 +671,7 @@ class WebRTCTransport {
   }
 
   /**
-   * Decrypt a Signal envelope and decompress the payload.
+   * Decrypt a crypto envelope and decompress the payload.
    * @returns {object|null} Decrypted message object, or null on failure
    */
   async #decryptEnvelope(hubId, envelope) {

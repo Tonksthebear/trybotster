@@ -1,24 +1,16 @@
 //! QR code generation for browser connection.
 //!
-//! This module provides QR code rendering optimized for terminal display.
-//! Supports two rendering modes:
-//!
-//! 1. **Kitty graphics protocol** - Renders QR as an inline PNG image.
-//!    Works in Ghostty, Kitty, and other modern terminals.
-//!
-//! 2. **Unicode half-block fallback** - Uses ▀▄█ characters for terminals
-//!    without graphics support. Requires larger terminal for Kyber keys.
+//! This module provides QR code rendering as ASCII art using Unicode
+//! half-block characters (▀▄█). Works in any terminal.
 //!
 //! Uses `qrcodegen` crate which properly supports alphanumeric mode encoding,
 //! allowing ~4296 chars capacity vs ~2953 in byte mode.
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-02
 
-use base64::Engine;
-use image::{GrayImage, ImageEncoder, Luma};
 use qrcodegen::{QrCode, QrCodeEcc, QrSegment};
 
-/// Connection code data containing URL and QR code PNG.
+/// Connection code data containing URL and QR code ASCII art.
 ///
 /// This struct is returned by the Hub when generating a connection code.
 /// Both TUI and Browser clients use this to display the shareable link
@@ -27,166 +19,8 @@ use qrcodegen::{QrCode, QrCodeEcc, QrSegment};
 pub struct ConnectionCodeData {
     /// The shareable URL containing the hub ID and encoded PreKeyBundle.
     pub url: String,
-    /// Raw PNG bytes of the QR code image.
-    pub qr_png: Vec<u8>,
-}
-
-/// Generate QR code as raw PNG bytes.
-///
-/// Creates a QR code image suitable for display in any context (terminal,
-/// browser, etc.). Uses optimal mixed-mode encoding for URLs with Base32
-/// fragments.
-///
-/// # Arguments
-///
-/// * `data` - The data to encode in the QR code
-/// * `module_size` - Pixels per QR module (4 recommended for good quality/size balance)
-///
-/// # Returns
-///
-/// Raw PNG bytes on success, or an error message if generation fails.
-///
-/// # Errors
-///
-/// Returns an error if the data is too long to encode in a QR code.
-pub fn generate_qr_png(data: &str, module_size: u8) -> Result<Vec<u8>, String> {
-    let code = generate_qr_code(data)
-        .ok_or_else(|| format!("Data too long for QR code ({} chars)", data.len()))?;
-
-    let size = code.size() as u32;
-    let quiet_zone = 2u32;
-    let total_modules = size + quiet_zone * 2;
-    let img_size = total_modules * module_size as u32;
-
-    // Create grayscale image (white background)
-    let mut img = GrayImage::from_pixel(img_size, img_size, Luma([255u8]));
-
-    // Draw QR modules
-    for y in 0..size {
-        for x in 0..size {
-            if code.get_module(x as i32, y as i32) {
-                // Draw black module
-                let px = (x + quiet_zone) * module_size as u32;
-                let py = (y + quiet_zone) * module_size as u32;
-                for dy in 0..module_size as u32 {
-                    for dx in 0..module_size as u32 {
-                        img.put_pixel(px + dx, py + dy, Luma([0u8]));
-                    }
-                }
-            }
-        }
-    }
-
-    // Encode as PNG
-    let mut png_bytes = Vec::new();
-    {
-        let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
-        encoder
-            .write_image(
-                img.as_raw(),
-                img_size,
-                img_size,
-                image::ExtendedColorType::L8,
-            )
-            .map_err(|e| format!("PNG encoding failed: {}", e))?;
-    }
-
-    Ok(png_bytes)
-}
-
-/// Build Kitty graphics protocol escape sequence from existing PNG bytes.
-///
-/// Takes pre-generated PNG bytes (e.g., from `generate_qr_png`) and creates the
-/// terminal escape sequence for displaying it via Kitty graphics protocol.
-///
-/// # Arguments
-///
-/// * `png_bytes` - Raw PNG image bytes
-/// * `max_cols` - Maximum terminal columns available for display
-/// * `max_rows` - Maximum terminal rows available for display
-///
-/// # Returns
-///
-/// Tuple of (escape_sequence, width_cells, height_cells) on success, or None if
-/// the PNG cannot be parsed or is too large.
-pub fn build_kitty_escape_from_png(
-    png_bytes: &[u8],
-    max_cols: u16,
-    max_rows: u16,
-) -> Option<(String, u16, u16)> {
-    // Decode PNG to get dimensions
-    let decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(png_bytes)).ok()?;
-    use image::ImageDecoder;
-    let (img_width, _img_height) = decoder.dimensions();
-
-    // Scale QR to fill available space while maintaining square aspect ratio.
-    // Terminal cells are ~2:1 (height:width), so for a square image:
-    // - display_rows determines the visual height
-    // - display_cols should be ~2x display_rows to appear square
-    //
-    // Use all available space - Kitty will scale the high-res PNG up.
-    let display_rows = max_rows;
-    let display_cols = max_cols.min(display_rows * 2);
-
-    if display_cols == 0 || display_rows == 0 {
-        return None;
-    }
-
-    // Build Kitty escape sequence
-    let b64_data = Engine::encode(&base64::engine::general_purpose::STANDARD, png_bytes);
-    let escape_sequence = build_kitty_escape_sequence(&b64_data, img_width, display_cols, display_rows);
-
-    Some((escape_sequence, display_cols, display_rows))
-}
-
-/// Escape sequence to delete all Kitty graphics images.
-/// Call this when closing the QR modal to clean up.
-pub fn kitty_delete_images() -> &'static str {
-    "\x1b_Ga=d\x1b\\"
-}
-
-/// Build Kitty graphics protocol escape sequence, handling chunking for large images.
-///
-/// - `img_size_px`: actual image dimensions in pixels (square)
-/// - `display_cols`: number of terminal columns to display image in
-/// - `display_rows`: number of terminal rows to display image in
-fn build_kitty_escape_sequence(
-    b64_data: &str,
-    img_size_px: u32,
-    display_cols: u16,
-    display_rows: u16,
-) -> String {
-    const CHUNK_SIZE: usize = 4096;
-    let mut result = String::new();
-    let chunks: Vec<&str> = b64_data
-        .as_bytes()
-        .chunks(CHUNK_SIZE)
-        .map(|c| std::str::from_utf8(c).unwrap_or(""))
-        .collect();
-
-    for (i, chunk) in chunks.iter().enumerate() {
-        let is_first = i == 0;
-        let is_last = i == chunks.len() - 1;
-        let more = if is_last { 0 } else { 1 };
-
-        if is_first {
-            // First chunk includes image parameters
-            // a=T: transmit and display
-            // f=100: PNG format
-            // s,v: source image size in pixels
-            // c,r: display size in terminal cells (columns, rows)
-            // m=1: more chunks coming (0 if last)
-            result.push_str(&format!(
-                "\x1b_Ga=T,f=100,s={},v={},c={},r={},m={};{}\x1b\\",
-                img_size_px, img_size_px, display_cols, display_rows, more, chunk
-            ));
-        } else {
-            // Continuation chunks
-            result.push_str(&format!("\x1b_Gm={};{}\x1b\\", more, chunk));
-        }
-    }
-
-    result
+    /// ASCII art lines of the QR code using Unicode half-blocks.
+    pub qr_ascii: Vec<String>,
 }
 
 /// Generate QR code from data using optimal encoding.

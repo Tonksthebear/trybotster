@@ -31,7 +31,7 @@ pub use types::{CreateAgentRequest, DeleteAgentRequest};
 pub enum ClientId {
     /// The local TUI client.
     Tui,
-    /// A browser client, identified by Signal identity key.
+    /// A browser client, identified by crypto identity key.
     Browser(String),
     /// Internal operations (Lua scripts, background tasks).
     ///
@@ -41,7 +41,7 @@ pub enum ClientId {
 }
 
 impl ClientId {
-    /// Create a browser client ID from a Signal identity key.
+    /// Create a browser client ID from a crypto identity key.
     pub fn browser(identity: impl Into<String>) -> Self {
         ClientId::Browser(identity.into())
     }

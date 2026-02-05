@@ -1,15 +1,15 @@
 //! ActionCable channel implementation.
 //!
 //! This module provides `ActionCableChannel`, an implementation of the `Channel`
-//! trait that communicates via Rails ActionCable WebSocket with optional Signal
-//! Protocol encryption and optional reliable delivery.
+//! trait that communicates via Rails ActionCable WebSocket with optional E2E
+//! encryption and optional reliable delivery.
 //!
 //! # Architecture
 //!
 //! ```text
 //! ActionCableChannel
 //!     ├── WebSocket connection (tokio-tungstenite)
-//!     ├── Signal encryption (optional, via CryptoServiceHandle)
+//!     ├── E2E encryption (optional, via CryptoServiceHandle)
 //!     ├── Reliable delivery (optional, per-peer seq/ack/retransmit)
 //!     ├── Gzip compression (optional, via compression module)
 //!     └── Reconnection (exponential backoff)
@@ -41,7 +41,7 @@ use tokio_tungstenite::{
 };
 
 use crate::relay::crypto_service::CryptoServiceHandle;
-use crate::relay::signal::SignalEnvelope;
+use crate::relay::matrix_crypto::CryptoEnvelope;
 
 use super::compression::{maybe_compress, maybe_decompress};
 use super::reliable::{ReliableMessage, ReliableSession};
@@ -205,7 +205,7 @@ struct RawIncoming {
     sender: PeerId,
 }
 
-/// ActionCable channel with optional Signal Protocol encryption and reliable delivery.
+/// ActionCable channel with optional E2E encryption and reliable delivery.
 pub struct ActionCableChannel {
     /// Channel configuration (set on connect).
     config: Option<ChannelConfig>,
@@ -985,7 +985,7 @@ impl ActionCableChannel {
             let Some(envelope_json) = message.get("envelope") else {
                 return Vec::new();
             };
-            let envelope: SignalEnvelope = match envelope_json {
+            let envelope: CryptoEnvelope = match envelope_json {
                 serde_json::Value::String(s) => match serde_json::from_str(s) {
                     Ok(e) => e,
                     Err(_) => return Vec::new(),
@@ -996,7 +996,7 @@ impl ActionCableChannel {
                 },
             };
 
-            let sender = PeerId(envelope.sender_identity.clone());
+            let sender = PeerId(envelope.sender_key.clone());
 
             // Track peer
             {
@@ -1156,7 +1156,7 @@ impl ActionCableChannel {
                     }
 
                     // Log peer reset but do NOT reset our sender.
-                    // Resetting sender would cause Signal counter desync because our
+                    // Resetting sender would cause crypto counter desync because our
                     // sender would use seq numbers (and thus ratchet forward) with
                     // counters the peer has already seen.
                     if reset_occurred {

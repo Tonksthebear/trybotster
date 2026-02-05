@@ -675,13 +675,14 @@ mod tests {
         let json = serde_json::json!({
             "type": "signal",
             "browser_identity": "abc123key:tab42",
-            "envelope": { "t": 3, "c": "encrypted_blob", "s": "sender_key", "d": 1 }
+            "envelope": { "t": 3, "c": "encrypted_blob", "s": "sender_key", "d": "browser-1" }
         });
 
         let msg: SignalMessage = serde_json::from_value(json).expect("valid SignalMessage");
         assert_eq!(msg.browser_identity, "abc123key:tab42");
         assert_eq!(msg.envelope["t"], 3);
         assert_eq!(msg.envelope["c"], "encrypted_blob");
+        assert_eq!(msg.envelope["d"], "browser-1");
     }
 
     #[test]

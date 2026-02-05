@@ -6,7 +6,7 @@ require_relative "concerns/health_status"
 #
 # Thin relay for encrypted WebRTC signaling between browser and CLI.
 # Rails is a dumb pipe — it never inspects envelope contents.
-# Only the endpoints (browser/CLI) can decrypt after Signal Protocol handshake.
+# Only the endpoints (browser/CLI) can decrypt after Olm session handshake.
 #
 # Streams:
 # - hub:{hub_id}:signal:{browser_identity} — scoped signals from CLI (opaque envelopes)

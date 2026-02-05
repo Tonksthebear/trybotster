@@ -1,3 +1,4 @@
 web: bin/rails server -b 0.0.0.0 -p ${PORT:-3000}
 css: bin/rails tailwindcss:watch
 jobs: bin/jobs
+turn: turnserver -n --log-file=stdout --lt-cred-mech --use-auth-secret --static-auth-secret=${TURN_SECRET} --realm=turn-dev.trybotster.com --listening-port=3478 --listening-ip=0.0.0.0 --min-port=49152 --max-port=49200

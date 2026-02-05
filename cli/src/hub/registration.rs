@@ -7,14 +7,14 @@
 //!
 //! - Device identity registration (E2E encryption keypairs)
 //! - Hub registration for message routing
-//! - Signal Protocol initialization for E2E encryption (lazy bundle generation)
+//! - Matrix crypto initialization for E2E encryption (lazy bundle generation)
 //!
 //! # Lazy Bundle Generation
 //!
-//! To avoid blocking boot for up to 10 seconds, Signal Protocol bundle generation
-//! is deferred until the connection URL is first requested. The flow is:
+//! To avoid blocking boot, device key bundle generation is deferred until the
+//! connection URL is first requested. The flow is:
 //!
-//! 1. `init_signal_protocol()` - starts CryptoService only (fast)
+//! 1. `init_crypto_service()` - starts CryptoService only (fast)
 //! 2. `get_or_generate_connection_bundle()` - generates bundle on first request
 //! 3. `write_connection_url_lazy()` - generates bundle + writes URL to disk
 //!
@@ -126,11 +126,11 @@ pub fn register_hub_with_server(
     local_identifier.to_string()
 }
 
-/// Initialize Signal Protocol CryptoService for E2E encryption.
+/// Initialize CryptoService for E2E encryption.
 ///
-/// This starts the CryptoService only. PreKeyBundle generation is deferred until
+/// This starts the CryptoService only. DeviceKeyBundle generation is deferred until
 /// the connection URL is first requested (lazy initialization). This avoids
-/// blocking boot for up to 10 seconds on bundle generation.
+/// blocking boot on bundle generation.
 ///
 /// Browser command handling is done directly via WebRTC in server_comms.rs.
 /// Hub-level events are handled by HubCommandChannel.
@@ -140,8 +140,8 @@ pub fn register_hub_with_server(
 /// After calling this, use `get_or_generate_connection_bundle()` to lazily
 /// generate the bundle when the TUI displays the QR code or external automation
 /// requests the connection URL.
-pub fn init_signal_protocol(browser: &mut BrowserState, local_identifier: &str) {
-    // Start CryptoService - runs Signal Protocol in its own LocalSet thread
+pub fn init_crypto_service(browser: &mut BrowserState, local_identifier: &str) {
+    // Start CryptoService - runs Matrix crypto in its own LocalSet thread
     // The handle is Send + Clone and can be used from any thread
     let crypto_service = match CryptoService::start(local_identifier) {
         Ok(handle) => handle,
@@ -157,9 +157,11 @@ pub fn init_signal_protocol(browser: &mut BrowserState, local_identifier: &str) 
     // Mark relay as ready to connect (bundle generated lazily on first request)
     browser.relay_connected = true;
     log::info!("CryptoService started - bundle will be generated on first request");
+
 }
 
-/// Generate the PreKeyBundle lazily on first request.
+
+/// Generate the DeviceKeyBundle lazily on first request.
 ///
 /// This is called when the connection URL is first needed (TUI QR display,
 /// external automation, etc.). The bundle is cached in `BrowserState` for
@@ -167,7 +169,7 @@ pub fn init_signal_protocol(browser: &mut BrowserState, local_identifier: &str) 
 ///
 /// # Returns
 ///
-/// The generated `PreKeyBundleData`, or an error if generation fails.
+/// The generated `DeviceKeyBundle`, or an error if generation fails.
 ///
 /// # Errors
 ///
@@ -177,9 +179,9 @@ pub fn init_signal_protocol(browser: &mut BrowserState, local_identifier: &str) 
 pub fn get_or_generate_connection_bundle(
     browser: &mut BrowserState,
     runtime: &tokio::runtime::Runtime,
-) -> Result<crate::relay::PreKeyBundleData, String> {
+) -> Result<crate::relay::DeviceKeyBundle, String> {
     // Return cached bundle if available and not used
-    if let Some(ref bundle) = browser.signal_bundle {
+    if let Some(ref bundle) = browser.device_key_bundle {
         if !browser.bundle_used {
             return Ok(bundle.clone());
         }
@@ -195,20 +197,19 @@ pub fn get_or_generate_connection_bundle(
 
     // Generate bundle (blocking call via runtime)
     let bundle = runtime.block_on(async {
-        let next_id = crypto_service.next_prekey_id().await.unwrap_or(1);
         crypto_service
-            .get_prekey_bundle(next_id)
+            .get_device_key_bundle()
             .await
-            .map_err(|e| format!("Failed to generate PreKeyBundle: {e}"))
+            .map_err(|e| format!("Failed to generate DeviceKeyBundle: {e}"))
     })?;
 
     log::info!(
-        "Signal Protocol bundle generated: identity={:.8}...",
-        bundle.identity_key
+        "Matrix crypto bundle generated: curve25519={:.8}...",
+        bundle.curve25519_key
     );
 
     // Cache the bundle
-    browser.signal_bundle = Some(bundle.clone());
+    browser.device_key_bundle = Some(bundle.clone());
     browser.bundle_used = false;
 
     Ok(bundle)
@@ -311,21 +312,21 @@ mod tests {
     }
 
     #[test]
-    fn test_init_signal_protocol_only_starts_crypto_service() {
-        // Verify that init_signal_protocol doesn't block or generate bundle
+    fn test_init_crypto_service_only_starts_crypto_service() {
+        // Verify that init_crypto_service doesn't block or generate bundle
         let mut browser = BrowserState::default();
 
         // Before init: no crypto service
         assert!(browser.crypto_service.is_none());
-        assert!(browser.signal_bundle.is_none());
+        assert!(browser.device_key_bundle.is_none());
         assert!(!browser.relay_connected);
 
         // Init should start crypto service but NOT generate bundle
-        init_signal_protocol(&mut browser, "test-hub-id");
+        init_crypto_service(&mut browser, "test-hub-id");
 
         // After init: crypto service started, but no bundle yet
         assert!(browser.crypto_service.is_some(), "CryptoService should be started");
-        assert!(browser.signal_bundle.is_none(), "Bundle should NOT be generated at init");
+        assert!(browser.device_key_bundle.is_none(), "Bundle should NOT be generated at init");
         assert!(browser.relay_connected, "relay_connected should be true after init");
     }
 
@@ -336,7 +337,7 @@ mod tests {
 
         // Create a browser state with crypto service
         let mut browser = BrowserState::default();
-        init_signal_protocol(&mut browser, &hub_id);
+        init_crypto_service(&mut browser, &hub_id);
 
         // Create runtime for bundle generation
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -344,16 +345,16 @@ mod tests {
         // First call should generate bundle
         let result1 = get_or_generate_connection_bundle(&mut browser, &runtime);
         assert!(result1.is_ok(), "First bundle generation should succeed");
-        assert!(browser.signal_bundle.is_some(), "Bundle should be cached");
+        assert!(browser.device_key_bundle.is_some(), "Bundle should be cached");
         assert!(!browser.bundle_used, "Bundle should not be marked as used");
 
-        // Get the identity key from first bundle
-        let identity1 = result1.unwrap().identity_key;
+        // Get the curve25519 key from first bundle (identity key equivalent)
+        let curve25519_1 = result1.unwrap().curve25519_key;
 
         // Second call should return cached bundle (same identity)
         let result2 = get_or_generate_connection_bundle(&mut browser, &runtime);
         assert!(result2.is_ok());
-        assert_eq!(result2.unwrap().identity_key, identity1, "Should return cached bundle");
+        assert_eq!(result2.unwrap().curve25519_key, curve25519_1, "Should return cached bundle");
     }
 
     #[test]
@@ -362,7 +363,7 @@ mod tests {
         let hub_id = format!("test-regen-bundle-{}", uuid::Uuid::new_v4());
 
         let mut browser = BrowserState::default();
-        init_signal_protocol(&mut browser, &hub_id);
+        init_crypto_service(&mut browser, &hub_id);
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
 
@@ -382,11 +383,10 @@ mod tests {
         // bundle_used should be reset after regeneration
         assert!(!browser.bundle_used, "bundle_used should be reset after regeneration");
 
-        // Both bundles should have the same identity key (same crypto service)
-        assert_eq!(bundle1.identity_key, bundle2.identity_key, "Identity key should remain same");
+        // Both bundles should have the same curve25519 key (same crypto service)
+        assert_eq!(bundle1.curve25519_key, bundle2.curve25519_key, "Curve25519 key should remain same");
 
-        // Both bundles should have valid prekeys
-        assert!(bundle2.prekey_id.is_some(), "Regenerated bundle should have a prekey");
-        assert!(bundle2.prekey.is_some(), "Regenerated bundle should have a prekey public key");
+        // Both bundles should have valid one-time keys
+        assert!(!bundle2.one_time_key.is_empty(), "Regenerated bundle should have a one-time key");
     }
 }

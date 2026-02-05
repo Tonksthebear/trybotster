@@ -50,7 +50,7 @@ use super::agent_handle::AgentHandle;
 ///
 /// - **Agent PTY handles**: Updated on agent create/delete via `sync_handle_cache()`
 /// - **Worktrees**: Updated when Hub loads worktrees (menu open, agent lifecycle)
-/// - **Connection URL**: Updated when Hub generates/refreshes the Signal bundle
+/// - **Connection URL**: Updated when Hub generates/refreshes the device key bundle
 #[derive(Debug, Default)]
 pub struct HandleCache {
     /// Agent handles indexed by display order.
@@ -64,7 +64,7 @@ pub struct HandleCache {
 
     /// Cached connection URL for browser pairing.
     ///
-    /// Hub updates this whenever the Signal bundle changes (initialization,
+    /// Hub updates this whenever the device key bundle changes (initialization,
     /// refresh, or ShowConnectionCode action).
     connection_url: RwLock<Option<Result<String, String>>>,
 }
@@ -216,7 +216,7 @@ impl HandleCache {
 
     /// Update the cached connection URL.
     ///
-    /// Called by Hub when the Signal bundle changes (initialization, refresh,
+    /// Called by Hub when the device key bundle changes (initialization, refresh,
     /// or ShowConnectionCode action).
     pub fn set_connection_url(&self, result: Result<String, String>) {
         if let Ok(mut url) = self.connection_url.write() {

@@ -62,15 +62,8 @@ where
 
             TuiAction::CloseModal => {
                 // Delete Kitty graphics images if closing ConnectionCode modal
-                if self.mode == AppMode::ConnectionCode {
-                    use crate::tui::qr::kitty_delete_images;
-                    use std::io::Write;
-                    let _ = std::io::stdout().write_all(kitty_delete_images().as_bytes());
-                    let _ = std::io::stdout().flush();
-                }
                 self.mode = AppMode::Normal;
                 self.input_buffer.clear();
-                self.qr_image_displayed = false;
             }
 
             // === Menu Navigation ===
@@ -124,7 +117,6 @@ where
             // === Connection Code ===
             TuiAction::ShowConnectionCode => {
                 self.mode = AppMode::ConnectionCode;
-                self.qr_image_displayed = false;
                 // Request connection code via Lua protocol
                 self.send_msg(serde_json::json!({
                     "subscriptionId": "tui_hub",
@@ -142,7 +134,6 @@ where
                 }));
                 // Clear cache and request fresh code
                 self.connection_code = None;
-                self.qr_image_displayed = false;
                 self.send_msg(serde_json::json!({
                     "subscriptionId": "tui_hub",
                     "data": { "type": "get_connection_code" }
@@ -374,25 +365,20 @@ where
             }
             "connection_code" => {
                 let url = msg.get("url").and_then(|v| v.as_str());
-                let qr_b64 = msg.get("qr_png").and_then(|v| v.as_str());
+                let qr_ascii = msg.get("qr_ascii").and_then(|v| v.as_array());
 
-                if let (Some(url), Some(qr_b64)) = (url, qr_b64) {
-                    use data_encoding::BASE64;
-                    match BASE64.decode(qr_b64.as_bytes()) {
-                        Ok(qr_png) => {
-                            self.connection_code = Some(crate::tui::ConnectionCodeData {
-                                url: url.to_string(),
-                                qr_png,
-                            });
-                            self.qr_image_displayed = false;
-                        }
-                        Err(e) => {
-                            log::error!("Failed to decode QR PNG: {}", e);
-                            self.connection_code = None;
-                        }
-                    }
+                if let (Some(url), Some(qr_array)) = (url, qr_ascii) {
+                    let qr_lines: Vec<String> = qr_array
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+
+                    self.connection_code = Some(crate::tui::ConnectionCodeData {
+                        url: url.to_string(),
+                        qr_ascii: qr_lines,
+                    });
                 } else {
-                    log::warn!("connection_code message missing url or qr_png");
+                    log::warn!("connection_code message missing url or qr_ascii");
                     self.connection_code = None;
                 }
             }

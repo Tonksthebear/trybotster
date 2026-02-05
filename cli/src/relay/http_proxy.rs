@@ -14,7 +14,7 @@
 //!
 //! # Security
 //!
-//! - All traffic is E2E encrypted (Signal Protocol)
+//! - All traffic is E2E encrypted
 //! - Rails server cannot inspect HTTP content
 //! - Only proxies to localhost (agent's own server)
 

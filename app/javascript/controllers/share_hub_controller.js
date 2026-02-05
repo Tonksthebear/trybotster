@@ -54,16 +54,19 @@ export default class extends Controller {
   }
 
   handleConnectionCode(message) {
-    const { url, qr_png } = message
+    const { url, qr_ascii } = message
 
-    if (!url || !qr_png) {
+    if (!url || !qr_ascii) {
       this.showError("Invalid response from hub")
       return
     }
 
-    // Set QR code image
+    // Set QR code ASCII art
     const qrCode = this.find("[data-share-qr]")
-    if (qrCode) qrCode.src = `data:image/png;base64,${qr_png}`
+    if (qrCode) {
+      // Join array of lines into single string
+      qrCode.textContent = Array.isArray(qr_ascii) ? qr_ascii.join("\n") : qr_ascii
+    }
 
     // Set URL
     const urlInput = this.find("[data-share-url]")

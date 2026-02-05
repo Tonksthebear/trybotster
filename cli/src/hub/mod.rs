@@ -404,13 +404,13 @@ impl Hub {
 
     /// Perform all initial setup steps.
     ///
-    /// Note: Signal Protocol bundle generation is deferred until the connection
+    /// Note: DeviceKeyBundle generation is deferred until the connection
     /// URL is first requested (TUI QR display, external automation, etc.).
-    /// This avoids blocking boot for up to 10 seconds on bundle generation.
+    /// This avoids blocking boot on bundle generation.
     pub fn setup(&mut self) {
         self.register_device();
         self.register_hub_with_server();
-        self.init_signal_protocol();
+        self.init_crypto_service();
 
         // Start background workers for non-blocking network I/O
         // Must be called after register_hub_with_server() sets botster_id
@@ -553,7 +553,7 @@ impl Hub {
         // Shutdown background workers (allows pending notifications to drain)
         self.shutdown_background_workers();
 
-        // Shutdown CryptoService (persists Signal session state to disk)
+        // Shutdown CryptoService (persists crypto session state to disk)
         if let Some(ref cs) = self.browser.crypto_service {
             let _guard = self.tokio_runtime.enter();
             if let Err(e) = self.tokio_runtime.block_on(cs.shutdown()) {

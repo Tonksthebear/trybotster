@@ -1,7 +1,7 @@
 //! Data types for the terminal relay protocol.
 //!
 //! This module defines the message and event types used for communication
-//! between the CLI and browser via Signal Protocol E2E encryption.
+//! between the CLI and browser via E2E encryption (Matrix Olm/Megolm).
 //!
 //! # Message Types
 //!
@@ -10,8 +10,8 @@
 //!
 //! # Transport
 //!
-//! Messages are sent as JSON over ActionCable WebSocket. E2E encryption is
-//! handled by Signal Protocol (X3DH + Double Ratchet).
+//! Messages are sent as JSON over WebRTC DataChannel. E2E encryption is
+//! handled by Matrix Olm (1:1 sessions) and Megolm (group sessions).
 
 // Rust guideline compliant 2025-01
 
@@ -79,15 +79,15 @@ pub enum TerminalMessage {
     },
     /// Connection code for sharing hub access.
     ///
-    /// Contains the shareable URL (with PreKeyBundle in fragment) and a
-    /// QR code PNG for easy scanning. Server never sees the bundle -
+    /// Contains the shareable URL (with PreKeyBundle in fragment) and
+    /// ASCII art QR code for display. Server never sees the bundle -
     /// it stays in the `#...` URL fragment.
     #[serde(rename = "connection_code")]
     ConnectionCode {
         /// Shareable URL with PreKeyBundle in fragment.
         url: String,
-        /// Base64-encoded QR code PNG image.
-        qr_png: String,
+        /// ASCII art QR code lines using Unicode half-blocks.
+        qr_ascii: Vec<String>,
     },
     /// HTTP response for preview proxy (CLI -> browser).
     ///

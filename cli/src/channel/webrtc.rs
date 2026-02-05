@@ -1,7 +1,7 @@
 //! WebRTC DataChannel implementation.
 //!
 //! This module provides `WebRtcChannel`, an implementation of the `Channel`
-//! trait that communicates via WebRTC DataChannel with Signal Protocol encryption.
+//! trait that communicates via WebRTC DataChannel with E2E encryption.
 //!
 //! # Architecture
 //!
@@ -9,7 +9,7 @@
 //! WebRtcChannel
 //!     |-- RTCPeerConnection (webrtc-rs)
 //!     |-- RTCDataChannel (SCTP - reliable ordered)
-//!     |-- Signal encryption (via CryptoServiceHandle)
+//!     |-- E2E encryption (via CryptoServiceHandle)
 //!     |-- Gzip compression (via compression module)
 //!     `-- Signaling via ActionCable (encrypted envelopes)
 //! ```
@@ -18,7 +18,7 @@
 //!
 //! - No custom reliable delivery needed (SCTP provides it natively)
 //! - Peer-to-peer when possible, TURN relay as fallback
-//! - Signaling (offer/answer/ICE) via ActionCable, encrypted with Signal Protocol
+//! - Signaling (offer/answer/ICE) via ActionCable, E2E encrypted
 //!
 //! Rust guideline compliant 2025-01
 
@@ -42,7 +42,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::relay::crypto_service::CryptoServiceHandle;
-use crate::relay::signal::SignalEnvelope;
+use crate::relay::matrix_crypto::CryptoEnvelope;
 
 use super::compression::{maybe_compress, maybe_decompress};
 use super::{
@@ -67,7 +67,7 @@ pub enum OutgoingSignal {
     Ice {
         /// Target browser identity (`identityKey:tabId`).
         browser_identity: String,
-        /// Encrypted Signal Protocol envelope (opaque to Rails).
+        /// E2E encrypted envelope (opaque to Rails).
         envelope: serde_json::Value,
     },
 }
@@ -436,7 +436,7 @@ impl WebRtcChannel {
                         // Try to decrypt if we have a crypto service and it looks like an envelope
                         // Control messages (subscribe/unsubscribe) may be plaintext
                         let decrypted = if let Some(ref cs) = crypto_service {
-                            match serde_json::from_slice::<SignalEnvelope>(&data) {
+                            match serde_json::from_slice::<CryptoEnvelope>(&data) {
                                 Ok(envelope) => match cs.decrypt(&envelope).await {
                                     Ok(plaintext) => {
                                         decrypt_failures.store(0, Ordering::Relaxed);
@@ -449,7 +449,7 @@ impl WebRtcChannel {
                                     }
                                 },
                                 Err(_) => {
-                                    // Not a Signal envelope - treat as plaintext control message
+                                    // Not a crypto envelope - treat as plaintext control message
                                     data
                                 }
                             }
@@ -525,7 +525,7 @@ impl WebRtcChannel {
                     "candidate": candidate_json,
                 });
 
-                // Encrypt with Signal Protocol if crypto service available
+                // Encrypt with E2E encryption if crypto service available
                 let envelope = if let Some(ref cs) = crypto {
                     // Extract identity key from browser_identity ("identityKey:tabId")
                     let identity_key = browser_id.split(':').next().unwrap_or(&browser_id);
@@ -666,9 +666,9 @@ impl Channel for WebRtcChannel {
 
         // Encrypt if we have a crypto service.
         // Browser identity format is "identityKey:tabId" — extract identity key
-        // for Signal encryption (sessions are keyed by identity key only).
+        // for encryption (sessions are keyed by identity key only).
         //
-        // Base64 encode compressed bytes before encryption because the Signal WASM
+        // Base64 encode compressed bytes before encryption because the crypto WASM
         // library expects UTF-8 strings. Gzip-compressed data contains invalid UTF-8.
         let to_send = if let Some(ref cs) = self.crypto_service {
             let identity_key = peer.as_ref().split(':').next().unwrap_or(peer.as_ref());
@@ -753,7 +753,7 @@ impl WebRtcChannel {
     /// Send a plaintext message through the DataChannel, bypassing encryption.
     ///
     /// Used for session recovery: when encryption is broken, we need to notify
-    /// the browser without going through the (broken) Signal session.
+    /// the browser without going through the (broken) crypto session.
     pub async fn send_plaintext(&self, msg: &[u8]) -> Result<(), ChannelError> {
         let dc_guard = self.data_channel.lock().await;
         let dc = dc_guard

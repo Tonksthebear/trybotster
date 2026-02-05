@@ -33,13 +33,11 @@
 
       <%# Success state %>
       <div data-share-content class="hidden space-y-5">
-        <%# QR Code %>
+        <%# QR Code (ASCII art) %>
         <div class="flex justify-center">
-          <div class="p-4 bg-white rounded-lg">
-            <img data-share-qr
-                 alt="Connection QR Code"
-                 class="size-64">
-          </div>
+          <pre data-share-qr
+               class="font-mono text-xs whitespace-pre leading-none tracking-tighter bg-white text-black p-3 rounded-lg select-none inline-block origin-center"
+               style="transform: scale(0.5) scaleY(1.1);"></pre>
         </div>
 
         <%# URL with copy button %>

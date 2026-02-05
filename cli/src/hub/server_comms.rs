@@ -4,7 +4,7 @@
 //!
 //! - WebSocket command channel for real-time message delivery
 //! - Heartbeat sending via command channel
-//! - WebRTC signaling via ActionCable (encrypted with Signal Protocol)
+//! - WebRTC signaling via ActionCable (E2E encrypted with Matrix Olm)
 //! - Agent notification delivery via background worker
 //! - Device and hub registration
 //!
@@ -32,8 +32,8 @@ impl Hub {
     /// the WebSocket command channel and background notification worker.
     pub fn tick(&mut self) {
         self.poll_command_channel();
-        self.poll_signal_channel();
-        self.poll_outgoing_signals();
+        self.poll_webrtc_signaling();
+        self.poll_outgoing_webrtc_signals();
         self.poll_webrtc_channels();
         self.poll_webrtc_pty_output();
         self.poll_tui_requests();
@@ -371,7 +371,7 @@ impl Hub {
                     let msg = serde_json::json!({
                         "type": "session_invalid",
                         "reason": "decryption_failed",
-                        "message": "Signal session out of sync. Please re-pair.",
+                        "message": "Crypto session out of sync. Please re-pair.",
                     });
                     if let Ok(payload) = serde_json::to_vec(&msg) {
                         let _guard = self.tokio_runtime.enter();
@@ -390,7 +390,7 @@ impl Hub {
     /// on_message callback which routes to the appropriate handler (subscribe,
     /// unsubscribe, terminal data, hub commands, etc.).
     ///
-    /// Note: Signal envelope decryption happens inside WebRtcChannel.try_recv(),
+    /// Note: Crypto envelope decryption happens inside WebRtcChannel.try_recv(),
     /// so we receive plaintext JSON here.
     fn handle_webrtc_message(&mut self, browser_identity: &str, payload: &[u8]) {
         let msg: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(payload) {
@@ -1069,7 +1069,7 @@ impl Hub {
             }
         };
 
-        // Send via WebRTC DataChannel with Signal Protocol E2E encryption
+        // Send via WebRTC DataChannel with E2E encryption
         let peer = crate::channel::PeerId(browser_identity.to_string());
         let _guard = self.tokio_runtime.enter();
         if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&payload, &peer)) {
@@ -1141,17 +1141,16 @@ impl Hub {
         }
     }
 
-    // === WebRTC Signaling (ActionCable + Signal Protocol) ===
+    // === WebRTC Signaling (ActionCable + E2E Encryption) ===
 
-    /// Poll command channel for incoming encrypted signal envelopes (non-blocking).
+    /// Poll for incoming WebRTC signaling messages (non-blocking).
     ///
-    /// Signals arrive via ActionCable (`HubSignalingChannel` -> `HubCommandChannel`
-    /// relay). Each envelope is encrypted with Signal Protocol -- Rails never sees
-    /// the plaintext. After decryption, routes by `type` field:
+    /// WebRTC signals (offers/answers/ICE) arrive via ActionCable, E2E encrypted.
+    /// Rails never sees plaintext. After decryption, routes by `type` field:
     /// - `"offer"` -> create peer connection + encrypted answer
     /// - `"ice"` -> add ICE candidate to existing peer connection
-    fn poll_signal_channel(&mut self) {
-        use crate::relay::signal::SignalEnvelope;
+    fn poll_webrtc_signaling(&mut self) {
+        use crate::relay::matrix_crypto::CryptoEnvelope;
 
         let signals: Vec<command_channel::SignalMessage> = {
             let Some(ref mut channel) = self.command_channel else {
@@ -1168,56 +1167,96 @@ impl Hub {
             return;
         }
 
+        log::info!(
+            "[WebRTC-Signal] Processing {} incoming signal(s)",
+            signals.len()
+        );
+
         let crypto = match self.browser.crypto_service.clone() {
             Some(cs) => cs,
             None => {
-                log::warn!("[Signal] No crypto service -- cannot decrypt signal envelopes");
+                log::warn!("[WebRTC-Signal] No crypto service -- cannot decrypt signal envelopes");
                 return;
             }
         };
 
         let _guard = self.tokio_runtime.enter();
 
-        for signal in signals {
-            // Deserialize envelope to SignalEnvelope for decryption
-            let envelope: SignalEnvelope = match serde_json::from_value(signal.envelope.clone()) {
+        for signal in &signals {
+            log::info!(
+                "[WebRTC-Signal] Processing signal from browser={}, envelope keys: {:?}",
+                &signal.browser_identity[..signal.browser_identity.len().min(16)],
+                signal.envelope.as_object().map(|o| o.keys().collect::<Vec<_>>())
+            );
+
+            // Deserialize envelope to CryptoEnvelope for decryption
+            let envelope: CryptoEnvelope = match serde_json::from_value(signal.envelope.clone()) {
                 Ok(e) => e,
                 Err(e) => {
-                    log::warn!("[Signal] Failed to parse signal envelope: {e}");
+                    log::warn!(
+                        "[WebRTC-Signal] Failed to parse signal envelope: {e}. Raw: {}",
+                        serde_json::to_string(&signal.envelope).unwrap_or_default()
+                    );
                     continue;
                 }
             };
+
+            log::info!(
+                "[WebRTC-Signal] Envelope parsed: t={}, d={}, s_len={}",
+                envelope.message_type,
+                envelope.device_id,
+                envelope.sender_key.len()
+            );
 
             // Decrypt the envelope
             let plaintext = match self.tokio_runtime.block_on(crypto.decrypt(&envelope)) {
                 Ok(pt) => pt,
                 Err(e) => {
                     log::error!(
-                        "[Signal] Failed to decrypt signal from {}: {e}",
+                        "[WebRTC-Signal] Failed to decrypt signal from {}: {e}",
                         &signal.browser_identity[..signal.browser_identity.len().min(8)]
                     );
                     continue;
                 }
             };
 
+            log::info!(
+                "[WebRTC-Signal] Decrypted {} bytes: {:?}",
+                plaintext.len(),
+                String::from_utf8_lossy(&plaintext[..plaintext.len().min(500)])
+            );
+
             // Parse decrypted plaintext as JSON
             let payload: serde_json::Value = match serde_json::from_slice(&plaintext) {
                 Ok(v) => v,
                 Err(e) => {
-                    log::warn!("[Signal] Failed to parse decrypted signal payload: {e}");
+                    log::warn!(
+                        "[WebRTC-Signal] Failed to parse decrypted signal payload: {e}. Raw UTF-8: {:?}",
+                        String::from_utf8_lossy(&plaintext)
+                    );
                     continue;
                 }
             };
 
+            log::info!(
+                "[WebRTC-Signal] Parsed payload keys: {:?}",
+                payload.as_object().map(|o| o.keys().collect::<Vec<_>>())
+            );
+
             let signal_type = payload.get("type").and_then(|t| t.as_str());
+            log::info!("[WebRTC-Signal] Signal type: {:?}", signal_type);
 
             match signal_type {
                 Some("offer") => {
                     let sdp = payload.get("sdp").and_then(|v| v.as_str()).unwrap_or("");
                     if sdp.is_empty() {
-                        log::warn!("[Signal] Offer missing SDP");
+                        log::warn!("[WebRTC-Signal] Offer missing SDP");
                         continue;
                     }
+                    log::info!(
+                        "[WebRTC-Signal] Processing offer from browser {}",
+                        &signal.browser_identity[..signal.browser_identity.len().min(16)]
+                    );
                     self.handle_webrtc_offer(sdp, &signal.browser_identity);
                 }
                 Some("ice") => {
@@ -1238,11 +1277,11 @@ impl Hub {
                             if let Err(e) = self.tokio_runtime.block_on(
                                 channel.handle_ice_candidate(candidate, sdp_mid, sdp_mline_index),
                             ) {
-                                log::warn!("[Signal] Failed to add ICE candidate: {e}");
+                                log::warn!("[WebRTC-Signal] Failed to add ICE candidate: {e}");
                             }
                         } else {
                             log::warn!(
-                                "[Signal] ICE candidate for unknown browser {}",
+                                "[WebRTC-Signal] ICE candidate for unknown browser {}",
                                 &signal.browser_identity
                                     [..signal.browser_identity.len().min(8)]
                             );
@@ -1250,18 +1289,18 @@ impl Hub {
                     }
                 }
                 other => {
-                    log::trace!("[Signal] Unknown signal type: {:?}", other);
+                    log::info!("[WebRTC-Signal] Unknown signal type: {:?}", other);
                 }
             }
         }
     }
 
-    /// Drain outgoing signals (encrypted ICE candidates) and relay via ActionCable.
+    /// Drain outgoing WebRTC signals (encrypted ICE candidates) and relay via ActionCable.
     ///
     /// WebRTC `on_ice_candidate` callbacks encrypt candidates and push them to
     /// `webrtc_outgoing_signal_rx`. This method drains them and sends each via
     /// `CommandChannelHandle::perform("signal", ...)` for ActionCable relay to browser.
-    fn poll_outgoing_signals(&mut self) {
+    fn poll_outgoing_webrtc_signals(&mut self) {
         use crate::channel::webrtc::OutgoingSignal;
 
         let Some(ref command_channel) = self.command_channel else {
@@ -1284,7 +1323,7 @@ impl Hub {
                         }),
                     );
                     log::debug!(
-                        "[Signal] Relayed ICE candidate to browser {}",
+                        "[Crypto] Relayed ICE candidate to browser {}",
                         &browser_identity[..browser_identity.len().min(8)]
                     );
                 }
@@ -1370,7 +1409,7 @@ impl Hub {
                     &browser_identity[..browser_identity.len().min(8)]
                 );
 
-                // Encrypt the answer with Signal Protocol
+                // Encrypt the answer with E2E encryption
                 let crypto = self
                     .browser
                     .crypto_service
@@ -1452,13 +1491,13 @@ impl Hub {
         self.botster_id = Some(botster_id);
     }
 
-    /// Initialize Signal Protocol CryptoService for E2E encryption.
+    /// Initialize CryptoService for E2E encryption (Matrix Olm/Megolm).
     ///
-    /// Starts the CryptoService only. PreKeyBundle generation is deferred until
+    /// Starts the CryptoService only. DeviceKeyBundle generation is deferred until
     /// the connection URL is first requested (lazy initialization via
     /// `get_or_generate_connection_url()`).
-    pub(crate) fn init_signal_protocol(&mut self) {
-        registration::init_signal_protocol(&mut self.browser, &self.hub_identifier);
+    pub(crate) fn init_crypto_service(&mut self) {
+        registration::init_crypto_service(&mut self.browser, &self.hub_identifier);
     }
 
     /// Get or generate the connection URL (lazy bundle generation).

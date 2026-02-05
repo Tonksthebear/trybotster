@@ -3,7 +3,7 @@
 //! This module provides the browser relay functionality, handling WebRTC
 //! DataChannel communication with connected browser clients. It manages:
 //!
-//! - E2E encrypted communication (Signal Protocol over DTLS)
+//! - E2E encrypted communication (Matrix Olm/Megolm)
 //! - Terminal output streaming
 //!
 //! # Architecture
@@ -21,33 +21,24 @@
 //! # Encryption
 //!
 //! All communication between the CLI and browser is E2E encrypted using
-//! the Signal Protocol (X3DH + Double Ratchet), the same battle-tested
-//! cryptography used by Signal, WhatsApp, and other secure messengers.
-//! The Rails server only sees encrypted blobs and cannot read the terminal content.
+//! Matrix Olm/Megolm protocols via `matrix-sdk-crypto`.
 //!
-//! ## Protocol (Signal)
+//! ## Matrix Crypto (v5)
 //!
-//! 1. CLI generates identity keys and PreKeyBundle
-//! 2. CLI displays QR code with PreKeyBundle
-//! 3. Browser scans QR code and calls process_prekey_bundle()
-//! 4. Browser sends PreKeySignalMessage to establish session
-//! 5. CLI decrypts and creates Double Ratchet session
-//! 6. Both sides can now encrypt/decrypt with forward secrecy
+//! Uses Olm (1:1 Double Ratchet) and Megolm (group ratchet) from matrix-sdk-crypto.
+//! Key bundles are ~165 bytes, fitting easily in QR codes.
 //!
-//! ## Group Messaging (SenderKey)
-//!
-//! For CLI → multiple browsers broadcast:
-//! 1. CLI creates SenderKeyDistributionMessage
-//! 2. CLI sends distribution to each browser via individual session
-//! 3. CLI uses group_encrypt for broadcasts (efficient)
-//! 4. Browsers use group_decrypt to receive
+//! 1. CLI creates OlmMachine with synthetic Matrix IDs
+//! 2. CLI displays QR code with DeviceKeyBundle
+//! 3. Browser scans QR, creates own OlmMachine
+//! 4. Browser establishes Olm session via key claim
+//! 5. Both sides can encrypt/decrypt with forward secrecy
 //!
 //! # Modules
 //!
-//! - [`crypto_service`] - Thread-safe Signal Protocol operations
-//! - [`signal`] - Signal Protocol E2E encryption
-//! - [`signal_stores`] - Signal Protocol store implementations
-//! - [`persistence`] - Encrypted storage for Signal state
+//! - [`crypto_service`] - Thread-safe crypto operations
+//! - [`matrix_crypto`] - Matrix Olm/Megolm E2E encryption
+//! - [`persistence`] - Encrypted storage for crypto state
 //! - [`state`] - Browser connection state management
 //! - [`types`] - Protocol message types
 //! - [`http_proxy`] - HTTP proxy for preview tunneling
@@ -55,10 +46,9 @@
 
 pub mod crypto_service;
 pub mod http_proxy;
+pub mod matrix_crypto;
 pub mod persistence;
 pub mod preview_types;
-pub mod signal;
-pub mod signal_stores;
 pub mod state;
 pub mod types;
 
@@ -66,8 +56,9 @@ pub use state::{build_agent_info, build_scrollback_message, build_worktree_info,
 
 pub use types::{AgentInfo, BrowserCommand, BrowserResize, TerminalMessage, WorktreeInfo};
 
-pub use signal::{
-    binary_format, PreKeyBundleData, SignalEnvelope, SignalProtocolManager, SIGNAL_PROTOCOL_VERSION,
+pub use matrix_crypto::{
+    binary_format as matrix_binary_format, CryptoEnvelope, DeviceKeyBundle, MatrixCryptoManager,
+    MatrixCryptoState, MATRIX_PROTOCOL_VERSION, MSG_TYPE_MEGOLM, MSG_TYPE_OLM, MSG_TYPE_OLM_PREKEY,
 };
 
 pub use persistence::{delete_connection_url, read_connection_url, write_connection_url};
@@ -79,4 +70,4 @@ pub use preview_types::{
 
 pub use http_proxy::HttpProxy;
 
-pub use crypto_service::{CryptoService, CryptoServiceHandle};
+pub use crypto_service::{CryptoRequest, CryptoService, CryptoServiceHandle};

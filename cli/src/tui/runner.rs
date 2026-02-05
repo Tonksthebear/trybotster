@@ -121,14 +121,11 @@ pub struct TuiRunner<B: Backend> {
     /// Available worktrees for agent creation.
     pub(super) available_worktrees: Vec<(String, String)>,
 
-    /// Current connection code data (URL + QR PNG) for display.
+    /// Current connection code data (URL + QR ASCII) for display.
     pub(super) connection_code: Option<ConnectionCodeData>,
 
     /// Error message to display in Error mode.
     pub(super) error_message: Option<String>,
-
-    /// Whether the QR image has been displayed (to avoid re-rendering every frame).
-    pub(super) qr_image_displayed: bool,
 
     /// Agent creation progress (identifier, stage).
     pub(super) creating_agent: Option<(String, CreationStage)>,
@@ -249,7 +246,6 @@ where
             available_worktrees: Vec::new(),
             connection_code: None,
             error_message: None,
-            qr_image_displayed: false,
             creating_agent: None,
             pending_issue_or_branch: None,
             agents: Vec::new(),
@@ -526,7 +522,6 @@ where
             worktree_selected: self.worktree_selected,
             available_worktrees: &self.available_worktrees,
             error_message: self.error_message.as_deref(),
-            qr_image_displayed: self.qr_image_displayed,
             creating_agent: creating_agent_ref,
             connection_code: self.connection_code.as_ref(),
             bundle_used: false, // TuiRunner doesn't track this - would need from Hub
@@ -548,13 +543,7 @@ where
             vpn_status: None,
         };
 
-        // Render and handle QR image state
-        let result = render(&mut self.terminal, &ctx, None)?;
-
-        // Update qr_image_displayed if we wrote one
-        if result.qr_image_written {
-            self.qr_image_displayed = true;
-        }
+        render(&mut self.terminal, &ctx, None)?;
 
         Ok(())
     }
@@ -1917,7 +1906,6 @@ mod tests {
         // Set mode to ConnectionCode with no cached code
         runner.mode = AppMode::ConnectionCode;
         runner.connection_code = None;
-        runner.qr_image_displayed = false;
 
         // Render should not panic even without cached connection code
         let result = runner.render();
@@ -1945,32 +1933,23 @@ mod tests {
         assert!(result.is_ok(), "Render should succeed in Normal mode");
     }
 
-    /// Verifies that pressing 'R' in ConnectionCode mode resets qr_image_displayed.
+    /// Verifies that pressing 'R' in ConnectionCode mode stays in that mode.
     ///
     /// # Purpose
     ///
-    /// When refreshing the connection code, the QR image flag must be reset
-    /// so the next render will display the new QR code. This test verifies
-    /// that the refresh action:
-    /// 1. Resets qr_image_displayed to false
-    /// 2. Stays in ConnectionCode mode (does not close the modal)
-    /// 3. Handles Hub errors gracefully (mock channels return error)
+    /// When refreshing the connection code, the modal should stay open
+    /// and a regeneration request should be sent.
     #[test]
-    fn test_regenerate_connection_code_resets_qr_flag() {
+    fn test_regenerate_connection_code_stays_in_mode() {
         let (mut runner, _cmd_rx) = create_test_runner();
 
-        // Setup: in ConnectionCode mode with QR already displayed
+        // Setup: in ConnectionCode mode
         runner.mode = AppMode::ConnectionCode;
-        runner.qr_image_displayed = true;
 
         // Action: regenerate connection code
         runner.handle_tui_action(TuiAction::RegenerateConnectionCode);
 
-        // Verify: QR flag is reset and we stay in ConnectionCode mode
-        assert!(
-            !runner.qr_image_displayed,
-            "qr_image_displayed should be reset after refresh"
-        );
+        // Verify: we stay in ConnectionCode mode
         assert_eq!(
             runner.mode,
             AppMode::ConnectionCode,
@@ -1985,16 +1964,12 @@ mod tests {
     /// The TUI must remain responsive during refresh. The regeneration request
     /// is sent as a JSON message through the same Lua client.lua protocol as
     /// browser clients, using `send_msg()` (fire-and-forget).
-    ///
-    /// The QR code will refresh on next render cycle when the new bundle arrives
-    /// (indicated by qr_image_displayed = false).
     #[test]
     fn test_regenerate_sends_lua_json_message() {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: in ConnectionCode mode
         runner.mode = AppMode::ConnectionCode;
-        runner.qr_image_displayed = true;
 
         // Action: regenerate connection code
         runner.handle_tui_action(TuiAction::RegenerateConnectionCode);
@@ -2021,9 +1996,6 @@ mod tests {
                 panic!("Channel error: {:?}", e);
             }
         }
-
-        // Verify: qr_image_displayed reset for next render
-        assert!(!runner.qr_image_displayed);
     }
 
     // =========================================================================

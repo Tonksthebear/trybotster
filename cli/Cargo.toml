@@ -62,8 +62,11 @@ sha2 = "0.10"
 semver = "1.0"
 hostname = "0.4"
 
-# E2E encryption (Signal Protocol - Double Ratchet with X3DH)
-libsignal-protocol = { git = "https://github.com/signalapp/libsignal", branch = "main" }
+# E2E encryption (Matrix Olm/Megolm via OlmMachine state machine)
+# matrix-sdk-crypto provides the high-level OlmMachine for wire-compatible encryption
+matrix-sdk-crypto = { version = "0.16", default-features = false, features = ["automatic-room-key-forwarding"] }
+# Matrix identifier types (UserId, DeviceId, RoomId) - required by OlmMachine
+ruma = "0.14"
 async-trait = "0.1"
 rand = "0.9"
 base64 = "0.22"
@@ -73,7 +76,7 @@ data-encoding = "2.6"  # Base32 encoding for QR-friendly URLs
 keyring = { version = "3", features = ["apple-native"] }  # OS keychain for secret key storage
 ed25519-dalek = "2"            # Ed25519 signing for device identity
 zeroize = { version = "1.8", features = ["derive"] }  # Secure memory zeroing
-aes-gcm = "0.10"               # AES-GCM for encrypting Signal state at rest
+aes-gcm = "0.10"               # AES-GCM for encrypting state at rest
 
 # WebSocket (kept for potential future use)
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
@@ -84,9 +87,6 @@ webrtc = "0.12"
 
 # QR code generation for browser connection (qrcodegen supports alphanumeric mode for smaller QR)
 qrcodegen = "1.8"
-
-# Image generation for QR code rendering (Kitty graphics protocol)
-image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Clipboard support for copying URLs
 arboard = "3.4"
