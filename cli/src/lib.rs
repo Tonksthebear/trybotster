@@ -22,7 +22,6 @@
 
 // Library modules
 pub mod agent;
-pub mod agents;
 pub mod app;
 pub mod auth;
 pub mod channel;
@@ -33,8 +32,6 @@ pub mod lua;
 pub mod relay;
 pub mod tui;
 
-// Re-export auth types for tests
-pub use auth::{DeviceCodeResponse, ErrorResponse, TokenResponse};
 pub mod compat;
 pub mod config;
 pub mod constants;
@@ -49,36 +46,13 @@ pub mod server;
 pub mod terminal_widget;
 
 // Re-export commonly used types
-pub use agent::{Agent, AgentNotification, AgentStatus, PtyView, ScreenInfo};
-pub use app::{dispatch_key_event, parse_terminal_input, InputAction, KeyEventContext, KeyInput};
-pub use compat::{BrowserDimensions, BrowserMode, VpnStatus};
+pub use agent::{Agent, PtyView};
 pub use config::Config;
-pub use device::Device;
 pub use git::WorktreeManager;
-pub use notifications::{NotificationSender, NotificationType};
-pub use process::{get_parent_pid, kill_orphaned_processes};
 pub use prompt::PromptManager;
-pub use relay::{AgentInfo, BrowserResize, TerminalMessage, WorktreeInfo};
+pub use relay::{AgentInfo, TerminalMessage, WorktreeInfo};
 pub use terminal_widget::TerminalWidget;
 
-// Re-export Channel types
-pub use channel::{
-    ActionCableChannel, Channel, ChannelConfig, ChannelError, ConnectionState, IncomingMessage,
-    PeerId, SharedConnectionState,
-};
-
-// Re-export Hub types
-pub use agents::AgentSpawnConfig;
-pub use hub::{Hub, HubAction, HubState};
-
-// Re-export Lua runtime
-pub use lua::LuaRuntime;
-
-// Re-export Client types
-pub use client::{
-    ClientId, CreateAgentRequest, DeleteAgentRequest,
-};
-
-// Re-export PTY event types (for pub/sub integration)
-pub use agent::pty::{ConnectedClient, PtyEvent};
+// Re-export Hub
+pub use hub::Hub;
 

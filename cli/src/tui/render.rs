@@ -35,7 +35,8 @@ use vt100::Parser;
 use crate::app::{buffer_to_ansi, centered_rect, AppMode};
 
 use super::menu::{build_menu, MenuContext, MenuItem};
-use crate::{BrowserDimensions, PtyView, VpnStatus};
+use crate::compat::{BrowserDimensions, VpnStatus};
+use crate::PtyView;
 
 use super::events::CreationStage;
 
@@ -374,11 +375,8 @@ fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect) {
 
     // Add existing agents
     items.extend(ctx.agents.iter().map(|agent| {
-        let base_text = if let Some(issue_num) = agent.issue_number {
-            format!("{}#{}", agent.repo, issue_num)
-        } else {
-            format!("{}/{}", agent.repo, agent.branch_name)
-        };
+        // Display branch name only (simpler, one agent per branch)
+        let base_text = agent.branch_name.clone();
 
         // Add server status indicator if HTTP forwarding port is assigned
         let server_info = if let Some(p) = agent.port {
@@ -458,17 +456,10 @@ fn render_terminal_panel(f: &mut Frame, ctx: &RenderContext, area: Rect) {
         String::new()
     };
 
-    let terminal_title = if let Some(issue_num) = agent.issue_number {
-        format!(
-            " {}#{} {}{} [Ctrl+P | Ctrl+J/K | Shift+PgUp/Dn scroll] ",
-            agent.repo, issue_num, view_indicator, scroll_indicator
-        )
-    } else {
-        format!(
-            " {}/{} {}{} [Ctrl+P | Ctrl+J/K | Shift+PgUp/Dn scroll] ",
-            agent.repo, agent.branch_name, view_indicator, scroll_indicator
-        )
-    };
+    let terminal_title = format!(
+        " {} {}{} [Ctrl+P | Ctrl+J/K | Shift+PgUp/Dn scroll] ",
+        agent.branch_name, view_indicator, scroll_indicator
+    );
 
     let block = Block::default().borders(Borders::ALL).title(terminal_title);
 

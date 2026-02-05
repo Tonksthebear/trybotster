@@ -1,8 +1,9 @@
-//! Thread-safe cache of agent handles for read-only access.
+//! Thread-safe cache of agent PTY handles for read-only access.
 //!
 //! Hub maintains this separately from HubState. When agents are
-//! created/deleted, Hub updates the cache. Clients call
-//! `HandleCache::get_agent()` to read directly without sending commands.
+//! created/deleted, Hub updates the cache via `sync_handle_cache()`.
+//! Clients call `HandleCache::get_agent()` to read directly without
+//! sending commands.
 //!
 //! # Why This Exists
 //!
@@ -10,10 +11,17 @@
 //! commands from Hub's thread would deadlock. HandleCache provides direct,
 //! non-blocking access. Hub updates the cache on agent lifecycle events.
 //!
+//! # Lua Migration
+//!
+//! Agent metadata (repo, issue, status) is managed by Lua. HandleCache
+//! only stores PTY handles (agent_key + Vec<PtyHandle>). Lua enriches
+//! the PTY-level data with its own agent registry.
+//!
 //! # Usage
 //!
 //! - **Hub tick loop**: `HandleCache::get_agent()` reads directly
 //! - **TuiRunner PTY I/O**: Hub reads from cache to forward input/resize
+//! - **Lua primitives**: `hub.get_agents()` / `hub.get_agent()` read from cache
 //!
 //! # Design Principle
 //!
@@ -25,11 +33,11 @@ use std::sync::RwLock;
 
 use super::agent_handle::AgentHandle;
 
-/// Thread-safe cache of agent handles and shared read-only data.
+/// Thread-safe cache of agent PTY handles and shared read-only data.
 ///
-/// This cache stores `AgentHandle` instances and other data that clients
-/// need to read without sending blocking commands through Hub's channel.
-/// Unlike `HubState`, this only contains cloneable, thread-safe types.
+/// Stores `AgentHandle` instances (agent_key + PTY handles) and other data
+/// that clients need to read without sending blocking commands through Hub.
+/// Agent metadata (repo, issue, status) is managed by Lua, not cached here.
 ///
 /// # Thread Safety
 ///
@@ -40,7 +48,7 @@ use super::agent_handle::AgentHandle;
 ///
 /// # Cached Data
 ///
-/// - **Agent handles**: Updated on agent create/delete via `sync_handle_cache()`
+/// - **Agent PTY handles**: Updated on agent create/delete via `sync_handle_cache()`
 /// - **Worktrees**: Updated when Hub loads worktrees (menu open, agent lifecycle)
 /// - **Connection URL**: Updated when Hub generates/refreshes the Signal bundle
 #[derive(Debug, Default)]
@@ -118,6 +126,50 @@ impl HandleCache {
         if let Ok(mut agents) = self.agents.write() {
             *agents = handles;
         }
+    }
+
+    /// Add or update an agent handle.
+    ///
+    /// If an agent with the same key exists, it's replaced.
+    /// Returns the index where the agent was placed.
+    pub fn add_agent(&self, handle: AgentHandle) -> Option<usize> {
+        let mut agents = self.agents.write().ok()?;
+        let key = handle.agent_key().to_string();
+
+        // Check if agent already exists
+        if let Some(idx) = agents.iter().position(|a| a.agent_key() == key) {
+            agents[idx] = handle;
+            Some(idx)
+        } else {
+            let idx = agents.len();
+            agents.push(handle);
+            Some(idx)
+        }
+    }
+
+    /// Remove an agent by key.
+    ///
+    /// Returns true if the agent was found and removed.
+    pub fn remove_agent(&self, key: &str) -> bool {
+        let Ok(mut agents) = self.agents.write() else {
+            return false;
+        };
+        if let Some(idx) = agents.iter().position(|a| a.agent_key() == key) {
+            agents.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Find agent index by key.
+    #[must_use]
+    pub fn find_agent_index(&self, key: &str) -> Option<usize> {
+        self.agents
+            .read()
+            .ok()?
+            .iter()
+            .position(|a| a.agent_key() == key)
     }
 
     // ============================================================

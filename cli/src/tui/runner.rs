@@ -667,11 +667,7 @@ pub fn run_with_hub(
     // Main thread: Hub tick loop for non-TUI operations.
     // Client request processing is handled by each client's async run_task().
     while !hub.quit && !shutdown_flag.load(Ordering::SeqCst) {
-        // 1. Poll pending agents and progress events
-        hub.poll_pending_agents();
-        hub.poll_progress_events();
-
-        // 2. Periodic tasks (polling, heartbeat, notifications)
+        // Periodic tasks (command channel, heartbeat, Lua queues, notifications)
         hub.tick();
 
         // Small sleep to prevent CPU spinning (60 FPS max)

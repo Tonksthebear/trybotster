@@ -1,23 +1,22 @@
 //! Server communication module for botster-hub.
 //!
-//! This module provides the API client and related types for communicating
-//! with the Rails server. It handles:
+//! This module provides types for communicating with the Rails server:
 //!
-//! - Heartbeat registration
-//! - Agent notification forwarding
-//! - Message parsing and dispatch to Hub actions
+//! - Message parsing (`ParsedMessage`)
+//! - Request/response data types (`MessageData`)
+//! - HTTP client for Rails API (`ApiClient`)
 //!
 //! # Architecture
 //!
-//! The [`ApiClient`] struct encapsulates all server communication, providing
-//! a clean interface for the TUI application to interact with the backend.
 //! Message delivery is handled by the WebSocket command channel, not HTTP polling.
+//! The `ParsedMessage` type extracts structured data from server payloads for
+//! routing in `server_comms.rs`.
 //!
 //! # Modules
 //!
 //! - [`client`] - HTTP client for Rails API
 //! - [`types`] - Request/response data types
-//! - [`messages`] - Message parsing and Hub action conversion
+//! - [`messages`] - Message parsing
 
 // Rust guideline compliant 2025-01
 
@@ -25,6 +24,5 @@ pub mod client;
 pub mod messages;
 pub mod types;
 
-pub use client::ApiClient;
-pub use messages::{message_to_hub_action, MessageContext, MessageError, ParsedMessage};
-pub use types::{AgentHeartbeatInfo, MessageData};
+pub use messages::ParsedMessage;
+pub use types::MessageData;

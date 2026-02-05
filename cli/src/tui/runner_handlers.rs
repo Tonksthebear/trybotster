@@ -318,6 +318,34 @@ where
                     msg.get("agent_id").and_then(|v| v.as_str()),
                     msg.get("status").and_then(|v| v.as_str()),
                 ) {
+                    // Update creation progress display based on lifecycle status
+                    match status {
+                        "creating_worktree" => {
+                            self.creating_agent = Some((
+                                agent_id.to_string(),
+                                crate::tui::events::CreationStage::CreatingWorktree,
+                            ));
+                        }
+                        "spawning_ptys" => {
+                            self.creating_agent = Some((
+                                agent_id.to_string(),
+                                crate::tui::events::CreationStage::SpawningAgent,
+                            ));
+                        }
+                        "running" | "failed" => {
+                            // Clear creation progress on completion or failure
+                            self.creating_agent = None;
+                        }
+                        "stopping" | "removing_worktree" | "deleted" => {
+                            // Clear creation progress if somehow still showing
+                            if self.creating_agent.as_ref().map(|(id, _)| id.as_str()) == Some(agent_id) {
+                                self.creating_agent = None;
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    // Update existing agent status if present in list
                     if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
                         agent.status = Some(status.to_string());
                     }

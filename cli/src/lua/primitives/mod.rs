@@ -8,8 +8,10 @@
 //! - `log` - Logging functions (info, warn, error, debug)
 //! - `webrtc` - WebRTC peer connection and messaging
 //! - `pty` - PTY terminal operations (forwarders, input, resize)
+//! - `fs` - File system operations (read, write, copy, exists)
 //! - `hub` - Hub state queries and operations (agents, worktrees)
 //! - `tui` - TUI terminal connection and messaging
+//! - `worktree` - Git worktree queries and operations (list, find, create, delete)
 //! - `events` - Event subscription system for agent lifecycle events
 //!
 //! # Adding New Primitives
@@ -21,12 +23,15 @@
 
 pub mod connection;
 pub mod events;
+pub mod fs;
 pub mod hub;
 pub mod log;
 pub mod pty;
 pub mod tui;
 pub mod webrtc;
+pub mod worktree;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -43,10 +48,14 @@ pub use connection::{
 pub use hub::{new_request_queue as new_hub_queue, HubRequest, HubRequestQueue};
 pub use pty::{
     new_request_queue as new_pty_queue, CreateForwarderRequest, CreateTuiForwarderRequest,
-    PtyForwarder, PtyOutputContext, PtyRequest, PtyRequestQueue,
+    CreateTuiForwarderDirectRequest, PtyForwarder, PtyOutputContext, PtyRequest, PtyRequestQueue,
+    PtySessionHandle,
 };
 pub use tui::{new_send_queue as new_tui_queue, TuiSendQueue, TuiSendRequest};
 pub use webrtc::{new_send_queue, WebRtcSendQueue, WebRtcSendRequest};
+pub use worktree::{
+    new_request_queue as new_worktree_queue, WorktreeRequest, WorktreeRequestQueue,
+};
 
 /// Register all primitive functions with the Lua state.
 ///
@@ -58,6 +67,7 @@ pub use webrtc::{new_send_queue, WebRtcSendQueue, WebRtcSendRequest};
 ///
 /// Returns an error if any primitive registration fails.
 pub fn register_all(lua: &Lua) -> Result<()> {
+    fs::register(lua)?;
     log::register(lua)?;
     Ok(())
 }
@@ -159,6 +169,31 @@ pub fn register_connection(
     handle_cache: Arc<HandleCache>,
 ) -> Result<()> {
     connection::register(lua, request_queue, handle_cache)?;
+    Ok(())
+}
+
+/// Register worktree primitives with a request queue and handle cache.
+///
+/// Call this after `register_all()` to set up worktree queries and operations.
+/// The request queue is drained by Hub after Lua callbacks return.
+///
+/// # Arguments
+///
+/// * `lua` - The Lua state to register primitives in
+/// * `request_queue` - Shared queue for worktree operations
+/// * `handle_cache` - Thread-safe cache for worktree queries
+/// * `worktree_base` - Base directory for worktree storage
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub fn register_worktree(
+    lua: &Lua,
+    request_queue: WorktreeRequestQueue,
+    handle_cache: Arc<HandleCache>,
+    worktree_base: PathBuf,
+) -> Result<()> {
+    worktree::register(lua, request_queue, handle_cache, worktree_base)?;
     Ok(())
 }
 

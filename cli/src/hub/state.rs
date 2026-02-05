@@ -1,64 +1,51 @@
 //! Hub state management.
 //!
 //! This module contains the core state types for the Hub, including
-//! agent management and worktree tracking.
+//! agent lifecycle operations and worktree/port tracking.
 //!
-//! # Selection Model
+//! # Lua Migration
 //!
-//! Agent selection is per-client. TuiRunner manages its own selection state;
-//! browser clients manage theirs via JavaScript.
-//! This module only manages the agent registry itself.
+//! Agent metadata (repo, issue, status, etc.) is managed by Lua.
+//! HubState retains ownership of Rust Agent structs for PTY lifecycle
+//! (spawn, close, PTY handle extraction). The agent registry (which
+//! agents exist, their metadata for display) has moved to Lua.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use crate::agent::Agent;
 use crate::git::WorktreeManager;
-use crate::hub::agent_handle::AgentHandle;
-use crate::relay::types::AgentInfo;
+use crate::hub::agent_handle::{AgentHandle, PtyHandle};
 
 /// Shared reference to HubState for thread-safe read access.
 ///
 /// Hub owns this via `hub.state`. The RwLock allows multiple readers without
 /// blocking Hub's write operations (when no write is in progress).
-///
-/// # Usage
-///
-/// ```ignore
-/// // Hub reads state directly:
-/// let state = hub.state.read().unwrap();
-/// let agents = state.get_agents_info();
-/// ```
 pub type SharedHubState = Arc<RwLock<HubState>>;
 
-/// Core hub state - manages active agents.
+/// Core hub state - manages agent PTY lifecycle and infrastructure.
 ///
-/// This struct holds the minimal state needed for agent management,
-/// delegating selection to the client abstraction layer.
+/// Agent metadata (repo, issue, status) is managed by Lua. HubState retains
+/// the Rust Agent structs for PTY lifecycle operations and exposes PTY handles
+/// via `get_agent_handle()` for the HandleCache.
 ///
-/// # Example
+/// # Worktree and Port Management
 ///
-/// ```ignore
-/// let mut state = HubState::new(worktree_base);
-///
-/// // Add an agent
-/// state.add_agent(session_key, agent);
-///
-/// // Query agents
-/// for (key, agent) in state.agents_ordered() {
-///     println!("Agent: {}", key);
-/// }
-/// ```
+/// HubState also manages worktree tracking and port allocation, which are
+/// infrastructure concerns that remain in Rust.
 pub struct HubState {
     /// Active agents indexed by session key.
+    ///
+    /// These are the Rust Agent structs that own PtySession instances.
+    /// Lua manages agent metadata; Rust manages PTY lifecycle.
     ///
     /// Session keys are formatted as `{repo-safe}-{issue_number}` or
     /// `{repo-safe}-{branch-name}` for branch-based sessions.
     pub agents: HashMap<String, Agent>,
 
-    /// Ordered list of agent keys for UI navigation.
+    /// Ordered list of agent keys for handle indexing.
     ///
-    /// This maintains insertion order for consistent UI display.
+    /// Maintains insertion order so HandleCache indices are stable.
     pub agent_keys_ordered: Vec<String>,
 
     /// Available worktrees for spawning new agents.
@@ -69,13 +56,6 @@ pub struct HubState {
 
     /// Git worktree manager for creating/deleting worktrees.
     pub git_manager: WorktreeManager,
-
-    /// Ports currently allocated to agents, tracked to prevent duplicates.
-    ///
-    /// When an agent is spawned, its port is added here. When deleted, removed.
-    /// This ensures we don't allocate the same port to multiple agents even if
-    /// the first hasn't bound to it yet.
-    pub allocated_ports: HashSet<u16>,
 }
 
 impl std::fmt::Debug for HubState {
@@ -95,23 +75,22 @@ impl HubState {
             agent_keys_ordered: Vec::new(),
             available_worktrees: Vec::new(),
             git_manager: WorktreeManager::new(worktree_base),
-            allocated_ports: HashSet::new(),
         }
     }
+
+    // =========================================================================
+    // Agent Lifecycle (Rust-owned PTY management)
+    // =========================================================================
 
     /// Returns the number of active agents.
     pub fn agent_count(&self) -> usize {
         self.agents.len()
     }
 
-    /// Returns true if there are no active agents.
-    pub fn is_empty(&self) -> bool {
-        self.agents.is_empty()
-    }
-
     /// Adds an agent to the hub state.
     ///
     /// The agent will be added to both the HashMap and the ordered list.
+    /// After adding, call `Hub::sync_handle_cache()` to update the HandleCache.
     pub fn add_agent(&mut self, session_key: String, agent: Agent) {
         self.agent_keys_ordered.push(session_key.clone());
         self.agents.insert(session_key, agent);
@@ -120,84 +99,30 @@ impl HubState {
     /// Removes an agent from the hub state.
     ///
     /// Returns the removed agent if it existed.
-    /// Note: Client selection updates are handled by the client abstraction layer.
+    /// After removing, call `Hub::sync_handle_cache()` to update the HandleCache.
     pub fn remove_agent(&mut self, session_key: &str) -> Option<Agent> {
         self.agent_keys_ordered.retain(|k| k != session_key);
         self.agents.remove(session_key)
     }
 
-    /// Returns an iterator over all agents in display order.
-    pub fn agents_ordered(&self) -> impl Iterator<Item = (&str, &Agent)> {
-        self.agent_keys_ordered
-            .iter()
-            .filter_map(|key| self.agents.get(key).map(|agent| (key.as_str(), agent)))
-    }
-
     // =========================================================================
-    // Client Data Access Methods
+    // PTY Handle Extraction (for HandleCache)
     // =========================================================================
-
-    /// Get a snapshot of all agents as `AgentInfo` in display order.
-    ///
-    /// Returns a vector of `AgentInfo` structs that clients can use to
-    /// display agent lists and implement `Client::get_agents()`.
-    /// This is a snapshot - changes won't be reflected until the next call.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let state = hub.state.read().unwrap();
-    /// let agents = state.get_agents_info();
-    /// for info in &agents {
-    ///     println!("{}: {}", info.id, info.status.as_deref().unwrap_or("Unknown"));
-    /// }
-    /// ```
-    #[must_use]
-    pub fn get_agents_info(&self) -> Vec<AgentInfo> {
-        self.agents_ordered()
-            .map(|(agent_id, agent)| self.agent_to_info(agent_id, agent))
-            .collect()
-    }
-
-    /// Get `AgentInfo` for a specific agent by ID.
-    ///
-    /// Returns `None` if the agent does not exist.
-    #[must_use]
-    pub fn get_agent_info(&self, agent_id: &str) -> Option<AgentInfo> {
-        self.agents
-            .get(agent_id)
-            .map(|agent| self.agent_to_info(agent_id, agent))
-    }
 
     /// Get an `AgentHandle` for the agent at the given index.
     ///
     /// Returns `None` if the index is out of bounds.
     ///
-    /// The handle provides:
-    /// - Agent metadata via `info()`
-    /// - PTY access via `get_pty(0)` (CLI) and `get_pty(1)` (Server)
+    /// The handle provides PTY access via `get_pty(0)` (CLI) and `get_pty(1)` (Server).
+    /// Agent metadata is managed by Lua, not included in the handle.
     ///
     /// # Arguments
     ///
     /// * `index` - The index of the agent in display order (0-based)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let state = hub.state.read().unwrap();
-    /// if let Some(handle) = state.get_agent_handle(0) {
-    ///     println!("Agent: {}", handle.info().id);
-    ///     let pty = handle.get_pty(0).unwrap(); // CLI PTY
-    /// }
-    /// ```
     #[must_use]
     pub fn get_agent_handle(&self, index: usize) -> Option<AgentHandle> {
-        use crate::hub::agent_handle::PtyHandle;
-
-        let agent_id = self.agent_keys_ordered.get(index)?;
-        let agent = self.agents.get(agent_id)?;
-
-        let info = self.agent_to_info(agent_id, agent);
+        let agent_key = self.agent_keys_ordered.get(index)?;
+        let agent = self.agents.get(agent_key)?;
 
         // Build PTY handles vector: ptys[0] = CLI, ptys[1] = Server (if exists)
         let mut ptys = Vec::with_capacity(2);
@@ -222,36 +147,12 @@ impl HubState {
             ));
         }
 
-        Some(AgentHandle::new(agent_id, info, ptys, index))
+        Some(AgentHandle::new(agent_key, ptys, index))
     }
 
-    /// Get the index of an agent by its ID.
-    ///
-    /// Returns `None` if no agent with that ID exists.
-    #[must_use]
-    pub fn get_agent_index(&self, agent_id: &str) -> Option<usize> {
-        self.agent_keys_ordered.iter().position(|id| id == agent_id)
-    }
-
-    /// Convert an Agent to AgentInfo.
-    ///
-    /// Internal helper for creating snapshots.
-    fn agent_to_info(&self, agent_id: &str, agent: &Agent) -> AgentInfo {
-        AgentInfo {
-            id: agent_id.to_string(),
-            repo: Some(agent.repo.clone()),
-            issue_number: agent.issue_number.map(u64::from),
-            branch_name: Some(agent.branch_name.clone()),
-            name: None,
-            status: Some(format!("{:?}", agent.status)),
-            port: agent.port(),
-            server_running: Some(agent.is_server_running()),
-            has_server_pty: Some(agent.has_server_pty()),
-            active_pty_view: None, // Client-owned state, not agent state
-            scroll_offset: None,   // Client-owned state, not agent state
-            hub_identifier: None,  // Set by Hub when sending to browser
-        }
-    }
+    // =========================================================================
+    // Worktree Management
+    // =========================================================================
 
     /// Load available worktrees for the selection UI.
     ///
@@ -345,7 +246,6 @@ mod tests {
     #[test]
     fn test_hub_state_new() {
         let state = HubState::new(PathBuf::from("/tmp/worktrees"));
-        assert!(state.is_empty());
         assert_eq!(state.agent_count(), 0);
     }
 
@@ -361,11 +261,11 @@ mod tests {
 
         let removed = state.remove_agent("owner-repo-42");
         assert!(removed.is_some());
-        assert!(state.is_empty());
+        assert_eq!(state.agent_count(), 0);
     }
 
     #[test]
-    fn test_agents_ordered() {
+    fn test_agent_keys_ordered() {
         let mut state = HubState::new(PathBuf::from("/tmp/worktrees"));
 
         // Add agents in order
@@ -374,8 +274,10 @@ mod tests {
             state.add_agent(format!("owner-repo-{i}"), agent);
         }
 
-        // Verify iteration order matches insertion order
-        let keys: Vec<_> = state.agents_ordered().map(|(k, _)| k).collect();
-        assert_eq!(keys, vec!["owner-repo-1", "owner-repo-2", "owner-repo-3"]);
+        // Verify order matches insertion order
+        assert_eq!(
+            state.agent_keys_ordered,
+            vec!["owner-repo-1", "owner-repo-2", "owner-repo-3"]
+        );
     }
 }

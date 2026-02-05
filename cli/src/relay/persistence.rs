@@ -141,22 +141,6 @@ fn hub_state_dir(hub_id: &str) -> Result<PathBuf> {
     Ok(config_dir)
 }
 
-/// Generate a stable hub_identifier from a repo path.
-///
-/// Uses SHA256 hash of the absolute path to ensure the same repo
-/// always gets the same hub_id, even across CLI restarts.
-#[must_use]
-pub fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
-    let canonical = repo_path
-        .canonicalize()
-        .unwrap_or_else(|_| repo_path.to_path_buf());
-
-    let hash = Sha256::digest(canonical.to_string_lossy().as_bytes());
-
-    // Use first 16 bytes as hex (32 chars) - enough uniqueness, shorter than UUID
-    hash[..16].iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Get or create the encryption key for a hub.
 ///
 /// Keys are cached in memory after the first load to avoid repeated keyring access.
@@ -375,8 +359,8 @@ mod tests {
     #[test]
     fn test_hub_id_for_repo_is_stable() {
         let path = std::path::Path::new("/tmp/test-repo");
-        let id1 = hub_id_for_repo(path);
-        let id2 = hub_id_for_repo(path);
+        let id1 = crate::hub::hub_id_for_repo(path);
+        let id2 = crate::hub::hub_id_for_repo(path);
         assert_eq!(id1, id2);
         assert_eq!(id1.len(), 32); // 16 bytes as hex
     }
@@ -385,8 +369,8 @@ mod tests {
     fn test_hub_id_for_repo_differs_by_path() {
         let path1 = std::path::Path::new("/tmp/repo-a");
         let path2 = std::path::Path::new("/tmp/repo-b");
-        let id1 = hub_id_for_repo(path1);
-        let id2 = hub_id_for_repo(path2);
+        let id1 = crate::hub::hub_id_for_repo(path1);
+        let id2 = crate::hub::hub_id_for_repo(path2);
         assert_ne!(id1, id2);
     }
 

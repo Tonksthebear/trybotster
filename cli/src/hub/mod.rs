@@ -25,7 +25,7 @@
 //!
 //! - `server_comms`: WebSocket command channel, notification worker, registration
 //! - `actions`: Hub action dispatch
-//! - `lifecycle`: Agent spawn/close operations
+//! - `lifecycle`: Agent close operations (spawn is now Lua-owned)
 //! - `registration`: Device and hub registration
 //!
 //! # Usage
@@ -52,13 +52,8 @@ pub mod workers;
 
 pub use actions::HubAction;
 pub use agent_handle::AgentHandle;
-pub use lifecycle::SpawnResult;
 pub use state::{HubState, SharedHubState};
 
-use crate::agents::AgentSpawnConfig;
-
-use std::net::TcpListener;
-use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -66,24 +61,10 @@ use reqwest::blocking::Client;
 
 use sha2::{Digest, Sha256};
 
-use crate::client::ClientId;
 use crate::config::Config;
 use crate::device::Device;
 use crate::git::WorktreeManager;
 use crate::lua::LuaRuntime;
-
-/// Progress event during agent creation.
-///
-/// Sent from background thread to main loop to report creation progress.
-#[derive(Debug, Clone)]
-pub struct AgentProgressEvent {
-    /// The client that requested the agent creation.
-    pub client_id: ClientId,
-    /// The branch or issue identifier being created.
-    pub identifier: String,
-    /// Current creation stage.
-    pub stage: crate::relay::AgentCreationStage,
-}
 
 /// Queued PTY output message for WebRTC delivery.
 ///
@@ -98,25 +79,12 @@ pub struct WebRtcPtyOutput {
     pub data: Vec<u8>,
 }
 
-/// Result of a background agent creation task.
-///
-/// Sent from the background thread to the main loop when agent creation completes.
-#[derive(Debug)]
-pub struct PendingAgentResult {
-    /// The client that requested the agent creation.
-    pub client_id: ClientId,
-    /// The result of the spawn operation.
-    pub result: Result<SpawnResult, String>,
-    /// The spawn config used (for error reporting).
-    pub config: AgentSpawnConfig,
-}
-
 /// Generate a stable hub_identifier from a repo path.
 ///
 /// Uses SHA256 hash of the absolute path to ensure the same repo
 /// always gets the same hub_id, even across CLI restarts.
 #[must_use]
-pub fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
+pub(crate) fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
     let canonical = repo_path
         .canonicalize()
         .unwrap_or_else(|_| repo_path.to_path_buf());
@@ -162,16 +130,6 @@ pub struct Hub {
     // === Browser Relay ===
     /// Browser connection state and communication.
     pub browser: crate::relay::BrowserState,
-
-    // === Background Task Channels ===
-    /// Sender for pending agent creation results (cloned for each background task).
-    pub pending_agent_tx: std_mpsc::Sender<PendingAgentResult>,
-    /// Receiver for pending agent creation results (polled in main loop).
-    pub pending_agent_rx: std_mpsc::Receiver<PendingAgentResult>,
-    /// Sender for agent creation progress updates (cloned for each background task).
-    pub progress_tx: std_mpsc::Sender<AgentProgressEvent>,
-    /// Receiver for agent creation progress updates (polled in main loop).
-    pub progress_rx: std_mpsc::Receiver<AgentProgressEvent>,
 
     // === Background Workers ===
     /// Background worker for notification sending (non-blocking).
@@ -292,11 +250,6 @@ impl Hub {
         // Initialize heartbeat timestamp to past to trigger immediate heartbeat on first tick
         let past = Instant::now() - std::time::Duration::from_secs(3600);
 
-        // Create channel for background agent creation results
-        let (pending_agent_tx, pending_agent_rx) = std_mpsc::channel();
-        // Create channel for progress updates during agent creation
-        let (progress_tx, progress_rx) = std_mpsc::channel();
-
         // Create handle cache for thread-safe agent handle access
         let handle_cache = Arc::new(handle_cache::HandleCache::new());
         // Create channel for WebRTC PTY output from forwarder tasks
@@ -318,10 +271,6 @@ impl Hub {
             quit: false,
             last_heartbeat: past,
             browser: crate::relay::BrowserState::default(),
-            pending_agent_tx,
-            pending_agent_rx,
-            progress_tx,
-            progress_rx,
             // Workers are started later via start_background_workers() after registration
             notification_worker: None,
             command_channel: None,
@@ -405,80 +354,15 @@ impl Hub {
 
     /// Sync the handle cache with current state.
     ///
-    /// Call this after agents are created or deleted to ensure the cache
-    /// reflects the current state. The cache allows `HandleCache::get_agent()`
-    /// to read directly without sending blocking commands.
+    /// Rebuilds HandleCache from HubState's agent PTY handles. Call this after
+    /// agents are created or deleted. Agent metadata is not included -- Lua
+    /// manages that separately.
     pub fn sync_handle_cache(&self) {
         let state = self.state.read().unwrap();
         let handles: Vec<AgentHandle> = (0..state.agent_count())
             .filter_map(|i| state.get_agent_handle(i))
             .collect();
         self.handle_cache.set_all(handles);
-    }
-
-    // === Port Allocation ===
-
-    /// Starting port for allocation (3000 is often used by Rails).
-    const PORT_RANGE_START: u16 = 3001;
-    /// Maximum port to try before giving up.
-    const PORT_RANGE_END: u16 = 4000;
-
-    /// Allocate a unique port for an agent's dev server.
-    ///
-    /// Finds an available port by:
-    /// 1. Checking it's not already allocated to another agent
-    /// 2. Verifying it's actually open via `TcpListener::bind`
-    ///
-    /// Ports are scanned starting from 3001 (avoiding 3000 which Rails commonly uses).
-    ///
-    /// # Returns
-    ///
-    /// - `Some(port)` if an available port was found and reserved
-    /// - `None` if no port available after scanning the range
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// if let Some(port) = hub.allocate_unique_port() {
-    ///     log::info!("Allocated port {} for dev server", port);
-    ///     // Port is now tracked in hub.state.allocated_ports
-    /// }
-    /// ```
-    #[must_use]
-    pub fn allocate_unique_port(&self) -> Option<u16> {
-        let mut state = self.state.write().unwrap();
-
-        for port in Self::PORT_RANGE_START..=Self::PORT_RANGE_END {
-            // Skip if already allocated to another agent
-            if state.allocated_ports.contains(&port) {
-                continue;
-            }
-
-            // Check if port is actually available
-            if TcpListener::bind(format!("127.0.0.1:{port}")).is_ok() {
-                state.allocated_ports.insert(port);
-                log::debug!("Allocated port {port} (total allocated: {})", state.allocated_ports.len());
-                return Some(port);
-            }
-        }
-
-        log::warn!(
-            "No available ports in range {}-{}",
-            Self::PORT_RANGE_START,
-            Self::PORT_RANGE_END
-        );
-        None
-    }
-
-    /// Release a previously allocated port.
-    ///
-    /// Call this when an agent is deleted to return its port to the pool.
-    /// Safe to call with a port that wasn't allocated (no-op).
-    pub fn release_port(&self, port: u16) {
-        let mut state = self.state.write().unwrap();
-        if state.allocated_ports.remove(&port) {
-            log::debug!("Released port {port} (total allocated: {})", state.allocated_ports.len());
-        }
     }
 
     /// Check if the hub should quit.
@@ -542,7 +426,10 @@ impl Hub {
         }
 
         // Register Hub primitives with Lua runtime (must happen before loading init script)
-        if let Err(e) = self.lua.register_hub_primitives(Arc::clone(&self.handle_cache)) {
+        if let Err(e) = self.lua.register_hub_primitives(
+            Arc::clone(&self.handle_cache),
+            self.config.worktree_base.clone(),
+        ) {
             log::warn!("Failed to register Hub Lua primitives: {}", e);
         }
 
@@ -830,7 +717,7 @@ mod tests {
 
         // Verify agent_id matches
         let handle = cached.unwrap();
-        assert_eq!(handle.agent_id(), key);
+        assert_eq!(handle.agent_key(), key);
     }
 
     #[test]
@@ -844,8 +731,8 @@ mod tests {
         hub.sync_handle_cache();
 
         assert_eq!(hub.handle_cache.len(), 2);
-        assert_eq!(hub.handle_cache.get_agent(0).unwrap().agent_id(), &key1);
-        assert_eq!(hub.handle_cache.get_agent(1).unwrap().agent_id(), &key2);
+        assert_eq!(hub.handle_cache.get_agent(0).unwrap().agent_key(), &key1);
+        assert_eq!(hub.handle_cache.get_agent(1).unwrap().agent_key(), &key2);
 
         // Remove agent 0 (key1)
         hub.state.write().unwrap().remove_agent(&key1);
@@ -855,13 +742,12 @@ mod tests {
         assert_eq!(hub.handle_cache.len(), 1);
         let remaining = hub.handle_cache.get_agent(0).unwrap();
         assert_eq!(
-            remaining.agent_id(), key2,
+            remaining.agent_key(), key2,
             "After deleting agent 0, index 0 should now point to what was agent 1"
         );
     }
 
-    // Note: TUI request processing tests are in runner.rs. Hub-side tests
-    // verify selection tracking via handle_action(SelectAgentForClient) above.
+    // Note: TUI request processing tests are in runner.rs.
 
     #[test]
     fn test_create_delete_agent_cycle() {
@@ -882,9 +768,9 @@ mod tests {
         assert_eq!(hub.handle_cache.len(), 3);
 
         // Verify cache contents
-        assert_eq!(hub.handle_cache.get_agent(0).unwrap().agent_id(), &key1);
-        assert_eq!(hub.handle_cache.get_agent(1).unwrap().agent_id(), &key2);
-        assert_eq!(hub.handle_cache.get_agent(2).unwrap().agent_id(), &key3);
+        assert_eq!(hub.handle_cache.get_agent(0).unwrap().agent_key(), &key1);
+        assert_eq!(hub.handle_cache.get_agent(1).unwrap().agent_key(), &key2);
+        assert_eq!(hub.handle_cache.get_agent(2).unwrap().agent_key(), &key3);
 
         // Delete middle agent (key2)
         hub.state.write().unwrap().remove_agent(&key2);
@@ -893,11 +779,11 @@ mod tests {
         // Cache should have 2 agents with correct IDs
         assert_eq!(hub.handle_cache.len(), 2);
         assert_eq!(
-            hub.handle_cache.get_agent(0).unwrap().agent_id(), &key1,
+            hub.handle_cache.get_agent(0).unwrap().agent_key(), &key1,
             "After deleting middle agent, index 0 should still be agent 1"
         );
         assert_eq!(
-            hub.handle_cache.get_agent(1).unwrap().agent_id(), &key3,
+            hub.handle_cache.get_agent(1).unwrap().agent_key(), &key3,
             "After deleting middle agent, index 1 should now be agent 3"
         );
     }
@@ -972,49 +858,6 @@ mod tests {
         }, Duration::from_secs(5));
     }
 
-    /// Stress test: rapid agent selection via Hub actions.
-    ///
-    /// Creates 3 agents, then sends 50 SelectAgentForClient actions rapidly,
-    /// alternating between agents. Verifies that the handle cache remains
-    /// consistent throughout.
-    #[test]
-    fn test_rapid_agent_selection_no_deadlock() {
-        use std::time::Duration;
-
-        run_with_timeout(|| {
-            let config = test_config();
-            let mut hub = Hub::new(config).unwrap();
-
-            // Add 3 agents
-            let keys: Vec<String> = (1..=3).map(|i| add_agent_to_hub(&hub, i)).collect();
-            hub.sync_handle_cache();
-
-            // Rapid selection: 50 iterations, alternating between agents
-            for i in 0..50usize {
-                let index = i % 3;
-                let agent_key = keys[index].clone();
-
-                hub.handle_action(HubAction::SelectAgentForClient {
-                    client_id: ClientId::Tui,
-                    agent_key,
-                });
-            }
-
-            // Verify final state is consistent: cache should still have 3 agents
-            assert_eq!(
-                hub.handle_cache.len(),
-                3,
-                "HandleCache should still have 3 agents after rapid selection"
-            );
-
-            let cached_agent = hub.handle_cache.get_agent(1);
-            assert!(
-                cached_agent.is_some(),
-                "Agent at index 1 should still be accessible after rapid selection"
-            );
-        }, Duration::from_secs(5));
-    }
-
     /// Consistency test: cache count matches state count through add/remove cycle.
     ///
     /// Adds 5 agents one by one, calling sync_handle_cache() after each, then
@@ -1069,85 +912,9 @@ mod tests {
 
             // Verify the remaining agents are correct (keys[3] and keys[4])
             let cached_agents = hub.handle_cache.get_all_agents();
-            assert_eq!(cached_agents[0].agent_id(), &keys[3]);
-            assert_eq!(cached_agents[1].agent_id(), &keys[4]);
+            assert_eq!(cached_agents[0].agent_key(), &keys[3]);
+            assert_eq!(cached_agents[1].agent_key(), &keys[4]);
         }, Duration::from_secs(5));
     }
 
-    // === Port Allocation Tests ===
-
-    #[test]
-    fn test_allocate_unique_port_returns_port() {
-        let config = test_config();
-        let hub = Hub::new(config).unwrap();
-
-        let port = hub.allocate_unique_port();
-        assert!(port.is_some(), "Should allocate a port");
-
-        let port = port.unwrap();
-        assert!(
-            port >= Hub::PORT_RANGE_START && port <= Hub::PORT_RANGE_END,
-            "Port {} should be in range {}-{}",
-            port,
-            Hub::PORT_RANGE_START,
-            Hub::PORT_RANGE_END
-        );
-    }
-
-    #[test]
-    fn test_allocate_unique_port_tracks_allocation() {
-        let config = test_config();
-        let hub = Hub::new(config).unwrap();
-
-        let port1 = hub.allocate_unique_port().unwrap();
-        let port2 = hub.allocate_unique_port().unwrap();
-
-        assert_ne!(port1, port2, "Should allocate different ports");
-
-        // Verify both are tracked
-        let state = hub.state.read().unwrap();
-        assert!(state.allocated_ports.contains(&port1));
-        assert!(state.allocated_ports.contains(&port2));
-        assert_eq!(state.allocated_ports.len(), 2);
-    }
-
-    #[test]
-    fn test_release_port() {
-        let config = test_config();
-        let hub = Hub::new(config).unwrap();
-
-        let port = hub.allocate_unique_port().unwrap();
-        assert!(hub.state.read().unwrap().allocated_ports.contains(&port));
-
-        hub.release_port(port);
-        assert!(!hub.state.read().unwrap().allocated_ports.contains(&port));
-    }
-
-    #[test]
-    fn test_release_port_allows_reallocation() {
-        let config = test_config();
-        let hub = Hub::new(config).unwrap();
-
-        let port1 = hub.allocate_unique_port().unwrap();
-        hub.release_port(port1);
-
-        // The released port should be available again (assuming no other process grabbed it)
-        let port2 = hub.allocate_unique_port().unwrap();
-
-        // port2 could be port1 or another port - we just verify allocation works
-        assert!(
-            port2 >= Hub::PORT_RANGE_START && port2 <= Hub::PORT_RANGE_END,
-            "Should allocate a valid port after release"
-        );
-    }
-
-    #[test]
-    fn test_release_unallocated_port_is_noop() {
-        let config = test_config();
-        let hub = Hub::new(config).unwrap();
-
-        // Should not panic or error
-        hub.release_port(9999);
-        assert!(hub.state.read().unwrap().allocated_ports.is_empty());
-    }
 }

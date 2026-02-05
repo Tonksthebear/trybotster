@@ -64,10 +64,7 @@ pub mod types;
 
 pub use state::{build_agent_info, build_scrollback_message, build_worktree_info, BrowserState};
 
-pub use types::{
-    AgentCreationStage, AgentInfo, BrowserCommand, BrowserResize, TerminalMessage,
-    WorktreeInfo,
-};
+pub use types::{AgentInfo, BrowserCommand, BrowserResize, TerminalMessage, WorktreeInfo};
 
 pub use signal::{
     binary_format, PreKeyBundleData, SignalEnvelope, SignalProtocolManager, SIGNAL_PROTOCOL_VERSION,

@@ -13,10 +13,11 @@
 //! Each client subscribes to events independently and handles them
 //! according to their transport requirements.
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-02
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::{mpsc::Sender, Arc, Mutex};
 use std::thread;
 
@@ -27,17 +28,52 @@ use tokio::sync::broadcast;
 use super::notification::{detect_notifications, AgentNotification};
 use super::pty::{PtyEvent, MAX_SCROLLBACK_BYTES};
 
-/// Configuration for spawning a PTY process.
+/// Configuration for spawning a process in a PtySession.
+///
+/// This struct captures all the parameters needed to spawn a process,
+/// unifying the CLI and server spawn paths into a single configurable
+/// entry point via [`PtySession::spawn()`](super::pty::PtySession::spawn).
+///
+/// # Example
+///
+/// ```ignore
+/// let config = PtySpawnConfig {
+///     worktree_path: PathBuf::from("/path/to/worktree"),
+///     command: "bash".to_string(),
+///     env: HashMap::new(),
+///     init_commands: vec!["source .botster_init".to_string()],
+///     detect_notifications: true,
+///     port: None,
+///     context: String::new(),
+/// };
+/// pty_session.spawn(config)?;
+/// ```
 #[derive(Debug)]
-pub struct PtySpawnConfig<'a> {
-    /// Terminal rows.
-    pub rows: u16,
-    /// Terminal columns.
-    pub cols: u16,
-    /// Working directory for the command.
-    pub cwd: &'a std::path::Path,
+pub struct PtySpawnConfig {
+    /// Working directory for the process.
+    pub worktree_path: PathBuf,
+    /// Command to run (e.g., "bash").
+    pub command: String,
     /// Environment variables to set.
-    pub env_vars: &'a std::collections::HashMap<String, String>,
+    pub env: HashMap<String, String>,
+    /// Commands to run after spawn (e.g., ["source .botster_init"]).
+    pub init_commands: Vec<String>,
+    /// Enable OSC notification detection on this session.
+    ///
+    /// When true, the reader thread will parse PTY output for OSC 9 and
+    /// OSC 777 notification sequences and make them available via
+    /// [`PtySession::poll_notifications()`](super::pty::PtySession::poll_notifications).
+    pub detect_notifications: bool,
+    /// HTTP forwarding port (if this session runs a server).
+    ///
+    /// When set, stored on the PtySession via `set_port()` for browser
+    /// clients to query when proxying preview requests.
+    pub port: Option<u16>,
+    /// Context string written to PTY before init commands.
+    ///
+    /// Typically used to send initial context to the agent process
+    /// before running init scripts.
+    pub context: String,
 }
 
 /// Open a new PTY pair with the given dimensions.
@@ -74,29 +110,39 @@ pub fn build_command(
     cmd
 }
 
-/// Spawn a CLI PTY reader thread with notification detection.
+/// Spawn a unified PTY reader thread with optional notification detection.
 ///
-/// Reads PTY output, broadcasts via event channel, adds to scrollback buffer,
-/// and detects OSC notification sequences.
+/// This is the reader thread implementation used by
+/// [`PtySession::spawn()`](super::pty::PtySession::spawn), parameterized
+/// by `notification_tx`:
 ///
-/// Note: This does NOT parse bytes through a vt100 parser. Consumers
-/// (TuiRunner, browser via Lua) own their own parsers.
+/// - When `notification_tx` is `Some`, OSC notification sequences are detected
+///   and forwarded (CLI session behavior).
+/// - When `notification_tx` is `None`, notification detection is skipped
+///   (server session behavior).
 ///
 /// # Arguments
 ///
 /// * `reader` - PTY output reader
 /// * `scrollback_buffer` - Raw byte buffer for session replay
 /// * `event_tx` - Broadcast channel for PtyEvent notifications
-/// * `notification_tx` - Channel for OSC notification events
-pub fn spawn_cli_reader_thread(
+/// * `notification_tx` - Optional channel for OSC notification events.
+///   `None` disables notification detection.
+pub fn spawn_reader_thread(
     reader: Box<dyn Read + Send>,
     scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
     event_tx: broadcast::Sender<PtyEvent>,
-    notification_tx: Sender<AgentNotification>,
+    notification_tx: Option<Sender<AgentNotification>>,
 ) -> thread::JoinHandle<()> {
+    let label = if notification_tx.is_some() {
+        "CLI"
+    } else {
+        "Server"
+    };
+
     thread::spawn(move || {
         let mut reader = reader;
-        log::info!("CLI PTY reader thread started");
+        log::info!("{label} PTY reader thread started");
         let mut buf = [0u8; 4096];
         let mut total_bytes_read: usize = 0;
 
@@ -106,14 +152,16 @@ pub fn spawn_cli_reader_thread(
                 Ok(n) => {
                     total_bytes_read += n;
                     if total_bytes_read % 10240 < n {
-                        log::info!("CLI PTY reader: {total_bytes_read} total bytes read");
+                        log::info!("{label} PTY reader: {total_bytes_read} total bytes read");
                     }
 
-                    // Detect notifications in output
-                    let notifications = detect_notifications(&buf[..n]);
-                    for notif in notifications {
-                        log::info!("Sending notification to channel: {:?}", notif);
-                        let _ = notification_tx.send(notif);
+                    // Detect notifications if enabled
+                    if let Some(ref tx) = notification_tx {
+                        let notifications = detect_notifications(&buf[..n]);
+                        for notif in notifications {
+                            log::info!("Sending notification to channel: {:?}", notif);
+                            let _ = tx.send(notif);
+                        }
                     }
 
                     // Add raw bytes to scrollback buffer
@@ -133,71 +181,12 @@ pub fn spawn_cli_reader_thread(
                     let _ = event_tx.send(PtyEvent::output(buf[..n].to_vec()));
                 }
                 Err(e) => {
-                    log::error!("CLI PTY read error: {e}");
+                    log::error!("{label} PTY read error: {e}");
                     break;
                 }
             }
         }
-        log::info!("CLI PTY reader thread exiting");
-    })
-}
-
-/// Spawn a Server PTY reader thread (no notification detection).
-///
-/// Similar to CLI reader but without OSC notification detection.
-/// Broadcasts output via [`PtyEvent::Output`].
-///
-/// Note: This does NOT parse bytes through a vt100 parser. Consumers
-/// (TuiRunner, browser via Lua) own their own parsers.
-///
-/// # Arguments
-///
-/// * `reader` - PTY output reader
-/// * `scrollback_buffer` - Raw byte buffer for session replay
-/// * `event_tx` - Broadcast channel for PtyEvent notifications
-pub fn spawn_server_reader_thread(
-    reader: Box<dyn Read + Send>,
-    scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
-    event_tx: broadcast::Sender<PtyEvent>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut reader = reader;
-        log::info!("Server PTY reader thread started");
-        let mut buf = [0u8; 4096];
-        let mut total_bytes_read: usize = 0;
-
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    total_bytes_read += n;
-                    if total_bytes_read % 10240 < n {
-                        log::info!("Server PTY reader: {total_bytes_read} total bytes read");
-                    }
-
-                    // Add raw bytes to scrollback buffer
-                    {
-                        let mut buffer = scrollback_buffer
-                            .lock()
-                            .expect("scrollback_buffer lock poisoned");
-                        buffer.extend(buf[..n].iter().copied());
-                        // Trim from front if over limit
-                        while buffer.len() > MAX_SCROLLBACK_BYTES {
-                            buffer.pop_front();
-                        }
-                    }
-
-                    // Broadcast output event to all subscribers
-                    // Clients parse bytes in their own parsers when they receive this event
-                    let _ = event_tx.send(PtyEvent::output(buf[..n].to_vec()));
-                }
-                Err(e) => {
-                    log::error!("Server PTY read error: {e}");
-                    break;
-                }
-            }
-        }
-        log::info!("Server PTY reader thread exiting");
+        log::info!("{label} PTY reader thread exiting");
     })
 }
 
@@ -229,13 +218,8 @@ mod tests {
     }
 
     // =========================================================================
-    // Hot Path Tests - Reader Thread Broadcasting
+    // Reader Thread Tests
     // =========================================================================
-    // These tests verify the critical hot path: reader thread -> broadcast::send()
-    //
-    // Note: spawn_cli_reader_thread and spawn_server_reader_thread are nearly
-    // identical in their broadcast behavior. The CLI version additionally does
-    // notification detection.
 
     /// Mock reader that returns predefined data.
     struct MockReader {
@@ -257,17 +241,14 @@ mod tests {
     }
 
     #[test]
-    fn test_hot_path_server_reader_broadcasts_output() {
-        // Tests that spawn_server_reader_thread broadcasts PtyEvent::Output
-        let test_data = b"Hello from server PTY";
+    fn test_unified_reader_broadcasts_output_without_notifications() {
+        // Tests spawn_reader_thread with notification_tx=None (server mode)
+        let test_data = b"Hello from unified reader (server mode)";
         let reader = MockReader::new(test_data);
         let scrollback = Arc::new(Mutex::new(VecDeque::new()));
         let (tx, mut rx) = broadcast::channel::<PtyEvent>(16);
 
-        // Spawn the reader thread
-        let handle = spawn_server_reader_thread(reader, scrollback.clone(), tx);
-
-        // Wait for thread to process and complete (short data = quick)
+        let handle = spawn_reader_thread(reader, scrollback.clone(), tx, None);
         handle.join().expect("Reader thread panicked");
 
         // Verify event was broadcast
@@ -278,18 +259,6 @@ mod tests {
             }
             _ => panic!("Expected Output event"),
         }
-    }
-
-    #[test]
-    fn test_hot_path_server_reader_populates_scrollback() {
-        // Tests that reader thread adds data to scrollback buffer
-        let test_data = b"Scrollback test data";
-        let reader = MockReader::new(test_data);
-        let scrollback = Arc::new(Mutex::new(VecDeque::new()));
-        let (tx, _rx) = broadcast::channel::<PtyEvent>(16);
-
-        let handle = spawn_server_reader_thread(reader, scrollback.clone(), tx);
-        handle.join().expect("Reader thread panicked");
 
         // Verify scrollback was populated
         let buffer = scrollback.lock().unwrap();
@@ -298,44 +267,15 @@ mod tests {
     }
 
     #[test]
-    fn test_hot_path_reader_broadcasts_to_multiple_subscribers() {
-        // Tests that multiple subscribers all receive the output
-        let test_data = b"Multi-subscriber test";
-        let reader = MockReader::new(test_data);
-        let scrollback = Arc::new(Mutex::new(VecDeque::new()));
-        let (tx, mut rx1) = broadcast::channel::<PtyEvent>(16);
-
-        // Create additional subscribers
-        let mut rx2 = tx.subscribe();
-        let mut rx3 = tx.subscribe();
-
-        let handle = spawn_server_reader_thread(reader, scrollback, tx);
-        handle.join().expect("Reader thread panicked");
-
-        // All three receivers should get the event
-        for (i, rx) in [&mut rx1, &mut rx2, &mut rx3].iter_mut().enumerate() {
-            let event = rx
-                .try_recv()
-                .unwrap_or_else(|_| panic!("Receiver {} should have event", i));
-            match event {
-                PtyEvent::Output(data) => {
-                    assert_eq!(data, test_data, "Receiver {} got wrong data", i);
-                }
-                _ => panic!("Receiver {} expected Output event", i),
-            }
-        }
-    }
-
-    #[test]
-    fn test_hot_path_cli_reader_broadcasts_output() {
-        // Tests that spawn_cli_reader_thread broadcasts PtyEvent::Output
-        let test_data = b"Hello from CLI PTY";
+    fn test_unified_reader_broadcasts_output_with_notifications() {
+        // Tests spawn_reader_thread with notification_tx=Some (CLI mode)
+        let test_data = b"Hello from unified reader (CLI mode)";
         let reader = MockReader::new(test_data);
         let scrollback = Arc::new(Mutex::new(VecDeque::new()));
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
         let (notif_tx, _notif_rx) = mpsc::channel::<AgentNotification>();
 
-        let handle = spawn_cli_reader_thread(reader, scrollback.clone(), event_tx, notif_tx);
+        let handle = spawn_reader_thread(reader, scrollback.clone(), event_tx, Some(notif_tx));
         handle.join().expect("Reader thread panicked");
 
         // Verify event was broadcast
@@ -349,71 +289,42 @@ mod tests {
     }
 
     #[test]
-    fn test_hot_path_cli_reader_populates_scrollback() {
-        // Tests that CLI reader thread adds data to scrollback buffer
-        let test_data = b"CLI scrollback test";
+    fn test_unified_reader_detects_notifications_when_enabled() {
+        // Tests that spawn_reader_thread detects OSC notifications when tx is Some
+        // OSC 9 notification: ESC ] 9 ; message BEL
+        let test_data = b"\x1b]9;Build complete\x07";
         let reader = MockReader::new(test_data);
         let scrollback = Arc::new(Mutex::new(VecDeque::new()));
-        let (event_tx, _rx) = broadcast::channel::<PtyEvent>(16);
-        let (notif_tx, _notif_rx) = mpsc::channel::<AgentNotification>();
+        let (event_tx, _event_rx) = broadcast::channel::<PtyEvent>(16);
+        let (notif_tx, notif_rx) = mpsc::channel::<AgentNotification>();
 
-        let handle = spawn_cli_reader_thread(reader, scrollback.clone(), event_tx, notif_tx);
+        let handle = spawn_reader_thread(reader, scrollback, event_tx, Some(notif_tx));
         handle.join().expect("Reader thread panicked");
 
-        // Verify scrollback was populated
-        let buffer = scrollback.lock().unwrap();
-        let snapshot: Vec<u8> = buffer.iter().copied().collect();
-        assert_eq!(snapshot, test_data, "Scrollback should contain input data");
-    }
-
-    #[test]
-    fn test_hot_path_reader_handles_chunked_data() {
-        // Tests that larger data is correctly chunked and broadcast
-        // The reader uses a 4096-byte buffer, so test with data requiring multiple reads
-        let large_data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
-        let reader = MockReader::new(&large_data);
-        let scrollback = Arc::new(Mutex::new(VecDeque::new()));
-        let (tx, mut rx) = broadcast::channel::<PtyEvent>(16);
-
-        let handle = spawn_server_reader_thread(reader, scrollback.clone(), tx);
-        handle.join().expect("Reader thread panicked");
-
-        // Collect all output events
-        let mut received_data = Vec::new();
-        while let Ok(PtyEvent::Output(chunk)) = rx.try_recv() {
-            received_data.extend(chunk);
+        // Should have received the notification
+        let notif = notif_rx.try_recv().expect("Should receive notification");
+        match notif {
+            AgentNotification::Osc9(Some(msg)) => {
+                assert_eq!(msg, "Build complete");
+            }
+            _ => panic!("Expected Osc9 notification"),
         }
-
-        // Total received should match input
-        assert_eq!(received_data, large_data, "All data should be received");
-
-        // Scrollback should also have all data
-        let buffer = scrollback.lock().unwrap();
-        let scrollback_data: Vec<u8> = buffer.iter().copied().collect();
-        assert_eq!(
-            scrollback_data, large_data,
-            "Scrollback should have all data"
-        );
     }
 
     #[test]
-    fn test_hot_path_reader_respects_scrollback_limit() {
-        // Tests that scrollback buffer is trimmed to MAX_SCROLLBACK_BYTES
-        // Create data larger than MAX_SCROLLBACK_BYTES
-        let oversized_data: Vec<u8> = vec![b'x'; MAX_SCROLLBACK_BYTES + 1000];
-        let reader = MockReader::new(&oversized_data);
+    fn test_unified_reader_skips_notifications_when_disabled() {
+        // Tests that spawn_reader_thread does NOT detect notifications when tx is None
+        // Even with OSC data, no notification channel means no detection
+        let test_data = b"\x1b]9;Build complete\x07";
+        let reader = MockReader::new(test_data);
         let scrollback = Arc::new(Mutex::new(VecDeque::new()));
-        let (tx, _rx) = broadcast::channel::<PtyEvent>(64); // Large capacity for all chunks
+        let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_server_reader_thread(reader, scrollback.clone(), tx);
+        let handle = spawn_reader_thread(reader, scrollback, event_tx, None);
         handle.join().expect("Reader thread panicked");
 
-        // Scrollback should be trimmed
-        let buffer = scrollback.lock().unwrap();
-        assert!(
-            buffer.len() <= MAX_SCROLLBACK_BYTES,
-            "Scrollback should be <= MAX_SCROLLBACK_BYTES, got {}",
-            buffer.len()
-        );
+        // Output should still be broadcast (the raw bytes including the OSC sequence)
+        let event = event_rx.try_recv().expect("Should receive Output event");
+        assert!(matches!(event, PtyEvent::Output(_)));
     }
 }

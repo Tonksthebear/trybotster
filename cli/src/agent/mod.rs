@@ -41,7 +41,7 @@ pub use pty::PtySession;
 
 use anyhow::Result;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     path::PathBuf,
     sync::{mpsc::Receiver, Arc, Mutex},
     time::Duration,
@@ -284,68 +284,6 @@ impl Agent {
     /// Returns an error if the write fails.
     pub fn write_input_to_cli(&mut self, input: &[u8]) -> Result<()> {
         self.cli_pty.write_input(input)
-    }
-
-    // =========================================================================
-    // Lifecycle & Spawn
-    // =========================================================================
-
-    /// Spawn the CLI PTY with the given command and environment.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if PTY creation or command spawn fails.
-    pub fn spawn(
-        &mut self,
-        command_str: &str,
-        context: &str,
-        init_commands: Vec<String>,
-        env_vars: &HashMap<String, String>,
-    ) -> Result<()> {
-        log::info!(
-            "Spawning agent for {}: command={}, worktree={}",
-            self.issue_number.map_or_else(
-                || format!("{}/{}", self.repo, self.branch_name),
-                |num| format!("{}#{num}", self.repo),
-            ),
-            command_str,
-            self.worktree_path.display()
-        );
-
-        // Use the extracted spawn function
-        let result = pty::spawn_cli_pty(
-            &mut self.cli_pty,
-            &self.worktree_path,
-            command_str,
-            env_vars,
-            init_commands,
-            context,
-        )?;
-
-        self.notification_rx = Some(result.notification_rx);
-        self.status = AgentStatus::Running;
-
-        Ok(())
-    }
-
-    /// Spawn a server PTY to run the dev server.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if PTY creation or shell spawn fails.
-    pub fn spawn_server_pty(
-        &mut self,
-        init_script: &str,
-        env_vars: &HashMap<String, String>,
-    ) -> Result<()> {
-        let (rows, cols) = self.cli_pty.dimensions();
-
-        // Use the extracted spawn function
-        let server_pty =
-            pty::spawn_server_pty(&self.worktree_path, init_script, env_vars, (rows, cols))?;
-
-        self.server_pty = Some(server_pty);
-        Ok(())
     }
 
     /// Check if the dev server is running.

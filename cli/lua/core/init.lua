@@ -6,7 +6,7 @@
 -- Module layout:
 --   core/     - Protected modules (never reloaded): state, hooks, loader
 --   lib/      - Library modules (hot-reloadable): client, utils
---   handlers/ - Handler modules (hot-reloadable): connections, webrtc, tui
+--   handlers/ - Handler modules (hot-reloadable): connections, agents, webrtc, tui
 
 log.info("=== Botster Lua Runtime ===")
 
@@ -23,10 +23,10 @@ _G.loader = loader
 log.debug("Core modules loaded: state, hooks, loader")
 
 -- ============================================================================
--- Handler Loading
+-- Library Loading
 -- ============================================================================
--- Load handler modules that register callbacks. These are hot-reloadable.
--- Errors in handlers are caught to prevent breaking the entire runtime.
+-- Load library modules that provide shared abstractions. These are
+-- hot-reloadable and must load BEFORE handlers that depend on them.
 
 --- Safely require a module, logging errors without failing.
 -- @param module_name The module name to require
@@ -42,8 +42,21 @@ local function safe_require(module_name)
     end
 end
 
+-- Load library modules
+safe_require("lib.agent")
+
+-- ============================================================================
+-- Handler Loading
+-- ============================================================================
+-- Load handler modules that register callbacks. These are hot-reloadable.
+-- Errors in handlers are caught to prevent breaking the entire runtime.
+
 -- Load connection registry (shared client management for all transports)
 safe_require("handlers.connections")
+
+-- Load agent lifecycle handler (orchestrates creation/deletion)
+-- Must load after connections (uses broadcast_hub_event)
+safe_require("handlers.agents")
 
 -- Load transport handlers (register peer/message callbacks)
 safe_require("handlers.webrtc")

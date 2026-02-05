@@ -15,7 +15,8 @@
 //!  ├── scrollback_buffer: Arc<Mutex<VecDeque<u8>>> (raw byte history)
 //!  ├── event_tx: broadcast::Sender<PtyEvent> (output broadcast)
 //!  ├── connected_clients: Vec<ConnectedClient> (client tracking)
-//!  └── notification_tx: Sender<AgentNotification> (agent notifications)
+//!  ├── notification_tx: Sender<AgentNotification> (send notifications)
+//!  └── notification_rx: Receiver<AgentNotification> (receive notifications)
 //! ```
 //!
 //! # Event Broadcasting
@@ -54,22 +55,20 @@
 //! The scrollback buffer is wrapped in `Arc<Mutex<>>` to allow concurrent
 //! reads from the PTY reader thread and writes from the main thread.
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-02
 
-pub mod cli;
 mod commands;
 pub mod connected_client;
 pub mod events;
-pub mod server;
 
 pub use commands::PtyCommand;
 
-pub use cli::{spawn_cli_pty, CliSpawnResult};
 pub use connected_client::ConnectedClient;
 pub use events::PtyEvent;
-pub use server::spawn_server_pty;
 
-use anyhow::Result;
+pub use super::spawn::PtySpawnConfig;
+
+use anyhow::{Context, Result};
 use portable_pty::{Child, MasterPty, PtySize};
 use std::{
     collections::VecDeque,
@@ -80,6 +79,7 @@ use std::{
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::agent::spawn;
 use crate::client::ClientId;
 
 use super::notification::AgentNotification;
@@ -227,6 +227,16 @@ pub struct PtySession {
     /// Channel for sending detected notifications.
     pub notification_tx: Option<Sender<AgentNotification>>,
 
+    /// Channel for receiving detected notifications.
+    ///
+    /// Populated by [`spawn()`](Self::spawn) when
+    /// [`PtySpawnConfig::detect_notifications`] is true.
+    /// Drained via [`poll_notifications()`](Self::poll_notifications).
+    ///
+    /// Note: `mpsc::Receiver` is not `Clone`, which is intentional -- only
+    /// one consumer should drain notifications for a given PTY session.
+    notification_rx: Option<std::sync::mpsc::Receiver<AgentNotification>>,
+
     /// Allocated port for HTTP forwarding.
     ///
     /// Used by server PTYs (pty_index=1) to expose the dev server port for
@@ -251,6 +261,7 @@ impl std::fmt::Debug for PtySession {
             .field("has_child", &self.child.is_some())
             .field("connected_clients", &state.connected_clients.len())
             .field("has_notification_tx", &self.notification_tx.is_some())
+            .field("has_notification_rx", &self.notification_rx.is_some())
             .field(
                 "has_command_processor",
                 &self.command_processor_handle.is_some(),
@@ -286,6 +297,7 @@ impl PtySession {
             command_tx,
             command_rx: Some(command_rx),
             notification_tx: None,
+            notification_rx: None,
             port: None,
         }
     }
@@ -339,6 +351,130 @@ impl PtySession {
         self.port
     }
 
+    // =========================================================================
+    // Unified Spawn
+    // =========================================================================
+
+    /// Spawn a process in this PTY session.
+    ///
+    /// This is the single entry point for spawning processes. The behavior
+    /// is configured via [`PtySpawnConfig`]:
+    ///
+    /// - Set `detect_notifications: true` for CLI sessions that need OSC
+    ///   notification detection.
+    /// - Set `detect_notifications: false` for server sessions that only
+    ///   need output broadcasting.
+    ///
+    /// After calling this method, the PtySession is fully configured with
+    /// a running process, reader thread, and command processor.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Spawn configuration including command, env, init commands, etc.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if PTY creation, command spawn, or writer setup fails.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut pty = PtySession::new(24, 80);
+    /// pty.spawn(PtySpawnConfig {
+    ///     worktree_path: PathBuf::from("/path/to/worktree"),
+    ///     command: "bash".to_string(),
+    ///     env: HashMap::new(),
+    ///     init_commands: vec!["source .botster_init".to_string()],
+    ///     detect_notifications: true,
+    ///     port: None,
+    ///     context: String::new(),
+    /// })?;
+    /// ```
+    pub fn spawn(&mut self, config: PtySpawnConfig) -> Result<()> {
+        // Set port if provided
+        if let Some(port) = config.port {
+            self.set_port(port);
+        }
+
+        // Open PTY pair with current dimensions
+        let (rows, cols) = self.dimensions();
+        let pair = spawn::open_pty(rows, cols)?;
+
+        // Build and spawn command
+        let cmd = spawn::build_command(&config.command, &config.worktree_path, &config.env);
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .context("Failed to spawn command")?;
+
+        // Set up notification channel if enabled
+        let notification_tx = if config.detect_notifications {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.notification_rx = Some(rx);
+            Some(tx)
+        } else {
+            None
+        };
+
+        // Store the notification_tx on self for external access if needed
+        self.notification_tx = notification_tx.clone();
+
+        // Configure PTY with spawned resources
+        self.set_child(child);
+        self.set_writer(pair.master.take_writer()?);
+
+        // Start unified reader thread
+        let reader = pair.master.try_clone_reader()?;
+        self.reader_thread = Some(spawn::spawn_reader_thread(
+            reader,
+            Arc::clone(&self.scrollback_buffer),
+            self.event_sender(),
+            notification_tx,
+        ));
+
+        self.set_master_pty(pair.master);
+
+        // Start command processor task
+        self.spawn_command_processor();
+
+        // Write context and init commands
+        if !config.context.is_empty() {
+            let _ = self.write_input_str(&format!("{}\n", config.context));
+        }
+
+        if !config.init_commands.is_empty() {
+            log::info!("Sending {} init command(s)", config.init_commands.len());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            for cmd_str in &config.init_commands {
+                log::debug!("Running init command: {cmd_str}");
+                let _ = self.write_input_str(&format!("{cmd_str}\n"));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Poll for pending notifications (non-blocking).
+    ///
+    /// Drains all available notifications from the internal receiver channel.
+    /// Returns an empty `Vec` if notifications are not enabled for this session
+    /// (i.e., `detect_notifications` was `false` in the spawn config).
+    ///
+    /// This is the PtySession-level equivalent of `Agent::poll_notifications()`.
+    /// As the Agent struct is dissolved, callers should use this method directly
+    /// on the PtySession instead.
+    #[must_use]
+    pub fn poll_notifications(&self) -> Vec<AgentNotification> {
+        let mut notifications = Vec::new();
+        if let Some(ref rx) = self.notification_rx {
+            while let Ok(notif) = rx.try_recv() {
+                notifications.push(notif);
+            }
+        }
+        notifications
+    }
+
     /// Get a clone of the shared state Arc for the command processor.
     ///
     /// Used internally by `spawn_command_processor()`.
@@ -387,6 +523,19 @@ impl PtySession {
         self.command_rx.take()
     }
 
+    /// Take the notification receiver from this PTY session.
+    ///
+    /// This transfers ownership of the notification channel receiver to the
+    /// caller. Used by `PtySessionHandle` to own the notification receiver
+    /// directly, avoiding the need to go through the `PtySession` for polling.
+    ///
+    /// Returns `None` if notifications are not enabled or already taken.
+    pub fn take_notification_rx(
+        &mut self,
+    ) -> Option<std::sync::mpsc::Receiver<AgentNotification>> {
+        self.notification_rx.take()
+    }
+
     /// Spawn the command processor task.
     ///
     /// This starts a background tokio task that processes commands from the
@@ -399,10 +548,29 @@ impl PtySession {
     /// The task runs until the command channel is closed (all senders dropped)
     /// or the PTY session is dropped.
     ///
+    /// # Runtime Context
+    ///
+    /// If called outside a Tokio runtime context, this method logs a warning
+    /// and returns without spawning. The caller should then use
+    /// [`process_commands`] for synchronous command processing.
+    ///
     /// # Panics
     ///
     /// Panics if called more than once (command receiver already taken).
     pub fn spawn_command_processor(&mut self) {
+        // Check for Tokio runtime before taking the rx.
+        // If no runtime available, leave rx in place for sync processing.
+        let runtime_handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                log::warn!(
+                    "PTY command processor not spawned - no Tokio runtime context. \
+                     Using synchronous command processing via process_commands()."
+                );
+                return;
+            }
+        };
+
         let rx = self
             .command_rx
             .take()
@@ -412,12 +580,12 @@ impl PtySession {
         let event_tx = self.event_sender();
         let scrollback_buffer = Arc::clone(&self.scrollback_buffer);
 
-        let handle = tokio::spawn(async move {
+        let handle = runtime_handle.spawn(async move {
             run_command_processor(rx, shared_state, event_tx, scrollback_buffer).await;
         });
 
         self.command_processor_handle = Some(handle);
-        log::debug!("PTY command processor spawned");
+        log::debug!("PTY command processor spawned (async)");
     }
 
     /// Process pending commands from clients (synchronous version).
@@ -1676,7 +1844,7 @@ mod tests {
 
     #[test]
     fn test_hot_path_event_sender_for_reader_thread() {
-        // Tests the pattern used by spawn_cli_reader_thread:
+        // Tests the pattern used by the reader thread:
         // Get a cloned sender and use it from a separate context.
         // This is exactly how the reader thread broadcasts output.
         let session = PtySession::new(24, 80);
@@ -2015,5 +2183,156 @@ mod tests {
             session.spawn_command_processor();
             session.spawn_command_processor(); // Should panic
         });
+    }
+
+    // =========================================================================
+    // PtySession::poll_notifications Tests
+    // =========================================================================
+
+    #[test]
+    fn test_poll_notifications_empty_when_no_rx() {
+        // poll_notifications returns empty vec when notification_rx is None
+        let session = PtySession::new(24, 80);
+        assert!(session.notification_rx.is_none());
+        assert!(session.poll_notifications().is_empty());
+    }
+
+    #[test]
+    fn test_poll_notifications_drains_channel() {
+        // poll_notifications drains all available notifications
+        let mut session = PtySession::new(24, 80);
+        let (tx, rx) = std::sync::mpsc::channel();
+        session.notification_rx = Some(rx);
+
+        // Send some notifications
+        tx.send(AgentNotification::Osc9(Some("first".to_string())))
+            .unwrap();
+        tx.send(AgentNotification::Osc9(Some("second".to_string())))
+            .unwrap();
+
+        let notifications = session.poll_notifications();
+        assert_eq!(notifications.len(), 2);
+
+        // Should be empty after draining
+        assert!(session.poll_notifications().is_empty());
+    }
+
+    #[test]
+    fn test_poll_notifications_handles_dropped_sender() {
+        // poll_notifications returns empty vec when sender is dropped
+        let mut session = PtySession::new(24, 80);
+        let (tx, rx) = std::sync::mpsc::channel::<AgentNotification>();
+        session.notification_rx = Some(rx);
+
+        // Drop the sender
+        drop(tx);
+
+        // Should not panic, just return empty
+        assert!(session.poll_notifications().is_empty());
+    }
+
+    // =========================================================================
+    // PtySession::spawn Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_spawn_basic() {
+        use std::collections::HashMap;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut session = PtySession::new(24, 80);
+
+        let config = PtySpawnConfig {
+            worktree_path: temp_dir.path().to_path_buf(),
+            command: "echo hello".to_string(),
+            env: HashMap::new(),
+            init_commands: vec![],
+            detect_notifications: false,
+            port: None,
+            context: String::new(),
+        };
+
+        let result = session.spawn(config);
+        assert!(result.is_ok());
+        assert!(session.is_spawned());
+        // No notification_rx when detect_notifications is false
+        assert!(session.notification_rx.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_with_notifications() {
+        use std::collections::HashMap;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut session = PtySession::new(24, 80);
+
+        let config = PtySpawnConfig {
+            worktree_path: temp_dir.path().to_path_buf(),
+            command: "echo hello".to_string(),
+            env: HashMap::new(),
+            init_commands: vec![],
+            detect_notifications: true,
+            port: None,
+            context: String::new(),
+        };
+
+        let result = session.spawn(config);
+        assert!(result.is_ok());
+        assert!(session.is_spawned());
+        // notification_rx should be set when detect_notifications is true
+        assert!(session.notification_rx.is_some());
+        assert!(session.notification_tx.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_with_port() {
+        use std::collections::HashMap;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut session = PtySession::new(24, 80);
+
+        let config = PtySpawnConfig {
+            worktree_path: temp_dir.path().to_path_buf(),
+            command: "echo hello".to_string(),
+            env: HashMap::new(),
+            init_commands: vec![],
+            detect_notifications: false,
+            port: Some(8080),
+            context: String::new(),
+        };
+
+        let result = session.spawn(config);
+        assert!(result.is_ok());
+        assert_eq!(session.port(), Some(8080));
+    }
+
+    #[test]
+    fn test_notification_rx_not_clone() {
+        // This is a compile-time check -- mpsc::Receiver is not Clone.
+        // We verify the field exists and is Option<Receiver<_>>.
+        let session = PtySession::new(24, 80);
+        let _: &Option<std::sync::mpsc::Receiver<AgentNotification>> = &session.notification_rx;
+    }
+
+    #[test]
+    fn test_spawn_command_processor_outside_tokio_runtime() {
+        // Test that spawn_command_processor gracefully handles being called
+        // outside a Tokio runtime context (no panic, falls back to sync mode).
+        //
+        // This test is NOT run inside #[tokio::test], so there's no runtime.
+        let mut session = PtySession::new(24, 80);
+
+        // Should not panic - just logs warning and returns
+        session.spawn_command_processor();
+
+        // Verify command_rx is still available for sync processing
+        assert!(
+            session.command_rx.is_some(),
+            "command_rx should remain available when no runtime"
+        );
+
+        // Verify we can still use sync process_commands
+        let processed = session.process_commands();
+        assert_eq!(processed, 0, "No commands should be queued");
     }
 }

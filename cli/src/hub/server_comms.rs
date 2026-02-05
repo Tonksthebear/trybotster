@@ -20,11 +20,9 @@ use std::time::{Duration, Instant};
 
 use crate::agent::AgentNotification;
 use crate::channel::Channel;
-use crate::client::ClientId;
 use crate::hub::actions::{self, HubAction};
-use crate::hub::lifecycle::SpawnResult;
-use crate::hub::{command_channel, registration, workers, AgentProgressEvent, Hub, PendingAgentResult};
-use crate::server::messages::{message_to_hub_action, MessageContext, ParsedMessage};
+use crate::hub::{command_channel, registration, workers, Hub};
+use crate::server::messages::ParsedMessage;
 
 impl Hub {
     /// Perform periodic tasks (command channel polling, heartbeat, notifications).
@@ -33,8 +31,6 @@ impl Hub {
     /// This method is **non-blocking** - all network I/O is handled via
     /// the WebSocket command channel and background notification worker.
     pub fn tick(&mut self) {
-        self.poll_pending_agents();
-        self.poll_progress_events();
         self.poll_command_channel();
         self.poll_signal_channel();
         self.poll_outgoing_signals();
@@ -61,6 +57,7 @@ impl Hub {
         self.process_lua_pty_requests();
         self.process_lua_hub_requests();
         self.process_lua_connection_requests();
+        self.process_lua_worktree_requests();
     }
 
     /// Poll for Lua file changes and hot-reload modified modules.
@@ -121,8 +118,10 @@ impl Hub {
 
     /// Process a standard (non-browser) message from the command channel.
     ///
-    /// Converts command channel messages to the same ParsedMessage/HubAction flow
-    /// used for message processing.
+    /// - `agent_cleanup` messages are handled directly in Rust via `HubAction::CloseAgent`.
+    /// - All other messages (including `issue_comment`, `pull_request`, and unknown types)
+    ///   are delegated to Lua via `fire_command_message()`. Lua's `handlers/agents.lua`
+    ///   listens for `"command_message"` events and handles agent creation routing.
     fn process_command_channel_message(&mut self, msg: &command_channel::CommandMessage) {
         use crate::server::types::MessageData;
 
@@ -133,15 +132,15 @@ impl Hub {
             payload: msg.payload.clone(),
         };
 
+        let parsed = ParsedMessage::from_message_data(&message_data);
+
         // Detect repo for context
-        let (repo_path, repo_name) = if let Ok(repo) = std::env::var("BOTSTER_REPO") {
-            (std::path::PathBuf::from("."), repo)
+        let repo_name = if let Ok(repo) = std::env::var("BOTSTER_REPO") {
+            repo
         } else {
             match crate::git::WorktreeManager::detect_current_repo() {
-                Ok(result) => result,
-                Err(_) if crate::env::is_test_mode() => {
-                    (std::path::PathBuf::from("."), "test/repo".to_string())
-                }
+                Ok((_path, name)) => name,
+                Err(_) if crate::env::is_test_mode() => "test/repo".to_string(),
                 Err(e) => {
                     log::warn!("Not in a git repository, skipping message processing: {e}");
                     return;
@@ -149,56 +148,82 @@ impl Hub {
             }
         };
 
-        let context = MessageContext {
-            repo_path,
-            repo_name: repo_name.clone(),
-            worktree_base: self.config.worktree_base.clone(),
-            max_sessions: self.config.max_sessions,
-            current_agent_count: self.state.read().unwrap().agent_count(),
-        };
-
-        let parsed = ParsedMessage::from_message_data(&message_data);
-
-        // Try to notify existing agent first
-        if self.try_notify_existing_agent(&parsed, &context.repo_name) {
+        // Try to notify existing agent first (before Lua or action dispatch)
+        if self.try_notify_existing_agent(&parsed, &repo_name) {
             return;
         }
 
-        // Convert to action and dispatch
-        match message_to_hub_action(&parsed, &context) {
-            Ok(Some(action)) => {
-                self.handle_action(action);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                log::error!(
-                    "Failed to process command channel message {}: {e}",
+        // Handle cleanup directly in Rust (still needs Rust-side agent removal)
+        if parsed.is_cleanup() {
+            if let (Some(issue_number), Some(repo)) = (parsed.issue_number, &parsed.repo) {
+                let repo_safe = repo.replace('/', "-");
+                let session_key = format!("{repo_safe}-{issue_number}");
+                self.handle_action(HubAction::CloseAgent {
+                    session_key,
+                    delete_worktree: false,
+                });
+            } else {
+                log::warn!(
+                    "Cleanup message {} missing repo or issue_number, skipping",
                     msg.id
                 );
             }
+            return;
         }
+
+        // Skip WebRTC offers (handled by signal channel)
+        if parsed.is_webrtc_offer() {
+            return;
+        }
+
+        // Everything else goes to Lua
+        let lua_message = serde_json::json!({
+            "type": "create_agent",
+            "issue_or_branch": parsed.issue_number.map(|n| n.to_string()),
+            "prompt": parsed.task_description(),
+            "repo": parsed.repo,
+            "invocation_url": parsed.invocation_url,
+        });
+
+        if let Err(e) = self.lua.fire_command_message(&lua_message) {
+            log::error!(
+                "Lua command_message error for message {}: {e}",
+                msg.id
+            );
+        }
+        self.flush_lua_queues();
     }
 
     /// Send heartbeat via command channel (non-blocking).
+    ///
+    /// Builds minimal agent data from Rust-owned state (session keys,
+    /// invocation URLs, PTY alive status).
     fn send_command_channel_heartbeat(&mut self) {
         let Some(ref channel) = self.command_channel else {
             return;
         };
 
-        // Only send every 30 seconds
-        if self.last_heartbeat.elapsed() < Duration::from_secs(30) {
+        /// Heartbeat interval in seconds. Aligned with Rails
+        /// `HubCommandChannel::HEARTBEAT_TIMEOUT` (90s) -- sending at 30s
+        /// gives three chances before the server considers the hub offline.
+        const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+        if self.last_heartbeat.elapsed() < Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
             return;
         }
         self.last_heartbeat = Instant::now();
 
-        let state = self.state.read().unwrap();
+        let state = self.state.read()
+            .expect("HubState RwLock poisoned in heartbeat");
         let agents: Vec<serde_json::Value> = state
-            .agents
-            .values()
-            .map(|agent| {
-                serde_json::json!({
-                    "session_key": agent.agent_id(),
-                    "last_invocation_url": agent.last_invocation_url
+            .agent_keys_ordered
+            .iter()
+            .filter_map(|key| {
+                state.agents.get(key).map(|agent| {
+                    serde_json::json!({
+                        "session_key": key,
+                        "last_invocation_url": agent.last_invocation_url
+                    })
                 })
             })
             .collect();
@@ -218,9 +243,9 @@ impl Hub {
             return;
         };
 
-        let state = self.state.read().unwrap();
+        let state = self.state.read()
+            .expect("HubState RwLock poisoned in poll_agent_notifications_async");
 
-        // Collect and send notifications from all agents
         for agent in state.agents.values() {
             for notification in agent.poll_notifications() {
                 // Only send if we have issue context (otherwise there's nowhere to post)
@@ -253,135 +278,10 @@ impl Hub {
         }
     }
 
-    /// Poll for completed background agent creation tasks.
-    ///
-    /// Non-blocking check for results from spawn_blocking tasks.
-    /// Processes all completed creations and sends appropriate responses to clients.
-    pub fn poll_pending_agents(&mut self) {
-        // Process all pending results (non-blocking)
-        while let Ok(pending) = self.pending_agent_rx.try_recv() {
-            self.handle_pending_agent_result(pending);
-        }
-    }
-
-    /// Poll for progress events from background agent creation.
-    ///
-    /// Non-blocking check for progress updates. Sends progress to the requesting
-    /// client (browser or TUI).
-    pub fn poll_progress_events(&mut self) {
-        while let Ok(event) = self.progress_rx.try_recv() {
-            self.handle_progress_event(event);
-        }
-    }
-
-    /// Handle a progress event from background agent creation.
-    fn handle_progress_event(&mut self, event: AgentProgressEvent) {
-        log::debug!(
-            "Progress: {} -> {:?} for client {:?}",
-            event.identifier,
-            event.stage,
-            event.client_id
-        );
-
-        // Progress is delivered to Lua via fire_event (no broadcast needed).
-        // Lua handlers route progress updates to connected clients (WebRTC, TUI).
-        log::trace!(
-            "Agent creation progress: {} -> {:?}",
-            event.identifier,
-            event.stage,
-        );
-    }
-
-    /// Handle a completed agent creation from background thread.
-    ///
-    /// The background thread has completed the slow git/file operations.
-    /// Now we do the fast PTY spawn on the main thread (needs &mut state).
-    fn handle_pending_agent_result(&mut self, pending: PendingAgentResult) {
-        use crate::hub::lifecycle;
-
-        match pending.result {
-            Ok(_) => {
-                // Background work succeeded - now spawn the agent (fast, needs &mut state)
-                log::info!(
-                    "Background worktree ready for {:?}, spawning agent...",
-                    pending.client_id
-                );
-
-                // Enter tokio runtime context for spawn_command_processor() which uses tokio::spawn()
-                let _runtime_guard = self.tokio_runtime.enter();
-
-                // Allocate a unique port for HTTP forwarding (before spawning)
-                let port = self.allocate_unique_port();
-
-                // Spawn agent (fast - just PTY creation) - release lock after spawning
-                // Dims are carried in pending.config from the requesting client
-                let spawn_result = {
-                    let mut state = self.state.write().unwrap();
-                    lifecycle::spawn_agent(&mut state, &pending.config, port)
-                };
-
-                match spawn_result {
-                    Ok(result) => {
-                        self.handle_successful_spawn(result, &pending.client_id);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to spawn agent for {}: {}", pending.client_id, e);
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!(
-                    "Background agent creation failed for {:?}: {}",
-                    pending.client_id,
-                    e
-                );
-                // Error already logged above
-            }
-        }
-    }
-
-    /// Handle successful agent spawn after background worktree creation.
-    fn handle_successful_spawn(&mut self, result: SpawnResult, client_id: &ClientId) {
-        log::info!(
-            "Agent spawned: {} for client {:?}",
-            result.agent_id,
-            client_id
-        );
-
-        // Sync handle cache for thread-safe agent access
-        self.sync_handle_cache();
-
-        // Auto-select the new agent for the requesting client
-        let session_key = result.agent_id.clone();
-        actions::dispatch(
-            self,
-            HubAction::SelectAgentForClient {
-                client_id: client_id.clone(),
-                agent_key: session_key.clone(),
-            },
-        );
-
-        // Refresh worktree cache BEFORE firing events so Lua sees updated state
-        if let Err(e) = self.load_available_worktrees() {
-            log::warn!("Failed to refresh worktree cache after agent creation: {}", e);
-        }
-
-        // Get info and release lock before calling methods that need &mut self
-        let info = self.state.read().unwrap().get_agent_info(&session_key);
-
-        if let Some(info) = info {
-            // Fire Lua event for agent_created
-            // Note: Queued WebRTC sends are flushed automatically in tick()
-            if let Err(e) = self.lua.fire_agent_created(&session_key, &info) {
-                log::warn!("Lua agent_created event error: {}", e);
-            }
-        }
-    }
-
     /// Try to send a notification to an existing agent for this issue.
     ///
     /// Returns true if an agent was found and notified, false otherwise.
-    /// Does NOT apply to cleanup messages - those need to go through the action dispatch.
+    /// Does NOT apply to cleanup messages -- those go through action dispatch.
     pub(crate) fn try_notify_existing_agent(
         &mut self,
         parsed: &ParsedMessage,
@@ -403,7 +303,8 @@ impl Hub {
             .replace('/', "-");
         let session_key = format!("{repo_safe}-{issue_number}");
 
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write()
+            .expect("HubState RwLock poisoned in try_notify_existing_agent");
         let Some(agent) = state.agents.get_mut(&session_key) else {
             return false;
         };
@@ -583,6 +484,9 @@ impl Hub {
                 PtyRequest::CreateTuiForwarder(req) => {
                     self.create_lua_tui_pty_forwarder(req);
                 }
+                PtyRequest::CreateTuiForwarderDirect(req) => {
+                    self.create_lua_tui_pty_forwarder_direct(req);
+                }
                 PtyRequest::StopForwarder { forwarder_id } => {
                     self.stop_lua_pty_forwarder(&forwarder_id);
                 }
@@ -644,64 +548,12 @@ impl Hub {
     /// Process Hub requests queued by Lua callbacks.
     ///
     /// Drains the Lua Hub request queue and processes each request.
-    /// Called after any Lua callback that might queue agent lifecycle operations.
+    /// Called after any Lua callback that might queue Hub-level operations.
     fn process_lua_hub_requests(&mut self) {
-        use crate::client::{CreateAgentRequest, DeleteAgentRequest};
         use crate::lua::primitives::HubRequest;
 
         for request in self.lua.drain_hub_requests() {
             match request {
-                HubRequest::CreateAgent {
-                    issue_or_branch,
-                    prompt,
-                    from_worktree,
-                    response_key,
-                } => {
-                    log::info!(
-                        "[Lua] Processing create_agent request: {} (key: {})",
-                        issue_or_branch,
-                        &response_key[..response_key.len().min(24)]
-                    );
-
-                    let request = CreateAgentRequest {
-                        issue_or_branch,
-                        prompt,
-                        from_worktree: from_worktree.map(std::path::PathBuf::from),
-                        dims: None, // Lua doesn't provide dims currently
-                    };
-
-                    // Use Internal client ID since this is from Lua
-                    actions::dispatch(
-                        self,
-                        HubAction::CreateAgentForClient {
-                            client_id: ClientId::Internal,
-                            request,
-                        },
-                    );
-                }
-                HubRequest::DeleteAgent {
-                    agent_id,
-                    delete_worktree,
-                } => {
-                    log::info!(
-                        "[Lua] Processing delete_agent request: {} (delete_worktree: {})",
-                        agent_id,
-                        delete_worktree
-                    );
-
-                    let request = DeleteAgentRequest {
-                        agent_id,
-                        delete_worktree,
-                    };
-
-                    actions::dispatch(
-                        self,
-                        HubAction::DeleteAgentForClient {
-                            client_id: ClientId::Internal,
-                            request,
-                        },
-                    );
-                }
                 HubRequest::Quit => {
                     log::info!("[Lua] Processing quit request");
                     self.quit = true;
@@ -747,6 +599,43 @@ impl Hub {
         }
     }
 
+    /// Process worktree requests queued by Lua callbacks.
+    ///
+    /// Drains the Lua worktree request queue and processes each request.
+    /// Called after any Lua callback that might queue worktree operations.
+    fn process_lua_worktree_requests(&mut self) {
+        use crate::git::WorktreeManager;
+        use crate::lua::primitives::WorktreeRequest;
+
+        for request in self.lua.drain_worktree_requests() {
+            match request {
+                WorktreeRequest::Delete { path, branch } => {
+                    log::info!("[Lua] Processing worktree.delete({}, {})", path, branch);
+                    let manager = WorktreeManager::new(self.config.worktree_base.clone());
+                    if let Err(e) = manager.delete_worktree_by_path(
+                        std::path::Path::new(&path),
+                        &branch,
+                    ) {
+                        log::error!("[Lua] Failed to delete worktree: {e}");
+                    } else {
+                        // Refresh worktrees after deletion
+                        if let Err(e) = self.load_available_worktrees() {
+                            log::warn!("Failed to refresh worktrees after deletion: {e}");
+                        }
+                    }
+                }
+                WorktreeRequest::CreateAsync { branch, response_key } => {
+                    // Legacy async create - superseded by synchronous worktree.create()
+                    log::debug!(
+                        "[Lua] Ignoring legacy CreateAsync for branch '{}' (key={})",
+                        branch,
+                        response_key
+                    );
+                }
+            }
+        }
+    }
+
     /// Create a PTY forwarder requested by Lua.
     ///
     /// Spawns a new forwarder task that streams PTY output to WebRTC.
@@ -757,7 +646,7 @@ impl Hub {
         let Some(agent_handle) = self.handle_cache.get_agent(req.agent_index) else {
             log::warn!("[Lua] Cannot create forwarder: no agent at index {}", req.agent_index);
             // Mark forwarder as inactive
-            *req.active_flag.lock().unwrap() = false;
+            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
             return;
         };
 
@@ -767,7 +656,7 @@ impl Hub {
                 req.pty_index,
                 req.agent_index
             );
-            *req.active_flag.lock().unwrap() = false;
+            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
             return;
         };
 
@@ -836,7 +725,7 @@ impl Hub {
             loop {
                 // Check if forwarder was stopped by Lua
                 {
-                    let active = active_flag.lock().unwrap();
+                    let active = active_flag.lock().expect("Forwarder active_flag mutex poisoned");
                     if !*active {
                         log::debug!("[Lua] PTY forwarder stopped by Lua");
                         break;
@@ -895,7 +784,7 @@ impl Hub {
             }
 
             // Mark forwarder as inactive
-            *active_flag.lock().unwrap() = false;
+            *active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
 
             log::info!(
                 "[Lua] Stopped PTY forwarder for peer {} agent {} pty {}",
@@ -920,7 +809,7 @@ impl Hub {
         // Check if agent and PTY exist
         let Some(agent_handle) = self.handle_cache.get_agent(req.agent_index) else {
             log::warn!("[Lua-TUI] Cannot create forwarder: no agent at index {}", req.agent_index);
-            *req.active_flag.lock().unwrap() = false;
+            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
             return;
         };
 
@@ -929,13 +818,13 @@ impl Hub {
                 "[Lua-TUI] Cannot create forwarder: no PTY at index {} for agent {}",
                 req.pty_index, req.agent_index
             );
-            *req.active_flag.lock().unwrap() = false;
+            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
             return;
         };
 
         let Some(ref output_tx) = self.tui_output_tx else {
             log::warn!("[Lua-TUI] Cannot create forwarder: no TUI output channel");
-            *req.active_flag.lock().unwrap() = false;
+            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
             return;
         };
 
@@ -981,7 +870,7 @@ impl Hub {
             loop {
                 // Check if forwarder was stopped by Lua
                 {
-                    let active = active_flag.lock().unwrap();
+                    let active = active_flag.lock().expect("Forwarder active_flag mutex poisoned");
                     if !*active {
                         log::debug!("[Lua-TUI] PTY forwarder stopped by Lua");
                         break;
@@ -1021,11 +910,125 @@ impl Hub {
             }
 
             // Mark forwarder as inactive
-            *active_flag.lock().unwrap() = false;
+            *active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
 
             log::info!(
                 "[Lua-TUI] Stopped PTY forwarder for agent {} pty {}",
                 agent_index, pty_index
+            );
+        });
+
+        self.webrtc_pty_forwarders.insert(forwarder_key, task);
+    }
+
+    /// Create a TUI PTY forwarder with direct session access.
+    ///
+    /// This variant receives the PTY event sender directly from Lua's PtySessionHandle,
+    /// avoiding the need to look up agents in HandleCache.
+    fn create_lua_tui_pty_forwarder_direct(
+        &mut self,
+        req: crate::lua::primitives::CreateTuiForwarderDirectRequest,
+    ) {
+        use crate::client::TuiOutput;
+
+        let forwarder_key = format!("tui:{}:{}", req.agent_key, req.session_name);
+
+        let Some(ref output_tx) = self.tui_output_tx else {
+            log::warn!("[Lua-TUI-Direct] Cannot create forwarder: no TUI output channel");
+            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
+            return;
+        };
+
+        // Abort any existing forwarder for this key
+        if let Some(old_task) = self.webrtc_pty_forwarders.remove(&forwarder_key) {
+            old_task.abort();
+            log::debug!("[Lua-TUI-Direct] Aborted existing PTY forwarder for {}", forwarder_key);
+        }
+
+        // Subscribe to PTY events directly from the session handle's event_tx
+        let pty_rx = req.event_tx.subscribe();
+
+        // Get scrollback buffer
+        let scrollback: Vec<u8> = {
+            let buffer = req.scrollback_buffer.lock().expect("Scrollback buffer mutex poisoned");
+            buffer.iter().copied().collect()
+        };
+
+        let sink = output_tx.clone();
+        let agent_key = req.agent_key.clone();
+        let session_name = req.session_name.clone();
+        let active_flag = req.active_flag;
+
+        let _guard = self.tokio_runtime.enter();
+        let task = tokio::spawn(async move {
+            use crate::agent::pty::PtyEvent;
+
+            log::info!(
+                "[Lua-TUI-Direct] Started PTY forwarder for {}:{}",
+                agent_key, session_name
+            );
+
+            // Send scrollback buffer first (if any)
+            if !scrollback.is_empty() {
+                log::debug!(
+                    "[Lua-TUI-Direct] Sending {} bytes of scrollback for {}:{}",
+                    scrollback.len(), agent_key, session_name
+                );
+                if sink.send(TuiOutput::Scrollback(scrollback)).is_err() {
+                    log::trace!("[Lua-TUI-Direct] Output channel closed before scrollback sent");
+                    return;
+                }
+            }
+
+            let mut pty_rx = pty_rx;
+            loop {
+                // Check if forwarder was stopped by Lua
+                {
+                    let active = active_flag.lock().expect("Forwarder active_flag mutex poisoned");
+                    if !*active {
+                        log::debug!("[Lua-TUI-Direct] PTY forwarder stopped by Lua");
+                        break;
+                    }
+                }
+
+                match pty_rx.recv().await {
+                    Ok(PtyEvent::Output(data)) => {
+                        if sink.send(TuiOutput::Output(data)).is_err() {
+                            log::trace!("[Lua-TUI-Direct] Output channel closed, stopping forwarder");
+                            break;
+                        }
+                    }
+                    Ok(PtyEvent::ProcessExited { exit_code }) => {
+                        log::info!(
+                            "[Lua-TUI-Direct] PTY process exited (code={:?}) for {}:{}",
+                            exit_code, agent_key, session_name
+                        );
+                        let _ = sink.send(TuiOutput::ProcessExited { exit_code });
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!(
+                            "[Lua-TUI-Direct] PTY forwarder lagged by {} events for {}:{}",
+                            n, agent_key, session_name
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        log::info!(
+                            "[Lua-TUI-Direct] PTY channel closed for {}:{}",
+                            agent_key, session_name
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // Mark forwarder as inactive
+            *active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
+
+            log::info!(
+                "[Lua-TUI-Direct] Stopped PTY forwarder for {}:{}",
+                agent_key, session_name
             );
         });
 
@@ -1361,7 +1364,8 @@ impl Hub {
         }
 
         // Handle the offer and get the answer
-        let channel = self.webrtc_channels.get(browser_identity).unwrap();
+        let channel = self.webrtc_channels.get(browser_identity)
+            .expect("WebRTC channel must exist after offer handling");
         let _guard = self.tokio_runtime.enter();
 
         match self
