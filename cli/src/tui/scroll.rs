@@ -6,8 +6,8 @@
 //! # Design
 //!
 //! Functions in this module take a parser reference (Arc<Mutex<Parser>>).
-//! Each client (TuiClient, TuiRunner) owns their own parser and manages
-//! their own scroll state.
+//! Each client (TuiRunner, browser via WebRTC) owns their own parser and
+//! manages their own scroll state.
 //!
 //! # Client State
 //!

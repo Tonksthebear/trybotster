@@ -23,7 +23,6 @@
 //!
 //! # Module Structure
 //!
-//! - `client_routing`: Client communication (agent/worktree lists, errors)
 //! - `server_comms`: WebSocket command channel, notification worker, registration
 //! - `actions`: Hub action dispatch
 //! - `lifecycle`: Agent spawn/close operations
@@ -38,15 +37,12 @@
 //! hub.run_headless()?;  // Starts event loop without TUI
 //! ```
 
-// Rust guideline compliant 2026-01-23
+// Rust guideline compliant 2026-02-04
 
 pub mod actions;
 pub mod agent_handle;
 pub mod command_channel;
-pub mod commands;
-pub mod events;
 pub mod handle_cache;
-pub mod hub_handle;
 pub mod lifecycle;
 pub mod registration;
 pub mod run;
@@ -54,16 +50,12 @@ mod server_comms;
 pub mod state;
 pub mod workers;
 
-pub use crate::agents::AgentSpawnConfig;
-pub use actions::{HubAction, ScrollDirection};
+pub use actions::HubAction;
 pub use agent_handle::AgentHandle;
-pub use commands::{
-    CreateAgentRequest, CreateAgentResult, DeleteAgentRequest, HubCommand, HubCommandSender,
-};
-pub use events::HubEvent;
-pub use hub_handle::HubHandle;
-pub use lifecycle::{close_agent, spawn_agent, SpawnResult};
+pub use lifecycle::SpawnResult;
 pub use state::{HubState, SharedHubState};
+
+use crate::agents::AgentSpawnConfig;
 
 use std::net::TcpListener;
 use std::sync::mpsc as std_mpsc;
@@ -74,7 +66,6 @@ use reqwest::blocking::Client;
 
 use sha2::{Digest, Sha256};
 
-// ActionCable channel imports removed - preview channels managed separately
 use crate::client::ClientId;
 use crate::config::Config;
 use crate::device::Device;
@@ -216,21 +207,11 @@ pub struct Hub {
     /// Receiver for outgoing WebRTC signals. Drained in `tick()`.
     webrtc_outgoing_signal_rx: tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::OutgoingSignal>,
 
-    // === Command Channel (Actor Pattern) ===
-    /// Sender for Hub commands (cloned for each client).
-    command_tx: tokio::sync::mpsc::Sender<HubCommand>,
-    /// Receiver for Hub commands (owned by Hub, polled in event loop).
-    command_rx: tokio::sync::mpsc::Receiver<HubCommand>,
-
-    // === Event Broadcast ===
-    /// Sender for Hub events (clients subscribe via `subscribe_events()`).
-    event_tx: tokio::sync::broadcast::Sender<HubEvent>,
-
     // === Handle Cache ===
     /// Thread-safe cache of agent handles for non-blocking client access.
     ///
     /// Updated by Hub when agents are created/deleted via `sync_handle_cache()`.
-    /// `HubHandle.get_agent()` reads from this cache directly, allowing clients
+    /// `HandleCache::get_agent()` reads from this cache directly, allowing clients
     /// to access agent handles without blocking commands - safe from any thread.
     pub handle_cache: Arc<handle_cache::HandleCache>,
 
@@ -242,26 +223,12 @@ pub struct Hub {
     /// Sender for TUI output messages to TuiRunner.
     ///
     /// Set by `register_tui_via_lua()`. Hub sends `TuiOutput` messages
-    /// through this channel instead of through a TuiClient intermediary.
+    /// through this channel directly.
     tui_output_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::client::TuiOutput>>,
     /// Receiver for TUI requests from TuiRunner.
     ///
     /// Set by `register_tui_via_lua()`. Polled by `poll_tui_requests()`.
-    tui_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::TuiRequest>>,
-    /// Hub event receiver for forwarding to TuiRunner.
-    ///
-    /// Set by `register_tui_via_lua()`. Polled by `poll_tui_hub_events()`.
-    tui_hub_event_rx: Option<tokio::sync::broadcast::Receiver<HubEvent>>,
-    /// Active PTY output forwarder task for TUI.
-    ///
-    /// Only one at a time (TUI connects to one PTY at a time).
-    /// Aborted on disconnect and re-created on connect.
-    tui_output_task: Option<tokio::task::JoinHandle<()>>,
-    /// Current TUI terminal dimensions (cols, rows).
-    ///
-    /// Updated by `SetDims` requests from TuiRunner. Used when
-    /// connecting to PTYs via `connect_direct()`.
-    tui_dims: (u16, u16),
+    tui_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>,
 }
 
 impl std::fmt::Debug for Hub {
@@ -330,12 +297,8 @@ impl Hub {
         // Create channel for progress updates during agent creation
         let (progress_tx, progress_rx) = std_mpsc::channel();
 
-        // Create command channel for actor pattern
-        let (command_tx, command_rx) = tokio::sync::mpsc::channel(256);
         // Create handle cache for thread-safe agent handle access
         let handle_cache = Arc::new(handle_cache::HandleCache::new());
-        // Create event broadcast channel for pub/sub
-        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(64);
         // Create channel for WebRTC PTY output from forwarder tasks
         let (webrtc_pty_output_tx, webrtc_pty_output_rx) = tokio::sync::mpsc::unbounded_channel();
         // Create channel for outgoing WebRTC signals (ICE candidates from async callbacks)
@@ -362,9 +325,6 @@ impl Hub {
             // Workers are started later via start_background_workers() after registration
             notification_worker: None,
             command_channel: None,
-            command_tx,
-            command_rx,
-            event_tx,
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
             webrtc_pty_output_tx,
@@ -375,9 +335,6 @@ impl Hub {
             lua,
             tui_output_tx: None,
             tui_request_rx: None,
-            tui_hub_event_rx: None,
-            tui_output_task: None,
-            tui_dims: (80, 24),
         })
     }
 
@@ -385,7 +342,7 @@ impl Hub {
     ///
     /// Call this after hub registration completes and `botster_id` is set.
     /// Currently starts the NotificationWorker for background notification sending.
-    pub fn start_background_workers(&mut self) {
+    fn start_background_workers(&mut self) {
         let worker_config = workers::WorkerConfig {
             server_url: self.config.server_url.clone(),
             api_key: self.config.get_api_key().to_string(),
@@ -403,7 +360,7 @@ impl Hub {
     ///
     /// Call this after hub registration completes and `botster_id` is set.
     /// The command channel replaces HTTP polling for message delivery.
-    pub fn connect_command_channel(&mut self) {
+    fn connect_command_channel(&mut self) {
         if self.command_channel.is_some() {
             log::warn!("Command channel already connected");
             return;
@@ -425,29 +382,10 @@ impl Hub {
     }
 
     /// Shutdown all background workers gracefully.
-    pub fn shutdown_background_workers(&mut self) {
+    fn shutdown_background_workers(&mut self) {
         if let Some(worker) = self.notification_worker.take() {
             worker.shutdown();
         }
-    }
-
-    /// Get a shared reference to the hub state for thread-safe access.
-    ///
-    /// Clients can clone this to access agent state without going through
-    /// Hub commands. The RwLock allows multiple readers without blocking.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let shared_state = hub.shared_state();
-    ///
-    /// // In client code (possibly different thread):
-    /// let state = shared_state.read().unwrap();
-    /// let agents = state.get_agents_info();
-    /// ```
-    #[must_use]
-    pub fn shared_state(&self) -> SharedHubState {
-        Arc::clone(&self.state)
     }
 
     /// Get the hub ID to use for server communication.
@@ -459,26 +397,6 @@ impl Hub {
         self.botster_id.as_deref().unwrap_or(&self.hub_identifier)
     }
 
-    /// Connect agent channels after spawn.
-    ///
-    /// NOTE: Preview channels are managed separately via HttpChannel.
-    /// HttpChannel is created on-demand when a browser requests preview.
-    /// Terminal channels are handled by PtySession broadcasts + browser relay.
-    ///
-    /// This method is kept for backwards compatibility but is now a no-op.
-    /// The spawning code still calls this, but there's nothing to connect here.
-    #[allow(unused_variables)]
-    pub fn connect_agent_channels(&mut self, session_key: &str, agent_index: usize) {
-        log::debug!(
-            "connect_agent_channels called for {} (index={}) - channels managed via WebRTC",
-            session_key,
-            agent_index
-        );
-        // Preview channels (HttpChannel) are created lazily when a
-        // browser_wants_preview message is received.
-        // See: cli/src/client/http_channel.rs
-    }
-
     /// Get the number of active agents.
     #[must_use]
     pub fn agent_count(&self) -> usize {
@@ -488,7 +406,7 @@ impl Hub {
     /// Sync the handle cache with current state.
     ///
     /// Call this after agents are created or deleted to ensure the cache
-    /// reflects the current state. The cache allows `HubHandle.get_agent()`
+    /// reflects the current state. The cache allows `HandleCache::get_agent()`
     /// to read directly without sending blocking commands.
     pub fn sync_handle_cache(&self) {
         let state = self.state.read().unwrap();
@@ -729,11 +647,6 @@ impl Hub {
 
     /// Send shutdown notification to server and cleanup resources.
     pub fn shutdown(&mut self) {
-        // Abort TUI output forwarder task
-        if let Some(task) = self.tui_output_task.take() {
-            task.abort();
-        }
-
         // Notify Lua that TUI is disconnecting
         if let Err(e) = self.lua.call_tui_disconnected() {
             log::warn!("Lua tui_disconnected callback error: {}", e);
@@ -770,85 +683,31 @@ impl Hub {
         );
     }
 
-    // === Command Channel (Actor Pattern) ===
-
-    /// Get a command sender for clients to communicate with the Hub.
-    ///
-    /// Clients use this to send commands (create agent, delete agent, etc.)
-    /// to the Hub. The Hub processes commands in its event loop via
-    /// `process_commands()`.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let sender = hub.command_sender();
-    /// // Pass to TuiRunner or other clients
-    /// let runner = TuiRunner::new(terminal, sender, ...);
-    /// ```
-    #[must_use]
-    pub fn command_sender(&self) -> HubCommandSender {
-        HubCommandSender::new(self.command_tx.clone())
-    }
-
-    /// Get a `HubHandle` for thread-safe client communication.
-    ///
-    /// `HubHandle` provides a simplified, blocking API for clients running
-    /// in their own threads. It wraps the command channel and provides
-    /// convenient methods for querying agents and sending commands.
-    ///
-    /// # Thread Safety
-    ///
-    /// The returned handle is `Clone + Send + Sync` and can be freely
-    /// passed to other threads.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let handle = hub.handle();
-    ///
-    /// // Pass to client thread
-    /// std::thread::spawn(move || {
-    ///     let agents = handle.get_agents();
-    ///     if let Some(agent) = handle.get_agent(0) {
-    ///         // Use agent handle...
-    ///     }
-    /// });
-    /// ```
-    #[must_use]
-    pub fn handle(&self) -> hub_handle::HubHandle {
-        hub_handle::HubHandle::new(self.command_sender(), Arc::clone(&self.handle_cache))
-    }
-
     /// Register TUI with Hub-side request processing.
     ///
-    /// Hub processes TUI requests directly in its tick loop (no async task)
-    /// and forwards Hub events to TuiRunner.
+    /// Hub processes TUI requests directly in its tick loop (no async task).
     ///
     /// Notifies Lua that the TUI is connected, registering it in the shared
     /// connection registry alongside browser clients.
     ///
     /// # Arguments
     ///
-    /// * `request_rx` - Receiver for TuiRequest messages from TuiRunner
+    /// * `request_rx` - Receiver for JSON messages from TuiRunner
     ///
     /// # Returns
     ///
     /// Receiver for TuiOutput messages to TuiRunner.
     pub fn register_tui_via_lua(
         &mut self,
-        request_rx: tokio::sync::mpsc::UnboundedReceiver<crate::client::TuiRequest>,
+        request_rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
     ) -> tokio::sync::mpsc::UnboundedReceiver<crate::client::TuiOutput> {
         use crate::client::TuiOutput;
 
         let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel::<TuiOutput>();
 
-        // Subscribe to hub events for forwarding to TuiRunner
-        let hub_event_rx = self.subscribe_events();
-
         // Store channels for Hub-side processing
         self.tui_output_tx = Some(output_tx);
         self.tui_request_rx = Some(request_rx);
-        self.tui_hub_event_rx = Some(hub_event_rx);
 
         // Notify Lua that TUI is connected (registers in connection registry)
         if let Err(e) = self.lua.call_tui_connected() {
@@ -861,209 +720,6 @@ impl Hub {
         output_rx
     }
 
-    /// Subscribe to Hub events.
-    ///
-    /// Returns a receiver that will receive all Hub events:
-    /// - `AgentCreated` - New agent was created
-    /// - `AgentDeleted` - Agent was deleted
-    /// - `AgentStatusChanged` - Agent status changed
-    /// - `Shutdown` - Hub is shutting down
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let mut rx = hub.subscribe_events();
-    /// tokio::spawn(async move {
-    ///     while let Ok(event) = rx.recv().await {
-    ///         match event {
-    ///             HubEvent::AgentCreated { agent_id, .. } => {
-    ///                 println!("Agent created: {}", agent_id);
-    ///             }
-    ///             // ...
-    ///         }
-    ///     }
-    /// });
-    /// ```
-    #[must_use]
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<HubEvent> {
-        self.event_tx.subscribe()
-    }
-
-    /// Broadcast an event to all subscribers.
-    ///
-    /// Events are sent to all clients that have called `subscribe_events()`.
-    /// If no subscribers exist, the event is silently dropped.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// hub.broadcast(HubEvent::agent_created("agent-123", info));
-    /// ```
-    pub fn broadcast(&self, event: HubEvent) {
-        // Ignore send errors - they just mean no subscribers exist
-        let _ = self.event_tx.send(event);
-    }
-
-    /// Process pending commands from clients.
-    ///
-    /// Call this in the event loop to handle commands sent via `command_sender()`.
-    /// Non-blocking - processes all available commands without waiting.
-    ///
-    /// Returns the number of commands processed.
-    pub fn process_commands(&mut self) -> usize {
-        let mut processed = 0;
-
-        while let Ok(cmd) = self.command_rx.try_recv() {
-            self.handle_command(cmd);
-            processed += 1;
-        }
-
-        processed
-    }
-
-    /// Handle a single Hub command.
-    fn handle_command(&mut self, cmd: HubCommand) {
-        match cmd {
-            HubCommand::CreateAgent {
-                request,
-                response_tx,
-            } => {
-                // Agent creation is async - dispatch to background worker
-                // For now, respond that the request was received
-                log::info!(
-                    "Received CreateAgent command for: {}",
-                    request.issue_or_branch
-                );
-
-                // Convert from commands::CreateAgentRequest to client::CreateAgentRequest
-                let client_request = crate::client::CreateAgentRequest {
-                    issue_or_branch: request.issue_or_branch,
-                    prompt: request.prompt,
-                    from_worktree: request.from_worktree,
-                    dims: request.dims,
-                };
-
-                // Dispatch to background creation
-                let action = HubAction::CreateAgentForClient {
-                    client_id: ClientId::Tui, // TODO: Track requesting client
-                    request: client_request,
-                };
-                self.handle_action(action);
-
-                // Can't return result immediately for async operation
-                // Client will be notified via HubEvent::AgentCreated
-                drop(response_tx);
-            }
-
-            HubCommand::DeleteAgent {
-                request,
-                response_tx,
-            } => {
-                log::info!("Received DeleteAgent command for: {}", request.agent_id);
-
-                // Convert from commands::DeleteAgentRequest to client::DeleteAgentRequest
-                let client_request = crate::client::DeleteAgentRequest {
-                    agent_id: request.agent_id,
-                    delete_worktree: request.delete_worktree,
-                };
-
-                let action = HubAction::DeleteAgentForClient {
-                    client_id: ClientId::Tui, // TODO: Track requesting client
-                    request: client_request,
-                };
-                self.handle_action(action);
-                let _ = response_tx.send(Ok(()));
-            }
-
-            HubCommand::ListAgents { response_tx } => {
-                let agents = self.state.read().unwrap().get_agents_info();
-                let _ = response_tx.send(agents);
-            }
-
-            HubCommand::GetAgentByIndex { index, response_tx } => {
-                let handle = self.state.read().unwrap().get_agent_handle(index);
-                let _ = response_tx.send(handle);
-            }
-
-            HubCommand::Quit => {
-                log::info!("Received Quit command");
-                self.quit = true;
-                self.broadcast(HubEvent::shutdown());
-            }
-
-            HubCommand::DispatchAction(action) => {
-                self.handle_action(action);
-            }
-
-            HubCommand::ListWorktrees { response_tx } => {
-                // Reload worktrees and return the list (load_available_worktrees syncs cache)
-                if let Err(e) = self.load_available_worktrees() {
-                    log::error!("Failed to load worktrees: {}", e);
-                }
-                let worktrees = self.state.read().unwrap().available_worktrees.clone();
-                let _ = response_tx.send(worktrees);
-            }
-
-            HubCommand::GetConnectionCode { response_tx } => {
-                let result = self.generate_connection_url();
-                // Cache for direct reads by clients on Hub thread
-                self.handle_cache.set_connection_url(result.clone());
-                let _ = response_tx.send(result);
-            }
-
-            HubCommand::RefreshConnectionCode { response_tx } => {
-                // Request bundle regeneration from relay, then return new URL
-                let result = self.refresh_and_get_connection_url();
-                // Cache for direct reads by clients on Hub thread
-                self.handle_cache.set_connection_url(result.clone());
-                let _ = response_tx.send(result);
-            }
-
-            // ============================================================
-            // Browser Client Support Commands
-            // ============================================================
-
-            HubCommand::GetCryptoService { response_tx } => {
-                let _ = response_tx.send(self.browser.crypto_service.clone());
-            }
-
-            HubCommand::GetServerHubId { response_tx } => {
-                let _ = response_tx.send(Some(self.server_hub_id().to_string()));
-            }
-
-            HubCommand::GetServerUrl { response_tx } => {
-                let _ = response_tx.send(self.config.server_url.clone());
-            }
-
-            HubCommand::GetApiKey { response_tx } => {
-                let _ = response_tx.send(self.config.get_api_key().to_string());
-            }
-
-            HubCommand::GetTokioRuntime { response_tx } => {
-                let _ = response_tx.send(Some(self.tokio_runtime.handle().clone()));
-            }
-
-            // ============================================================
-            // Browser PTY I/O Commands (fire-and-forget)
-            // ============================================================
-
-            HubCommand::BrowserPtyInput {
-                client_id,
-                agent_index: _,
-                pty_index: _,
-                data: _,
-            } => {
-                // Browser PTY input flows directly through WebRTC in server_comms.rs,
-                // not through Hub commands.
-                log::debug!(
-                    "BrowserPtyInput received for {} (routed via client task)",
-                    client_id
-                );
-            }
-
-        }
-    }
-
     /// Generate connection URL, lazily generating bundle if needed.
     ///
     /// Format: `{server_url}/hubs/{id}#{base32_binary_bundle}`
@@ -1071,22 +727,18 @@ impl Hub {
     /// - Bundle (after #): alphanumeric mode (uppercase Base32)
     ///
     /// On first call, this generates the PreKeyBundle (lazy initialization).
-    /// Subsequent calls return the cached bundle unless it was used.
-    pub(crate) fn generate_connection_url(&mut self) -> Result<String, String> {
-        // Delegate to the lazy generation function which handles caching
-        self.get_or_generate_connection_url()
-    }
-
-    /// Regenerate the PreKeyBundle and return the new connection URL.
+    /// Subsequent calls return the cached bundle unless it was used (in which
+    /// case a fresh bundle is auto-generated).
     ///
-    /// Forces bundle regeneration even if a cached bundle exists.
-    fn refresh_and_get_connection_url(&mut self) -> Result<String, String> {
-        // Mark bundle as used to force regeneration
-        self.browser.bundle_used = true;
-
-        // Delegate to lazy generation (will regenerate due to bundle_used flag)
-        self.get_or_generate_connection_url()
+    /// Always updates HandleCache so `connection.get_url()` in Lua returns
+    /// the current value.
+    pub(crate) fn generate_connection_url(&mut self) -> Result<String, String> {
+        let result = self.get_or_generate_connection_url();
+        // Always update cache so Lua connection.get_url() returns current value
+        self.handle_cache.set_connection_url(result.clone());
+        result
     }
+
 }
 
 #[cfg(test)]
@@ -1135,7 +787,7 @@ mod tests {
 
     // === Agent Lifecycle / HandleCache Integration Tests ===
     //
-    // These tests verify the integration between Hub, HandleCache, and Client trait
+    // These tests verify the integration between Hub, HandleCache, and HubAction
     // for agent lifecycle operations (create, select, delete).
 
     /// Helper: create a test agent and return (key, agent).
@@ -1208,11 +860,8 @@ mod tests {
         );
     }
 
-    // Note: Tests for TuiClient request processing (select_agent_via_client_trait,
-    // select_nonexistent_agent_returns_none) were removed because TuiClient now
-    // processes requests in its own async task. Those flows are tested in
-    // client/tui.rs tests. Hub-side tests verify selection tracking via
-    // handle_action(SelectAgentForClient) above.
+    // Note: TUI request processing tests are in runner.rs. Hub-side tests
+    // verify selection tracking via handle_action(SelectAgentForClient) above.
 
     #[test]
     fn test_create_delete_agent_cycle() {
@@ -1279,9 +928,8 @@ mod tests {
     /// that the RwLock-based HandleCache doesn't deadlock or panic under
     /// concurrent access.
     ///
-    /// This exercises the production pattern where TuiClient reads from
-    /// HandleCache (via HubHandle) while Hub mutates it on agent
-    /// lifecycle events.
+    /// This exercises the production pattern where clients read from
+    /// HandleCache while Hub mutates it on agent lifecycle events.
     #[test]
     fn test_handle_cache_concurrent_read_write() {
         use std::sync::Arc;

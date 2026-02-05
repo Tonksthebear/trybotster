@@ -5,7 +5,7 @@
 //!
 //! # Architecture
 //!
-//! Hub communicates with TUI via HubEvent broadcasts. Browser communication
+//! Hub communicates with clients via Lua event callbacks. Browser communication
 //! happens directly via WebRTC + Lua in `server_comms.rs`.
 //!
 //! This module handles high-level client actions:
@@ -24,12 +24,11 @@ use crate::hub::{lifecycle, Hub};
 ///
 /// When a client selects an agent:
 /// 1. Validates agent exists
-/// 2. Ensures agent's channels are connected (lazy connection)
 ///
 /// TUI selection state is owned by TuiRunner, not Hub.
-/// PTY connection is handled separately:
-/// - TUI: TuiRequest::SelectAgent triggers PTY connection
-/// - Browser: terminal_connected event triggers PtyConnectionRequested broadcast
+/// PTY connection is handled via Lua subscribe messages for both clients:
+/// - TUI: Lua subscribe message via `client.lua` triggers PTY forwarder
+/// - Browser: WebRTC subscribe message via `client.lua` triggers PTY forwarder
 pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_key: String) {
     log::info!(
         "handle_select_agent_for_client: client={}, agent={}",
@@ -41,24 +40,6 @@ pub fn handle_select_agent_for_client(hub: &mut Hub, client_id: ClientId, agent_
     if !hub.state.read().unwrap().agents.contains_key(&agent_key) {
         log::error!("Agent not found for client {}: {}", client_id, &agent_key[..8.min(agent_key.len())]);
         return;
-    }
-
-    // Connect agent's channels if not already connected (lazy connection)
-    // This handles agents created before a browser connected (no crypto service yet)
-    let agent_index = hub
-        .state
-        .read()
-        .unwrap()
-        .agents
-        .keys()
-        .position(|k| k == &agent_key);
-
-    if let Some(idx) = agent_index {
-        log::debug!(
-            "Ensuring terminal channel connected for agent {}",
-            &agent_key[..8.min(agent_key.len())]
-        );
-        hub.connect_agent_channels(&agent_key, idx);
     }
 
     log::debug!(
@@ -78,11 +59,12 @@ pub fn handle_create_agent_for_client(
     client_id: ClientId,
     request: CreateAgentRequest,
 ) {
-    // Broadcast creation progress to all subscribers (WebRTC, TUI)
-    hub.broadcast(crate::hub::HubEvent::AgentCreationProgress {
-        identifier: request.issue_or_branch.clone(),
-        stage: crate::relay::AgentCreationStage::CreatingWorktree,
-    });
+    // Log creation progress (Lua event callbacks handle client notification)
+    log::info!(
+        "Agent creation started: {} for client {}",
+        request.issue_or_branch,
+        client_id
+    );
 
     // Resolve dims: use request dims if provided, otherwise default (24, 80)
     let dims = request.dims.unwrap_or((24, 80));
@@ -270,19 +252,6 @@ fn spawn_agent_sync(
             // Sync handle cache for thread-safe agent access
             hub.sync_handle_cache();
 
-            // Connect agent's channels (terminal + preview if port assigned)
-            let agent_index = hub
-                .state
-                .read()
-                .unwrap()
-                .agents
-                .keys()
-                .position(|k| k == &result.agent_id);
-
-            if let Some(idx) = agent_index {
-                hub.connect_agent_channels(&result.agent_id, idx);
-            }
-
             let agent_id = result.agent_id;
 
             handle_select_agent_for_client(hub, client_id, agent_id.clone());
@@ -292,13 +261,10 @@ fn spawn_agent_sync(
                 log::warn!("Failed to refresh worktree cache after agent creation: {}", e);
             }
 
-            // Broadcast AgentCreated event to all subscribers (including TUI)
             // Get info and release lock before calling methods that need &mut hub
             let info = hub.state.read().unwrap().get_agent_info(&agent_id);
 
             if let Some(info) = info {
-                hub.broadcast(crate::hub::HubEvent::agent_created(agent_id.clone(), info.clone()));
-
                 // Fire Lua event for agent_created
                 // Note: Queued WebRTC sends are flushed automatically in tick()
                 if let Err(e) = hub.lua.fire_agent_created(&agent_id, &info) {
@@ -315,9 +281,9 @@ fn spawn_agent_sync(
 /// Handle deleting an agent for a specific client.
 ///
 /// When an agent is deleted:
-/// 1. HubEvent::AgentDeleted is broadcast — Lua clients disconnect from
+/// 1. The agent and optionally its worktree are deleted.
+/// 2. Lua `agent_deleted` event is fired -- Lua clients disconnect from
 ///    the deleted agent's PTYs via their own event handling.
-/// 2. The agent and optionally its worktree are deleted.
 pub fn handle_delete_agent_for_client(
     hub: &mut Hub,
     client_id: ClientId,
@@ -340,9 +306,6 @@ pub fn handle_delete_agent_for_client(
             if let Err(e) = hub.load_available_worktrees() {
                 log::warn!("Failed to refresh worktree cache after agent deletion: {}", e);
             }
-
-            // Broadcast AgentDeleted event to all subscribers (TUI, WebRTC)
-            hub.broadcast(crate::hub::HubEvent::agent_deleted(&request.agent_id));
 
             // Fire Lua event for agent_deleted
             // Note: Queued WebRTC sends are flushed automatically in tick()

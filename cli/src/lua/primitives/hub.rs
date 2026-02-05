@@ -68,6 +68,8 @@ pub enum HubRequest {
         /// Whether to also delete the worktree.
         delete_worktree: bool,
     },
+    /// Request Hub shutdown.
+    Quit,
 }
 
 /// Shared request queue for Hub operations from Lua.
@@ -287,7 +289,7 @@ pub fn register(
         .map_err(|e| anyhow!("Failed to set hub.create_agent: {e}"))?;
 
     // hub.delete_agent(agent_id, delete_worktree?)
-    let queue2 = request_queue;
+    let queue2 = Arc::clone(&request_queue);
     let delete_agent_fn = lua
         .create_function(move |_, (agent_id, delete_worktree): (String, Option<bool>)| {
             let mut q = queue2.lock()
@@ -302,6 +304,20 @@ pub fn register(
 
     hub.set("delete_agent", delete_agent_fn)
         .map_err(|e| anyhow!("Failed to set hub.delete_agent: {e}"))?;
+
+    // hub.quit() - Request Hub shutdown
+    let queue3 = request_queue;
+    let quit_fn = lua
+        .create_function(move |_, ()| {
+            let mut q = queue3.lock()
+                .expect("Hub request queue mutex poisoned");
+            q.push(HubRequest::Quit);
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create hub.quit function: {e}"))?;
+
+    hub.set("quit", quit_fn)
+        .map_err(|e| anyhow!("Failed to set hub.quit: {e}"))?;
 
     // Ensure hub table is globally registered
     lua.globals()
@@ -333,6 +349,7 @@ mod tests {
         assert!(hub.contains_key("get_worktrees").unwrap());
         assert!(hub.contains_key("create_agent").unwrap());
         assert!(hub.contains_key("delete_agent").unwrap());
+        assert!(hub.contains_key("quit").unwrap());
     }
 
     #[test]
@@ -585,5 +602,20 @@ mod tests {
         assert!(matches!(requests[0], HubRequest::CreateAgent { .. }));
         assert!(matches!(requests[1], HubRequest::DeleteAgent { .. }));
         assert!(matches!(requests[2], HubRequest::CreateAgent { .. }));
+    }
+
+    #[test]
+    fn test_quit_queues_request() {
+        let lua = Lua::new();
+        let (queue, cache) = create_test_queue_and_cache();
+
+        register(&lua, Arc::clone(&queue), cache).expect("Should register");
+
+        lua.load("hub.quit()").exec().expect("Should queue quit");
+
+        let requests = queue.lock()
+            .expect("Hub request queue mutex poisoned");
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(requests[0], HubRequest::Quit));
     }
 }

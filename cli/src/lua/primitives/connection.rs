@@ -39,11 +39,26 @@ use crate::hub::handle_cache::HandleCache;
 /// These are processed by Hub in its event loop after Lua callbacks return.
 #[derive(Debug, Clone)]
 pub enum ConnectionRequest {
-    /// Regenerate the connection code (PreKeyBundle).
+    /// Generate the connection URL (lazy, with auto-regeneration).
     ///
-    /// Hub will regenerate the Signal Protocol bundle and update the
-    /// cached connection URL.
+    /// Hub calls `generate_connection_url()` which:
+    /// - Generates the PreKeyBundle on first call
+    /// - Auto-regenerates if the previous bundle was consumed by a browser
+    /// - Caches the result in HandleCache
+    /// - Fires `connection_code_ready` Lua event for broadcast
+    Generate,
+
+    /// Force-regenerate the connection code (PreKeyBundle).
+    ///
+    /// Hub will regenerate the Signal Protocol bundle unconditionally
+    /// and update the cached connection URL.
     Regenerate,
+
+    /// Copy the connection URL to the system clipboard.
+    ///
+    /// Hub generates the URL (fresh from current Signal bundle) and
+    /// copies it to clipboard via `arboard::Clipboard`.
+    CopyToClipboard,
 }
 
 /// Shared request queue for connection operations from Lua.
@@ -98,11 +113,33 @@ pub fn register(
         .set("get_url", get_url_fn)
         .map_err(|e| anyhow!("Failed to set connection.get_url: {e}"))?;
 
-    // connection.regenerate() - Queue a code regeneration request
-    let queue = request_queue;
+    // connection.generate() - Queue a lazy generation request
+    //
+    // Triggers Hub-side generation which:
+    // - Creates the PreKeyBundle on first call
+    // - Auto-regenerates if previous bundle was consumed
+    // - Caches result in HandleCache
+    // - Fires connection_code_ready Lua event for broadcast
+    let generate_queue = Arc::clone(&request_queue);
+    let generate_fn = lua
+        .create_function(move |_, ()| {
+            let mut q = generate_queue
+                .lock()
+                .expect("Connection request queue mutex poisoned");
+            q.push(ConnectionRequest::Generate);
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create connection.generate function: {e}"))?;
+
+    connection
+        .set("generate", generate_fn)
+        .map_err(|e| anyhow!("Failed to set connection.generate: {e}"))?;
+
+    // connection.regenerate() - Queue a forced code regeneration request
+    let regen_queue = Arc::clone(&request_queue);
     let regenerate_fn = lua
         .create_function(move |_, ()| {
-            let mut q = queue
+            let mut q = regen_queue
                 .lock()
                 .expect("Connection request queue mutex poisoned");
             q.push(ConnectionRequest::Regenerate);
@@ -113,6 +150,22 @@ pub fn register(
     connection
         .set("regenerate", regenerate_fn)
         .map_err(|e| anyhow!("Failed to set connection.regenerate: {e}"))?;
+
+    // connection.copy_to_clipboard() - Copy connection URL to system clipboard
+    let clipboard_queue = request_queue;
+    let copy_fn = lua
+        .create_function(move |_, ()| {
+            let mut q = clipboard_queue
+                .lock()
+                .expect("Connection request queue mutex poisoned");
+            q.push(ConnectionRequest::CopyToClipboard);
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create connection.copy_to_clipboard function: {e}"))?;
+
+    connection
+        .set("copy_to_clipboard", copy_fn)
+        .map_err(|e| anyhow!("Failed to set connection.copy_to_clipboard: {e}"))?;
 
     // Register globally
     lua.globals()
@@ -142,7 +195,9 @@ mod tests {
             .get("connection")
             .expect("connection table should exist");
         assert!(conn.contains_key("get_url").unwrap());
+        assert!(conn.contains_key("generate").unwrap());
         assert!(conn.contains_key("regenerate").unwrap());
+        assert!(conn.contains_key("copy_to_clipboard").unwrap());
     }
 
     #[test]
@@ -204,6 +259,22 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_queues_request() {
+        let lua = Lua::new();
+        let (queue, cache) = create_test_queue_and_cache();
+
+        register(&lua, Arc::clone(&queue), cache).expect("Should register");
+
+        lua.load("connection.generate()").exec().unwrap();
+
+        let requests = queue
+            .lock()
+            .expect("Connection request queue mutex poisoned");
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(requests[0], ConnectionRequest::Generate));
+    }
+
+    #[test]
     fn test_regenerate_queues_request() {
         let lua = Lua::new();
         let (queue, cache) = create_test_queue_and_cache();
@@ -240,5 +311,21 @@ mod tests {
             .lock()
             .expect("Connection request queue mutex poisoned");
         assert_eq!(requests.len(), 3);
+    }
+
+    #[test]
+    fn test_copy_to_clipboard_queues_request() {
+        let lua = Lua::new();
+        let (queue, cache) = create_test_queue_and_cache();
+
+        register(&lua, Arc::clone(&queue), cache).expect("Should register");
+
+        lua.load("connection.copy_to_clipboard()").exec().unwrap();
+
+        let requests = queue
+            .lock()
+            .expect("Connection request queue mutex poisoned");
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(requests[0], ConnectionRequest::CopyToClipboard));
     }
 }

@@ -9,13 +9,13 @@
 //! ```text
 //! TuiRunner (TUI thread)
 //! ├── owns: mode, menu_selected, input_buffer, vt100_parser
-//! ├── sends: TuiRequest via request_tx (to TuiClient)
-//! └── receives: TuiOutput via output_rx (PTY output + HubEvents from TuiClient)
+//! ├── sends: JSON messages via request_tx (to Hub → Lua client.lua)
+//! └── receives: TuiOutput via output_rx (PTY output and Lua events from Hub)
 //! ```
 //!
 //! The TuiRunner owns all TUI state and runs its own event loop. It converts
-//! keyboard/mouse input into either local TUI actions or PTY input, and
-//! communicates with TuiClient via the request channel. TuiRunner is Hub-agnostic.
+//! keyboard/mouse input into either local TUI actions or JSON messages, and
+//! communicates with Hub exclusively through the Lua client protocol.
 //!
 //! # Modules
 //!

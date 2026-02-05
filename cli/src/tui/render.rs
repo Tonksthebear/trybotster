@@ -68,8 +68,6 @@ pub struct AgentRenderInfo {
     pub port: Option<u16>,
     /// Whether the server is running.
     pub server_running: bool,
-    /// Whether this agent has a server PTY.
-    pub has_server_pty: bool,
 }
 
 /// Context required for rendering the TUI.
@@ -153,10 +151,8 @@ impl<'a> RenderContext<'a> {
     /// Build menu context from current state.
     #[must_use]
     pub fn menu_context(&self) -> MenuContext {
-        let selected_agent = self.selected_agent();
         MenuContext {
-            has_agent: selected_agent.is_some(),
-            has_server_pty: selected_agent.map_or(false, |a| a.has_server_pty),
+            has_agent: self.selected_agent().is_some(),
             active_pty: self.active_pty_view,
         }
     }
@@ -449,15 +445,9 @@ fn render_terminal_panel(f: &mut Frame, ctx: &RenderContext, area: Rect) {
         return;
     };
 
-    // Build terminal title with view indicator
+    // Build terminal title with view indicator (PTY 0 = agent, PTY 1 = server)
     let view_indicator = match ctx.active_pty_view {
-        PtyView::Cli => {
-            if agent.has_server_pty {
-                "[CLI | Ctrl+]: Server]"
-            } else {
-                "[CLI]"
-            }
-        }
+        PtyView::Cli => "[CLI | Ctrl+]: Server]",
         PtyView::Server => "[SERVER | Ctrl+]: CLI]",
     };
 
@@ -903,7 +893,6 @@ mod tests {
                 branch_name: "botster-issue-1".to_string(),
                 port: None,
                 server_running: false,
-                has_server_pty: false,
             },
             AgentRenderInfo {
                 key: "test-2".to_string(),
@@ -912,7 +901,6 @@ mod tests {
                 branch_name: "botster-issue-2".to_string(),
                 port: Some(3000),
                 server_running: true,
-                has_server_pty: true,
             },
         ];
 
@@ -954,7 +942,6 @@ mod tests {
             branch_name: "botster-issue-1".to_string(),
             port: None,
             server_running: false,
-            has_server_pty: true,
         }];
 
         let ctx = RenderContext {
@@ -982,7 +969,6 @@ mod tests {
 
         let menu_ctx = ctx.menu_context();
         assert!(menu_ctx.has_agent);
-        assert!(menu_ctx.has_server_pty);
         assert_eq!(menu_ctx.active_pty, PtyView::Server);
     }
 

@@ -226,9 +226,6 @@ pub struct ActionCableChannel {
     /// Whether reliable delivery is enabled.
     reliable: bool,
 
-    /// Whether this is a CLI subscription for per-browser HubChannel streams.
-    cli_subscription: bool,
-
     /// Per-peer reliable sessions (only if reliable=true).
     /// Each peer has independent sequence number spaces.
     reliable_sessions: Arc<RwLock<HashMap<String, ReliableSession>>>,
@@ -324,7 +321,6 @@ impl ActionCableChannelBuilder {
             server_url: self.server_url.expect("server_url is required"),
             api_key: self.api_key.expect("api_key is required"),
             reliable: self.reliable,
-            cli_subscription: self.cli_subscription,
             reliable_sessions: Arc::new(RwLock::new(HashMap::new())),
             send_tx: None,
             recv_rx: None,
@@ -1634,7 +1630,6 @@ mod tests {
             server_url: "http://test".to_string(),
             api_key: "key".to_string(),
             reliable: false,
-            cli_subscription: false,
             reliable_sessions: Arc::new(RwLock::new(HashMap::new())),
             send_tx: None,
             recv_rx: Some(recv_rx),

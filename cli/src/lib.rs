@@ -45,7 +45,6 @@ pub mod keyring;
 pub mod notifications;
 pub mod process;
 pub mod prompt;
-pub mod render;
 pub mod server;
 pub mod terminal_widget;
 
@@ -77,11 +76,9 @@ pub use lua::LuaRuntime;
 
 // Re-export Client types
 pub use client::{
-    ClientId, CreateAgentRequest, DeleteAgentRequest, Response,
+    ClientId, CreateAgentRequest, DeleteAgentRequest,
 };
 
 // Re-export PTY event types (for pub/sub integration)
 pub use agent::pty::{ConnectedClient, PtyEvent};
 
-// Re-export Hub event/command types (for event-driven architecture)
-pub use hub::{HubCommand, HubCommandSender, HubEvent};

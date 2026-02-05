@@ -11,15 +11,15 @@
 //! ├── terminal: Terminal<CrosstermBackend>  - ratatui terminal
 //! ├── mode, menu_selected, input_buffer  - UI state
 //! ├── agents, selected_agent  - agent state cache
-//! ├── request_tx  - send requests to TuiClient
-//! └── output_rx  - receive PTY output and HubEvents from TuiClient
+//! ├── request_tx  - send requests to Hub
+//! └── output_rx  - receive PTY output and Lua events from Hub
 //! ```
 //!
 //! # Event Loop
 //!
 //! The TuiRunner event loop:
 //! 1. Polls for keyboard/mouse input
-//! 2. Polls for PTY output and HubEvents (via TuiClient output channel)
+//! 2. Polls for PTY output and Lua events (via Hub output channel)
 //! 3. Renders the UI
 //!
 //! All communication with Hub is non-blocking via channels.
@@ -33,23 +33,17 @@
 //! # Module Organization
 //!
 //! Handler methods are split across several modules for maintainability:
-//! - [`super::runner_handlers`] - `handle_tui_action()`, `handle_hub_event()`
+//! - [`super::runner_handlers`] - `handle_tui_action()`, `handle_lua_message()`
 //! - [`super::runner_agent`] - Agent navigation (`request_select_next()`, etc.)
 //! - [`super::runner_input`] - Input handlers (`handle_menu_select()`, etc.)
 //!
-//! # Event Flow (Phase 1.6+)
+//! # Event Flow
 //!
-//! Hub broadcast events flow through TuiClient, not directly to TuiRunner:
-//!
-//! ```text
-//! Hub broadcasts HubEvent
-//!   → TuiClient receives via broadcast::Receiver
-//!   → TuiClient forwards as TuiOutput::HubEvent
-//!   → TuiRunner receives via output_rx in poll_pty_events()
-//!   → TuiRunner calls handle_hub_event()
-//! ```
+//! Agent lifecycle events flow through Lua (`broadcast_hub_event()` in
+//! `connections.lua`) and arrive as `TuiOutput::Message` JSON. TuiRunner
+//! processes these in `handle_lua_message()` to update its cached state.
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-02
 
 use std::io::Stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,8 +61,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::agent::PtyView;
 use crate::app::AppMode;
-use crate::client::{TuiOutput, TuiRequest};
-use crate::constants;
+use crate::client::TuiOutput;
 use crate::hub::Hub;
 use crate::relay::AgentInfo;
 use crate::tui::layout::terminal_widget_inner_area;
@@ -91,22 +84,22 @@ pub(super) const DEFAULT_SCROLLBACK: usize = 1000;
 ///
 /// # Architecture
 ///
-/// TuiRunner is a pure renderer that receives PTY output from Hub's TuiClient:
-///
 /// ```text
 /// Hub (main thread)
-/// └── ClientRegistry
-///     └── TuiClient ───> TuiRunner (output_rx) ───> vt100_parser ───> render
+/// ├── Lua runtime (client.lua) ──► tui.send() ──► TuiOutput::Message
+/// └── PTY forwarders ──────────────────────────► TuiOutput::Output
+///                                                       │
+///                                            TuiRunner (output_rx)
+///                                            ──► vt100_parser ──► render
 /// ```
 ///
-/// TuiRunner does NOT own a TuiClient. All PTY operations go through
-/// `request_tx` which routes to TuiClient. TuiRunner is Hub-agnostic.
+/// TuiRunner sends JSON messages through `request_tx`. Hub routes all messages
+/// through Lua `client.lua` — the same protocol as browser clients.
 pub struct TuiRunner<B: Backend> {
     // === Terminal ===
     /// VT100 parser for terminal emulation.
     ///
     /// Receives PTY output via output_rx channel and maintains screen state.
-    /// Owned exclusively by TuiRunner (TuiClient only routes bytes).
     pub(super) vt100_parser: Arc<Mutex<Parser>>,
 
     /// Ratatui terminal for rendering.
@@ -144,28 +137,20 @@ pub struct TuiRunner<B: Backend> {
     pub(super) pending_issue_or_branch: Option<String>,
 
     // === Agent State ===
-    /// Cached agent list (updated via Hub broadcasts).
+    /// Cached agent list (updated via Lua event callbacks).
     pub(super) agents: Vec<AgentInfo>,
 
     // === Channels ===
-    /// Request sender to TuiClient.
+    /// Request sender to Hub.
     ///
-    /// TuiRunner sends `TuiRequest` messages through this channel. TuiClient
-    /// receives and processes them, forwarding to Hub when needed. This keeps
-    /// TuiRunner Hub-agnostic - it only knows about TuiRequest.
-    pub(super) request_tx: tokio::sync::mpsc::UnboundedSender<TuiRequest>,
+    /// All TUI operations flow through this channel as JSON messages,
+    /// routed through Lua `client.lua` — the same path as browser clients.
+    pub(super) request_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
 
-    /// Whether the current agent has a server PTY (for view toggling).
-    ///
-    /// Updated when selecting an agent via `TuiRequest::SelectAgent`.
-    /// Used to determine if PTY view toggle is available.
-    pub(super) has_server_pty: bool,
-
-    // === Selection State (owned by TuiRunner, not TuiClient) ===
+    // === Selection State ===
     /// Currently selected agent ID.
     ///
     /// The agent ID (session key) of the currently selected agent.
-    /// TuiRunner owns this state, not TuiClient.
     pub(super) selected_agent: Option<String>,
 
     /// Active PTY view (CLI or Server).
@@ -175,7 +160,7 @@ pub struct TuiRunner<B: Backend> {
 
     /// Index of the agent currently being viewed/interacted with.
     ///
-    /// Used for index-based PTY operations via Client trait.
+    /// Used for Lua subscribe/unsubscribe operations.
     pub(super) current_agent_index: Option<usize>,
 
     /// Index of the PTY currently being viewed/interacted with.
@@ -184,12 +169,18 @@ pub struct TuiRunner<B: Backend> {
     /// input and is displayed in the terminal widget.
     pub(super) current_pty_index: Option<usize>,
 
-    // === Output Channel ===
-    /// Receiver for PTY output from TuiClient.
+    /// Active terminal subscription ID for the Lua subscribe/unsubscribe protocol.
     ///
-    /// TuiClient sends `TuiOutput` messages through this channel when connected
-    /// to a PTY. TuiRunner receives and processes them (feeding to vt100 parser,
-    /// handling process exit, etc.).
+    /// Tracks the current terminal subscription so we can unsubscribe before
+    /// switching agents or toggling PTY views. Uses the same subscription
+    /// protocol as browser clients.
+    pub(super) current_terminal_sub_id: Option<String>,
+
+    // === Output Channel ===
+    /// Receiver for PTY output and Lua events from Hub.
+    ///
+    /// Hub sends `TuiOutput` messages through this channel: binary PTY data
+    /// from Lua forwarder tasks and JSON events from `tui.send()` in Lua.
     output_rx: tokio::sync::mpsc::UnboundedReceiver<TuiOutput>,
 
     // === Control ===
@@ -229,8 +220,8 @@ where
     /// # Arguments
     ///
     /// * `terminal` - The ratatui terminal (ownership transferred to runner)
-    /// * `request_tx` - Sender for requests to TuiClient
-    /// * `output_rx` - Receiver for PTY output and HubEvents from TuiClient
+    /// * `request_tx` - Sender for requests to Hub
+    /// * `output_rx` - Receiver for PTY output and Lua events from Hub
     /// * `shutdown` - Shared shutdown flag
     /// * `terminal_dims` - Initial terminal dimensions (rows, cols)
     ///
@@ -239,7 +230,7 @@ where
     /// A new TuiRunner ready to run.
     pub fn new(
         terminal: Terminal<B>,
-        request_tx: tokio::sync::mpsc::UnboundedSender<TuiRequest>,
+        request_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
         output_rx: tokio::sync::mpsc::UnboundedReceiver<TuiOutput>,
         shutdown: Arc<AtomicBool>,
         terminal_dims: (u16, u16),
@@ -263,11 +254,11 @@ where
             pending_issue_or_branch: None,
             agents: Vec::new(),
             request_tx,
-            has_server_pty: false,
             selected_agent: None,
             active_pty_view: PtyView::default(),
             current_agent_index: None,
             current_pty_index: None,
+            current_terminal_sub_id: None,
             output_rx,
             shutdown,
             quit: false,
@@ -329,7 +320,7 @@ where
                 break;
             }
 
-            // 2. Poll PTY events and HubEvents (via TuiClient output channel)
+            // 2. Poll PTY output and Lua events (via Hub output channel)
             self.poll_pty_events();
 
             // 4. Render
@@ -362,7 +353,10 @@ where
         let context = InputContext {
             terminal_rows: self.terminal_dims.0,
             menu_selected: self.menu_selected,
-            menu_count: constants::MENU_ITEMS.len(),
+            menu_count: {
+                let ctx = self.build_menu_context();
+                crate::tui::menu::selectable_count(&crate::tui::menu::build_menu(&ctx))
+            },
             worktree_selected: self.worktree_selected,
             worktree_count: self.available_worktrees.len() + 1, // +1 for "Create New"
         };
@@ -378,16 +372,16 @@ where
         }
     }
 
-    /// Handle PTY input (send to connected agent).
+    /// Handle PTY input (send to connected agent via Lua terminal subscription).
     fn handle_pty_input(&mut self, data: &[u8]) {
-        if let (Some(agent_index), Some(pty_index)) = (self.current_agent_index, self.current_pty_index) {
-            if let Err(e) = self.request_tx.send(TuiRequest::SendInput {
-                agent_index,
-                pty_index,
-                data: data.to_vec(),
-            }) {
-                log::error!("Failed to send input to TuiClient: {}", e);
-            }
+        if let Some(ref sub_id) = self.current_terminal_sub_id {
+            self.send_msg(serde_json::json!({
+                "subscriptionId": sub_id,
+                "data": {
+                    "type": "input",
+                    "data": String::from_utf8_lossy(data),
+                }
+            }));
         }
     }
 
@@ -396,8 +390,8 @@ where
     /// Updates both local state and propagates to the connected PTY:
     /// 1. Updates `terminal_dims` for TuiRunner's own use
     /// 2. Resizes the vt100 parser so output is interpreted correctly
-    /// 3. If connected, sends `TuiRequest::SetDims` to TuiClient with explicit
-    ///    agent and PTY indices for PTY resize propagation
+    /// 3. If connected, sends resize through Lua terminal subscription
+    /// 4. Sends client-level resize through hub subscription for dims tracking
     fn handle_resize(&mut self, rows: u16, cols: u16) {
         self.terminal_dims = (rows, cols);
 
@@ -409,21 +403,35 @@ where
             parser.screen_mut().set_size(rows, cols);
         }
 
-        // Propagate resize to the connected PTY via TuiClient.
-        if let (Some(agent_index), Some(pty_index)) = (self.current_agent_index, self.current_pty_index) {
-            if let Err(e) = self.request_tx.send(TuiRequest::SetDims { agent_index, pty_index, cols, rows }) {
-                log::warn!("Failed to set dims: {}", e);
-            }
+        // Propagate resize to the connected PTY via Lua terminal subscription.
+        if let Some(ref sub_id) = self.current_terminal_sub_id {
+            self.send_msg(serde_json::json!({
+                "subscriptionId": sub_id,
+                "data": {
+                    "type": "resize",
+                    "rows": rows,
+                    "cols": cols,
+                }
+            }));
         }
+
+        // Also update client-level dims via hub subscription so
+        // client.lua tracks dimensions for future PTY subscriptions.
+        self.send_msg(serde_json::json!({
+            "subscriptionId": "tui_hub",
+            "data": {
+                "type": "resize",
+                "rows": rows,
+                "cols": cols,
+            }
+        }));
     }
 
-    /// Poll PTY output and HubEvents from TuiClient output channel.
+    /// Poll PTY output and Lua events from Hub output channel.
     ///
-    /// TuiClient sends `TuiOutput` messages through the channel when connected
-    /// to a PTY. TuiRunner receives and processes them here (feeding to vt100
-    /// parser, handling process exit, etc.).
-    ///
-    /// TuiClient sends output through channel, TuiRunner does the parsing/rendering.
+    /// Hub sends `TuiOutput` messages through the channel: binary PTY data
+    /// from Lua forwarder tasks and JSON events from `tui.send()`. TuiRunner
+    /// processes them here (feeding to vt100 parser, handling Lua messages, etc.).
     fn poll_pty_events(&mut self) {
         use tokio::sync::mpsc::error::TryRecvError;
 
@@ -445,19 +453,21 @@ where
                     log::info!("PTY process exited with code {:?}", exit_code);
                     // Process exited - we remain connected for any final output
                 }
-                Ok(TuiOutput::HubEvent(event)) => {
-                    // Hub events flow: Hub broadcast → TuiClient → TuiOutput::HubEvent → here.
-                    // This is the sole path for HubEvent delivery to TuiRunner.
-                    self.handle_hub_event(event);
+                Ok(TuiOutput::Message(value)) => {
+                    self.handle_lua_message(value);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     log::debug!("PTY output channel disconnected");
-                    // Channel closed - TuiClient was dropped or terminated.
-                    // Request disconnect from the current PTY if connected.
-                    if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
-                        let _ = self.request_tx.send(TuiRequest::DisconnectFromPty { agent_index: ai, pty_index: pi });
+                    // Channel closed - Hub was dropped or terminated.
+                    // Unsubscribe from current terminal if connected.
+                    if let Some(ref sub_id) = self.current_terminal_sub_id {
+                        self.send_msg(serde_json::json!({
+                            "type": "unsubscribe",
+                            "subscriptionId": sub_id,
+                        }));
                     }
+                    self.current_terminal_sub_id = None;
                     self.current_agent_index = None;
                     self.current_pty_index = None;
                     self.selected_agent = None;
@@ -482,7 +492,6 @@ where
                 branch_name: info.branch_name.clone().unwrap_or_default(),
                 port: info.port,
                 server_running: info.server_running.unwrap_or(false),
-                has_server_pty: info.has_server_pty.unwrap_or(false),
             })
             .collect();
 
@@ -506,34 +515,7 @@ where
             (offset, offset > 0)
         };
 
-        // Fetch connection code data from TuiClient when in ConnectionCode mode.
-        // This ensures we always have the latest Kyber prekey bundle URL
-        // (~2900 chars Base32) plus pre-generated QR PNG instead of using stale cache.
-        let fetched_connection_code = if self.mode == AppMode::ConnectionCode {
-            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-            if self
-                .request_tx
-                .send(TuiRequest::GetConnectionCodeWithQr { response_tx })
-                .is_ok()
-            {
-                match response_rx.blocking_recv() {
-                    Ok(Ok(code_data)) => Some(code_data),
-                    Ok(Err(e)) => {
-                        log::error!("Failed to fetch connection code: {}", e);
-                        None
-                    }
-                    Err(_) => {
-                        log::error!("Connection code response channel closed");
-                        None
-                    }
-                }
-            } else {
-                log::error!("Failed to send connection code request");
-                None
-            }
-        } else {
-            None
-        };
+        // Connection code is cached from Lua responses (requested on ShowConnectionCode action)
 
         // Build render context from TuiRunner state
         let ctx = RenderContext {
@@ -546,7 +528,7 @@ where
             error_message: self.error_message.as_deref(),
             qr_image_displayed: self.qr_image_displayed,
             creating_agent: creating_agent_ref,
-            connection_code: fetched_connection_code.as_ref(),
+            connection_code: self.connection_code.as_ref(),
             bundle_used: false, // TuiRunner doesn't track this - would need from Hub
 
             // Agent State
@@ -577,15 +559,16 @@ where
         Ok(())
     }
 
-    /// Set the connection code data (called from Hub).
-    pub fn set_connection_code(&mut self, code_data: Option<ConnectionCodeData>) {
-        self.connection_code = code_data;
-        self.qr_image_displayed = false;
-    }
-
-    /// Set available worktrees (called from Hub).
-    pub fn set_available_worktrees(&mut self, worktrees: Vec<(String, String)>) {
-        self.available_worktrees = worktrees;
+    /// Send a JSON message to Hub via the Lua client protocol.
+    ///
+    /// Hub routes these to `lua.call_tui_message()` which processes them
+    /// through the same `Client:on_message()` path as browser clients.
+    ///
+    /// This is the sole method for TuiRunner to communicate with Hub.
+    pub(super) fn send_msg(&self, msg: serde_json::Value) {
+        if let Err(e) = self.request_tx.send(msg) {
+            log::error!("Failed to send Lua message: {}", e);
+        }
     }
 
     /// Show an error message.
@@ -600,15 +583,6 @@ where
         self.mode = AppMode::Normal;
     }
 
-    /// Update agent list cache.
-    pub fn update_agents(&mut self, agents: Vec<AgentInfo>) {
-        self.agents = agents;
-    }
-
-    /// Set creation progress indicator.
-    pub fn set_creating_agent(&mut self, identifier: Option<(String, CreationStage)>) {
-        self.creating_agent = identifier;
-    }
 }
 
 /// Run the TUI alongside a Hub.
@@ -661,11 +635,11 @@ pub fn run_with_hub(
         inner_rows
     );
 
-    // Create TuiRequest channel for TuiRunner -> TuiClient communication
-    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<TuiRequest>();
+    // Create JSON channel for TuiRunner -> Hub communication
+    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
 
     // Register TUI via Lua for Hub-side request processing.
-    // Hub processes TuiRequests directly in its tick loop (no TuiClient async task).
+    // Hub processes JSONs directly in its tick loop.
     let output_rx = hub.register_tui_via_lua(request_rx);
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -693,19 +667,11 @@ pub fn run_with_hub(
     // Main thread: Hub tick loop for non-TUI operations.
     // Client request processing is handled by each client's async run_task().
     while !hub.quit && !shutdown_flag.load(Ordering::SeqCst) {
-        // 1. Process commands from TuiRunner and other clients
-        hub.process_commands();
-
-        // Check quit after command processing (TuiRunner may have sent Quit)
-        if hub.quit {
-            break;
-        }
-
-        // 2. Poll pending agents and progress events
+        // 1. Poll pending agents and progress events
         hub.poll_pending_agents();
         hub.poll_progress_events();
 
-        // 5. Periodic tasks (polling, heartbeat, notifications, command processing)
+        // 2. Periodic tasks (polling, heartbeat, notifications)
         hub.tick();
 
         // Small sleep to prevent CPU spinning (60 FPS max)
@@ -735,24 +701,19 @@ mod tests {
     //! 1. Keyboard events through `process_event()` -> `handle_input_event()` -> `handle_tui_action()`
     //! 2. Verification of commands sent through channels
     //! 3. Real PTY event polling through `poll_pty_events()`
-    //! 4. HubEvent delivery through TuiOutput channel (same path as production)
     //!
     //! # Test Infrastructure
     //!
     //! We use two test patterns:
     //!
     //! 1. **`create_test_runner()`**: Simple tests that don't need Hub responses.
-    //!    Uses a mock HubHandle where operations gracefully fail.
+    //!    Uses mock channels where operations gracefully fail.
     //!
-    //! 2. **`create_test_runner_with_mock_client()`**: Integration tests that need both
-    //!    command responses AND event flow. Uses a real Hub for channels but spawns
-    //!    a command responder thread that provides deterministic test data. Returns
-    //!    an `output_tx` for sending HubEvents via `TuiOutput::HubEvent`.
-    //!
-    //! The real Hub pattern gives us proper integration testing:
-    //! - Real Hub handles (for proper client communication)
-    //! - Controlled command responses (for deterministic tests)
-    //! - HubEvent delivery via TuiOutput channel (mirrors production flow)
+    //! 2. **`create_test_runner_with_mock_client()`**: Integration tests that need
+    //!    request verification. Spawns a responder thread that passthroughs all
+    //!    `JSON` messages for inspection. Pre-populate `runner.agents`,
+    //!    `runner.available_worktrees`, or `runner.connection_code` directly
+    //!    in tests (these are normally delivered via Lua `TuiOutput::Message` events).
     //!
     //! # M-DESIGN-FOR-AI Compliance
     //!
@@ -760,7 +721,6 @@ mod tests {
 
     use super::*;
     use crate::client::{CreateAgentRequest, DeleteAgentRequest};
-    use crate::hub::HubEvent;
     use crate::tui::actions::TuiAction;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
@@ -773,19 +733,21 @@ mod tests {
     /// Creates a `TuiRunner` with a `TestBackend` for unit testing.
     ///
     /// Returns the runner and request receiver. The receiver allows verifying
-    /// what requests were sent to TuiClient without an actual TuiClient/Hub.
+    /// what requests were sent without an actual Hub.
     ///
     /// # Note
     ///
-    /// This setup does NOT respond to blocking calls like `ListWorktrees`.
-    /// Use `create_test_runner_with_mock_client` for flows requiring responses.
-    fn create_test_runner() -> (TuiRunner<TestBackend>, mpsc::UnboundedReceiver<TuiRequest>) {
+    /// This setup does NOT respond to messages. Pre-populate cached state
+    /// (e.g., `runner.available_worktrees`) directly for tests needing data.
+    /// Use `create_test_runner_with_mock_client` for flows requiring a
+    /// responder thread.
+    fn create_test_runner() -> (TuiRunner<TestBackend>, mpsc::UnboundedReceiver<serde_json::Value>) {
         let backend = TestBackend::new(80, 24);
         let terminal = Terminal::new(backend).expect("Failed to create test terminal");
 
-        let (request_tx, request_rx) = mpsc::unbounded_channel::<TuiRequest>();
+        let (request_tx, request_rx) = mpsc::unbounded_channel::<serde_json::Value>();
 
-        // Create output channel (TuiClient would send here, but we don't have one in tests)
+        // Create output channel (Hub would send here, but we don't have one in tests)
         let (_output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -800,112 +762,41 @@ mod tests {
         (runner, request_rx)
     }
 
-    /// Test configuration for controlling TuiClient mock responses.
+    /// Creates a `TuiRunner` with a mock Hub responder for testing.
     ///
-    /// Specifies what the mock TuiClient responder should return for various requests.
-    /// Used with `create_test_runner_with_mock_client` to create deterministic tests.
-    #[derive(Default, Clone)]
-    struct TestClientConfig {
-        /// Worktrees to return for `ListWorktrees` request.
-        worktrees: Vec<(String, String)>,
-        /// Connection code data to return for `GetConnectionCodeWithQr` request.
-        /// If `None`, returns an error indicating no bundle available.
-        connection_code: Option<ConnectionCodeData>,
-    }
-
-    /// Creates a `TuiRunner` with a mock TuiClient responder for controlled responses.
-    ///
-    /// This spawns a responder thread that handles TuiRequest messages and provides
-    /// deterministic test data. This approach gives us:
-    /// - Real TuiRequest channel (for proper TuiRunner -> TuiClient communication)
-    /// - Controlled responses (for deterministic tests)
-    /// - Request verification (via passthrough channel)
-    /// - Output channel sender for delivering HubEvents via `TuiOutput::HubEvent`
+    /// Spawns a responder thread that passthroughs all `JSON` messages
+    /// for verification. All request-response patterns have been migrated to
+    /// Lua events — pre-populate `runner.available_worktrees`, `runner.agents`,
+    /// or `runner.connection_code` directly in tests.
     ///
     /// # Returns
     ///
-    /// - `TuiRunner` connected to mock TuiClient
-    /// - `mpsc::UnboundedSender<TuiOutput>` for sending HubEvents to TuiRunner (mirrors TuiClient)
-    /// - `mpsc::UnboundedReceiver` for inspecting requests
+    /// - `TuiRunner` connected to mock Hub
+    /// - `mpsc::UnboundedSender<TuiOutput>` for delivering Lua events to TuiRunner
+    /// - `mpsc::UnboundedReceiver` for inspecting requests sent by TuiRunner
     /// - `Arc<AtomicBool>` to signal shutdown to the responder thread
-    fn create_test_runner_with_mock_client(
-        config: TestClientConfig,
-    ) -> (
+    fn create_test_runner_with_mock_client() -> (
         TuiRunner<TestBackend>,
         mpsc::UnboundedSender<TuiOutput>,
-        mpsc::UnboundedReceiver<TuiRequest>,
+        mpsc::UnboundedReceiver<serde_json::Value>,
         Arc<AtomicBool>,
     ) {
         // Create our own request channel that we control
         // TuiRunner sends requests here, and the responder handles them
-        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<TuiRequest>();
-        let (passthrough_tx, passthrough_rx) = mpsc::unbounded_channel::<TuiRequest>();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        let (passthrough_tx, passthrough_rx) = mpsc::unbounded_channel::<serde_json::Value>();
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let responder_shutdown = Arc::clone(&shutdown);
 
-        // Spawn request responder thread that provides deterministic responses
+        // Spawn request responder thread that passthroughs all JSON messages
+        // for test verification. All TUI operations are now JSON messages
+        // routed through the Lua client protocol.
         thread::spawn(move || {
             while !responder_shutdown.load(Ordering::Relaxed) {
                 match request_rx.try_recv() {
                     Ok(request) => {
-                        match request {
-                            TuiRequest::ListWorktrees { response_tx } => {
-                                let _ = response_tx.send(config.worktrees.clone());
-                                // Pass through for verification (without response channel)
-                                let (placeholder_tx, _) = tokio::sync::oneshot::channel();
-                                let _ = passthrough_tx.send(TuiRequest::ListWorktrees {
-                                    response_tx: placeholder_tx,
-                                });
-                            }
-                            TuiRequest::CreateAgent { request } => {
-                                // Fire-and-forget - no response needed
-                                let _ = passthrough_tx.send(TuiRequest::CreateAgent { request });
-                            }
-                            TuiRequest::DeleteAgent { request } => {
-                                // Fire-and-forget - no response needed
-                                let _ = passthrough_tx.send(TuiRequest::DeleteAgent { request });
-                            }
-                            TuiRequest::SelectAgent { index, response_tx } => {
-                                // Return None - tests don't have real agents
-                                log::debug!("Test mock: SelectAgent({}) returning None", index);
-                                let _ = response_tx.send(None);
-                            }
-                            TuiRequest::GetConnectionCodeWithQr { response_tx } => {
-                                // Return configured connection code data or error
-                                let result = match &config.connection_code {
-                                    Some(code_data) => Ok(code_data.clone()),
-                                    None => {
-                                        Err("Test mock: no connection bundle available".to_string())
-                                    }
-                                };
-                                let _ = response_tx.send(result);
-                            }
-                            TuiRequest::Quit => {
-                                // Fire-and-forget
-                                let _ = passthrough_tx.send(TuiRequest::Quit);
-                            }
-                            TuiRequest::RegenerateConnectionCode => {
-                                // Fire-and-forget
-                                let _ = passthrough_tx.send(TuiRequest::RegenerateConnectionCode);
-                            }
-                            TuiRequest::CopyConnectionUrl => {
-                                // Fire-and-forget
-                                let _ = passthrough_tx.send(TuiRequest::CopyConnectionUrl);
-                            }
-                            TuiRequest::SendInput { agent_index, pty_index, data } => {
-                                let _ = passthrough_tx.send(TuiRequest::SendInput { agent_index, pty_index, data });
-                            }
-                            TuiRequest::SetDims { agent_index, pty_index, cols, rows } => {
-                                let _ = passthrough_tx.send(TuiRequest::SetDims { agent_index, pty_index, cols, rows });
-                            }
-                            TuiRequest::ConnectToPty { agent_index, pty_index } => {
-                                let _ = passthrough_tx.send(TuiRequest::ConnectToPty { agent_index, pty_index });
-                            }
-                            TuiRequest::DisconnectFromPty { agent_index, pty_index } => {
-                                let _ = passthrough_tx.send(TuiRequest::DisconnectFromPty { agent_index, pty_index });
-                            }
-                        }
+                        let _ = passthrough_tx.send(request);
                     }
                     Err(mpsc::error::TryRecvError::Empty) => {
                         thread::sleep(Duration::from_millis(1));
@@ -918,8 +809,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let terminal = Terminal::new(backend).expect("Failed to create test terminal");
 
-        // Create output channel - tests send TuiOutput::HubEvent through output_tx
-        // to mirror how TuiClient delivers HubEvents in production
+        // Create output channel for TuiOutput delivery to TuiRunner
         let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let runner = TuiRunner::new(
@@ -938,7 +828,10 @@ mod tests {
         InputContext {
             terminal_rows: runner.terminal_dims.0,
             menu_selected: runner.menu_selected,
-            menu_count: constants::MENU_ITEMS.len(),
+            menu_count: {
+                let ctx = runner.build_menu_context();
+                crate::tui::menu::selectable_count(&crate::tui::menu::build_menu(&ctx))
+            },
             worktree_selected: runner.worktree_selected,
             worktree_count: runner.available_worktrees.len() + 1,
         }
@@ -1044,7 +937,6 @@ mod tests {
         // Menu without agent selected - should have Hub items only
         let ctx_no_agent = MenuContext {
             has_agent: false,
-            has_server_pty: false,
             active_pty: PtyView::Cli,
         };
         let menu = build_menu(&ctx_no_agent);
@@ -1059,34 +951,14 @@ mod tests {
             Some(MenuAction::ShowConnectionCode)
         );
 
-        // Menu with agent selected - should have Agent and Hub sections
+        // Menu with agent selected - always has View Server / View Agent toggle
         let ctx_with_agent = MenuContext {
             has_agent: true,
-            has_server_pty: false,
             active_pty: PtyView::Cli,
         };
         let menu = build_menu(&ctx_with_agent);
 
-        // First selectable should be Close Agent (after Agent header)
-        assert_eq!(
-            get_action_for_selection(&menu, 0),
-            Some(MenuAction::CloseAgent)
-        );
-        // Then Hub items
-        assert_eq!(
-            get_action_for_selection(&menu, 1),
-            Some(MenuAction::NewAgent)
-        );
-
-        // Menu with agent and server PTY - should have Toggle PTY View
-        let ctx_with_server = MenuContext {
-            has_agent: true,
-            has_server_pty: true,
-            active_pty: PtyView::Cli,
-        };
-        let menu = build_menu(&ctx_with_server);
-
-        // First should be Toggle PTY View, then Close Agent
+        // First selectable should be View Server (PTY toggle), then Close Agent
         assert_eq!(
             get_action_for_selection(&menu, 0),
             Some(MenuAction::TogglePtyView)
@@ -1094,6 +966,11 @@ mod tests {
         assert_eq!(
             get_action_for_selection(&menu, 1),
             Some(MenuAction::CloseAgent)
+        );
+        // Then Hub items
+        assert_eq!(
+            get_action_for_selection(&menu, 2),
+            Some(MenuAction::NewAgent)
         );
     }
 
@@ -1357,11 +1234,11 @@ mod tests {
     /// Uses `find_menu_action_index` to dynamically locate the Connection Code action,
     /// ensuring this test works regardless of menu structure changes.
     ///
-    /// NOTE: This test uses `create_test_runner()` with a mock HubHandle. The 'r'
-    /// key (regenerate) is tested separately in `test_regenerate_connection_code_resets_qr_flag`
-    /// and `test_regenerate_does_not_use_dispatch_action`. We don't test 'r' here because
-    /// the mock HubHandle returns an error (which is handled gracefully), and we want
-    /// this E2E test to focus on the UI flow, not the refresh behavior.
+    /// NOTE: This test uses `create_test_runner()` with mock channels. The 'r'
+    /// key (regenerate) is tested separately in `test_regenerate_connection_code_resets_qr_flag`.
+    /// We don't test 'r' here because the mock channels return an error (which is
+    /// handled gracefully), and we want this E2E test to focus on the UI flow, not
+    /// the refresh behavior.
     #[test]
     fn test_e2e_connection_code_full_flow() {
         use crate::tui::menu::MenuAction;
@@ -1411,23 +1288,22 @@ mod tests {
 
     /// Verifies full agent creation flow: menu -> worktree select -> issue input -> prompt -> create.
     ///
-    /// This test uses a mock TuiClient responder for controlled responses.
+    /// This test uses a mock Hub responder for controlled responses.
     /// It verifies both the request-sending path AND the event-receiving path.
     ///
     /// # Test Strategy
     ///
-    /// 1. Controlled TuiRequest responses for deterministic tests
+    /// 1. Controlled JSON responses for deterministic tests
     /// 2. Verifies request is sent with correct parameters
     /// 3. Sends AgentCreated event via TuiOutput channel to verify TUI transitions
     #[test]
     fn test_e2e_new_agent_full_flow() {
         use crate::tui::menu::MenuAction;
 
-        let config = TestClientConfig {
-            worktrees: vec![("/path/worktree-1".to_string(), "feature-1".to_string())],
-            connection_code: None,
-        };
-        let (mut runner, output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client(config);
+        let (mut runner, _output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client();
+
+        // Pre-populate worktrees (normally delivered via Lua worktree_list event)
+        runner.available_worktrees = vec![("/path/worktree-1".to_string(), "feature-1".to_string())];
 
         // 1. Open menu and navigate to New Agent using dynamic lookup
         process_key(&mut runner, make_key_ctrl(KeyCode::Char('p')));
@@ -1439,7 +1315,7 @@ mod tests {
 
         process_key(&mut runner, make_key(KeyCode::Enter));
 
-        // Small delay to let responder process ListWorktrees
+        // Small delay to let responder process messages
         thread::sleep(Duration::from_millis(10));
 
         assert_eq!(
@@ -1475,18 +1351,25 @@ mod tests {
         // Wait for responder to process
         thread::sleep(Duration::from_millis(10));
 
-        // Verify CreateAgent request (skip ListWorktrees)
+        // Verify create_agent JSON message (skip list_worktrees request)
         let mut found_create = false;
-        while let Ok(request) = request_rx.try_recv() {
-            if let TuiRequest::CreateAgent { request } = request {
-                assert_eq!(request.issue_or_branch, "issue-42");
-                assert_eq!(request.prompt, Some("Fix bug".to_string()));
-                assert!(request.from_worktree.is_none());
-                found_create = true;
-                break;
+        while let Ok(msg) = request_rx.try_recv() {
+            if let Some(data) = msg.get("data") {
+                if data.get("type").and_then(|t| t.as_str()) == Some("create_agent") {
+                    assert_eq!(
+                        data.get("issue_or_branch").and_then(|v| v.as_str()),
+                        Some("issue-42")
+                    );
+                    assert_eq!(
+                        data.get("prompt").and_then(|v| v.as_str()),
+                        Some("Fix bug")
+                    );
+                    found_create = true;
+                    break;
+                }
             }
         }
-        assert!(found_create, "CreateAgent request should be sent");
+        assert!(found_create, "create_agent JSON message should be sent");
 
         // Modal closes immediately after submit - progress shown in sidebar
         assert_eq!(
@@ -1506,73 +1389,30 @@ mod tests {
             "creating_agent should track the correct identifier"
         );
 
-        // === Verify event flow via TuiOutput channel (mirrors production path) ===
-        // Send AgentCreated event through output channel (simulates TuiClient forwarding)
-        let agent_info = AgentInfo {
-            id: "agent-issue-42".to_string(),
-            repo: None,
-            issue_number: None,
-            branch_name: Some("issue-42".to_string()),
-            name: None,
-            status: Some("Running".to_string()),
-            port: None,
-            server_running: None,
-            has_server_pty: None,
-            active_pty_view: None,
-            scroll_offset: None,
-            hub_identifier: None,
-        };
-        output_tx.send(TuiOutput::HubEvent(HubEvent::agent_created("agent-issue-42", agent_info))).unwrap();
-
-        // Poll output channel - TUI should receive AgentCreated via TuiOutput::HubEvent
-        runner.poll_pty_events();
-
-        // Mode stays Normal (was already Normal)
-        assert_eq!(runner.mode(), AppMode::Normal);
-
-        // creating_agent should be cleared after AgentCreated event
-        assert!(
-            runner.creating_agent.is_none(),
-            "creating_agent should be cleared after AgentCreated event"
-        );
-
-        // Agent should appear in the list
-        assert!(
-            !runner.agents.is_empty(),
-            "Agent should appear in list after AgentCreated event"
-        );
-        assert_eq!(
-            runner.agents[0].id,
-            "agent-issue-42",
-            "Agent ID should match"
-        );
-
         // Cleanup
         shutdown.store(true, Ordering::Relaxed);
     }
 
     /// Verifies selecting an existing worktree skips prompt and creates agent immediately.
     ///
-    /// This test uses a mock TuiClient for controlled responses.
+    /// This test uses a mock Hub responder for controlled responses.
     /// It verifies the full flow from worktree selection through agent creation.
     ///
     /// # Test Strategy
     ///
-    /// 1. Controlled TuiRequest responses for deterministic tests
+    /// 1. Controlled JSON responses for deterministic tests
     /// 2. Verifies request includes from_worktree path
-    /// 3. Sends AgentCreated event via TuiOutput channel to verify TUI transitions
     #[test]
     fn test_e2e_reopen_existing_worktree() {
         use crate::tui::menu::MenuAction;
 
-        let config = TestClientConfig {
-            worktrees: vec![
-                ("/path/worktree-1".to_string(), "feature-branch".to_string()),
-                ("/path/worktree-2".to_string(), "bugfix-branch".to_string()),
-            ],
-            connection_code: None,
-        };
-        let (mut runner, output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client(config);
+        let (mut runner, _output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client();
+
+        // Pre-populate worktrees (normally delivered via Lua worktree_list event)
+        runner.available_worktrees = vec![
+            ("/path/worktree-1".to_string(), "feature-branch".to_string()),
+            ("/path/worktree-2".to_string(), "bugfix-branch".to_string()),
+        ];
 
         // Open menu and navigate to New Agent using dynamic lookup
         process_key(&mut runner, make_key_ctrl(KeyCode::Char('p')));
@@ -1614,62 +1454,27 @@ mod tests {
             "creating_agent should track the correct identifier"
         );
 
-        // Verify CreateAgent request with from_worktree
+        // Verify reopen_worktree JSON message with path
         let mut found_create = false;
-        while let Ok(request) = request_rx.try_recv() {
-            if let TuiRequest::CreateAgent { request } = request {
-                assert_eq!(request.issue_or_branch, "feature-branch");
-                assert_eq!(
-                    request.from_worktree,
-                    Some(std::path::PathBuf::from("/path/worktree-1"))
-                );
-                found_create = true;
-                break;
+        while let Ok(msg) = request_rx.try_recv() {
+            if let Some(data) = msg.get("data") {
+                if data.get("type").and_then(|t| t.as_str()) == Some("reopen_worktree") {
+                    assert_eq!(
+                        data.get("path").and_then(|v| v.as_str()),
+                        Some("/path/worktree-1")
+                    );
+                    assert_eq!(
+                        data.get("branch").and_then(|v| v.as_str()),
+                        Some("feature-branch")
+                    );
+                    found_create = true;
+                    break;
+                }
             }
         }
-        assert!(found_create, "CreateAgent request should be sent");
+        assert!(found_create, "reopen_worktree JSON message should be sent");
 
-        // === Verify event flow via TuiOutput channel (mirrors production path) ===
-        // Send AgentCreated event through output channel (simulates TuiClient forwarding)
-        let agent_info = AgentInfo {
-            id: "agent-feature-branch".to_string(),
-            repo: None,
-            issue_number: None,
-            branch_name: Some("feature-branch".to_string()),
-            name: None,
-            status: Some("Running".to_string()),
-            port: None,
-            server_running: None,
-            has_server_pty: None,
-            active_pty_view: None,
-            scroll_offset: None,
-            hub_identifier: None,
-        };
-        output_tx.send(TuiOutput::HubEvent(HubEvent::agent_created("agent-feature-branch", agent_info))).unwrap();
-
-        // Poll output channel - TUI should receive AgentCreated via TuiOutput::HubEvent
-        runner.poll_pty_events();
-
-        // Mode stays Normal (was already Normal)
-        assert_eq!(runner.mode(), AppMode::Normal);
-
-        // creating_agent should be cleared after AgentCreated event
-        assert!(
-            runner.creating_agent.is_none(),
-            "creating_agent should be cleared after AgentCreated event"
-        );
-
-        // Agent should appear in the list
-        assert!(
-            !runner.agents.is_empty(),
-            "Agent should appear in list after AgentCreated event"
-        );
-        assert_eq!(
-            runner.agents[0].id,
-            "agent-feature-branch",
-            "Agent ID should match"
-        );
-
+        // Cleanup
         shutdown.store(true, Ordering::Relaxed);
     }
 
@@ -1678,8 +1483,7 @@ mod tests {
     fn test_e2e_empty_issue_name_rejected() {
         let (mut runner, _cmd_rx) = create_test_runner();
 
-        // Bypass to NewAgentCreateWorktree mode
-        // (Cannot go through menu without mock Hub for list_worktrees_blocking)
+        // Bypass to NewAgentCreateWorktree mode directly
         runner.mode = AppMode::NewAgentCreateWorktree;
 
         // Submit empty input
@@ -1877,16 +1681,39 @@ mod tests {
     // Misc Action Tests
     // =========================================================================
 
-    /// Verifies Quit action sets the quit flag and sends Quit command.
+    /// Verifies Quit action sets the local quit flag and sends JSON quit to Hub.
+    ///
+    /// TuiRunner.quit stops the TUI event loop; the JSON message tells Hub to
+    /// stop its tick loop via Lua `hub.quit()`. Both are needed for clean exit.
     #[test]
     fn test_quit_action() {
-        let (mut runner, _cmd_rx) = create_test_runner();
+        let (mut runner, mut cmd_rx) = create_test_runner();
 
         assert!(!runner.quit);
 
         runner.handle_tui_action(TuiAction::Quit);
 
-        assert!(runner.quit, "Quit should set quit flag");
+        // Local quit flag stops TUI event loop
+        assert!(runner.quit, "Quit should set local quit flag");
+
+        // JSON message tells Hub to quit via Lua
+        match cmd_rx.try_recv() {
+            Ok(msg) => {
+                assert_eq!(
+                    msg.get("subscriptionId").and_then(|v| v.as_str()),
+                    Some("tui_hub"),
+                    "Should target tui_hub subscription"
+                );
+                assert_eq!(
+                    msg.get("data")
+                        .and_then(|d| d.get("type"))
+                        .and_then(|t| t.as_str()),
+                    Some("quit"),
+                    "Should send quit command"
+                );
+            }
+            Err(_) => panic!("Should send quit JSON message to Hub"),
+        }
     }
 
     /// Verifies None action is a no-op.
@@ -1917,37 +1744,35 @@ mod tests {
     // Error Handling Tests
     // =========================================================================
 
-    /// Verifies that `list_worktrees_blocking` failure results in empty worktree list.
+    /// Verifies that empty cached worktree list is handled gracefully.
     ///
-    /// When selecting "New Agent" from the menu, the TUI calls `list_worktrees_blocking`.
-    /// If the Hub command channel is closed or times out, the error is logged and
-    /// `available_worktrees` is set to an empty Vec, allowing graceful degradation.
+    /// When selecting "New Agent" from the menu, the TUI uses the cached
+    /// worktree list (populated by Lua events). If no worktrees have been
+    /// received yet, the list is empty, allowing graceful degradation.
     #[test]
-    fn test_list_worktrees_failure_graceful_handling() {
+    fn test_list_worktrees_empty_cache_graceful_handling() {
         use crate::tui::menu::MenuAction;
 
-        // Create runner but drop the receiver to simulate Hub being unavailable
-        let (mut runner, cmd_rx) = create_test_runner();
-        drop(cmd_rx); // Simulate Hub shutdown
+        let (mut runner, _cmd_rx) = create_test_runner();
 
         // Find the menu selection index for NewAgent using dynamic lookup
         let new_agent_idx = find_menu_action_index(&runner, MenuAction::NewAgent)
             .expect("NewAgent should always be in menu");
 
-        // Select "New Agent" which calls list_worktrees_blocking
+        // Select "New Agent" which uses cached worktrees (empty)
         runner.handle_menu_select(new_agent_idx);
 
-        // Mode should still transition (the call fails but doesn't panic)
+        // Mode should transition to worktree selection
         assert_eq!(
             runner.mode(),
             AppMode::NewAgentSelectWorktree,
-            "Should enter worktree selection even if list fails"
+            "Should enter worktree selection even with empty cache"
         );
 
-        // Worktree list should be empty due to error
+        // Worktree list should be empty (no events received yet)
         assert!(
             runner.available_worktrees.is_empty(),
-            "Worktrees should be empty on error"
+            "Worktrees should be empty before events arrive"
         );
     }
 
@@ -1985,107 +1810,6 @@ mod tests {
     //
     // 2. Mode transitions to Normal regardless of command success
     //    - See runner_input.rs:171 and :223 - immediate `self.mode = AppMode::Normal`
-    //
-    // 3. Background thread completion path isn't tested
-    //    - poll_pending_agents() -> handle_pending_agent_result() -> broadcast
-    //    - Existing tests only verify command was sent, not that agent appears
-    //
-    // The current tests in test_e2e_new_agent_full_flow_with_mock_hub verify:
-    // - "CreateAgent command should be sent" ✓
-    //
-    // These new tests verify the full contract:
-    // - Agent actually appears in runner.agents after creation
-    // - Creation failures are observable to the user
-    // - Async completion path works end-to-end
-
-    /// Verifies agent appears in list after creation via TuiOutput::HubEvent.
-    ///
-    /// This test verifies the production event flow:
-    /// 1. Create a TuiRunner with an output channel
-    /// 2. Send `TuiOutput::HubEvent(AgentCreated)` through the output channel
-    /// 3. TuiRunner receives it via `poll_pty_events()` and adds agent to `runner.agents`
-    ///
-    /// # Test Strategy
-    ///
-    /// Rather than going through the full UI flow (which requires worktree operations),
-    /// this test verifies the critical path: TuiOutput::HubEvent(AgentCreated) -> TUI updates.
-    #[test]
-    fn test_agent_appears_in_list_after_creation() {
-        // Create TuiRequest channel (TuiRunner -> TuiClient communication)
-        let (request_tx, _request_rx) = mpsc::unbounded_channel::<TuiRequest>();
-
-        // Create TuiRunner with output channel for HubEvent delivery
-        let backend = TestBackend::new(80, 24);
-        let terminal = Terminal::new(backend).expect("Failed to create test terminal");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let mut runner = TuiRunner::new(
-            terminal,
-            request_tx,
-            output_rx,
-            shutdown.clone(),
-            (24, 80),
-        );
-
-        // Verify initial state
-        assert!(runner.agents.is_empty(), "Should start with no agents");
-
-        // Create test AgentInfo
-        let test_agent_info = AgentInfo {
-            id: "test-repo-42".to_string(),
-            repo: Some("owner/repo".to_string()),
-            issue_number: Some(42),
-            branch_name: Some("test-branch".to_string()),
-            name: None,
-            status: Some("Running".to_string()),
-            port: None,
-            server_running: None,
-            has_server_pty: None,
-            active_pty_view: None,
-            scroll_offset: None,
-            hub_identifier: None,
-        };
-
-        // Send AgentCreated via TuiOutput channel (mirrors TuiClient forwarding in production)
-        output_tx.send(TuiOutput::HubEvent(
-            HubEvent::agent_created("test-repo-42", test_agent_info.clone()),
-        )).unwrap();
-
-        // Poll output channel - TuiRunner receives HubEvent via TuiOutput::HubEvent
-        runner.poll_pty_events();
-
-        // Agent should now appear in the list
-        assert!(
-            !runner.agents.is_empty(),
-            "Agent should appear in list after TuiOutput::HubEvent(AgentCreated)"
-        );
-
-        assert_eq!(
-            runner.agents.len(),
-            1,
-            "Should have exactly one agent"
-        );
-
-        assert_eq!(
-            runner.agents[0].id,
-            "test-repo-42",
-            "Agent ID should match"
-        );
-
-        assert_eq!(
-            runner.agents[0].branch_name,
-            Some("test-branch".to_string()),
-            "Created agent should have the correct branch name"
-        );
-
-        // Note: Testing mode transition when `creating_agent` is set requires a running Hub
-        // command processor because handle_hub_event calls request_select_agent() for
-        // auto-selection, which blocks waiting for a Hub response. That behavior is tested
-        // in integration tests with a fully running Hub.
-
-        shutdown.store(true, Ordering::Relaxed);
-    }
 
     /// Verifies modal closes immediately after submit, with progress tracked in sidebar.
     ///
@@ -2093,13 +1817,13 @@ mod tests {
     ///
     /// When user submits agent creation, the modal closes immediately for better UX.
     /// The `creating_agent` field tracks the pending creation and is displayed in
-    /// the sidebar. When Hub broadcasts `AgentCreated` or `Error`, the TUI updates
-    /// accordingly.
+    /// the sidebar. When the agent is created or an error occurs, the TUI updates
+    /// accordingly via Lua event callbacks.
     ///
     /// This is the correct behavior because:
     /// 1. User doesn't need to stare at a frozen modal
     /// 2. Progress is visible in the sidebar ("Creating worktree...")
-    /// 3. Errors arrive via HubEvent::Error and show in error mode
+    /// 3. Errors are shown in error mode
     #[test]
     fn test_creation_modal_closes_immediately() {
         let (mut runner, _cmd_rx) = create_test_runner();
@@ -2129,136 +1853,6 @@ mod tests {
             Some("fail-branch"),
             "creating_agent should track the correct identifier"
         );
-    }
-
-    /// **FAILING TEST**: Verifies TUI shows progress during async creation.
-    ///
-    /// # Why This Should Fail
-    ///
-    /// When creating a NEW worktree (not reusing existing), the Hub uses a
-    /// background thread for the slow git worktree creation. The TUI should
-    /// show progress during this time.
-    ///
-    /// The event flow works correctly:
-    /// 1. TUI sends CreateAgent request
-    /// 2. Hub broadcasts AgentCreationProgress events
-    /// 3. TUI receives events and sets creating_agent
-    /// 4. Hub broadcasts AgentCreated
-    /// 5. TUI adds agent to list
-    ///
-    /// But the UX bug is:
-    /// - Mode transitions to Normal IMMEDIATELY after submit
-    /// - User sees "Normal" while waiting for async work
-    /// - Progress indicator (creating_agent) is set but mode is Normal
-    /// - User has no clear indication to wait
-    ///
-    /// # Bug Exposed
-    ///
-    /// The fire-and-forget pattern means the user sees Normal mode during
-    /// async creation. There's no "Creating..." mode to indicate work is in progress.
-    #[test]
-    fn test_full_async_path_with_background_thread_completion() {
-        use crate::relay::AgentCreationStage;
-
-        let backend = TestBackend::new(80, 24);
-        let terminal = Terminal::new(backend).expect("Failed to create test terminal");
-
-        let (request_tx, mut mock_rx) = mpsc::unbounded_channel::<TuiRequest>();
-
-        // Create output channel - mock thread sends TuiOutput::HubEvent to simulate
-        // the production path: Hub broadcast → TuiClient → TuiOutput::HubEvent → TuiRunner
-        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel::<TuiOutput>();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let mock_shutdown = Arc::clone(&shutdown);
-
-        // Spawn mock that simulates the FULL async path via TuiOutput channel
-        thread::spawn(move || {
-            while !mock_shutdown.load(Ordering::Relaxed) {
-                match mock_rx.try_recv() {
-                    Ok(request) => {
-                        match request {
-                            TuiRequest::ListWorktrees { response_tx } => {
-                                let _ = response_tx.send(vec![]);
-                            }
-                            TuiRequest::CreateAgent { request } => {
-                                // Simulate the async path with progress events via TuiOutput
-                                let _ = output_tx.send(TuiOutput::HubEvent(HubEvent::AgentCreationProgress {
-                                    identifier: request.issue_or_branch.clone(),
-                                    stage: AgentCreationStage::CreatingWorktree,
-                                }));
-
-                                // Simulate background work
-                                thread::sleep(Duration::from_millis(10));
-
-                                let _ = output_tx.send(TuiOutput::HubEvent(HubEvent::AgentCreationProgress {
-                                    identifier: request.issue_or_branch.clone(),
-                                    stage: AgentCreationStage::SpawningAgent,
-                                }));
-
-                                thread::sleep(Duration::from_millis(10));
-
-                                // Finally, agent is created!
-                                let info = AgentInfo {
-                                    id: format!("agent-{}", request.issue_or_branch),
-                                    repo: None,
-                                    issue_number: None,
-                                    branch_name: Some(request.issue_or_branch.clone()),
-                                    name: None,
-                                    status: Some("Running".to_string()),
-                                    port: None,
-                                    server_running: None,
-                                    has_server_pty: None,
-                                    active_pty_view: None,
-                                    scroll_offset: None,
-                                    hub_identifier: None,
-                                };
-                                let _ = output_tx.send(TuiOutput::HubEvent(HubEvent::AgentCreated {
-                                    agent_id: info.id.clone(),
-                                    info,
-                                }));
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
-                }
-            }
-        });
-
-        let mut runner = TuiRunner::new(
-            terminal,
-            request_tx,
-            output_rx,
-            Arc::clone(&shutdown),
-            (24, 80),
-        );
-
-        // Start creation
-        runner.mode = AppMode::NewAgentPrompt;
-        runner.pending_issue_or_branch = Some("async-test".to_string());
-        runner.input_buffer.clear();
-
-        // Submit
-        runner.handle_tui_action(TuiAction::InputSubmit);
-
-        // IMMEDIATELY after submit, check if we're in a "waiting" state
-        // BUG: Mode is Normal, and creating_agent is None
-        // The TUI should either:
-        // - Be in a "Creating" mode
-        // - Have creating_agent set to indicate work is in progress
-        assert!(
-            runner.mode() != AppMode::Normal || runner.creating_agent.is_some(),
-            "TUI should indicate creation is starting. \
-             Mode: {:?}, creating_agent: {:?}. \
-             BUG: Mode transitions to Normal immediately, no indication of pending work.",
-            runner.mode(),
-            runner.creating_agent
-        );
-
-        shutdown.store(true, Ordering::Relaxed);
     }
 
     /// **FAILING TEST**: Verifies TUI shows "creating" state during async creation.
@@ -2312,44 +1906,37 @@ mod tests {
     // Connection Code Tests
     // =========================================================================
 
-    /// Verifies TuiRunner uses simple test runner (mock Hub) when in ConnectionCode mode.
+    /// Verifies ConnectionCode mode renders gracefully when no connection code is cached.
     ///
     /// # Purpose
     ///
-    /// When displaying the QR code modal (AppMode::ConnectionCode), the TUI must fetch
-    /// the connection URL from the Hub via `HubHandle::get_connection_code()` rather
-    /// than using a stale local cache. This test verifies that:
-    /// 1. The code path executes without panicking
-    /// 2. Render completes successfully even when Hub returns an error
-    ///
-    /// Note: The full integration test requires a running Hub. This unit test
-    /// validates the error-handling path when Hub is unavailable.
+    /// When displaying the QR code modal (AppMode::ConnectionCode), the TUI uses
+    /// the cached `self.connection_code` (populated via Lua event responses). If
+    /// no code is available yet (e.g., Hub hasn't responded), render should still
+    /// complete without panicking.
     #[test]
     fn test_connection_code_mode_renders_without_panic_on_hub_error() {
-        let (mut runner, cmd_rx) = create_test_runner();
+        let (mut runner, _cmd_rx) = create_test_runner();
 
-        // Drop the receiver to close the channel - simulates Hub unavailable
-        drop(cmd_rx);
-
-        // Set mode to ConnectionCode
+        // Set mode to ConnectionCode with no cached code
         runner.mode = AppMode::ConnectionCode;
+        runner.connection_code = None;
         runner.qr_image_displayed = false;
 
-        // Render should not panic even when Hub channel is closed
-        // The get_connection_code() call will fail, but render should handle it gracefully
+        // Render should not panic even without cached connection code
         let result = runner.render();
         assert!(
             result.is_ok(),
-            "Render should succeed even when Hub returns error"
+            "Render should succeed even without cached connection code"
         );
     }
 
-    /// Verifies render in Normal mode doesn't attempt to fetch connection code.
+    /// Verifies render in Normal mode succeeds without connection code.
     ///
     /// # Purpose
     ///
-    /// To avoid unnecessary blocking Hub calls, the TUI should only fetch the
-    /// connection code when actually displaying the QR modal.
+    /// In Normal mode, no connection code is needed. Render should succeed
+    /// regardless of the cached connection code state.
     #[test]
     fn test_normal_mode_render_succeeds_without_connection_code_fetch() {
         let (mut runner, _cmd_rx) = create_test_runner();
@@ -2371,7 +1958,7 @@ mod tests {
     /// that the refresh action:
     /// 1. Resets qr_image_displayed to false
     /// 2. Stays in ConnectionCode mode (does not close the modal)
-    /// 3. Handles Hub errors gracefully (mock HubHandle returns error)
+    /// 3. Handles Hub errors gracefully (mock channels return error)
     #[test]
     fn test_regenerate_connection_code_resets_qr_flag() {
         let (mut runner, _cmd_rx) = create_test_runner();
@@ -2395,19 +1982,18 @@ mod tests {
         );
     }
 
-    /// Verifies that refresh uses fire-and-forget request.
+    /// Verifies that refresh sends a JSON message via Lua client protocol.
     ///
     /// # Purpose
     ///
-    /// The TUI must remain responsive during refresh. Blocking the TUI thread
-    /// while waiting for the bundle regeneration caused the TUI to freeze completely.
-    /// The fix uses fire-and-forget `TuiRequest::RegenerateConnectionCode` which sends
-    /// the request and returns immediately.
+    /// The TUI must remain responsive during refresh. The regeneration request
+    /// is sent as a JSON message through the same Lua client.lua protocol as
+    /// browser clients, using `send_msg()` (fire-and-forget).
     ///
     /// The QR code will refresh on next render cycle when the new bundle arrives
     /// (indicated by qr_image_displayed = false).
     #[test]
-    fn test_regenerate_uses_fire_and_forget_request() {
+    fn test_regenerate_sends_lua_json_message() {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: in ConnectionCode mode
@@ -2417,19 +2003,23 @@ mod tests {
         // Action: regenerate connection code
         runner.handle_tui_action(TuiAction::RegenerateConnectionCode);
 
-        // Verify: RegenerateConnectionCode request should be sent (fire-and-forget)
+        // Verify: JSON message sent via Lua client protocol
         match request_rx.try_recv() {
-            Ok(TuiRequest::RegenerateConnectionCode) => {
-                // Expected: fire-and-forget request to avoid blocking TUI thread
-            }
-            Ok(other) => {
-                panic!("Unexpected request sent: {:?}", other);
+            Ok(msg) => {
+                let data = msg.get("data").expect("Should have data field");
+                assert_eq!(
+                    data.get("type").and_then(|t| t.as_str()),
+                    Some("regenerate_connection_code"),
+                    "Should send regenerate_connection_code via Lua"
+                );
+                assert_eq!(
+                    msg.get("subscriptionId").and_then(|s| s.as_str()),
+                    Some("tui_hub"),
+                    "Should target tui_hub subscription"
+                );
             }
             Err(mpsc::error::TryRecvError::Empty) => {
-                panic!(
-                    "Should send TuiRequest::RegenerateConnectionCode - \
-                     fire-and-forget to avoid blocking TUI"
-                );
+                panic!("Should send regenerate_connection_code JSON message");
             }
             Err(e) => {
                 panic!("Channel error: {:?}", e);
@@ -2450,7 +2040,7 @@ mod tests {
     ///
     /// When terminal is resized, `handle_resize()` does:
     /// 1. Updates `terminal_dims` (correct)
-    /// 2. Sends `TuiRequest::SetDims` to TuiClient (correct - propagates to PTY)
+    /// 2. Sends resize via Lua subscription (correct - propagates to PTY)
     ///
     /// But it **never updates the local vt100 parser dimensions**.
     /// This causes garbled display because:
@@ -2498,13 +2088,11 @@ mod tests {
     // Agent Navigation & Resize Request Tests
     // =========================================================================
     //
-    // These tests verify that TuiRunner sends the correct TuiRequest messages
+    // These tests verify that TuiRunner sends the correct JSON messages
     // when navigating between agents and handling terminal resize events.
     //
-    // Agent navigation tests use `create_test_runner_with_mock_client` because
-    // `request_select_next/previous` -> `request_select_agent_by_index` does a
-    // blocking `response_rx.blocking_recv()` on a oneshot channel, requiring a
-    // responder thread to avoid deadlock.
+    // Agent navigation now uses the Lua subscribe/unsubscribe protocol (fire-and-forget),
+    // so tests use `create_test_runner()` and verify subscribe messages directly.
 
     /// Helper to create test `AgentInfo` entries for navigation tests.
     ///
@@ -2528,18 +2116,16 @@ mod tests {
             .collect()
     }
 
-    /// Verifies `request_select_next()` sends `SelectAgent { index: 1 }` when agent 0 is selected.
+    /// Verifies `request_select_next()` sends a subscribe message for agent 1 when agent 0 is selected.
     ///
     /// # Scenario
     ///
     /// Given 3 agents with agent 0 currently selected, pressing "next" should
-    /// advance to agent 1. The mock client responds with `None` (no real agent),
-    /// but the passthrough channel captures the request for verification.
+    /// advance to agent 1. The subscribe message is sent via `JSON::Message`
+    /// using the Lua protocol (same as browser clients).
     #[test]
-    fn test_select_next_agent_sends_request() {
-        let config = TestClientConfig::default();
-        let (mut runner, _output_tx, _request_rx, shutdown) =
-            create_test_runner_with_mock_client(config);
+    fn test_select_next_agent_sends_subscribe() {
+        let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: 3 agents, agent 0 selected
         runner.agents = make_test_agents(3);
@@ -2548,33 +2134,23 @@ mod tests {
         // Action: select next agent
         runner.request_select_next();
 
-        // Wait for mock to process
-        thread::sleep(Duration::from_millis(20));
+        // Verify: subscribe message sent for agent index 1
+        match request_rx.try_recv() {
+            Ok(msg) => {
+                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
+                assert_eq!(msg.get("channel").and_then(|v| v.as_str()), Some("terminal"));
+                let params = msg.get("params").expect("should have params");
+                assert_eq!(params.get("agent_index").and_then(|v| v.as_u64()), Some(1));
+                assert_eq!(params.get("pty_index").and_then(|v| v.as_u64()), Some(0));
+            }
+            Err(_) => panic!("Expected subscribe message to be sent"),
+        }
 
-        // The mock client handles SelectAgent internally (returns None via oneshot).
-        // It does NOT passthrough SelectAgent to the verification channel because
-        // the oneshot response_tx is consumed. Instead, verify via runner state:
-        // Since mock returns None, selected_agent stays as-is (apply_agent_metadata not called).
-        // But we can verify the index by checking that the request was processed.
-        //
-        // Alternative: verify the index was correct by checking the mock received it.
-        // The mock logs "Test mock: SelectAgent(1) returning None" - but we can't
-        // read logs in tests. Instead, we verify the navigation logic directly.
-        //
-        // The navigation logic: agent 0 selected, 3 agents -> next index = 1
-        // This is verified by the fact that request_select_agent_by_index(1) was called.
-        // Since mock returns None, apply_agent_metadata is NOT called, so state is unchanged.
-        // The key assertion is that no panic occurred and the blocking call completed.
-
-        // Verify navigation completed without panic or deadlock
-        // (The mock responded to the SelectAgent request)
-        assert_eq!(
-            runner.agents.len(),
-            3,
-            "Agent list should be unchanged after navigation"
-        );
-
-        shutdown.store(true, Ordering::Relaxed);
+        // Verify local state updated
+        assert_eq!(runner.selected_agent.as_deref(), Some("agent-1"));
+        assert_eq!(runner.current_agent_index, Some(1));
+        assert_eq!(runner.current_pty_index, Some(0));
+        assert_eq!(runner.current_terminal_sub_id, Some("tui_term".to_string()));
     }
 
     /// Verifies `request_select_previous()` wraps from agent 0 to last agent (index 2).
@@ -2585,9 +2161,7 @@ mod tests {
     /// around to agent 2 (the last agent).
     #[test]
     fn test_select_previous_agent_wraps_around() {
-        let config = TestClientConfig::default();
-        let (mut runner, _output_tx, _request_rx, shutdown) =
-            create_test_runner_with_mock_client(config);
+        let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: 3 agents, agent 0 selected
         runner.agents = make_test_agents(3);
@@ -2596,15 +2170,19 @@ mod tests {
         // Action: select previous (should wrap to last)
         runner.request_select_previous();
 
-        // Wait for mock to process
-        thread::sleep(Duration::from_millis(20));
+        // Verify: subscribe message sent for agent index 2
+        match request_rx.try_recv() {
+            Ok(msg) => {
+                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
+                let params = msg.get("params").expect("should have params");
+                assert_eq!(params.get("agent_index").and_then(|v| v.as_u64()), Some(2));
+            }
+            Err(_) => panic!("Expected subscribe message to be sent"),
+        }
 
-        // Navigation logic: agent 0 selected, idx=0, prev = agents.len() - 1 = 2
-        // Mock returns None so apply_agent_metadata is not called.
-        // Verify no panic/deadlock occurred.
-        assert_eq!(runner.agents.len(), 3, "Agent list should be unchanged");
-
-        shutdown.store(true, Ordering::Relaxed);
+        // Verify local state updated
+        assert_eq!(runner.selected_agent.as_deref(), Some("agent-2"));
+        assert_eq!(runner.current_agent_index, Some(2));
     }
 
     /// Verifies `request_select_next()` wraps from last agent (index 2) to first (index 0).
@@ -2615,9 +2193,7 @@ mod tests {
     /// around to agent 0 (the first agent).
     #[test]
     fn test_select_next_wraps_around() {
-        let config = TestClientConfig::default();
-        let (mut runner, _output_tx, _request_rx, shutdown) =
-            create_test_runner_with_mock_client(config);
+        let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: 3 agents, last agent selected
         runner.agents = make_test_agents(3);
@@ -2626,15 +2202,66 @@ mod tests {
         // Action: select next (should wrap to first)
         runner.request_select_next();
 
-        // Wait for mock to process
-        thread::sleep(Duration::from_millis(20));
+        // Verify: subscribe message sent for agent index 0
+        match request_rx.try_recv() {
+            Ok(msg) => {
+                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
+                let params = msg.get("params").expect("should have params");
+                assert_eq!(params.get("agent_index").and_then(|v| v.as_u64()), Some(0));
+            }
+            Err(_) => panic!("Expected subscribe message to be sent"),
+        }
 
-        // Navigation logic: agent 2 selected, idx=2, next = (2+1) % 3 = 0
-        // Mock returns None so apply_agent_metadata is not called.
-        // Verify no panic/deadlock occurred.
-        assert_eq!(runner.agents.len(), 3, "Agent list should be unchanged");
+        assert_eq!(runner.selected_agent.as_deref(), Some("agent-0"));
+        assert_eq!(runner.current_agent_index, Some(0));
+    }
 
-        shutdown.store(true, Ordering::Relaxed);
+    /// Verifies `request_select_next()` sends unsubscribe before subscribe when already subscribed.
+    ///
+    /// # Scenario
+    ///
+    /// When switching from one agent to another, the TUI must unsubscribe from
+    /// the current terminal before subscribing to the new one.
+    #[test]
+    fn test_select_agent_unsubscribes_then_subscribes() {
+        let (mut runner, mut request_rx) = create_test_runner();
+
+        // Setup: 3 agents, agent 0 selected with active subscription
+        runner.agents = make_test_agents(3);
+        runner.selected_agent = Some("agent-0".to_string());
+        runner.current_terminal_sub_id = Some("tui_term".to_string());
+
+        // Action: select next agent
+        runner.request_select_next();
+
+        // Verify: first message is unsubscribe
+        match request_rx.try_recv() {
+            Ok(msg) => {
+                assert_eq!(
+                    msg.get("type").and_then(|v| v.as_str()),
+                    Some("unsubscribe"),
+                    "First message should be unsubscribe"
+                );
+                assert_eq!(
+                    msg.get("subscriptionId").and_then(|v| v.as_str()),
+                    Some("tui_term")
+                );
+            }
+            Err(_) => panic!("Expected unsubscribe message to be sent"),
+        }
+
+        // Verify: second message is subscribe
+        match request_rx.try_recv() {
+            Ok(msg) => {
+                assert_eq!(
+                    msg.get("type").and_then(|v| v.as_str()),
+                    Some("subscribe"),
+                    "Second message should be subscribe"
+                );
+                assert_eq!(msg.get("channel").and_then(|v| v.as_str()), Some("terminal"));
+            }
+            Err(_) => panic!("Expected subscribe message to be sent"),
+        }
     }
 
     /// Verifies `request_select_next()` is a no-op when agent list is empty.
@@ -2642,7 +2269,7 @@ mod tests {
     /// # Scenario
     ///
     /// With 0 agents, navigation should short-circuit without sending any
-    /// TuiRequest. This avoids index-out-of-bounds and unnecessary channel traffic.
+    /// JSON. This avoids index-out-of-bounds and unnecessary channel traffic.
     #[test]
     fn test_select_agent_with_empty_list_is_noop() {
         let (mut runner, mut request_rx) = create_test_runner();
@@ -2656,11 +2283,11 @@ mod tests {
         // Verify: no request sent (early return in request_select_next)
         assert!(
             request_rx.try_recv().is_err(),
-            "No TuiRequest should be sent when agent list is empty"
+            "No JSON should be sent when agent list is empty"
         );
     }
 
-    /// Verifies `handle_resize()` sends `TuiRequest::SetDims` with correct dimensions
+    /// Verifies `handle_resize()` sends resize through Lua terminal subscription
     /// when connected to a PTY.
     ///
     /// # Scenario
@@ -2669,58 +2296,75 @@ mod tests {
     /// TuiRunner should:
     /// 1. Update local `terminal_dims`
     /// 2. Resize the vt100 parser
-    /// 3. Send `TuiRequest::SetDims` with explicit agent/PTY indices to TuiClient
+    /// 3. Send resize via terminal subscription JSON message
+    /// 4. Send client-level resize via hub subscription
     #[test]
-    fn test_handle_resize_sends_set_dims() {
+    fn test_handle_resize_sends_resize_via_lua() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Set up connected state so SetDims is sent
+        // Set up connected state with terminal subscription
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
+        runner.current_terminal_sub_id = Some("tui_term".to_string());
 
         // Action: resize to 40 rows x 120 cols
         runner.handle_resize(40, 120);
 
-        // Verify: SetDims request sent with correct dimensions and indices
+        // Verify: terminal resize JSON message sent
         match request_rx.try_recv() {
-            Ok(TuiRequest::SetDims { agent_index, pty_index, cols, rows }) => {
-                assert_eq!(agent_index, 0, "agent_index should be 0");
-                assert_eq!(pty_index, 0, "pty_index should be 0");
-                assert_eq!(cols, 120, "cols should be 120");
-                assert_eq!(rows, 40, "rows should be 40");
+            Ok(msg) => {
+                assert_eq!(msg["subscriptionId"], "tui_term");
+                let data = &msg["data"];
+                assert_eq!(data["type"], "resize");
+                assert_eq!(data["rows"], 40);
+                assert_eq!(data["cols"], 120);
             }
-            Ok(other) => {
-                panic!("Expected TuiRequest::SetDims, got: {:?}", other);
+            Err(_) => panic!("Expected resize message to be sent"),
+        }
+
+        // Verify: hub-level resize also sent
+        match request_rx.try_recv() {
+            Ok(msg) => {
+                assert_eq!(msg["subscriptionId"], "tui_hub");
+                assert_eq!(msg["data"]["type"], "resize");
             }
-            Err(_) => {
-                panic!("Expected TuiRequest::SetDims to be sent");
-            }
+            Err(_) => panic!("Expected hub resize message to be sent"),
         }
 
         // Verify: local state also updated
         assert_eq!(runner.terminal_dims, (40, 120));
     }
 
-    /// Verifies `handle_resize()` updates local state but does not send SetDims
-    /// when no PTY is connected.
+    /// Verifies `handle_resize()` sends only hub-level resize (not terminal)
+    /// when no terminal subscription is active.
     #[test]
-    fn test_handle_resize_without_connection_updates_local_only() {
+    fn test_handle_resize_without_terminal_sub_sends_hub_only() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // No agent/pty indices set (not connected)
+        // No terminal subscription (not connected to a PTY)
         runner.handle_resize(40, 120);
 
-        // Verify: no SetDims request sent
+        // Verify: hub-level resize sent (client dims tracking)
+        match request_rx.try_recv() {
+            Ok(msg) => {
+                assert_eq!(msg["subscriptionId"], "tui_hub");
+                assert_eq!(msg["data"]["type"], "resize");
+            }
+            _ => panic!("Expected hub resize message"),
+        }
+
+        // Verify: no terminal resize sent (order: terminal first, then hub)
+        // Since no terminal sub, the hub resize was the first and only message
         assert!(
             request_rx.try_recv().is_err(),
-            "No TuiRequest::SetDims should be sent when not connected to a PTY"
+            "No additional messages should be sent"
         );
 
         // Verify: local state still updated
         assert_eq!(runner.terminal_dims, (40, 120));
     }
 
-    // Rust guideline compliant 2026-01
+    // Rust guideline compliant 2026-02
 }
 
 

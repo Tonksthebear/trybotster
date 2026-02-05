@@ -42,8 +42,6 @@ pub struct MenuItem {
 pub struct MenuContext {
     /// Whether an agent is currently selected.
     pub has_agent: bool,
-    /// Whether the selected agent has a server PTY.
-    pub has_server_pty: bool,
     /// Current PTY view for the selected agent.
     pub active_pty: PtyView,
 }
@@ -52,7 +50,6 @@ impl Default for MenuContext {
     fn default() -> Self {
         Self {
             has_agent: false,
-            has_server_pty: false,
             active_pty: PtyView::Cli,
         }
     }
@@ -74,18 +71,16 @@ pub fn build_menu(ctx: &MenuContext) -> Vec<MenuItem> {
             is_header: true,
         });
 
-        // Toggle PTY view (only if agent has server PTY)
-        if ctx.has_server_pty {
-            let label = match ctx.active_pty {
-                PtyView::Cli => "View Server",
-                PtyView::Server => "View Agent",
-            };
-            items.push(MenuItem {
-                label: label.to_string(),
-                action: MenuAction::TogglePtyView,
-                is_header: false,
-            });
-        }
+        // Toggle PTY view: PTY 0 = agent, PTY 1 = server
+        let label = match ctx.active_pty {
+            PtyView::Cli => "View Server",
+            PtyView::Server => "View Agent",
+        };
+        items.push(MenuItem {
+            label: label.to_string(),
+            action: MenuAction::TogglePtyView,
+            is_header: false,
+        });
 
         items.push(MenuItem {
             label: "Close Agent".to_string(),
@@ -151,7 +146,6 @@ mod tests {
     fn test_menu_without_agent() {
         let ctx = MenuContext {
             has_agent: false,
-            has_server_pty: false,
             active_pty: PtyView::Cli,
         };
         let items = build_menu(&ctx);
@@ -167,10 +161,9 @@ mod tests {
     }
 
     #[test]
-    fn test_menu_with_agent_no_server() {
+    fn test_menu_with_agent_on_cli() {
         let ctx = MenuContext {
             has_agent: true,
-            has_server_pty: false,
             active_pty: PtyView::Cli,
         };
         let items = build_menu(&ctx);
@@ -181,41 +174,24 @@ mod tests {
             .any(|i| i.label.contains("Agent") && i.is_header));
         assert!(items.iter().any(|i| i.label.contains("Hub")));
 
-        // Should have Close Agent but NOT View Server
-        assert!(items.iter().any(|i| i.label == "Close Agent"));
-        assert!(!items.iter().any(|i| i.label == "View Server"));
-
-        // 3 selectable items (Close Agent + 2 Hub items)
-        assert_eq!(selectable_count(&items), 3);
-    }
-
-    #[test]
-    fn test_menu_with_agent_and_server_on_cli() {
-        let ctx = MenuContext {
-            has_agent: true,
-            has_server_pty: true,
-            active_pty: PtyView::Cli,
-        };
-        let items = build_menu(&ctx);
-
-        // Should show "View Server" when on CLI
+        // Should show "View Server" when on CLI PTY
         assert!(items.iter().any(|i| i.label == "View Server"));
         assert!(!items.iter().any(|i| i.label == "View Agent"));
+        assert!(items.iter().any(|i| i.label == "Close Agent"));
 
-        // 4 selectable items
+        // 4 selectable items (View Server, Close Agent, New Agent, Connection Code)
         assert_eq!(selectable_count(&items), 4);
     }
 
     #[test]
-    fn test_menu_with_agent_and_server_on_server() {
+    fn test_menu_with_agent_on_server() {
         let ctx = MenuContext {
             has_agent: true,
-            has_server_pty: true,
             active_pty: PtyView::Server,
         };
         let items = build_menu(&ctx);
 
-        // Should show "View Agent" when on Server
+        // Should show "View Agent" when on Server PTY
         assert!(items.iter().any(|i| i.label == "View Agent"));
         assert!(!items.iter().any(|i| i.label == "View Server"));
     }
@@ -224,7 +200,6 @@ mod tests {
     fn test_selection_to_item_index() {
         let ctx = MenuContext {
             has_agent: true,
-            has_server_pty: true,
             active_pty: PtyView::Cli,
         };
         let items = build_menu(&ctx);
@@ -239,17 +214,16 @@ mod tests {
     fn test_get_action_for_selection() {
         let ctx = MenuContext {
             has_agent: true,
-            has_server_pty: false,
             active_pty: PtyView::Cli,
         };
         let items = build_menu(&ctx);
 
-        // First selectable should be Close Agent
+        // First selectable should be View Server
         let action = get_action_for_selection(&items, 0);
-        assert_eq!(action, Some(MenuAction::CloseAgent));
+        assert_eq!(action, Some(MenuAction::TogglePtyView));
 
-        // Second should be New Agent
+        // Second should be Close Agent
         let action = get_action_for_selection(&items, 1);
-        assert_eq!(action, Some(MenuAction::NewAgent));
+        assert_eq!(action, Some(MenuAction::CloseAgent));
     }
 }

@@ -31,30 +31,6 @@ pub struct ConnectionCodeData {
     pub qr_png: Vec<u8>,
 }
 
-/// Result of QR code generation for terminal display.
-#[derive(Debug)]
-pub enum QrRenderResult {
-    /// QR rendered as inline image via Kitty graphics protocol.
-    /// Contains the escape sequence to display the image.
-    KittyImage {
-        /// Escape sequence containing the image data.
-        escape_sequence: String,
-        /// Width of image in terminal cells (columns).
-        width_cells: u16,
-        /// Height of image in terminal cells (rows).
-        height_cells: u16,
-    },
-    /// QR rendered as text lines using Unicode half-blocks.
-    TextLines(Vec<String>),
-    /// QR code could not be generated (data too long or terminal too small).
-    Error {
-        /// Error message lines to display.
-        lines: Vec<String>,
-        /// Whether the terminal is too small (vs data too long).
-        terminal_too_small: bool,
-    },
-}
-
 /// Generate QR code as raw PNG bytes.
 ///
 /// Creates a QR code image suitable for display in any context (terminal,
@@ -141,7 +117,7 @@ pub fn build_kitty_escape_from_png(
     // Decode PNG to get dimensions
     let decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(png_bytes)).ok()?;
     use image::ImageDecoder;
-    let (img_width, img_height) = decoder.dimensions();
+    let (img_width, _img_height) = decoder.dimensions();
 
     // Scale QR to fill available space while maintaining square aspect ratio.
     // Terminal cells are ~2:1 (height:width), so for a square image:
@@ -161,84 +137,6 @@ pub fn build_kitty_escape_from_png(
     let escape_sequence = build_kitty_escape_sequence(&b64_data, img_width, display_cols, display_rows);
 
     Some((escape_sequence, display_cols, display_rows))
-}
-
-/// Generate QR code as PNG image and encode for Kitty graphics protocol.
-///
-/// Returns the escape sequence to display the image inline, or None if generation fails.
-/// The caller specifies max display dimensions; the image scales to fit while maintaining
-/// aspect ratio. High-res PNG ensures scannability even when scaled down.
-///
-/// # Arguments
-///
-/// * `data` - The data to encode in the QR code
-/// * `module_size` - Pixels per QR module in the generated PNG (4 recommended for quality)
-/// * `max_cols` - Maximum terminal columns available for display
-/// * `max_rows` - Maximum terminal rows available for display
-pub fn generate_qr_kitty_image(
-    data: &str,
-    module_size: u8,
-    max_cols: u16,
-    max_rows: u16,
-) -> Option<QrRenderResult> {
-    let code = generate_qr_code(data)?;
-    let size = code.size() as u32;
-    let quiet_zone = 2u32;
-    let total_modules = size + quiet_zone * 2;
-    let img_size = total_modules * module_size as u32;
-
-    // Scale QR to fill available space while maintaining square aspect ratio.
-    // Terminal cells are ~2:1 (height:width), so for a square image:
-    // - display_rows determines the visual height
-    // - display_cols should be ~2x display_rows to appear square
-    //
-    // Use all available space - Kitty will scale the high-res PNG up.
-    let display_rows = max_rows;
-    let display_cols = max_cols.min(display_rows * 2);
-
-    // Create grayscale image (white background)
-    let mut img = GrayImage::from_pixel(img_size, img_size, Luma([255u8]));
-
-    // Draw QR modules
-    for y in 0..size {
-        for x in 0..size {
-            if code.get_module(x as i32, y as i32) {
-                // Draw black module
-                let px = (x + quiet_zone) * module_size as u32;
-                let py = (y + quiet_zone) * module_size as u32;
-                for dy in 0..module_size as u32 {
-                    for dx in 0..module_size as u32 {
-                        img.put_pixel(px + dx, py + dy, Luma([0u8]));
-                    }
-                }
-            }
-        }
-    }
-
-    // Encode as PNG
-    let mut png_bytes = Vec::new();
-    {
-        let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
-        encoder
-            .write_image(
-                img.as_raw(),
-                img_size,
-                img_size,
-                image::ExtendedColorType::L8,
-            )
-            .ok()?;
-    }
-
-    // Build Kitty graphics protocol escape sequence with calculated cell sizing
-    let b64_data = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-    let escape_sequence =
-        build_kitty_escape_sequence(&b64_data, img_size, display_cols, display_rows);
-
-    Some(QrRenderResult::KittyImage {
-        escape_sequence,
-        width_cells: display_cols,
-        height_cells: display_rows,
-    })
 }
 
 /// Escape sequence to delete all Kitty graphics images.
@@ -318,16 +216,6 @@ fn generate_qr_code(data: &str) -> Option<QrCode> {
         }
     }
     None
-}
-
-/// Calculate required terminal rows for a Kitty image.
-///
-/// Kitty displays images using character cells. Each cell is typically
-/// ~7x14 pixels (varies by font). We estimate conservatively.
-pub fn kitty_image_rows(height_px: u32) -> u16 {
-    // Assume ~14 pixels per row (common for terminal fonts)
-    // Add 1 for rounding
-    ((height_px + 13) / 14) as u16
 }
 
 /// Build mixed-mode QR segments: byte for URL, alphanumeric for Base32 bundle.

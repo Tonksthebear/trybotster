@@ -22,7 +22,7 @@ fn test_hub() -> Hub {
     let mut hub = Hub::new(config).unwrap();
 
     // Register TUI via Lua (Hub-side processing)
-    let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<crate::client::TuiRequest>();
+    let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let _output_rx = hub.register_tui_via_lua(request_rx);
 
     // Initialize crypto service for browser client tests
@@ -150,72 +150,6 @@ fn test_delete_nonexistent_agent_is_graceful() {
 
     // Hub should still be functional - no panic occurred
     assert!(hub.state.read().unwrap().agents.is_empty());
-}
-
-// === Request Routing Tests ===
-
-/// Helper: Create hub with two agents.
-fn setup_hub_with_two_agents() -> (Hub, tempfile::TempDir, tempfile::TempDir) {
-    use crate::agent::Agent;
-    use uuid::Uuid;
-
-    let hub = test_hub();
-
-    let temp_dir1 = tempfile::TempDir::new().unwrap();
-    let agent1 = Agent::new(
-        Uuid::new_v4(),
-        "test/repo".to_string(),
-        Some(1),
-        "branch-1".to_string(),
-        temp_dir1.path().to_path_buf(),
-    );
-    hub.state
-        .write()
-        .unwrap()
-        .add_agent("agent-1".to_string(), agent1);
-
-    let temp_dir2 = tempfile::TempDir::new().unwrap();
-    let agent2 = Agent::new(
-        Uuid::new_v4(),
-        "test/repo".to_string(),
-        Some(2),
-        "branch-2".to_string(),
-        temp_dir2.path().to_path_buf(),
-    );
-    hub.state
-        .write()
-        .unwrap()
-        .add_agent("agent-2".to_string(), agent2);
-
-    (hub, temp_dir1, temp_dir2)
-}
-
-/// TEST: RequestAgentList should not panic.
-#[test]
-fn test_request_agent_list_targets_requesting_browser() {
-    let (mut hub, _td1, _td2) = setup_hub_with_two_agents();
-
-    let browser_a = ClientId::Browser("browser-a".to_string());
-    dispatch(
-        &mut hub,
-        HubAction::RequestAgentList {
-            client_id: browser_a.clone(),
-        },
-    );
-}
-
-/// TEST: RequestWorktreeList should not panic.
-#[test]
-fn test_request_worktree_list_targets_requesting_browser() {
-    let (mut hub, _td1, _td2) = setup_hub_with_two_agents();
-
-    let browser_a = ClientId::Browser("browser-a".to_string());
-    dispatch(
-        &mut hub,
-        HubAction::RequestWorktreeList {
-            client_id: browser_a.clone(),
-        },
-    );
 }
 
 // === Connection URL Tests ===

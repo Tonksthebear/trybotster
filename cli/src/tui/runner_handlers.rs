@@ -1,28 +1,22 @@
-//! TUI Runner Handlers - action and event handlers for TuiRunner.
+//! TUI Runner Handlers - action handlers and Lua message processing.
 //!
-//! This module contains the handler methods that process TUI actions and Hub events.
-//! These are extracted from `TuiRunner` to keep the main module focused on the
-//! event loop and state management.
+//! This module contains the handler methods that process TUI actions and
+//! incoming Lua messages. These are extracted from `TuiRunner` to keep the
+//! main module focused on the event loop and state management.
 //!
 //! # Handler Categories
 //!
 //! - [`handle_tui_action`] - Processes `TuiAction` variants (UI state changes)
-//! - [`handle_hub_event`] - Processes `HubEvent` variants (Hub broadcasts)
-//! - [`handle_input_event`] - Converts terminal events to actions
-//! - [`handle_pty_input`] - Sends input to connected PTY
-//! - [`handle_resize`] - Handles terminal resize events
+//! - [`handle_pty_view_toggle`] - Toggles between CLI and Server PTY views
+//! - [`handle_lua_message`] - Processes JSON messages from Lua event system
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-02
 
 use ratatui::backend::Backend;
 use vt100::Parser;
 
 use crate::agent::PtyView;
-use crate::client::TuiRequest;
-use crate::hub::HubEvent;
-
 use super::actions::TuiAction;
-use super::events::CreationStage;
 use super::runner::{TuiRunner, DEFAULT_SCROLLBACK};
 
 impl<B> TuiRunner<B>
@@ -54,7 +48,10 @@ where
             // === Application Control ===
             TuiAction::Quit => {
                 self.quit = true;
-                let _ = self.request_tx.send(TuiRequest::Quit);
+                self.send_msg(serde_json::json!({
+                    "subscriptionId": "tui_hub",
+                    "data": { "type": "quit" }
+                }));
             }
 
             // === Modal State ===
@@ -128,22 +125,35 @@ where
             TuiAction::ShowConnectionCode => {
                 self.mode = AppMode::ConnectionCode;
                 self.qr_image_displayed = false;
+                // Request connection code via Lua protocol
+                self.send_msg(serde_json::json!({
+                    "subscriptionId": "tui_hub",
+                    "data": { "type": "get_connection_code" }
+                }));
             }
 
             TuiAction::RegenerateConnectionCode => {
-                // Fire-and-forget: TuiClient forwards to Hub for bundle regeneration.
-                // When the new bundle arrives, the QR will refresh on next render.
-                if let Err(e) = self.request_tx.send(TuiRequest::RegenerateConnectionCode) {
-                    log::error!("Failed to send regenerate connection code: {}", e);
-                }
+                // Send via Lua client protocol (same path as browser).
+                self.send_msg(serde_json::json!({
+                    "subscriptionId": "tui_hub",
+                    "data": {
+                        "type": "regenerate_connection_code",
+                    }
+                }));
+                // Clear cache and request fresh code
+                self.connection_code = None;
                 self.qr_image_displayed = false;
+                self.send_msg(serde_json::json!({
+                    "subscriptionId": "tui_hub",
+                    "data": { "type": "get_connection_code" }
+                }));
             }
 
             TuiAction::CopyConnectionUrl => {
-                // Fire-and-forget: TuiClient forwards to Hub for clipboard access.
-                if let Err(e) = self.request_tx.send(TuiRequest::CopyConnectionUrl) {
-                    log::error!("Failed to send copy connection URL: {}", e);
-                }
+                self.send_msg(serde_json::json!({
+                    "subscriptionId": "tui_hub",
+                    "data": { "type": "copy_connection_url" }
+                }));
             }
 
             // === Agent Close Confirmation ===
@@ -192,162 +202,218 @@ where
 
     /// Handle PTY view toggle action.
     ///
-    /// Toggles between CLI and Server PTY for the current agent.
-    /// If no server PTY is available, this is a no-op.
-    fn handle_pty_view_toggle(&mut self) {
-        // Need both an agent selected and a server PTY available
+    /// Toggles between CLI and Server PTY for the current agent using the
+    /// Lua subscribe/unsubscribe protocol (same path as browser clients).
+    /// Toggles unconditionally: PTY 0 = agent, PTY 1 = server.
+    pub(super) fn handle_pty_view_toggle(&mut self) {
+        // Need an agent selected
         let Some(agent_index) = self.current_agent_index else {
             log::debug!("Cannot toggle PTY view - no agent selected");
             return;
         };
 
-        // Toggle the view
-        let current_view = self.active_pty_view;
-        let new_view = match current_view {
+        // Toggle: PTY 0 = agent, PTY 1 = server
+        let new_view = match self.active_pty_view {
             PtyView::Cli => PtyView::Server,
             PtyView::Server => PtyView::Cli,
         };
 
-        // Get the PTY index for the new view (0 = CLI, 1 = Server)
         let pty_index = match new_view {
             PtyView::Cli => 0,
             PtyView::Server => 1,
         };
 
-        // Check if the PTY exists for this view
-        let can_toggle = match new_view {
-            PtyView::Cli => true, // CLI PTY always exists
-            PtyView::Server => self.has_server_pty,
-        };
+        log::debug!(
+            "Toggling PTY view to {:?} (pty_index={}) for agent index {}",
+            new_view,
+            pty_index,
+            agent_index
+        );
 
-        if can_toggle {
-            log::debug!(
-                "Toggling PTY view to {:?} for agent index {}",
-                new_view,
-                agent_index
-            );
-
-            // Update TuiRunner state
-            self.active_pty_view = new_view;
-            self.current_pty_index = Some(pty_index);
-
-            // Reset parser FIRST (before loading new scrollback)
-            {
-                let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-                let (rows, cols) = self.terminal_dims;
-                *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
-            }
-
-            // Connect to PTY - scrollback arrives via channel, gets processed
-            // in poll_pty_events() and fed to the fresh parser above.
-            if let Err(e) = self.request_tx.send(TuiRequest::ConnectToPty {
-                agent_index,
-                pty_index,
-            }) {
-                log::warn!("Failed to send connect to PTY request: {}", e);
-            }
-        } else {
-            log::debug!("Cannot toggle to Server PTY - no server PTY available");
+        // Unsubscribe from current terminal
+        if let Some(ref sub_id) = self.current_terminal_sub_id {
+            self.send_msg(serde_json::json!({
+                "type": "unsubscribe",
+                "subscriptionId": sub_id,
+            }));
         }
+
+        // Reset parser for fresh output
+        {
+            let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
+            let (rows, cols) = self.terminal_dims;
+            *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
+        }
+
+        // Subscribe to new PTY via Lua protocol
+        let sub_id = "tui_term".to_string();
+        self.send_msg(serde_json::json!({
+            "type": "subscribe",
+            "channel": "terminal",
+            "subscriptionId": sub_id,
+            "params": {
+                "agent_index": agent_index,
+                "pty_index": pty_index,
+            }
+        }));
+
+        self.active_pty_view = new_view;
+        self.current_pty_index = Some(pty_index);
+        self.current_terminal_sub_id = Some(sub_id);
     }
 
-    /// Handle a Hub broadcast event.
+    /// Handle a JSON message from the Lua event system.
     ///
-    /// Hub events are broadcasts that notify the TUI of state changes in the Hub.
-    /// These include agent lifecycle events, status changes, and shutdown signals.
+    /// These messages arrive via `tui.send()` in Lua and carry agent lifecycle
+    /// events broadcast by `broadcast_hub_event()` to all hub-subscribed clients,
+    /// plus responses to explicit requests (connection_code, agent_list, etc.).
     ///
-    /// # Event Types
+    /// # Message Types
     ///
-    /// - `AgentCreated` - New agent spawned
-    /// - `AgentDeleted` - Agent terminated
-    /// - `AgentStatusChanged` - Agent status updated
-    /// - `AgentCreationProgress` - Creation stage updates
-    /// - `Error` - Hub error occurred
-    /// - `Shutdown` - Hub is shutting down
-    /// - `PtyConnectionRequested` / `PtyDisconnectionRequested` / `HttpConnectionRequested` - Browser-specific, ignored
-    pub fn handle_hub_event(&mut self, event: HubEvent) {
-        use crate::app::AppMode;
+    /// - `agent_created` -- Add agent to cache, auto-select
+    /// - `agent_deleted` -- Remove agent from cache, clear selection if active
+    /// - `agent_status_changed` -- Update cached agent status in-place
+    /// - `agent_list` -- Full agent list refresh (initial subscription, explicit request)
+    /// - `worktree_list` -- Update cached worktree list
+    /// - `connection_code` -- Cache connection URL and generate QR PNG locally
+    /// - `connection_code_error` -- Clear cached connection code
+    /// - `subscribed` -- Subscription confirmation (logged, no action needed)
+    /// - `error` -- Generic Lua protocol error (logged)
+    // Rust guideline compliant 2026-02
+    pub(super) fn handle_lua_message(&mut self, msg: serde_json::Value) {
+        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-        match event {
-            HubEvent::AgentCreated { agent_id, info } => {
-                log::debug!("TUI: Agent created: {}", agent_id);
-                // Add to local cache
-                if !self.agents.iter().any(|a| a.id == agent_id) {
-                    self.agents.push(info.clone());
-                }
-                // Clear creating indicator and transition to Normal if this was our pending creation
-                // Match against branch_name since that's what we stored in creating_agent
-                let was_creating = self
-                    .creating_agent
-                    .as_ref()
-                    .map(|(identifier, _)| {
-                        info.branch_name.as_ref() == Some(identifier)
-                            || info.issue_number.map(|n| n.to_string()).as_ref() == Some(identifier)
-                    })
-                    .unwrap_or(false);
-                if was_creating {
-                    self.creating_agent = None;
-                    self.mode = AppMode::Normal;
-                    // Auto-select the newly created agent so user sees PTY output
-                    self.request_select_agent(&agent_id);
-                }
-            }
+        match msg_type {
+            "agent_created" => {
+                // Clear the "creating" indicator
+                self.creating_agent = None;
 
-            HubEvent::AgentDeleted { agent_id } => {
-                log::debug!("TUI: Agent deleted: {}", agent_id);
-                // Remove from local cache
-                self.agents.retain(|a| a.id != agent_id);
-                // If this was the selected agent, clear selection
-                if self.selected_agent.as_ref() == Some(&agent_id) {
-                    // Request disconnect from PTY if connected
-                    if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
-                        let _ = self.request_tx.send(TuiRequest::DisconnectFromPty { agent_index: ai, pty_index: pi });
+                // Add/update agent in local cache from event data
+                if let Some(agent) = msg.get("agent") {
+                    if let Some(info) = parse_agent_info(agent) {
+                        // Remove existing entry if present (in case of duplicate events)
+                        self.agents.retain(|a| a.id != info.id);
+                        self.agents.push(info);
                     }
-                    self.selected_agent = None;
-                    self.current_agent_index = None;
-                    self.current_pty_index = None;
-                    self.has_server_pty = false;
-                }
-            }
-
-            HubEvent::AgentStatusChanged { agent_id, status } => {
-                log::debug!("TUI: Agent {} status: {:?}", agent_id, status);
-                // Update local cache
-                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                    agent.status = Some(status.to_string());
-                }
-            }
-
-            HubEvent::Shutdown => {
-                log::info!("TUI: Hub shutdown received");
-                self.quit = true;
-            }
-
-            HubEvent::AgentCreationProgress { identifier, stage } => {
-                log::debug!("TUI: Agent {} creation: {:?}", identifier, stage);
-                // Convert relay stage to TUI stage for display
-                let tui_stage = match stage {
-                    crate::relay::AgentCreationStage::CreatingWorktree => {
-                        CreationStage::CreatingWorktree
+                    // Auto-select the new agent
+                    if let Some(agent_id) = agent.get("id").and_then(|v| v.as_str()) {
+                        self.request_select_agent(agent_id);
                     }
-                    crate::relay::AgentCreationStage::CopyingConfig => CreationStage::CopyingConfig,
-                    crate::relay::AgentCreationStage::SpawningAgent => CreationStage::SpawningAgent,
-                    crate::relay::AgentCreationStage::Ready => CreationStage::Ready,
-                };
-                self.creating_agent = Some((identifier, tui_stage));
+                }
             }
-
-            HubEvent::Error { message } => {
-                log::error!("TUI: Hub error: {}", message);
-                self.error_message = Some(message);
-                self.mode = AppMode::Error;
+            "agent_deleted" => {
+                if let Some(agent_id) = msg.get("agent_id").and_then(|v| v.as_str()) {
+                    // Clear selection if the deleted agent was active
+                    if self.selected_agent.as_deref() == Some(agent_id) {
+                        self.selected_agent = None;
+                        self.current_agent_index = None;
+                        self.current_pty_index = None;
+                    }
+                    // Remove from cached list
+                    self.agents.retain(|a| a.id != agent_id);
+                }
             }
+            "agent_status_changed" => {
+                if let (Some(agent_id), Some(status)) = (
+                    msg.get("agent_id").and_then(|v| v.as_str()),
+                    msg.get("status").and_then(|v| v.as_str()),
+                ) {
+                    if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                        agent.status = Some(status.to_string());
+                    }
+                }
+            }
+            "agent_list" => {
+                if let Some(agents) = msg.get("agents").and_then(|v| v.as_array()) {
+                    self.agents = agents
+                        .iter()
+                        .filter_map(|a| parse_agent_info(a))
+                        .collect();
+                    log::debug!("Updated agent list: {} agents", self.agents.len());
+                }
+            }
+            "worktree_list" => {
+                if let Some(worktrees) = msg.get("worktrees").and_then(|v| v.as_array()) {
+                    self.available_worktrees = worktrees
+                        .iter()
+                        .filter_map(|w| {
+                            let path = w.get("path").and_then(|v| v.as_str())?;
+                            let branch = w.get("branch").and_then(|v| v.as_str())?;
+                            Some((path.to_string(), branch.to_string()))
+                        })
+                        .collect();
+                }
+            }
+            "connection_code" => {
+                let url = msg.get("url").and_then(|v| v.as_str());
+                let qr_b64 = msg.get("qr_png").and_then(|v| v.as_str());
 
-            HubEvent::PtyConnectionRequested { .. }
-            | HubEvent::PtyDisconnectionRequested { .. }
-            | HubEvent::HttpConnectionRequested { .. } => {
-                // Browser-specific, TuiRunner ignores.
+                if let (Some(url), Some(qr_b64)) = (url, qr_b64) {
+                    use data_encoding::BASE64;
+                    match BASE64.decode(qr_b64.as_bytes()) {
+                        Ok(qr_png) => {
+                            self.connection_code = Some(crate::tui::ConnectionCodeData {
+                                url: url.to_string(),
+                                qr_png,
+                            });
+                            self.qr_image_displayed = false;
+                        }
+                        Err(e) => {
+                            log::error!("Failed to decode QR PNG: {}", e);
+                            self.connection_code = None;
+                        }
+                    }
+                } else {
+                    log::warn!("connection_code message missing url or qr_png");
+                    self.connection_code = None;
+                }
+            }
+            "connection_code_error" => {
+                log::warn!(
+                    "Connection code error: {}",
+                    msg.get("error").and_then(|v| v.as_str()).unwrap_or("unknown")
+                );
+                self.connection_code = None;
+            }
+            "subscribed" => {
+                // Subscription confirmation from client.lua. Browser clients use
+                // this to gate input; TUI doesn't need to gate but we log for
+                // protocol traceability.
+                log::debug!(
+                    "Subscription confirmed: {}",
+                    msg.get("subscriptionId").and_then(|v| v.as_str()).unwrap_or("?")
+                );
+            }
+            "error" => {
+                let error = msg.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                log::error!("Lua protocol error: {}", error);
+            }
+            _ => {
+                log::trace!("Unhandled Lua message type: {}", msg_type);
             }
         }
     }
+}
+
+/// Parse agent info from a JSON value received via Lua events.
+///
+/// Converts the JSON agent object (from `hub.get_agents()` via Lua) into
+/// an `AgentInfo` struct. Returns `None` if the `id` field is missing.
+// Rust guideline compliant 2026-02
+fn parse_agent_info(value: &serde_json::Value) -> Option<crate::relay::AgentInfo> {
+    let id = value.get("id").and_then(|v| v.as_str())?.to_string();
+    Some(crate::relay::AgentInfo {
+        id,
+        repo: value.get("repo").and_then(|v| v.as_str()).map(String::from),
+        issue_number: value.get("issue_number").and_then(|v| v.as_u64()),
+        branch_name: value.get("branch_name").and_then(|v| v.as_str()).map(String::from),
+        name: value.get("name").and_then(|v| v.as_str()).map(String::from),
+        status: value.get("status").and_then(|v| v.as_str()).map(String::from),
+        port: value.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
+        server_running: value.get("server_running").and_then(|v| v.as_bool()),
+        has_server_pty: value.get("has_server_pty").and_then(|v| v.as_bool()),
+        active_pty_view: value.get("active_pty_view").and_then(|v| v.as_str()).map(String::from),
+        scroll_offset: value.get("scroll_offset").and_then(|v| v.as_u64()).map(|s| s as u32),
+        hub_identifier: value.get("hub_identifier").and_then(|v| v.as_str()).map(String::from),
+    })
 }
