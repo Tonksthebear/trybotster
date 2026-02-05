@@ -1,22 +1,19 @@
 //! Thread-safe cache of agent handles for read-only access.
 //!
 //! Hub maintains this separately from HubState. When agents are
-//! created/deleted, Hub updates the cache. `HubHandle::get_agent()` reads
-//! from the cache directly without sending commands.
+//! created/deleted, Hub updates the cache. Clients call
+//! `HandleCache::get_agent()` to read directly without sending commands.
 //!
 //! # Why This Exists
 //!
-//! Clients (TuiClient) run on Hub's thread. If they used
-//! blocking commands like `GetAgentByIndex` to get agent handles, they
-//! would deadlock (Hub can't process commands while blocked).
+//! PTY I/O operations need non-blocking access to agent handles. Blocking
+//! commands from Hub's thread would deadlock. HandleCache provides direct,
+//! non-blocking access. Hub updates the cache on agent lifecycle events.
 //!
-//! HandleCache solves this by providing direct, non-blocking access to
-//! agent handles. The cache is updated by Hub on agent lifecycle events.
+//! # Usage
 //!
-//! # Who Uses What
-//!
-//! - **TuiClient**: Use `HubHandle::get_agent()` → reads from cache
-//! - **TuiRunner**: Uses `GetAgentByIndex` command (safe - runs on different thread)
+//! - **Hub tick loop**: `HandleCache::get_agent()` reads directly
+//! - **TuiRunner PTY I/O**: Hub reads from cache to forward input/resize
 //!
 //! # Design Principle
 //!
@@ -112,31 +109,6 @@ impl HandleCache {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Insert or update an agent handle at the given index.
-    ///
-    /// Called by Hub when an agent is created. If index is beyond
-    /// current length, the vector is extended.
-    pub fn insert_agent(&self, index: usize, handle: AgentHandle) {
-        if let Ok(mut agents) = self.agents.write() {
-            if index >= agents.len() {
-                agents.resize(index + 1, handle.clone());
-            }
-            agents[index] = handle;
-        }
-    }
-
-    /// Remove an agent handle at the given index.
-    ///
-    /// Called by Hub when an agent is deleted. Removes the handle
-    /// and shifts subsequent handles down.
-    pub fn remove_agent(&self, index: usize) {
-        if let Ok(mut agents) = self.agents.write() {
-            if index < agents.len() {
-                agents.remove(index);
-            }
-        }
     }
 
     /// Replace all agent handles.

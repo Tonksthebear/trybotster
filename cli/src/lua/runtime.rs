@@ -1476,6 +1476,56 @@ impl LuaRuntime {
         })
     }
 
+    /// Fire the "connection_code_ready" event with URL and QR PNG.
+    ///
+    /// Called by Hub when a connection URL is generated or regenerated.
+    /// Generates a QR code PNG and base64-encodes it for transport.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The connection URL
+    pub fn fire_connection_code_ready(&self, url: &str) -> Result<()> {
+        if !self.has_event_callbacks("connection_code_ready") {
+            return Ok(());
+        }
+
+        // Generate QR PNG on the Hub side (shared by TUI and browser)
+        let qr_png_base64 = match crate::tui::generate_qr_png(url, 4) {
+            Ok(png_bytes) => {
+                use data_encoding::BASE64;
+                BASE64.encode(&png_bytes)
+            }
+            Err(e) => {
+                log::error!("Failed to generate QR PNG: {e}");
+                return Err(anyhow!("QR generation failed: {e}"));
+            }
+        };
+
+        let url = url.to_string();
+
+        self.fire_event("connection_code_ready", |lua| {
+            let t = lua.create_table().map_err(|e| anyhow!("create_table: {e}"))?;
+            t.set("url", url.clone()).map_err(|e| anyhow!("set url: {e}"))?;
+            t.set("qr_png", qr_png_base64.clone()).map_err(|e| anyhow!("set qr_png: {e}"))?;
+            Ok(mlua::Value::Table(t))
+        })
+    }
+
+    /// Fire the "connection_code_error" event.
+    ///
+    /// Called by Hub when connection URL generation fails.
+    pub fn fire_connection_code_error(&self, error: &str) -> Result<()> {
+        if !self.has_event_callbacks("connection_code_error") {
+            return Ok(());
+        }
+
+        let error = error.to_string();
+        self.fire_event("connection_code_error", |lua| {
+            let s = lua.create_string(&error).map_err(|e| anyhow!("create_string: {e}"))?;
+            Ok(mlua::Value::String(s))
+        })
+    }
+
     /// Fire the "shutdown" event.
     ///
     /// Called by Hub when shutting down.

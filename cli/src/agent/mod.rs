@@ -209,23 +209,6 @@ impl Agent {
         }
     }
 
-    /// Get mutable PTY session for the specified view.
-    ///
-    /// Falls back to CLI PTY if Server view is requested but server_pty is None.
-    #[must_use]
-    pub fn get_pty_mut(&mut self, view: PtyView) -> &mut PtySession {
-        match view {
-            PtyView::Cli => &mut self.cli_pty,
-            PtyView::Server => {
-                if self.server_pty.is_some() {
-                    self.server_pty.as_mut().unwrap()
-                } else {
-                    &mut self.cli_pty
-                }
-            }
-        }
-    }
-
     /// Get the scrollback buffer for the specified PTY view.
     #[must_use]
     pub fn get_scrollback_buffer(&self, view: PtyView) -> Arc<Mutex<VecDeque<u8>>> {
@@ -289,43 +272,8 @@ impl Agent {
     }
 
     // =========================================================================
-    // Resize Operations
-    // =========================================================================
-
-    /// Resize all PTY sessions to new dimensions.
-    pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.cli_pty.resize(rows, cols);
-        if let Some(server_pty) = &mut self.server_pty {
-            server_pty.resize(rows, cols);
-        }
-    }
-
-    /// Resize a specific PTY view.
-    pub fn resize_pty(&mut self, view: PtyView, rows: u16, cols: u16) {
-        self.get_pty_mut(view).resize(rows, cols);
-    }
-
-    // =========================================================================
     // Input/Output
     // =========================================================================
-
-    /// Write input to the specified PTY view.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the write fails.
-    pub fn write_input(&mut self, view: PtyView, input: &[u8]) -> Result<()> {
-        self.get_pty_mut(view).write_input(input)
-    }
-
-    /// Write a string to the specified PTY view.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the write fails.
-    pub fn write_input_str(&mut self, view: PtyView, input: &str) -> Result<()> {
-        self.write_input(view, input.as_bytes())
-    }
 
     /// Write input specifically to the CLI PTY (for notifications, etc.).
     ///
@@ -481,14 +429,6 @@ impl Agent {
     #[must_use]
     pub fn get_scrollback_snapshot(&self, view: PtyView) -> Vec<u8> {
         self.get_pty(view).get_scrollback_snapshot()
-    }
-
-    /// Get scrollback as raw bytes for CLI PTY.
-    ///
-    /// Convenience method for backward compatibility.
-    #[must_use]
-    pub fn get_scrollback_bytes(&self) -> Vec<u8> {
-        self.get_scrollback_snapshot(PtyView::Cli)
     }
 
     /// Get the current screen dimensions for the specified view.

@@ -1,37 +1,24 @@
-//! TUI events - events received by TUI from Hub broadcasts.
+//! TUI events - events received by TUI for display updates.
 //!
-//! TUI subscribes to Hub's event broadcast channel to receive notifications
-//! about agent lifecycle changes and hub-level events. This module provides
-//! TUI-specific event handling utilities.
+//! This module provides TUI-specific event types for the event loop.
 //!
 //! # Architecture
 //!
-//! The TUI receives two types of events:
-//!
-//! 1. **Hub broadcasts** (`HubEvent`) - Agent created/deleted, status changes, shutdown
-//! 2. **Command responses** - Via oneshot channels in `TuiCommand` responses
+//! The TUI receives events via the output channel from Hub:
 //!
 //! ```text
-//! Hub ──broadcast::Sender<HubEvent>──> TUI (broadcast::Receiver<HubEvent>)
-//!     └──oneshot::Sender<Response>───> TUI (oneshot::Receiver<Response>)
+//! Hub ──TuiOutput channel──> TuiRunner (polls in event loop)
 //! ```
 
-// Rust guideline compliant 2026-01
-
-// Re-export hub events for TUI use
-pub use crate::hub::events::{AgentStatus, HubEvent};
+// Rust guideline compliant 2026-02
 
 use crate::relay::AgentInfo;
 
 /// TUI-specific event wrapper for unified event handling.
 ///
-/// Combines hub broadcast events with TUI-local events in a single type
-/// for easier event loop handling.
+/// Combines TUI-local events in a single type for easier event loop handling.
 #[derive(Debug, Clone)]
 pub enum TuiEvent {
-    /// Hub broadcast event.
-    Hub(HubEvent),
-
     /// Agent list was updated (derived from AgentCreated/Deleted).
     AgentListUpdated {
         /// Current agent list.
@@ -113,31 +100,10 @@ impl TuiEvent {
         }
     }
 
-    /// Check if this is a hub event.
-    #[must_use]
-    pub fn is_hub_event(&self) -> bool {
-        matches!(self, Self::Hub(_))
-    }
-
     /// Check if this is an error event.
     #[must_use]
     pub fn is_error(&self) -> bool {
         matches!(self, Self::Error { .. })
-    }
-
-    /// Get the inner hub event if this is a hub event.
-    #[must_use]
-    pub fn as_hub_event(&self) -> Option<&HubEvent> {
-        match self {
-            Self::Hub(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<HubEvent> for TuiEvent {
-    fn from(event: HubEvent) -> Self {
-        Self::Hub(event)
     }
 }
 
@@ -146,20 +112,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tui_event_from_hub_event() {
-        let hub_event = HubEvent::shutdown();
-        let tui_event: TuiEvent = hub_event.into();
-
-        assert!(tui_event.is_hub_event());
-        assert!(tui_event.as_hub_event().is_some());
-    }
-
-    #[test]
     fn test_tui_event_error() {
         let event = TuiEvent::error("Something went wrong");
 
         assert!(event.is_error());
-        assert!(!event.is_hub_event());
 
         match event {
             TuiEvent::Error { message } => {

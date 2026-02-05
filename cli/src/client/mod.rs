@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - `ClientId` — unique identifier for client sessions (TUI, browser, internal)
-//! - `TuiRequest` / `TuiOutput` — message types for TuiRunner <-> Hub communication
+//! - `TuiOutput` — messages from Hub to TuiRunner (PTY output, Lua events)
 //! - `CreateAgentRequest` / `DeleteAgentRequest` — client-layer agent operation types
 //!
 //! # Architecture
@@ -10,28 +10,21 @@
 //! ```text
 //! TuiRunner (rendering, keyboard)
 //!   │
-//!   └── TuiRequest channel ──► Hub.handle_tui_request() (direct processing)
-//!   ◄── TuiOutput channel  ◄── Hub.poll_tui_hub_events() / forwarder tasks
+//!   ├── serde_json::Value ──► Hub ──► lua.call_tui_message() ──► client.lua
+//!   ◄── TuiOutput::Message  ◄── Lua tui.send() (events, subscriptions)
+//!   ◄── TuiOutput::Output   ◄── Lua PTY forwarder tasks
 //! ```
 //!
-//! Hub processes TuiRequests directly in its tick loop via HandleCache.
-//! Browser communication happens via WebRTC + Lua in `server_comms.rs`.
+//! ALL TUI operations flow as JSON through `client.lua` — the same
+//! protocol as browser clients. No Rust-side shortcuts.
 
 // Rust guideline compliant 2026-02
 
-pub mod http_channel;
 mod tui;
 mod types;
 
-pub use http_channel::{HttpChannel, HttpChannelConfig};
-pub use tui::{TuiAgentMetadata, TuiOutput, TuiRequest};
-pub use types::{CreateAgentRequest, DeleteAgentRequest, Response};
-
-pub use crate::agent::pty::PtyCommand;
-pub use crate::hub::agent_handle::{AgentHandle, PtyHandle};
-pub use crate::hub::HubHandle;
-pub use crate::relay::signal::PreKeyBundleData;
-pub use crate::relay::AgentInfo;
+pub use tui::TuiOutput;
+pub use types::{CreateAgentRequest, DeleteAgentRequest};
 
 /// Unique identifier for a client session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

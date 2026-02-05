@@ -2,7 +2,7 @@
 //!
 //! These actions are handled entirely within TuiRunner - they do NOT go to Hub.
 //! For client operations (agent selection, PTY input, resize), TuiRunner uses
-//! the TuiRequest channel to communicate with TuiClient.
+//! JSON messages through the Lua client protocol to communicate with Hub.
 
 // Rust guideline compliant 2026-01
 
@@ -58,7 +58,7 @@ impl From<TuiAction> for InputResult {
 /// Actions handled entirely within the TUI.
 ///
 /// These are pure UI state changes - menus, modals, text input, scrolling.
-/// Client operations use TuiRequest channel instead.
+/// Client operations send JSON through the Lua client protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
     // === Application Control ===
@@ -132,7 +132,7 @@ pub enum TuiAction {
     /// Scroll to bottom (live view).
     ScrollToBottom,
 
-    // === Agent Navigation (triggers TuiRequest) ===
+    // === Agent Navigation (sends Lua subscribe/unsubscribe) ===
     /// Select next agent in list.
     SelectNext,
 

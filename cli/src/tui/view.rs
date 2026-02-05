@@ -15,7 +15,7 @@
 //! # Client-Owned View State
 //!
 //! Note that `active_view` (which PTY is being viewed) and scroll position
-//! are per-client state. The caller (TuiRunner/TuiClient) tracks which view
+//! are per-client state. The caller (TuiRunner) tracks which view
 //! is active and passes it as a parameter when needed.
 
 // Rust guideline compliant 2026-01
@@ -176,7 +176,7 @@ impl AgentDisplayInfo {
     /// * `is_scrolled` - Whether the client's parser is scrolled (caller tracks this)
     ///
     /// The `view` and `is_scrolled` parameters are required because they are per-client state,
-    /// not agent state. The caller (TuiRunner/TuiClient) knows its own view and scroll state.
+    /// not agent state. The caller (TuiRunner) knows its own view and scroll state.
     #[must_use]
     pub fn from_agent(agent: &crate::agent::Agent, view: PtyView, is_scrolled: bool) -> Self {
         let label = if let Some(issue_num) = agent.issue_number {

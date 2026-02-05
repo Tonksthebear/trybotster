@@ -143,6 +143,16 @@ events.on("agent_deleted", function(agent_id)
     broadcast_hub_event("worktree_list", { worktrees = worktrees })
 end)
 
+events.on("connection_code_ready", function(data)
+    log.info("Broadcasting connection_code to hub subscribers")
+    broadcast_hub_event("connection_code", { url = data.url, qr_png = data.qr_png })
+end)
+
+events.on("connection_code_error", function(err)
+    log.warn(string.format("Broadcasting connection_code_error: %s", err or "unknown"))
+    broadcast_hub_event("connection_code_error", { error = err or "Connection code not available" })
+end)
+
 events.on("agent_status_changed", function(info)
     log.debug(string.format("Broadcasting agent_status_changed: %s -> %s",
         info.agent_id or "?", info.status or "?"))

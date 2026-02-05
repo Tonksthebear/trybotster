@@ -243,7 +243,7 @@ fn build_spawn_environment(config: &AgentSpawnConfig) -> HashMap<String, String>
 /// Spawn a server PTY if .botster_server exists.
 ///
 /// After spawning, stores the allocated port on the server PtySession via `set_port()`.
-/// This allows HttpChannel to query the port when needed for preview proxying.
+/// This allows browser clients to query the port when needed for preview proxying.
 ///
 /// Returns true if a server PTY was successfully spawned.
 fn spawn_server_pty_if_exists(agent: &mut Agent, worktree_path: &Path, port: u16) -> bool {
@@ -263,7 +263,7 @@ fn spawn_server_pty_if_exists(agent: &mut Agent, worktree_path: &Path, port: u16
 
     match agent.spawn_server_pty(".botster_server", &server_env) {
         Ok(()) => {
-            // Store the port on the server PtySession for HttpChannel to query
+            // Store the port on the server PtySession for browser clients to query
             if let Some(ref mut server_pty) = agent.server_pty {
                 server_pty.set_port(port);
                 log::debug!("Set port {port} on server PTY");

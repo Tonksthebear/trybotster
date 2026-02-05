@@ -42,18 +42,11 @@ pub fn run_headless_loop(hub: &mut Hub, shutdown_flag: &AtomicBool) -> Result<()
     log::info!("Hub event loop starting (headless mode)");
 
     while !hub.quit && !shutdown_flag.load(Ordering::SeqCst) {
-        // 1. Process commands from clients
-        hub.process_commands();
-
-        if hub.quit {
-            break;
-        }
-
-        // 2. Poll pending agents and progress events
+        // 1. Poll pending agents and progress events
         hub.poll_pending_agents();
         hub.poll_progress_events();
 
-        // 3. Periodic tasks
+        // 2. Periodic tasks
         hub.tick();
 
         // Sleep to prevent CPU spinning

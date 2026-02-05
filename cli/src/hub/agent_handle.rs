@@ -7,24 +7,11 @@
 //!
 //! # How to Get Agent Handles
 //!
-//! There are two ways to obtain handles, depending on thread context:
-//!
-//! ## 1. Via HandleCache (preferred for clients)
-//!
-//! Clients using `HubHandle` read directly from the cache:
+//! Clients use `HandleCache::get_agent()` to read agent handles directly.
+//! This is non-blocking and safe from any thread:
 //!
 //! ```text
-//! HubHandle::get_agent(idx) → HandleCache → Option<AgentHandle>
-//! ```
-//!
-//! Use this from TuiClient or any code on Hub's thread.
-//!
-//! ## 2. Via GetAgentByIndex command (TuiRunner only)
-//!
-//! TuiRunner runs on a separate thread and uses blocking commands:
-//!
-//! ```text
-//! TuiRunner → HubCommand::GetAgentByIndex(idx) → Hub → AgentHandle
+//! HandleCache::get_agent(idx) → Option<AgentHandle>
 //! ```
 //!
 //! # Hierarchy
@@ -47,8 +34,7 @@
 //! - Index 0: CLI PTY (always present)
 //! - Index 1: Server PTY (present when server is running)
 //!
-//! This matches the CLIENT_REFACTOR_DESIGN.md architecture where clients
-//! call `pty.write_input()` directly rather than through Hub.
+//! Clients call `pty.write_input()` directly rather than through Hub.
 
 // Rust guideline compliant 2026-01
 
@@ -67,9 +53,8 @@ use crate::relay::types::AgentInfo;
 
 /// Handle for interacting with an agent.
 ///
-/// Clients obtain this via:
-/// - `HubHandle::get_agent()` - reads from HandleCache (preferred)
-/// - `HubCommand::GetAgentByIndex` - cross-thread only (TuiRunner)
+/// Clients obtain this via `HandleCache::get_agent()`, which reads
+/// directly from the cache (non-blocking, safe from any thread).
 ///
 /// The handle provides access to agent info and PTY sessions without
 /// exposing internal state.
@@ -107,7 +92,7 @@ pub struct AgentHandle {
 impl AgentHandle {
     /// Create a new agent handle.
     ///
-    /// Called internally by Hub when processing `GetAgentByIndex` command.
+    /// Called internally by Hub when building `HandleCache`.
     ///
     /// # Arguments
     ///
@@ -145,7 +130,7 @@ impl AgentHandle {
     /// Get agent info snapshot.
     ///
     /// Note: This is a snapshot from when the handle was created.
-    /// For live status, re-fetch via `GetAgent` or subscribe to `HubEvent`.
+    /// For live status, re-fetch via `GetAgent` command.
     #[must_use]
     pub fn info(&self) -> &AgentInfo {
         &self.info
@@ -203,7 +188,7 @@ impl AgentHandle {
 /// # Example
 ///
 /// ```ignore
-/// let handle = hub.get_agent_by_index(0).await?.unwrap();
+/// let handle = handle_cache.get_agent(0).unwrap();
 /// let pty = handle.get_pty(0).unwrap();
 ///
 /// // Subscribe to output events

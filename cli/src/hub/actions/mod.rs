@@ -9,7 +9,6 @@
 //! - `agent_handlers.rs` - Agent lifecycle: spawn, close
 //! - `client_handlers.rs` - Client-scoped: selection, create, delete, lifecycle
 //! - `connection_handlers.rs` - Connection URL copy and regeneration
-//! - `input_handlers.rs` - Agent spawn helper
 //!
 //! # Dispatch
 //!
@@ -24,8 +23,6 @@
 mod agent_handlers;
 mod client_handlers;
 mod connection_handlers;
-mod input_handlers;
-
 #[cfg(test)]
 mod tests;
 
@@ -37,20 +34,6 @@ use super::Hub;
 
 // Re-export handler functions that need to be called from other modules
 pub use client_handlers::handle_select_agent_for_client;
-pub use input_handlers::spawn_agent_with_tunnel;
-
-/// Scroll direction for client-scoped scroll actions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScrollDirection {
-    /// Scroll up by N lines.
-    Up(usize),
-    /// Scroll down by N lines.
-    Down(usize),
-    /// Scroll to top of buffer.
-    ToTop,
-    /// Scroll to bottom (live view).
-    ToBottom,
-}
 
 /// Actions that can be dispatched to the Hub.
 ///
@@ -138,33 +121,6 @@ pub enum HubAction {
         /// Deletion request details.
         request: DeleteAgentRequest,
     },
-
-    /// Request agent list (client-scoped for response routing).
-    RequestAgentList {
-        /// Which client is requesting.
-        client_id: ClientId,
-    },
-
-    /// Request worktree list (client-scoped for response routing).
-    RequestWorktreeList {
-        /// Which client is requesting.
-        client_id: ClientId,
-    },
-
-    /// Scroll the client's selected agent's terminal.
-    ScrollForClient {
-        /// Which client is scrolling.
-        client_id: ClientId,
-        /// Scroll direction and amount.
-        scroll: ScrollDirection,
-    },
-
-    /// Toggle PTY view for the client's selected agent.
-    TogglePtyViewForClient {
-        /// Which client is toggling.
-        client_id: ClientId,
-    },
-
 }
 
 
@@ -234,43 +190,6 @@ pub fn dispatch(hub: &mut Hub, action: HubAction) {
 
         HubAction::DeleteAgentForClient { client_id, request } => {
             client_handlers::handle_delete_agent_for_client(hub, client_id, request);
-        }
-
-        HubAction::RequestAgentList { client_id } => {
-            // Browser clients handle ListAgents directly via WebRTC.
-            // TUI clients read agent list from hub state.
-            log::debug!(
-                "RequestAgentList from {} (handled client-side)",
-                client_id
-            );
-        }
-
-        HubAction::RequestWorktreeList { client_id } => {
-            // Browser clients handle ListWorktrees directly via WebRTC.
-            // TUI clients read worktree list from hub state.
-            log::debug!(
-                "RequestWorktreeList from {} (handled client-side)",
-                client_id
-            );
-        }
-
-        HubAction::ScrollForClient { client_id, scroll } => {
-            // Scroll state is client-local (TuiClient owns scroll offset, xterm.js for browser).
-            // This action is dispatched from browser events but handled client-side.
-            log::debug!(
-                "ScrollForClient from {}: {:?} (handled client-side)",
-                client_id,
-                scroll
-            );
-        }
-
-        HubAction::TogglePtyViewForClient { client_id } => {
-            // PTY view (CLI vs Server) is client-local state.
-            // This action is dispatched from browser events but handled client-side.
-            log::debug!(
-                "TogglePtyViewForClient from {} (handled client-side)",
-                client_id
-            );
         }
     }
 }

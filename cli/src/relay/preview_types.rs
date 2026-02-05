@@ -23,7 +23,7 @@
 //!
 //! Response bodies >4KB are gzip compressed before encryption.
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-02
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -34,8 +34,8 @@ use std::collections::HashMap;
 pub enum PreviewMessage {
     /// CLI is ready to receive HTTP requests.
     ///
-    /// Sent after HttpChannel subscribes to PreviewChannel. Browser should
-    /// wait for this before sending requests to avoid message loss.
+    /// Sent after the WebRTC preview channel is established. The browser
+    /// should wait for this before sending requests to avoid message loss.
     #[serde(rename = "preview_ready")]
     Ready,
     /// HTTP response from agent's dev server.

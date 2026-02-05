@@ -3,69 +3,7 @@
 //! These types define the request/response protocol between clients and Hub.
 //! Note: AgentInfo and WorktreeInfo are re-exported from relay::types.
 
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-
-/// Response to a client action.
-///
-/// Hub sends these to clients after processing their requests.
-/// Browser clients serialize and send via WebSocket.
-/// TUI client may show toast/notification (or ignore since it re-renders).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum Response {
-    /// Agent was successfully selected.
-    #[serde(rename = "agent_selected")]
-    AgentSelected {
-        /// Selected agent's session key.
-        id: String,
-    },
-
-    /// Agent was successfully created.
-    #[serde(rename = "agent_created")]
-    AgentCreated {
-        /// Created agent's session key.
-        id: String,
-    },
-
-    /// Agent was successfully deleted.
-    #[serde(rename = "agent_deleted")]
-    AgentDeleted {
-        /// Deleted agent's session key.
-        id: String,
-    },
-
-    /// An error occurred processing the request.
-    #[serde(rename = "error")]
-    Error {
-        /// Human-readable error message.
-        message: String,
-    },
-}
-
-impl Response {
-    /// Create an error response.
-    pub fn error(message: impl Into<String>) -> Self {
-        Response::Error {
-            message: message.into(),
-        }
-    }
-
-    /// Create an agent selected response.
-    pub fn agent_selected(id: impl Into<String>) -> Self {
-        Response::AgentSelected { id: id.into() }
-    }
-
-    /// Create an agent created response.
-    pub fn agent_created(id: impl Into<String>) -> Self {
-        Response::AgentCreated { id: id.into() }
-    }
-
-    /// Create an agent deleted response.
-    pub fn agent_deleted(id: impl Into<String>) -> Self {
-        Response::AgentDeleted { id: id.into() }
-    }
-}
 
 /// Request to create an agent.
 ///
@@ -150,24 +88,6 @@ impl DeleteAgentRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_response_serialization() {
-        let resp = Response::AgentSelected {
-            id: "agent-123".to_string(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""type":"agent_selected""#));
-        assert!(json.contains(r#""id":"agent-123""#));
-    }
-
-    #[test]
-    fn test_response_error_serialization() {
-        let resp = Response::error("Something went wrong");
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""type":"error""#));
-        assert!(json.contains(r#""message":"Something went wrong""#));
-    }
 
     #[test]
     fn test_create_agent_request_builder() {

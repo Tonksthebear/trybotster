@@ -79,8 +79,8 @@ pub fn build_command(
 /// Reads PTY output, broadcasts via event channel, adds to scrollback buffer,
 /// and detects OSC notification sequences.
 ///
-/// Note: This does NOT parse bytes through a vt100 parser. Clients (TuiRunner,
-/// TuiClient) own their own parsers and feed bytes in their `on_output()` handlers.
+/// Note: This does NOT parse bytes through a vt100 parser. Consumers
+/// (TuiRunner, browser via Lua) own their own parsers.
 ///
 /// # Arguments
 ///
@@ -147,8 +147,8 @@ pub fn spawn_cli_reader_thread(
 /// Similar to CLI reader but without OSC notification detection.
 /// Broadcasts output via [`PtyEvent::Output`].
 ///
-/// Note: This does NOT parse bytes through a vt100 parser. Clients (TuiRunner,
-/// TuiClient) own their own parsers and feed bytes in their `on_output()` handlers.
+/// Note: This does NOT parse bytes through a vt100 parser. Consumers
+/// (TuiRunner, browser via Lua) own their own parsers.
 ///
 /// # Arguments
 ///

@@ -374,24 +374,13 @@ function Client:handle_hub_data(sub_id, command)
         log.debug(string.format("Select agent: %s", tostring(command.id or command.agent_index)))
 
     elseif cmd_type == "get_connection_code" then
-        -- Request connection URL from cache
-        local url, err = connection.get_url()
-        if url then
-            self:send({
-                subscriptionId = sub_id,
-                type = "connection_code",
-                url = url,
-            })
-        else
-            self:send({
-                subscriptionId = sub_id,
-                type = "connection_code_error",
-                error = err or "Connection code not available",
-            })
-        end
+        -- Always go through Hub-side generation which includes QR PNG.
+        -- generate_connection_url() is idempotent (returns cached bundle
+        -- unless consumed by a browser, in which case it auto-regenerates).
+        connection.generate()
 
     elseif cmd_type == "regenerate_connection_code" then
-        -- Queue a connection code regeneration request
+        -- Force-regenerate: creates a fresh PreKeyBundle unconditionally
         connection.regenerate()
         log.info("Connection code regeneration requested")
 
@@ -400,6 +389,12 @@ function Client:handle_hub_data(sub_id, command)
         local rows = command.rows or 24
         local cols = command.cols or 80
         self:update_dims(rows, cols)
+
+    elseif cmd_type == "quit" then
+        hub.quit()
+
+    elseif cmd_type == "copy_connection_url" then
+        connection.copy_to_clipboard()
 
     else
         log.debug(string.format("Unknown hub command: %s", tostring(cmd_type)))

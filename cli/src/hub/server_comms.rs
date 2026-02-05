@@ -14,7 +14,7 @@
 //! and heartbeat. The NotificationWorker handles agent notification
 //! delivery in a background thread.
 
-// Rust guideline compliant 2026-01-29
+// Rust guideline compliant 2026-02
 
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,6 @@ use crate::agent::AgentNotification;
 use crate::channel::Channel;
 use crate::client::ClientId;
 use crate::hub::actions::{self, HubAction};
-use crate::hub::events::HubEvent;
 use crate::hub::lifecycle::SpawnResult;
 use crate::hub::{command_channel, registration, workers, AgentProgressEvent, Hub, PendingAgentResult};
 use crate::server::messages::{message_to_hub_action, MessageContext, ParsedMessage};
@@ -42,7 +41,6 @@ impl Hub {
         self.poll_webrtc_channels();
         self.poll_webrtc_pty_output();
         self.poll_tui_requests();
-        self.poll_tui_hub_events();
         self.send_command_channel_heartbeat();
         self.poll_agent_notifications_async();
         self.poll_lua_file_changes();
@@ -57,7 +55,7 @@ impl Hub {
     /// callbacks may have queued. Called automatically in `tick()` to ensure all
     /// queued operations are processed without requiring manual calls after each
     /// Lua event.
-    pub fn flush_lua_queues(&mut self) {
+    pub(crate) fn flush_lua_queues(&mut self) {
         self.process_lua_webrtc_sends();
         self.process_lua_tui_sends();
         self.process_lua_pty_requests();
@@ -105,121 +103,9 @@ impl Hub {
                 // sent by Rails since HubChannel was deleted. Browser communication now
                 // happens directly via WebRTC (see handle_webrtc_* methods below).
                 // These event types remain in Bot::Message validation for legacy compatibility.
-                "terminal_connected" => {
-                    // Browser wants terminal I/O for a specific PTY (legacy notification path).
-                    // WebRTC browsers now subscribe directly via DataChannel.
-                    let agent_index = msg.payload.get("agent_index").and_then(|v| v.as_u64());
-                    let pty_index = msg.payload.get("pty_index").and_then(|v| v.as_u64());
-                    let browser_identity = msg.payload
-                        .get("browser_identity")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-
-                    log::debug!(
-                        "[INPUT-TRACE] Hub received terminal_connected: browser={}, agent={:?}, pty={:?}",
-                        &browser_identity[..browser_identity.len().min(8)],
-                        agent_index,
-                        pty_index
-                    );
-
-                    if let (Some(ai), Some(pi)) = (agent_index, pty_index) {
-                        let agent_index = ai as usize;
-                        let pty_index = pi as usize;
-
-                        // Ensure agent channels are connected (preview, etc.)
-                        let agent_key = self.state.read().unwrap()
-                            .agent_keys_ordered
-                            .get(agent_index)
-                            .cloned();
-
-                        if let Some(key) = agent_key {
-                            self.connect_agent_channels(&key, agent_index);
-                        }
-
-                        // Broadcast event so WebRTC can set up PTY forwarding.
-                        let client_id = ClientId::Browser(browser_identity.to_string());
-                        log::debug!(
-                            "[INPUT-TRACE] Broadcasting PtyConnectionRequested for agent={} pty={}",
-                            agent_index,
-                            pty_index
-                        );
-                        self.broadcast(HubEvent::PtyConnectionRequested {
-                            client_id,
-                            agent_index,
-                            pty_index,
-                        });
-                    } else {
-                        log::warn!(
-                            "Terminal connected missing agent_index or pty_index: {:?}",
-                            msg.payload
-                        );
-                    }
-                }
-                "terminal_disconnected" => {
-                    // Browser no longer wants terminal I/O (legacy notification path).
-                    // WebRTC browsers unsubscribe directly via DataChannel.
-                    let agent_index = msg.payload.get("agent_index").and_then(|v| v.as_u64());
-                    let pty_index = msg.payload.get("pty_index").and_then(|v| v.as_u64());
-                    let browser_identity = msg.payload
-                        .get("browser_identity")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-
-                    log::debug!(
-                        "Terminal disconnected (command channel): browser={}, agent={:?}, pty={:?}",
-                        &browser_identity[..browser_identity.len().min(8)],
-                        agent_index,
-                        pty_index
-                    );
-
-                    if let (Some(ai), Some(pi)) = (agent_index, pty_index) {
-                        let client_id = ClientId::Browser(browser_identity.to_string());
-                        self.broadcast(HubEvent::PtyDisconnectionRequested {
-                            client_id,
-                            agent_index: ai as usize,
-                            pty_index: pi as usize,
-                        });
-                    } else {
-                        log::warn!(
-                            "Terminal disconnected missing agent_index or pty_index: {:?}",
-                            msg.payload
-                        );
-                    }
-                }
-                "browser_wants_preview" => {
-                    // Browser subscribed to PreviewChannel - notify to create HttpChannel.
-                    let agent_index = msg.payload.get("agent_index").and_then(|v| v.as_u64());
-                    let pty_index = msg
-                        .payload
-                        .get("pty_index")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(1); // Default to server PTY
-                    let browser_identity = msg.payload
-                        .get("browser_identity")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-
-                    log::debug!(
-                        "[CommandChannel] Browser wants preview: browser={}, agent={:?}, pty={}",
-                        &browser_identity[..browser_identity.len().min(8)],
-                        agent_index,
-                        pty_index
-                    );
-
-                    if let Some(ai) = agent_index {
-                        let client_id = ClientId::Browser(browser_identity.to_string());
-                        self.broadcast(HubEvent::HttpConnectionRequested {
-                            client_id,
-                            agent_index: ai as usize,
-                            pty_index: pty_index as usize,
-                            browser_identity: browser_identity.to_string(),
-                        });
-                    } else {
-                        log::warn!(
-                            "Browser wants preview missing agent_index: {:?}",
-                            msg.payload
-                        );
-                    }
+                "terminal_connected" | "terminal_disconnected" | "browser_wants_preview" => {
+                    // Legacy event types -- browsers now connect via WebRTC DataChannel directly.
+                    log::debug!("Ignoring legacy command channel event: {}", msg.event_type);
                 }
                 _ => {
                     self.process_command_channel_message(msg);
@@ -397,11 +283,13 @@ impl Hub {
             event.client_id
         );
 
-        // Broadcast progress event to all subscribers (WebRTC, TUI)
-        self.broadcast(HubEvent::AgentCreationProgress {
-            identifier: event.identifier,
-            stage: event.stage,
-        });
+        // Progress is delivered to Lua via fire_event (no broadcast needed).
+        // Lua handlers route progress updates to connected clients (WebRTC, TUI).
+        log::trace!(
+            "Agent creation progress: {} -> {:?}",
+            event.identifier,
+            event.stage,
+        );
     }
 
     /// Handle a completed agent creation from background thread.
@@ -463,19 +351,6 @@ impl Hub {
         // Sync handle cache for thread-safe agent access
         self.sync_handle_cache();
 
-        // Connect agent's channels (terminal + preview if port assigned)
-        let agent_index = self
-            .state
-            .read()
-            .unwrap()
-            .agents
-            .keys()
-            .position(|k| k == &result.agent_id);
-
-        if let Some(idx) = agent_index {
-            self.connect_agent_channels(&result.agent_id, idx);
-        }
-
         // Auto-select the new agent for the requesting client
         let session_key = result.agent_id.clone();
         actions::dispatch(
@@ -491,13 +366,10 @@ impl Hub {
             log::warn!("Failed to refresh worktree cache after agent creation: {}", e);
         }
 
-        // Broadcast AgentCreated event to all subscribers (WebRTC, TUI)
         // Get info and release lock before calling methods that need &mut self
         let info = self.state.read().unwrap().get_agent_info(&session_key);
 
         if let Some(info) = info {
-            self.broadcast(HubEvent::agent_created(session_key.clone(), info.clone()));
-
             // Fire Lua event for agent_created
             // Note: Queued WebRTC sends are flushed automatically in tick()
             if let Err(e) = self.lua.fire_agent_created(&session_key, &info) {
@@ -654,7 +526,7 @@ impl Hub {
     ///
     /// Drains the Lua send queue and sends each message to the target peer.
     /// Called after any Lua callback that might queue messages.
-    pub fn process_lua_webrtc_sends(&mut self) {
+    fn process_lua_webrtc_sends(&mut self) {
         use crate::lua::primitives::WebRtcSendRequest;
 
         for send_req in self.lua.drain_webrtc_sends() {
@@ -700,7 +572,7 @@ impl Hub {
     ///
     /// Drains the Lua PTY request queue and processes each request.
     /// Called after any Lua callback that might queue PTY operations.
-    pub fn process_lua_pty_requests(&mut self) {
+    fn process_lua_pty_requests(&mut self) {
         use crate::lua::PtyRequest;
 
         for request in self.lua.drain_pty_requests() {
@@ -773,7 +645,7 @@ impl Hub {
     ///
     /// Drains the Lua Hub request queue and processes each request.
     /// Called after any Lua callback that might queue agent lifecycle operations.
-    pub fn process_lua_hub_requests(&mut self) {
+    fn process_lua_hub_requests(&mut self) {
         use crate::client::{CreateAgentRequest, DeleteAgentRequest};
         use crate::lua::primitives::HubRequest;
 
@@ -830,6 +702,10 @@ impl Hub {
                         },
                     );
                 }
+                HubRequest::Quit => {
+                    log::info!("[Lua] Processing quit request");
+                    self.quit = true;
+                }
             }
         }
     }
@@ -838,14 +714,34 @@ impl Hub {
     ///
     /// Drains the Lua connection request queue and processes each request.
     /// Called after any Lua callback that might queue connection operations.
-    pub fn process_lua_connection_requests(&mut self) {
+    fn process_lua_connection_requests(&mut self) {
         use crate::lua::primitives::ConnectionRequest;
 
         for request in self.lua.drain_connection_requests() {
             match request {
+                ConnectionRequest::Generate => {
+                    log::debug!("[Lua] Processing connection.generate() request");
+                    match self.generate_connection_url() {
+                        Ok(ref url) => {
+                            if let Err(e) = self.lua.fire_connection_code_ready(url) {
+                                log::error!("Failed to fire connection_code_ready: {e}");
+                            }
+                        }
+                        Err(ref e) => {
+                            log::warn!("Connection URL generation failed: {e}");
+                            if let Err(fire_err) = self.lua.fire_connection_code_error(e) {
+                                log::error!("Failed to fire connection_code_error: {fire_err}");
+                            }
+                        }
+                    }
+                }
                 ConnectionRequest::Regenerate => {
                     log::info!("[Lua] Processing connection.regenerate() request");
                     actions::dispatch(self, HubAction::RegenerateConnectionCode);
+                }
+                ConnectionRequest::CopyToClipboard => {
+                    log::debug!("[Lua] Processing connection.copy_to_clipboard() request");
+                    actions::dispatch(self, HubAction::CopyConnectionUrl);
                 }
             }
         }
@@ -1200,101 +1096,32 @@ impl Hub {
 
     /// Poll TUI requests from TuiRunner (non-blocking).
     ///
-    /// Drains all pending `TuiRequest` messages and handles each one directly.
-    /// Hub processes TUI requests synchronously instead of delegating to a
-    /// `TuiClient` async task, allowing Lua to participate in the pipeline.
+    /// All TUI messages are JSON routed through Lua `client.lua` — the same
+    /// path as browser clients. Each message goes to `lua.call_tui_message()`
+    /// which routes through `Client:on_message()` in Lua.
     fn poll_tui_requests(&mut self) {
         let Some(ref mut rx) = self.tui_request_rx else {
             return;
         };
 
-        let mut requests = Vec::new();
-        while let Ok(req) = rx.try_recv() {
-            requests.push(req);
-        }
+        // Drain into Vec to release the mutable borrow on self before
+        // calling lua.call_tui_message() and flush_lua_queues().
+        let messages: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
 
-        for request in requests {
-            self.handle_tui_request(request);
-        }
-    }
-
-    /// Poll Hub events and forward to TuiRunner (non-blocking).
-    ///
-    /// Receives Hub events via broadcast channel and sends them to TuiRunner
-    /// as `TuiOutput::HubEvent`. Filters browser-specific and Shutdown events
-    /// (matching `TuiClient::handle_hub_event` behavior).
-    ///
-    /// Events are drained into a Vec first to release the mutable borrow on
-    /// `tui_hub_event_rx` before calling `handle_tui_disconnect_from_pty`.
-    fn poll_tui_hub_events(&mut self) {
-        use crate::client::TuiOutput;
-
-        // Drain events into a Vec to release the mutable borrow
-        let events: Vec<HubEvent> = {
-            let Some(ref mut rx) = self.tui_hub_event_rx else {
-                return;
-            };
-
-            let mut events = Vec::new();
-            loop {
-                match rx.try_recv() {
-                    Ok(event) => events.push(event),
-                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                        log::warn!("[TUI] Hub event receiver lagged by {} events", n);
-                    }
-                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-                }
+        for msg in messages {
+            if let Err(e) = self.lua.call_tui_message(msg) {
+                log::error!("[TUI] Lua message handling error: {}", e);
             }
-            events
-        };
-
-        if events.is_empty() {
-            return;
-        }
-
-        // Clone the sender to avoid borrow conflict with &mut self methods
-        let tx = match self.tui_output_tx.clone() {
-            Some(tx) => tx,
-            None => return,
-        };
-
-        for event in events {
-            match &event {
-                HubEvent::AgentDeleted { agent_id } => {
-                    // Disconnect from deleted agent's PTYs before forwarding
-                    let agent_index = self
-                        .handle_cache
-                        .get_all_agents()
-                        .iter()
-                        .position(|h| h.agent_id() == agent_id);
-
-                    if let Some(idx) = agent_index {
-                        self.handle_tui_disconnect_from_pty(idx, 0);
-                        self.handle_tui_disconnect_from_pty(idx, 1);
-                    }
-                    let _ = tx.send(TuiOutput::HubEvent(event));
-                }
-                HubEvent::Shutdown => {
-                    // Don't forward - TuiRunner detects shutdown via its own mechanisms
-                }
-                HubEvent::PtyConnectionRequested { .. }
-                | HubEvent::PtyDisconnectionRequested { .. }
-                | HubEvent::HttpConnectionRequested { .. } => {
-                    // Browser-specific events, TUI ignores
-                }
-                _ => {
-                    let _ = tx.send(TuiOutput::HubEvent(event));
-                }
-            }
+            self.flush_lua_queues();
         }
     }
 
     /// Process TUI send requests queued by Lua callbacks.
     ///
     /// Drains JSON and binary messages queued by `tui.send()` in Lua.
-    /// JSON messages are logged and discarded (TuiRunner speaks `TuiOutput`,
-    /// not JSON subscription protocol). Binary messages are forwarded as
+    /// JSON messages carry agent lifecycle events (`agent_created`,
+    /// `agent_deleted`, `worktree_list`, etc.) and are forwarded as
+    /// `TuiOutput::Message`. Binary messages are forwarded as
     /// `TuiOutput::Output` (raw terminal data).
     fn process_lua_tui_sends(&mut self) {
         use crate::client::TuiOutput;
@@ -1309,9 +1136,7 @@ impl Hub {
         for send_req in self.lua.drain_tui_sends() {
             match send_req {
                 TuiSendRequest::Json { data } => {
-                    // TuiRunner doesn't speak JSON subscription protocol.
-                    // These are subscription confirmations and Lua hub broadcasts.
-                    log::trace!("[TUI-LUA] Discarding JSON send: {}", data);
+                    let _ = tx.send(TuiOutput::Message(data));
                 }
                 TuiSendRequest::Binary { data } => {
                     // Binary data = raw terminal output, forward to TuiRunner
@@ -1319,220 +1144,6 @@ impl Hub {
                 }
             }
         }
-    }
-
-    /// Handle a single TUI request from TuiRunner.
-    ///
-    /// Processes the request synchronously on the Hub main thread. PTY operations
-    /// use `HandleCache` for direct access. Agent lifecycle operations dispatch
-    /// `HubAction`s through the standard action pipeline.
-    fn handle_tui_request(&mut self, request: crate::client::TuiRequest) {
-        use crate::client::TuiRequest;
-
-        match request {
-            // === PTY I/O (direct HandleCache access) ===
-            TuiRequest::SendInput { agent_index, pty_index, data } => {
-                if let Some(agent) = self.handle_cache.get_agent(agent_index) {
-                    if let Some(pty) = agent.get_pty(pty_index) {
-                        if let Err(e) = pty.write_input_direct(&data) {
-                            log::error!("[TUI] Failed to send input: {}", e);
-                        }
-                    }
-                }
-            }
-            TuiRequest::SetDims { agent_index, pty_index, cols, rows } => {
-                self.tui_dims = (cols, rows);
-                if let Some(agent) = self.handle_cache.get_agent(agent_index) {
-                    if let Some(pty) = agent.get_pty(pty_index) {
-                        pty.resize_direct(ClientId::Tui, rows, cols);
-                    }
-                }
-            }
-
-            // === Agent Selection / PTY Connection ===
-            TuiRequest::SelectAgent { index, response_tx } => {
-                let result = self.handle_tui_select_agent(index);
-                let _ = response_tx.send(result);
-            }
-            TuiRequest::ConnectToPty { agent_index, pty_index } => {
-                self.handle_tui_connect_to_pty(agent_index, pty_index);
-            }
-            TuiRequest::DisconnectFromPty { agent_index, pty_index } => {
-                self.handle_tui_disconnect_from_pty(agent_index, pty_index);
-            }
-
-            // === Hub Lifecycle ===
-            TuiRequest::Quit => {
-                self.quit = true;
-                self.broadcast(HubEvent::shutdown());
-            }
-            TuiRequest::ListWorktrees { response_tx } => {
-                if let Err(e) = self.load_available_worktrees() {
-                    log::error!("[TUI] Failed to load worktrees: {}", e);
-                }
-                let worktrees = self.state.read().unwrap().available_worktrees.clone();
-                let _ = response_tx.send(worktrees);
-            }
-            TuiRequest::GetConnectionCodeWithQr { response_tx } => {
-                let result = self.generate_connection_url().and_then(|url| {
-                    // Cache the URL so connection.get_url() works from Lua
-                    self.handle_cache.set_connection_url(Ok(url.clone()));
-                    crate::tui::generate_qr_png(&url, 4)
-                        .map(|qr_png| crate::tui::ConnectionCodeData { url, qr_png })
-                });
-                let _ = response_tx.send(result);
-            }
-            TuiRequest::CreateAgent { request } => {
-                actions::dispatch(
-                    self,
-                    HubAction::CreateAgentForClient {
-                        client_id: ClientId::Tui,
-                        request,
-                    },
-                );
-            }
-            TuiRequest::DeleteAgent { request } => {
-                actions::dispatch(
-                    self,
-                    HubAction::DeleteAgentForClient {
-                        client_id: ClientId::Tui,
-                        request,
-                    },
-                );
-            }
-            TuiRequest::RegenerateConnectionCode => {
-                actions::dispatch(self, HubAction::RegenerateConnectionCode);
-            }
-            TuiRequest::CopyConnectionUrl => {
-                actions::dispatch(self, HubAction::CopyConnectionUrl);
-            }
-        }
-    }
-
-    /// Select an agent for TUI and connect to its CLI PTY.
-    ///
-    /// Dispatches `SelectAgentForClient` action and connects to the CLI PTY
-    /// (index 0). Returns metadata for TuiRunner, or `None` if the agent
-    /// doesn't exist at the given index.
-    fn handle_tui_select_agent(
-        &mut self,
-        index: usize,
-    ) -> Option<crate::client::TuiAgentMetadata> {
-        let agent = self.handle_cache.get_agent(index)?;
-        let agent_id = agent.agent_id().to_string();
-        let has_server_pty = agent.get_pty(1).is_some();
-
-        // Notify Hub of selection
-        actions::dispatch(
-            self,
-            HubAction::SelectAgentForClient {
-                client_id: ClientId::Tui,
-                agent_key: agent_id.clone(),
-            },
-        );
-
-        // Connect to CLI PTY (index 0)
-        self.handle_tui_connect_to_pty(index, 0);
-
-        Some(crate::client::TuiAgentMetadata {
-            agent_id,
-            agent_index: index,
-            has_server_pty,
-        })
-    }
-
-    /// Connect TUI to a specific PTY and start output forwarding.
-    ///
-    /// Aborts any existing forwarder task, connects to the PTY (getting scrollback),
-    /// subscribes to PTY events, and spawns a new forwarder task that routes
-    /// `PtyEvent::Output` to `TuiOutput::Output`.
-    fn handle_tui_connect_to_pty(&mut self, agent_index: usize, pty_index: usize) {
-        use crate::client::TuiOutput;
-
-        // Abort existing forwarder
-        if let Some(task) = self.tui_output_task.take() {
-            task.abort();
-        }
-
-        let Some(agent) = self.handle_cache.get_agent(agent_index) else {
-            log::warn!("[TUI] No agent at index {}", agent_index);
-            return;
-        };
-
-        let Some(pty) = agent.get_pty(pty_index) else {
-            log::warn!("[TUI] No PTY at index {} for agent {}", pty_index, agent_index);
-            return;
-        };
-
-        // Connect and get scrollback
-        let scrollback = match pty.connect_direct(ClientId::Tui, self.tui_dims) {
-            Ok(sb) => sb,
-            Err(e) => {
-                log::error!("[TUI] Failed to connect to PTY: {}", e);
-                return;
-            }
-        };
-
-        let Some(ref output_tx) = self.tui_output_tx else {
-            log::warn!("[TUI] No output channel for PTY connection");
-            return;
-        };
-
-        // Send scrollback
-        if !scrollback.is_empty() {
-            let _ = output_tx.send(TuiOutput::Scrollback(scrollback));
-        }
-
-        // Subscribe and spawn forwarder
-        let pty_rx = pty.subscribe();
-        let sink = output_tx.clone();
-
-        let _guard = self.tokio_runtime.enter();
-        self.tui_output_task = Some(tokio::spawn(async move {
-            use crate::agent::pty::PtyEvent;
-
-            let mut pty_rx = pty_rx;
-            loop {
-                match pty_rx.recv().await {
-                    Ok(PtyEvent::Output(data)) => {
-                        if sink.send(TuiOutput::Output(data)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(PtyEvent::ProcessExited { exit_code }) => {
-                        let _ = sink.send(TuiOutput::ProcessExited { exit_code });
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!("[TUI] Output forwarder lagged by {} events", n);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                }
-            }
-        }));
-
-        log::info!("[TUI] Connected to PTY ({}, {})", agent_index, pty_index);
-    }
-
-    /// Disconnect TUI from a specific PTY.
-    ///
-    /// Aborts the output forwarder task and notifies the PTY of disconnection.
-    fn handle_tui_disconnect_from_pty(&mut self, agent_index: usize, pty_index: usize) {
-        // Abort forwarder
-        if let Some(task) = self.tui_output_task.take() {
-            task.abort();
-        }
-
-        // Notify PTY
-        if let Some(agent) = self.handle_cache.get_agent(agent_index) {
-            if let Some(pty) = agent.get_pty(pty_index) {
-                pty.disconnect_direct(ClientId::Tui);
-            }
-        }
-
-        log::info!("[TUI] Disconnected from PTY ({}, {})", agent_index, pty_index);
     }
 
     // === WebRTC Signaling (ActionCable + Signal Protocol) ===
@@ -1825,7 +1436,7 @@ impl Hub {
     // === Connection Setup ===
 
     /// Register the device with the server if not already registered.
-    pub fn register_device(&mut self) {
+    pub(crate) fn register_device(&mut self) {
         registration::register_device(&mut self.device, &self.client, &self.config);
     }
 
@@ -1834,7 +1445,7 @@ impl Hub {
     /// The server-assigned `botster_id` is used for all URLs and WebSocket subscriptions
     /// to guarantee uniqueness (no collision between different CLI instances).
     /// The local `hub_identifier` is kept for config directories.
-    pub fn register_hub_with_server(&mut self) {
+    pub(crate) fn register_hub_with_server(&mut self) {
         let botster_id = registration::register_hub_with_server(
             &self.hub_identifier,
             &self.config.server_url,
@@ -1850,7 +1461,7 @@ impl Hub {
     /// Starts the CryptoService only. PreKeyBundle generation is deferred until
     /// the connection URL is first requested (lazy initialization via
     /// `get_or_generate_connection_url()`).
-    pub fn init_signal_protocol(&mut self) {
+    pub(crate) fn init_signal_protocol(&mut self) {
         registration::init_signal_protocol(&mut self.browser, &self.hub_identifier);
     }
 
@@ -1862,7 +1473,7 @@ impl Hub {
     /// # Returns
     ///
     /// The connection URL string, or an error message.
-    pub fn get_or_generate_connection_url(&mut self) -> Result<String, String> {
+    pub(crate) fn get_or_generate_connection_url(&mut self) -> Result<String, String> {
         // Extract values before mutable borrow of browser
         let server_hub_id = self.server_hub_id().to_string();
         let local_id = self.hub_identifier.clone();

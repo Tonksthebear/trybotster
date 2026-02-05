@@ -5,8 +5,8 @@
 //!
 //! # Selection Model
 //!
-//! Agent selection is now per-client, managed by the client abstraction layer.
-//! See `crate::client` for the `TuiClient` implementation.
+//! Agent selection is per-client. TuiRunner manages its own selection state;
+//! browser clients manage theirs via JavaScript.
 //! This module only manages the agent registry itself.
 
 use std::collections::{HashMap, HashSet};
@@ -19,27 +19,15 @@ use crate::relay::types::AgentInfo;
 
 /// Shared reference to HubState for thread-safe read access.
 ///
-/// Clients store a clone of this to access agent state without going through
-/// Hub commands. The RwLock allows multiple readers without blocking Hub's
-/// write operations (when no write is in progress).
+/// Hub owns this via `hub.state`. The RwLock allows multiple readers without
+/// blocking Hub's write operations (when no write is in progress).
 ///
 /// # Usage
 ///
 /// ```ignore
-/// let shared_state = hub.shared_state();
-///
-/// // In client code (possibly different thread):
-/// let state = shared_state.read().unwrap();
+/// // Hub reads state directly:
+/// let state = hub.state.read().unwrap();
 /// let agents = state.get_agents_info();
-/// for info in &agents {
-///     println!("{}: {:?}", info.id, info.status);
-/// }
-///
-/// // Get a handle for specific agent
-/// if let Some(handle) = state.get_agent_handle(0) {
-///     let pty = handle.get_pty(0).unwrap(); // CLI PTY
-///     // Use pty handle...
-/// }
 /// ```
 pub type SharedHubState = Arc<RwLock<HubState>>;
 
@@ -158,7 +146,7 @@ impl HubState {
     /// # Example
     ///
     /// ```ignore
-    /// let state = hub.shared_state().read().unwrap();
+    /// let state = hub.state.read().unwrap();
     /// let agents = state.get_agents_info();
     /// for info in &agents {
     ///     println!("{}: {}", info.id, info.status.as_deref().unwrap_or("Unknown"));
@@ -196,12 +184,10 @@ impl HubState {
     /// # Example
     ///
     /// ```ignore
-    /// let state = hub.shared_state().read().unwrap();
+    /// let state = hub.state.read().unwrap();
     /// if let Some(handle) = state.get_agent_handle(0) {
     ///     println!("Agent: {}", handle.info().id);
-    ///     // Connect to CLI PTY
-    ///     let pty = handle.get_pty(0).unwrap();
-    ///     // ...
+    ///     let pty = handle.get_pty(0).unwrap(); // CLI PTY
     /// }
     /// ```
     #[must_use]
@@ -277,7 +263,6 @@ impl HubState {
     ///
     /// Returns an error if git commands fail.
     pub fn load_available_worktrees(&mut self) -> anyhow::Result<()> {
-        use std::collections::HashSet;
         use std::process::Command;
 
         let (repo_path, _) = WorktreeManager::detect_current_repo()?;

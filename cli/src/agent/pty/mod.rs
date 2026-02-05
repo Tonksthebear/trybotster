@@ -158,8 +158,8 @@ impl std::fmt::Debug for SharedPtyState {
 /// # Terminal Emulation
 ///
 /// PtySession does NOT own a vt100 parser. It emits raw bytes via broadcast.
-/// Clients (TuiClient, TuiRunner) own their own parsers and feed bytes in
-/// their `on_output()` handlers. This keeps PtySession as pure I/O.
+/// Consumers (TuiRunner, browser via Lua) own their own parsers.
+/// This keeps PtySession as pure I/O.
 ///
 /// # Size Ownership
 ///
@@ -1733,7 +1733,7 @@ mod tests {
     #[test]
     fn test_hot_path_connect_returns_working_subscription() {
         // Tests that connect() returns a subscription that receives events.
-        // This is how TuiClient gets its event stream.
+        // This is how Lua PTY forwarders get their event stream.
         let session = PtySession::new(24, 80);
 
         // Connect returns a subscription + scrollback (via connect, not subscribe)
