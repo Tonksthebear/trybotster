@@ -143,7 +143,6 @@ pub struct PtySessionHandle {
     scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
 
     /// Event broadcast sender for subscribing to PTY output.
-    #[allow(dead_code)]
     event_tx: broadcast::Sender<PtyEvent>,
 
     /// Forwarding port (if configured).

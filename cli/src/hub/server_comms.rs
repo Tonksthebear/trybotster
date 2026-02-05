@@ -624,14 +624,6 @@ impl Hub {
                         }
                     }
                 }
-                WorktreeRequest::CreateAsync { branch, response_key } => {
-                    // Legacy async create - superseded by synchronous worktree.create()
-                    log::debug!(
-                        "[Lua] Ignoring legacy CreateAsync for branch '{}' (key={})",
-                        branch,
-                        response_key
-                    );
-                }
             }
         }
     }
