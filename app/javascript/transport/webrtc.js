@@ -33,8 +33,20 @@ export const TransportState = {
   ERROR: "error",
 }
 
+// Connection mode (P2P vs relayed)
+export const ConnectionMode = {
+  UNKNOWN: "unknown",     // Not yet determined
+  DIRECT: "direct",       // P2P (host, srflx, prflx candidates)
+  RELAYED: "relayed",     // Through TURN server
+}
+
 // Grace period before closing idle connections (ms)
 const DISCONNECT_GRACE_PERIOD_MS = 3000
+
+// ICE restart configuration
+const ICE_RESTART_DELAY_MS = 1000        // Wait before first restart attempt
+const ICE_RESTART_MAX_ATTEMPTS = 3       // Max restarts before full reconnect
+const ICE_RESTART_BACKOFF_MULTIPLIER = 2 // Exponential backoff
 
 class WebRTCTransport {
   #connections = new Map() // hubId -> { pc, dataChannel, state, subscriptions }
@@ -127,10 +139,14 @@ class WebRTCTransport {
       pc,
       dataChannel: null,
       state: TransportState.CONNECTING,
+      mode: ConnectionMode.UNKNOWN,
       hubId,
       browserIdentity,
       subscriptions: new Map(),
       pendingCandidates: [],
+      // ICE restart tracking
+      iceRestartAttempts: 0,
+      iceRestartTimer: null,
     }
     this.#connections.set(hubId, conn)
 
@@ -152,23 +168,56 @@ class WebRTCTransport {
       }
     }
 
-    // Set up connection state handling
+    // ICE connection state handler - triggers ICE restart on network changes
+    pc.oniceconnectionstatechange = () => {
+      const state = pc.iceConnectionState
+      console.debug(`[WebRTCTransport] ICE connection state: ${state}`)
+
+      if (state === "connected" || state === "completed") {
+        // Connection recovered - reset restart counter
+        const hadRestartAttempts = conn.iceRestartAttempts > 0
+        conn.iceRestartAttempts = 0
+        if (conn.iceRestartTimer) {
+          clearTimeout(conn.iceRestartTimer)
+          conn.iceRestartTimer = null
+        }
+        // Re-detect connection mode after ICE restart (path may have changed)
+        if (hadRestartAttempts) {
+          this.refreshConnectionMode(hubId)
+        }
+      } else if (state === "disconnected") {
+        // Network path lost - attempt ICE restart after brief delay
+        // (WebRTC sometimes recovers on its own)
+        this.#scheduleIceRestart(hubId, conn)
+      } else if (state === "failed") {
+        // ICE completely failed - try restart or full reconnect
+        this.#scheduleIceRestart(hubId, conn)
+      }
+    }
+
+    // Overall connection state handler - for terminal states
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState
       console.debug(`[WebRTCTransport] Connection state: ${state}`)
 
       if (state === "connected") {
         conn.state = TransportState.CONNECTED
-        this.#emit("connection:state", { hubId, state: "connected" })
-      } else if (state === "failed" || state === "disconnected" || state === "closed") {
-        conn.state = TransportState.DISCONNECTED
-        this.#emit("connection:state", { hubId, state: "disconnected" })
-        // Clean up so reconnect can create fresh connection
-        if (conn.dataChannel) {
-          conn.dataChannel.close()
+        // Detect connection mode (P2P vs relayed) and emit both events.
+        // connection:state includes mode for convenience, connection:mode
+        // is separate so listeners that only care about mode can subscribe to it.
+        this.#detectConnectionMode(hubId, conn).then(mode => {
+          this.#emit("connection:state", { hubId, state: "connected", mode })
+          this.#emit("connection:mode", { hubId, mode })
+        })
+      } else if (state === "closed") {
+        // Only clean up on explicit close, not on failed (ICE restart handles that)
+        this.#cleanupConnection(hubId, conn)
+      } else if (state === "failed") {
+        // If ICE restart exhausted, this will fire - clean up and allow full reconnect
+        if (conn.iceRestartAttempts >= ICE_RESTART_MAX_ATTEMPTS) {
+          console.debug(`[WebRTCTransport] Connection failed after ${conn.iceRestartAttempts} ICE restarts, cleaning up`)
+          this.#cleanupConnection(hubId, conn)
         }
-        pc.close()
-        this.#connections.delete(hubId)
       }
     }
 
@@ -357,6 +406,28 @@ class WebRTCTransport {
   }
 
   /**
+   * Get the current connection mode for a hub.
+   * @returns {string} ConnectionMode value (direct, relayed, unknown)
+   */
+  getConnectionMode(hubId) {
+    const conn = this.#connections.get(hubId)
+    return conn?.mode || ConnectionMode.UNKNOWN
+  }
+
+  /**
+   * Force re-detection of connection mode (useful after ICE restart).
+   * Emits connection:mode event with the result.
+   */
+  async refreshConnectionMode(hubId) {
+    const conn = this.#connections.get(hubId)
+    if (!conn) return ConnectionMode.UNKNOWN
+
+    const mode = await this.#detectConnectionMode(hubId, conn)
+    this.#emit("connection:mode", { hubId, mode })
+    return mode
+  }
+
+  /**
    * Subscribe to events
    */
   on(eventName, callback) {
@@ -398,6 +469,147 @@ class WebRTCTransport {
   }
 
   // ========== Private Methods ==========
+
+  /**
+   * Schedule an ICE restart with exponential backoff.
+   * If max attempts exceeded, allows connection to fail for full reconnect.
+   */
+  #scheduleIceRestart(hubId, conn) {
+    // Don't schedule if already pending or max attempts reached
+    if (conn.iceRestartTimer) return
+    if (conn.iceRestartAttempts >= ICE_RESTART_MAX_ATTEMPTS) {
+      console.debug(`[WebRTCTransport] ICE restart max attempts (${ICE_RESTART_MAX_ATTEMPTS}) reached for hub ${hubId}`)
+      return
+    }
+
+    const delay = ICE_RESTART_DELAY_MS * Math.pow(ICE_RESTART_BACKOFF_MULTIPLIER, conn.iceRestartAttempts)
+    console.debug(`[WebRTCTransport] Scheduling ICE restart for hub ${hubId} in ${delay}ms (attempt ${conn.iceRestartAttempts + 1}/${ICE_RESTART_MAX_ATTEMPTS})`)
+
+    conn.iceRestartTimer = setTimeout(() => {
+      conn.iceRestartTimer = null
+      this.#performIceRestart(hubId, conn)
+    }, delay)
+  }
+
+  /**
+   * Perform ICE restart - renegotiate ICE candidates without tearing down the connection.
+   */
+  async #performIceRestart(hubId, conn) {
+    const { pc } = conn
+    if (!pc || pc.connectionState === "closed") return
+
+    conn.iceRestartAttempts++
+    console.debug(`[WebRTCTransport] Performing ICE restart for hub ${hubId} (attempt ${conn.iceRestartAttempts})`)
+
+    try {
+      // Trigger ICE restart
+      pc.restartIce()
+
+      // Create new offer with iceRestart flag
+      const offer = await pc.createOffer({ iceRestart: true })
+      await pc.setLocalDescription(offer)
+
+      // Send encrypted offer via ActionCable
+      const subscription = this.#cableSubscriptions.get(hubId)
+      if (!subscription) {
+        console.error(`[WebRTCTransport] No signaling subscription for ICE restart`)
+        return
+      }
+
+      const envelope = await this.#encryptSignal(hubId, {
+        type: "offer",
+        sdp: offer.sdp,
+      })
+      subscription.perform("signal", { envelope })
+
+      console.debug(`[WebRTCTransport] ICE restart offer sent for hub ${hubId}`)
+    } catch (e) {
+      console.error(`[WebRTCTransport] ICE restart failed for hub ${hubId}:`, e)
+    }
+  }
+
+  /**
+   * Detect connection mode (P2P vs relayed) from ICE candidate pair.
+   * Returns the mode and updates conn.mode.
+   */
+  async #detectConnectionMode(hubId, conn) {
+    const { pc } = conn
+    if (!pc) return ConnectionMode.UNKNOWN
+
+    try {
+      const stats = await pc.getStats()
+      let selectedPairId = null
+      let localCandidateId = null
+
+      // Find the selected candidate pair
+      stats.forEach(report => {
+        if (report.type === "transport" && report.selectedCandidatePairId) {
+          selectedPairId = report.selectedCandidatePairId
+        }
+      })
+
+      // Get the candidate pair
+      if (selectedPairId) {
+        const pair = stats.get(selectedPairId)
+        if (pair) {
+          localCandidateId = pair.localCandidateId
+        }
+      }
+
+      // Get the local candidate type
+      if (localCandidateId) {
+        const localCandidate = stats.get(localCandidateId)
+        if (localCandidate) {
+          const candidateType = localCandidate.candidateType
+          console.debug(`[WebRTCTransport] Selected candidate type: ${candidateType}`)
+
+          // relay = TURN, anything else = P2P
+          const mode = candidateType === "relay" ? ConnectionMode.RELAYED : ConnectionMode.DIRECT
+          conn.mode = mode
+          return mode
+        }
+      }
+
+      // Fallback: check all candidate pairs for the nominated one
+      stats.forEach(report => {
+        if (report.type === "candidate-pair" && report.nominated && report.state === "succeeded") {
+          const localCandidate = stats.get(report.localCandidateId)
+          if (localCandidate) {
+            const candidateType = localCandidate.candidateType
+            console.debug(`[WebRTCTransport] Nominated candidate type: ${candidateType}`)
+            conn.mode = candidateType === "relay" ? ConnectionMode.RELAYED : ConnectionMode.DIRECT
+          }
+        }
+      })
+
+      return conn.mode
+    } catch (e) {
+      console.error(`[WebRTCTransport] Failed to detect connection mode:`, e)
+      return ConnectionMode.UNKNOWN
+    }
+  }
+
+  /**
+   * Clean up a connection and emit disconnected state.
+   */
+  #cleanupConnection(hubId, conn) {
+    // Clear any pending ICE restart
+    if (conn.iceRestartTimer) {
+      clearTimeout(conn.iceRestartTimer)
+      conn.iceRestartTimer = null
+    }
+
+    conn.state = TransportState.DISCONNECTED
+    this.#emit("connection:state", { hubId, state: "disconnected" })
+
+    if (conn.dataChannel) {
+      conn.dataChannel.close()
+    }
+    if (conn.pc) {
+      conn.pc.close()
+    }
+    this.#connections.delete(hubId)
+  }
 
   #emit(eventName, data) {
     const listeners = this.#eventListeners.get(eventName)

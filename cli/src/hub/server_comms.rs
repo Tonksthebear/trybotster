@@ -35,6 +35,7 @@ impl Hub {
         self.poll_webrtc_signaling();
         self.poll_outgoing_webrtc_signals();
         self.poll_webrtc_channels();
+        self.cleanup_disconnected_webrtc_channels();
         self.poll_webrtc_pty_output();
         self.poll_tui_requests();
         self.send_command_channel_heartbeat();
@@ -381,6 +382,116 @@ impl Hub {
                     }
                 }
             }
+        }
+    }
+
+    /// Clean up WebRTC channels that have disconnected or timed out.
+    ///
+    /// When a WebRTC connection fails (ICE failure, network change, etc.),
+    /// the channel transitions to Disconnected state but remains in the map.
+    /// This leaks file descriptors (UDP sockets from ICE gathering) and
+    /// prevents new connections.
+    ///
+    /// Also cleans up connections stuck in "Connecting" state for too long
+    /// (e.g., ICE negotiation that never completes due to network issues).
+    ///
+    /// This function removes stale channels and properly closes them
+    /// to release resources, including aborting any associated PTY forwarders.
+    fn cleanup_disconnected_webrtc_channels(&mut self) {
+        use crate::channel::ConnectionState;
+
+        // Enter tokio runtime for channel state() calls
+        let _guard = self.tokio_runtime.enter();
+
+        // Timeout for connections stuck in "Connecting" state (30 seconds)
+        const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+        let now = Instant::now();
+
+        // Collect IDs of channels that need cleanup:
+        // 1. Disconnected channels
+        // 2. Channels stuck in Connecting state for too long
+        let to_cleanup: Vec<(String, &'static str)> = self
+            .webrtc_channels
+            .iter()
+            .filter_map(|(id, ch)| {
+                let state = ch.state();
+                if state == ConnectionState::Disconnected {
+                    Some((id.clone(), "disconnected"))
+                } else if state == ConnectionState::Connecting {
+                    // Check if connection has timed out
+                    if let Some(started) = self.webrtc_connection_started.get(id) {
+                        if now.duration_since(*started) > CONNECTION_TIMEOUT {
+                            return Some((id.clone(), "timeout"));
+                        }
+                    }
+                    None
+                } else {
+                    // Connection is Connected - remove from start tracking
+                    None
+                }
+            })
+            .collect();
+
+        // Also clean up tracking for connections that reached Connected state
+        let connected: Vec<String> = self
+            .webrtc_channels
+            .iter()
+            .filter(|(_, ch)| ch.state() == ConnectionState::Connected)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in connected {
+            self.webrtc_connection_started.remove(&id);
+        }
+
+        // Clean up stale channels
+        for (browser_identity, reason) in to_cleanup {
+            self.cleanup_webrtc_channel(&browser_identity, reason);
+        }
+    }
+
+    /// Clean up a single WebRTC channel and its associated resources.
+    ///
+    /// This is the centralized cleanup point that:
+    /// 1. Removes and disconnects the WebRTC channel
+    /// 2. Removes connection start time tracking
+    /// 3. Aborts any PTY forwarder tasks for this browser
+    /// 4. Notifies Lua of peer disconnection
+    fn cleanup_webrtc_channel(&mut self, browser_identity: &str, reason: &str) {
+        log::info!(
+            "[WebRTC] Cleaning up {} channel: {}",
+            reason,
+            &browser_identity[..browser_identity.len().min(8)]
+        );
+
+        // Remove and disconnect the channel (fire-and-forget to avoid deadlock)
+        if let Some(mut channel) = self.webrtc_channels.remove(browser_identity) {
+            self.tokio_runtime.spawn(async move {
+                channel.disconnect().await;
+            });
+        }
+
+        // Remove connection start time tracking
+        self.webrtc_connection_started.remove(browser_identity);
+
+        // Abort any PTY forwarders for this browser.
+        // Forwarder keys are "{peer_id}:{agent_index}:{pty_index}" where peer_id = browser_identity
+        let forwarders_to_remove: Vec<String> = self
+            .webrtc_pty_forwarders
+            .keys()
+            .filter(|key| key.starts_with(browser_identity))
+            .cloned()
+            .collect();
+
+        for key in forwarders_to_remove {
+            if let Some(task) = self.webrtc_pty_forwarders.remove(&key) {
+                task.abort();
+                log::debug!("[WebRTC] Aborted PTY forwarder: {}", key);
+            }
+        }
+
+        // Notify Lua of peer disconnection (Lua handles subscription cleanup)
+        if let Err(e) = self.lua.call_peer_disconnected(browser_identity) {
+            log::warn!("[WebRTC] Lua peer_disconnected callback error: {e}");
         }
     }
 
@@ -1384,6 +1495,10 @@ impl Hub {
 
             self.webrtc_channels
                 .insert(browser_identity.to_string(), channel);
+
+            // Track connection start time for timeout detection
+            self.webrtc_connection_started
+                .insert(browser_identity.to_string(), Instant::now());
 
             // Notify Lua of peer connection
             if let Err(e) = self.lua.call_peer_connected(browser_identity) {

@@ -74,6 +74,7 @@ class WorkerBridge {
 
       // Wire up event forwarding from WebRTCTransport
       webrtcTransport.on("connection:state", (data) => this.#dispatchEvent(data))
+      webrtcTransport.on("connection:mode", (data) => this.#dispatchEvent({ event: "connection:mode", ...data }))
       webrtcTransport.on("subscription:message", (data) => this.#dispatchEvent({ event: "subscription:message", ...data }))
       webrtcTransport.on("subscription:confirmed", (data) => this.#dispatchEvent({ event: "subscription:confirmed", ...data }))
 

@@ -52,6 +52,13 @@ export const CliStatus = {
   DISCONNECTED: "disconnected", // CLI was connected but disconnected
 }
 
+// Connection mode (P2P vs relayed through TURN)
+export const ConnectionMode = {
+  UNKNOWN: "unknown",
+  DIRECT: "direct",    // P2P connection (host, srflx, prflx)
+  RELAYED: "relayed",  // Relayed through TURN server
+}
+
 // Handshake timeout in milliseconds
 const HANDSHAKE_TIMEOUT_MS = 8000
 
@@ -83,6 +90,7 @@ export class Connection {
     // Two-sided status tracking
     this.browserStatus = BrowserStatus.DISCONNECTED
     this.cliStatus = CliStatus.UNKNOWN
+    this.connectionMode = ConnectionMode.UNKNOWN
 
     // Event subscribers: Map<eventName, Set<callback>>
     this.subscribers = new Map()
@@ -326,27 +334,54 @@ export class Connection {
         this.#setBrowserStatus(BrowserStatus.DISCONNECTED)
         this.#setState(ConnectionState.DISCONNECTED)
         this.emit("disconnected")
-      } else if (event.state === "connected" && !this.#hubConnected) {
-        this.#hubConnected = true
-        this.emit("reconnected")
 
-        // Auto-resubscribe after reconnection - old subscription is stale
-        if (this.subscriptionId) {
-          console.debug(`[${this.constructor.name}] Auto-resubscribing after reconnect`)
-          // Clear stale subscription ID and resubscribe
-          const oldSubId = this.subscriptionId
-          this.subscriptionId = null
-          this.#clearSubscriptionEventListeners()
-          bridge.clearSubscriptionListeners(oldSubId)
+        // Auto-reconnect after ICE restart exhaustion (full reconnect as fallback)
+        // WebRTCTransport handles ICE restarts internally; if we get here, those failed
+        setTimeout(() => {
+          if (this.state === ConnectionState.DISCONNECTED) {
+            console.debug(`[${this.constructor.name}] Auto-reconnecting after disconnect...`)
+            this.connect().catch(err => {
+              console.error(`[${this.constructor.name}] Auto-reconnect failed:`, err)
+            })
+          }
+        }, 2000)
+      } else if (event.state === "connected") {
+        // Always update mode when provided (may arrive after initial connection
+        // or change after ICE restart). Mode detection is async, so the first
+        // "connected" event may not have mode yet.
+        if (event.mode) {
+          this.#setConnectionMode(event.mode)
+        }
 
-          this.subscribe().catch(err => {
-            console.error(`[${this.constructor.name}] Resubscribe failed:`, err)
-            this.#setError("resubscribe_failed", err.message)
-          })
+        if (!this.#hubConnected) {
+          this.#hubConnected = true
+          this.emit("reconnected")
+
+          // Auto-resubscribe after reconnection - old subscription is stale
+          if (this.subscriptionId) {
+            console.debug(`[${this.constructor.name}] Auto-resubscribing after reconnect`)
+            // Clear stale subscription ID and resubscribe
+            const oldSubId = this.subscriptionId
+            this.subscriptionId = null
+            this.#clearSubscriptionEventListeners()
+            bridge.clearSubscriptionListeners(oldSubId)
+
+            this.subscribe().catch(err => {
+              console.error(`[${this.constructor.name}] Resubscribe failed:`, err)
+              this.#setError("resubscribe_failed", err.message)
+            })
+          }
         }
       }
     })
     this.#unsubscribers.push(unsubState)
+
+    // Listen for connection mode changes (after ICE restart, path may change)
+    const unsubMode = bridge.on("connection:mode", (event) => {
+      if (event.hubId !== hubId) return
+      this.#setConnectionMode(event.mode)
+    })
+    this.#unsubscribers.push(unsubMode)
 
     // Listen for health events from ActionCable signaling channel
     // Health messages arrive via HubSignalingChannel → WebRTCTransport → bridge
@@ -728,6 +763,11 @@ export class Connection {
     this.handshakeComplete = true
     console.debug(`[${this.constructor.name}] Handshake complete`)
 
+    // Update CLI status to CONNECTED now that E2E handshake is done.
+    // This is the definitive "CLI is talking to us" signal - health messages
+    // via ActionCable may lag behind the actual WebRTC connection state.
+    this.cliStatus = CliStatus.CONNECTED
+
     // Update state to CONNECTED now that E2E is established
     this.#setState(ConnectionState.CONNECTED)
     this.#emitHealthChange()
@@ -953,6 +993,16 @@ export class Connection {
 
     this.emit("browserStatusChange", { status: newStatus, prevStatus })
     this.#emitHealthChange()
+  }
+
+  #setConnectionMode(newMode) {
+    const prevMode = this.connectionMode
+    if (newMode === prevMode) return
+
+    this.connectionMode = newMode
+    console.debug(`[${this.constructor.name}] Connection mode: ${prevMode} → ${newMode}`)
+
+    this.emit("connectionModeChange", { mode: newMode, prevMode })
   }
 
   /**

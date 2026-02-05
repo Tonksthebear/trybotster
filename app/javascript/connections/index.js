@@ -29,7 +29,7 @@
  */
 
 export { ConnectionManager } from "connections/connection_manager";
-export { Connection, ConnectionState, BrowserStatus, CliStatus } from "connections/connection";
+export { Connection, ConnectionState, BrowserStatus, CliStatus, ConnectionMode } from "connections/connection";
 export { HubConnection } from "connections/hub_connection";
 export { TerminalConnection } from "connections/terminal_connection";
 export { PreviewConnection } from "connections/preview_connection";
