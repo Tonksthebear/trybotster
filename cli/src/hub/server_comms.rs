@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::agent::AgentNotification;
 use crate::channel::Channel;
 use crate::hub::actions::{self, HubAction};
-use crate::hub::{command_channel, registration, workers, Hub};
+use crate::hub::{command_channel, registration, workers, Hub, WebRtcPtyOutput};
 use crate::server::messages::ParsedMessage;
 
 impl Hub {
@@ -37,6 +37,7 @@ impl Hub {
         self.poll_webrtc_channels();
         self.cleanup_disconnected_webrtc_channels();
         self.poll_webrtc_pty_output();
+        self.poll_pty_observers();
         self.poll_tui_requests();
         self.send_command_channel_heartbeat();
         self.poll_agent_notifications_async();
@@ -789,7 +790,6 @@ impl Hub {
         let _guard = self.tokio_runtime.enter();
         let task = tokio::spawn(async move {
             use crate::agent::pty::PtyEvent;
-            use crate::hub::WebRtcPtyOutput;
 
             log::info!(
                 "[Lua] Started PTY forwarder for peer {} agent {} pty {}",
@@ -816,6 +816,8 @@ impl Hub {
                         subscription_id: subscription_id.clone(),
                         browser_identity: peer_id.clone(),
                         data: raw_message,
+                        agent_index,
+                        pty_index,
                     })
                     .is_err()
                 {
@@ -847,6 +849,8 @@ impl Hub {
                                 subscription_id: subscription_id.clone(),
                                 browser_identity: peer_id.clone(),
                                 data: raw_message,
+                                agent_index,
+                                pty_index,
                             })
                             .is_err()
                         {
@@ -1190,11 +1194,79 @@ impl Hub {
 
     /// Poll for queued PTY output and send via WebRTC.
     ///
-    /// Forwarder tasks queue `WebRtcPtyOutput` messages; this drains and sends them.
+    /// Forwarder tasks queue [`WebRtcPtyOutput`] messages; this drains and
+    /// sends them. If interceptors are registered, they run synchronously
+    /// (opt-in blocking). If observers are registered, notifications are
+    /// queued for [`Self::poll_pty_observers`] — never inline.
     fn poll_webrtc_pty_output(&mut self) {
+        use crate::hub::PtyObserverNotification;
+        use crate::lua::primitives::PtyOutputContext;
+
         // Drain all pending PTY output messages
-        while let Ok(msg) = self.webrtc_pty_output_rx.try_recv() {
-            self.send_webrtc_raw(&msg.subscription_id, &msg.browser_identity, msg.data);
+        let messages: Vec<WebRtcPtyOutput> =
+            std::iter::from_fn(|| self.webrtc_pty_output_rx.try_recv().ok()).collect();
+
+        let has_interceptors = self.lua.has_interceptors("pty_output");
+        let has_observers = self.lua.has_observers("pty_output");
+
+        for msg in messages {
+            let ctx = PtyOutputContext {
+                agent_index: msg.agent_index,
+                pty_index: msg.pty_index,
+                peer_id: msg.browser_identity.clone(),
+            };
+
+            // Interceptors: sync, opt-in blocking, can transform or drop
+            let final_data = if has_interceptors {
+                match self.lua.call_pty_output_interceptors(&ctx, &msg.data) {
+                    Ok(Some(transformed)) => transformed,
+                    Ok(None) => continue, // Dropped by interceptor
+                    Err(e) => {
+                        log::warn!("PTY interceptor error: {}", e);
+                        msg.data // Fallback to original on error
+                    }
+                }
+            } else {
+                msg.data
+            };
+
+            // Fast path: send to browser immediately
+            self.send_webrtc_raw(&msg.subscription_id, &msg.browser_identity, final_data.clone());
+
+            // Observers: queue for async processing, never block here
+            if has_observers {
+                // Drop oldest if queue is full
+                if self.pty_observer_queue.len() >= super::PTY_OBSERVER_QUEUE_CAPACITY {
+                    self.pty_observer_queue.pop_front();
+                }
+                self.pty_observer_queue.push_back(PtyObserverNotification {
+                    ctx,
+                    data: final_data,
+                });
+            }
+        }
+    }
+
+    /// Drain pending PTY observer notifications (budget-limited).
+    ///
+    /// Called separately from [`Self::poll_webrtc_pty_output`] so slow
+    /// observers never block the WebRTC send path. Processes up to
+    /// `OBSERVER_BUDGET_PER_TICK` notifications per tick to keep the
+    /// main loop responsive.
+    fn poll_pty_observers(&mut self) {
+        /// Max observer callbacks per tick to prevent stalling the event loop.
+        const OBSERVER_BUDGET_PER_TICK: usize = 64;
+
+        if self.pty_observer_queue.is_empty() {
+            return;
+        }
+
+        let budget = OBSERVER_BUDGET_PER_TICK.min(self.pty_observer_queue.len());
+        for _ in 0..budget {
+            let Some(notification) = self.pty_observer_queue.pop_front() else {
+                break;
+            };
+            self.lua.notify_pty_output_observers(&notification.ctx, &notification.data);
         }
     }
 

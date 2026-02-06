@@ -54,8 +54,10 @@ export default class extends Controller {
   // ========== Private ==========
 
   async #acquireConnection() {
+    // HTML defaults to "connecting" for both sections - keep that state
+    // while the async connection work happens
     this.#setBrowserStatus("connecting");
-    this.#setConnectionState("disconnected");
+    this.#setConnectionState("connecting");
 
     try {
       const ConnectionClass = this.#getConnectionClass();
@@ -99,30 +101,30 @@ export default class extends Controller {
         })
       );
 
-      // Listen for reconnected event
+      // Listen for errors - session_invalid shows "expired", others show "disconnected"
       this.unsubscribers.push(
-        this.connection.on("reconnected", () => {
-          this.#setConnectionState("connecting");
+        this.connection.on("error", ({ reason }) => {
+          if (reason === "session_invalid") {
+            this.#setConnectionState("expired");
+          } else {
+            this.#setConnectionState("disconnected");
+          }
         })
       );
 
-      // Listen for errors - show as disconnected (only 4 states: disconnected, connecting, direct, relay)
-      this.unsubscribers.push(
-        this.connection.on("error", () => {
-          this.#setConnectionState("disconnected");
-        })
-      );
-
-      // Subscribe
-      await this.connection.subscribe();
-
-      // Apply current status
+      // Apply current browser status — browser is already green
+      // (WebSocket connected via signaling), connection stays orange.
+      // Don't apply health here — CLI status is likely UNKNOWN and would
+      // regress the server-rendered hub status to "offline". The health
+      // event from ActionCable will update the hub section when it arrives.
       this.#handleBrowserStatusChange(this.connection.browserStatus);
-      this.#handleHealthChange(this.connection.browserStatus, this.connection.cliStatus);
 
-      // If already connected, set connection state
+      // If already connected (reacquired after Turbo nav), sync state immediately.
+      // Otherwise, health events will drive peer connection + subscribe,
+      // and event listeners above will update the UI as it progresses.
       if (this.connection.isConnected()) {
         this.#updateConnectionState();
+        this.#handleHealthChange(this.connection.browserStatus, this.connection.cliStatus);
       }
     } catch (error) {
       console.error("[ConnectionStatus] Failed to acquire connection:", error);

@@ -87,8 +87,8 @@ export default class extends Controller {
         }),
       );
 
-      // Subscribe if not already subscribed
-      await this.hub.subscribe();
+      // No explicit subscribe() — health events drive the WebRTC lifecycle.
+      // onConnected above fires when handshake completes (or immediately if already connected).
     });
   }
 

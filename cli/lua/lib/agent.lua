@@ -189,8 +189,8 @@ function Agent.new(config)
     -- Register in agent registry
     agents[key] = self
 
-    -- Fire after_agent_create hook
-    hooks.call("after_agent_create", self)
+    -- Notify observers
+    hooks.notify("after_agent_create", self)
 
     log.info(string.format("Agent created: %s (sessions: %d)", key, self:session_count()))
     return self
@@ -218,8 +218,8 @@ end
 function Agent:close(delete_worktree)
     local key = self:agent_key()
 
-    -- Fire before_agent_close hook
-    hooks.call("before_agent_close", self)
+    -- Notify observers
+    hooks.notify("before_agent_close", self)
 
     -- Unregister from HandleCache (before killing sessions)
     local ok, err = pcall(hub.unregister_agent, key)
@@ -250,8 +250,8 @@ function Agent:close(delete_worktree)
         end
     end
 
-    -- Fire after_agent_close hook
-    hooks.call("after_agent_close", self)
+    -- Notify observers
+    hooks.notify("after_agent_close", self)
 
     log.info(string.format("Agent closed: %s (delete_worktree=%s)", key, tostring(delete_worktree or false)))
 end

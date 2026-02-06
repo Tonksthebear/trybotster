@@ -367,12 +367,8 @@ function Client:handle_hub_data(sub_id, command)
         local prompt = command.prompt
         local from_worktree = command.from_worktree
 
-        if issue_or_branch then
-            get_agents_handler().handle_create_agent(issue_or_branch, prompt, from_worktree, self)
-            log.info(string.format("Create agent request: %s", issue_or_branch))
-        else
-            log.warn("create_agent missing issue_or_branch")
-        end
+        get_agents_handler().handle_create_agent(issue_or_branch, prompt, from_worktree, self)
+        log.info(string.format("Create agent request: %s", tostring(issue_or_branch or "main")))
 
     elseif cmd_type == "reopen_worktree" then
         local path = command.path

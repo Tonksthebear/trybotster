@@ -1,121 +1,224 @@
--- Hook system for event callbacks
+-- Hook system: observers and interceptors
+--
+-- OBSERVERS: Async, safe, fire-and-forget. Cannot block or transform data.
+--   hooks.on("pty_output", "my_logger", fn)
+--   hooks.notify("pty_output", ctx, data)
+--
+-- INTERCEPTORS: Sync, blocking, can transform/drop. Use sparingly.
+--   hooks.intercept("pty_output", "my_filter", fn, { timeout_ms = 10 })
+--   hooks.call("pty_output", ctx, data) -> transformed or nil
+--
 local M = {}
 
--- Storage: hooks[event_name][hook_name] = { callback, priority, enabled }
-local hooks = {}
+-- Storage: observers[event][name] = { callback, priority, enabled }
+local observers = {}
 
--- Register a hook
--- options: { priority = 100, enabled = true }
-function M.register(event_name, hook_name, callback, options)
-    options = options or {}
-    local priority = options.priority or 100
-    local enabled = options.enabled ~= false
+-- Storage: interceptors[event][name] = { callback, priority, enabled, timeout_ms }
+local interceptors = {}
 
-    if not hooks[event_name] then
-        hooks[event_name] = {}
-    end
+-- =============================================================================
+-- OBSERVERS
+-- =============================================================================
 
-    hooks[event_name][hook_name] = {
+--- Register an observer. Observers are notified asynchronously and cannot
+--- affect data flow. Use for logging, metrics, side effects.
+---
+--- @param event string Event name
+--- @param name string Unique hook name
+--- @param callback function Called with event args (return value ignored)
+--- @param opts? table { priority = 100, enabled = true }
+function M.on(event, name, callback, opts)
+    opts = opts or {}
+    observers[event] = observers[event] or {}
+    observers[event][name] = {
         callback = callback,
-        priority = priority,
-        enabled = enabled,
+        priority = opts.priority or 100,
+        enabled = opts.enabled ~= false,
     }
-
-    log.debug(string.format("Hook registered: %s.%s (priority=%d)", event_name, hook_name, priority))
+    log.debug(string.format("hooks.on: %s.%s", event, name))
 end
 
--- Unregister a hook
-function M.unregister(event_name, hook_name)
-    if hooks[event_name] then
-        hooks[event_name][hook_name] = nil
-        log.debug(string.format("Hook unregistered: %s.%s", event_name, hook_name))
+--- Remove an observer.
+function M.off(event, name)
+    if observers[event] then
+        observers[event][name] = nil
     end
 end
 
--- Enable/disable without removing
-function M.enable(event_name, hook_name)
-    if hooks[event_name] and hooks[event_name][hook_name] then
-        hooks[event_name][hook_name].enabled = true
-    end
-end
-
-function M.disable(event_name, hook_name)
-    if hooks[event_name] and hooks[event_name][hook_name] then
-        hooks[event_name][hook_name].enabled = false
-    end
-end
-
--- Check if any hooks are registered for an event
-function M.has(event_name)
-    if not hooks[event_name] then
-        return false
-    end
-    for _, hook in pairs(hooks[event_name]) do
-        if hook.enabled then
-            return true
-        end
+--- Check if observers exist for an event.
+function M.has_observers(event)
+    if not observers[event] then return false end
+    for _, h in pairs(observers[event]) do
+        if h.enabled then return true end
     end
     return false
 end
 
---- Execute hook chain (sorted by priority, higher first).
---
--- LIMITATIONS:
--- - Multi-value returns are NOT preserved through the chain. Only the first
---   return value from each hook is passed to the next hook.
--- - If a hook returns nil (explicit or implicit), the data is DROPPED and
---   nil is returned to the caller. Hooks that want to pass data through
---   MUST return a value.
--- - When no hooks are registered, returns the original arguments unchanged.
---
--- @param event_name The event to fire
--- @param ... Arguments to pass to hooks
--- @return Transformed data from hook chain, or nil if any hook dropped it
-function M.call(event_name, ...)
-    if not hooks[event_name] then
-        return ...
-    end
+--- Notify all observers (fire-and-forget). Errors logged, not propagated.
+--- @param event string Event name
+--- @param ... any Arguments passed to observers
+--- @return number Number of observers called
+function M.notify(event, ...)
+    if not observers[event] then return 0 end
 
-    -- Sort hooks by priority (higher priority first)
     local sorted = {}
-    for name, hook in pairs(hooks[event_name]) do
-        if hook.enabled then
-            table.insert(sorted, { name = name, hook = hook })
+    for name, h in pairs(observers[event]) do
+        if h.enabled then
+            table.insert(sorted, { name = name, h = h })
         end
     end
-    table.sort(sorted, function(a, b) return a.hook.priority > b.hook.priority end)
+    table.sort(sorted, function(a, b) return a.h.priority > b.h.priority end)
 
-    -- Execute chain
+    local count = 0
+    local args = { ... }
+    for _, entry in ipairs(sorted) do
+        local ok, err = pcall(entry.h.callback, table.unpack(args))
+        if not ok then
+            log.error(string.format("hooks.notify %s.%s: %s", event, entry.name, err))
+        end
+        count = count + 1
+    end
+    return count
+end
+
+-- =============================================================================
+-- INTERCEPTORS
+-- =============================================================================
+
+--- Register an interceptor. Interceptors run synchronously and can transform
+--- or drop data. WARNING: Blocks the pipeline. Use timeout_ms to limit damage.
+---
+--- @param event string Event name
+--- @param name string Unique hook name
+--- @param callback function Must return transformed data or nil to drop
+--- @param opts? table { priority = 100, enabled = true, timeout_ms = 10 }
+function M.intercept(event, name, callback, opts)
+    opts = opts or {}
+    interceptors[event] = interceptors[event] or {}
+    interceptors[event][name] = {
+        callback = callback,
+        priority = opts.priority or 100,
+        enabled = opts.enabled ~= false,
+        timeout_ms = opts.timeout_ms or 10,
+    }
+    log.debug(string.format("hooks.intercept: %s.%s (timeout=%dms)",
+        event, name, opts.timeout_ms or 10))
+end
+
+--- Remove an interceptor.
+function M.unintercept(event, name)
+    if interceptors[event] then
+        interceptors[event][name] = nil
+    end
+end
+
+--- Check if interceptors exist for an event.
+function M.has_interceptors(event)
+    if not interceptors[event] then return false end
+    for _, h in pairs(interceptors[event]) do
+        if h.enabled then return true end
+    end
+    return false
+end
+
+--- Call interceptor chain. Each can transform or drop (return nil).
+--- @param event string Event name
+--- @param ... any Arguments passed through chain
+--- @return any Transformed result, or nil if dropped
+function M.call(event, ...)
+    if not interceptors[event] then return ... end
+
+    local sorted = {}
+    for name, h in pairs(interceptors[event]) do
+        if h.enabled then
+            table.insert(sorted, { name = name, h = h })
+        end
+    end
+    table.sort(sorted, function(a, b) return a.h.priority > b.h.priority end)
+
     local result = { ... }
     for _, entry in ipairs(sorted) do
-        local ok, new_result = pcall(entry.hook.callback, table.unpack(result))
+        local ok, new_result = pcall(entry.h.callback, table.unpack(result))
         if not ok then
-            log.error(string.format("Hook %s.%s error: %s", event_name, entry.name, tostring(new_result)))
+            log.error(string.format("hooks.call %s.%s: %s", event, entry.name, new_result))
             -- Continue with previous result on error
         elseif new_result == nil then
-            -- Hook returned nil (explicit or implicit), signal to drop data.
-            -- WARNING: Hooks that forget to return a value will drop data!
-            return nil
+            return nil -- Dropped
         else
             result = { new_result }
         end
     end
-
     return table.unpack(result)
 end
 
--- List hooks for an event (for debugging)
-function M.list(event_name)
+-- =============================================================================
+-- UTILITIES
+-- =============================================================================
+
+--- Enable a hook (observer or interceptor).
+function M.enable(event, name)
+    if observers[event] and observers[event][name] then
+        observers[event][name].enabled = true
+    end
+    if interceptors[event] and interceptors[event][name] then
+        interceptors[event][name].enabled = true
+    end
+end
+
+--- Disable a hook without removing it.
+function M.disable(event, name)
+    if observers[event] and observers[event][name] then
+        observers[event][name].enabled = false
+    end
+    if interceptors[event] and interceptors[event][name] then
+        interceptors[event][name].enabled = false
+    end
+end
+
+--- List all hooks for an event.
+function M.list(event)
     local result = {}
-    if hooks[event_name] then
-        for name, hook in pairs(hooks[event_name]) do
+    if observers[event] then
+        for name, h in pairs(observers[event]) do
             table.insert(result, {
                 name = name,
-                priority = hook.priority,
-                enabled = hook.enabled,
+                type = "observer",
+                priority = h.priority,
+                enabled = h.enabled,
             })
         end
     end
+    if interceptors[event] then
+        for name, h in pairs(interceptors[event]) do
+            table.insert(result, {
+                name = name,
+                type = "interceptor",
+                priority = h.priority,
+                enabled = h.enabled,
+                timeout_ms = h.timeout_ms,
+            })
+        end
+    end
+    return result
+end
+
+--- List all events with registered hooks.
+function M.list_events()
+    local seen = {}
+    local result = {}
+    for event in pairs(observers) do
+        if not seen[event] then
+            table.insert(result, event)
+            seen[event] = true
+        end
+    end
+    for event in pairs(interceptors) do
+        if not seen[event] then
+            table.insert(result, event)
+            seen[event] = true
+        end
+    end
+    table.sort(result)
     return result
 end
 

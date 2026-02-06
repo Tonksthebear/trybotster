@@ -70,6 +70,7 @@ use crate::lua::LuaRuntime;
 /// Queued PTY output message for WebRTC delivery.
 ///
 /// Spawned forwarder tasks queue these messages; the main loop drains and sends.
+/// Includes context for hook processing.
 #[derive(Debug)]
 pub struct WebRtcPtyOutput {
     /// Subscription ID for routing on the browser side.
@@ -78,7 +79,29 @@ pub struct WebRtcPtyOutput {
     pub browser_identity: String,
     /// Raw PTY data (already prefixed with 0x01 for terminal output).
     pub data: Vec<u8>,
+    /// Agent index for hook context.
+    pub agent_index: usize,
+    /// PTY index for hook context.
+    pub pty_index: usize,
 }
+
+/// Pending observer notification for PTY output.
+///
+/// Queued during [`Hub::poll_webrtc_pty_output`] and drained separately in
+/// [`Hub::poll_pty_observers`] to avoid blocking the WebRTC send path.
+#[derive(Debug)]
+pub struct PtyObserverNotification {
+    /// Context for the hook callback.
+    pub ctx: crate::lua::primitives::PtyOutputContext,
+    /// Data that was sent (post-interception).
+    pub data: Vec<u8>,
+}
+
+/// Maximum pending observer notifications before oldest are dropped.
+///
+/// Prevents unbounded memory growth if observers are registered but
+/// the Lua callback is slow. At ~4KB per PTY chunk this caps at ~4MB.
+const PTY_OBSERVER_QUEUE_CAPACITY: usize = 1024;
 
 /// Generate a stable hub_identifier from a repo path.
 ///
@@ -184,6 +207,13 @@ pub struct Hub {
     // === Lua Scripting ===
     /// Lua scripting runtime for hot-reloadable behavior customization.
     pub lua: LuaRuntime,
+
+    /// Pending PTY output observer notifications.
+    ///
+    /// Populated during [`Self::poll_webrtc_pty_output`] (after WebRTC send),
+    /// drained independently in [`Self::poll_pty_observers`] so slow observers
+    /// never block the WebRTC fast path.
+    pty_observer_queue: std::collections::VecDeque<PtyObserverNotification>,
 
     // === TUI via Lua (Hub-side Processing) ===
     /// Sender for TUI output messages to TuiRunner.
@@ -291,6 +321,7 @@ impl Hub {
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx,
             lua,
+            pty_observer_queue: std::collections::VecDeque::new(),
             tui_output_tx: None,
             tui_request_rx: None,
         })

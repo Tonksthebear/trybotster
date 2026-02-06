@@ -72,15 +72,21 @@
 //!
 //! # Hook Integration
 //!
-//! If hooks are registered for "pty_output", Rust will call them for each output:
+//! Two hook types for PTY output:
 //!
 //! ```lua
-//! hooks.register("pty_output", function(ctx, data)
+//! -- OBSERVER: Async, safe, cannot block or transform
+//! hooks.on("pty_output", "my_logger", function(ctx, data)
 //!     -- ctx contains: agent_index, pty_index, peer_id
 //!     -- data is the raw output bytes
-//!     -- Return transformed data, or nil to drop
-//!     return data
+//!     log.info("Got " .. #data .. " bytes from PTY")
 //! end)
+//!
+//! -- INTERCEPTOR: Sync, blocking, can transform/drop (use sparingly!)
+//! hooks.intercept("pty_output", "my_filter", function(ctx, data)
+//!     -- Return transformed data, or nil to drop
+//!     return data:gsub("secret", "***")
+//! end, { timeout_ms = 10 })
 //! ```
 
 use std::collections::{HashMap, VecDeque};

@@ -17,6 +17,21 @@
     </div>
 
     <div class="flex-1 overflow-y-auto">
+      <%# Main Branch Option %>
+      <div class="p-5 pb-0">
+        <button type="button"
+                data-action="new-agent-form#selectMainBranch"
+                class="w-full text-left px-3 py-2.5 rounded-lg border border-zinc-700 hover:border-primary-500/50 hover:bg-zinc-800/50 text-zinc-300 transition-colors">
+          <div class="flex items-center gap-2">
+            <svg class="w-4 h-4 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
+            </svg>
+            <span class="text-sm font-medium text-zinc-200">Main Branch</span>
+            <span class="text-xs text-zinc-500 ml-auto">no worktree</span>
+          </div>
+        </button>
+      </div>
+
       <%# Existing Worktrees Section %>
       <div class="p-5">
         <div class="flex items-center gap-2 mb-3">
