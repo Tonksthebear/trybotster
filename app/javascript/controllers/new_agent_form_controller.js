@@ -56,8 +56,8 @@ export default class extends Controller {
         }),
       );
 
-      // Subscribe if not already subscribed
-      await this.hub.subscribe();
+      // No explicit subscribe() — health events drive the WebRTC lifecycle.
+      // onConnected above fires when handshake completes.
     });
   }
 
@@ -80,6 +80,12 @@ export default class extends Controller {
 
     this.pendingSelection = { type: "existing", path, branch };
     this.#goToStep2(branch);
+  }
+
+  // Action: Spawn agent on main branch (no worktree)
+  selectMainBranch() {
+    this.pendingSelection = { type: "main" };
+    this.#goToStep2("main branch");
   }
 
   // Action: Create new branch/issue
@@ -124,6 +130,10 @@ export default class extends Controller {
       this.hub.send("reopen_worktree", {
         path: this.pendingSelection.path,
         branch: this.pendingSelection.branch,
+        prompt: prompt || null,
+      });
+    } else if (this.pendingSelection.type === "main") {
+      this.hub.send("create_agent", {
         prompt: prompt || null,
       });
     } else {

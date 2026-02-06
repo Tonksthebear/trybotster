@@ -50,7 +50,8 @@ const ICE_RESTART_BACKOFF_MULTIPLIER = 2 // Exponential backoff
 
 class WebRTCTransport {
   #connections = new Map() // hubId -> { pc, dataChannel, state, subscriptions }
-  #connectPromises = new Map() // hubId -> Promise (pending connection)
+  #connectPromises = new Map() // hubId -> Promise (pending connect())
+  #peerConnectPromises = new Map() // hubId -> Promise (pending connectPeer())
   #eventListeners = new Map() // eventName -> Set<callback>
   #subscriptionListeners = new Map() // subscriptionId -> Set<callback>
   #pendingSubscriptions = new Map() // subscriptionId -> { resolve, reject, timeout }
@@ -92,68 +93,103 @@ class WebRTCTransport {
   }
 
   /**
-   * Connect to a hub via WebRTC.
+   * Connect to a hub via WebRTC (signaling + peer connection).
    * Multiple callers share the same connection - subsequent calls wait for
    * the pending connection or return the existing one.
    */
   async connect(hubId, browserIdentity) {
-    // Cancel any pending grace period disconnect for this hub
     this.#cancelGracePeriod(hubId)
 
-    // If already connected, return existing connection
     let conn = this.#connections.get(hubId)
-    if (conn) {
-      return { state: conn.state }
-    }
+    if (conn?.pc) return { state: conn.state }
 
-    // If connection in progress, wait for it
+    // If signaling exists but no peer, just add peer
+    if (conn && !conn.pc) return this.connectPeer(hubId)
+
     const pendingPromise = this.#connectPromises.get(hubId)
-    if (pendingPromise) {
-      return pendingPromise
-    }
+    if (pendingPromise) return pendingPromise
 
-    // Create connection promise for other callers to wait on
-    const connectPromise = this.#doConnect(hubId, browserIdentity)
+    const connectPromise = (async () => {
+      await this.connectSignaling(hubId, browserIdentity)
+      return this.connectPeer(hubId)
+    })()
     this.#connectPromises.set(hubId, connectPromise)
 
     try {
-      const result = await connectPromise
-      return result
+      return await connectPromise
     } finally {
       this.#connectPromises.delete(hubId)
     }
   }
 
   /**
-   * Internal: Actually establish the WebRTC connection.
-   * Signaling flows through ActionCable with encrypted envelopes.
+   * Connect ActionCable signaling channel only (no WebRTC peer connection).
+   * Health messages flow immediately. Call connectPeer() later to start WebRTC.
    */
-  async #doConnect(hubId, browserIdentity) {
-    // Fetch ICE server configuration (HTTP GET — just config, not signaling)
-    const iceConfig = await this.#fetchIceConfig(hubId)
+  async connectSignaling(hubId, browserIdentity) {
+    this.#cancelGracePeriod(hubId)
 
-    // Create peer connection
-    const pc = new RTCPeerConnection({ iceServers: iceConfig.ice_servers })
+    let conn = this.#connections.get(hubId)
+    if (conn) return { state: conn.state }
 
-    const conn = {
-      pc,
+    const conn2 = {
+      pc: null,
       dataChannel: null,
-      state: TransportState.CONNECTING,
+      state: TransportState.DISCONNECTED,
       mode: ConnectionMode.UNKNOWN,
       hubId,
       browserIdentity,
       subscriptions: new Map(),
       pendingCandidates: [],
-      // ICE restart tracking
       iceRestartAttempts: 0,
       iceRestartTimer: null,
+      iceDisrupted: false,
+      decryptFailures: 0,
     }
-    this.#connections.set(hubId, conn)
+    this.#connections.set(hubId, conn2)
 
-    // Subscribe to ActionCable signaling channel FIRST (to receive answer/ICE/health)
-    const subscription = await this.#createSignalingChannel(hubId, browserIdentity)
+    await this.#createSignalingChannel(hubId, browserIdentity)
 
-    // ICE candidate handler — encrypt and send via ActionCable
+    return { state: TransportState.DISCONNECTED }
+  }
+
+  /**
+   * Create WebRTC peer connection on an existing signaling channel.
+   * Fetches ICE config, creates RTCPeerConnection + DataChannel, sends offer.
+   * Deduplicates concurrent callers (e.g., multiple Connection instances
+   * reacting to the same health "online" event).
+   */
+  async connectPeer(hubId) {
+    const conn = this.#connections.get(hubId)
+    if (!conn) throw new Error(`No signaling connection for hub ${hubId}`)
+    if (conn.pc) return { state: conn.state }
+
+    // Deduplicate: if another caller is already creating the peer, wait for it
+    const pending = this.#peerConnectPromises.get(hubId)
+    if (pending) return pending
+
+    const promise = this.#doConnectPeer(hubId, conn)
+    this.#peerConnectPromises.set(hubId, promise)
+
+    try {
+      return await promise
+    } finally {
+      this.#peerConnectPromises.delete(hubId)
+    }
+  }
+
+  async #doConnectPeer(hubId, conn) {
+    const subscription = this.#cableSubscriptions.get(hubId)
+    if (!subscription) throw new Error(`No signaling subscription for hub ${hubId}`)
+
+    console.debug(`[WebRTCTransport] Creating peer connection for hub ${hubId}`)
+
+    const iceConfig = await this.#fetchIceConfig(hubId)
+    const pc = new RTCPeerConnection({ iceServers: iceConfig.ice_servers })
+    conn.pc = pc
+    conn.state = TransportState.CONNECTING
+
+    // ICE candidate handler
     pc.onicecandidate = async (event) => {
       if (event.candidate) {
         try {
@@ -174,23 +210,22 @@ class WebRTCTransport {
       console.debug(`[WebRTCTransport] ICE connection state: ${state}`)
 
       if (state === "connected" || state === "completed") {
-        // Connection recovered - reset restart counter
-        const hadRestartAttempts = conn.iceRestartAttempts > 0
         conn.iceRestartAttempts = 0
         if (conn.iceRestartTimer) {
           clearTimeout(conn.iceRestartTimer)
           conn.iceRestartTimer = null
         }
-        // Re-detect connection mode after ICE restart (path may have changed)
-        if (hadRestartAttempts) {
-          this.refreshConnectionMode(hubId)
+        if (conn.iceDisrupted) {
+          conn.iceDisrupted = false
+          this.#detectConnectionMode(hubId, conn).then(mode => {
+            this.#emit("connection:state", { hubId, state: "connected", mode })
+            this.#emit("connection:mode", { hubId, mode })
+          })
         }
-      } else if (state === "disconnected") {
-        // Network path lost - attempt ICE restart after brief delay
-        // (WebRTC sometimes recovers on its own)
-        this.#scheduleIceRestart(hubId, conn)
-      } else if (state === "failed") {
-        // ICE completely failed - try restart or full reconnect
+      } else if (state === "disconnected" || state === "failed") {
+        conn.mode = ConnectionMode.UNKNOWN
+        conn.iceDisrupted = true
+        this.#emit("connection:mode", { hubId, mode: ConnectionMode.UNKNOWN })
         this.#scheduleIceRestart(hubId, conn)
       }
     }
@@ -202,26 +237,22 @@ class WebRTCTransport {
 
       if (state === "connected") {
         conn.state = TransportState.CONNECTED
-        // Detect connection mode (P2P vs relayed) and emit both events.
-        // connection:state includes mode for convenience, connection:mode
-        // is separate so listeners that only care about mode can subscribe to it.
         this.#detectConnectionMode(hubId, conn).then(mode => {
           this.#emit("connection:state", { hubId, state: "connected", mode })
           this.#emit("connection:mode", { hubId, mode })
         })
       } else if (state === "closed") {
-        // Only clean up on explicit close, not on failed (ICE restart handles that)
-        this.#cleanupConnection(hubId, conn)
+        // Only clean up peer on explicit close — don't remove signaling
+        this.#cleanupPeer(hubId, conn)
       } else if (state === "failed") {
-        // If ICE restart exhausted, this will fire - clean up and allow full reconnect
         if (conn.iceRestartAttempts >= ICE_RESTART_MAX_ATTEMPTS) {
-          console.debug(`[WebRTCTransport] Connection failed after ${conn.iceRestartAttempts} ICE restarts, cleaning up`)
-          this.#cleanupConnection(hubId, conn)
+          console.debug(`[WebRTCTransport] Connection failed after ${conn.iceRestartAttempts} ICE restarts, cleaning up peer`)
+          this.#cleanupPeer(hubId, conn)
         }
       }
     }
 
-    // Create data channel (browser initiates)
+    // Create data channel
     const dataChannel = pc.createDataChannel("relay", { ordered: true })
     conn.dataChannel = dataChannel
     this.#setupDataChannel(hubId, dataChannel)
@@ -237,6 +268,19 @@ class WebRTCTransport {
     subscription.perform("signal", { envelope })
 
     return { state: TransportState.CONNECTING }
+  }
+
+  /**
+   * Close WebRTC peer connection but keep ActionCable signaling alive.
+   * Used when hub goes offline — signaling stays up for health events.
+   */
+  disconnectPeer(hubId) {
+    const conn = this.#connections.get(hubId)
+    if (!conn?.pc) return
+
+    console.debug(`[WebRTCTransport] Disconnecting peer for hub ${hubId} (keeping signaling)`)
+    this.#teardownPeer(conn)
+    this.#emit("connection:state", { hubId, state: "disconnected" })
   }
 
   /**
@@ -283,18 +327,14 @@ class WebRTCTransport {
 
     console.debug(`[WebRTCTransport] Closing connection for hub ${hubId}`)
 
+    // Tear down peer connection (if any)
+    this.#teardownPeer(conn)
+
     // Unsubscribe ActionCable signaling channel
     const cableSub = this.#cableSubscriptions.get(hubId)
     if (cableSub) {
       cableSub.unsubscribe()
       this.#cableSubscriptions.delete(hubId)
-    }
-
-    if (conn.dataChannel) {
-      conn.dataChannel.close()
-    }
-    if (conn.pc) {
-      conn.pc.close()
     }
 
     this.#connections.delete(hubId)
@@ -412,19 +452,6 @@ class WebRTCTransport {
   getConnectionMode(hubId) {
     const conn = this.#connections.get(hubId)
     return conn?.mode || ConnectionMode.UNKNOWN
-  }
-
-  /**
-   * Force re-detection of connection mode (useful after ICE restart).
-   * Emits connection:mode event with the result.
-   */
-  async refreshConnectionMode(hubId) {
-    const conn = this.#connections.get(hubId)
-    if (!conn) return ConnectionMode.UNKNOWN
-
-    const mode = await this.#detectConnectionMode(hubId, conn)
-    this.#emit("connection:mode", { hubId, mode })
-    return mode
   }
 
   /**
@@ -590,24 +617,54 @@ class WebRTCTransport {
   }
 
   /**
-   * Clean up a connection and emit disconnected state.
+   * Tear down peer connection internals without emitting events.
+   * Removes handlers before closing to prevent cascading cleanup.
    */
-  #cleanupConnection(hubId, conn) {
-    // Clear any pending ICE restart
+  #teardownPeer(conn) {
     if (conn.iceRestartTimer) {
       clearTimeout(conn.iceRestartTimer)
       conn.iceRestartTimer = null
     }
 
-    conn.state = TransportState.DISCONNECTED
-    this.#emit("connection:state", { hubId, state: "disconnected" })
-
     if (conn.dataChannel) {
+      conn.dataChannel.onopen = null
+      conn.dataChannel.onclose = null
+      conn.dataChannel.onerror = null
+      conn.dataChannel.onmessage = null
       conn.dataChannel.close()
+      conn.dataChannel = null
     }
     if (conn.pc) {
+      conn.pc.oniceconnectionstatechange = null
+      conn.pc.onconnectionstatechange = null
+      conn.pc.onicecandidate = null
       conn.pc.close()
+      conn.pc = null
     }
+
+    conn.state = TransportState.DISCONNECTED
+    conn.mode = ConnectionMode.UNKNOWN
+    conn.iceDisrupted = false
+    conn.iceRestartAttempts = 0
+    conn.decryptFailures = 0
+    conn.pendingCandidates = []
+  }
+
+  /**
+   * Clean up peer connection on failure/close but keep signaling alive.
+   * Called from onconnectionstatechange handlers.
+   */
+  #cleanupPeer(hubId, conn) {
+    this.#teardownPeer(conn)
+    this.#emit("connection:state", { hubId, state: "disconnected" })
+  }
+
+  /**
+   * Clean up everything (peer + signaling) and remove from connections map.
+   */
+  #cleanupConnection(hubId, conn) {
+    this.#teardownPeer(conn)
+    this.#emit("connection:state", { hubId, state: "disconnected" })
     this.#connections.delete(hubId)
   }
 
@@ -680,7 +737,6 @@ class WebRTCTransport {
           },
           connected: () => {
             console.debug(`[WebRTCTransport] Signaling channel connected for hub ${hubId}`)
-            this.#cableSubscriptions.set(hubId, subscription)
             resolve(subscription)
           },
           disconnected: () => {
@@ -688,6 +744,10 @@ class WebRTCTransport {
           },
         }
       )
+      // Store subscription immediately — ActionCable can deliver `received`
+      // before `connected` fires (initial health transmit). connectPeer()
+      // needs the subscription in #cableSubscriptions to send signals.
+      this.#cableSubscriptions.set(hubId, subscription)
     })
   }
 
@@ -752,7 +812,7 @@ class WebRTCTransport {
 
   async #handleAnswer(hubId, sdp) {
     const conn = this.#connections.get(hubId)
-    if (!conn) return
+    if (!conn?.pc) return // No peer connection (signaling-only state)
 
     // Skip if we've already processed an answer (connection is stable or connected)
     if (conn.pc.signalingState === "stable") {
@@ -772,7 +832,7 @@ class WebRTCTransport {
 
   async #handleIceCandidate(hubId, candidateData) {
     const conn = this.#connections.get(hubId)
-    if (!conn) return
+    if (!conn?.pc) return // No peer connection (signaling-only state)
 
     const candidate = new RTCIceCandidate(candidateData)
 
@@ -828,7 +888,22 @@ class WebRTCTransport {
       let msg = parsed
       if (parsed.t !== undefined && parsed.c && parsed.s) {
         msg = await this.#decryptEnvelope(hubId, parsed)
-        if (!msg) return // decryption failed
+        if (!msg) {
+          // Track consecutive decryption failures (mirrors CLI's 3-strike detection)
+          const conn = this.#connections.get(hubId)
+          if (conn) {
+            conn.decryptFailures++
+            if (conn.decryptFailures >= 3) {
+              console.warn(`[WebRTCTransport] ${conn.decryptFailures} consecutive decryption failures, session invalid`)
+              conn.decryptFailures = 0
+              this.#emit("session:invalid", { hubId, message: "Crypto session out of sync. Please re-pair." })
+            }
+          }
+          return
+        }
+        // Reset on successful decrypt
+        const conn = this.#connections.get(hubId)
+        if (conn) conn.decryptFailures = 0
       }
 
       // Handle subscription confirmation (control message, decrypted)

@@ -13,7 +13,7 @@
   <%# Browser - Signaling/ActionCable status %>
   <div class="flex items-center gap-1 px-2 py-1 rounded-l-md border-r border-zinc-700/50 group/browser"
        data-connection-status-target="browserSection"
-       data-status="disconnected"
+       data-status="connecting"
        title="Browser signaling connection">
     <%# Icon %>
     <span class="transition-colors
@@ -30,25 +30,31 @@
                  group-data-[status=connected]/browser:bg-emerald-500
                  group-data-[status=error]/browser:bg-red-500"></span>
     <%# Label %>
-    <span class="text-zinc-400 hidden sm:inline">Browser</span>
+    <span class="text-zinc-400 hidden sm:inline min-w-[4rem]">
+      <span class="group-data-[status=disconnected]/browser:inline hidden">Offline</span>
+      <span class="group-data-[status=connecting]/browser:inline hidden">Connecting</span>
+      <span class="group-data-[status=connected]/browser:inline hidden text-emerald-400">Online</span>
+      <span class="group-data-[status=error]/browser:inline hidden text-red-400">Error</span>
+    </span>
   </div>
 
-  <%# Connection - WebRTC status (4 states: disconnected, connecting, direct, relay) %>
+  <%# Connection - WebRTC status (5 states: disconnected, connecting, direct, relay, expired) %>
   <div class="flex items-center gap-1 px-2 py-1 border-r border-zinc-700/50 group/connection"
        data-connection-status-target="connectionSection"
-       data-state="disconnected"
+       data-state="connecting"
        title="WebRTC connection mode">
     <%# Left connector %>
     <span class="text-zinc-600 transition-colors
                  group-data-[state=direct]/connection:text-emerald-500/50
                  group-data-[state=relay]/connection:text-sky-500/50
-                 group-data-[state=connecting]/connection:text-amber-500/50">
+                 group-data-[state=connecting]/connection:text-amber-500/50
+                 group-data-[state=expired]/connection:text-red-500/50">
       <svg class="size-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M5 12h14"/>
       </svg>
     </span>
 
-    <%# Center icon - 4 states: disconnected, connecting, direct, relay %>
+    <%# Center icon - 5 states: disconnected, connecting, direct, relay, expired %>
     <div class="relative flex items-center justify-center">
       <%# Disconnected %>
       <span class="group-data-[state=disconnected]/connection:flex hidden items-center text-zinc-500">
@@ -72,13 +78,18 @@
           <%= icon "lock-closed", variant: :micro, class: "size-2 text-emerald-400" %>
         </span>
       </span>
+      <%# Expired (crypto session invalid - needs re-pair via QR code) %>
+      <span class="group-data-[state=expired]/connection:flex hidden items-center text-red-500">
+        <%= icon "lock-open", class: "size-4" %>
+      </span>
     </div>
 
     <%# Right connector %>
     <span class="text-zinc-600 transition-colors
                  group-data-[state=direct]/connection:text-emerald-500/50
                  group-data-[state=relay]/connection:text-sky-500/50
-                 group-data-[state=connecting]/connection:text-amber-500/50">
+                 group-data-[state=connecting]/connection:text-amber-500/50
+                 group-data-[state=expired]/connection:text-red-500/50">
       <svg class="size-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M5 12h14"/>
       </svg>
@@ -90,6 +101,7 @@
       <span class="group-data-[state=connecting]/connection:inline hidden">Connecting</span>
       <span class="group-data-[state=direct]/connection:inline hidden text-emerald-400">Direct</span>
       <span class="group-data-[state=relay]/connection:inline hidden text-sky-400">Relay</span>
+      <span class="group-data-[state=expired]/connection:inline hidden text-red-400">Expired</span>
     </span>
   </div>
 

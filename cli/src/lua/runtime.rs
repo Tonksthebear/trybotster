@@ -667,53 +667,93 @@ impl LuaRuntime {
     /// # Returns
     ///
     /// `true` if at least one enabled hook is registered for the event.
+    /// Check if any observers are registered for an event.
+    ///
+    /// Observers are async/safe - they receive notifications but cannot
+    /// block or transform data.
+    #[must_use]
+    pub fn has_observers(&self, event_name: &str) -> bool {
+        let result: mlua::Result<bool> = (|| {
+            let hooks: mlua::Table = self.lua.globals().get("hooks")?;
+            let has_fn: mlua::Function = hooks.get("has_observers")?;
+            has_fn.call::<bool>(event_name)
+        })();
+        result.unwrap_or(false)
+    }
+
+    /// Check if any interceptors are registered for an event.
+    ///
+    /// Interceptors are sync/blocking - they can transform or drop data
+    /// but run in the critical path.
+    #[must_use]
+    pub fn has_interceptors(&self, event_name: &str) -> bool {
+        let result: mlua::Result<bool> = (|| {
+            let hooks: mlua::Table = self.lua.globals().get("hooks")?;
+            let has_fn: mlua::Function = hooks.get("has_interceptors")?;
+            has_fn.call::<bool>(event_name)
+        })();
+        result.unwrap_or(false)
+    }
+
+    /// Check if any hooks (observers or interceptors) are registered.
     ///
     /// # Example
     ///
     /// ```ignore
     /// if lua.has_hooks("pty_output") {
-    ///     // Prepare arguments and call hooks.call("pty_output", data)
+    ///     // Hooks exist - need to involve Lua
     /// } else {
     ///     // Fast path: no hooks, skip Lua entirely
     /// }
     /// ```
     #[must_use]
     pub fn has_hooks(&self, event_name: &str) -> bool {
-        // Use safe function call mechanism instead of string formatting
-        let result: mlua::Result<bool> = (|| {
-            let hooks: mlua::Table = self.lua.globals().get("hooks")?;
-            let has: mlua::Function = hooks.get("has")?;
-            has.call::<bool>(event_name)
-        })();
-
-        result.unwrap_or(false)
+        self.has_observers(event_name) || self.has_interceptors(event_name)
     }
 
-    /// Call hooks for an event with a single string argument.
+    /// Notify observers of an event (fire-and-forget).
     ///
-    /// This is a convenience method for the common case of calling hooks
-    /// with string data. For more complex argument types, use `lua()` directly.
-    ///
-    /// # Arguments
-    ///
-    /// * `event_name` - The event name (e.g., "pty_output")
-    /// * `data` - String data to pass to the hooks
+    /// Observers are called asynchronously and cannot affect data flow.
+    /// Errors are logged but don't stop notification to other observers.
     ///
     /// # Returns
     ///
-    /// The transformed data, or `None` if any hook returned `nil` (drop signal).
+    /// Number of observers notified.
+    pub fn notify_observers(&self, event_name: &str, data: &str) -> usize {
+        let result: mlua::Result<usize> = (|| {
+            let hooks: mlua::Table = self.lua.globals().get("hooks")?;
+            let notify: mlua::Function = hooks.get("notify")?;
+            notify.call::<usize>((event_name, data))
+        })();
+
+        match result {
+            Ok(count) => count,
+            Err(e) => {
+                log::error!("Observer notification failed for '{}': {}", event_name, e);
+                0
+            }
+        }
+    }
+
+    /// Call interceptor chain for an event with string data.
+    ///
+    /// Interceptors can transform or drop data. They run synchronously
+    /// in the critical path - use sparingly.
+    ///
+    /// # Returns
+    ///
+    /// The transformed data, or `None` if any interceptor returned `nil` (drop).
     ///
     /// # Example
     ///
     /// ```ignore
-    /// if let Some(output) = lua.call_hooks("pty_output", raw_output) {
+    /// if let Some(output) = lua.call_interceptors("pty_output", raw_output) {
     ///     // Use transformed output
     /// } else {
-    ///     // Hook returned nil, drop this output
+    ///     // Interceptor returned nil, drop this output
     /// }
     /// ```
-    pub fn call_hooks(&self, event_name: &str, data: &str) -> Option<String> {
-        // Use safe function call mechanism - no string escaping needed
+    pub fn call_interceptors(&self, event_name: &str, data: &str) -> Option<String> {
         let result: mlua::Result<Option<String>> = (|| {
             let hooks: mlua::Table = self.lua.globals().get("hooks")?;
             let call: mlua::Function = hooks.get("call")?;
@@ -723,7 +763,7 @@ impl LuaRuntime {
         match result {
             Ok(value) => value,
             Err(e) => {
-                log::error!("Hook call failed for '{}': {}", event_name, e);
+                log::error!("Interceptor chain failed for '{}': {}", event_name, e);
                 // On error, return original data (don't drop)
                 Some(data.to_string())
             }
@@ -1127,10 +1167,50 @@ impl LuaRuntime {
         std::mem::take(&mut *queue)
     }
 
-    /// Call PTY output hooks with context and data.
+    /// Notify PTY output observers (fire-and-forget).
     ///
-    /// This is used by Hub when PTY output occurs and hooks are registered.
-    /// The hook can transform the data or return `None` to drop it.
+    /// Observers are called asynchronously and cannot affect data flow.
+    /// Use this for logging, metrics, side effects.
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - Context containing agent_index, pty_index, peer_id
+    /// * `data` - Raw PTY output bytes
+    ///
+    /// # Returns
+    ///
+    /// Number of observers notified.
+    pub fn notify_pty_output_observers(
+        &self,
+        ctx: &PtyOutputContext,
+        data: &[u8],
+    ) -> usize {
+        let result: mlua::Result<usize> = (|| {
+            let ctx_table = self.lua.create_table()?;
+            ctx_table.set("agent_index", ctx.agent_index)?;
+            ctx_table.set("pty_index", ctx.pty_index)?;
+            ctx_table.set("peer_id", ctx.peer_id.clone())?;
+
+            let data_str = self.lua.create_string(data)?;
+
+            let hooks: mlua::Table = self.lua.globals().get("hooks")?;
+            let notify: mlua::Function = hooks.get("notify")?;
+            notify.call::<usize>(("pty_output", ctx_table, data_str))
+        })();
+
+        match result {
+            Ok(count) => count,
+            Err(e) => {
+                log::warn!("PTY output observer notification failed: {}", e);
+                0
+            }
+        }
+    }
+
+    /// Call PTY output interceptors with context and data.
+    ///
+    /// Interceptors can transform or drop data. They run synchronously
+    /// in the critical path - only use when transformation is needed.
     ///
     /// # Arguments
     ///
@@ -1140,28 +1220,30 @@ impl LuaRuntime {
     /// # Returns
     ///
     /// - `Ok(Some(data))` - Transformed data to send
-    /// - `Ok(None)` - Hook returned nil, drop this output
-    /// - `Err(_)` - Hook error (Hub should send original data)
+    /// - `Ok(None)` - Interceptor returned nil, drop this output
+    /// - `Err(_)` - Error (Hub should send original data)
     ///
-    /// # Fast Path
-    ///
-    /// Check `has_hooks("pty_output")` first to avoid this call when no hooks
-    /// are registered:
+    /// # Usage
     ///
     /// ```ignore
-    /// if lua.has_hooks("pty_output") {
-    ///     // Slow path: call hooks
-    ///     match lua.call_pty_output_hooks(&ctx, &data) {
-    ///         Ok(Some(transformed)) => send(transformed),
-    ///         Ok(None) => { /* drop */ },
-    ///         Err(e) => send(data), // fallback
+    /// // Check for interceptors first (observers don't block)
+    /// let final_data = if lua.has_interceptors("pty_output") {
+    ///     match lua.call_pty_output_interceptors(&ctx, &data) {
+    ///         Ok(Some(transformed)) => transformed,
+    ///         Ok(None) => return, // drop
+    ///         Err(_) => data, // fallback
     ///     }
     /// } else {
-    ///     // Fast path: no hooks, send directly
-    ///     send(data);
+    ///     data
+    /// };
+    /// send(final_data);
+    ///
+    /// // Notify observers separately (async, never blocks)
+    /// if lua.has_observers("pty_output") {
+    ///     lua.notify_pty_output_observers(&ctx, &final_data);
     /// }
     /// ```
-    pub fn call_pty_output_hooks(
+    pub fn call_pty_output_interceptors(
         &self,
         ctx: &PtyOutputContext,
         data: &[u8],
@@ -1609,7 +1691,10 @@ mod tests {
         // Load hooks module inline for testing
         runtime.lua().load(r#"
             hooks = {
-                has = function(event_name)
+                has_observers = function(event_name)
+                    return false
+                end,
+                has_interceptors = function(event_name)
                     return false
                 end
             }
@@ -1622,11 +1707,14 @@ mod tests {
     fn test_has_hooks_true_when_hooks_exist() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        // Load hooks module with a registered hook
+        // Load hooks module with observer/interceptor API
         runtime.lua().load(r#"
             hooks = {
-                has = function(event_name)
+                has_observers = function(event_name)
                     return event_name == "test_event"
+                end,
+                has_interceptors = function(event_name)
+                    return false
                 end
             }
         "#).exec().unwrap();
@@ -1636,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn test_call_hooks_returns_transformed_data() {
+    fn test_call_interceptors_returns_transformed_data() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Load hooks module that transforms data
@@ -1648,12 +1736,12 @@ mod tests {
             }
         "#).exec().unwrap();
 
-        let result = runtime.call_hooks("test_event", "hello");
+        let result = runtime.call_interceptors("test_event", "hello");
         assert_eq!(result, Some("hello_transformed".to_string()));
     }
 
     #[test]
-    fn test_call_hooks_returns_none_on_drop() {
+    fn test_call_interceptors_returns_none_on_drop() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Load hooks module that drops data
@@ -1665,7 +1753,7 @@ mod tests {
             }
         "#).exec().unwrap();
 
-        let result = runtime.call_hooks("test_event", "hello");
+        let result = runtime.call_interceptors("test_event", "hello");
         assert_eq!(result, None);
     }
 
@@ -1982,7 +2070,7 @@ mod tests {
     }
 
     #[test]
-    fn test_call_pty_output_hooks_passthrough() {
+    fn test_call_pty_output_interceptors_passthrough() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that pass through unchanged
@@ -2000,12 +2088,12 @@ mod tests {
             peer_id: "test-peer".to_string(),
         };
 
-        let result = runtime.call_pty_output_hooks(&ctx, b"hello world").unwrap();
+        let result = runtime.call_pty_output_interceptors(&ctx, b"hello world").unwrap();
         assert_eq!(result, Some(b"hello world".to_vec()));
     }
 
     #[test]
-    fn test_call_pty_output_hooks_transform() {
+    fn test_call_pty_output_interceptors_transform() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that transform data
@@ -2023,12 +2111,12 @@ mod tests {
             peer_id: "test-peer".to_string(),
         };
 
-        let result = runtime.call_pty_output_hooks(&ctx, b"hello").unwrap();
+        let result = runtime.call_pty_output_interceptors(&ctx, b"hello").unwrap();
         assert_eq!(result, Some(b"hello transformed".to_vec()));
     }
 
     #[test]
-    fn test_call_pty_output_hooks_drop() {
+    fn test_call_pty_output_interceptors_drop() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that drop data
@@ -2046,12 +2134,12 @@ mod tests {
             peer_id: "test-peer".to_string(),
         };
 
-        let result = runtime.call_pty_output_hooks(&ctx, b"hello").unwrap();
+        let result = runtime.call_pty_output_interceptors(&ctx, b"hello").unwrap();
         assert_eq!(result, None);
     }
 
     #[test]
-    fn test_call_pty_output_hooks_receives_context() {
+    fn test_call_pty_output_interceptors_receives_context() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that use context
@@ -2071,7 +2159,7 @@ mod tests {
             peer_id: "context-test-peer".to_string(),
         };
 
-        runtime.call_pty_output_hooks(&ctx, b"test").unwrap();
+        runtime.call_pty_output_interceptors(&ctx, b"test").unwrap();
 
         let agent_idx: usize = runtime.lua().load("return received_ctx.agent_index").eval().unwrap();
         let pty_idx: usize = runtime.lua().load("return received_ctx.pty_index").eval().unwrap();

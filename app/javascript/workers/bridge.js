@@ -162,6 +162,12 @@ class WorkerBridge {
         return { initialized: true }
       case "connect":
         return webrtcTransport.connect(params.hubId, params.browserIdentity)
+      case "connectSignaling":
+        return webrtcTransport.connectSignaling(params.hubId, params.browserIdentity)
+      case "connectPeer":
+        return webrtcTransport.connectPeer(params.hubId)
+      case "disconnectPeer":
+        return webrtcTransport.disconnectPeer(params.hubId)
       case "disconnect":
         return webrtcTransport.disconnect(params.hubId)
       case "subscribe": {

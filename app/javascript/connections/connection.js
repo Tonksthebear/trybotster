@@ -8,10 +8,11 @@
  *   - State tracking
  *
  * Lifecycle:
- *   - initialize() establishes hub connection (WebRTC + Olm session)
- *   - subscribe() creates virtual channel subscription (CLI routing)
+ *   - initialize() connects ActionCable signaling + Olm session
+ *   - Health events drive WebRTC: hub online → connectPeer + subscribe, offline → disconnectPeer
+ *   - subscribe() creates virtual channel subscription (called internally by health lifecycle)
  *   - unsubscribe() removes channel subscription (keeps peer connection alive)
- *   - destroy() tears down everything
+ *   - destroy() tears down everything (signaling + peer)
  *
  * Subclasses implement:
  *   - channelName() - Virtual channel name for CLI routing (e.g., "TerminalRelayChannel")
@@ -74,6 +75,7 @@ export class Connection {
   #hubConnected = false
   #subscribing = false      // Lock to prevent concurrent subscribe/unsubscribe
   #resubscribing = false    // Lock to prevent concurrent resubscribe on stale send
+  #peerConnecting = false   // Lock to prevent concurrent peer connection attempts
 
   constructor(key, options, manager) {
     this.key = key
@@ -107,7 +109,8 @@ export class Connection {
 
   /**
    * Initialize the connection. Called by ConnectionManager.acquire().
-   * Establishes hub connection (WebRTC + Olm session) and subscribes.
+   * Connects ActionCable signaling (WebSocket) and sets up health-driven lifecycle.
+   * WebRTC peer connection is created later when hub health reports "online".
    */
   async initialize() {
     try {
@@ -119,12 +122,7 @@ export class Connection {
 
       await ensureMatrixReady(cryptoWorkerUrl, wasmJsUrl)
 
-      // Connect to hub
-      await this.#connectHub()
-      if (this.state === ConnectionState.ERROR) return
-
-      // Subscribe to channel
-      await this.subscribe()
+      await this.#connectSignaling()
     } catch (error) {
       console.error(`[${this.constructor.name}] Initialize failed:`, error)
       this.#setError("init_failed", error.message)
@@ -132,10 +130,11 @@ export class Connection {
   }
 
   /**
-   * Connect to the hub (WebRTC + Olm session).
-   * Called by initialize() or can be used to reconnect.
+   * Connect ActionCable signaling (WebSocket + Olm session).
+   * Returns when WebSocket is connected. Does NOT create WebRTC peer connection —
+   * that's driven by health events (hub online → connect peer, offline → disconnect peer).
    */
-  async #connectHub() {
+  async #connectSignaling() {
     if (this.#hubConnected) return
 
     this.#setBrowserStatus(BrowserStatus.CONNECTING)
@@ -144,23 +143,17 @@ export class Connection {
     const hubId = this.getHubId()
 
     // 1. Handle Olm session via crypto worker
-    // Parse session bundle from fragment if requested
     let sessionBundle = this.options.sessionBundle || null
     if (!sessionBundle && this.options.fromFragment) {
       sessionBundle = parseBundleFromFragment()
       if (sessionBundle) {
-        // Strip the fragment so the bundle isn't reprocessed on reload
         history.replaceState(null, "", location.pathname + location.search)
       }
     }
 
-    // Create or load session via crypto worker
     if (sessionBundle) {
-      // Always create fresh session from new QR bundle.
-      // createSession() deletes any stale session before establishing the new one.
       await bridge.createSession(hubId, sessionBundle)
     } else {
-      // Try to load existing session
       const loadResult = await bridge.loadSession(hubId)
       if (!loadResult.loaded) {
         this.#setError("no_session", "No session available. Scan QR code to pair.")
@@ -171,23 +164,68 @@ export class Connection {
     // Get identity key for channel params
     const keyResult = await bridge.getIdentityKey(hubId)
     this.identityKey = keyResult.identityKey
-    // Generate tab-unique browser identity for routing.
-    // Multiple tabs share the same Olm session but need separate WebRTC connections.
     this.browserIdentity = `${this.identityKey}:${Connection.tabId}`
 
     // Set up hub-level event listeners BEFORE connecting transport
     // so we catch the initial health transmit from HubSignalingChannel
     this.#setupHubEventListeners()
 
-    // 2. Connect transport via WebRTC (also subscribes to ActionCable signaling)
-    const signalingUrl = window.location.origin
-    await bridge.send("connect", {
+    // 2. Connect ActionCable signaling only (health + WebRTC signal relay)
+    await bridge.send("connectSignaling", {
       hubId,
-      signalingUrl,
       browserIdentity: this.browserIdentity
     })
 
     this.#hubConnected = true
+    // WebSocket is now connected — browser is "online"
+    this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
+  }
+
+  /**
+   * Create WebRTC peer connection and subscribe to virtual channel.
+   * Called when hub health reports "online".
+   */
+  async #connectPeerAndSubscribe() {
+    if (this.#peerConnecting) return
+    this.#peerConnecting = true
+
+    try {
+      const hubId = this.getHubId()
+
+      // Create WebRTC peer connection (ICE + DataChannel + offer)
+      await bridge.send("connectPeer", { hubId })
+
+      // Subscribe to virtual channel via DataChannel
+      await this.subscribe()
+    } catch (error) {
+      console.error(`[${this.constructor.name}] Peer connection failed:`, error)
+    } finally {
+      this.#peerConnecting = false
+    }
+  }
+
+  /**
+   * Tear down WebRTC peer connection (hub went offline).
+   * Keeps ActionCable signaling alive for health events.
+   */
+  async #disconnectPeer() {
+    const hubId = this.getHubId()
+
+    // Unsubscribe virtual channel first
+    if (this.subscriptionId) {
+      await this.unsubscribe()
+    }
+
+    // Close WebRTC peer connection (keeps signaling)
+    bridge.send("disconnectPeer", { hubId }).catch(() => {})
+
+    // Reset handshake state
+    this.handshakeComplete = false
+    this.handshakeSent = false
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer)
+      this.handshakeTimer = null
+    }
   }
 
   /**
@@ -221,7 +259,6 @@ export class Connection {
     }
 
     this.#subscribing = true
-    this.#setBrowserStatus(BrowserStatus.SUBSCRIBING)
 
     try {
       // Unsubscribe first if forcing refresh
@@ -236,7 +273,9 @@ export class Connection {
         clearTimeout(this.handshakeTimer)
         this.handshakeTimer = null
       }
-      this.cliStatus = CliStatus.UNKNOWN
+      // Don't reset cliStatus here — it's managed by health events.
+      // Resetting would cause hub status to blip "offline" when
+      // health-driven #connectPeerAndSubscribe() calls subscribe().
 
       const hubId = this.getHubId()
 
@@ -258,7 +297,6 @@ export class Connection {
       // so input isn't buffered when listeners fire
       this.#completeHandshake()
 
-      this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
       this.#setState(ConnectionState.CONNECTED)
       this.emit("subscribed", this)
     } finally {
@@ -298,7 +336,7 @@ export class Connection {
     this.subscriptionId = null
 
     // Back to CONNECTING state (hub still connected, but not subscribed)
-    this.#setBrowserStatus(BrowserStatus.CONNECTING)
+    // Browser status stays green — WebSocket is still up
     this.#setState(ConnectionState.CONNECTING)
 
     // Clean up subscription event listeners
@@ -321,56 +359,32 @@ export class Connection {
   #setupHubEventListeners() {
     const hubId = this.getHubId()
 
-    // Listen for connection state changes
+    // Listen for WebRTC peer connection state changes
     const unsubState = bridge.on("connection:state", (event) => {
       if (event.hubId !== hubId) return
 
       if (event.state === "disconnected") {
-        this.#hubConnected = false
         // Preserve session_invalid error state — user must re-pair, not auto-reconnect
         if (this.state === ConnectionState.ERROR && this.errorCode === "session_invalid") {
           return
         }
-        this.#setBrowserStatus(BrowserStatus.DISCONNECTED)
-        this.#setState(ConnectionState.DISCONNECTED)
+
+        // Peer connection lost — don't auto-reconnect, let health events drive it.
+        // If hub is still online, health listener will trigger reconnect.
         this.emit("disconnected")
 
-        // Auto-reconnect after ICE restart exhaustion (full reconnect as fallback)
-        // WebRTCTransport handles ICE restarts internally; if we get here, those failed
-        setTimeout(() => {
-          if (this.state === ConnectionState.DISCONNECTED) {
-            console.debug(`[${this.constructor.name}] Auto-reconnecting after disconnect...`)
-            this.connect().catch(err => {
-              console.error(`[${this.constructor.name}] Auto-reconnect failed:`, err)
-            })
-          }
-        }, 2000)
+        // If hub is online but peer failed (ICE exhaustion), retry via health path
+        if (this.cliStatus === CliStatus.ONLINE || this.cliStatus === CliStatus.NOTIFIED) {
+          setTimeout(() => {
+            if (!this.handshakeComplete) {
+              console.debug(`[${this.constructor.name}] Peer lost but hub online, reconnecting peer...`)
+              this.#connectPeerAndSubscribe()
+            }
+          }, 2000)
+        }
       } else if (event.state === "connected") {
-        // Always update mode when provided (may arrive after initial connection
-        // or change after ICE restart). Mode detection is async, so the first
-        // "connected" event may not have mode yet.
         if (event.mode) {
           this.#setConnectionMode(event.mode)
-        }
-
-        if (!this.#hubConnected) {
-          this.#hubConnected = true
-          this.emit("reconnected")
-
-          // Auto-resubscribe after reconnection - old subscription is stale
-          if (this.subscriptionId) {
-            console.debug(`[${this.constructor.name}] Auto-resubscribing after reconnect`)
-            // Clear stale subscription ID and resubscribe
-            const oldSubId = this.subscriptionId
-            this.subscriptionId = null
-            this.#clearSubscriptionEventListeners()
-            bridge.clearSubscriptionListeners(oldSubId)
-
-            this.subscribe().catch(err => {
-              console.error(`[${this.constructor.name}] Resubscribe failed:`, err)
-              this.#setError("resubscribe_failed", err.message)
-            })
-          }
         }
       }
     })
@@ -516,22 +530,30 @@ export class Connection {
     // Check if session exists via crypto worker
     const { hasSession } = await bridge.hasSession(hubId)
 
-    // Tell transport worker we're reacquiring - this cancels any pending close timer
-    // and reconnects if the connection was closed during grace period
-    const signalingUrl = window.location.origin
-    await bridge.send("connect", {
+    if (!hasSession) {
+      // Session gone, need full reinitialize
+      this.#hubConnected = false
+      this.subscriptionId = null
+      return
+    }
+
+    // Re-establish signaling (cancels any pending grace period).
+    // If signaling still alive, this is a no-op. If grace period expired
+    // and transport closed, this creates fresh ActionCable subscription.
+    // Health events will drive peer connection + subscribe automatically.
+    await bridge.send("connectSignaling", {
       hubId,
-      signalingUrl,
       browserIdentity: this.browserIdentity
     })
 
-    // If session is gone or we weren't connected, need to reinitialize
-    if (!this.#hubConnected || !hasSession) {
-      this.#hubConnected = hasSession
-      if (this.subscriptionId) {
-        // Our subscription is gone, clear it so subscribe() creates a new one
-        this.subscriptionId = null
-      }
+    this.#hubConnected = true
+
+    // Only clear subscription if the peer connection was actually lost
+    // (grace period expired and transport tore down the DataChannel).
+    // During normal Turbo navigation, the grace period was cancelled by
+    // connectSignaling above, so the peer + subscription are still valid.
+    if (this.subscriptionId && this.state !== ConnectionState.CONNECTED) {
+      this.subscriptionId = null
     }
   }
 
@@ -813,28 +835,27 @@ export class Connection {
       this.emit("cliStatusChange", { status: newCliStatus, prevStatus })
       this.#emitHealthChange()
 
+      // Hub came online — start WebRTC peer connection + subscribe
+      const wasOffline = prevStatus === CliStatus.UNKNOWN || prevStatus === CliStatus.OFFLINE || prevStatus === CliStatus.DISCONNECTED
+      const isOnline = newCliStatus === CliStatus.ONLINE || newCliStatus === CliStatus.NOTIFIED || newCliStatus === CliStatus.CONNECTING
+      if (isOnline && wasOffline) {
+        this.#connectPeerAndSubscribe()
+      }
+
       // If CLI just connected to E2E channel, initiate handshake (browser is "last")
       if (newCliStatus === CliStatus.CONNECTED && prevStatus !== CliStatus.CONNECTED) {
         this.emit("cliConnected")
         this.#sendHandshake()
       }
 
-      // If CLI just disconnected, reset handshake state for fresh start on reconnect
+      // Hub went offline — tear down WebRTC, keep signaling for health
       if ((newCliStatus === CliStatus.DISCONNECTED || newCliStatus === CliStatus.OFFLINE) &&
-          prevStatus !== CliStatus.DISCONNECTED && prevStatus !== CliStatus.OFFLINE) {
-        this.handshakeComplete = false
-        this.handshakeSent = false
-        if (this.handshakeTimer) {
-          clearTimeout(this.handshakeTimer)
-          this.handshakeTimer = null
-        }
+          prevStatus !== CliStatus.DISCONNECTED && prevStatus !== CliStatus.OFFLINE &&
+          prevStatus !== CliStatus.UNKNOWN) {
+        this.#disconnectPeer()
         this.emit("cliDisconnected")
+        this.#setState(ConnectionState.CLI_DISCONNECTED)
       }
-    }
-
-    // Also update legacy state for backward compatibility
-    if (message.cli === "disconnected" || message.cli === "offline") {
-      this.#setState(ConnectionState.CLI_DISCONNECTED)
     }
   }
 

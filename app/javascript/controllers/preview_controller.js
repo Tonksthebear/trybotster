@@ -82,7 +82,8 @@ export default class extends Controller {
       // Set up SW message listener
       this.#setupServiceWorkerListener();
 
-      await this.#connection.subscribe();
+      // No explicit subscribe() — health events drive the WebRTC lifecycle.
+      // onStateChange above will update UI when connection progresses.
     } catch (error) {
       this.#updateStatus("Connection failed", "error");
       this.#showError(error.message);

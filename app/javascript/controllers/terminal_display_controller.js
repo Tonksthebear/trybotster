@@ -143,8 +143,9 @@ export default class extends Controller {
       }),
     );
 
-    // Connection is already subscribed via ConnectionManager.acquire() → initialize()
-    // Just wait for CLI to connect and complete handshake
+    // No explicit subscribe() — health events drive the WebRTC lifecycle.
+    // When hub reports "online", connection.js connects peer + subscribes.
+    // Event listeners above will fire as the connection progresses.
   }
 
   // Public actions for touch control buttons

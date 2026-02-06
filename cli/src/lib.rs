@@ -34,6 +34,7 @@ pub mod tui;
 
 pub mod compat;
 pub mod config;
+pub mod file_watcher;
 pub mod constants;
 pub mod device;
 pub mod env;
