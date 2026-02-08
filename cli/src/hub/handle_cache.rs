@@ -21,7 +21,7 @@
 //!
 //! - **Hub tick loop**: `HandleCache::get_agent()` reads directly
 //! - **TuiRunner PTY I/O**: Hub reads from cache to forward input/resize
-//! - **Lua primitives**: `hub.get_agents()` / `hub.get_agent()` read from cache
+//! - **Lua primitives**: `hub.register_agent()` / `hub.unregister_agent()` manage cache
 //!
 //! # Design Principle
 //!
@@ -31,11 +31,11 @@
 
 use std::sync::RwLock;
 
-use super::agent_handle::AgentHandle;
+use super::agent_handle::AgentPtys;
 
 /// Thread-safe cache of agent PTY handles and shared read-only data.
 ///
-/// Stores `AgentHandle` instances (agent_key + PTY handles) and other data
+/// Stores `AgentPtys` instances (agent_key + PTY handles) and other data
 /// that clients need to read without sending blocking commands through Hub.
 /// Agent metadata (repo, issue, status) is managed by Lua, not cached here.
 ///
@@ -54,7 +54,7 @@ use super::agent_handle::AgentHandle;
 #[derive(Debug, Default)]
 pub struct HandleCache {
     /// Agent handles indexed by display order.
-    agents: RwLock<Vec<AgentHandle>>,
+    agents: RwLock<Vec<AgentPtys>>,
 
     /// Available worktrees for agent creation.
     ///
@@ -85,7 +85,7 @@ impl HandleCache {
     /// Returns `None` if index is out of bounds or lock is poisoned.
     /// This is a direct read - no command channel involved.
     #[must_use]
-    pub fn get_agent(&self, index: usize) -> Option<AgentHandle> {
+    pub fn get_agent(&self, index: usize) -> Option<AgentPtys> {
         self.agents
             .read()
             .ok()?
@@ -97,7 +97,7 @@ impl HandleCache {
     ///
     /// Returns empty vec if lock is poisoned.
     #[must_use]
-    pub fn get_all_agents(&self) -> Vec<AgentHandle> {
+    pub fn get_all_agents(&self) -> Vec<AgentPtys> {
         self.agents
             .read()
             .map(|agents| agents.clone())
@@ -122,7 +122,7 @@ impl HandleCache {
     /// Replace all agent handles.
     ///
     /// Called by Hub to sync the entire cache with current state.
-    pub fn set_all(&self, handles: Vec<AgentHandle>) {
+    pub fn set_all(&self, handles: Vec<AgentPtys>) {
         if let Ok(mut agents) = self.agents.write() {
             *agents = handles;
         }
@@ -132,7 +132,7 @@ impl HandleCache {
     ///
     /// If an agent with the same key exists, it's replaced.
     /// Returns the index where the agent was placed.
-    pub fn add_agent(&self, handle: AgentHandle) -> Option<usize> {
+    pub fn add_agent(&self, handle: AgentPtys) -> Option<usize> {
         let mut agents = self.agents.write().ok()?;
         let key = handle.agent_key().to_string();
 
@@ -229,8 +229,8 @@ impl HandleCache {
 mod tests {
     use super::*;
 
-    // Note: These tests use a mock AgentHandle. Full integration tests
-    // will be added after AgentHandle is available.
+    // Note: These tests use a mock AgentPtys. Full integration tests
+    // will be added after AgentPtys is available.
 
     #[test]
     fn test_new_cache_is_empty() {

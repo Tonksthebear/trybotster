@@ -16,8 +16,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use flate2::{write::GzEncoder, Compression};
 use std::io::Write;
 
-use super::crypto_service::CryptoServiceHandle;
-use super::matrix_crypto::DeviceKeyBundle;
+use super::crypto_service::CryptoService;
+use super::olm_crypto::DeviceKeyBundle;
 use crate::{AgentInfo, TerminalMessage, WorktreeInfo};
 
 /// Browser connection state.
@@ -33,8 +33,8 @@ pub struct BrowserState {
     /// Whether the current bundle's one-time key has been used (consumed by a connection).
     /// When true, the QR code should be regenerated before pairing additional devices.
     pub bundle_used: bool,
-    /// Shared crypto service handle for E2E encryption (Matrix Olm/Megolm).
-    pub crypto_service: Option<CryptoServiceHandle>,
+    /// Shared crypto service for E2E encryption (vodozemac Olm).
+    pub crypto_service: Option<CryptoService>,
     /// Whether the relay WebSocket connection is established.
     ///
     /// When `false`, the hub cannot receive browser handshake messages even if

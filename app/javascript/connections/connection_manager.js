@@ -193,6 +193,22 @@ class ConnectionManagerSingleton {
   }
 
   /**
+   * Find any connection to a given hub that has signaling established.
+   * Used by Connection to inherit hub state from a sibling (same hubId, different key).
+   *
+   * @param {string} hubId - Hub identifier
+   * @returns {Connection|null}
+   */
+  findHubConnection(hubId) {
+    for (const [key, entry] of this.connections) {
+      if (entry.wrapper.getHubId() === hubId && entry.wrapper.isHubConnected()) {
+        return entry.wrapper;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Force destroy a connection immediately.
    *
    * @param {string} key - Connection key

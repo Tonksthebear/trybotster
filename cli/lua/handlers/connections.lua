@@ -7,6 +7,7 @@
 -- State is persisted in core.state across hot-reloads.
 
 local state = require("core.state")
+local Agent = require("lib.agent")
 
 -- Shared client registry - all transports register here
 local clients = state.get("connections.clients", {})
@@ -36,6 +37,7 @@ local function register_client(peer_id, client)
 
     clients[peer_id] = client
     stats.total_connections = stats.total_connections + 1
+    hooks.notify("client_connected", { peer_id = peer_id, transport = client.transport.type })
 end
 
 --- Unregister a client from the shared registry.
@@ -44,6 +46,7 @@ end
 local function unregister_client(peer_id)
     local client = clients[peer_id]
     if client then
+        hooks.notify("client_disconnected", { peer_id = peer_id, transport = client.transport.type })
         client:disconnect()
         clients[peer_id] = nil
     end
@@ -118,42 +121,61 @@ local function broadcast_hub_event(event_name, event_data)
 end
 
 -- ============================================================================
--- Hub Event Handlers
+-- Hook Observers (Lua → Lua)
 -- ============================================================================
--- Broadcast agent lifecycle events to all connected clients.
+-- Observe agent lifecycle hooks emitted by handlers/agents.lua.
+-- hooks.on() is name-based (overwrites on re-register), so no ID tracking needed.
 
-events.on("agent_created", function(info)
+hooks.on("agent_created", "broadcast_agent_created", function(info)
     log.info(string.format("Broadcasting agent_created: %s",
         info.id or info.session_key or "?"))
 
     broadcast_hub_event("agent_created", { agent = info })
+    broadcast_hub_event("agent_list", { agents = Agent.all_info() })
 
-    -- Worktree list changed (new agent uses a worktree)
     local worktrees = hub.get_worktrees()
     broadcast_hub_event("worktree_list", { worktrees = worktrees })
 end)
 
-events.on("agent_deleted", function(agent_id)
+hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
     log.info(string.format("Broadcasting agent_deleted: %s", agent_id or "?"))
 
     broadcast_hub_event("agent_deleted", { agent_id = agent_id })
+    broadcast_hub_event("agent_list", { agents = Agent.all_info() })
 
-    -- Worktree list changed (deleted agent may free a worktree)
     local worktrees = hub.get_worktrees()
     broadcast_hub_event("worktree_list", { worktrees = worktrees })
 end)
 
-events.on("connection_code_ready", function(data)
+hooks.on("agent_lifecycle", "broadcast_lifecycle", function(info)
+    log.debug(string.format("Broadcasting agent_lifecycle: %s -> %s",
+        info.agent_id or "?", info.status or "?"))
+
+    broadcast_hub_event("agent_status_changed", {
+        agent_id = info.agent_id,
+        status = info.status,
+    })
+end)
+
+-- ============================================================================
+-- Rust Event Handlers (Rust → Lua)
+-- ============================================================================
+-- These events originate from Rust and are delivered through the events system.
+-- Tracked for cleanup on hot-reload (see _before_reload).
+
+local _event_subs = {}
+
+_event_subs[#_event_subs + 1] = events.on("connection_code_ready", function(data)
     log.info("Broadcasting connection_code to hub subscribers")
     broadcast_hub_event("connection_code", { url = data.url, qr_ascii = data.qr_ascii })
 end)
 
-events.on("connection_code_error", function(err)
+_event_subs[#_event_subs + 1] = events.on("connection_code_error", function(err)
     log.warn(string.format("Broadcasting connection_code_error: %s", err or "unknown"))
     broadcast_hub_event("connection_code_error", { error = err or "Connection code not available" })
 end)
 
-events.on("agent_status_changed", function(info)
+_event_subs[#_event_subs + 1] = events.on("agent_status_changed", function(info)
     log.debug(string.format("Broadcasting agent_status_changed: %s -> %s",
         info.agent_id or "?", info.status or "?"))
 
@@ -179,6 +201,15 @@ local M = {
 
 -- Lifecycle hooks for hot-reload
 function M._before_reload()
+    -- Unsubscribe Rust event callbacks
+    for _, sub_id in ipairs(_event_subs) do
+        events.off(sub_id)
+    end
+    _event_subs = {}
+    -- Remove hook observers (re-registered on reload)
+    hooks.off("agent_created", "broadcast_agent_created")
+    hooks.off("agent_deleted", "broadcast_agent_deleted")
+    hooks.off("agent_lifecycle", "broadcast_lifecycle")
     log.info(string.format("connections.lua reloading with %d client(s)", get_client_count()))
 end
 

@@ -1,39 +1,22 @@
 //! Hub state primitives for Lua scripts.
 //!
 //! Exposes Hub state queries and operations to Lua, allowing scripts to
-//! inspect agent PTY handles, worktrees, and request agent lifecycle operations.
+//! inspect worktrees, register/unregister agents, and request lifecycle operations.
 //!
 //! # Design Principle: "Query freely. Mutate via queue."
 //!
-//! - **State queries** (get_agents, get_agent, get_worktrees) read directly from
-//!   HandleCache - non-blocking, thread-safe snapshots
+//! - **State queries** (get_worktrees) read directly from HandleCache
+//! - **Registration** (register_agent, unregister_agent) manages PTY handles
 //! - **Operations** (quit) queue requests for Hub to process asynchronously
-//!   after Lua callbacks return
-//!
-//! # Lua Migration
-//!
-//! Agent metadata (repo, issue, status, etc.) is now managed by Lua.
-//! The `hub.get_agents()` and `hub.get_agent()` functions return PTY-level
-//! information (agent_key, pty_count, index). Lua enriches this with its
-//! own agent registry data.
 //!
 //! # Usage in Lua
 //!
 //! ```lua
-//! -- Query agent handles (non-blocking, reads from cache)
-//! local agents = hub.get_agents()
-//! for i, agent in ipairs(agents) do
-//!     log.info(string.format("Agent %d: %s (ptys: %d)", i, agent.key, agent.pty_count))
-//! end
-//!
-//! -- Get single agent handle by index
-//! local agent = hub.get_agent(0)
-//! if agent then
-//!     log.info("First agent: " .. agent.key)
-//! end
-//!
 //! -- Get available worktrees
 //! local worktrees = hub.get_worktrees()
+//!
+//! -- Register agent PTY handles
+//! local index = hub.register_agent("owner-repo-42", sessions)
 //!
 //! -- Request Hub shutdown
 //! hub.quit()
@@ -67,10 +50,9 @@ pub fn new_request_queue() -> HubRequestQueue {
 /// Register Hub state primitives with the Lua state.
 ///
 /// Adds the following functions to the `hub` table:
-/// - `hub.get_agents()` - Get all agent PTY handles (key, index, pty_count)
-/// - `hub.get_agent(index)` - Get single agent PTY handle by index
-/// - `hub.get_agent_count()` - Get number of agents
 /// - `hub.get_worktrees()` - Get available worktrees
+/// - `hub.register_agent(key, sessions)` - Register agent PTY handles
+/// - `hub.unregister_agent(key)` - Unregister agent PTY handles
 /// - `hub.quit()` - Request Hub shutdown
 ///
 /// # Arguments
@@ -93,81 +75,12 @@ pub fn register(
         .get("hub")
         .unwrap_or_else(|_| lua.create_table().unwrap());
 
-    // hub.get_agents() - Returns array of agent PTY handle info
-    // Agent metadata (repo, issue, status) is managed by Lua's own registry.
-    // This returns PTY-level data: key, index, pty_count.
-    let cache = Arc::clone(&handle_cache);
-    let get_agents_fn = lua
-        .create_function(move |lua, ()| {
-            let agents = cache.get_all_agents();
-
-            // Build as Vec for proper array serialization
-            let agents_data: Vec<serde_json::Value> = agents
-                .iter()
-                .enumerate()
-                .map(|(i, agent)| {
-                    let mut obj = serde_json::Map::new();
-
-                    // Core identity from handle
-                    obj.insert("index".to_string(), serde_json::json!(i));
-                    obj.insert("key".to_string(), serde_json::json!(agent.agent_key()));
-
-                    // PTY count from handle
-                    obj.insert("pty_count".to_string(), serde_json::json!(agent.pty_count()));
-
-                    serde_json::Value::Object(obj)
-                })
-                .collect();
-
-            // Convert to Lua - Vec serializes as array
-            lua.to_value(&agents_data)
-        })
-        .map_err(|e| anyhow!("Failed to create hub.get_agents function: {e}"))?;
-
-    hub.set("get_agents", get_agents_fn)
-        .map_err(|e| anyhow!("Failed to set hub.get_agents: {e}"))?;
-
-    // hub.get_agent(index) - Returns single agent PTY handle info or nil
-    // Agent metadata is managed by Lua's own registry.
-    let cache2 = Arc::clone(&handle_cache);
-    let get_agent_fn = lua
-        .create_function(move |lua, index: usize| {
-            match cache2.get_agent(index) {
-                Some(agent) => {
-                    let agent_table = lua.create_table()?;
-
-                    // Core identity from handle
-                    agent_table.set("index", index)?;
-                    agent_table.set("key", agent.agent_key().to_string())?;
-
-                    // PTY count from handle
-                    agent_table.set("pty_count", agent.pty_count())?;
-
-                    Ok(LuaValue::Table(agent_table))
-                }
-                None => Ok(LuaValue::Nil),
-            }
-        })
-        .map_err(|e| anyhow!("Failed to create hub.get_agent function: {e}"))?;
-
-    hub.set("get_agent", get_agent_fn)
-        .map_err(|e| anyhow!("Failed to set hub.get_agent: {e}"))?;
-
-    // hub.get_agent_count() - Returns number of agents
-    let cache3 = Arc::clone(&handle_cache);
-    let get_agent_count_fn = lua
-        .create_function(move |_, ()| Ok(cache3.len()))
-        .map_err(|e| anyhow!("Failed to create hub.get_agent_count function: {e}"))?;
-
-    hub.set("get_agent_count", get_agent_count_fn)
-        .map_err(|e| anyhow!("Failed to set hub.get_agent_count: {e}"))?;
-
     // hub.get_worktrees() - Returns array of available worktrees
     // Uses serde serialization to ensure proper JSON array format
-    let cache4 = Arc::clone(&handle_cache);
+    let cache = Arc::clone(&handle_cache);
     let get_worktrees_fn = lua
         .create_function(move |lua, ()| {
-            let worktrees = cache4.get_worktrees();
+            let worktrees = cache.get_worktrees();
 
             // Build as Vec for proper array serialization
             let worktrees_data: Vec<serde_json::Value> = worktrees
@@ -199,10 +112,10 @@ pub fn register(
     //                     e.g., { cli = <PtySessionHandle>, server = <PtySessionHandle> }
     //
     // The order of PTYs in HandleCache is: cli first (index 0), then server (index 1).
-    let cache5 = Arc::clone(&handle_cache);
+    let cache2 = Arc::clone(&handle_cache);
     let register_agent_fn = lua
         .create_function(move |_, (agent_key, sessions): (String, LuaTable)| {
-            use crate::hub::agent_handle::{AgentHandle, PtyHandle};
+            use crate::hub::agent_handle::{AgentPtys, PtyHandle};
             use crate::lua::primitives::pty::PtySessionHandle;
 
             let mut pty_handles: Vec<PtyHandle> = Vec::new();
@@ -250,10 +163,10 @@ pub fn register(
             let pty_count = pty_handles.len();
 
             // Determine index (will be updated by add_agent)
-            let agent_index = cache5.len();
-            let handle = AgentHandle::new(agent_key.clone(), pty_handles, agent_index);
+            let agent_index = cache2.len();
+            let handle = AgentPtys::new(agent_key.clone(), pty_handles, agent_index);
 
-            match cache5.add_agent(handle) {
+            match cache2.add_agent(handle) {
                 Some(idx) => {
                     log::info!("[Lua] Registered agent '{}' at index {} with {} PTY(s)",
                         agent_key, idx, pty_count);
@@ -270,10 +183,10 @@ pub fn register(
     // hub.unregister_agent(agent_key) - Unregister agent PTY handles
     //
     // Called by Lua when an agent is closed to remove it from HandleCache.
-    let cache6 = Arc::clone(&handle_cache);
+    let cache3 = Arc::clone(&handle_cache);
     let unregister_agent_fn = lua
         .create_function(move |_, agent_key: String| {
-            let removed = cache6.remove_agent(&agent_key);
+            let removed = cache3.remove_agent(&agent_key);
             if removed {
                 log::info!("[Lua] Unregistered agent '{}'", agent_key);
             }
@@ -322,75 +235,10 @@ mod tests {
         register(&lua, queue, cache).expect("Should register hub primitives");
 
         let hub: LuaTable = lua.globals().get("hub").expect("hub table should exist");
-        assert!(hub.contains_key("get_agents").unwrap());
-        assert!(hub.contains_key("get_agent").unwrap());
-        assert!(hub.contains_key("get_agent_count").unwrap());
         assert!(hub.contains_key("get_worktrees").unwrap());
+        assert!(hub.contains_key("register_agent").unwrap());
+        assert!(hub.contains_key("unregister_agent").unwrap());
         assert!(hub.contains_key("quit").unwrap());
-    }
-
-    #[test]
-    fn test_get_agents_returns_empty_table() {
-        let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
-
-        register(&lua, queue, cache).expect("Should register");
-
-        let agents: LuaTable = lua.load("return hub.get_agents()").eval().unwrap();
-        assert_eq!(agents.len().unwrap(), 0);
-    }
-
-    #[test]
-    fn test_get_agent_returns_nil_for_invalid_index() {
-        let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
-
-        register(&lua, queue, cache).expect("Should register");
-
-        let result: LuaValue = lua.load("return hub.get_agent(0)").eval().unwrap();
-        assert!(matches!(result, LuaValue::Nil));
-
-        let result: LuaValue = lua.load("return hub.get_agent(100)").eval().unwrap();
-        assert!(matches!(result, LuaValue::Nil));
-    }
-
-    #[test]
-    fn test_get_agent_count_returns_zero_initially() {
-        let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
-
-        register(&lua, queue, cache).expect("Should register");
-
-        let count: usize = lua.load("return hub.get_agent_count()").eval().unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn test_get_agents_returns_key_and_pty_count() {
-        let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
-
-        // Populate cache with a test handle
-        use crate::agent::pty::PtySession;
-        use crate::hub::agent_handle::{AgentHandle, PtyHandle};
-
-        let pty_session = PtySession::new(24, 80);
-        let (shared_state, scrollback, event_tx) = pty_session.get_direct_access();
-        std::mem::forget(pty_session);
-        let pty = PtyHandle::new(event_tx, shared_state, scrollback, None);
-        let handle = AgentHandle::new("test-key", vec![pty], 0);
-        cache.set_all(vec![handle]);
-
-        register(&lua, queue, cache).expect("Should register");
-
-        let agents: LuaTable = lua.load("return hub.get_agents()").eval().unwrap();
-        assert_eq!(agents.len().unwrap(), 1);
-
-        let first: LuaTable = agents.get(1).unwrap();
-        let key: String = first.get("key").unwrap();
-        let pty_count: usize = first.get("pty_count").unwrap();
-        assert_eq!(key, "test-key");
-        assert_eq!(pty_count, 1);
     }
 
     #[test]
@@ -402,22 +250,6 @@ mod tests {
 
         let worktrees: LuaTable = lua.load("return hub.get_worktrees()").eval().unwrap();
         assert_eq!(worktrees.len().unwrap(), 0);
-    }
-
-    #[test]
-    fn test_get_agents_serializes_as_json_array() {
-        let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
-
-        register(&lua, queue, cache).expect("Should register");
-
-        // Get agents and convert back to JSON to verify array format
-        let agents: LuaValue = lua.load("return hub.get_agents()").eval().unwrap();
-        let json: serde_json::Value = lua.from_value(agents).unwrap();
-
-        // Empty agents should be an array [], not an object {}
-        assert!(json.is_array(), "Empty agents should serialize as JSON array, got: {}", json);
-        assert_eq!(json.as_array().unwrap().len(), 0);
     }
 
     #[test]

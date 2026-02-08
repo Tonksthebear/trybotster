@@ -16,18 +16,6 @@
 local state = require("core.state")
 local Agent = require("lib.agent")
 
--- Lazy-load handlers.agents to avoid circular dependency at require-time.
--- client.lua is a lib module loaded before handlers, so handlers.agents
--- may not exist yet when this file first loads. The accessor defers the
--- require() to first use, which is always after init.lua finishes loading.
-local _agents_handler
-local function get_agents_handler()
-    if not _agents_handler then
-        _agents_handler = require("handlers.agents")
-    end
-    return _agents_handler
-end
-
 local Client = state.class("client")
 
 --- Create a new Client instance for a peer connection.
@@ -134,9 +122,17 @@ function Client:handle_subscribe(msg)
     local agent_index = params.agent_index
     local pty_index = params.pty_index
 
-    log.debug(string.format("Subscribe: %s -> %s (agent=%s, pty=%s)",
+    -- Update client dims from subscribe params (browser embeds terminal
+    -- dimensions so PTY gets correct size immediately at subscription time,
+    -- eliminating the race between subscribe and resize messages).
+    if params.rows and params.cols then
+        self.rows = params.rows
+        self.cols = params.cols
+    end
+
+    log.debug(string.format("Subscribe: %s -> %s (agent=%s, pty=%s, dims=%dx%d)",
         sub_id:sub(1, 16), channel,
-        tostring(agent_index), tostring(pty_index)))
+        tostring(agent_index), tostring(pty_index), self.cols, self.rows))
 
     -- Store subscription info
     self.subscriptions[sub_id] = {
@@ -150,6 +146,13 @@ function Client:handle_subscribe(msg)
     self:send({
         type = "subscribed",
         subscriptionId = sub_id,
+    })
+
+    hooks.notify("client_subscribed", {
+        peer_id = self.peer_id,
+        channel = channel,
+        sub_id = sub_id,
+        params = params,
     })
 
     -- Channel-specific setup
@@ -183,9 +186,8 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
     -- Map pty_index to session name
     local session_name = pty_index == 0 and "cli" or "server"
 
-    -- Get agent from Lua registry by index
-    local agents = Agent.list()
-    local agent = agents[agent_index + 1]  -- Lua 1-indexed
+    -- Get agent by HandleCache index (stable across deletions)
+    local agent = Agent.get_by_index(agent_index)
 
     if agent and self.transport.type == "tui" then
         -- TUI: Use direct session access (no HandleCache needed)
@@ -222,9 +224,6 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
 
     -- Resize PTY to client's current dimensions
     hub.resize_pty(agent_index, pty_index, self.rows, self.cols)
-
-    -- Request scrollback buffer
-    hub.get_scrollback(agent_index, pty_index)
 
     log.info(string.format("Terminal subscription %s: agent=%d, pty=%d (%dx%d)",
         sub_id:sub(1, 16), agent_index, pty_index, self.cols, self.rows))
@@ -278,6 +277,12 @@ function Client:handle_unsubscribe(msg)
         self.forwarders[sub_id] = nil
         log.debug(string.format("Stopped forwarder for subscription: %s", sub_id:sub(1, 16)))
     end
+
+    hooks.notify("client_unsubscribed", {
+        peer_id = self.peer_id,
+        channel = sub.channel,
+        sub_id = sub_id,
+    })
 
     self.subscriptions[sub_id] = nil
     log.info(string.format("Unsubscribed: %s (was %s)", sub_id:sub(1, 16), sub.channel))
@@ -349,81 +354,21 @@ function Client:handle_terminal_data(sub, command)
 end
 
 --- Handle hub control data (list_agents, create_agent, etc.).
+-- Runs the before_hub_command interceptor chain, then dispatches
+-- to the command registry. See lib/commands.lua and handlers/commands.lua.
 -- @param sub_id The subscription ID for responses
 -- @param command The hub command
 function Client:handle_hub_data(sub_id, command)
-    -- Field name inconsistency: command type may be in "type" or "command" field.
     local cmd_type = command.type or command.command
     log.debug(string.format("handle_hub_data: type=%s", tostring(cmd_type)))
 
-    if cmd_type == "list_agents" then
-        self:send_agent_list(sub_id)
+    -- Interceptor chain: transform, validate, or drop before dispatch.
+    -- Return nil from an interceptor to block the command entirely.
+    -- Only pass command through the chain (self/sub_id are context, not transformable).
+    command = hooks.call("before_hub_command", command)
+    if command == nil then return end
 
-    elseif cmd_type == "list_worktrees" then
-        self:send_worktree_list(sub_id)
-
-    elseif cmd_type == "create_agent" then
-        local issue_or_branch = command.issue_or_branch or command.branch
-        local prompt = command.prompt
-        local from_worktree = command.from_worktree
-
-        get_agents_handler().handle_create_agent(issue_or_branch, prompt, from_worktree, self)
-        log.info(string.format("Create agent request: %s", tostring(issue_or_branch or "main")))
-
-    elseif cmd_type == "reopen_worktree" then
-        local path = command.path
-        local branch = command.branch or ""
-        local prompt = command.prompt
-
-        if path then
-            get_agents_handler().handle_create_agent(branch, prompt, path, self)
-            log.info(string.format("Reopen worktree request: %s", path))
-        else
-            log.warn("reopen_worktree missing path")
-        end
-
-    elseif cmd_type == "delete_agent" then
-        -- Field name inconsistency: agent ID may be in "id", "agent_id", or "session_key".
-        local agent_id = command.id or command.agent_id or command.session_key
-        local delete_worktree = command.delete_worktree or false
-
-        if agent_id then
-            get_agents_handler().handle_delete_agent(agent_id, delete_worktree)
-            log.info(string.format("Delete agent request: %s", agent_id))
-        else
-            log.warn("delete_agent missing agent_id")
-        end
-
-    elseif cmd_type == "select_agent" then
-        -- No backend action needed; agent selection is client-side UI state
-        log.debug(string.format("Select agent: %s", tostring(command.id or command.agent_index)))
-
-    elseif cmd_type == "get_connection_code" then
-        -- Always go through Hub-side generation which includes QR PNG.
-        -- generate_connection_url() is idempotent (returns cached bundle
-        -- unless consumed by a browser, in which case it auto-regenerates).
-        connection.generate()
-
-    elseif cmd_type == "regenerate_connection_code" then
-        -- Force-regenerate: creates a fresh PreKeyBundle unconditionally
-        connection.regenerate()
-        log.info("Connection code regeneration requested")
-
-    elseif cmd_type == "resize" then
-        -- Client resize - update stored dims and resize any active PTY forwarders
-        local rows = command.rows or 24
-        local cols = command.cols or 80
-        self:update_dims(rows, cols)
-
-    elseif cmd_type == "quit" then
-        hub.quit()
-
-    elseif cmd_type == "copy_connection_url" then
-        connection.copy_to_clipboard()
-
-    else
-        log.debug(string.format("Unknown hub command: %s", tostring(cmd_type)))
-    end
+    require("lib.commands").dispatch(self, sub_id, command)
 end
 
 --- Count active subscriptions (for debugging).
@@ -458,9 +403,6 @@ end
 
 -- Lifecycle hooks for hot-reload
 function Client._before_reload()
-    -- Clear cached handler reference so next call picks up the fresh module.
-    -- Handles the case where handlers.agents was reloaded independently.
-    _agents_handler = nil
     log.info("client.lua reloading (persistent metatable — instances auto-upgrade)")
 end
 

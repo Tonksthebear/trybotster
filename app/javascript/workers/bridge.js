@@ -3,7 +3,7 @@
  *
  * Architecture:
  * - Main thread (bridge.js) proxies all crypto operations
- * - Crypto Worker (matrix_crypto.js) - SharedWorker handling Matrix Olm/Megolm crypto
+ * - Crypto Worker (olm_crypto.js) - SharedWorker handling vodozemac Olm crypto
  * - Transport: WebRTCTransport in main thread (RTCPeerConnection not available in Workers)
  *
  * The main thread talks directly to crypto SharedWorker for encrypt/decrypt,
@@ -17,9 +17,6 @@ let instance = null
 let webrtcTransport = null
 
 class WorkerBridge {
-  #pendingRequests = new Map()
-  #requestId = 0
-
   // Crypto SharedWorker
   #cryptoWorker = null
   #cryptoWorkerPort = null
@@ -44,39 +41,41 @@ class WorkerBridge {
   /**
    * Initialize the workers (idempotent)
    * @param {Object} options
-   * @param {string} options.cryptoWorkerUrl - URL to the crypto SharedWorker (matrix_crypto.js)
-   * @param {string} options.wasmJsUrl - URL to matrix-sdk-crypto-wasm JS
-   * @param {string} options.wasmBinaryUrl - URL to WASM binary (optional, Matrix SDK loads internally)
+   * @param {string} options.cryptoWorkerUrl - URL to the crypto SharedWorker
+   * @param {string} options.wasmJsUrl - URL to vodozemac-wasm JS
    */
-  async init({ cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl }) {
+  async init({ cryptoWorkerUrl, wasmJsUrl }) {
     if (this.#initialized) return
     if (this.#initPromise) return this.#initPromise
 
-    this.#initPromise = this.#doInit({ cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl })
+    this.#initPromise = this.#doInit({ cryptoWorkerUrl, wasmJsUrl })
     return this.#initPromise
   }
 
-  async #doInit({ cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl }) {
+  async #doInit({ cryptoWorkerUrl, wasmJsUrl }) {
     try {
       // 1. Create crypto SharedWorker first and initialize WASM
-      this.#cryptoWorker = new SharedWorker(cryptoWorkerUrl, { type: "module", name: "matrix-crypto" })
+      this.#cryptoWorker = new SharedWorker(cryptoWorkerUrl, { type: "module", name: "vodozemac-crypto" })
       this.#cryptoWorkerPort = this.#cryptoWorker.port
       this.#cryptoWorkerPort.onmessage = (e) => this.#handleCryptoMessage(e)
       this.#cryptoWorkerPort.start()
 
       // Initialize WASM via crypto worker
-      await this.sendCrypto("init", { wasmJsUrl, wasmBinaryUrl })
+      await this.sendCrypto("init", { wasmJsUrl })
 
       // 2. Create WebRTC transport (runs in main thread - RTCPeerConnection not available in Workers)
       console.debug(`[WorkerBridge] Using WebRTC transport`)
       const { default: transport } = await import("transport/webrtc")
       webrtcTransport = transport
 
-      // Wire up event forwarding from WebRTCTransport
-      webrtcTransport.on("connection:state", (data) => this.#dispatchEvent(data))
+      // Wire up event forwarding from WebRTCTransport.
+      // Every event must include { event: "<name>" } so #dispatchEvent can route it.
+      webrtcTransport.on("connection:state", (data) => this.#dispatchEvent({ event: "connection:state", ...data }))
       webrtcTransport.on("connection:mode", (data) => this.#dispatchEvent({ event: "connection:mode", ...data }))
       webrtcTransport.on("subscription:message", (data) => this.#dispatchEvent({ event: "subscription:message", ...data }))
       webrtcTransport.on("subscription:confirmed", (data) => this.#dispatchEvent({ event: "subscription:confirmed", ...data }))
+      webrtcTransport.on("health", (data) => this.#dispatchEvent({ event: "health", ...data }))
+      webrtcTransport.on("session:invalid", (data) => this.#dispatchEvent({ event: "session:invalid", ...data }))
 
       this.#initialized = true
     } catch (error) {
@@ -158,8 +157,6 @@ class WorkerBridge {
     }
 
     switch (action) {
-      case "init":
-        return { initialized: true }
       case "connect":
         return webrtcTransport.connect(params.hubId, params.browserIdentity)
       case "connectSignaling":
@@ -171,24 +168,27 @@ class WorkerBridge {
       case "disconnect":
         return webrtcTransport.disconnect(params.hubId)
       case "subscribe": {
-        // Encrypt the subscribe message so the browser's first message is a
-        // CryptoEnvelope - establishes the Matrix session on the CLI side.
-        const subscribeMsg = {
+        // Build binary control frame: [0x00][JSON bytes]
+        const subscribePayload = {
           type: "subscribe",
           subscriptionId: params.subscriptionId,
           channel: params.channel,
           params: params.params,
         }
-        const { envelope } = await this.encrypt(params.hubId, subscribeMsg)
-        const envelopeObj = typeof envelope === "string" ? JSON.parse(envelope) : envelope
-        return webrtcTransport.subscribe(params.hubId, params.channel, params.params, params.subscriptionId, envelopeObj)
+        const jsonBytes = new TextEncoder().encode(JSON.stringify(subscribePayload))
+        const plaintext = new Uint8Array(1 + jsonBytes.length)
+        plaintext[0] = 0x00  // CONTENT_MSG
+        plaintext.set(jsonBytes, 1)
+
+        const { data: encrypted } = await this.encryptBinary(params.hubId, plaintext)
+        return webrtcTransport.subscribe(params.hubId, params.channel, params.params, params.subscriptionId, encrypted)
       }
       case "unsubscribe":
         return webrtcTransport.unsubscribe(params.subscriptionId)
       case "sendRaw":
         return webrtcTransport.sendRaw(params.subscriptionId, params.message)
-      case "sendEnvelope":
-        return webrtcTransport.sendEnvelope(params.hubId, params.envelope)
+      case "sendEncrypted":
+        return webrtcTransport.sendEncrypted(params.hubId, params.encrypted)
       default:
         throw new Error(`Unknown action: ${action}`)
     }
@@ -235,22 +235,13 @@ class WorkerBridge {
   // ===========================================================================
 
   /**
-   * Create a new Matrix session from a device key bundle
+   * Create a new Olm session from a device key bundle
    * @param {string} hubId - The hub ID
-   * @param {Object|string} bundleJson - The device key bundle (Matrix format)
+   * @param {Object|string} bundleJson - The device key bundle
    * @returns {Promise<{created: boolean, identityKey: string}>}
    */
   async createSession(hubId, bundleJson) {
     return this.sendCrypto("createSession", { hubId, bundleJson })
-  }
-
-  /**
-   * Load an existing session from storage
-   * @param {string} hubId - The hub ID
-   * @returns {Promise<{loaded: boolean, fromCache?: boolean, error?: string}>}
-   */
-  async loadSession(hubId) {
-    return this.sendCrypto("loadSession", { hubId })
   }
 
   /**
@@ -263,26 +254,45 @@ class WorkerBridge {
   }
 
   /**
-   * Encrypt a message for a hub
+   * Encrypt a message (JSON envelope for ActionCable signaling).
    * @param {string} hubId - The hub ID
-   * @param {string|Uint8Array|Object} message - The message to encrypt
-   * @returns {Promise<{envelope: string}>} CryptoEnvelope as JSON string
+   * @param {string|Object} message - The message to encrypt (string or JSON-serializable)
+   * @returns {Promise<{encrypted: Object}>} OlmEnvelope { t, b, k? }
    */
   async encrypt(hubId, message) {
-    // Convert to string if needed (handles Uint8Array binary messages)
-    const messageStr = this.#messageToString(message)
+    const messageStr = typeof message === "string" ? message : JSON.stringify(message)
     return this.sendCrypto("encrypt", { hubId, message: messageStr })
   }
 
   /**
-   * Decrypt a CryptoEnvelope from a hub
+   * Decrypt a JSON OlmEnvelope (ActionCable signaling).
    * @param {string} hubId - The hub ID
-   * @param {string|Object} envelope - The encrypted envelope { t, c, s, d }
+   * @param {string|Object} encryptedData - OlmEnvelope { t, b, k? }
    * @returns {Promise<{plaintext: any}>}
    */
-  async decrypt(hubId, envelope) {
-    const envelopeStr = typeof envelope === "string" ? envelope : JSON.stringify(envelope)
-    return this.sendCrypto("decrypt", { hubId, envelope: envelopeStr })
+  async decrypt(hubId, encryptedData) {
+    const dataStr = typeof encryptedData === "string" ? encryptedData : JSON.stringify(encryptedData)
+    return this.sendCrypto("decrypt", { hubId, encryptedData: dataStr })
+  }
+
+  /**
+   * Encrypt raw bytes into a binary DataChannel frame (zero base64).
+   * @param {string} hubId - The hub ID
+   * @param {Uint8Array} plaintext - Raw bytes to encrypt
+   * @returns {Promise<{data: Uint8Array}>} Binary frame
+   */
+  async encryptBinary(hubId, plaintext) {
+    return this.sendCrypto("encryptBinary", { hubId, plaintext })
+  }
+
+  /**
+   * Decrypt a binary DataChannel frame (zero base64).
+   * @param {string} hubId - The hub ID
+   * @param {Uint8Array} data - Binary frame from DataChannel
+   * @returns {Promise<{data: Uint8Array}>} Decrypted plaintext bytes
+   */
+  async decryptBinary(hubId, data) {
+    return this.sendCrypto("decryptBinary", { hubId, data })
   }
 
   /**
@@ -304,33 +314,6 @@ class WorkerBridge {
   }
 
   /**
-   * Process a sender key distribution message (for group sessions)
-   * @param {string} hubId - The hub ID
-   * @param {string} distributionB64 - The distribution message in base64
-   * @returns {Promise<{processed: boolean}>}
-   */
-  async processSenderKeyDistribution(hubId, distributionB64) {
-    return this.sendCrypto("processSenderKeyDistribution", { hubId, distributionB64 })
-  }
-
-  /**
-   * Convert message to string for encryption.
-   * Uint8Array -> Latin-1 string (each byte -> char code).
-   * Objects -> JSON string.
-   * @private
-   */
-  #messageToString(message) {
-    if (message instanceof Uint8Array) {
-      // Binary data: convert to Latin-1 string (byte values 0-255 -> char codes)
-      return String.fromCharCode.apply(null, message)
-    } else if (typeof message === "string") {
-      return message
-    } else {
-      return JSON.stringify(message)
-    }
-  }
-
-  /**
    * Subscribe to transport events
    * @param {string} eventName - Event name (e.g., "connection:state", "subscription:message")
    * @param {Function} callback - Callback function receiving the event data
@@ -342,8 +325,8 @@ class WorkerBridge {
     }
     this.#eventListeners.get(eventName).add(callback)
 
-    // Also register with WebRTCTransport
-    const webrtcUnsub = webrtcTransport?.on(eventName, callback)
+    // Events flow: WebRTCTransport → bridge.#dispatchEvent → local listeners.
+    // Do NOT also register with WebRTCTransport directly (set up in #doInit).
 
     // Return unsubscribe function
     return () => {
@@ -354,7 +337,6 @@ class WorkerBridge {
           this.#eventListeners.delete(eventName)
         }
       }
-      if (webrtcUnsub) webrtcUnsub()
     }
   }
 

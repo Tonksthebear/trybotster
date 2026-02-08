@@ -30,21 +30,22 @@ pub fn handle_copy_connection_url(hub: &mut Hub) {
 /// event so all hub subscribers receive the fresh URL.
 pub fn handle_regenerate_connection_code(hub: &mut Hub) {
     // Get crypto service from browser state
-    let Some(crypto_service) = hub.browser.crypto_service.clone() else {
+    let Some(ref crypto_service) = hub.browser.crypto_service else {
         log::warn!("Cannot regenerate bundle: crypto service not initialized");
         return;
     };
 
-    // Regenerate bundle directly via crypto service
-    let result = hub.tokio_runtime.block_on(async {
-        crypto_service.get_device_key_bundle().await
-    });
+    // Regenerate bundle directly via crypto service (synchronous mutex)
+    let result = crypto_service
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Mutex poisoned: {e}"))
+        .and_then(|mut guard| guard.build_device_key_bundle());
 
     match result {
         Ok(bundle) => {
             log::info!(
-                "New DeviceKeyBundle generated with key_id {}",
-                bundle.key_id
+                "New DeviceKeyBundle generated (identity: {}...)",
+                &bundle.curve25519_key[..bundle.curve25519_key.len().min(16)]
             );
             hub.browser.device_key_bundle = Some(bundle);
             hub.browser.bundle_used = false;

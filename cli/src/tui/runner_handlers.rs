@@ -411,7 +411,7 @@ where
 
 /// Parse agent info from a JSON value received via Lua events.
 ///
-/// Converts the JSON agent object (from `hub.get_agents()` via Lua) into
+/// Converts the JSON agent object (from Lua agent events) into
 /// an `AgentInfo` struct. Returns `None` if the `id` field is missing.
 // Rust guideline compliant 2026-02
 fn parse_agent_info(value: &serde_json::Value) -> Option<crate::relay::AgentInfo> {

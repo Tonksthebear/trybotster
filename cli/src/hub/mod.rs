@@ -51,7 +51,7 @@ pub mod state;
 pub mod workers;
 
 pub use actions::HubAction;
-pub use agent_handle::AgentHandle;
+pub use agent_handle::AgentPtys;
 pub use state::{HubState, SharedHubState};
 
 use std::sync::Arc;
@@ -399,7 +399,7 @@ impl Hub {
     /// manages that separately.
     pub fn sync_handle_cache(&self) {
         let state = self.state.read().unwrap();
-        let handles: Vec<AgentHandle> = (0..state.agent_count())
+        let handles: Vec<AgentPtys> = (0..state.agent_count())
             .filter_map(|i| state.get_agent_handle(i))
             .collect();
         self.handle_cache.set_all(handles);
@@ -606,11 +606,17 @@ impl Hub {
         }
         self.webrtc_connection_started.clear();
 
-        // Shutdown CryptoService (persists crypto session state to disk)
+        // Persist crypto session state to disk on shutdown
         if let Some(ref cs) = self.browser.crypto_service {
-            let _guard = self.tokio_runtime.enter();
-            if let Err(e) = self.tokio_runtime.block_on(cs.shutdown()) {
-                log::warn!("CryptoService shutdown failed: {e}");
+            match cs.lock() {
+                Ok(guard) => {
+                    if let Err(e) = guard.persist() {
+                        log::warn!("CryptoService persist failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("CryptoService mutex poisoned on shutdown: {e}");
+                }
             }
         }
 

@@ -78,7 +78,7 @@ pub enum PtyView {
 ///
 /// Agent does NOT track:
 /// - `active_pty` - Each client tracks their own view
-/// - `size_owner` - PTY sessions track connected clients
+/// - `size_owner` - Lua tracks connected clients
 /// - Scroll position - Each client tracks their own scroll
 ///
 /// Methods that previously used `active_pty` now take a `view: PtyView`

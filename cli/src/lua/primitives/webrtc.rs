@@ -102,8 +102,7 @@ pub fn register(lua: &Lua, send_queue: WebRtcSendQueue) -> Result<()> {
     // webrtc.on_peer_connected(callback)
     let on_connected_fn = lua
         .create_function(|lua, callback: LuaFunction| {
-            let key = lua.create_registry_value(callback)?;
-            lua.set_named_registry_value(registry_keys::ON_PEER_CONNECTED, key)?;
+            lua.set_named_registry_value(registry_keys::ON_PEER_CONNECTED, callback)?;
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create webrtc.on_peer_connected function: {e}"))?;
@@ -114,8 +113,7 @@ pub fn register(lua: &Lua, send_queue: WebRtcSendQueue) -> Result<()> {
     // webrtc.on_peer_disconnected(callback)
     let on_disconnected_fn = lua
         .create_function(|lua, callback: LuaFunction| {
-            let key = lua.create_registry_value(callback)?;
-            lua.set_named_registry_value(registry_keys::ON_PEER_DISCONNECTED, key)?;
+            lua.set_named_registry_value(registry_keys::ON_PEER_DISCONNECTED, callback)?;
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create webrtc.on_peer_disconnected function: {e}"))?;
@@ -126,8 +124,7 @@ pub fn register(lua: &Lua, send_queue: WebRtcSendQueue) -> Result<()> {
     // webrtc.on_message(callback)
     let on_message_fn = lua
         .create_function(|lua, callback: LuaFunction| {
-            let key = lua.create_registry_value(callback)?;
-            lua.set_named_registry_value(registry_keys::ON_MESSAGE, key)?;
+            lua.set_named_registry_value(registry_keys::ON_MESSAGE, callback)?;
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create webrtc.on_message function: {e}"))?;
