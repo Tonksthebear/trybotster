@@ -59,7 +59,6 @@ use vt100::Parser;
 
 use ratatui::backend::CrosstermBackend;
 
-use crate::agent::PtyView;
 use crate::app::AppMode;
 use crate::client::TuiOutput;
 use crate::hub::Hub;
@@ -150,10 +149,10 @@ pub struct TuiRunner<B: Backend> {
     /// The agent ID (session key) of the currently selected agent.
     pub(super) selected_agent: Option<String>,
 
-    /// Active PTY view (CLI or Server).
+    /// Active PTY session index (0 = first session, typically "agent").
     ///
-    /// Tracks which PTY view is displayed. TuiRunner owns this state.
-    pub(super) active_pty_view: PtyView,
+    /// Cycles through available sessions with Ctrl+]. TuiRunner owns this state.
+    pub(super) active_pty_index: usize,
 
     /// Index of the agent currently being viewed/interacted with.
     ///
@@ -251,7 +250,7 @@ where
             agents: Vec::new(),
             request_tx,
             selected_agent: None,
-            active_pty_view: PtyView::default(),
+            active_pty_index: 0,
             current_agent_index: None,
             current_pty_index: None,
             current_terminal_sub_id: None,
@@ -500,6 +499,11 @@ where
                 branch_name: info.branch_name.clone().unwrap_or_default(),
                 port: info.port,
                 server_running: info.server_running.unwrap_or(false),
+                session_names: info
+                    .sessions
+                    .as_ref()
+                    .map(|s| s.iter().map(|si| si.name.clone()).collect())
+                    .unwrap_or_default(),
             })
             .collect();
 
@@ -545,7 +549,7 @@ where
 
             // Terminal State - use TuiRunner's local parser
             active_parser: Some(self.parser_handle()),
-            active_pty_view: self.active_pty_view,
+            active_pty_index: self.active_pty_index,
             scroll_offset,
             is_scrolled,
 
@@ -928,13 +932,13 @@ mod tests {
     /// by selection index.
     #[test]
     fn test_dynamic_menu_builds_correctly() {
-        use crate::agent::PtyView;
         use crate::tui::menu::{build_menu, get_action_for_selection, MenuAction, MenuContext};
 
         // Menu without agent selected - should have Hub items only
         let ctx_no_agent = MenuContext {
             has_agent: false,
-            active_pty: PtyView::Cli,
+            active_pty_index: 0,
+            session_count: 0,
         };
         let menu = build_menu(&ctx_no_agent);
 
@@ -948,14 +952,15 @@ mod tests {
             Some(MenuAction::ShowConnectionCode)
         );
 
-        // Menu with agent selected - always has View Server / View Agent toggle
+        // Menu with agent selected and multiple sessions - shows Next Session toggle
         let ctx_with_agent = MenuContext {
             has_agent: true,
-            active_pty: PtyView::Cli,
+            active_pty_index: 0,
+            session_count: 2,
         };
         let menu = build_menu(&ctx_with_agent);
 
-        // First selectable should be View Server (PTY toggle), then Close Agent
+        // First selectable should be Next Session (PTY toggle), then Close Agent
         assert_eq!(
             get_action_for_selection(&menu, 0),
             Some(MenuAction::TogglePtyView)
@@ -2086,10 +2091,10 @@ mod tests {
                 branch_name: Some(format!("branch-{}", i)),
                 name: None,
                 status: Some("Running".to_string()),
+                sessions: None,
                 port: None,
                 server_running: None,
                 has_server_pty: None,
-                active_pty_view: None,
                 scroll_offset: None,
                 hub_identifier: None,
             })

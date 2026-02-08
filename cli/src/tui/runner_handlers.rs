@@ -15,7 +15,6 @@
 use ratatui::backend::Backend;
 use vt100::Parser;
 
-use crate::agent::PtyView;
 use super::actions::TuiAction;
 use super::runner::{TuiRunner, DEFAULT_SCROLLBACK};
 
@@ -193,9 +192,9 @@ where
 
     /// Handle PTY view toggle action.
     ///
-    /// Toggles between CLI and Server PTY for the current agent using the
+    /// Cycles through available PTY sessions for the current agent using the
     /// Lua subscribe/unsubscribe protocol (same path as browser clients).
-    /// Toggles unconditionally: PTY 0 = agent, PTY 1 = server.
+    /// Wraps around: after the last session, returns to session 0.
     pub(super) fn handle_pty_view_toggle(&mut self) {
         // Need an agent selected
         let Some(agent_index) = self.current_agent_index else {
@@ -203,21 +202,21 @@ where
             return;
         };
 
-        // Toggle: PTY 0 = agent, PTY 1 = server
-        let new_view = match self.active_pty_view {
-            PtyView::Cli => PtyView::Server,
-            PtyView::Server => PtyView::Cli,
-        };
+        // Determine session count from the selected agent's info
+        let session_count = self
+            .selected_agent
+            .as_ref()
+            .and_then(|key| self.agents.iter().find(|a| a.id == *key))
+            .and_then(|a| a.sessions.as_ref())
+            .map_or(1, |s| s.len().max(1));
 
-        let pty_index = match new_view {
-            PtyView::Cli => 0,
-            PtyView::Server => 1,
-        };
+        // Cycle to next session (wrap around)
+        let new_index = (self.active_pty_index + 1) % session_count;
 
         log::debug!(
-            "Toggling PTY view to {:?} (pty_index={}) for agent index {}",
-            new_view,
-            pty_index,
+            "Cycling PTY view to index {} (of {}) for agent index {}",
+            new_index,
+            session_count,
             agent_index
         );
 
@@ -244,12 +243,12 @@ where
             "subscriptionId": sub_id,
             "params": {
                 "agent_index": agent_index,
-                "pty_index": pty_index,
+                "pty_index": new_index,
             }
         }));
 
-        self.active_pty_view = new_view;
-        self.current_pty_index = Some(pty_index);
+        self.active_pty_index = new_index;
+        self.current_pty_index = Some(new_index);
         self.current_terminal_sub_id = Some(sub_id);
     }
 
@@ -416,6 +415,19 @@ where
 // Rust guideline compliant 2026-02
 fn parse_agent_info(value: &serde_json::Value) -> Option<crate::relay::AgentInfo> {
     let id = value.get("id").and_then(|v| v.as_str())?.to_string();
+
+    // Parse sessions array if present
+    let sessions = value.get("sessions").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|s| {
+                let name = s.get("name").and_then(|v| v.as_str())?.to_string();
+                let port_forward = s.get("port_forward").and_then(|v| v.as_bool()).unwrap_or(false);
+                let port = s.get("port").and_then(|v| v.as_u64()).and_then(|p| u16::try_from(p).ok());
+                Some(crate::relay::SessionInfo { name, port_forward, port })
+            })
+            .collect()
+    });
+
     Some(crate::relay::AgentInfo {
         id,
         repo: value.get("repo").and_then(|v| v.as_str()).map(String::from),
@@ -423,10 +435,10 @@ fn parse_agent_info(value: &serde_json::Value) -> Option<crate::relay::AgentInfo
         branch_name: value.get("branch_name").and_then(|v| v.as_str()).map(String::from),
         name: value.get("name").and_then(|v| v.as_str()).map(String::from),
         status: value.get("status").and_then(|v| v.as_str()).map(String::from),
-        port: value.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
+        sessions,
+        port: value.get("port").and_then(|v| v.as_u64()).and_then(|p| u16::try_from(p).ok()),
         server_running: value.get("server_running").and_then(|v| v.as_bool()),
         has_server_pty: value.get("has_server_pty").and_then(|v| v.as_bool()),
-        active_pty_view: value.get("active_pty_view").and_then(|v| v.as_str()).map(String::from),
         scroll_offset: value.get("scroll_offset").and_then(|v| v.as_u64()).map(|s| s as u32),
         hub_identifier: value.get("hub_identifier").and_then(|v| v.as_str()).map(String::from),
     })

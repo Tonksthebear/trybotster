@@ -80,9 +80,8 @@ impl BrowserState {
 ///
 /// This is a helper to convert agent data into the format expected by browsers.
 ///
-/// Note: `active_pty_view` and `scroll_offset` are set to `None` because these
-/// are now client-scoped state. Each browser tracks its own view selection and
-/// scroll position independently via xterm.js.
+/// Note: `scroll_offset` is set to `None` because it is client-scoped state.
+/// Each browser tracks its own scroll position independently via xterm.js.
 #[must_use]
 pub fn build_agent_info(id: &str, agent: &crate::Agent, hub_identifier: &str) -> AgentInfo {
     AgentInfo {
@@ -92,11 +91,11 @@ pub fn build_agent_info(id: &str, agent: &crate::Agent, hub_identifier: &str) ->
         branch_name: Some(agent.branch_name.clone()),
         name: None,
         status: Some(format!("{:?}", agent.status)),
+        sessions: None, // Populated from Lua agent info when available
         port: agent.port(),
         server_running: Some(agent.is_server_running()),
         has_server_pty: Some(agent.has_server_pty()),
-        // View and scroll are client-scoped - browser tracks its own state
-        active_pty_view: None,
+        // Scroll is client-scoped — browser tracks its own position
         scroll_offset: None,
         hub_identifier: Some(hub_identifier.to_string()),
     }

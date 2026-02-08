@@ -134,7 +134,7 @@ fn test_pty_view_switch() {
     // Test that agent.has_server_pty() returns true when server PTY exists.
     assert!(agent.has_server_pty());
 
-    // Clients track their own active_pty_view and use toggle_pty_view() method.
+    // Clients track their own active PTY index and cycle sessions locally.
     // See client tests (tui.rs, browser.rs) for client-side toggle testing.
 }
 
@@ -457,7 +457,7 @@ fn test_spawn_server_pty() {
         // Now spawn the server PTY
         let server_script = fixture_path("test_botster_server.sh");
         let mut server_env = HashMap::new();
-        server_env.insert("BOTSTER_TUNNEL_PORT".to_string(), "3000".to_string());
+        server_env.insert("PORT".to_string(), "3000".to_string());
 
         agent
             .spawn_server_pty(&server_script.display().to_string(), &server_env)
@@ -532,7 +532,7 @@ fn test_real_pty_view_switching() {
         assert!(agent.cli_pty.is_spawned());
         assert!(agent.has_server_pty());
 
-        // Clients track their own active_pty_view and use write_input_to_view().
+        // Clients track their own active PTY index and use write_input_to_view().
         // See client tests (tui.rs, browser.rs) for client-side toggle testing.
 
         tx.send(()).unwrap();

@@ -18,6 +18,7 @@
  *   - agentCreated - New agent data
  *   - agentDeleted - { id }
  *   - connectionCode - { url, qr_ascii }
+ *   - profileList - Array of profile names
  *
  * Usage:
  *   const hub = await ConnectionManager.acquire(HubConnection, hubId, { hubId });
@@ -84,6 +85,13 @@ export class HubConnection extends Connection {
         this.emit("connectionCode", message);
         break;
 
+      case "profiles":
+        this.emit("profileList", {
+          profiles: Array.isArray(message.profiles) ? message.profiles : [],
+          sharedAgent: !!message.shared_agent,
+        });
+        break;
+
       default:
         // Route fs:* responses to one-shot listeners keyed by request_id
         if (message.type?.startsWith("fs:") && message.request_id) {
@@ -137,6 +145,13 @@ export class HubConnection extends Connection {
    */
   createAgent(options = {}) {
     return this.send("create_agent", options);
+  }
+
+  /**
+   * Request list of config profiles from CLI.
+   */
+  requestProfiles() {
+    return this.send("list_profiles");
   }
 
   /**
@@ -204,6 +219,10 @@ export class HubConnection extends Connection {
 
   mkDir(path) {
     return this.fsRequest("fs:mkdir", { path });
+  }
+
+  rmDir(path) {
+    return this.fsRequest("fs:rmdir", { path });
   }
 
   // ========== Convenience event helpers ==========

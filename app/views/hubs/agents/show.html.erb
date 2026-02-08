@@ -75,19 +75,20 @@
             <span class="size-3 rounded-full bg-green-500/80"></span>
           </div>
 
-          <%# PTY switcher tabs %>
-          <div class="flex items-center bg-zinc-800/50 rounded p-0.5">
-            <%= link_to hub_agent_pty_path(Current.hub, Current.agent_index, 0),
-                        class: "px-2 py-1 text-xs font-medium rounded transition-colors #{Current.pty_index == 0 ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}",
-                        data: { turbo_action: "replace" } do %>
-              <span class="hidden sm:inline">Agent</span>
-              <span class="sm:hidden">CLI</span>
-            <% end %>
-            <%= link_to hub_agent_pty_path(Current.hub, Current.agent_index, 1),
-                        class: "px-2 py-1 text-xs font-medium rounded transition-colors #{Current.pty_index == 1 ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}",
-                        data: { turbo_action: "replace" } do %>
-              Server
-            <% end %>
+          <%# Dynamic PTY session tabs (populated from sessions[] via Stimulus) %>
+          <div data-controller="pty-tabs"
+               data-pty-tabs-hub-id-value="<%= Current.hub.id %>"
+               data-pty-tabs-agent-index-value="<%= Current.agent_index %>"
+               data-pty-tabs-pty-index-value="<%= Current.pty_index %>">
+            <div data-pty-tabs-target="tabBar"
+                 class="flex items-center bg-zinc-800/50 rounded p-0.5">
+              <%# Default tab rendered server-side; replaced dynamically when session data arrives %>
+              <%= link_to hub_agent_pty_path(Current.hub, Current.agent_index, 0),
+                          class: "px-2 py-1 text-xs font-medium rounded transition-colors #{Current.pty_index == 0 ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}",
+                          data: { turbo_action: "replace" } do %>
+                Agent
+              <% end %>
+            </div>
           </div>
         </div>
 

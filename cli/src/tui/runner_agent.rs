@@ -19,7 +19,6 @@
 use ratatui::backend::Backend;
 use vt100::Parser;
 
-use crate::agent::PtyView;
 
 use super::runner::{TuiRunner, DEFAULT_SCROLLBACK};
 
@@ -124,7 +123,7 @@ where
         }
 
         // Reset to CLI view when switching agents
-        self.active_pty_view = PtyView::Cli;
+        self.active_pty_index = 0;
 
         // Reset parser for fresh output
         {

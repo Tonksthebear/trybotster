@@ -214,6 +214,32 @@ pub fn register(
         .set("repo_root", repo_root_fn)
         .map_err(|e| anyhow!("Failed to set worktree.repo_root: {e}"))?;
 
+    // worktree.copy_from_patterns(repo_root, dest, patterns_file) -> true | error
+    //
+    // Copies files from repo_root to dest matching glob patterns in patterns_file.
+    // Raises a Lua error on failure (callers use pcall for error handling).
+    let copy_fn = lua
+        .create_function(
+            |_, (repo_root, dest, patterns_file): (String, String, String)| {
+                use std::path::Path;
+                WorktreeManager::copy_from_patterns(
+                    Path::new(&repo_root),
+                    Path::new(&dest),
+                    Path::new(&patterns_file),
+                )
+                .map(|()| true)
+                .map_err(|e| mlua::Error::runtime(format!(
+                    "Failed to copy patterns from '{}': {}",
+                    patterns_file, e
+                )))
+            },
+        )
+        .map_err(|e| anyhow!("Failed to create worktree.copy_from_patterns function: {e}"))?;
+
+    worktree
+        .set("copy_from_patterns", copy_fn)
+        .map_err(|e| anyhow!("Failed to set worktree.copy_from_patterns: {e}"))?;
+
     // worktree.delete(path, branch) - Queue worktree deletion
     //
     // Queues a request to delete a worktree. Hub processes it asynchronously.
@@ -267,6 +293,7 @@ mod tests {
         assert!(wt.contains_key("exists").unwrap());
         assert!(wt.contains_key("find").unwrap());
         assert!(wt.contains_key("create").unwrap());
+        assert!(wt.contains_key("copy_from_patterns").unwrap());
         assert!(wt.contains_key("delete").unwrap());
         assert!(wt.contains_key("repo_root").unwrap());
     }

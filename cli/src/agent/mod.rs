@@ -12,17 +12,17 @@
 //! +-- server_pty: Option<PtySession> (runs dev server)
 //! ```
 //!
-//! Agents are agnostic - they spawn whatever processes the user configures
-//! via `.botster_init` and `.botster_server` scripts in the worktree.
+//! Agents are agnostic — they spawn whatever processes the user configures
+//! via `.botster/` session initialization scripts in the worktree.
 //!
 //! # Client State vs Agent State
 //!
 //! Agent owns process state (PTYs, channels, metadata).
-//! Clients own view state (active_pty, scroll position).
+//! Clients own view state (active PTY index, scroll position).
 //!
 //! This separation allows multiple clients to view the same agent with
-//! independent view states - one client can be scrolled up in CLI PTY
-//! while another views the Server PTY live.
+//! independent view states — one client can be scrolled up in one session
+//! while another views a different session live.
 //!
 //! # Submodules
 //!

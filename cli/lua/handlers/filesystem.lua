@@ -149,6 +149,21 @@ commands.register("fs:mkdir", function(client, sub_id, command)
     end
 end, { description = "Create a directory in the repo" })
 
+commands.register("fs:rmdir", function(client, sub_id, command)
+    local path, err = safe_path(command.path or "")
+    if not path then
+        respond(client, sub_id, command.request_id, "fs:rmdir", { ok = false, error = err })
+        return
+    end
+
+    local ok, rmdir_err = fs.rmdir(path)
+    if ok then
+        respond(client, sub_id, command.request_id, "fs:rmdir", { ok = true })
+    else
+        respond(client, sub_id, command.request_id, "fs:rmdir", { ok = false, error = rmdir_err })
+    end
+end, { description = "Recursively remove a directory from the repo" })
+
 -- ============================================================================
 -- Module Interface
 -- ============================================================================

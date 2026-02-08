@@ -36,7 +36,6 @@ use crate::app::{buffer_to_ansi, centered_rect, AppMode};
 
 use super::menu::{build_menu, MenuContext, MenuItem};
 use crate::compat::{BrowserDimensions, VpnStatus};
-use crate::PtyView;
 
 use super::events::CreationStage;
 
@@ -57,6 +56,9 @@ pub struct AgentRenderInfo {
     pub port: Option<u16>,
     /// Whether the server is running.
     pub server_running: bool,
+    /// Ordered session names (e.g., ["agent", "server", "watcher"]).
+    /// Empty if sessions info not available (backward compat).
+    pub session_names: Vec<String>,
 }
 
 /// Context required for rendering the TUI.
@@ -97,8 +99,8 @@ pub struct RenderContext<'a> {
     /// The VT100 parser for the currently selected agent's active PTY.
     /// This is the parser that should be rendered in the terminal area.
     pub active_parser: Option<Arc<Mutex<Parser>>>,
-    /// Which PTY view is currently active.
-    pub active_pty_view: PtyView,
+    /// Index of the currently active PTY session (0 = first session).
+    pub active_pty_index: usize,
     /// Current scroll offset for the active PTY.
     pub scroll_offset: usize,
     /// Whether the active PTY is scrolled (not at bottom).
@@ -121,7 +123,7 @@ impl<'a> std::fmt::Debug for RenderContext<'a> {
             .field("selected_agent_index", &self.selected_agent_index)
             .field("agents_count", &self.agents.len())
             .field("has_active_parser", &self.active_parser.is_some())
-            .field("active_pty_view", &self.active_pty_view)
+            .field("active_pty_index", &self.active_pty_index)
             .field("scroll_offset", &self.scroll_offset)
             .field("is_scrolled", &self.is_scrolled)
             .finish_non_exhaustive()
@@ -138,9 +140,14 @@ impl<'a> RenderContext<'a> {
     /// Build menu context from current state.
     #[must_use]
     pub fn menu_context(&self) -> MenuContext {
+        let session_count = self
+            .selected_agent()
+            .map(|a| a.session_names.len())
+            .unwrap_or(0);
         MenuContext {
             has_agent: self.selected_agent().is_some(),
-            active_pty: self.active_pty_view,
+            active_pty_index: self.active_pty_index,
+            session_count,
         }
     }
 }
@@ -367,10 +374,16 @@ fn render_terminal_panel(f: &mut Frame, ctx: &RenderContext, area: Rect) {
         return;
     };
 
-    // Build terminal title with view indicator (PTY 0 = agent, PTY 1 = server)
-    let view_indicator = match ctx.active_pty_view {
-        PtyView::Cli => "[CLI | Ctrl+]: Server]",
-        PtyView::Server => "[SERVER | Ctrl+]: CLI]",
+    // Build terminal title with view indicator from sessions array
+    let session_name = agent
+        .session_names
+        .get(ctx.active_pty_index)
+        .map(String::as_str)
+        .unwrap_or("agent");
+    let view_indicator = if agent.session_names.len() > 1 {
+        format!("[{} | Ctrl+]: next]", session_name.to_uppercase())
+    } else {
+        format!("[{}]", session_name.to_uppercase())
     };
 
     // Add scroll indicator if scrolled
@@ -700,6 +713,7 @@ mod tests {
                 branch_name: "botster-issue-1".to_string(),
                 port: None,
                 server_running: false,
+                session_names: vec!["agent".to_string()],
             },
             AgentRenderInfo {
                 key: "test-2".to_string(),
@@ -708,6 +722,7 @@ mod tests {
                 branch_name: "botster-issue-2".to_string(),
                 port: Some(3000),
                 server_running: true,
+                session_names: vec!["agent".to_string(), "server".to_string()],
             },
         ];
 
@@ -718,14 +733,14 @@ mod tests {
             worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-                        creating_agent: None,
+            creating_agent: None,
             connection_code: None,
             bundle_used: false,
             agent_ids: &[],
             agents: &agents,
             selected_agent_index: 1,
             active_parser: None,
-            active_pty_view: PtyView::Cli,
+            active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
             seconds_since_poll: 0,
@@ -748,6 +763,7 @@ mod tests {
             branch_name: "botster-issue-1".to_string(),
             port: None,
             server_running: false,
+            session_names: vec!["agent".to_string(), "server".to_string()],
         }];
 
         let ctx = RenderContext {
@@ -757,14 +773,14 @@ mod tests {
             worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-                        creating_agent: None,
+            creating_agent: None,
             connection_code: None,
             bundle_used: false,
             agent_ids: &[],
             agents: &agents,
             selected_agent_index: 0,
             active_parser: None,
-            active_pty_view: PtyView::Server,
+            active_pty_index: 1,
             scroll_offset: 0,
             is_scrolled: false,
             seconds_since_poll: 5,
@@ -774,7 +790,8 @@ mod tests {
 
         let menu_ctx = ctx.menu_context();
         assert!(menu_ctx.has_agent);
-        assert_eq!(menu_ctx.active_pty, PtyView::Server);
+        assert_eq!(menu_ctx.active_pty_index, 1);
+        assert_eq!(menu_ctx.session_count, 2);
     }
 
     #[test]

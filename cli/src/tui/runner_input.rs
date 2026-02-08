@@ -89,9 +89,16 @@ where
     ///
     /// A `MenuContext` reflecting the current TUI state for dynamic menu building.
     pub fn build_menu_context(&self) -> MenuContext {
+        let session_count = self
+            .selected_agent
+            .as_ref()
+            .and_then(|key| self.agents.iter().find(|a| a.id == *key))
+            .and_then(|a| a.sessions.as_ref())
+            .map_or(1, |s| s.len());
         MenuContext {
             has_agent: self.selected_agent.is_some(),
-            active_pty: self.active_pty_view,
+            active_pty_index: self.active_pty_index,
+            session_count,
         }
     }
 

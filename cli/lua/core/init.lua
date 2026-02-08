@@ -43,6 +43,7 @@ local function safe_require(module_name)
 end
 
 -- Load library modules
+safe_require("lib.config_resolver")
 safe_require("lib.agent")
 safe_require("lib.commands")
 

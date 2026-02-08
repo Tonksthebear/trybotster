@@ -2,21 +2,18 @@
 //!
 //! This module provides a dynamic menu that adapts based on:
 //! - Whether an agent is selected
-//! - Which PTY view is active (CLI/Server)
-//! - Whether the agent has a server PTY
+//! - How many PTY sessions the agent has
 //!
 //! The menu is divided into two sections:
 //! - **Agent section**: Actions related to the selected agent (only shown when agent exists)
 //! - **Hub section**: Global hub actions (always shown)
 
-// Rust guideline compliant 2025-01
-
-use crate::PtyView;
+// Rust guideline compliant 2026-02
 
 /// Actions that can be triggered from the menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
-    /// Toggle between CLI and Server PTY views.
+    /// Toggle between PTY sessions (cycles through available sessions).
     TogglePtyView,
     /// Close the currently selected agent.
     CloseAgent,
@@ -42,15 +39,18 @@ pub struct MenuItem {
 pub struct MenuContext {
     /// Whether an agent is currently selected.
     pub has_agent: bool,
-    /// Current PTY view for the selected agent.
-    pub active_pty: PtyView,
+    /// Current PTY session index (0-based).
+    pub active_pty_index: usize,
+    /// Total number of PTY sessions for the selected agent.
+    pub session_count: usize,
 }
 
 impl Default for MenuContext {
     fn default() -> Self {
         Self {
             has_agent: false,
-            active_pty: PtyView::Cli,
+            active_pty_index: 0,
+            session_count: 0,
         }
     }
 }
@@ -71,16 +71,14 @@ pub fn build_menu(ctx: &MenuContext) -> Vec<MenuItem> {
             is_header: true,
         });
 
-        // Toggle PTY view: PTY 0 = agent, PTY 1 = server
-        let label = match ctx.active_pty {
-            PtyView::Cli => "View Server",
-            PtyView::Server => "View Agent",
-        };
-        items.push(MenuItem {
-            label: label.to_string(),
-            action: MenuAction::TogglePtyView,
-            is_header: false,
-        });
+        // Only show toggle if there are multiple sessions
+        if ctx.session_count > 1 {
+            items.push(MenuItem {
+                label: "Next Session (Ctrl+])".to_string(),
+                action: MenuAction::TogglePtyView,
+                is_header: false,
+            });
+        }
 
         items.push(MenuItem {
             label: "Close Agent".to_string(),
@@ -146,7 +144,8 @@ mod tests {
     fn test_menu_without_agent() {
         let ctx = MenuContext {
             has_agent: false,
-            active_pty: PtyView::Cli,
+            active_pty_index: 0,
+            session_count: 0,
         };
         let items = build_menu(&ctx);
 
@@ -161,10 +160,11 @@ mod tests {
     }
 
     #[test]
-    fn test_menu_with_agent_on_cli() {
+    fn test_menu_with_agent_single_session() {
         let ctx = MenuContext {
             has_agent: true,
-            active_pty: PtyView::Cli,
+            active_pty_index: 0,
+            session_count: 1,
         };
         let items = build_menu(&ctx);
 
@@ -174,51 +174,56 @@ mod tests {
             .any(|i| i.label.contains("Agent") && i.is_header));
         assert!(items.iter().any(|i| i.label.contains("Hub")));
 
-        // Should show "View Server" when on CLI PTY
-        assert!(items.iter().any(|i| i.label == "View Server"));
-        assert!(!items.iter().any(|i| i.label == "View Agent"));
+        // Should NOT show "Next Session" when only one session
+        assert!(!items.iter().any(|i| i.label.contains("Next Session")));
         assert!(items.iter().any(|i| i.label == "Close Agent"));
 
-        // 4 selectable items (View Server, Close Agent, New Agent, Connection Code)
-        assert_eq!(selectable_count(&items), 4);
+        // 3 selectable items (Close Agent, New Agent, Connection Code)
+        assert_eq!(selectable_count(&items), 3);
     }
 
     #[test]
-    fn test_menu_with_agent_on_server() {
+    fn test_menu_with_agent_multiple_sessions() {
         let ctx = MenuContext {
             has_agent: true,
-            active_pty: PtyView::Server,
+            active_pty_index: 0,
+            session_count: 3,
         };
         let items = build_menu(&ctx);
 
-        // Should show "View Agent" when on Server PTY
-        assert!(items.iter().any(|i| i.label == "View Agent"));
-        assert!(!items.iter().any(|i| i.label == "View Server"));
+        // Should show "Next Session" when multiple sessions
+        assert!(items.iter().any(|i| i.label.contains("Next Session")));
+        assert!(items.iter().any(|i| i.label == "Close Agent"));
+
+        // 4 selectable items (Next Session, Close Agent, New Agent, Connection Code)
+        assert_eq!(selectable_count(&items), 4);
     }
 
     #[test]
     fn test_selection_to_item_index() {
         let ctx = MenuContext {
             has_agent: true,
-            active_pty: PtyView::Cli,
+            active_pty_index: 0,
+            session_count: 2,
         };
         let items = build_menu(&ctx);
 
-        // Selection 0 should be first selectable (View Server), not the header
+        // Selection 0 should be first selectable (Next Session), not the header
         let idx = selection_to_item_index(&items, 0).unwrap();
         assert!(!items[idx].is_header);
-        assert_eq!(items[idx].label, "View Server");
+        assert!(items[idx].label.contains("Next Session"));
     }
 
     #[test]
     fn test_get_action_for_selection() {
         let ctx = MenuContext {
             has_agent: true,
-            active_pty: PtyView::Cli,
+            active_pty_index: 0,
+            session_count: 2,
         };
         let items = build_menu(&ctx);
 
-        // First selectable should be View Server
+        // First selectable should be Next Session
         let action = get_action_for_selection(&items, 0);
         assert_eq!(action, Some(MenuAction::TogglePtyView));
 

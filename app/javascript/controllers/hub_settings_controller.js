@@ -4,42 +4,53 @@ import { ConnectionManager, HubConnection } from "connections";
 /**
  * Hub Settings Controller
  *
- * Manages config file editing via E2E encrypted DataChannel to CLI.
- * Rails serves the page shell + default templates; all file I/O goes
- * through HubConnection's fs:* API directly to the CLI.
+ * Manages .botster/ config tree editing via E2E encrypted DataChannel to CLI.
+ * Dynamically scans the .botster/ directory structure and renders a tree
+ * navigation with Shared and Profiles sections.
+ *
+ * State management:
+ *   - Tree panel: data-view = loading | tree | empty | disconnected
+ *   - Editor panel: data-editor = empty | loading | editing | creating | error
+ *   - Dialog: data-mode = prompt | confirm
+ *   - File selection: data-selected attribute on tree buttons
+ *   - Flash highlights: data-flash attribute (auto-removed after timeout)
+ *
+ * All visual state changes are driven by data attributes — CSS handles visibility
+ * via group-data-[...] selectors. No classList manipulation.
  */
 export default class extends Controller {
+  #saveTimer = null;
+
   static targets = [
-    "loading",
-    "fileList",
-    "fileEntry",
-    "fileStatus",
+    "treePanel",
+    "treeContainer",
+    "treeFeedback",
+    "editorPanel",
     "editorTitle",
-    "editorActions",
-    "editorEmpty",
-    "editorLoading",
-    "editorWrapper",
     "editor",
-    "editorError",
     "editorErrorMsg",
     "saveBtn",
-    "revertBtn",
     "createBtn",
     "deleteBtn",
+    "promptPanel",
+    "promptTitle",
+    "promptMessage",
+    "promptInput",
+    "promptError",
   ];
 
   static values = {
     hubId: String,
-    configFiles: Array,
+    configMetadata: Object,
   };
 
   connect() {
     if (!this.hubIdValue) return;
 
     this.unsubscribers = [];
-    this.currentFile = null; // Currently selected file name
-    this.originalContent = null; // Content when file was loaded (for dirty tracking)
-    this.fileExists = {}; // Map of filename -> boolean
+    this.currentFilePath = null;
+    this.originalContent = null;
+    this.tree = null;
 
     ConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
@@ -49,19 +60,25 @@ export default class extends Controller {
 
       this.unsubscribers.push(
         this.hub.onConnected(() => {
-          this.loadFiles();
+          this.scanTree();
         }),
       );
 
       this.unsubscribers.push(
         this.hub.onDisconnected(() => {
-          this.#setDisconnected();
+          this.treeFeedbackTarget.textContent = "Hub disconnected. Reconnecting...";
+          this.treePanelTarget.dataset.view = "disconnected";
         }),
       );
     });
   }
 
   disconnect() {
+    if (this.#saveTimer) {
+      clearTimeout(this.#saveTimer);
+      this.#saveTimer = null;
+    }
+
     this.unsubscribers?.forEach((unsub) => unsub());
     this.unsubscribers = null;
 
@@ -73,39 +90,41 @@ export default class extends Controller {
   // ========== Actions ==========
 
   async selectFile(event) {
-    const fileName =
-      event.currentTarget.dataset.fileName || event.params?.fileName;
-    if (!fileName || !this.hub) return;
+    const filePath = event.currentTarget.dataset.filePath;
+    if (!filePath || !this.hub) return;
 
-    this.currentFile = fileName;
-    this.#highlightSelected(fileName);
+    this.currentFilePath = filePath;
+    this.#highlightSelected(filePath);
 
-    const exists = this.fileExists[fileName];
-
-    if (exists) {
-      await this.#loadFileContent(fileName);
-    } else {
-      this.#showCreateState(fileName);
+    try {
+      const stat = await this.hub.statFile(filePath);
+      if (!this.hub) return;
+      if (stat.exists) {
+        await this.#loadFileContent(filePath);
+      } else {
+        this.#showCreateState(filePath);
+      }
+    } catch {
+      if (!this.hub) return;
+      this.#showCreateState(filePath);
     }
   }
 
   async save() {
-    if (!this.currentFile || !this.hub) return;
+    if (!this.currentFilePath || !this.hub) return;
 
     const content = this.editorTarget.value;
     this.saveBtnTarget.disabled = true;
     this.saveBtnTarget.textContent = "Saving...";
 
     try {
-      await this.hub.writeFile(this.currentFile, content);
+      await this.hub.writeFile(this.currentFilePath, content);
       this.originalContent = content;
-      this.fileExists[this.currentFile] = true;
       this.#updateDirtyState();
-      this.#updateFileStatuses();
-      this.#showEditorState(this.currentFile, true);
       this.saveBtnTarget.textContent = "Saved";
-      setTimeout(() => {
-        this.saveBtnTarget.textContent = "Save";
+      this.#saveTimer = setTimeout(() => {
+        this.#saveTimer = null;
+        if (this.hub) this.saveBtnTarget.textContent = "Save";
       }, 1500);
     } catch (error) {
       this.saveBtnTarget.textContent = "Save";
@@ -122,21 +141,20 @@ export default class extends Controller {
   }
 
   async createFile() {
-    if (!this.currentFile || !this.hub) return;
+    if (!this.currentFilePath || !this.hub) return;
 
-    const config = this.configFilesValue.find(
-      (f) => f.name === this.currentFile,
-    );
-    const content = this.editorTarget.value || config?.default || "";
+    const content = this.editorTarget.value || this.#defaultContent(this.currentFilePath);
 
     this.createBtnTarget.textContent = "Creating...";
 
     try {
-      await this.hub.writeFile(this.currentFile, content);
+      const parentDir = this.currentFilePath.replace(/\/[^/]+$/, "");
+      await this.hub.mkDir(parentDir).catch(() => {});
+
+      await this.hub.writeFile(this.currentFilePath, content);
       this.originalContent = content;
-      this.fileExists[this.currentFile] = true;
-      this.#updateFileStatuses();
-      this.#showEditorState(this.currentFile, true);
+      this.editorPanelTarget.dataset.editor = "editing";
+      this.scanTree();
     } catch (error) {
       this.#showError(`Create failed: ${error.message}`);
     } finally {
@@ -145,16 +163,20 @@ export default class extends Controller {
   }
 
   async deleteFile() {
-    if (!this.currentFile || !this.hub) return;
-    if (!confirm(`Delete ${this.currentFile}?`)) return;
+    if (!this.currentFilePath || !this.hub) return;
+
+    const confirmed = await this.#confirmUser(
+      "Delete File",
+      `Delete ${this.currentFilePath}?`,
+    );
+    if (!confirmed) return;
 
     this.deleteBtnTarget.textContent = "Deleting...";
 
     try {
-      await this.hub.deleteFile(this.currentFile);
-      this.fileExists[this.currentFile] = false;
-      this.#updateFileStatuses();
-      this.#showCreateState(this.currentFile);
+      await this.hub.deleteFile(this.currentFilePath);
+      this.#showCreateState(this.currentFilePath);
+      this.scanTree();
     } catch (error) {
       this.#showError(`Delete failed: ${error.message}`);
     } finally {
@@ -162,106 +184,431 @@ export default class extends Controller {
     }
   }
 
+  async togglePortForward(event) {
+    const filePath = event.currentTarget.dataset.filePath;
+    const checked = event.currentTarget.checked;
+
+    if (!filePath || !this.hub) return;
+
+    // Toggle hint visibility
+    const hint = this.element.querySelector(`[data-pf-hint="${event.currentTarget.id}"]`);
+    if (hint) hint.classList.toggle("hidden", !checked);
+
+    try {
+      if (checked) {
+        const parentDir = filePath.replace(/\/[^/]+$/, "");
+        await this.hub.mkDir(parentDir).catch(() => {});
+        await this.hub.writeFile(filePath, "");
+      } else {
+        await this.hub.deleteFile(filePath);
+      }
+      this.scanTree();
+    } catch (error) {
+      event.currentTarget.checked = !checked;
+      if (hint) hint.classList.toggle("hidden", checked);
+    }
+  }
+
+  async addSession(event) {
+    const basePath = event.currentTarget.dataset.basePath;
+    if (!basePath || !this.hub) return;
+
+    // Get existing session names in this scope for duplicate checking
+    const existingSessions = this.#sessionsForBasePath(basePath);
+
+    const name = await this.#promptUser(
+      "Add Session",
+      "Enter a name for the new session (lowercase, no spaces):",
+      (val) => {
+        if (existingSessions.includes(val)) return `Session '${val}' already exists here`;
+        return null;
+      },
+    );
+    if (!name) return;
+
+    try {
+      const sessionDir = `${basePath}/${name}`;
+      await this.hub.mkDir(sessionDir);
+      const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
+      await this.hub.writeFile(`${sessionDir}/initialization`, defaultInit);
+      await this.scanTree();
+      this.#selectFileByPath(`${sessionDir}/initialization`);
+    } catch (error) {
+      this.#showError(`Failed to create session: ${error.message}`);
+    }
+  }
+
+  async addProfile(event) {
+    if (!this.hub) return;
+
+    const name = await this.#promptUser(
+      "Add Profile",
+      "Enter a name for the new profile (lowercase, no spaces):",
+    );
+    if (!name) return;
+
+    try {
+      await this.hub.mkDir(`.botster/profiles/${name}`);
+      await this.hub.mkDir(`.botster/profiles/${name}/sessions`);
+      await this.scanTree();
+      this.#scrollToProfile(name);
+    } catch (error) {
+      this.#showError(`Failed to create profile: ${error.message}`);
+    }
+  }
+
+  async removeProfile(event) {
+    const profileName = event.currentTarget.dataset.profileName;
+    if (!profileName || !this.hub) return;
+
+    const confirmed = await this.#confirmUser(
+      "Remove Profile",
+      `Delete profile "${profileName}" and all its sessions? This cannot be undone.`,
+    );
+    if (!confirmed) return;
+
+    try {
+      await this.hub.rmDir(`.botster/profiles/${profileName}`);
+      if (this.currentFilePath?.startsWith(`.botster/profiles/${profileName}/`)) {
+        this.currentFilePath = null;
+        this.originalContent = null;
+        this.editorPanelTarget.dataset.editor = "empty";
+        this.editorTitleTarget.textContent = "Select a file";
+      }
+      await this.scanTree();
+    } catch (error) {
+      this.#showError(`Failed to remove profile: ${error.message}`);
+    }
+  }
+
   onEditorInput() {
     this.#updateDirtyState();
   }
 
-  // ========== Data Loading ==========
+  // ========== Tree Scanning ==========
 
-  async loadFiles() {
-    this.loadingTarget.classList.remove("hidden");
-    this.fileListTarget.classList.add("hidden");
+  async scanTree() {
+    const isFirstLoad = !this.tree;
+    if (isFirstLoad) {
+      this.treeFeedbackTarget.textContent = "Loading configuration...";
+      this.treePanelTarget.dataset.view = "loading";
+    }
 
     try {
-      // Stat each config file to check existence
-      const results = await Promise.allSettled(
-        this.configFilesValue.map((file) => this.hub.statFile(file.name)),
-      );
+      const tree = { shared: null, profiles: {} };
 
-      results.forEach((result, i) => {
-        const fileName = this.configFilesValue[i].name;
-        this.fileExists[fileName] =
-          result.status === "fulfilled" && result.value.exists;
-      });
+      const botsterStat = await this.hub.statFile(".botster").catch(() => ({ exists: false }));
+      if (!botsterStat.exists) {
+        this.treePanelTarget.dataset.view = "empty";
+        return;
+      }
 
-      this.#updateFileStatuses();
-      this.loadingTarget.classList.add("hidden");
-      this.fileListTarget.classList.remove("hidden");
+      tree.shared = await this.#scanScope(".botster/shared");
+
+      const profileEntries = await this.#listDirs(".botster/profiles");
+      for (const profileName of profileEntries) {
+        tree.profiles[profileName] = await this.#scanScope(`.botster/profiles/${profileName}`);
+      }
+
+      this.tree = tree;
+      this.#renderTree();
     } catch (error) {
-      this.loadingTarget.innerHTML = `<p class="text-sm text-red-400">Failed to load: ${error.message}</p>`;
+      if (isFirstLoad) {
+        this.treeFeedbackTarget.textContent = `Failed to scan: ${error.message}`;
+      }
     }
   }
 
-  // ========== Private ==========
+  async #scanScope(basePath) {
+    const scope = { files: {}, sessions: {} };
 
-  async #loadFileContent(fileName) {
-    this.#showEditorLoading();
+    for (const fileName of ["workspace_include", "workspace_teardown"]) {
+      const stat = await this.hub.statFile(`${basePath}/${fileName}`).catch(() => ({ exists: false }));
+      scope.files[fileName] = stat.exists;
+    }
+
+    const sessionNames = await this.#listDirs(`${basePath}/sessions`);
+    for (const sessionName of sessionNames) {
+      const sessionPath = `${basePath}/sessions/${sessionName}`;
+      const initStat = await this.hub.statFile(`${sessionPath}/initialization`).catch(() => ({ exists: false }));
+      const pfStat = await this.hub.statFile(`${sessionPath}/port_forward`).catch(() => ({ exists: false }));
+      scope.sessions[sessionName] = {
+        initialization: initStat.exists,
+        port_forward: pfStat.exists,
+      };
+    }
+
+    return scope;
+  }
+
+  async #listDirs(path) {
+    try {
+      const result = await this.hub.listDir(path);
+      return (result.entries || [])
+        .filter((e) => e.type === "dir")
+        .map((e) => e.name)
+        .sort();
+    } catch {
+      return [];
+    }
+  }
+
+  // ========== Tree Rendering ==========
+
+  async initBotster() {
+    if (!this.hub) return;
 
     try {
-      const result = await this.hub.readFile(fileName);
+      await this.hub.mkDir(".botster/shared/sessions/agent");
+      await this.hub.mkDir(".botster/profiles");
+      const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
+      await this.hub.writeFile(".botster/shared/sessions/agent/initialization", defaultInit);
+      this.scanTree();
+    } catch (error) {
+      this.#showError(`Failed to initialize: ${error.message}`);
+    }
+  }
+
+  #renderTree() {
+    const container = this.treeContainerTarget;
+    container.innerHTML = "";
+
+    // Shared section
+    if (this.tree.shared) {
+      container.appendChild(this.#renderSection("Shared", ".botster/shared", this.tree.shared));
+    }
+
+    // Profiles section
+    const profileNames = Object.keys(this.tree.profiles).sort();
+    if (profileNames.length > 0) {
+      const header = document.createElement("div");
+      header.className = "mt-2";
+      header.innerHTML = `<h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">Profiles</h2>`;
+      container.appendChild(header);
+
+      for (const name of profileNames) {
+        container.appendChild(
+          this.#renderSection(
+            this.#capitalize(name),
+            `.botster/profiles/${name}`,
+            this.tree.profiles[name],
+            { sharedScope: this.tree.shared, profileName: name },
+          ),
+        );
+      }
+    }
+
+    // Add profile button
+    const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "w-full mt-2 px-3 py-2 text-xs font-medium text-zinc-500 hover:text-zinc-300 border border-dashed border-zinc-700 hover:border-zinc-600 rounded-lg transition-colors";
+    addBtn.textContent = "+ Add Profile";
+    addBtn.dataset.action = "hub-settings#addProfile";
+    container.appendChild(addBtn);
+
+    this.treePanelTarget.dataset.view = "tree";
+
+    // Re-apply selection highlight after tree rebuild
+    if (this.currentFilePath) {
+      this.#highlightSelected(this.currentFilePath);
+    }
+  }
+
+  #renderSection(title, basePath, scope, options = {}) {
+    const { sharedScope, profileName } = options;
+    const isProfile = !!profileName;
+
+    const section = document.createElement("div");
+    section.className = "mb-3 group/section data-[flash]:ring-1 data-[flash]:ring-primary-500/30 data-[flash]:rounded-lg";
+
+    if (isProfile) {
+      section.dataset.profile = profileName;
+    }
+
+    // Section header — profiles get a remove button
+    const headerDiv = document.createElement("div");
+    headerDiv.className = "flex items-center justify-between mb-2";
+    headerDiv.innerHTML = `<h3 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">${this.#escapeHtml(title)}</h3>`;
+
+    if (isProfile) {
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className =
+        "text-zinc-700 hover:text-red-400 transition-colors opacity-0 group-hover/section:opacity-100";
+      removeBtn.title = "Remove profile";
+      removeBtn.dataset.action = "hub-settings#removeProfile";
+      removeBtn.dataset.profileName = profileName;
+      removeBtn.innerHTML = `<svg class="size-3.5" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.52.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clip-rule="evenodd"/>
+      </svg>`;
+      headerDiv.appendChild(removeBtn);
+    }
+
+    section.appendChild(headerDiv);
+
+    const list = document.createElement("div");
+    list.className = "space-y-1";
+
+    // Workspace files
+    for (const [fileName, exists] of Object.entries(scope.files)) {
+      const status = this.#fileStatus(exists, sharedScope?.files?.[fileName]);
+      list.appendChild(this.#renderFileEntry(`${basePath}/${fileName}`, fileName, status));
+    }
+
+    // Sessions
+    const sessionNames = Object.keys(scope.sessions).sort((a, b) => {
+      if (a === "agent") return -1;
+      if (b === "agent") return 1;
+      return a.localeCompare(b);
+    });
+
+    if (sessionNames.length > 0) {
+      const sessHeader = document.createElement("div");
+      sessHeader.className = "mt-2 mb-1";
+      sessHeader.innerHTML = `<span class="text-xs text-zinc-600 uppercase tracking-wider">Sessions</span>`;
+      list.appendChild(sessHeader);
+
+      for (const sessionName of sessionNames) {
+        const session = scope.sessions[sessionName];
+        const sessionPath = `${basePath}/sessions/${sessionName}`;
+        const sharedSession = sharedScope?.sessions?.[sessionName];
+
+        const initStatus = this.#fileStatus(session.initialization, sharedSession?.initialization);
+        list.appendChild(
+          this.#renderFileEntry(`${sessionPath}/initialization`, `${sessionName}/initialization`, initStatus),
+        );
+
+        list.appendChild(
+          this.#renderPortForwardToggle(`${sessionPath}/port_forward`, sessionName, session.port_forward),
+        );
+      }
+    }
+
+    // Agent session warning — resolved config must include agent
+    const hasAgent = !!scope.sessions?.agent;
+    const hasAgentInShared = !!sharedScope?.sessions?.agent;
+    if (isProfile && !hasAgent && !hasAgentInShared) {
+      const warning = document.createElement("p");
+      warning.className = "text-xs text-amber-400 mt-2 px-2.5";
+      warning.textContent = "Missing agent session — required for this profile to work";
+      list.appendChild(warning);
+    } else if (!isProfile && !hasAgent) {
+      const warning = document.createElement("p");
+      warning.className = "text-xs text-amber-400 mt-2 px-2.5";
+      warning.textContent = "No agent session — profiles without their own will not work";
+      list.appendChild(warning);
+    }
+
+    // Add session button
+    const addSessionBtn = document.createElement("button");
+    addSessionBtn.type = "button";
+    addSessionBtn.className = "w-full mt-1 px-2 py-1.5 text-xs text-zinc-600 hover:text-zinc-400 transition-colors text-left";
+    addSessionBtn.textContent = "+ Add session";
+    addSessionBtn.dataset.action = "hub-settings#addSession";
+    addSessionBtn.dataset.basePath = `${basePath}/sessions`;
+    list.appendChild(addSessionBtn);
+
+    section.appendChild(list);
+    return section;
+  }
+
+  /**
+   * Determine the display status for a file entry.
+   * @param {boolean} exists - Whether the file exists in this scope
+   * @param {boolean} [existsInShared] - Whether the file exists in shared (undefined for shared scope)
+   * @returns {"exists"|"override"|"inherited"|"missing"}
+   */
+  #fileStatus(exists, existsInShared) {
+    if (exists) return existsInShared !== undefined ? "override" : "exists";
+    if (existsInShared) return "inherited";
+    return "missing";
+  }
+
+  #renderFileEntry(filePath, label, status) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className =
+      "w-full text-left px-2.5 py-1.5 rounded border border-zinc-700/50 hover:border-zinc-700 hover:bg-zinc-800/50 transition-colors " +
+      "data-[selected]:bg-zinc-800/50 data-[selected]:border-primary-500/30 " +
+      "data-[flash]:ring-1 data-[flash]:ring-primary-500/50";
+    btn.dataset.action = "hub-settings#selectFile";
+    btn.dataset.filePath = filePath;
+
+    const styles = {
+      exists: "bg-emerald-500/10 text-emerald-400",
+      override: "bg-amber-500/10 text-amber-400",
+      inherited: "bg-sky-500/10 text-sky-400",
+      missing: "bg-zinc-700/50 text-zinc-500",
+    };
+
+    btn.innerHTML = `
+      <div class="flex items-center justify-between">
+        <span class="text-xs font-mono text-zinc-300 truncate">${this.#escapeHtml(label)}</span>
+        <span class="shrink-0 ml-2 text-[10px] px-1.5 py-0.5 rounded ${styles[status] || styles.missing}">${status}</span>
+      </div>
+    `;
+
+    return btn;
+  }
+
+  #renderPortForwardToggle(filePath, sessionName, enabled) {
+    const div = document.createElement("div");
+    div.className = "flex items-center justify-between px-2.5 py-1";
+
+    const id = `pf-${filePath.replace(/[/.]/g, "-")}`;
+    div.innerHTML = `
+      <div class="flex items-center gap-2">
+        <label for="${id}" class="text-xs text-zinc-500 cursor-pointer">${this.#escapeHtml(sessionName)}/port_forward</label>
+        <span class="text-[10px] text-emerald-400/70 ${enabled ? "" : "hidden"}" data-pf-hint="${id}">$PORT available</span>
+      </div>
+      <div class="group relative inline-flex w-9 shrink-0 rounded-full p-0.5
+                  bg-white/5 inset-ring inset-ring-white/10
+                  has-checked:bg-primary-500
+                  transition-colors duration-200 ease-in-out
+                  outline-offset-2 outline-primary-500 has-focus-visible:outline-2">
+        <span class="size-4 rounded-full bg-white shadow-xs ring-1 ring-gray-900/5
+                     transition-transform duration-200 ease-in-out
+                     group-has-checked:translate-x-4"></span>
+        <input type="checkbox" id="${id}"
+               ${enabled ? "checked" : ""}
+               data-action="hub-settings#togglePortForward"
+               data-file-path="${this.#escapeAttr(filePath)}"
+               class="absolute inset-0 appearance-none cursor-pointer focus:outline-hidden">
+      </div>
+    `;
+
+    return div;
+  }
+
+  // ========== Editor State ==========
+
+  async #loadFileContent(filePath) {
+    this.editorPanelTarget.dataset.editor = "loading";
+
+    try {
+      const result = await this.hub.readFile(filePath);
+      if (!this.hub) return;
       this.originalContent = result.content;
       this.editorTarget.value = result.content;
-      this.#showEditorState(fileName, true);
+      this.editorTitleTarget.textContent = filePath;
+      this.editorPanelTarget.dataset.editor = "editing";
       this.#updateDirtyState();
     } catch (error) {
+      if (!this.hub) return;
       this.#showError(`Read failed: ${error.message}`);
     }
   }
 
-  #showCreateState(fileName) {
-    const config = this.configFilesValue.find((f) => f.name === fileName);
-
-    this.editorTitleTarget.textContent = fileName;
-    this.editorEmptyTarget.classList.add("hidden");
-    this.editorLoadingTarget.classList.add("hidden");
-    this.editorErrorTarget.classList.add("hidden");
-    this.editorWrapperTarget.classList.remove("hidden");
-
-    this.editorTarget.value = config?.default || "";
+  #showCreateState(filePath) {
+    this.editorTitleTarget.textContent = filePath;
+    this.editorTarget.value = this.#defaultContent(filePath);
     this.originalContent = null;
-
-    this.saveBtnTarget.classList.add("hidden");
-    this.revertBtnTarget.classList.add("hidden");
-    this.createBtnTarget.classList.remove("hidden");
-    this.deleteBtnTarget.classList.add("hidden");
-  }
-
-  #showEditorState(fileName, exists) {
-    this.editorTitleTarget.textContent = fileName;
-    this.editorEmptyTarget.classList.add("hidden");
-    this.editorLoadingTarget.classList.add("hidden");
-    this.editorErrorTarget.classList.add("hidden");
-    this.editorWrapperTarget.classList.remove("hidden");
-
-    this.saveBtnTarget.classList.remove("hidden");
-    this.revertBtnTarget.classList.remove("hidden");
-    this.createBtnTarget.classList.add("hidden");
-
-    if (exists) {
-      this.deleteBtnTarget.classList.remove("hidden");
-    } else {
-      this.deleteBtnTarget.classList.add("hidden");
-    }
-  }
-
-  #showEditorLoading() {
-    this.editorEmptyTarget.classList.add("hidden");
-    this.editorWrapperTarget.classList.add("hidden");
-    this.editorErrorTarget.classList.add("hidden");
-    this.editorLoadingTarget.classList.remove("hidden");
-
-    this.saveBtnTarget.classList.add("hidden");
-    this.revertBtnTarget.classList.add("hidden");
-    this.createBtnTarget.classList.add("hidden");
-    this.deleteBtnTarget.classList.add("hidden");
+    this.editorPanelTarget.dataset.editor = "creating";
   }
 
   #showError(message) {
-    this.editorEmptyTarget.classList.add("hidden");
-    this.editorLoadingTarget.classList.add("hidden");
-    this.editorWrapperTarget.classList.add("hidden");
-    this.editorErrorTarget.classList.remove("hidden");
     this.editorErrorMsgTarget.textContent = message;
+    this.editorPanelTarget.dataset.editor = "error";
   }
 
   #updateDirtyState() {
@@ -270,44 +617,159 @@ export default class extends Controller {
       this.editorTarget.value !== this.originalContent;
 
     this.saveBtnTarget.disabled = !isDirty;
-    if (isDirty) {
-      this.revertBtnTarget.classList.remove("hidden");
+  }
+
+  #highlightSelected(filePath) {
+    this.treeContainerTarget.querySelectorAll("button[data-file-path]").forEach((el) => {
+      el.toggleAttribute("data-selected", el.dataset.filePath === filePath);
+    });
+  }
+
+  // ========== Prompt / Confirm Dialog ==========
+
+  async #promptUser(title, message, validate) {
+    return this.#openDialog(title, message, { mode: "prompt", validate });
+  }
+
+  async #confirmUser(title, message) {
+    const result = await this.#openDialog(title, message, { mode: "confirm" });
+    return result !== null;
+  }
+
+  async #openDialog(title, message, { mode, validate }) {
+    const dialog = document.getElementById("settings-prompt-modal");
+    if (!dialog) return null;
+
+    this.promptPanelTarget.dataset.mode = mode;
+    this.promptTitleTarget.textContent = title;
+    this.promptMessageTarget.textContent = message;
+    this.promptInputTarget.value = "";
+    this.promptErrorTarget.textContent = "";
+
+    this._promptMode = mode;
+    this._promptValidate = validate || null;
+
+    return new Promise((resolve) => {
+      this._promptResolve = resolve;
+      dialog.showModal();
+      if (mode === "prompt") {
+        requestAnimationFrame(() => this.promptInputTarget.focus());
+      }
+
+      dialog.addEventListener(
+        "close",
+        () => {
+          if (this._promptResolve) {
+            this._promptResolve(null);
+            this._promptResolve = null;
+          }
+        },
+        { once: true },
+      );
+    });
+  }
+
+  promptConfirm() {
+    if (this._promptMode === "confirm") {
+      const resolve = this._promptResolve;
+      this._promptResolve = null;
+      document.getElementById("settings-prompt-modal")?.close();
+      if (resolve) resolve(true);
+      return;
+    }
+
+    const value = this.promptInputTarget.value.trim();
+
+    if (!value || !/^[a-z][a-z0-9_-]*$/.test(value)) {
+      this.promptErrorTarget.textContent =
+        "Must start with a letter. Only lowercase letters, numbers, hyphens, or underscores.";
+      return;
+    }
+
+    if (this._promptValidate) {
+      const error = this._promptValidate(value);
+      if (error) {
+        this.promptErrorTarget.textContent = error;
+        return;
+      }
+    }
+
+    const resolve = this._promptResolve;
+    this._promptResolve = null;
+    this._promptValidate = null;
+    document.getElementById("settings-prompt-modal")?.close();
+    if (resolve) resolve(value);
+  }
+
+  // ========== Feedback Helpers ==========
+
+  #selectFileByPath(filePath) {
+    const btn = this.treeContainerTarget.querySelector(
+      `button[data-file-path="${CSS.escape(filePath)}"]`,
+    );
+    if (btn) {
+      this.#highlightSelected(filePath);
+      btn.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      btn.toggleAttribute("data-flash", true);
+      setTimeout(() => btn.removeAttribute("data-flash"), 1500);
     }
   }
 
-  #updateFileStatuses() {
-    this.fileStatusTargets.forEach((el) => {
-      const fileName = el.dataset.fileName;
-      const exists = this.fileExists[fileName];
-
-      if (exists) {
-        el.textContent = "exists";
-        el.className =
-          "shrink-0 ml-2 text-xs px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400";
-      } else {
-        el.textContent = "missing";
-        el.className =
-          "shrink-0 ml-2 text-xs px-1.5 py-0.5 rounded bg-zinc-700/50 text-zinc-500";
-      }
-    });
+  #scrollToProfile(name) {
+    const section = this.treeContainerTarget.querySelector(
+      `[data-profile="${CSS.escape(name)}"]`,
+    );
+    if (section) {
+      section.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      section.toggleAttribute("data-flash", true);
+      setTimeout(() => section.removeAttribute("data-flash"), 1500);
+    }
   }
 
-  #highlightSelected(fileName) {
-    this.fileEntryTargets.forEach((el) => {
-      if (el.dataset.fileName === fileName) {
-        el.classList.add("bg-zinc-800/50", "border-primary-500/30");
-        el.classList.remove("border-zinc-700/50");
-      } else {
-        el.classList.remove("bg-zinc-800/50", "border-primary-500/30");
-        el.classList.add("border-zinc-700/50");
-      }
-    });
+  // ========== Helpers ==========
+
+  #defaultContent(filePath) {
+    const meta = this.configMetadataValue || {};
+
+    if (filePath.endsWith("/workspace_include")) {
+      return meta.shared_files?.workspace_include?.default || "";
+    }
+    if (filePath.endsWith("/workspace_teardown")) {
+      return meta.shared_files?.workspace_teardown?.default || "";
+    }
+    if (filePath.endsWith("/initialization")) {
+      return meta.session_files?.initialization?.default || "#!/bin/bash\n";
+    }
+    return "";
   }
 
-  #setDisconnected() {
-    this.loadingTarget.classList.remove("hidden");
-    this.loadingTarget.innerHTML =
-      '<p class="text-sm text-zinc-500">Hub disconnected. Reconnecting...</p>';
-    this.fileListTarget.classList.add("hidden");
+  /**
+   * Get existing session names for a sessions/ basePath by looking up the tree data.
+   * basePath is like ".botster/shared/sessions" or ".botster/profiles/standard/sessions"
+   */
+  #sessionsForBasePath(basePath) {
+    if (!this.tree) return [];
+    if (basePath.startsWith(".botster/shared/")) {
+      return Object.keys(this.tree.shared?.sessions || {});
+    }
+    const match = basePath.match(/\.botster\/profiles\/([^/]+)\//);
+    if (match) {
+      return Object.keys(this.tree.profiles?.[match[1]]?.sessions || {});
+    }
+    return [];
+  }
+
+  #capitalize(str) {
+    return str.charAt(0).toUpperCase() + str.slice(1);
+  }
+
+  #escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  #escapeAttr(text) {
+    return text.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 }

@@ -41,7 +41,7 @@ use super::pty::{PtyEvent, MAX_SCROLLBACK_BYTES};
 ///     worktree_path: PathBuf::from("/path/to/worktree"),
 ///     command: "bash".to_string(),
 ///     env: HashMap::new(),
-///     init_commands: vec!["source .botster_init".to_string()],
+///     init_commands: vec!["source .botster/shared/sessions/agent/initialization".to_string()],
 ///     detect_notifications: true,
 ///     port: None,
 ///     context: String::new(),
@@ -56,7 +56,7 @@ pub struct PtySpawnConfig {
     pub command: String,
     /// Environment variables to set.
     pub env: HashMap<String, String>,
-    /// Commands to run after spawn (e.g., ["source .botster_init"]).
+    /// Commands to run after spawn (e.g., sourcing a session initialization script).
     pub init_commands: Vec<String>,
     /// Enable OSC notification detection on this session.
     ///
