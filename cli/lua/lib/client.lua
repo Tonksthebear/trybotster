@@ -119,6 +119,22 @@ function Client:handle_subscribe(msg)
 
     local channel = msg.channel or "unknown"
     local params = msg.params or {}
+
+    -- Interceptor: plugins can transform or block subscriptions (return nil)
+    local result = hooks.call("before_client_subscribe", {
+        client = self,
+        sub_id = sub_id,
+        channel = channel,
+        params = params,
+    })
+    if result == nil then
+        log.info(string.format("before_client_subscribe interceptor blocked: %s", sub_id:sub(1, 16)))
+        return
+    end
+    -- Allow interceptors to modify fields
+    channel = result.channel or channel
+    params = result.params or params
+
     local agent_index = params.agent_index
     local pty_index = params.pty_index
 
@@ -153,6 +169,12 @@ function Client:handle_subscribe(msg)
         channel = channel,
         sub_id = sub_id,
         params = params,
+    })
+
+    hooks.notify("after_client_subscribe", {
+        client = self,
+        sub_id = sub_id,
+        channel = channel,
     })
 
     -- Channel-specific setup
@@ -384,6 +406,8 @@ end
 --- Clean up client on disconnect.
 -- Stops all forwarders and clears subscriptions.
 function Client:disconnect()
+    hooks.notify("before_client_disconnect", { peer_id = self.peer_id })
+
     -- Stop all forwarders with error protection to prevent early exit
     for sub_id, forwarder in pairs(self.forwarders) do
         if forwarder and forwarder.stop then

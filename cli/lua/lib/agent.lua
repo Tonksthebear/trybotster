@@ -83,8 +83,8 @@ function Agent.new(config)
     assert(config.branch_name, "Agent.new requires config.branch_name")
     assert(config.worktree_path, "Agent.new requires config.worktree_path")
 
-    -- Fire before_agent_create hook (allows config modification)
-    config = hooks.call("before_agent_create", config) or config
+    -- NOTE: before_agent_create hook fires in handlers/agents.lua (high-level params).
+    -- Agent.new() is a low-level constructor and does NOT re-fire the hook.
 
     local self = setmetatable({
         repo = config.repo,

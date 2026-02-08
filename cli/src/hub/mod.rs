@@ -530,12 +530,31 @@ impl Hub {
             }
         }
 
-        // Release mode: use embedded files (no hot-reload possible)
+        // Release mode: extract embedded Lua to filesystem, then load from there.
+        // This enables hot-reload even in release builds (agent can edit Lua on disk).
         #[cfg(not(debug_assertions))]
         {
-            log::info!("Release mode: using embedded Lua files");
-            if let Err(e) = self.lua.load_embedded() {
-                log::warn!("Failed to load embedded Lua: {}", e);
+            match self.lua.ensure_lua_on_filesystem() {
+                Ok(extracted_path) => {
+                    log::info!(
+                        "Release mode: Lua extracted to {}, loading from filesystem",
+                        extracted_path.display()
+                    );
+                    let init_path = std::path::Path::new("core/init.lua");
+                    if let Err(e) = self.lua.load_file(init_path) {
+                        log::warn!("Failed to load extracted init.lua: {}", e);
+                        // Fall back to in-memory embedded loading
+                        if let Err(e) = self.lua.load_embedded() {
+                            log::warn!("Fallback embedded load also failed: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to extract Lua files: {}, using in-memory fallback", e);
+                    if let Err(e) = self.lua.load_embedded() {
+                        log::warn!("Failed to load embedded Lua: {}", e);
+                    }
+                }
             }
         }
 

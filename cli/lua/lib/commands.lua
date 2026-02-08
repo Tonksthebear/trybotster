@@ -51,6 +51,21 @@ end
 function M.dispatch(client, sub_id, command)
     local cmd_type = command.type or command.command
 
+    -- Interceptor: plugins can transform or block commands (return nil)
+    local result = hooks.call("before_command", {
+        type = cmd_type,
+        client = client,
+        sub_id = sub_id,
+        command = command,
+    })
+    if result == nil then
+        log.debug(string.format("before_command interceptor blocked: %s", tostring(cmd_type)))
+        return
+    end
+    -- Allow interceptors to replace the command
+    command = result.command or command
+    cmd_type = command.type or command.command
+
     local entry = registry[cmd_type]
     if entry then
         local ok, err = pcall(entry.handler, client, sub_id, command)

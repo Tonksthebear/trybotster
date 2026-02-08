@@ -56,6 +56,8 @@ use mlua::Lua;
 /// - `fs.read(path)` - Read file contents as a string
 /// - `fs.exists(path)` - Check if a file exists
 /// - `fs.copy(src, dst)` - Copy a file
+/// - `fs.listdir(path)` - List entries in a directory
+/// - `fs.is_dir(path)` - Check if path is a directory
 ///
 /// # Errors
 ///
@@ -135,6 +137,44 @@ pub fn register(lua: &Lua) -> Result<()> {
     fs_table
         .set("copy", copy_fn)
         .map_err(|e| anyhow!("Failed to set fs.copy: {e}"))?;
+
+    // fs.listdir(path) -> (entries, nil) or (nil, error_string)
+    //
+    // Returns an array of entry names (files and directories) in the given directory.
+    // Does not include "." or "..".
+    let listdir_fn = lua
+        .create_function(|lua, path: String| {
+            match std::fs::read_dir(&path) {
+                Ok(entries) => {
+                    let table = lua.create_table()?;
+                    let mut i = 1;
+                    for entry in entries.flatten() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            table.set(i, name.to_string())?;
+                            i += 1;
+                        }
+                    }
+                    Ok((Some(table), None::<String>))
+                }
+                Err(e) => Ok((None::<mlua::Table>, Some(format!("Failed to list directory: {e}")))),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create fs.listdir function: {e}"))?;
+
+    fs_table
+        .set("listdir", listdir_fn)
+        .map_err(|e| anyhow!("Failed to set fs.listdir: {e}"))?;
+
+    // fs.is_dir(path) -> boolean
+    //
+    // Returns true if the path exists and is a directory.
+    let is_dir_fn = lua
+        .create_function(|_, path: String| Ok(Path::new(&path).is_dir()))
+        .map_err(|e| anyhow!("Failed to create fs.is_dir function: {e}"))?;
+
+    fs_table
+        .set("is_dir", is_dir_fn)
+        .map_err(|e| anyhow!("Failed to set fs.is_dir: {e}"))?;
 
     // Register the table globally
     lua.globals()

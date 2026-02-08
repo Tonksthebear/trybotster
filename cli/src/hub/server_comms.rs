@@ -43,6 +43,8 @@ impl Hub {
         self.poll_agent_notifications_async();
         self.poll_lua_file_changes();
         self.poll_user_file_watches();
+        self.poll_lua_timers();
+        self.poll_lua_http_responses();
         // Flush any Lua-queued operations (WebRTC sends, TUI sends, PTY requests, Hub requests)
         // This catches any events fired outside the normal message flow
         self.flush_lua_queues();
@@ -80,6 +82,28 @@ impl Hub {
         let fired = self.lua.poll_user_file_watches();
         if fired > 0 {
             log::debug!("Fired {} user file watch event(s)", fired);
+        }
+    }
+
+    /// Poll Lua timers and fire callbacks for expired timers.
+    ///
+    /// Checks all registered timers, fires callbacks for expired ones,
+    /// reschedules repeating timers, and removes completed entries.
+    fn poll_lua_timers(&self) {
+        let fired = self.lua.poll_timers();
+        if fired > 0 {
+            log::debug!("Fired {} Lua timer callback(s)", fired);
+        }
+    }
+
+    /// Poll for completed async HTTP responses and fire Lua callbacks.
+    ///
+    /// Background threads spawned by `http.request()` push completed
+    /// responses to the registry. This drains them and fires callbacks.
+    fn poll_lua_http_responses(&self) {
+        let fired = self.lua.poll_http_responses();
+        if fired > 0 {
+            log::debug!("Fired {} Lua HTTP callback(s)", fired);
         }
     }
 
