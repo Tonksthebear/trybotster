@@ -9,7 +9,7 @@
 //! ```text
 //! ActionCableChannel
 //!     ├── WebSocket connection (tokio-tungstenite)
-//!     ├── E2E encryption (optional, via CryptoServiceHandle)
+//!     ├── E2E encryption (optional, via CryptoService = Arc<Mutex<VodozemacCrypto>>)
 //!     ├── Reliable delivery (optional, per-peer seq/ack/retransmit)
 //!     ├── Gzip compression (optional, via compression module)
 //!     └── Reconnection (exponential backoff)
@@ -22,12 +22,10 @@
 //! let channel = ActionCableChannel::builder()
 //!     .server_url("https://example.com")
 //!     .api_key("secret")
-//!     .crypto_service(crypto_handle)  // optional: enables E2E encryption
-//!     .reliable(true)                 // optional: enables guaranteed delivery
+//!     .crypto_service(crypto_service)  // optional: enables E2E encryption
+//!     .reliable(true)                  // optional: enables guaranteed delivery
 //!     .build();
 //! ```
-//!
-//! Rust guideline compliant 2025-01
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -40,8 +38,8 @@ use tokio_tungstenite::{
     connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message,
 };
 
-use crate::relay::crypto_service::CryptoServiceHandle;
-use crate::relay::matrix_crypto::CryptoEnvelope;
+use crate::relay::crypto_service::CryptoService;
+use crate::relay::olm_crypto::OlmEnvelope;
 
 use super::compression::{maybe_compress, maybe_decompress};
 use super::reliable::{ReliableMessage, ReliableSession};
@@ -214,8 +212,8 @@ pub struct ActionCableChannel {
     state: Arc<SharedConnectionState>,
 
     /// Crypto service handle for encryption (None = unencrypted).
-    /// Uses CryptoServiceHandle which is Send + Clone for thread-safe access.
-    crypto_service: Option<CryptoServiceHandle>,
+    /// Uses CryptoService which is Send + Clone for thread-safe access.
+    crypto_service: Option<CryptoService>,
 
     /// Server URL (without /cable suffix).
     server_url: String,
@@ -251,7 +249,7 @@ pub struct ActionCableChannel {
 pub struct ActionCableChannelBuilder {
     server_url: Option<String>,
     api_key: Option<String>,
-    crypto_service: Option<CryptoServiceHandle>,
+    crypto_service: Option<CryptoService>,
     reliable: bool,
     cli_subscription: bool,
 }
@@ -278,7 +276,7 @@ impl ActionCableChannelBuilder {
 
     /// Enable E2E encryption with the given crypto service.
     #[must_use]
-    pub fn crypto_service(mut self, cs: CryptoServiceHandle) -> Self {
+    pub fn crypto_service(mut self, cs: CryptoService) -> Self {
         self.crypto_service = Some(cs);
         self
     }
@@ -362,12 +360,12 @@ impl ActionCableChannel {
     /// Create an encrypted channel using the provided crypto service handle.
     ///
     /// The crypto service is shared, enabling session reuse across channels.
-    /// CryptoServiceHandle is Send + Clone, so this channel can run on any thread.
+    /// CryptoService (`Arc<Mutex<VodozemacCrypto>>`) is Send + Clone.
     ///
     /// For more options, use `ActionCableChannel::builder()`.
     #[must_use]
     pub fn encrypted(
-        crypto_service: CryptoServiceHandle,
+        crypto_service: CryptoService,
         server_url: String,
         api_key: String,
     ) -> Self {
@@ -469,7 +467,7 @@ impl ActionCableChannel {
     /// Run the connection loop with automatic reconnection.
     #[allow(clippy::too_many_arguments)]
     async fn run_connection_loop(
-        crypto_service: Option<CryptoServiceHandle>,
+        crypto_service: Option<CryptoService>,
         config: ChannelConfig,
         server_url: String,
         api_key: String,
@@ -680,7 +678,7 @@ impl ActionCableChannel {
     /// reconnection loop if shutdown was requested.
     #[allow(clippy::too_many_arguments)]
     async fn run_message_loop(
-        crypto_service: &Option<CryptoServiceHandle>,
+        crypto_service: &Option<CryptoService>,
         config: &ChannelConfig,
         identifier_json: &str,
         reliable: bool,
@@ -792,7 +790,7 @@ impl ActionCableChannel {
     /// Handle outgoing message.
     #[allow(clippy::too_many_arguments)]
     async fn handle_outgoing(
-        crypto_service: &Option<CryptoServiceHandle>,
+        crypto_service: &Option<CryptoService>,
         config: &ChannelConfig,
         identifier_json: &str,
         reliable: bool,
@@ -848,18 +846,23 @@ impl ActionCableChannel {
             };
 
             let envelope_data = if let Some(ref cs) = crypto_service {
-                // Encrypt via CryptoServiceHandle (message passing, no lock needed)
-                match cs.encrypt(&to_encrypt, target.as_ref()).await {
-                    Ok(envelope) => {
-                        // Use serde to serialize envelope with short keys (t, c, s, d)
-                        serde_json::json!({
-                            "action": "relay",
-                            "recipient_identity": target.as_ref(),
-                            "envelope": envelope,
-                        })
-                    }
+                // Encrypt via CryptoService (synchronous mutex lock)
+                match cs.lock() {
+                    Ok(mut guard) => match guard.encrypt(&to_encrypt) {
+                        Ok(envelope) => {
+                            serde_json::json!({
+                                "action": "relay",
+                                "recipient_identity": target.as_ref(),
+                                "envelope": envelope,
+                            })
+                        }
+                        Err(e) => {
+                            log::error!("Encryption failed for {}: {}", target, e);
+                            continue;
+                        }
+                    },
                     Err(e) => {
-                        log::error!("Encryption failed for {}: {}", target, e);
+                        log::error!("Crypto mutex poisoned: {}", e);
                         continue;
                     }
                 }
@@ -891,7 +894,7 @@ impl ActionCableChannel {
     /// Handle incoming message, returns parsed messages (may be multiple due to reordering).
     #[allow(clippy::too_many_arguments)]
     async fn handle_incoming(
-        crypto_service: &Option<CryptoServiceHandle>,
+        crypto_service: &Option<CryptoService>,
         config: &ChannelConfig,
         text: &str,
         reliable: bool,
@@ -985,7 +988,7 @@ impl ActionCableChannel {
             let Some(envelope_json) = message.get("envelope") else {
                 return Vec::new();
             };
-            let envelope: CryptoEnvelope = match envelope_json {
+            let envelope: OlmEnvelope = match envelope_json {
                 serde_json::Value::String(s) => match serde_json::from_str(s) {
                     Ok(e) => e,
                     Err(_) => return Vec::new(),
@@ -996,7 +999,12 @@ impl ActionCableChannel {
                 },
             };
 
-            let sender = PeerId(envelope.sender_key.clone());
+            // Sender identity: from sender_key on PreKey messages, or stored peer key
+            let sender_id = envelope
+                .sender_key
+                .clone()
+                .unwrap_or_else(|| "peer".to_string());
+            let sender = PeerId(sender_id);
 
             // Track peer
             {
@@ -1006,41 +1014,40 @@ impl ActionCableChannel {
                 }
             }
 
-            // Decrypt via CryptoServiceHandle
+            // Decrypt via CryptoService (synchronous mutex)
             log::trace!(
-                "[INPUT-TRACE] Received encrypted message from {} (msg_type={}, device_id={})",
+                "[INPUT-TRACE] Received encrypted message from {} (msg_type={})",
                 &sender.0[..8.min(sender.0.len())],
                 envelope.message_type,
-                envelope.device_id
             );
             let decrypt_start = std::time::Instant::now();
-            let plaintext = match cs.decrypt(&envelope).await {
-                Ok(p) => {
-                    log::trace!(
-                        "[INPUT-TRACE] Decrypted {} bytes from {} in {:?}",
-                        p.len(),
-                        &sender.0[..8.min(sender.0.len())],
-                        decrypt_start.elapsed()
-                    );
-                    p
-                }
+            let plaintext = match cs.lock() {
+                Ok(mut guard) => match guard.decrypt(&envelope) {
+                    Ok(p) => {
+                        log::trace!(
+                            "[INPUT-TRACE] Decrypted {} bytes from {} in {:?}",
+                            p.len(),
+                            &sender.0[..8.min(sender.0.len())],
+                            decrypt_start.elapsed()
+                        );
+                        p
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "[INPUT-TRACE] DECRYPTION FAILED for {} after {:?}: {} (msg_type={})",
+                            &sender.0[..8.min(sender.0.len())],
+                            decrypt_start.elapsed(),
+                            e,
+                            envelope.message_type,
+                        );
+                        return Vec::new();
+                    }
+                },
                 Err(e) => {
-                    log::error!(
-                        "[INPUT-TRACE] DECRYPTION FAILED for {} after {:?}: {} (msg_type={}, device_id={})",
-                        &sender.0[..8.min(sender.0.len())],
-                        decrypt_start.elapsed(),
-                        e,
-                        envelope.message_type,
-                        envelope.device_id
-                    );
+                    log::error!("Crypto mutex poisoned: {}", e);
                     return Vec::new();
                 }
             };
-
-            // Persist session state
-            if let Err(e) = cs.persist().await {
-                log::warn!("Failed to persist session: {}", e);
-            }
 
             (plaintext, sender)
         } else {
@@ -1092,7 +1099,7 @@ impl ActionCableChannel {
         plaintext: &[u8],
         sender: &PeerId,
         reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
-        crypto_service: &Option<CryptoServiceHandle>,
+        crypto_service: &Option<CryptoService>,
         identifier_json: &str,
         write: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<
@@ -1239,7 +1246,7 @@ impl ActionCableChannel {
     /// - Sends retransmits for any unacked messages past their timeout
     async fn reliable_maintenance(
         reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
-        crypto_service: &Option<CryptoServiceHandle>,
+        crypto_service: &Option<CryptoService>,
         identifier_json: &str,
         write: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<
@@ -1305,7 +1312,7 @@ impl ActionCableChannel {
     async fn send_reliable_message(
         peer: &PeerId,
         msg: &ReliableMessage,
-        crypto_service: &Option<CryptoServiceHandle>,
+        crypto_service: &Option<CryptoService>,
         identifier_json: &str,
         write: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<
@@ -1317,17 +1324,22 @@ impl ActionCableChannel {
         let msg_bytes = msg.to_bytes();
 
         let envelope_data = if let Some(ref cs) = crypto_service {
-            match cs.encrypt(&msg_bytes, peer.as_ref()).await {
-                Ok(envelope) => {
-                    // Use serde to serialize envelope with short keys (t, c, s, d)
-                    serde_json::json!({
-                        "action": "relay",
-                        "recipient_identity": peer.as_ref(),
-                        "envelope": envelope,
-                    })
-                }
+            match cs.lock() {
+                Ok(mut guard) => match guard.encrypt(&msg_bytes) {
+                    Ok(envelope) => {
+                        serde_json::json!({
+                            "action": "relay",
+                            "recipient_identity": peer.as_ref(),
+                            "envelope": envelope,
+                        })
+                    }
+                    Err(e) => {
+                        log::error!("Failed to encrypt message to {}: {}", peer, e);
+                        return;
+                    }
+                },
                 Err(e) => {
-                    log::error!("Failed to encrypt message to {}: {}", peer, e);
+                    log::error!("Crypto mutex poisoned: {}", e);
                     return;
                 }
             }
@@ -1360,7 +1372,7 @@ impl ActionCableChannel {
     async fn send_ack(
         peer: &PeerId,
         reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
-        crypto_service: &Option<CryptoServiceHandle>,
+        crypto_service: &Option<CryptoService>,
         identifier_json: &str,
         write: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<
@@ -1380,17 +1392,22 @@ impl ActionCableChannel {
 
         // Encrypt if needed
         let envelope_data = if let Some(ref cs) = crypto_service {
-            match cs.encrypt(&ack_bytes, peer.as_ref()).await {
-                Ok(envelope) => {
-                    // Use serde to serialize envelope with short keys (t, c, s, d)
-                    serde_json::json!({
-                        "action": "relay",
-                        "recipient_identity": peer.as_ref(),
-                        "envelope": envelope,
-                    })
-                }
+            match cs.lock() {
+                Ok(mut guard) => match guard.encrypt(&ack_bytes) {
+                    Ok(envelope) => {
+                        serde_json::json!({
+                            "action": "relay",
+                            "recipient_identity": peer.as_ref(),
+                            "envelope": envelope,
+                        })
+                    }
+                    Err(e) => {
+                        log::error!("Failed to encrypt ACK: {}", e);
+                        return;
+                    }
+                },
                 Err(e) => {
-                    log::error!("Failed to encrypt ACK: {}", e);
+                    log::error!("Crypto mutex poisoned: {}", e);
                     return;
                 }
             }
@@ -1437,7 +1454,7 @@ impl Channel for ActionCableChannel {
         self.shutdown_tx = Some(shutdown_tx);
         self.config = Some(config.clone());
 
-        // Spawn connection task - using tokio::spawn since CryptoServiceHandle is Send
+        // Spawn connection task - CryptoService (Arc<Mutex>) is Send
         let crypto_service = self.crypto_service.clone();
         let server_url = self.server_url.clone();
         let api_key = self.api_key.clone();

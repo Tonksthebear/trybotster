@@ -1,34 +1,31 @@
 /**
- * Matrix Device Key Bundle Parsing
+ * Device Key Bundle Parsing
  *
  * Parses DeviceKeyBundle from QR code URL fragments.
- * The bundle is Base32-encoded binary data containing Matrix device keys.
+ * The bundle is Base32-encoded binary data containing Olm device keys.
  *
  * Used during initial pairing: CLI displays QR code, browser scans it,
- * URL fragment contains the bundle needed to establish Matrix session.
+ * URL fragment contains the bundle needed to establish Olm session.
  *
- * Binary format (~165 bytes vs 1813 bytes for Signal):
- * - version: 1 byte (0x05 for Matrix)
- * - identity_key: 32 bytes (Curve25519)
- * - signing_key: 32 bytes (Ed25519)
- * - one_time_key: 32 bytes (Curve25519)
- * - key_id_length: 4 bytes (LE u32)
- * - key_id: N bytes (UTF-8, ~10 bytes typical)
- * - signature: 64 bytes (Ed25519)
+ * Binary format (161 bytes, fixed size):
+ *   [1]  version (0x06)
+ *   [32] identity_key (Curve25519)
+ *   [32] signing_key (Ed25519)
+ *   [32] one_time_key (Curve25519)
+ *   [64] signature (Ed25519)
  */
 
 import bridge from "workers/bridge"
 
 /**
- * Ensure the worker bridge is initialized for Matrix crypto.
- * Call this before any Matrix operations.
+ * Ensure the worker bridge is initialized for crypto.
+ * Call this before any crypto operations.
  *
- * @param {string} cryptoWorkerUrl - URL to crypto SharedWorker (matrix_crypto.js)
- * @param {string} wasmJsUrl - URL to matrix-sdk-crypto-wasm JS
+ * @param {string} cryptoWorkerUrl - URL to crypto SharedWorker
+ * @param {string} wasmJsUrl - URL to vodozemac-wasm JS
  */
 export async function ensureMatrixReady(cryptoWorkerUrl, wasmJsUrl) {
-  // Matrix SDK crypto WASM handles binary loading internally, no separate binary URL needed
-  await bridge.init({ cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl: null })
+  await bridge.init({ cryptoWorkerUrl, wasmJsUrl })
 }
 
 /**
@@ -58,106 +55,60 @@ function base32Decode(base32) {
 }
 
 /**
- * Convert Uint8Array to Base64 string.
+ * Convert Uint8Array to unpadded Base64 string.
  */
 function bytesToBase64(bytes) {
-  let binary = ""
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i])
-  }
-  return btoa(binary)
+  return btoa(String.fromCharCode(...bytes)).replace(/=+$/, "")
 }
 
 /**
- * Read little-endian u32 from byte array.
- */
-function readU32LE(bytes, offset) {
-  return (
-    (bytes[offset] |
-      (bytes[offset + 1] << 8) |
-      (bytes[offset + 2] << 16) |
-      (bytes[offset + 3] << 24)) >>>
-    0
-  )
-}
-
-/**
- * Parse binary DeviceKeyBundle format from CLI.
+ * Parse binary DeviceKeyBundle v6 format from CLI.
  *
- * Binary format (~165 bytes):
- * - version: 1 byte (0x05 for Matrix)
- * - identity_key: 32 bytes (Curve25519)
- * - signing_key: 32 bytes (Ed25519)
- * - one_time_key: 32 bytes (Curve25519)
- * - key_id_length: 4 bytes (LE u32)
- * - key_id: N bytes (UTF-8)
- * - signature: 64 bytes (Ed25519)
+ * Fixed 161 bytes:
+ *   [1]  version (0x06)
+ *   [32] identity_key (Curve25519)
+ *   [32] signing_key (Ed25519)
+ *   [32] one_time_key (Curve25519)
+ *   [64] signature (Ed25519)
  */
 function parseBinaryBundle(bytes) {
-  const MATRIX_VERSION = 0x05
-  const MIN_SIZE = 1 + 32 + 32 + 32 + 4 + 64 // 165 bytes minimum (key_id can be 0)
+  const BUNDLE_VERSION = 0x06
+  const BUNDLE_SIZE = 161
 
-  if (bytes.length < MIN_SIZE) {
+  if (bytes.length < BUNDLE_SIZE) {
     throw new Error(
-      `Invalid bundle size: ${bytes.length}, expected at least ${MIN_SIZE}`
+      `Invalid bundle size: ${bytes.length}, expected ${BUNDLE_SIZE}`
     )
   }
 
   let offset = 0
 
-  // Version (1 byte)
   const version = bytes[offset]
   offset += 1
 
-  if (version !== MATRIX_VERSION) {
+  if (version !== BUNDLE_VERSION) {
     throw new Error(
-      `Invalid bundle version: ${version}, expected ${MATRIX_VERSION}`
+      `Invalid bundle version: ${version}, expected ${BUNDLE_VERSION}`
     )
   }
 
-  // Identity key - Curve25519 (32 bytes)
   const identityKey = bytes.slice(offset, offset + 32)
   offset += 32
 
-  // Signing key - Ed25519 (32 bytes)
   const signingKey = bytes.slice(offset, offset + 32)
   offset += 32
 
-  // One-time key - Curve25519 (32 bytes)
   const oneTimeKey = bytes.slice(offset, offset + 32)
   offset += 32
 
-  // Key ID length (4 bytes LE u32)
-  const keyIdLength = readU32LE(bytes, offset)
-  offset += 4
-
-  // Validate key ID length is reasonable
-  if (keyIdLength > 256) {
-    throw new Error(`Invalid key ID length: ${keyIdLength}`)
-  }
-
-  // Validate total size
-  const expectedSize = MIN_SIZE + keyIdLength
-  if (bytes.length !== expectedSize) {
-    throw new Error(
-      `Invalid bundle size: ${bytes.length}, expected ${expectedSize}`
-    )
-  }
-
-  // Key ID (N bytes UTF-8)
-  const keyIdBytes = bytes.slice(offset, offset + keyIdLength)
-  const oneTimeKeyId = new TextDecoder().decode(keyIdBytes)
-  offset += keyIdLength
-
-  // Signature - Ed25519 (64 bytes)
   const signature = bytes.slice(offset, offset + 64)
+  offset += 64
 
   return {
     version,
     identityKey: bytesToBase64(identityKey),
     signingKey: bytesToBase64(signingKey),
     oneTimeKey: bytesToBase64(oneTimeKey),
-    oneTimeKeyId,
     signature: bytesToBase64(signature),
   }
 }
@@ -176,8 +127,7 @@ export function parseBundleFromFragment() {
   }
 
   const base32Data = hash.startsWith("#") ? hash.slice(1) : hash
-  // Matrix bundles are ~165 bytes, which is ~264 base32 chars
-  // Use a lower threshold since Matrix bundles are much smaller than Signal
+  // v6 bundles are 161 bytes = ~258 base32 chars
   if (!base32Data || base32Data.length < 50) {
     return null
   }
@@ -192,7 +142,7 @@ export function parseBundleFromFragment() {
 
     return bundle
   } catch (error) {
-    console.error("[Matrix] Failed to parse bundle from fragment:", error)
+    console.error("[Bundle] Failed to parse bundle from fragment:", error)
     return null
   }
 }

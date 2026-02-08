@@ -62,12 +62,11 @@ sha2 = "0.10"
 semver = "1.0"
 hostname = "0.4"
 
-# E2E encryption (Matrix Olm/Megolm via OlmMachine state machine)
-# matrix-sdk-crypto provides the high-level OlmMachine for wire-compatible encryption
-matrix-sdk-crypto = { version = "0.16", default-features = false, features = ["automatic-room-key-forwarding"] }
-# Matrix identifier types (UserId, DeviceId, RoomId) - required by OlmMachine
-ruma = "0.14"
+# Async trait (used by Channel trait)
 async-trait = "0.1"
+
+# E2E encryption (vodozemac - direct Olm/Megolm without matrix-sdk-crypto overhead)
+vodozemac = "0.9"
 rand = "0.9"
 base64 = "0.22"
 data-encoding = "2.6"  # Base32 encoding for QR-friendly URLs

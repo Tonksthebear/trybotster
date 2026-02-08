@@ -23,7 +23,7 @@
 //! tui.on_message(function(message)
 //!     log.debug("TUI message: type=" .. tostring(message.type))
 //!     if message.type == "list_agents" then
-//!         tui.send({ type = "agent_list", agents = hub.get_agents() })
+//!         tui.send({ type = "agent_list", agents = Agent.all_info() })
 //!     end
 //! end)
 //! ```
@@ -102,8 +102,7 @@ pub fn register(lua: &Lua, send_queue: TuiSendQueue) -> Result<()> {
     // tui.on_connected(callback)
     let on_connected_fn = lua
         .create_function(|lua, callback: LuaFunction| {
-            let key = lua.create_registry_value(callback)?;
-            lua.set_named_registry_value(registry_keys::ON_CONNECTED, key)?;
+            lua.set_named_registry_value(registry_keys::ON_CONNECTED, callback)?;
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create tui.on_connected function: {e}"))?;
@@ -114,8 +113,7 @@ pub fn register(lua: &Lua, send_queue: TuiSendQueue) -> Result<()> {
     // tui.on_disconnected(callback)
     let on_disconnected_fn = lua
         .create_function(|lua, callback: LuaFunction| {
-            let key = lua.create_registry_value(callback)?;
-            lua.set_named_registry_value(registry_keys::ON_DISCONNECTED, key)?;
+            lua.set_named_registry_value(registry_keys::ON_DISCONNECTED, callback)?;
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create tui.on_disconnected function: {e}"))?;
@@ -126,8 +124,7 @@ pub fn register(lua: &Lua, send_queue: TuiSendQueue) -> Result<()> {
     // tui.on_message(callback)
     let on_message_fn = lua
         .create_function(|lua, callback: LuaFunction| {
-            let key = lua.create_registry_value(callback)?;
-            lua.set_named_registry_value(registry_keys::ON_MESSAGE, key)?;
+            lua.set_named_registry_value(registry_keys::ON_MESSAGE, callback)?;
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create tui.on_message function: {e}"))?;

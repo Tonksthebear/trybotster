@@ -114,6 +114,8 @@ export default class extends Controller {
         hubId: this.hubIdValue,
         agentIndex: this.agentIndexValue,
         ptyIndex: this.ptyIndexValue,
+        rows: this.#terminal?.rows || 24,
+        cols: this.#terminal?.cols || 80,
       },
     );
 
@@ -465,15 +467,20 @@ export default class extends Controller {
   }
 
   async #sendResize() {
-    if (!this.#terminal || !this.#hubConn) return;
+    if (!this.#terminal) return;
 
     const cols = this.#terminal.cols;
     const rows = this.#terminal.rows;
     console.log("[Terminal] Sending resize:", cols, "x", rows);
 
-    // Send resize via hub connection to update client dims centrally.
-    // Hub's update_dims() resizes all PTYs for this client.
-    this.#hubConn.sendResize(cols, rows);
+    // Send resize via terminal connection (guaranteed connected when
+    // called from #handleConnected). This directly resizes the PTY
+    // and updates client dims in Lua.
+    this.#terminalConn?.sendResize(cols, rows);
+
+    // Also send via hub connection to update client dims centrally
+    // (resizes all PTYs for this client, not just the current one).
+    this.#hubConn?.sendResize(cols, rows);
   }
 
   #handleResize() {

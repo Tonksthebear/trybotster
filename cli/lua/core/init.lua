@@ -44,6 +44,7 @@ end
 
 -- Load library modules
 safe_require("lib.agent")
+safe_require("lib.commands")
 
 -- ============================================================================
 -- Handler Loading
@@ -62,6 +63,10 @@ safe_require("handlers.agents")
 safe_require("handlers.webrtc")
 safe_require("handlers.tui")
 
+-- Load command registrations (registers built-in hub commands)
+-- Must load after transports; uses require() for lazy handler access.
+safe_require("handlers.commands")
+
 -- ============================================================================
 -- Event Subscriptions (Logging)
 -- ============================================================================
@@ -72,6 +77,15 @@ events.on("shutdown", function()
     log.info("Hub shutting down - Lua cleanup")
     -- Could add cleanup logic here if needed
 end)
+
+-- ============================================================================
+-- User Customization
+-- ============================================================================
+-- Load user init file if it exists. This is the entry point for all user
+-- customization: hooks, custom commands, overrides, etc.
+-- Analogous to Neovim's ~/.config/nvim/init.lua.
+
+safe_require("user.init")
 
 -- ============================================================================
 -- Initialization Complete

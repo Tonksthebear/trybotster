@@ -28,6 +28,7 @@ pub mod hub;
 pub mod log;
 pub mod pty;
 pub mod tui;
+pub mod watch;
 pub mod webrtc;
 pub mod worktree;
 
@@ -53,6 +54,7 @@ pub use pty::{
 };
 pub use tui::{new_send_queue as new_tui_queue, TuiSendQueue, TuiSendRequest};
 pub use webrtc::{new_send_queue, WebRtcSendQueue, WebRtcSendRequest};
+pub use watch::{new_watcher_registry, WatcherRegistry};
 pub use worktree::{
     new_request_queue as new_worktree_queue, WorktreeRequest, WorktreeRequestQueue,
 };
@@ -212,5 +214,23 @@ pub fn register_worktree(
 /// Returns an error if registration fails.
 pub fn register_events(lua: &Lua, callbacks: SharedEventCallbacks) -> Result<()> {
     events::register(lua, callbacks)?;
+    Ok(())
+}
+
+/// Register file watch primitives with a watcher registry.
+///
+/// Call this after `register_all()` to set up user-facing file watching.
+/// The registry is polled each tick to fire Lua callbacks.
+///
+/// # Arguments
+///
+/// * `lua` - The Lua state to register primitives in
+/// * `registry` - Shared watcher registry
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub fn register_watch(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
+    watch::register(lua, registry)?;
     Ok(())
 }

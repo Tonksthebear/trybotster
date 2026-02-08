@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! ~/.config/botster/hubs/{hub_id}/
-//!     matrix_store.enc    # AES-GCM encrypted Matrix crypto state
+//!     vodozemac_store.enc    # AES-GCM encrypted Matrix crypto state
 //!
 //! OS Keyring (consolidated):
 //!     botster/credentials  # Contains crypto_keys[hub_id] = base64 AES key
@@ -199,10 +199,10 @@ fn decrypt_data(key: &[u8; 32], encrypted: &EncryptedData) -> Result<Vec<u8>> {
 // Matrix Crypto Persistence
 // ============================================================================
 
-use super::matrix_crypto::MatrixCryptoState;
+use super::olm_crypto::VodozemacCryptoState;
 
-/// Encrypt data using AES-256-GCM with Matrix version marker.
-fn encrypt_data_matrix(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedData> {
+/// Encrypt data using AES-256-GCM with version marker.
+fn encrypt_data_versioned(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedData> {
     let cipher = Aes256Gcm::new_from_slice(key).expect("valid key length");
 
     // Generate random nonce
@@ -218,14 +218,14 @@ fn encrypt_data_matrix(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedData
     Ok(EncryptedData {
         nonce: BASE64.encode(nonce_bytes),
         ciphertext: BASE64.encode(ciphertext),
-        version: 5, // Matrix crypto version
+        version: 6, // vodozemac crypto version
     })
 }
 
-/// Load a Matrix crypto store from encrypted storage.
-pub fn load_matrix_crypto_store(hub_id: &str) -> Result<MatrixCryptoState> {
+/// Load a vodozemac crypto store from encrypted storage.
+pub fn load_vodozemac_crypto_store(hub_id: &str) -> Result<VodozemacCryptoState> {
     let state_dir = hub_state_dir(hub_id)?;
-    let store_path = state_dir.join("matrix_store.enc");
+    let store_path = state_dir.join("vodozemac_store.enc");
 
     if !store_path.exists() {
         anyhow::bail!(
@@ -241,7 +241,7 @@ pub fn load_matrix_crypto_store(hub_id: &str) -> Result<MatrixCryptoState> {
         serde_json::from_str(&content).context("Failed to parse Matrix store file")?;
 
     let plaintext = decrypt_data(&key, &encrypted)?;
-    let state: MatrixCryptoState =
+    let state: VodozemacCryptoState =
         serde_json::from_slice(&plaintext).context("Failed to deserialize Matrix store")?;
 
     log::info!(
@@ -251,14 +251,14 @@ pub fn load_matrix_crypto_store(hub_id: &str) -> Result<MatrixCryptoState> {
     Ok(state)
 }
 
-/// Save a Matrix crypto store to encrypted storage.
-pub fn save_matrix_crypto_store(hub_id: &str, state: &MatrixCryptoState) -> Result<()> {
+/// Save a vodozemac crypto store to encrypted storage.
+pub fn save_vodozemac_crypto_store(hub_id: &str, state: &VodozemacCryptoState) -> Result<()> {
     let key = get_or_create_encryption_key(hub_id)?;
     let state_dir = hub_state_dir(hub_id)?;
-    let store_path = state_dir.join("matrix_store.enc");
+    let store_path = state_dir.join("vodozemac_store.enc");
 
     let plaintext = serde_json::to_vec(state).context("Failed to serialize Matrix store")?;
-    let encrypted = encrypt_data_matrix(&key, &plaintext)?;
+    let encrypted = encrypt_data_versioned(&key, &plaintext)?;
 
     let content =
         serde_json::to_string_pretty(&encrypted).context("Failed to serialize encrypted store")?;
@@ -277,10 +277,10 @@ pub fn save_matrix_crypto_store(hub_id: &str, state: &MatrixCryptoState) -> Resu
     Ok(())
 }
 
-/// Delete all Matrix crypto state for a hub.
-pub fn delete_matrix_crypto_store(hub_id: &str) -> Result<()> {
+/// Delete all vodozemac crypto state for a hub.
+pub fn delete_vodozemac_crypto_store(hub_id: &str) -> Result<()> {
     let state_dir = hub_state_dir(hub_id)?;
-    let store_path = state_dir.join("matrix_store.enc");
+    let store_path = state_dir.join("vodozemac_store.enc");
 
     if store_path.exists() {
         fs::remove_file(&store_path).context("Failed to delete Matrix store file")?;
@@ -290,10 +290,10 @@ pub fn delete_matrix_crypto_store(hub_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Check if a Matrix crypto store exists for a hub.
-pub fn matrix_crypto_store_exists(hub_id: &str) -> bool {
+/// Check if a vodozemac crypto store exists for a hub.
+pub(crate) fn vodozemac_crypto_store_exists(hub_id: &str) -> bool {
     hub_state_dir(hub_id)
-        .map(|dir| dir.join("matrix_store.enc").exists())
+        .map(|dir| dir.join("vodozemac_store.enc").exists())
         .unwrap_or(false)
 }
 
@@ -362,36 +362,33 @@ mod tests {
         let key = [0u8; 32]; // Test key
         let plaintext = b"Hello, Matrix crypto!";
 
-        let encrypted = encrypt_data_matrix(&key, plaintext).unwrap();
+        let encrypted = encrypt_data_versioned(&key, plaintext).unwrap();
         let decrypted = decrypt_data(&key, &encrypted).unwrap();
 
         assert_eq!(decrypted, plaintext);
-        assert_eq!(encrypted.version, 5);
+        assert_eq!(encrypted.version, 6);
     }
 
     #[test]
-    fn test_matrix_crypto_store_persistence_roundtrip() {
+    fn test_olm_crypto_store_persistence_roundtrip() {
         let hub_id = "test-hub-matrix-store";
 
         // Create a test store state
-        let state = MatrixCryptoState {
+        let state = VodozemacCryptoState {
             pickled_account: "test_pickled_account".to_string(),
             hub_id: hub_id.to_string(),
-            signing_key: vec![1, 2, 3, 4],
-            sessions: HashMap::new(),
-            used_one_time_keys: vec![],
-            outbound_group_session: None,
-            inbound_group_sessions: HashMap::new(),
+            pickled_session: None,
+            peer_identity_key: Some("test_peer_key".to_string()),
         };
 
         // Save
-        save_matrix_crypto_store(hub_id, &state).unwrap();
+        save_vodozemac_crypto_store(hub_id, &state).unwrap();
 
         // Load
-        let loaded = load_matrix_crypto_store(hub_id).unwrap();
+        let loaded = load_vodozemac_crypto_store(hub_id).unwrap();
         assert_eq!(loaded.hub_id, hub_id);
         assert_eq!(loaded.pickled_account, "test_pickled_account");
-        assert_eq!(loaded.signing_key, vec![1, 2, 3, 4]);
+        assert_eq!(loaded.peer_identity_key, Some("test_peer_key".to_string()));
 
         // Cleanup
         let state_dir = hub_state_dir(hub_id).unwrap();
@@ -399,18 +396,18 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_crypto_store_exists() {
+    fn test_vodozemac_crypto_store_exists() {
         let hub_id = "test-hub-matrix-exists";
 
         // Should not exist initially
-        assert!(!matrix_crypto_store_exists(hub_id));
+        assert!(!vodozemac_crypto_store_exists(hub_id));
 
         // Create and save
-        let state = MatrixCryptoState::default();
-        save_matrix_crypto_store(hub_id, &state).unwrap();
+        let state = VodozemacCryptoState::default();
+        save_vodozemac_crypto_store(hub_id, &state).unwrap();
 
         // Should exist now
-        assert!(matrix_crypto_store_exists(hub_id));
+        assert!(vodozemac_crypto_store_exists(hub_id));
 
         // Cleanup
         let state_dir = hub_state_dir(hub_id).unwrap();

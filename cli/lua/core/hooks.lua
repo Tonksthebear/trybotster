@@ -16,6 +16,52 @@ local observers = {}
 -- Storage: interceptors[event][name] = { callback, priority, enabled, timeout_ms }
 local interceptors = {}
 
+-- Sorted list caches: event -> sorted array (nil = dirty)
+local observer_cache = {}
+local interceptor_cache = {}
+
+-- Enabled counts: event -> number of enabled hooks (for fast has_* checks)
+local observer_enabled_count = {}
+local interceptor_enabled_count = {}
+
+local function invalidate_observer_cache(event)
+    observer_cache[event] = nil
+end
+
+local function invalidate_interceptor_cache(event)
+    interceptor_cache[event] = nil
+end
+
+local function get_sorted_observers(event)
+    if observer_cache[event] then return observer_cache[event] end
+    local sorted = {}
+    if observers[event] then
+        for name, h in pairs(observers[event]) do
+            if h.enabled then
+                table.insert(sorted, { name = name, h = h })
+            end
+        end
+        table.sort(sorted, function(a, b) return a.h.priority > b.h.priority end)
+    end
+    observer_cache[event] = sorted
+    return sorted
+end
+
+local function get_sorted_interceptors(event)
+    if interceptor_cache[event] then return interceptor_cache[event] end
+    local sorted = {}
+    if interceptors[event] then
+        for name, h in pairs(interceptors[event]) do
+            if h.enabled then
+                table.insert(sorted, { name = name, h = h })
+            end
+        end
+        table.sort(sorted, function(a, b) return a.h.priority > b.h.priority end)
+    end
+    interceptor_cache[event] = sorted
+    return sorted
+end
+
 -- =============================================================================
 -- OBSERVERS
 -- =============================================================================
@@ -30,28 +76,43 @@ local interceptors = {}
 function M.on(event, name, callback, opts)
     opts = opts or {}
     observers[event] = observers[event] or {}
+    local enabled = opts.enabled ~= false
+
+    -- Track enabled count: if replacing an existing hook, adjust accordingly
+    local old = observers[event][name]
+    if old then
+        if old.enabled and not enabled then
+            observer_enabled_count[event] = (observer_enabled_count[event] or 1) - 1
+        elseif not old.enabled and enabled then
+            observer_enabled_count[event] = (observer_enabled_count[event] or 0) + 1
+        end
+    elseif enabled then
+        observer_enabled_count[event] = (observer_enabled_count[event] or 0) + 1
+    end
+
     observers[event][name] = {
         callback = callback,
         priority = opts.priority or 100,
-        enabled = opts.enabled ~= false,
+        enabled = enabled,
     }
+    invalidate_observer_cache(event)
     log.debug(string.format("hooks.on: %s.%s", event, name))
 end
 
 --- Remove an observer.
 function M.off(event, name)
-    if observers[event] then
+    if observers[event] and observers[event][name] then
+        if observers[event][name].enabled then
+            observer_enabled_count[event] = (observer_enabled_count[event] or 1) - 1
+        end
         observers[event][name] = nil
+        invalidate_observer_cache(event)
     end
 end
 
 --- Check if observers exist for an event.
 function M.has_observers(event)
-    if not observers[event] then return false end
-    for _, h in pairs(observers[event]) do
-        if h.enabled then return true end
-    end
-    return false
+    return (observer_enabled_count[event] or 0) > 0
 end
 
 --- Notify all observers (fire-and-forget). Errors logged, not propagated.
@@ -59,16 +120,9 @@ end
 --- @param ... any Arguments passed to observers
 --- @return number Number of observers called
 function M.notify(event, ...)
-    if not observers[event] then return 0 end
+    if (observer_enabled_count[event] or 0) == 0 then return 0 end
 
-    local sorted = {}
-    for name, h in pairs(observers[event]) do
-        if h.enabled then
-            table.insert(sorted, { name = name, h = h })
-        end
-    end
-    table.sort(sorted, function(a, b) return a.h.priority > b.h.priority end)
-
+    local sorted = get_sorted_observers(event)
     local count = 0
     local args = { ... }
     for _, entry in ipairs(sorted) do
@@ -95,30 +149,45 @@ end
 function M.intercept(event, name, callback, opts)
     opts = opts or {}
     interceptors[event] = interceptors[event] or {}
+    local enabled = opts.enabled ~= false
+
+    -- Track enabled count: if replacing an existing hook, adjust accordingly
+    local old = interceptors[event][name]
+    if old then
+        if old.enabled and not enabled then
+            interceptor_enabled_count[event] = (interceptor_enabled_count[event] or 1) - 1
+        elseif not old.enabled and enabled then
+            interceptor_enabled_count[event] = (interceptor_enabled_count[event] or 0) + 1
+        end
+    elseif enabled then
+        interceptor_enabled_count[event] = (interceptor_enabled_count[event] or 0) + 1
+    end
+
     interceptors[event][name] = {
         callback = callback,
         priority = opts.priority or 100,
-        enabled = opts.enabled ~= false,
+        enabled = enabled,
         timeout_ms = opts.timeout_ms or 10,
     }
+    invalidate_interceptor_cache(event)
     log.debug(string.format("hooks.intercept: %s.%s (timeout=%dms)",
         event, name, opts.timeout_ms or 10))
 end
 
 --- Remove an interceptor.
 function M.unintercept(event, name)
-    if interceptors[event] then
+    if interceptors[event] and interceptors[event][name] then
+        if interceptors[event][name].enabled then
+            interceptor_enabled_count[event] = (interceptor_enabled_count[event] or 1) - 1
+        end
         interceptors[event][name] = nil
+        invalidate_interceptor_cache(event)
     end
 end
 
 --- Check if interceptors exist for an event.
 function M.has_interceptors(event)
-    if not interceptors[event] then return false end
-    for _, h in pairs(interceptors[event]) do
-        if h.enabled then return true end
-    end
-    return false
+    return (interceptor_enabled_count[event] or 0) > 0
 end
 
 --- Call interceptor chain. Each can transform or drop (return nil).
@@ -126,29 +195,24 @@ end
 --- @param ... any Arguments passed through chain
 --- @return any Transformed result, or nil if dropped
 function M.call(event, ...)
-    if not interceptors[event] then return ... end
+    if (interceptor_enabled_count[event] or 0) == 0 then return ... end
 
-    local sorted = {}
-    for name, h in pairs(interceptors[event]) do
-        if h.enabled then
-            table.insert(sorted, { name = name, h = h })
-        end
-    end
-    table.sort(sorted, function(a, b) return a.h.priority > b.h.priority end)
+    local sorted = get_sorted_interceptors(event)
 
-    local result = { ... }
+    local result = table.pack(...)
     for _, entry in ipairs(sorted) do
-        local ok, new_result = pcall(entry.h.callback, table.unpack(result))
+        local returns = table.pack(pcall(entry.h.callback, table.unpack(result, 1, result.n)))
+        local ok = returns[1]
         if not ok then
-            log.error(string.format("hooks.call %s.%s: %s", event, entry.name, new_result))
+            log.error(string.format("hooks.call %s.%s: %s", event, entry.name, returns[2]))
             -- Continue with previous result on error
-        elseif new_result == nil then
-            return nil -- Dropped
+        elseif returns.n <= 1 or returns[2] == nil then
+            return nil -- Dropped (no return values or explicit nil)
         else
-            result = { new_result }
+            result = table.pack(select(2, table.unpack(returns, 1, returns.n)))
         end
     end
-    return table.unpack(result)
+    return table.unpack(result, 1, result.n)
 end
 
 -- =============================================================================
@@ -157,21 +221,29 @@ end
 
 --- Enable a hook (observer or interceptor).
 function M.enable(event, name)
-    if observers[event] and observers[event][name] then
+    if observers[event] and observers[event][name] and not observers[event][name].enabled then
         observers[event][name].enabled = true
+        observer_enabled_count[event] = (observer_enabled_count[event] or 0) + 1
+        invalidate_observer_cache(event)
     end
-    if interceptors[event] and interceptors[event][name] then
+    if interceptors[event] and interceptors[event][name] and not interceptors[event][name].enabled then
         interceptors[event][name].enabled = true
+        interceptor_enabled_count[event] = (interceptor_enabled_count[event] or 0) + 1
+        invalidate_interceptor_cache(event)
     end
 end
 
 --- Disable a hook without removing it.
 function M.disable(event, name)
-    if observers[event] and observers[event][name] then
+    if observers[event] and observers[event][name] and observers[event][name].enabled then
         observers[event][name].enabled = false
+        observer_enabled_count[event] = (observer_enabled_count[event] or 1) - 1
+        invalidate_observer_cache(event)
     end
-    if interceptors[event] and interceptors[event][name] then
+    if interceptors[event] and interceptors[event][name] and interceptors[event][name].enabled then
         interceptors[event][name].enabled = false
+        interceptor_enabled_count[event] = (interceptor_enabled_count[event] or 1) - 1
+        invalidate_interceptor_cache(event)
     end
 end
 

@@ -1,6 +1,6 @@
 //! Agent handle for client-to-agent PTY access.
 //!
-//! `AgentHandle` provides thread-safe access to an agent's PTY sessions.
+//! `AgentPtys` provides thread-safe access to an agent's PTY sessions.
 //! It is a lightweight wrapper around PTY handles -- agent metadata (repo,
 //! issue, status, etc.) is now managed by Lua, not Rust.
 //!
@@ -10,13 +10,13 @@
 //! This is non-blocking and safe from any thread:
 //!
 //! ```text
-//! HandleCache::get_agent(idx) → Option<AgentHandle>
+//! HandleCache::get_agent(idx) → Option<AgentPtys>
 //! ```
 //!
 //! # Hierarchy
 //!
 //! ```text
-//! AgentHandle
+//! AgentPtys
 //!   ├── agent_key() → &str
 //!   ├── get_pty(0) → Option<&PtyHandle>  (CLI PTY)
 //!   └── get_pty(1) → Option<&PtyHandle>  (Server PTY)
@@ -43,8 +43,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
-use crate::agent::pty::{process_resize_command, PtyEvent, SharedPtyState};
-use crate::client::ClientId;
+use crate::agent::pty::{do_resize, PtyEvent, SharedPtyState};
 
 /// Handle for interacting with an agent's PTY sessions.
 ///
@@ -56,7 +55,7 @@ use crate::client::ClientId;
 ///
 /// # Thread Safety
 ///
-/// `AgentHandle` is `Clone` + `Send` + `Sync`, allowing it to be passed
+/// `AgentPtys` is `Clone` + `Send` + `Sync`, allowing it to be passed
 /// across threads and shared between async tasks.
 ///
 /// # PTY Access
@@ -65,7 +64,7 @@ use crate::client::ClientId;
 /// - Index 0: CLI PTY (always present)
 /// - Index 1: Server PTY (present when server is running)
 #[derive(Debug, Clone)]
-pub struct AgentHandle {
+pub struct AgentPtys {
     /// Agent session key (e.g., "owner-repo-42").
     agent_key: String,
 
@@ -81,7 +80,7 @@ pub struct AgentHandle {
     agent_index: usize,
 }
 
-impl AgentHandle {
+impl AgentPtys {
     /// Create a new agent handle.
     ///
     /// Called internally by Hub when building `HandleCache`.
@@ -101,7 +100,7 @@ impl AgentHandle {
         ptys: Vec<PtyHandle>,
         agent_index: usize,
     ) -> Self {
-        assert!(!ptys.is_empty(), "AgentHandle requires at least one PTY (CLI PTY)");
+        assert!(!ptys.is_empty(), "AgentPtys requires at least one PTY (CLI PTY)");
 
         Self {
             agent_key: agent_key.into(),
@@ -253,7 +252,7 @@ impl PtyHandle {
     /// - `Output(Vec<u8>)` - Terminal output data
     /// - `Resized { rows, cols }` - PTY was resized
     /// - `ProcessExited { exit_code }` - PTY process exited
-    /// - `OwnerChanged { new_owner }` - Size ownership changed
+    /// - `ProcessExited { exit_code }` - PTY process exited
     ///
     /// # Lagging
     ///
@@ -327,9 +326,10 @@ impl PtyHandle {
 
     /// Resize the PTY directly.
     ///
-    /// Checks if the client is the size owner and resizes if so.
-    pub fn resize_direct(&self, client_id: ClientId, rows: u16, cols: u16) {
-        process_resize_command(&client_id, rows, cols, &self.shared_state, &self.event_tx);
+    /// Unconditionally resizes the PTY. Lua is the trusted coordinator —
+    /// client-level ownership is managed there, not in the PTY.
+    pub fn resize_direct(&self, rows: u16, cols: u16) {
+        do_resize(rows, cols, &self.shared_state, &self.event_tx);
     }
 }
 
@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn test_agent_handle_creation() {
         let ptys = vec![create_test_pty()];
-        let handle = AgentHandle::new("agent-123", ptys, 0);
+        let handle = AgentPtys::new("agent-123", ptys, 0);
 
         assert_eq!(handle.agent_key(), "agent-123");
         assert_eq!(handle.agent_index(), 0);
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn test_agent_handle_with_server_pty() {
         let ptys = vec![create_test_pty(), create_test_pty()];
-        let handle = AgentHandle::new("agent-123", ptys, 0);
+        let handle = AgentPtys::new("agent-123", ptys, 0);
 
         assert_eq!(handle.pty_count(), 2);
         assert!(handle.get_pty(0).is_some());
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn test_get_pty_index_based_access() {
         let ptys = vec![create_test_pty()];
-        let handle = AgentHandle::new("agent-123", ptys, 0);
+        let handle = AgentPtys::new("agent-123", ptys, 0);
 
         // Index 0 is CLI PTY (always present)
         assert!(handle.get_pty(0).is_some());
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn test_get_pty_with_server() {
         let ptys = vec![create_test_pty(), create_test_pty()];
-        let handle = AgentHandle::new("agent-123", ptys, 0);
+        let handle = AgentPtys::new("agent-123", ptys, 0);
 
         // Both PTYs present
         assert!(handle.get_pty(0).is_some());
@@ -403,21 +403,21 @@ mod tests {
     fn test_pty_count() {
         // Without server PTY
         let ptys = vec![create_test_pty()];
-        let handle = AgentHandle::new("agent-123", ptys, 0);
+        let handle = AgentPtys::new("agent-123", ptys, 0);
         assert_eq!(handle.pty_count(), 1);
 
         // With server PTY
         let ptys = vec![create_test_pty(), create_test_pty()];
-        let handle = AgentHandle::new("agent-456", ptys, 1);
+        let handle = AgentPtys::new("agent-456", ptys, 1);
         assert_eq!(handle.pty_count(), 2);
         assert_eq!(handle.agent_index(), 1);
     }
 
     #[test]
-    #[should_panic(expected = "AgentHandle requires at least one PTY")]
+    #[should_panic(expected = "AgentPtys requires at least one PTY")]
     fn test_agent_handle_panics_on_empty_ptys() {
         let ptys: Vec<PtyHandle> = vec![];
-        let _ = AgentHandle::new("agent-123", ptys, 0);
+        let _ = AgentPtys::new("agent-123", ptys, 0);
     }
 
     #[test]

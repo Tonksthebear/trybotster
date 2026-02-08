@@ -308,6 +308,18 @@ where
         let (rows, cols) = self.terminal_dims;
         log::info!("Initial TUI dimensions: {}cols x {}rows", cols, rows);
 
+        // Send initial resize to Lua client so it knows the actual terminal
+        // dimensions before the first terminal subscription. Without this,
+        // the Lua Client defaults to 24x80 and the first PTY gets wrong dims.
+        self.send_msg(serde_json::json!({
+            "subscriptionId": "tui_hub",
+            "data": {
+                "type": "resize",
+                "rows": rows,
+                "cols": cols,
+            }
+        }));
+
         while !self.should_quit() {
             // 1. Handle keyboard/mouse input
             self.poll_input()?;

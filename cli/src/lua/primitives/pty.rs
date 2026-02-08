@@ -67,7 +67,6 @@
 //! -- Direct PTY operations
 //! hub.write_pty(0, 0, "ls -la\n")      -- Send input to PTY
 //! hub.resize_pty(0, 0, 24, 80)         -- Resize PTY
-//! local key = hub.get_scrollback(0, 0) -- Request scrollback (async)
 //! ```
 //!
 //! # Hook Integration
@@ -482,15 +481,6 @@ pub enum PtyRequest {
         cols: u16,
     },
 
-    /// Request scrollback buffer (async - Hub will call back with data).
-    GetScrollback {
-        /// Agent index in Hub's agent list.
-        agent_index: usize,
-        /// PTY index within the agent.
-        pty_index: usize,
-        /// Key for storing the response in Lua registry.
-        response_key: String,
-    },
 }
 
 // Implement Clone for PtyRequest to satisfy the requirement
@@ -523,15 +513,6 @@ impl Clone for PtyRequest {
                 rows: *rows,
                 cols: *cols,
             },
-            Self::GetScrollback {
-                agent_index,
-                pty_index,
-                response_key,
-            } => Self::GetScrollback {
-                agent_index: *agent_index,
-                pty_index: *pty_index,
-                response_key: response_key.clone(),
-            },
         }
     }
 }
@@ -553,7 +534,6 @@ pub fn new_request_queue() -> PtyRequestQueue {
 /// - `tui.create_pty_forwarder(opts)` - Create a PTY-to-TUI forwarder
 /// - `hub.write_pty(agent_index, pty_index, data)` - Write input to PTY
 /// - `hub.resize_pty(agent_index, pty_index, rows, cols)` - Resize PTY
-/// - `hub.get_scrollback(agent_index, pty_index)` - Get scrollback buffer
 ///
 /// # Arguments
 ///
@@ -802,29 +782,6 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
 
     hub.set("resize_pty", resize_pty_fn)
         .map_err(|e| anyhow!("Failed to set hub.resize_pty: {e}"))?;
-
-    // hub.get_scrollback(agent_index, pty_index) -> response_key
-    let queue4 = request_queue;
-    let get_scrollback_fn = lua
-        .create_function(move |_, (agent_index, pty_index): (usize, usize)| {
-            // Generate a unique response key for this request
-            let response_key = format!("scrollback:{}:{}:{}", agent_index, pty_index, uuid::Uuid::new_v4());
-
-            let mut q = queue4.lock()
-                .expect("PTY request queue mutex poisoned");
-            q.push(PtyRequest::GetScrollback {
-                agent_index,
-                pty_index,
-                response_key: response_key.clone(),
-            });
-
-            // Return the key so Lua can retrieve the response later
-            Ok(response_key)
-        })
-        .map_err(|e| anyhow!("Failed to create hub.get_scrollback function: {e}"))?;
-
-    hub.set("get_scrollback", get_scrollback_fn)
-        .map_err(|e| anyhow!("Failed to set hub.get_scrollback: {e}"))?;
 
     // Ensure hub table is globally registered
     lua.globals()
@@ -1130,39 +1087,6 @@ mod tests {
                 assert_eq!(*cols, 120);
             }
             _ => panic!("Expected ResizePty request"),
-        }
-    }
-
-    #[test]
-    fn test_get_scrollback_queues_request_and_returns_key() {
-        let lua = Lua::new();
-        let queue = new_request_queue();
-
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
-
-        let key: String = lua
-            .load(r#"return hub.get_scrollback(1, 0)"#)
-            .eval()
-            .expect("Should get scrollback");
-
-        // Key should start with the expected prefix
-        assert!(key.starts_with("scrollback:1:0:"), "Key should have correct prefix");
-
-        let requests = queue.lock()
-            .expect("PTY request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-
-        match &requests[0] {
-            PtyRequest::GetScrollback {
-                agent_index,
-                pty_index,
-                response_key,
-            } => {
-                assert_eq!(*agent_index, 1);
-                assert_eq!(*pty_index, 0);
-                assert_eq!(response_key, &key);
-            }
-            _ => panic!("Expected GetScrollback request"),
         }
     }
 

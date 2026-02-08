@@ -6,8 +6,8 @@
   <title>Preview</title>
   <%= csrf_meta_tags %>
   <%= csp_meta_tag %>
-  <meta name="crypto-worker-url" content="<%= asset_path('workers/matrix_crypto.js') %>">
-  <meta name="crypto-wasm-js-url" content="https://esm.sh/@matrix-org/matrix-sdk-crypto-wasm@15.3.0">
+  <meta name="crypto-worker-url" content="<%= asset_path('workers/olm_crypto.js') %>">
+  <meta name="crypto-wasm-js-url" content="/wasm/vodozemac/vodozemac_wasm.js">
   <%= stylesheet_link_tag "application", "data-turbo-track": "reload" %>
   <%= javascript_importmap_tags %>
   <style>

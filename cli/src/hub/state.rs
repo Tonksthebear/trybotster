@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::agent::Agent;
 use crate::git::WorktreeManager;
-use crate::hub::agent_handle::{AgentHandle, PtyHandle};
+use crate::hub::agent_handle::{AgentPtys, PtyHandle};
 
 /// Shared reference to HubState for thread-safe read access.
 ///
@@ -109,7 +109,7 @@ impl HubState {
     // PTY Handle Extraction (for HandleCache)
     // =========================================================================
 
-    /// Get an `AgentHandle` for the agent at the given index.
+    /// Get an `AgentPtys` for the agent at the given index.
     ///
     /// Returns `None` if the index is out of bounds.
     ///
@@ -120,7 +120,7 @@ impl HubState {
     ///
     /// * `index` - The index of the agent in display order (0-based)
     #[must_use]
-    pub fn get_agent_handle(&self, index: usize) -> Option<AgentHandle> {
+    pub fn get_agent_handle(&self, index: usize) -> Option<AgentPtys> {
         let agent_key = self.agent_keys_ordered.get(index)?;
         let agent = self.agents.get(agent_key)?;
 
@@ -147,7 +147,7 @@ impl HubState {
             ));
         }
 
-        Some(AgentHandle::new(agent_key, ptys, index))
+        Some(AgentPtys::new(agent_key, ptys, index))
     }
 
     // =========================================================================

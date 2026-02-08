@@ -339,6 +339,20 @@ function Agent.get(key)
     return agents[key]
 end
 
+--- Get an agent by its HandleCache index.
+-- Unlike list-based lookup, this is stable across agent deletions because
+-- it matches against the index assigned at registration time.
+-- @param index number HandleCache index (0-based)
+-- @return Agent or nil
+function Agent.get_by_index(index)
+    for _, agent in pairs(agents) do
+        if agent.agent_index == index then
+            return agent
+        end
+    end
+    return nil
+end
+
 --- List all agents in creation order.
 -- @return array of Agent instances
 function Agent.list()

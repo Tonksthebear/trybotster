@@ -4,6 +4,7 @@
 <% pty_index ||= 0 %>
 
 <div data-controller="connection-status"
+     data-turbo-permanent
      data-connection-status-hub-id-value="<%= hub.id %>"
      data-connection-status-type-value="<%= connection_type %>"
      data-connection-status-agent-index-value="<%= agent_index %>"

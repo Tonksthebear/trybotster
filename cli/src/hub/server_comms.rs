@@ -4,7 +4,7 @@
 //!
 //! - WebSocket command channel for real-time message delivery
 //! - Heartbeat sending via command channel
-//! - WebRTC signaling via ActionCable (E2E encrypted with Matrix Olm)
+//! - WebRTC signaling via ActionCable (E2E encrypted with vodozemac Olm)
 //! - Agent notification delivery via background worker
 //! - Device and hub registration
 //!
@@ -42,6 +42,7 @@ impl Hub {
         self.send_command_channel_heartbeat();
         self.poll_agent_notifications_async();
         self.poll_lua_file_changes();
+        self.poll_user_file_watches();
         // Flush any Lua-queued operations (WebRTC sends, TUI sends, PTY requests, Hub requests)
         // This catches any events fired outside the normal message flow
         self.flush_lua_queues();
@@ -69,6 +70,16 @@ impl Hub {
         let reloaded = self.lua.poll_and_reload();
         if reloaded > 0 {
             log::info!("Hot-reloaded {} Lua module(s)", reloaded);
+        }
+    }
+
+    /// Poll user file watches created by `watch.directory()` in Lua.
+    ///
+    /// Fires registered Lua callbacks for any file events detected.
+    fn poll_user_file_watches(&self) {
+        let fired = self.lua.poll_user_file_watches();
+        if fired > 0 {
+            log::debug!("Fired {} user file watch event(s)", fired);
         }
     }
 
@@ -377,7 +388,7 @@ impl Hub {
                     });
                     if let Ok(payload) = serde_json::to_vec(&msg) {
                         let _guard = self.tokio_runtime.enter();
-                        if let Err(e) = self.tokio_runtime.block_on(channel.send_plaintext(&payload)) {
+                        if let Err(e) = self.tokio_runtime.block_on(channel.send_session_recovery(&payload)) {
                             log::warn!("[WebRTC] Failed to send session_invalid: {e}");
                         }
                     }
@@ -627,31 +638,13 @@ impl Hub {
                 } => {
                     if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
                         if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
-                            // For Lua-initiated resize, use a synthetic client ID
-                            pty_handle.resize_direct(crate::client::ClientId::Internal, rows, cols);
+                            pty_handle.resize_direct(rows, cols);
                         } else {
                             log::debug!("[Lua] No PTY at index {} for agent {}", pty_index, agent_index);
                         }
                     } else {
                         log::debug!("[Lua] No agent at index {}", agent_index);
                     }
-                }
-                PtyRequest::GetScrollback {
-                    agent_index,
-                    pty_index,
-                    response_key,
-                } => {
-                    let scrollback = if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
-                        if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
-                            pty_handle.get_scrollback()
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
-                        Vec::new()
-                    };
-                    // Store response for Lua to retrieve
-                    self.lua.set_scrollback_response(&response_key, scrollback);
                 }
             }
         }
@@ -1150,10 +1143,10 @@ impl Hub {
         }
     }
 
-    /// Send raw bytes to a WebRTC subscription (for PTY output).
+    /// Send raw PTY bytes to a WebRTC subscription via Olm-encrypted m.botster.pty.
     ///
-    /// Unlike `send_webrtc_message`, this sends raw bytes without JSON wrapping.
-    /// The browser distinguishes raw terminal data by the 0x01 prefix byte.
+    /// Uses the hot path: compress → base64 → Olm encrypt → binary DataChannel.
+    /// The browser decrypts and routes by subscription ID + msgtype.
     fn send_webrtc_raw(
         &self,
         subscription_id: &str,
@@ -1168,27 +1161,12 @@ impl Hub {
             return;
         };
 
-        // Wrap raw data with subscriptionId for routing on browser side
-        // Format: { "subscriptionId": "...", "raw": <base64 encoded bytes> }
-        // Browser detects "raw" key and decodes base64 to pass to xterm
-        let message = serde_json::json!({
-            "subscriptionId": subscription_id,
-            "raw": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data)
-        });
-
-        let payload = match serde_json::to_vec(&message) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("[WebRTC] Failed to serialize raw message: {e}");
-                return;
-            }
-        };
-
-        // Send via WebRTC DataChannel with E2E encryption
         let peer = crate::channel::PeerId(browser_identity.to_string());
         let _guard = self.tokio_runtime.enter();
-        if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&payload, &peer)) {
-            log::warn!("[WebRTC] Failed to send raw data: {e}");
+        if let Err(e) = self.tokio_runtime.block_on(
+            channel.send_pty_raw(subscription_id, &data, &peer)
+        ) {
+            log::warn!("[WebRTC] Failed to send PTY data: {e}");
         }
     }
 
@@ -1333,7 +1311,7 @@ impl Hub {
     /// - `"offer"` -> create peer connection + encrypted answer
     /// - `"ice"` -> add ICE candidate to existing peer connection
     fn poll_webrtc_signaling(&mut self) {
-        use crate::relay::matrix_crypto::CryptoEnvelope;
+        use crate::relay::OlmEnvelope;
 
         let signals: Vec<command_channel::SignalMessage> = {
             let Some(ref mut channel) = self.command_channel else {
@@ -1372,8 +1350,8 @@ impl Hub {
                 signal.envelope.as_object().map(|o| o.keys().collect::<Vec<_>>())
             );
 
-            // Deserialize envelope to CryptoEnvelope for decryption
-            let envelope: CryptoEnvelope = match serde_json::from_value(signal.envelope.clone()) {
+            // Deserialize envelope to OlmEnvelope for decryption
+            let envelope: OlmEnvelope = match serde_json::from_value(signal.envelope.clone()) {
                 Ok(e) => e,
                 Err(e) => {
                     log::warn!(
@@ -1385,20 +1363,24 @@ impl Hub {
             };
 
             log::info!(
-                "[WebRTC-Signal] Envelope parsed: t={}, d={}, s_len={}",
+                "[WebRTC-Signal] Envelope parsed: t={}",
                 envelope.message_type,
-                envelope.device_id,
-                envelope.sender_key.len()
             );
 
-            // Decrypt the envelope
-            let plaintext = match self.tokio_runtime.block_on(crypto.decrypt(&envelope)) {
-                Ok(pt) => pt,
+            // Decrypt the envelope (synchronous via mutex)
+            let plaintext = match crypto.lock() {
+                Ok(mut guard) => match guard.decrypt(&envelope) {
+                    Ok(pt) => pt,
+                    Err(e) => {
+                        log::error!(
+                            "[WebRTC-Signal] Failed to decrypt signal from {}: {e}",
+                            &signal.browser_identity[..signal.browser_identity.len().min(8)]
+                        );
+                        continue;
+                    }
+                },
                 Err(e) => {
-                    log::error!(
-                        "[WebRTC-Signal] Failed to decrypt signal from {}: {e}",
-                        &signal.browser_identity[..signal.browser_identity.len().min(8)]
-                    );
+                    log::error!("[WebRTC-Signal] Crypto mutex poisoned: {e}");
                     continue;
                 }
             };
@@ -1596,7 +1578,7 @@ impl Hub {
                     &browser_identity[..browser_identity.len().min(8)]
                 );
 
-                // Encrypt the answer with E2E encryption
+                // Encrypt the answer with E2E encryption (synchronous via mutex)
                 let crypto = self
                     .browser
                     .crypto_service
@@ -1609,45 +1591,41 @@ impl Hub {
                 });
                 let plaintext = serde_json::to_vec(&answer_payload).unwrap_or_default();
 
-                // Extract identity key from browser_identity ("identityKey:tabId")
-                let identity_key = browser_identity
-                    .split(':')
-                    .next()
-                    .unwrap_or(browser_identity);
+                match crypto.lock() {
+                    Ok(mut guard) => match guard.encrypt(&plaintext) {
+                        Ok(envelope) => {
+                            let envelope_value = match serde_json::to_value(&envelope) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    log::error!(
+                                        "[WebRTC] Failed to serialize answer envelope: {e}"
+                                    );
+                                    return;
+                                }
+                            };
 
-                match self
-                    .tokio_runtime
-                    .block_on(crypto.encrypt(&plaintext, identity_key))
-                {
-                    Ok(envelope) => {
-                        let envelope_value = match serde_json::to_value(&envelope) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log::error!(
-                                    "[WebRTC] Failed to serialize answer envelope: {e}"
+                            // Send via ActionCable (CommandChannel perform)
+                            if let Some(ref cmd_channel) = self.command_channel {
+                                cmd_channel.perform(
+                                    "signal",
+                                    serde_json::json!({
+                                        "browser_identity": browser_identity,
+                                        "envelope": envelope_value,
+                                    }),
                                 );
-                                return;
+                                log::info!("[WebRTC] Encrypted answer sent via ActionCable");
+                            } else {
+                                log::error!("[WebRTC] No command channel for answer relay");
                             }
-                        };
-
-                        // Send via ActionCable (CommandChannel perform)
-                        if let Some(ref cmd_channel) = self.command_channel {
-                            cmd_channel.perform(
-                                "signal",
-                                serde_json::json!({
-                                    "browser_identity": browser_identity,
-                                    "envelope": envelope_value,
-                                }),
-                            );
-                            log::info!("[WebRTC] Encrypted answer sent via ActionCable");
-                        } else {
-                            log::error!("[WebRTC] No command channel for answer relay");
                         }
-                    }
+                        Err(e) => {
+                            log::error!("[WebRTC] Failed to encrypt answer: {e}");
+                        }
+                    },
                     Err(e) => {
-                        log::error!("[WebRTC] Failed to encrypt answer: {e}");
+                        log::error!("[WebRTC] Crypto mutex poisoned: {e}");
                     }
-                }
+                };
             }
             Err(e) => {
                 log::error!("[WebRTC] Failed to handle offer: {e}");
@@ -1678,10 +1656,10 @@ impl Hub {
         self.botster_id = Some(botster_id);
     }
 
-    /// Initialize CryptoService for E2E encryption (Matrix Olm/Megolm).
+    /// Initialize CryptoService for E2E encryption (vodozemac Olm).
     ///
-    /// Starts the CryptoService only. DeviceKeyBundle generation is deferred until
-    /// the connection URL is first requested (lazy initialization via
+    /// Creates the CryptoService only. DeviceKeyBundle generation is deferred
+    /// until the connection URL is first requested (lazy initialization via
     /// `get_or_generate_connection_url()`).
     pub(crate) fn init_crypto_service(&mut self) {
         registration::init_crypto_service(&mut self.browser, &self.hub_identifier);

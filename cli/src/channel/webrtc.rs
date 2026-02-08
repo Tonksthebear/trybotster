@@ -9,7 +9,7 @@
 //! WebRtcChannel
 //!     |-- RTCPeerConnection (webrtc-rs)
 //!     |-- RTCDataChannel (SCTP - reliable ordered)
-//!     |-- E2E encryption (via CryptoServiceHandle)
+//!     |-- E2E encryption (via CryptoService = Arc<Mutex<VodozemacCrypto>>)
 //!     |-- Gzip compression (via compression module)
 //!     `-- Signaling via ActionCable (encrypted envelopes)
 //! ```
@@ -19,11 +19,8 @@
 //! - No custom reliable delivery needed (SCTP provides it natively)
 //! - Peer-to-peer when possible, TURN relay as fallback
 //! - Signaling (offer/answer/ICE) via ActionCable, E2E encrypted
-//!
-//! Rust guideline compliant 2025-01
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -41,10 +38,10 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
-use crate::relay::crypto_service::CryptoServiceHandle;
-use crate::relay::matrix_crypto::CryptoEnvelope;
+use crate::relay::crypto_service::CryptoService;
+use crate::relay::olm_crypto::{CONTENT_MSG, CONTENT_PTY};
 
-use super::compression::{maybe_compress, maybe_decompress};
+use super::compression::maybe_compress;
 use super::{
     Channel, ChannelConfig, ChannelError, ConnectionState, IncomingMessage, PeerId,
     SharedConnectionState,
@@ -93,7 +90,7 @@ pub struct WebRtcConfig {
 pub struct WebRtcChannelBuilder {
     server_url: Option<String>,
     api_key: Option<String>,
-    crypto_service: Option<CryptoServiceHandle>,
+    crypto_service: Option<CryptoService>,
     signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
 }
 
@@ -141,7 +138,7 @@ impl WebRtcChannelBuilder {
 
     /// Set the crypto service for E2E encryption.
     #[must_use]
-    pub fn crypto_service(mut self, cs: CryptoServiceHandle) -> Self {
+    pub fn crypto_service(mut self, cs: CryptoService) -> Self {
         self.crypto_service = Some(cs);
         self
     }
@@ -186,7 +183,7 @@ pub struct WebRtcChannel {
     /// API key for auth.
     api_key: String,
     /// Optional crypto service for E2E encryption.
-    crypto_service: Option<CryptoServiceHandle>,
+    crypto_service: Option<CryptoService>,
     /// Sender for outgoing signals (ICE candidates) to relay via ActionCable.
     signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
     /// WebRTC peer connection.
@@ -350,9 +347,6 @@ impl WebRtcChannel {
         // Get or create peer connection
         let mut pc_guard = self.peer_connection.lock().await;
 
-        // If we already have a peer connection, we've already processed an offer.
-        // Don't process another one - it would create new ICE credentials that mismatch.
-        // Wait for the connection to either succeed or fail before accepting new offers.
         if pc_guard.is_some() {
             log::info!("[WebRTC] Ignoring duplicate offer (peer connection already exists)");
             return Err(ChannelError::ConnectionFailed("Connection in progress".to_string()));
@@ -394,7 +388,6 @@ impl WebRtcChannel {
         let recv_tx = Arc::clone(&self.recv_tx);
         let peers = Arc::clone(&self.peers);
         let crypto_service = self.crypto_service.clone();
-        let config = Arc::clone(&self.config);
         let browser_id = browser_identity.to_string();
         let data_channel = Arc::clone(&self.data_channel);
         let decrypt_failures = Arc::clone(&self.decrypt_failures);
@@ -403,7 +396,6 @@ impl WebRtcChannel {
             let recv_tx = Arc::clone(&recv_tx);
             let peers = Arc::clone(&peers);
             let crypto_service = crypto_service.clone();
-            let config = Arc::clone(&config);
             let browser_id = browser_id.clone();
             let data_channel = Arc::clone(&data_channel);
             let decrypt_failures = Arc::clone(&decrypt_failures);
@@ -414,11 +406,10 @@ impl WebRtcChannel {
                 // Store data channel
                 *data_channel.lock().await = Some(Arc::clone(&dc));
 
-                // Set up message handler
+                // Set up message handler — every byte is Olm-encrypted
                 let recv_tx_inner = Arc::clone(&recv_tx);
                 let peers_inner = Arc::clone(&peers);
                 let crypto_inner = crypto_service.clone();
-                let config_inner = Arc::clone(&config);
                 let browser_inner = browser_id.clone();
                 let decrypt_failures_inner = Arc::clone(&decrypt_failures);
 
@@ -426,54 +417,60 @@ impl WebRtcChannel {
                     let recv_tx = Arc::clone(&recv_tx_inner);
                     let peers = Arc::clone(&peers_inner);
                     let crypto_service = crypto_inner.clone();
-                    let config = Arc::clone(&config_inner);
                     let browser_identity = browser_inner.clone();
                     let decrypt_failures = Arc::clone(&decrypt_failures_inner);
 
                     Box::pin(async move {
                         let data = msg.data.to_vec();
 
-                        // Try to decrypt if we have a crypto service and it looks like an envelope
-                        // Control messages (subscribe/unsubscribe) may be plaintext
-                        let decrypted = if let Some(ref cs) = crypto_service {
-                            match serde_json::from_slice::<CryptoEnvelope>(&data) {
-                                Ok(envelope) => match cs.decrypt(&envelope).await {
-                                    Ok(plaintext) => {
-                                        decrypt_failures.store(0, Ordering::Relaxed);
-                                        plaintext
-                                    }
-                                    Err(e) => {
-                                        decrypt_failures.fetch_add(1, Ordering::Relaxed);
-                                        log::error!("[WebRTC-DC] Decryption FAILED: {e}");
-                                        return;
-                                    }
-                                },
-                                Err(_) => {
-                                    // Not a crypto envelope - treat as plaintext control message
-                                    data
-                                }
-                            }
-                        } else {
-                            data
+                        // Every DataChannel message is a binary Olm frame:
+                        // [msg_type:1][ciphertext] or [msg_type:1][key:32][ciphertext]
+                        let Some(ref cs) = crypto_service else {
+                            log::error!("[WebRTC-DC] No crypto service -- cannot decrypt");
+                            return;
                         };
 
-                        // Decompress
-                        let config_guard = config.lock().await;
-                        let decompressed = if config_guard
-                            .as_ref()
-                            .is_some_and(|c| c.compression_threshold.is_some())
-                        {
-                            match maybe_decompress(&decrypted) {
-                                Ok(d) => d,
+                        // Decrypt binary frame via vodozemac
+                        let plaintext = match cs.lock() {
+                            Ok(mut guard) => match guard.decrypt_binary(&data) {
+                                Ok(pt) => {
+                                    decrypt_failures.store(0, Ordering::Relaxed);
+                                    pt
+                                }
                                 Err(e) => {
-                                    log::error!("[WebRTC] Decompression failed: {e}");
+                                    decrypt_failures.fetch_add(1, Ordering::Relaxed);
+                                    log::error!("[WebRTC-DC] Olm decryption FAILED: {e}");
                                     return;
                                 }
+                            },
+                            Err(e) => {
+                                log::error!("[WebRTC-DC] Crypto mutex poisoned: {e}");
+                                return;
                             }
-                        } else {
-                            decrypted
                         };
-                        drop(config_guard);
+
+                        // Parse binary inner content: first byte = content type
+                        if plaintext.is_empty() {
+                            log::warn!("[WebRTC-DC] Empty decrypted content");
+                            return;
+                        }
+
+                        let body_bytes = match plaintext[0] {
+                            CONTENT_MSG => {
+                                // Control message: [CONTENT_MSG][JSON bytes]
+                                plaintext[1..].to_vec()
+                            }
+                            CONTENT_PTY => {
+                                // PTY: [CONTENT_PTY][flags][sub_len][sub_id][payload]
+                                // CLI doesn't receive PTY from browser, ignore
+                                log::warn!("[WebRTC-DC] Unexpected PTY content from browser");
+                                return;
+                            }
+                            other => {
+                                log::warn!("[WebRTC-DC] Unknown content type: 0x{other:02x}");
+                                return;
+                            }
+                        };
 
                         // Add peer
                         {
@@ -485,7 +482,7 @@ impl WebRtcChannel {
                         if let Some(tx) = recv_tx.lock().await.as_ref() {
                             let _ = tx
                                 .send(RawIncoming {
-                                    payload: decompressed,
+                                    payload: body_bytes,
                                     sender: PeerId(browser_identity.clone()),
                                 })
                                 .await;
@@ -497,8 +494,7 @@ impl WebRtcChannel {
             })
         }));
 
-        // Set up ICE candidate handler — encrypt and send via mpsc for ActionCable relay.
-        // server_comms tick loop drains these and forwards through CommandChannelHandle::perform.
+        // Set up ICE candidate handler -- encrypt and send via mpsc for ActionCable relay.
         let ice_crypto = self.crypto_service.clone();
         let ice_signal_tx = self.signal_tx.clone();
         let browser_id = browser_identity.to_string();
@@ -519,7 +515,7 @@ impl WebRtcChannel {
                     }
                 };
 
-                // Build the plaintext payload — browser decrypts to discover type
+                // Build the plaintext payload
                 let payload = serde_json::json!({
                     "type": "ice",
                     "candidate": candidate_json,
@@ -527,24 +523,27 @@ impl WebRtcChannel {
 
                 // Encrypt with E2E encryption if crypto service available
                 let envelope = if let Some(ref cs) = crypto {
-                    // Extract identity key from browser_identity ("identityKey:tabId")
-                    let identity_key = browser_id.split(':').next().unwrap_or(&browser_id);
                     let plaintext = serde_json::to_vec(&payload).unwrap_or_default();
-                    match cs.encrypt(&plaintext, identity_key).await {
-                        Ok(env) => match serde_json::to_value(&env) {
-                            Ok(v) => v,
+                    match cs.lock() {
+                        Ok(mut guard) => match guard.encrypt(&plaintext) {
+                            Ok(env) => match serde_json::to_value(&env) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    log::error!("[WebRTC] Failed to serialize ICE envelope: {e}");
+                                    return;
+                                }
+                            },
                             Err(e) => {
-                                log::error!("[WebRTC] Failed to serialize ICE envelope: {e}");
+                                log::error!("[WebRTC] Failed to encrypt ICE candidate: {e}");
                                 return;
                             }
                         },
                         Err(e) => {
-                            log::error!("[WebRTC] Failed to encrypt ICE candidate: {e}");
+                            log::error!("[WebRTC] Crypto mutex poisoned: {e}");
                             return;
                         }
                     }
                 } else {
-                    // No encryption — send plaintext (shouldn't happen in production)
                     payload
                 };
 
@@ -555,7 +554,7 @@ impl WebRtcChannel {
                         envelope,
                     });
                 } else {
-                    log::warn!("[WebRTC] No signal_tx — cannot relay ICE candidate");
+                    log::warn!("[WebRTC] No signal_tx -- cannot relay ICE candidate");
                 }
             })
         }));
@@ -610,7 +609,6 @@ impl Channel for WebRtcChannel {
         *self.recv_rx.lock().await = Some(recv_rx);
 
         // For CLI, we wait for the browser to initiate the offer
-        // The connection is established when handle_sdp_offer is called
         log::info!("[WebRTC] Channel configured, waiting for browser offer");
 
         Ok(())
@@ -648,44 +646,30 @@ impl Channel for WebRtcChannel {
         Ok(())
     }
 
-    async fn send_to(&self, msg: &[u8], peer: &PeerId) -> Result<(), ChannelError> {
+    async fn send_to(&self, msg: &[u8], _peer: &PeerId) -> Result<(), ChannelError> {
         let dc_guard = self.data_channel.lock().await;
         let dc = dc_guard
             .as_ref()
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
-        // Compress if configured
-        let config_guard = self.config.lock().await;
-        let compressed =
-            if let Some(threshold) = config_guard.as_ref().and_then(|c| c.compression_threshold) {
-                maybe_compress(msg, Some(threshold))?
-            } else {
-                msg.to_vec()
-            };
-        drop(config_guard);
+        let cs = self
+            .crypto_service
+            .as_ref()
+            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
 
-        // Encrypt if we have a crypto service.
-        // Browser identity format is "identityKey:tabId" — extract identity key
-        // for encryption (sessions are keyed by identity key only).
-        //
-        // Base64 encode compressed bytes before encryption because the crypto WASM
-        // library expects UTF-8 strings. Gzip-compressed data contains invalid UTF-8.
-        let to_send = if let Some(ref cs) = self.crypto_service {
-            let identity_key = peer.as_ref().split(':').next().unwrap_or(peer.as_ref());
-            let b64_payload = BASE64.encode(&compressed);
-            let envelope = cs
-                .encrypt(b64_payload.as_bytes(), identity_key)
-                .await
-                .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+        // Binary inner: [0x00][JSON bytes] (control message)
+        let mut plaintext = Vec::with_capacity(1 + msg.len());
+        plaintext.push(CONTENT_MSG);
+        plaintext.extend_from_slice(msg);
 
-            serde_json::to_vec(&envelope)
-                .map_err(|e| ChannelError::EncryptionError(e.to_string()))?
-        } else {
-            compressed
-        };
+        // Encrypt → binary frame (no base64, no JSON)
+        let encrypted = cs
+            .lock()
+            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
+            .encrypt_binary(&plaintext)
+            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
 
-        // Send via data channel (SCTP handles reliability)
-        dc.send(&bytes::Bytes::from(to_send))
+        dc.send(&bytes::Bytes::from(encrypted))
             .await
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
@@ -750,11 +734,89 @@ impl WebRtcChannel {
         self.decrypt_failures.store(0, Ordering::Relaxed);
     }
 
-    /// Send a plaintext message through the DataChannel, bypassing encryption.
+    /// Check if the channel is ready for application messages.
     ///
-    /// Used for session recovery: when encryption is broken, we need to notify
-    /// the browser without going through the (broken) crypto session.
-    pub async fn send_plaintext(&self, msg: &[u8]) -> Result<(), ChannelError> {
+    /// With vodozemac, the session is established on first PreKey decrypt --
+    /// no separate handshake needed.
+    pub fn is_ready(&self) -> bool {
+        self.crypto_service
+            .as_ref()
+            .and_then(|cs| cs.lock().ok())
+            .is_some_and(|guard| guard.has_session())
+    }
+
+    /// Send PTY output via the hot path: compress → binary frame → Olm → wire.
+    ///
+    /// Zero base64, zero JSON. Binary inner format:
+    /// `[0x01][flags:1][sub_id_len:1][sub_id][raw payload]`
+    pub async fn send_pty_raw(
+        &self,
+        subscription_id: &str,
+        data: &[u8],
+        _peer: &PeerId,
+    ) -> Result<(), ChannelError> {
+        let dc_guard = self.data_channel.lock().await;
+        let dc = dc_guard
+            .as_ref()
+            .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
+
+        let cs = self
+            .crypto_service
+            .as_ref()
+            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
+
+        // Compress raw bytes (gzip is very effective on terminal output)
+        let config_guard = self.config.lock().await;
+        let threshold = config_guard
+            .as_ref()
+            .and_then(|c| c.compression_threshold);
+        drop(config_guard);
+
+        // Compress if above threshold. Cow avoids cloning the common uncompressed path.
+        let (payload, was_compressed): (std::borrow::Cow<'_, [u8]>, bool) =
+            if let Some(threshold) = threshold {
+                let compressed = maybe_compress(data, Some(threshold))
+                    .map_err(|e| ChannelError::CompressionError(e.to_string()))?;
+                if compressed[0] == 0x1f {
+                    (std::borrow::Cow::Owned(compressed[1..].to_vec()), true)
+                } else {
+                    (std::borrow::Cow::Borrowed(data), false)
+                }
+            } else {
+                (std::borrow::Cow::Borrowed(data), false)
+            };
+
+        // Build binary inner content: [CONTENT_PTY][flags][sub_id_len][sub_id][payload]
+        let sub_bytes = subscription_id.as_bytes();
+        let flags: u8 = if was_compressed { 0x01 } else { 0x00 };
+        let mut plaintext = Vec::with_capacity(3 + sub_bytes.len() + payload.len());
+        plaintext.push(CONTENT_PTY);
+        plaintext.push(flags);
+        plaintext.push(sub_bytes.len() as u8);
+        plaintext.extend_from_slice(sub_bytes);
+        plaintext.extend_from_slice(&payload);
+
+        // Encrypt → binary frame (no base64, no JSON)
+        let encrypted = cs
+            .lock()
+            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
+            .encrypt_binary(&plaintext)
+            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+
+        dc.send(&bytes::Bytes::from(encrypted))
+            .await
+            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Send an **unencrypted** session-recovery message through the DataChannel.
+    ///
+    /// # WARNING: Bypasses E2E encryption
+    ///
+    /// This exists ONLY for notifying the browser that the Olm session is
+    /// invalid and re-pairing is required. Do NOT use for any other purpose.
+    pub async fn send_session_recovery(&self, msg: &[u8]) -> Result<(), ChannelError> {
         let dc_guard = self.data_channel.lock().await;
         let dc = dc_guard
             .as_ref()

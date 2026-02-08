@@ -9,7 +9,6 @@
 //! - [`PtyEvent::Output`] - Raw terminal output bytes
 //! - [`PtyEvent::Resized`] - PTY dimensions changed
 //! - [`PtyEvent::ProcessExited`] - Process in PTY terminated
-//! - [`PtyEvent::OwnerChanged`] - Size ownership transferred
 //!
 //! # Usage
 //!
@@ -25,9 +24,7 @@
 //! }
 //! ```
 
-// Rust guideline compliant 2026-01
-
-use crate::client::ClientId;
+// Rust guideline compliant 2026-02
 
 /// Events broadcast by PTY sessions to connected clients.
 ///
@@ -45,7 +42,7 @@ pub enum PtyEvent {
 
     /// PTY was resized to new dimensions.
     ///
-    /// Broadcast when the size owner's dimensions are applied.
+    /// Broadcast when a resize is applied to the PTY.
     /// Clients may use this to sync their terminal display.
     Resized {
         /// New height in rows.
@@ -61,15 +58,6 @@ pub enum PtyEvent {
     ProcessExited {
         /// Exit code if available (None if killed by signal).
         exit_code: Option<i32>,
-    },
-
-    /// Size ownership changed to a different client.
-    ///
-    /// The newest connected client owns the PTY dimensions.
-    /// When they disconnect, ownership passes to the next most recent.
-    OwnerChanged {
-        /// New owner's ID, or None if no clients connected.
-        new_owner: Option<ClientId>,
     },
 }
 
@@ -92,12 +80,6 @@ impl PtyEvent {
         Self::ProcessExited { exit_code }
     }
 
-    /// Create an owner changed event.
-    #[must_use]
-    pub fn owner_changed(new_owner: Option<ClientId>) -> Self {
-        Self::OwnerChanged { new_owner }
-    }
-
     /// Check if this is an output event.
     #[must_use]
     pub fn is_output(&self) -> bool {
@@ -114,12 +96,6 @@ impl PtyEvent {
     #[must_use]
     pub fn is_process_exited(&self) -> bool {
         matches!(self, Self::ProcessExited { .. })
-    }
-
-    /// Check if this is an owner change event.
-    #[must_use]
-    pub fn is_owner_changed(&self) -> bool {
-        matches!(self, Self::OwnerChanged { .. })
     }
 }
 
@@ -181,42 +157,16 @@ mod tests {
     }
 
     #[test]
-    fn test_pty_event_owner_changed_with_client() {
-        let event = PtyEvent::owner_changed(Some(ClientId::Tui));
-        assert!(event.is_owner_changed());
-        match event {
-            PtyEvent::OwnerChanged { new_owner } => {
-                assert_eq!(new_owner, Some(ClientId::Tui));
-            }
-            _ => panic!("Expected OwnerChanged variant"),
-        }
-    }
-
-    #[test]
-    fn test_pty_event_owner_changed_no_owner() {
-        let event = PtyEvent::owner_changed(None);
-        assert!(event.is_owner_changed());
-        match event {
-            PtyEvent::OwnerChanged { new_owner } => {
-                assert!(new_owner.is_none());
-            }
-            _ => panic!("Expected OwnerChanged variant"),
-        }
-    }
-
-    #[test]
     fn test_pty_event_is_predicates_are_exclusive() {
         let output = PtyEvent::output(vec![]);
         assert!(output.is_output());
         assert!(!output.is_resized());
         assert!(!output.is_process_exited());
-        assert!(!output.is_owner_changed());
 
         let resized = PtyEvent::resized(24, 80);
         assert!(!resized.is_output());
         assert!(resized.is_resized());
         assert!(!resized.is_process_exited());
-        assert!(!resized.is_owner_changed());
     }
 
     #[test]

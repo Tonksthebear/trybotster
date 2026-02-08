@@ -20,7 +20,6 @@
 -- the orchestration layer that connects incoming requests to the Agent API.
 
 local Agent = require("lib.agent")
-local connections = require("handlers.connections")
 
 -- ============================================================================
 -- Input Parsing
@@ -77,13 +76,14 @@ end
 -- Lifecycle Broadcasting
 -- ============================================================================
 
---- Broadcast a lifecycle status change for a pending agent.
--- Used during creation before the agent object exists.
+--- Notify lifecycle status change via hooks.
+-- Used during creation/deletion for intermediate statuses (creating_worktree,
+-- spawning_ptys, stopping, etc.). Observers in connections.lua broadcast to clients.
 --
 -- @param agent_key string The agent key
 -- @param status string The lifecycle status
 -- @param extra table|nil Optional extra fields to include
-local function broadcast_lifecycle_status(agent_key, status, extra)
+local function notify_lifecycle(agent_key, status, extra)
     local payload = {
         agent_id = agent_key,
         status = status,
@@ -93,24 +93,7 @@ local function broadcast_lifecycle_status(agent_key, status, extra)
             payload[k] = v
         end
     end
-    connections.broadcast_hub_event("agent_status_changed", payload)
-end
-
---- Broadcast the current agent list to all connected clients.
--- Uses connections.broadcast_hub_event to send to all hub-subscribed clients.
-local function broadcast_agent_list()
-    connections.broadcast_hub_event("agent_list", {
-        agents = Agent.all_info(),
-    })
-end
-
---- Broadcast the current worktree list to all connected clients.
--- Called after agent creation/deletion since worktree availability changes.
-local function broadcast_worktree_list()
-    local worktrees = hub.get_worktrees()
-    connections.broadcast_hub_event("worktree_list", {
-        worktrees = worktrees,
-    })
+    hooks.notify("agent_lifecycle", payload)
 end
 
 -- ============================================================================
@@ -130,7 +113,7 @@ local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, a
     local repo = os.getenv("BOTSTER_REPO") or "unknown/repo"
 
     -- Broadcast: spawning PTYs
-    broadcast_lifecycle_status(agent_key, "spawning_ptys")
+    notify_lifecycle(agent_key, "spawning_ptys")
 
     -- Determine session config based on worktree contents
     local sessions = Agent.default_sessions()
@@ -158,16 +141,12 @@ local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, a
         log.error(string.format("Failed to spawn agent for %s: %s",
             branch_name, tostring(agent)))
         -- Broadcast failure status
-        broadcast_lifecycle_status(agent_key, "failed", { error = tostring(agent) })
+        notify_lifecycle(agent_key, "failed", { error = tostring(agent) })
         return nil
     end
 
-    -- Emit agent_created event (triggers broadcast in connections.lua)
-    events.emit("agent_created", agent:info())
-
-    -- Broadcast updated lists to all clients
-    broadcast_agent_list()
-    broadcast_worktree_list()
+    -- Notify via hooks (connections.lua observes and broadcasts to clients)
+    hooks.notify("agent_created", agent:info())
 
     return agent
 end
@@ -226,7 +205,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     local wt_path = from_worktree or worktree.find(branch_name)
     if not wt_path then
         -- Broadcast: creating worktree
-        broadcast_lifecycle_status(agent_key, "creating_worktree")
+        notify_lifecycle(agent_key, "creating_worktree")
         log.info(string.format("No worktree found for %s, creating...", branch_name))
 
         local ok, result = pcall(worktree.create, branch_name)
@@ -235,7 +214,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
             log.info(string.format("Created worktree for %s at %s", branch_name, wt_path))
         else
             log.error(string.format("Failed to create worktree for %s: %s", branch_name, tostring(result)))
-            broadcast_lifecycle_status(agent_key, "failed", { error = tostring(result) })
+            notify_lifecycle(agent_key, "failed", { error = tostring(result) })
             return nil
         end
     else
@@ -258,22 +237,18 @@ local function handle_delete_agent(agent_key, delete_worktree)
     end
 
     -- Broadcast: stopping
-    broadcast_lifecycle_status(agent_key, "stopping")
+    notify_lifecycle(agent_key, "stopping")
 
     -- Close the agent (kills PTY sessions)
     agent:close(delete_worktree)
 
     -- Broadcast: deleted (or removing_worktree if that was requested)
     if delete_worktree then
-        broadcast_lifecycle_status(agent_key, "removing_worktree")
+        notify_lifecycle(agent_key, "removing_worktree")
     end
 
-    -- Emit agent_deleted event
-    events.emit("agent_deleted", agent_key)
-
-    -- Broadcast updated lists to all clients
-    broadcast_agent_list()
-    broadcast_worktree_list()
+    -- Notify via hooks (connections.lua observes and broadcasts to clients)
+    hooks.notify("agent_deleted", agent_key)
 
     return true
 end
@@ -311,8 +286,6 @@ end)
 local M = {
     handle_create_agent = handle_create_agent,
     handle_delete_agent = handle_delete_agent,
-    broadcast_agent_list = broadcast_agent_list,
-    broadcast_worktree_list = broadcast_worktree_list,
 }
 
 -- Lifecycle hooks for hot-reload

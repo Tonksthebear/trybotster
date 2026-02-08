@@ -7,14 +7,14 @@
 //!
 //! - Device identity registration (E2E encryption keypairs)
 //! - Hub registration for message routing
-//! - Matrix crypto initialization for E2E encryption (lazy bundle generation)
+//! - Vodozemac crypto initialization for E2E encryption (lazy bundle generation)
 //!
 //! # Lazy Bundle Generation
 //!
 //! To avoid blocking boot, device key bundle generation is deferred until the
 //! connection URL is first requested. The flow is:
 //!
-//! 1. `init_crypto_service()` - starts CryptoService only (fast)
+//! 1. `init_crypto_service()` - creates CryptoService only (fast)
 //! 2. `get_or_generate_connection_bundle()` - generates bundle on first request
 //! 3. `write_connection_url_lazy()` - generates bundle + writes URL to disk
 //!
@@ -22,14 +22,14 @@
 //! - TUI QR code display request (`GetConnectionCode` command)
 //! - External automation requesting the connection URL
 
-// Rust guideline compliant 2026-01-29
+// Rust guideline compliant 2026-02
 
 
 use reqwest::blocking::Client;
 
 use crate::config::Config;
 use crate::device::Device;
-use crate::relay::{BrowserState, CryptoService};
+use crate::relay::BrowserState;
 
 /// Register the device with the server if not already registered.
 ///
@@ -126,14 +126,11 @@ pub fn register_hub_with_server(
     local_identifier.to_string()
 }
 
-/// Initialize CryptoService for E2E encryption.
+/// Initialize CryptoService for E2E encryption (vodozemac Olm).
 ///
-/// This starts the CryptoService only. DeviceKeyBundle generation is deferred until
-/// the connection URL is first requested (lazy initialization). This avoids
-/// blocking boot on bundle generation.
-///
-/// Browser command handling is done directly via WebRTC in server_comms.rs.
-/// Hub-level events are handled by HubCommandChannel.
+/// Creates the CryptoService (`Arc<Mutex<VodozemacCrypto>>`). DeviceKeyBundle
+/// generation is deferred until the connection URL is first requested (lazy
+/// initialization).
 ///
 /// # Usage
 ///
@@ -141,23 +138,16 @@ pub fn register_hub_with_server(
 /// generate the bundle when the TUI displays the QR code or external automation
 /// requests the connection URL.
 pub fn init_crypto_service(browser: &mut BrowserState, local_identifier: &str) {
-    // Start CryptoService - runs Matrix crypto in its own LocalSet thread
-    // The handle is Send + Clone and can be used from any thread
-    let crypto_service = match CryptoService::start(local_identifier) {
-        Ok(handle) => handle,
-        Err(e) => {
-            log::error!("Failed to start crypto service: {e}");
-            return;
-        }
-    };
+    use crate::relay::create_crypto_service;
 
-    // Store the crypto service handle for agent channel encryption
+    let crypto_service = create_crypto_service(local_identifier);
+
+    // Store the crypto service for E2E encryption
     browser.crypto_service = Some(crypto_service);
 
     // Mark relay as ready to connect (bundle generated lazily on first request)
     browser.relay_connected = true;
-    log::info!("CryptoService started - bundle will be generated on first request");
-
+    log::info!("CryptoService created - bundle will be generated on first request");
 }
 
 
@@ -178,7 +168,7 @@ pub fn init_crypto_service(browser: &mut BrowserState, local_identifier: &str) {
 /// - Bundle generation fails
 pub fn get_or_generate_connection_bundle(
     browser: &mut BrowserState,
-    runtime: &tokio::runtime::Runtime,
+    _runtime: &tokio::runtime::Runtime,
 ) -> Result<crate::relay::DeviceKeyBundle, String> {
     // Return cached bundle if available and not used
     if let Some(ref bundle) = browser.device_key_bundle {
@@ -195,16 +185,15 @@ pub fn get_or_generate_connection_bundle(
         .clone()
         .ok_or_else(|| "CryptoService not initialized".to_string())?;
 
-    // Generate bundle (blocking call via runtime)
-    let bundle = runtime.block_on(async {
-        crypto_service
-            .get_device_key_bundle()
-            .await
-            .map_err(|e| format!("Failed to generate DeviceKeyBundle: {e}"))
-    })?;
+    // Generate bundle (synchronous via mutex)
+    let bundle = crypto_service
+        .lock()
+        .map_err(|e| format!("Crypto mutex poisoned: {e}"))?
+        .build_device_key_bundle()
+        .map_err(|e| format!("Failed to generate DeviceKeyBundle: {e}"))?;
 
     log::info!(
-        "Matrix crypto bundle generated: curve25519={:.8}...",
+        "Vodozemac bundle generated: curve25519={:.8}...",
         bundle.curve25519_key
     );
 

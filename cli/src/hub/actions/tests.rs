@@ -18,7 +18,7 @@ fn test_config() -> Config {
 
 /// Create a Hub with TUI registered via Lua and crypto service initialized.
 fn test_hub() -> Hub {
-    use crate::relay::crypto_service::CryptoService;
+    use crate::relay::create_crypto_service;
 
     let config = test_config();
     let mut hub = Hub::new(config).unwrap();
@@ -28,7 +28,7 @@ fn test_hub() -> Hub {
     let _output_rx = hub.register_tui_via_lua(request_rx);
 
     // Initialize crypto service for browser client tests
-    let crypto_service = CryptoService::start("test-hub").unwrap();
+    let crypto_service = create_crypto_service("test-hub");
     hub.browser.crypto_service = Some(crypto_service);
 
     hub
@@ -47,12 +47,11 @@ fn create_test_device_key_bundle() -> crate::relay::DeviceKeyBundle {
     let signature_bytes = [3u8; 64];
 
     crate::relay::DeviceKeyBundle {
-        version: 5,
+        version: 6,
         hub_id: "test-hub-123".to_string(),
         curve25519_key: STANDARD.encode(curve25519_bytes),
         ed25519_key: STANDARD.encode(ed25519_bytes),
         one_time_key: STANDARD.encode(one_time_bytes),
-        key_id: "AAAAAA".to_string(),
         signature: STANDARD.encode(signature_bytes),
     }
 }

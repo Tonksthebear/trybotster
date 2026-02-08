@@ -22,6 +22,7 @@ use super::primitives::pty::{PtyOutputContext, PtyRequest, PtyRequestQueue};
 use super::primitives::tui::{
     registry_keys as tui_registry_keys, TuiSendQueue, TuiSendRequest,
 };
+use super::primitives::watch::WatcherRegistry;
 use super::primitives::webrtc::{registry_keys, WebRtcSendQueue, WebRtcSendRequest};
 
 /// Lua scripting runtime for the botster hub.
@@ -74,6 +75,12 @@ pub struct LuaRuntime {
     worktree_request_queue: WorktreeRequestQueue,
     /// Event callbacks registered by Lua scripts.
     event_callbacks: SharedEventCallbacks,
+    /// Registry of active user file watches (for `watch.directory()`).
+    watcher_registry: WatcherRegistry,
+    /// Cached compiled function for PTY output interceptor calls.
+    pty_hook_fn: Option<mlua::RegistryKey>,
+    /// Cached reusable context table for PTY output interceptor calls.
+    pty_hook_ctx: Option<mlua::RegistryKey>,
 }
 
 impl std::fmt::Debug for LuaRuntime {
@@ -85,6 +92,7 @@ impl std::fmt::Debug for LuaRuntime {
         let conn_queue_len = self.connection_request_queue.lock().map(|q| q.len()).unwrap_or(0);
         let wt_queue_len = self.worktree_request_queue.lock().map(|q| q.len()).unwrap_or(0);
         let event_cb_count = self.event_callbacks.lock().map(|c| c.callback_count()).unwrap_or(0);
+        let watch_count = self.watcher_registry.lock().map(|w| w.len()).unwrap_or(0);
         f.debug_struct("LuaRuntime")
             .field("base_path", &self.base_path)
             .field("strict", &self.strict)
@@ -96,6 +104,7 @@ impl std::fmt::Debug for LuaRuntime {
             .field("connection_queue_len", &conn_queue_len)
             .field("worktree_queue_len", &wt_queue_len)
             .field("event_callback_count", &event_cb_count)
+            .field("active_watches", &watch_count)
             .finish_non_exhaustive()
     }
 }
@@ -148,6 +157,9 @@ impl LuaRuntime {
         // Create event callback storage
         let event_callbacks = primitives::new_event_callbacks();
 
+        // Create watcher registry for watch.directory()
+        let watcher_registry = primitives::new_watcher_registry();
+
         // Register all primitives
         primitives::register_all(&lua).context("Failed to register Lua primitives")?;
 
@@ -166,6 +178,10 @@ impl LuaRuntime {
         // Register event primitives with the callback storage
         primitives::register_events(&lua, Arc::clone(&event_callbacks))
             .context("Failed to register event primitives")?;
+
+        // Register watch primitives with the watcher registry
+        primitives::register_watch(&lua, Arc::clone(&watcher_registry))
+            .context("Failed to register watch primitives")?;
 
         // Note: Hub, connection, and worktree primitives are registered later via
         // register_hub_primitives() because they need a HandleCache reference from Hub
@@ -191,6 +207,9 @@ impl LuaRuntime {
             connection_request_queue,
             worktree_request_queue,
             event_callbacks,
+            watcher_registry,
+            pty_hook_fn: None,
+            pty_hook_ctx: None,
         })
     }
 
@@ -628,6 +647,22 @@ impl LuaRuntime {
         }
 
         reloaded
+    }
+
+    /// Poll user file watches and fire Lua callbacks.
+    ///
+    /// Drains OS events from all watches created by `watch.directory()`,
+    /// applies glob filtering, and calls registered Lua callbacks. Also
+    /// fires `hooks.notify("file_changed", ...)` for each event.
+    ///
+    /// Call this periodically in the event loop (each tick).
+    ///
+    /// # Returns
+    ///
+    /// The number of file events fired.
+    pub fn poll_user_file_watches(&self) -> usize {
+        use super::primitives::watch;
+        watch::poll_user_watches(&self.lua, &self.watcher_registry)
     }
 
     /// Reload a single Lua module via the loader.
@@ -1244,13 +1279,34 @@ impl LuaRuntime {
     /// }
     /// ```
     pub fn call_pty_output_interceptors(
-        &self,
+        &mut self,
         ctx: &PtyOutputContext,
         data: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        // Create context table for Lua
-        let ctx_table = self.lua.create_table()
-            .map_err(|e| anyhow!("Failed to create context table: {e}"))?;
+        // Lazily initialize cached function and reusable context table
+        if self.pty_hook_fn.is_none() {
+            let f: mlua::Function = self.lua.load(
+                r#"
+                return function(ctx, data)
+                    return hooks.call("pty_output", ctx, data)
+                end
+                "#
+            ).eval()
+                .map_err(|e| anyhow!("Failed to create PTY hook wrapper: {e}"))?;
+            let fn_key = self.lua.create_registry_value(f)
+                .map_err(|e| anyhow!("Failed to cache PTY hook function: {e}"))?;
+            self.pty_hook_fn = Some(fn_key);
+
+            let ctx_table = self.lua.create_table()
+                .map_err(|e| anyhow!("Failed to create context table: {e}"))?;
+            let ctx_key = self.lua.create_registry_value(ctx_table)
+                .map_err(|e| anyhow!("Failed to cache PTY context table: {e}"))?;
+            self.pty_hook_ctx = Some(ctx_key);
+        }
+
+        // Reuse cached context table — update fields in place
+        let ctx_table: mlua::Table = self.lua.registry_value(self.pty_hook_ctx.as_ref().unwrap())
+            .map_err(|e| anyhow!("Failed to retrieve cached PTY context table: {e}"))?;
 
         ctx_table.set("agent_index", ctx.agent_index)
             .map_err(|e| anyhow!("Failed to set agent_index: {e}"))?;
@@ -1263,15 +1319,8 @@ impl LuaRuntime {
         let data_str = self.lua.create_string(data)
             .map_err(|e| anyhow!("Failed to create data string: {e}"))?;
 
-        // Call hooks.call("pty_output", ctx, data)
-        let func: mlua::Function = self.lua.load(
-            r#"
-            return function(ctx, data)
-                return hooks.call("pty_output", ctx, data)
-            end
-            "#
-        ).eval()
-            .map_err(|e| anyhow!("Failed to create PTY hook wrapper: {e}"))?;
+        let func: mlua::Function = self.lua.registry_value(self.pty_hook_fn.as_ref().unwrap())
+            .map_err(|e| anyhow!("Failed to retrieve cached PTY hook function: {e}"))?;
 
         let result: mlua::Result<Option<mlua::String>> = func.call((ctx_table, data_str));
 
@@ -1281,45 +1330,6 @@ impl LuaRuntime {
             }
             Ok(None) => Ok(None),
             Err(e) => Err(anyhow!("PTY output hook error: {e}")),
-        }
-    }
-
-    /// Store scrollback response in Lua registry for retrieval.
-    ///
-    /// Called by Hub when a GetScrollback request completes. The response
-    /// is stored in the registry keyed by the response_key returned from
-    /// `hub.get_scrollback()`.
-    ///
-    /// # Arguments
-    ///
-    /// * `response_key` - The key returned by hub.get_scrollback()
-    /// * `scrollback` - The scrollback buffer data
-    pub fn set_scrollback_response(&self, response_key: &str, scrollback: Vec<u8>) {
-        // Store in a global table for Lua to retrieve
-        if let Ok(responses) = self.get_or_create_scrollback_responses() {
-            let data = match self.lua.create_string(&scrollback) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("Failed to create scrollback string: {e}");
-                    return;
-                }
-            };
-            if let Err(e) = responses.set(response_key, data) {
-                log::error!("Failed to store scrollback response: {e}");
-            }
-        }
-    }
-
-    /// Get or create the _scrollback_responses table.
-    fn get_or_create_scrollback_responses(&self) -> mlua::Result<mlua::Table> {
-        let globals = self.lua.globals();
-        match globals.get::<mlua::Table>("_scrollback_responses") {
-            Ok(t) => Ok(t),
-            Err(_) => {
-                let t = self.lua.create_table()?;
-                globals.set("_scrollback_responses", t.clone())?;
-                Ok(t)
-            }
         }
     }
 
@@ -1978,29 +1988,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_scrollback_queues_request_and_returns_key() {
-        let runtime = LuaRuntime::new().expect("Should create runtime");
-
-        let key: String = runtime.lua().load(r#"
-            return hub.get_scrollback(0, 1)
-        "#).eval().unwrap();
-
-        assert!(key.starts_with("scrollback:0:1:"), "Key should start with expected prefix");
-
-        let requests = runtime.drain_pty_requests();
-        assert_eq!(requests.len(), 1);
-
-        match &requests[0] {
-            PtyRequest::GetScrollback { agent_index, pty_index, response_key } => {
-                assert_eq!(*agent_index, 0);
-                assert_eq!(*pty_index, 1);
-                assert_eq!(response_key, &key);
-            }
-            _ => panic!("Expected GetScrollback request"),
-        }
-    }
-
-    #[test]
     fn test_create_forwarder_queues_request() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
@@ -2053,25 +2040,8 @@ mod tests {
     }
 
     #[test]
-    fn test_set_scrollback_response() {
-        let runtime = LuaRuntime::new().expect("Should create runtime");
-
-        let key = "scrollback:0:0:test-uuid";
-        let scrollback = b"terminal output data".to_vec();
-
-        runtime.set_scrollback_response(key, scrollback);
-
-        // Verify we can retrieve it from Lua
-        let retrieved: mlua::String = runtime.lua().load(
-            &format!(r#"return _scrollback_responses["{}"]"#, key)
-        ).eval().unwrap();
-
-        assert_eq!(retrieved.as_bytes(), b"terminal output data");
-    }
-
-    #[test]
     fn test_call_pty_output_interceptors_passthrough() {
-        let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that pass through unchanged
         runtime.lua().load(r#"
@@ -2094,7 +2064,7 @@ mod tests {
 
     #[test]
     fn test_call_pty_output_interceptors_transform() {
-        let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that transform data
         runtime.lua().load(r#"
@@ -2117,7 +2087,7 @@ mod tests {
 
     #[test]
     fn test_call_pty_output_interceptors_drop() {
-        let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that drop data
         runtime.lua().load(r#"
@@ -2140,7 +2110,7 @@ mod tests {
 
     #[test]
     fn test_call_pty_output_interceptors_receives_context() {
-        let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that use context
         runtime.lua().load(r#"

@@ -52,11 +52,15 @@ export class TerminalConnection extends Connection {
   channelParams() {
     // WebRTC subscription params - used by CLI to route PTY I/O
     // CLI keys forwarders by (browser_identity, agent_index, pty_index)
+    // rows/cols included so CLI can resize PTY immediately at subscription
+    // time, eliminating the race between subscribe and resize messages.
     return {
       hub_id: this.getHubId(),
       agent_index: this.agentIndex,
       pty_index: this.ptyIndex,
       browser_identity: this.browserIdentity,
+      rows: this.options.rows,
+      cols: this.options.cols,
     };
   }
 

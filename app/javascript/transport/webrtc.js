@@ -12,9 +12,13 @@
  *
  * Architecture:
  * - Main thread: WebRTCTransport (this) handles RTCPeerConnection, DataChannel
- * - SharedWorker: matrix_crypto.js handles encryption/decryption
- * - Signaling: ActionCable push via HubSignalingChannel (encrypted envelopes)
+ * - SharedWorker: olm_crypto.js handles encryption/decryption (vodozemac)
+ * - Signaling: ActionCable push via HubSignalingChannel (encrypted OlmEnvelopes)
  *   Rails is a dumb pipe — envelopes are opaque, only browser/CLI can decrypt.
+ *
+ * Wire format (OlmEnvelope):
+ *   PreKey:  { t: 0, b: "<base64 ciphertext>", k: "<sender curve25519 key>" }
+ *   Normal:  { t: 1, b: "<base64 ciphertext>" }
  */
 
 import bridge from "workers/bridge"
@@ -40,8 +44,25 @@ export const ConnectionMode = {
   RELAYED: "relayed",     // Through TURN server
 }
 
+// Binary inner content types (must match CLI's CONTENT_MSG / CONTENT_PTY)
+const CONTENT_MSG = 0x00
+const CONTENT_PTY = 0x01
+
 // Grace period before closing idle connections (ms)
 const DISCONNECT_GRACE_PERIOD_MS = 3000
+
+/**
+ * Build a binary control message frame: [CONTENT_MSG][JSON bytes].
+ * @param {Object} payload - JSON-serializable message
+ * @returns {Uint8Array}
+ */
+function buildControlFrame(payload) {
+  const jsonBytes = new TextEncoder().encode(JSON.stringify(payload))
+  const frame = new Uint8Array(1 + jsonBytes.length)
+  frame[0] = CONTENT_MSG
+  frame.set(jsonBytes, 1)
+  return frame
+}
 
 // ICE restart configuration
 const ICE_RESTART_DELAY_MS = 1000        // Wait before first restart attempt
@@ -132,7 +153,7 @@ class WebRTCTransport {
     let conn = this.#connections.get(hubId)
     if (conn) return { state: conn.state }
 
-    const conn2 = {
+    const newConn = {
       pc: null,
       dataChannel: null,
       state: TransportState.DISCONNECTED,
@@ -146,7 +167,7 @@ class WebRTCTransport {
       iceDisrupted: false,
       decryptFailures: 0,
     }
-    this.#connections.set(hubId, conn2)
+    this.#connections.set(hubId, newConn)
 
     await this.#createSignalingChannel(hubId, browserIdentity)
 
@@ -347,8 +368,9 @@ class WebRTCTransport {
    * @param {string} channelName - Channel name (e.g., "terminal", "hub", "preview")
    * @param {Object} params - Subscription params
    * @param {string} [providedSubscriptionId] - Optional semantic subscription ID
+   * @param {Uint8Array} encryptedBinary - Binary Olm frame for subscribe message
    */
-  async subscribe(hubId, channelName, params, providedSubscriptionId = null, encryptedEnvelope = null) {
+  async subscribe(hubId, channelName, params, providedSubscriptionId = null, encryptedBinary = null) {
     const conn = this.#connections.get(hubId)
     if (!conn) {
       throw new Error(`No connection for hub ${hubId}`)
@@ -367,22 +389,15 @@ class WebRTCTransport {
       await this.#waitForDataChannel(conn.dataChannel)
     }
 
-    // Send subscribe message through data channel.
-    // When an encrypted envelope is provided, the subscribe message is inside it
-    // as an Olm pre-key message — establishing the encrypted session on the CLI side.
-    if (encryptedEnvelope) {
-      conn.dataChannel.send(JSON.stringify(encryptedEnvelope))
+    // Send binary Olm frame directly (zero JSON, zero base64)
+    if (encryptedBinary) {
+      conn.dataChannel.send(encryptedBinary.buffer)
     } else {
-      conn.dataChannel.send(JSON.stringify({
-        type: "subscribe",
-        subscriptionId,
-        channel: channelName,
-        params,
-      }))
+      console.error("[WebRTCTransport] subscribe called without encrypted payload — CLI will reject")
+      throw new Error("Cannot subscribe without encrypted payload")
     }
 
-    // Wait for CLI to confirm subscription before allowing input.
-    // This prevents race condition where input arrives before CLI registers subscription.
+    // Wait for CLI to confirm subscription before allowing input
     await this.#waitForSubscriptionConfirmed(subscriptionId)
 
     this.#emit("subscription:confirmed", { subscriptionId })
@@ -397,10 +412,13 @@ class WebRTCTransport {
     for (const [hubId, conn] of this.#connections) {
       if (conn.subscriptions.has(subscriptionId)) {
         if (conn.dataChannel?.readyState === "open") {
-          conn.dataChannel.send(JSON.stringify({
-            type: "unsubscribe",
-            subscriptionId,
-          }))
+          try {
+            const plaintext = buildControlFrame({ type: "unsubscribe", subscriptionId })
+            const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
+            conn.dataChannel.send(encrypted.buffer)
+          } catch (e) {
+            console.warn("[WebRTCTransport] Failed to encrypt unsubscribe:", e)
+          }
         }
         conn.subscriptions.delete(subscriptionId)
         return { unsubscribed: true }
@@ -410,7 +428,8 @@ class WebRTCTransport {
   }
 
   /**
-   * Send raw data through the data channel
+   * Send data through the data channel (Olm-encrypted).
+   * Wraps in m.botster.msg with subscriptionId for CLI routing.
    */
   async sendRaw(subscriptionId, message) {
     for (const [hubId, conn] of this.#connections) {
@@ -419,8 +438,9 @@ class WebRTCTransport {
           throw new Error("DataChannel not open")
         }
 
-        const wrapped = { subscriptionId, data: message }
-        conn.dataChannel.send(JSON.stringify(wrapped))
+        const plaintext = buildControlFrame({ subscriptionId, data: message })
+        const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
+        conn.dataChannel.send(encrypted.buffer)
         return { sent: true }
       }
     }
@@ -428,11 +448,11 @@ class WebRTCTransport {
   }
 
   /**
-   * Send a pre-encrypted crypto envelope directly through the DataChannel.
-   * Used for browser → CLI communication where encryption happens in
-   * Connection.#sendEncrypted via the bridge.
+   * Send pre-encrypted binary frame through the DataChannel.
+   * @param {string} hubId - Hub identifier
+   * @param {Uint8Array} encrypted - Binary Olm frame
    */
-  async sendEnvelope(hubId, envelope) {
+  async sendEncrypted(hubId, encrypted) {
     const conn = this.#connections.get(hubId)
     if (!conn) {
       throw new Error(`No connection for hub ${hubId}`)
@@ -441,7 +461,7 @@ class WebRTCTransport {
       throw new Error("DataChannel not open")
     }
 
-    conn.dataChannel.send(JSON.stringify(envelope))
+    conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
     return { sent: true }
   }
 
@@ -781,12 +801,8 @@ class WebRTCTransport {
   }
 
   /**
-   * Decrypt a signal envelope (offer, answer, ICE) from ActionCable.
-   *
-   * Unlike #decryptEnvelope (used for DataChannel messages which are
-   * base64-encoded and optionally compressed), signaling payloads are
-   * raw JSON — no base64, no compression.
-   *
+   * Decrypt a signal envelope (OlmEnvelope) from ActionCable.
+   * Uses unified Olm decryption (same as DataChannel).
    * @returns {object|null} Decrypted signal payload, or null on failure
    */
   async #decryptSignalEnvelope(hubId, envelope) {
@@ -801,11 +817,11 @@ class WebRTCTransport {
 
   /**
    * Encrypt a signaling payload (offer, answer, ICE) for transmission.
-   * Returns the envelope object ready for ActionCable perform.
+   * Uses unified Olm encryption. Returns OlmEnvelope object for ActionCable.
    */
   async #encryptSignal(hubId, payload) {
-    const { envelope } = await bridge.encrypt(String(hubId), payload)
-    return typeof envelope === "string" ? JSON.parse(envelope) : envelope
+    const { encrypted } = await bridge.encrypt(String(hubId), payload)
+    return encrypted
   }
 
   // ========== WebRTC Signal Handling ==========
@@ -873,23 +889,23 @@ class WebRTCTransport {
 
   async #handleDataChannelMessage(hubId, data) {
     try {
-      // Handle binary data (ArrayBuffer)
-      let textData = data
-      if (data instanceof ArrayBuffer) {
-        textData = new TextDecoder().decode(data)
-      }
+      // All DataChannel messages are binary Olm frames:
+      // [msg_type:1][raw ciphertext] or [msg_type:1][key:32][ciphertext]
+      const raw = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data)
 
-      const parsed = typeof textData === "string" ? JSON.parse(textData) : textData
+      // First byte distinguishes binary Olm frame (0x00/0x01) from plaintext JSON (0x7B = '{')
+      if (raw.length > 0 && raw[0] <= 0x01) {
+        // Binary Olm frame — decrypt
+        let plaintext
+        try {
+          const result = await bridge.decryptBinary(String(hubId), raw)
+          plaintext = result.data
 
-      // Check if this is a crypto envelope (encrypted message from CLI)
-      // Crypto envelopes have short keys: t (type), c (ciphertext), s (sender)
-      // Control messages (subscribed, agent_list) may be plaintext during bootstrap
-      // before the Olm session is established via pre-key message
-      let msg = parsed
-      if (parsed.t !== undefined && parsed.c && parsed.s) {
-        msg = await this.#decryptEnvelope(hubId, parsed)
-        if (!msg) {
-          // Track consecutive decryption failures (mirrors CLI's 3-strike detection)
+          // Reset on successful decrypt
+          const conn = this.#connections.get(hubId)
+          if (conn) conn.decryptFailures = 0
+        } catch (err) {
+          console.error("[WebRTCTransport] Olm decryption failed:", err.message || err)
           const conn = this.#connections.get(hubId)
           if (conn) {
             conn.decryptFailures++
@@ -901,96 +917,114 @@ class WebRTCTransport {
           }
           return
         }
-        // Reset on successful decrypt
-        const conn = this.#connections.get(hubId)
-        if (conn) conn.decryptFailures = 0
-      }
 
-      // Handle subscription confirmation (control message, decrypted)
-      if (msg.type === "subscribed" && msg.subscriptionId) {
-        this.#handleSubscriptionConfirmed(msg.subscriptionId)
+        if (!plaintext || plaintext.length === 0) return
+
+        // Route by inner content type (first byte of decrypted plaintext)
+        const contentType = plaintext[0]
+
+        if (contentType === CONTENT_MSG) {
+          // Control message: [CONTENT_MSG][JSON bytes]
+          const json = new TextDecoder().decode(plaintext.slice(1))
+          const msg = JSON.parse(json)
+          this.#routeControlMessage(hubId, msg)
+          return
+        }
+
+        if (contentType === CONTENT_PTY) {
+          // PTY: [CONTENT_PTY][flags:1][sub_id_len:1][sub_id][payload]
+          this.#handlePtyBinary(hubId, plaintext)
+          return
+        }
+
+        console.warn("[WebRTCTransport] Unknown content type:", contentType)
         return
       }
 
-      // Handle session invalid (plaintext from CLI when decryption repeatedly fails)
-      if (msg.type === "session_invalid") {
-        console.warn("[WebRTCTransport] Session invalid:", msg.reason)
-        this.#emit("session:invalid", { hubId, message: msg.message || msg.reason || "Session invalid" })
+      // Plaintext JSON fallback (session_invalid from CLI)
+      const text = new TextDecoder().decode(raw)
+      const parsed = JSON.parse(text)
+      if (parsed.type === "session_invalid") {
+        console.warn("[WebRTCTransport] Session invalid:", parsed.reason)
+        this.#emit("session:invalid", { hubId, message: parsed.message || parsed.reason || "Session invalid" })
         return
       }
 
-      if (msg.subscriptionId) {
-        // Message with subscription routing (decrypted)
-        // Check for raw binary data (base64-encoded PTY output)
-        if (msg.raw) {
-          // Decode base64 to Uint8Array
-          const binaryString = atob(msg.raw)
-          const bytes = new Uint8Array(binaryString.length)
-          for (let i = 0; i < binaryString.length; i++) {
-            bytes[i] = binaryString.charCodeAt(i)
-          }
-          this.#emit("subscription:message", {
-            subscriptionId: msg.subscriptionId,
-            message: bytes,
-            isRaw: true,
-          })
-        } else {
-          this.#emit("subscription:message", {
-            subscriptionId: msg.subscriptionId,
-            message: msg.data || msg,
-          })
-        }
-      } else if (msg.type === "health") {
-        // Health messages via DataChannel (fallback — primary path is ActionCable)
-        const conn = this.#connections.get(hubId)
-        if (conn) {
-          for (const subId of conn.subscriptions.keys()) {
-            this.#emit("subscription:message", {
-              subscriptionId: subId,
-              message: msg,
-            })
-          }
-        }
-      }
+      console.warn("[WebRTCTransport] Unexpected plaintext message:", parsed)
     } catch (e) {
-      console.error("[WebRTCTransport] Failed to parse message:", e)
+      console.error("[WebRTCTransport] Failed to handle message:", e)
     }
   }
 
   /**
-   * Decrypt a crypto envelope and decompress the payload.
-   * @returns {object|null} Decrypted message object, or null on failure
+   * Handle binary PTY output (zero base64, zero JSON).
+   * Format: [0x01][flags:1][sub_id_len:1][sub_id][raw payload]
    */
-  async #decryptEnvelope(hubId, envelope) {
-    try {
-      const { plaintext } = await bridge.decrypt(String(hubId), envelope)
+  async #handlePtyBinary(hubId, plaintext) {
+    if (plaintext.length < 4) return // Minimum: type + flags + len + at least 0
 
-      // Plaintext is base64-encoded, decode to bytes
-      const binaryString = atob(plaintext)
-      const bytes = new Uint8Array(binaryString.length)
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i)
+    const flags = plaintext[1]
+    const compressed = (flags & 0x01) !== 0
+    const subIdLen = plaintext[2]
+    const subIdStart = 3
+    const payloadStart = subIdStart + subIdLen
+
+    if (plaintext.length < payloadStart) return
+
+    const subscriptionId = new TextDecoder().decode(plaintext.slice(subIdStart, payloadStart))
+    const payload = plaintext.slice(payloadStart)
+
+    let outputText
+    if (compressed) {
+      const stream = new Blob([payload])
+        .stream()
+        .pipeThrough(new DecompressionStream("gzip"))
+      outputText = await new Response(stream).text()
+    } else {
+      outputText = new TextDecoder().decode(payload)
+    }
+
+    this.#emit("subscription:message", {
+      subscriptionId,
+      message: { type: "output", data: outputText },
+    })
+  }
+
+  /**
+   * Route a decrypted control message (m.botster.msg body).
+   * These are the same message types as before, just unwrapped from Olm.
+   */
+  #routeControlMessage(hubId, msg) {
+    // Subscription confirmation
+    if (msg.type === "subscribed" && msg.subscriptionId) {
+      this.#handleSubscriptionConfirmed(msg.subscriptionId)
+      return
+    }
+
+    // Session invalid (sent encrypted from CLI)
+    if (msg.type === "session_invalid") {
+      console.warn("[WebRTCTransport] Session invalid:", msg.reason)
+      this.#emit("session:invalid", { hubId, message: msg.message || msg.reason || "Session invalid" })
+      return
+    }
+
+    if (msg.subscriptionId) {
+      // Message with subscription routing
+      this.#emit("subscription:message", {
+        subscriptionId: msg.subscriptionId,
+        message: msg.data || msg,
+      })
+    } else if (msg.type === "health") {
+      // Health messages via DataChannel (fallback — primary path is ActionCable)
+      const conn = this.#connections.get(hubId)
+      if (conn) {
+        for (const subId of conn.subscriptions.keys()) {
+          this.#emit("subscription:message", {
+            subscriptionId: subId,
+            message: msg,
+          })
+        }
       }
-
-      // Handle compression marker: 0x00 = uncompressed, 0x1f = gzip
-      const marker = bytes[0]
-      let jsonStr
-      if (marker === 0x00) {
-        jsonStr = new TextDecoder().decode(bytes.slice(1))
-      } else if (marker === 0x1f) {
-        const stream = new Blob([bytes.slice(1)])
-          .stream()
-          .pipeThrough(new DecompressionStream("gzip"))
-        jsonStr = await new Response(stream).text()
-      } else {
-        // No marker - try as raw UTF-8
-        jsonStr = new TextDecoder().decode(bytes)
-      }
-
-      return JSON.parse(jsonStr)
-    } catch (err) {
-      console.error("[WebRTCTransport] Decryption failed:", err.message || err)
-      return null
     }
   }
 

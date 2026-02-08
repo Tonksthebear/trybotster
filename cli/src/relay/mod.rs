@@ -3,7 +3,7 @@
 //! This module provides the browser relay functionality, handling WebRTC
 //! DataChannel communication with connected browser clients. It manages:
 //!
-//! - E2E encrypted communication (Matrix Olm/Megolm)
+//! - E2E encrypted communication (vodozemac Olm)
 //! - Terminal output streaming
 //!
 //! # Architecture
@@ -21,23 +21,23 @@
 //! # Encryption
 //!
 //! All communication between the CLI and browser is E2E encrypted using
-//! Matrix Olm/Megolm protocols via `matrix-sdk-crypto`.
+//! vodozemac Olm (direct, no matrix-sdk-crypto wrapper).
 //!
-//! ## Matrix Crypto (v5)
+//! ## Vodozemac Crypto (v6)
 //!
-//! Uses Olm (1:1 Double Ratchet) and Megolm (group ratchet) from matrix-sdk-crypto.
-//! Key bundles are ~165 bytes, fitting easily in QR codes.
+//! Uses Olm (1:1 Double Ratchet) from vodozemac directly.
+//! Key bundles are 161 bytes (fixed size), fitting easily in QR codes.
 //!
-//! 1. CLI creates OlmMachine with synthetic Matrix IDs
+//! 1. CLI creates vodozemac Account
 //! 2. CLI displays QR code with DeviceKeyBundle
-//! 3. Browser scans QR, creates own OlmMachine
-//! 4. Browser establishes Olm session via key claim
-//! 5. Both sides can encrypt/decrypt with forward secrecy
+//! 3. Browser scans QR, creates outbound Olm session
+//! 4. Browser sends PreKey message via DataChannel
+//! 5. CLI creates inbound session, both sides encrypted
 //!
 //! # Modules
 //!
-//! - [`crypto_service`] - Thread-safe crypto operations
-//! - [`matrix_crypto`] - Matrix Olm/Megolm E2E encryption
+//! - [`crypto_service`] - Thread-safe crypto wrapper (`Arc<Mutex<VodozemacCrypto>>`)
+//! - [`olm_crypto`] - Vodozemac Olm E2E encryption
 //! - [`persistence`] - Encrypted storage for crypto state
 //! - [`state`] - Browser connection state management
 //! - [`types`] - Protocol message types
@@ -46,7 +46,7 @@
 
 pub mod crypto_service;
 pub mod http_proxy;
-pub mod matrix_crypto;
+pub mod olm_crypto;
 pub mod persistence;
 pub mod preview_types;
 pub mod state;
@@ -56,9 +56,9 @@ pub use state::{build_agent_info, build_scrollback_message, build_worktree_info,
 
 pub use types::{AgentInfo, BrowserCommand, BrowserResize, TerminalMessage, WorktreeInfo};
 
-pub use matrix_crypto::{
-    binary_format as matrix_binary_format, CryptoEnvelope, DeviceKeyBundle, MatrixCryptoManager,
-    MatrixCryptoState, MATRIX_PROTOCOL_VERSION, MSG_TYPE_MEGOLM, MSG_TYPE_OLM, MSG_TYPE_OLM_PREKEY,
+pub use olm_crypto::{
+    binary_format, DeviceKeyBundle, OlmEnvelope, VodozemacCrypto, VodozemacCryptoState,
+    MSG_TYPE_NORMAL, MSG_TYPE_PREKEY, PROTOCOL_VERSION,
 };
 
 pub use persistence::{delete_connection_url, read_connection_url, write_connection_url};
@@ -70,4 +70,4 @@ pub use preview_types::{
 
 pub use http_proxy::HttpProxy;
 
-pub use crypto_service::{CryptoRequest, CryptoService, CryptoServiceHandle};
+pub use crypto_service::{create_crypto_service, CryptoService};
