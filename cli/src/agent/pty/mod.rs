@@ -152,9 +152,8 @@ impl std::fmt::Debug for SharedPtyState {
 /// # Port Field
 ///
 /// The `port` field stores the HTTP forwarding port for preview functionality.
-/// This is primarily used by server PTYs (pty_index=1) running dev servers.
-/// When set, the port value is also passed via `BOTSTER_TUNNEL_PORT` env var
-/// to the PTY process at spawn time.
+/// Used by sessions with `port_forward` enabled. When set, the port is
+/// passed via the `PORT` environment variable to the PTY process at spawn time.
 pub struct PtySession {
     /// Shared mutable state accessed by the command processor task.
     ///
@@ -209,12 +208,12 @@ pub struct PtySession {
 
     /// Allocated port for HTTP forwarding.
     ///
-    /// Used by server PTYs (pty_index=1) to expose the dev server port for
-    /// preview proxying. The port is set via [`set_port()`](Self::set_port)
+    /// Used by sessions with `port_forward` enabled to expose the dev server
+    /// port for preview proxying. The port is set via [`set_port()`](Self::set_port)
     /// and queried via [`port()`](Self::port).
     ///
-    /// When spawning the PTY process, the caller should also pass this port
-    /// via the `BOTSTER_TUNNEL_PORT` environment variable.
+    /// When spawning the PTY process, the caller passes this port via the
+    /// `PORT` environment variable.
     port: Option<u16>,
 }
 
@@ -301,11 +300,11 @@ impl PtySession {
 
     /// Set the HTTP forwarding port for this PTY.
     ///
-    /// Called after spawning to record the allocated port. This is primarily
-    /// used for server PTYs (pty_index=1) running dev servers.
+    /// Called after spawning to record the allocated port. Used for sessions
+    /// with `port_forward` enabled.
     ///
-    /// Note: The port should also be passed via `BOTSTER_TUNNEL_PORT` env var
-    /// when spawning the PTY process.
+    /// Note: The port is also passed via the `PORT` env var when spawning
+    /// the PTY process.
     pub fn set_port(&mut self, port: u16) {
         self.port = Some(port);
     }
@@ -352,7 +351,7 @@ impl PtySession {
     ///     worktree_path: PathBuf::from("/path/to/worktree"),
     ///     command: "bash".to_string(),
     ///     env: HashMap::new(),
-    ///     init_commands: vec!["source .botster_init".to_string()],
+    ///     init_commands: vec!["source .botster/shared/sessions/agent/initialization".to_string()],
     ///     detect_notifications: true,
     ///     port: None,
     ///     context: String::new(),

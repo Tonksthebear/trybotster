@@ -5,6 +5,7 @@
 -- Responsibilities:
 -- - Parse issue-or-branch input into branch_name + issue_number
 -- - Find or create worktrees
+-- - Resolve config profiles via ConfigResolver
 -- - Spawn agents via Agent.new() (which handles PTY, env, prompt files)
 -- - Broadcast agent lifecycle events to connected clients
 --
@@ -20,6 +21,7 @@
 -- the orchestration layer that connects incoming requests to the Agent API.
 
 local Agent = require("lib.agent")
+local ConfigResolver = require("lib.config_resolver")
 
 -- ============================================================================
 -- Input Parsing
@@ -73,6 +75,71 @@ local function build_agent_key(repo, issue_number, branch_name)
 end
 
 -- ============================================================================
+-- Profile Resolution
+-- ============================================================================
+
+--- Resolve profile name from user input.
+--
+-- Three input cases:
+--   non-empty string  → explicit profile name, use as-is
+--   empty string ""   → user explicitly chose "Default" (shared-only)
+--   nil               → not specified, auto-select or fall back to shared
+--
+-- @param repo_root string Repository root path
+-- @param profile_name string|nil Input from user/browser
+-- @return string|nil Resolved profile name (nil = shared-only)
+-- @return string|nil Error message if resolution fails
+local function resolve_profile_name(repo_root, profile_name)
+    -- Explicit profile name
+    if profile_name and profile_name ~= "" then
+        return profile_name, nil
+    end
+
+    -- Empty string = user chose "Default" (shared-only)
+    if profile_name == "" then
+        if ConfigResolver.has_shared_agent(repo_root) then
+            return nil, nil
+        end
+        return nil, "Cannot use Default: no agent session in shared/"
+    end
+
+    -- nil = not specified, auto-select
+    local profiles = ConfigResolver.list_profiles(repo_root)
+    if #profiles == 0 then
+        if ConfigResolver.has_shared_agent(repo_root) then
+            log.info("No profiles found, using shared-only config")
+            return nil, nil
+        end
+        return nil, "No profiles found and no shared agent session."
+    elseif #profiles == 1 then
+        log.info(string.format("Auto-selected profile: %s", profiles[1]))
+        return profiles[1], nil
+    else
+        return nil, string.format(
+            "Multiple profiles available (%s). Please specify a profile.",
+            table.concat(profiles, ", "))
+    end
+end
+
+--- Build session configs for Agent.new() from resolved config.
+-- Maps ConfigResolver output to the format Agent.new() expects.
+-- @param resolved table ConfigResolver.resolve() output
+-- @return array Session configs for Agent.new()
+local function build_sessions_from_resolved(resolved)
+    local sessions = {}
+    for _, session in ipairs(resolved.sessions) do
+        sessions[#sessions + 1] = {
+            name = session.name,
+            command = "bash",
+            init_script = session.initialization,  -- absolute path
+            notifications = (session.name == "agent"),
+            forward_port = session.port_forward,
+        }
+    end
+    return sessions
+end
+
+-- ============================================================================
 -- Lifecycle Broadcasting
 -- ============================================================================
 
@@ -108,18 +175,25 @@ end
 -- @param prompt string          Task description
 -- @param client table|nil       Requesting client (for dimensions)
 -- @param agent_key string       Pre-computed agent key for status broadcasts
+-- @param profile_name string    Profile to use for config resolution
 -- @return Agent|nil             The created agent, or nil on error
-local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key)
+local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name)
     local repo = config.env("BOTSTER_REPO") or "unknown/repo"
+    local repo_root = worktree.repo_root()
 
     -- Broadcast: spawning PTYs
     notify_lifecycle(agent_key, "spawning_ptys")
 
-    -- Determine session config based on worktree contents
-    local sessions = Agent.default_sessions()
-    if fs.exists(wt_path .. "/.botster_server") then
-        sessions = Agent.default_sessions_with_server()
+    -- Resolve config from .botster/ directory
+    local resolved, err = ConfigResolver.resolve(repo_root, profile_name)
+    if not resolved then
+        log.error(string.format("Config resolution failed for profile '%s': %s",
+            tostring(profile_name), tostring(err)))
+        notify_lifecycle(agent_key, "failed", { error = tostring(err) })
+        return nil
     end
+
+    local sessions = build_sessions_from_resolved(resolved)
 
     -- Get dimensions from requesting client if available
     local dims = nil
@@ -167,13 +241,15 @@ end
 -- @param prompt string|nil           Optional task prompt
 -- @param from_worktree string|nil    Optional existing worktree path
 -- @param client table|nil            Requesting client (for progress/dims)
+-- @param profile_name string|nil     Profile name (auto-selected if only one)
 -- @return Agent|nil                  The created agent, or nil on error
-local function handle_create_agent(issue_or_branch, prompt, from_worktree, client)
+local function handle_create_agent(issue_or_branch, prompt, from_worktree, client, profile_name)
     -- Interceptor: plugins can transform params or block creation (return nil)
     local params = hooks.call("before_agent_create", {
         issue_or_branch = issue_or_branch,
         prompt = prompt,
         from_worktree = from_worktree,
+        profile_name = profile_name,
     })
     if params == nil then
         log.info("before_agent_create interceptor blocked agent creation")
@@ -183,17 +259,27 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     issue_or_branch = params.issue_or_branch
     prompt = params.prompt
     from_worktree = params.from_worktree
+    profile_name = params.profile_name
+
+    -- Resolve profile name (auto-select if only one, nil = shared-only)
+    local repo_root = worktree.repo_root()
+    if repo_root then
+        local resolved_profile, profile_err = resolve_profile_name(repo_root, profile_name)
+        if profile_err then
+            log.error(string.format("Profile resolution failed: %s", profile_err))
+            return nil
+        end
+        profile_name = resolved_profile  -- nil for shared-only, or a profile name
+    else
+        log.error("Cannot resolve profile: no repo root detected")
+        return nil
+    end
 
     -- Main repo mode: no issue_or_branch AND no from_worktree
     if not issue_or_branch and not from_worktree then
-        local repo_root = worktree.repo_root()
-        if not repo_root then
-            log.error("No issue_or_branch and no repo root detected")
-            return nil
-        end
         local repo = config.env("BOTSTER_REPO") or "unknown/repo"
         local agent_key = build_agent_key(repo, nil, "main")
-        return spawn_agent("main", nil, repo_root, prompt or "Work on the main branch", client, agent_key)
+        return spawn_agent("main", nil, repo_root, prompt or "Work on the main branch", client, agent_key, profile_name)
     end
 
     local issue_number, branch_name = parse_issue_or_branch(issue_or_branch)
@@ -227,6 +313,16 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         if ok then
             wt_path = result
             log.info(string.format("Created worktree for %s at %s", branch_name, wt_path))
+
+            -- Copy workspace files into new worktree
+            local resolved_for_copy, _ = ConfigResolver.resolve(repo_root, profile_name)
+            if resolved_for_copy and resolved_for_copy.workspace_include then
+                local ok_copy, copy_err = pcall(worktree.copy_from_patterns,
+                    repo_root, wt_path, resolved_for_copy.workspace_include)
+                if not ok_copy then
+                    log.warn(string.format("Failed to copy workspace files: %s", tostring(copy_err)))
+                end
+            end
         else
             log.error(string.format("Failed to create worktree for %s: %s", branch_name, tostring(result)))
             notify_lifecycle(agent_key, "failed", { error = tostring(result) })
@@ -236,7 +332,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         log.info(string.format("Worktree found for %s at %s", branch_name, wt_path))
     end
 
-    return spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key)
+    return spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name)
 end
 
 --- Handle a request to delete an agent.
@@ -293,7 +389,7 @@ events.on("command_message", function(message)
     if msg_type == "create_agent" then
         local issue_or_branch = message.issue_or_branch or message.branch
         if issue_or_branch then
-            handle_create_agent(issue_or_branch, message.prompt, message.from_worktree)
+            handle_create_agent(issue_or_branch, message.prompt, message.from_worktree, nil, message.profile)
         else
             log.warn("command_message create_agent missing issue_or_branch")
         end

@@ -37,16 +37,46 @@ impl WorktreeManager {
         Self { base_dir }
     }
 
-    /// Reads .botster_copy file and returns patterns
-    fn read_botster_copy_patterns(repo_path: &Path) -> Result<Vec<String>> {
-        let botster_copy_path = repo_path.join(".botster_copy");
+    /// Read workspace teardown commands from `.botster/shared/workspace_teardown`.
+    ///
+    /// Returns non-empty, non-comment lines from the teardown file.
+    /// Returns an empty vector if the file does not exist.
+    pub fn read_teardown_commands(repo_path: &Path) -> Result<Vec<String>> {
+        let teardown_path = repo_path.join(".botster/shared/workspace_teardown");
 
-        if !botster_copy_path.exists() {
+        if !teardown_path.exists() {
             return Ok(Vec::new());
         }
 
+        let content = fs::read_to_string(&teardown_path)
+            .context("Failed to read .botster/shared/workspace_teardown")?;
+
+        let commands: Vec<String> = content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(std::string::ToString::to_string)
+            .collect();
+
+        log::info!(
+            "Read {} teardown command(s) from workspace_teardown",
+            commands.len()
+        );
+        Ok(commands)
+    }
+
+    /// Copy files from `source_repo` to `dest` matching glob patterns in `patterns_file`.
+    ///
+    /// Reads one glob pattern per line from `patterns_file` (ignoring blanks and
+    /// `#`-comments), then recursively walks `source_repo` and copies every
+    /// matching file into `dest`, preserving relative paths.
+    pub fn copy_from_patterns(
+        source_repo: &Path,
+        dest: &Path,
+        patterns_file: &Path,
+    ) -> Result<()> {
         let content =
-            fs::read_to_string(&botster_copy_path).context("Failed to read .botster_copy")?;
+            fs::read_to_string(patterns_file).context("Failed to read patterns file")?;
 
         let patterns: Vec<String> = content
             .lines()
@@ -55,83 +85,18 @@ impl WorktreeManager {
             .map(std::string::ToString::to_string)
             .collect();
 
-        Ok(patterns)
-    }
-
-    /// Reads .botster_init file and returns commands to run in the shell
-    pub fn read_botster_init_commands(repo_path: &Path) -> Result<Vec<String>> {
-        let botster_init_path = repo_path.join(".botster_init");
-
-        if !botster_init_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let content =
-            fs::read_to_string(&botster_init_path).context("Failed to read .botster_init")?;
-
-        let commands: Vec<String> = content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(std::string::ToString::to_string)
-            .collect();
-
-        log::info!("Read {} init command(s) from .botster_init", commands.len());
-        Ok(commands)
-    }
-
-    /// Reads .botster_teardown file and returns commands to run before deletion
-    pub fn read_botster_teardown_commands(repo_path: &Path) -> Result<Vec<String>> {
-        let botster_teardown_path = repo_path.join(".botster_teardown");
-
-        if !botster_teardown_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let content = fs::read_to_string(&botster_teardown_path)
-            .context("Failed to read .botster_teardown")?;
-
-        let commands: Vec<String> = content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(std::string::ToString::to_string)
-            .collect();
-
-        log::info!(
-            "Read {} teardown command(s) from .botster_teardown",
-            commands.len()
-        );
-        Ok(commands)
-    }
-
-    /// Copies files matching .botster_copy patterns from source to destination
-    fn copy_botster_files(source_repo: &Path, dest_worktree: &Path) -> Result<()> {
-        let patterns = Self::read_botster_copy_patterns(source_repo)?;
-
         if patterns.is_empty() {
-            log::debug!("No .botster_copy patterns found, skipping file copy");
+            log::debug!("No patterns in {}, skipping file copy", patterns_file.display());
             return Ok(());
         }
 
         log::info!(
-            "Found {} patterns in .botster_copy: {:?}",
+            "Copying {} pattern(s) from {} into {}",
             patterns.len(),
-            patterns
+            patterns_file.display(),
+            dest.display(),
         );
-        log::info!("Source repo: {}", source_repo.display());
-        log::info!("Dest worktree: {}", dest_worktree.display());
 
-        // Write debug info to file for troubleshooting
-        let debug_log = format!(
-            "[copy_botster_files] patterns={:?}, source={}, dest={}\n",
-            patterns,
-            source_repo.display(),
-            dest_worktree.display()
-        );
-        let _ = std::fs::write(debug_log_path(), &debug_log);
-
-        // Build globset from patterns
         let mut builder = GlobSetBuilder::new();
         for pattern in &patterns {
             match Glob::new(pattern) {
@@ -139,17 +104,16 @@ impl WorktreeManager {
                     builder.add(glob);
                 }
                 Err(e) => {
-                    log::warn!("Invalid pattern in .botster_copy: '{}' - {}", pattern, e);
+                    log::warn!("Invalid glob pattern '{}': {}", pattern, e);
                     continue;
                 }
             }
         }
         let globset = builder.build()?;
 
-        // Walk the source repo and copy matching files
-        Self::copy_matching_files(source_repo, dest_worktree, source_repo, &globset)?;
+        Self::copy_matching_files(source_repo, dest, source_repo, &globset)?;
 
-        log::info!("Copied {} pattern(s) from .botster_copy", patterns.len());
+        log::info!("Copied {} pattern(s) into {}", patterns.len(), dest.display());
         Ok(())
     }
 
@@ -356,8 +320,8 @@ impl WorktreeManager {
             anyhow::bail!("Failed to create worktree: {}", stderr);
         }
 
-        // Copy files matching .botster_copy patterns
-        Self::copy_botster_files(&repo_path, &worktree_path)?;
+        // File copying is now Lua-driven via worktree.copy_from_patterns()
+        // using the resolved workspace_include from .botster/ config.
 
         Ok(worktree_path)
     }
@@ -712,7 +676,7 @@ impl WorktreeManager {
         log::info!("Deleting worktree at {}", worktree_path.display());
 
         // Read and run teardown commands
-        let teardown_commands = Self::read_botster_teardown_commands(&repo_path)?;
+        let teardown_commands = Self::read_teardown_commands(&repo_path)?;
 
         if !teardown_commands.is_empty() {
             log::info!("Running {} teardown command(s)", teardown_commands.len());
@@ -843,7 +807,7 @@ impl WorktreeManager {
         log::info!("Deleting worktree for issue #{}", issue_number);
 
         // Read and run teardown commands
-        let teardown_commands = Self::read_botster_teardown_commands(&repo_path)?;
+        let teardown_commands = Self::read_teardown_commands(&repo_path)?;
 
         if !teardown_commands.is_empty() {
             log::info!("Running {} teardown command(s)", teardown_commands.len());

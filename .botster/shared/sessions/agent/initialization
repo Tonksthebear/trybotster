@@ -1,0 +1,43 @@
+# Init commands to run when agent shell starts
+mise trust
+
+# Change to the worktree directory
+cd "$BOTSTER_WORKTREE_PATH"
+
+# Read prompt from .botster_prompt file if it exists, otherwise use env var
+if [ -f ".botster_prompt" ]; then
+  BOTSTER_PROMPT=$(cat .botster_prompt)
+  echo "Using prompt from .botster_prompt file"
+else
+  BOTSTER_PROMPT="$BOTSTER_TASK_DESCRIPTION"
+  echo "Using prompt from BOTSTER_TASK_DESCRIPTION env var"
+fi
+
+# Auto-trust the worktree in Claude config using botster-hub's JSON tools
+"$BOTSTER_HUB_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
+
+# Note: We detect when Claude asks questions by scanning for UI patterns like
+# "Enter to select" and "Tab/Arrow keys to navigate" in the terminal output.
+# This works regardless of notification settings.
+
+# Register trybotster MCP server for this worktree (if token is available)
+if [ -n "$BOTSTER_MCP_TOKEN" ]; then
+  echo "Registering trybotster MCP server..."
+  claude mcp add trybotster \
+    --transport http \
+    https://mcp-dev.trybotster.com \
+    --header \
+    "Authorization: Bearer `echo $BOTSTER_MCP_TOKEN`"
+fi
+
+if [ "$BOTSTER_ISSUE_NUMBER" != "0" ]; then
+  echo "Botster agent initialized for issue #$BOTSTER_ISSUE_NUMBER"
+else
+  echo "Botster agent initialized for branch: $BOTSTER_BRANCH_NAME"
+fi
+echo "Worktree: $BOTSTER_WORKTREE_PATH"
+
+# Server is now spawned in a separate PTY by botster-hub (Ctrl+T to toggle view)
+
+# Start Claude with the prompt
+claude --permission-mode acceptEdits "$BOTSTER_PROMPT"

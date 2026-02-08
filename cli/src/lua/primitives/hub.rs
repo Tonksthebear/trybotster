@@ -108,10 +108,8 @@ pub fn register(
     //
     // Arguments:
     //   agent_key: string - Agent key (e.g., "owner-repo-42")
-    //   sessions: table - Map of session name to PtySessionHandle userdata
-    //                     e.g., { cli = <PtySessionHandle>, server = <PtySessionHandle> }
-    //
-    // The order of PTYs in HandleCache is: cli first (index 0), then server (index 1).
+    //   sessions: array - Ordered Lua array of PtySessionHandle userdata
+    //                     Index order determines PTY index (agent=0, then alphabetical)
     let cache2 = Arc::clone(&handle_cache);
     let register_agent_fn = lua
         .create_function(move |_, (agent_key, sessions): (String, LuaTable)| {
@@ -120,49 +118,38 @@ pub fn register(
 
             let mut pty_handles: Vec<PtyHandle> = Vec::new();
 
-            // Extract CLI session first (index 0)
-            // Use AnyUserData and borrow for more robust type handling
-            if let Ok(cli_ud) = sessions.get::<LuaAnyUserData>("cli") {
-                match cli_ud.borrow::<PtySessionHandle>() {
-                    Ok(cli_handle) => {
-                        pty_handles.push(cli_handle.to_pty_handle());
-                        log::debug!("[Lua] Extracted CLI PTY handle for '{}'", agent_key);
-                    }
-                    Err(e) => {
-                        log::warn!("[Lua] Failed to borrow CLI session as PtySessionHandle: {}", e);
-                    }
-                }
-            } else {
-                log::debug!("[Lua] No 'cli' session found for agent '{}'", agent_key);
-            }
-
-            // Extract server session second (index 1)
-            if let Ok(server_ud) = sessions.get::<LuaAnyUserData>("server") {
-                match server_ud.borrow::<PtySessionHandle>() {
-                    Ok(server_handle) => {
-                        pty_handles.push(server_handle.to_pty_handle());
-                        log::debug!("[Lua] Extracted server PTY handle for '{}'", agent_key);
-                    }
-                    Err(e) => {
-                        log::warn!("[Lua] Failed to borrow server session as PtySessionHandle: {}", e);
+            // Iterate ordered Lua array (1-based indices)
+            for i in 1..=sessions.raw_len() {
+                if let Ok(ud) = sessions.get::<LuaAnyUserData>(i) {
+                    match ud.borrow::<PtySessionHandle>() {
+                        Ok(handle) => {
+                            pty_handles.push(handle.to_pty_handle());
+                            log::debug!(
+                                "[Lua] Extracted PTY handle at index {} for '{}'",
+                                i - 1, agent_key
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[Lua] Failed to borrow PTY session at index {} for '{}': {}",
+                                i, agent_key, e
+                            );
+                        }
                     }
                 }
             }
 
             if pty_handles.is_empty() {
                 log::error!(
-                    "[Lua] register_agent '{}' failed: no valid PTY sessions found in table",
+                    "[Lua] register_agent '{}' failed: no valid PTY sessions found in array",
                     agent_key
                 );
                 return Err(LuaError::runtime(
-                    "register_agent requires at least one PTY session (cli or server)"
+                    "register_agent requires at least one PTY session"
                 ));
             }
 
-            // Capture count before moving
             let pty_count = pty_handles.len();
-
-            // Determine index (will be updated by add_agent)
             let agent_index = cache2.len();
             let handle = AgentPtys::new(agent_key.clone(), pty_handles, agent_index);
 

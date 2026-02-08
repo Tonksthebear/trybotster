@@ -1,12 +1,10 @@
 #!/bin/bash
 # Test server script for integration tests
-# This simulates what .botster_server does without requiring a real Rails app
+# This simulates a session initialization script with port forwarding
 
 echo "=== Test Botster Server ==="
-echo "BOTSTER_TUNNEL_PORT: ${BOTSTER_TUNNEL_PORT:-3000}"
+echo "PORT: ${PORT:-3000}"
 echo "Starting fake server..."
-
-PORT="${BOTSTER_TUNNEL_PORT:-3000}"
 
 # Simulate server startup logs with enough content for scrollback testing
 echo "[$(date '+%H:%M:%S')] * Loading config..."

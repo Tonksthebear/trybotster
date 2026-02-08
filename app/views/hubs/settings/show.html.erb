@@ -1,7 +1,7 @@
 <div class="h-full flex flex-col overflow-hidden"
      data-controller="hub-settings"
      data-hub-settings-hub-id-value="<%= Current.hub.id %>"
-     data-hub-settings-config-files-value="<%= @config_files.to_json %>">
+     data-hub-settings-config-metadata-value="<%= @config_metadata.to_json %>">
 
   <%# Header %>
   <div class="shrink-0 border-b border-zinc-800 bg-zinc-900/50">
@@ -23,97 +23,136 @@
     </div>
   </div>
 
+  <%# Prompt/Confirm Dialog — mode drives button style + input visibility via CSS %>
+  <%= render Elements::DialogComponent.new(id: "settings-prompt-modal") do %>
+    <div class="flex flex-col min-w-[320px] group/prompt"
+         data-hub-settings-target="promptPanel"
+         data-mode="prompt">
+      <div class="px-5 py-4 border-b border-zinc-800 bg-zinc-950/50">
+        <h3 class="text-base font-semibold text-zinc-100"
+            data-hub-settings-target="promptTitle">Enter name</h3>
+      </div>
+      <div class="p-5 space-y-3">
+        <p class="text-sm text-zinc-400"
+           data-hub-settings-target="promptMessage">Enter a name</p>
+        <input type="text"
+               data-hub-settings-target="promptInput"
+               data-action="keydown.enter->hub-settings#promptConfirm"
+               class="group-data-[mode=prompt]/prompt:block hidden w-full px-3 py-2 bg-zinc-950 border border-zinc-700 rounded text-zinc-100 text-sm font-mono placeholder-zinc-600 focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/30 focus:outline-none"
+               placeholder="my-name"
+               autocomplete="off"
+               spellcheck="false">
+        <p class="text-xs text-red-400 empty:hidden"
+           data-hub-settings-target="promptError"></p>
+      </div>
+      <div class="px-5 py-4 border-t border-zinc-800 bg-zinc-950/30 flex gap-2 justify-end">
+        <button type="button"
+                command="close"
+                commandfor="settings-prompt-modal"
+                class="px-4 py-2 text-sm font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">
+          Cancel
+        </button>
+        <button type="button"
+                data-action="hub-settings#promptConfirm"
+                class="px-4 py-2 text-sm font-medium text-white rounded transition-colors
+                       group-data-[mode=prompt]/prompt:bg-primary-600 group-data-[mode=prompt]/prompt:hover:bg-primary-500
+                       group-data-[mode=confirm]/prompt:bg-red-600 group-data-[mode=confirm]/prompt:hover:bg-red-500">
+          <span class="group-data-[mode=prompt]/prompt:inline hidden">Create</span>
+          <span class="group-data-[mode=confirm]/prompt:inline hidden">Delete</span>
+        </button>
+      </div>
+    </div>
+  <% end %>
+
   <%# Content %>
   <div class="flex-1 overflow-y-auto">
     <div class="max-w-4xl mx-auto px-4 py-6 lg:py-8">
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
 
-        <%# File List (left) %>
+        <%# Tree Navigation (left) — data-view drives which child is visible %>
         <div class="lg:col-span-1">
-          <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4">
-            <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-4">Config Files</h2>
+          <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 group/tree"
+               data-hub-settings-target="treePanel"
+               data-view="loading">
 
-            <%# Loading state %>
-            <div data-hub-settings-target="loading" class="py-4 text-center">
-              <p class="text-sm text-zinc-500">Connecting to hub...</p>
+            <%# Loading / Disconnected feedback %>
+            <div class="group-data-[view=loading]/tree:block group-data-[view=disconnected]/tree:block hidden py-4 text-center">
+              <p class="text-sm text-zinc-500"
+                 data-hub-settings-target="treeFeedback">Connecting to hub...</p>
             </div>
 
-            <%# File list %>
-            <div data-hub-settings-target="fileList" class="hidden space-y-2">
-              <% @config_files.each do |file| %>
-                <button type="button"
-                        data-hub-settings-target="fileEntry"
-                        data-file-name="<%= file[:name] %>"
-                        data-action="hub-settings#selectFile"
-                        class="w-full text-left px-3 py-2.5 rounded-lg border border-zinc-700/50 hover:border-zinc-700 hover:bg-zinc-800/50 transition-colors group">
-                  <div class="flex items-center justify-between">
-                    <div class="min-w-0">
-                      <div class="text-sm font-mono text-zinc-200 truncate"><%= file[:name] %></div>
-                      <div class="text-xs text-zinc-500 mt-0.5"><%= file[:description] %></div>
-                    </div>
-                    <span data-hub-settings-target="fileStatus"
-                          data-file-name="<%= file[:name] %>"
-                          class="shrink-0 ml-2 text-xs px-1.5 py-0.5 rounded">
-                    </span>
-                  </div>
-                </button>
-              <% end %>
+            <%# Empty state — no .botster/ directory %>
+            <div class="group-data-[view=empty]/tree:block hidden text-center py-6">
+              <p class="text-sm text-zinc-500 mb-3">No .botster/ directory found</p>
+              <button type="button"
+                      data-action="hub-settings#initBotster"
+                      class="px-3 py-1.5 text-xs font-medium text-primary-400 bg-primary-500/10 border border-primary-500/30 rounded hover:bg-primary-500/20 transition-colors">
+                Initialize .botster/
+              </button>
+            </div>
+
+            <%# Tree view — dynamically rendered by Stimulus %>
+            <div data-hub-settings-target="treeContainer"
+                 class="group-data-[view=tree]/tree:block hidden space-y-4">
             </div>
           </div>
         </div>
 
-        <%# Editor (right) %>
+        <%# Editor (right) — data-editor drives which child + buttons are visible %>
         <div class="lg:col-span-2">
-          <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg">
+          <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg group/editor"
+               data-hub-settings-target="editorPanel"
+               data-editor="empty">
+
             <%# Editor header %>
             <div class="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
               <div class="min-w-0">
-                <span data-hub-settings-target="editorTitle" class="text-sm font-mono text-zinc-400">
+                <span data-hub-settings-target="editorTitle"
+                      class="text-sm font-mono text-zinc-400">
                   Select a file
                 </span>
               </div>
-              <div class="flex items-center gap-2" data-hub-settings-target="editorActions">
+              <div class="flex items-center gap-2">
                 <button type="button"
-                        data-hub-settings-target="revertBtn"
                         data-action="hub-settings#revert"
-                        class="hidden px-3 py-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">
+                        class="group-data-[editor=editing]/editor:block hidden px-3 py-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">
                   Revert
                 </button>
                 <button type="button"
                         data-hub-settings-target="saveBtn"
                         data-action="hub-settings#save"
-                        class="hidden px-3 py-1.5 text-xs font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        class="group-data-[editor=editing]/editor:block hidden px-3 py-1.5 text-xs font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                         disabled>
                   Save
                 </button>
                 <button type="button"
                         data-hub-settings-target="createBtn"
                         data-action="hub-settings#createFile"
-                        class="hidden px-3 py-1.5 text-xs font-medium text-primary-400 hover:text-primary-300 bg-primary-500/10 hover:bg-primary-500/20 border border-primary-500/30 rounded transition-colors">
+                        class="group-data-[editor=creating]/editor:block hidden px-3 py-1.5 text-xs font-medium text-primary-400 hover:text-primary-300 bg-primary-500/10 hover:bg-primary-500/20 border border-primary-500/30 rounded transition-colors">
                   Create
                 </button>
                 <button type="button"
                         data-hub-settings-target="deleteBtn"
                         data-action="hub-settings#deleteFile"
-                        class="hidden px-3 py-1.5 text-xs font-medium text-red-400 hover:text-red-300 bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 rounded transition-colors">
+                        class="group-data-[editor=editing]/editor:block hidden px-3 py-1.5 text-xs font-medium text-red-400 hover:text-red-300 bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 rounded transition-colors">
                   Delete
                 </button>
               </div>
             </div>
 
             <%# Empty state %>
-            <div data-hub-settings-target="editorEmpty" class="py-16 text-center">
+            <div class="group-data-[editor=empty]/editor:block hidden py-16 text-center">
               <%= icon "document-text", class: "size-12 text-zinc-700 mx-auto mb-4" %>
               <p class="text-sm text-zinc-500">Select a config file to edit</p>
             </div>
 
             <%# Loading state %>
-            <div data-hub-settings-target="editorLoading" class="hidden py-16 text-center">
+            <div class="group-data-[editor=loading]/editor:block hidden py-16 text-center">
               <p class="text-sm text-zinc-500">Loading...</p>
             </div>
 
-            <%# Textarea %>
-            <div data-hub-settings-target="editorWrapper" class="hidden">
+            <%# Textarea — visible in editing and creating modes %>
+            <div class="group-data-[editor=editing]/editor:block group-data-[editor=creating]/editor:block hidden">
               <textarea data-hub-settings-target="editor"
                         data-action="input->hub-settings#onEditorInput"
                         class="w-full min-h-[400px] p-4 bg-transparent text-sm font-mono text-zinc-200 placeholder-zinc-600 border-0 focus:ring-0 focus:outline-none resize-y"
@@ -122,8 +161,9 @@
             </div>
 
             <%# Error state %>
-            <div data-hub-settings-target="editorError" class="hidden py-16 text-center">
-              <p class="text-sm text-red-400" data-hub-settings-target="editorErrorMsg"></p>
+            <div class="group-data-[editor=error]/editor:block hidden py-16 text-center">
+              <p class="text-sm text-red-400"
+                 data-hub-settings-target="editorErrorMsg"></p>
             </div>
           </div>
         </div>

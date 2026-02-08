@@ -54,7 +54,7 @@ pub mod types;
 
 pub use state::{build_agent_info, build_scrollback_message, build_worktree_info, BrowserState};
 
-pub use types::{AgentInfo, BrowserCommand, BrowserResize, TerminalMessage, WorktreeInfo};
+pub use types::{AgentInfo, BrowserCommand, BrowserResize, SessionInfo, TerminalMessage, WorktreeInfo};
 
 pub use olm_crypto::{
     binary_format, DeviceKeyBundle, OlmEnvelope, VodozemacCrypto, VodozemacCryptoState,

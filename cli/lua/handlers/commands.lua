@@ -23,6 +23,19 @@ commands.register("list_worktrees", function(client, sub_id, _command)
     client:send_worktree_list(sub_id)
 end, { description = "Send worktree list to client" })
 
+commands.register("list_profiles", function(client, sub_id, _command)
+    local ConfigResolver = require("lib.config_resolver")
+    local repo_root = worktree.repo_root()
+    local profiles = ConfigResolver.list_profiles(repo_root)
+    local shared_agent = ConfigResolver.has_shared_agent(repo_root)
+    client:send({
+        subscriptionId = sub_id,
+        type = "profiles",
+        profiles = profiles,
+        shared_agent = shared_agent,
+    })
+end, { description = "List available config profiles" })
+
 -- ============================================================================
 -- Agent Lifecycle Commands
 -- ============================================================================
@@ -31,10 +44,12 @@ commands.register("create_agent", function(client, _sub_id, command)
     local issue_or_branch = command.issue_or_branch or command.branch
     local prompt = command.prompt
     local from_worktree = command.from_worktree
+    local profile = command.profile
 
-    require("handlers.agents").handle_create_agent(issue_or_branch, prompt, from_worktree, client)
-    log.info(string.format("Create agent request: %s", tostring(issue_or_branch or "main")))
-end, { description = "Create a new agent (with optional worktree)" })
+    require("handlers.agents").handle_create_agent(issue_or_branch, prompt, from_worktree, client, profile)
+    log.info(string.format("Create agent request: %s (profile: %s)",
+        tostring(issue_or_branch or "main"), tostring(profile or "auto")))
+end, { description = "Create a new agent (with optional worktree and profile)" })
 
 commands.register("reopen_worktree", function(client, _sub_id, command)
     local path = command.path
@@ -42,7 +57,7 @@ commands.register("reopen_worktree", function(client, _sub_id, command)
     local prompt = command.prompt
 
     if path then
-        require("handlers.agents").handle_create_agent(branch, prompt, path, client)
+        require("handlers.agents").handle_create_agent(branch, prompt, path, client, command.profile)
         log.info(string.format("Reopen worktree request: %s", path))
     else
         log.warn("reopen_worktree missing path")

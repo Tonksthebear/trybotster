@@ -140,6 +140,21 @@ pub enum TerminalMessage {
     },
 }
 
+/// Info about a single PTY session within an agent.
+///
+/// Part of the dynamic sessions model where agents can have N sessions
+/// (agent, server, watcher, etc.) instead of just cli + server.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// Session name (e.g., "agent", "server", "watcher").
+    pub name: String,
+    /// Whether this session has port forwarding enabled.
+    pub port_forward: bool,
+    /// Allocated port number, if port forwarding is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
 /// Agent info for list response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
@@ -155,14 +170,18 @@ pub struct AgentInfo {
     pub name: Option<String>,
     /// Current agent status (e.g., "Running", "Idle").
     pub status: Option<String>,
+    /// Ordered list of PTY sessions (agent first, then alphabetical).
+    ///
+    /// Browser checks this field first for dynamic tab rendering.
+    /// Falls back to `has_server_pty`/`port` for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<Vec<SessionInfo>>,
     /// Port number for the agent's HTTP forwarding.
     pub port: Option<u16>,
     /// Whether a dev server is running.
     pub server_running: Option<bool>,
     /// Whether a server PTY exists.
     pub has_server_pty: Option<bool>,
-    /// Currently active PTY view ("cli" or "server").
-    pub active_pty_view: Option<String>,
     /// Scrollback offset in lines.
     pub scroll_offset: Option<u32>,
     /// Hub identifier where this agent runs.
@@ -233,6 +252,9 @@ pub enum BrowserCommand {
         issue_or_branch: Option<String>,
         /// Initial prompt for the agent.
         prompt: Option<String>,
+        /// Config profile name (auto-selected if only one exists).
+        #[serde(default)]
+        profile: Option<String>,
     },
     /// Reopen an existing worktree.
     #[serde(rename = "reopen_worktree")]
@@ -317,10 +339,13 @@ mod tests {
                 branch_name: Some("botster-issue-42".to_string()),
                 name: None,
                 status: Some("Running".to_string()),
+                sessions: Some(vec![
+                    SessionInfo { name: "agent".to_string(), port_forward: false, port: None },
+                    SessionInfo { name: "server".to_string(), port_forward: true, port: Some(3000) },
+                ]),
                 port: Some(3000),
                 server_running: Some(true),
                 has_server_pty: Some(true),
-                active_pty_view: Some("cli".to_string()),
                 scroll_offset: Some(0),
                 hub_identifier: Some("hub-123".to_string()),
             }],
@@ -447,9 +472,11 @@ mod tests {
             BrowserCommand::CreateAgent {
                 issue_or_branch,
                 prompt,
+                profile,
             } => {
                 assert_eq!(issue_or_branch, Some("42".to_string()));
                 assert_eq!(prompt, Some("Fix the bug".to_string()));
+                assert_eq!(profile, None);
             }
             _ => panic!("Wrong variant"),
         }

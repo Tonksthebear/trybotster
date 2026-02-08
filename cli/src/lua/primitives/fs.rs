@@ -58,6 +58,7 @@ use mlua::Lua;
 /// - `fs.copy(src, dst)` - Copy a file
 /// - `fs.listdir(path)` - List entries in a directory
 /// - `fs.is_dir(path)` - Check if path is a directory
+/// - `fs.rmdir(path)` - Recursively remove a directory and all contents
 ///
 /// # Errors
 ///
@@ -216,6 +217,32 @@ pub fn register(lua: &Lua) -> Result<()> {
     fs_table
         .set("mkdir", mkdir_fn)
         .map_err(|e| anyhow!("Failed to set fs.mkdir: {e}"))?;
+
+    // fs.rmdir(path) -> (true, nil) or (nil, error_string)
+    //
+    // Recursively removes a directory and all of its contents.
+    // Fails if the path does not exist or is not a directory.
+    let rmdir_fn = lua
+        .create_function(|_, path: String| {
+            let p = Path::new(&path);
+            if !p.exists() {
+                return Ok((None::<bool>, Some("Path does not exist".to_string())));
+            }
+            if !p.is_dir() {
+                return Ok((None::<bool>, Some("Path is not a directory".to_string())));
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => Ok((Some(true), None::<String>)),
+                Err(e) => {
+                    Ok((None::<bool>, Some(format!("Failed to remove directory: {e}"))))
+                }
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create fs.rmdir function: {e}"))?;
+
+    fs_table
+        .set("rmdir", rmdir_fn)
+        .map_err(|e| anyhow!("Failed to set fs.rmdir: {e}"))?;
 
     // fs.stat(path) -> (table, nil) or (nil, error_string)
     //

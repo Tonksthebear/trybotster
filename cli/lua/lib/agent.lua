@@ -2,9 +2,12 @@
 --
 -- Each Agent instance tracks:
 -- - Repository and issue/branch metadata
--- - One or more named PTY sessions (cli, server, etc.)
+-- - One or more named PTY sessions in deterministic order
 -- - Worktree path and lifecycle state
 -- - Environment variables for spawned processes
+--
+-- Sessions are ordered: agent always first (index 0 in Rust), then
+-- alphabetical. The order is set at creation time via config resolver.
 --
 -- Manages agent lifecycle: creation, tracking, metadata, and cleanup.
 --
@@ -24,42 +27,6 @@ local agents = state.get("agent_registry", {})
 local port_state = state.get("agent_port_state", { next_port = 8080 })
 
 -- =============================================================================
--- Default Session Configurations
--- =============================================================================
-
---- Default session config: CLI only.
--- @return Table of session configs keyed by name
-function Agent.default_sessions()
-    return {
-        cli = {
-            command = "bash",
-            init_script = ".botster_init",
-            notifications = true,
-            forward_port = false,
-        },
-    }
-end
-
---- Default session config: CLI + server.
--- @return Table of session configs keyed by name
-function Agent.default_sessions_with_server()
-    return {
-        cli = {
-            command = "bash",
-            init_script = ".botster_init",
-            notifications = true,
-            forward_port = false,
-        },
-        server = {
-            command = "bash",
-            init_script = ".botster_server",
-            notifications = false,
-            forward_port = true,
-        },
-    }
-end
-
--- =============================================================================
 -- Constructor
 -- =============================================================================
 
@@ -72,7 +39,8 @@ end
 --   worktree_path   string   (required)
 --   prompt          string   (optional)  task description
 --   invocation_url  string   (optional)  GitHub URL
---   sessions        table    (optional)  named session configs, defaults to default_sessions()
+--   sessions        array    (required)  ordered session configs from config resolver:
+--                              { name, command, init_script, notifications, forward_port }
 --   env             table    (optional)  base environment variables
 --   dims            table    (optional)  { rows = 24, cols = 80 }
 --
@@ -82,6 +50,7 @@ function Agent.new(config)
     assert(config.repo, "Agent.new requires config.repo")
     assert(config.branch_name, "Agent.new requires config.branch_name")
     assert(config.worktree_path, "Agent.new requires config.worktree_path")
+    assert(config.sessions and #config.sessions > 0, "Agent.new requires config.sessions array")
 
     -- NOTE: before_agent_create hook fires in handlers/agents.lua (high-level params).
     -- Agent.new() is a low-level constructor and does NOT re-fire the hook.
@@ -95,7 +64,8 @@ function Agent.new(config)
         invocation_url = config.invocation_url,
         created_at = os.time(),
         status = "running",
-        sessions = {},  -- name -> PtySessionHandle
+        sessions = {},        -- name -> PtySessionHandle (for lookup by name)
+        session_order = {},   -- ordered array of { name, port_forward, port }
     }, Agent)
 
     local key = self:agent_key()
@@ -120,44 +90,56 @@ function Agent.new(config)
         cols = config.dims.cols or 80
     end
 
-    -- Determine session configuration
-    local session_configs = config.sessions or Agent.default_sessions()
+    -- Ordered array of PtySessionHandle for hub.register_agent()
+    local ordered_handles = {}
 
-    -- Spawn each configured session
-    for name, session_config in pairs(session_configs) do
+    -- Spawn sessions in order (ipairs guarantees deterministic iteration)
+    for _, session_config in ipairs(config.sessions) do
+        local name = session_config.name
+
+        -- Shallow-copy env per session to prevent PORT leaking across sessions
+        local session_env = {}
+        for k, v in pairs(env) do
+            session_env[k] = v
+        end
+
         local spawn_config = {
             worktree_path = config.worktree_path,
             command = session_config.command or "bash",
-            env = env,
+            env = session_env,
             detect_notifications = session_config.notifications or false,
             rows = rows,
             cols = cols,
         }
 
-        -- Build init_commands from init_script
+        -- Build init_commands from init_script (absolute path from config resolver)
         if session_config.init_script then
-            local script_path = config.worktree_path .. "/" .. session_config.init_script
-            if fs.exists(script_path) then
+            if fs.exists(session_config.init_script) then
                 spawn_config.init_commands = { "source " .. session_config.init_script }
             else
-                log.debug(string.format("Init script not found: %s", script_path))
+                log.debug(string.format("Init script not found: %s", session_config.init_script))
             end
         end
 
         -- Allocate port for forward_port sessions
+        local port = nil
         if session_config.forward_port then
-            local port = port_state.next_port
+            port = port_state.next_port
             port_state.next_port = port + 1
             spawn_config.port = port
-            -- Also inject port into env for the spawned process
-            spawn_config.env = spawn_config.env or {}
-            spawn_config.env.BOTSTER_TUNNEL_PORT = tostring(port)
+            session_env.PORT = tostring(port)
         end
 
         local ok, handle = pcall(pty.spawn, spawn_config)
         if ok then
             self.sessions[name] = handle
-            log.info(string.format("Agent %s: spawned session '%s'", key, name))
+            ordered_handles[#ordered_handles + 1] = handle
+            self.session_order[#self.session_order + 1] = {
+                name = name,
+                port_forward = session_config.forward_port or false,
+                port = port,
+            }
+            log.info(string.format("Agent %s: spawned session '%s' (pty_index %d)", key, name, #ordered_handles - 1))
         else
             log.error(string.format("Agent %s: failed to spawn session '%s': %s",
                 key, name, tostring(handle)))
@@ -166,16 +148,11 @@ function Agent.new(config)
 
     -- Register PTY handles with HandleCache for Rust-side access
     -- (enables write_pty, resize_pty, forwarders, etc.)
-    local session_count = self:session_count()
+    local session_count = #ordered_handles
     log.info(string.format("Agent %s: spawned %d sessions, preparing to register", key, session_count))
 
-    -- Log what sessions we have
-    for name, handle in pairs(self.sessions) do
-        log.info(string.format("Agent %s: session '%s' = %s", key, name, tostring(handle)))
-    end
-
     if session_count > 0 then
-        local ok, result = pcall(hub.register_agent, key, self.sessions)
+        local ok, result = pcall(hub.register_agent, key, ordered_handles)
         if ok then
             self.agent_index = result
             log.info(string.format("Agent %s: registered with HandleCache at index %d", key, result))
@@ -192,7 +169,7 @@ function Agent.new(config)
     -- Notify observers
     hooks.notify("after_agent_create", self)
 
-    log.info(string.format("Agent created: %s (sessions: %d)", key, self:session_count()))
+    log.info(string.format("Agent created: %s (sessions: %d)", key, session_count))
     return self
 end
 
@@ -236,6 +213,7 @@ function Agent:close(delete_worktree)
         end
     end
     self.sessions = {}
+    self.session_order = {}
     self.status = "closed"
 
     -- Remove from registry
@@ -259,11 +237,7 @@ end
 --- Count active sessions.
 -- @return number
 function Agent:session_count()
-    local count = 0
-    for _ in pairs(self.sessions) do
-        count = count + 1
-    end
-    return count
+    return #(self.session_order or {})
 end
 
 --- Build environment variables for spawned sessions.
@@ -293,11 +267,26 @@ end
 
 --- Get agent metadata for clients.
 -- Returns a serializable table of agent info.
+-- Includes both new sessions[] array and backward-compat fields.
 -- @return table Agent info
 function Agent:info()
     local key = self:agent_key()
 
-    -- Determine server state
+    -- Build sessions array from session_order
+    local sessions_info = {}
+    for _, entry in ipairs(self.session_order or {}) do
+        local session_info = {
+            name = entry.name,
+            port_forward = entry.port_forward,
+        }
+        -- Get port from the PTY handle if port_forward is set
+        if entry.port then
+            session_info.port = entry.port
+        end
+        sessions_info[#sessions_info + 1] = session_info
+    end
+
+    -- Backward-compat: derive has_server_pty/port from sessions
     local has_server_pty = self.sessions.server ~= nil
     local server_running = false
     local port = nil
@@ -321,6 +310,9 @@ function Agent:info()
         branch_name = self.branch_name,
         worktree_path = self.worktree_path,
         status = self.status,
+        -- New: ordered sessions array
+        sessions = sessions_info,
+        -- Backward compat (browser checks sessions first, falls back to these)
         has_server_pty = has_server_pty,
         server_running = server_running,
         port = port,
