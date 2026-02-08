@@ -176,6 +176,159 @@ pub fn register(lua: &Lua) -> Result<()> {
         .set("is_dir", is_dir_fn)
         .map_err(|e| anyhow!("Failed to set fs.is_dir: {e}"))?;
 
+    // fs.delete(path) -> (true, nil) or (nil, error_string)
+    //
+    // Deletes a file or empty directory at the given path.
+    let delete_fn = lua
+        .create_function(|_, path: String| {
+            let p = Path::new(&path);
+            if !p.exists() {
+                return Ok((None::<bool>, Some("Path does not exist".to_string())));
+            }
+            let result = if p.is_dir() {
+                std::fs::remove_dir(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            match result {
+                Ok(()) => Ok((Some(true), None::<String>)),
+                Err(e) => Ok((None::<bool>, Some(format!("Failed to delete: {e}")))),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create fs.delete function: {e}"))?;
+
+    fs_table
+        .set("delete", delete_fn)
+        .map_err(|e| anyhow!("Failed to set fs.delete: {e}"))?;
+
+    // fs.mkdir(path) -> (true, nil) or (nil, error_string)
+    //
+    // Creates a directory and all parent directories.
+    let mkdir_fn = lua
+        .create_function(|_, path: String| {
+            match std::fs::create_dir_all(&path) {
+                Ok(()) => Ok((Some(true), None::<String>)),
+                Err(e) => Ok((None::<bool>, Some(format!("Failed to create directory: {e}")))),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create fs.mkdir function: {e}"))?;
+
+    fs_table
+        .set("mkdir", mkdir_fn)
+        .map_err(|e| anyhow!("Failed to set fs.mkdir: {e}"))?;
+
+    // fs.stat(path) -> (table, nil) or (nil, error_string)
+    //
+    // Returns { type = "file"|"dir", size = N, exists = true } or { exists = false }.
+    let stat_fn = lua
+        .create_function(|lua, path: String| {
+            let p = Path::new(&path);
+            if !p.exists() {
+                let table = lua.create_table()?;
+                table.set("exists", false)?;
+                return Ok((Some(table), None::<String>));
+            }
+            match std::fs::metadata(&path) {
+                Ok(meta) => {
+                    let table = lua.create_table()?;
+                    table.set("exists", true)?;
+                    table.set(
+                        "type",
+                        if meta.is_dir() { "dir" } else { "file" },
+                    )?;
+                    table.set("size", meta.len())?;
+                    Ok((Some(table), None::<String>))
+                }
+                Err(e) => Ok((None::<mlua::Table>, Some(format!("Failed to stat: {e}")))),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create fs.stat function: {e}"))?;
+
+    fs_table
+        .set("stat", stat_fn)
+        .map_err(|e| anyhow!("Failed to set fs.stat: {e}"))?;
+
+    // fs.resolve_safe(root, relative) -> (absolute_path, nil) or (nil, error_string)
+    //
+    // Security primitive: canonicalizes path, verifies it stays within root.
+    // Rejects absolute paths, `..` traversal, null bytes, symlink escapes.
+    let resolve_safe_fn = lua
+        .create_function(|_, (root, relative): (String, String)| {
+            // Reject null bytes
+            if relative.contains('\0') || root.contains('\0') {
+                return Ok((None::<String>, Some("Path contains null byte".to_string())));
+            }
+
+            // Reject absolute paths in the relative component
+            if relative.starts_with('/') || relative.starts_with('\\') {
+                return Ok((
+                    None::<String>,
+                    Some("Absolute paths not allowed".to_string()),
+                ));
+            }
+
+            // Reject explicit traversal patterns before canonicalization
+            // (catches cases where the target doesn't exist yet)
+            for component in relative.split('/') {
+                if component == ".." {
+                    return Ok((
+                        None::<String>,
+                        Some("Path traversal not allowed".to_string()),
+                    ));
+                }
+            }
+
+            let root_path = match std::fs::canonicalize(&root) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok((
+                        None::<String>,
+                        Some(format!("Failed to resolve root: {e}")),
+                    ))
+                }
+            };
+
+            let joined = root_path.join(&relative);
+
+            // If the path exists, canonicalize to resolve symlinks
+            let resolved = if joined.exists() {
+                match std::fs::canonicalize(&joined) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Ok((
+                            None::<String>,
+                            Some(format!("Failed to resolve path: {e}")),
+                        ))
+                    }
+                }
+            } else {
+                // For non-existent paths, normalize manually (no symlinks to resolve)
+                // We already rejected ".." components above
+                joined
+            };
+
+            // Verify the resolved path is within root
+            if !resolved.starts_with(&root_path) {
+                return Ok((
+                    None::<String>,
+                    Some("Path escapes root directory".to_string()),
+                ));
+            }
+
+            match resolved.to_str() {
+                Some(s) => Ok((Some(s.to_string()), None::<String>)),
+                None => Ok((
+                    None::<String>,
+                    Some("Path contains invalid UTF-8".to_string()),
+                )),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create fs.resolve_safe function: {e}"))?;
+
+    fs_table
+        .set("resolve_safe", resolve_safe_fn)
+        .map_err(|e| anyhow!("Failed to set fs.resolve_safe: {e}"))?;
+
     // Register the table globally
     lua.globals()
         .set("fs", fs_table)
@@ -323,6 +476,200 @@ mod tests {
         assert_eq!(ok, Some(true));
         assert!(err.is_none());
         assert_eq!(std::fs::read_to_string(&dst).unwrap(), "copy me");
+    }
+
+    #[test]
+    fn test_delete_file() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deleteme.txt");
+        std::fs::write(&path, "bye").unwrap();
+        assert!(path.exists());
+
+        let path_str = path.to_str().unwrap();
+        let (ok, err): (Option<bool>, Option<String>) = lua
+            .load(format!(r#"return fs.delete("{path_str}")"#))
+            .eval()
+            .expect("fs.delete should be callable");
+
+        assert_eq!(ok, Some(true));
+        assert!(err.is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_delete_nonexistent() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let (ok, err): (Option<bool>, Option<String>) = lua
+            .load(r#"return fs.delete("/nonexistent/path/file.txt")"#)
+            .eval()
+            .expect("fs.delete should be callable");
+
+        assert!(ok.is_none());
+        assert!(err.is_some());
+        assert!(err.unwrap().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_mkdir_creates_parents() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a").join("b").join("c");
+        let path_str = path.to_str().unwrap();
+
+        let (ok, err): (Option<bool>, Option<String>) = lua
+            .load(format!(r#"return fs.mkdir("{path_str}")"#))
+            .eval()
+            .expect("fs.mkdir should be callable");
+
+        assert_eq!(ok, Some(true));
+        assert!(err.is_none());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn test_stat_file() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello").unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let result: mlua::Table = lua
+            .load(format!(r#"
+                local stat, err = fs.stat("{path_str}")
+                return stat
+            "#))
+            .eval()
+            .expect("fs.stat should be callable");
+
+        assert_eq!(result.get::<bool>("exists").unwrap(), true);
+        assert_eq!(result.get::<String>("type").unwrap(), "file");
+        assert_eq!(result.get::<u64>("size").unwrap(), 5);
+    }
+
+    #[test]
+    fn test_stat_dir() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path_str = dir.path().to_str().unwrap();
+
+        let result: mlua::Table = lua
+            .load(format!(r#"
+                local stat, err = fs.stat("{path_str}")
+                return stat
+            "#))
+            .eval()
+            .expect("fs.stat should be callable");
+
+        assert_eq!(result.get::<bool>("exists").unwrap(), true);
+        assert_eq!(result.get::<String>("type").unwrap(), "dir");
+    }
+
+    #[test]
+    fn test_stat_nonexistent() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let result: mlua::Table = lua
+            .load(r#"
+                local stat, err = fs.stat("/nonexistent/path/file.txt")
+                return stat
+            "#)
+            .eval()
+            .expect("fs.stat should be callable");
+
+        assert_eq!(result.get::<bool>("exists").unwrap(), false);
+    }
+
+    #[test]
+    fn test_resolve_safe_normal_path() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root_str = dir.path().to_str().unwrap();
+
+        // Create a file so canonicalize works
+        std::fs::write(dir.path().join("test.txt"), "hello").unwrap();
+
+        let (resolved, err): (Option<String>, Option<String>) = lua
+            .load(format!(
+                r#"return fs.resolve_safe("{root_str}", "test.txt")"#
+            ))
+            .eval()
+            .expect("fs.resolve_safe should be callable");
+
+        assert!(resolved.is_some());
+        assert!(err.is_none());
+        assert!(resolved.unwrap().ends_with("test.txt"));
+    }
+
+    #[test]
+    fn test_resolve_safe_rejects_absolute() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root_str = dir.path().to_str().unwrap();
+
+        let (resolved, err): (Option<String>, Option<String>) = lua
+            .load(format!(
+                r#"return fs.resolve_safe("{root_str}", "/etc/passwd")"#
+            ))
+            .eval()
+            .expect("fs.resolve_safe should be callable");
+
+        assert!(resolved.is_none());
+        assert!(err.unwrap().contains("Absolute paths not allowed"));
+    }
+
+    #[test]
+    fn test_resolve_safe_rejects_traversal() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root_str = dir.path().to_str().unwrap();
+
+        let (resolved, err): (Option<String>, Option<String>) = lua
+            .load(format!(
+                r#"return fs.resolve_safe("{root_str}", "../../../etc/passwd")"#
+            ))
+            .eval()
+            .expect("fs.resolve_safe should be callable");
+
+        assert!(resolved.is_none());
+        assert!(err.unwrap().contains("traversal not allowed"));
+    }
+
+    #[test]
+    fn test_resolve_safe_rejects_null_byte() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root_str = dir.path().to_str().unwrap();
+
+        let (resolved, err): (Option<String>, Option<String>) = lua
+            .load(format!(
+                r#"return fs.resolve_safe("{root_str}", "test\0.txt")"#
+            ))
+            .eval()
+            .expect("fs.resolve_safe should be callable");
+
+        assert!(resolved.is_none());
+        assert!(err.unwrap().contains("null byte"));
     }
 
     #[test]

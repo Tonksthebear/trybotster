@@ -67,6 +67,10 @@ safe_require("handlers.tui")
 -- Must load after transports; uses require() for lazy handler access.
 safe_require("handlers.commands")
 
+-- Load filesystem command handlers (fs:read, fs:write, fs:list, etc.)
+-- Must load after commands registry.
+safe_require("handlers.filesystem")
+
 -- ============================================================================
 -- Event Subscriptions (Logging)
 -- ============================================================================

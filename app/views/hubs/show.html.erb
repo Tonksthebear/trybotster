@@ -23,20 +23,26 @@
       <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6 mb-6">
         <div class="flex items-center justify-between mb-4">
           <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider">Hub Information</h2>
-          <%= render Elements::ButtonComponent.new(color: :neutral, variant: :ghost, size: :sm,
-                data: {
-                  controller: "requires-connection share-hub",
-                  requires_connection_key_value: Current.hub.id,
-                  share_hub_hub_id_value: Current.hub.id,
-                  action: "share-hub#open"
-                },
-                command: "show-modal",
-                commandfor: "share-hub-modal",
-                title: "Share Hub",
-                disabled: true) do %>
-            <%= icon "share", class: "size-3.5" %>
-            <span>Share</span>
-          <% end %>
+          <div class="flex items-center gap-2">
+            <%= link_to hub_settings_path(Current.hub), class: "inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 rounded-lg transition-colors" do %>
+              <%= icon "cog-6-tooth", class: "size-3.5" %>
+              <span>Settings</span>
+            <% end %>
+            <%= render Elements::ButtonComponent.new(color: :neutral, variant: :ghost, size: :sm,
+                  data: {
+                    controller: "requires-connection share-hub",
+                    requires_connection_key_value: Current.hub.id,
+                    share_hub_hub_id_value: Current.hub.id,
+                    action: "share-hub#open"
+                  },
+                  command: "show-modal",
+                  commandfor: "share-hub-modal",
+                  title: "Share Hub",
+                  disabled: true) do %>
+              <%= icon "share", class: "size-3.5" %>
+              <span>Share</span>
+            <% end %>
+          </div>
         </div>
         <dl class="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
