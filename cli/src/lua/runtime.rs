@@ -22,6 +22,8 @@ use super::primitives::pty::{PtyOutputContext, PtyRequest, PtyRequestQueue};
 use super::primitives::tui::{
     registry_keys as tui_registry_keys, TuiSendQueue, TuiSendRequest,
 };
+use super::primitives::http::HttpAsyncRegistry;
+use super::primitives::timer::TimerRegistry;
 use super::primitives::watch::WatcherRegistry;
 use super::primitives::webrtc::{registry_keys, WebRtcSendQueue, WebRtcSendRequest};
 
@@ -77,6 +79,10 @@ pub struct LuaRuntime {
     event_callbacks: SharedEventCallbacks,
     /// Registry of active user file watches (for `watch.directory()`).
     watcher_registry: WatcherRegistry,
+    /// Registry of active timers (for `timer.after()` and `timer.every()`).
+    timer_registry: TimerRegistry,
+    /// Registry of async HTTP requests (for `http.request()`).
+    http_registry: HttpAsyncRegistry,
     /// Cached compiled function for PTY output interceptor calls.
     pty_hook_fn: Option<mlua::RegistryKey>,
     /// Cached reusable context table for PTY output interceptor calls.
@@ -93,6 +99,12 @@ impl std::fmt::Debug for LuaRuntime {
         let wt_queue_len = self.worktree_request_queue.lock().map(|q| q.len()).unwrap_or(0);
         let event_cb_count = self.event_callbacks.lock().map(|c| c.callback_count()).unwrap_or(0);
         let watch_count = self.watcher_registry.lock().map(|w| w.len()).unwrap_or(0);
+        let timer_count = self.timer_registry.lock().map(|t| t.len()).unwrap_or(0);
+        let (http_pending, http_in_flight) = self
+            .http_registry
+            .lock()
+            .map(|h| (h.pending_count(), h.in_flight_count()))
+            .unwrap_or((0, 0));
         f.debug_struct("LuaRuntime")
             .field("base_path", &self.base_path)
             .field("strict", &self.strict)
@@ -105,6 +117,9 @@ impl std::fmt::Debug for LuaRuntime {
             .field("worktree_queue_len", &wt_queue_len)
             .field("event_callback_count", &event_cb_count)
             .field("active_watches", &watch_count)
+            .field("active_timers", &timer_count)
+            .field("http_pending", &http_pending)
+            .field("http_in_flight", &http_in_flight)
             .finish_non_exhaustive()
     }
 }
@@ -160,6 +175,12 @@ impl LuaRuntime {
         // Create watcher registry for watch.directory()
         let watcher_registry = primitives::new_watcher_registry();
 
+        // Create timer registry for timer.after() / timer.every()
+        let timer_registry = primitives::new_timer_registry();
+
+        // Create HTTP async registry for http.request()
+        let http_registry = primitives::new_http_registry();
+
         // Register all primitives
         primitives::register_all(&lua).context("Failed to register Lua primitives")?;
 
@@ -182,6 +203,14 @@ impl LuaRuntime {
         // Register watch primitives with the watcher registry
         primitives::register_watch(&lua, Arc::clone(&watcher_registry))
             .context("Failed to register watch primitives")?;
+
+        // Register timer primitives with the timer registry
+        primitives::register_timer(&lua, Arc::clone(&timer_registry))
+            .context("Failed to register timer primitives")?;
+
+        // Register HTTP primitives with the async registry
+        primitives::register_http(&lua, Arc::clone(&http_registry))
+            .context("Failed to register HTTP primitives")?;
 
         // Note: Hub, connection, and worktree primitives are registered later via
         // register_hub_primitives() because they need a HandleCache reference from Hub
@@ -208,6 +237,8 @@ impl LuaRuntime {
             worktree_request_queue,
             event_callbacks,
             watcher_registry,
+            timer_registry,
+            http_registry,
             pty_hook_fn: None,
             pty_hook_ctx: None,
         })
@@ -235,8 +266,10 @@ impl LuaRuntime {
         // - {base}/lib/?.lua - library modules (client, utils)
         // - {base}/handlers/?.lua - handler modules (webrtc)
         // - {base}/core/?.lua - core modules (state, hooks, loader)
+        // - {base}/plugins/?.lua - user plugins
+        // - {base}/plugins/?/init.lua - user plugin packages
         let new_path = format!(
-            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/core/?.lua;{current}",
+            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/core/?.lua;{path}/plugins/?.lua;{path}/plugins/?/init.lua;{current}",
             path = base_path.display(),
             current = current_path
         );
@@ -278,7 +311,7 @@ impl LuaRuntime {
 
         // Prepend the additional path to package.path so embedded modules are found first
         let new_path = format!(
-            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/core/?.lua;{current}",
+            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/core/?.lua;{path}/plugins/?.lua;{path}/plugins/?/init.lua;{current}",
             path = additional_path.display(),
             current = current_path
         );
@@ -480,6 +513,91 @@ impl LuaRuntime {
         Ok(())
     }
 
+    /// Extract embedded Lua files to the filesystem for hot-reload support.
+    ///
+    /// On first run (or version upgrade), extracts all embedded Lua files
+    /// to `~/.botster/lua/`. This enables hot-reload even in release builds:
+    /// the agent can modify Lua files on disk and the hub reloads them.
+    ///
+    /// Also creates `plugins/` and `improvements/` subdirectories for
+    /// user extensions.
+    ///
+    /// # Version Check
+    ///
+    /// A `.version` file tracks which binary version extracted the files.
+    /// Extraction is skipped if the version matches, preserving any user
+    /// edits. On upgrade, files are overwritten with the new version.
+    ///
+    /// # Returns
+    ///
+    /// The path where files were extracted (`~/.botster/lua/`), or an error
+    /// if extraction fails.
+    pub fn ensure_lua_on_filesystem(&mut self) -> Result<PathBuf> {
+        use super::embedded;
+
+        let files = embedded::all();
+        if files.is_empty() {
+            return Err(anyhow!("No embedded Lua files to extract"));
+        }
+
+        let data_dir = dirs::home_dir()
+            .ok_or_else(|| anyhow!("Cannot determine home directory"))?
+            .join(".botster")
+            .join("lua");
+
+        let version_file = data_dir.join(".version");
+        let current_version = env!("CARGO_PKG_VERSION");
+
+        let needs_extract = if version_file.exists() {
+            let existing = std::fs::read_to_string(&version_file).unwrap_or_default();
+            existing.trim() != current_version
+        } else {
+            true
+        };
+
+        if needs_extract {
+            log::info!(
+                "Extracting {} embedded Lua files to {} (version {})",
+                files.len(),
+                data_dir.display(),
+                current_version
+            );
+
+            for (path, content) in files {
+                let full_path = data_dir.join(path);
+                if let Some(parent) = full_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+                }
+                std::fs::write(&full_path, content)
+                    .with_context(|| format!("Failed to write: {}", full_path.display()))?;
+            }
+
+            // Create extension directories
+            std::fs::create_dir_all(data_dir.join("plugins"))
+                .context("Failed to create plugins directory")?;
+            std::fs::create_dir_all(data_dir.join("improvements"))
+                .context("Failed to create improvements directory")?;
+
+            // Write version marker last (so partial extraction retries)
+            std::fs::write(&version_file, current_version)
+                .context("Failed to write version file")?;
+
+            log::info!("Lua extraction complete");
+        } else {
+            log::debug!(
+                "Lua files already extracted (version {})",
+                current_version
+            );
+        }
+
+        // Update runtime to use the extracted path
+        self.set_base_path(data_dir.clone());
+        Self::setup_package_path(&self.lua, &data_dir)?;
+
+        Ok(data_dir)
+    }
+
     /// Call a global Lua function.
     ///
     /// Looks up a function in the global table and invokes it with the
@@ -663,6 +781,34 @@ impl LuaRuntime {
     pub fn poll_user_file_watches(&self) -> usize {
         use super::primitives::watch;
         watch::poll_user_watches(&self.lua, &self.watcher_registry)
+    }
+
+    /// Poll timers and fire Lua callbacks for any that have expired.
+    ///
+    /// Checks all registered timers against the current time, fires callbacks
+    /// for expired timers, reschedules repeating timers, and removes completed
+    /// or cancelled entries.
+    ///
+    /// Call this periodically in the event loop (each tick).
+    ///
+    /// # Returns
+    ///
+    /// The number of timer callbacks fired.
+    pub fn poll_timers(&self) -> usize {
+        use super::primitives::timer;
+        timer::poll_timers(&self.lua, &self.timer_registry)
+    }
+
+    /// Poll for completed async HTTP responses and fire Lua callbacks.
+    ///
+    /// Call this each tick in the Hub event loop.
+    ///
+    /// # Returns
+    ///
+    /// The number of HTTP callbacks fired.
+    pub fn poll_http_responses(&self) -> usize {
+        use super::primitives::http;
+        http::poll_http_responses(&self.lua, &self.http_registry)
     }
 
     /// Reload a single Lua module via the loader.

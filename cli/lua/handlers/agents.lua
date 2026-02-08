@@ -110,7 +110,7 @@ end
 -- @param agent_key string       Pre-computed agent key for status broadcasts
 -- @return Agent|nil             The created agent, or nil on error
 local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key)
-    local repo = os.getenv("BOTSTER_REPO") or "unknown/repo"
+    local repo = config.env("BOTSTER_REPO") or "unknown/repo"
 
     -- Broadcast: spawning PTYs
     notify_lifecycle(agent_key, "spawning_ptys")
@@ -169,6 +169,21 @@ end
 -- @param client table|nil            Requesting client (for progress/dims)
 -- @return Agent|nil                  The created agent, or nil on error
 local function handle_create_agent(issue_or_branch, prompt, from_worktree, client)
+    -- Interceptor: plugins can transform params or block creation (return nil)
+    local params = hooks.call("before_agent_create", {
+        issue_or_branch = issue_or_branch,
+        prompt = prompt,
+        from_worktree = from_worktree,
+    })
+    if params == nil then
+        log.info("before_agent_create interceptor blocked agent creation")
+        return nil
+    end
+    -- Allow interceptors to modify fields
+    issue_or_branch = params.issue_or_branch
+    prompt = params.prompt
+    from_worktree = params.from_worktree
+
     -- Main repo mode: no issue_or_branch AND no from_worktree
     if not issue_or_branch and not from_worktree then
         local repo_root = worktree.repo_root()
@@ -176,7 +191,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
             log.error("No issue_or_branch and no repo root detected")
             return nil
         end
-        local repo = os.getenv("BOTSTER_REPO") or "unknown/repo"
+        local repo = config.env("BOTSTER_REPO") or "unknown/repo"
         local agent_key = build_agent_key(repo, nil, "main")
         return spawn_agent("main", nil, repo_root, prompt or "Work on the main branch", client, agent_key)
     end
@@ -189,7 +204,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     end
 
     -- Detect repo
-    local repo = os.getenv("BOTSTER_REPO") or "unknown/repo"
+    local repo = config.env("BOTSTER_REPO") or "unknown/repo"
 
     -- Build agent key for status broadcasts and duplicate checking
     local agent_key = build_agent_key(repo, issue_number, branch_name)
@@ -230,6 +245,19 @@ end
 -- @param delete_worktree boolean  Whether to also delete the worktree
 -- @return boolean                 True if agent was found and deleted
 local function handle_delete_agent(agent_key, delete_worktree)
+    -- Interceptor: plugins can block deletion (return nil)
+    local config = hooks.call("before_agent_delete", {
+        agent_key = agent_key,
+        delete_worktree = delete_worktree,
+    })
+    if config == nil then
+        log.info("before_agent_delete interceptor blocked agent deletion")
+        return false
+    end
+    -- Allow interceptors to modify fields
+    agent_key = config.agent_key
+    delete_worktree = config.delete_worktree
+
     local agent = Agent.get(agent_key)
     if not agent then
         log.warn("Cannot delete unknown agent: " .. tostring(agent_key))

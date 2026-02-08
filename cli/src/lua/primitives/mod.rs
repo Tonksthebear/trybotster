@@ -8,11 +8,15 @@
 //! - `log` - Logging functions (info, warn, error, debug)
 //! - `webrtc` - WebRTC peer connection and messaging
 //! - `pty` - PTY terminal operations (forwarders, input, resize)
-//! - `fs` - File system operations (read, write, copy, exists)
+//! - `fs` - File system operations (read, write, copy, exists, listdir, is_dir)
 //! - `hub` - Hub state queries and operations (agents, worktrees)
 //! - `tui` - TUI terminal connection and messaging
 //! - `worktree` - Git worktree queries and operations (list, find, create, delete)
 //! - `events` - Event subscription system for agent lifecycle events
+//! - `json` - JSON encode/decode (explicit serialization)
+//! - `http` - HTTP client (GET, POST, PUT, DELETE)
+//! - `timer` - One-shot and repeating timers
+//! - `config` - Hub configuration and environment access
 //!
 //! # Adding New Primitives
 //!
@@ -21,12 +25,16 @@
 //! 3. Add `pub mod foo;` here
 //! 4. Call `foo::register(lua)?;` in `register_all`
 
+pub mod config;
 pub mod connection;
 pub mod events;
 pub mod fs;
+pub mod http;
 pub mod hub;
+pub mod json;
 pub mod log;
 pub mod pty;
+pub mod timer;
 pub mod tui;
 pub mod watch;
 pub mod webrtc;
@@ -54,6 +62,8 @@ pub use pty::{
 };
 pub use tui::{new_send_queue as new_tui_queue, TuiSendQueue, TuiSendRequest};
 pub use webrtc::{new_send_queue, WebRtcSendQueue, WebRtcSendRequest};
+pub use http::{new_http_registry, HttpAsyncRegistry};
+pub use timer::{new_timer_registry, TimerRegistry};
 pub use watch::{new_watcher_registry, WatcherRegistry};
 pub use worktree::{
     new_request_queue as new_worktree_queue, WorktreeRequest, WorktreeRequestQueue,
@@ -71,6 +81,8 @@ pub use worktree::{
 pub fn register_all(lua: &Lua) -> Result<()> {
     fs::register(lua)?;
     log::register(lua)?;
+    json::register(lua)?;
+    config::register(lua)?;
     Ok(())
 }
 
@@ -214,6 +226,44 @@ pub fn register_worktree(
 /// Returns an error if registration fails.
 pub fn register_events(lua: &Lua, callbacks: SharedEventCallbacks) -> Result<()> {
     events::register(lua, callbacks)?;
+    Ok(())
+}
+
+/// Register HTTP primitives with an async response registry.
+///
+/// Call this after `register_all()` to set up HTTP request functions.
+/// Sync functions (`http.get/post/put/delete`) block the caller.
+/// The async function (`http.request`) spawns a background thread and
+/// the registry is polled each tick to fire Lua callbacks.
+///
+/// # Arguments
+///
+/// * `lua` - The Lua state to register primitives in
+/// * `registry` - Shared async HTTP registry
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub fn register_http(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
+    http::register(lua, registry)?;
+    Ok(())
+}
+
+/// Register timer primitives with a timer registry.
+///
+/// Call this after `register_all()` to set up one-shot and repeating timers.
+/// The registry is polled each tick to fire Lua callbacks.
+///
+/// # Arguments
+///
+/// * `lua` - The Lua state to register primitives in
+/// * `registry` - Shared timer registry
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub fn register_timer(lua: &Lua, registry: TimerRegistry) -> Result<()> {
+    timer::register(lua, registry)?;
     Ok(())
 }
 

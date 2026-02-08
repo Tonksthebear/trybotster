@@ -88,6 +88,41 @@ end)
 safe_require("user.init")
 
 -- ============================================================================
+-- Plugin Loading
+-- ============================================================================
+-- Load plugins from ~/.botster/lua/plugins/*/init.lua
+-- Each plugin is a directory with an init.lua that registers hooks,
+-- commands, or other extensions. Analogous to Neovim's plugin system.
+
+local plugin_base = config.lua_path()
+local plugin_dir = plugin_base .. "/plugins"
+
+local plugins = loader.discover_plugins(plugin_dir)
+if #plugins > 0 then
+    log.info(string.format("Discovered %d plugin(s): %s", #plugins, table.concat(plugins, ", ")))
+    for _, plugin_name in ipairs(plugins) do
+        safe_require("plugins." .. plugin_name .. ".init")
+    end
+else
+    log.debug("No plugins found")
+end
+
+-- ============================================================================
+-- Agent Improvements (Sandboxed)
+-- ============================================================================
+-- Load agent-written improvements with restricted access.
+-- These run in a sandbox: no process spawn, no keyring, fs restricted
+-- to the improvements directory only.
+
+local improvements_dir = plugin_base .. "/improvements"
+if fs.exists(improvements_dir) then
+    local count = loader.load_improvements(improvements_dir)
+    if count > 0 then
+        log.info(string.format("Loaded %d improvement(s) from %s", count, improvements_dir))
+    end
+end
+
+-- ============================================================================
 -- Initialization Complete
 -- ============================================================================
 
