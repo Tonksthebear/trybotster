@@ -14,19 +14,21 @@
 //! # Usage in Lua
 //!
 //! ```lua
-//! -- One-shot timer: fires once after 1000ms
-//! local id = timer.after(1000, function()
+//! -- One-shot timer: fires once after 1 second
+//! local id = timer.after(1, function()
 //!     log.info("Timer fired!")
 //! end)
 //!
-//! -- Repeating timer: fires every 500ms
-//! local id = timer.every(500, function()
+//! -- Repeating timer: fires every 0.5 seconds
+//! local id = timer.every(0.5, function()
 //!     log.info("Tick!")
 //! end)
 //!
 //! -- Cancel a timer
 //! timer.cancel(id)
 //! ```
+//!
+//! All durations are in **seconds** (fractional values supported via `f64`).
 //!
 //! # Error Handling
 //!
@@ -98,9 +100,12 @@ pub fn new_timer_registry() -> TimerRegistry {
 /// Register timer primitives with the Lua state.
 ///
 /// Adds the following functions to the global `timer` table:
-/// - `timer.after(ms, callback)` -> timer_id (one-shot)
-/// - `timer.every(ms, callback)` -> timer_id (repeating)
+/// - `timer.after(seconds, callback)` -> timer_id (one-shot)
+/// - `timer.every(seconds, callback)` -> timer_id (repeating)
 /// - `timer.cancel(timer_id)` -> boolean
+///
+/// Durations are in **seconds** (`f64`), converted via
+/// [`Duration::from_secs_f64`].
 ///
 /// # Arguments
 ///
@@ -115,12 +120,12 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
         .create_table()
         .map_err(|e| anyhow!("Failed to create timer table: {e}"))?;
 
-    // timer.after(ms, callback) -> timer_id
+    // timer.after(seconds, callback) -> timer_id
     //
-    // Creates a one-shot timer that fires the callback after `ms` milliseconds.
+    // Creates a one-shot timer that fires the callback after `seconds` seconds.
     let reg = Arc::clone(&registry);
     let after_fn = lua
-        .create_function(move |lua, (ms, callback): (u64, LuaFunction)| {
+        .create_function(move |lua, (seconds, callback): (f64, LuaFunction)| {
             let callback_key = lua.create_registry_value(callback).map_err(|e| {
                 LuaError::external(format!("timer.after: failed to store callback: {e}"))
             })?;
@@ -133,7 +138,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                 id.clone(),
                 TimerEntry {
                     callback_key,
-                    fire_at: Instant::now() + Duration::from_millis(ms),
+                    fire_at: Instant::now() + Duration::from_secs_f64(seconds),
                     repeat_interval: None,
                     cancelled: false,
                 },
@@ -147,17 +152,17 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
         .set("after", after_fn)
         .map_err(|e| anyhow!("Failed to set timer.after: {e}"))?;
 
-    // timer.every(ms, callback) -> timer_id
+    // timer.every(seconds, callback) -> timer_id
     //
-    // Creates a repeating timer that fires the callback every `ms` milliseconds.
+    // Creates a repeating timer that fires the callback every `seconds` seconds.
     let reg2 = Arc::clone(&registry);
     let every_fn = lua
-        .create_function(move |lua, (ms, callback): (u64, LuaFunction)| {
+        .create_function(move |lua, (seconds, callback): (f64, LuaFunction)| {
             let callback_key = lua.create_registry_value(callback).map_err(|e| {
                 LuaError::external(format!("timer.every: failed to store callback: {e}"))
             })?;
 
-            let interval = Duration::from_millis(ms);
+            let interval = Duration::from_secs_f64(seconds);
             let mut entries = reg2.lock().expect("TimerEntries mutex poisoned");
             let id = format!("timer_{}", entries.next_id);
             entries.next_id += 1;
@@ -358,7 +363,7 @@ mod tests {
         let id: String = lua
             .load(
                 r#"
-                return timer.after(1000, function()
+                return timer.after(1.0, function()
                 end)
             "#,
             )
@@ -382,7 +387,7 @@ mod tests {
         let id: String = lua
             .load(
                 r#"
-                return timer.every(500, function()
+                return timer.every(0.5, function()
                 end)
             "#,
             )
@@ -395,7 +400,7 @@ mod tests {
         assert_eq!(entries.entries.len(), 1);
         assert_eq!(
             entries.entries[0].1.repeat_interval,
-            Some(Duration::from_millis(500))
+            Some(Duration::from_secs_f64(0.5))
         );
     }
 
@@ -408,7 +413,7 @@ mod tests {
 
         lua.load(
             r#"
-            my_timer_id = timer.after(10000, function() end)
+            my_timer_id = timer.after(10, function() end)
         "#,
         )
         .exec()
@@ -462,7 +467,7 @@ mod tests {
             .exec()
             .expect("setup counter");
 
-        // Create a timer with 0ms delay (fires immediately)
+        // Create a timer with 0s delay (fires immediately)
         lua.load(
             r#"
             timer.after(0, function()
@@ -501,7 +506,7 @@ mod tests {
             .exec()
             .expect("setup counter");
 
-        // Create a repeating timer with 0ms interval
+        // Create a repeating timer with 0s interval
         lua.load(
             r#"
             timer.every(0, function()
@@ -584,10 +589,10 @@ mod tests {
             .exec()
             .expect("setup");
 
-        // Create a timer far in the future
+        // Create a timer far in the future (60 seconds)
         lua.load(
             r#"
-            timer.after(60000, function()
+            timer.after(60, function()
                 future_fired = true
             end)
         "#,
@@ -617,17 +622,17 @@ mod tests {
         register(&lua, Arc::clone(&registry)).expect("Should register");
 
         let id1: String = lua
-            .load("return timer.after(10000, function() end)")
+            .load("return timer.after(10, function() end)")
             .eval()
             .expect("timer 1");
 
         let id2: String = lua
-            .load("return timer.after(10000, function() end)")
+            .load("return timer.after(10, function() end)")
             .eval()
             .expect("timer 2");
 
         let id3: String = lua
-            .load("return timer.every(10000, function() end)")
+            .load("return timer.every(10, function() end)")
             .eval()
             .expect("timer 3");
 
@@ -645,8 +650,8 @@ mod tests {
 
         lua.load(
             r#"
-            timer.after(10000, function() end)
-            local id = timer.after(10000, function() end)
+            timer.after(10, function() end)
+            local id = timer.after(10, function() end)
             timer.cancel(id)
         "#,
         )

@@ -381,6 +381,36 @@ end
 -- Event Listeners
 -- ============================================================================
 
+--- Format a notification string for an existing agent.
+-- Matches the format used by the Rust try_notify_existing_agent().
+-- @param message table The command_message with prompt/context fields
+-- @return string The notification text
+local function format_notification(message)
+    local prompt = message.prompt
+    if prompt then
+        return string.format(
+            "=== NEW MENTION (automated notification) ===\n\n%s\n\n==================",
+            prompt
+        )
+    else
+        return "=== NEW MENTION (automated notification) ===\nNew mention\n=================="
+    end
+end
+
+--- Notify an existing agent of a new mention via PTY input.
+-- Writes the notification text to the agent's "agent" session PTY.
+-- @param agent Agent The existing agent to notify
+-- @param text string The notification text
+local function notify_existing_agent(agent, text)
+    local session = agent.sessions and agent.sessions["agent"]
+    if session then
+        session:write(text .. "\r\r")
+        log.info("Sent notification to existing agent: " .. agent:agent_key())
+    else
+        log.warn("Cannot notify agent (no 'agent' session): " .. agent:agent_key())
+    end
+end
+
 -- Handle command channel messages that create or delete agents.
 events.on("command_message", function(message)
     if not message then return end
@@ -388,6 +418,20 @@ events.on("command_message", function(message)
     local msg_type = message.type or message.command
     if msg_type == "create_agent" then
         local issue_or_branch = message.issue_or_branch or message.branch
+
+        -- Check if an agent already exists for this issue — notify instead of creating
+        if issue_or_branch then
+            local repo = message.repo or config.env("BOTSTER_REPO") or "unknown/repo"
+            local issue_number, branch_name = parse_issue_or_branch(issue_or_branch)
+            local agent_key = build_agent_key(repo, issue_number, branch_name)
+            local existing = Agent.get(agent_key)
+            if existing then
+                log.info("Agent exists for " .. agent_key .. ", sending notification")
+                notify_existing_agent(existing, format_notification(message))
+                return
+            end
+        end
+
         if issue_or_branch then
             handle_create_agent(issue_or_branch, message.prompt, message.from_worktree, nil, message.profile)
         else

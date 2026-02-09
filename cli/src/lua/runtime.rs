@@ -26,6 +26,8 @@ use super::primitives::http::HttpAsyncRegistry;
 use super::primitives::timer::TimerRegistry;
 use super::primitives::watch::WatcherRegistry;
 use super::primitives::webrtc::{registry_keys, WebRtcSendQueue, WebRtcSendRequest};
+use super::primitives::websocket::WebSocketRegistry;
+use super::primitives::action_cable::{ActionCableRequest, ActionCableRequestQueue};
 
 /// Lua scripting runtime for the botster hub.
 ///
@@ -83,6 +85,10 @@ pub struct LuaRuntime {
     timer_registry: TimerRegistry,
     /// Registry of async HTTP requests (for `http.request()`).
     http_registry: HttpAsyncRegistry,
+    /// Registry of WebSocket connections (for `websocket.connect()`).
+    websocket_registry: WebSocketRegistry,
+    /// Queue for ActionCable requests from Lua (for `action_cable.connect()`).
+    action_cable_queue: ActionCableRequestQueue,
     /// Cached compiled function for PTY output interceptor calls.
     pty_hook_fn: Option<mlua::RegistryKey>,
     /// Cached reusable context table for PTY output interceptor calls.
@@ -120,6 +126,10 @@ impl std::fmt::Debug for LuaRuntime {
             .field("active_timers", &timer_count)
             .field("http_pending", &http_pending)
             .field("http_in_flight", &http_in_flight)
+            .field("websocket_connections",
+                &self.websocket_registry.lock().map(|r| r.connection_count()).unwrap_or(0))
+            .field("action_cable_queue_len",
+                &self.action_cable_queue.lock().map(|q| q.len()).unwrap_or(0))
             .finish_non_exhaustive()
     }
 }
@@ -181,6 +191,12 @@ impl LuaRuntime {
         // Create HTTP async registry for http.request()
         let http_registry = primitives::new_http_registry();
 
+        // Create WebSocket connection registry for websocket.connect()
+        let websocket_registry = primitives::new_websocket_registry();
+
+        // Create ActionCable request queue for action_cable.connect()
+        let action_cable_queue = primitives::new_action_cable_queue();
+
         // Register all primitives
         primitives::register_all(&lua).context("Failed to register Lua primitives")?;
 
@@ -212,6 +228,14 @@ impl LuaRuntime {
         primitives::register_http(&lua, Arc::clone(&http_registry))
             .context("Failed to register HTTP primitives")?;
 
+        // Register WebSocket primitives with the connection registry
+        primitives::register_websocket(&lua, Arc::clone(&websocket_registry))
+            .context("Failed to register WebSocket primitives")?;
+
+        // Register ActionCable primitives with the request queue
+        primitives::register_action_cable(&lua, Arc::clone(&action_cable_queue))
+            .context("Failed to register ActionCable primitives")?;
+
         // Note: Hub, connection, and worktree primitives are registered later via
         // register_hub_primitives() because they need a HandleCache reference from Hub
 
@@ -239,6 +263,8 @@ impl LuaRuntime {
             watcher_registry,
             timer_registry,
             http_registry,
+            websocket_registry,
+            action_cable_queue,
             pty_hook_fn: None,
             pty_hook_ctx: None,
         })
@@ -1493,6 +1519,8 @@ impl LuaRuntime {
     ///
     /// * `handle_cache` - Thread-safe cache of agent handles and connection URL
     /// * `worktree_base` - Base directory for worktree storage
+    /// * `server_id` - Server-assigned hub ID (set after registration)
+    /// * `shared_state` - Shared hub state for agent queries
     ///
     /// # Errors
     ///
@@ -1501,11 +1529,15 @@ impl LuaRuntime {
         &self,
         handle_cache: Arc<HandleCache>,
         worktree_base: PathBuf,
+        server_id: primitives::SharedServerId,
+        shared_state: Arc<std::sync::RwLock<crate::hub::state::HubState>>,
     ) -> Result<()> {
         primitives::register_hub(
             &self.lua,
             Arc::clone(&self.hub_request_queue),
             Arc::clone(&handle_cache),
+            server_id,
+            shared_state,
         )
         .context("Failed to register Hub primitives")?;
 
@@ -1601,6 +1633,44 @@ impl LuaRuntime {
             .lock()
             .expect("Worktree request queue mutex poisoned");
         std::mem::take(&mut *queue)
+    }
+
+    /// Drain pending ActionCable requests.
+    ///
+    /// Returns all ActionCable operations queued by Lua's `action_cable.*`
+    /// calls since the last drain. The queue is cleared after this call.
+    #[must_use]
+    pub fn drain_action_cable_requests(&self) -> Vec<ActionCableRequest> {
+        let mut queue = self
+            .action_cable_queue
+            .lock()
+            .expect("ActionCable request queue mutex poisoned");
+        std::mem::take(&mut *queue)
+    }
+
+    /// Poll WebSocket connections for pending events and fire Lua callbacks.
+    ///
+    /// Returns the number of events processed.
+    pub fn poll_websocket_events(&self) -> usize {
+        primitives::websocket::poll_websocket_events(
+            &self.lua,
+            &self.websocket_registry,
+        )
+    }
+
+    /// Get a reference to the ActionCable request queue.
+    ///
+    /// Used by Hub to pass to `process_lua_action_cable_requests()`.
+    pub fn action_cable_queue_ref(&self) -> &ActionCableRequestQueue {
+        &self.action_cable_queue
+    }
+
+    /// Get a reference to the inner Lua state.
+    ///
+    /// Used by Hub for ActionCable channel polling where direct Lua access
+    /// is needed for callback dispatch.
+    pub fn lua_ref(&self) -> &Lua {
+        &self.lua
     }
 
     // =========================================================================
@@ -1728,27 +1798,30 @@ impl LuaRuntime {
         })
     }
 
+    /// Fire an event with a JSON value as the Lua argument.
+    ///
+    /// Converts `value` to a Lua table/value via serde and dispatches
+    /// to all registered callbacks for `event`. No-ops when no callbacks
+    /// are registered for the event name.
+    pub fn fire_json_event(&self, event: &str, value: &serde_json::Value) -> Result<()> {
+        if !self.has_event_callbacks(event) {
+            return Ok(());
+        }
+
+        let value = value.clone();
+
+        self.fire_event(event, |lua| {
+            lua.to_value(&value).map_err(|e| anyhow!("to_value: {e}"))
+        })
+    }
+
     /// Fire the "command_message" event with the full message payload.
     ///
     /// Called by Hub when a command channel message should be handled by Lua.
     /// Lua handlers (e.g., `handlers/agents.lua`) listen for this event and
     /// route `create_agent`, `delete_agent`, etc. to their respective handlers.
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - The message payload as a JSON value. Lua receives it as
-    ///   a table with fields like `type`, `issue_or_branch`, `prompt`, etc.
     pub fn fire_command_message(&self, message: &serde_json::Value) -> Result<()> {
-        if !self.has_event_callbacks("command_message") {
-            return Ok(());
-        }
-
-        let message = message.clone();
-
-        self.fire_event("command_message", |lua| {
-            let lua_value = lua.to_value(&message).map_err(|e| anyhow!("to_value: {e}"))?;
-            Ok(lua_value)
-        })
+        self.fire_json_event("command_message", message)
     }
 
     /// Fire the "shutdown" event.

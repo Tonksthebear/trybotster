@@ -17,6 +17,8 @@
 //! - `http` - HTTP client (GET, POST, PUT, DELETE)
 //! - `timer` - One-shot and repeating timers
 //! - `config` - Hub configuration and environment access
+//! - `action_cable` - ActionCable WebSocket connections (subscribe, perform, callbacks)
+//! - `websocket` - WebSocket client (persistent connections with callbacks)
 //!
 //! # Adding New Primitives
 //!
@@ -25,6 +27,7 @@
 //! 3. Add `pub mod foo;` here
 //! 4. Call `foo::register(lua)?;` in `register_all`
 
+pub mod action_cable;
 pub mod config;
 pub mod connection;
 pub mod events;
@@ -38,6 +41,7 @@ pub mod timer;
 pub mod tui;
 pub mod watch;
 pub mod webrtc;
+pub mod websocket;
 pub mod worktree;
 
 use std::path::PathBuf;
@@ -54,7 +58,7 @@ pub use events::{
 pub use connection::{
     new_request_queue as new_connection_queue, ConnectionRequest, ConnectionRequestQueue,
 };
-pub use hub::{new_request_queue as new_hub_queue, HubRequest, HubRequestQueue};
+pub use hub::{new_request_queue as new_hub_queue, HubRequest, HubRequestQueue, SharedServerId};
 pub use pty::{
     new_request_queue as new_pty_queue, CreateForwarderRequest, CreateTuiForwarderRequest,
     CreateTuiForwarderDirectRequest, PtyForwarder, PtyOutputContext, PtyRequest, PtyRequestQueue,
@@ -65,6 +69,11 @@ pub use webrtc::{new_send_queue, WebRtcSendQueue, WebRtcSendRequest};
 pub use http::{new_http_registry, HttpAsyncRegistry};
 pub use timer::{new_timer_registry, TimerRegistry};
 pub use watch::{new_watcher_registry, WatcherRegistry};
+pub use action_cable::{
+    new_request_queue as new_action_cable_queue, ActionCableRequest, ActionCableRequestQueue,
+    LuaAcChannel, LuaAcConnection,
+};
+pub use websocket::{new_websocket_registry, WebSocketRegistry};
 pub use worktree::{
     new_request_queue as new_worktree_queue, WorktreeRequest, WorktreeRequestQueue,
 };
@@ -140,7 +149,7 @@ pub fn register_pty(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
     Ok(())
 }
 
-/// Register Hub state primitives with a request queue and handle cache.
+/// Register Hub state primitives with a request queue, handle cache, and shared state.
 ///
 /// Call this after `register_all()` to set up Hub state queries and operations.
 /// The request queue is drained by Hub after Lua callbacks return.
@@ -150,6 +159,8 @@ pub fn register_pty(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
 /// * `lua` - The Lua state to register primitives in
 /// * `request_queue` - Shared queue for Hub operations
 /// * `handle_cache` - Thread-safe cache of agent handles for queries
+/// * `server_id` - Server-assigned hub ID (set after registration)
+/// * `shared_state` - Shared hub state for agent queries
 ///
 /// # Errors
 ///
@@ -158,8 +169,10 @@ pub fn register_hub(
     lua: &Lua,
     request_queue: HubRequestQueue,
     handle_cache: Arc<HandleCache>,
+    server_id: SharedServerId,
+    shared_state: Arc<std::sync::RwLock<crate::hub::state::HubState>>,
 ) -> Result<()> {
-    hub::register(lua, request_queue, handle_cache)?;
+    hub::register(lua, request_queue, handle_cache, server_id, shared_state)?;
     Ok(())
 }
 
@@ -282,5 +295,39 @@ pub fn register_timer(lua: &Lua, registry: TimerRegistry) -> Result<()> {
 /// Returns an error if registration fails.
 pub fn register_watch(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
     watch::register(lua, registry)?;
+    Ok(())
+}
+
+/// Register WebSocket primitives with a connection registry.
+///
+/// Call this after `register_all()` to set up persistent WebSocket connections.
+/// Each `websocket.connect()` spawns a background thread. The registry is
+/// polled each tick to fire Lua callbacks for incoming events.
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub fn register_websocket(lua: &Lua, registry: WebSocketRegistry) -> Result<()> {
+    websocket::register(lua, registry)?;
+    Ok(())
+}
+
+/// Register ActionCable primitives with a request queue.
+///
+/// Call this after `register_all()` to set up ActionCable connection management.
+/// The request queue is drained by Hub each tick via
+/// `process_lua_action_cable_requests`. Channel messages are polled via
+/// `poll_lua_action_cable_channels`.
+///
+/// # Arguments
+///
+/// * `lua` - The Lua state to register primitives in
+/// * `queue` - Shared request queue for ActionCable operations
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Result<()> {
+    action_cable::register_action_cable(lua, queue)?;
     Ok(())
 }

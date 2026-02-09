@@ -54,6 +54,7 @@ class HubsController < ApplicationController
     is_new = hub.new_record?
     hub.last_seen_at = Time.current
     hub.alive = true
+    hub.name = params[:repo] if params[:repo].present? && hub.name.blank?
 
     if params[:device_id].present?
       device = current_hub_user.devices.find_by(id: params[:device_id])

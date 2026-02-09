@@ -28,7 +28,7 @@ class Hub < ApplicationRecord
 
   # Display name for the hub
   def name
-    device&.name || identifier.truncate(20)
+    read_attribute(:name).presence || device&.name || identifier.truncate(20)
   end
 
   # Synchronize hub_agents with data from CLI heartbeat.

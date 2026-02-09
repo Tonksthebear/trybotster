@@ -2,17 +2,16 @@
 //!
 //! This module handles all communication with the Rails server, including:
 //!
-//! - WebSocket command channel for real-time message delivery
-//! - Heartbeat sending via command channel
-//! - WebRTC signaling via ActionCable (E2E encrypted with vodozemac Olm)
+//! - WebRTC peer connections and signaling (E2E encrypted with vodozemac Olm)
 //! - Agent notification delivery via background worker
 //! - Device and hub registration
+//! - Lua plugin event processing (ActionCable, WebSocket, timers, HTTP, etc.)
 //!
 //! # Architecture
 //!
-//! The command channel (WebSocket) is the sole path for message delivery
-//! and heartbeat. The NotificationWorker handles agent notification
-//! delivery in a background thread.
+//! ActionCable channels and heartbeat are now managed by Lua plugins.
+//! The Rust side handles WebRTC peer connections, agent notifications,
+//! and Lua event processing in the tick loop.
 
 // Rust guideline compliant 2026-02
 
@@ -21,18 +20,19 @@ use std::time::{Duration, Instant};
 use crate::agent::AgentNotification;
 use crate::channel::Channel;
 use crate::hub::actions::{self, HubAction};
-use crate::hub::{command_channel, registration, workers, Hub, WebRtcPtyOutput};
-use crate::server::messages::ParsedMessage;
+use crate::hub::{registration, workers, Hub, WebRtcPtyOutput};
 
 impl Hub {
-    /// Perform periodic tasks (command channel polling, heartbeat, notifications).
+    /// Perform periodic tasks (Lua event processing, WebRTC, notifications).
     ///
     /// Call this from your event loop to handle time-based operations.
     /// This method is **non-blocking** - all network I/O is handled via
-    /// the WebSocket command channel and background notification worker.
+    /// Lua plugins (ActionCable, WebSocket) and background workers.
     pub fn tick(&mut self) {
-        self.poll_command_channel();
-        self.poll_webrtc_signaling();
+        self.poll_lua_websocket_events();
+        self.process_lua_action_cable_requests();
+        self.poll_lua_action_cable_channels();
+
         self.poll_outgoing_webrtc_signals();
         self.poll_webrtc_channels();
         self.cleanup_disconnected_webrtc_channels();
@@ -41,7 +41,6 @@ impl Hub {
         self.poll_stream_frames_outgoing();
         self.poll_pty_observers();
         self.poll_tui_requests();
-        self.send_command_channel_heartbeat();
         self.poll_agent_notifications_async();
         self.poll_lua_file_changes();
         self.poll_user_file_watches();
@@ -65,6 +64,7 @@ impl Hub {
         self.process_lua_hub_requests();
         self.process_lua_connection_requests();
         self.process_lua_worktree_requests();
+        self.process_lua_action_cable_requests();
     }
 
     /// Poll for Lua file changes and hot-reload modified modules.
@@ -107,168 +107,6 @@ impl Hub {
         if fired > 0 {
             log::debug!("Fired {} Lua HTTP callback(s)", fired);
         }
-    }
-
-    // === Command Channel (WebSocket) Methods ===
-
-    /// Poll command channel for messages (non-blocking).
-    ///
-    /// Messages arrive in real-time via WebSocket instead of HTTP polling.
-    ///
-    /// Collects all pending messages first (releasing the mutable borrow on the
-    /// channel), then processes each message with full `&mut self` access.
-    fn poll_command_channel(&mut self) {
-        // Drain all pending messages first to release the mutable borrow
-        let messages: Vec<command_channel::CommandMessage> = {
-            let Some(ref mut channel) = self.command_channel else {
-                return;
-            };
-            let mut msgs = Vec::new();
-            while let Some(msg) = channel.try_recv() {
-                msgs.push(msg);
-            }
-            msgs
-        };
-
-        // Now process each message with full &mut self access
-        for msg in &messages {
-            match msg.event_type.as_str() {
-                "terminal_connected" | "terminal_disconnected" | "browser_wants_preview" => {
-                    // Legacy event types -- browsers now connect via WebRTC DataChannel directly.
-                    log::debug!("Ignoring legacy command channel event: {}", msg.event_type);
-                }
-                _ => {
-                    self.process_command_channel_message(msg);
-                }
-            }
-
-            // Acknowledge after processing: bifurcate by message source
-            if let Some(ref channel) = self.command_channel {
-                if msg.sequence >= 0 {
-                    // Hub command — ack by sequence
-                    channel.acknowledge(msg.sequence);
-                } else {
-                    // GitHub message (sentinel -1) — ack by ID
-                    channel.perform("ack_github", serde_json::json!({ "id": msg.id }));
-                }
-            }
-        }
-    }
-
-    /// Process a standard (non-browser) message from the command channel.
-    ///
-    /// - `agent_cleanup` messages are handled directly in Rust via `HubAction::CloseAgent`.
-    /// - All other messages (including `issue_comment`, `pull_request`, and unknown types)
-    ///   are delegated to Lua via `fire_command_message()`. Lua's `handlers/agents.lua`
-    ///   listens for `"command_message"` events and handles agent creation routing.
-    fn process_command_channel_message(&mut self, msg: &command_channel::CommandMessage) {
-        use crate::server::types::MessageData;
-
-        // Convert CommandMessage to MessageData for compatibility with existing parsing
-        let message_data = MessageData {
-            id: msg.id,
-            event_type: msg.event_type.clone(),
-            payload: msg.payload.clone(),
-        };
-
-        let parsed = ParsedMessage::from_message_data(&message_data);
-
-        // Detect repo for context
-        let repo_name = if let Ok(repo) = std::env::var("BOTSTER_REPO") {
-            repo
-        } else {
-            match crate::git::WorktreeManager::detect_current_repo() {
-                Ok((_path, name)) => name,
-                Err(_) if crate::env::is_test_mode() => "test/repo".to_string(),
-                Err(e) => {
-                    log::warn!("Not in a git repository, skipping message processing: {e}");
-                    return;
-                }
-            }
-        };
-
-        // Try to notify existing agent first (before Lua or action dispatch)
-        if self.try_notify_existing_agent(&parsed, &repo_name) {
-            return;
-        }
-
-        // Handle cleanup directly in Rust (still needs Rust-side agent removal)
-        if parsed.is_cleanup() {
-            if let (Some(issue_number), Some(repo)) = (parsed.issue_number, &parsed.repo) {
-                let repo_safe = repo.replace('/', "-");
-                let session_key = format!("{repo_safe}-{issue_number}");
-                self.handle_action(HubAction::CloseAgent {
-                    session_key,
-                    delete_worktree: false,
-                });
-            } else {
-                log::warn!(
-                    "Cleanup message {} missing repo or issue_number, skipping",
-                    msg.id
-                );
-            }
-            return;
-        }
-
-        // Skip WebRTC offers (handled by signal channel)
-        if parsed.is_webrtc_offer() {
-            return;
-        }
-
-        // Everything else goes to Lua
-        let lua_message = serde_json::json!({
-            "type": "create_agent",
-            "issue_or_branch": parsed.issue_number.map(|n| n.to_string()),
-            "prompt": parsed.task_description(),
-            "repo": parsed.repo,
-            "invocation_url": parsed.invocation_url,
-        });
-
-        if let Err(e) = self.lua.fire_command_message(&lua_message) {
-            log::error!(
-                "Lua command_message error for message {}: {e}",
-                msg.id
-            );
-        }
-        self.flush_lua_queues();
-    }
-
-    /// Send heartbeat via command channel (non-blocking).
-    ///
-    /// Builds minimal agent data from Rust-owned state (session keys,
-    /// invocation URLs, PTY alive status).
-    fn send_command_channel_heartbeat(&mut self) {
-        let Some(ref channel) = self.command_channel else {
-            return;
-        };
-
-        /// Heartbeat interval in seconds. Aligned with Rails
-        /// `HubCommandChannel::HEARTBEAT_TIMEOUT` (90s) -- sending at 30s
-        /// gives three chances before the server considers the hub offline.
-        const HEARTBEAT_INTERVAL_SECS: u64 = 30;
-
-        if self.last_heartbeat.elapsed() < Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
-            return;
-        }
-        self.last_heartbeat = Instant::now();
-
-        let state = self.state.read()
-            .expect("HubState RwLock poisoned in heartbeat");
-        let agents: Vec<serde_json::Value> = state
-            .agent_keys_ordered
-            .iter()
-            .filter_map(|key| {
-                state.agents.get(key).map(|agent| {
-                    serde_json::json!({
-                        "session_key": key,
-                        "last_invocation_url": agent.last_invocation_url
-                    })
-                })
-            })
-            .collect();
-
-        channel.send_heartbeat(serde_json::json!(agents));
-        log::debug!("Sent heartbeat via command channel ({} agents)", agents.len());
     }
 
     // === Background Worker Methods ===
@@ -315,52 +153,6 @@ impl Hub {
                 worker.send(request);
             }
         }
-    }
-
-    /// Try to send a notification to an existing agent for this issue.
-    ///
-    /// Returns true if an agent was found and notified, false otherwise.
-    /// Does NOT apply to cleanup messages -- those go through action dispatch.
-    pub(crate) fn try_notify_existing_agent(
-        &mut self,
-        parsed: &ParsedMessage,
-        default_repo: &str,
-    ) -> bool {
-        // Cleanup messages should not be treated as notifications
-        if parsed.is_cleanup() {
-            return false;
-        }
-
-        let Some(issue_number) = parsed.issue_number else {
-            return false;
-        };
-
-        let repo_safe = parsed
-            .repo
-            .as_deref()
-            .unwrap_or(default_repo)
-            .replace('/', "-");
-        let session_key = format!("{repo_safe}-{issue_number}");
-
-        let mut state = self.state.write()
-            .expect("HubState RwLock poisoned in try_notify_existing_agent");
-        let Some(agent) = state.agents.get_mut(&session_key) else {
-            return false;
-        };
-
-        log::info!("Agent exists for issue #{issue_number}, sending notification");
-        let notification = parsed.format_notification();
-
-        if let Err(e) = agent.write_input_to_cli(notification.as_bytes()) {
-            log::error!("Failed to send notification to agent: {e}");
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let _ = agent.write_input_to_cli(b"\r");
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let _ = agent.write_input_to_cli(b"\r");
-        }
-
-        true
     }
 
     // === WebRTC Data Routing ===
@@ -519,19 +311,15 @@ impl Hub {
 
         // Abort any PTY forwarders for this browser.
         // Forwarder keys are "{peer_id}:{agent_index}:{pty_index}" where peer_id = browser_identity
-        let forwarders_to_remove: Vec<String> = self
-            .webrtc_pty_forwarders
-            .keys()
-            .filter(|key| key.starts_with(browser_identity))
-            .cloned()
-            .collect();
-
-        for key in forwarders_to_remove {
-            if let Some(task) = self.webrtc_pty_forwarders.remove(&key) {
+        self.webrtc_pty_forwarders.retain(|key, task| {
+            if key.starts_with(browser_identity) {
                 task.abort();
                 log::debug!("[WebRTC] Aborted PTY forwarder: {}", key);
+                false
+            } else {
+                true
             }
-        }
+        });
 
         // Notify Lua of peer disconnection (Lua handles subscription cleanup)
         if let Err(e) = self.lua.call_peer_disconnected(browser_identity) {
@@ -695,7 +483,87 @@ impl Hub {
                     log::info!("[Lua] Processing quit request");
                     self.quit = true;
                 }
+                HubRequest::HandleWebrtcOffer {
+                    browser_identity,
+                    sdp,
+                } => {
+                    log::info!(
+                        "[Lua] Processing WebRTC offer from {}",
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
+                    self.handle_webrtc_offer(&sdp, &browser_identity);
+                }
+                HubRequest::HandleIceCandidate {
+                    browser_identity,
+                    candidate,
+                } => {
+                    let candidate_str = candidate
+                        .get("candidate")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    let sdp_mid = candidate.get("sdpMid").and_then(|m| m.as_str());
+                    let sdp_mline_index = candidate
+                        .get("sdpMLineIndex")
+                        .and_then(|i| i.as_u64())
+                        .map(|i| i as u16);
+
+                    if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
+                        let _guard = self.tokio_runtime.enter();
+                        if let Err(e) = self.tokio_runtime.block_on(
+                            channel.handle_ice_candidate(candidate_str, sdp_mid, sdp_mline_index),
+                        ) {
+                            log::warn!("[Lua] Failed to add ICE candidate: {e}");
+                        }
+                    } else {
+                        log::warn!(
+                            "[Lua] ICE candidate for unknown browser {}",
+                            &browser_identity[..browser_identity.len().min(8)]
+                        );
+                    }
+                }
             }
+        }
+    }
+
+    /// Poll WebSocket connections for events and fire Lua callbacks.
+    fn poll_lua_websocket_events(&mut self) {
+        let count = self.lua.poll_websocket_events();
+        if count > 0 {
+            self.flush_lua_queues();
+        }
+    }
+
+    /// Process ActionCable requests queued by Lua callbacks.
+    ///
+    /// Delegates to the primitive's processing function which drains the
+    /// shared queue and handles connect/subscribe/perform/unsubscribe/close.
+    fn process_lua_action_cable_requests(&mut self) {
+        use crate::lua::primitives::action_cable;
+
+        let handle = self.tokio_runtime.handle().clone();
+        action_cable::process_lua_action_cable_requests(
+            self.lua.action_cable_queue_ref(),
+            &mut self.lua_ac_connections,
+            &mut self.lua_ac_channels,
+            &self.config.server_url,
+            self.config.get_api_key(),
+            &handle,
+        );
+    }
+
+    /// Poll Lua ActionCable channels for incoming messages and fire callbacks.
+    fn poll_lua_action_cable_channels(&mut self) {
+        use crate::lua::primitives::action_cable;
+
+        let crypto = self.browser.crypto_service.as_ref();
+        let count = action_cable::poll_lua_action_cable_channels(
+            self.lua.lua_ref(),
+            &mut self.lua_ac_channels,
+            &self.lua_ac_connections,
+            crypto,
+        );
+        if count > 0 {
+            self.flush_lua_queues();
         }
     }
 
@@ -1400,177 +1268,13 @@ impl Hub {
         }
     }
 
-    // === WebRTC Signaling (ActionCable + E2E Encryption) ===
-
-    /// Poll for incoming WebRTC signaling messages (non-blocking).
+    /// Drain outgoing WebRTC signals and fire Lua events for relay.
     ///
-    /// WebRTC signals (offers/answers/ICE) arrive via ActionCable, E2E encrypted.
-    /// Rails never sees plaintext. After decryption, routes by `type` field:
-    /// - `"offer"` -> create peer connection + encrypted answer
-    /// - `"ice"` -> add ICE candidate to existing peer connection
-    fn poll_webrtc_signaling(&mut self) {
-        use crate::relay::OlmEnvelope;
-
-        let signals: Vec<command_channel::SignalMessage> = {
-            let Some(ref mut channel) = self.command_channel else {
-                return;
-            };
-            let mut sigs = Vec::new();
-            while let Some(sig) = channel.try_recv_signal() {
-                sigs.push(sig);
-            }
-            sigs
-        };
-
-        if signals.is_empty() {
-            return;
-        }
-
-        log::info!(
-            "[WebRTC-Signal] Processing {} incoming signal(s)",
-            signals.len()
-        );
-
-        let crypto = match self.browser.crypto_service.clone() {
-            Some(cs) => cs,
-            None => {
-                log::warn!("[WebRTC-Signal] No crypto service -- cannot decrypt signal envelopes");
-                return;
-            }
-        };
-
-        let _guard = self.tokio_runtime.enter();
-
-        for signal in &signals {
-            log::info!(
-                "[WebRTC-Signal] Processing signal from browser={}, envelope keys: {:?}",
-                &signal.browser_identity[..signal.browser_identity.len().min(16)],
-                signal.envelope.as_object().map(|o| o.keys().collect::<Vec<_>>())
-            );
-
-            // Deserialize envelope to OlmEnvelope for decryption
-            let envelope: OlmEnvelope = match serde_json::from_value(signal.envelope.clone()) {
-                Ok(e) => e,
-                Err(e) => {
-                    log::warn!(
-                        "[WebRTC-Signal] Failed to parse signal envelope: {e}. Raw: {}",
-                        serde_json::to_string(&signal.envelope).unwrap_or_default()
-                    );
-                    continue;
-                }
-            };
-
-            log::info!(
-                "[WebRTC-Signal] Envelope parsed: t={}",
-                envelope.message_type,
-            );
-
-            // Decrypt the envelope (synchronous via mutex)
-            let plaintext = match crypto.lock() {
-                Ok(mut guard) => match guard.decrypt(&envelope) {
-                    Ok(pt) => pt,
-                    Err(e) => {
-                        log::error!(
-                            "[WebRTC-Signal] Failed to decrypt signal from {}: {e}",
-                            &signal.browser_identity[..signal.browser_identity.len().min(8)]
-                        );
-                        continue;
-                    }
-                },
-                Err(e) => {
-                    log::error!("[WebRTC-Signal] Crypto mutex poisoned: {e}");
-                    continue;
-                }
-            };
-
-            log::info!(
-                "[WebRTC-Signal] Decrypted {} bytes: {:?}",
-                plaintext.len(),
-                String::from_utf8_lossy(&plaintext[..plaintext.len().min(500)])
-            );
-
-            // Parse decrypted plaintext as JSON
-            let payload: serde_json::Value = match serde_json::from_slice(&plaintext) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!(
-                        "[WebRTC-Signal] Failed to parse decrypted signal payload: {e}. Raw UTF-8: {:?}",
-                        String::from_utf8_lossy(&plaintext)
-                    );
-                    continue;
-                }
-            };
-
-            log::info!(
-                "[WebRTC-Signal] Parsed payload keys: {:?}",
-                payload.as_object().map(|o| o.keys().collect::<Vec<_>>())
-            );
-
-            let signal_type = payload.get("type").and_then(|t| t.as_str());
-            log::info!("[WebRTC-Signal] Signal type: {:?}", signal_type);
-
-            match signal_type {
-                Some("offer") => {
-                    let sdp = payload.get("sdp").and_then(|v| v.as_str()).unwrap_or("");
-                    if sdp.is_empty() {
-                        log::warn!("[WebRTC-Signal] Offer missing SDP");
-                        continue;
-                    }
-                    log::info!(
-                        "[WebRTC-Signal] Processing offer from browser {}",
-                        &signal.browser_identity[..signal.browser_identity.len().min(16)]
-                    );
-                    self.handle_webrtc_offer(sdp, &signal.browser_identity);
-                }
-                Some("ice") => {
-                    if let Some(candidate_obj) = payload.get("candidate") {
-                        let candidate = candidate_obj
-                            .get("candidate")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("");
-                        let sdp_mid = candidate_obj.get("sdpMid").and_then(|m| m.as_str());
-                        let sdp_mline_index = candidate_obj
-                            .get("sdpMLineIndex")
-                            .and_then(|i| i.as_u64())
-                            .map(|i| i as u16);
-
-                        if let Some(channel) =
-                            self.webrtc_channels.get(&signal.browser_identity)
-                        {
-                            if let Err(e) = self.tokio_runtime.block_on(
-                                channel.handle_ice_candidate(candidate, sdp_mid, sdp_mline_index),
-                            ) {
-                                log::warn!("[WebRTC-Signal] Failed to add ICE candidate: {e}");
-                            }
-                        } else {
-                            log::warn!(
-                                "[WebRTC-Signal] ICE candidate for unknown browser {}",
-                                &signal.browser_identity
-                                    [..signal.browser_identity.len().min(8)]
-                            );
-                        }
-                    }
-                }
-                other => {
-                    log::info!("[WebRTC-Signal] Unknown signal type: {:?}", other);
-                }
-            }
-        }
-    }
-
-    /// Drain outgoing WebRTC signals (encrypted ICE candidates) and relay via ActionCable.
-    ///
-    /// WebRTC `on_ice_candidate` callbacks encrypt candidates and push them to
-    /// `webrtc_outgoing_signal_rx`. This method drains them and sends each via
-    /// `CommandChannelHandle::perform("signal", ...)` for ActionCable relay to browser.
+    /// Pre-encrypted ICE candidates from `webrtc_outgoing_signal_rx` are
+    /// dispatched as `"outgoing_signal"` Lua events. The `hub_commands.lua`
+    /// handler picks these up and relays them via the ActionCable primitive.
     fn poll_outgoing_webrtc_signals(&mut self) {
         use crate::channel::webrtc::OutgoingSignal;
-
-        let Some(ref command_channel) = self.command_channel else {
-            // Drain and discard if no command channel
-            while self.webrtc_outgoing_signal_rx.try_recv().is_ok() {}
-            return;
-        };
 
         while let Ok(signal) = self.webrtc_outgoing_signal_rx.try_recv() {
             match signal {
@@ -1578,13 +1282,13 @@ impl Hub {
                     browser_identity,
                     envelope,
                 } => {
-                    command_channel.perform(
-                        "signal",
-                        serde_json::json!({
-                            "browser_identity": browser_identity,
-                            "envelope": envelope,
-                        }),
-                    );
+                    let data = serde_json::json!({
+                        "browser_identity": browser_identity,
+                        "envelope": envelope,
+                    });
+                    if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
+                        log::error!("Failed to fire outgoing_signal event: {e}");
+                    }
                     log::debug!(
                         "[Crypto] Relayed ICE candidate to browser {}",
                         &browser_identity[..browser_identity.len().min(8)]
@@ -1703,18 +1407,15 @@ impl Hub {
                                 }
                             };
 
-                            // Send via ActionCable (CommandChannel perform)
-                            if let Some(ref cmd_channel) = self.command_channel {
-                                cmd_channel.perform(
-                                    "signal",
-                                    serde_json::json!({
-                                        "browser_identity": browser_identity,
-                                        "envelope": envelope_value,
-                                    }),
-                                );
-                                log::info!("[WebRTC] Encrypted answer sent via ActionCable");
+                            // Relay encrypted answer through Lua → ActionCable
+                            let data = serde_json::json!({
+                                "browser_identity": browser_identity,
+                                "envelope": envelope_value,
+                            });
+                            if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
+                                log::error!("[WebRTC] Failed to fire outgoing_signal for answer: {e}");
                             } else {
-                                log::error!("[WebRTC] No command channel for answer relay");
+                                log::info!("[WebRTC] Encrypted answer sent via Lua relay");
                             }
                         }
                         Err(e) => {
@@ -1752,7 +1453,9 @@ impl Hub {
             self.device.device_id,
         );
         // Store server-assigned ID (used for all server communication)
-        self.botster_id = Some(botster_id);
+        self.botster_id = Some(botster_id.clone());
+        // Sync to shared copy for Lua primitives
+        *self.shared_server_id.lock().expect("SharedServerId mutex poisoned") = Some(botster_id);
     }
 
     /// Initialize CryptoService for E2E encryption (vodozemac Olm).
