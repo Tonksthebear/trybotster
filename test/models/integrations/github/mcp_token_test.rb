@@ -2,7 +2,7 @@
 
 require "test_helper"
 
-class McpTokenTest < ActiveSupport::TestCase
+class Integrations::Github::MCPTokenTest < ActiveSupport::TestCase
   setup do
     @user = User.create!(
       email: "mcp_token_test@example.com",
@@ -64,7 +64,7 @@ class McpTokenTest < ActiveSupport::TestCase
   end
 
   test "requires device" do
-    token = MCPToken.new
+    token = Integrations::Github::MCPToken.new
 
     assert_not token.valid?
     assert_includes token.errors[:device], "must exist"

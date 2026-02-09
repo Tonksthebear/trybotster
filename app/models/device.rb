@@ -14,7 +14,7 @@ class Device < ApplicationRecord
   belongs_to :user
   has_many :hubs, dependent: :nullify
   has_one :device_token, dependent: :destroy
-  has_one :mcp_token, dependent: :destroy
+  has_one :mcp_token, class_name: "Integrations::Github::MCPToken", dependent: :destroy
 
   # public_key is optional for CLI devices in secure mode
   # Browser devices always need public_key

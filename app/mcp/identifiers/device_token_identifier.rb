@@ -12,7 +12,7 @@ class DeviceTokenIdentifier < ActionMCP::GatewayIdentifier
     token = extract_bearer_token
     return nil if token.blank?
 
-    mcp_token = MCPToken.find_by(token: token)
+    mcp_token = Integrations::Github::MCPToken.find_by(token: token)
     return nil unless mcp_token
 
     mcp_token.touch_usage!(ip: request_ip)

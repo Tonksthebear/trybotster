@@ -11,7 +11,7 @@ class User < ApplicationRecord
   belongs_to :team, optional: true
   has_many :devices, dependent: :destroy
   has_many :device_tokens, through: :devices
-  has_many :mcp_tokens, through: :devices
+  has_many :mcp_tokens, through: :devices, class_name: "Integrations::Github::MCPToken"
   has_many :hubs, dependent: :destroy
 
   # Skip email/password validations for OAuth users

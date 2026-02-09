@@ -95,7 +95,7 @@ class Hubs::CodesControllerTest < ActionDispatch::IntegrationTest
     assert_equal users(:primary_user), device_token.user
 
     # Verify MCPToken was created
-    mcp_token = MCPToken.find_by(token: json["mcp_token"])
+    mcp_token = Integrations::Github::MCPToken.find_by(token: json["mcp_token"])
     assert_not_nil mcp_token
     assert_equal users(:primary_user), mcp_token.user
 

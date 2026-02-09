@@ -89,6 +89,7 @@ pub fn new_request_queue() -> HubRequestQueue {
 /// - `hub.unregister_agent(key)` - Unregister agent PTY handles
 /// - `hub.server_id()` - Get server-assigned hub ID
 /// - `hub.detect_repo()` - Detect current repo name
+/// - `hub.api_token()` - Get hub's API bearer token for authenticated requests
 /// - `hub.agent_list()` - Get list of active agents with metadata
 /// - `hub.handle_webrtc_offer(browser_identity, sdp)` - Queue WebRTC offer
 /// - `hub.handle_ice_candidate(browser_identity, candidate)` - Queue ICE candidate
@@ -258,6 +259,23 @@ pub fn register(
 
     hub.set("detect_repo", detect_repo_fn)
         .map_err(|e| anyhow!("Failed to set hub.detect_repo: {e}"))?;
+
+    // hub.api_token() - Returns the hub's API bearer token from the keyring.
+    //
+    // Plugins use this to make authenticated HTTP requests to the Rails server.
+    // The token stays within the hub process — plugins should fetch scoped
+    // tokens (e.g., MCP tokens) for passing to agents.
+    let api_token_fn = lua
+        .create_function(|_, ()| {
+            let token = crate::keyring::Credentials::load()
+                .ok()
+                .and_then(|c| c.api_token().map(String::from));
+            Ok(token)
+        })
+        .map_err(|e| anyhow!("Failed to create hub.api_token function: {e}"))?;
+
+    hub.set("api_token", api_token_fn)
+        .map_err(|e| anyhow!("Failed to set hub.api_token: {e}"))?;
 
     // hub.agent_list() - Returns array of {session_key, last_invocation_url} for active agents.
     //

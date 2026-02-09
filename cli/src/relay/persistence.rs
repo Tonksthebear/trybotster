@@ -21,42 +21,27 @@
 //!
 //! Rust guideline compliant 2025-01
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::RngCore;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::crypto::EncryptedData;
 use crate::keyring::Credentials;
 
 use std::sync::{OnceLock, RwLock};
 
-/// Nonce size for AES-GCM (96 bits = 12 bytes).
-const NONCE_SIZE: usize = 12;
+/// Vodozemac crypto format version.
+const CRYPTO_VERSION: u8 = 6;
 
 /// Cache for encryption keys to avoid repeated keyring access.
 /// Maps hub_id -> encryption key.
 fn key_cache() -> &'static RwLock<HashMap<String, [u8; 32]>> {
     static CACHE: OnceLock<RwLock<HashMap<String, [u8; 32]>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Encrypted data format stored on disk.
-#[derive(Debug, Serialize, Deserialize)]
-struct EncryptedData {
-    /// Base64-encoded nonce (12 bytes).
-    nonce: String,
-    /// Base64-encoded ciphertext.
-    ciphertext: String,
-    /// Version identifier for the encrypted data format.
-    version: u8,
 }
 
 /// Check if we're in test mode (for deterministic key generation).
@@ -175,52 +160,11 @@ fn get_or_create_encryption_key(hub_id: &str) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-/// Decrypt data using AES-256-GCM.
-fn decrypt_data(key: &[u8; 32], encrypted: &EncryptedData) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new_from_slice(key).expect("valid key length");
-
-    let nonce_bytes = BASE64
-        .decode(&encrypted.nonce)
-        .context("Invalid nonce encoding")?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = BASE64
-        .decode(&encrypted.ciphertext)
-        .context("Invalid ciphertext encoding")?;
-
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext.as_ref())
-        .map_err(|e| anyhow::anyhow!("Decryption failed: {e}"))?;
-
-    Ok(plaintext)
-}
-
 // ============================================================================
 // Matrix Crypto Persistence
 // ============================================================================
 
 use super::olm_crypto::VodozemacCryptoState;
-
-/// Encrypt data using AES-256-GCM with version marker.
-fn encrypt_data_versioned(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedData> {
-    let cipher = Aes256Gcm::new_from_slice(key).expect("valid key length");
-
-    // Generate random nonce
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    rand::rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    // Encrypt
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
-
-    Ok(EncryptedData {
-        nonce: BASE64.encode(nonce_bytes),
-        ciphertext: BASE64.encode(ciphertext),
-        version: 6, // vodozemac crypto version
-    })
-}
 
 /// Load a vodozemac crypto store from encrypted storage.
 pub fn load_vodozemac_crypto_store(hub_id: &str) -> Result<VodozemacCryptoState> {
@@ -240,7 +184,7 @@ pub fn load_vodozemac_crypto_store(hub_id: &str) -> Result<VodozemacCryptoState>
     let encrypted: EncryptedData =
         serde_json::from_str(&content).context("Failed to parse Matrix store file")?;
 
-    let plaintext = decrypt_data(&key, &encrypted)?;
+    let plaintext = crate::crypto::decrypt(&key, &encrypted)?;
     let state: VodozemacCryptoState =
         serde_json::from_slice(&plaintext).context("Failed to deserialize Matrix store")?;
 
@@ -258,7 +202,7 @@ pub fn save_vodozemac_crypto_store(hub_id: &str, state: &VodozemacCryptoState) -
     let store_path = state_dir.join("vodozemac_store.enc");
 
     let plaintext = serde_json::to_vec(state).context("Failed to serialize Matrix store")?;
-    let encrypted = encrypt_data_versioned(&key, &plaintext)?;
+    let encrypted = crate::crypto::encrypt(&key, &plaintext, CRYPTO_VERSION)?;
 
     let content =
         serde_json::to_string_pretty(&encrypted).context("Failed to serialize encrypted store")?;
@@ -359,14 +303,14 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
-        let key = [0u8; 32]; // Test key
+        let key = [0u8; 32];
         let plaintext = b"Hello, Matrix crypto!";
 
-        let encrypted = encrypt_data_versioned(&key, plaintext).unwrap();
-        let decrypted = decrypt_data(&key, &encrypted).unwrap();
+        let encrypted = crate::crypto::encrypt(&key, plaintext, CRYPTO_VERSION).unwrap();
+        let decrypted = crate::crypto::decrypt(&key, &encrypted).unwrap();
 
         assert_eq!(decrypted, plaintext);
-        assert_eq!(encrypted.version, 6);
+        assert_eq!(encrypted.version, CRYPTO_VERSION);
     }
 
     #[test]

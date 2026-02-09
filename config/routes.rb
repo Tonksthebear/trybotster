@@ -51,6 +51,14 @@ Rails.application.routes.draw do
     end
   end
 
+  # Integration-specific endpoints
+  namespace :integrations do
+    namespace :github do
+      # MCP token creation/refresh for plugins (bearer auth via device token)
+      resources :mcp_tokens, only: [ :create ]
+    end
+  end
+
   # E2E devices (browser keypairs - no heartbeat, they're session-based)
   resources :devices, only: [ :index, :create, :destroy ]
 
