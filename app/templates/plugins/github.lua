@@ -1,4 +1,10 @@
--- GitHub event integration (pure Lua plugin)
+-- @template GitHub Integration
+-- @description Subscribe to GitHub events and trigger agent workflows from issues/PRs
+-- @category plugins
+-- @dest plugins/github/init.lua
+-- @version 1.0.0
+
+-- GitHub event integration (plugin)
 --
 -- Subscribes to Github::EventsChannel for this repo and routes
 -- incoming events to the command_message event system.
@@ -42,10 +48,6 @@ local channel_id = action_cable.subscribe(conn, "Github::EventsChannel",
         action_cable.perform(channel_id, "ack", { id = message.id })
     end
 )
-
-events.on("shutdown", function()
-    if conn then action_cable.close(conn) end
-end)
 
 log.info(string.format("GitHub plugin loaded for %s", repo))
 return {}

@@ -7,6 +7,7 @@ module Hubs
 
     def show
       @config_metadata = config_metadata
+      @templates = template_catalog
     end
 
     private
@@ -29,6 +30,37 @@ module Hubs
             default: "#!/bin/bash\n# Session initialization\n# Commands run when this session starts\n" }
         }
       }
+    end
+
+    # Parse app/templates/**/*.lua into a grouped catalog.
+    # Each template has @tag metadata in comment headers.
+    def template_catalog
+      Dir.glob(Rails.root.join("app/templates/**/*.lua")).filter_map { |path|
+        content = File.read(path)
+        meta = extract_template_metadata(content)
+        next unless meta[:template] && meta[:category] && meta[:dest]
+
+        {
+          slug: "#{meta[:category]}-#{File.basename(path, '.lua')}",
+          name: meta[:template],
+          description: meta[:description],
+          category: meta[:category],
+          dest: meta[:dest],
+          version: meta[:version] || "1.0.0",
+          content: content
+        }
+      }.group_by { |t| t[:category] }
+    end
+
+    def extract_template_metadata(content)
+      metadata = {}
+      content.each_line do |line|
+        break unless line.start_with?("--")
+        if (match = line.match(/^--\s*@(\w+)\s+(.+)/))
+          metadata[match[1].to_sym] = match[2].strip
+        end
+      end
+      metadata
     end
   end
 end

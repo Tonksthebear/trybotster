@@ -22,6 +22,7 @@ export default class extends Controller {
   #saveTimer = null;
 
   static targets = [
+    "tabPanel",
     "treePanel",
     "treeContainer",
     "treeFeedback",
@@ -88,6 +89,21 @@ export default class extends Controller {
   }
 
   // ========== Actions ==========
+
+  switchTab(event) {
+    const tabName = event.currentTarget.dataset.tab;
+    if (!tabName) return;
+
+    // Toggle tab button active state
+    this.element.querySelectorAll("[data-tab]").forEach((btn) => {
+      btn.toggleAttribute("data-active", btn.dataset.tab === tabName);
+    });
+
+    // Toggle tab panels
+    this.tabPanelTargets.forEach((panel) => {
+      panel.classList.toggle("hidden", panel.dataset.tabPanel !== tabName);
+    });
+  }
 
   async selectFile(event) {
     const filePath = event.currentTarget.dataset.filePath;
