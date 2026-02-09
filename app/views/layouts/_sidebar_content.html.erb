@@ -23,7 +23,7 @@
                 class: "#{dom_id(hub, :sidebar)} group flex items-center gap-2 px-2 py-1.5 rounded text-sm transition-colors text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200",
                 data: { active: hub.active? } do %>
               <span class="shrink-0 size-2 rounded-full group-data-[active=true]:bg-success-500 bg-zinc-600"></span>
-              <span class="truncate font-mono text-xs"><%= hub.repo.presence || hub.identifier.truncate(20) %></span>
+              <span class="truncate font-mono text-xs"><%= hub.name %></span>
             <% end %>
         <% end %>
         <p class="not-only:hidden px-2 py-4 text-center text-xs text-zinc-600">No hubs connected</p>

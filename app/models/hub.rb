@@ -6,12 +6,10 @@ class Hub < ApplicationRecord
   has_many :hub_agents, dependent: :destroy
   has_many :hub_commands, dependent: :destroy
 
-  validates :repo, presence: true
   validates :identifier, presence: true, uniqueness: true
   validates :last_seen_at, presence: true
 
   scope :active, -> { where(alive: true).where("last_seen_at > ?", 2.minutes.ago) }
-  scope :for_repo, ->(repo) { where(repo: repo) }
   scope :stale, -> { where(alive: false).or(where("last_seen_at <= ?", 2.minutes.ago)) }
   scope :with_device, -> { where.not(device_id: nil) }
 
@@ -28,9 +26,9 @@ class Hub < ApplicationRecord
     alive? && last_seen_at > 2.minutes.ago
   end
 
-  # Display name for the hub (uses repo name)
+  # Display name for the hub
   def name
-    repo
+    device&.name || identifier.truncate(20)
   end
 
   # Synchronize hub_agents with data from CLI heartbeat.

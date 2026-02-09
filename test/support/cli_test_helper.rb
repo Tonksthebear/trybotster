@@ -176,7 +176,7 @@ module CliTestHelper
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => api_key,  # Use BOTSTER_TOKEN (takes precedence over BOTSTER_API_KEY)
       "BOTSTER_HUB_ID" => hub.identifier,  # Use string identifier for find_or_initialize_by lookup
-      "BOTSTER_REPO" => hub.repo,  # Required for hub registration
+      "BOTSTER_REPO" => "test/repo",  # Optional — used for GitHub event subscription
       "RUST_LOG" => options[:log_level] || "info,botster_hub=debug"
     }
 
@@ -271,7 +271,6 @@ module CliTestHelper
     Hub.create!(
       user: user,
       identifier: "test-hub-#{SecureRandom.hex(8)}",
-      repo: "test/repo",
       last_seen_at: Time.current
     )
   end

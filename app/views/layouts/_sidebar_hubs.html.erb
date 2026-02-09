@@ -3,7 +3,7 @@
       class: "sidebar-hub-link flex items-center gap-2 px-2 py-1.5 rounded text-sm transition-colors text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200",
       data: { turbo_frame: "_top", hub_id: hub.id } do %>
     <span class="shrink-0 size-2 rounded-full <%= hub.active? ? 'bg-success-500' : 'bg-zinc-600' %>"></span>
-    <span class="truncate font-mono text-xs"><%= hub.repo.presence || hub.identifier.truncate(20) %></span>
+    <span class="truncate font-mono text-xs"><%= hub.name %></span>
   <% end %>
 <% end %>
 

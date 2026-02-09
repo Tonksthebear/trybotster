@@ -52,7 +52,6 @@ class HubsController < ApplicationController
   def create
     hub = current_hub_user.hubs.find_or_initialize_by(identifier: params[:identifier])
     is_new = hub.new_record?
-    hub.repo = params[:repo]
     hub.last_seen_at = Time.current
     hub.alive = true
 
@@ -77,7 +76,6 @@ class HubsController < ApplicationController
       return
     end
 
-    Current.hub.repo = params[:repo] if params[:repo].present?
     Current.hub.last_seen_at = Time.current
     Current.hub.alive = true
 

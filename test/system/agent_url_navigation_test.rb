@@ -334,9 +334,9 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
   def create_and_wait_for_agent(hub, issue_number:, timeout: 20)
     message = Integrations::Github::Message.create!(
       event_type: "github_mention",
-      repo: hub.repo,
+      repo: "test/repo",
       issue_number: issue_number,
-      payload: { repo: hub.repo, issue_number: issue_number, prompt: "Test" }
+      payload: { repo: "test/repo", issue_number: issue_number, prompt: "Test" }
     )
 
     # Wait for message to be acknowledged
@@ -361,7 +361,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
     @test_temp_dirs << worktree_base
 
     # Set up git repo with test .botster_init
-    setup_test_git_repo(temp_dir, hub.repo)
+    setup_test_git_repo(temp_dir, "test/repo")
 
     # Create device token
     token_name = "Nav Test #{SecureRandom.hex(4)}"
@@ -378,7 +378,7 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => device_token.token,
       "BOTSTER_HUB_ID" => hub.identifier,
-      "BOTSTER_REPO" => hub.repo,
+      "BOTSTER_REPO" => "test/repo",
       "BOTSTER_WORKTREE_BASE" => worktree_base,
       "RUST_LOG" => options[:log_level] || "info,botster_hub=debug"
     }

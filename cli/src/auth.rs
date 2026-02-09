@@ -55,6 +55,7 @@ pub struct ErrorResponse {
 pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
+        .user_agent(crate::constants::user_agent())
         .build()?;
 
     // Get device name from hostname
@@ -239,6 +240,7 @@ pub fn validate_token(server_url: &str, token: &str) -> bool {
 
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
+        .user_agent(crate::constants::user_agent())
         .build()
     {
         Ok(c) => c,

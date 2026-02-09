@@ -6,7 +6,7 @@
         <div class="min-w-0">
           <h1 class="text-xl lg:text-2xl font-bold text-zinc-100 font-mono truncate"><%= Current.hub.device&.name || Current.hub.identifier.truncate(32) %></h1>
           <p class="text-sm text-zinc-500 mt-1 truncate">
-            <%= Current.hub.repo || "No repository" %>
+            <%= Current.hub.identifier %>
           </p>
         </div>
 
@@ -50,8 +50,8 @@
             <dd class="text-sm text-zinc-200 font-mono mt-1 truncate"><%= Current.hub.identifier %></dd>
           </div>
           <div>
-            <dt class="text-xs text-zinc-500">Repository</dt>
-            <dd class="text-sm text-zinc-200 font-mono mt-1 truncate"><%= Current.hub.repo || "—" %></dd>
+            <dt class="text-xs text-zinc-500">Device</dt>
+            <dd class="text-sm text-zinc-200 font-mono mt-1 truncate"><%= Current.hub.device&.name || "—" %></dd>
           </div>
           <div>
             <dt class="text-xs text-zinc-500">Status</dt>

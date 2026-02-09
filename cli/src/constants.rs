@@ -13,6 +13,18 @@
 use std::time::Duration;
 
 // ============================================================================
+// Identity
+// ============================================================================
+
+/// User-Agent header sent with all API requests to the Rails server.
+///
+/// Includes the CLI version so Rails can track which versions are in the wild
+/// and gate compatibility if needed.
+pub fn user_agent() -> String {
+    format!("botster-hub/{}", crate::commands::update::VERSION)
+}
+
+// ============================================================================
 // Timeouts
 // ============================================================================
 

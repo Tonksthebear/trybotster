@@ -34,6 +34,7 @@ impl ApiClient {
     pub fn new(server_url: String, api_key: String) -> Result<Self> {
         let client = Client::builder()
             .timeout(constants::HTTP_REQUEST_TIMEOUT)
+            .user_agent(constants::user_agent())
             .build()?;
 
         Ok(Self {
