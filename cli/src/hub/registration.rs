@@ -62,35 +62,34 @@ pub fn register_hub_with_server(
     api_key: &str,
     device_id: Option<i64>,
 ) -> String {
-    // Detect repo: env var > git detection > test fallback > error
-    let repo_name = std::env::var("BOTSTER_REPO")
+    // Detect repo: env var > git detection (optional — not stored on server)
+    let repo_name: Option<String> = std::env::var("BOTSTER_REPO")
         .ok()
         .or_else(|| {
             crate::git::WorktreeManager::detect_current_repo()
                 .map(|(_, name)| name)
                 .ok()
-        })
-        .unwrap_or_else(|| {
-            if crate::env::is_any_test() {
-                "test/repo".to_string()
-            } else {
-                log::error!(
-                    "Not in a git repository. Run from a git repo or set BOTSTER_REPO env var."
-                );
-                String::new() // Will fail validation on server
-            }
         });
+
+    if repo_name.is_none() && !crate::env::is_any_test() {
+        log::warn!("Not in a git repository — GitHub event subscription disabled. Run from a git repo or set BOTSTER_REPO env var.");
+    }
 
     // POST /hubs to register and get server-assigned ID
     let url = format!("{server_url}/hubs");
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "identifier": local_identifier,
-        "repo": repo_name,
         "device_id": device_id,
     });
+    if let Some(ref repo) = repo_name {
+        payload["repo"] = serde_json::Value::String(repo.clone());
+    }
 
     log::info!("Registering hub with server to get Botster ID...");
-    match reqwest::blocking::Client::new()
+    match reqwest::blocking::Client::builder()
+        .user_agent(crate::constants::user_agent())
+        .build()
+        .expect("failed to build HTTP client")
         .post(&url)
         .header("Content-Type", "application/json")
         .bearer_auth(api_key)

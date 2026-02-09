@@ -30,13 +30,10 @@ class HubCommandChannel < ApplicationCable::Channel
     @hub.broadcast_update!
     stream_from "hub_command:#{@hub.id}"
 
-    # Subscribe to repo-scoped GitHub events (if CLI provides repo matching hub)
+    # Subscribe to repo-scoped GitHub events (CLI declares its repo at connect time)
     @repo = params[:repo]
-    if @repo.present? && @hub.repo == @repo
+    if @repo.present?
       stream_from "github_events:#{@repo}"
-    elsif @repo.present?
-      Rails.logger.warn "[HubCommandChannel] Repo mismatch: hub.repo=#{@hub.repo}, requested=#{@repo}"
-      @repo = nil
     end
 
     # Notify all browsers that CLI is now online

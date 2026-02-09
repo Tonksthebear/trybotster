@@ -23,8 +23,8 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     get hubs_path
     assert_response :success
 
-    # Hubs are shown in sidebar - check for repo name in sidebar hub list
-    assert_match /botster\/trybotster/, response.body
+    # Hubs are shown in sidebar - check for device name in sidebar hub list
+    assert_match /Test CLI Device/, response.body
 
     # Main content shows "Select a Hub" message
     assert_select "h2", text: /Select a Hub/
@@ -39,13 +39,13 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_select ".bg-success-500"
   end
 
-  test "index displays hub repo in sidebar" do
+  test "index displays hub name in sidebar" do
     sign_in @user
     get hubs_path
     assert_response :success
 
-    # Should show repo name in sidebar
-    assert_match /botster\/trybotster/, response.body
+    # Should show device name in sidebar
+    assert_match /Test CLI Device/, response.body
   end
 
   test "index links to hub show page" do
@@ -96,8 +96,8 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     # Should show hub identifier in header
     assert_match /hub-active-123/, response.body
 
-    # Should show repo name
-    assert_match /botster\/trybotster/, response.body
+    # Should show hub identifier
+    assert_match /hub-active-123/, response.body
   end
 
   test "show has sidebar with hubs list" do
@@ -121,7 +121,6 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     other_user = User.create!(email: "other@example.com", username: "other")
     other_hub = Hub.create!(
       user: other_user,
-      repo: "other/repo",
       identifier: "other-hub-id",
       last_seen_at: Time.current
     )

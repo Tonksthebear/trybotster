@@ -46,7 +46,7 @@
               <%= Current.hub.device&.name || Current.hub.identifier.truncate(24) %>
             </h1>
             <p class="text-xs text-zinc-500 truncate">
-              <%= Current.hub.repo || "No repository" %>
+              <%= Current.hub.identifier %>
             </p>
           </div>
         </div>

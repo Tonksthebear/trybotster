@@ -20,7 +20,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
   test "POST /hubs returns 401 without authentication" do
     post hubs_url,
-      params: { identifier: "new-hub-123", repo: "owner/repo" }.to_json,
+      params: { identifier: "new-hub-123" }.to_json,
       headers: json_headers
 
     assert_response :unauthorized
@@ -31,7 +31,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
     assert_difference -> { Hub.count }, 1 do
       post hubs_url,
-        params: { identifier: identifier, repo: "owner/repo" }.to_json,
+        params: { identifier: identifier }.to_json,
         headers: auth_headers_for(:jason)
     end
 
@@ -43,7 +43,6 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
     hub = Hub.find(json["id"])
     assert_equal identifier, hub.identifier
-    assert_equal "owner/repo", hub.repo
     assert_equal users(:jason), hub.user
   end
 
@@ -53,7 +52,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
     assert_no_difference -> { Hub.count } do
       post hubs_url,
-        params: { identifier: hub.identifier, repo: "updated/repo" }.to_json,
+        params: { identifier: hub.identifier }.to_json,
         headers: auth_headers_for(:jason)
     end
 
@@ -61,9 +60,6 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     json = assert_json_keys(:id, :identifier)
 
     assert_equal original_id, json["id"]
-
-    hub.reload
-    assert_equal "updated/repo", hub.repo
   end
 
   # ==========================================================================
@@ -84,16 +80,13 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     hub = hubs(:active_hub)
 
     put hub_url(hub),
-      params: { repo: "updated/repo" }.to_json,
+      params: {}.to_json,
       headers: auth_headers_for(:jason)
 
     assert_response :ok
     json = assert_json_keys(:success, :hub_id)
 
     assert_equal hub.id, json["hub_id"]
-
-    hub.reload
-    assert_equal "updated/repo", hub.repo
   end
 
   test "PUT /hubs/:id updates last_seen_at" do
@@ -101,7 +94,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     old_last_seen = hub.last_seen_at
 
     put hub_url(hub),
-      params: { repo: hub.repo }.to_json,
+      params: {}.to_json,
       headers: auth_headers_for(:jason)
 
     assert_response :ok
@@ -115,7 +108,6 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
     put hub_url(hub),
       params: {
-        repo: hub.repo,
         agents: [
           { session_key: "session-123", last_invocation_url: "https://github.com/owner/repo/issues/42" },
           { session_key: "session-456" }
@@ -139,7 +131,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     hub = hubs(:active_hub)
 
     put hub_url(hub),
-      params: { repo: "owner/repo", device_id: device.id }.to_json,
+      params: { device_id: device.id }.to_json,
       headers: auth_headers_for(:jason)
 
     assert_response :ok
@@ -152,7 +144,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     hub = hubs(:active_hub)
 
     put hub_url(hub),
-      params: { repo: "owner/repo" }.to_json,
+      params: {}.to_json,
       headers: auth_headers_for(:jason)
 
     assert_response :ok
@@ -164,12 +156,11 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
   test "PUT /hubs/:id returns 404 for other user's hub" do
     other_hub = users(:one).hubs.create!(
       identifier: "other-user-hub-#{SecureRandom.hex(4)}",
-      repo: "other/repo",
       last_seen_at: Time.current
     )
 
     put hub_url(other_hub),
-      params: { repo: "hacked/repo" }.to_json,
+      params: {}.to_json,
       headers: auth_headers_for(:jason)
 
     assert_response :not_found
@@ -215,7 +206,6 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
   test "PATCH /hubs/:hub_id/heartbeat returns 404 for other user's hub" do
     other_hub = users(:one).hubs.create!(
       identifier: "other-user-hub-#{SecureRandom.hex(4)}",
-      repo: "other/repo",
       last_seen_at: Time.current
     )
 
@@ -270,7 +260,6 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
   test "DELETE /hubs/:id cannot delete other user's hub" do
     other_hub = users(:one).hubs.create!(
       identifier: "other-hub-#{SecureRandom.hex(4)}",
-      repo: "other/repo",
       last_seen_at: Time.current
     )
 

@@ -92,7 +92,11 @@ impl NotificationWorker {
         shutdown: Arc<AtomicBool>,
     ) {
         // Create HTTP client for this thread
-        let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+        let client = match Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent(crate::constants::user_agent())
+            .build()
+        {
             Ok(c) => c,
             Err(e) => {
                 log::error!("Failed to create HTTP client for notification worker: {e}");

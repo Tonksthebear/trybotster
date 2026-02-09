@@ -18,16 +18,22 @@ require_relative "cli_integration_test_case"
 # - BOTSTER_REPO: Override repo detection for test isolation
 #
 class CliAgentLifecycleTest < CliIntegrationTestCase
+  TEST_REPO = "test/repo"
+
+  setup do
+    @test_repo = TEST_REPO
+  end
+
   # === Agent Spawn Tests ===
 
   test "github_mention message triggers agent spawn" do
     # Create a pending message that should spawn an agent
     message = Integrations::Github::Message.create!(
       event_type: "github_mention",
-      repo: @hub.repo,
+      repo: @test_repo,
       issue_number: 123,
       payload: {
-        repo: @hub.repo,
+        repo: @test_repo,
         issue_number: 123,
         comment_body: "Hey @botster, please help with this",
         prompt: "Help with the issue"
@@ -55,10 +61,10 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
   test "agent spawn creates worktree" do
     message = Integrations::Github::Message.create!(
       event_type: "github_mention",
-      repo: @hub.repo,
+      repo: @test_repo,
       issue_number: 456,
       payload: {
-        repo: @hub.repo,
+        repo: @test_repo,
         issue_number: 456,
         prompt: "Create a feature"
       }
@@ -69,7 +75,7 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
 
     # Worktrees are created at BOTSTER_WORKTREE_BASE/repo-safe-name-branch-name
     # e.g., /tmp/worktrees/test-repo-botster-issue-456
-    repo_safe = @hub.repo.tr("/", "-")
+    repo_safe = @test_repo.tr("/", "-")
     expected_worktree = File.join(@worktree_base, "#{repo_safe}-botster-issue-456")
 
     # Wait for worktree to be created
@@ -82,10 +88,10 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
   test "agent receives environment variables" do
     message = Integrations::Github::Message.create!(
       event_type: "github_mention",
-      repo: @hub.repo,
+      repo: @test_repo,
       issue_number: 789,
       payload: {
-        repo: @hub.repo,
+        repo: @test_repo,
         issue_number: 789,
         prompt: "Check environment",
         invocation_url: "https://github.com/test/repo/issues/789#issuecomment-123"
@@ -96,7 +102,7 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
     assert_message_acknowledged(message, timeout: 20)
 
     # Find the worktree path
-    repo_safe = @hub.repo.tr("/", "-")
+    repo_safe = @test_repo.tr("/", "-")
     worktree_path = File.join(@worktree_base, "#{repo_safe}-botster-issue-789")
     prompt_file = File.join(worktree_path, ".botster_prompt")
 
@@ -116,9 +122,9 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
     # First, spawn an agent
     spawn_message = Integrations::Github::Message.create!(
       event_type: "github_mention",
-      repo: @hub.repo,
+      repo: @test_repo,
       issue_number: 101,
-      payload: { repo: @hub.repo, issue_number: 101, prompt: "Task" }
+      payload: { repo: @test_repo, issue_number: 101, prompt: "Task" }
     )
 
     cli = start_cli_in_git_repo(@hub, timeout: 30)
@@ -135,10 +141,10 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
     # Now send cleanup message
     cleanup_message = Integrations::Github::Message.create!(
       event_type: "agent_cleanup",
-      repo: @hub.repo,
+      repo: @test_repo,
       issue_number: 101,
       payload: {
-        repo: @hub.repo,
+        repo: @test_repo,
         issue_number: 101,
         cleanup_reason: "Issue resolved"
       }
@@ -162,9 +168,9 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
     messages = [ 111, 222, 333 ].map do |issue_num|
       Integrations::Github::Message.create!(
         event_type: "github_mention",
-        repo: @hub.repo,
+        repo: @test_repo,
         issue_number: issue_num,
-        payload: { repo: @hub.repo, issue_number: issue_num, prompt: "Task #{issue_num}" }
+        payload: { repo: @test_repo, issue_number: issue_num, prompt: "Task #{issue_num}" }
       )
     end
 
@@ -198,7 +204,7 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
     temp_dir = Dir.mktmpdir("cli_agent_test_")
     worktree_base = Dir.mktmpdir("cli_worktrees_")
 
-    setup_git_repo(temp_dir, hub.repo)
+    setup_git_repo(temp_dir, TEST_REPO)
 
     # Store for cleanup and test assertions
     @test_temp_dirs ||= []
@@ -224,14 +230,14 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => api_key,
       "BOTSTER_HUB_ID" => hub.identifier,
-      "BOTSTER_REPO" => hub.repo,  # Explicit repo name for test isolation
+      "BOTSTER_REPO" => TEST_REPO,  # Explicit repo name for test isolation
       "BOTSTER_WORKTREE_BASE" => worktree_base,  # Custom worktree location
       "RUST_LOG" => options[:log_level] || "info,botster_hub=debug"
     }
 
     Rails.logger.info "[CliAgentTest] Starting CLI in git repo: #{temp_dir}"
     Rails.logger.info "[CliAgentTest] Worktree base: #{worktree_base}"
-    Rails.logger.info "[CliAgentTest] Repo: #{hub.repo}"
+    Rails.logger.info "[CliAgentTest] Repo: #{TEST_REPO}"
 
     # Start CLI process in the git repo directory
     stdout_r, stdout_w = IO.pipe

@@ -8,6 +8,7 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
   setup do
     @user = users(:jason)
     @hub = hubs(:active_hub)
+    @test_repo = "botster/trybotster"
     stub_connection current_user: @user
   end
 
@@ -20,20 +21,20 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
     assert_has_stream "hub_command:#{@hub.id}"
   end
 
-  test "subscribes with matching repo and streams from github events channel" do
-    subscribe hub_id: @hub.id, repo: @hub.repo
+  test "subscribes with repo and streams from github events channel" do
+    subscribe hub_id: @hub.id, repo: @test_repo
 
     assert subscription.confirmed?
     assert_has_stream "hub_command:#{@hub.id}"
-    assert_has_stream "github_events:#{@hub.repo}"
+    assert_has_stream "github_events:#{@test_repo}"
   end
 
-  test "subscribes but ignores mismatched repo" do
-    subscribe hub_id: @hub.id, repo: "attacker/evil-repo"
+  test "subscribes without repo and does not stream github events" do
+    subscribe hub_id: @hub.id
 
     assert subscription.confirmed?
     assert_has_stream "hub_command:#{@hub.id}"
-    assert_has_no_stream "github_events:attacker/evil-repo"
+    assert_has_no_stream "github_events:#{@test_repo}"
   end
 
   test "rejects subscription without hub_id" do
@@ -84,12 +85,12 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
   test "replays pending GitHub messages for repo on subscribe" do
     msg = Integrations::Github::Message.create!(
       event_type: "github_mention",
-      repo: @hub.repo,
+      repo: @test_repo,
       issue_number: 42,
-      payload: { repo: @hub.repo, issue_number: 42 }
+      payload: { repo: @test_repo, issue_number: 42 }
     )
 
-    subscribe hub_id: @hub.id, start_from: 0, repo: @hub.repo
+    subscribe hub_id: @hub.id, start_from: 0, repo: @test_repo
 
     assert subscription.confirmed?
 
@@ -118,12 +119,12 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
   test "ack_github action acknowledges a GitHub message" do
     msg = Integrations::Github::Message.create!(
       event_type: "github_mention",
-      repo: @hub.repo,
+      repo: @test_repo,
       issue_number: 42,
-      payload: { repo: @hub.repo, issue_number: 42 }
+      payload: { repo: @test_repo, issue_number: 42 }
     )
 
-    subscribe hub_id: @hub.id, repo: @hub.repo
+    subscribe hub_id: @hub.id, repo: @test_repo
     assert subscription.confirmed?
 
     # Stub the eyes reaction
