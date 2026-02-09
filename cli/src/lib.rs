@@ -31,6 +31,7 @@ pub mod hub;
 pub mod lua;
 pub mod relay;
 pub mod tui;
+pub mod ws;
 
 pub mod compat;
 pub mod config;

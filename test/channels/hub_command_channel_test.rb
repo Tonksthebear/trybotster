@@ -8,7 +8,6 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
   setup do
     @user = users(:jason)
     @hub = hubs(:active_hub)
-    @test_repo = "botster/trybotster"
     stub_connection current_user: @user
   end
 
@@ -21,20 +20,12 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
     assert_has_stream "hub_command:#{@hub.id}"
   end
 
-  test "subscribes with repo and streams from github events channel" do
-    subscribe hub_id: @hub.id, repo: @test_repo
-
-    assert subscription.confirmed?
-    assert_has_stream "hub_command:#{@hub.id}"
-    assert_has_stream "github_events:#{@test_repo}"
-  end
-
-  test "subscribes without repo and does not stream github events" do
+  test "does not stream github events (handled by Github::EventsChannel)" do
     subscribe hub_id: @hub.id
 
     assert subscription.confirmed?
     assert_has_stream "hub_command:#{@hub.id}"
-    assert_has_no_stream "github_events:#{@test_repo}"
+    assert_has_no_stream "github_events:botster/trybotster"
   end
 
   test "rejects subscription without hub_id" do
@@ -82,25 +73,6 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
     assert_equal cmd3.sequence, transmissions[0]["sequence"]
   end
 
-  test "replays pending GitHub messages for repo on subscribe" do
-    msg = Integrations::Github::Message.create!(
-      event_type: "github_mention",
-      repo: @test_repo,
-      issue_number: 42,
-      payload: { repo: @test_repo, issue_number: 42 }
-    )
-
-    subscribe hub_id: @hub.id, start_from: 0, repo: @test_repo
-
-    assert subscription.confirmed?
-
-    # Find the GitHub message in transmissions (sequence: -1)
-    github_msgs = transmissions.select { |t| t["sequence"] == Integrations::Github::Message::NO_SEQUENCE }
-    assert_equal 1, github_msgs.size
-    assert_equal msg.id, github_msgs.first["id"]
-    assert_equal "github_mention", github_msgs.first["event_type"]
-  end
-
   # === Ack Action Tests ===
 
   test "ack action acknowledges a hub command" do
@@ -114,28 +86,6 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
     cmd.reload
     assert cmd.acknowledged?
     assert_equal "acknowledged", cmd.status
-  end
-
-  test "ack_github action acknowledges a GitHub message" do
-    msg = Integrations::Github::Message.create!(
-      event_type: "github_mention",
-      repo: @test_repo,
-      issue_number: 42,
-      payload: { repo: @test_repo, issue_number: 42 }
-    )
-
-    subscribe hub_id: @hub.id, repo: @test_repo
-    assert subscription.confirmed?
-
-    # Stub the eyes reaction
-    Github::App.stub :create_comment_reaction, { success: true } do
-      Github::App.stub :create_issue_reaction, { success: true } do
-        perform :ack_github, id: msg.id
-      end
-    end
-
-    msg.reload
-    assert msg.acknowledged?
   end
 
   # === Heartbeat Action Tests ===

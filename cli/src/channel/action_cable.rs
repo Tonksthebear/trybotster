@@ -28,15 +28,11 @@
 //! ```
 
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
-use tokio_tungstenite::{
-    connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message,
-};
 
 use crate::relay::crypto_service::CryptoService;
 use crate::relay::olm_crypto::OlmEnvelope;
@@ -565,56 +561,23 @@ impl ActionCableChannel {
         server_url: &str,
         api_key: &str,
         config: &ChannelConfig,
-    ) -> Result<
-        (
-            futures_util::stream::SplitSink<
-                tokio_tungstenite::WebSocketStream<
-                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-                >,
-                Message,
-            >,
-            futures_util::stream::SplitStream<
-                tokio_tungstenite::WebSocketStream<
-                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-                >,
-            >,
-            String,
-        ),
-        ChannelError,
-    > {
-        let ws_url = format!(
-            "{}/cable",
-            server_url
-                .replace("https://", "wss://")
-                .replace("http://", "ws://")
-        );
+    ) -> Result<(crate::ws::WsWriter, crate::ws::WsReader, String), ChannelError> {
+        let ws_url = format!("{}/cable", crate::ws::http_to_ws_scheme(server_url));
 
         log::debug!("Connecting to ActionCable: {}", ws_url);
 
-        let mut request = ws_url
-            .into_client_request()
-            .map_err(|e| ChannelError::ConnectionFailed(format!("invalid URL: {e}")))?;
-
-        // No fallback - invalid server_url should fail explicitly
-        let origin_header = server_url.parse().map_err(|e| {
-            ChannelError::ConnectionFailed(format!("Invalid server URL '{server_url}': {e}"))
-        })?;
-        request.headers_mut().insert("Origin", origin_header);
-        request.headers_mut().insert(
-            "Authorization",
-            format!("Bearer {}", api_key).parse().expect("valid header"),
-        );
-
-        let (ws_stream, _) = connect_async(request).await.map_err(|e| {
-            ChannelError::ConnectionFailed(format!("WebSocket connect failed: {e}"))
-        })?;
-
-        let (mut write, mut read) = ws_stream.split();
+        let bearer = format!("Bearer {}", api_key);
+        let (mut write, mut read) = crate::ws::connect(
+            &ws_url,
+            &[("Origin", server_url), ("Authorization", &bearer)],
+        )
+        .await
+        .map_err(|e| ChannelError::ConnectionFailed(format!("{e}")))?;
 
         // Wait for welcome
         let welcome_timeout = tokio::time::timeout(Duration::from_secs(10), async {
-            while let Some(msg) = read.next().await {
-                if let Ok(Message::Text(text)) = msg {
+            while let Some(msg) = read.recv().await {
+                if let Ok(crate::ws::WsMessage::Text(text)) = msg {
                     if let Ok(cable_msg) = serde_json::from_str::<IncomingCableMessage>(&text) {
                         if cable_msg.msg_type.as_deref() == Some("welcome") {
                             return Ok(());
@@ -656,9 +619,7 @@ impl ActionCableChannel {
         };
 
         write
-            .send(Message::Text(
-                serde_json::to_string(&subscribe).expect("serializable"),
-            ))
+            .send_text(&serde_json::to_string(&subscribe).expect("serializable"))
             .await
             .map_err(|e| ChannelError::ConnectionFailed(format!("subscribe failed: {e}")))?;
 
@@ -683,17 +644,8 @@ impl ActionCableChannel {
         identifier_json: &str,
         reliable: bool,
         reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
-        read: &mut futures_util::stream::SplitStream<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-        >,
+        write: &mut crate::ws::WsWriter,
+        read: &mut crate::ws::WsReader,
         send_rx: &mut mpsc::Receiver<OutgoingMessage>,
         recv_tx: &mpsc::Sender<RawIncoming>,
         peers: &Arc<StdRwLock<HashSet<PeerId>>>,
@@ -720,11 +672,10 @@ impl ActionCableChannel {
                 }
 
                 // Incoming messages
-                Some(msg) = read.next() => {
-                    last_activity = Instant::now();
-
+                msg = read.recv() => {
                     match msg {
-                        Ok(Message::Text(text)) => {
+                        Some(Ok(crate::ws::WsMessage::Text(text))) => {
+                            last_activity = Instant::now();
                             let incoming_list = Self::handle_incoming(
                                 crypto_service,
                                 config,
@@ -742,21 +693,28 @@ impl ActionCableChannel {
                                 }
                             }
                         }
-                        Ok(Message::Ping(data)) => {
-                            if write.send(Message::Pong(data)).await.is_err() {
+                        Some(Ok(crate::ws::WsMessage::Ping(data))) => {
+                            last_activity = Instant::now();
+                            if write.send_pong(data).await.is_err() {
                                 log::warn!("Failed to send pong");
                                 return false;
                             }
                         }
-                        Ok(Message::Close(_)) => {
+                        Some(Ok(crate::ws::WsMessage::Close { .. })) => {
                             log::info!("WebSocket closed by server");
                             return false;
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             log::error!("WebSocket error: {}", e);
                             return false;
                         }
-                        _ => {}
+                        None => {
+                            log::info!("WebSocket stream ended");
+                            return false;
+                        }
+                        _ => {
+                            last_activity = Instant::now();
+                        }
                     }
                 }
 
@@ -795,12 +753,7 @@ impl ActionCableChannel {
         identifier_json: &str,
         reliable: bool,
         reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        write: &mut crate::ws::WsWriter,
         msg: OutgoingMessage,
         peers: &Arc<StdRwLock<HashSet<PeerId>>>,
     ) {
@@ -881,9 +834,7 @@ impl ActionCableChannel {
             };
 
             if let Err(e) = write
-                .send(Message::Text(
-                    serde_json::to_string(&cable_msg).expect("serializable"),
-                ))
+                .send_text(&serde_json::to_string(&cable_msg).expect("serializable"))
                 .await
             {
                 log::error!("Failed to send to {}: {}", target, e);
@@ -900,12 +851,7 @@ impl ActionCableChannel {
         reliable: bool,
         reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
         identifier_json: &str,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        write: &mut crate::ws::WsWriter,
         peers: &Arc<StdRwLock<HashSet<PeerId>>>,
     ) -> Vec<RawIncoming> {
         let Some(cable_msg) = serde_json::from_str::<IncomingCableMessage>(text).ok() else {
@@ -1101,12 +1047,7 @@ impl ActionCableChannel {
         reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
         crypto_service: &Option<CryptoService>,
         identifier_json: &str,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        write: &mut crate::ws::WsWriter,
     ) -> Vec<RawIncoming> {
         // Parse binary reliable message: [type][seq 8B LE][payload] or [type][count 2B LE][ranges]
         let Ok(reliable_msg) = ReliableMessage::from_bytes(plaintext) else {
@@ -1248,12 +1189,7 @@ impl ActionCableChannel {
         reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
         crypto_service: &Option<CryptoService>,
         identifier_json: &str,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        write: &mut crate::ws::WsWriter,
     ) {
         // Collect peers needing maintenance (avoid holding lock during I/O)
         let maintenance: Vec<(PeerId, bool, Vec<ReliableMessage>)> = {
@@ -1314,12 +1250,7 @@ impl ActionCableChannel {
         msg: &ReliableMessage,
         crypto_service: &Option<CryptoService>,
         identifier_json: &str,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        write: &mut crate::ws::WsWriter,
     ) {
         let msg_bytes = msg.to_bytes();
 
@@ -1357,9 +1288,7 @@ impl ActionCableChannel {
         };
 
         if let Err(e) = write
-            .send(Message::Text(
-                serde_json::to_string(&cable_msg).expect("serializable"),
-            ))
+            .send_text(&serde_json::to_string(&cable_msg).expect("serializable"))
             .await
         {
             log::warn!("Failed to send reliable message to {}: {}", peer, e);
@@ -1374,12 +1303,7 @@ impl ActionCableChannel {
         reliable_sessions: &Arc<RwLock<HashMap<String, ReliableSession>>>,
         crypto_service: &Option<CryptoService>,
         identifier_json: &str,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        write: &mut crate::ws::WsWriter,
     ) {
         // Generate ACK from receiver state and encode as binary
         let ack_bytes = {
@@ -1425,9 +1349,7 @@ impl ActionCableChannel {
         };
 
         if let Err(e) = write
-            .send(Message::Text(
-                serde_json::to_string(&cable_msg).expect("serializable"),
-            ))
+            .send_text(&serde_json::to_string(&cable_msg).expect("serializable"))
             .await
         {
             log::warn!("Failed to send ACK to {}: {}", peer, e);

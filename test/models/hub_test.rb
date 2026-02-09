@@ -169,7 +169,33 @@ class HubTest < ActiveSupport::TestCase
     assert_not hub.active?
   end
 
-  test "name returns device name when device present" do
+  test "name returns column value when set" do
+    hub = Hub.new(
+      user: @user,
+      name: "My Custom Name",
+      identifier: SecureRandom.uuid,
+      last_seen_at: Time.current
+    )
+    assert_equal "My Custom Name", hub.name
+  end
+
+  test "name returns column value over device name" do
+    device = @user.devices.create!(
+      name: "My CLI",
+      device_type: "cli",
+      fingerprint: SecureRandom.hex(8)
+    )
+    hub = Hub.new(
+      user: @user,
+      name: "Custom Name",
+      device: device,
+      identifier: SecureRandom.uuid,
+      last_seen_at: Time.current
+    )
+    assert_equal "Custom Name", hub.name
+  end
+
+  test "name returns device name when column is blank" do
     device = @user.devices.create!(
       name: "My CLI",
       device_type: "cli",
@@ -184,7 +210,7 @@ class HubTest < ActiveSupport::TestCase
     assert_equal "My CLI", hub.name
   end
 
-  test "name returns truncated identifier when no device" do
+  test "name returns truncated identifier when no column and no device" do
     hub = Hub.new(
       user: @user,
       identifier: "a-very-long-hub-identifier-string",

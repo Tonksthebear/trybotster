@@ -39,9 +39,9 @@
 
 // Rust guideline compliant 2026-02-04
 
+pub mod action_cable_connection;
 pub mod actions;
 pub mod agent_handle;
-pub mod command_channel;
 pub mod handle_cache;
 pub mod lifecycle;
 pub mod registration;
@@ -54,7 +54,7 @@ pub use actions::HubAction;
 pub use agent_handle::AgentPtys;
 pub use state::{HubState, SharedHubState};
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use reqwest::blocking::Client;
@@ -66,6 +66,7 @@ use crate::config::Config;
 use crate::device::Device;
 use crate::git::WorktreeManager;
 use crate::lua::LuaRuntime;
+use crate::lua::primitives::SharedServerId;
 
 /// Queued PTY output message for WebRTC delivery.
 ///
@@ -140,16 +141,14 @@ pub struct Hub {
     pub hub_identifier: String,
     /// Server-assigned ID for server communication (set after registration).
     pub botster_id: Option<String>,
+    /// Shared copy of `botster_id` for Lua primitives (updated on registration).
+    pub shared_server_id: SharedServerId,
     /// Async runtime for relay and preview channel operations.
     pub tokio_runtime: tokio::runtime::Runtime,
 
     // === Control Flags ===
     /// Whether the hub should quit.
     pub quit: bool,
-
-    // === Timing ===
-    /// Last time we sent a heartbeat.
-    pub last_heartbeat: Instant,
 
     // === Browser Relay ===
     /// Browser connection state and communication.
@@ -158,8 +157,6 @@ pub struct Hub {
     // === Background Workers ===
     /// Background worker for notification sending (non-blocking).
     pub notification_worker: Option<workers::NotificationWorker>,
-    /// WebSocket command channel for real-time message delivery from Rails.
-    pub command_channel: Option<command_channel::CommandChannelHandle>,
 
     // === WebRTC Channels ===
     /// WebRTC peer connections indexed by browser identity.
@@ -191,7 +188,7 @@ pub struct Hub {
     ///
     /// Cloned for each new WebRTC channel. The async `on_ice_candidate` callback
     /// encrypts the candidate and sends it here. `poll_outgoing_signals()` drains
-    /// the receiver and relays via `CommandChannelHandle::perform("signal", ...)`.
+    /// the receiver and relays via `ChannelHandle::perform("signal", ...)`.
     pub webrtc_outgoing_signal_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::OutgoingSignal>,
     /// Receiver for outgoing WebRTC signals. Drained in `tick()`.
     webrtc_outgoing_signal_rx: tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::OutgoingSignal>,
@@ -214,6 +211,12 @@ pub struct Hub {
     // === Lua Scripting ===
     /// Lua scripting runtime for hot-reloadable behavior customization.
     pub lua: LuaRuntime,
+
+    // === Lua ActionCable ===
+    /// Lua-managed ActionCable connections keyed by connection ID.
+    lua_ac_connections: std::collections::HashMap<String, crate::lua::primitives::action_cable::LuaAcConnection>,
+    /// Lua-managed ActionCable channel subscriptions keyed by channel ID.
+    lua_ac_channels: std::collections::HashMap<String, crate::lua::primitives::action_cable::LuaAcChannel>,
 
     /// Pending PTY output observer notifications.
     ///
@@ -292,9 +295,6 @@ impl Hub {
         let device = Device::load_or_create()?;
         log::info!("Device fingerprint: {}", device.fingerprint);
 
-        // Initialize heartbeat timestamp to past to trigger immediate heartbeat on first tick
-        let past = Instant::now() - std::time::Duration::from_secs(3600);
-
         // Create handle cache for thread-safe agent handle access
         let handle_cache = Arc::new(handle_cache::HandleCache::new());
         // Create channel for WebRTC PTY output from forwarder tasks
@@ -314,13 +314,12 @@ impl Hub {
             device,
             hub_identifier,
             botster_id: None,
+            shared_server_id: Arc::new(Mutex::new(None)),
             tokio_runtime,
             quit: false,
-            last_heartbeat: past,
             browser: crate::relay::BrowserState::default(),
             // Workers are started later via start_background_workers() after registration
             notification_worker: None,
-            command_channel: None,
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
             webrtc_connection_started: std::collections::HashMap::new(),
@@ -333,6 +332,8 @@ impl Hub {
             stream_frame_rx,
             stream_frame_tx,
             lua,
+            lua_ac_connections: std::collections::HashMap::new(),
+            lua_ac_channels: std::collections::HashMap::new(),
             pty_observer_queue: std::collections::VecDeque::new(),
             tui_output_tx: None,
             tui_request_rx: None,
@@ -355,41 +356,6 @@ impl Hub {
             log::info!("Starting background notification worker");
             self.notification_worker = Some(workers::NotificationWorker::new(worker_config));
         }
-    }
-
-    /// Connect to the HubCommandChannel for real-time message delivery.
-    ///
-    /// Call this after hub registration completes and `botster_id` is set.
-    /// The command channel replaces HTTP polling for message delivery.
-    fn connect_command_channel(&mut self) {
-        if self.command_channel.is_some() {
-            log::warn!("Command channel already connected");
-            return;
-        }
-
-        let server_url = self.config.server_url.clone();
-        let api_key = self.config.get_api_key().to_string();
-        let hub_id = self.server_hub_id().to_string();
-
-        // Start from sequence 0 on first connect (no messages acked yet)
-        let start_from = 0i64;
-
-        // Detect repo for GitHub event subscription
-        let repo = if let Ok(repo) = std::env::var("BOTSTER_REPO") {
-            Some(repo)
-        } else {
-            match crate::git::WorktreeManager::detect_current_repo() {
-                Ok((_path, name)) => Some(name),
-                Err(_) => None,
-            }
-        };
-
-        log::info!("Connecting command channel to {} (hub={}, repo={:?})", server_url, hub_id, repo);
-
-        // Must enter tokio runtime context for tokio::spawn in connect()
-        let _guard = self.tokio_runtime.enter();
-        let handle = command_channel::connect(&server_url, &api_key, &hub_id, start_from, repo.as_deref());
-        self.command_channel = Some(handle);
     }
 
     /// Shutdown all background workers gracefully.
@@ -478,9 +444,8 @@ impl Hub {
         // Must be called after register_hub_with_server() sets botster_id
         self.start_background_workers();
 
-        // Connect command channel for real-time WebSocket message delivery
-        // Must be called after register_hub_with_server() sets botster_id
-        self.connect_command_channel();
+        // ActionCable connections are now managed by Lua plugins
+        // (hub_commands.lua and github.lua handle subscription lifecycle)
 
         // Seed shared state so clients have data immediately
         if let Err(e) = self.load_available_worktrees() {
@@ -491,6 +456,8 @@ impl Hub {
         if let Err(e) = self.lua.register_hub_primitives(
             Arc::clone(&self.handle_cache),
             self.config.worktree_base.clone(),
+            Arc::clone(&self.shared_server_id),
+            Arc::clone(&self.state),
         ) {
             log::warn!("Failed to register Hub Lua primitives: {}", e);
         }
@@ -624,12 +591,6 @@ impl Hub {
         if let Err(e) = self.lua.fire_shutdown() {
             log::warn!("Lua shutdown event error: {}", e);
         }
-
-        // Shutdown command channel
-        if let Some(ref channel) = self.command_channel {
-            channel.shutdown();
-        }
-        self.command_channel = None;
 
         // Shutdown background workers (allows pending notifications to drain)
         self.shutdown_background_workers();

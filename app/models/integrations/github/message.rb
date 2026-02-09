@@ -5,10 +5,6 @@ module Integrations
     class Message < ApplicationRecord
       self.table_name = "github_messages"
 
-      # GitHub messages don't use hub-scoped sequences. This sentinel distinguishes
-      # them from HubCommands on the wire so the CLI can route acks correctly.
-      NO_SEQUENCE = -1
-
       validates :event_type, presence: true, inclusion: {
         in: %w[github_mention agent_cleanup],
         message: "%{value} is not a valid event type"
@@ -40,11 +36,10 @@ module Integrations
         event_type == "github_mention"
       end
 
-      # Wire format for ActionCable transmission to CLI
+      # Wire format for ActionCable transmission to CLI via Github::EventsChannel
       def to_wire
         {
           type: "message",
-          sequence: NO_SEQUENCE,
           id: id,
           event_type: event_type,
           payload: payload,
