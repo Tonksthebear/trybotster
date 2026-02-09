@@ -24,7 +24,7 @@ class DropBotMessages < ActiveRecord::Migration[8.0]
     add_index :bot_messages, :claimed_at
     add_index :bot_messages, :claimed_by_user_id
     add_index :bot_messages, :event_type
-    add_index :bot_messages, [:hub_id, :sequence], unique: true, where: "((hub_id IS NOT NULL) AND (sequence IS NOT NULL))"
+    add_index :bot_messages, [ :hub_id, :sequence ], unique: true, where: "((hub_id IS NOT NULL) AND (sequence IS NOT NULL))"
     add_index :bot_messages, :hub_id
     add_index :bot_messages, :sent_at
     add_index :bot_messages, :status

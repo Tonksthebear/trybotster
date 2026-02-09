@@ -83,11 +83,11 @@ module Hubs
         password = Base64.strict_encode64(
           OpenSSL::HMAC.digest("SHA1", ENV["TURN_SECRET"], username)
         )
-        [{
+        [ {
           urls: ENV["TURN_SERVER_URL"],
           username: username,
           credential: password
-        }]
+        } ]
       else
         []
       end
