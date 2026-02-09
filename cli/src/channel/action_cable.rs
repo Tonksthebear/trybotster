@@ -920,7 +920,7 @@ impl ActionCableChannel {
                     log::info!("{} subscription confirmed", config.channel_name);
 
                     // Send handshake to browser if we have browser identity.
-                    // CLI is "last" to connect (browser subscribes first, notifies CLI via Bot::Message).
+                    // CLI is "last" to connect (browser subscribes first, notifies CLI via HubCommand).
                     // This initiates the E2E handshake; browser responds with "ack".
                     if let Some(ref browser_identity) = config.browser_identity {
                         let peer = PeerId(browser_identity.clone());

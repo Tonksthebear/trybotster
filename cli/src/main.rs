@@ -153,6 +153,9 @@ fn run_headless() -> Result<()> {
     // Ensure we have a valid authentication token
     ensure_authenticated()?;
 
+    // Check for updates (non-interactive — logs warning only)
+    let _ = commands::update::check_on_boot_headless();
+
     // Set up signal handlers
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::flag;
@@ -211,6 +214,9 @@ fn run_headless() -> Result<()> {
 fn run_with_tui() -> Result<()> {
     // Ensure we have a valid authentication token
     ensure_authenticated()?;
+
+    // Check for updates (at most once per 24h, never blocks startup on failure)
+    let _ = commands::update::check_on_boot();
 
     // Set up signal handlers
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};

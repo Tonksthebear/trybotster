@@ -48,7 +48,7 @@ The webhook system processes GitHub events (issue comments, PR comments) and rou
    ↓
 7. Build structured context
    ↓
-8. Create Bot::Message with formatted prompt
+8. Create Integrations::Github::Message with formatted prompt
    ↓
 9. Agent processes the message
 ```
@@ -365,23 +365,18 @@ end
 
 ## Implementation Details
 
-### Bot::Message Payload Structure
+### Integrations::Github::Message Payload Structure
 
-The payload stored in the database includes multiple fields for flexibility:
+The message stores `repo` and `issue_number` as top-level columns; the payload holds structured context:
 
 ```ruby
-message = Bot::Message.create!(
+message = Integrations::Github::Message.create!(
   event_type: "github_mention",
+  repo: repo,
+  issue_number: issue_number,
   payload: {
-    # Primary field - used by botster-hub (checked first)
     prompt: formatted_context,
-    
-    # Structured data for programmatic access
     structured_context: structured_context,
-    
-    # Raw data fields for custom prompt building
-    repo: repo,
-    issue_number: issue_number,
     comment_id: comment_id,
     comment_body: comment_body,
     comment_author: comment_author,
@@ -389,9 +384,7 @@ message = Bot::Message.create!(
     issue_body: issue_body,
     issue_url: issue_url,
     is_pr: is_pr,
-    
-    # Legacy context field (same as prompt for backwards compatibility)
-    context: formatted_context
+    installation_id: installation_id
   }
 )
 ```
@@ -455,8 +448,8 @@ test "issue_comment on PR with linked issue routes to issue" do
     }
   
   # 4. Verify routing
-  message = Bot::Message.last
-  assert_equal 50, message.payload["issue_number"], "Should route to issue #50"
+  message = Integrations::Github::Message.last
+  assert_equal 50, message.issue_number, "Should route to issue #50"
   assert_equal false, message.payload["is_pr"], "Should be marked as issue"
 end
 ```

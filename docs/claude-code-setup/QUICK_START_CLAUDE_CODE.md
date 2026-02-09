@@ -243,7 +243,7 @@ The skills enforce **Botster Hub architectural principles**:
 
 **Put business logic in models:**
 ```ruby
-class Bot::Message < ApplicationRecord
+class Integrations::Github::Message < ApplicationRecord
   def acknowledge!
     update!(acknowledged_at: Time.current, status: 'acknowledged')
   end

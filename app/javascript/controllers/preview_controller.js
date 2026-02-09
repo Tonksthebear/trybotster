@@ -2,14 +2,14 @@
  * Preview Controller - HTTP preview tunneling via Service Worker.
  *
  * Bridges the Service Worker (which intercepts fetch requests in the iframe)
- * with the PreviewConnection (E2E encrypted channel to CLI's dev server).
+ * with the PreviewConnection (E2E encrypted TCP streams to CLI's dev server).
  *
  * Architecture:
  *   1. SW intercepts fetch requests in preview iframe
  *   2. SW sends http_request via client.postMessage() to this page
  *   3. This controller receives request via navigator.serviceWorker message event
- *   4. Controller proxies request through PreviewConnection to CLI
- *   5. CLI forwards to localhost dev server, returns encrypted response
+ *   4. Controller proxies request through PreviewConnection's stream multiplexer
+ *   5. CLI forwards TCP stream to localhost dev server
  *   6. Controller sends response back to SW via controller.postMessage()
  *   7. SW resolves the fetch with the proxied response
  *
@@ -34,6 +34,7 @@ export default class extends Controller {
     ptyIndex: { type: Number, default: 1 },
     scope: String,
     initialUrl: { type: String, default: "/" },
+    port: { type: Number, default: 3000 },
   };
 
   #connection = null;
@@ -68,6 +69,7 @@ export default class extends Controller {
           hubId: this.hubIdValue,
           agentIndex: this.agentIndexValue,
           ptyIndex: this.ptyIndexValue,
+          port: this.portValue,
         },
       );
 
@@ -81,9 +83,6 @@ export default class extends Controller {
 
       // Set up SW message listener
       this.#setupServiceWorkerListener();
-
-      // No explicit subscribe() — health events drive the WebRTC lifecycle.
-      // onStateChange above will update UI when connection progresses.
     } catch (error) {
       this.#updateStatus("Connection failed", "error");
       this.#showError(error.message);
@@ -101,7 +100,6 @@ export default class extends Controller {
     this.#unsubscribers = [];
 
     // Unsubscribe from channel then release connection ref
-    // Fire and forget - the wrapper tracks its own state
     const conn = this.#connection;
     this.#connection = null;
     if (conn) {
@@ -135,7 +133,6 @@ export default class extends Controller {
     if (data.type !== "http_request") return;
 
     try {
-      // Proxy request through PreviewConnection
       const response = await this.#connection.fetch({
         method: data.method,
         path: data.path,
@@ -143,15 +140,19 @@ export default class extends Controller {
         body: data.body,
       });
 
-      // Send response back to SW
+      // Response is a real Response object — extract for postMessage
+      const body = await response.arrayBuffer();
+      const headers = {};
+      response.headers.forEach((value, key) => { headers[key] = value; });
+
       this.#sendToServiceWorker({
         type: "http_response",
         requestId: data.requestId,
         response: {
           status: response.status,
           statusText: response.statusText,
-          headers: response.headers,
-          body: response.body ? this.#encodeBody(response.body) : null,
+          headers,
+          body: this.#arrayBufferToBase64(body),
         },
       });
     } catch (error) {
@@ -232,33 +233,13 @@ export default class extends Controller {
 
   // ========== Utility ==========
 
-  #encodeBody(body) {
-    if (!body) return null;
-
-    // Handle compressed response from PreviewConnection
-    if (body.compressed && body.bytes) {
-      // Return as-is, SW will handle decompression
-      let binary = "";
-      for (let i = 0; i < body.bytes.length; i++) {
-        binary += String.fromCharCode(body.bytes[i]);
-      }
-      return btoa(binary);
+  #arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    const CHUNK = 8192;
+    const parts = [];
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      parts.push(String.fromCharCode(...bytes.subarray(i, i + CHUNK)));
     }
-
-    // Handle Uint8Array
-    if (body instanceof Uint8Array) {
-      let binary = "";
-      for (let i = 0; i < body.length; i++) {
-        binary += String.fromCharCode(body[i]);
-      }
-      return btoa(binary);
-    }
-
-    // Handle string
-    if (typeof body === "string") {
-      return btoa(body);
-    }
-
-    return null;
+    return btoa(parts.join(""));
   }
 }

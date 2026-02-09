@@ -196,6 +196,13 @@ pub struct Hub {
     /// Receiver for outgoing WebRTC signals. Drained in `tick()`.
     webrtc_outgoing_signal_rx: tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::OutgoingSignal>,
 
+    /// TCP stream multiplexers per browser identity for preview tunneling.
+    stream_muxes: std::collections::HashMap<String, crate::relay::stream_mux::StreamMultiplexer>,
+    /// Receiver for incoming stream frames from WebRTC DataChannels.
+    stream_frame_rx: tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::StreamIncoming>,
+    /// Sender for incoming stream frames (cloned into each WebRtcChannel).
+    pub stream_frame_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::StreamIncoming>,
+
     // === Handle Cache ===
     /// Thread-safe cache of agent handles for non-blocking client access.
     ///
@@ -294,6 +301,8 @@ impl Hub {
         let (webrtc_pty_output_tx, webrtc_pty_output_rx) = tokio::sync::mpsc::unbounded_channel();
         // Create channel for outgoing WebRTC signals (ICE candidates from async callbacks)
         let (webrtc_outgoing_signal_tx, webrtc_outgoing_signal_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Create channel for incoming stream multiplexer frames from WebRTC DataChannels
+        let (stream_frame_tx, stream_frame_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Initialize Lua scripting runtime
         let lua = LuaRuntime::new()?;
@@ -320,6 +329,9 @@ impl Hub {
             webrtc_pty_forwarders: std::collections::HashMap::new(),
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx,
+            stream_muxes: std::collections::HashMap::new(),
+            stream_frame_rx,
+            stream_frame_tx,
             lua,
             pty_observer_queue: std::collections::VecDeque::new(),
             tui_output_tx: None,
@@ -362,11 +374,21 @@ impl Hub {
         // Start from sequence 0 on first connect (no messages acked yet)
         let start_from = 0i64;
 
-        log::info!("Connecting command channel to {} (hub={})", server_url, hub_id);
+        // Detect repo for GitHub event subscription
+        let repo = if let Ok(repo) = std::env::var("BOTSTER_REPO") {
+            Some(repo)
+        } else {
+            match crate::git::WorktreeManager::detect_current_repo() {
+                Ok((_path, name)) => Some(name),
+                Err(_) => None,
+            }
+        };
+
+        log::info!("Connecting command channel to {} (hub={}, repo={:?})", server_url, hub_id, repo);
 
         // Must enter tokio runtime context for tokio::spawn in connect()
         let _guard = self.tokio_runtime.enter();
-        let handle = command_channel::connect(&server_url, &api_key, &hub_id, start_from);
+        let handle = command_channel::connect(&server_url, &api_key, &hub_id, start_from, repo.as_deref());
         self.command_channel = Some(handle);
     }
 
@@ -615,6 +637,11 @@ impl Hub {
         // Abort all PTY forwarder tasks
         for (_key, task) in self.webrtc_pty_forwarders.drain() {
             task.abort();
+        }
+
+        // Close all stream multiplexers
+        for (_id, mut mux) in self.stream_muxes.drain() {
+            mux.close_all();
         }
 
         // Disconnect all WebRTC channels (fire-and-forget to avoid deadlock)

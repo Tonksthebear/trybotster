@@ -22,15 +22,16 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
 
   test "github_mention message triggers agent spawn" do
     # Create a pending message that should spawn an agent
-    message = Bot::Message.create!(
+    message = Integrations::Github::Message.create!(
       event_type: "github_mention",
+      repo: @hub.repo,
+      issue_number: 123,
       payload: {
         repo: @hub.repo,
         issue_number: 123,
         comment_body: "Hey @botster, please help with this",
         prompt: "Help with the issue"
-      },
-      status: "pending"
+      }
     )
 
     # Start CLI - it will poll and pick up the message
@@ -52,14 +53,15 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
   end
 
   test "agent spawn creates worktree" do
-    message = Bot::Message.create!(
+    message = Integrations::Github::Message.create!(
       event_type: "github_mention",
+      repo: @hub.repo,
+      issue_number: 456,
       payload: {
         repo: @hub.repo,
         issue_number: 456,
         prompt: "Create a feature"
-      },
-      status: "pending"
+      }
     )
 
     cli = start_cli_in_git_repo(@hub, timeout: 30)
@@ -78,15 +80,16 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
   end
 
   test "agent receives environment variables" do
-    message = Bot::Message.create!(
+    message = Integrations::Github::Message.create!(
       event_type: "github_mention",
+      repo: @hub.repo,
+      issue_number: 789,
       payload: {
         repo: @hub.repo,
         issue_number: 789,
         prompt: "Check environment",
         invocation_url: "https://github.com/test/repo/issues/789#issuecomment-123"
-      },
-      status: "pending"
+      }
     )
 
     cli = start_cli_in_git_repo(@hub, timeout: 30)
@@ -111,10 +114,11 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
 
   test "agent_cleanup message removes agent session" do
     # First, spawn an agent
-    spawn_message = Bot::Message.create!(
+    spawn_message = Integrations::Github::Message.create!(
       event_type: "github_mention",
-      payload: { repo: @hub.repo, issue_number: 101, prompt: "Task" },
-      status: "pending"
+      repo: @hub.repo,
+      issue_number: 101,
+      payload: { repo: @hub.repo, issue_number: 101, prompt: "Task" }
     )
 
     cli = start_cli_in_git_repo(@hub, timeout: 30)
@@ -129,14 +133,15 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
     initial_agent_count = @hub.hub_agents.count
 
     # Now send cleanup message
-    cleanup_message = Bot::Message.create!(
+    cleanup_message = Integrations::Github::Message.create!(
       event_type: "agent_cleanup",
+      repo: @hub.repo,
+      issue_number: 101,
       payload: {
         repo: @hub.repo,
         issue_number: 101,
         cleanup_reason: "Issue resolved"
-      },
-      status: "pending"
+      }
     )
 
     # Wait for cleanup to be processed (poll interval is 5s, plus processing time)
@@ -155,10 +160,11 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
 
   test "multiple agents can run concurrently" do
     messages = [ 111, 222, 333 ].map do |issue_num|
-      Bot::Message.create!(
+      Integrations::Github::Message.create!(
         event_type: "github_mention",
-        payload: { repo: @hub.repo, issue_number: issue_num, prompt: "Task #{issue_num}" },
-        status: "pending"
+        repo: @hub.repo,
+        issue_number: issue_num,
+        payload: { repo: @hub.repo, issue_number: issue_num, prompt: "Task #{issue_num}" }
       )
     end
 
@@ -186,6 +192,8 @@ class CliAgentLifecycleTest < CliIntegrationTestCase
 
   # Start CLI with a git repo already set up
   def start_cli_in_git_repo(hub, **options)
+    build_cli unless skip_build?
+
     # Create temp directory with git repo
     temp_dir = Dir.mktmpdir("cli_agent_test_")
     worktree_base = Dir.mktmpdir("cli_worktrees_")

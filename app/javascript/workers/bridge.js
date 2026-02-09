@@ -76,6 +76,7 @@ class WorkerBridge {
       webrtcTransport.on("subscription:confirmed", (data) => this.#dispatchEvent({ event: "subscription:confirmed", ...data }))
       webrtcTransport.on("health", (data) => this.#dispatchEvent({ event: "health", ...data }))
       webrtcTransport.on("session:invalid", (data) => this.#dispatchEvent({ event: "session:invalid", ...data }))
+      webrtcTransport.on("stream:frame", (data) => this.#dispatchEvent({ event: "stream:frame", ...data }))
 
       this.#initialized = true
     } catch (error) {
@@ -189,6 +190,8 @@ class WorkerBridge {
         return webrtcTransport.sendRaw(params.subscriptionId, params.message)
       case "sendEncrypted":
         return webrtcTransport.sendEncrypted(params.hubId, params.encrypted)
+      case "sendStreamFrame":
+        return webrtcTransport.sendStreamFrame(params.hubId, params.frameType, params.streamId, params.payload)
       default:
         throw new Error(`Unknown action: ${action}`)
     }

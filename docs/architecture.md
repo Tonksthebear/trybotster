@@ -27,10 +27,10 @@ GitHub @mention → Rails server → Message queue → Rust CLI polls
 **Responsibilities:**
 
 - GitHub OAuth authentication
-- GitHub webhook processing (creates `Bot::Message` records)
+- GitHub webhook processing (creates `Integrations::Github::Message` records)
 - User/Hub/Device record management
 - Action Cable WebSocket relay (TerminalRelayChannel)
-- HTTP polling endpoint for CLI messages
+- ActionCable delivery of hub commands and GitHub events to CLI
 
 **Does NOT:**
 
@@ -197,9 +197,13 @@ Browser device identity for E2E encryption.
 - `identity_public_key` - Ed25519 public key
 - `device_type` - "browser" or "cli"
 
-### Bot::Message
+### Integrations::Github::Message
 
-Queued messages from GitHub webhooks for CLI to poll.
+GitHub webhook events (mentions, cleanup). Delivered to CLI via `github_events:{repo}` ActionCable stream.
+
+### HubCommand
+
+Hub platform commands (browser_wants_preview). Delivered to CLI via `hub_command:{hub_id}` ActionCable stream.
 
 ---
 

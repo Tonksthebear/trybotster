@@ -209,7 +209,8 @@ Comprehensive testing of all 6 environment variables:
 | Webhooks Controller | ✅ Excellent | 12 tests, all routing scenarios |
 | PR-to-Issue Routing | ✅ Excellent | Full integration test |
 | Structured Context | ✅ Excellent | Format and content verified |
-| Bot::Message | ✅ Good | Payload structure tested |
+| Integrations::Github::Message | ✅ Good | Payload structure tested |
+| HubCommand | ✅ Good | Sequence generation, broadcast tested |
 | Signature Validation | ✅ Good | Security tested |
 
 ### Rust Components

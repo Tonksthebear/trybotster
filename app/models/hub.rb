@@ -4,7 +4,7 @@ class Hub < ApplicationRecord
   belongs_to :user
   belongs_to :device, optional: true  # The CLI device running this hub
   has_many :hub_agents, dependent: :destroy
-  has_many :bot_messages, class_name: "Bot::Message", dependent: :nullify
+  has_many :hub_commands, dependent: :destroy
 
   validates :repo, presence: true
   validates :identifier, presence: true, uniqueness: true

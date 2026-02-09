@@ -44,11 +44,11 @@
 │  │  • Browser subscribes with browser_identity                           │  │
 │  │  • Agent subscribes without browser_identity                          │  │
 │  │  • Rails relays encrypted blobs (cannot read content)                 │  │
-│  │  • On browser subscribe: creates browser_wants_preview Bot::Message   │  │
+│  │  • On browser subscribe: creates browser_wants_preview HubCommand     │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┬───────────────┘
                                                               │
-                                           Bot::Message queue
+                                           HubCommand queue
                                            (browser_wants_preview)
                                                               │
 ┌─────────────────────────────────────────────────────────────┼───────────────┐
@@ -122,7 +122,7 @@ Browser                          Rails                           CLI
    │   {hub_id, agent_index,       │                               │
    │    browser_identity}          │                               │
    │                               │                               │
-   │                               │──Bot::Message────────────────▶│
+   │                               │──HubCommand──────────────────▶│
    │                               │  browser_wants_preview        │
    │                               │  {agent_index,                │
    │                               │   browser_identity}           │

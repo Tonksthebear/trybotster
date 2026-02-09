@@ -332,10 +332,11 @@ class AgentUrlNavigationTest < ApplicationSystemTestCase
   end
 
   def create_and_wait_for_agent(hub, issue_number:, timeout: 20)
-    message = Bot::Message.create!(
+    message = Integrations::Github::Message.create!(
       event_type: "github_mention",
-      payload: { repo: hub.repo, issue_number: issue_number, prompt: "Test" },
-      status: "pending"
+      repo: hub.repo,
+      issue_number: issue_number,
+      payload: { repo: hub.repo, issue_number: issue_number, prompt: "Test" }
     )
 
     # Wait for message to be acknowledged

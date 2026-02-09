@@ -129,7 +129,7 @@ test "issue_comment webhook creates bot message with prompt field" do
 
   assert_response :success
 
-  message = Bot::Message.last
+  message = Integrations::Github::Message.last
   assert_equal "github_mention", message.event_type
   assert_not_nil message.payload["prompt"]
 end
@@ -157,11 +157,11 @@ assert_response :not_found
 assert_response :unauthorized
 
 # Record count assertions
-assert_difference "Bot::Message.count", 1 do
+assert_difference "Integrations::Github::Message.count", 1 do
   # Code that creates a record
 end
 
-assert_no_difference "Bot::Message.count" do
+assert_no_difference "Integrations::Github::Message.count" do
   # Code that should not create a record
 end
 
@@ -189,23 +189,29 @@ assert_match /regex/, string
 ### ActiveRecord Model Tests
 
 ```ruby
-class BotMessageTest < ActiveSupport::TestCase
+class GithubMessageTest < ActiveSupport::TestCase
   test "should not save without event_type" do
-    message = Bot::Message.new(payload: {})
+    message = Integrations::Github::Message.new(repo: "owner/repo", payload: {})
     assert_not message.save
   end
 
   test "should save with valid attributes" do
-    message = Bot::Message.new(
+    message = Integrations::Github::Message.new(
       event_type: "github_mention",
-      payload: { repo: "owner/repo" }
+      repo: "owner/repo",
+      payload: { prompt: "Help with issue" }
     )
     assert message.save
   end
 
-  test "associations work correctly" do
-    message = bot_messages(:one)
-    assert_respond_to message, :tags
+  test "acknowledge! updates status" do
+    message = Integrations::Github::Message.create!(
+      event_type: "github_mention",
+      repo: "owner/repo",
+      payload: { prompt: "test" }
+    )
+    message.acknowledge!
+    assert_equal "acknowledged", message.status
   end
 end
 ```
@@ -333,7 +339,7 @@ test "ignores comments from bot users" do
     ...
   }
 
-  assert_no_difference "Bot::Message.count" do
+  assert_no_difference "Integrations::Github::Message.count" do
     post "/github/webhooks", ...
   end
 end
@@ -382,14 +388,14 @@ end
 ```ruby
 # Good - self-contained
 test "creates message" do
-  assert_difference "Bot::Message.count", 1 do
-    Bot::Message.create!(event_type: "test", payload: {})
+  assert_difference "Integrations::Github::Message.count", 1 do
+    Integrations::Github::Message.create!(event_type: "github_mention", repo: "owner/repo", payload: { prompt: "test" })
   end
 end
 
 # Bad - depends on other tests
 test "updates message created in previous test" do
-  message = Bot::Message.last  # Assumes previous test ran
+  message = Integrations::Github::Message.last  # Assumes previous test ran
   message.update!(payload: { updated: true })
 end
 ```

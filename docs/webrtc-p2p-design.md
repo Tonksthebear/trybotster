@@ -174,7 +174,7 @@ module Api
       )
 
       # Create message for CLI to pick up
-      Bot::Message.create!(
+      HubCommand.create!(
         event_type: 'webrtc_offer',
         payload: {
           session_id: session.id,
