@@ -37,6 +37,8 @@ impl Hub {
         self.poll_webrtc_channels();
         self.cleanup_disconnected_webrtc_channels();
         self.poll_webrtc_pty_output();
+        self.poll_stream_frames_incoming();
+        self.poll_stream_frames_outgoing();
         self.poll_pty_observers();
         self.poll_tui_requests();
         self.send_command_channel_heartbeat();
@@ -130,13 +132,7 @@ impl Hub {
 
         // Now process each message with full &mut self access
         for msg in &messages {
-            let sequence = msg.sequence;
-
             match msg.event_type.as_str() {
-                // Note: "browser_connected" and "browser_disconnected" events are no longer
-                // sent by Rails since HubChannel was deleted. Browser communication now
-                // happens directly via WebRTC (see handle_webrtc_* methods below).
-                // These event types remain in Bot::Message validation for legacy compatibility.
                 "terminal_connected" | "terminal_disconnected" | "browser_wants_preview" => {
                     // Legacy event types -- browsers now connect via WebRTC DataChannel directly.
                     log::debug!("Ignoring legacy command channel event: {}", msg.event_type);
@@ -146,9 +142,15 @@ impl Hub {
                 }
             }
 
-            // Acknowledge after processing
+            // Acknowledge after processing: bifurcate by message source
             if let Some(ref channel) = self.command_channel {
-                channel.acknowledge(sequence);
+                if msg.sequence >= 0 {
+                    // Hub command — ack by sequence
+                    channel.acknowledge(msg.sequence);
+                } else {
+                    // GitHub message (sentinel -1) — ack by ID
+                    channel.perform("ack_github", serde_json::json!({ "id": msg.id }));
+                }
             }
         }
     }
@@ -508,6 +510,12 @@ impl Hub {
 
         // Remove connection start time tracking
         self.webrtc_connection_started.remove(browser_identity);
+
+        // Close and remove stream multiplexer for this browser
+        if let Some(mut mux) = self.stream_muxes.remove(browser_identity) {
+            mux.close_all();
+            log::debug!("[WebRTC] Closed stream multiplexer for {}", &browser_identity[..browser_identity.len().min(8)]);
+        }
 
         // Abort any PTY forwarders for this browser.
         // Forwarder keys are "{peer_id}:{agent_index}:{pty_index}" where peer_id = browser_identity
@@ -1167,6 +1175,72 @@ impl Hub {
         }
     }
 
+    // === Stream Multiplexer ===
+
+    /// Poll for incoming stream frames from WebRTC DataChannels.
+    ///
+    /// Drains `stream_frame_rx`, gets or creates a `StreamMultiplexer` per
+    /// browser identity, and dispatches each frame.
+    fn poll_stream_frames_incoming(&mut self) {
+        use crate::relay::stream_mux::StreamMultiplexer;
+
+        let frames: Vec<crate::channel::webrtc::StreamIncoming> =
+            std::iter::from_fn(|| self.stream_frame_rx.try_recv().ok()).collect();
+
+        if frames.is_empty() {
+            return;
+        }
+
+        for frame in frames {
+            let mux = self
+                .stream_muxes
+                .entry(frame.browser_identity.clone())
+                .or_insert_with(StreamMultiplexer::new);
+
+            mux.handle_frame(frame.frame_type, frame.stream_id, frame.payload);
+        }
+    }
+
+    /// Poll stream multiplexers for outgoing frames and send via WebRTC.
+    ///
+    /// Iterates all active multiplexers, drains their output queues, and sends
+    /// each frame via the corresponding WebRTC channel's `send_stream_raw`.
+    fn poll_stream_frames_outgoing(&mut self) {
+        let browser_ids: Vec<String> = self.stream_muxes.keys().cloned().collect();
+
+        for browser_identity in browser_ids {
+            let frames = {
+                let Some(mux) = self.stream_muxes.get_mut(&browser_identity) else {
+                    continue;
+                };
+                mux.drain_output()
+            };
+
+            if frames.is_empty() {
+                continue;
+            }
+
+            let Some(channel) = self.webrtc_channels.get(&browser_identity) else {
+                log::warn!(
+                    "[StreamMux] No WebRTC channel for browser {} when sending frames",
+                    &browser_identity[..browser_identity.len().min(8)]
+                );
+                continue;
+            };
+
+            let peer = crate::channel::PeerId(browser_identity.clone());
+            let _guard = self.tokio_runtime.enter();
+
+            for frame in frames {
+                if let Err(e) = self.tokio_runtime.block_on(
+                    channel.send_stream_raw(frame.frame_type, frame.stream_id, &frame.payload, &peer),
+                ) {
+                    log::warn!("[StreamMux] Failed to send frame: {e}");
+                }
+            }
+        }
+    }
+
     /// Send raw PTY bytes to a WebRTC subscription via Olm-encrypted m.botster.pty.
     ///
     /// Uses the hot path: compress → base64 → Olm encrypt → binary DataChannel.
@@ -1550,6 +1624,7 @@ impl Hub {
                         .expect("crypto service required"),
                 )
                 .signal_tx(self.webrtc_outgoing_signal_tx.clone())
+                .stream_frame_tx(self.stream_frame_tx.clone())
                 .build();
 
             // Configure the channel with hub_id

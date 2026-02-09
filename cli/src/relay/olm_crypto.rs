@@ -78,6 +78,9 @@ pub const CONTENT_MSG: u8 = 0x00;
 /// Binary inner content type: PTY output.
 pub const CONTENT_PTY: u8 = 0x01;
 
+/// Binary inner content type: TCP stream multiplexer.
+pub const CONTENT_STREAM: u8 = 0x02;
+
 /// Encrypted message envelope (minimal wire format).
 ///
 /// Uses short keys to minimize wire size:

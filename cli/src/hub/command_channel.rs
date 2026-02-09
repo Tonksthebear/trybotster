@@ -155,11 +155,13 @@ impl Drop for CommandChannelHandle {
 /// * `api_key` - DeviceToken for Bearer authentication
 /// * `hub_id` - Hub identifier for channel subscription
 /// * `start_from` - Initial sequence number to start from
+/// * `repo` - Optional repo (e.g., "owner/repo") to subscribe to GitHub events
 pub fn connect(
     server_url: &str,
     api_key: &str,
     hub_id: &str,
     start_from: i64,
+    repo: Option<&str>,
 ) -> CommandChannelHandle {
     let (message_tx, message_rx) = mpsc::channel(256);
     let (signal_tx, signal_rx) = mpsc::channel(64);
@@ -173,6 +175,7 @@ pub fn connect(
         server_url: server_url.to_string(),
         api_key: api_key.to_string(),
         hub_id: hub_id.to_string(),
+        repo: repo.map(|s| s.to_string()),
         last_acked_sequence: Arc::clone(&last_acked_sequence),
         shutdown: Arc::clone(&shutdown),
     };
@@ -200,6 +203,8 @@ struct ConnectionConfig {
     api_key: String,
     /// Hub identifier for channel subscription.
     hub_id: String,
+    /// Optional repo for GitHub event subscription (e.g., "owner/repo").
+    repo: Option<String>,
     /// Shared last-acked sequence for reconnection replay.
     last_acked_sequence: Arc<AtomicI64>,
     /// Shared shutdown flag.
@@ -219,13 +224,16 @@ fn build_ws_url(server_url: &str) -> String {
 }
 
 /// Build the ActionCable channel identifier JSON.
-fn channel_identifier(hub_id: &str, start_from: i64) -> String {
-    serde_json::json!({
+fn channel_identifier(hub_id: &str, start_from: i64, repo: Option<&str>) -> String {
+    let mut id = serde_json::json!({
         "channel": "HubCommandChannel",
         "hub_id": hub_id,
         "start_from": start_from
-    })
-    .to_string()
+    });
+    if let Some(repo) = repo {
+        id["repo"] = serde_json::Value::String(repo.to_string());
+    }
+    id.to_string()
 }
 
 /// Main connection loop with reconnection logic.
@@ -309,7 +317,7 @@ async fn run_connection_loop(
         }
 
         // Subscribe to HubCommandChannel
-        let identifier = channel_identifier(&config.hub_id, start_from);
+        let identifier = channel_identifier(&config.hub_id, start_from, config.repo.as_deref());
         let subscribe_cmd = serde_json::json!({
             "command": "subscribe",
             "identifier": identifier
@@ -581,7 +589,7 @@ async fn handle_text_message(
 
                 match msg_type {
                     Some("message") => {
-                        // Command channel message (Bot::Message)
+                        // HubCommand or GitHub message from HubCommandChannel
                         match serde_json::from_value::<CommandMessage>(message.clone()) {
                             Ok(cmd_msg) => {
                                 log::info!("[CommandChannel] Received message seq={} type={}", cmd_msg.sequence, cmd_msg.event_type);
@@ -645,11 +653,22 @@ mod tests {
 
     #[test]
     fn test_channel_identifier() {
-        let id = channel_identifier("hub-123", 42);
+        let id = channel_identifier("hub-123", 42, None);
         let parsed: serde_json::Value = serde_json::from_str(&id).expect("valid JSON");
         assert_eq!(parsed["channel"], "HubCommandChannel");
         assert_eq!(parsed["hub_id"], "hub-123");
         assert_eq!(parsed["start_from"], 42);
+        assert!(parsed.get("repo").is_none());
+    }
+
+    #[test]
+    fn test_channel_identifier_with_repo() {
+        let id = channel_identifier("hub-123", 42, Some("owner/repo"));
+        let parsed: serde_json::Value = serde_json::from_str(&id).expect("valid JSON");
+        assert_eq!(parsed["channel"], "HubCommandChannel");
+        assert_eq!(parsed["hub_id"], "hub-123");
+        assert_eq!(parsed["start_from"], 42);
+        assert_eq!(parsed["repo"], "owner/repo");
     }
 
     #[test]

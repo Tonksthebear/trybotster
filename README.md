@@ -54,7 +54,7 @@ GitHub Issue/PR Comment
 │              Rails Server (Message Broker + Relay)            │
 │                                                               │
 │  • Receives GitHub webhooks                                  │
-│  • Creates Bot::Message records                              │
+│  • Creates Integrations::Github::Message records              │
 │  • Verifies repo access via GitHub API                       │
 │  • Provides MCP tools for agents                             │
 │  • Relays E2E encrypted terminal data (cannot decrypt)       │
@@ -541,18 +541,18 @@ Create a test message in Rails console:
 
 ```ruby
 user = User.find_by(username: "your_username")
-Bot::Message.create!(
+Integrations::Github::Message.create!(
   event_type: "github_mention",
+  repo: "owner/repo",
+  issue_number: 999,
   payload: {
-    repo: "owner/repo",
-    issue_number: 999,
     comment_body: "@trybotster test this",
     comment_author: "testuser",
     issue_title: "Test Issue",
     issue_body: "Description",
     issue_url: "https://github.com/owner/repo/issues/999",
     is_pr: false,
-    context: "Work on issue #999"
+    prompt: "Work on issue #999"
   }
 )
 ```

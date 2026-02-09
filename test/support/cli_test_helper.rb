@@ -306,8 +306,9 @@ module CliTestHelper
 
     binary_mtime = File.mtime(CLI_BINARY)
 
-    # Check key source files
-    source_files = Dir.glob(CLI_PATH.join("src/**/*.rs"))
+    # Check source files and build config
+    source_files = Dir.glob(CLI_PATH.join("src/**/*.rs")) +
+                   Dir.glob(CLI_PATH.join("Cargo.{toml,lock}"))
     source_files.all? { |f| File.mtime(f) <= binary_mtime }
   rescue Errno::ENOENT
     false

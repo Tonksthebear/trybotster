@@ -319,7 +319,7 @@ ls -la dev/active/user-auth/
 
 **For Backend Resources (4-6 hours):**
 1. Create each resource file following the existing `SKILL.md` structure
-2. Use code examples from your actual project (Bot::Message, GithubApp, etc.)
+2. Use code examples from your actual project (Integrations::Github::Message, GithubApp, etc.)
 3. Emphasize NO services, RESTful only, models for business logic
 4. Include real migration examples from `db/migrate/`
 
@@ -418,7 +418,7 @@ Based on BOTSTER_HUB.md analysis:
 
 ```ruby
 # ✅ Models contain project-specific logic
-class Bot::Message < ApplicationRecord
+class Integrations::Github::Message < ApplicationRecord
   def acknowledge!
     update!(acknowledged_at: Time.current, status: 'acknowledged')
   end
@@ -461,15 +461,19 @@ end
 
 ```ruby
 # ✅ Use JSONB for flexible data
-create_table :bot_messages do |t|
-  t.jsonb :payload, null: false  # GitHub context
+create_table :github_messages do |t|
+  t.string :event_type, null: false
+  t.string :repo, null: false
+  t.integer :issue_number
+  t.jsonb :payload, null: false, default: {}
+  t.string :status, null: false, default: "pending"
   t.datetime :acknowledged_at
-  t.string :status, default: "pending"
+  t.timestamps
 end
 
 # ✅ Always add indexes
-add_index :bot_messages, :status
-add_index :bot_messages, [:user_id, :created_at]
+add_index :github_messages, :repo
+add_index :github_messages, [:repo, :status]
 
 # ✅ Use references with foreign keys
 t.references :user, null: false, foreign_key: true, index: true
@@ -479,7 +483,7 @@ t.references :user, null: false, foreign_key: true, index: true
 
 ```ruby
 # ✅ Broadcast from models
-class Bot::Message < ApplicationRecord
+class Integrations::Github::Message < ApplicationRecord
   after_create_commit do
     broadcast_to_user
   end

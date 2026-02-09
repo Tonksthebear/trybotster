@@ -41,15 +41,13 @@
 //! - [`persistence`] - Encrypted storage for crypto state
 //! - [`state`] - Browser connection state management
 //! - [`types`] - Protocol message types
-//! - [`http_proxy`] - HTTP proxy for preview tunneling
-//! - [`preview_types`] - Preview proxy message types
+//! - [`stream_mux`] - TCP stream multiplexer for preview tunneling
 
 pub mod crypto_service;
-pub mod http_proxy;
 pub mod olm_crypto;
 pub mod persistence;
-pub mod preview_types;
 pub mod state;
+pub mod stream_mux;
 pub mod types;
 
 pub use state::{build_agent_info, build_scrollback_message, build_worktree_info, BrowserState};
@@ -62,12 +60,5 @@ pub use olm_crypto::{
 };
 
 pub use persistence::{delete_connection_url, read_connection_url, write_connection_url};
-
-pub use preview_types::{
-    HttpRequest, HttpResponse, PreviewCommand, PreviewEvent, PreviewMessage, ProxyConfig,
-    ProxyResult,
-};
-
-pub use http_proxy::HttpProxy;
 
 pub use crypto_service::{create_crypto_service, CryptoService};

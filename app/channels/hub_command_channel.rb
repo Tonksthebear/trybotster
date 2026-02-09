@@ -4,17 +4,20 @@ require_relative "concerns/health_status"
 
 # Hub Command Channel - Reliable plaintext message delivery to CLI
 #
-# Delivers Bot::Messages to the CLI in real-time with ordered replay-on-reconnect.
+# Delivers HubCommands and Integrations::Github::Messages to the CLI in real-time
+# with ordered replay-on-reconnect.
 # NOT encrypted — TLS is sufficient for server→CLI plaintext commands.
 #
 # Protocol:
-# - CLI subscribes with hub_id and start_from (last acked sequence)
-# - On subscribe: replay unacked messages from start_from sequence
-# - Real-time: new messages broadcast via Bot::Message after_create_commit
-# - CLI acks each message via perform("ack", { sequence: N })
+# - CLI subscribes with hub_id, start_from (last acked sequence), and optional repo
+# - On subscribe: replay unacked hub commands from start_from sequence
+# - On subscribe: if repo provided, also stream github_events:{repo} and replay pending GitHub messages
+# - Real-time: new messages broadcast via after_create_commit callbacks
+# - CLI acks hub commands via perform("ack", { sequence: N })
+# - CLI acks GitHub messages via perform("ack_github", { id: N })
 # - CLI sends heartbeat via perform("heartbeat", { agents: [...] })
 #
-# Stream: hub_command:{hub_id}
+# Streams: hub_command:{hub_id}, github_events:{repo} (optional)
 #
 # Auth: DeviceToken Bearer (CLI only — browsers use HubSignalingChannel for E2E relay)
 class HubCommandChannel < ApplicationCable::Channel
@@ -27,13 +30,22 @@ class HubCommandChannel < ApplicationCable::Channel
     @hub.broadcast_update!
     stream_from "hub_command:#{@hub.id}"
 
+    # Subscribe to repo-scoped GitHub events (if CLI provides repo matching hub)
+    @repo = params[:repo]
+    if @repo.present? && @hub.repo == @repo
+      stream_from "github_events:#{@repo}"
+    elsif @repo.present?
+      Rails.logger.warn "[HubCommandChannel] Repo mismatch: hub.repo=#{@hub.repo}, requested=#{@repo}"
+      @repo = nil
+    end
+
     # Notify all browsers that CLI is now online
-    # Each browser channel's health stream handler will re-notify CLI if needed
     broadcast_hub_health(HealthStatus::ONLINE)
 
     replay_messages(params[:start_from].to_i)
+    replay_github_messages if @repo.present?
 
-    Rails.logger.info "[HubCommandChannel] CLI subscribed: hub=#{@hub.id}, start_from=#{params[:start_from]}"
+    Rails.logger.info "[HubCommandChannel] CLI subscribed: hub=#{@hub.id}, start_from=#{params[:start_from]}, repo=#{@repo}"
   end
 
   def unsubscribed
@@ -56,10 +68,18 @@ class HubCommandChannel < ApplicationCable::Channel
 
   def ack(data)
     sequence = data["sequence"].to_i
-    msg = @hub.bot_messages.find_by(sequence: sequence)
+    msg = @hub.hub_commands.find_by(sequence: sequence)
     if msg && !msg.acknowledged?
       msg.acknowledge!
-      Rails.logger.debug "[HubCommandChannel] Acked sequence #{sequence}"
+      Rails.logger.debug "[HubCommandChannel] Acked hub command sequence #{sequence}"
+    end
+  end
+
+  def ack_github(data)
+    msg = Integrations::Github::Message.find_by(id: data["id"])
+    if msg && !msg.acknowledged?
+      msg.acknowledge!
+      Rails.logger.debug "[HubCommandChannel] Acked GitHub message #{data["id"]}"
     end
   end
 
@@ -102,20 +122,30 @@ class HubCommandChannel < ApplicationCable::Channel
   end
 
   def replay_messages(start_from)
-    messages = @hub.bot_messages
-      .where("sequence > ?", start_from)
-      .where.not(status: "acknowledged")
-      .order(sequence: :asc)
-      .limit(100)
+    messages = @hub.hub_commands.unacked_from(start_from).limit(100)
 
     messages.each do |msg|
-      transmit(message_payload(msg))
+      transmit(hub_command_payload(msg))
     end
 
-    Rails.logger.info "[HubCommandChannel] Replayed #{messages.size} messages from sequence #{start_from}"
+    Rails.logger.info "[HubCommandChannel] Replayed #{messages.size} hub commands from sequence #{start_from}"
   end
 
-  def message_payload(msg)
+  def replay_github_messages
+    messages = Integrations::Github::Message
+      .for_repo(@repo)
+      .pending
+      .order(created_at: :asc)
+      .limit(50)
+
+    messages.each do |msg|
+      transmit(msg.to_wire)
+    end
+
+    Rails.logger.info "[HubCommandChannel] Replayed #{messages.size} GitHub messages for #{@repo}"
+  end
+
+  def hub_command_payload(msg)
     {
       type: "message",
       sequence: msg.sequence,
@@ -125,4 +155,5 @@ class HubCommandChannel < ApplicationCable::Channel
       created_at: msg.created_at.iso8601
     }
   end
+
 end

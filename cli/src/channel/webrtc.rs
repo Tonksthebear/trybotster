@@ -39,7 +39,20 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::relay::crypto_service::CryptoService;
-use crate::relay::olm_crypto::{CONTENT_MSG, CONTENT_PTY};
+use crate::relay::olm_crypto::{CONTENT_MSG, CONTENT_PTY, CONTENT_STREAM};
+
+/// Incoming stream frame from browser via DataChannel.
+#[derive(Debug)]
+pub struct StreamIncoming {
+    /// Browser identity that sent this frame.
+    pub browser_identity: String,
+    /// Stream frame type (OPEN, DATA, CLOSE).
+    pub frame_type: u8,
+    /// Stream identifier.
+    pub stream_id: u16,
+    /// Frame payload.
+    pub payload: Vec<u8>,
+}
 
 use super::compression::maybe_compress;
 use super::{
@@ -92,6 +105,7 @@ pub struct WebRtcChannelBuilder {
     api_key: Option<String>,
     crypto_service: Option<CryptoService>,
     signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
+    stream_frame_tx: Option<mpsc::UnboundedSender<StreamIncoming>>,
 }
 
 impl std::fmt::Debug for WebRtcChannelBuilder {
@@ -100,6 +114,7 @@ impl std::fmt::Debug for WebRtcChannelBuilder {
             .field("server_url", &self.server_url)
             .field("crypto_service", &self.crypto_service.is_some())
             .field("signal_tx", &self.signal_tx.is_some())
+            .field("stream_frame_tx", &self.stream_frame_tx.is_some())
             .finish()
     }
 }
@@ -111,6 +126,7 @@ impl Default for WebRtcChannelBuilder {
             api_key: None,
             crypto_service: None,
             signal_tx: None,
+            stream_frame_tx: None,
         }
     }
 }
@@ -150,6 +166,13 @@ impl WebRtcChannelBuilder {
         self
     }
 
+    /// Set the stream frame sender for TCP stream multiplexer frames.
+    #[must_use]
+    pub fn stream_frame_tx(mut self, tx: mpsc::UnboundedSender<StreamIncoming>) -> Self {
+        self.stream_frame_tx = Some(tx);
+        self
+    }
+
     /// Build the channel.
     ///
     /// # Panics
@@ -162,6 +185,7 @@ impl WebRtcChannelBuilder {
             api_key: self.api_key.expect("api_key required"),
             crypto_service: self.crypto_service,
             signal_tx: self.signal_tx,
+            stream_frame_tx: self.stream_frame_tx,
             peer_connection: Arc::new(Mutex::new(None)),
             data_channel: Arc::new(Mutex::new(None)),
             state: SharedConnectionState::new(),
@@ -186,6 +210,8 @@ pub struct WebRtcChannel {
     crypto_service: Option<CryptoService>,
     /// Sender for outgoing signals (ICE candidates) to relay via ActionCable.
     signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
+    /// Sender for incoming stream multiplexer frames.
+    stream_frame_tx: Option<mpsc::UnboundedSender<StreamIncoming>>,
     /// WebRTC peer connection.
     peer_connection: Arc<Mutex<Option<Arc<RTCPeerConnection>>>>,
     /// WebRTC data channel.
@@ -210,6 +236,7 @@ impl std::fmt::Debug for WebRtcChannel {
             .field("server_url", &self.server_url)
             .field("crypto_service", &self.crypto_service.is_some())
             .field("signal_tx", &self.signal_tx.is_some())
+            .field("stream_frame_tx", &self.stream_frame_tx.is_some())
             .finish()
     }
 }
@@ -391,6 +418,7 @@ impl WebRtcChannel {
         let browser_id = browser_identity.to_string();
         let data_channel = Arc::clone(&self.data_channel);
         let decrypt_failures = Arc::clone(&self.decrypt_failures);
+        let stream_frame_tx = self.stream_frame_tx.clone();
 
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let recv_tx = Arc::clone(&recv_tx);
@@ -399,6 +427,7 @@ impl WebRtcChannel {
             let browser_id = browser_id.clone();
             let data_channel = Arc::clone(&data_channel);
             let decrypt_failures = Arc::clone(&decrypt_failures);
+            let stream_frame_tx = stream_frame_tx.clone();
 
             Box::pin(async move {
                 log::info!("[WebRTC] Data channel opened: {}", dc.label());
@@ -412,6 +441,7 @@ impl WebRtcChannel {
                 let crypto_inner = crypto_service.clone();
                 let browser_inner = browser_id.clone();
                 let decrypt_failures_inner = Arc::clone(&decrypt_failures);
+                let stream_frame_tx_inner = stream_frame_tx.clone();
 
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     let recv_tx = Arc::clone(&recv_tx_inner);
@@ -419,6 +449,7 @@ impl WebRtcChannel {
                     let crypto_service = crypto_inner.clone();
                     let browser_identity = browser_inner.clone();
                     let decrypt_failures = Arc::clone(&decrypt_failures_inner);
+                    let stream_frame_tx = stream_frame_tx_inner.clone();
 
                     Box::pin(async move {
                         let data = msg.data.to_vec();
@@ -464,6 +495,26 @@ impl WebRtcChannel {
                                 // PTY: [CONTENT_PTY][flags][sub_len][sub_id][payload]
                                 // CLI doesn't receive PTY from browser, ignore
                                 log::warn!("[WebRTC-DC] Unexpected PTY content from browser");
+                                return;
+                            }
+                            CONTENT_STREAM => {
+                                // Stream mux: [CONTENT_STREAM][frame_type][stream_id_hi][stream_id_lo][payload]
+                                if plaintext.len() < 4 {
+                                    log::warn!("[WebRTC-DC] CONTENT_STREAM frame too short");
+                                    return;
+                                }
+                                let frame_type = plaintext[1];
+                                let stream_id = u16::from_be_bytes([plaintext[2], plaintext[3]]);
+                                let payload = plaintext[4..].to_vec();
+
+                                if let Some(ref tx) = stream_frame_tx {
+                                    let _ = tx.send(StreamIncoming {
+                                        browser_identity: browser_identity.clone(),
+                                        frame_type,
+                                        stream_id,
+                                        payload,
+                                    });
+                                }
                                 return;
                             }
                             other => {
@@ -797,6 +848,46 @@ impl WebRtcChannel {
         plaintext.extend_from_slice(&payload);
 
         // Encrypt → binary frame (no base64, no JSON)
+        let encrypted = cs
+            .lock()
+            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
+            .encrypt_binary(&plaintext)
+            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+
+        dc.send(&bytes::Bytes::from(encrypted))
+            .await
+            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Send a stream multiplexer frame via encrypted DataChannel.
+    ///
+    /// Binary format: `[CONTENT_STREAM][frame_type][stream_id_hi][stream_id_lo][payload]`
+    pub async fn send_stream_raw(
+        &self,
+        frame_type: u8,
+        stream_id: u16,
+        payload: &[u8],
+        _peer: &PeerId,
+    ) -> Result<(), ChannelError> {
+        let dc_guard = self.data_channel.lock().await;
+        let dc = dc_guard
+            .as_ref()
+            .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
+
+        let cs = self
+            .crypto_service
+            .as_ref()
+            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
+
+        let stream_id_bytes = stream_id.to_be_bytes();
+        let mut plaintext = Vec::with_capacity(4 + payload.len());
+        plaintext.push(CONTENT_STREAM);
+        plaintext.push(frame_type);
+        plaintext.extend_from_slice(&stream_id_bytes);
+        plaintext.extend_from_slice(payload);
+
         let encrypted = cs
             .lock()
             .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?

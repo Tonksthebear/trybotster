@@ -46,7 +46,7 @@ export const CliStatus = {
   UNKNOWN: "unknown",           // Initial state, waiting for health message
   OFFLINE: "offline",           // CLI not connected to Rails at all
   ONLINE: "online",             // CLI connected to Rails, but not yet on this E2E channel
-  NOTIFIED: "notified",         // Bot::Message sent to tell CLI about browser
+  NOTIFIED: "notified",         // HubCommand sent to tell CLI about browser
   CONNECTING: "connecting",     // CLI connecting to this channel
   CONNECTED: "connected",       // CLI connected to this channel, ready for handshake
   DISCONNECTED: "disconnected", // CLI was connected but disconnected

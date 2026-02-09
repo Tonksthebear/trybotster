@@ -44,9 +44,10 @@ export const ConnectionMode = {
   RELAYED: "relayed",     // Through TURN server
 }
 
-// Binary inner content types (must match CLI's CONTENT_MSG / CONTENT_PTY)
+// Binary inner content types (must match CLI's CONTENT_MSG / CONTENT_PTY / CONTENT_STREAM)
 const CONTENT_MSG = 0x00
 const CONTENT_PTY = 0x01
+const CONTENT_STREAM = 0x02
 
 // Grace period before closing idle connections (ms)
 const DISCONNECT_GRACE_PERIOD_MS = 3000
@@ -463,6 +464,30 @@ class WebRTCTransport {
 
     conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
     return { sent: true }
+  }
+
+  /**
+   * Send a stream multiplexer frame through the encrypted DataChannel.
+   * @param {string} hubId - Hub identifier
+   * @param {number} frameType - Frame type (OPEN, DATA, CLOSE)
+   * @param {number} streamId - Stream identifier
+   * @param {Uint8Array} payload - Frame payload
+   */
+  async sendStreamFrame(hubId, frameType, streamId, payload) {
+    const conn = this.#connections.get(hubId)
+    if (!conn) throw new Error(`No connection for hub ${hubId}`)
+    if (conn.dataChannel?.readyState !== "open") throw new Error("DataChannel not open")
+
+    // Build plaintext: [CONTENT_STREAM][frameType][streamId_hi][streamId_lo][payload]
+    const plaintext = new Uint8Array(4 + (payload?.length || 0))
+    plaintext[0] = CONTENT_STREAM
+    plaintext[1] = frameType
+    plaintext[2] = (streamId >> 8) & 0xFF
+    plaintext[3] = streamId & 0xFF
+    if (payload?.length) plaintext.set(payload, 4)
+
+    const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
+    conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
   }
 
   /**
@@ -934,6 +959,16 @@ class WebRTCTransport {
         if (contentType === CONTENT_PTY) {
           // PTY: [CONTENT_PTY][flags:1][sub_id_len:1][sub_id][payload]
           this.#handlePtyBinary(hubId, plaintext)
+          return
+        }
+
+        if (contentType === CONTENT_STREAM) {
+          // Stream mux: [CONTENT_STREAM][frame_type:1][stream_id:2 BE][payload]
+          if (plaintext.length < 4) return
+          const frameType = plaintext[1]
+          const streamId = (plaintext[2] << 8) | plaintext[3]
+          const payload = plaintext.slice(4)
+          this.#emit("stream:frame", { hubId, frameType, streamId, payload })
           return
         }
 

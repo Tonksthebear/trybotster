@@ -1,7 +1,8 @@
 //! Self-update functionality for botster-hub.
 //!
 //! Provides commands to check for updates and automatically download/install
-//! new versions from GitHub releases.
+//! new versions from GitHub releases. Includes a boot-time update check that
+//! runs on every startup and prompts the user to update interactively.
 //!
 //! # Security
 //!
@@ -20,6 +21,7 @@
 use anyhow::Result;
 use semver::Version;
 use serde_json::Value;
+use std::time::Duration;
 
 /// The current version of botster-hub, derived from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -34,6 +36,10 @@ const GITHUB_RELEASES_DOWNLOAD: &str =
 
 /// User-Agent header value for GitHub API requests.
 const USER_AGENT: &str = "botster-hub";
+
+/// Timeout for the boot-time version fetch.
+/// Short to avoid delaying startup when offline or GitHub is slow.
+const BOOT_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Result of checking for updates.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +63,148 @@ pub enum UpdateStatus {
         /// Latest release version.
         latest: String,
     },
+}
+
+/// Checks for updates at boot time and prompts the user to update if available.
+///
+/// This is designed to be called early in startup, before the TUI takes over.
+/// Failures are silently logged — an update check must never block startup.
+///
+/// # Errors
+///
+/// Returns an error only if the update/exec-restart itself fails after the user
+/// accepts. All other failures (network, parse) are logged and swallowed.
+pub fn check_on_boot() -> Result<()> {
+    if crate::env::is_test_mode() {
+        return Ok(());
+    }
+
+    let latest_str = match fetch_latest_version_with_timeout(BOOT_CHECK_TIMEOUT) {
+        Ok(v) => v,
+        Err(e) => {
+            log::debug!("Boot update check skipped: {e}");
+            return Ok(());
+        }
+    };
+
+    let current = match Version::parse(VERSION) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    let latest = match Version::parse(&latest_str) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    if latest <= current {
+        return Ok(());
+    }
+
+    println!("Update available: v{VERSION} -> v{latest_str}");
+
+    if !atty::is(atty::Stream::Stdin) {
+        log::warn!("Update available: v{VERSION} -> v{latest_str}");
+        return Ok(());
+    }
+
+    use std::io::{self, Write};
+    print!("Update now? [Y/n] ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let answer = input.trim().to_lowercase();
+
+    if answer.is_empty() || answer == "y" || answer == "yes" {
+        install()?;
+        exec_restart()?;
+    }
+
+    Ok(())
+}
+
+/// Non-interactive variant for headless mode.
+///
+/// Logs a warning if an update is available but never prompts.
+pub fn check_on_boot_headless() -> Result<()> {
+    if crate::env::is_test_mode() {
+        return Ok(());
+    }
+
+    let latest_str = match fetch_latest_version_with_timeout(BOOT_CHECK_TIMEOUT) {
+        Ok(v) => v,
+        Err(e) => {
+            log::debug!("Boot update check skipped: {e}");
+            return Ok(());
+        }
+    };
+
+    let current = Version::parse(VERSION).ok();
+    let latest = Version::parse(&latest_str).ok();
+
+    if let (Some(cur), Some(lat)) = (current, latest) {
+        if lat > cur {
+            log::warn!("Update available: v{VERSION} -> v{latest_str}. Run 'botster-hub update' to install.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Replaces the current process with the updated binary using the same arguments.
+///
+/// On success this function never returns — the current process image is replaced.
+///
+/// # Errors
+///
+/// Returns an error if `exec` fails (e.g., binary not found or permission denied).
+fn exec_restart() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().collect();
+
+    println!("Restarting with updated binary...");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe)
+            .args(&args[1..])
+            .exec();
+        // exec() only returns on error
+        anyhow::bail!("Failed to exec into updated binary: {err}");
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Fallback for non-Unix: just tell the user to restart
+        println!("Please restart botster-hub to use the new version.");
+        Ok(())
+    }
+}
+
+/// Fetches the latest version string from GitHub with a custom timeout.
+fn fetch_latest_version_with_timeout(timeout: Duration) -> Result<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()?;
+
+    let response = client
+        .get(GITHUB_RELEASES_API)
+        .header("User-Agent", USER_AGENT)
+        .send()?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Failed to check for updates: {}", response.status());
+    }
+
+    let release: Value = response.json()?;
+    let version = release["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid release data: missing tag_name"))?
+        .trim_start_matches('v')
+        .to_string();
+
+    Ok(version)
 }
 
 /// Checks for available updates by querying the GitHub releases API.
@@ -255,6 +403,7 @@ pub fn install() -> Result<()> {
     // Get current binary path
     let current_exe = env::current_exe()?;
     let temp_path = current_exe.with_extension("new");
+    let backup_path = current_exe.with_extension("bak");
 
     // Write new binary to temp location
     fs::write(&temp_path, &binary_data)?;
@@ -268,11 +417,15 @@ pub fn install() -> Result<()> {
         fs::set_permissions(&temp_path, perms)?;
     }
 
+    // Backup current binary before replacing
+    if let Err(e) = fs::copy(&current_exe, &backup_path) {
+        log::warn!("Could not create backup at {}: {e}", backup_path.display());
+    }
+
     // Replace current binary
     fs::rename(&temp_path, &current_exe)?;
 
     println!("✓ Successfully updated to version {}", latest_version_str);
-    println!("Please restart botster-hub to use the new version");
 
     Ok(())
 }
@@ -349,4 +502,5 @@ mod tests {
         }
         // On unsupported platforms, it should fail
     }
+
 }

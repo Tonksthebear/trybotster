@@ -30,7 +30,6 @@ Rails.application.routes.draw do
 
     scope module: :hubs do
       resource :heartbeat, only: [ :update ]
-      resources :messages, only: [ :update ]
       resources :notifications, only: [ :create ]
       resource :connection, only: [ :show ]
       resource :webrtc, only: [ :show ], controller: :webrtc  # GET config

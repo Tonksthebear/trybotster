@@ -14,7 +14,7 @@ GitHub webhook → Rails server → Message queue → Rust daemon polls
 
 **Rails server** (trybotster.com):
 
-- Receives GitHub webhooks, creates `Bot::Message` records
+- Receives GitHub webhooks, creates `Integrations::Github::Message` records
 - VPN coordination via `WireguardCoordinator` (key exchange, IP allocation)
 - MCP tools for agents (GitHub operations)
 - User auth via GitHub OAuth
@@ -31,7 +31,8 @@ GitHub webhook → Rails server → Message queue → Rust daemon polls
 
 ```
 # Rails
-app/models/bot/message.rb              # Message queue
+app/models/integrations/github/message.rb  # GitHub webhook messages
+app/models/hub_command.rb                  # Hub platform commands
 app/models/vpn_node.rb                 # VPN node records
 app/services/wireguard_coordinator.rb  # VPN key exchange
 app/controllers/github/webhooks_controller.rb

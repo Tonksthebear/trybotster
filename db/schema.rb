@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_02_02_100000) do
+ActiveRecord::Schema[8.1].define(version: 2026_02_08_100002) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "vector"
@@ -83,28 +83,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_02_100000) do
     t.index ["session_id"], name: "index_action_mcp_sse_events_on_session_id"
   end
 
-  create_table "bot_messages", force: :cascade do |t|
-    t.datetime "acknowledged_at"
-    t.datetime "claimed_at"
-    t.bigint "claimed_by_user_id"
-    t.datetime "created_at", null: false
-    t.string "event_type", null: false
-    t.bigint "hub_id"
-    t.jsonb "payload", default: {}, null: false
-    t.datetime "sent_at"
-    t.bigint "sequence"
-    t.string "status", default: "pending", null: false
-    t.datetime "updated_at", null: false
-    t.index ["acknowledged_at"], name: "index_bot_messages_on_acknowledged_at"
-    t.index ["claimed_at"], name: "index_bot_messages_on_claimed_at"
-    t.index ["claimed_by_user_id"], name: "index_bot_messages_on_claimed_by_user_id"
-    t.index ["event_type"], name: "index_bot_messages_on_event_type"
-    t.index ["hub_id", "sequence"], name: "index_bot_messages_on_hub_id_and_sequence", unique: true, where: "((hub_id IS NOT NULL) AND (sequence IS NOT NULL))"
-    t.index ["hub_id"], name: "index_bot_messages_on_hub_id"
-    t.index ["sent_at"], name: "index_bot_messages_on_sent_at"
-    t.index ["status"], name: "index_bot_messages_on_status"
-  end
-
   create_table "device_authorizations", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.string "device_code", null: false
@@ -146,6 +124,21 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_02_100000) do
     t.index ["user_id"], name: "index_devices_on_user_id"
   end
 
+  create_table "github_messages", force: :cascade do |t|
+    t.datetime "acknowledged_at"
+    t.datetime "created_at", null: false
+    t.string "event_type", null: false
+    t.integer "issue_number"
+    t.jsonb "payload", default: {}, null: false
+    t.string "repo", null: false
+    t.string "status", default: "pending", null: false
+    t.datetime "updated_at", null: false
+    t.index ["event_type"], name: "index_github_messages_on_event_type"
+    t.index ["repo", "status"], name: "index_github_messages_on_repo_and_status"
+    t.index ["repo"], name: "index_github_messages_on_repo"
+    t.index ["status"], name: "index_github_messages_on_status"
+  end
+
   create_table "hub_agents", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.bigint "hub_id", null: false
@@ -158,6 +151,20 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_02_100000) do
     t.datetime "updated_at", null: false
     t.index ["hub_id", "session_key"], name: "index_hub_agents_on_hub_id_and_session_key", unique: true
     t.index ["hub_id"], name: "index_hub_agents_on_hub_id"
+  end
+
+  create_table "hub_commands", force: :cascade do |t|
+    t.datetime "acknowledged_at"
+    t.datetime "created_at", null: false
+    t.string "event_type", null: false
+    t.bigint "hub_id", null: false
+    t.jsonb "payload", default: {}, null: false
+    t.bigint "sequence", null: false
+    t.string "status", default: "pending", null: false
+    t.datetime "updated_at", null: false
+    t.index ["hub_id", "sequence"], name: "index_hub_commands_on_hub_id_and_sequence", unique: true
+    t.index ["hub_id"], name: "index_hub_commands_on_hub_id"
+    t.index ["status"], name: "index_hub_commands_on_status"
   end
 
   create_table "hubs", force: :cascade do |t|
@@ -287,11 +294,11 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_02_100000) do
   add_foreign_key "action_mcp_session_resources", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_session_subscriptions", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_sse_events", "action_mcp_sessions", column: "session_id"
-  add_foreign_key "bot_messages", "hubs"
   add_foreign_key "device_authorizations", "users"
   add_foreign_key "device_tokens", "devices"
   add_foreign_key "devices", "users"
   add_foreign_key "hub_agents", "hubs"
+  add_foreign_key "hub_commands", "hubs"
   add_foreign_key "hubs", "devices"
   add_foreign_key "hubs", "users"
   add_foreign_key "mcp_tokens", "devices"

@@ -139,17 +139,14 @@ class PreviewChannel < ApplicationCable::Channel
     notify_cli_of_preview
   end
 
-  # Create Bot::Message to tell CLI about this preview.
-  # Uses DB unique constraint to prevent duplicates atomically.
+  # Create HubCommand to tell CLI about this preview.
   def notify_cli_of_preview
     hub = find_hub
     return unless hub
 
-    Bot::Message.create_for_hub!(hub,
+    HubCommand.create_for_hub!(hub,
       event_type: "browser_wants_preview",
       payload: { agent_index: @agent_index, pty_index: @pty_index, browser_identity: @browser_identity })
-  rescue ActiveRecord::RecordNotUnique
-    Rails.logger.info "[Preview] Skipping duplicate browser_wants_preview (constraint)"
   rescue => e
     Rails.logger.warn "[Preview] Failed to notify CLI: #{e.message}"
   end
