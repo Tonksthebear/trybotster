@@ -60,10 +60,9 @@ safe_require("handlers.connections")
 -- Must load after connections (uses broadcast_hub_event)
 safe_require("handlers.agents")
 
--- Load ActionCable handlers (hub commands + GitHub events)
+-- Load ActionCable handlers (hub commands)
 -- Must load after agents (emits command_message events)
 safe_require("handlers.hub_commands")
-safe_require("handlers.github")
 
 -- Load transport handlers (register peer/message callbacks)
 safe_require("handlers.webrtc")
@@ -76,6 +75,10 @@ safe_require("handlers.commands")
 -- Load filesystem command handlers (fs:read, fs:write, fs:list, etc.)
 -- Must load after commands registry.
 safe_require("handlers.filesystem")
+
+-- Load template command handlers (template:install, template:uninstall, template:list)
+-- Must load after commands registry.
+safe_require("handlers.templates")
 
 -- ============================================================================
 -- Event Subscriptions (Logging)

@@ -91,9 +91,5 @@ events.on("outgoing_signal", function(data)
     end
 end)
 
-events.on("shutdown", function()
-    if conn then action_cable.close(conn) end
-end)
-
 log.info("Hub commands plugin loaded")
 return {}

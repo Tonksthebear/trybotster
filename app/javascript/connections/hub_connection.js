@@ -93,9 +93,13 @@ export class HubConnection extends Connection {
         break;
 
       default:
-        // Route fs:* responses to one-shot listeners keyed by request_id
+        // Route fs:* and template:* responses to one-shot listeners keyed by request_id
         if (message.type?.startsWith("fs:") && message.request_id) {
           this.emit(`fs:response:${message.request_id}`, message);
+          return;
+        }
+        if (message.type === "template:response" && message.request_id) {
+          this.emit(`template:response:${message.request_id}`, message);
           return;
         }
         // Emit as generic message for anything unhandled
@@ -223,6 +227,40 @@ export class HubConnection extends Connection {
 
   rmDir(path) {
     return this.fsRequest("fs:rmdir", { path });
+  }
+
+  // ========== Template API ==========
+
+  /**
+   * Send a template request and wait for the correlated response.
+   * Same pattern as fsRequest but for template:* commands.
+   */
+  templateRequest(type, params = {}, timeout = 10000) {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        unsub();
+        reject(new Error(`${type} timed out`));
+      }, timeout);
+      const unsub = this.on(`template:response:${requestId}`, (response) => {
+        clearTimeout(timer);
+        unsub();
+        response.ok ? resolve(response) : reject(new Error(response.error));
+      });
+      this.send(type, { ...params, request_id: requestId });
+    });
+  }
+
+  installTemplate(dest, content) {
+    return this.templateRequest("template:install", { dest, content });
+  }
+
+  uninstallTemplate(dest) {
+    return this.templateRequest("template:uninstall", { dest });
+  }
+
+  listInstalledTemplates() {
+    return this.templateRequest("template:list");
   }
 
   // ========== Convenience event helpers ==========
