@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_02_09_062947) do
+ActiveRecord::Schema[8.1].define(version: 2026_02_09_231651) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "vector"
@@ -195,7 +195,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_09_062947) do
     t.index ["key"], name: "index_idempotency_keys_on_key", unique: true
   end
 
-  create_table "mcp_tokens", force: :cascade do |t|
+  create_table "integrations_github_mcp_tokens", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.bigint "device_id", null: false
     t.string "last_ip"
@@ -203,8 +203,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_09_062947) do
     t.string "name"
     t.string "token"
     t.datetime "updated_at", null: false
-    t.index ["device_id"], name: "index_mcp_tokens_on_device_id"
-    t.index ["token"], name: "index_mcp_tokens_on_token", unique: true
+    t.index ["device_id"], name: "index_integrations_github_mcp_tokens_on_device_id"
+    t.index ["token"], name: "index_integrations_github_mcp_tokens_on_token", unique: true
   end
 
   create_table "memories", force: :cascade do |t|
@@ -300,7 +300,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_09_062947) do
   add_foreign_key "hub_commands", "hubs"
   add_foreign_key "hubs", "devices"
   add_foreign_key "hubs", "users"
-  add_foreign_key "mcp_tokens", "devices"
+  add_foreign_key "integrations_github_mcp_tokens", "devices"
   add_foreign_key "memories", "memories", column: "parent_id"
   add_foreign_key "memories", "teams"
   add_foreign_key "memories", "users"

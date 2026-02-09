@@ -74,6 +74,7 @@ module ActiveSupport
     end
 
     # Setup all fixtures in test/fixtures/*.yml for all tests in alphabetical order.
+    set_fixture_class "integrations/github/mcp_tokens" => Integrations::Github::MCPToken
     fixtures :all
 
     # Add more helper methods to be used by all tests here...

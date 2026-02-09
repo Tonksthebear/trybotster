@@ -17,6 +17,7 @@
 //! - `http` - HTTP client (GET, POST, PUT, DELETE)
 //! - `timer` - One-shot and repeating timers
 //! - `config` - Hub configuration and environment access
+//! - `secrets` - Plugin-scoped encrypted secret storage (AES-GCM files, no keyring access)
 //! - `action_cable` - ActionCable WebSocket connections (subscribe, perform, callbacks)
 //! - `websocket` - WebSocket client (persistent connections with callbacks)
 //!
@@ -37,6 +38,7 @@ pub mod hub;
 pub mod json;
 pub mod log;
 pub mod pty;
+pub mod secrets;
 pub mod timer;
 pub mod tui;
 pub mod watch;
@@ -92,6 +94,7 @@ pub fn register_all(lua: &Lua) -> Result<()> {
     log::register(lua)?;
     json::register(lua)?;
     config::register(lua)?;
+    secrets::register(lua)?;
     Ok(())
 }
 

@@ -274,6 +274,22 @@ pub fn register(lua: &Lua) -> Result<()> {
         .set("data_dir", data_dir_fn)
         .map_err(|e| anyhow!("Failed to set config.data_dir: {e}"))?;
 
+    // config.server_url() -> string
+    //
+    // Returns the Botster server URL from the BOTSTER_SERVER_URL env var,
+    // or defaults to "https://trybotster.com".
+    let server_url_fn = lua
+        .create_function(|_, ()| {
+            let url = std::env::var("BOTSTER_SERVER_URL")
+                .unwrap_or_else(|_| "https://trybotster.com".to_string());
+            Ok(url)
+        })
+        .map_err(|e| anyhow!("Failed to create config.server_url function: {e}"))?;
+
+    config_table
+        .set("server_url", server_url_fn)
+        .map_err(|e| anyhow!("Failed to set config.server_url: {e}"))?;
+
     // config.env(key) -> string or nil
     //
     // Reads an environment variable. Returns nil if not set.
