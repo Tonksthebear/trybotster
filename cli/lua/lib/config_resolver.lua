@@ -241,6 +241,230 @@ function M.default_template(config_type)
 end
 
 -- =============================================================================
+-- Unified Multi-Scope Resolution
+-- =============================================================================
+-- Resolves config across 4 layers (most specific wins):
+--   1. device shared   (~/.botster/shared/)
+--   2. device profile  (~/.botster/profiles/{profile}/)
+--   3. repo shared     ({repo}/.botster/shared/)
+--   4. repo profile    ({repo}/.botster/profiles/{profile}/)
+
+--- Source labels for provenance tracking.
+local SOURCES = {
+    device_shared = "device_shared",
+    device_profile = "device_profile",
+    repo_shared = "repo_shared",
+    repo_profile = "repo_profile",
+}
+
+--- Read plugins from a base path's plugins/ directory.
+-- Scans {base}/plugins/*/init.lua and returns a map of name -> { init_path }.
+-- @param base_path string Directory containing plugins/
+-- @return table Map of plugin_name -> { init_path }
+function M.read_plugins(base_path)
+    local plugins_dir = base_path .. "/plugins"
+    local result = {}
+    local plugin_names = list_subdirs(plugins_dir)
+    for _, name in ipairs(plugin_names) do
+        local init_path = plugins_dir .. "/" .. name .. "/init.lua"
+        if fs.exists(init_path) then
+            result[name] = { init_path = init_path }
+        end
+    end
+    return result
+end
+
+--- Read a single layer's config (sessions, plugins, workspace files).
+-- @param base_path string Path to a shared/ or profiles/{name}/ dir
+-- @param source string Source label from SOURCES
+-- @return table { sessions, plugins, workspace_include, workspace_teardown }
+local function read_layer(base_path, source)
+    local layer = {
+        sessions = {},
+        plugins = {},
+        workspace_include = nil,
+        workspace_teardown = nil,
+    }
+
+    if not fs.exists(base_path) or not fs.is_dir(base_path) then
+        return layer
+    end
+
+    -- Sessions
+    local raw_sessions = read_sessions(base_path .. "/sessions")
+    for name, session in pairs(raw_sessions) do
+        layer.sessions[name] = {
+            name = name,
+            initialization = session.initialization,
+            port_forward = session.port_forward,
+            source = source,
+        }
+    end
+
+    -- Plugins
+    local raw_plugins = M.read_plugins(base_path)
+    for name, plugin in pairs(raw_plugins) do
+        layer.plugins[name] = {
+            name = name,
+            init_path = plugin.init_path,
+            source = source,
+        }
+    end
+
+    -- Workspace files
+    local wi_path = base_path .. "/workspace_include"
+    if fs.exists(wi_path) then
+        layer.workspace_include = { path = wi_path, source = source }
+    end
+
+    local wt_path = base_path .. "/workspace_teardown"
+    if fs.exists(wt_path) then
+        layer.workspace_teardown = { path = wt_path, source = source }
+    end
+
+    return layer
+end
+
+--- Merge a higher-priority layer into an accumulator.
+-- Higher-priority values overwrite lower-priority ones.
+-- @param acc table Accumulator (mutated in place)
+-- @param layer table Layer to merge in
+local function merge_layer(acc, layer)
+    -- Sessions: merge by name, higher priority wins
+    for name, session in pairs(layer.sessions) do
+        acc.sessions[name] = session
+    end
+
+    -- Plugins: merge by name, higher priority wins
+    for name, plugin in pairs(layer.plugins) do
+        acc.plugins[name] = plugin
+    end
+
+    -- Workspace files: higher priority wins (single value)
+    if layer.workspace_include then
+        acc.workspace_include = layer.workspace_include
+    end
+    if layer.workspace_teardown then
+        acc.workspace_teardown = layer.workspace_teardown
+    end
+end
+
+--- Resolve config across all 4 layers (device shared, device profile, repo shared, repo profile).
+-- @param opts table { device_root, repo_root, profile }
+--   device_root: path to ~/.botster (nil to skip device layers)
+--   repo_root: path to repo root (nil to skip repo layers)
+--   profile: profile name (nil for shared-only)
+-- @return table { sessions[], plugins[], workspace_include, workspace_teardown } or nil, error
+function M.resolve_all(opts)
+    local device_root = opts.device_root
+    local repo_root = opts.repo_root
+    local profile = opts.profile
+
+    local acc = {
+        sessions = {},
+        plugins = {},
+        workspace_include = nil,
+        workspace_teardown = nil,
+    }
+
+    -- Layer 1: device shared
+    if device_root then
+        merge_layer(acc, read_layer(device_root .. "/shared", SOURCES.device_shared))
+    end
+
+    -- Layer 2: device profile
+    if device_root and profile then
+        local dp = device_root .. "/profiles/" .. profile
+        if fs.exists(dp) and fs.is_dir(dp) then
+            merge_layer(acc, read_layer(dp, SOURCES.device_profile))
+        end
+    end
+
+    -- Layer 3: repo shared
+    if repo_root then
+        merge_layer(acc, read_layer(repo_root .. "/.botster/shared", SOURCES.repo_shared))
+    end
+
+    -- Layer 4: repo profile
+    if repo_root and profile then
+        local rp = repo_root .. "/.botster/profiles/" .. profile
+        if fs.exists(rp) and fs.is_dir(rp) then
+            merge_layer(acc, read_layer(rp, SOURCES.repo_profile))
+        end
+    end
+
+    -- Validate: agent session must exist in merged result
+    if not acc.sessions.agent then
+        return nil, "No 'agent' session found in any config layer. " ..
+            "An agent session with an initialization file is required."
+    end
+
+    -- Build sorted sessions array (agent first, then alphabetical)
+    local sessions_array = {}
+    local other_names = {}
+    for name, _ in pairs(acc.sessions) do
+        if name ~= "agent" then
+            other_names[#other_names + 1] = name
+        end
+    end
+    table.sort(other_names)
+
+    sessions_array[1] = acc.sessions.agent
+    for _, name in ipairs(other_names) do
+        sessions_array[#sessions_array + 1] = acc.sessions[name]
+    end
+
+    -- Build sorted plugins array
+    local plugins_array = {}
+    local plugin_names = {}
+    for name, _ in pairs(acc.plugins) do
+        plugin_names[#plugin_names + 1] = name
+    end
+    table.sort(plugin_names)
+    for _, name in ipairs(plugin_names) do
+        plugins_array[#plugins_array + 1] = acc.plugins[name]
+    end
+
+    return {
+        sessions = sessions_array,
+        plugins = plugins_array,
+        workspace_include = acc.workspace_include,
+        workspace_teardown = acc.workspace_teardown,
+    }
+end
+
+--- List all profiles across device and repo scopes.
+-- Returns the union of profile directory names from both locations.
+-- @param device_root string|nil Path to ~/.botster
+-- @param repo_root string|nil Path to repo root
+-- @return string[] Sorted, deduplicated profile names
+function M.list_profiles_all(device_root, repo_root)
+    local seen = {}
+    local result = {}
+
+    local function add_profiles(root)
+        if not root then return end
+        local names = list_subdirs(root)
+        for _, name in ipairs(names) do
+            if not seen[name] then
+                seen[name] = true
+                result[#result + 1] = name
+            end
+        end
+    end
+
+    if device_root then
+        add_profiles(device_root .. "/profiles")
+    end
+    if repo_root then
+        add_profiles(repo_root .. "/.botster/profiles")
+    end
+
+    table.sort(result)
+    return result
+end
+
+-- =============================================================================
 -- Lifecycle Hooks for Hot-Reload
 -- =============================================================================
 

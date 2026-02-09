@@ -13,7 +13,7 @@ class CreateHubCommands < ActiveRecord::Migration[8.0]
       t.timestamps
     end
 
-    add_index :hub_commands, [:hub_id, :sequence], unique: true
+    add_index :hub_commands, [ :hub_id, :sequence ], unique: true
     add_index :hub_commands, :status
   end
 end

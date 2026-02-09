@@ -15,7 +15,7 @@ class CreateGithubMessages < ActiveRecord::Migration[8.0]
 
     add_index :github_messages, :repo
     add_index :github_messages, :status
-    add_index :github_messages, [:repo, :status]
+    add_index :github_messages, [ :repo, :status ]
     add_index :github_messages, :event_type
   end
 end

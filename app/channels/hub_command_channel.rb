@@ -116,5 +116,4 @@ class HubCommandChannel < ApplicationCable::Channel
       created_at: msg.created_at.iso8601
     }
   end
-
 end
