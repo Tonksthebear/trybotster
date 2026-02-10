@@ -96,6 +96,28 @@
 
           <%# Tree Navigation (left) — data-view drives which child is visible %>
           <div class="lg:col-span-1">
+
+            <%# Scope sub-tabs: Repository | Device %>
+            <div class="flex gap-1 mb-3">
+              <button type="button"
+                      data-config-scope="repo"
+                      data-action="hub-settings#switchConfigScope"
+                      class="flex-1 px-3 py-1.5 text-xs font-medium rounded transition-colors
+                             data-[active]:bg-zinc-800 data-[active]:text-zinc-200
+                             text-zinc-500 hover:text-zinc-300"
+                      data-active>
+                Repository
+              </button>
+              <button type="button"
+                      data-config-scope="device"
+                      data-action="hub-settings#switchConfigScope"
+                      class="flex-1 px-3 py-1.5 text-xs font-medium rounded transition-colors
+                             data-[active]:bg-zinc-800 data-[active]:text-zinc-200
+                             text-zinc-500 hover:text-zinc-300">
+                Device
+              </button>
+            </div>
+
             <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 group/tree"
                  data-hub-settings-target="treePanel"
                  data-view="loading">
@@ -106,13 +128,13 @@
                    data-hub-settings-target="treeFeedback">Connecting to hub...</p>
               </div>
 
-              <%# Empty state — no .botster/ directory %>
+              <%# Empty state — no config directory found for active scope %>
               <div class="group-data-[view=empty]/tree:block hidden text-center py-6">
-                <p class="text-sm text-zinc-500 mb-3">No .botster/ directory found</p>
+                <p class="text-sm text-zinc-500 mb-3">No configuration found</p>
                 <button type="button"
                         data-action="hub-settings#initBotster"
                         class="px-3 py-1.5 text-xs font-medium text-primary-400 bg-primary-500/10 border border-primary-500/30 rounded hover:bg-primary-500/20 transition-colors">
-                  Initialize .botster/
+                  Initialize
                 </button>
               </div>
 
@@ -238,10 +260,12 @@
 
             <%# Preview panels — one per template, hidden until selected %>
             <% @templates.values.flatten.each do |template| %>
+              <% default_scope = template[:scope] || "device" %>
               <div data-hub-templates-target="previewPanel"
                    data-slug="<%= template[:slug] %>"
                    data-dest="<%= template[:dest] %>"
                    data-content="<%= template[:content] %>"
+                   data-default-scope="<%= default_scope %>"
                    class="hidden">
 
                 <div class="mb-4">
@@ -258,14 +282,41 @@
                     <h2 class="text-lg font-semibold text-zinc-100"><%= template[:name] %></h2>
                     <p class="text-sm text-zinc-500 mt-1"><%= template[:description] %></p>
                   </div>
-                  <button type="button"
-                          data-action="hub-templates#toggleInstall"
-                          data-hub-templates-target="installBtn"
-                          data-slug="<%= template[:slug] %>"
-                          class="shrink-0 px-4 py-2 text-sm font-medium rounded transition-colors disabled:opacity-50
-                                 text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30">
-                    Install
-                  </button>
+                  <div class="flex items-center gap-2">
+                    <%# Scope selector %>
+                    <div class="flex gap-1">
+                      <button type="button"
+                              data-action="hub-templates#switchInstallScope"
+                              data-hub-templates-target="scopeBtn"
+                              data-slug="<%= template[:slug] %>"
+                              data-install-scope="device"
+                              class="px-2 py-1 text-xs font-medium rounded transition-colors
+                                     data-[active]:bg-zinc-700 data-[active]:text-zinc-200
+                                     text-zinc-500 hover:text-zinc-300"
+                              <%= "data-active" if default_scope == "device" %>>
+                        Device
+                      </button>
+                      <button type="button"
+                              data-action="hub-templates#switchInstallScope"
+                              data-hub-templates-target="scopeBtn"
+                              data-slug="<%= template[:slug] %>"
+                              data-install-scope="repo"
+                              class="px-2 py-1 text-xs font-medium rounded transition-colors
+                                     data-[active]:bg-zinc-700 data-[active]:text-zinc-200
+                                     text-zinc-500 hover:text-zinc-300"
+                              <%= "data-active" if default_scope == "repo" %>>
+                        Repo
+                      </button>
+                    </div>
+                    <button type="button"
+                            data-action="hub-templates#toggleInstall"
+                            data-hub-templates-target="installBtn"
+                            data-slug="<%= template[:slug] %>"
+                            class="shrink-0 px-4 py-2 text-sm font-medium rounded transition-colors disabled:opacity-50
+                                   text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30">
+                      Install
+                    </button>
+                  </div>
                 </div>
 
                 <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg overflow-hidden">

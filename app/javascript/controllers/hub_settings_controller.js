@@ -52,6 +52,9 @@ export default class extends Controller {
     this.currentFilePath = null;
     this.originalContent = null;
     this.tree = null;
+    this.configScope = "repo";       // "repo" or "device"
+    this.deviceTree = null;           // cached device tree
+    this.repoTree = null;             // cached repo tree
 
     ConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
@@ -105,6 +108,33 @@ export default class extends Controller {
     });
   }
 
+  switchConfigScope(event) {
+    const scope = event.currentTarget.dataset.configScope;
+    if (!scope || scope === this.configScope) return;
+
+    this.configScope = scope;
+
+    // Toggle scope button active state
+    this.element.querySelectorAll("[data-config-scope]").forEach((btn) => {
+      btn.toggleAttribute("data-active", btn.dataset.configScope === scope);
+    });
+
+    // Clear editor when switching scopes
+    this.currentFilePath = null;
+    this.originalContent = null;
+    this.editorPanelTarget.dataset.editor = "empty";
+    this.editorTitleTarget.textContent = "Select a file";
+
+    // Use cached tree if available, otherwise scan
+    const cached = scope === "device" ? this.deviceTree : this.repoTree;
+    if (cached) {
+      this.tree = cached;
+      this.#renderTree();
+    } else {
+      this.scanTree();
+    }
+  }
+
   async selectFile(event) {
     const filePath = event.currentTarget.dataset.filePath;
     if (!filePath || !this.hub) return;
@@ -112,8 +142,9 @@ export default class extends Controller {
     this.currentFilePath = filePath;
     this.#highlightSelected(filePath);
 
+    const fsScope = this.#fsScope();
     try {
-      const stat = await this.hub.statFile(filePath);
+      const stat = await this.hub.statFile(filePath, fsScope);
       if (!this.hub) return;
       if (stat.exists) {
         await this.#loadFileContent(filePath);
@@ -134,7 +165,7 @@ export default class extends Controller {
     this.saveBtnTarget.textContent = "Saving...";
 
     try {
-      await this.hub.writeFile(this.currentFilePath, content);
+      await this.hub.writeFile(this.currentFilePath, content, this.#fsScope());
       this.originalContent = content;
       this.#updateDirtyState();
       this.saveBtnTarget.textContent = "Saved";
@@ -160,14 +191,15 @@ export default class extends Controller {
     if (!this.currentFilePath || !this.hub) return;
 
     const content = this.editorTarget.value || this.#defaultContent(this.currentFilePath);
+    const fsScope = this.#fsScope();
 
     this.createBtnTarget.textContent = "Creating...";
 
     try {
       const parentDir = this.currentFilePath.replace(/\/[^/]+$/, "");
-      await this.hub.mkDir(parentDir).catch(() => {});
+      await this.hub.mkDir(parentDir, fsScope).catch(() => {});
 
-      await this.hub.writeFile(this.currentFilePath, content);
+      await this.hub.writeFile(this.currentFilePath, content, fsScope);
       this.originalContent = content;
       this.editorPanelTarget.dataset.editor = "editing";
       this.scanTree();
@@ -190,7 +222,7 @@ export default class extends Controller {
     this.deleteBtnTarget.textContent = "Deleting...";
 
     try {
-      await this.hub.deleteFile(this.currentFilePath);
+      await this.hub.deleteFile(this.currentFilePath, this.#fsScope());
       this.#showCreateState(this.currentFilePath);
       this.scanTree();
     } catch (error) {
@@ -206,6 +238,8 @@ export default class extends Controller {
 
     if (!filePath || !this.hub) return;
 
+    const fsScope = this.#fsScope();
+
     // Toggle hint visibility
     const hint = this.element.querySelector(`[data-pf-hint="${event.currentTarget.id}"]`);
     if (hint) hint.classList.toggle("hidden", !checked);
@@ -213,10 +247,10 @@ export default class extends Controller {
     try {
       if (checked) {
         const parentDir = filePath.replace(/\/[^/]+$/, "");
-        await this.hub.mkDir(parentDir).catch(() => {});
-        await this.hub.writeFile(filePath, "");
+        await this.hub.mkDir(parentDir, fsScope).catch(() => {});
+        await this.hub.writeFile(filePath, "", fsScope);
       } else {
-        await this.hub.deleteFile(filePath);
+        await this.hub.deleteFile(filePath, fsScope);
       }
       this.scanTree();
     } catch (error) {
@@ -228,6 +262,8 @@ export default class extends Controller {
   async addSession(event) {
     const basePath = event.currentTarget.dataset.basePath;
     if (!basePath || !this.hub) return;
+
+    const fsScope = this.#fsScope();
 
     // Get existing session names in this scope for duplicate checking
     const existingSessions = this.#sessionsForBasePath(basePath);
@@ -244,9 +280,9 @@ export default class extends Controller {
 
     try {
       const sessionDir = `${basePath}/${name}`;
-      await this.hub.mkDir(sessionDir);
+      await this.hub.mkDir(sessionDir, fsScope);
       const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
-      await this.hub.writeFile(`${sessionDir}/initialization`, defaultInit);
+      await this.hub.writeFile(`${sessionDir}/initialization`, defaultInit, fsScope);
       await this.scanTree();
       this.#selectFileByPath(`${sessionDir}/initialization`);
     } catch (error) {
@@ -257,6 +293,9 @@ export default class extends Controller {
   async addProfile(event) {
     if (!this.hub) return;
 
+    const fsScope = this.#fsScope();
+    const prefix = this.configScope === "device" ? "profiles" : ".botster/profiles";
+
     const name = await this.#promptUser(
       "Add Profile",
       "Enter a name for the new profile (lowercase, no spaces):",
@@ -264,8 +303,8 @@ export default class extends Controller {
     if (!name) return;
 
     try {
-      await this.hub.mkDir(`.botster/profiles/${name}`);
-      await this.hub.mkDir(`.botster/profiles/${name}/sessions`);
+      await this.hub.mkDir(`${prefix}/${name}`, fsScope);
+      await this.hub.mkDir(`${prefix}/${name}/sessions`, fsScope);
       await this.scanTree();
       this.#scrollToProfile(name);
     } catch (error) {
@@ -283,9 +322,12 @@ export default class extends Controller {
     );
     if (!confirmed) return;
 
+    const fsScope = this.#fsScope();
+    const prefix = this.configScope === "device" ? "profiles" : ".botster/profiles";
+
     try {
-      await this.hub.rmDir(`.botster/profiles/${profileName}`);
-      if (this.currentFilePath?.startsWith(`.botster/profiles/${profileName}/`)) {
+      await this.hub.rmDir(`${prefix}/${profileName}`, fsScope);
+      if (this.currentFilePath?.startsWith(`${prefix}/${profileName}/`)) {
         this.currentFilePath = null;
         this.originalContent = null;
         this.editorPanelTarget.dataset.editor = "empty";
@@ -310,23 +352,55 @@ export default class extends Controller {
       this.treePanelTarget.dataset.view = "loading";
     }
 
+    const scope = this.configScope;
+    const fsScope = scope === "device" ? "device" : undefined;
+
     try {
       const tree = { shared: null, profiles: {} };
 
-      const botsterStat = await this.hub.statFile(".botster").catch(() => ({ exists: false }));
-      if (!botsterStat.exists) {
-        this.treePanelTarget.dataset.view = "empty";
-        return;
-      }
+      if (scope === "device") {
+        // Device scope: root is ~/.botster/, check shared/ and profiles/
+        const sharedStat = await this.hub.statFile("shared", fsScope).catch(() => ({ exists: false }));
+        if (!sharedStat.exists) {
+          // Check if profiles exist at least
+          const profilesStat = await this.hub.statFile("profiles", fsScope).catch(() => ({ exists: false }));
+          if (!profilesStat.exists) {
+            this.treePanelTarget.dataset.view = "empty";
+            return;
+          }
+        }
 
-      tree.shared = await this.#scanScope(".botster/shared");
+        if (sharedStat.exists) {
+          tree.shared = await this.#scanScopeWithFs("shared", fsScope);
+        }
 
-      const profileEntries = await this.#listDirs(".botster/profiles");
-      for (const profileName of profileEntries) {
-        tree.profiles[profileName] = await this.#scanScope(`.botster/profiles/${profileName}`);
+        const profileEntries = await this.#listDirs("profiles", fsScope);
+        for (const profileName of profileEntries) {
+          tree.profiles[profileName] = await this.#scanScopeWithFs(`profiles/${profileName}`, fsScope);
+        }
+      } else {
+        // Repo scope: root is repo root, check .botster/
+        const botsterStat = await this.hub.statFile(".botster").catch(() => ({ exists: false }));
+        if (!botsterStat.exists) {
+          this.treePanelTarget.dataset.view = "empty";
+          return;
+        }
+
+        tree.shared = await this.#scanScopeWithFs(".botster/shared", fsScope);
+
+        const profileEntries = await this.#listDirs(".botster/profiles", fsScope);
+        for (const profileName of profileEntries) {
+          tree.profiles[profileName] = await this.#scanScopeWithFs(`.botster/profiles/${profileName}`, fsScope);
+        }
       }
 
       this.tree = tree;
+      // Cache for scope switching
+      if (scope === "device") {
+        this.deviceTree = tree;
+      } else {
+        this.repoTree = tree;
+      }
       this.#renderTree();
     } catch (error) {
       if (isFirstLoad) {
@@ -335,31 +409,50 @@ export default class extends Controller {
     }
   }
 
-  async #scanScope(basePath) {
-    const scope = { files: {}, sessions: {} };
+  async #scanScopeWithFs(basePath, fsScope) {
+    const scope = { files: {}, sessions: {}, plugins: {} };
 
-    for (const fileName of ["workspace_include", "workspace_teardown"]) {
-      const stat = await this.hub.statFile(`${basePath}/${fileName}`).catch(() => ({ exists: false }));
-      scope.files[fileName] = stat.exists;
-    }
+    // Scan workspace files, session dirs, and plugin dirs in parallel
+    const [, , sessionNames, pluginNames] = await Promise.all([
+      ...["workspace_include", "workspace_teardown"].map(async (fileName) => {
+        const stat = await this.hub.statFile(`${basePath}/${fileName}`, fsScope).catch(() => ({ exists: false }));
+        scope.files[fileName] = stat.exists;
+      }),
+      this.#listDirs(`${basePath}/sessions`, fsScope),
+      this.#listDirs(`${basePath}/plugins`, fsScope),
+    ]);
 
-    const sessionNames = await this.#listDirs(`${basePath}/sessions`);
-    for (const sessionName of sessionNames) {
-      const sessionPath = `${basePath}/sessions/${sessionName}`;
-      const initStat = await this.hub.statFile(`${sessionPath}/initialization`).catch(() => ({ exists: false }));
-      const pfStat = await this.hub.statFile(`${sessionPath}/port_forward`).catch(() => ({ exists: false }));
-      scope.sessions[sessionName] = {
-        initialization: initStat.exists,
-        port_forward: pfStat.exists,
-      };
-    }
+    // Scan sessions (init + port_forward per session)
+    await Promise.all(
+      sessionNames.map(async (sessionName) => {
+        const sessionPath = `${basePath}/sessions/${sessionName}`;
+        const [initStat, pfStat] = await Promise.all([
+          this.hub.statFile(`${sessionPath}/initialization`, fsScope).catch(() => ({ exists: false })),
+          this.hub.statFile(`${sessionPath}/port_forward`, fsScope).catch(() => ({ exists: false })),
+        ]);
+        scope.sessions[sessionName] = {
+          initialization: initStat.exists,
+          port_forward: pfStat.exists,
+        };
+      }),
+    );
+
+    // Scan plugins (check init.lua per plugin)
+    await Promise.all(
+      pluginNames.map(async (pluginName) => {
+        const initStat = await this.hub
+          .statFile(`${basePath}/plugins/${pluginName}/init.lua`, fsScope)
+          .catch(() => ({ exists: false }));
+        scope.plugins[pluginName] = { init: initStat.exists };
+      }),
+    );
 
     return scope;
   }
 
-  async #listDirs(path) {
+  async #listDirs(path, fsScope) {
     try {
-      const result = await this.hub.listDir(path);
+      const result = await this.hub.listDir(path, fsScope);
       return (result.entries || [])
         .filter((e) => e.type === "dir")
         .map((e) => e.name)
@@ -374,11 +467,22 @@ export default class extends Controller {
   async initBotster() {
     if (!this.hub) return;
 
+    const fsScope = this.#fsScope();
+
     try {
-      await this.hub.mkDir(".botster/shared/sessions/agent");
-      await this.hub.mkDir(".botster/profiles");
-      const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
-      await this.hub.writeFile(".botster/shared/sessions/agent/initialization", defaultInit);
+      if (this.configScope === "device") {
+        // Device: create shared/ and profiles/ under ~/.botster/
+        await this.hub.mkDir("shared/sessions/agent", fsScope);
+        await this.hub.mkDir("profiles", fsScope);
+        const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
+        await this.hub.writeFile("shared/sessions/agent/initialization", defaultInit, fsScope);
+      } else {
+        // Repo: create .botster/ structure
+        await this.hub.mkDir(".botster/shared/sessions/agent");
+        await this.hub.mkDir(".botster/profiles");
+        const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
+        await this.hub.writeFile(".botster/shared/sessions/agent/initialization", defaultInit);
+      }
       this.scanTree();
     } catch (error) {
       this.#showError(`Failed to initialize: ${error.message}`);
@@ -389,9 +493,13 @@ export default class extends Controller {
     const container = this.treeContainerTarget;
     container.innerHTML = "";
 
+    const isDevice = this.configScope === "device";
+    const sharedBase = isDevice ? "shared" : ".botster/shared";
+    const profilesBase = isDevice ? "profiles" : ".botster/profiles";
+
     // Shared section
     if (this.tree.shared) {
-      container.appendChild(this.#renderSection("Shared", ".botster/shared", this.tree.shared));
+      container.appendChild(this.#renderSection("Shared", sharedBase, this.tree.shared));
     }
 
     // Profiles section
@@ -406,7 +514,7 @@ export default class extends Controller {
         container.appendChild(
           this.#renderSection(
             this.#capitalize(name),
-            `.botster/profiles/${name}`,
+            `${profilesBase}/${name}`,
             this.tree.profiles[name],
             { sharedScope: this.tree.shared, profileName: name },
           ),
@@ -497,6 +605,23 @@ export default class extends Controller {
         list.appendChild(
           this.#renderPortForwardToggle(`${sessionPath}/port_forward`, sessionName, session.port_forward),
         );
+      }
+    }
+
+    // Plugins
+    const pluginNames = Object.keys(scope.plugins || {}).sort();
+    if (pluginNames.length > 0) {
+      const plugHeader = document.createElement("div");
+      plugHeader.className = "mt-2 mb-1";
+      plugHeader.innerHTML = `<span class="text-xs text-zinc-600 uppercase tracking-wider">Plugins</span>`;
+      list.appendChild(plugHeader);
+
+      for (const pluginName of pluginNames) {
+        const plugin = scope.plugins[pluginName];
+        const pluginPath = `${basePath}/plugins/${pluginName}/init.lua`;
+        const sharedPlugin = sharedScope?.plugins?.[pluginName];
+        const status = this.#fileStatus(plugin.init, sharedPlugin?.init);
+        list.appendChild(this.#renderFileEntry(pluginPath, `${pluginName}/init.lua`, status));
       }
     }
 
@@ -602,7 +727,7 @@ export default class extends Controller {
     this.editorPanelTarget.dataset.editor = "loading";
 
     try {
-      const result = await this.hub.readFile(filePath);
+      const result = await this.hub.readFile(filePath, this.#fsScope());
       if (!this.hub) return;
       this.originalContent = result.content;
       this.editorTarget.value = result.content;
@@ -761,18 +886,28 @@ export default class extends Controller {
 
   /**
    * Get existing session names for a sessions/ basePath by looking up the tree data.
-   * basePath is like ".botster/shared/sessions" or ".botster/profiles/standard/sessions"
+   * Repo scope: ".botster/shared/sessions" or ".botster/profiles/standard/sessions"
+   * Device scope: "shared/sessions" or "profiles/standard/sessions"
    */
   #sessionsForBasePath(basePath) {
     if (!this.tree) return [];
-    if (basePath.startsWith(".botster/shared/")) {
+
+    // Match shared sessions (repo or device path format)
+    if (basePath.match(/(?:^|\.botster\/)shared\//)) {
       return Object.keys(this.tree.shared?.sessions || {});
     }
-    const match = basePath.match(/\.botster\/profiles\/([^/]+)\//);
+
+    // Match profile sessions (repo or device path format)
+    const match = basePath.match(/(?:\.botster\/)?profiles\/([^/]+)\//);
     if (match) {
       return Object.keys(this.tree.profiles?.[match[1]]?.sessions || {});
     }
     return [];
+  }
+
+  /** Return the fs scope string to pass to hub methods. */
+  #fsScope() {
+    return this.configScope === "device" ? "device" : undefined;
   }
 
   #capitalize(str) {

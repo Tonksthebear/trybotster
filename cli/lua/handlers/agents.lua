@@ -90,6 +90,8 @@ end
 -- @return string|nil Resolved profile name (nil = shared-only)
 -- @return string|nil Error message if resolution fails
 local function resolve_profile_name(repo_root, profile_name)
+    local device_root = config.data_dir and config.data_dir() or nil
+
     -- Explicit profile name
     if profile_name and profile_name ~= "" then
         return profile_name, nil
@@ -97,16 +99,16 @@ local function resolve_profile_name(repo_root, profile_name)
 
     -- Empty string = user chose "Default" (shared-only)
     if profile_name == "" then
-        if ConfigResolver.has_shared_agent(repo_root) then
+        if ConfigResolver.has_agent_without_profile(device_root, repo_root) then
             return nil, nil
         end
         return nil, "Cannot use Default: no agent session in shared/"
     end
 
     -- nil = not specified, auto-select
-    local profiles = ConfigResolver.list_profiles(repo_root)
+    local profiles = ConfigResolver.list_profiles_all(device_root, repo_root)
     if #profiles == 0 then
-        if ConfigResolver.has_shared_agent(repo_root) then
+        if ConfigResolver.has_agent_without_profile(device_root, repo_root) then
             log.info("No profiles found, using shared-only config")
             return nil, nil
         end
@@ -123,7 +125,7 @@ end
 
 --- Build session configs for Agent.new() from resolved config.
 -- Maps ConfigResolver output to the format Agent.new() expects.
--- @param resolved table ConfigResolver.resolve() output
+-- @param resolved table ConfigResolver.resolve_all() output
 -- @return array Session configs for Agent.new()
 local function build_sessions_from_resolved(resolved)
     local sessions = {}
@@ -184,8 +186,13 @@ local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, a
     -- Broadcast: spawning PTYs
     notify_lifecycle(agent_key, "spawning_ptys")
 
-    -- Resolve config from .botster/ directory
-    local resolved, err = ConfigResolver.resolve(repo_root, profile_name)
+    -- Resolve config across device + repo layers
+    local device_root = config.data_dir and config.data_dir() or nil
+    local resolved, err = ConfigResolver.resolve_all({
+        device_root = device_root,
+        repo_root = repo_root,
+        profile = profile_name,
+    })
     if not resolved then
         log.error(string.format("Config resolution failed for profile '%s': %s",
             tostring(profile_name), tostring(err)))
@@ -315,10 +322,15 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
             log.info(string.format("Created worktree for %s at %s", branch_name, wt_path))
 
             -- Copy workspace files into new worktree
-            local resolved_for_copy, _ = ConfigResolver.resolve(repo_root, profile_name)
+            local device_root_copy = config.data_dir and config.data_dir() or nil
+            local resolved_for_copy, _ = ConfigResolver.resolve_all({
+                device_root = device_root_copy,
+                repo_root = repo_root,
+                profile = profile_name,
+            })
             if resolved_for_copy and resolved_for_copy.workspace_include then
                 local ok_copy, copy_err = pcall(worktree.copy_from_patterns,
-                    repo_root, wt_path, resolved_for_copy.workspace_include)
+                    repo_root, wt_path, resolved_for_copy.workspace_include.path)
                 if not ok_copy then
                     log.warn(string.format("Failed to copy workspace files: %s", tostring(copy_err)))
                 end

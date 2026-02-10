@@ -101,22 +101,39 @@ end)
 safe_require("user.init")
 
 -- ============================================================================
--- Plugin Loading
+-- Plugin Loading (Unified: device + repo layers)
 -- ============================================================================
--- Load plugins from ~/.botster/lua/plugins/*/init.lua
--- Each plugin is a directory with an init.lua that registers hooks,
--- commands, or other extensions. Analogous to Neovim's plugin system.
+-- Uses config_resolver.resolve_all() to discover plugins across:
+--   1. ~/.botster/shared/plugins/
+--   2. ~/.botster/profiles/{profile}/plugins/
+--   3. {repo}/.botster/shared/plugins/
+--   4. {repo}/.botster/profiles/{profile}/plugins/
 
-local plugin_base = config.lua_path()
-local plugin_dir = plugin_base .. "/plugins"
+local ConfigResolver = require("lib.config_resolver")
+local loaded_plugin_names = {}
 
-local plugins = loader.discover_plugins(plugin_dir)
-if #plugins > 0 then
-    log.info(string.format("Discovered %d plugin(s): %s", #plugins, table.concat(plugins, ", ")))
-    for _, plugin_name in ipairs(plugins) do
-        safe_require("plugins." .. plugin_name .. ".init")
+local device_root = config.data_dir and config.data_dir() or nil
+local repo_root = (worktree and worktree.repo_root) and worktree.repo_root() or nil
+local active_profile = (config.get and config.get("active_profile")) or nil
+
+if device_root or repo_root then
+    local unified = ConfigResolver.resolve_all({
+        device_root = device_root,
+        repo_root = repo_root,
+        profile = active_profile,
+        require_agent = false,  -- plugin discovery doesn't need agent session
+    })
+
+    if unified and unified.plugins then
+        for _, plugin in ipairs(unified.plugins) do
+            if loader.load_plugin(plugin.init_path, plugin.name) then
+                loaded_plugin_names[plugin.name] = true
+            end
+        end
     end
-else
+end
+
+if not next(loaded_plugin_names) then
     log.debug("No plugins found")
 end
 
@@ -127,7 +144,7 @@ end
 -- These run in a sandbox: no process spawn, no keyring, fs restricted
 -- to the improvements directory only.
 
-local improvements_dir = plugin_base .. "/improvements"
+local improvements_dir = config.lua_path() .. "/improvements"
 if fs.exists(improvements_dir) then
     local count = loader.load_improvements(improvements_dir)
     if count > 0 then
