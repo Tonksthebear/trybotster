@@ -48,7 +48,6 @@ pub mod registration;
 pub mod run;
 mod server_comms;
 pub mod state;
-pub mod workers;
 
 pub use actions::HubAction;
 pub use agent_handle::AgentPtys;
@@ -96,6 +95,17 @@ pub struct PtyObserverNotification {
     pub ctx: crate::lua::primitives::PtyOutputContext,
     /// Data that was sent (post-interception).
     pub data: Vec<u8>,
+}
+
+/// A PTY notification event queued by a watcher task for the Hub tick loop.
+#[derive(Debug)]
+pub struct PtyNotificationEvent {
+    /// Agent key for the Lua hook context.
+    pub agent_key: String,
+    /// Session name (e.g., "cli", "server").
+    pub session_name: String,
+    /// The notification detected in PTY output.
+    pub notification: crate::agent::AgentNotification,
 }
 
 /// Maximum pending observer notifications before oldest are dropped.
@@ -153,10 +163,6 @@ pub struct Hub {
     // === Browser Relay ===
     /// Browser connection state and communication.
     pub browser: crate::relay::BrowserState,
-
-    // === Background Workers ===
-    /// Background worker for notification sending (non-blocking).
-    pub notification_worker: Option<workers::NotificationWorker>,
 
     // === WebRTC Channels ===
     /// WebRTC peer connections indexed by browser identity.
@@ -224,6 +230,16 @@ pub struct Hub {
     /// drained independently in [`Self::poll_pty_observers`] so slow observers
     /// never block the WebRTC fast path.
     pty_observer_queue: std::collections::VecDeque<PtyObserverNotification>,
+
+    /// Pending PTY notification events from watcher tasks.
+    ///
+    /// Watcher tasks subscribe to PTY broadcast channels, filter for
+    /// `PtyEvent::Notification`, and push events here. Drained in
+    /// `poll_pty_notifications()` which fires the `pty_notification` Lua hook.
+    pty_notification_queue: std::sync::Arc<std::sync::Mutex<Vec<PtyNotificationEvent>>>,
+
+    /// Handles for notification watcher tasks, keyed by "{agent_key}:{session_name}".
+    notification_watcher_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
 
     // === TUI via Lua (Hub-side Processing) ===
     /// Sender for TUI output messages to TuiRunner.
@@ -318,8 +334,6 @@ impl Hub {
             tokio_runtime,
             quit: false,
             browser: crate::relay::BrowserState::default(),
-            // Workers are started later via start_background_workers() after registration
-            notification_worker: None,
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
             webrtc_connection_started: std::collections::HashMap::new(),
@@ -335,34 +349,11 @@ impl Hub {
             lua_ac_connections: std::collections::HashMap::new(),
             lua_ac_channels: std::collections::HashMap::new(),
             pty_observer_queue: std::collections::VecDeque::new(),
+            pty_notification_queue: Arc::new(Mutex::new(Vec::new())),
+            notification_watcher_handles: std::collections::HashMap::new(),
             tui_output_tx: None,
             tui_request_rx: None,
         })
-    }
-
-    /// Start background workers for non-blocking network I/O.
-    ///
-    /// Call this after hub registration completes and `botster_id` is set.
-    /// Currently starts the NotificationWorker for background notification sending.
-    fn start_background_workers(&mut self) {
-        let worker_config = workers::WorkerConfig {
-            server_url: self.config.server_url.clone(),
-            api_key: self.config.get_api_key().to_string(),
-            server_hub_id: self.server_hub_id().to_string(),
-        };
-
-        // Start notification worker
-        if self.notification_worker.is_none() {
-            log::info!("Starting background notification worker");
-            self.notification_worker = Some(workers::NotificationWorker::new(worker_config));
-        }
-    }
-
-    /// Shutdown all background workers gracefully.
-    fn shutdown_background_workers(&mut self) {
-        if let Some(worker) = self.notification_worker.take() {
-            worker.shutdown();
-        }
     }
 
     /// Get the hub ID to use for server communication.
@@ -439,10 +430,6 @@ impl Hub {
         self.register_device();
         self.register_hub_with_server();
         self.init_crypto_service();
-
-        // Start background workers for non-blocking network I/O
-        // Must be called after register_hub_with_server() sets botster_id
-        self.start_background_workers();
 
         // ActionCable connections are now managed by Lua plugins
         // (hub_commands.lua and github.lua handle subscription lifecycle)
@@ -592,11 +579,13 @@ impl Hub {
             log::warn!("Lua shutdown event error: {}", e);
         }
 
-        // Shutdown background workers (allows pending notifications to drain)
-        self.shutdown_background_workers();
-
         // Abort all PTY forwarder tasks
         for (_key, task) in self.webrtc_pty_forwarders.drain() {
+            task.abort();
+        }
+
+        // Abort all notification watcher tasks
+        for (_key, task) in self.notification_watcher_handles.drain() {
             task.abort();
         }
 

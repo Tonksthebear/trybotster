@@ -13,9 +13,7 @@
 //!  ├── reader_thread: JoinHandle (PTY output reader)
 //!  ├── child: Child (spawned process)
 //!  ├── scrollback_buffer: Arc<Mutex<VecDeque<u8>>> (raw byte history)
-//!  ├── event_tx: broadcast::Sender<PtyEvent> (output broadcast)
-//!  ├── notification_tx: Sender<AgentNotification> (send notifications)
-//!  └── notification_rx: Receiver<AgentNotification> (receive notifications)
+//!  └── event_tx: broadcast::Sender<PtyEvent> (output + notification broadcast)
 //! ```
 //!
 //! # Event Broadcasting
@@ -51,15 +49,13 @@ use portable_pty::{Child, MasterPty, PtySize};
 use std::{
     collections::VecDeque,
     io::Write,
-    sync::{mpsc::Sender, Arc, Mutex},
+    sync::{Arc, Mutex},
     thread,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::agent::spawn;
-
-use super::notification::AgentNotification;
 
 /// Default channel capacity for PTY command channels.
 const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
@@ -193,18 +189,11 @@ pub struct PtySession {
     /// to be processed in a background task.
     command_rx: Option<mpsc::Receiver<PtyCommand>>,
 
-    /// Channel for sending detected notifications.
-    pub notification_tx: Option<Sender<AgentNotification>>,
-
-    /// Channel for receiving detected notifications.
+    /// Whether notification detection is enabled for this session.
     ///
-    /// Populated by [`spawn()`](Self::spawn) when
-    /// [`PtySpawnConfig::detect_notifications`] is true.
-    /// Drained via [`poll_notifications()`](Self::poll_notifications).
-    ///
-    /// Note: `mpsc::Receiver` is not `Clone`, which is intentional -- only
-    /// one consumer should drain notifications for a given PTY session.
-    notification_rx: Option<std::sync::mpsc::Receiver<AgentNotification>>,
+    /// When true, the reader thread broadcasts [`PtyEvent::Notification`]
+    /// events for detected OSC 9 / OSC 777 sequences.
+    detect_notifications: bool,
 
     /// Allocated port for HTTP forwarding.
     ///
@@ -228,8 +217,7 @@ impl std::fmt::Debug for PtySession {
             .field("has_writer", &state.writer.is_some())
             .field("has_reader_thread", &self.reader_thread.is_some())
             .field("has_child", &self.child.is_some())
-            .field("has_notification_tx", &self.notification_tx.is_some())
-            .field("has_notification_rx", &self.notification_rx.is_some())
+            .field("detect_notifications", &self.detect_notifications)
             .field(
                 "has_command_processor",
                 &self.command_processor_handle.is_some(),
@@ -263,8 +251,7 @@ impl PtySession {
             event_tx,
             command_tx,
             command_rx: Some(command_rx),
-            notification_tx: None,
-            notification_rx: None,
+            detect_notifications: false,
             port: None,
         }
     }
@@ -374,17 +361,8 @@ impl PtySession {
             .spawn_command(cmd)
             .context("Failed to spawn command")?;
 
-        // Set up notification channel if enabled
-        let notification_tx = if config.detect_notifications {
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.notification_rx = Some(rx);
-            Some(tx)
-        } else {
-            None
-        };
-
-        // Store the notification_tx on self for external access if needed
-        self.notification_tx = notification_tx.clone();
+        // Track notification detection flag
+        self.detect_notifications = config.detect_notifications;
 
         // Configure PTY with spawned resources
         self.set_child(child);
@@ -396,7 +374,7 @@ impl PtySession {
             reader,
             Arc::clone(&self.scrollback_buffer),
             self.event_sender(),
-            notification_tx,
+            config.detect_notifications,
         ));
 
         self.set_master_pty(pair.master);
@@ -422,24 +400,10 @@ impl PtySession {
         Ok(())
     }
 
-    /// Poll for pending notifications (non-blocking).
-    ///
-    /// Drains all available notifications from the internal receiver channel.
-    /// Returns an empty `Vec` if notifications are not enabled for this session
-    /// (i.e., `detect_notifications` was `false` in the spawn config).
-    ///
-    /// This is the PtySession-level equivalent of `Agent::poll_notifications()`.
-    /// As the Agent struct is dissolved, callers should use this method directly
-    /// on the PtySession instead.
+    /// Check if notification detection is enabled for this session.
     #[must_use]
-    pub fn poll_notifications(&self) -> Vec<AgentNotification> {
-        let mut notifications = Vec::new();
-        if let Some(ref rx) = self.notification_rx {
-            while let Ok(notif) = rx.try_recv() {
-                notifications.push(notif);
-            }
-        }
-        notifications
+    pub fn has_notifications(&self) -> bool {
+        self.detect_notifications
     }
 
     /// Get a clone of the shared state Arc for the command processor.
@@ -488,19 +452,6 @@ impl PtySession {
     /// processing commands in the event loop. Returns None if already taken.
     pub fn take_command_receiver(&mut self) -> Option<mpsc::Receiver<PtyCommand>> {
         self.command_rx.take()
-    }
-
-    /// Take the notification receiver from this PTY session.
-    ///
-    /// This transfers ownership of the notification channel receiver to the
-    /// caller. Used by `PtySessionHandle` to own the notification receiver
-    /// directly, avoiding the need to go through the `PtySession` for polling.
-    ///
-    /// Returns `None` if notifications are not enabled or already taken.
-    pub fn take_notification_rx(
-        &mut self,
-    ) -> Option<std::sync::mpsc::Receiver<AgentNotification>> {
-        self.notification_rx.take()
     }
 
     /// Spawn the command processor task.
@@ -1140,42 +1091,6 @@ mod tests {
     }
 
     // =========================================================================
-    // PtySession::poll_notifications Tests
-    // =========================================================================
-
-    #[test]
-    fn test_poll_notifications_empty_when_no_rx() {
-        let session = PtySession::new(24, 80);
-        assert!(session.notification_rx.is_none());
-        assert!(session.poll_notifications().is_empty());
-    }
-
-    #[test]
-    fn test_poll_notifications_drains_channel() {
-        let mut session = PtySession::new(24, 80);
-        let (tx, rx) = std::sync::mpsc::channel();
-        session.notification_rx = Some(rx);
-
-        tx.send(AgentNotification::Osc9(Some("first".to_string())))
-            .unwrap();
-        tx.send(AgentNotification::Osc9(Some("second".to_string())))
-            .unwrap();
-
-        let notifications = session.poll_notifications();
-        assert_eq!(notifications.len(), 2);
-        assert!(session.poll_notifications().is_empty());
-    }
-
-    #[test]
-    fn test_poll_notifications_handles_dropped_sender() {
-        let mut session = PtySession::new(24, 80);
-        let (tx, rx) = std::sync::mpsc::channel::<AgentNotification>();
-        session.notification_rx = Some(rx);
-        drop(tx);
-        assert!(session.poll_notifications().is_empty());
-    }
-
-    // =========================================================================
     // PtySession::spawn Tests
     // =========================================================================
 
@@ -1199,7 +1114,7 @@ mod tests {
         let result = session.spawn(config);
         assert!(result.is_ok());
         assert!(session.is_spawned());
-        assert!(session.notification_rx.is_none());
+        assert!(!session.has_notifications());
     }
 
     #[tokio::test]
@@ -1222,8 +1137,7 @@ mod tests {
         let result = session.spawn(config);
         assert!(result.is_ok());
         assert!(session.is_spawned());
-        assert!(session.notification_rx.is_some());
-        assert!(session.notification_tx.is_some());
+        assert!(session.has_notifications());
     }
 
     #[tokio::test]
@@ -1246,12 +1160,6 @@ mod tests {
         let result = session.spawn(config);
         assert!(result.is_ok());
         assert_eq!(session.port(), Some(8080));
-    }
-
-    #[test]
-    fn test_notification_rx_not_clone() {
-        let session = PtySession::new(24, 80);
-        let _: &Option<std::sync::mpsc::Receiver<AgentNotification>> = &session.notification_rx;
     }
 
     #[test]

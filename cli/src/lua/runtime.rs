@@ -1824,6 +1824,50 @@ impl LuaRuntime {
         self.fire_json_event("command_message", message)
     }
 
+    /// Notify observers of a PTY notification event.
+    ///
+    /// Fires the `pty_notification` hook with a table containing:
+    /// - `type`: "osc9" or "osc777"
+    /// - `message`: notification message (osc9)
+    /// - `title`/`body`: notification fields (osc777)
+    /// - `agent_key`: agent identifier
+    /// - `session_name`: PTY session name
+    pub fn notify_pty_notification(
+        &self,
+        agent_key: &str,
+        session_name: &str,
+        notification: &crate::agent::AgentNotification,
+    ) {
+        use crate::agent::AgentNotification;
+
+        let result: mlua::Result<()> = (|| {
+            let data = self.lua.create_table()?;
+            data.set("agent_key", agent_key)?;
+            data.set("session_name", session_name)?;
+
+            match notification {
+                AgentNotification::Osc9(msg) => {
+                    data.set("type", "osc9")?;
+                    data.set("message", msg.clone())?;
+                }
+                AgentNotification::Osc777 { title, body } => {
+                    data.set("type", "osc777")?;
+                    data.set("title", title.clone())?;
+                    data.set("body", body.clone())?;
+                }
+            }
+
+            let hooks: mlua::Table = self.lua.globals().get("hooks")?;
+            let notify: mlua::Function = hooks.get("notify")?;
+            notify.call::<mlua::Value>(("pty_notification", data))?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            log::warn!("PTY notification hook failed: {}", e);
+        }
+    }
+
     /// Fire the "shutdown" event.
     ///
     /// Called by Hub when shutting down.

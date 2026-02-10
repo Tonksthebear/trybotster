@@ -122,7 +122,10 @@ export class Connection {
       await this.#connectSignaling()
     } catch (error) {
       console.error(`[${this.constructor.name}] Initialize failed:`, error)
-      this.#setError("init_failed", error.message)
+      // Don't overwrite session_invalid — it's already showing "Scan Code"
+      if (this.errorCode !== "session_invalid") {
+        this.#setError("init_failed", error.message)
+      }
     }
   }
 
@@ -219,6 +222,12 @@ export class Connection {
     }
 
     await this.#ensureConnected()  // continues to peer+subscribe if CLI online + session exists
+
+    // No crypto session — WebRTC unavailable, user must scan connection code
+    if (!this.identityKey) {
+      this.errorCode = "unpaired"
+      this.emit("error", { reason: "unpaired", message: "Scan connection code" })
+    }
   }
 
   /**
@@ -456,10 +465,19 @@ export class Connection {
     this.#unsubscribers.push(unsubHealth)
 
     // Listen for session invalid (Olm session desync detected by CLI)
+    // Don't use #setError — ActionCable is still connected, only crypto is bad
     const unsubSession = bridge.on("session:invalid", (event) => {
       if (event.hubId !== hubId) return
+      if (this.errorCode === "session_invalid") return  // already handled
       console.warn(`[${this.constructor.name}] Session invalid:`, event.message)
-      this.#setError("session_invalid", event.message)
+      this.#disconnectPeer()
+      // Clear stale Olm session so it can't interfere with fresh sessions (e.g., new tab)
+      bridge.clearSession(hubId).catch(() => {})
+      this.identityKey = null
+      this.errorCode = "session_invalid"
+      this.errorReason = event.message
+      this.#setState(ConnectionState.ERROR)
+      this.emit("error", { reason: "session_invalid", message: event.message })
     })
     this.#unsubscribers.push(unsubSession)
   }
@@ -576,6 +594,22 @@ export class Connection {
   async reacquire() {
     const hubId = this.getHubId()
     if (!hubId) return
+
+    // Check for new session bundle in URL fragment (QR code scan)
+    const sessionBundle = parseBundleFromFragment()
+    if (sessionBundle) {
+      history.replaceState(null, "", location.pathname + location.search)
+      await bridge.createSession(hubId, sessionBundle)
+      // Update identity key now that session exists
+      try {
+        const keyResult = await bridge.getIdentityKey(hubId)
+        this.identityKey = keyResult.identityKey
+        this.browserIdentity = `${this.identityKey}:${Connection.tabId}`
+      } catch { /* handled below via hasSession check */ }
+      // Clear unpaired error
+      this.errorCode = null
+      this.errorReason = null
+    }
 
     const { hasSession } = await bridge.hasSession(hubId)
 

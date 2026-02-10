@@ -442,7 +442,14 @@ fn decrypt_signal_envelope(
                     "[ActionCable-Lua] Channel '{}': decryption failed: {e}",
                     channel_id
                 );
-                return msg.clone();
+                let mut result = msg.clone();
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert(
+                        "decrypt_failed".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+                return result;
             }
         },
         Err(e) => {

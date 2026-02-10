@@ -18,43 +18,12 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to root_path
   end
 
-  test "index shows list of active hubs in sidebar" do
+  test "index shows select a hub message when hubs exist" do
     sign_in @user
     get hubs_path
     assert_response :success
 
-    # Hubs are shown in sidebar - check for device name in sidebar hub list
-    assert_match /Test CLI Device/, response.body
-
-    # Main content shows "Select a Hub" message
     assert_select "h2", text: /Select a Hub/
-  end
-
-  test "index displays hub health indicators in sidebar" do
-    sign_in @user
-    get hubs_path
-    assert_response :success
-
-    # Active hub should have success indicator in sidebar
-    assert_select ".bg-success-500"
-  end
-
-  test "index displays hub name in sidebar" do
-    sign_in @user
-    get hubs_path
-    assert_response :success
-
-    # Should show device name in sidebar
-    assert_match /Test CLI Device/, response.body
-  end
-
-  test "index links to hub show page" do
-    sign_in @user
-    get hubs_path
-    assert_response :success
-
-    # Should have link to hub show page
-    assert_select "a[href=?]", hub_path(@active_hub)
   end
 
   test "index shows empty state when no hubs" do
@@ -64,28 +33,15 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     get hubs_path
     assert_response :success
 
-    # Main content shows empty state
-    assert_match /No Active Hubs/, response.body
-    assert_match /botster-hub/, response.body
+    assert_select "h2", text: /No Active Hubs/
+    assert_match "botster-hub", response.body
   end
 
-  # === Show Tests ===
+  # === Show HTML Tests ===
 
   test "show requires authentication" do
     get hub_path(@active_hub)
     assert_redirected_to root_path
-  end
-
-  test "show displays landing page with hub-connection controller" do
-    sign_in @user
-    get hub_path(@active_hub)
-    assert_response :success
-
-    # Should have hub-connection controller attached (permanent container for Turbo navigation)
-    assert_select "[data-controller~='hub-connection']"
-
-    # Should pass hub ID to hub-connection controller
-    assert_select "[data-hub-connection-hub-id-value=?]", @active_hub.id.to_s
   end
 
   test "show displays hub info" do
@@ -93,20 +49,32 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     get hub_path(@active_hub)
     assert_response :success
 
-    # Should show hub identifier in header
-    assert_match /hub-active-123/, response.body
-
     # Should show hub identifier
-    assert_match /hub-active-123/, response.body
+    assert_match @active_hub.identifier, response.body
   end
 
-  test "show has sidebar with hubs list" do
+  test "show displays agents section with agent-list controller" do
     sign_in @user
     get hub_path(@active_hub)
     assert_response :success
 
-    # Sidebar contains link to hubs (the current hub should be highlighted)
-    assert_select "[data-sidebar-hubs-target='list'] a[href=?]", hub_path(@active_hub)
+    assert_select "[data-controller='agent-list']"
+  end
+
+  test "show displays new agent button" do
+    sign_in @user
+    get hub_path(@active_hub)
+    assert_response :success
+
+    assert_select "[commandfor='new-agent-modal']"
+  end
+
+  test "show displays settings link" do
+    sign_in @user
+    get hub_path(@active_hub)
+    assert_response :success
+
+    assert_select "a[href=?]", hub_settings_path(@active_hub)
   end
 
   test "show redirects to index for non-existent hub" do
@@ -118,7 +86,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "show does not allow access to other users hubs" do
-    other_user = User.create!(email: "other@example.com", username: "other")
+    other_user = users(:one)
     other_hub = Hub.create!(
       user: other_user,
       identifier: "other-hub-id",
@@ -130,34 +98,8 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
     assert_redirected_to hubs_path
     assert_equal "Hub not found", flash[:alert]
-  end
-
-  test "show displays connection status indicator" do
-    sign_in @user
-    get hub_path(@active_hub)
-    assert_response :success
-
-    # Landing page has connection status in header (status text, not terminal badge)
-    assert_select "[data-hub-connection-target='status']"
-    assert_select "[data-hub-connection-target='statusText']"
-  end
-
-  test "show displays agents section" do
-    sign_in @user
-    get hub_path(@active_hub)
-    assert_response :success
-
-    # Landing page has agents section (JS populates after connection)
-    assert_select "[data-agents-target='landingAgentList']"
-  end
-
-  test "show displays new agent button" do
-    sign_in @user
-    get hub_path(@active_hub)
-    assert_response :success
-
-    # Landing page has button to create new agent
-    assert_select "[commandfor='new-agent-modal']"
+  ensure
+    other_hub&.destroy
   end
 
   # === JSON Status Endpoint Tests ===
@@ -186,7 +128,6 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_equal @stale_hub.id, json["id"]
     assert_not json["active"], "Expected stale hub to be marked inactive"
     assert_not json["alive"], "Expected stale hub to have alive=false"
-    # Stale hub should have heartbeat > 2 minutes ago
     assert json["seconds_since_heartbeat"] > 120, "Stale hub should have old heartbeat"
   end
 
@@ -201,7 +142,6 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
   test "show json requires authentication" do
     get hub_path(@active_hub), as: :json
-    # JSON requests get 401 Unauthorized instead of redirect
     assert_response :unauthorized
   end
 end

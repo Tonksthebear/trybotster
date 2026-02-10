@@ -94,7 +94,7 @@ module Hubs
       end
 
       def set_indices
-        Current.agent_index = params[:index].to_i
+        Current.agent_index = params[:agent_index].to_i
         Current.pty_index = params[:pty_index].to_i
       end
 

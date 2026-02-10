@@ -2,7 +2,8 @@
      data-controller="hub-settings hub-templates"
      data-hub-settings-hub-id-value="<%= Current.hub.id %>"
      data-hub-settings-config-metadata-value="<%= @config_metadata.to_json %>"
-     data-hub-templates-hub-id-value="<%= Current.hub.id %>">
+     data-hub-templates-hub-id-value="<%= Current.hub.id %>"
+     data-action="hub-templates:templateChanged->hub-settings#scanTree hub-settings:configChanged->hub-templates#recheckInstalled">
 
   <%# Header %>
   <div class="shrink-0 border-b border-zinc-800 bg-zinc-900/50">

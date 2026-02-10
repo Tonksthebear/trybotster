@@ -42,10 +42,6 @@ class User < ApplicationRecord
     end
   end
 
-  def after_sign_in_path
-    root_path
-  end
-
   # Generate a secure API token for MCP access
   def generate_api_key
     self.api_key = SecureRandom.urlsafe_base64(32)
@@ -60,11 +56,6 @@ class User < ApplicationRecord
   def regenerate_api_key!
     generate_api_key
     save!
-  end
-
-  # Check if user is active (default to true if column doesn't exist)
-  def active?
-    respond_to?(:active) ? active : true
   end
 
   # E2E Encryption Security Settings
@@ -86,11 +77,6 @@ class User < ApplicationRecord
   # Keys must be exchanged via QR code URL fragment
   def disable_server_assisted_pairing!
     update!(server_assisted_pairing: false)
-  end
-
-  # Touch last login timestamp
-  def touch_last_login!
-    touch(:last_sign_in_at) if respond_to?(:last_sign_in_at)
   end
 
   # GitHub App Authorization Methods

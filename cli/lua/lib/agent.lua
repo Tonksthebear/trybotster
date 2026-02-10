@@ -108,6 +108,8 @@ function Agent.new(config)
             command = session_config.command or "bash",
             env = session_env,
             detect_notifications = session_config.notifications or false,
+            agent_key = key,
+            session_name = name,
             rows = rows,
             cols = cols,
         }

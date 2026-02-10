@@ -219,6 +219,91 @@ class HubTest < ActiveSupport::TestCase
     assert_equal "a-very-long-hub-i...", hub.name
   end
 
+  test "e2e_enabled? returns true when device is present" do
+    device = @user.devices.create!(
+      name: "CLI",
+      device_type: "cli",
+      fingerprint: SecureRandom.hex(8)
+    )
+    hub = Hub.new(
+      user: @user,
+      device: device,
+      identifier: SecureRandom.uuid,
+      last_seen_at: Time.current
+    )
+    assert hub.e2e_enabled?
+  end
+
+  test "e2e_enabled? returns false when no device" do
+    hub = Hub.new(
+      user: @user,
+      identifier: SecureRandom.uuid,
+      last_seen_at: Time.current
+    )
+    assert_not hub.e2e_enabled?
+  end
+
+  test "with_device scope returns only hubs with a device" do
+    device = @user.devices.create!(
+      name: "CLI",
+      device_type: "cli",
+      fingerprint: SecureRandom.hex(8)
+    )
+    hub_with_device = Hub.create!(
+      user: @user,
+      device: device,
+      identifier: SecureRandom.uuid,
+      last_seen_at: Time.current
+    )
+    hub_without_device = Hub.create!(
+      user: @user,
+      identifier: SecureRandom.uuid,
+      last_seen_at: Time.current
+    )
+
+    result = Hub.with_device
+    assert_includes result, hub_with_device
+    assert_not_includes result, hub_without_device
+  end
+
+  test "sync_agents creates and removes agents" do
+    hub = Hub.create!(
+      user: @user,
+      identifier: SecureRandom.uuid,
+      last_seen_at: Time.current
+    )
+    hub.hub_agents.create!(session_key: "old-agent")
+
+    hub.sync_agents([
+      { session_key: "new-agent-1" },
+      { session_key: "new-agent-2", last_invocation_url: "https://example.com" }
+    ])
+
+    hub.reload
+    assert_equal 2, hub.hub_agents.count
+    assert_nil hub.hub_agents.find_by(session_key: "old-agent")
+    assert_not_nil hub.hub_agents.find_by(session_key: "new-agent-1")
+
+    agent2 = hub.hub_agents.find_by(session_key: "new-agent-2")
+    assert_equal "https://example.com", agent2.last_invocation_url
+  end
+
+  test "next_message_sequence! increments atomically" do
+    hub = Hub.create!(
+      user: @user,
+      identifier: SecureRandom.uuid,
+      last_seen_at: Time.current
+    )
+
+    seq1 = hub.next_message_sequence!
+    seq2 = hub.next_message_sequence!
+    seq3 = hub.next_message_sequence!
+
+    assert_equal 1, seq1
+    assert_equal 2, seq2
+    assert_equal 3, seq3
+  end
+
   test "destroying hub destroys associated hub_agents" do
     hub = Hub.create!(
       user: @user,

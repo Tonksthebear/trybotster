@@ -9,6 +9,7 @@
 //! - [`PtyEvent::Output`] - Raw terminal output bytes
 //! - [`PtyEvent::Resized`] - PTY dimensions changed
 //! - [`PtyEvent::ProcessExited`] - Process in PTY terminated
+//! - [`PtyEvent::Notification`] - OSC notification detected (OSC 9, OSC 777)
 //!
 //! # Usage
 //!
@@ -25,6 +26,8 @@
 //! ```
 
 // Rust guideline compliant 2026-02
+
+use super::super::notification::AgentNotification;
 
 /// Events broadcast by PTY sessions to connected clients.
 ///
@@ -59,6 +62,13 @@ pub enum PtyEvent {
         /// Exit code if available (None if killed by signal).
         exit_code: Option<i32>,
     },
+
+    /// OSC notification detected in PTY output.
+    ///
+    /// Broadcast when the reader thread detects OSC 9 or OSC 777
+    /// notification sequences. Subscribers (e.g., notification watcher
+    /// tasks) can filter for this event to fire Lua hooks.
+    Notification(AgentNotification),
 }
 
 impl PtyEvent {
@@ -80,6 +90,12 @@ impl PtyEvent {
         Self::ProcessExited { exit_code }
     }
 
+    /// Create a notification event.
+    #[must_use]
+    pub fn notification(notif: AgentNotification) -> Self {
+        Self::Notification(notif)
+    }
+
     /// Check if this is an output event.
     #[must_use]
     pub fn is_output(&self) -> bool {
@@ -96,6 +112,12 @@ impl PtyEvent {
     #[must_use]
     pub fn is_process_exited(&self) -> bool {
         matches!(self, Self::ProcessExited { .. })
+    }
+
+    /// Check if this is a notification event.
+    #[must_use]
+    pub fn is_notification(&self) -> bool {
+        matches!(self, Self::Notification(_))
     }
 }
 
@@ -158,15 +180,25 @@ mod tests {
 
     #[test]
     fn test_pty_event_is_predicates_are_exclusive() {
+        use crate::agent::notification::AgentNotification;
+
         let output = PtyEvent::output(vec![]);
         assert!(output.is_output());
         assert!(!output.is_resized());
         assert!(!output.is_process_exited());
+        assert!(!output.is_notification());
 
         let resized = PtyEvent::resized(24, 80);
         assert!(!resized.is_output());
         assert!(resized.is_resized());
         assert!(!resized.is_process_exited());
+        assert!(!resized.is_notification());
+
+        let notification = PtyEvent::notification(AgentNotification::Osc9(Some("test".to_string())));
+        assert!(!notification.is_output());
+        assert!(!notification.is_resized());
+        assert!(!notification.is_process_exited());
+        assert!(notification.is_notification());
     }
 
     #[test]

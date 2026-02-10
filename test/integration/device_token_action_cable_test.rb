@@ -10,7 +10,6 @@ class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
     @hub = Hub.create!(
       user: @user,
       identifier: "integration-test-hub",
-      repo: "test/repo",
       last_seen_at: Time.current
     )
   end

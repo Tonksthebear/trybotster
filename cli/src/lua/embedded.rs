@@ -52,26 +52,35 @@ pub fn contains(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    // Debug builds use empty stubs (Lua files loaded from filesystem for hot-reload).
+    // Release builds embed all Lua files via include_str!().
+    // These tests verify both behaviors are correct.
+
     #[test]
-    fn test_core_init_embedded() {
-        // core/init.lua should always be embedded
-        assert!(contains("core/init.lua"), "core/init.lua should be embedded");
-        let content = get("core/init.lua").unwrap();
-        assert!(content.contains("Botster"), "Should contain Botster identifier");
+    fn test_debug_build_has_empty_stubs() {
+        if cfg!(debug_assertions) {
+            assert!(all().is_empty(), "Debug builds should not embed Lua files");
+            assert!(get("core/init.lua").is_none(), "Debug builds return None for all lookups");
+        }
     }
 
     #[test]
-    fn test_all_returns_files() {
-        let files = all();
-        assert!(!files.is_empty(), "Should have embedded files");
+    fn test_release_build_embeds_core_files() {
+        if !cfg!(debug_assertions) {
+            assert!(contains("core/init.lua"), "Release build should embed core/init.lua");
+            let content = get("core/init.lua").unwrap();
+            assert!(content.contains("Botster"), "Should contain Botster identifier");
 
-        // Check for expected files
-        let paths: Vec<_> = files.iter().map(|(p, _)| *p).collect();
-        assert!(paths.contains(&"core/init.lua"));
-        assert!(paths.contains(&"core/state.lua"));
-        assert!(paths.contains(&"core/hooks.lua"));
-        assert!(paths.contains(&"lib/client.lua"));
-        assert!(paths.contains(&"handlers/webrtc.lua"));
+            let files = all();
+            assert!(!files.is_empty(), "Release build should have embedded files");
+
+            let paths: Vec<_> = files.iter().map(|(p, _)| *p).collect();
+            assert!(paths.contains(&"core/init.lua"));
+            assert!(paths.contains(&"core/state.lua"));
+            assert!(paths.contains(&"core/hooks.lua"));
+            assert!(paths.contains(&"lib/client.lua"));
+            assert!(paths.contains(&"handlers/webrtc.lua"));
+        }
     }
 
     #[test]

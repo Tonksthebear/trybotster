@@ -404,6 +404,317 @@ module Github
       end
     end
 
+    # === Signature Validation ===
+
+    test "rejects webhook with missing signature" do
+      payload = { action: "created" }.to_json
+
+      post "/github/webhooks",
+        params: payload,
+        headers: {
+          "Content-Type" => "application/json",
+          "X-GitHub-Event" => "issue_comment"
+        }
+
+      assert_response :unauthorized
+    end
+
+    test "rejects webhook with invalid signature" do
+      payload = { action: "created" }.to_json
+
+      post "/github/webhooks",
+        params: payload,
+        headers: {
+          "Content-Type" => "application/json",
+          "X-GitHub-Event" => "issue_comment",
+          "X-Hub-Signature-256" => "sha256=invalid_signature"
+        }
+
+      assert_response :unauthorized
+    end
+
+    test "rejects webhook when no secret configured" do
+      ENV.delete("GITHUB_WEBHOOK_SECRET")
+
+      payload = { action: "created" }.to_json
+
+      post "/github/webhooks",
+        params: payload,
+        headers: {
+          "Content-Type" => "application/json",
+          "X-GitHub-Event" => "issue_comment",
+          "X-Hub-Signature-256" => "sha256=anything"
+        }
+
+      assert_response :unauthorized
+    end
+
+    test "rejects invalid JSON payload" do
+      body = "not valid json"
+      signature = "sha256=" + OpenSSL::HMAC.hexdigest(
+        OpenSSL::Digest.new("sha256"), @webhook_secret, body
+      )
+
+      post "/github/webhooks",
+        params: body,
+        headers: {
+          "Content-Type" => "application/json",
+          "X-GitHub-Event" => "issue_comment",
+          "X-Hub-Signature-256" => signature
+        }
+
+      assert_response :bad_request
+    end
+
+    # === Unknown Event Type ===
+
+    test "returns 200 for unknown event type" do
+      payload = { action: "created" }
+      body, signature = sign_webhook_payload(payload)
+
+      assert_no_difference "Integrations::Github::Message.count" do
+        post "/github/webhooks",
+          params: body,
+          headers: {
+            "Content-Type" => "application/json",
+            "X-GitHub-Event" => "star",
+            "X-Hub-Signature-256" => signature
+          }
+      end
+
+      assert_response :success
+    end
+
+    # === Issues Event ===
+
+    test "issues closed event creates cleanup message" do
+      payload = {
+        action: "closed",
+        issue: {
+          number: 50,
+          title: "Closed Issue",
+          body: "Done",
+          html_url: "https://github.com/test/repo/issues/50",
+          user: { login: "closer" }
+        },
+        repository: { full_name: "test/repo" }
+      }
+
+      body, signature = sign_webhook_payload(payload)
+
+      assert_difference "Integrations::Github::Message.count", 1 do
+        post "/github/webhooks",
+          params: body,
+          headers: {
+            "Content-Type" => "application/json",
+            "X-GitHub-Event" => "issues",
+            "X-Hub-Signature-256" => signature
+          }
+      end
+
+      assert_response :success
+      message = Integrations::Github::Message.last
+      assert_equal "agent_cleanup", message.event_type
+      assert_equal 50, message.issue_number
+      assert_equal "issue_closed", message.payload["reason"]
+    end
+
+    test "issues opened with @trybotster mention creates github message" do
+      payload = {
+        action: "opened",
+        issue: {
+          number: 60,
+          title: "New Issue",
+          body: "@trybotster please investigate this",
+          html_url: "https://github.com/test/repo/issues/60",
+          user: { login: "reporter" }
+        },
+        repository: { full_name: "test/repo" }
+      }
+
+      body, signature = sign_webhook_payload(payload)
+
+      assert_difference "Integrations::Github::Message.count", 1 do
+        post "/github/webhooks",
+          params: body,
+          headers: {
+            "Content-Type" => "application/json",
+            "X-GitHub-Event" => "issues",
+            "X-Hub-Signature-256" => signature
+          }
+      end
+
+      message = Integrations::Github::Message.last
+      assert_equal "github_mention", message.event_type
+      assert_equal 60, message.issue_number
+    end
+
+    test "issues opened without mention does not create message" do
+      payload = {
+        action: "opened",
+        issue: {
+          number: 61,
+          title: "Normal Issue",
+          body: "Just a regular issue",
+          html_url: "https://github.com/test/repo/issues/61",
+          user: { login: "reporter" }
+        },
+        repository: { full_name: "test/repo" }
+      }
+
+      body, signature = sign_webhook_payload(payload)
+
+      assert_no_difference "Integrations::Github::Message.count" do
+        post "/github/webhooks",
+          params: body,
+          headers: {
+            "Content-Type" => "application/json",
+            "X-GitHub-Event" => "issues",
+            "X-Hub-Signature-256" => signature
+          }
+      end
+
+      assert_response :success
+    end
+
+    # === Pull Request Event ===
+
+    test "pull_request closed creates cleanup message" do
+      payload = {
+        action: "closed",
+        pull_request: {
+          number: 70,
+          title: "Closed PR",
+          body: "Done",
+          html_url: "https://github.com/test/repo/pull/70",
+          user: { login: "merger" }
+        },
+        repository: { full_name: "test/repo" }
+      }
+
+      body, signature = sign_webhook_payload(payload)
+
+      assert_difference "Integrations::Github::Message.count", 1 do
+        post "/github/webhooks",
+          params: body,
+          headers: {
+            "Content-Type" => "application/json",
+            "X-GitHub-Event" => "pull_request",
+            "X-Hub-Signature-256" => signature
+          }
+      end
+
+      message = Integrations::Github::Message.last
+      assert_equal "agent_cleanup", message.event_type
+      assert_equal 70, message.issue_number
+      assert_equal "pr_closed", message.payload["reason"]
+      assert_equal true, message.payload["is_pr"]
+    end
+
+    test "pull_request opened with @trybotster mention creates message" do
+      payload = {
+        action: "opened",
+        pull_request: {
+          number: 80,
+          title: "New PR",
+          body: "@trybotster review this please",
+          html_url: "https://github.com/test/repo/pull/80",
+          user: { login: "author" }
+        },
+        repository: { full_name: "test/repo" }
+      }
+
+      body, signature = sign_webhook_payload(payload)
+
+      assert_difference "Integrations::Github::Message.count", 1 do
+        post "/github/webhooks",
+          params: body,
+          headers: {
+            "Content-Type" => "application/json",
+            "X-GitHub-Event" => "pull_request",
+            "X-Hub-Signature-256" => signature
+          }
+      end
+
+      message = Integrations::Github::Message.last
+      assert_equal "github_mention", message.event_type
+      assert_equal 80, message.issue_number
+      assert_equal true, message.payload["is_pr"]
+    end
+
+    # === PR Review Comment Event ===
+
+    test "pr_review_comment with @trybotster mention creates message" do
+      payload = {
+        action: "created",
+        pull_request: {
+          number: 90,
+          title: "Review PR",
+          body: "Regular PR",
+          html_url: "https://github.com/test/repo/pull/90",
+          user: { login: "author" }
+        },
+        comment: {
+          id: 555,
+          body: "@trybotster can you fix this?",
+          user: { login: "reviewer" }
+        },
+        repository: { full_name: "test/repo" },
+        installation: { id: 12345 }
+      }
+
+      body, signature = sign_webhook_payload(payload)
+
+      with_stubbed_github do
+        assert_difference "Integrations::Github::Message.count", 1 do
+          post "/github/webhooks",
+            params: body,
+            headers: {
+              "Content-Type" => "application/json",
+              "X-GitHub-Event" => "pull_request_review_comment",
+              "X-Hub-Signature-256" => signature
+            }
+        end
+      end
+
+      message = Integrations::Github::Message.last
+      assert_equal "github_mention", message.event_type
+      assert_equal 90, message.issue_number
+    end
+
+    test "pr_review_comment without mention does not create message" do
+      payload = {
+        action: "created",
+        pull_request: {
+          number: 91,
+          title: "Review PR",
+          body: "PR body",
+          html_url: "https://github.com/test/repo/pull/91",
+          user: { login: "author" }
+        },
+        comment: {
+          id: 556,
+          body: "Looks good to me!",
+          user: { login: "reviewer" }
+        },
+        repository: { full_name: "test/repo" }
+      }
+
+      body, signature = sign_webhook_payload(payload)
+
+      assert_no_difference "Integrations::Github::Message.count" do
+        post "/github/webhooks",
+          params: body,
+          headers: {
+            "Content-Type" => "application/json",
+            "X-GitHub-Event" => "pull_request_review_comment",
+            "X-Hub-Signature-256" => signature
+          }
+      end
+
+      assert_response :success
+    end
+
     private
 
     def extract_linked_issues(pr_body)

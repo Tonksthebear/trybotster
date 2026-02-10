@@ -4,7 +4,7 @@ class HubCommand < ApplicationRecord
   belongs_to :hub
 
   validates :event_type, presence: true, inclusion: {
-    in: %w[browser_wants_preview],
+    in: %w[create_agent agent_cleanup],
     message: "%{value} is not a valid event type"
   }
   validates :payload, presence: true

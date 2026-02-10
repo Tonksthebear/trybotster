@@ -160,6 +160,49 @@ local function notify_agent(agent, payload)
 end
 
 -- ============================================================================
+-- PTY Notification Hook (agent asked a question)
+-- ============================================================================
+
+--- Post agent notification to Rails for GitHub integration.
+-- When an agent sends an OSC notification (e.g., "question asked"),
+-- this posts to Rails which can update the GitHub issue/PR.
+hooks.on("pty_notification", "github_question_notify", function(data)
+    local agent_key = data.agent_key
+    if not agent_key then return end
+
+    local agent = Agent.get(agent_key)
+    if not agent then return end
+
+    -- Only post if we have issue context
+    if not agent.issue_number and not agent.invocation_url then return end
+
+    local api_token = hub.api_token()
+    if not api_token then return end
+
+    local server_url = config.server_url()
+    local server_id = hub.server_id()
+    if not server_id then return end
+
+    local notification_type = "question_asked"
+
+    log.info(string.format("GitHub: posting %s notification for agent %s", notification_type, agent_key))
+
+    http.request(server_url .. "/api/hubs/" .. server_id .. "/notifications", {
+        method = "POST",
+        headers = {
+            ["Authorization"] = "Bearer " .. api_token,
+            ["Content-Type"] = "application/json",
+        },
+        json = {
+            repo = agent.repo,
+            issue_number = agent.issue_number,
+            invocation_url = agent.invocation_url,
+            notification_type = notification_type,
+        },
+    })
+end)
+
+-- ============================================================================
 -- Event Channel
 -- ============================================================================
 

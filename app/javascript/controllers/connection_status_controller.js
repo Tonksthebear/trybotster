@@ -101,11 +101,11 @@ export default class extends Controller {
         })
       );
 
-      // Listen for errors - session_invalid shows "expired", others show "disconnected"
+      // Listen for errors - crypto issues show "Scan Code", others show "disconnected"
       this.unsubscribers.push(
         this.connection.on("error", ({ reason }) => {
-          if (reason === "session_invalid") {
-            this.#setConnectionState("expired");
+          if (reason === "session_invalid" || reason === "unpaired") {
+            this.#setConnectionState("unpaired");
           } else {
             this.#setConnectionState("disconnected");
           }
@@ -119,10 +119,13 @@ export default class extends Controller {
       // event from ActionCable will update the hub section when it arrives.
       this.#handleBrowserStatusChange(this.connection.browserStatus);
 
-      // If already connected (reacquired after Turbo nav), sync state immediately.
-      // Otherwise, health events will drive peer connection + subscribe,
-      // and event listeners above will update the UI as it progresses.
-      if (this.connection.isConnected()) {
+      // Sync initial connection state — error may have been set during initialize()
+      // (before event listeners were attached), so check errorCode directly.
+      const errCode = this.connection.errorCode
+      if (errCode === "unpaired" || errCode === "session_invalid") {
+        this.#setConnectionState("unpaired");
+      } else if (this.connection.isConnected()) {
+        // Already connected (reacquired after Turbo nav), sync state immediately.
         this.#updateConnectionState();
         this.#handleHealthChange(this.connection.browserStatus, this.connection.cliStatus);
       }
@@ -201,6 +204,10 @@ export default class extends Controller {
       [CliStatus.DISCONNECTED]: "offline",
     };
     this.#setHubStatus(hubStatusMap[cli] || "offline");
+
+    // Don't let health events overwrite scan-code state — user must re-pair first
+    const err = this.connection?.errorCode
+    if (err === "unpaired" || err === "session_invalid") return;
 
     // Update connection state based on overall state
     if (this.connection?.isConnected()) {

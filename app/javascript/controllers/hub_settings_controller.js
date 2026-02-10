@@ -173,6 +173,7 @@ export default class extends Controller {
         this.#saveTimer = null;
         if (this.hub) this.saveBtnTarget.textContent = "Save";
       }, 1500);
+      this.scanTree();
     } catch (error) {
       this.saveBtnTarget.textContent = "Save";
       this.saveBtnTarget.disabled = false;
@@ -402,6 +403,7 @@ export default class extends Controller {
         this.repoTree = tree;
       }
       this.#renderTree();
+      this.dispatch("configChanged");
     } catch (error) {
       if (isFirstLoad) {
         this.treeFeedbackTarget.textContent = `Failed to scan: ${error.message}`;
@@ -437,13 +439,15 @@ export default class extends Controller {
       }),
     );
 
-    // Scan plugins (check init.lua per plugin)
+    // Scan plugins (only include plugins that have init.lua)
     await Promise.all(
       pluginNames.map(async (pluginName) => {
         const initStat = await this.hub
           .statFile(`${basePath}/plugins/${pluginName}/init.lua`, fsScope)
           .catch(() => ({ exists: false }));
-        scope.plugins[pluginName] = { init: initStat.exists };
+        if (initStat.exists) {
+          scope.plugins[pluginName] = { init: true };
+        }
       }),
     );
 
