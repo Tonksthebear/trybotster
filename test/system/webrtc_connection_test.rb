@@ -6,7 +6,7 @@ require_relative "../support/cli_test_helper"
 class WebrtcConnectionTest < ApplicationSystemTestCase
   include CliTestHelper
 
-  driven_by :selenium, using: :headless_chrome, screen_size: [1280, 900]
+  driven_by :selenium, using: :headless_chrome, screen_size: [ 1280, 900 ]
 
   setup do
     @user = users(:one)
