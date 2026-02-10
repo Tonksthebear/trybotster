@@ -413,7 +413,7 @@ class DeviceTest < ActiveSupport::TestCase
     assert_equal users(:jason), device.user
   end
 
-  test "has many hubs with nullify" do
+  test "has many hubs with destroy" do
     device = @user.devices.create!(
       name: "Hub Owner",
       device_type: "cli",
@@ -427,9 +427,7 @@ class DeviceTest < ActiveSupport::TestCase
     )
 
     device.destroy
-    assert_nil hub.reload.device_id
-  ensure
-    hub&.destroy
+    assert_not Hub.exists?(hub.id), "Hub should be destroyed with device"
   end
 
   # --- Fixtures ---

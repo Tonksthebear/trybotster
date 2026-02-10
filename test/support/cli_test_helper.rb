@@ -103,16 +103,25 @@ module CliTestHelper
     #
     # This URL includes the Signal PreKeyBundle in the fragment
     # and can be used to visit the hub page with encryption ready
-    def connection_url
+    # Get the connection URL from the running CLI.
+    # Polls for up to `timeout` seconds since bundle generation is deferred
+    # and may not be complete immediately after heartbeat readiness.
+    def connection_url(timeout: 15)
       return @cached_url if @cached_url
 
-      # Read directly from the file written by the CLI
-      # CLI uses hub.identifier for directory structure (the string identifier passed via BOTSTER_HUB_ID)
       url_path = File.join(@temp_dir, "hubs", @hub.identifier, "connection_url.txt")
-      return nil unless File.exist?(url_path)
 
-      @cached_url = File.read(url_path).strip
-      @cached_url.present? ? @cached_url : nil
+      wait_until?(timeout: timeout, poll: 0.3) do
+        if File.exist?(url_path)
+          content = File.read(url_path).strip
+          if content.present?
+            @cached_url = content
+            true
+          end
+        end
+      end
+
+      @cached_url
     end
 
     def add_output(line)
@@ -189,13 +198,16 @@ module CliTestHelper
     stdout_r, stdout_w = IO.pipe
     stderr_r, stderr_w = IO.pipe
 
-    # Run from project root so CLI can detect git repo for heartbeats
-    # Config files still go to temp_dir via BOTSTER_CONFIG_DIR env var
+    # Run from temp_dir so the CLI doesn't find an existing .botster/ in the
+    # real repo root. Init a bare git repo so the CLI can detect a repo for
+    # heartbeat purposes. Config files go to temp_dir via BOTSTER_CONFIG_DIR.
+    system("git", "init", "--quiet", temp_dir) unless File.exist?(File.join(temp_dir, ".git"))
     pid = spawn(
       env,
       CLI_BINARY.to_s,
       "start",
       "--headless",
+      chdir: temp_dir,
       out: stdout_w,
       err: stderr_w
     )

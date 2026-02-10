@@ -119,6 +119,7 @@ fn test_ctrl_q_exits_cleanly() {
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
     // Use test mode to skip authentication and network connections
     cmd.env("BOTSTER_ENV", "test");
+    cmd.env("BOTSTER_HUB_ID", "test-hub");
 
     let mut child = pair
         .slave
@@ -203,6 +204,7 @@ fn test_sigint_triggers_graceful_shutdown() {
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
     // Use test mode to skip authentication and network connections
     cmd.env("BOTSTER_ENV", "test");
+    cmd.env("BOTSTER_HUB_ID", "test-hub");
 
     let mut child = pair
         .slave
@@ -285,6 +287,7 @@ fn test_sigterm_triggers_graceful_shutdown() {
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
     // Use test mode to skip authentication and network connections
     cmd.env("BOTSTER_ENV", "test");
+    cmd.env("BOTSTER_HUB_ID", "test-hub");
 
     let mut child = pair
         .slave
@@ -368,6 +371,7 @@ fn test_pty_close_triggers_cleanup() {
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
     // Use test mode to skip authentication and network connections
     cmd.env("BOTSTER_ENV", "test");
+    cmd.env("BOTSTER_HUB_ID", "test-hub");
 
     let mut child = pair
         .slave
@@ -442,6 +446,7 @@ fn test_input_is_responsive() {
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
     // Use test mode to skip authentication and network connections
     cmd.env("BOTSTER_ENV", "test");
+    cmd.env("BOTSTER_HUB_ID", "test-hub");
 
     let mut child = pair
         .slave
@@ -547,6 +552,7 @@ fn test_no_orphan_processes_after_exit() {
     cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
     // Use test mode to skip authentication and network connections
     cmd.env("BOTSTER_ENV", "test");
+    cmd.env("BOTSTER_HUB_ID", "test-hub");
 
     let mut child = pair
         .slave

@@ -474,6 +474,25 @@ async function handleClearSession(hubId) {
   return { cleared: true }
 }
 
+/**
+ * Clear ALL session state (memory + IndexedDB).
+ * Used by test teardown to prevent session leakage between tests.
+ */
+async function handleClearAllSessions() {
+  const hubIds = [...sessions.keys()]
+  accounts.clear()
+  sessions.clear()
+  bundles.clear()
+
+  // Clear all hub entries from IndexedDB
+  for (const hubId of hubIds) {
+    await dbDelete(`hub:${hubId}`)
+  }
+
+  console.log(`[VodozemacCrypto] Cleared all sessions (${hubIds.length} hubs)`)
+  return { cleared: true, count: hubIds.length }
+}
+
 // =============================================================================
 // Message Handler
 // =============================================================================
@@ -520,6 +539,9 @@ async function handleMessage(event, portId, replyFn) {
         break
       case "clearSession":
         result = await handleClearSession(params.hubId)
+        break
+      case "clearAllSessions":
+        result = await handleClearAllSessions()
         break
       default:
         throw new Error(`Unknown action: ${action}`)

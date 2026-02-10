@@ -172,7 +172,8 @@ fn run_headless() -> Result<()> {
     let config = Config::load()?;
 
     // Verify token is available after load - catches keyring save/load issues
-    if !config.has_token() {
+    // Skip in test mode since ensure_authenticated() skips auth entirely
+    if !botster_hub::env::is_test_mode() && !config.has_token() {
         anyhow::bail!(
             "Authentication token not found after auth flow. \
              This may indicate a keyring access issue. \
@@ -180,16 +181,23 @@ fn run_headless() -> Result<()> {
         );
     }
 
-    log::info!(
-        "Token loaded: {}...{} (valid format)",
-        &config.get_api_key()[..10.min(config.get_api_key().len())],
-        &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
-    );
+    if config.has_token() {
+        log::info!(
+            "Token loaded: {}...{} (valid format)",
+            &config.get_api_key()[..10.min(config.get_api_key().len())],
+            &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
+        );
+    }
 
     let mut hub = Hub::new(config)?;
 
     println!("Setting up connections...");
     hub.setup();
+
+    // In headless mode, eagerly generate the connection URL so external
+    // tools (system tests, automation) can read it from connection_url.txt
+    // without needing a TUI interaction to trigger lazy generation.
+    hub.eager_generate_connection_url();
 
     println!("Hub ready. Waiting for connections...");
     log::info!("Botster Hub v{} started in headless mode", VERSION);
@@ -235,7 +243,8 @@ fn run_with_tui() -> Result<()> {
     let config = Config::load()?;
 
     // Verify token is available after load - catches keyring save/load issues
-    if !config.has_token() {
+    // Skip in test mode since ensure_authenticated() skips auth entirely
+    if !botster_hub::env::is_test_mode() && !config.has_token() {
         anyhow::bail!(
             "Authentication token not found after auth flow. \
              This may indicate a keyring access issue. \
@@ -243,11 +252,13 @@ fn run_with_tui() -> Result<()> {
         );
     }
 
-    log::info!(
-        "Token loaded: {}...{} (valid format)",
-        &config.get_api_key()[..10.min(config.get_api_key().len())],
-        &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
-    );
+    if config.has_token() {
+        log::info!(
+            "Token loaded: {}...{} (valid format)",
+            &config.get_api_key()[..10.min(config.get_api_key().len())],
+            &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
+        );
+    }
     let mut hub = Hub::new(config)?;
 
     // Perform setup BEFORE entering raw mode so errors are visible
