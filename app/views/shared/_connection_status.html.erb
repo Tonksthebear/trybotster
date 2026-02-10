@@ -39,7 +39,7 @@
     </span>
   </div>
 
-  <%# Connection - WebRTC status (5 states: disconnected, connecting, direct, relay, expired) %>
+  <%# Connection - WebRTC status (6 states: disconnected, connecting, direct, relay, expired, unpaired) %>
   <div class="flex items-center gap-1 px-2 py-1 border-r border-zinc-700/50 group/connection"
        data-connection-status-target="connectionSection"
        data-state="connecting"
@@ -49,13 +49,14 @@
                  group-data-[state=direct]/connection:text-emerald-500/50
                  group-data-[state=relay]/connection:text-sky-500/50
                  group-data-[state=connecting]/connection:text-amber-500/50
-                 group-data-[state=expired]/connection:text-red-500/50">
+                 group-data-[state=expired]/connection:text-red-500/50
+                 group-data-[state=unpaired]/connection:text-amber-500/50">
       <svg class="size-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M5 12h14"/>
       </svg>
     </span>
 
-    <%# Center icon - 5 states: disconnected, connecting, direct, relay, expired %>
+    <%# Center icon - 6 states: disconnected, connecting, direct, relay, expired, unpaired %>
     <div class="relative flex items-center justify-center">
       <%# Disconnected %>
       <span class="group-data-[state=disconnected]/connection:flex hidden items-center text-zinc-500">
@@ -83,6 +84,10 @@
       <span class="group-data-[state=expired]/connection:flex hidden items-center text-red-500">
         <%= icon "lock-open", class: "size-4" %>
       </span>
+      <%# Needs pairing (no crypto session - scan connection code) %>
+      <span class="group-data-[state=unpaired]/connection:flex hidden items-center text-amber-500">
+        <%= icon "qr-code", class: "size-4" %>
+      </span>
     </div>
 
     <%# Right connector %>
@@ -90,7 +95,8 @@
                  group-data-[state=direct]/connection:text-emerald-500/50
                  group-data-[state=relay]/connection:text-sky-500/50
                  group-data-[state=connecting]/connection:text-amber-500/50
-                 group-data-[state=expired]/connection:text-red-500/50">
+                 group-data-[state=expired]/connection:text-red-500/50
+                 group-data-[state=unpaired]/connection:text-amber-500/50">
       <svg class="size-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M5 12h14"/>
       </svg>
@@ -103,6 +109,7 @@
       <span class="group-data-[state=direct]/connection:inline hidden text-emerald-400">Direct</span>
       <span class="group-data-[state=relay]/connection:inline hidden text-sky-400">Relay</span>
       <span class="group-data-[state=expired]/connection:inline hidden text-red-400">Expired</span>
+      <span class="group-data-[state=unpaired]/connection:inline hidden text-amber-400">Scan Code</span>
     </span>
   </div>
 

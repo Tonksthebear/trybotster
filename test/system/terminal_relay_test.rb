@@ -613,20 +613,21 @@ class TerminalRelayTest < ApplicationSystemTestCase
   end
 
   def create_and_wait_for_agent(hub, issue_number:, timeout: 20)
-    message = Integrations::Github::Message.create!(
-      event_type: "github_mention",
-      repo: "test/repo",
-      issue_number: issue_number,
-      payload: { repo: "test/repo", issue_number: issue_number, prompt: "Test" }
+    # Use core HubCommand path (not GitHub plugin) to spawn agents.
+    # The CLI receives this via HubCommandChannel and routes it through
+    # hub_commands.lua → agents.lua event listener.
+    command = HubCommand.create_for_hub!(hub,
+      event_type: "create_agent",
+      payload: { issue_number: issue_number, prompt: "Test" }
     )
 
-    # Wait for message to be acknowledged
-    wait_until?(timeout: timeout) { message.reload.status == "acknowledged" }
+    # Wait for command to be acknowledged by CLI
+    wait_until?(timeout: timeout) { command.reload.acknowledged? }
 
     # Wait for agent registration via heartbeat
     wait_until?(timeout: 10) { hub.reload.hub_agents.exists?(session_key: "test-repo-#{issue_number}") }
 
-    message
+    command
   end
 
   def start_cli_with_agent_support(hub, **options)

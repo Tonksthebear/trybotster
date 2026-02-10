@@ -43,7 +43,7 @@ use anyhow::Result;
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{mpsc::Receiver, Arc, Mutex},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -70,7 +70,6 @@ pub enum PtyView {
 /// - A unique ID and session key
 /// - A CLI PTY running the main agent process
 /// - An optional server PTY for the dev server
-/// - Notification channel for terminal events
 ///
 /// The agent is process-agnostic - it runs whatever the user configures.
 ///
@@ -110,8 +109,6 @@ pub struct Agent {
 
     /// Secondary PTY (Server - runs dev server).
     pub server_pty: Option<PtySession>,
-
-    notification_rx: Option<Receiver<AgentNotification>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -190,7 +187,6 @@ impl Agent {
             terminal_window_id: None,
             cli_pty: PtySession::new(rows, cols),
             server_pty: None,
-            notification_rx: None,
         }
     }
 
@@ -342,18 +338,6 @@ impl Agent {
         } else {
             format!("{}-{}", repo_safe, self.branch_name.replace('/', "-"))
         }
-    }
-
-    /// Poll for any pending notifications from the PTY (non-blocking).
-    #[must_use]
-    pub fn poll_notifications(&self) -> Vec<AgentNotification> {
-        let mut notifications = Vec::new();
-        if let Some(ref rx) = self.notification_rx {
-            while let Ok(notif) = rx.try_recv() {
-                notifications.push(notif);
-            }
-        }
-        notifications
     }
 
     // =========================================================================

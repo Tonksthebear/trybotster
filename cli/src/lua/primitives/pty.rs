@@ -39,9 +39,6 @@
 //! -- Check forwarding port
 //! local port = session:port()  -- number or nil
 //!
-//! -- Poll for OSC notifications
-//! local notifications = session:poll_notifications()
-//!
 //! -- Kill the session
 //! session:kill()
 //! ```
@@ -93,7 +90,6 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::agent::notification::AgentNotification;
 use crate::agent::pty::{PtySession, SharedPtyState};
 use crate::agent::spawn::PtySpawnConfig;
 use tokio::sync::broadcast;
@@ -116,12 +112,6 @@ use crate::agent::pty::events::PtyEvent;
 /// The `_session` field keeps the `PtySession` alive via `Arc` -- dropping
 /// the last reference triggers `PtySession::drop()` which kills the child
 /// process and aborts the command processor task.
-///
-/// # Thread Safety
-///
-/// All fields are `Send + Sync` as required by [`LuaUserData`]. The
-/// `notification_rx` field wraps `std::sync::mpsc::Receiver` (which is
-/// `!Sync`) in `Arc<Mutex<>>` to satisfy this constraint.
 ///
 /// # Example (Lua)
 ///
@@ -152,23 +142,12 @@ pub struct PtySessionHandle {
 
     /// Forwarding port (if configured).
     port: Option<u16>,
-
-    /// Whether notifications are enabled on this session.
-    has_notifications: bool,
-
-    /// Notification receiver (moved out of `PtySession`, owned by handle).
-    ///
-    /// Wrapped in `Arc<Mutex<>>` to satisfy `LuaUserData`'s `Send + Sync`
-    /// requirements (`std::sync::mpsc::Receiver` is `!Sync`).
-    notification_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<AgentNotification>>>>,
 }
 
 impl std::fmt::Debug for PtySessionHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PtySessionHandle")
             .field("port", &self.port)
-            .field("has_notifications", &self.has_notifications)
-            .field("has_notification_rx", &self.notification_rx.is_some())
             .finish()
     }
 }
@@ -264,45 +243,6 @@ impl LuaUserData for PtySessionHandle {
                 .lock()
                 .expect("PtySessionHandle shared_state lock poisoned");
             Ok(state.writer.is_some())
-        });
-
-        // session:poll_notifications() -> table of notifications
-        //
-        // Drains all pending notifications from the channel. Returns an
-        // array-like table where each entry is a table with:
-        //   { type = "osc9", message = "..." }
-        //   { type = "osc777", title = "...", body = "..." }
-        methods.add_method("poll_notifications", |lua, this, ()| {
-            let table = lua.create_table()?;
-
-            if !this.has_notifications {
-                return Ok(table);
-            }
-
-            if let Some(ref rx_arc) = this.notification_rx {
-                let rx = rx_arc
-                    .lock()
-                    .expect("PtySessionHandle notification_rx lock poisoned");
-                let mut idx = 1;
-                while let Ok(notif) = rx.try_recv() {
-                    let entry = lua.create_table()?;
-                    match notif {
-                        AgentNotification::Osc9(msg) => {
-                            entry.set("type", "osc9")?;
-                            entry.set("message", msg)?;
-                        }
-                        AgentNotification::Osc777 { title, body } => {
-                            entry.set("type", "osc777")?;
-                            entry.set("title", title)?;
-                            entry.set("body", body)?;
-                        }
-                    }
-                    table.set(idx, entry)?;
-                    idx += 1;
-                }
-            }
-
-            Ok(table)
         });
 
         // session:kill() - Kill the child process.
@@ -481,6 +421,18 @@ pub enum PtyRequest {
         cols: u16,
     },
 
+    /// Spawn a notification watcher task that subscribes to PTY events
+    /// and queues `PtyEvent::Notification` events for the Hub tick loop.
+    SpawnNotificationWatcher {
+        /// Unique key: "{agent_key}:{session_name}".
+        watcher_key: String,
+        /// Agent key for the Lua hook context.
+        agent_key: String,
+        /// Session name (e.g., "cli", "server").
+        session_name: String,
+        /// Event sender to subscribe to PTY events.
+        event_tx: broadcast::Sender<PtyEvent>,
+    },
 }
 
 // Implement Clone for PtyRequest to satisfy the requirement
@@ -512,6 +464,17 @@ impl Clone for PtyRequest {
                 pty_index: *pty_index,
                 rows: *rows,
                 cols: *cols,
+            },
+            Self::SpawnNotificationWatcher {
+                watcher_key,
+                agent_key,
+                session_name,
+                event_tx,
+            } => Self::SpawnNotificationWatcher {
+                watcher_key: watcher_key.clone(),
+                agent_key: agent_key.clone(),
+                session_name: session_name.clone(),
+                event_tx: event_tx.clone(),
             },
         }
     }
@@ -809,9 +772,12 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
     //   port: number (optional) - HTTP forwarding port
     //   context: string (default "") - Context written before init commands
     //   rows: number (default 24) - Initial rows
+    //   agent_key: string (optional) - Agent key for notification watcher
+    //   session_name: string (optional) - Session name for notification watcher
     //   cols: number (default 80) - Initial cols
+    let queue_spawn = request_queue.clone();
     let spawn_fn = lua
-        .create_function(|_lua, opts: LuaTable| {
+        .create_function(move |_lua, opts: LuaTable| {
             // Parse required fields
             let worktree_path: String = opts
                 .get("worktree_path")
@@ -825,6 +791,8 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
                 opts.get("detect_notifications").unwrap_or(false);
             let port: Option<u16> = opts.get("port").ok();
             let context: String = opts.get("context").unwrap_or_default();
+            let agent_key: Option<String> = opts.get("agent_key").ok();
+            let session_name: Option<String> = opts.get("session_name").ok();
 
             // Parse env table
             let mut env = HashMap::new();
@@ -866,12 +834,22 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
             // Extract direct access handles before wrapping in Arc
             let (shared_state, scrollback_buffer, event_tx) = session.get_direct_access();
             let session_port = session.port();
-            let has_notifications = session.notification_tx.is_some();
 
-            // Take the notification_rx from the session and wrap for thread safety
-            let notification_rx = session.take_notification_rx().map(|rx| {
-                Arc::new(Mutex::new(rx))
-            });
+            // Auto-queue notification watcher if notifications enabled and identity provided
+            if detect_notifications {
+                if let (Some(ak), Some(sn)) = (&agent_key, &session_name) {
+                    let watcher_key = format!("{ak}:{sn}");
+                    let mut q = queue_spawn
+                        .lock()
+                        .expect("PTY request queue mutex poisoned");
+                    q.push(PtyRequest::SpawnNotificationWatcher {
+                        watcher_key,
+                        agent_key: ak.clone(),
+                        session_name: sn.clone(),
+                        event_tx: event_tx.clone(),
+                    });
+                }
+            }
 
             // Wrap session in Arc<Mutex<>> to keep it alive (Drop kills child)
             let session_arc = Arc::new(Mutex::new(session));
@@ -882,8 +860,6 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
                 scrollback_buffer,
                 event_tx,
                 port: session_port,
-                has_notifications,
-                notification_rx,
             };
 
             Ok(handle)
@@ -1321,21 +1297,10 @@ mod tests {
     /// Helper to create a PtySessionHandle for testing without spawning a real
     /// process. Uses the direct PtySession constructor and sets up shared state
     /// manually.
-    fn create_test_session_handle(with_notifications: bool) -> PtySessionHandle {
+    fn create_test_session_handle() -> PtySessionHandle {
         let session = PtySession::new(24, 80);
         let (shared_state, scrollback_buffer, event_tx) = session.get_direct_access();
         let session_arc = Arc::new(Mutex::new(session));
-
-        let notification_rx = if with_notifications {
-            let (tx, rx) = std::sync::mpsc::channel();
-            // Send a test notification
-            tx.send(AgentNotification::Osc9(Some("test".to_string())))
-                .unwrap();
-            drop(tx);
-            Some(Arc::new(Mutex::new(rx)))
-        } else {
-            None
-        };
 
         PtySessionHandle {
             _session: session_arc,
@@ -1343,15 +1308,13 @@ mod tests {
             scrollback_buffer,
             event_tx,
             port: None,
-            has_notifications: with_notifications,
-            notification_rx,
         }
     }
 
     #[test]
     fn test_pty_session_handle_dimensions() {
         let lua = Lua::new();
-        let handle = create_test_session_handle(false);
+        let handle = create_test_session_handle();
 
         lua.globals()
             .set("session", handle)
@@ -1368,7 +1331,7 @@ mod tests {
     #[test]
     fn test_pty_session_handle_resize() {
         let lua = Lua::new();
-        let handle = create_test_session_handle(false);
+        let handle = create_test_session_handle();
 
         lua.globals()
             .set("session", handle)
@@ -1389,7 +1352,7 @@ mod tests {
     #[test]
     fn test_pty_session_handle_get_scrollback_empty() {
         let lua = Lua::new();
-        let handle = create_test_session_handle(false);
+        let handle = create_test_session_handle();
 
         lua.globals()
             .set("session", handle)
@@ -1406,7 +1369,7 @@ mod tests {
     #[test]
     fn test_pty_session_handle_get_scrollback_with_data() {
         let lua = Lua::new();
-        let handle = create_test_session_handle(false);
+        let handle = create_test_session_handle();
 
         // Add data to scrollback buffer directly
         {
@@ -1431,7 +1394,7 @@ mod tests {
     #[test]
     fn test_pty_session_handle_port_nil() {
         let lua = Lua::new();
-        let handle = create_test_session_handle(false);
+        let handle = create_test_session_handle();
 
         lua.globals()
             .set("session", handle)
@@ -1448,7 +1411,7 @@ mod tests {
     #[test]
     fn test_pty_session_handle_port_with_value() {
         let lua = Lua::new();
-        let mut handle = create_test_session_handle(false);
+        let mut handle = create_test_session_handle();
         handle.port = Some(8080);
 
         lua.globals()
@@ -1465,7 +1428,7 @@ mod tests {
     #[test]
     fn test_pty_session_handle_is_alive_no_writer() {
         let lua = Lua::new();
-        let handle = create_test_session_handle(false);
+        let handle = create_test_session_handle();
 
         lua.globals()
             .set("session", handle)
@@ -1482,7 +1445,7 @@ mod tests {
     #[test]
     fn test_pty_session_handle_write_no_writer_is_noop() {
         let lua = Lua::new();
-        let handle = create_test_session_handle(false);
+        let handle = create_test_session_handle();
 
         lua.globals()
             .set("session", handle)
@@ -1495,128 +1458,9 @@ mod tests {
     }
 
     #[test]
-    fn test_pty_session_handle_poll_notifications_empty() {
-        let lua = Lua::new();
-        let handle = create_test_session_handle(false);
-
-        lua.globals()
-            .set("session", handle)
-            .expect("Failed to set session");
-
-        // No notifications configured -> empty table
-        let result: LuaTable = lua
-            .load("return session:poll_notifications()")
-            .eval()
-            .expect("poll_notifications should work");
-        assert_eq!(result.len().unwrap(), 0);
-    }
-
-    #[test]
-    fn test_pty_session_handle_poll_notifications_with_data() {
-        let lua = Lua::new();
-        let handle = create_test_session_handle(true);
-
-        lua.globals()
-            .set("session", handle)
-            .expect("Failed to set session");
-
-        // Should have one notification (from create_test_session_handle)
-        let count: i64 = lua
-            .load(
-                r#"
-                local notifs = session:poll_notifications()
-                return #notifs
-            "#,
-            )
-            .eval()
-            .expect("poll_notifications should work");
-        assert_eq!(count, 1);
-
-        // Second poll should be empty (drained)
-        let count2: i64 = lua
-            .load(
-                r#"
-                local notifs = session:poll_notifications()
-                return #notifs
-            "#,
-            )
-            .eval()
-            .expect("second poll should work");
-        assert_eq!(count2, 0);
-    }
-
-    #[test]
-    fn test_pty_session_handle_poll_notifications_osc9_fields() {
-        let lua = Lua::new();
-        let handle = create_test_session_handle(true);
-
-        lua.globals()
-            .set("session", handle)
-            .expect("Failed to set session");
-
-        // Verify notification fields
-        let (notif_type, message): (String, String) = lua
-            .load(
-                r#"
-                local notifs = session:poll_notifications()
-                return notifs[1].type, notifs[1].message
-            "#,
-            )
-            .eval()
-            .expect("notification fields should work");
-        assert_eq!(notif_type, "osc9");
-        assert_eq!(message, "test");
-    }
-
-    #[test]
-    fn test_pty_session_handle_poll_notifications_osc777() {
-        let lua = Lua::new();
-
-        // Create handle with osc777 notification
-        let session = PtySession::new(24, 80);
-        let (shared_state, scrollback_buffer, event_tx) = session.get_direct_access();
-        let session_arc = Arc::new(Mutex::new(session));
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(AgentNotification::Osc777 {
-            title: "Build".to_string(),
-            body: "Complete".to_string(),
-        })
-        .unwrap();
-        drop(tx);
-
-        let handle = PtySessionHandle {
-            _session: session_arc,
-            shared_state,
-            scrollback_buffer,
-            event_tx,
-            port: None,
-            has_notifications: true,
-            notification_rx: Some(Arc::new(Mutex::new(rx))),
-        };
-
-        lua.globals()
-            .set("session", handle)
-            .expect("Failed to set session");
-
-        let (notif_type, title, body): (String, String, String) = lua
-            .load(
-                r#"
-                local notifs = session:poll_notifications()
-                return notifs[1].type, notifs[1].title, notifs[1].body
-            "#,
-            )
-            .eval()
-            .expect("osc777 fields should work");
-        assert_eq!(notif_type, "osc777");
-        assert_eq!(title, "Build");
-        assert_eq!(body, "Complete");
-    }
-
-    #[test]
     fn test_pty_session_handle_kill() {
         let lua = Lua::new();
-        let handle = create_test_session_handle(false);
+        let handle = create_test_session_handle();
 
         lua.globals()
             .set("session", handle)
@@ -1750,7 +1594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pty_spawn_with_notifications() {
+    async fn test_pty_spawn_with_notifications_queues_watcher() {
         let lua = Lua::new();
         let queue = new_request_queue();
 
@@ -1769,24 +1613,61 @@ mod tests {
                     worktree_path = temp_path,
                     command = "echo hello",
                     detect_notifications = true,
+                    agent_key = "agent-1",
+                    session_name = "cli",
                 })
             "#,
         )
         .exec()
         .expect("pty.spawn with notifications should work");
 
-        // poll_notifications should work (returns empty table, no OSC in output)
-        let count: i64 = lua
-            .load(
-                r#"
-                local notifs = session:poll_notifications()
-                return #notifs
+        // Should have queued a SpawnNotificationWatcher request
+        let requests = queue.lock().expect("queue lock");
+        assert_eq!(requests.len(), 1);
+        match &requests[0] {
+            PtyRequest::SpawnNotificationWatcher {
+                watcher_key,
+                agent_key,
+                session_name,
+                ..
+            } => {
+                assert_eq!(watcher_key, "agent-1:cli");
+                assert_eq!(agent_key, "agent-1");
+                assert_eq!(session_name, "cli");
+            }
+            other => panic!("Expected SpawnNotificationWatcher, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pty_spawn_notifications_without_identity_no_watcher() {
+        let lua = Lua::new();
+        let queue = new_request_queue();
+
+        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+
+        lua.globals()
+            .set("temp_path", temp_path)
+            .expect("Failed to set temp_path");
+
+        // detect_notifications=true but no agent_key/session_name -> no watcher queued
+        lua.load(
+            r#"
+                session = pty.spawn({
+                    worktree_path = temp_path,
+                    command = "echo hello",
+                    detect_notifications = true,
+                })
             "#,
-            )
-            .eval()
-            .expect("poll_notifications should work");
-        // May be 0 or more depending on timing, just verify no crash
-        assert!(count >= 0);
+        )
+        .exec()
+        .expect("pty.spawn should work");
+
+        let requests = queue.lock().expect("queue lock");
+        assert!(requests.is_empty(), "No watcher should be queued without identity");
     }
 
     #[tokio::test]

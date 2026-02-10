@@ -17,10 +17,9 @@
 
 use std::time::{Duration, Instant};
 
-use crate::agent::AgentNotification;
 use crate::channel::Channel;
 use crate::hub::actions::{self, HubAction};
-use crate::hub::{registration, workers, Hub, WebRtcPtyOutput};
+use crate::hub::{registration, Hub, WebRtcPtyOutput};
 
 impl Hub {
     /// Perform periodic tasks (Lua event processing, WebRTC, notifications).
@@ -41,7 +40,7 @@ impl Hub {
         self.poll_stream_frames_outgoing();
         self.poll_pty_observers();
         self.poll_tui_requests();
-        self.poll_agent_notifications_async();
+        self.poll_pty_notifications();
         self.poll_lua_file_changes();
         self.poll_user_file_watches();
         self.poll_lua_timers();
@@ -109,49 +108,87 @@ impl Hub {
         }
     }
 
-    // === Background Worker Methods ===
-
-    /// Poll agents for notifications and send via background worker (non-blocking).
+    /// Spawn a notification watcher task for a PTY session.
     ///
-    /// Collects notifications from all agents and queues them to the
-    /// notification worker for background sending to Rails.
-    fn poll_agent_notifications_async(&self) {
-        let Some(ref worker) = self.notification_worker else {
-            return;
+    /// Subscribes to the PTY's broadcast channel, filters for
+    /// `PtyEvent::Notification`, and pushes events to the Hub's
+    /// `pty_notification_queue` for processing in the tick loop.
+    fn spawn_notification_watcher(
+        &mut self,
+        watcher_key: String,
+        agent_key: String,
+        session_name: String,
+        event_tx: tokio::sync::broadcast::Sender<crate::agent::pty::PtyEvent>,
+    ) {
+        // Abort any existing watcher for this key
+        if let Some(old) = self.notification_watcher_handles.remove(&watcher_key) {
+            old.abort();
+            log::debug!("[NotifWatcher] Aborted existing watcher for {}", watcher_key);
+        }
+
+        let queue = std::sync::Arc::clone(&self.pty_notification_queue);
+        let mut rx = event_tx.subscribe();
+        let key = watcher_key.clone();
+
+        let _guard = self.tokio_runtime.enter();
+        let task = tokio::spawn(async move {
+            use crate::agent::pty::PtyEvent;
+
+            log::info!("[NotifWatcher] Started for {}", key);
+
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::Notification(notif)) => {
+                        log::info!("[NotifWatcher] Got notification for {}: {:?}", key, notif);
+                        let mut q = queue.lock().expect("pty_notification_queue lock poisoned");
+                        q.push(super::PtyNotificationEvent {
+                            agent_key: agent_key.clone(),
+                            session_name: session_name.clone(),
+                            notification: notif,
+                        });
+                    }
+                    Ok(_) => {
+                        // Ignore non-notification events
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("[NotifWatcher] Lagged by {} events for {}", n, key);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        log::info!("[NotifWatcher] Channel closed for {}", key);
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.notification_watcher_handles.insert(watcher_key, task);
+    }
+
+    // === PTY Notification Watcher ===
+
+    /// Poll queued PTY notifications and fire the `pty_notification` Lua hook.
+    ///
+    /// Watcher tasks push `PtyNotificationEvent` into `pty_notification_queue`.
+    /// This method drains the queue and fires the Lua hook for each event.
+    fn poll_pty_notifications(&self) {
+        let events: Vec<super::PtyNotificationEvent> = {
+            let mut queue = self
+                .pty_notification_queue
+                .lock()
+                .expect("pty_notification_queue lock poisoned");
+            std::mem::take(&mut *queue)
         };
 
-        let state = self.state.read()
-            .expect("HubState RwLock poisoned in poll_agent_notifications_async");
+        if events.is_empty() {
+            return;
+        }
 
-        for agent in state.agents.values() {
-            for notification in agent.poll_notifications() {
-                // Only send if we have issue context (otherwise there's nowhere to post)
-                if agent.issue_number.is_none() && agent.last_invocation_url.is_none() {
-                    continue;
-                }
-
-                let notification_type = match &notification {
-                    AgentNotification::Osc9(_) | AgentNotification::Osc777 { .. } => {
-                        "question_asked"
-                    }
-                };
-
-                log::info!(
-                    "Agent {} sent notification: {} (url: {:?})",
-                    agent.agent_id(),
-                    notification_type,
-                    agent.last_invocation_url
-                );
-
-                let request = workers::NotificationRequest {
-                    repo: agent.repo.clone(),
-                    issue_number: agent.issue_number,
-                    invocation_url: agent.last_invocation_url.clone(),
-                    notification_type: notification_type.to_string(),
-                };
-
-                worker.send(request);
-            }
+        for event in events {
+            self.lua.notify_pty_notification(
+                &event.agent_key,
+                &event.session_name,
+                &event.notification,
+            );
         }
     }
 
@@ -465,6 +502,19 @@ impl Hub {
                     } else {
                         log::debug!("[Lua] No agent at index {}", agent_index);
                     }
+                }
+                PtyRequest::SpawnNotificationWatcher {
+                    watcher_key,
+                    agent_key,
+                    session_name,
+                    event_tx,
+                } => {
+                    self.spawn_notification_watcher(
+                        watcher_key,
+                        agent_key,
+                        session_name,
+                        event_tx,
+                    );
                 }
             }
         }

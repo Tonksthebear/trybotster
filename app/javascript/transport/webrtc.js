@@ -808,6 +808,12 @@ class WebRTCTransport {
     }
 
     if (data.type === "signal") {
+      // Unencrypted session_invalid from CLI — Olm session mismatch on signaling path
+      if (data.envelope?.type === "session_invalid") {
+        this.#emit("session:invalid", { hubId, message: data.envelope.message || "Session expired" })
+        return
+      }
+
       try {
         const decrypted = await this.#decryptSignalEnvelope(hubId, data.envelope)
         if (!decrypted) return
@@ -1065,17 +1071,36 @@ class WebRTCTransport {
 
   async #waitForDataChannel(dataChannel) {
     if (dataChannel?.readyState === "open") return
+    if (!dataChannel || dataChannel.readyState === "closed" || dataChannel.readyState === "closing") {
+      throw new Error("DataChannel closed")
+    }
 
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("DataChannel timeout")), 30000)
+      const timeout = setTimeout(() => {
+        cleanup()
+        reject(new Error("DataChannel timeout"))
+      }, 30000)
 
-      const onOpen = () => {
+      const cleanup = () => {
         clearTimeout(timeout)
         dataChannel.removeEventListener("open", onOpen)
+        dataChannel.removeEventListener("close", onClose)
+        dataChannel.removeEventListener("error", onClose)
+      }
+
+      const onOpen = () => {
+        cleanup()
         resolve()
       }
 
+      const onClose = () => {
+        cleanup()
+        reject(new Error("DataChannel closed"))
+      }
+
       dataChannel.addEventListener("open", onOpen)
+      dataChannel.addEventListener("close", onClose)
+      dataChannel.addEventListener("error", onClose)
     })
   }
 

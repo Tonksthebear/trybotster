@@ -47,20 +47,16 @@ class CliHubRegistrationTest < CliIntegrationTestCase
       "Bundle should be ~2900 chars for Kyber keys. Got: #{uri.fragment.length}"
   end
 
-  test "CLI updates hub repo on registration" do
-    # Create hub with initial repo
+  test "CLI updates hub last_seen_at on registration" do
     hub = Hub.create!(
       user: @user,
       identifier: "cli-update-test-#{SecureRandom.hex(4)}",
-      repo: "original/repo",
       last_seen_at: 1.hour.ago
     )
 
-    # Start CLI (it will register and may update hub)
     cli = start_cli(hub, timeout: 20)
     @started_clis << cli
 
-    # Hub should be updated
     hub.reload
     assert hub.last_seen_at > 1.minute.ago
 

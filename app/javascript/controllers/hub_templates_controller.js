@@ -106,6 +106,7 @@ export default class extends Controller {
         scopeSet.add(name);
       }
       this.#syncState(slug, dest);
+      this.dispatch("templateChanged");
     } catch (error) {
       btn.textContent = "Failed";
       setTimeout(() => this.#syncState(slug, dest), 2000);
@@ -127,6 +128,10 @@ export default class extends Controller {
     // Update install button text
     const dest = this.previewPanelTargets.find((p) => p.dataset.slug === slug)?.dataset.dest;
     if (dest) this.#syncState(slug, dest);
+  }
+
+  recheckInstalled() {
+    if (this.hub) this.#checkInstalled();
   }
 
   // ========== DataChannel ==========

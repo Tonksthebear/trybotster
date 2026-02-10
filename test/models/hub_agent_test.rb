@@ -7,7 +7,6 @@ class HubAgentTest < ActiveSupport::TestCase
     @user = users(:one)
     @hub = Hub.create!(
       user: @user,
-      repo: "owner/repo",
       identifier: SecureRandom.uuid,
       last_seen_at: Time.current
     )
@@ -67,7 +66,6 @@ class HubAgentTest < ActiveSupport::TestCase
   test "same session_key allowed in different hubs" do
     other_hub = Hub.create!(
       user: @user,
-      repo: "owner/other-repo",
       identifier: SecureRandom.uuid,
       last_seen_at: Time.current
     )

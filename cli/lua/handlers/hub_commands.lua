@@ -24,6 +24,20 @@ hub_ch = action_cable.subscribe(conn, "HubCommandChannel",
         local msg_type = message.type
 
         if msg_type == "signal" then
+            -- If Rust couldn't decrypt the envelope (Olm session mismatch),
+            -- tell the browser its session is stale so it can re-pair.
+            if message.decrypt_failed then
+                log.warn("Signal decryption failed for browser " ..
+                    tostring(message.browser_identity) .. ", sending session_invalid")
+                if hub_ch then
+                    action_cable.perform(hub_ch, "signal", {
+                        browser_identity = message.browser_identity,
+                        envelope = { type = "session_invalid", message = "Crypto session expired. Please re-pair." }
+                    })
+                end
+                return
+            end
+
             -- Primitive already decrypted the OlmEnvelope.
             -- message.envelope is now the decrypted plaintext JSON:
             --   { type = "offer"|"ice"|"answer", sdp = ..., candidate = ... }
@@ -47,12 +61,7 @@ hub_ch = action_cable.subscribe(conn, "HubCommandChannel",
         elseif msg_type == "message" then
             local event_type = message.event_type or ""
 
-            -- Skip legacy events
-            if event_type == "terminal_connected"
-                or event_type == "terminal_disconnected"
-                or event_type == "browser_wants_preview" then
-                log.debug("Ignoring legacy event: " .. event_type)
-            else
+            if event_type == "create_agent" or event_type == "agent_cleanup" then
                 local payload = message.payload or {}
                 events.emit("command_message", {
                     type = (event_type == "agent_cleanup") and "delete_agent" or "create_agent",
@@ -66,6 +75,8 @@ hub_ch = action_cable.subscribe(conn, "HubCommandChannel",
                         .. "-" .. tostring(payload.issue_number)),
                     delete_worktree = false,
                 })
+            else
+                log.warn("Unhandled command event_type: " .. event_type)
             end
 
             -- Ack by sequence

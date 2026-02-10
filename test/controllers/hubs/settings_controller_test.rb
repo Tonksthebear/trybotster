@@ -2,7 +2,7 @@
 
 require "test_helper"
 
-class SettingsTemplatesTest < ActionDispatch::IntegrationTest
+class Hubs::SettingsControllerTest < ActionDispatch::IntegrationTest
   include Devise::Test::IntegrationHelpers
 
   setup do

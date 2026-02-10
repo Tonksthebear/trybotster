@@ -11,7 +11,7 @@ class DetectStaleHubsJobTest < ActiveJob::TestCase
     hub = Hub.create!(
       user: @user,
       identifier: "stale-hub-#{SecureRandom.hex(4)}",
-      repo: "test/repo",
+
       alive: true,
       last_seen_at: 3.minutes.ago
     )
@@ -29,7 +29,7 @@ class DetectStaleHubsJobTest < ActiveJob::TestCase
     hub = Hub.create!(
       user: @user,
       identifier: "active-hub-#{SecureRandom.hex(4)}",
-      repo: "test/repo",
+
       alive: true,
       last_seen_at: 1.minute.ago
     )
@@ -47,7 +47,7 @@ class DetectStaleHubsJobTest < ActiveJob::TestCase
     hub = Hub.create!(
       user: @user,
       identifier: "dead-hub-#{SecureRandom.hex(4)}",
-      repo: "test/repo",
+
       alive: false,
       last_seen_at: 10.minutes.ago
     )
@@ -64,7 +64,7 @@ class DetectStaleHubsJobTest < ActiveJob::TestCase
     hub = Hub.create!(
       user: @user,
       identifier: "broadcast-hub-#{SecureRandom.hex(4)}",
-      repo: "test/repo",
+
       alive: true,
       last_seen_at: 3.minutes.ago
     )
@@ -81,7 +81,7 @@ class DetectStaleHubsJobTest < ActiveJob::TestCase
       Hub.create!(
         user: @user,
         identifier: "multi-stale-hub-#{i}-#{SecureRandom.hex(4)}",
-        repo: "test/repo",
+  
         alive: true,
         last_seen_at: 5.minutes.ago
       )
