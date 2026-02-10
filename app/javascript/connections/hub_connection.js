@@ -201,32 +201,32 @@ export class HubConnection extends Connection {
     });
   }
 
-  readFile(path) {
-    return this.fsRequest("fs:read", { path });
+  readFile(path, scope) {
+    return this.fsRequest("fs:read", { path, scope });
   }
 
-  writeFile(path, content) {
-    return this.fsRequest("fs:write", { path, content });
+  writeFile(path, content, scope) {
+    return this.fsRequest("fs:write", { path, content, scope });
   }
 
-  listDir(path = ".") {
-    return this.fsRequest("fs:list", { path });
+  listDir(path = ".", scope) {
+    return this.fsRequest("fs:list", { path, scope });
   }
 
-  statFile(path) {
-    return this.fsRequest("fs:stat", { path });
+  statFile(path, scope) {
+    return this.fsRequest("fs:stat", { path, scope });
   }
 
-  deleteFile(path) {
-    return this.fsRequest("fs:delete", { path });
+  deleteFile(path, scope) {
+    return this.fsRequest("fs:delete", { path, scope });
   }
 
-  mkDir(path) {
-    return this.fsRequest("fs:mkdir", { path });
+  mkDir(path, scope) {
+    return this.fsRequest("fs:mkdir", { path, scope });
   }
 
-  rmDir(path) {
-    return this.fsRequest("fs:rmdir", { path });
+  rmDir(path, scope) {
+    return this.fsRequest("fs:rmdir", { path, scope });
   }
 
   // ========== Template API ==========
@@ -251,12 +251,12 @@ export class HubConnection extends Connection {
     });
   }
 
-  installTemplate(dest, content) {
-    return this.templateRequest("template:install", { dest, content });
+  installTemplate(dest, content, scope) {
+    return this.templateRequest("template:install", { dest, content, scope });
   }
 
-  uninstallTemplate(dest) {
-    return this.templateRequest("template:uninstall", { dest });
+  uninstallTemplate(dest, scope) {
+    return this.templateRequest("template:uninstall", { dest, scope });
   }
 
   listInstalledTemplates() {

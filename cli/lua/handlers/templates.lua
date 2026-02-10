@@ -10,15 +10,29 @@ local commands = require("lib.commands")
 -- Helpers
 -- ============================================================================
 
---- Resolve a relative path safely within the Lua config directory.
+--- Resolve a relative path safely within the appropriate root.
+-- "repo" scope: resolves within {repo}/.botster/
+-- "device" scope (or nil/default): resolves within ~/.botster/
 -- @param relative string The relative dest path from the template
+-- @param scope string|nil "repo" or nil/device
 -- @return string|nil absolute_path
 -- @return string|nil error
-local function safe_path(relative)
-    local root = config.lua_path()
-    if not root then return nil, "No lua_path configured" end
-    return fs.resolve_safe(root, relative)
+local function safe_path(relative, scope)
+    if scope == "repo" then
+        local repo_root = worktree.repo_root()
+        if not repo_root then return nil, "No repo root" end
+        return fs.resolve_safe(repo_root .. "/.botster", relative)
+    else
+        local root = config.data_dir and config.data_dir() or nil
+        if not root then return nil, "No data_dir configured" end
+        -- Ensure device root exists (may not yet for first-time initialization)
+        if not fs.exists(root) then
+            fs.mkdir(root)
+        end
+        return fs.resolve_safe(root, relative)
+    end
 end
+
 
 --- Send a response back to the browser client.
 -- @param client The Client instance
@@ -52,13 +66,14 @@ end
 commands.register("template:install", function(client, sub_id, command)
     local dest = command.dest
     local content = command.content
+    local scope = command.scope  -- "device" or "repo"
 
     if not dest or not content then
         respond(client, sub_id, command.request_id, { ok = false, error = "Missing dest or content" })
         return
     end
 
-    local path, err = safe_path(dest)
+    local path, err = safe_path(dest, scope)
     if not path then
         respond(client, sub_id, command.request_id, { ok = false, error = err })
         return
@@ -72,8 +87,8 @@ commands.register("template:install", function(client, sub_id, command)
 
     local ok, write_err = fs.write(path, content)
     if ok then
-        log.info(string.format("Template installed: %s", dest))
-        respond(client, sub_id, command.request_id, { ok = true, dest = dest })
+        log.info(string.format("Template installed: %s (scope=%s)", dest, scope or "device"))
+        respond(client, sub_id, command.request_id, { ok = true, dest = dest, scope = scope or "device" })
     else
         respond(client, sub_id, command.request_id, { ok = false, error = write_err })
     end
@@ -81,13 +96,14 @@ end, { description = "Install a template file" })
 
 commands.register("template:uninstall", function(client, sub_id, command)
     local dest = command.dest
+    local scope = command.scope  -- "device" or "repo"
 
     if not dest then
         respond(client, sub_id, command.request_id, { ok = false, error = "Missing dest" })
         return
     end
 
-    local path, err = safe_path(dest)
+    local path, err = safe_path(dest, scope)
     if not path then
         respond(client, sub_id, command.request_id, { ok = false, error = err })
         return
@@ -103,49 +119,61 @@ commands.register("template:uninstall", function(client, sub_id, command)
                 fs.rmdir(parent)
             end
         end
-        log.info(string.format("Template uninstalled: %s", dest))
-        respond(client, sub_id, command.request_id, { ok = true, dest = dest })
+        log.info(string.format("Template uninstalled: %s (scope=%s)", dest, scope or "device"))
+        respond(client, sub_id, command.request_id, { ok = true, dest = dest, scope = scope or "device" })
     else
         respond(client, sub_id, command.request_id, { ok = false, error = del_err })
     end
 end, { description = "Uninstall a template file" })
 
 commands.register("template:list", function(client, sub_id, command)
-    local root = config.lua_path()
-    if not root then
-        respond(client, sub_id, command.request_id, { ok = false, error = "No lua_path configured" })
-        return
-    end
-
+    local ConfigResolver = require("lib.config_resolver")
     local installed = {}
 
-    -- Scan plugins/*/init.lua
-    local plugin_dir = root .. "/plugins"
-    local plugins = fs.listdir(plugin_dir)
-    if plugins then
-        for _, name in ipairs(plugins) do
-            local init_path = plugin_dir .. "/" .. name .. "/init.lua"
-            if fs.exists(init_path) then
-                table.insert(installed, "plugins/" .. name .. "/init.lua")
+    -- Scan all 4 layers independently so we report every scope a plugin exists in.
+    -- (resolve_all merges by name and only keeps the winning layer.)
+    local device_root = config.data_dir and config.data_dir() or nil
+    local repo_root = worktree.repo_root()
+    local active_profile = (config.get and config.get("active_profile")) or nil
+
+    local function scan_layer(base_path, scope_label, path_prefix)
+        local plugins = ConfigResolver.read_plugins(base_path)
+        for name, plugin in pairs(plugins) do
+            local dest = path_prefix .. "plugins/" .. name .. "/init.lua"
+            table.insert(installed, { dest = dest, scope = scope_label, name = name })
+        end
+    end
+
+    -- Device shared
+    if device_root and fs.exists(device_root .. "/shared") then
+        scan_layer(device_root .. "/shared", "device", "shared/")
+    end
+
+    -- Device profiles
+    if device_root then
+        local profiles = ConfigResolver.list_profiles_all(device_root, nil)
+        for _, profile_name in ipairs(profiles) do
+            local profile_path = device_root .. "/profiles/" .. profile_name
+            if fs.exists(profile_path) then
+                scan_layer(profile_path, "device", "profiles/" .. profile_name .. "/")
             end
         end
     end
 
-    -- Scan sessions/*/init.lua
-    local session_dir = root .. "/sessions"
-    local sessions = fs.listdir(session_dir)
-    if sessions then
-        for _, name in ipairs(sessions) do
-            local init_path = session_dir .. "/" .. name .. "/init.lua"
-            if fs.exists(init_path) then
-                table.insert(installed, "sessions/" .. name .. "/init.lua")
-            end
-        end
+    -- Repo shared
+    if repo_root and fs.exists(repo_root .. "/.botster/shared") then
+        scan_layer(repo_root .. "/.botster/shared", "repo", "shared/")
     end
 
-    -- Check user/init.lua
-    if fs.exists(root .. "/user/init.lua") then
-        table.insert(installed, "user/init.lua")
+    -- Repo profiles
+    if repo_root then
+        local profiles = ConfigResolver.list_profiles_all(nil, repo_root)
+        for _, profile_name in ipairs(profiles) do
+            local profile_path = repo_root .. "/.botster/profiles/" .. profile_name
+            if fs.exists(profile_path) then
+                scan_layer(profile_path, "repo", "profiles/" .. profile_name .. "/")
+            end
+        end
     end
 
     respond(client, sub_id, command.request_id, { ok = true, installed = installed })

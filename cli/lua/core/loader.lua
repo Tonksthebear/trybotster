@@ -66,34 +66,41 @@ function M.is_protected(module_name)
     return protected_modules[module_name] == true
 end
 
---- Discover plugins in a directory.
--- Scans for subdirectories containing init.lua.
--- Returns a sorted list of plugin names.
--- @param dir string The plugins directory path
--- @return table Array of plugin names (sorted)
-function M.discover_plugins(dir)
-    local plugins = {}
-
-    if not fs.exists(dir) then
-        return plugins
+--- Load a plugin by absolute path (not via require/package.path).
+-- Loads the file with full _ENV (same trust as user plugins), registers
+-- it in package.loaded so it can be reloaded by name.
+-- @param path string Absolute path to the plugin's init.lua
+-- @param name string Plugin name (used for registration and logging)
+-- @return boolean success
+function M.load_plugin(path, name)
+    if not fs.exists(path) then
+        log.warn(string.format("load_plugin: %s not found at %s", name, path))
+        return false
     end
 
-    local entries, err = fs.listdir(dir)
-    if not entries then
-        log.warn(string.format("Failed to scan plugins directory %s: %s", dir, tostring(err)))
-        return plugins
+    local source, read_err = fs.read(path)
+    if not source then
+        log.error(string.format("load_plugin: cannot read %s: %s", path, tostring(read_err)))
+        return false
     end
 
-    for _, name in ipairs(entries) do
-        local plugin_dir = dir .. "/" .. name
-        local init_path = plugin_dir .. "/init.lua"
-        if fs.is_dir(plugin_dir) and fs.exists(init_path) then
-            table.insert(plugins, name)
-        end
+    local chunk, err = load(source, "@" .. path)
+    if not chunk then
+        log.error(string.format("load_plugin: syntax error in %s: %s", path, tostring(err)))
+        return false
     end
 
-    table.sort(plugins)
-    return plugins
+    local ok, result = pcall(chunk)
+    if not ok then
+        log.error(string.format("load_plugin: runtime error in %s: %s", path, tostring(result)))
+        return false
+    end
+
+    -- Register in package.loaded so reload works
+    local module_key = "plugin." .. name
+    package.loaded[module_key] = result or true
+    log.info(string.format("Loaded plugin: %s from %s", name, path))
+    return true
 end
 
 -- ============================================================================

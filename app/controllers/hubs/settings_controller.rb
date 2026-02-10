@@ -46,6 +46,7 @@ module Hubs
           description: meta[:description],
           category: meta[:category],
           dest: meta[:dest],
+          scope: meta[:scope],
           version: meta[:version] || "1.0.0",
           content: content
         }

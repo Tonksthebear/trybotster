@@ -10,13 +10,26 @@ local commands = require("lib.commands")
 -- Helpers
 -- ============================================================================
 
---- Resolve a relative path safely within the repo root.
+--- Resolve a relative path safely within the appropriate root.
+-- When scope is "device", resolves within ~/.botster (config.data_dir()).
+-- Otherwise (nil or "repo"), resolves within the repo root.
 -- @param relative string The relative path from the browser
+-- @param scope string|nil "device" or nil/repo
 -- @return string|nil absolute_path
 -- @return string|nil error
-local function safe_path(relative)
-    local root = worktree.repo_root()
-    if not root then return nil, "No repo root" end
+local function safe_path(relative, scope)
+    local root
+    if scope == "device" then
+        root = config.data_dir and config.data_dir() or nil
+        if not root then return nil, "No device data_dir configured" end
+        -- Ensure device root exists (may not yet for first-time initialization)
+        if not fs.exists(root) then
+            fs.mkdir(root)
+        end
+    else
+        root = worktree.repo_root()
+        if not root then return nil, "No repo root" end
+    end
     return fs.resolve_safe(root, relative)
 end
 
@@ -38,7 +51,7 @@ end
 -- ============================================================================
 
 commands.register("fs:read", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "")
+    local path, err = safe_path(command.path or "", command.scope)
     if not path then
         respond(client, sub_id, command.request_id, "fs:read", { ok = false, error = err })
         return
@@ -57,7 +70,7 @@ commands.register("fs:read", function(client, sub_id, command)
 end, { description = "Read a file from the repo" })
 
 commands.register("fs:write", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "")
+    local path, err = safe_path(command.path or "", command.scope)
     if not path then
         respond(client, sub_id, command.request_id, "fs:write", { ok = false, error = err })
         return
@@ -72,7 +85,7 @@ commands.register("fs:write", function(client, sub_id, command)
 end, { description = "Write a file to the repo" })
 
 commands.register("fs:list", function(client, sub_id, command)
-    local path, err = safe_path(command.path or ".")
+    local path, err = safe_path(command.path or ".", command.scope)
     if not path then
         respond(client, sub_id, command.request_id, "fs:list", { ok = false, error = err })
         return
@@ -100,7 +113,7 @@ commands.register("fs:list", function(client, sub_id, command)
 end, { description = "List directory entries in the repo" })
 
 commands.register("fs:stat", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "")
+    local path, err = safe_path(command.path or "", command.scope)
     if not path then
         respond(client, sub_id, command.request_id, "fs:stat", { ok = false, error = err })
         return
@@ -120,7 +133,7 @@ commands.register("fs:stat", function(client, sub_id, command)
 end, { description = "Get file/directory metadata" })
 
 commands.register("fs:delete", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "")
+    local path, err = safe_path(command.path or "", command.scope)
     if not path then
         respond(client, sub_id, command.request_id, "fs:delete", { ok = false, error = err })
         return
@@ -135,7 +148,7 @@ commands.register("fs:delete", function(client, sub_id, command)
 end, { description = "Delete a file from the repo" })
 
 commands.register("fs:mkdir", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "")
+    local path, err = safe_path(command.path or "", command.scope)
     if not path then
         respond(client, sub_id, command.request_id, "fs:mkdir", { ok = false, error = err })
         return
@@ -150,7 +163,7 @@ commands.register("fs:mkdir", function(client, sub_id, command)
 end, { description = "Create a directory in the repo" })
 
 commands.register("fs:rmdir", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "")
+    local path, err = safe_path(command.path or "", command.scope)
     if not path then
         respond(client, sub_id, command.request_id, "fs:rmdir", { ok = false, error = err })
         return

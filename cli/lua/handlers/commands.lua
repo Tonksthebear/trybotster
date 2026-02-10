@@ -25,9 +25,10 @@ end, { description = "Send worktree list to client" })
 
 commands.register("list_profiles", function(client, sub_id, _command)
     local ConfigResolver = require("lib.config_resolver")
+    local device_root = config.data_dir and config.data_dir() or nil
     local repo_root = worktree.repo_root()
-    local profiles = ConfigResolver.list_profiles(repo_root)
-    local shared_agent = ConfigResolver.has_shared_agent(repo_root)
+    local profiles = ConfigResolver.list_profiles_all(device_root, repo_root)
+    local shared_agent = ConfigResolver.has_agent_without_profile(device_root, repo_root)
     client:send({
         subscriptionId = sub_id,
         type = "profiles",
