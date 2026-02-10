@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_02_10_050458) do
+ActiveRecord::Schema[8.1].define(version: 2026_02_10_051852) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -206,44 +206,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_10_050458) do
     t.index ["token"], name: "index_integrations_github_mcp_tokens_on_token", unique: true
   end
 
-  create_table "memories", force: :cascade do |t|
-    t.text "content", null: false
-    t.datetime "created_at", null: false
-    t.string "memory_type", default: "other"
-    t.jsonb "metadata", default: {}
-    t.bigint "parent_id"
-    t.string "source"
-    t.bigint "team_id"
-    t.datetime "updated_at", null: false
-    t.bigint "user_id", null: false
-    t.string "visibility", default: "private", null: false
-    t.index ["created_at"], name: "index_memories_on_created_at"
-    t.index ["memory_type"], name: "index_memories_on_memory_type"
-    t.index ["metadata"], name: "index_memories_on_metadata", using: :gin
-    t.index ["parent_id"], name: "index_memories_on_parent_id"
-    t.index ["source"], name: "index_memories_on_source"
-    t.index ["team_id"], name: "index_memories_on_team_id"
-    t.index ["user_id"], name: "index_memories_on_user_id"
-    t.index ["visibility"], name: "index_memories_on_visibility"
-  end
-
-  create_table "memory_tags", force: :cascade do |t|
-    t.datetime "created_at", null: false
-    t.bigint "memory_id", null: false
-    t.bigint "tag_id", null: false
-    t.datetime "updated_at", null: false
-    t.index ["memory_id", "tag_id"], name: "index_memory_tags_on_memory_id_and_tag_id", unique: true
-    t.index ["memory_id"], name: "index_memory_tags_on_memory_id"
-    t.index ["tag_id"], name: "index_memory_tags_on_tag_id"
-  end
-
-  create_table "tags", force: :cascade do |t|
-    t.datetime "created_at", null: false
-    t.string "name"
-    t.datetime "updated_at", null: false
-    t.index ["name"], name: "index_tags_on_name", unique: true
-  end
-
   create_table "teams", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.string "name"
@@ -289,10 +251,5 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_10_050458) do
   add_foreign_key "hubs", "devices"
   add_foreign_key "hubs", "users"
   add_foreign_key "integrations_github_mcp_tokens", "devices"
-  add_foreign_key "memories", "memories", column: "parent_id"
-  add_foreign_key "memories", "teams"
-  add_foreign_key "memories", "users"
-  add_foreign_key "memory_tags", "memories"
-  add_foreign_key "memory_tags", "tags"
   add_foreign_key "users", "teams"
 end
