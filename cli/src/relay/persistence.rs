@@ -235,6 +235,7 @@ pub fn delete_vodozemac_crypto_store(hub_id: &str) -> Result<()> {
 }
 
 /// Check if a vodozemac crypto store exists for a hub.
+#[cfg(test)]
 pub(crate) fn vodozemac_crypto_store_exists(hub_id: &str) -> bool {
     hub_state_dir(hub_id)
         .map(|dir| dir.join("vodozemac_store.enc").exists())
