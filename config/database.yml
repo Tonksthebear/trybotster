@@ -36,15 +36,18 @@ development:
 # re-generated from your development database when you run "rake".
 # Do not set this db to the same as development or production.
 test:
-  primary:
+  primary: &primary_test
     <<: *default
     database: trybotster_test
+    host: <%= ENV.fetch("DB_HOST", nil) %>
+    username: <%= ENV.fetch("DB_USERNAME", nil) %>
+    password: <%= ENV.fetch("DB_PASSWORD", "") %>
   queue:
-    <<: *default
+    <<: *primary_test
     database: trybotster_test_queue
     migrations_paths: db/queue_migrate
   cable:
-    <<: *default
+    <<: *primary_test
     database: trybotster_test_cable
     migrations_paths: db/cable_migrate
 
@@ -80,6 +83,8 @@ production:
     database: trybotster_production
     username: trybotster
     password: <%= ENV["TRYBOTSTER_DATABASE_PASSWORD"] %>
+    host: <%= ENV.fetch("DB_HOST", "localhost") %>
+    port: <%= ENV.fetch("DB_PORT", 5432) %>
   cache:
     <<: *primary_production
     database: trybotster_production_cache
