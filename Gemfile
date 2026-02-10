@@ -78,6 +78,7 @@ group :test do
   gem "selenium-webdriver"
   gem "webmock"
   gem "minitest"
+  gem "minitest-mock"
 end
 # UI Components
 gem "view_component"
