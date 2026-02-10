@@ -57,9 +57,6 @@ gem "octokit", "~> 8.0"
 gem "actionmcp"
 # gem "solid_mcp"
 
-# Memories
-gem "langchainrb_rails"
-
 group :development, :test do
   # See https://guides.rubyonrails.org/debugging_rails_applications.html#debugging-with-the-debug-gem
   gem "debug", platforms: %i[ mri windows ], require: "debug/prelude"
@@ -85,9 +82,6 @@ group :test do
   gem "selenium-webdriver"
   gem "webmock"
 end
-gem "neighbor"
-gem "ruby-openai"
-
 # UI Components
 gem "view_component"
 gem "classy-yaml"

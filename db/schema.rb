@@ -10,10 +10,9 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_02_09_231651) do
+ActiveRecord::Schema[8.1].define(version: 2026_02_10_050458) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
-  enable_extension "vector"
 
   create_table "action_mcp_session_messages", force: :cascade do |t|
     t.datetime "created_at", null: false
@@ -210,7 +209,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_09_231651) do
   create_table "memories", force: :cascade do |t|
     t.text "content", null: false
     t.datetime "created_at", null: false
-    t.vector "embedding"
     t.string "memory_type", default: "other"
     t.jsonb "metadata", default: {}
     t.bigint "parent_id"
@@ -237,16 +235,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_09_231651) do
     t.index ["memory_id", "tag_id"], name: "index_memory_tags_on_memory_id_and_tag_id", unique: true
     t.index ["memory_id"], name: "index_memory_tags_on_memory_id"
     t.index ["tag_id"], name: "index_memory_tags_on_tag_id"
-  end
-
-  create_table "solid_mcp_messages", force: :cascade do |t|
-    t.datetime "created_at", null: false
-    t.text "data"
-    t.datetime "delivered_at"
-    t.string "event_type", limit: 50, null: false
-    t.string "session_id", limit: 36, null: false
-    t.index ["delivered_at", "created_at"], name: "idx_solid_mcp_messages_on_delivered_and_created"
-    t.index ["session_id", "id"], name: "idx_solid_mcp_messages_on_session_and_id"
   end
 
   create_table "tags", force: :cascade do |t|
