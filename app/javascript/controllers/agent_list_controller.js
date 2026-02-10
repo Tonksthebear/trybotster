@@ -37,7 +37,7 @@ import { ConnectionManager, HubConnection } from "connections";
  *   </div>
  */
 export default class extends Controller {
-  static targets = ["template", "list", "empty", "loading"];
+  static targets = ["template", "list", "empty", "loading", "header"];
 
   static values = {
     hubId: String,
@@ -56,7 +56,6 @@ export default class extends Controller {
 
     ConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
-      fromFragment: true,
     }).then(async (hub) => {
       this.hub = hub;
 
@@ -153,6 +152,9 @@ export default class extends Controller {
     // Toggle empty/loading/list visibility
     if (this.hasLoadingTarget) {
       this.loadingTarget.classList.add("hidden");
+    }
+    if (this.hasHeaderTarget) {
+      this.headerTarget.classList.remove("hidden");
     }
 
     if (agents.length === 0) {

@@ -42,6 +42,8 @@
 //!    ◄── Encrypted OlmEnvelope messages ──►
 //! ```
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
@@ -52,6 +54,15 @@ use vodozemac::olm::SessionConfig;
 use vodozemac::Curve25519PublicKey;
 
 use super::persistence;
+
+/// Extract the Olm identity key from a browser_identity string.
+///
+/// Browser identity format: `{olm_identity_key}:{tab_id}`.
+/// Returns the identity key portion (before first colon), or the
+/// full string if no colon is present.
+pub fn extract_olm_key(browser_identity: &str) -> &str {
+    browser_identity.split(':').next().unwrap_or(browser_identity)
+}
 
 /// Decode base64 that may or may not have padding.
 fn decode_b64(input: &str) -> Result<Vec<u8>> {
@@ -223,31 +234,31 @@ impl DeviceKeyBundle {
 }
 
 /// Serializable vodozemac crypto state for persistence.
+///
+/// Supports multiple concurrent Olm sessions (one per browser device).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VodozemacCryptoState {
     /// Pickled Account (vodozemac's serialized format).
     pub pickled_account: String,
     /// Hub ID.
     pub hub_id: String,
-    /// Pickled Session (if established).
-    pub pickled_session: Option<String>,
-    /// Peer identity key (Curve25519, base64).
-    pub peer_identity_key: Option<String>,
+    /// Pickled sessions keyed by peer identity key (Curve25519, base64).
+    #[serde(default)]
+    pub pickled_sessions: HashMap<String, String>,
 }
 
 /// Vodozemac crypto manager for CLI-side encryption.
 ///
-/// Manages a vodozemac `Account` and optional `Session` for secure
-/// communication with the browser. All operations are synchronous.
+/// Manages a vodozemac `Account` and multiple `Session`s for secure
+/// communication with browser devices. Each browser device gets its own
+/// Olm session, keyed by the browser's Curve25519 identity key.
 pub struct VodozemacCrypto {
     /// The vodozemac Olm account.
     account: Account,
-    /// Active Olm session (established after first PreKey message).
-    session: Option<Session>,
+    /// Active Olm sessions keyed by peer identity key (Curve25519 base64).
+    sessions: HashMap<String, Session>,
     /// Our Curve25519 identity key (base64 unpadded, cached).
     identity_key: String,
-    /// Peer's Curve25519 identity key (base64 unpadded).
-    peer_identity_key: Option<String>,
     /// Hub identifier.
     hub_id: String,
 }
@@ -256,7 +267,7 @@ impl std::fmt::Debug for VodozemacCrypto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VodozemacCrypto")
             .field("hub_id", &self.hub_id)
-            .field("has_session", &self.session.is_some())
+            .field("session_count", &self.sessions.len())
             .finish_non_exhaustive()
     }
 }
@@ -275,9 +286,8 @@ impl VodozemacCrypto {
 
         Self {
             account,
-            session: None,
+            sessions: HashMap::new(),
             identity_key,
-            peer_identity_key: None,
             hub_id: hub_id.to_string(),
         }
     }
@@ -309,22 +319,19 @@ impl VodozemacCrypto {
         let account = Account::from(pickle);
         let identity_key = account.curve25519_key().to_base64();
 
-        let session = state
-            .pickled_session
-            .as_deref()
-            .map(|pickled| -> Result<Session> {
-                let pickle: vodozemac::olm::SessionPickle =
-                    serde_json::from_str(pickled)
-                        .context("Failed to deserialize SessionPickle")?;
-                Ok(Session::from(pickle))
-            })
-            .transpose()?;
+        let mut sessions = HashMap::new();
+
+        for (peer_key, pickled) in &state.pickled_sessions {
+            let pickle: vodozemac::olm::SessionPickle =
+                serde_json::from_str(pickled)
+                    .context("Failed to deserialize SessionPickle")?;
+            sessions.insert(peer_key.clone(), Session::from(pickle));
+        }
 
         Ok(Self {
             account,
-            session,
+            sessions,
             identity_key,
-            peer_identity_key: state.peer_identity_key,
             hub_id: hub_id.to_string(),
         })
     }
@@ -381,20 +388,20 @@ impl VodozemacCrypto {
         &self.identity_key
     }
 
-    /// Check if we have an active Olm session.
+    /// Check if we have an active Olm session for any peer.
     pub fn has_session(&self) -> bool {
-        self.session.is_some()
+        !self.sessions.is_empty()
     }
 
-    /// Encrypt plaintext bytes, returning an `OlmEnvelope`.
+    /// Encrypt plaintext bytes for a specific peer, returning an `OlmEnvelope`.
     ///
-    /// Requires an established session (via `create_inbound_session` or
-    /// `create_outbound_session`).
-    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<OlmEnvelope> {
+    /// `peer_key` is the peer's Curve25519 identity key (base64).
+    /// Requires an established session with that peer.
+    pub fn encrypt(&mut self, plaintext: &[u8], peer_key: &str) -> Result<OlmEnvelope> {
         let session = self
-            .session
-            .as_mut()
-            .context("No Olm session established")?;
+            .sessions
+            .get_mut(peer_key)
+            .with_context(|| format!("No Olm session for peer {}...", &peer_key[..peer_key.len().min(16)]))?;
 
         let olm_message = session.encrypt(plaintext);
 
@@ -416,10 +423,9 @@ impl VodozemacCrypto {
 
     /// Decrypt an `OlmEnvelope`, returning plaintext bytes.
     ///
-    /// For PreKey messages: if an existing session can decrypt it (same
-    /// outbound session, OTK already consumed), uses the session directly.
-    /// Otherwise creates a new inbound session (first PreKey or re-pairing).
-    /// For Normal messages: uses the existing session.
+    /// For PreKey messages: looks up existing session by sender_key, or creates
+    /// a new inbound session. Supports multiple concurrent browser sessions.
+    /// For Normal messages: tries all sessions (few sessions, fast HMAC fail).
     pub fn decrypt(&mut self, envelope: &OlmEnvelope) -> Result<Vec<u8>> {
         let ciphertext_bytes = STANDARD_NO_PAD
             .decode(&envelope.ciphertext)
@@ -430,27 +436,27 @@ impl VodozemacCrypto {
                 let prekey_message = vodozemac::olm::PreKeyMessage::try_from(ciphertext_bytes.as_slice())
                     .map_err(|e| anyhow::anyhow!("Invalid PreKey message: {e}"))?;
 
-                // If we already have a session, try decrypting with it first.
-                // An outbound Olm session sends ALL messages as PreKey until it
-                // receives a response, so the existing inbound session must handle
-                // subsequent PreKey messages from the same outbound session.
-                if let Some(session) = self.session.as_mut() {
+                let sender_key = envelope
+                    .sender_key
+                    .as_deref()
+                    .context("PreKey message missing sender_key")?;
+
+                // Try existing session for this sender first (outbound session
+                // sends ALL messages as PreKey until it receives a response).
+                if let Some(session) = self.sessions.get_mut(sender_key) {
                     let olm_msg = OlmMessage::PreKey(prekey_message.clone());
                     match session.decrypt(&olm_msg) {
                         Ok(plaintext) => return Ok(plaintext),
                         Err(e) => {
                             log::debug!(
-                                "Existing session couldn't decrypt PreKey (new pairing?): {e}"
+                                "Existing session for peer {}... couldn't decrypt PreKey (re-pairing?): {e}",
+                                &sender_key[..sender_key.len().min(16)]
                             );
                         }
                     }
                 }
 
-                // No session or existing session failed — create new inbound session.
-                let sender_key = envelope
-                    .sender_key
-                    .as_deref()
-                    .context("PreKey message missing sender_key")?;
+                // No session for this sender, or existing one failed — create new.
                 let sender_curve25519 = Curve25519PublicKey::from_base64(sender_key)
                     .map_err(|e| anyhow::anyhow!("Invalid sender Curve25519 key: {e}"))?;
 
@@ -459,12 +465,12 @@ impl VodozemacCrypto {
                     .create_inbound_session(sender_curve25519, &prekey_message)
                     .map_err(|e| anyhow::anyhow!("Failed to create inbound session: {e}"))?;
 
-                self.session = Some(result.session);
-                self.peer_identity_key = Some(sender_key.to_string());
+                self.sessions.insert(sender_key.to_string(), result.session);
 
                 log::info!(
-                    "Created inbound Olm session from PreKey (peer: {}...)",
-                    &sender_key[..sender_key.len().min(16)]
+                    "Created inbound Olm session from PreKey (peer: {}..., total sessions: {})",
+                    &sender_key[..sender_key.len().min(16)],
+                    self.sessions.len()
                 );
 
                 Ok(result.plaintext)
@@ -473,16 +479,19 @@ impl VodozemacCrypto {
                 let normal_message = vodozemac::olm::Message::try_from(ciphertext_bytes.as_slice())
                     .map_err(|e| anyhow::anyhow!("Invalid Normal message: {e}"))?;
 
-                let session = self
-                    .session
-                    .as_mut()
-                    .context("No session for Normal message decryption")?;
+                // Try all sessions — there are typically 1-3, and wrong sessions
+                // fail fast on HMAC check.
+                for session in self.sessions.values_mut() {
+                    match session.decrypt(&OlmMessage::Normal(normal_message.clone())) {
+                        Ok(plaintext) => return Ok(plaintext),
+                        Err(_) => continue,
+                    }
+                }
 
-                let plaintext = session
-                    .decrypt(&OlmMessage::Normal(normal_message))
-                    .map_err(|e| anyhow::anyhow!("Olm decryption failed: {e}"))?;
-
-                Ok(plaintext)
+                anyhow::bail!(
+                    "No session could decrypt Normal message ({} sessions tried)",
+                    self.sessions.len()
+                )
             }
             other => anyhow::bail!("Unknown message type: {other}"),
         }
@@ -490,18 +499,17 @@ impl VodozemacCrypto {
 
     // ========== Binary DataChannel API (zero base64, zero JSON) ==========
 
-    /// Encrypt plaintext into a binary DataChannel frame.
+    /// Encrypt plaintext into a binary DataChannel frame for a specific peer.
     ///
     /// Output: `[message_type: 1][raw Olm ciphertext]` (Normal)
     /// or: `[message_type: 1][32-byte sender key][raw Olm ciphertext]` (PreKey).
     ///
-    /// This is the efficient path for DataChannel (binary-native transport).
-    /// ActionCable signaling uses `encrypt()` → `OlmEnvelope` (JSON) instead.
-    pub fn encrypt_binary(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    /// `peer_key` is the peer's Curve25519 identity key (base64).
+    pub fn encrypt_binary(&mut self, plaintext: &[u8], peer_key: &str) -> Result<Vec<u8>> {
         let session = self
-            .session
-            .as_mut()
-            .context("No Olm session established")?;
+            .sessions
+            .get_mut(peer_key)
+            .with_context(|| format!("No Olm session for peer {}...", &peer_key[..peer_key.len().min(16)]))?;
 
         let olm_message = session.encrypt(plaintext);
 
@@ -540,21 +548,22 @@ impl VodozemacCrypto {
                     .try_into()
                     .expect("slice is exactly 32 bytes");
                 let sender_curve25519 = Curve25519PublicKey::from_bytes(sender_key_bytes);
+                let sender_key_b64 = sender_curve25519.to_base64();
                 let ciphertext = &data[33..];
 
                 let prekey_message =
                     vodozemac::olm::PreKeyMessage::try_from(ciphertext)
                         .map_err(|e| anyhow::anyhow!("Invalid PreKey message: {e}"))?;
 
-                // Try existing session first (outbound session sends PreKey
-                // until ratcheted by a response).
-                if let Some(session) = self.session.as_mut() {
+                // Try existing session for this sender first.
+                if let Some(session) = self.sessions.get_mut(&sender_key_b64) {
                     let olm_msg = OlmMessage::PreKey(prekey_message.clone());
                     match session.decrypt(&olm_msg) {
                         Ok(plaintext) => return Ok(plaintext),
                         Err(e) => {
                             log::debug!(
-                                "Existing session couldn't decrypt PreKey: {e}"
+                                "Existing session for peer {}... couldn't decrypt PreKey: {e}",
+                                &sender_key_b64[..sender_key_b64.len().min(16)]
                             );
                         }
                     }
@@ -565,14 +574,12 @@ impl VodozemacCrypto {
                     .create_inbound_session(sender_curve25519, &prekey_message)
                     .map_err(|e| anyhow::anyhow!("Failed to create inbound session: {e}"))?;
 
-                self.session = Some(result.session);
-                self.peer_identity_key = Some(sender_curve25519.to_base64());
+                self.sessions.insert(sender_key_b64.clone(), result.session);
 
                 log::info!(
-                    "Created inbound Olm session from binary PreKey (peer: {}...)",
-                    &self.peer_identity_key.as_ref().unwrap()[..16.min(
-                        self.peer_identity_key.as_ref().unwrap().len()
-                    )]
+                    "Created inbound Olm session from binary PreKey (peer: {}..., total sessions: {})",
+                    &sender_key_b64[..sender_key_b64.len().min(16)],
+                    self.sessions.len()
                 );
 
                 Ok(result.plaintext)
@@ -583,16 +590,18 @@ impl VodozemacCrypto {
                     vodozemac::olm::Message::try_from(ciphertext)
                         .map_err(|e| anyhow::anyhow!("Invalid Normal message: {e}"))?;
 
-                let session = self
-                    .session
-                    .as_mut()
-                    .context("No session for Normal message")?;
+                // Try all sessions.
+                for session in self.sessions.values_mut() {
+                    match session.decrypt(&OlmMessage::Normal(normal_message.clone())) {
+                        Ok(plaintext) => return Ok(plaintext),
+                        Err(_) => continue,
+                    }
+                }
 
-                let plaintext = session
-                    .decrypt(&OlmMessage::Normal(normal_message))
-                    .map_err(|e| anyhow::anyhow!("Olm decryption failed: {e}"))?;
-
-                Ok(plaintext)
+                anyhow::bail!(
+                    "No session could decrypt binary Normal message ({} sessions tried)",
+                    self.sessions.len()
+                )
             }
             other => anyhow::bail!("Unknown binary message type: 0x{other:02x}"),
         }
@@ -605,25 +614,25 @@ impl VodozemacCrypto {
         let pickled_account = serde_json::to_string(&self.account.pickle())
             .context("Failed to serialize AccountPickle")?;
 
-        let pickled_session = self
-            .session
-            .as_ref()
-            .map(|s| serde_json::to_string(&s.pickle()))
-            .transpose()
-            .context("Failed to serialize SessionPickle")?;
+        let mut pickled_sessions = HashMap::new();
+        for (peer_key, session) in &self.sessions {
+            let pickled = serde_json::to_string(&session.pickle())
+                .context("Failed to serialize SessionPickle")?;
+            pickled_sessions.insert(peer_key.clone(), pickled);
+        }
 
         let state = VodozemacCryptoState {
             pickled_account,
             hub_id: self.hub_id.clone(),
-            pickled_session,
-            peer_identity_key: self.peer_identity_key.clone(),
+            pickled_sessions,
         };
 
         persistence::save_vodozemac_crypto_store(&self.hub_id, &state)?;
 
         log::debug!(
-            "Persisted vodozemac crypto state for hub {}",
-            &self.hub_id[..self.hub_id.len().min(8)]
+            "Persisted vodozemac crypto state for hub {} ({} sessions)",
+            &self.hub_id[..self.hub_id.len().min(8)],
+            self.sessions.len()
         );
 
         Ok(())
@@ -651,8 +660,7 @@ impl VodozemacCrypto {
             .account
             .create_outbound_session(SessionConfig::version_2(), identity, otk);
 
-        self.session = Some(session);
-        self.peer_identity_key = Some(peer_identity_key.to_string());
+        self.sessions.insert(peer_identity_key.to_string(), session);
         Ok(())
     }
 }
@@ -733,6 +741,8 @@ mod tests {
         // Create two accounts to simulate CLI and browser
         let mut cli = VodozemacCrypto::new("test-roundtrip-cli");
         let mut browser = VodozemacCrypto::new("test-roundtrip-browser");
+        let cli_key = cli.identity_key().to_string();
+        let browser_key = browser.identity_key().to_string();
 
         // CLI generates bundle, browser creates outbound session
         let bundle = cli.build_device_key_bundle().unwrap();
@@ -742,7 +752,7 @@ mod tests {
 
         // Browser encrypts (PreKey message)
         let plaintext = b"Hello from browser!";
-        let envelope = browser.encrypt(plaintext).unwrap();
+        let envelope = browser.encrypt(plaintext, &cli_key).unwrap();
         assert_eq!(envelope.message_type, MSG_TYPE_PREKEY);
 
         // CLI decrypts (creates inbound session)
@@ -752,7 +762,7 @@ mod tests {
 
         // CLI encrypts back (Normal message)
         let reply = b"Hello from CLI!";
-        let reply_envelope = cli.encrypt(reply).unwrap();
+        let reply_envelope = cli.encrypt(reply, &browser_key).unwrap();
         assert_eq!(reply_envelope.message_type, MSG_TYPE_NORMAL);
 
         // Browser decrypts
@@ -815,6 +825,8 @@ mod tests {
     fn test_multiple_prekey_messages_before_reply() {
         let mut cli = VodozemacCrypto::new("test-multi-prekey-cli");
         let mut browser = VodozemacCrypto::new("test-multi-prekey-browser");
+        let cli_key = cli.identity_key().to_string();
+        let browser_key = browser.identity_key().to_string();
 
         let bundle = cli.build_device_key_bundle().unwrap();
         browser
@@ -826,7 +838,7 @@ mod tests {
         let mut envelopes = Vec::new();
         for i in 0..5 {
             let msg = format!("browser msg {i}");
-            let env = browser.encrypt(msg.as_bytes()).unwrap();
+            let env = browser.encrypt(msg.as_bytes(), &cli_key).unwrap();
             assert_eq!(env.message_type, MSG_TYPE_PREKEY, "msg {i} should be PreKey");
             envelopes.push((msg, env));
         }
@@ -838,13 +850,13 @@ mod tests {
         }
 
         // CLI replies (Normal). Browser decrypts → session ratchets.
-        let reply_env = cli.encrypt(b"cli reply").unwrap();
+        let reply_env = cli.encrypt(b"cli reply", &browser_key).unwrap();
         assert_eq!(reply_env.message_type, MSG_TYPE_NORMAL);
         let reply_dec = browser.decrypt(&reply_env).unwrap();
         assert_eq!(reply_dec, b"cli reply");
 
         // Browser's subsequent messages are now Normal.
-        let post_ratchet = browser.encrypt(b"normal now").unwrap();
+        let post_ratchet = browser.encrypt(b"normal now", &cli_key).unwrap();
         assert_eq!(post_ratchet.message_type, MSG_TYPE_NORMAL);
         let dec = cli.decrypt(&post_ratchet).unwrap();
         assert_eq!(dec, b"normal now");
@@ -854,6 +866,8 @@ mod tests {
     fn test_multiple_messages_after_session() {
         let mut cli = VodozemacCrypto::new("test-multi-cli");
         let mut browser = VodozemacCrypto::new("test-multi-browser");
+        let cli_key = cli.identity_key().to_string();
+        let browser_key = browser.identity_key().to_string();
 
         let bundle = cli.build_device_key_bundle().unwrap();
         browser
@@ -861,19 +875,19 @@ mod tests {
             .unwrap();
 
         // Establish session
-        let envelope = browser.encrypt(b"first").unwrap();
+        let envelope = browser.encrypt(b"first", &cli_key).unwrap();
         let _ = cli.decrypt(&envelope).unwrap();
 
         // Multiple messages in both directions
         for i in 0..5 {
             let msg = format!("cli message {i}");
-            let env = cli.encrypt(msg.as_bytes()).unwrap();
+            let env = cli.encrypt(msg.as_bytes(), &browser_key).unwrap();
             assert_eq!(env.message_type, MSG_TYPE_NORMAL);
             let dec = browser.decrypt(&env).unwrap();
             assert_eq!(dec, msg.as_bytes());
 
             let msg2 = format!("browser message {i}");
-            let env2 = browser.encrypt(msg2.as_bytes()).unwrap();
+            let env2 = browser.encrypt(msg2.as_bytes(), &cli_key).unwrap();
             assert_eq!(env2.message_type, MSG_TYPE_NORMAL);
             let dec2 = cli.decrypt(&env2).unwrap();
             assert_eq!(dec2, msg2.as_bytes());
@@ -884,6 +898,8 @@ mod tests {
     fn test_binary_encrypt_decrypt_round_trip() {
         let mut cli = VodozemacCrypto::new("test-binary-rt-cli");
         let mut browser = VodozemacCrypto::new("test-binary-rt-browser");
+        let cli_key = cli.identity_key().to_string();
+        let browser_key = browser.identity_key().to_string();
 
         let bundle = cli.build_device_key_bundle().unwrap();
         browser
@@ -892,7 +908,7 @@ mod tests {
 
         // Browser encrypts binary (PreKey)
         let plaintext = b"binary payload";
-        let frame = browser.encrypt_binary(plaintext).unwrap();
+        let frame = browser.encrypt_binary(plaintext, &cli_key).unwrap();
         assert_eq!(frame[0], MSG_TYPE_PREKEY);
         // PreKey frame: [0x00][32 sender key][ciphertext]
         assert!(frame.len() > 33);
@@ -903,7 +919,7 @@ mod tests {
 
         // CLI encrypts binary back (Normal)
         let reply = b"binary reply";
-        let reply_frame = cli.encrypt_binary(reply).unwrap();
+        let reply_frame = cli.encrypt_binary(reply, &browser_key).unwrap();
         assert_eq!(reply_frame[0], MSG_TYPE_NORMAL);
         // Normal frame: [0x01][ciphertext]
 
@@ -914,11 +930,55 @@ mod tests {
         // Multiple binary round-trips
         for i in 0..5 {
             let msg = format!("binary msg {i}");
-            let f = cli.encrypt_binary(msg.as_bytes()).unwrap();
+            let f = cli.encrypt_binary(msg.as_bytes(), &browser_key).unwrap();
             assert_eq!(f[0], MSG_TYPE_NORMAL);
             let d = browser.decrypt_binary(&f).unwrap();
             assert_eq!(d, msg.as_bytes());
         }
+    }
+
+    /// Two browser devices connecting to the same CLI simultaneously.
+    /// Each device gets its own Olm session; messages don't interfere.
+    #[test]
+    fn test_multi_device_concurrent_sessions() {
+        let mut cli = VodozemacCrypto::new("test-multi-device-cli");
+        let mut desktop = VodozemacCrypto::new("test-multi-device-desktop");
+        let mut phone = VodozemacCrypto::new("test-multi-device-phone");
+        let cli_key = cli.identity_key().to_string();
+        let desktop_key = desktop.identity_key().to_string();
+        let phone_key = phone.identity_key().to_string();
+
+        // Desktop pairs first.
+        let bundle1 = cli.build_device_key_bundle().unwrap();
+        desktop
+            .create_outbound_session(&bundle1.curve25519_key, &bundle1.one_time_key)
+            .unwrap();
+        let env1 = desktop.encrypt(b"hello from desktop", &cli_key).unwrap();
+        let dec1 = cli.decrypt(&env1).unwrap();
+        assert_eq!(dec1, b"hello from desktop");
+
+        // Phone pairs second (needs a fresh OTK).
+        let bundle2 = cli.build_device_key_bundle().unwrap();
+        phone
+            .create_outbound_session(&bundle2.curve25519_key, &bundle2.one_time_key)
+            .unwrap();
+        let env2 = phone.encrypt(b"hello from phone", &cli_key).unwrap();
+        let dec2 = cli.decrypt(&env2).unwrap();
+        assert_eq!(dec2, b"hello from phone");
+
+        // CLI should have 2 sessions.
+        assert_eq!(cli.sessions.len(), 2);
+
+        // CLI can reply to each device independently.
+        let reply_desktop = cli.encrypt(b"reply to desktop", &desktop_key).unwrap();
+        let reply_phone = cli.encrypt(b"reply to phone", &phone_key).unwrap();
+
+        assert_eq!(desktop.decrypt(&reply_desktop).unwrap(), b"reply to desktop");
+        assert_eq!(phone.decrypt(&reply_phone).unwrap(), b"reply to phone");
+
+        // Continued messages from desktop still work (session not broken by phone).
+        let env3 = desktop.encrypt(b"desktop still here", &cli_key).unwrap();
+        assert_eq!(cli.decrypt(&env3).unwrap(), b"desktop still here");
     }
 
     #[test]

@@ -54,7 +54,11 @@ class HubsController < ApplicationController
     is_new = hub.new_record?
     hub.last_seen_at = Time.current
     hub.alive = true
-    hub.name = params[:repo] if params[:repo].present? && hub.name.blank?
+    if params[:name].present?
+      hub.name = params[:name]
+    elsif params[:repo].present? && hub.read_attribute(:name).blank?
+      hub.name = params[:repo]
+    end
 
     if params[:device_id].present?
       device = current_hub_user.devices.find_by(id: params[:device_id])
@@ -78,7 +82,7 @@ class HubsController < ApplicationController
     end
 
     Current.hub.last_seen_at = Time.current
-    Current.hub.alive = true
+    Current.hub.alive = params.key?(:alive) ? ActiveModel::Type::Boolean.new.cast(params[:alive]) : true
 
     if params[:device_id].present?
       device = current_hub_user.devices.find_by(id: params[:device_id])
@@ -87,7 +91,6 @@ class HubsController < ApplicationController
 
     if Current.hub.save
       Current.hub.sync_agents(params[:agents] || [])
-      Current.hub.broadcast_update!
 
       render json: { success: true, hub_id: Current.hub.id, e2e_enabled: Current.hub.e2e_enabled? }
     else
@@ -96,13 +99,11 @@ class HubsController < ApplicationController
   end
 
   # DELETE /hubs/:id
-  # Called when CLI shuts down gracefully
-  # Sets alive=false to mark offline while preserving hub ID for reconnection.
-  # Browser sessions are tied to hub ID, so destroying breaks reconnection.
+  # Destroys the hub record. Only called on CLI reset.
+  # Normal shutdown uses PUT with alive: false instead.
   def destroy
     if Current.hub
-      Current.hub.broadcast_removal!
-      Current.hub.update!(alive: false)
+      Current.hub.destroy!
       render json: { success: true }
     else
       render json: { success: true } # Idempotent - already gone is fine

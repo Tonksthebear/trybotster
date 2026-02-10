@@ -24,6 +24,21 @@ module Hubs
       DeviceAuthorization.find_by(device_code: json&.dig("device_code"))&.destroy
     end
 
+    test "create includes user code in verification_uri for auto-fill" do
+      post codes_path, params: { device_name: "my-laptop" }, as: :json
+
+      assert_response :success
+      json = JSON.parse(response.body)
+
+      uri = URI.parse(json["verification_uri"])
+      code_param = Rack::Utils.parse_query(uri.query)["code"]
+
+      assert_equal json["user_code"], code_param,
+        "verification_uri should include code param matching user_code"
+    ensure
+      DeviceAuthorization.find_by(device_code: json&.dig("device_code"))&.destroy
+    end
+
     test "create persists a pending device authorization" do
       assert_difference "DeviceAuthorization.count", 1 do
         post codes_path, params: { device_name: "test-cli" }, as: :json

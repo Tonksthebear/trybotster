@@ -55,8 +55,8 @@ pub use state::{build_agent_info, build_scrollback_message, build_worktree_info,
 pub use types::{AgentInfo, BrowserCommand, BrowserResize, SessionInfo, TerminalMessage, WorktreeInfo};
 
 pub use olm_crypto::{
-    binary_format, DeviceKeyBundle, OlmEnvelope, VodozemacCrypto, VodozemacCryptoState,
-    MSG_TYPE_NORMAL, MSG_TYPE_PREKEY, PROTOCOL_VERSION,
+    binary_format, extract_olm_key, DeviceKeyBundle, OlmEnvelope, VodozemacCrypto,
+    VodozemacCryptoState, MSG_TYPE_NORMAL, MSG_TYPE_PREKEY, PROTOCOL_VERSION,
 };
 
 pub use persistence::{delete_connection_url, read_connection_url, write_connection_url};

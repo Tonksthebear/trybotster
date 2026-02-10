@@ -60,7 +60,7 @@ class DetectStaleHubsJobTest < ActiveJob::TestCase
     refute hub.alive?
   end
 
-  test "calls broadcast_update on stale hubs" do
+  test "broadcasts status change when marking stale hubs offline" do
     hub = Hub.create!(
       user: @user,
       identifier: "broadcast-hub-#{SecureRandom.hex(4)}",

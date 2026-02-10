@@ -26,7 +26,6 @@ class HubCommandChannel < ApplicationCable::Channel
 
     @hub = hub
     @hub.update!(alive: true, last_seen_at: Time.current)
-    @hub.broadcast_update!
     stream_from "hub_command:#{@hub.id}"
 
     # Notify all browsers that CLI is now online
@@ -41,7 +40,6 @@ class HubCommandChannel < ApplicationCable::Channel
     return unless @hub
 
     @hub.update!(alive: false)
-    @hub.broadcast_update!
 
     # Notify all browsers that CLI is now offline
     broadcast_hub_health(HealthStatus::OFFLINE)

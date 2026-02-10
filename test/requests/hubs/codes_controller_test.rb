@@ -55,6 +55,19 @@ class Hubs::CodesControllerTest < ActionDispatch::IntegrationTest
     assert auth.expires_at > Time.current
   end
 
+  test "POST /hubs/codes includes user code in verification_uri" do
+    post codes_url, params: { device_name: "Test CLI" }.to_json, headers: json_headers
+
+    assert_response :ok
+    json = JSON.parse(response.body)
+
+    uri = URI.parse(json["verification_uri"])
+    code_param = Rack::Utils.parse_query(uri.query)["code"]
+
+    assert_equal json["user_code"], code_param,
+      "verification_uri should contain the user_code as a query param"
+  end
+
   test "POST /hubs/codes works without device_name" do
     post codes_url, params: {}.to_json, headers: json_headers
 

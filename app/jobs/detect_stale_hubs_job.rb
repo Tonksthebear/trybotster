@@ -13,9 +13,8 @@ class DetectStaleHubsJob < ApplicationJob
     stale_hubs.find_each do |hub|
       Rails.logger.info "[DetectStaleHubsJob] Marking hub #{hub.id} as offline (last seen: #{hub.last_seen_at})"
 
-      # Mark as not alive and broadcast the status change
+      # Mark as not alive — after_commit callback broadcasts sidebar + health updates
       hub.update!(alive: false)
-      hub.broadcast_update!
     end
 
     Rails.logger.info "[DetectStaleHubsJob] Processed #{stale_hubs.count} stale hubs" if stale_hubs.any?

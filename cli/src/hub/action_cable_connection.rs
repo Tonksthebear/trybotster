@@ -39,6 +39,14 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
+/// How long to wait for a `confirm_subscription` response before re-sending
+/// the subscribe command. Covers transient timing races where the confirmation
+/// is lost between the re-subscribe loop and the message loop.
+const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often to check for unconfirmed subscriptions that have timed out.
+const CONFIRM_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Message received from the hub command channel.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommandMessage {
@@ -372,6 +380,12 @@ async fn wait_for_welcome(
 /// Routes incoming messages to subscribed channels, processes outgoing perform
 /// requests, and handles runtime subscribe requests. Returns when the connection
 /// is lost or shutdown is requested.
+///
+/// # Confirmation Timeout
+///
+/// If a subscription is not confirmed within [`CONFIRM_TIMEOUT`], the subscribe
+/// command is re-sent. This handles edge cases where a confirmation message is
+/// lost due to timing races between the re-subscribe loop and the message loop.
 #[expect(
     clippy::too_many_arguments,
     reason = "connection loop needs all channel endpoints"
@@ -387,6 +401,20 @@ async fn run_message_loop(
     // Track which channels have been confirmed by the server
     let mut confirmed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Track when each subscription was sent, for confirmation timeout.
+    // Entries are removed once confirmed. Re-subscribe fires if the entry
+    // exceeds CONFIRM_TIMEOUT without confirmation.
+    let mut pending_confirm: HashMap<String, tokio::time::Instant> = subscriptions
+        .keys()
+        .map(|id| (id.clone(), tokio::time::Instant::now()))
+        .collect();
+
+    // Tick interval for checking confirmation timeouts.
+    // Uses a moderate interval so we don't spin — the timeout itself is what
+    // matters, not sub-second precision on the retry.
+    let mut confirm_check = tokio::time::interval(CONFIRM_CHECK_INTERVAL);
+    confirm_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         if config.shutdown.load(Ordering::SeqCst) {
             log::info!("[ActionCable] Shutdown requested, closing connection");
@@ -399,7 +427,7 @@ async fn run_message_loop(
             msg = reader.recv() => {
                 match msg {
                     Some(Ok(crate::ws::WsMessage::Text(text))) => {
-                        match handle_text_message(&text, subscriptions, &mut confirmed).await {
+                        match handle_text_message(&text, subscriptions, &mut confirmed, &mut pending_confirm).await {
                             TextMessageResult::Continue => {}
                             TextMessageResult::Disconnected => return ConnectionLoopExit::Disconnected,
                         }
@@ -438,6 +466,7 @@ async fn run_message_loop(
                     return ConnectionLoopExit::Disconnected;
                 }
                 log::debug!("[ActionCable] Sent runtime subscribe command");
+                pending_confirm.insert(identifier, tokio::time::Instant::now());
             }
 
             // Process outgoing perform requests
@@ -467,9 +496,41 @@ async fn run_message_loop(
                     log::trace!("[ActionCable] Sent perform '{}'", request.action);
                 } else {
                     log::debug!(
-                        "[ActionCable] Dropping perform '{}' -- channel not yet confirmed",
-                        request.action
+                        "[ActionCable] Dropping perform '{}' -- channel not yet confirmed (identifier={}, confirmed={:?})",
+                        request.action,
+                        &request.identifier[..request.identifier.len().min(80)],
+                        confirmed
                     );
+                }
+            }
+
+            // Check for unconfirmed subscriptions that have timed out
+            _ = confirm_check.tick() => {
+                let now = tokio::time::Instant::now();
+                let timed_out: Vec<String> = pending_confirm
+                    .iter()
+                    .filter(|(_, sent_at)| now.duration_since(**sent_at) >= CONFIRM_TIMEOUT)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+
+                for identifier in timed_out {
+                    log::warn!(
+                        "[ActionCable] Subscription not confirmed after {}s, re-sending subscribe (identifier={})",
+                        CONFIRM_TIMEOUT.as_secs(),
+                        &identifier[..identifier.len().min(80)]
+                    );
+
+                    let subscribe_cmd = serde_json::json!({
+                        "command": "subscribe",
+                        "identifier": identifier
+                    });
+                    if let Err(e) = writer.send_text(&subscribe_cmd.to_string()).await {
+                        log::warn!("[ActionCable] Failed to re-send subscribe: {}", e);
+                        return ConnectionLoopExit::Disconnected;
+                    }
+
+                    // Reset the timer for this subscription
+                    pending_confirm.insert(identifier, tokio::time::Instant::now());
                 }
             }
         }
@@ -488,22 +549,42 @@ enum TextMessageResult {
 ///
 /// Routes data messages to the appropriate channel by matching the `identifier`
 /// field. Handles subscription confirmations, rejections, pings, and disconnects.
+/// Clears the `pending_confirm` timer on successful confirmation.
 async fn handle_text_message(
     text: &str,
     subscriptions: &mut HashMap<String, mpsc::Sender<serde_json::Value>>,
     confirmed: &mut std::collections::HashSet<String>,
+    pending_confirm: &mut HashMap<String, tokio::time::Instant>,
 ) -> TextMessageResult {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+        log::warn!("[ActionCable] Failed to parse message as JSON: {}", &text[..text.len().min(100)]);
         return TextMessageResult::Continue;
     };
 
     let msg_type = json.get("type").and_then(|t| t.as_str());
+    log::debug!(
+        "[ActionCable] Received message type={:?} identifier={}",
+        msg_type,
+        json.get("identifier")
+            .and_then(|i| i.as_str())
+            .map(|s| &s[..s.len().min(60)])
+            .unwrap_or("none")
+    );
 
     match msg_type {
         Some("confirm_subscription") => {
             if let Some(identifier) = json.get("identifier").and_then(|i| i.as_str()) {
                 confirmed.insert(identifier.to_string());
-                log::info!("[ActionCable] Subscription confirmed for channel");
+                pending_confirm.remove(identifier);
+                log::info!(
+                    "[ActionCable] Subscription confirmed for channel (identifier={})",
+                    &identifier[..identifier.len().min(80)]
+                );
+            } else {
+                log::warn!(
+                    "[ActionCable] Subscription confirmed but no identifier field in: {}",
+                    &text[..text.len().min(200)]
+                );
             }
             TextMessageResult::Continue
         }
@@ -514,6 +595,7 @@ async fn handle_text_message(
                     identifier
                 );
                 subscriptions.remove(identifier);
+                pending_confirm.remove(identifier);
             }
             TextMessageResult::Continue
         }

@@ -27,6 +27,9 @@ pub struct Config {
     pub max_sessions: usize,
     /// Base directory for creating worktrees.
     pub worktree_base: PathBuf,
+    /// User-chosen hub name (set during first-time auth flow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_name: Option<String>,
 }
 
 impl Default for Config {
@@ -55,6 +58,7 @@ impl Default for Config {
             agent_timeout: 3600,
             max_sessions: 20,
             worktree_base,
+            hub_name: None,
         }
     }
 }

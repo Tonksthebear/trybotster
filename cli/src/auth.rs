@@ -81,43 +81,32 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
     let device_code: DeviceCodeResponse =
         response.json().context("Invalid device code response")?;
 
-    // Step 2: Display instructions to user
+    // Step 2: Display instructions
     println!();
-    println!("  To authenticate, visit:");
+    println!("  To authorize, visit:");
     println!();
     println!("    {}", device_code.verification_uri);
     println!();
-    println!("  And enter this code:");
-    println!();
-    println!("    {}", device_code.user_code);
+    println!("  Code: {}", device_code.user_code);
     println!();
 
-    // Check if we're in interactive mode (TTY)
+    // Open browser on Enter (synchronous — no background thread)
     let interactive = atty::is(atty::Stream::Stdin)
         && std::env::var("BOTSTER_NO_BROWSER").is_err()
         && std::env::var("CI").is_err();
 
-    // Spawn a thread to listen for Enter key to open browser
-    let verification_uri = device_code.verification_uri.clone();
-    let browser_thread = if interactive {
-        println!("  Press Enter to open browser...");
-        println!();
-        Some(thread::spawn(move || {
-            let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_ok() {
-                match open_browser(&verification_uri) {
-                    Ok(()) => println!("\r  Browser opened.                    "),
-                    Err(e) => println!("\r  Could not open browser: {}         ", e),
-                }
-            }
-        }))
-    } else {
-        println!("  Waiting for authorization...");
-        println!();
-        None
-    };
+    if interactive {
+        print!("  Press Enter to open browser...");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        let _ = io::stdin().read_line(&mut input);
+        match open_browser(&device_code.verification_uri) {
+            Ok(()) => println!("  Browser opened."),
+            Err(e) => println!("  Could not open browser: {}", e),
+        }
+    }
 
-    print!("  Polling");
+    print!("  Waiting for approval");
     io::stdout().flush()?;
 
     // Step 3: Poll for authorization
@@ -143,8 +132,6 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
                 println!();
                 println!("  Authorized successfully!");
                 println!();
-                // Browser thread will be dropped/ignored
-                drop(browser_thread);
                 return Ok(token);
             }
             202 => {
@@ -168,17 +155,14 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
                     }
                     "expired_token" => {
                         println!();
-                        drop(browser_thread);
                         anyhow::bail!("Authorization code expired. Please try again.");
                     }
                     "access_denied" => {
                         println!();
-                        drop(browser_thread);
                         anyhow::bail!("Authorization was denied.");
                     }
                     _ => {
                         println!();
-                        drop(browser_thread);
                         anyhow::bail!("Authorization failed: {}", error.error);
                     }
                 }
@@ -197,8 +181,46 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
     }
 
     println!();
-    drop(browser_thread);
     anyhow::bail!("Authorization timed out. Please try again.")
+}
+
+/// Prompt the user to name their hub during first-time setup.
+///
+/// Detects the current git repo name as a default. Returns the chosen name.
+pub fn prompt_hub_name() -> Result<String> {
+    let repo_name = std::env::var("BOTSTER_REPO")
+        .ok()
+        .or_else(|| {
+            crate::git::WorktreeManager::detect_current_repo()
+                .map(|(_, name)| name)
+                .ok()
+        });
+
+    println!();
+    println!("  Setting up a new Botster hub.");
+    println!();
+
+    let default_name = repo_name.as_deref().unwrap_or("my-hub");
+
+    if repo_name.is_some() {
+        print!("  Name this hub (Enter for \"{}\"): ", default_name);
+    } else {
+        print!("  Name this hub: ");
+    }
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    let name = if input.is_empty() {
+        default_name.to_string()
+    } else {
+        input.to_string()
+    };
+
+    println!();
+    Ok(name)
 }
 
 /// Try to open the verification URL in the user's browser.

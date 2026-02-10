@@ -801,7 +801,7 @@ impl ActionCableChannel {
             let envelope_data = if let Some(ref cs) = crypto_service {
                 // Encrypt via CryptoService (synchronous mutex lock)
                 match cs.lock() {
-                    Ok(mut guard) => match guard.encrypt(&to_encrypt) {
+                    Ok(mut guard) => match guard.encrypt(&to_encrypt, crate::relay::extract_olm_key(target.as_ref())) {
                         Ok(envelope) => {
                             serde_json::json!({
                                 "action": "relay",
@@ -1256,7 +1256,7 @@ impl ActionCableChannel {
 
         let envelope_data = if let Some(ref cs) = crypto_service {
             match cs.lock() {
-                Ok(mut guard) => match guard.encrypt(&msg_bytes) {
+                Ok(mut guard) => match guard.encrypt(&msg_bytes, crate::relay::extract_olm_key(peer.as_ref())) {
                     Ok(envelope) => {
                         serde_json::json!({
                             "action": "relay",
@@ -1317,7 +1317,7 @@ impl ActionCableChannel {
         // Encrypt if needed
         let envelope_data = if let Some(ref cs) = crypto_service {
             match cs.lock() {
-                Ok(mut guard) => match guard.encrypt(&ack_bytes) {
+                Ok(mut guard) => match guard.encrypt(&ack_bytes, crate::relay::extract_olm_key(peer.as_ref())) {
                     Ok(envelope) => {
                         serde_json::json!({
                             "action": "relay",

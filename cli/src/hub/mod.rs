@@ -696,6 +696,7 @@ mod tests {
             agent_timeout: 300,
             max_sessions: 10,
             worktree_base: PathBuf::from("/tmp/test-worktrees"),
+            hub_name: None,
         }
     }
 

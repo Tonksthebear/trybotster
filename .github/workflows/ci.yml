@@ -67,6 +67,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    environment: test
 
     services:
       postgres:
@@ -102,12 +103,13 @@ jobs:
           DB_HOST: localhost
           DB_USERNAME: postgres
           DB_PASSWORD: postgres
-          # RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
+          RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
           # REDIS_URL: redis://localhost:6379/0
         run: bin/rails db:test:prepare test
 
   system-test:
     runs-on: ubuntu-latest
+    environment: test
 
     services:
       postgres:
@@ -143,7 +145,7 @@ jobs:
           DB_HOST: localhost
           DB_USERNAME: postgres
           DB_PASSWORD: postgres
-          # RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
+          RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
           # REDIS_URL: redis://localhost:6379/0
         run: bin/rails db:test:prepare test:system
 
@@ -159,6 +161,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Install packages
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y liblua5.4-dev
+
       - name: Checkout code
         uses: actions/checkout@v5
 

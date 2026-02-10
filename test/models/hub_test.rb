@@ -1,8 +1,11 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "turbo/broadcastable/test_helper"
 
 class HubTest < ActiveSupport::TestCase
+  include Turbo::Broadcastable::TestHelper
+
   setup do
     @user = User.create!(
       email: "hub_test_user@example.com",
@@ -303,6 +306,73 @@ class HubTest < ActiveSupport::TestCase
     assert_equal 2, seq2
     assert_equal 3, seq3
   end
+
+  # ==========================================================================
+  # Turbo Stream Broadcasts
+  # ==========================================================================
+
+  test "creating hub broadcasts hubs list update" do
+    assert_turbo_stream_broadcasts [ @user, :hubs ] do
+      Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current)
+    end
+  end
+
+  test "updating hub broadcasts hubs list update" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: 1.minute.ago, alive: true)
+
+    assert_turbo_stream_broadcasts [ @user, :hubs ] do
+      hub.update!(last_seen_at: Time.current)
+    end
+  end
+
+  test "destroying hub broadcasts hubs list update" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current)
+
+    assert_turbo_stream_broadcasts [ @user, :hubs ] do
+      hub.destroy!
+    end
+  end
+
+  test "hubs list broadcast targets both sidebars" do
+    streams = capture_turbo_stream_broadcasts [ @user, :hubs ] do
+      Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current)
+    end
+
+    assert_equal 1, streams.size
+    assert_equal "update", streams.first["action"]
+    assert_equal ".hubs-list", streams.first["targets"]
+  end
+
+  test "destroying hub broadcasts health offline" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
+    health_stream = "hub:#{hub.id}:health"
+
+    assert_broadcast_on(health_stream, { type: "health", cli: "offline" }) do
+      hub.destroy!
+    end
+  end
+
+  test "marking hub offline broadcasts health status change" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
+    health_stream = "hub:#{hub.id}:health"
+
+    assert_broadcast_on(health_stream, { type: "health", cli: "offline" }) do
+      hub.update!(alive: false)
+    end
+  end
+
+  test "heartbeat-only update does not broadcast health when status unchanged" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: 30.seconds.ago, alive: true)
+    health_stream = "hub:#{hub.id}:health"
+
+    assert_no_broadcasts(health_stream) do
+      hub.update!(last_seen_at: Time.current)
+    end
+  end
+
+  # ==========================================================================
+  # Associations
+  # ==========================================================================
 
   test "destroying hub destroys associated hub_agents" do
     hub = Hub.create!(

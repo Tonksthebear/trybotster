@@ -49,10 +49,15 @@ fn ensure_authenticated() -> Result<()> {
 
     // Check if we have a token at all
     if !config.has_token() {
-        println!("No authentication token found. Starting device authorization...");
+        // Name the hub first, then authenticate
+        let hub_name = auth::prompt_hub_name()?;
+        config.hub_name = Some(hub_name);
+
         let token_response = auth::device_flow(&config.server_url)?;
         save_tokens(&mut config, &token_response)?;
-        println!("Tokens saved successfully.");
+        config.save()?;
+        println!("  Setup complete.");
+        println!();
 
         // Verify the token was saved correctly by reloading
         let verify_config = Config::load()?;
