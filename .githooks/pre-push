@@ -32,10 +32,21 @@ if [ -z "$CHANGED_FILES" ]; then
     echo -e "${GREEN}No Ruby files changed, skipping Rubocop${NC}"
 else
     echo "Checking $(echo "$CHANGED_FILES" | wc -l | tr -d ' ') files..."
+    # Auto-correct first, then check if clean
+    echo "$CHANGED_FILES" | xargs bundle exec rubocop --force-exclusion --parallel -A 2>/dev/null || true
+
+    # If rubocop modified any files, stage and amend the commit
+    if ! git diff --quiet -- $CHANGED_FILES 2>/dev/null; then
+        echo -e "${YELLOW}Rubocop auto-corrected files, amending commit...${NC}"
+        echo "$CHANGED_FILES" | xargs git add
+        git commit --amend --no-edit --no-verify
+    fi
+
+    # Final check — fail only if unfixable issues remain
     if echo "$CHANGED_FILES" | xargs bundle exec rubocop --force-exclusion --parallel; then
         echo -e "${GREEN}Rubocop passed!${NC}"
     else
-        echo -e "${RED}Rubocop failed!${NC}"
+        echo -e "${RED}Rubocop found issues that can't be auto-corrected!${NC}"
         FAILED=1
     fi
 fi
