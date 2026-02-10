@@ -29,22 +29,22 @@ class CliHubRegistrationTest < CliIntegrationTestCase
     assert @hub.last_seen_at > 5.seconds.ago, "Hub should have been seen recently"
   end
 
-  test "CLI creates connection URL with Signal PreKeyBundle" do
+  test "CLI creates connection URL with vodozemac DeviceKeyBundle" do
     cli = start_cli(@hub, timeout: 20)
 
     connection_url = cli.connection_url
     assert connection_url.present?, "Connection URL should be available"
 
     # URL format: /hubs/{id}#{base32_bundle}
-    # Fragment contains raw Base32-encoded PreKeyBundle (no prefix for QR efficiency)
+    # Fragment contains raw Base32-encoded DeviceKeyBundle (no prefix for QR efficiency)
     uri = URI.parse(connection_url)
-    assert uri.fragment.present?, "URL should have fragment with PreKeyBundle"
+    assert uri.fragment.present?, "URL should have fragment with DeviceKeyBundle"
 
     # Bundle should be Base32-encoded data (uppercase A-Z, 2-7)
     assert uri.fragment.match?(/\A[A-Z2-7]+\z/),
       "Fragment should be raw Base32 encoded. Got: #{uri.fragment[0..50]}..."
-    assert uri.fragment.length > 2800,
-      "Bundle should be ~2900 chars for Kyber keys. Got: #{uri.fragment.length}"
+    assert uri.fragment.length >= 250,
+      "Bundle should be ~258 chars for v6 vodozemac bundle (161 bytes). Got: #{uri.fragment.length}"
   end
 
   test "CLI updates hub last_seen_at on registration" do
