@@ -1,13 +1,13 @@
-// Build script for botster-hub CLI.
-//
-// Embeds all Lua files from the `lua/` directory into the binary at compile time.
-// This allows the CLI to run without external Lua files in release mode.
-//
-// Generated file: `$OUT_DIR/embedded_lua.rs`
-//
-// The generated module provides:
-// - `EMBEDDED_LUA_FILES`: Array of (path, content) tuples
-// - `get_embedded_lua(path) -> Option<&'static str>`: Lookup function
+//! Build script for botster-hub CLI.
+//!
+//! Embeds all Lua files from the `lua/` directory into the binary at compile time.
+//! This allows the CLI to run without external Lua files in release mode.
+//!
+//! Generated file: `$OUT_DIR/embedded_lua.rs`
+//!
+//! The generated module provides:
+//! - `EMBEDDED_LUA_FILES`: Array of (path, content) tuples
+//! - `get_embedded_lua(path) -> Option<&'static str>`: Lookup function
 
 use std::env;
 use std::fs::{self, File};

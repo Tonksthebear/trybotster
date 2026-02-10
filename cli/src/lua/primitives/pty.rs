@@ -264,6 +264,7 @@ impl LuaUserData for PtySessionHandle {
 ///
 /// Represents an active PTY-to-WebRTC forwarder. Lua can check status
 /// and stop the forwarder. The actual streaming is handled by Rust.
+#[derive(Debug)]
 pub struct PtyForwarder {
     /// Unique forwarder identifier: "{peer_id}:{agent_index}:{pty_index}".
     pub id: String,

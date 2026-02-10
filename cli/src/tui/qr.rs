@@ -23,35 +23,6 @@ pub struct ConnectionCodeData {
     pub qr_ascii: Vec<String>,
 }
 
-/// Generate QR code from data using optimal encoding.
-fn generate_qr_code(data: &str) -> Option<QrCode> {
-    let is_alphanumeric_char =
-        |c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || " $%*+-./:".contains(c);
-
-    // Try different error correction levels
-    for ec_level in [QrCodeEcc::Quartile, QrCodeEcc::Medium, QrCodeEcc::Low] {
-        let code_result = build_mixed_mode_segments(data, &is_alphanumeric_char)
-            .and_then(|segments| {
-                QrCode::encode_segments_advanced(
-                    &segments,
-                    ec_level,
-                    qrcodegen::Version::MIN,
-                    qrcodegen::Version::MAX,
-                    None,
-                    true,
-                )
-                .ok()
-            })
-            .map(Ok)
-            .unwrap_or_else(|| QrCode::encode_text(data, ec_level));
-
-        if let Ok(code) = code_result {
-            return Some(code);
-        }
-    }
-    None
-}
-
 /// Build mixed-mode QR segments: byte for URL, alphanumeric for Base32 bundle.
 ///
 /// Simple split on `#`:

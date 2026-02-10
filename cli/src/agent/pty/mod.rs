@@ -88,7 +88,7 @@ pub mod pty_index {
 /// wrapped in the outer `Mutex` of `PtySession::shared_state`.
 ///
 /// Exposed as `pub(crate)` to allow direct sync I/O from `PtyHandle`.
-pub(crate) struct SharedPtyState {
+pub struct SharedPtyState {
     /// Master PTY for resizing operations.
     pub(crate) master_pty: Option<Box<dyn MasterPty + Send>>,
 

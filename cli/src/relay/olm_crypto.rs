@@ -46,7 +46,9 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use vodozemac::olm::{Account, OlmMessage, Session, SessionConfig};
+use vodozemac::olm::{Account, OlmMessage, Session};
+#[cfg(test)]
+use vodozemac::olm::SessionConfig;
 use vodozemac::Curve25519PublicKey;
 
 use super::persistence;

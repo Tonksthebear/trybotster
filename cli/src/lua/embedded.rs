@@ -26,7 +26,11 @@
 //! ```
 
 // Include the generated file from build.rs
-include!(concat!(env!("OUT_DIR"), "/embedded_lua.rs"));
+#[allow(missing_docs)]
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/embedded_lua.rs"));
+}
+use generated::{get_embedded_lua, EMBEDDED_LUA_FILES};
 
 /// Get embedded Lua file content by path.
 ///
