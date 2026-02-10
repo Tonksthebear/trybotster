@@ -81,7 +81,7 @@ class DetectStaleHubsJobTest < ActiveJob::TestCase
       Hub.create!(
         user: @user,
         identifier: "multi-stale-hub-#{i}-#{SecureRandom.hex(4)}",
-  
+
         alive: true,
         last_seen_at: 5.minutes.ago
       )

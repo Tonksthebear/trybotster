@@ -178,7 +178,7 @@ class Integrations::Github::Webhooks::LinkedIssueResolverTest < ActiveSupport::T
   def stub_github_api(pr_body:)
     pr_double = OpenStruct.new(body: pr_body)
     client_double = Minitest::Mock.new
-    client_double.expect(:pull_request, pr_double, [@repo, @pr_number])
+    client_double.expect(:pull_request, pr_double, [ @repo, @pr_number ])
 
     stub_valid_token do
       Github::App.stub :get_installation_for_repo, { success: true, installation_id: 111 } do
