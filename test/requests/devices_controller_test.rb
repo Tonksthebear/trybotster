@@ -212,6 +212,29 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
     assert_response :no_content
   end
 
+  test "DELETE /devices/:id cascades to destroy associated hubs" do
+    headers = auth_headers_for(:jason)
+
+    device = users(:jason).devices.create!(
+      device_type: "cli",
+      name: "Device with Hubs",
+      fingerprint: unique_fingerprint("cascade")
+    )
+
+    hub1 = users(:jason).hubs.create!(identifier: "cascade-hub-1-#{SecureRandom.hex(4)}", device: device, last_seen_at: Time.current)
+    hub2 = users(:jason).hubs.create!(identifier: "cascade-hub-2-#{SecureRandom.hex(4)}", device: device, last_seen_at: Time.current)
+
+    assert_difference -> { Hub.count }, -2 do
+      assert_difference -> { Device.count }, -1 do
+        delete device_url(device), headers: headers
+      end
+    end
+
+    assert_response :no_content
+    assert_not Hub.exists?(hub1.id), "Hub 1 should be destroyed with device"
+    assert_not Hub.exists?(hub2.id), "Hub 2 should be destroyed with device"
+  end
+
   test "DELETE /devices/:id returns 404 for other user's device" do
     # Pre-create auth headers so auth device isn't counted in assert_difference
     headers = auth_headers_for(:jason)

@@ -193,6 +193,7 @@ impl WebRtcChannelBuilder {
             config: Arc::new(Mutex::new(None)),
             recv_rx: Arc::new(Mutex::new(None)),
             recv_tx: Arc::new(Mutex::new(None)),
+            peer_olm_key: Arc::new(Mutex::new(None)),
             decrypt_failures: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -226,6 +227,8 @@ pub struct WebRtcChannel {
     recv_rx: Arc<Mutex<Option<mpsc::Receiver<RawIncoming>>>>,
     /// Send side of receive queue.
     recv_tx: Arc<Mutex<Option<mpsc::Sender<RawIncoming>>>>,
+    /// Peer's Olm identity key (set when SDP offer is handled).
+    peer_olm_key: Arc<Mutex<Option<String>>>,
     /// Consecutive decryption failure count for session health monitoring.
     decrypt_failures: Arc<AtomicU32>,
 }
@@ -411,6 +414,12 @@ impl WebRtcChannel {
             .await
             .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to set local description: {e}")))?;
 
+        // Store the peer's Olm key for encrypt routing.
+        {
+            let mut olm_key = self.peer_olm_key.lock().await;
+            *olm_key = Some(crate::relay::extract_olm_key(browser_identity).to_string());
+        }
+
         // Set up data channel handler (browser creates the channel, we receive it)
         let recv_tx = Arc::clone(&self.recv_tx);
         let peers = Arc::clone(&self.peers);
@@ -576,7 +585,7 @@ impl WebRtcChannel {
                 let envelope = if let Some(ref cs) = crypto {
                     let plaintext = serde_json::to_vec(&payload).unwrap_or_default();
                     match cs.lock() {
-                        Ok(mut guard) => match guard.encrypt(&plaintext) {
+                        Ok(mut guard) => match guard.encrypt(&plaintext, crate::relay::extract_olm_key(&browser_id)) {
                             Ok(env) => match serde_json::to_value(&env) {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -708,6 +717,8 @@ impl Channel for WebRtcChannel {
             .as_ref()
             .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
 
+        let peer_key = self.get_peer_olm_key().await?;
+
         // Binary inner: [0x00][JSON bytes] (control message)
         let mut plaintext = Vec::with_capacity(1 + msg.len());
         plaintext.push(CONTENT_MSG);
@@ -717,7 +728,7 @@ impl Channel for WebRtcChannel {
         let encrypted = cs
             .lock()
             .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext)
+            .encrypt_binary(&plaintext, &peer_key)
             .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
 
         dc.send(&bytes::Bytes::from(encrypted))
@@ -785,6 +796,15 @@ impl WebRtcChannel {
         self.decrypt_failures.store(0, Ordering::Relaxed);
     }
 
+    /// Get the peer's Olm identity key for encrypting messages.
+    async fn get_peer_olm_key(&self) -> Result<String, ChannelError> {
+        self.peer_olm_key
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| ChannelError::EncryptionError("No peer Olm key (SDP offer not yet handled)".into()))
+    }
+
     /// Check if the channel is ready for application messages.
     ///
     /// With vodozemac, the session is established on first PreKey decrypt --
@@ -837,6 +857,8 @@ impl WebRtcChannel {
                 (std::borrow::Cow::Borrowed(data), false)
             };
 
+        let peer_key = self.get_peer_olm_key().await?;
+
         // Build binary inner content: [CONTENT_PTY][flags][sub_id_len][sub_id][payload]
         let sub_bytes = subscription_id.as_bytes();
         let flags: u8 = if was_compressed { 0x01 } else { 0x00 };
@@ -851,7 +873,7 @@ impl WebRtcChannel {
         let encrypted = cs
             .lock()
             .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext)
+            .encrypt_binary(&plaintext, &peer_key)
             .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
 
         dc.send(&bytes::Bytes::from(encrypted))
@@ -881,6 +903,8 @@ impl WebRtcChannel {
             .as_ref()
             .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
 
+        let peer_key = self.get_peer_olm_key().await?;
+
         let stream_id_bytes = stream_id.to_be_bytes();
         let mut plaintext = Vec::with_capacity(4 + payload.len());
         plaintext.push(CONTENT_STREAM);
@@ -891,7 +915,7 @@ impl WebRtcChannel {
         let encrypted = cs
             .lock()
             .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext)
+            .encrypt_binary(&plaintext, &peer_key)
             .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
 
         dc.send(&bytes::Bytes::from(encrypted))

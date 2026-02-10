@@ -35,6 +35,11 @@ webrtc.on_peer_connected(function(peer_id)
 
     local client = Client.new(peer_id, make_webrtc_transport(peer_id))
     connections.register_client(peer_id, client)
+
+    -- The one-time key in the DeviceKeyBundle was consumed during the Olm
+    -- handshake.  Regenerate immediately so the next QR / share-link is fresh.
+    -- Fires connection_code_ready → broadcasts to TUI + browser.
+    connection.regenerate()
 end)
 
 -- Called when WebRTC peer disconnects

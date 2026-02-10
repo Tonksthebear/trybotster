@@ -13,8 +13,9 @@ class Hub < ApplicationRecord
   scope :stale, -> { where(alive: false).or(where("last_seen_at <= ?", 2.minutes.ago)) }
   scope :with_device, -> { where.not(device_id: nil) }
 
-  after_update_commit :update_sidebar
+  after_commit :broadcast_hubs_list
   after_update_commit :broadcast_health_status, if: :health_status_changed?
+  after_destroy_commit :broadcast_health_offline
 
   # Check if this hub supports E2E encrypted terminal access
   def e2e_enabled?
@@ -52,30 +53,6 @@ class Hub < ApplicationRecord
     end
   end
 
-  # Broadcast Turbo Stream update for sidebar hubs list
-  def broadcast_update!
-    Turbo::StreamsChannel.broadcast_update_to(
-      turbo_stream_name,
-      target: "sidebar_hubs_list",
-      partial: "layouts/sidebar_hubs",
-      locals: { hubs: user.hubs.includes(:device).order(last_seen_at: :desc) }
-    )
-  rescue => e
-    Rails.logger.warn "Failed to broadcast hub update: #{e.message}"
-  end
-
-  # Broadcast Turbo Stream update after hub removal (call before destroy)
-  def broadcast_removal!
-    Turbo::StreamsChannel.broadcast_update_to(
-      turbo_stream_name,
-      target: "sidebar_hubs_list",
-      partial: "layouts/sidebar_hubs",
-      locals: { hubs: user.hubs.includes(:device).order(last_seen_at: :desc) }
-    )
-  rescue => e
-    Rails.logger.warn "Failed to broadcast hub removal: #{e.message}"
-  end
-
   # Atomically increment and return the next message sequence number.
   # Uses row-level locking for safe concurrent access.
   def next_message_sequence!
@@ -91,18 +68,19 @@ class Hub < ApplicationRecord
     data.is_a?(ActionController::Parameters) ? data.values : Array(data)
   end
 
-  def turbo_stream_name
-    "user_#{user_id}_hubs"
+  def broadcast_hubs_list
+    Turbo::StreamsChannel.broadcast_update_to(
+      [ user, :hubs ],
+      targets: ".hubs-list",
+      partial: "layouts/sidebar_hubs",
+      locals: { hubs: user.hubs.includes(:device).order(last_seen_at: :desc) }
+    )
+  rescue => e
+    Rails.logger.warn "Failed to broadcast hubs list: #{e.message}"
   end
 
-  def update_sidebar
-    Turbo::StreamsChannel.broadcast_action_to [ user, :hubs ],
-      action: :update_attribute,
-      targets: ".#{dom_id(self, :sidebar)}",
-      content: active?.to_s,
-      attributes: {
-        attribute: "data-active"
-      }
+  def broadcast_health_offline
+    ActionCable.server.broadcast("hub:#{id}:health", { type: "health", cli: "offline" })
   end
 
   # Only broadcast when active? status actually transitions

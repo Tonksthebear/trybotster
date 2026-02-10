@@ -157,7 +157,7 @@ export default class extends Controller {
   }
 
   #getConnectionOptions() {
-    const base = { hubId: this.hubIdValue, fromFragment: true };
+    const base = { hubId: this.hubIdValue };
 
     switch (this.typeValue) {
       case "terminal":

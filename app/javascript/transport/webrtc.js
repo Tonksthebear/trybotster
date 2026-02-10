@@ -85,6 +85,14 @@ class WebRTCTransport {
     // Clean up connections on actual page unload only.
     // Turbo navigation preserves connections - they're cleaned up via grace periods
     // when controllers release them.
+    // When tab becomes visible after backgrounding, check for stale connections.
+    // Browsers throttle timers and may not fire ICE/connection state handlers
+    // while backgrounded, so connections can die silently.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") return
+      this.#probeStaleConnections()
+    })
+
     window.addEventListener("beforeunload", () => {
       // Cancel all grace timers and close immediately
       for (const timer of this.#graceTimers.values()) {
@@ -337,6 +345,36 @@ class WebRTCTransport {
       console.debug(`[WebRTCTransport] Cancelled grace period for hub ${hubId} (reacquired)`)
       clearTimeout(timer)
       this.#graceTimers.delete(hubId)
+    }
+  }
+
+  /**
+   * Check all connections for stale peers after tab becomes visible.
+   * Cleans up dead peers and emits disconnected so the connection layer
+   * can re-initiate via #ensureConnected().
+   */
+  #probeStaleConnections() {
+    for (const [hubId, conn] of this.#connections) {
+      if (!conn.pc) continue // signaling-only, nothing to probe
+
+      const pcState = conn.pc.connectionState
+      const dcState = conn.dataChannel?.readyState
+
+      // Peer is clearly dead
+      if (pcState === "failed" || pcState === "closed" || pcState === "disconnected") {
+        console.debug(`[WebRTCTransport] Stale peer detected for hub ${hubId} (pc=${pcState}), cleaning up`)
+        conn.iceRestartAttempts = 0 // reset so reconnect gets fresh attempts
+        this.#cleanupPeer(hubId, conn)
+        continue
+      }
+
+      // PC reports connected but DataChannel is gone (browser killed it while backgrounded)
+      if (pcState === "connected" && dcState !== "open") {
+        console.debug(`[WebRTCTransport] DataChannel stale for hub ${hubId} (dc=${dcState}), cleaning up peer`)
+        conn.iceRestartAttempts = 0
+        this.#cleanupPeer(hubId, conn)
+        continue
+      }
     }
   }
 
@@ -773,7 +811,19 @@ class WebRTCTransport {
   async #createSignalingChannel(hubId, browserIdentity) {
     const consumer = await this.#getConsumer()
 
-    return new Promise((resolve) => {
+    console.debug(`[WebRTCTransport] Creating signaling channel: hub=${hubId}, identity=${browserIdentity?.slice(0, 16)}...`)
+
+    return new Promise((resolve, reject) => {
+      let settled = false
+
+      const timeout = setTimeout(() => {
+        if (!settled) {
+          settled = true
+          console.error(`[WebRTCTransport] Signaling channel TIMEOUT for hub ${hubId} (15s — WebSocket may not be connected)`)
+          reject(new Error(`Signaling channel timeout for hub ${hubId}`))
+        }
+      }, 15000)
+
       const subscription = consumer.subscriptions.create(
         { channel: "HubSignalingChannel", hub_id: hubId, browser_identity: browserIdentity },
         {
@@ -781,11 +831,23 @@ class WebRTCTransport {
             this.#handleSignalingMessage(hubId, data)
           },
           connected: () => {
-            console.debug(`[WebRTCTransport] Signaling channel connected for hub ${hubId}`)
-            resolve(subscription)
+            if (!settled) {
+              settled = true
+              clearTimeout(timeout)
+              console.debug(`[WebRTCTransport] Signaling channel connected for hub ${hubId}`)
+              resolve(subscription)
+            }
           },
           disconnected: () => {
             console.debug(`[WebRTCTransport] Signaling channel disconnected for hub ${hubId}`)
+          },
+          rejected: () => {
+            if (!settled) {
+              settled = true
+              clearTimeout(timeout)
+              console.error(`[WebRTCTransport] Signaling channel REJECTED for hub ${hubId} (auth or hub not found)`)
+              reject(new Error(`Signaling channel rejected for hub ${hubId}`))
+            }
           },
         }
       )

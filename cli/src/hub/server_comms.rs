@@ -1445,7 +1445,7 @@ impl Hub {
                 let plaintext = serde_json::to_vec(&answer_payload).unwrap_or_default();
 
                 match crypto.lock() {
-                    Ok(mut guard) => match guard.encrypt(&plaintext) {
+                    Ok(mut guard) => match guard.encrypt(&plaintext, crate::relay::extract_olm_key(browser_identity)) {
                         Ok(envelope) => {
                             let envelope_value = match serde_json::to_value(&envelope) {
                                 Ok(v) => v,
@@ -1501,6 +1501,7 @@ impl Hub {
             &self.config.server_url,
             self.config.get_api_key(),
             self.device.device_id,
+            self.config.hub_name.as_deref(),
         );
         // Store server-assigned ID (used for all server communication)
         self.botster_id = Some(botster_id.clone());

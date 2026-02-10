@@ -46,6 +46,45 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_equal users(:jason), hub.user
   end
 
+  test "POST /hubs sets hub name when provided" do
+    identifier = "named-hub-#{SecureRandom.hex(8)}"
+
+    post hubs_url,
+      params: { identifier: identifier, name: "My Cool Hub" }.to_json,
+      headers: auth_headers_for(:jason)
+
+    assert_response :created
+
+    hub = Hub.find_by(identifier: identifier)
+    assert_equal "My Cool Hub", hub.name
+  end
+
+  test "POST /hubs name param overrides repo fallback" do
+    identifier = "override-hub-#{SecureRandom.hex(8)}"
+
+    post hubs_url,
+      params: { identifier: identifier, name: "Custom Name", repo: "owner/repo" }.to_json,
+      headers: auth_headers_for(:jason)
+
+    assert_response :created
+
+    hub = Hub.find_by(identifier: identifier)
+    assert_equal "Custom Name", hub.name
+  end
+
+  test "POST /hubs falls back to repo for name when name not provided" do
+    identifier = "repo-hub-#{SecureRandom.hex(8)}"
+
+    post hubs_url,
+      params: { identifier: identifier, repo: "owner/my-repo" }.to_json,
+      headers: auth_headers_for(:jason)
+
+    assert_response :created
+
+    hub = Hub.find_by(identifier: identifier)
+    assert_equal "owner/my-repo", hub.name
+  end
+
   test "POST /hubs finds existing hub by identifier and returns 200" do
     hub = hubs(:active_hub)
     original_id = hub.id
@@ -216,7 +255,40 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
   end
 
   # ==========================================================================
-  # DELETE /hubs/:id - Unregister Hub
+  # PUT /hubs/:id with alive: false - Graceful Shutdown
+  # ==========================================================================
+
+  test "PUT /hubs/:id with alive false marks hub offline" do
+    hub = hubs(:active_hub)
+    assert hub.alive?, "Precondition: hub should be alive"
+
+    put hub_url(hub),
+      params: { alive: false }.to_json,
+      headers: auth_headers_for(:jason)
+
+    assert_response :ok
+
+    hub.reload
+    refute hub.alive?, "Hub should be marked offline"
+    assert Hub.exists?(hub.id), "Hub record should still exist"
+  end
+
+  test "PUT /hubs/:id without alive param defaults to alive true" do
+    hub = hubs(:stale_hub)
+    refute hub.alive?, "Precondition: hub should be offline"
+
+    put hub_url(hub),
+      params: {}.to_json,
+      headers: auth_headers_for(:jason)
+
+    assert_response :ok
+
+    hub.reload
+    assert hub.alive?, "Hub should be marked alive by default"
+  end
+
+  # ==========================================================================
+  # DELETE /hubs/:id - Destroy Hub (CLI Reset)
   # ==========================================================================
 
   test "DELETE /hubs/:id returns 401 without authentication" do
@@ -228,11 +300,10 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_response :unauthorized
   end
 
-  test "DELETE /hubs/:id marks hub as dead but preserves record" do
+  test "DELETE /hubs/:id destroys hub record" do
     hub = hubs(:active_hub)
-    assert hub.alive?
 
-    assert_no_difference -> { Hub.count } do
+    assert_difference -> { Hub.count }, -1 do
       delete hub_url(hub),
         headers: auth_headers_for(:jason)
     end
@@ -241,10 +312,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     json = assert_json_keys(:success)
 
     assert_equal true, json["success"]
-
-    hub.reload
-    assert_not hub.alive?, "Hub should be marked as dead"
-    assert hub.persisted?, "Hub record should be preserved for reconnection"
+    assert_nil Hub.find_by(id: hub.id), "Hub should be destroyed"
   end
 
   test "DELETE /hubs/:id is idempotent for nonexistent hub" do

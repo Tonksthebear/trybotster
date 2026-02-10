@@ -318,13 +318,12 @@ mod tests {
     fn test_olm_crypto_store_persistence_roundtrip() {
         let hub_id = "test-hub-matrix-store";
 
-        // Create a test store state
-        let state = VodozemacCryptoState {
-            pickled_account: "test_pickled_account".to_string(),
-            hub_id: hub_id.to_string(),
-            pickled_session: None,
-            peer_identity_key: Some("test_peer_key".to_string()),
-        };
+        // Create a test store state with multiple sessions
+        let mut state = VodozemacCryptoState::default();
+        state.pickled_account = "test_pickled_account".to_string();
+        state.hub_id = hub_id.to_string();
+        state.pickled_sessions.insert("peer_key_1".to_string(), "pickled_session_1".to_string());
+        state.pickled_sessions.insert("peer_key_2".to_string(), "pickled_session_2".to_string());
 
         // Save
         save_vodozemac_crypto_store(hub_id, &state).unwrap();
@@ -333,7 +332,9 @@ mod tests {
         let loaded = load_vodozemac_crypto_store(hub_id).unwrap();
         assert_eq!(loaded.hub_id, hub_id);
         assert_eq!(loaded.pickled_account, "test_pickled_account");
-        assert_eq!(loaded.peer_identity_key, Some("test_peer_key".to_string()));
+        assert_eq!(loaded.pickled_sessions.len(), 2);
+        assert_eq!(loaded.pickled_sessions["peer_key_1"], "pickled_session_1");
+        assert_eq!(loaded.pickled_sessions["peer_key_2"], "pickled_session_2");
 
         // Cleanup
         let state_dir = hub_state_dir(hub_id).unwrap();

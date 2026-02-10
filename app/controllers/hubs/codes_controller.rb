@@ -14,7 +14,7 @@ module Hubs
       render json: {
         device_code: auth.device_code,
         user_code: auth.formatted_user_code,
-        verification_uri: new_users_hub_url,
+        verification_uri: new_users_hub_url(code: auth.formatted_user_code),
         expires_in: auth.expires_in,
         interval: 5
       }

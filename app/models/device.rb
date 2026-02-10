@@ -12,7 +12,7 @@
 # Browser devices always store public_key (they need it for bidirectional key exchange).
 class Device < ApplicationRecord
   belongs_to :user
-  has_many :hubs, dependent: :nullify
+  has_many :hubs, dependent: :destroy
   has_one :device_token, dependent: :destroy
   has_one :mcp_token, class_name: "Integrations::Github::MCPToken", dependent: :destroy
 

@@ -61,6 +61,7 @@ pub fn register_hub_with_server(
     server_url: &str,
     api_key: &str,
     device_id: Option<i64>,
+    hub_name: Option<&str>,
 ) -> String {
     // Detect repo: env var > git detection (optional — not stored on server)
     let repo_name: Option<String> = std::env::var("BOTSTER_REPO")
@@ -83,6 +84,9 @@ pub fn register_hub_with_server(
     });
     if let Some(ref repo) = repo_name {
         payload["repo"] = serde_json::Value::String(repo.clone());
+    }
+    if let Some(name) = hub_name {
+        payload["name"] = serde_json::Value::String(name.to_string());
     }
 
     log::info!("Registering hub with server to get Botster ID...");
@@ -250,22 +254,28 @@ pub fn write_connection_url_lazy(
 
 /// Send shutdown notification to server.
 ///
-/// Call this when the hub is shutting down to unregister from the server.
+/// Marks the hub as offline (`alive: false`) via PUT. The hub record is
+/// preserved so the same ID is reused on next startup. Full destruction
+/// only happens on `cli reset` (which deletes the device, cascading to hubs).
 pub fn shutdown(client: &Client, server_url: &str, hub_identifier: &str, api_key: &str) {
     log::info!("Sending shutdown notification to server...");
     let shutdown_url = format!("{server_url}/hubs/{hub_identifier}");
 
+    let payload = serde_json::json!({ "alive": false });
+
     match client
-        .delete(&shutdown_url)
+        .put(&shutdown_url)
         .bearer_auth(api_key)
         .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .json(&payload)
         .send()
     {
         Ok(response) if response.status().is_success() => {
-            log::info!("Hub unregistered from server");
+            log::info!("Hub marked offline on server");
         }
         Ok(response) => {
-            log::warn!("Failed to unregister hub: {}", response.status());
+            log::warn!("Failed to mark hub offline: {}", response.status());
         }
         Err(e) => {
             log::warn!("Failed to send shutdown notification: {e}");
@@ -293,6 +303,7 @@ mod tests {
             agent_timeout: 300,
             max_sessions: 10,
             worktree_base: std::path::PathBuf::from("/tmp"),
+            hub_name: None,
         };
 
         register_device(&mut device, &client, &config);

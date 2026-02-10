@@ -76,6 +76,7 @@ export class Connection {
   #subscribeLock = null     // Promise-based lock (resolves when subscribe/unsubscribe finishes)
   #subscribeLockResolve = null
   #resubscribing = false    // Lock to prevent concurrent resubscribe on stale send
+  #visibilityHandler = null // Cleanup ref for visibilitychange listener
 
   constructor(key, options, manager) {
     this.key = key
@@ -103,6 +104,17 @@ export class Connection {
     this.handshakeComplete = false
     this.handshakeSent = false
     this.handshakeTimer = null
+
+    // Resume connections when tab becomes visible after backgrounding.
+    // The transport layer probes stale peers; this picks up the pieces
+    // by re-running the connect flow (peer + subscribe).
+    this.#visibilityHandler = () => {
+      if (document.visibilityState !== "visible") return
+      if (!this.#hubConnected || !this.identityKey) return
+      if (this.state === ConnectionState.ERROR && this.errorCode === "session_invalid") return
+      this.#ensureConnected()
+    }
+    document.addEventListener("visibilitychange", this.#visibilityHandler)
   }
 
   // ========== Lifecycle (called by ConnectionManager) ==========
@@ -114,6 +126,17 @@ export class Connection {
   async initialize() {
     try {
       this.#setState(ConnectionState.LOADING)
+
+      // Parse bundle from URL fragment BEFORE async worker init.
+      // The hash can get stripped during the ensureMatrixReady() async gap
+      // (SharedWorker + WASM loading), so read it synchronously now.
+      if (!this.options.sessionBundle) {
+        const bundle = parseBundleFromFragment()
+        if (bundle) {
+          this.options.sessionBundle = bundle
+          history.replaceState(null, "", location.pathname + location.search)
+        }
+      }
 
       const cryptoWorkerUrl = document.querySelector('meta[name="crypto-worker-url"]')?.content
       const wasmJsUrl = document.querySelector('meta[name="crypto-wasm-js-url"]')?.content
@@ -169,13 +192,7 @@ export class Connection {
     const hubId = this.getHubId()
 
     // 1. Handle Olm session (optional — not required for ActionCable health)
-    let sessionBundle = this.options.sessionBundle || null
-    if (!sessionBundle && this.options.fromFragment) {
-      sessionBundle = parseBundleFromFragment()
-      if (sessionBundle) {
-        history.replaceState(null, "", location.pathname + location.search)
-      }
-    }
+    const sessionBundle = this.options.sessionBundle || null
 
     if (sessionBundle) {
       await bridge.createSession(hubId, sessionBundle)
@@ -545,6 +562,12 @@ export class Connection {
     }
     this.#unsubscribers = []
     this.#clearSubscriptionEventListeners()
+
+    // Remove visibility listener
+    if (this.#visibilityHandler) {
+      document.removeEventListener("visibilitychange", this.#visibilityHandler)
+      this.#visibilityHandler = null
+    }
 
     this.browserStatus = BrowserStatus.DISCONNECTED
     this.cliStatus = CliStatus.UNKNOWN

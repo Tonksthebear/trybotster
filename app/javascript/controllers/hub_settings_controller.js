@@ -58,7 +58,6 @@ export default class extends Controller {
 
     ConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
-      fromFragment: true,
     }).then((hub) => {
       this.hub = hub;
 
