@@ -137,5 +137,4 @@ class Github::CallbacksControllerTest < ActionDispatch::IntegrationTest
     Github::App.define_singleton_method(:exchange_code_for_token, original_exchange)
     Github::App.define_singleton_method(:get_user_info, original_user_info)
   end
-
 end

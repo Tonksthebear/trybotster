@@ -187,7 +187,7 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
     @hub.hub_agents.create!(session_key: "stale-agent")
 
     subscribe hub_id: @hub.id
-    perform :heartbeat, agents: [{ session_key: "active-agent" }]
+    perform :heartbeat, agents: [ { session_key: "active-agent" } ]
 
     @hub.reload
     assert_equal 1, @hub.hub_agents.count

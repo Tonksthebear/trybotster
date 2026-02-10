@@ -142,7 +142,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
 
   test "multiple agents can run concurrently" do
     with_stubbed_github do
-      messages = [111, 222, 333].map do |issue_num|
+      messages = [ 111, 222, 333 ].map do |issue_num|
         create_github_message(issue_number: issue_num, prompt: "Task #{issue_num}")
       end
 
@@ -159,7 +159,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
         "All three agents should be registered.\nCLI logs:\n#{cli.log_contents(lines: 50)}"
 
       session_keys = @hub.hub_agents.pluck(:session_key).sort
-      assert_equal ["test-repo-111", "test-repo-222", "test-repo-333"], session_keys
+      assert_equal [ "test-repo-111", "test-repo-222", "test-repo-333" ], session_keys
     end
   end
 
@@ -253,7 +253,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
 
     log_thread = Thread.new do
       while cli.running?
-        ready = IO.select([stdout_r, stderr_r], nil, nil, 0.1)
+        ready = IO.select([ stdout_r, stderr_r ], nil, nil, 0.1)
         next unless ready
 
         ready[0].each do |io|
