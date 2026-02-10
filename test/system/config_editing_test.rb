@@ -29,10 +29,10 @@ class ConfigEditingTest < ApplicationSystemTestCase
 
     # Config tab panel should be visible (no hidden class)
     assert_selector "[data-tab-panel='config']", wait: 10
-    assert_no_selector "[data-tab-panel='config'].hidden"
+    assert_no_selector "[data-tab-panel='config'].hidden", visible: :all
 
     # Templates tab panel should be hidden
-    assert_selector "[data-tab-panel='templates'].hidden"
+    assert_selector "[data-tab-panel='templates'].hidden", visible: :all
 
     # Tree panel should exist in loading/disconnected state (no CLI running)
     tree_panel = find("[data-hub-settings-target='treePanel']", wait: 10)
@@ -180,8 +180,8 @@ class ConfigEditingTest < ApplicationSystemTestCase
     assert_no_selector "[data-tab='config'][data-active]"
 
     # Templates panel should be visible, config panel hidden
-    assert_no_selector "[data-tab-panel='templates'].hidden", wait: 10
-    assert_selector "[data-tab-panel='config'].hidden"
+    assert_no_selector "[data-tab-panel='templates'].hidden", visible: :all, wait: 10
+    assert_selector "[data-tab-panel='config'].hidden", visible: :all
 
     # Template catalog should render with cards
     assert_selector "[data-hub-templates-target='catalog']", wait: 10
@@ -201,8 +201,10 @@ class ConfigEditingTest < ApplicationSystemTestCase
     find("[data-tab='templates']").click
     assert_selector "[data-hub-templates-target='catalog']", wait: 10
 
-    # Click the first template card to open its preview
-    first("[data-hub-templates-target='card']").click
+    # Click a plugin template card (plugins are tracked by template:list,
+    # unlike non-plugin templates like user/init.lua which aren't detected)
+    plugin_card = find("[data-hub-templates-target='card'][data-dest*='plugins/']", wait: 10)
+    plugin_card.click
 
     # Preview panel should appear with an install button
     install_btn = find("[data-hub-templates-target='installBtn']", wait: 10)

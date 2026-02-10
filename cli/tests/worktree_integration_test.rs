@@ -1,4 +1,6 @@
 use botster_hub::Agent;
+use botster_hub::agent::spawn::PtySpawnConfig;
+use std::collections::HashMap;
 use std::process::Command;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -66,12 +68,20 @@ async fn test_agent_spawns_with_echo_command() {
         "test/repo".to_string(),
         Some(1),
         "test-branch".to_string(),
-        worktree,
+        worktree.clone(),
     );
 
     // Spawn with echo command (simple, won't fail)
-    let empty_env = std::collections::HashMap::new();
-    let result = agent.spawn("echo test", "", vec![], &empty_env);
+    let config = PtySpawnConfig {
+        worktree_path: worktree,
+        command: "echo test".to_string(),
+        env: HashMap::new(),
+        init_commands: vec![],
+        detect_notifications: false,
+        port: None,
+        context: String::new(),
+    };
+    let result = agent.cli_pty.spawn(config);
 
     // Should succeed in spawning
     assert!(result.is_ok());

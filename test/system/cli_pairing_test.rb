@@ -43,8 +43,8 @@ class CliPairingTest < ApplicationSystemTestCase
     url = @cli.connection_url
     assert url.present?, "CLI should write connection_url.txt"
 
-    # Parse the URL components
-    uri = URI.parse("http://localhost#{url}")
+    # Parse the URL components (CLI writes full URL with scheme + host)
+    uri = URI.parse(url)
     fragment = uri.fragment
 
     # Path should be /hubs/:id (Rails integer ID)
@@ -72,7 +72,7 @@ class CliPairingTest < ApplicationSystemTestCase
     assert url.present?, "CLI should provide connection URL"
 
     sign_in_as(@user)
-    visit "#{page.server_url}#{url}"
+    visit url
 
     # All three status sections should reach their connected states
     assert_selector(
@@ -99,10 +99,13 @@ class CliPairingTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit "#{page.server_url}/hubs/#{@hub.id}#INVALIDGARBAGE1234567890ABCDEF"
 
-    # Connection section should show "unpaired" (bundle parse failure -> no Olm session)
+    # Connection section should show "unpaired" (bundle parse failure -> no Olm session).
+    # The state transitions: connecting -> (ActionCable subscribes) -> unpaired.
+    # In the full test suite, ActionCable subscription + WASM init can take longer
+    # due to SharedWorker reinitialization overhead.
     assert_selector(
       "[data-connection-status-target='connectionSection'][data-state='unpaired']",
-      wait: 20
+      wait: 45
     )
   end
 
@@ -119,7 +122,7 @@ class CliPairingTest < ApplicationSystemTestCase
     assert url.present?
 
     sign_in_as(@user)
-    visit "#{page.server_url}#{url}"
+    visit url
 
     # Wait for connection to fully establish
     assert_selector(
@@ -166,10 +169,13 @@ class CliPairingTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit "#{page.server_url}/hubs/#{@hub.id}"
 
-    # Connection section should show "unpaired"
+    # Connection section should show "unpaired" (no bundle -> no Olm session).
+    # The state transitions: connecting -> (ActionCable subscribes) -> unpaired.
+    # In the full test suite, ActionCable subscription + WASM init can take longer
+    # due to SharedWorker reinitialization overhead.
     assert_selector(
       "[data-connection-status-target='connectionSection'][data-state='unpaired']",
-      wait: 20
+      wait: 45
     )
   end
 

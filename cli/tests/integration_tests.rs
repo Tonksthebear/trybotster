@@ -391,13 +391,17 @@ fn test_spawn_real_pty_with_init_script() {
         env_vars.insert("BOTSTER_BRANCH_NAME".to_string(), "test-branch".to_string());
 
         // Spawn bash and source the init script
+        use botster_hub::agent::spawn::PtySpawnConfig;
         agent
-            .spawn(
-                "bash",
-                "",
-                vec![format!("source {}", init_script.display())],
-                &env_vars,
-            )
+            .cli_pty.spawn(PtySpawnConfig {
+                worktree_path: temp_dir.path().to_path_buf(),
+                command: "bash".to_string(),
+                env: env_vars,
+                init_commands: vec![format!("source {}", init_script.display())],
+                detect_notifications: true,
+                port: None,
+                context: String::new(),
+            })
             .expect("Failed to spawn PTY");
 
         // Wait for output to be generated
@@ -444,14 +448,18 @@ fn test_spawn_server_pty() {
         );
 
         // First set up the CLI PTY (as would happen in normal operation)
-        let empty_env = HashMap::new();
+        use botster_hub::agent::spawn::PtySpawnConfig;
+        use botster_hub::agent::pty::PtySession;
         agent
-            .spawn(
-                "bash",
-                "",
-                vec!["echo 'CLI PTY started'".to_string()],
-                &empty_env,
-            )
+            .cli_pty.spawn(PtySpawnConfig {
+                worktree_path: temp_dir.path().to_path_buf(),
+                command: "bash".to_string(),
+                env: HashMap::new(),
+                init_commands: vec!["echo 'CLI PTY started'".to_string()],
+                detect_notifications: true,
+                port: None,
+                context: String::new(),
+            })
             .expect("Failed to spawn CLI PTY");
 
         // Now spawn the server PTY
@@ -459,9 +467,17 @@ fn test_spawn_server_pty() {
         let mut server_env = HashMap::new();
         server_env.insert("PORT".to_string(), "3000".to_string());
 
-        agent
-            .spawn_server_pty(&server_script.display().to_string(), &server_env)
-            .expect("Failed to spawn server PTY");
+        let mut server_pty = PtySession::new(24, 80);
+        server_pty.spawn(PtySpawnConfig {
+            worktree_path: temp_dir.path().to_path_buf(),
+            command: server_script.display().to_string(),
+            env: server_env,
+            init_commands: vec![],
+            detect_notifications: false,
+            port: Some(3000),
+            context: String::new(),
+        }).expect("Failed to spawn server PTY");
+        agent.server_pty = Some(server_pty);
 
         assert!(agent.has_server_pty(), "Server PTY should be available");
 
@@ -508,21 +524,33 @@ fn test_real_pty_view_switching() {
         );
 
         // Spawn CLI PTY
-        let empty_env = HashMap::new();
+        use botster_hub::agent::spawn::PtySpawnConfig;
+        use botster_hub::agent::pty::PtySession;
         agent
-            .spawn(
-                "bash",
-                "",
-                vec!["for i in $(seq 1 50); do echo \"CLI Line $i\"; done".to_string()],
-                &empty_env,
-            )
+            .cli_pty.spawn(PtySpawnConfig {
+                worktree_path: temp_dir.path().to_path_buf(),
+                command: "bash".to_string(),
+                env: HashMap::new(),
+                init_commands: vec!["for i in $(seq 1 50); do echo \"CLI Line $i\"; done".to_string()],
+                detect_notifications: true,
+                port: None,
+                context: String::new(),
+            })
             .expect("Failed to spawn CLI PTY");
 
         // Spawn server PTY
         let server_script = fixture_path("test_botster_server.sh");
-        agent
-            .spawn_server_pty(&server_script.display().to_string(), &empty_env)
-            .expect("Failed to spawn server PTY");
+        let mut server_pty = PtySession::new(24, 80);
+        server_pty.spawn(PtySpawnConfig {
+            worktree_path: temp_dir.path().to_path_buf(),
+            command: server_script.display().to_string(),
+            env: HashMap::new(),
+            init_commands: vec![],
+            detect_notifications: false,
+            port: None,
+            context: String::new(),
+        }).expect("Failed to spawn server PTY");
+        agent.server_pty = Some(server_pty);
 
         // Wait for output
         thread::sleep(Duration::from_secs(2));
@@ -690,7 +718,7 @@ fn test_pty_broadcast_to_multiple_subscribers() {
 #[test]
 fn test_pty_input_via_command_channel() {
     use botster_hub::agent::pty::PtySession;
-    use botster_hub::client::PtyCommand;
+    use botster_hub::agent::pty::PtyCommand;
 
     // Create a PTY session
     let session = PtySession::new(24, 80);
@@ -702,38 +730,30 @@ fn test_pty_input_via_command_channel() {
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
 
     // Send input command (even without spawned process, channel should accept)
-    let result: Result<(), tokio::sync::mpsc::error::SendError<PtyCommand>> = runtime.block_on(async { cmd_tx.send(PtyCommand::Input(b"test input".to_vec())).await });
+    let result = runtime.block_on(async { cmd_tx.send(PtyCommand::Input(b"test input".to_vec())).await });
 
     // Command should be accepted (channel is open)
     assert!(result.is_ok(), "Command channel should accept input");
 }
 
-/// Test that PTY resize can be sent via command channel.
+/// Test that PTY resize works via direct resize method.
 ///
 /// This verifies browser resize events can be delivered to the PTY.
+/// Resize is performed directly on PtySession rather than via the command channel.
 #[test]
-fn test_pty_resize_via_command_channel() {
+fn test_pty_resize_direct() {
     use botster_hub::agent::pty::PtySession;
-    use botster_hub::client::{ClientId, PtyCommand};
 
     let session = PtySession::new(24, 80);
-    let (_event_tx, cmd_tx, _port) = session.get_channels();
 
-    // Create tokio runtime for async send
-    let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+    // Verify initial dimensions
+    assert_eq!(session.dimensions(), (24, 80));
 
-    // Send resize command with client_id
-    let result: Result<(), tokio::sync::mpsc::error::SendError<PtyCommand>> = runtime.block_on(async {
-        cmd_tx
-            .send(PtyCommand::Resize {
-                client_id: ClientId::Tui,
-                rows: 50,
-                cols: 100,
-            })
-            .await
-    });
+    // Resize directly (the current API for resize operations)
+    session.resize(50, 100);
 
-    assert!(result.is_ok(), "Command channel should accept resize");
+    // Verify new dimensions
+    assert_eq!(session.dimensions(), (50, 100));
 }
 
 /// Test that Agent's get_scrollback_snapshot works correctly.
@@ -780,14 +800,17 @@ fn test_spawned_pty_output_reaches_scrollback() {
         );
 
         // Spawn a simple command that produces output
-        let empty_env = HashMap::new();
+        use botster_hub::agent::spawn::PtySpawnConfig;
         agent
-            .spawn(
-                "bash",
-                "",
-                vec!["echo 'Hello from PTY output test'".to_string()],
-                &empty_env,
-            )
+            .cli_pty.spawn(PtySpawnConfig {
+                worktree_path: temp_dir.path().to_path_buf(),
+                command: "bash".to_string(),
+                env: HashMap::new(),
+                init_commands: vec!["echo 'Hello from PTY output test'".to_string()],
+                detect_notifications: true,
+                port: None,
+                context: String::new(),
+            })
             .expect("Failed to spawn PTY");
 
         // Wait for output to appear in scrollback
@@ -841,9 +864,17 @@ fn test_input_written_to_pty_appears_in_scrollback() {
         );
 
         // Spawn bash with no initial commands
-        let empty_env = HashMap::new();
+        use botster_hub::agent::spawn::PtySpawnConfig;
         agent
-            .spawn("bash", "", vec![], &empty_env)
+            .cli_pty.spawn(PtySpawnConfig {
+                worktree_path: temp_dir.path().to_path_buf(),
+                command: "bash".to_string(),
+                env: HashMap::new(),
+                init_commands: vec![],
+                detect_notifications: true,
+                port: None,
+                context: String::new(),
+            })
             .expect("Failed to spawn PTY");
 
         // Wait for shell to initialize

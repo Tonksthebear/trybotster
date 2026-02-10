@@ -317,6 +317,14 @@ class WorkerBridge {
   }
 
   /**
+   * Clear all sessions (memory + IndexedDB).
+   * @returns {Promise<{cleared: boolean, count: number}>}
+   */
+  async clearAllSessions() {
+    return this.sendCrypto("clearAllSessions", {})
+  }
+
+  /**
    * Subscribe to transport events
    * @param {string} eventName - Event name (e.g., "connection:state", "subscription:message")
    * @param {Function} callback - Callback function receiving the event data

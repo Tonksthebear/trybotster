@@ -66,7 +66,11 @@
 
     <div class="flex-1 flex flex-col min-h-0 bg-zinc-950 overflow-hidden">
       <%# Terminal header bar %>
-      <div class="shrink-0 px-2 lg:px-4 py-1.5 lg:py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900">
+      <div class="shrink-0 px-2 lg:px-4 py-1.5 lg:py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900"
+           data-controller="pty-tabs"
+           data-pty-tabs-hub-id-value="<%= Current.hub.id %>"
+           data-pty-tabs-agent-index-value="<%= Current.agent_index %>"
+           data-pty-tabs-pty-index-value="<%= Current.pty_index %>">
         <div class="flex items-center gap-2 lg:gap-3">
           <%# Traffic lights - desktop only %>
           <div class="hidden lg:flex items-center gap-1.5">
@@ -76,10 +80,7 @@
           </div>
 
           <%# Dynamic PTY session tabs (populated from sessions[] via Stimulus) %>
-          <div data-controller="pty-tabs"
-               data-pty-tabs-hub-id-value="<%= Current.hub.id %>"
-               data-pty-tabs-agent-index-value="<%= Current.agent_index %>"
-               data-pty-tabs-pty-index-value="<%= Current.pty_index %>">
+          <div>
             <div data-pty-tabs-target="tabBar"
                  class="flex items-center bg-zinc-800/50 rounded p-0.5">
               <%# Default tab rendered server-side; replaced dynamically when session data arrives %>
@@ -93,13 +94,15 @@
         </div>
 
         <div class="flex items-center gap-2 lg:gap-3">
-          <%# Preview button - opens preview page (tunnel created on-demand) %>
-          <%= link_to hub_agent_pty_preview_path(Current.hub, Current.agent_index, 1),
-                      class: "inline-flex items-center gap-1.5 px-2 py-1 text-xs font-medium bg-zinc-700/50 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 rounded transition-colors",
-                      target: "_blank" do %>
-            <%= icon "eye", class: "size-3" %>
-            <span class="hidden sm:inline">Preview</span>
-          <% end %>
+          <%# Preview button - shown only when current PTY has port forwarding %>
+          <div data-pty-tabs-target="preview" hidden>
+            <%= link_to hub_agent_pty_preview_path(Current.hub, Current.agent_index, Current.pty_index),
+                        class: "inline-flex items-center gap-1.5 px-2 py-1 text-xs font-medium bg-zinc-700/50 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 rounded transition-colors",
+                        target: "_blank" do %>
+              <%= icon "eye", class: "size-3" %>
+              <span class="hidden sm:inline">Preview</span>
+            <% end %>
+          </div>
 
           <span class="text-xs text-zinc-600 hidden lg:inline">scroll: mouse wheel</span>
         </div>

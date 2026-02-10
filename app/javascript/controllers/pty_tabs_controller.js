@@ -5,14 +5,11 @@ import { ConnectionManager, HubConnection } from "connections";
  * Dynamic PTY Tab Controller
  *
  * Renders PTY session tabs based on the sessions[] array from agent info.
- * Replaces the hardcoded 2-tab (Agent/Server) switcher with N dynamic tabs.
- *
- * Connects to the HubConnection to request agent info, then builds tab
- * links from the sessions array. Falls back to a single "Agent" tab if
- * session data is not available (backward compat).
+ * Also controls Preview button visibility — only shown when the current
+ * PTY session has port_forward enabled.
  */
 export default class extends Controller {
-  static targets = ["tabBar"];
+  static targets = ["tabBar", "preview"];
 
   static values = {
     hubId: String,
@@ -65,17 +62,23 @@ export default class extends Controller {
     const agent = agents[this.agentIndexValue];
     if (!agent) return;
 
+    let sessions;
+
     // Use sessions array if available, fall back to legacy
     if (agent.sessions && agent.sessions.length > 0) {
-      this.#renderTabs(agent.sessions);
+      sessions = agent.sessions;
     } else if (agent.has_server_pty) {
       // Legacy: 2 hardcoded tabs
-      this.#renderTabs([
+      sessions = [
         { name: "agent" },
         { name: "server", port_forward: true },
-      ]);
+      ];
+    } else {
+      sessions = [{ name: "agent" }];
     }
-    // Otherwise keep the default single "agent" tab
+
+    this.#renderTabs(sessions);
+    this.#updatePreview(sessions);
   }
 
   #renderTabs(sessions) {
@@ -98,5 +101,21 @@ export default class extends Controller {
       link.textContent = name.charAt(0).toUpperCase() + name.slice(1);
       tabBar.appendChild(link);
     });
+  }
+
+  #updatePreview(sessions) {
+    if (!this.hasPreviewTarget) return;
+
+    const current = sessions[this.ptyIndexValue];
+    if (current?.port_forward) {
+      // Update href to point to the correct PTY index
+      const link = this.previewTarget.querySelector("a");
+      if (link) {
+        link.href = `/hubs/${this.hubIdValue}/agents/${this.agentIndexValue}/${this.ptyIndexValue}/preview`;
+      }
+      this.previewTarget.hidden = false;
+    } else {
+      this.previewTarget.hidden = true;
+    }
   }
 }

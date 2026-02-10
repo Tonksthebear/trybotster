@@ -131,6 +131,7 @@ export class PreviewConnection extends Connection {
       request.path,
       request.headers || {},
       request.body,
+      `localhost:${this.port}`,
     )
     stream.write(reqBytes)
 

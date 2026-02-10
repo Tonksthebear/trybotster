@@ -1109,6 +1109,9 @@ impl Hub {
             return;
         }
 
+        // handle_frame may call tokio::spawn, so we need a runtime context
+        let _guard = self.tokio_runtime.enter();
+
         for frame in frames {
             let mux = self
                 .stream_muxes

@@ -15,9 +15,10 @@ const decoder = new TextDecoder()
  * @param {string} path - Request path with query string
  * @param {Object} headers - Request headers (host/connection are overridden)
  * @param {string|Uint8Array|null} body - Request body
+ * @param {string} [host="localhost"] - Host header value
  * @returns {Uint8Array}
  */
-export function serializeRequest(method, path, headers = {}, body = null) {
+export function serializeRequest(method, path, headers = {}, body = null, host = "localhost") {
   let bodyBytes = null
   if (body != null) {
     bodyBytes = typeof body === "string" ? encoder.encode(body) : body
@@ -32,6 +33,9 @@ export function serializeRequest(method, path, headers = {}, body = null) {
     request += `${key}: ${value}\r\n`
   }
 
+  // Host header required by HTTP/1.1 — use localhost since
+  // the stream mux connects to 127.0.0.1 on the CLI side
+  request += `Host: ${host}\r\n`
   request += "Connection: close\r\n"
 
   if (bodyBytes) {

@@ -457,7 +457,20 @@ impl Hub {
         // The bundle will be generated lazily when:
         // 1. TUI requests QR code display (GetConnectionCode command)
         // 2. External automation requests the connection URL
-        // This avoids blocking boot for up to 10 seconds.
+        // 3. Headless mode calls setup_headless() which eagerly generates it
+        // This avoids blocking boot for up to 10 seconds in TUI mode.
+    }
+
+    /// Eagerly generate the connection URL.
+    ///
+    /// In headless mode there is no TUI to trigger lazy generation, so
+    /// external tools (system tests, automation) need the URL written to
+    /// disk at startup.
+    pub fn eager_generate_connection_url(&mut self) {
+        match self.generate_connection_url() {
+            Ok(url) => log::info!("Connection URL generated ({} chars)", url.len()),
+            Err(e) => log::warn!("Failed to generate connection URL: {e}"),
+        }
     }
 
     /// Load the Lua initialization script.

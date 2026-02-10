@@ -77,6 +77,7 @@ group :test do
   gem "capybara"
   gem "selenium-webdriver"
   gem "webmock"
+  gem "minitest"
 end
 # UI Components
 gem "view_component"
