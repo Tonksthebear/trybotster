@@ -2,7 +2,7 @@
 
 module Integrations
   module Github
-    class McpTokensController < ApplicationController
+    class MCPTokensController < ApplicationController
       include ApiKeyAuthenticatable
 
       skip_before_action :verify_authenticity_token
