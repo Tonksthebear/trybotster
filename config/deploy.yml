@@ -38,7 +38,7 @@ env:
     SOLID_QUEUE_IN_PUMA: true
     DB_HOST: 172.17.0.1
     DB_PORT: 5433
-    HOST_URL: https://trybotster.com
+    HOST_URL: trybotster.com
     TURN_SERVER_URL: "turn:turn.trybotster.com:3478"
 
 volumes:
