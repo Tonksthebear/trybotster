@@ -208,9 +208,11 @@ end)
 
 local conn = action_cable.connect()
 
-local channel_id = action_cable.subscribe(conn, "Github::EventsChannel",
+-- The callback receives (message, channel_id) from the primitive,
+-- so we use channel_id directly — no upvalue capture needed.
+action_cable.subscribe(conn, "Github::EventsChannel",
     { repo = repo },
-    function(message)
+    function(message, channel_id)
         local payload = message.payload or {}
         local event_repo = message.repo or repo
 

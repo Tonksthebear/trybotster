@@ -42,14 +42,18 @@ class Hub < ApplicationRecord
     # Remove agents no longer reported by CLI
     hub_agents.where.not(session_key: session_keys).destroy_all
 
-    # Create or update agents
+    # Create or update agents (retry on unique constraint race)
     agents_array.each do |agent_data|
       session_key = agent_data[:session_key] || agent_data["session_key"]
       next if session_key.blank?
 
-      agent = hub_agents.find_or_initialize_by(session_key: session_key)
-      agent.last_invocation_url = agent_data[:last_invocation_url] || agent_data["last_invocation_url"]
-      agent.save!
+      url = agent_data[:last_invocation_url] || agent_data["last_invocation_url"]
+      hub_agents
+        .create_with(last_invocation_url: url)
+        .find_or_create_by!(session_key: session_key)
+        .then { |agent| agent.update!(last_invocation_url: url) if url.present? && agent.last_invocation_url != url }
+    rescue ActiveRecord::RecordNotUnique
+      retry
     end
   end
 

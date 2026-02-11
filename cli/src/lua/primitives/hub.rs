@@ -111,7 +111,7 @@ pub fn register(
     request_queue: HubRequestQueue,
     handle_cache: Arc<HandleCache>,
     server_id: SharedServerId,
-    shared_state: Arc<RwLock<HubState>>,
+    _shared_state: Arc<RwLock<HubState>>,
 ) -> Result<()> {
     // Get or create the hub table
     let hub: LuaTable = lua
@@ -277,23 +277,19 @@ pub fn register(
     hub.set("api_token", api_token_fn)
         .map_err(|e| anyhow!("Failed to set hub.api_token: {e}"))?;
 
-    // hub.agent_list() - Returns array of {session_key, last_invocation_url} for active agents.
+    // hub.agent_list() - Returns array of {session_key} for active agents.
     //
-    // Reads from SharedHubState, matching the heartbeat data format used by
-    // the Lua heartbeat handler in hub_commands.lua.
-    let state_ref = Arc::clone(&shared_state);
+    // Reads from HandleCache (the authoritative agent registry after Lua migration).
+    // Lua manages agent metadata; this only provides session keys for heartbeat sync.
+    let cache4 = Arc::clone(&handle_cache);
     let agent_list_fn = lua
         .create_function(move |lua, ()| {
-            let state = state_ref.read().expect("HubState RwLock poisoned in agent_list");
-            let agents: Vec<serde_json::Value> = state
-                .agent_keys_ordered
+            let agents: Vec<serde_json::Value> = cache4
+                .get_all_agents()
                 .iter()
-                .filter_map(|key| {
-                    state.agents.get(key).map(|agent| {
-                        serde_json::json!({
-                            "session_key": key,
-                            "last_invocation_url": agent.last_invocation_url
-                        })
+                .map(|agent| {
+                    serde_json::json!({
+                        "session_key": agent.agent_key()
                     })
                 })
                 .collect();

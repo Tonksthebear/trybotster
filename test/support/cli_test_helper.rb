@@ -280,6 +280,14 @@ module CliTestHelper
   def create_test_hub(user: nil)
     user ||= users(:one)
 
+    # Randomize hub ID sequence so each test gets a unique database ID.
+    # Fixture loading resets Postgres sequences via TRUNCATE RESTART IDENTITY,
+    # causing all tests to get the same hub ID. SharedWorker sessions (keyed by
+    # hub ID) persist across test page loads and cause stale session collisions.
+    ActiveRecord::Base.connection.execute(
+      "SELECT setval('hubs_id_seq', #{rand(2_000_000_000)}, false)"
+    )
+
     Hub.create!(
       user: user,
       identifier: "test-hub-#{SecureRandom.hex(8)}",
