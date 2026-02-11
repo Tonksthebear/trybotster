@@ -14,8 +14,21 @@
 // IMPORTANT: Run `cargo build --release` before running these tests!
 
 use std::process::{Command, Stdio};
+use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Ensure test environment is configured.
+///
+/// Sets BOTSTER_ENV=test and BOTSTER_HUB_ID=test-hub once for the process.
+/// This is the single source of truth — individual tests don't need to set these.
+static INIT: Once = Once::new();
+fn ensure_test_env() {
+    INIT.call_once(|| {
+        std::env::set_var("BOTSTER_ENV", "test");
+        std::env::set_var("BOTSTER_HUB_ID", "test-hub");
+    });
+}
 
 /// Path to the release binary (built by cargo build --release)
 fn get_binary_path() -> std::path::PathBuf {
@@ -68,6 +81,7 @@ fn wait_with_timeout(
 
 #[test]
 fn test_help_command_exits_immediately() {
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
@@ -104,6 +118,7 @@ fn test_help_command_exits_immediately() {
 
 #[test]
 fn test_version_command_exits_immediately() {
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
@@ -141,6 +156,7 @@ fn test_version_command_exits_immediately() {
 fn test_start_without_tty_fails_gracefully() {
     // The interactive CLI requires a TTY. When run without one (e.g., in a pipe),
     // it should fail with a clear error rather than hanging or crashing.
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
@@ -153,8 +169,6 @@ fn test_start_without_tty_fails_gracefully() {
     let output = Command::new(get_binary_path())
         .arg("start")
         .env("BOTSTER_CONFIG_DIR", temp_dir.path())
-        .env("BOTSTER_API_KEY", "test-key")
-        .env("BOTSTER_SERVER_URL", "http://localhost:9999")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -187,6 +201,7 @@ fn test_start_without_tty_fails_gracefully() {
 
 #[test]
 fn test_config_command_works() {
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
@@ -217,6 +232,7 @@ fn test_config_command_works() {
 
 #[test]
 fn test_status_command_works() {
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
@@ -237,6 +253,7 @@ fn test_status_command_works() {
 
 #[test]
 fn test_invalid_command_fails() {
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
