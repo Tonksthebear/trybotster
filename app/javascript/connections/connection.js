@@ -147,7 +147,16 @@ export class Connection {
       console.error(`[${this.constructor.name}] Initialize failed:`, error)
       // Don't overwrite session_invalid — it's already showing "Scan Code"
       if (this.errorCode !== "session_invalid") {
-        this.#setError("init_failed", error.message)
+        // No crypto session means user needs to scan QR code, not a generic init error.
+        // Use lightweight errorCode (not #setError) to keep browserStatus/state intact —
+        // browser signaling may still be functional, only crypto is missing.
+        if (!this.identityKey) {
+          this.errorCode = "unpaired"
+          this.errorReason = "Scan connection code"
+          this.emit("error", { reason: "unpaired", message: "Scan connection code" })
+        } else {
+          this.#setError("init_failed", error.message)
+        }
       }
     }
   }
@@ -193,22 +202,30 @@ export class Connection {
 
     // 1. Handle Olm session (optional — not required for ActionCable health)
     const sessionBundle = this.options.sessionBundle || null
+    let hasOlmSession = false
 
     if (sessionBundle) {
       await bridge.createSession(hubId, sessionBundle)
+      hasOlmSession = true
     } else {
-      const { hasSession } = await bridge.hasSession(hubId)
-      if (!hasSession) {
+      const result = await bridge.hasSession(hubId)
+      hasOlmSession = result.hasSession
+      if (!hasOlmSession) {
         console.debug(`[${this.constructor.name}] No Olm session — WebRTC disabled until QR scan`)
       }
     }
 
-    // Get identity key if session exists (null = health-only mode)
-    try {
-      const keyResult = await bridge.getIdentityKey(hubId)
-      this.identityKey = keyResult.identityKey
-    } catch {
-      // No session — health-only mode, WebRTC will be unavailable
+    // Get identity key only when a session exists. An account (keypair) can exist
+    // without a session due to cleanup race conditions — checking hasSession is
+    // the authoritative test for whether we can encrypt.
+    if (hasOlmSession) {
+      try {
+        const keyResult = await bridge.getIdentityKey(hubId)
+        this.identityKey = keyResult.identityKey
+      } catch {
+        this.identityKey = null
+      }
+    } else {
       this.identityKey = null
     }
 
@@ -240,7 +257,9 @@ export class Connection {
 
     await this.#ensureConnected()  // continues to peer+subscribe if CLI online + session exists
 
-    // No crypto session — WebRTC unavailable, user must scan connection code
+    // No crypto session — WebRTC unavailable, user must scan connection code.
+    // Use lightweight errorCode (not #setError) to keep browserStatus SUBSCRIBED —
+    // signaling IS connected, only crypto is missing.
     if (!this.identityKey) {
       this.errorCode = "unpaired"
       this.emit("error", { reason: "unpaired", message: "Scan connection code" })
