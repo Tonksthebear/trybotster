@@ -12,6 +12,8 @@
 
 // Rust guideline compliant 2026-02
 
+use std::sync::{Arc, Mutex};
+
 use ratatui::backend::Backend;
 use vt100::Parser;
 
@@ -193,10 +195,11 @@ where
     /// Handle PTY view toggle action.
     ///
     /// Cycles through available PTY sessions for the current agent using the
-    /// Lua subscribe/unsubscribe protocol (same path as browser clients).
+    /// Lua subscribe/unsubscribe protocol. Eagerly subscribes to the new PTY
+    /// for immediate responsiveness, and updates `active_subscriptions` so
+    /// `sync_subscriptions()` stays consistent.
     /// Wraps around: after the last session, returns to session 0.
     pub(super) fn handle_pty_view_toggle(&mut self) {
-        // Need an agent selected
         let Some(agent_index) = self.current_agent_index else {
             log::debug!("Cannot toggle PTY view - no agent selected");
             return;
@@ -220,23 +223,27 @@ where
             agent_index
         );
 
-        // Unsubscribe from current terminal
+        // Unsubscribe from current focused PTY
         if let Some(ref sub_id) = self.current_terminal_sub_id {
             self.send_msg(serde_json::json!({
                 "type": "unsubscribe",
                 "subscriptionId": sub_id,
             }));
+            if let Some(pi) = self.current_pty_index {
+                self.active_subscriptions.remove(&(agent_index, pi));
+            }
         }
 
-        // Reset parser for fresh output
-        {
-            let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-            let (rows, cols) = self.terminal_dims;
-            *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
-        }
+        // Point vt100_parser at the pool entry for the new PTY.
+        let (rows, cols) = self.terminal_dims;
+        let parser = self.parser_pool
+            .entry((agent_index, new_index))
+            .or_insert_with(|| Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK))))
+            .clone();
+        self.vt100_parser = parser;
 
-        // Subscribe to new PTY via Lua protocol
-        let sub_id = "tui_term".to_string();
+        // Eagerly subscribe to new PTY via Lua protocol
+        let sub_id = format!("tui:{}:{}", agent_index, new_index);
         self.send_msg(serde_json::json!({
             "type": "subscribe",
             "channel": "terminal",
@@ -250,6 +257,7 @@ where
         self.active_pty_index = new_index;
         self.current_pty_index = Some(new_index);
         self.current_terminal_sub_id = Some(sub_id);
+        self.active_subscriptions.insert((agent_index, new_index));
     }
 
     /// Handle a JSON message from the Lua event system.
@@ -437,7 +445,9 @@ fn parse_agent_info(value: &serde_json::Value) -> Option<crate::relay::AgentInfo
         repo: value.get("repo").and_then(|v| v.as_str()).map(String::from),
         issue_number: value.get("issue_number").and_then(|v| v.as_u64()),
         branch_name: value.get("branch_name").and_then(|v| v.as_str()).map(String::from),
-        name: value.get("name").and_then(|v| v.as_str()).map(String::from),
+        name: value.get("display_name").and_then(|v| v.as_str())
+            .or_else(|| value.get("name").and_then(|v| v.as_str()))
+            .map(String::from),
         status: value.get("status").and_then(|v| v.as_str()).map(String::from),
         sessions,
         port: value.get("port").and_then(|v| v.as_u64()).and_then(|p| u16::try_from(p).ok()),

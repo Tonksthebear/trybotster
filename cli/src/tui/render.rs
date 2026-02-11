@@ -35,6 +35,7 @@ use vt100::Parser;
 use crate::app::{buffer_to_ansi, centered_rect, AppMode};
 
 use super::menu::{build_menu, MenuContext};
+use super::render_tree::StyledContent;
 use crate::compat::{BrowserDimensions, VpnStatus};
 
 use super::events::CreationStage;
@@ -46,6 +47,8 @@ use super::events::CreationStage;
 pub struct AgentRenderInfo {
     /// Unique key for this agent (e.g., "repo-42").
     pub key: String,
+    /// Display name for agent list (e.g., "refactor-tui-2"). Computed by Lua.
+    pub display_name: Option<String>,
     /// Repository name.
     pub repo: String,
     /// Issue number (if issue-based agent).
@@ -99,6 +102,9 @@ pub struct RenderContext<'a> {
     /// The VT100 parser for the currently selected agent's active PTY.
     /// This is the parser that should be rendered in the terminal area.
     pub active_parser: Option<Arc<Mutex<Parser>>>,
+    /// Pool of VT100 parsers keyed by `(agent_index, pty_index)`.
+    /// Used by terminal widgets with explicit PTY bindings.
+    pub parser_pool: &'a std::collections::HashMap<(usize, usize), Arc<Mutex<Parser>>>,
     /// Index of the currently active PTY session (0 = first session).
     pub active_pty_index: usize,
     /// Current scroll offset for the active PTY.
@@ -119,6 +125,11 @@ pub struct RenderContext<'a> {
     pub terminal_cols: u16,
     /// Terminal height in rows.
     pub terminal_rows: u16,
+
+    // === Widget Area Tracking ===
+    /// Actual rendered area (rows, cols) of each terminal widget, keyed by (agent_index, pty_index).
+    /// Populated during rendering so the runner can resize parsers and PTYs to match.
+    pub terminal_areas: std::cell::RefCell<std::collections::HashMap<(usize, usize), (u16, u16)>>,
 }
 
 impl<'a> std::fmt::Debug for RenderContext<'a> {
@@ -268,11 +279,24 @@ fn render_frame(f: &mut Frame, ctx: &RenderContext) {
         );
     }
 
-    // Render agent list
-    render_agent_list(f, ctx, chunks[0]);
+    // Render agent list with fallback title
+    let agent_block = {
+        let poll_status = if ctx.seconds_since_poll < 1 { "*" } else { "o" };
+        let agent_title = format!(" Agents ({}) {} ", ctx.agents.len(), poll_status);
+        Block::default().borders(Borders::ALL).title(agent_title)
+    };
+    render_agent_list(f, ctx, chunks[0], agent_block);
 
-    // Render terminal view
-    render_terminal_panel(f, ctx, chunks[1]);
+    // Render terminal view with fallback title
+    let term_block = {
+        let title = if let Some(agent) = ctx.selected_agent() {
+            format!(" {} [AGENT] ", agent.branch_name)
+        } else {
+            " Terminal [No agent selected] ".to_string()
+        };
+        Block::default().borders(Borders::ALL).title(title)
+    };
+    render_terminal_panel(f, ctx, chunks[1], term_block, None);
 
     // Render modal overlays based on mode (using area-based widget functions)
     let modal_params: Option<(u16, u16, &str)> = match ctx.mode {
@@ -310,7 +334,10 @@ fn render_frame(f: &mut Frame, ctx: &RenderContext) {
 }
 
 /// Render the agent list panel.
-pub(super) fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect) {
+///
+/// The `block` parameter provides the pre-built block with title from Lua
+/// (or the fallback). This function handles list items and selection state.
+pub(super) fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect, block: Block) {
     let mut items: Vec<ListItem> = Vec::new();
 
     // Add creating indicator at top if agent creation is in progress
@@ -329,109 +356,72 @@ pub(super) fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect) 
 
     // Add existing agents
     items.extend(ctx.agents.iter().map(|agent| {
-        // Display branch name only (simpler, one agent per branch)
-        let base_text = agent.branch_name.clone();
-
-        // Add server status indicator if HTTP forwarding port is assigned
+        let base_text = agent.display_name.as_deref().unwrap_or(&agent.branch_name);
         let server_info = if let Some(p) = agent.port {
-            let server_icon = if agent.server_running {
-                ">" // Server running
-            } else {
-                "o" // Server not running
-            };
+            let server_icon = if agent.server_running { ">" } else { "o" };
             format!(" {}:{}", server_icon, p)
         } else {
             String::new()
         };
-
         ListItem::new(format!("{}{}", base_text, server_info))
     }));
 
     let mut state = ListState::default();
-    // Offset selection by 1 if creating indicator is shown
     let creating_offset = if ctx.creating_agent.is_some() { 1 } else { 0 };
     state.select(Some(
         (ctx.selected_agent_index + creating_offset).min(items.len().saturating_sub(1)),
     ));
 
-    // Add polling indicator
-    let poll_status = if ctx.seconds_since_poll < 1 {
-        "*"
-    } else {
-        "o"
-    };
-
-    // Add VPN status indicator (if VPN manager is available)
-    let vpn_indicator = match ctx.vpn_status {
-        Some(VpnStatus::Connected) => "*",    // Filled = connected
-        Some(VpnStatus::Connecting) => "~",   // Half = connecting
-        Some(VpnStatus::Error) => "x",        // X = error
-        Some(VpnStatus::Disconnected) => "o", // Empty = disconnected
-        None => "-",                          // Dash = VPN disabled
-    };
-
-    let agent_title = format!(
-        " Agents ({}) {} {}s V:{} ",
-        ctx.agents.len(),
-        poll_status,
-        ctx.poll_interval - ctx.seconds_since_poll.min(ctx.poll_interval),
-        vpn_indicator
-    );
-
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(agent_title))
+        .block(block)
         .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// Render the terminal panel showing the selected agent's PTY output.
-pub(super) fn render_terminal_panel(f: &mut Frame, ctx: &RenderContext, area: Rect) {
-    let Some(agent) = ctx.selected_agent() else {
-        // No agent selected - show placeholder
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Terminal [No agent selected] ");
-        f.render_widget(block, area);
-        return;
-    };
-
-    // Build terminal title with view indicator from sessions array
-    let session_name = agent
-        .session_names
-        .get(ctx.active_pty_index)
-        .map(String::as_str)
-        .unwrap_or("agent");
-    let view_indicator = if agent.session_names.len() > 1 {
-        format!("[{} | Ctrl+]: next]", session_name.to_uppercase())
+/// Render the terminal panel showing PTY output.
+///
+/// The `block` parameter provides the pre-built block with title from Lua
+/// (or the fallback). The optional `binding` specifies which PTY to render;
+/// if `None`, renders the currently active PTY.
+pub(super) fn render_terminal_panel(
+    f: &mut Frame,
+    ctx: &RenderContext,
+    area: Rect,
+    block: Block,
+    binding: Option<&super::render_tree::TerminalBinding>,
+) {
+    // Resolve which parser to use: explicit binding → pool lookup, else active parser
+    let (agent_idx, pty_idx) = if let Some(b) = binding {
+        (
+            b.agent_index.unwrap_or(ctx.selected_agent_index),
+            b.pty_index.unwrap_or(ctx.active_pty_index),
+        )
     } else {
-        format!("[{}]", session_name.to_uppercase())
+        (ctx.selected_agent_index, ctx.active_pty_index)
     };
 
-    // Add scroll indicator if scrolled
-    let scroll_indicator = if ctx.is_scrolled {
-        format!(" [SCROLLBACK +{} | Shift+End: live]", ctx.scroll_offset)
+    let parser = if binding.is_some() {
+        ctx.parser_pool.get(&(agent_idx, pty_idx)).cloned()
     } else {
-        String::new()
+        ctx.active_parser.clone()
     };
 
-    let terminal_title = format!(
-        " {} {}{} [Ctrl+P | Ctrl+J/K | Shift+PgUp/Dn scroll] ",
-        agent.branch_name, view_indicator, scroll_indicator
-    );
+    // Record the inner area (minus borders) so the runner can resize parsers/PTYs
+    let inner = block.inner(area);
+    if inner.width > 0 && inner.height > 0 {
+        ctx.terminal_areas
+            .borrow_mut()
+            .insert((agent_idx, pty_idx), (inner.height, inner.width));
+    }
 
-    let block = Block::default().borders(Borders::ALL).title(terminal_title);
-
-    // Render the parser content if available
-    if let Some(ref parser) = ctx.active_parser {
+    if let Some(ref parser) = parser {
         let parser_lock = parser.lock().expect("parser lock not poisoned");
         let screen = parser_lock.screen();
 
         let widget = crate::TerminalWidget::new(screen).block(block);
-
-        // Hide cursor if scrolled
-        let widget = if ctx.is_scrolled {
+        let widget = if binding.is_none() && ctx.is_scrolled {
             widget.hide_cursor()
         } else {
             widget
@@ -439,7 +429,6 @@ pub(super) fn render_terminal_panel(f: &mut Frame, ctx: &RenderContext, area: Re
 
         widget.render(area, f.buffer_mut());
     } else {
-        // No parser - just show the bordered block
         f.render_widget(block, area);
     }
 }
@@ -452,8 +441,6 @@ pub(super) fn render_terminal_panel(f: &mut Frame, ctx: &RenderContext, area: Re
 
 /// Render menu items with selection into a given area.
 pub(super) fn render_menu_widget(f: &mut Frame, ctx: &RenderContext, area: Rect, block: Block) {
-    use super::menu::selectable_count;
-
     let menu_items = build_menu(&ctx.menu_context());
 
     let mut lines: Vec<Line> = Vec::new();
@@ -490,7 +477,6 @@ pub(super) fn render_menu_widget(f: &mut Frame, ctx: &RenderContext, area: Rect,
         .alignment(Alignment::Left);
 
     f.render_widget(menu, area);
-    let _ = selectable_count(&menu_items);
 }
 
 /// Render worktree selection list into a given area.
@@ -537,10 +523,10 @@ pub(super) fn render_text_input_widget(
     ctx: &RenderContext,
     area: Rect,
     block: Block,
-    custom_lines: Option<&[String]>,
+    custom_lines: Option<&[StyledContent]>,
 ) {
     let prompt_lines = if let Some(lines) = custom_lines {
-        let mut result: Vec<Line> = lines.iter().map(|l| Line::from(l.as_str())).collect();
+        let mut result: Vec<Line> = lines.iter().map(StyledContent::to_line).collect();
         result.push(Line::from(""));
         result.push(Line::from(Span::raw(ctx.input_buffer)));
         result
@@ -577,10 +563,10 @@ pub(super) fn render_close_confirm_widget(
     f: &mut Frame,
     area: Rect,
     block: Block,
-    custom_lines: Option<&[String]>,
+    custom_lines: Option<&[StyledContent]>,
 ) {
     let text: Vec<Line> = if let Some(lines) = custom_lines {
-        lines.iter().map(|l| Line::from(l.as_str())).collect()
+        lines.iter().map(StyledContent::to_line).collect()
     } else {
         vec![
             Line::from("Close selected agent?"),
@@ -608,54 +594,42 @@ pub(super) fn render_connection_code_widget(
     ctx: &RenderContext,
     area: Rect,
     block: Block,
-    custom_lines: Option<&[String]>,
+    custom_lines: Option<&[StyledContent]>,
 ) {
     let qr_lines: Vec<String> = ctx
         .connection_code
         .map(|c| c.qr_ascii.clone())
         .unwrap_or_else(|| vec!["Error: No connection code".to_string()]);
 
-    let qr_fits = !qr_lines.iter().any(|l| l.contains("Terminal") || l.contains("Error"));
-
-    // Custom lines format: [header, footer] or [header, used_header, footer]
+    // Custom lines format: [header, used_header, footer]
     let (header, footer) = if let Some(lines) = custom_lines {
         let h = if ctx.bundle_used {
-            lines.get(1).map(String::as_str).unwrap_or("Link used - [r] to pair new device")
+            lines.get(1).map(StyledContent::to_line)
+                .unwrap_or_else(|| Line::from("Link used - [r] to pair new device"))
         } else {
-            lines.first().map(String::as_str).unwrap_or("Scan QR to connect securely")
+            lines.first().map(StyledContent::to_line)
+                .unwrap_or_else(|| Line::from("Scan QR to connect securely"))
         };
-        let f = lines.last().map(String::as_str).unwrap_or("[r] new link  [c] copy  [Esc] close");
+        let f = lines.last().map(StyledContent::to_line)
+            .unwrap_or_else(|| Line::from("[r] new link  [c] copy  [Esc] close"));
         (h, f)
     } else {
         let h = if ctx.bundle_used {
-            "Link used - [r] to pair new device"
+            Line::from("Link used - [r] to pair new device")
         } else {
-            "Scan QR to connect securely"
+            Line::from("Scan QR to connect securely")
         };
-        (h, "[r] new link  [c] copy  [Esc] close")
+        (h, Line::from("[r] new link  [c] copy  [Esc] close"))
     };
 
-    let mut text_lines = vec![
-        Line::from(Span::styled(
-            header,
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+    let mut text_lines = vec![header, Line::from("")];
 
     for qr_line in &qr_lines {
         text_lines.push(Line::from(qr_line.clone()));
     }
 
     text_lines.push(Line::from(""));
-    text_lines.push(Line::from(Span::styled(
-        footer,
-        if qr_fits {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default().add_modifier(Modifier::BOLD)
-        },
-    )));
+    text_lines.push(footer);
 
     let widget = Paragraph::new(text_lines)
         .block(block)
@@ -674,19 +648,18 @@ pub(super) fn render_error_widget(
     ctx: &RenderContext,
     area: Rect,
     block: Block,
-    custom_lines: Option<&[String]>,
+    custom_lines: Option<&[StyledContent]>,
 ) {
     let message = ctx.error_message.unwrap_or("An error occurred");
 
     let text_lines: Vec<Line> = if let Some(lines) = custom_lines {
         lines
             .iter()
-            .map(|l| {
-                if l.contains("{error}") {
-                    Line::from(l.replace("{error}", message))
-                } else {
-                    Line::from(l.as_str())
+            .map(|l| match l {
+                StyledContent::Plain(s) if s.contains("{error}") => {
+                    Line::from(s.replace("{error}", message))
                 }
+                _ => l.to_line(),
             })
             .collect()
     } else {
@@ -723,6 +696,7 @@ mod tests {
         let agents = vec![
             AgentRenderInfo {
                 key: "test-1".to_string(),
+                display_name: None,
                 repo: "test/repo".to_string(),
                 issue_number: Some(1),
                 branch_name: "botster-issue-1".to_string(),
@@ -732,6 +706,7 @@ mod tests {
             },
             AgentRenderInfo {
                 key: "test-2".to_string(),
+                display_name: None,
                 repo: "test/repo".to_string(),
                 issue_number: Some(2),
                 branch_name: "botster-issue-2".to_string(),
@@ -755,6 +730,7 @@ mod tests {
             agents: &agents,
             selected_agent_index: 1,
             active_parser: None,
+            parser_pool: &std::collections::HashMap::new(),
             active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
@@ -763,6 +739,7 @@ mod tests {
             vpn_status: None,
             terminal_cols: 80,
             terminal_rows: 24,
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         let selected = ctx.selected_agent();
@@ -775,6 +752,7 @@ mod tests {
     fn test_render_context_menu_context() {
         let agents = vec![AgentRenderInfo {
             key: "test-1".to_string(),
+            display_name: None,
             repo: "test/repo".to_string(),
             issue_number: Some(1),
             branch_name: "botster-issue-1".to_string(),
@@ -797,6 +775,7 @@ mod tests {
             agents: &agents,
             selected_agent_index: 0,
             active_parser: None,
+            parser_pool: &std::collections::HashMap::new(),
             active_pty_index: 1,
             scroll_offset: 0,
             is_scrolled: false,
@@ -805,6 +784,7 @@ mod tests {
             vpn_status: None,
             terminal_cols: 80,
             terminal_rows: 24,
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         let menu_ctx = ctx.menu_context();

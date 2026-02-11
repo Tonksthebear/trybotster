@@ -19,10 +19,10 @@
 //!
 //! # Modules
 //!
-//! - [`actions`] - TUI-local action types (`TuiAction`, `InputResult`)
+//! - [`actions`] - TUI-local action types (`TuiAction`)
 //! - [`events`] - TUI-specific event types (creation stages)
 //! - [`guard`] - Terminal state RAII guard for cleanup
-//! - [`input`] - Event to action/input conversion
+//! - [`input`] - Key descriptor and PTY byte conversion
 //! - [`layout`] - Layout calculations
 //! - [`qr`] - QR code generation for browser connection
 //! - [`render`] - Main rendering function
@@ -54,13 +54,13 @@ pub mod scroll;
 pub mod view;
 
 #[doc(inline)]
-pub use actions::{InputResult, TuiAction};
+pub use actions::TuiAction;
 #[doc(inline)]
 pub use events::CreationStage;
 #[doc(inline)]
 pub use guard::TerminalGuard;
 #[doc(inline)]
-pub use input::{process_event, InputContext};
+pub use input::{key_event_to_descriptor, key_to_pty_bytes};
 #[doc(inline)]
 pub use layout::terminal_widget_inner_area;
 #[doc(inline)]

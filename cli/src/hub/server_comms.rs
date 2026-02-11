@@ -910,7 +910,11 @@ impl Hub {
                     "[Lua-TUI] Sending {} bytes of scrollback for agent {} pty {}",
                     scrollback.len(), agent_index, pty_index
                 );
-                if sink.send(TuiOutput::Scrollback(scrollback)).is_err() {
+                if sink.send(TuiOutput::Scrollback {
+                    agent_index: Some(agent_index),
+                    pty_index: Some(pty_index),
+                    data: scrollback,
+                }).is_err() {
                     log::trace!("[Lua-TUI] Output channel closed before scrollback sent");
                     return;
                 }
@@ -929,7 +933,11 @@ impl Hub {
 
                 match pty_rx.recv().await {
                     Ok(PtyEvent::Output(data)) => {
-                        if sink.send(TuiOutput::Output(data)).is_err() {
+                        if sink.send(TuiOutput::Output {
+                            agent_index: Some(agent_index),
+                            pty_index: Some(pty_index),
+                            data,
+                        }).is_err() {
                             log::trace!("[Lua-TUI] Output channel closed, stopping forwarder");
                             break;
                         }
@@ -939,7 +947,11 @@ impl Hub {
                             "[Lua-TUI] PTY process exited (code={:?}) for agent {} pty {}",
                             exit_code, agent_index, pty_index
                         );
-                        let _ = sink.send(TuiOutput::ProcessExited { exit_code });
+                        let _ = sink.send(TuiOutput::ProcessExited {
+                            agent_index: Some(agent_index),
+                            pty_index: Some(pty_index),
+                            exit_code,
+                        });
                         break;
                     }
                     Ok(_) => {}
@@ -1024,7 +1036,11 @@ impl Hub {
                     "[Lua-TUI-Direct] Sending {} bytes of scrollback for {}:{}",
                     scrollback.len(), agent_key, session_name
                 );
-                if sink.send(TuiOutput::Scrollback(scrollback)).is_err() {
+                if sink.send(TuiOutput::Scrollback {
+                    agent_index: None,
+                    pty_index: None,
+                    data: scrollback,
+                }).is_err() {
                     log::trace!("[Lua-TUI-Direct] Output channel closed before scrollback sent");
                     return;
                 }
@@ -1043,7 +1059,11 @@ impl Hub {
 
                 match pty_rx.recv().await {
                     Ok(PtyEvent::Output(data)) => {
-                        if sink.send(TuiOutput::Output(data)).is_err() {
+                        if sink.send(TuiOutput::Output {
+                            agent_index: None,
+                            pty_index: None,
+                            data,
+                        }).is_err() {
                             log::trace!("[Lua-TUI-Direct] Output channel closed, stopping forwarder");
                             break;
                         }
@@ -1053,7 +1073,11 @@ impl Hub {
                             "[Lua-TUI-Direct] PTY process exited (code={:?}) for {}:{}",
                             exit_code, agent_key, session_name
                         );
-                        let _ = sink.send(TuiOutput::ProcessExited { exit_code });
+                        let _ = sink.send(TuiOutput::ProcessExited {
+                            agent_index: None,
+                            pty_index: None,
+                            exit_code,
+                        });
                         break;
                     }
                     Ok(_) => {}
@@ -1314,8 +1338,12 @@ impl Hub {
                     let _ = tx.send(TuiOutput::Message(data));
                 }
                 TuiSendRequest::Binary { data } => {
-                    // Binary data = raw terminal output, forward to TuiRunner
-                    let _ = tx.send(TuiOutput::Output(data));
+                    // Binary data = raw terminal output, forward to active parser
+                    let _ = tx.send(TuiOutput::Output {
+                        agent_index: None,
+                        pty_index: None,
+                        data,
+                    });
                 }
             }
         }

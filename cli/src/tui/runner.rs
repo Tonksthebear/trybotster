@@ -7,7 +7,9 @@
 //!
 //! ```text
 //! TuiRunner (TUI thread)
-//! ├── vt100_parser: Arc<Mutex<Parser>>  - terminal emulation
+//! ├── parser_pool: HashMap<(agent, pty), Parser>  - per-PTY terminal emulation
+//! ├── vt100_parser: Arc<Mutex<Parser>>  - alias into pool for focused PTY
+//! ├── active_subscriptions: HashSet<(agent, pty)>  - synced from render tree
 //! ├── terminal: Terminal<CrosstermBackend>  - ratatui terminal
 //! ├── mode, menu_selected, input_buffer  - UI state
 //! ├── agents, selected_agent  - agent state cache
@@ -65,10 +67,10 @@ use crate::hub::Hub;
 use crate::relay::AgentInfo;
 use crate::tui::layout::terminal_widget_inner_area;
 
-use super::actions::InputResult;
+use super::actions::TuiAction;
 use super::events::CreationStage;
-use super::input::{process_event, InputContext};
-use super::layout_lua::LayoutLua;
+use super::input::{key_event_to_descriptor, key_to_pty_bytes};
+use super::layout_lua::{KeyContext, LayoutLua, LuaKeyAction};
 use super::qr::ConnectionCodeData;
 
 /// Default scrollback lines for VT100 parser.
@@ -97,10 +99,17 @@ pub(super) const DEFAULT_SCROLLBACK: usize = 1000;
 /// through Lua `client.lua` — the same protocol as browser clients.
 pub struct TuiRunner<B: Backend> {
     // === Terminal ===
-    /// VT100 parser for terminal emulation.
+    /// VT100 parser for the currently active PTY.
     ///
-    /// Receives PTY output via output_rx channel and maintains screen state.
+    /// This is an Arc clone of the active entry in `parser_pool`, so writing
+    /// to one updates both. Existing scroll/resize code uses this directly.
     pub(super) vt100_parser: Arc<Mutex<Parser>>,
+
+    /// Pool of VT100 parsers keyed by `(agent_index, pty_index)`.
+    ///
+    /// Each visible terminal widget can bind to a different parser.
+    /// Parsers are created on demand when PTY output arrives.
+    pub(super) parser_pool: std::collections::HashMap<(usize, usize), Arc<Mutex<Parser>>>,
 
     /// Ratatui terminal for rendering.
     terminal: Terminal<B>,
@@ -166,12 +175,25 @@ pub struct TuiRunner<B: Backend> {
     /// input and is displayed in the terminal widget.
     pub(super) current_pty_index: Option<usize>,
 
-    /// Active terminal subscription ID for the Lua subscribe/unsubscribe protocol.
+    /// Active terminal subscription ID for the focused PTY (receives keyboard input).
     ///
-    /// Tracks the current terminal subscription so we can unsubscribe before
-    /// switching agents or toggling PTY views. Uses the same subscription
-    /// protocol as browser clients.
+    /// Tracks which PTY subscription receives keyboard input and resize events.
+    /// Uses the same subscription protocol as browser clients.
     pub(super) current_terminal_sub_id: Option<String>,
+
+    /// Set of `(agent_index, pty_index)` pairs with active Lua subscriptions.
+    ///
+    /// Maintained by `sync_subscriptions()` which diffs the desired bindings
+    /// (from the render tree) against this set, sending subscribe/unsubscribe
+    /// messages as needed. This enables Lua to declaratively control which
+    /// PTYs receive data without manual subscription management.
+    pub(super) active_subscriptions: std::collections::HashSet<(usize, usize)>,
+
+    /// Last known widget dimensions (rows, cols) for each terminal binding.
+    ///
+    /// Tracks the rendered area of each terminal widget so we can detect
+    /// when a PTY needs resizing (layout change, terminal resize, etc.).
+    pub(super) widget_dims: std::collections::HashMap<(usize, usize), (u16, u16)>,
 
     // === Output Channel ===
     /// Receiver for PTY output and Lua events from Hub.
@@ -201,6 +223,13 @@ pub struct TuiRunner<B: Backend> {
     /// Filesystem path to layout.lua for hot-reload watching.
     /// None if loaded from embedded (no watching needed).
     layout_lua_fs_path: Option<std::path::PathBuf>,
+
+    // === Lua Keybindings ===
+    /// Lua keybinding source code, loaded alongside layout.
+    keybinding_lua_source: Option<String>,
+
+    /// Filesystem path to keybindings.lua for hot-reload watching.
+    keybinding_lua_fs_path: Option<std::path::PathBuf>,
 }
 
 impl<B: Backend> std::fmt::Debug for TuiRunner<B>
@@ -249,6 +278,7 @@ where
 
         Self {
             vt100_parser,
+            parser_pool: std::collections::HashMap::new(),
             terminal,
             mode: AppMode::Normal,
             menu_selected: 0,
@@ -266,12 +296,16 @@ where
             current_agent_index: None,
             current_pty_index: None,
             current_terminal_sub_id: None,
+            active_subscriptions: std::collections::HashSet::new(),
+            widget_dims: std::collections::HashMap::new(),
             output_rx,
             shutdown,
             quit: false,
             terminal_dims,
             layout_lua_source: None,
             layout_lua_fs_path: None,
+            keybinding_lua_source: None,
+            keybinding_lua_fs_path: None,
         }
     }
 
@@ -283,12 +317,141 @@ where
         self.layout_lua_source = Some(lua_source);
     }
 
-    /// Get the VT100 parser handle.
+    /// Set the Lua keybinding source for hot-reloadable key handling.
+    pub fn set_keybinding_lua_source(&mut self, lua_source: String) {
+        self.keybinding_lua_source = Some(lua_source);
+    }
+
+    /// Get the VT100 parser handle for the active PTY.
     ///
     /// Used for rendering the terminal content.
     #[must_use]
     pub fn parser_handle(&self) -> Arc<Mutex<Parser>> {
         Arc::clone(&self.vt100_parser)
+    }
+
+    /// Resolve a parser from the pool by agent/PTY identity.
+    ///
+    /// If identity is `Some`, looks up or creates a parser in the pool.
+    /// If identity is `None`, falls back to `current_agent_index`/`current_pty_index`.
+    /// Creates parsers on demand with current terminal dimensions.
+    fn resolve_parser(
+        &mut self,
+        agent_index: Option<usize>,
+        pty_index: Option<usize>,
+    ) -> Arc<Mutex<Parser>> {
+        let key = (
+            agent_index.or(self.current_agent_index).unwrap_or(0),
+            pty_index.or(self.current_pty_index).unwrap_or(0),
+        );
+        let (rows, cols) = self.terminal_dims;
+        self.parser_pool
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK))))
+            .clone()
+    }
+
+    /// Synchronize PTY subscriptions to match what the render tree needs.
+    ///
+    /// Walks the render tree, collects all `(agent_index, pty_index)` bindings
+    /// from terminal widgets, then diffs against `active_subscriptions`:
+    /// - **New pairs**: sends subscribe JSON, creates parser in pool
+    /// - **Removed pairs**: sends unsubscribe JSON, removes parser from pool
+    ///
+    /// This is the declarative reconciliation layer: Lua says "show these PTYs",
+    /// Rust ensures exactly those subscriptions are active. Called after each
+    /// successful Lua render.
+    pub(super) fn sync_subscriptions(&mut self, tree: &super::render_tree::RenderNode) {
+        let default_agent = self.current_agent_index.unwrap_or(0);
+        let default_pty = self.current_pty_index.unwrap_or(0);
+
+        let desired = super::render_tree::collect_terminal_bindings(tree, default_agent, default_pty);
+
+        // Subscribe to new pairs
+        for &(agent_idx, pty_idx) in &desired {
+            if !self.active_subscriptions.contains(&(agent_idx, pty_idx)) {
+                let sub_id = format!("tui:{}:{}", agent_idx, pty_idx);
+                self.send_msg(serde_json::json!({
+                    "type": "subscribe",
+                    "channel": "terminal",
+                    "subscriptionId": sub_id,
+                    "params": {
+                        "agent_index": agent_idx,
+                        "pty_index": pty_idx,
+                    }
+                }));
+
+                // Ensure parser exists for this binding.
+                // Use per-widget dims if known (from previous render), else full terminal dims.
+                let (rows, cols) = self.widget_dims
+                    .get(&(agent_idx, pty_idx))
+                    .copied()
+                    .unwrap_or(self.terminal_dims);
+                self.parser_pool
+                    .entry((agent_idx, pty_idx))
+                    .or_insert_with(|| Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK))));
+            }
+        }
+
+        // Unsubscribe from removed pairs
+        for &(agent_idx, pty_idx) in &self.active_subscriptions {
+            if !desired.contains(&(agent_idx, pty_idx)) {
+                let sub_id = format!("tui:{}:{}", agent_idx, pty_idx);
+                self.send_msg(serde_json::json!({
+                    "type": "unsubscribe",
+                    "subscriptionId": sub_id,
+                }));
+
+                // Remove parser from pool (data no longer needed)
+                self.parser_pool.remove(&(agent_idx, pty_idx));
+            }
+        }
+
+        self.active_subscriptions = desired;
+    }
+
+    /// Resize parsers and PTYs to match the actual rendered widget areas.
+    ///
+    /// Called after each render pass. Compares the collected terminal widget
+    /// areas against the last known dimensions. For any that changed, resizes
+    /// both the vt100 parser (so output is interpreted correctly) and sends a
+    /// resize command to the PTY process (so programs like vim/less reflow).
+    pub(super) fn sync_widget_dims(
+        &mut self,
+        areas: &std::collections::HashMap<(usize, usize), (u16, u16)>,
+    ) {
+        for (&(agent_idx, pty_idx), &(rows, cols)) in areas {
+            if rows == 0 || cols == 0 {
+                continue;
+            }
+
+            let prev = self.widget_dims.get(&(agent_idx, pty_idx));
+            if prev == Some(&(rows, cols)) {
+                continue; // No change
+            }
+
+            self.widget_dims.insert((agent_idx, pty_idx), (rows, cols));
+
+            // Resize the parser
+            if let Some(parser) = self.parser_pool.get(&(agent_idx, pty_idx)) {
+                let mut p = parser.lock().expect("parser lock poisoned");
+                p.screen_mut().set_size(rows, cols);
+            }
+
+            // Send resize to the PTY process
+            let sub_id = format!("tui:{}:{}", agent_idx, pty_idx);
+            self.send_msg(serde_json::json!({
+                "subscriptionId": sub_id,
+                "data": {
+                    "type": "resize",
+                    "rows": rows,
+                    "cols": cols,
+                }
+            }));
+        }
+
+        // Clean up stale entries for bindings no longer rendered
+        self.widget_dims.retain(|k, _| areas.contains_key(k));
     }
 
     /// Get the current mode.
@@ -340,7 +503,18 @@ where
             }
         });
 
-        // Set up file watcher for hot-reload (only if loaded from filesystem)
+        // Load keybindings into the same Lua state (if available).
+        if let Some(ref mut lua) = layout_lua {
+            if let Some(kb_source) = self.keybinding_lua_source.take() {
+                match lua.load_keybindings(&kb_source) {
+                    Ok(()) => log::info!("Lua keybindings loaded"),
+                    Err(e) => log::warn!("Failed to load Lua keybindings: {e}"),
+                }
+            }
+        }
+
+        // Set up file watcher for hot-reload (watches ui/ directory for both files)
+        let keybinding_fs_path = self.keybinding_lua_fs_path.take();
         let layout_watcher = self.layout_lua_fs_path.take().and_then(|path| {
             match crate::file_watcher::FileWatcher::new() {
                 Ok(mut watcher) => {
@@ -382,7 +556,7 @@ where
 
         while !self.should_quit() {
             // 1. Handle keyboard/mouse input
-            self.poll_input()?;
+            self.poll_input(layout_lua.as_ref())?;
 
             if self.should_quit() {
                 break;
@@ -391,20 +565,31 @@ where
             // 2. Poll PTY output and Lua events (via Hub output channel)
             self.poll_pty_events();
 
-            // 3. Hot-reload layout.lua if changed
+            // 3. Hot-reload layout.lua and keybindings.lua if changed
             if let Some((ref watcher, ref path)) = layout_watcher {
                 let events = watcher.poll();
                 if !events.is_empty() {
                     log::debug!("FileWatcher events: {:?}", events);
-                    log::debug!("Comparing against path: {:?}", path);
+                    log::debug!("Comparing against layout path: {:?}", path);
                 }
-                let layout_changed = events.iter().any(|evt| {
+
+                let is_modify = |evt: &crate::file_watcher::FileEvent| {
                     matches!(
                         evt.kind,
                         crate::file_watcher::FileEventKind::Create
                             | crate::file_watcher::FileEventKind::Modify
                             | crate::file_watcher::FileEventKind::Rename
-                    ) && evt.path.file_name() == path.file_name()
+                    )
+                };
+
+                let layout_changed = events.iter().any(|evt| {
+                    is_modify(evt) && evt.path.file_name() == path.file_name()
+                });
+
+                let keybinding_changed = keybinding_fs_path.as_ref().map_or(false, |kb_path| {
+                    events.iter().any(|evt| {
+                        is_modify(evt) && evt.path.file_name() == kb_path.file_name()
+                    })
                 });
 
                 if layout_changed {
@@ -443,6 +628,24 @@ where
                         }
                     }
                 }
+
+                if keybinding_changed {
+                    if let Some(ref kb_path) = keybinding_fs_path {
+                        match std::fs::read_to_string(kb_path) {
+                            Ok(new_source) => {
+                                if let Some(ref mut lua) = layout_lua {
+                                    match lua.reload_keybindings(&new_source) {
+                                        Ok(()) => log::info!("Keybindings hot-reloaded"),
+                                        Err(e) => log::warn!("Keybindings reload failed: {e}"),
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to read keybindings.lua: {e}");
+                            }
+                        }
+                    }
+                }
             }
 
             // 4. Render
@@ -460,38 +663,185 @@ where
     ///
     /// Drains all available events per frame to prevent scroll stall when
     /// rapid input (e.g., mouse wheel) queues events faster than render rate.
-    fn poll_input(&mut self) -> Result<()> {
+    fn poll_input(&mut self, layout_lua: Option<&LayoutLua>) -> Result<()> {
         // Drain all available events (0ms timeout = non-blocking check)
         while event::poll(Duration::from_millis(0))? {
             let ev = event::read()?;
-            self.handle_input_event(&ev);
+            self.handle_input_event(&ev, layout_lua);
         }
         Ok(())
     }
 
     /// Handle a terminal input event.
-    fn handle_input_event(&mut self, event: &Event) {
-        // Build input context
-        let context = InputContext {
-            terminal_rows: self.terminal_dims.0,
-            menu_selected: self.menu_selected,
-            menu_count: {
-                let ctx = self.build_menu_context();
-                crate::tui::menu::selectable_count(&crate::tui::menu::build_menu(&ctx))
-            },
-            worktree_selected: self.worktree_selected,
-            worktree_count: self.available_worktrees.len() + 1, // +1 for "Create New"
+    ///
+    /// Key events go through Lua keybinding dispatch:
+    /// 1. Convert crossterm `KeyEvent` to descriptor string
+    /// 2. Ctrl+Q is hardcoded as Quit (safety — works even if Lua is broken)
+    /// 3. Call Lua `handle_key(descriptor, mode, context)`
+    /// 4. If Lua returns an action → map to `TuiAction` and handle
+    /// 5. If Lua returns `nil` in Normal mode → forward key to PTY
+    /// 6. If Lua returns `nil` in modal mode → ignore (swallow key)
+    ///
+    /// Mouse and resize events are handled directly in Rust.
+    fn handle_input_event(&mut self, event: &Event, layout_lua: Option<&LayoutLua>) {
+        match event {
+            Event::Key(key) => {
+                // Only process key press events
+                if key.kind != crossterm::event::KeyEventKind::Press {
+                    return;
+                }
+
+                let descriptor = key_event_to_descriptor(key);
+
+                // Safety: Ctrl+Q always works, even if Lua is broken
+                if descriptor == "ctrl+q" {
+                    self.handle_tui_action(TuiAction::Quit);
+                    return;
+                }
+
+                // Try Lua keybinding dispatch
+                if let Some(lua) = layout_lua {
+                    if lua.has_keybindings() {
+                        let mode_str = mode_to_lua_string(&self.mode);
+                        let context = KeyContext {
+                            menu_selected: self.menu_selected,
+                            menu_count: {
+                                let ctx = self.build_menu_context();
+                                crate::tui::menu::selectable_count(
+                                    &crate::tui::menu::build_menu(&ctx),
+                                )
+                            },
+                            worktree_selected: self.worktree_selected,
+                            terminal_rows: self.terminal_dims.0,
+                        };
+
+                        match lua.call_handle_key(&descriptor, mode_str, &context) {
+                            Ok(Some(lua_action)) => {
+                                self.handle_lua_key_action(&lua_action);
+                                return;
+                            }
+                            Ok(None) => {
+                                // Unbound key
+                                if self.mode == AppMode::Normal {
+                                    // Forward to PTY
+                                    if let Some(bytes) = key_to_pty_bytes(key) {
+                                        self.handle_pty_input(&bytes);
+                                    }
+                                }
+                                // In modal modes, unbound keys are swallowed
+                                return;
+                            }
+                            Err(e) => {
+                                log::warn!("Lua handle_key failed: {e}");
+                                // Fall through to PTY forwarding in normal mode
+                                if self.mode == AppMode::Normal {
+                                    if let Some(bytes) = key_to_pty_bytes(key) {
+                                        self.handle_pty_input(&bytes);
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                // No Lua keybindings loaded — fall back to PTY forwarding in normal mode
+                if self.mode == AppMode::Normal {
+                    if let Some(bytes) = key_to_pty_bytes(key) {
+                        self.handle_pty_input(&bytes);
+                    }
+                }
+            }
+            Event::Mouse(mouse) => {
+                // Mouse scroll only in normal mode
+                if self.mode == AppMode::Normal {
+                    match mouse.kind {
+                        crossterm::event::MouseEventKind::ScrollUp => {
+                            self.handle_tui_action(TuiAction::ScrollUp(3));
+                        }
+                        crossterm::event::MouseEventKind::ScrollDown => {
+                            self.handle_tui_action(TuiAction::ScrollDown(3));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Event::Resize(cols, rows) => {
+                let (inner_rows, inner_cols) =
+                    crate::tui::layout::terminal_widget_inner_area(*cols, *rows);
+                self.handle_resize(inner_rows, inner_cols);
+            }
+            _ => {}
+        }
+    }
+
+    /// Map a Lua key action to a `TuiAction` and handle it.
+    fn handle_lua_key_action(&mut self, lua_action: &LuaKeyAction) {
+        let action = match lua_action.action.as_str() {
+            // Application control
+            "quit" => TuiAction::Quit,
+
+            // Modal state
+            "open_menu" => TuiAction::OpenMenu,
+            "close_modal" => TuiAction::CloseModal,
+
+            // Menu navigation
+            "menu_up" => TuiAction::MenuUp,
+            "menu_down" => TuiAction::MenuDown,
+            "menu_select" => {
+                let idx = lua_action.index.unwrap_or(self.menu_selected);
+                TuiAction::MenuSelect(idx)
+            }
+
+            // Worktree selection
+            "worktree_up" => TuiAction::WorktreeUp,
+            "worktree_down" => TuiAction::WorktreeDown,
+            "worktree_select" => {
+                TuiAction::WorktreeSelect(self.worktree_selected)
+            }
+
+            // Text input
+            "input_char" => {
+                if let Some(c) = lua_action.char {
+                    TuiAction::InputChar(c)
+                } else {
+                    return;
+                }
+            }
+            "input_backspace" => TuiAction::InputBackspace,
+            "input_submit" => TuiAction::InputSubmit,
+
+            // Connection code
+            "show_connection_code" => TuiAction::ShowConnectionCode,
+            "regenerate_connection_code" => TuiAction::RegenerateConnectionCode,
+            "copy_connection_url" => TuiAction::CopyConnectionUrl,
+
+            // Agent close confirmation
+            "confirm_close" => TuiAction::ConfirmCloseAgent,
+            "confirm_close_delete" => TuiAction::ConfirmCloseAgentDeleteWorktree,
+
+            // Scrolling
+            "scroll_half_up" => {
+                TuiAction::ScrollUp(self.terminal_dims.0 as usize / 2)
+            }
+            "scroll_half_down" => {
+                TuiAction::ScrollDown(self.terminal_dims.0 as usize / 2)
+            }
+            "scroll_top" => TuiAction::ScrollToTop,
+            "scroll_bottom" => TuiAction::ScrollToBottom,
+
+            // Agent navigation
+            "select_next" => TuiAction::SelectNext,
+            "select_previous" => TuiAction::SelectPrevious,
+            "toggle_pty" => TuiAction::TogglePtyView,
+
+            unknown => {
+                log::warn!("Unknown Lua key action: {unknown}");
+                return;
+            }
         };
 
-        // Convert event to input result
-        let result = process_event(event, &self.mode, &context);
-
-        match result {
-            InputResult::Action(action) => self.handle_tui_action(action),
-            InputResult::PtyInput(data) => self.handle_pty_input(&data),
-            InputResult::Resize { rows, cols } => self.handle_resize(rows, cols),
-            InputResult::None => {}
-        }
+        self.handle_tui_action(action);
     }
 
     /// Handle PTY input (send to connected agent via Lua terminal subscription).
@@ -517,27 +867,17 @@ where
     fn handle_resize(&mut self, rows: u16, cols: u16) {
         self.terminal_dims = (rows, cols);
 
-        // Resize the vt100 parser to match new terminal dimensions.
-        // This is critical - without this, PTY output formatted for new dimensions
-        // would be interpreted with old dimensions, causing garbled display.
+        // Clear cached widget dims so the next render + sync_widget_dims will
+        // recompute and resize all parsers/PTYs to their actual widget areas.
+        self.widget_dims.clear();
+
+        // Also resize the fallback parser (used when no Lua layout is active)
         {
             let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
             parser.screen_mut().set_size(rows, cols);
         }
 
-        // Propagate resize to the connected PTY via Lua terminal subscription.
-        if let Some(ref sub_id) = self.current_terminal_sub_id {
-            self.send_msg(serde_json::json!({
-                "subscriptionId": sub_id,
-                "data": {
-                    "type": "resize",
-                    "rows": rows,
-                    "cols": cols,
-                }
-            }));
-        }
-
-        // Also update client-level dims via hub subscription so
+        // Update client-level dims via hub subscription so
         // client.lua tracks dimensions for future PTY subscriptions.
         self.send_msg(serde_json::json!({
             "subscriptionId": "tui_hub",
@@ -560,18 +900,16 @@ where
         // Process up to 100 events per tick
         for _ in 0..100 {
             match self.output_rx.try_recv() {
-                Ok(TuiOutput::Scrollback(data)) => {
-                    // Feed historical output to TuiRunner's vt100 parser
-                    let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-                    parser.process(&data);
+                Ok(TuiOutput::Scrollback { agent_index, pty_index, data }) => {
+                    let parser = self.resolve_parser(agent_index, pty_index);
+                    parser.lock().expect("parser lock poisoned").process(&data);
                     log::debug!("Processed {} bytes of scrollback", data.len());
                 }
-                Ok(TuiOutput::Output(data)) => {
-                    // Feed ongoing output to TuiRunner's vt100 parser
-                    let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-                    parser.process(&data);
+                Ok(TuiOutput::Output { agent_index, pty_index, data }) => {
+                    let parser = self.resolve_parser(agent_index, pty_index);
+                    parser.lock().expect("parser lock poisoned").process(&data);
                 }
-                Ok(TuiOutput::ProcessExited { exit_code }) => {
+                Ok(TuiOutput::ProcessExited { exit_code, .. }) => {
                     log::info!("PTY process exited with code {:?}", exit_code);
                     // Process exited - we remain connected for any final output
                 }
@@ -582,13 +920,15 @@ where
                 Err(TryRecvError::Disconnected) => {
                     log::debug!("PTY output channel disconnected");
                     // Channel closed - Hub was dropped or terminated.
-                    // Unsubscribe from current terminal if connected.
-                    if let Some(ref sub_id) = self.current_terminal_sub_id {
+                    // Unsubscribe from all active subscriptions.
+                    for &(agent_idx, pty_idx) in &self.active_subscriptions {
+                        let sub_id = format!("tui:{}:{}", agent_idx, pty_idx);
                         self.send_msg(serde_json::json!({
                             "type": "unsubscribe",
                             "subscriptionId": sub_id,
                         }));
                     }
+                    self.active_subscriptions.clear();
                     self.current_terminal_sub_id = None;
                     self.current_agent_index = None;
                     self.current_pty_index = None;
@@ -613,6 +953,7 @@ where
             .iter()
             .map(|info| AgentRenderInfo {
                 key: info.id.clone(),
+                display_name: info.name.clone(),
                 repo: info.repo.clone().unwrap_or_default(),
                 issue_number: info.issue_number.map(|n| n as u32),
                 branch_name: info.branch_name.clone().unwrap_or_default(),
@@ -633,9 +974,13 @@ where
             .and_then(|key| self.agents.iter().position(|a| a.id == *key))
             .unwrap_or(0);
 
-        // Build creating_agent reference
-        let creating_agent_ref = self
+        // Clone creating_agent data so ctx doesn't borrow self
+        // (needed because sync_subscriptions/sync_widget_dims need &mut self after render)
+        let creating_agent_owned = self
             .creating_agent
+            .as_ref()
+            .map(|(id, stage)| (id.clone(), *stage));
+        let creating_agent_ref = creating_agent_owned
             .as_ref()
             .map(|(id, stage)| (id.as_str(), *stage));
 
@@ -668,6 +1013,7 @@ where
 
             // Terminal State - use TuiRunner's local parser
             active_parser: Some(self.parser_handle()),
+            parser_pool: &self.parser_pool,
             active_pty_index: self.active_pty_index,
             scroll_offset,
             is_scrolled,
@@ -680,23 +1026,40 @@ where
             // Terminal dimensions for responsive layout
             terminal_cols: self.terminal_dims.1,
             terminal_rows: self.terminal_dims.0,
+
+            // Widget area tracking (populated during rendering)
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         // Try Lua-driven render, fall back to hardcoded Rust layout
-        let lua_render_ok = if let Some(layout_lua) = layout_lua {
+        let lua_tree = if let Some(layout_lua) = layout_lua {
             match render_with_lua(&mut self.terminal, layout_lua, &ctx) {
-                Ok(()) => true,
+                Ok(tree) => Some(tree),
                 Err(e) => {
                     log::warn!("Lua layout render failed, using fallback: {e}");
-                    false
+                    None
                 }
             }
         } else {
-            false
+            None
         };
 
-        if !lua_render_ok {
+        if lua_tree.is_none() {
             render(&mut self.terminal, &ctx, None)?;
+        }
+
+        // Extract terminal areas and drop ctx (which borrows self) before mutation
+        let rendered_areas = ctx.terminal_areas.borrow().clone();
+        drop(ctx);
+
+        if let Some(ref tree) = lua_tree {
+            // Sync subscriptions to match what the render tree declares
+            self.sync_subscriptions(tree);
+        }
+
+        // Resize parsers and PTYs to match actual widget areas from the render pass
+        if !rendered_areas.is_empty() {
+            self.sync_widget_dims(&rendered_areas);
         }
 
         // Render error indicator overlay if there's a layout error
@@ -736,12 +1099,13 @@ where
 /// Render using the Lua layout engine (free function to avoid borrow conflicts).
 ///
 /// Calls Lua `render(state)` and `render_overlay(state)`, interprets
-/// the returned render trees into ratatui calls.
+/// the returned render trees into ratatui calls. Returns the main render
+/// tree on success so the caller can sync subscriptions from it.
 fn render_with_lua<B>(
     terminal: &mut Terminal<B>,
     layout_lua: &LayoutLua,
     ctx: &super::render::RenderContext,
-) -> Result<()>
+) -> Result<super::render_tree::RenderNode>
 where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -764,7 +1128,7 @@ where
         }
     })?;
 
-    Ok(())
+    Ok(tree)
 }
 
 /// Render a dim error indicator in the bottom-right corner of the terminal.
@@ -889,6 +1253,12 @@ pub fn run_with_hub(
         tui_runner.layout_lua_fs_path = layout.fs_path;
     }
 
+    // Load Lua keybinding source alongside layout.
+    if let Some(kb) = load_keybinding_lua_source() {
+        tui_runner.set_keybinding_lua_source(kb.source);
+        tui_runner.keybinding_lua_fs_path = kb.fs_path;
+    }
+
     // Spawn TUI thread
     let tui_handle = thread::Builder::new()
         .name("tui-runner".to_string())
@@ -921,6 +1291,22 @@ pub fn run_with_hub(
 
     log::info!("Hub event loop exiting");
     Ok(())
+}
+
+/// Map `AppMode` to the Lua mode string used in keybinding tables.
+///
+/// These strings match the table names in `ui/keybindings.lua`.
+/// Both `NewAgentCreateWorktree` and `NewAgentPrompt` map to `"text_input"`.
+fn mode_to_lua_string(mode: &AppMode) -> &'static str {
+    match mode {
+        AppMode::Normal => "normal",
+        AppMode::Menu => "menu",
+        AppMode::NewAgentSelectWorktree => "worktree_select",
+        AppMode::NewAgentCreateWorktree | AppMode::NewAgentPrompt => "text_input",
+        AppMode::CloseAgentConfirm => "close_confirm",
+        AppMode::ConnectionCode => "connection_code",
+        AppMode::Error => "error",
+    }
 }
 
 /// Result of loading Lua layout source.
@@ -970,6 +1356,44 @@ fn load_layout_lua_source() -> Option<LayoutSource> {
     None
 }
 
+/// Load the Lua keybinding source from filesystem or embedded.
+///
+/// Same priority as layout: filesystem first, then embedded fallback.
+fn load_keybinding_lua_source() -> Option<LayoutSource> {
+    let lua_base = std::env::var("BOTSTER_LUA_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .map(|h| h.join(".botster").join("lua"))
+                .unwrap_or_else(|| std::path::PathBuf::from(".botster/lua"))
+        });
+
+    let fs_path = lua_base.join("ui").join("keybindings.lua");
+    if let Ok(source) = std::fs::read_to_string(&fs_path) {
+        let fs_path = fs_path.canonicalize().unwrap_or(fs_path);
+        log::info!(
+            "Loaded keybindings.lua from filesystem: {}",
+            fs_path.display()
+        );
+        return Some(LayoutSource {
+            source,
+            fs_path: Some(fs_path),
+        });
+    }
+
+    // Fall back to embedded (release builds)
+    if let Some(source) = crate::lua::embedded::get("ui/keybindings.lua") {
+        log::info!("Loaded keybindings.lua from embedded");
+        return Some(LayoutSource {
+            source: source.to_string(),
+            fs_path: None,
+        });
+    }
+
+    log::info!("No keybindings.lua found, using Rust-only key handling");
+    None
+}
+
 #[cfg(test)]
 mod tests {
     //! TuiRunner tests - comprehensive end-to-end tests through the input chain.
@@ -977,7 +1401,7 @@ mod tests {
     //! # Test Philosophy
     //!
     //! Tests in this module exercise real code paths via:
-    //! 1. Keyboard events through `process_event()` -> `handle_input_event()` -> `handle_tui_action()`
+    //! 1. Keyboard events through Lua `handle_key()` -> `handle_input_event()` -> `handle_tui_action()`
     //! 2. Verification of commands sent through channels
     //! 3. Real PTY event polling through `poll_pty_events()`
     //!
@@ -1102,20 +1526,6 @@ mod tests {
         (runner, output_tx, passthrough_rx, shutdown)
     }
 
-    /// Builds an `InputContext` from the current runner state.
-    fn runner_input_context(runner: &TuiRunner<TestBackend>) -> InputContext {
-        InputContext {
-            terminal_rows: runner.terminal_dims.0,
-            menu_selected: runner.menu_selected,
-            menu_count: {
-                let ctx = runner.build_menu_context();
-                crate::tui::menu::selectable_count(&crate::tui::menu::build_menu(&ctx))
-            },
-            worktree_selected: runner.worktree_selected,
-            worktree_count: runner.available_worktrees.len() + 1,
-        }
-    }
-
     /// Creates a key event without modifiers.
     fn make_key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -1131,25 +1541,22 @@ mod tests {
         Event::Key(KeyEvent::new(code, KeyModifiers::SHIFT))
     }
 
-    /// Processes a keyboard event through the full input pipeline.
-    ///
-    /// This exercises: `Event` -> `process_event()` -> `handle_input_event()` -> state change
-    fn process_key(runner: &mut TuiRunner<TestBackend>, event: Event) {
-        let context = runner_input_context(runner);
-        let result = process_event(&event, &runner.mode(), &context);
+    /// Creates a `LayoutLua` with keybindings loaded from the actual file.
+    fn make_test_layout_with_keybindings() -> LayoutLua {
+        let layout_source = "function render(s) return { type = 'empty' } end\nfunction render_overlay(s) return nil end";
+        let kb_source = include_str!("../../lua/ui/keybindings.lua");
+        let mut lua = LayoutLua::new(layout_source).expect("test layout should load");
+        lua.load_keybindings(kb_source)
+            .expect("test keybindings should load");
+        lua
+    }
 
-        match result {
-            InputResult::Action(action) => {
-                runner.handle_tui_action(action);
-            }
-            InputResult::PtyInput(_) => {
-                // PTY input goes to agent - not testing that path here
-            }
-            InputResult::Resize { rows, cols } => {
-                runner.handle_resize(rows, cols);
-            }
-            InputResult::None => {}
-        }
+    /// Processes a keyboard event through the full Lua-driven input pipeline.
+    ///
+    /// This exercises: `Event` -> `handle_input_event()` with Lua keybindings
+    fn process_key(runner: &mut TuiRunner<TestBackend>, event: Event) {
+        let lua = make_test_layout_with_keybindings();
+        runner.handle_input_event(&event, Some(&lua));
     }
 
     // =========================================================================
@@ -1479,25 +1886,19 @@ mod tests {
         assert!(runner.quit, "Ctrl+Q should set quit flag");
     }
 
-    /// Verifies plain keys in Normal mode go to PTY, not actions.
+    /// Verifies plain keys in Normal mode go to PTY (via Lua returning nil).
     #[test]
     fn test_e2e_normal_mode_keys_go_to_pty() {
-        let (runner, _cmd_rx) = create_test_runner();
-        let context = runner_input_context(&runner);
+        let lua = make_test_layout_with_keybindings();
+        let context = KeyContext::default();
 
-        // Plain 'q' should go to PTY (not quit)
-        let result = process_event(&make_key(KeyCode::Char('q')), &runner.mode(), &context);
-        assert!(
-            matches!(result, InputResult::PtyInput(_)),
-            "Plain 'q' should go to PTY"
-        );
+        // Plain 'q' should NOT match any binding in normal mode -> nil -> PTY
+        let result = lua.call_handle_key("q", "normal", &context).unwrap();
+        assert!(result.is_none(), "Plain 'q' should return nil (PTY forward)");
 
-        // Plain 'p' should go to PTY (not open menu)
-        let result = process_event(&make_key(KeyCode::Char('p')), &runner.mode(), &context);
-        assert!(
-            matches!(result, InputResult::PtyInput(_)),
-            "Plain 'p' should go to PTY"
-        );
+        // Plain 'p' should NOT match any binding in normal mode -> nil -> PTY
+        let result = lua.call_handle_key("p", "normal", &context).unwrap();
+        assert!(result.is_none(), "Plain 'p' should return nil (PTY forward)");
     }
 
     // =========================================================================
@@ -1876,21 +2277,27 @@ mod tests {
     /// Verifies scroll key bindings produce correct actions.
     #[test]
     fn test_e2e_scroll_keys() {
-        let (runner, _cmd_rx) = create_test_runner();
-        let context = runner_input_context(&runner);
+        let lua = make_test_layout_with_keybindings();
+        let context = KeyContext::default();
 
         // Shift+PageUp for scroll up
-        let result = process_event(&make_key_shift(KeyCode::PageUp), &runner.mode(), &context);
-        assert!(
-            matches!(result, InputResult::Action(TuiAction::ScrollUp(_))),
-            "Shift+PageUp should scroll up"
+        let result = lua
+            .call_handle_key("shift+pageup", "normal", &context)
+            .unwrap();
+        assert_eq!(
+            result.as_ref().map(|a| a.action.as_str()),
+            Some("scroll_half_up"),
+            "Shift+PageUp should produce scroll_half_up"
         );
 
         // Shift+PageDown for scroll down
-        let result = process_event(&make_key_shift(KeyCode::PageDown), &runner.mode(), &context);
-        assert!(
-            matches!(result, InputResult::Action(TuiAction::ScrollDown(_))),
-            "Shift+PageDown should scroll down"
+        let result = lua
+            .call_handle_key("shift+pagedown", "normal", &context)
+            .unwrap();
+        assert_eq!(
+            result.as_ref().map(|a| a.action.as_str()),
+            Some("scroll_half_down"),
+            "Shift+PageDown should produce scroll_half_down"
         );
     }
 
@@ -1910,38 +2317,44 @@ mod tests {
     // E2E Agent Navigation Tests
     // =========================================================================
 
-    /// Verifies Ctrl+J/K produce SelectNext/SelectPrevious actions.
+    /// Verifies Ctrl+J/K produce SelectNext/SelectPrevious actions via Lua.
     #[test]
     fn test_e2e_agent_navigation_keybindings() {
-        let (runner, _cmd_rx) = create_test_runner();
-        let context = runner_input_context(&runner);
+        let lua = make_test_layout_with_keybindings();
+        let context = KeyContext::default();
 
-        let result = process_event(&make_key_ctrl(KeyCode::Char('j')), &runner.mode(), &context);
+        let result = lua
+            .call_handle_key("ctrl+j", "normal", &context)
+            .unwrap();
         assert_eq!(
-            result,
-            InputResult::Action(TuiAction::SelectNext),
-            "Ctrl+J should be SelectNext"
+            result.as_ref().map(|a| a.action.as_str()),
+            Some("select_next"),
+            "Ctrl+J should be select_next"
         );
 
-        let result = process_event(&make_key_ctrl(KeyCode::Char('k')), &runner.mode(), &context);
+        let result = lua
+            .call_handle_key("ctrl+k", "normal", &context)
+            .unwrap();
         assert_eq!(
-            result,
-            InputResult::Action(TuiAction::SelectPrevious),
-            "Ctrl+K should be SelectPrevious"
+            result.as_ref().map(|a| a.action.as_str()),
+            Some("select_previous"),
+            "Ctrl+K should be select_previous"
         );
     }
 
-    /// Verifies Ctrl+] produces TogglePtyView action.
+    /// Verifies Ctrl+] produces toggle_pty action via Lua.
     #[test]
     fn test_e2e_pty_toggle_keybinding() {
-        let (runner, _cmd_rx) = create_test_runner();
-        let context = runner_input_context(&runner);
+        let lua = make_test_layout_with_keybindings();
+        let context = KeyContext::default();
 
-        let result = process_event(&make_key_ctrl(KeyCode::Char(']')), &runner.mode(), &context);
+        let result = lua
+            .call_handle_key("ctrl+]", "normal", &context)
+            .unwrap();
         assert_eq!(
-            result,
-            InputResult::Action(TuiAction::TogglePtyView),
-            "Ctrl+] should be TogglePtyView"
+            result.as_ref().map(|a| a.action.as_str()),
+            Some("toggle_pty"),
+            "Ctrl+] should be toggle_pty"
         );
     }
 
@@ -2379,15 +2792,15 @@ mod tests {
             .collect()
     }
 
-    /// Verifies `request_select_next()` sends a subscribe message for agent 1 when agent 0 is selected.
+    /// Verifies `request_select_next()` eagerly subscribes and updates state.
     ///
     /// # Scenario
     ///
     /// Given 3 agents with agent 0 currently selected, pressing "next" should
-    /// advance to agent 1. The subscribe message is sent via `JSON::Message`
-    /// using the Lua protocol (same as browser clients).
+    /// advance to agent 1. A subscribe message is sent immediately for
+    /// responsive keyboard input routing.
     #[test]
-    fn test_select_next_agent_sends_subscribe() {
+    fn test_select_next_agent_subscribes_and_updates_state() {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: 3 agents, agent 0 selected
@@ -2413,7 +2826,8 @@ mod tests {
         assert_eq!(runner.selected_agent.as_deref(), Some("agent-1"));
         assert_eq!(runner.current_agent_index, Some(1));
         assert_eq!(runner.current_pty_index, Some(0));
-        assert_eq!(runner.current_terminal_sub_id, Some("tui_term".to_string()));
+        assert_eq!(runner.current_terminal_sub_id, Some("tui:1:0".to_string()));
+        assert!(runner.active_subscriptions.contains(&(1, 0)));
     }
 
     /// Verifies `request_select_previous()` wraps from agent 0 to last agent (index 2).
@@ -2443,9 +2857,9 @@ mod tests {
             Err(_) => panic!("Expected subscribe message to be sent"),
         }
 
-        // Verify local state updated
         assert_eq!(runner.selected_agent.as_deref(), Some("agent-2"));
         assert_eq!(runner.current_agent_index, Some(2));
+        assert_eq!(runner.current_terminal_sub_id, Some("tui:2:0".to_string()));
     }
 
     /// Verifies `request_select_next()` wraps from last agent (index 2) to first (index 0).
@@ -2465,7 +2879,7 @@ mod tests {
         // Action: select next (should wrap to first)
         runner.request_select_next();
 
-        // Verify: subscribe message sent for agent index 0
+        // Verify subscribe for agent 0
         match request_rx.try_recv() {
             Ok(msg) => {
                 assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
@@ -2477,14 +2891,16 @@ mod tests {
 
         assert_eq!(runner.selected_agent.as_deref(), Some("agent-0"));
         assert_eq!(runner.current_agent_index, Some(0));
+        assert_eq!(runner.current_terminal_sub_id, Some("tui:0:0".to_string()));
     }
 
-    /// Verifies `request_select_next()` sends unsubscribe before subscribe when already subscribed.
+    /// Verifies `request_select_next()` sends unsubscribe then subscribe when switching.
     ///
     /// # Scenario
     ///
     /// When switching from one agent to another, the TUI must unsubscribe from
-    /// the current terminal before subscribing to the new one.
+    /// the current terminal before subscribing to the new one, and update
+    /// `active_subscriptions` accordingly.
     #[test]
     fn test_select_agent_unsubscribes_then_subscribes() {
         let (mut runner, mut request_rx) = create_test_runner();
@@ -2492,7 +2908,10 @@ mod tests {
         // Setup: 3 agents, agent 0 selected with active subscription
         runner.agents = make_test_agents(3);
         runner.selected_agent = Some("agent-0".to_string());
-        runner.current_terminal_sub_id = Some("tui_term".to_string());
+        runner.current_agent_index = Some(0);
+        runner.current_pty_index = Some(0);
+        runner.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.active_subscriptions.insert((0, 0));
 
         // Action: select next agent
         runner.request_select_next();
@@ -2507,7 +2926,7 @@ mod tests {
                 );
                 assert_eq!(
                     msg.get("subscriptionId").and_then(|v| v.as_str()),
-                    Some("tui_term")
+                    Some("tui:0:0")
                 );
             }
             Err(_) => panic!("Expected unsubscribe message to be sent"),
@@ -2525,6 +2944,13 @@ mod tests {
             }
             Err(_) => panic!("Expected subscribe message to be sent"),
         }
+
+        // Verify state and active_subscriptions
+        assert_eq!(runner.selected_agent.as_deref(), Some("agent-1"));
+        assert_eq!(runner.current_agent_index, Some(1));
+        assert_eq!(runner.current_terminal_sub_id, Some("tui:1:0".to_string()));
+        assert!(!runner.active_subscriptions.contains(&(0, 0)), "Old sub should be removed");
+        assert!(runner.active_subscriptions.contains(&(1, 0)), "New sub should be added");
     }
 
     /// Verifies `request_select_next()` is a no-op when agent list is empty.
@@ -2558,44 +2984,45 @@ mod tests {
     /// When terminal is resized to 40 rows x 120 cols with a PTY connected,
     /// TuiRunner should:
     /// 1. Update local `terminal_dims`
-    /// 2. Resize the vt100 parser
-    /// 3. Send resize via terminal subscription JSON message
+    /// 2. Resize the fallback parser
+    /// 3. Clear `widget_dims` so next render triggers per-widget resize
     /// 4. Send client-level resize via hub subscription
+    ///
+    /// Per-PTY resize is NOT sent here — it's deferred to `sync_widget_dims()`
+    /// after the next render pass, which knows the actual widget dimensions.
     #[test]
     fn test_handle_resize_sends_resize_via_lua() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Set up connected state with terminal subscription
+        // Set up connected state with active subscription and cached widget dims
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
-        runner.current_terminal_sub_id = Some("tui_term".to_string());
+        runner.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.active_subscriptions.insert((0, 0));
+        runner.widget_dims.insert((0, 0), (24, 80));
 
         // Action: resize to 40 rows x 120 cols
         runner.handle_resize(40, 120);
 
-        // Verify: terminal resize JSON message sent
-        match request_rx.try_recv() {
-            Ok(msg) => {
-                assert_eq!(msg["subscriptionId"], "tui_term");
-                let data = &msg["data"];
-                assert_eq!(data["type"], "resize");
-                assert_eq!(data["rows"], 40);
-                assert_eq!(data["cols"], 120);
-            }
-            Err(_) => panic!("Expected resize message to be sent"),
-        }
-
-        // Verify: hub-level resize also sent
+        // Verify: only hub-level resize sent (per-PTY resize deferred to sync_widget_dims)
         match request_rx.try_recv() {
             Ok(msg) => {
                 assert_eq!(msg["subscriptionId"], "tui_hub");
                 assert_eq!(msg["data"]["type"], "resize");
+                assert_eq!(msg["data"]["rows"], 40);
+                assert_eq!(msg["data"]["cols"], 120);
             }
             Err(_) => panic!("Expected hub resize message to be sent"),
         }
 
-        // Verify: local state also updated
+        // Verify: no additional messages (per-PTY resize is deferred)
+        assert!(request_rx.try_recv().is_err(), "No per-PTY resize should be sent during handle_resize");
+
+        // Verify: local state updated
         assert_eq!(runner.terminal_dims, (40, 120));
+
+        // Verify: widget_dims cleared so next render triggers resize
+        assert!(runner.widget_dims.is_empty());
     }
 
     /// Verifies `handle_resize()` sends only hub-level resize (not terminal)
@@ -2616,8 +3043,8 @@ mod tests {
             _ => panic!("Expected hub resize message"),
         }
 
-        // Verify: no terminal resize sent (order: terminal first, then hub)
-        // Since no terminal sub, the hub resize was the first and only message
+        // Verify: no terminal resize sent (active_subscriptions is empty)
+        // The hub resize was the first and only message
         assert!(
             request_rx.try_recv().is_err(),
             "No additional messages should be sent"
@@ -2677,6 +3104,9 @@ mod tests {
 
     fn make_test_render_context() -> super::super::render::RenderContext<'static> {
         use crate::app::AppMode;
+        // 'static requires a leaked reference for the empty pool
+        let pool: &'static std::collections::HashMap<(usize, usize), std::sync::Arc<std::sync::Mutex<vt100::Parser>>> =
+            Box::leak(Box::new(std::collections::HashMap::new()));
         super::super::render::RenderContext {
             mode: AppMode::Normal,
             menu_selected: 0,
@@ -2691,6 +3121,7 @@ mod tests {
             agents: &[],
             selected_agent_index: 0,
             active_parser: None,
+            parser_pool: pool,
             active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
@@ -2699,7 +3130,111 @@ mod tests {
             vpn_status: None,
             terminal_cols: 80,
             terminal_rows: 24,
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    // === Subscription Sync Tests ===
+
+    /// Verifies `sync_subscriptions` subscribes to a new terminal binding.
+    #[test]
+    fn test_sync_subscriptions_subscribes_new() {
+        let (mut runner, mut request_rx) = create_test_runner();
+
+        runner.current_agent_index = Some(0);
+        runner.current_pty_index = Some(0);
+
+        // Tree with a single terminal widget (no explicit binding → defaults)
+        let tree = crate::tui::render_tree::RenderNode::Widget {
+            widget_type: crate::tui::render_tree::WidgetType::Terminal,
+            block: None,
+            custom_lines: None,
+            props: None,
+        };
+
+        runner.sync_subscriptions(&tree);
+
+        // Should have sent a subscribe message for (0, 0)
+        match request_rx.try_recv() {
+            Ok(msg) => {
+                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
+                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:0:0"));
+                let params = msg.get("params").expect("should have params");
+                assert_eq!(params.get("agent_index").and_then(|v| v.as_u64()), Some(0));
+                assert_eq!(params.get("pty_index").and_then(|v| v.as_u64()), Some(0));
+            }
+            Err(_) => panic!("Expected subscribe message"),
+        }
+
+        assert!(runner.active_subscriptions.contains(&(0, 0)));
+        assert!(runner.parser_pool.contains_key(&(0, 0)));
+    }
+
+    /// Verifies `sync_subscriptions` unsubscribes when a binding is removed.
+    #[test]
+    fn test_sync_subscriptions_unsubscribes_removed() {
+        let (mut runner, mut request_rx) = create_test_runner();
+
+        runner.current_agent_index = Some(0);
+        runner.current_pty_index = Some(0);
+
+        // Pre-populate active subscriptions for two PTYs
+        runner.active_subscriptions.insert((0, 0));
+        runner.active_subscriptions.insert((0, 1));
+
+        // Tree only has terminal for PTY 0 — PTY 1 should be unsubscribed
+        let tree = crate::tui::render_tree::RenderNode::Widget {
+            widget_type: crate::tui::render_tree::WidgetType::Terminal,
+            block: None,
+            custom_lines: None,
+            props: Some(crate::tui::render_tree::WidgetProps::Terminal(
+                crate::tui::render_tree::TerminalBinding {
+                    agent_index: Some(0),
+                    pty_index: Some(0),
+                },
+            )),
+        };
+
+        runner.sync_subscriptions(&tree);
+
+        // Should have sent unsubscribe for (0, 1)
+        let mut found_unsubscribe = false;
+        while let Ok(msg) = request_rx.try_recv() {
+            if msg.get("type").and_then(|v| v.as_str()) == Some("unsubscribe") {
+                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:0:1"));
+                found_unsubscribe = true;
+            }
+        }
+        assert!(found_unsubscribe, "Should send unsubscribe for removed binding");
+
+        assert!(runner.active_subscriptions.contains(&(0, 0)));
+        assert!(!runner.active_subscriptions.contains(&(0, 1)));
+    }
+
+    /// Verifies `sync_subscriptions` is idempotent for unchanged bindings.
+    #[test]
+    fn test_sync_subscriptions_no_change_idempotent() {
+        let (mut runner, mut request_rx) = create_test_runner();
+
+        runner.current_agent_index = Some(0);
+        runner.current_pty_index = Some(0);
+        runner.active_subscriptions.insert((0, 0));
+
+        let tree = crate::tui::render_tree::RenderNode::Widget {
+            widget_type: crate::tui::render_tree::WidgetType::Terminal,
+            block: None,
+            custom_lines: None,
+            props: None,
+        };
+
+        runner.sync_subscriptions(&tree);
+
+        // No messages should be sent (already subscribed)
+        assert!(
+            request_rx.try_recv().is_err(),
+            "No messages should be sent when subscriptions unchanged"
+        );
+        assert_eq!(runner.active_subscriptions.len(), 1);
     }
 
     // Rust guideline compliant 2026-02

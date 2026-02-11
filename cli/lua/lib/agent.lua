@@ -56,6 +56,7 @@ function Agent.new(config)
     -- Agent.new() is a low-level constructor and does NOT re-fire the hook.
 
     local self = setmetatable({
+        _agent_key = config.agent_key,  -- explicit key (may include suffix for multi-agent)
         repo = config.repo,
         issue_number = config.issue_number,
         branch_name = config.branch_name,
@@ -183,6 +184,9 @@ end
 -- Format: repo-name-issue_number (slashes replaced with dashes)
 -- @return string agent key
 function Agent:agent_key()
+    if self._agent_key then
+        return self._agent_key
+    end
     local repo_safe = self.repo:gsub("/", "-")
     if self.issue_number then
         return repo_safe .. "-" .. tostring(self.issue_number)
@@ -305,8 +309,23 @@ function Agent:info()
         end
     end
 
+    -- Build display name: branch_name plus instance suffix from key if present
+    local display_name = self.branch_name
+    local base_key = (function()
+        local repo_safe = self.repo:gsub("/", "-")
+        if self.issue_number then
+            return repo_safe .. "-" .. tostring(self.issue_number)
+        else
+            return repo_safe .. "-" .. self.branch_name:gsub("/", "-")
+        end
+    end)()
+    if #key > #base_key and key:sub(1, #base_key) == base_key then
+        display_name = self.branch_name .. key:sub(#base_key + 1)
+    end
+
     return {
         id = key,
+        display_name = display_name,
         repo = self.repo,
         issue_number = self.issue_number,
         branch_name = self.branch_name,

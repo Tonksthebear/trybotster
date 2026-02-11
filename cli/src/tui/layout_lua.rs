@@ -1,10 +1,11 @@
-//! TUI-owned Lua state for declarative layout rendering.
+//! TUI-owned Lua state for declarative layout rendering and keybinding dispatch.
 //!
 //! Creates a separate, lightweight `mlua::Lua` state owned by TuiRunner's thread.
 //! This avoids threading issues (the Hub's LuaRuntime is `!Send`).
 //!
-//! The layout Lua state only loads `ui/layout.lua` and calls `render(state)`
-//! and `render_overlay(state)` each frame.
+//! Loads two Lua modules:
+//! - `ui/layout.lua` — calls `render(state)` and `render_overlay(state)` each frame
+//! - `ui/keybindings.lua` — calls `handle_key(descriptor, mode, context)` per keypress
 
 use anyhow::{anyhow, Result};
 use mlua::{Lua, Table as LuaTable, Value as LuaValue};
@@ -13,13 +14,46 @@ use super::render::RenderContext;
 use super::render_tree::RenderNode;
 use crate::compat::VpnStatus;
 
-/// TUI-owned Lua state for layout rendering.
+/// Action returned by Lua `handle_key()`.
 ///
-/// Wraps a `mlua::Lua` instance with layout-specific functions loaded.
+/// Lua returns a table `{ action = "name", ... }` or `nil`. This struct
+/// captures the action name plus optional extra fields for parameterized
+/// actions (e.g., `menu_select` with an `index`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaKeyAction {
+    /// Action name (e.g., `"open_menu"`, `"input_char"`).
+    pub action: String,
+    /// Optional character for `input_char` action.
+    pub char: Option<char>,
+    /// Optional index for `menu_select` action.
+    pub index: Option<usize>,
+}
+
+/// Context passed to Lua `handle_key()` for mode-specific logic.
+///
+/// Contains state that keybinding fallback logic needs (e.g., menu item
+/// count for number shortcut validation).
+#[derive(Debug, Clone, Default)]
+pub struct KeyContext {
+    /// Currently selected menu item index.
+    pub menu_selected: usize,
+    /// Total number of selectable menu items.
+    pub menu_count: usize,
+    /// Currently selected worktree index.
+    pub worktree_selected: usize,
+    /// Terminal height in rows (for scroll amount calculation).
+    pub terminal_rows: u16,
+}
+
+/// TUI-owned Lua state for layout rendering and keybinding dispatch.
+///
+/// Wraps a `mlua::Lua` instance with layout and keybinding functions loaded.
 /// Owned by TuiRunner's thread — no Send/Sync requirements.
 #[derive(Debug)]
 pub struct LayoutLua {
     lua: Lua,
+    /// Whether keybindings module is loaded (handle_key available).
+    keybindings_loaded: bool,
 }
 
 impl LayoutLua {
@@ -33,7 +67,10 @@ impl LayoutLua {
         lua.load(lua_source)
             .exec()
             .map_err(|e| anyhow!("Failed to load layout Lua: {e}"))?;
-        Ok(Self { lua })
+        Ok(Self {
+            lua,
+            keybindings_loaded: false,
+        })
     }
 
     /// Reload the layout from new source (for hot-reload).
@@ -86,6 +123,106 @@ impl LayoutLua {
             )),
         }
     }
+
+    // === Keybinding Support ===
+
+    /// Load the keybindings Lua module.
+    ///
+    /// Executes the source and stores the returned module table as a global
+    /// `_keybindings` so `call_handle_key()` can call `handle_key()` on it.
+    pub fn load_keybindings(&mut self, lua_source: &str) -> Result<()> {
+        let chunk = self
+            .lua
+            .load(lua_source)
+            .eval::<LuaTable>()
+            .map_err(|e| anyhow!("Failed to load keybindings Lua: {e}"))?;
+
+        self.lua
+            .globals()
+            .set("_keybindings", chunk)
+            .map_err(|e| anyhow!("Failed to store keybindings module: {e}"))?;
+
+        self.keybindings_loaded = true;
+        Ok(())
+    }
+
+    /// Reload the keybindings from new source (for hot-reload).
+    pub fn reload_keybindings(&mut self, lua_source: &str) -> Result<()> {
+        self.load_keybindings(lua_source)
+    }
+
+    /// Whether keybindings are loaded and available.
+    #[must_use]
+    pub fn has_keybindings(&self) -> bool {
+        self.keybindings_loaded
+    }
+
+    /// Call Lua `handle_key(descriptor, mode, context)`.
+    ///
+    /// Returns `Ok(Some(action))` if Lua returned an action table,
+    /// `Ok(None)` if Lua returned `nil` (unbound key — caller decides
+    /// whether to forward to PTY or ignore).
+    ///
+    /// # Arguments
+    ///
+    /// * `descriptor` - Key descriptor string (e.g., `"ctrl+p"`, `"shift+enter"`)
+    /// * `mode` - Current app mode as Lua string (e.g., `"normal"`, `"menu"`)
+    /// * `context` - Additional context for keybinding logic
+    pub fn call_handle_key(
+        &self,
+        descriptor: &str,
+        mode: &str,
+        context: &KeyContext,
+    ) -> Result<Option<LuaKeyAction>> {
+        if !self.keybindings_loaded {
+            return Ok(None);
+        }
+
+        let globals = self.lua.globals();
+        let kb_module: LuaTable = globals
+            .get("_keybindings")
+            .map_err(|e| anyhow!("Keybindings module not found: {e}"))?;
+
+        let handle_key_fn: mlua::Function = kb_module
+            .get("handle_key")
+            .map_err(|e| anyhow!("handle_key function not found: {e}"))?;
+
+        // Build context table
+        let ctx_table = self
+            .lua
+            .create_table()
+            .map_err(|e| anyhow!("Failed to create context table: {e}"))?;
+        set_field(&ctx_table, "menu_selected", context.menu_selected)?;
+        set_field(&ctx_table, "menu_count", context.menu_count)?;
+        set_field(&ctx_table, "worktree_selected", context.worktree_selected)?;
+        set_field(&ctx_table, "terminal_rows", context.terminal_rows)?;
+
+        let result: LuaValue = handle_key_fn
+            .call((descriptor, mode, ctx_table))
+            .map_err(|e| anyhow!("Lua handle_key() failed: {e}"))?;
+
+        match result {
+            LuaValue::Nil => Ok(None),
+            LuaValue::Table(table) => {
+                let action: String = table
+                    .get("action")
+                    .map_err(|e| anyhow!("handle_key() result missing 'action': {e}"))?;
+
+                let char_val: Option<String> = table.get("char").ok();
+                let index_val: Option<usize> = table.get("index").ok();
+
+                Ok(Some(LuaKeyAction {
+                    action,
+                    char: char_val.and_then(|s| s.chars().next()),
+                    index: index_val,
+                }))
+            }
+            _ => Err(anyhow!(
+                "handle_key() must return a table or nil, got {:?}",
+                result
+            )),
+        }
+    }
 }
 
 /// Serialize RenderContext into a Lua table for layout functions.
@@ -124,6 +261,9 @@ fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
             .map_err(|e| anyhow!("Failed to create agent table: {e}"))?;
         set_field(&a, "key", agent.key.as_str())?;
         set_field(&a, "branch_name", agent.branch_name.as_str())?;
+        if let Some(ref dn) = agent.display_name {
+            set_field(&a, "display_name", dn.as_str())?;
+        }
         set_field(&a, "repo", agent.repo.as_str())?;
         if let Some(n) = agent.issue_number {
             set_field(&a, "issue_number", n)?;
@@ -164,6 +304,19 @@ fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
         }
         set_field(&sa, "server_running", agent.server_running)?;
         set_field(&sa, "session_count", agent.session_names.len())?;
+
+        // Session names for terminal title computation
+        let sa_sessions = lua
+            .create_table()
+            .map_err(|e| anyhow!("Failed to create selected_agent sessions table: {e}"))?;
+        for (j, name) in agent.session_names.iter().enumerate() {
+            sa_sessions
+                .set(j + 1, name.as_str())
+                .map_err(|e| anyhow!("Failed to set selected_agent session name: {e}"))?;
+        }
+        sa.set("session_names", sa_sessions)
+            .map_err(|e| anyhow!("Failed to set selected_agent session_names: {e}"))?;
+
         state
             .set("selected_agent", sa)
             .map_err(|e| anyhow!("Failed to set selected_agent: {e}"))?;
@@ -262,6 +415,7 @@ mod tests {
     fn make_test_ctx() -> (Vec<AgentRenderInfo>, Vec<String>) {
         let agents = vec![AgentRenderInfo {
             key: "test-1".to_string(),
+            display_name: None,
             repo: "test/repo".to_string(),
             issue_number: Some(42),
             branch_name: "feature-branch".to_string(),
@@ -306,6 +460,7 @@ mod tests {
             agents: &agents,
             selected_agent_index: 0,
             active_parser: None,
+            parser_pool: &std::collections::HashMap::new(),
             active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
@@ -314,6 +469,7 @@ mod tests {
             vpn_status: None,
             terminal_cols: 80,
             terminal_rows: 24,
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         let tree = layout.call_render(&ctx).unwrap();
@@ -354,6 +510,7 @@ mod tests {
             agents: &agents,
             selected_agent_index: 0,
             active_parser: None,
+            parser_pool: &std::collections::HashMap::new(),
             active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
@@ -362,6 +519,7 @@ mod tests {
             vpn_status: None,
             terminal_cols: 80,
             terminal_rows: 24,
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         let tree = layout.call_render(&ctx).unwrap();
@@ -370,7 +528,7 @@ mod tests {
                 match &children[0] {
                     RenderNode::Widget { block, .. } => {
                         let block = block.as_ref().unwrap();
-                        assert_eq!(block.title.as_deref(), Some(" Agents (1) "));
+                        assert_eq!(block.title.as_ref().and_then(|t| t.as_plain_str()), Some(" Agents (1) "));
                     }
                     _ => panic!("Expected Widget"),
                 }
@@ -408,6 +566,7 @@ mod tests {
             agents: &agents,
             selected_agent_index: 0,
             active_parser: None,
+            parser_pool: &std::collections::HashMap::new(),
             active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
@@ -416,6 +575,7 @@ mod tests {
             vpn_status: None,
             terminal_cols: 80,
             terminal_rows: 24,
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         let overlay = layout.call_render_overlay(&ctx).unwrap();
@@ -457,6 +617,7 @@ mod tests {
             agents: &agents,
             selected_agent_index: 0,
             active_parser: None,
+            parser_pool: &std::collections::HashMap::new(),
             active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
@@ -465,6 +626,7 @@ mod tests {
             vpn_status: None,
             terminal_cols: 80,
             terminal_rows: 24,
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         let overlay = layout.call_render_overlay(&ctx).unwrap();
@@ -512,6 +674,7 @@ mod tests {
                 agents: &agents,
                 selected_agent_index: 0,
                 active_parser: None,
+                parser_pool: &std::collections::HashMap::new(),
                 active_pty_index: 0,
                 scroll_offset: 0,
                 is_scrolled: false,
@@ -520,6 +683,7 @@ mod tests {
                 vpn_status: None,
                 terminal_cols: 80,
                 terminal_rows: 24,
+                terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
             };
 
             // Main render should always succeed
@@ -573,6 +737,7 @@ mod tests {
                 agents: &agents,
                 selected_agent_index: 0,
                 active_parser: None,
+                parser_pool: &std::collections::HashMap::new(),
                 active_pty_index: 0,
                 scroll_offset: 0,
                 is_scrolled: false,
@@ -581,6 +746,7 @@ mod tests {
                 vpn_status: None,
                 terminal_cols: 80,
                 terminal_rows: 24,
+                terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
             };
 
             let overlay = layout.call_render_overlay(&ctx).unwrap().unwrap();
@@ -624,6 +790,7 @@ mod tests {
             agents: &agents,
             selected_agent_index: 0,
             active_parser: None,
+            parser_pool: &std::collections::HashMap::new(),
             active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
@@ -632,6 +799,7 @@ mod tests {
             vpn_status: None,
             terminal_cols: 80,
             terminal_rows: 24,
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         let result = layout.call_render(&ctx);
@@ -680,6 +848,7 @@ mod tests {
             agents: &agents,
             selected_agent_index: 0,
             active_parser: None,
+            parser_pool: &std::collections::HashMap::new(),
             active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
@@ -688,6 +857,7 @@ mod tests {
             vpn_status: None,
             terminal_cols: 80,
             terminal_rows: 24,
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         let tree = layout.call_render(&ctx).unwrap();
