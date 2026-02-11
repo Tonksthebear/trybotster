@@ -82,7 +82,7 @@ production:
     <<: *default
     database: trybotster_production
     username: trybotster
-    password: <%= ENV["TRYBOTSTER_DATABASE_PASSWORD"] %>
+    password: <%= ENV["POSTGRES_PASSWORD"] %>
     host: <%= ENV.fetch("DB_HOST", "localhost") %>
     port: <%= ENV.fetch("DB_PORT", 5432) %>
   cache:

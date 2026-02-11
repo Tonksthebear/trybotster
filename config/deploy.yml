@@ -58,7 +58,7 @@ accessories:
   db:
     image: postgres:16
     host: 5.78.156.108
-    port: "127.0.0.1:5433:5432"
+    port: "5433:5432"
     env:
       clear:
         POSTGRES_DB: trybotster_production
