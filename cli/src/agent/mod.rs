@@ -1,0 +1,573 @@
+//! Agent management for the botster-hub.
+//!
+//! This module provides the core agent types for managing PTY sessions.
+//! Each agent runs in its own git worktree with dedicated PTY sessions
+//! for the CLI process and optionally a dev server.
+//!
+//! # Architecture
+//!
+//! ```text
+//! Agent
+//! +-- cli_pty: PtySession (runs main agent process)
+//! +-- server_pty: Option<PtySession> (runs dev server)
+//! ```
+//!
+//! Agents are agnostic — they spawn whatever processes the user configures
+//! via `.botster/` session initialization scripts in the worktree.
+//!
+//! # Client State vs Agent State
+//!
+//! Agent owns process state (PTYs, channels, metadata).
+//! Clients own view state (active PTY index, scroll position).
+//!
+//! This separation allows multiple clients to view the same agent with
+//! independent view states — one client can be scrolled up in one session
+//! while another views a different session live.
+//!
+//! # Submodules
+//!
+//! - [`notification`]: Terminal notification detection (OSC 9, OSC 777)
+//! - [`pty`]: PTY session management
+
+// Rust guideline compliant 2026-01
+
+pub mod notification;
+pub mod pty;
+pub mod spawn;
+
+pub use crate::tui::screen::ScreenInfo;
+pub use notification::{detect_notifications, AgentNotification, AgentStatus};
+pub use pty::PtySession;
+
+use anyhow::Result;
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+/// Which PTY view to target for operations.
+///
+/// Agents can have both a CLI PTY (main process) and a server PTY
+/// (dev server). Operations that need to target a specific PTY
+/// take this enum as a parameter.
+///
+/// Note: This is NOT agent state - it's a parameter for operations.
+/// Each client tracks their own active view separately.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PtyView {
+    /// CLI view - shows main agent process output.
+    #[default]
+    Cli,
+    /// Server view - shows dev server output.
+    Server,
+}
+
+/// An agent running in a git worktree.
+///
+/// Each agent has:
+/// - A unique ID and session key
+/// - A CLI PTY running the main agent process
+/// - An optional server PTY for the dev server
+///
+/// The agent is process-agnostic - it runs whatever the user configures.
+///
+/// # Client State Separation
+///
+/// Agent does NOT track:
+/// - `active_pty` - Each client tracks their own view
+/// - `size_owner` - Lua tracks connected clients
+/// - Scroll position - Each client tracks their own scroll
+///
+/// Methods that previously used `active_pty` now take a `view: PtyView`
+/// parameter, allowing each client to operate independently.
+pub struct Agent {
+    /// Unique identifier for this agent instance.
+    pub id: uuid::Uuid,
+    /// Repository name in "owner/repo" format.
+    pub repo: String,
+    /// Issue number if working on a specific issue.
+    pub issue_number: Option<u32>,
+    /// Git branch name.
+    pub branch_name: String,
+    /// Path to the git worktree directory.
+    pub worktree_path: PathBuf,
+    /// When this agent was created.
+    pub start_time: chrono::DateTime<chrono::Utc>,
+    /// Current execution status.
+    pub status: AgentStatus,
+    /// GitHub URL where this agent was last invoked from.
+    pub last_invocation_url: Option<String>,
+    /// macOS Terminal window ID for focusing.
+    pub terminal_window_id: Option<String>,
+
+    /// Primary PTY (CLI - runs main agent process).
+    ///
+    /// Always exists. Check `cli_pty.is_spawned()` to see if a process is running.
+    pub cli_pty: PtySession,
+
+    /// Secondary PTY (Server - runs dev server).
+    pub server_pty: Option<PtySession>,
+}
+
+impl std::fmt::Debug for Agent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Agent")
+            .field("id", &self.id)
+            .field("repo", &self.repo)
+            .field("issue_number", &self.issue_number)
+            .field("branch_name", &self.branch_name)
+            .field("worktree_path", &self.worktree_path)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Default PTY dimensions used when no specific dimensions are provided.
+///
+/// These are placeholder values; the PTY should be resized to actual terminal
+/// dimensions before spawning a process. See `new_with_dims()` for creating
+/// agents with specific dimensions.
+const DEFAULT_PTY_ROWS: u16 = 24;
+const DEFAULT_PTY_COLS: u16 = 80;
+
+impl Agent {
+    /// Creates a new agent for the specified repository and worktree.
+    ///
+    /// Uses default PTY dimensions (24x80). For production use, prefer
+    /// `new_with_dims()` which accepts actual terminal dimensions.
+    #[must_use]
+    pub fn new(
+        id: uuid::Uuid,
+        repo: String,
+        issue_number: Option<u32>,
+        branch_name: String,
+        worktree_path: PathBuf,
+    ) -> Self {
+        Self::new_with_dims(
+            id,
+            repo,
+            issue_number,
+            branch_name,
+            worktree_path,
+            (DEFAULT_PTY_ROWS, DEFAULT_PTY_COLS),
+        )
+    }
+
+    /// Creates a new agent with specific PTY dimensions.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Unique agent identifier
+    /// * `repo` - Repository name in "owner/repo" format
+    /// * `issue_number` - Optional issue number
+    /// * `branch_name` - Git branch name
+    /// * `worktree_path` - Path to the git worktree
+    /// * `terminal_dims` - PTY dimensions as (rows, cols)
+    #[must_use]
+    pub fn new_with_dims(
+        id: uuid::Uuid,
+        repo: String,
+        issue_number: Option<u32>,
+        branch_name: String,
+        worktree_path: PathBuf,
+        terminal_dims: (u16, u16),
+    ) -> Self {
+        let (rows, cols) = terminal_dims;
+        Self {
+            id,
+            repo,
+            issue_number,
+            branch_name,
+            worktree_path,
+            start_time: chrono::Utc::now(),
+            status: AgentStatus::Initializing,
+            last_invocation_url: None,
+            terminal_window_id: None,
+            cli_pty: PtySession::new(rows, cols),
+            server_pty: None,
+        }
+    }
+
+    // =========================================================================
+    // PTY Access
+    // =========================================================================
+
+    /// Get the PTY session for the specified view.
+    ///
+    /// Falls back to CLI PTY if Server view is requested but server_pty is None.
+    #[must_use]
+    pub fn get_pty(&self, view: PtyView) -> &PtySession {
+        match view {
+            PtyView::Cli => &self.cli_pty,
+            PtyView::Server => self.server_pty.as_ref().unwrap_or(&self.cli_pty),
+        }
+    }
+
+    /// Get the scrollback buffer for the specified PTY view.
+    #[must_use]
+    pub fn get_scrollback_buffer(&self, view: PtyView) -> Arc<Mutex<VecDeque<u8>>> {
+        Arc::clone(&self.get_pty(view).scrollback_buffer)
+    }
+
+    /// Check if server PTY is available.
+    #[must_use]
+    pub fn has_server_pty(&self) -> bool {
+        self.server_pty.is_some()
+    }
+
+    /// Get a PtyHandle for the specified PTY index.
+    ///
+    /// - Index 0: CLI PTY (always present)
+    /// - Index 1: Server PTY (if server is running)
+    ///
+    /// Returns `None` if index is out of bounds or server PTY not available.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Get handle for CLI PTY
+    /// let cli_handle = agent.get_pty_handle(0)?;
+    ///
+    /// // Subscribe to PTY events
+    /// let rx = cli_handle.subscribe();
+    /// ```
+    #[must_use]
+    pub fn get_pty_handle(&self, pty_index: usize) -> Option<crate::hub::agent_handle::PtyHandle> {
+        match pty_index {
+            0 => {
+                let (shared_state, scrollback, event_tx) = self.cli_pty.get_direct_access();
+                Some(crate::hub::agent_handle::PtyHandle::new(
+                    event_tx,
+                    shared_state,
+                    scrollback,
+                    self.cli_pty.port(),
+                ))
+            }
+            1 => {
+                let server_pty = self.server_pty.as_ref()?;
+                let (shared_state, scrollback, event_tx) = server_pty.get_direct_access();
+                Some(crate::hub::agent_handle::PtyHandle::new(
+                    event_tx,
+                    shared_state,
+                    scrollback,
+                    server_pty.port(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the current PTY size (rows, cols).
+    ///
+    /// Returns the dimensions tracked by the CLI PTY.
+    #[must_use]
+    pub fn get_pty_size(&self) -> (u16, u16) {
+        self.cli_pty.dimensions()
+    }
+
+    // =========================================================================
+    // Input/Output
+    // =========================================================================
+
+    /// Write input specifically to the CLI PTY (for notifications, etc.).
+    ///
+    /// Convenience method that always targets CLI regardless of client view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub fn write_input_to_cli(&mut self, input: &[u8]) -> Result<()> {
+        self.cli_pty.write_input(input)
+    }
+
+    /// Check if the dev server is running.
+    ///
+    /// Queries the server PTY's allocated port and checks if a TCP connection
+    /// can be established. Returns false if no server PTY or no port assigned.
+    #[must_use]
+    pub fn is_server_running(&self) -> bool {
+        let Some(ref server_pty) = self.server_pty else {
+            return false;
+        };
+        let Some(port) = server_pty.port() else {
+            return false;
+        };
+
+        use std::net::TcpStream;
+        TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}")
+                .parse()
+                .expect("valid socket addr"),
+            Duration::from_millis(50),
+        )
+        .is_ok()
+    }
+
+    /// Get the HTTP forwarding port for this agent's dev server.
+    ///
+    /// Returns the port allocated to the server PTY, if one exists.
+    /// This is the port where the dev server listens for HTTP requests.
+    #[must_use]
+    pub fn port(&self) -> Option<u16> {
+        self.server_pty.as_ref().and_then(|pty| pty.port())
+    }
+
+    // =========================================================================
+    // Metadata & Info
+    // =========================================================================
+
+    /// Get how long this agent has been running.
+    #[must_use]
+    pub fn age(&self) -> Duration {
+        chrono::Utc::now()
+            .signed_duration_since(self.start_time)
+            .to_std()
+            .unwrap_or_default()
+    }
+
+    /// Generate a unique agent ID for this agent.
+    ///
+    /// Format: `{repo-safe}-{issue_number}` or `{repo-safe}-{branch-name}`.
+    #[must_use]
+    pub fn agent_id(&self) -> String {
+        let repo_safe = self.repo.replace('/', "-");
+        if let Some(issue_num) = self.issue_number {
+            format!("{repo_safe}-{issue_num}")
+        } else {
+            format!("{}-{}", repo_safe, self.branch_name.replace('/', "-"))
+        }
+    }
+
+    // =========================================================================
+    // Screen & Scrollback (parameterized by view)
+    // =========================================================================
+
+    /// Get a snapshot of the scrollback buffer as raw bytes for the specified view.
+    ///
+    /// Returns raw PTY output bytes that can be replayed in xterm.js.
+    /// Preserves escape sequences, carriage returns, and all terminal control.
+    #[must_use]
+    pub fn get_scrollback_snapshot(&self, view: PtyView) -> Vec<u8> {
+        self.get_pty(view).get_scrollback_snapshot()
+    }
+
+    /// Get the current screen dimensions for the specified view.
+    #[must_use]
+    pub fn get_screen_info(&self, view: PtyView) -> ScreenInfo {
+        let (rows, cols) = self.get_pty(view).dimensions();
+        ScreenInfo { rows, cols }
+    }
+
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        log::info!(
+            "Agent {} dropping - cleaning up PTY sessions",
+            self.agent_id()
+        );
+        // PTY child processes are killed by PtySession's Drop
+        // which is called when Agent is dropped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_agent_creation() {
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "issue-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        assert_eq!(agent.repo, "test/repo");
+        assert_eq!(agent.issue_number, Some(1));
+        assert_eq!(agent.branch_name, "issue-1");
+        assert!(matches!(agent.status, AgentStatus::Initializing));
+    }
+
+    #[test]
+    fn test_agent_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "owner/repo".to_string(),
+            Some(42),
+            "issue-42".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        assert_eq!(agent.agent_id(), "owner-repo-42");
+    }
+
+    #[test]
+    fn test_scrollback_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "issue-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        // Scrollback is initially empty (populated by PTY reader thread)
+        let snapshot = agent.get_scrollback_snapshot(PtyView::Cli);
+        assert!(snapshot.is_empty());
+    }
+
+    #[test]
+    fn test_agent_age() {
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "issue-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        let age = agent.age();
+        assert!(age.as_millis() < 1000);
+    }
+
+    #[test]
+    fn test_get_pty_cli() {
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "issue-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        // CLI PTY is always available, check dimensions
+        let pty = agent.get_pty(PtyView::Cli);
+        let (rows, cols) = pty.dimensions();
+
+        assert_eq!(rows, 24);
+        assert_eq!(cols, 80);
+    }
+
+    #[test]
+    fn test_get_pty_server_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "issue-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        // Without server_pty, Server view falls back to CLI
+        let pty = agent.get_pty(PtyView::Server);
+        let (rows, cols) = pty.dimensions();
+
+        assert_eq!(rows, 24);
+        assert_eq!(cols, 80);
+    }
+
+    #[test]
+    fn test_get_pty_server_when_available() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "issue-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        // Add server PTY with different dimensions
+        agent.server_pty = Some(PtySession::new(40, 120));
+
+        let pty = agent.get_pty(PtyView::Server);
+        let (rows, cols) = pty.dimensions();
+
+        assert_eq!(rows, 40);
+        assert_eq!(cols, 120);
+    }
+
+    #[test]
+    fn test_has_server_pty() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "issue-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        assert!(!agent.has_server_pty());
+
+        agent.server_pty = Some(PtySession::new(24, 80));
+        assert!(agent.has_server_pty());
+    }
+
+    #[test]
+    fn test_pty_view_default() {
+        assert_eq!(PtyView::default(), PtyView::Cli);
+    }
+
+    #[test]
+    fn test_scrollback_for_view() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "issue-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        agent.server_pty = Some(PtySession::new(24, 80));
+
+        // Add different scrollback to each PTY
+        agent.cli_pty.add_to_scrollback(b"CLI scrollback");
+        agent
+            .server_pty
+            .as_ref()
+            .unwrap()
+            .add_to_scrollback(b"SERVER scrollback");
+
+        let cli_snapshot = agent.get_scrollback_snapshot(PtyView::Cli);
+        let server_snapshot = agent.get_scrollback_snapshot(PtyView::Server);
+
+        assert_eq!(cli_snapshot, b"CLI scrollback");
+        assert_eq!(server_snapshot, b"SERVER scrollback");
+    }
+
+    #[test]
+    fn test_get_screen_info() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut agent = Agent::new(
+            uuid::Uuid::new_v4(),
+            "test/repo".to_string(),
+            Some(1),
+            "issue-1".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        agent.server_pty = Some(PtySession::new(40, 120));
+
+        let cli_info = agent.get_screen_info(PtyView::Cli);
+        assert_eq!(cli_info.rows, 24);
+        assert_eq!(cli_info.cols, 80);
+
+        let server_info = agent.get_screen_info(PtyView::Server);
+        assert_eq!(server_info.rows, 40);
+        assert_eq!(server_info.cols, 120);
+    }
+}

@@ -1,0 +1,804 @@
+//! TUI rendering functions.
+//!
+//! This module provides the main rendering function for the botster-hub TUI.
+//! It renders TuiRunner state to a terminal and optionally produces ANSI output
+//! for browser streaming.
+//!
+//! # Architecture
+//!
+//! Rendering is decoupled from TuiRunner via `RenderContext`:
+//!
+//! ```text
+//! TuiRunner ──builds──> RenderContext ──passed to──> render()
+//! ```
+//!
+//! This separation ensures:
+//! - Clear contract for what rendering needs
+//! - Testable rendering logic
+//! - No tight coupling to TuiRunner internals
+
+// Rust guideline compliant 2026-01
+
+use std::sync::{Arc, Mutex};
+
+use anyhow::Result;
+use ratatui::{
+    backend::{Backend, TestBackend},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap},
+    Frame, Terminal,
+};
+use vt100::Parser;
+
+use crate::app::{buffer_to_ansi, centered_rect, AppMode};
+
+use super::menu::{build_menu, MenuContext, MenuItem};
+use crate::compat::{BrowserDimensions, VpnStatus};
+
+use super::events::CreationStage;
+
+/// Information about an agent for rendering.
+///
+/// Extracted subset of Agent data needed for TUI display.
+#[derive(Debug, Clone)]
+pub struct AgentRenderInfo {
+    /// Unique key for this agent (e.g., "repo-42").
+    pub key: String,
+    /// Repository name.
+    pub repo: String,
+    /// Issue number (if issue-based agent).
+    pub issue_number: Option<u32>,
+    /// Branch name.
+    pub branch_name: String,
+    /// HTTP forwarding port if assigned.
+    pub port: Option<u16>,
+    /// Whether the server is running.
+    pub server_running: bool,
+    /// Ordered session names (e.g., ["agent", "server", "watcher"]).
+    /// Empty if sessions info not available (backward compat).
+    pub session_names: Vec<String>,
+}
+
+/// Context required for rendering the TUI.
+///
+/// `TuiRunner` builds this struct from its internal state and passes it to
+/// the render function. This creates a clear interface between the runner
+/// and the renderer, making dependencies explicit.
+pub struct RenderContext<'a> {
+    // === UI State ===
+    /// Current application mode (Normal, Menu, etc.).
+    pub mode: AppMode,
+    /// Currently selected menu item index.
+    pub menu_selected: usize,
+    /// Text input buffer for text entry modes.
+    pub input_buffer: &'a str,
+    /// Currently selected worktree index in selection modal.
+    pub worktree_selected: usize,
+    /// Available worktrees for agent creation (path, branch).
+    pub available_worktrees: &'a [(String, String)],
+    /// Error message to display in Error mode.
+    pub error_message: Option<&'a str>,
+    /// Agent creation progress (identifier, stage).
+    pub creating_agent: Option<(&'a str, CreationStage)>,
+    /// Connection code data (URL + QR ASCII) for display.
+    pub connection_code: Option<&'a super::qr::ConnectionCodeData>,
+    /// Whether the connection bundle has been used.
+    pub bundle_used: bool,
+
+    // === Agent State ===
+    /// Ordered list of agent IDs.
+    pub agent_ids: &'a [String],
+    /// Agent information for display.
+    pub agents: &'a [AgentRenderInfo],
+    /// Currently selected agent index.
+    pub selected_agent_index: usize,
+
+    // === Terminal State ===
+    /// The VT100 parser for the currently selected agent's active PTY.
+    /// This is the parser that should be rendered in the terminal area.
+    pub active_parser: Option<Arc<Mutex<Parser>>>,
+    /// Index of the currently active PTY session (0 = first session).
+    pub active_pty_index: usize,
+    /// Current scroll offset for the active PTY.
+    pub scroll_offset: usize,
+    /// Whether the active PTY is scrolled (not at bottom).
+    pub is_scrolled: bool,
+
+    // === Status Indicators ===
+    /// Seconds since last poll.
+    pub seconds_since_poll: u64,
+    /// Poll interval in seconds.
+    pub poll_interval: u64,
+    /// VPN connection status.
+    pub vpn_status: Option<VpnStatus>,
+}
+
+impl<'a> std::fmt::Debug for RenderContext<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderContext")
+            .field("mode", &self.mode)
+            .field("menu_selected", &self.menu_selected)
+            .field("selected_agent_index", &self.selected_agent_index)
+            .field("agents_count", &self.agents.len())
+            .field("has_active_parser", &self.active_parser.is_some())
+            .field("active_pty_index", &self.active_pty_index)
+            .field("scroll_offset", &self.scroll_offset)
+            .field("is_scrolled", &self.is_scrolled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> RenderContext<'a> {
+    /// Get the currently selected agent info.
+    #[must_use]
+    pub fn selected_agent(&self) -> Option<&AgentRenderInfo> {
+        self.agents.get(self.selected_agent_index)
+    }
+
+    /// Build menu context from current state.
+    #[must_use]
+    pub fn menu_context(&self) -> MenuContext {
+        let session_count = self
+            .selected_agent()
+            .map(|a| a.session_names.len())
+            .unwrap_or(0);
+        MenuContext {
+            has_agent: self.selected_agent().is_some(),
+            active_pty_index: self.active_pty_index,
+            session_count,
+        }
+    }
+}
+
+/// Render result containing ANSI output for browser streaming.
+#[derive(Debug, Default)]
+pub struct RenderResult {
+    /// ANSI output for browser streaming.
+    pub ansi_output: String,
+    /// Number of rows in the output.
+    pub rows: u16,
+    /// Number of columns in the output.
+    pub cols: u16,
+}
+
+/// Render the TUI and return ANSI output for browser streaming.
+///
+/// Returns `RenderResult` containing ANSI output and metadata for browser streaming.
+/// If `browser_dims` is provided, renders at those dimensions for proper layout.
+///
+/// # Arguments
+///
+/// * `terminal` - The ratatui terminal to render to
+/// * `ctx` - Render context containing all state needed for display
+/// * `browser_dims` - Optional browser dimensions for virtual terminal rendering
+///
+/// # Returns
+///
+/// A `RenderResult` with ANSI output.
+pub fn render<B>(
+    terminal: &mut Terminal<B>,
+    ctx: &RenderContext,
+    browser_dims: Option<BrowserDimensions>,
+) -> Result<RenderResult>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    // Build menu items from context
+    let menu_items = build_menu(&ctx.menu_context());
+
+    // Helper to render UI to a frame
+    let render_ui = |f: &mut Frame| { render_frame(f, ctx, &menu_items) };
+
+    // Always render to real terminal for local display
+    terminal.draw(render_ui)?;
+
+    // For browser streaming, render to browser-sized buffer if dimensions provided
+    let (ansi_output, out_rows, out_cols) = if let Some(dims) = browser_dims {
+        // Create a virtual terminal at browser dimensions
+        let backend = TestBackend::new(dims.cols, dims.rows);
+        let mut virtual_terminal = Terminal::new(backend)?;
+
+        // Render to virtual terminal at browser dimensions
+        let completed_frame = virtual_terminal.draw(|f| {
+            // Log once when dimensions change
+            static LAST_AREA: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let area = f.area();
+            let combined = (u32::from(area.width) << 16) | u32::from(area.height);
+            let last = LAST_AREA.swap(combined, std::sync::atomic::Ordering::Relaxed);
+            if last != combined {
+                log::info!(
+                    "Virtual terminal rendering at {}x{}",
+                    area.width,
+                    area.height
+                );
+            }
+            render_ui(f);
+        })?;
+
+        // Convert virtual buffer to ANSI
+        let ansi = buffer_to_ansi(
+            completed_frame.buffer,
+            dims.cols,
+            dims.rows,
+            None, // No clipping needed, already at correct size
+            None,
+        );
+        (ansi, dims.rows, dims.cols)
+    } else {
+        // No browser connected, return empty output
+        (String::new(), 0, 0)
+    };
+
+    Ok(RenderResult {
+        ansi_output,
+        rows: out_rows,
+        cols: out_cols,
+    })
+}
+
+/// Render the full TUI frame.
+///
+/// Internal function that does the actual rendering work.
+fn render_frame(f: &mut Frame, ctx: &RenderContext, menu_items: &[MenuItem]) {
+    let frame_area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
+        .split(frame_area);
+
+    // Log frame and chunk sizes once for debugging
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let block = Block::default().borders(Borders::ALL);
+        let inner = block.inner(chunks[1]);
+        log::info!(
+            "Render areas - Frame: {}x{}, Right chunk: {}x{}, Inner (visible): {}x{}",
+            frame_area.width,
+            frame_area.height,
+            chunks[1].width,
+            chunks[1].height,
+            inner.width,
+            inner.height
+        );
+    }
+
+    // Render agent list
+    render_agent_list(f, ctx, chunks[0]);
+
+    // Render terminal view
+    render_terminal_panel(f, ctx, chunks[1]);
+
+    // Render modal overlays based on mode
+    match ctx.mode {
+        AppMode::Menu => render_menu_modal(f, menu_items, ctx.menu_selected),
+        AppMode::NewAgentSelectWorktree => {
+            render_worktree_select_modal(f, ctx.available_worktrees, ctx.worktree_selected);
+        }
+        AppMode::NewAgentCreateWorktree => render_create_worktree_modal(f, ctx.input_buffer),
+        AppMode::NewAgentPrompt => render_prompt_modal(f, ctx.input_buffer),
+        AppMode::CloseAgentConfirm => render_close_confirm_modal(f),
+        AppMode::ConnectionCode => render_connection_code_modal(f, ctx.connection_code, ctx.bundle_used),
+        AppMode::Error => render_error_modal(f, ctx.error_message),
+        AppMode::Normal => {}
+    }
+}
+
+/// Render the agent list panel.
+fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect) {
+    let mut items: Vec<ListItem> = Vec::new();
+
+    // Add creating indicator at top if agent creation is in progress
+    if let Some((identifier, stage)) = &ctx.creating_agent {
+        let stage_label = match stage {
+            CreationStage::CreatingWorktree => "Creating worktree...",
+            CreationStage::CopyingConfig => "Copying config...",
+            CreationStage::SpawningAgent => "Starting agent...",
+            CreationStage::Ready => "Ready",
+        };
+        let creating_text = format!("-> {} ({})", identifier, stage_label);
+        items.push(
+            ListItem::new(creating_text).style(Style::default().fg(ratatui::style::Color::Cyan)),
+        );
+    }
+
+    // Add existing agents
+    items.extend(ctx.agents.iter().map(|agent| {
+        // Display branch name only (simpler, one agent per branch)
+        let base_text = agent.branch_name.clone();
+
+        // Add server status indicator if HTTP forwarding port is assigned
+        let server_info = if let Some(p) = agent.port {
+            let server_icon = if agent.server_running {
+                ">" // Server running
+            } else {
+                "o" // Server not running
+            };
+            format!(" {}:{}", server_icon, p)
+        } else {
+            String::new()
+        };
+
+        ListItem::new(format!("{}{}", base_text, server_info))
+    }));
+
+    let mut state = ListState::default();
+    // Offset selection by 1 if creating indicator is shown
+    let creating_offset = if ctx.creating_agent.is_some() { 1 } else { 0 };
+    state.select(Some(
+        (ctx.selected_agent_index + creating_offset).min(items.len().saturating_sub(1)),
+    ));
+
+    // Add polling indicator
+    let poll_status = if ctx.seconds_since_poll < 1 {
+        "*"
+    } else {
+        "o"
+    };
+
+    // Add VPN status indicator (if VPN manager is available)
+    let vpn_indicator = match ctx.vpn_status {
+        Some(VpnStatus::Connected) => "*",    // Filled = connected
+        Some(VpnStatus::Connecting) => "~",   // Half = connecting
+        Some(VpnStatus::Error) => "x",        // X = error
+        Some(VpnStatus::Disconnected) => "o", // Empty = disconnected
+        None => "-",                          // Dash = VPN disabled
+    };
+
+    let agent_title = format!(
+        " Agents ({}) {} {}s V:{} ",
+        ctx.agents.len(),
+        poll_status,
+        ctx.poll_interval - ctx.seconds_since_poll.min(ctx.poll_interval),
+        vpn_indicator
+    );
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(agent_title))
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Render the terminal panel showing the selected agent's PTY output.
+fn render_terminal_panel(f: &mut Frame, ctx: &RenderContext, area: Rect) {
+    let Some(agent) = ctx.selected_agent() else {
+        // No agent selected - show placeholder
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Terminal [No agent selected] ");
+        f.render_widget(block, area);
+        return;
+    };
+
+    // Build terminal title with view indicator from sessions array
+    let session_name = agent
+        .session_names
+        .get(ctx.active_pty_index)
+        .map(String::as_str)
+        .unwrap_or("agent");
+    let view_indicator = if agent.session_names.len() > 1 {
+        format!("[{} | Ctrl+]: next]", session_name.to_uppercase())
+    } else {
+        format!("[{}]", session_name.to_uppercase())
+    };
+
+    // Add scroll indicator if scrolled
+    let scroll_indicator = if ctx.is_scrolled {
+        format!(" [SCROLLBACK +{} | Shift+End: live]", ctx.scroll_offset)
+    } else {
+        String::new()
+    };
+
+    let terminal_title = format!(
+        " {} {}{} [Ctrl+P | Ctrl+J/K | Shift+PgUp/Dn scroll] ",
+        agent.branch_name, view_indicator, scroll_indicator
+    );
+
+    let block = Block::default().borders(Borders::ALL).title(terminal_title);
+
+    // Render the parser content if available
+    if let Some(ref parser) = ctx.active_parser {
+        let parser_lock = parser.lock().expect("parser lock not poisoned");
+        let screen = parser_lock.screen();
+
+        let widget = crate::TerminalWidget::new(screen).block(block);
+
+        // Hide cursor if scrolled
+        let widget = if ctx.is_scrolled {
+            widget.hide_cursor()
+        } else {
+            widget
+        };
+
+        widget.render(area, f.buffer_mut());
+    } else {
+        // No parser - just show the bordered block
+        f.render_widget(block, area);
+    }
+}
+
+// === Modal Rendering Helpers ===
+
+fn render_menu_modal(f: &mut Frame, menu_items: &[MenuItem], menu_selected: usize) {
+    use super::menu::selectable_count;
+
+    // Build display lines with selection indicator
+    let mut lines: Vec<Line> = Vec::new();
+    let mut selectable_idx = 0;
+
+    for item in menu_items {
+        if item.is_header {
+            // Section headers are dimmed and not selectable (use terminal default with DIM modifier)
+            lines.push(Line::from(Span::styled(
+                item.label.clone(),
+                Style::default()
+                    .add_modifier(Modifier::DIM)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            // Selectable items with cursor indicator
+            let is_selected = selectable_idx == menu_selected;
+            let cursor = if is_selected { ">" } else { " " };
+            let style = if is_selected {
+                // Use REVERSED modifier to invert terminal colors instead of hardcoding
+                Style::default()
+                    .add_modifier(Modifier::REVERSED)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                // Use terminal default colors
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{} {}", cursor, item.label),
+                style,
+            )));
+            selectable_idx += 1;
+        }
+    }
+
+    // Calculate modal height as percentage of terminal
+    // Need enough space for content + borders (lines.len() + 4 padding)
+    let content_rows = lines.len() as u16 + 4;
+    let terminal_height = f.area().height;
+    // Convert absolute rows to percentage, with minimum 30% for visibility
+    let height_percent = ((content_rows * 100) / terminal_height.max(1))
+        .max(30)
+        .min(60);
+
+    let area = centered_rect(50, height_percent, f.area());
+    f.render_widget(Clear, area);
+
+    let menu = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Menu [Up/Down navigate | Enter select | Esc cancel] "),
+        )
+        .alignment(Alignment::Left);
+
+    f.render_widget(menu, area);
+
+    // Suppress unused warning - selectable_count is used for validation elsewhere
+    let _ = selectable_count(menu_items);
+}
+
+fn render_worktree_select_modal(
+    f: &mut Frame,
+    available_worktrees: &[(String, String)],
+    worktree_selected: usize,
+) {
+    let mut worktree_items: Vec<String> = vec![format!(
+        "{} [Create New Worktree]",
+        if worktree_selected == 0 { ">" } else { " " }
+    )];
+
+    // Add existing worktrees (index offset by 1)
+    for (i, (path, branch)) in available_worktrees.iter().enumerate() {
+        worktree_items.push(format!(
+            "{} {} ({})",
+            if i + 1 == worktree_selected { ">" } else { " " },
+            branch,
+            path
+        ));
+    }
+
+    let area = centered_rect(70, 50, f.area());
+    f.render_widget(Clear, area);
+
+    let worktree_text: Vec<Line> = worktree_items
+        .iter()
+        .map(|item| Line::from(item.clone()))
+        .collect();
+
+    let worktree_list = Paragraph::new(worktree_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Select Worktree [Up/Down navigate | Enter select | Esc cancel] "),
+        )
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(worktree_list, area);
+}
+
+fn render_create_worktree_modal(f: &mut Frame, input_buffer: &str) {
+    let area = centered_rect(60, 30, f.area());
+    f.render_widget(Clear, area);
+
+    let prompt_text = vec![
+        Line::from("Enter branch name or issue number:"),
+        Line::from(""),
+        Line::from("Examples: 123, feature-auth, bugfix-login"),
+        Line::from(""),
+        Line::from(Span::raw(input_buffer)),
+    ];
+
+    let prompt_widget = Paragraph::new(prompt_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Create Worktree [Enter confirm | Esc cancel] "),
+        )
+        .alignment(Alignment::Left);
+
+    f.render_widget(prompt_widget, area);
+}
+
+fn render_prompt_modal(f: &mut Frame, input_buffer: &str) {
+    let area = centered_rect(60, 20, f.area());
+    f.render_widget(Clear, area);
+
+    let prompt_text = vec![
+        Line::from("Enter prompt for agent (leave empty for default):"),
+        Line::from(""),
+        Line::from(Span::raw(input_buffer)),
+    ];
+
+    let prompt_widget = Paragraph::new(prompt_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Agent Prompt [Enter confirm | Esc cancel] "),
+        )
+        .alignment(Alignment::Left);
+
+    f.render_widget(prompt_widget, area);
+}
+
+fn render_close_confirm_modal(f: &mut Frame) {
+    let area = centered_rect(50, 20, f.area());
+    f.render_widget(Clear, area);
+
+    let confirm_text = vec![
+        Line::from("Close selected agent?"),
+        Line::from(""),
+        Line::from("Y - Close agent (keep worktree)"),
+        Line::from("D - Close agent and delete worktree"),
+        Line::from("N/Esc - Cancel"),
+    ];
+
+    let confirm_widget = Paragraph::new(confirm_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Confirm Close "),
+        )
+        .alignment(Alignment::Left);
+
+    f.render_widget(confirm_widget, area);
+}
+
+fn render_connection_code_modal(
+    f: &mut Frame,
+    connection_code: Option<&super::qr::ConnectionCodeData>,
+    bundle_used: bool,
+) {
+    let terminal = f.area();
+
+    // Get QR lines from connection code, or show error
+    let qr_lines: Vec<String> = connection_code
+        .map(|c| c.qr_ascii.clone())
+        .unwrap_or_else(|| vec!["Error: No connection code".to_string()]);
+
+    let qr_fits = !qr_lines.iter().any(|l| l.contains("Terminal") || l.contains("Error"));
+
+    let qr_width = qr_lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let qr_height = qr_lines.len() as u16;
+
+    let header = if bundle_used {
+        "Link used - [r] to pair new device"
+    } else {
+        "Scan QR to connect securely"
+    };
+    let footer = "[r] new link  [c] copy  [Esc] close";
+
+    let content_width = qr_width.max(header.len() as u16).max(footer.len() as u16);
+    let modal_width = content_width + 4;
+    let modal_height = qr_height + 6;
+
+    let x = terminal.x + (terminal.width.saturating_sub(modal_width)) / 2;
+    let y = terminal.y + (terminal.height.saturating_sub(modal_height)) / 2;
+    let area = Rect::new(
+        x,
+        y,
+        modal_width.min(terminal.width),
+        modal_height.min(terminal.height),
+    );
+
+    f.render_widget(Clear, area);
+
+    let mut text_lines = vec![
+        Line::from(Span::styled(
+            header,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for qr_line in &qr_lines {
+        text_lines.push(Line::from(qr_line.clone()));
+    }
+
+    text_lines.push(Line::from(""));
+    text_lines.push(Line::from(Span::styled(
+        footer,
+        if qr_fits {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        },
+    )));
+
+    let code_widget = Paragraph::new(text_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Secure Connection "),
+        )
+        .alignment(Alignment::Center);
+
+    f.render_widget(code_widget, area);
+}
+
+/// Render an error modal.
+fn render_error_modal(f: &mut Frame, error_message: Option<&str>) {
+    let area = centered_rect(60, 30, f.area());
+    f.render_widget(Clear, area);
+
+    let message = error_message.unwrap_or("An error occurred");
+
+    let text_lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Error",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(message),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[Esc/Enter] dismiss",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    ];
+
+    let error_widget = Paragraph::new(text_lines)
+        .block(Block::default().borders(Borders::ALL).title(" Error "))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(error_widget, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_render_context_selected_agent() {
+        let agents = vec![
+            AgentRenderInfo {
+                key: "test-1".to_string(),
+                repo: "test/repo".to_string(),
+                issue_number: Some(1),
+                branch_name: "botster-issue-1".to_string(),
+                port: None,
+                server_running: false,
+                session_names: vec!["agent".to_string()],
+            },
+            AgentRenderInfo {
+                key: "test-2".to_string(),
+                repo: "test/repo".to_string(),
+                issue_number: Some(2),
+                branch_name: "botster-issue-2".to_string(),
+                port: Some(3000),
+                server_running: true,
+                session_names: vec!["agent".to_string(), "server".to_string()],
+            },
+        ];
+
+        let ctx = RenderContext {
+            mode: AppMode::Normal,
+            menu_selected: 0,
+            input_buffer: "",
+            worktree_selected: 0,
+            available_worktrees: &[],
+            error_message: None,
+            creating_agent: None,
+            connection_code: None,
+            bundle_used: false,
+            agent_ids: &[],
+            agents: &agents,
+            selected_agent_index: 1,
+            active_parser: None,
+            active_pty_index: 0,
+            scroll_offset: 0,
+            is_scrolled: false,
+            seconds_since_poll: 0,
+            poll_interval: 10,
+            vpn_status: None,
+        };
+
+        let selected = ctx.selected_agent();
+        assert!(selected.is_some());
+        assert_eq!(selected.unwrap().key, "test-2");
+        assert_eq!(selected.unwrap().issue_number, Some(2));
+    }
+
+    #[test]
+    fn test_render_context_menu_context() {
+        let agents = vec![AgentRenderInfo {
+            key: "test-1".to_string(),
+            repo: "test/repo".to_string(),
+            issue_number: Some(1),
+            branch_name: "botster-issue-1".to_string(),
+            port: None,
+            server_running: false,
+            session_names: vec!["agent".to_string(), "server".to_string()],
+        }];
+
+        let ctx = RenderContext {
+            mode: AppMode::Normal,
+            menu_selected: 0,
+            input_buffer: "",
+            worktree_selected: 0,
+            available_worktrees: &[],
+            error_message: None,
+            creating_agent: None,
+            connection_code: None,
+            bundle_used: false,
+            agent_ids: &[],
+            agents: &agents,
+            selected_agent_index: 0,
+            active_parser: None,
+            active_pty_index: 1,
+            scroll_offset: 0,
+            is_scrolled: false,
+            seconds_since_poll: 5,
+            poll_interval: 10,
+            vpn_status: None,
+        };
+
+        let menu_ctx = ctx.menu_context();
+        assert!(menu_ctx.has_agent);
+        assert_eq!(menu_ctx.active_pty_index, 1);
+        assert_eq!(menu_ctx.session_count, 2);
+    }
+
+    #[test]
+    fn test_render_result_default() {
+        let result = RenderResult::default();
+        assert!(result.ansi_output.is_empty());
+        assert_eq!(result.rows, 0);
+        assert_eq!(result.cols, 0);
+    }
+}

@@ -1,0 +1,138 @@
+<%# Connection Status Partial - shows [Browser] | [Connection] | [Hub] %>
+<% connection_type ||= "hub" %>
+<% agent_index ||= 0 %>
+<% pty_index ||= 0 %>
+
+<div data-controller="connection-status"
+     data-turbo-permanent
+     data-connection-status-hub-id-value="<%= hub.id %>"
+     data-connection-status-type-value="<%= connection_type %>"
+     data-connection-status-agent-index-value="<%= agent_index %>"
+     data-connection-status-pty-index-value="<%= pty_index %>"
+     class="flex items-center gap-1 text-xs font-medium">
+
+  <%# Browser - Signaling/ActionCable status %>
+  <div class="flex items-center gap-1 px-2 py-1 rounded-l-md border-r border-zinc-700/50 group/browser"
+       data-connection-status-target="browserSection"
+       data-status="connecting"
+       title="Browser signaling connection">
+    <%# Icon %>
+    <span class="transition-colors
+                 group-data-[status=disconnected]/browser:text-zinc-500
+                 group-data-[status=connecting]/browser:text-amber-500
+                 group-data-[status=connected]/browser:text-emerald-500
+                 group-data-[status=error]/browser:text-red-500">
+      <%= icon "globe-alt", class: "size-3.5" %>
+    </span>
+    <%# Status dot %>
+    <span class="size-1.5 rounded-full transition-colors
+                 group-data-[status=disconnected]/browser:bg-zinc-500
+                 group-data-[status=connecting]/browser:bg-amber-500 group-data-[status=connecting]/browser:animate-pulse
+                 group-data-[status=connected]/browser:bg-emerald-500
+                 group-data-[status=error]/browser:bg-red-500"></span>
+    <%# Label %>
+    <span class="text-zinc-400 hidden sm:inline min-w-[4rem]">
+      <span class="group-data-[status=disconnected]/browser:inline hidden">Offline</span>
+      <span class="group-data-[status=connecting]/browser:inline hidden">Connecting</span>
+      <span class="group-data-[status=connected]/browser:inline hidden text-emerald-400">Online</span>
+      <span class="group-data-[status=error]/browser:inline hidden text-red-400">Error</span>
+    </span>
+  </div>
+
+  <%# Connection - WebRTC status (6 states: disconnected, connecting, direct, relay, expired, unpaired) %>
+  <div class="flex items-center gap-1 px-2 py-1 border-r border-zinc-700/50 group/connection"
+       data-connection-status-target="connectionSection"
+       data-state="connecting"
+       title="WebRTC connection mode">
+    <%# Left connector %>
+    <span class="text-zinc-600 transition-colors
+                 group-data-[state=direct]/connection:text-emerald-500/50
+                 group-data-[state=relay]/connection:text-sky-500/50
+                 group-data-[state=connecting]/connection:text-amber-500/50
+                 group-data-[state=expired]/connection:text-red-500/50
+                 group-data-[state=unpaired]/connection:text-amber-500/50">
+      <svg class="size-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M5 12h14"/>
+      </svg>
+    </span>
+
+    <%# Center icon - 6 states: disconnected, connecting, direct, relay, expired, unpaired %>
+    <div class="relative flex items-center justify-center">
+      <%# Disconnected %>
+      <span class="group-data-[state=disconnected]/connection:flex hidden items-center text-zinc-500">
+        <%= icon "x-circle", class: "size-4" %>
+      </span>
+      <%# Connecting (establishing, renegotiating, or detecting mode) %>
+      <span class="group-data-[state=connecting]/connection:flex hidden items-center text-amber-500">
+        <%= icon "arrow-path", class: "size-4 animate-spin" %>
+      </span>
+      <%# Direct (P2P) - with lock badge for E2E %>
+      <span class="group-data-[state=direct]/connection:flex hidden items-center text-emerald-500 relative">
+        <%= icon "bolt", variant: :solid, class: "size-4" %>
+        <span class="absolute -bottom-0.5 -right-0.5 bg-zinc-900 rounded-full p-px">
+          <%= icon "lock-closed", variant: :micro, class: "size-2 text-emerald-400" %>
+        </span>
+      </span>
+      <%# Relay (TURN) - with lock badge for E2E %>
+      <span class="group-data-[state=relay]/connection:flex hidden items-center text-sky-500 relative">
+        <%= icon "cloud", variant: :solid, class: "size-4" %>
+        <span class="absolute -bottom-0.5 -right-0.5 bg-zinc-900 rounded-full p-px">
+          <%= icon "lock-closed", variant: :micro, class: "size-2 text-emerald-400" %>
+        </span>
+      </span>
+      <%# Expired (crypto session invalid - needs re-pair via QR code) %>
+      <span class="group-data-[state=expired]/connection:flex hidden items-center text-red-500">
+        <%= icon "lock-open", class: "size-4" %>
+      </span>
+      <%# Needs pairing (no crypto session - scan connection code) %>
+      <span class="group-data-[state=unpaired]/connection:flex hidden items-center text-amber-500">
+        <%= icon "qr-code", class: "size-4" %>
+      </span>
+    </div>
+
+    <%# Right connector %>
+    <span class="text-zinc-600 transition-colors
+                 group-data-[state=direct]/connection:text-emerald-500/50
+                 group-data-[state=relay]/connection:text-sky-500/50
+                 group-data-[state=connecting]/connection:text-amber-500/50
+                 group-data-[state=expired]/connection:text-red-500/50
+                 group-data-[state=unpaired]/connection:text-amber-500/50">
+      <svg class="size-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M5 12h14"/>
+      </svg>
+    </span>
+
+    <%# State label %>
+    <span class="text-zinc-400 hidden sm:inline min-w-[4rem]">
+      <span class="group-data-[state=disconnected]/connection:inline hidden">Offline</span>
+      <span class="group-data-[state=connecting]/connection:inline hidden">Connecting</span>
+      <span class="group-data-[state=direct]/connection:inline hidden text-emerald-400">Direct</span>
+      <span class="group-data-[state=relay]/connection:inline hidden text-sky-400">Relay</span>
+      <span class="group-data-[state=expired]/connection:inline hidden text-red-400">Expired</span>
+      <span class="group-data-[state=unpaired]/connection:inline hidden text-amber-400">Scan Code</span>
+    </span>
+  </div>
+
+  <%# Hub - CLI health status %>
+  <div class="flex items-center gap-1 px-2 py-1 rounded-r-md group/hub"
+       data-connection-status-target="hubSection"
+       data-status="<%= hub.active? ? 'online' : 'offline' %>"
+       title="Hub CLI status">
+    <%# Label %>
+    <span class="text-zinc-400 hidden sm:inline">Hub</span>
+    <%# Status dot %>
+    <span class="size-1.5 rounded-full transition-colors
+                 group-data-[status=offline]/hub:bg-zinc-500
+                 group-data-[status=connecting]/hub:bg-amber-500 group-data-[status=connecting]/hub:animate-pulse
+                 group-data-[status=online]/hub:bg-emerald-500
+                 group-data-[status=error]/hub:bg-red-500"></span>
+    <%# Icon %>
+    <span class="transition-colors
+                 group-data-[status=offline]/hub:text-zinc-500
+                 group-data-[status=connecting]/hub:text-amber-500
+                 group-data-[status=online]/hub:text-emerald-500
+                 group-data-[status=error]/hub:text-red-500">
+      <%= icon "server", class: "size-3.5" %>
+    </span>
+  </div>
+</div>

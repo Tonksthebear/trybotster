@@ -1,0 +1,80 @@
+<%# Delete Agent Confirmation Modal %>
+<%# Matches TUI options: keep worktree, delete worktree, or cancel %>
+<%= render Elements::DialogComponent.new(id: "delete-agent-modal") do %>
+  <div data-controller="delete-agent-modal"
+       data-delete-agent-modal-hub-id-value="<%= Current.hub.id %>"
+       class="flex flex-col">
+    <%# Header %>
+    <div class="px-5 py-4 border-b border-zinc-800 bg-zinc-950/50">
+      <div class="flex items-center gap-3">
+        <span class="size-7 rounded-md bg-danger-500/20 text-danger-400 flex items-center justify-center border border-danger-500/30">
+          <%= icon "trash", class: "size-4" %>
+        </span>
+        <div>
+          <h3 class="text-base font-semibold text-zinc-100">Close Agent</h3>
+          <p class="text-xs text-zinc-500 mt-0.5" data-agent-name>Selected agent</p>
+        </div>
+      </div>
+    </div>
+
+    <%# Content %>
+    <div class="p-5 space-y-4">
+      <p class="text-sm text-zinc-300">
+        What would you like to do with the git worktree?
+      </p>
+
+      <div class="space-y-2">
+        <%# Option 1: Keep worktree %>
+        <%= render Elements::ButtonComponent.new(
+          color: :success,
+          variant: :soft,
+          class: "w-full text-left px-4 py-3 h-auto",
+          data: { action: "delete-agent-modal#confirmKeep" },
+          command: "close",
+          commandfor: "delete-agent-modal"
+        ) do %>
+          <div class="flex items-center gap-3 w-full">
+            <span class="size-8 rounded-md bg-success-500/20 text-success-400 flex items-center justify-center border border-success-500/30 shrink-0">
+              <%= icon "check", class: "size-4" %>
+            </span>
+            <div class="text-left">
+              <div class="text-sm font-medium">Close agent only</div>
+              <div class="text-xs opacity-70 font-normal">Keep worktree for later use</div>
+            </div>
+          </div>
+        <% end %>
+
+        <%# Option 2: Delete worktree %>
+        <%= render Elements::ButtonComponent.new(
+          color: :danger,
+          variant: :soft,
+          class: "w-full text-left px-4 py-3 h-auto",
+          data: { action: "delete-agent-modal#confirmDelete" },
+          command: "close",
+          commandfor: "delete-agent-modal"
+        ) do %>
+          <div class="flex items-center gap-3 w-full">
+            <span class="size-8 rounded-md bg-danger-500/20 text-danger-400 flex items-center justify-center border border-danger-500/30 shrink-0">
+              <%= icon "trash", class: "size-4" %>
+            </span>
+            <div class="text-left">
+              <div class="text-sm font-medium">Close and delete worktree</div>
+              <div class="text-xs opacity-70 font-normal">Remove git worktree permanently</div>
+            </div>
+          </div>
+        <% end %>
+      </div>
+    </div>
+
+    <%# Footer %>
+    <div class="px-5 py-4 border-t border-zinc-800 bg-zinc-950/30">
+      <%= render Elements::ButtonComponent.new("Cancel",
+        color: :neutral,
+        variant: :ghost,
+        class: "w-full",
+        command: "close",
+        commandfor: "delete-agent-modal"
+      ) %>
+    </div>
+  </div>
+<% end %>

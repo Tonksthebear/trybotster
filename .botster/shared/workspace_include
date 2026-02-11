@@ -1,0 +1,13 @@
+# Glob patterns for files to copy into worktrees
+# One pattern per line
+# Example:
+# .env
+# config/secrets.yml
+
+config/credentials/*.key
+.claude/settings.local.json
+
+# Ignore GitHub App private key
+config/**.pem
+
+mise.toml

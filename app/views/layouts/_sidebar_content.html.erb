@@ -1,0 +1,111 @@
+<div class="flex h-full flex-col bg-zinc-900 border-r border-zinc-800">
+  <%# Logo %>
+  <div class="shrink-0 flex items-center gap-2 px-4 py-4 border-b border-zinc-800">
+    <%= link_to root_path, class: "flex items-center gap-2 text-primary-400 hover:text-primary-300 transition-colors" do %>
+      <%= icon "command-line", class: "size-6" %>
+      <span class="font-mono font-bold text-lg tracking-tight">botster</span>
+    <% end %>
+  </div>
+
+  <%# Scrollable content %>
+  <div class="flex-1 flex flex-col min-h-0 overflow-hidden">
+    <%# Hubs Section %>
+    <div class="flex flex-col min-h-0">
+      <div class="shrink-0 flex items-center justify-between px-4 py-3">
+        <h2 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Hubs</h2>
+        <%= link_to new_users_hub_path, class: "p-1 text-zinc-500 hover:text-primary-400 transition-colors", title: "Connect Hub" do %>
+          <%= icon "plus", class: "size-4" %>
+        <% end %>
+      </div>
+      <div class="hubs-list flex-1 overflow-y-auto px-2 pb-2">
+        <%= render "layouts/sidebar_hubs", hubs: Current.user.hubs.includes(:device).order(last_seen_at: :desc) %>
+      </div>
+    </div>
+
+    <%# Agents Section - only shown when hub is selected %>
+    <% if Current.hub %>
+      <div class="flex flex-col min-h-0 border-t border-zinc-800"
+           data-controller="agent-list"
+           data-agent-list-hub-id-value="<%= Current.hub.id %>"
+           data-agent-list-agents-value="[]"
+           data-turbo-permanent
+           id="sidebar-agent-list-<%= local_assigns[:sidebar_id] || 'default' %>">
+        <div class="shrink-0 flex items-center justify-between px-4 py-3">
+          <h2 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Agents</h2>
+          <button type="button"
+                  data-controller="requires-connection"
+                  data-requires-connection-key-value="<%= Current.hub.id %>"
+                  class="p-1 text-zinc-500 hover:text-primary-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-500"
+                  title="New Agent"
+                  command="show-modal"
+                  commandfor="new-agent-modal"
+                  disabled>
+            <%= icon "plus", class: "size-4" %>
+          </button>
+        </div>
+
+        <%# Template for each agent item %>
+        <template data-agent-list-target="template">
+          <div class="group flex items-center gap-1 rounded transition-colors hover:bg-zinc-800/50 data-[selected=true]:bg-primary-500/20">
+            <a data-href="/hubs/{hubId}/agents/{index}"
+               data-agent-id
+               class="flex-1 text-left px-2 py-1.5 min-w-0 text-zinc-400 hover:text-zinc-200 data-[selected=true]:text-primary-400 data-[selected=true]:font-medium">
+              <span data-field="name" class="truncate font-mono text-xs block"></span>
+            </a>
+            <button type="button"
+                    data-agent-id
+                    data-action="agent-list#delete"
+                    class="shrink-0 p-1.5 text-zinc-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                    title="Delete agent">
+              <%= icon "trash", class: "size-3.5" %>
+            </button>
+          </div>
+        </template>
+
+        <%# List container %>
+        <div data-agent-list-target="list" class="flex-1 overflow-y-auto px-2 pb-2 space-y-1"></div>
+
+        <%# Empty state %>
+        <div data-agent-list-target="empty" class="hidden px-2 pb-2">
+          <p class="px-2 py-4 text-center text-xs text-zinc-600">No agents running</p>
+        </div>
+
+        <%# Loading state %>
+        <div data-agent-list-target="loading" class="px-2 pb-2">
+          <p class="px-2 py-4 text-center text-xs text-zinc-600">Connecting...</p>
+        </div>
+      </div>
+    <% end %>
+  </div>
+
+  <%# Bottom section - Settings & User %>
+  <div class="shrink-0 border-t border-zinc-800">
+    <%# Settings %>
+    <%= link_to settings_path,
+        class: "flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
+        <%= icon "cog-6-tooth", class: "size-5" %>
+      <span>Settings</span>
+    <% end %>
+
+    <%# User dropdown %>
+    <%= render Elements::DropdownComponent.new(
+      anchor: "top start",
+      class: "block",
+      panel: "w-(--button-width) rounded-md bg-zinc-800 shadow-lg outline-1 -outline-offset-1 outline-white/10"
+    ) do |dropdown| %>
+      <% dropdown.with_button class: "w-full flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
+        <div class="size-8 rounded-full bg-zinc-800 flex items-center justify-center text-xs font-medium text-zinc-300">
+          <%= current_user.username&.first&.upcase || "?" %>
+        </div>
+        <span class="flex-1 text-left truncate font-mono text-xs"><%= current_user.username || "User" %></span>
+        <%= icon "chevron-up-down", class: "size-4 text-zinc-600" %>
+      <% end %>
+
+      <%= link_to destroy_user_session_path,
+          data: { turbo_method: :delete },
+          class: "block px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-700 rounded-md transition-colors" do %>
+        Logout
+      <% end %>
+    <% end %>
+  </div>
+</div>

@@ -1,0 +1,81 @@
+<%# Share Hub Modal - displays connection code QR and URL %>
+<%= render Elements::DialogComponent.new(id: "share-hub-modal") do %>
+  <div class="flex flex-col">
+    <%# Header %>
+    <div class="px-5 py-4 border-b border-zinc-800 bg-zinc-950/50">
+      <div class="flex items-center gap-3">
+        <%= icon "qr-code", class: "size-6 text-primary-400" %>
+        <div>
+          <h3 class="text-base font-semibold text-zinc-100">Share Hub Access</h3>
+          <p class="text-xs text-zinc-500 mt-0.5">Scan QR or copy link to connect another device</p>
+        </div>
+      </div>
+    </div>
+
+    <%# Content %>
+    <div class="p-5 space-y-5">
+      <%# Loading state %>
+      <div data-share-loading class="py-8 text-center">
+        <%= icon "arrow-path", class: "size-8 text-zinc-600 mx-auto mb-3 animate-spin" %>
+        <p class="text-sm text-zinc-500">Generating connection code...</p>
+      </div>
+
+      <%# Error state %>
+      <div data-share-error class="hidden py-8 text-center">
+        <%= icon "exclamation-circle", class: "size-8 text-red-500 mx-auto mb-3" %>
+        <p class="text-sm text-red-400" data-share-error-message>Failed to generate code</p>
+        <button type="button"
+                onclick="document.querySelector('[data-controller*=share-hub]')?.dispatchEvent(new CustomEvent('share-hub:retry'))"
+                class="mt-3 text-sm text-primary-400 hover:text-primary-300">
+          Try again
+        </button>
+      </div>
+
+      <%# Success state %>
+      <div data-share-content class="hidden space-y-5">
+        <%# QR Code (ASCII art) %>
+        <div class="flex justify-center">
+          <pre data-share-qr
+               class="font-mono text-xs whitespace-pre leading-none tracking-tighter bg-white text-black p-3 rounded-lg select-none inline-block origin-center"
+               style="transform: scale(0.5) scaleY(1.1);"></pre>
+        </div>
+
+        <%# URL with copy button %>
+        <div class="space-y-2">
+          <label class="text-xs text-zinc-500 uppercase tracking-wider">Connection URL</label>
+          <div class="flex gap-2">
+            <input type="text"
+                   data-share-url
+                   readonly
+                   class="flex-1 px-3 py-2 bg-zinc-950 border border-zinc-700 rounded text-zinc-300 text-sm font-mono truncate focus:outline-none">
+            <button type="button"
+                    onclick="document.querySelector('[data-controller*=share-hub]')?.dispatchEvent(new CustomEvent('share-hub:copy'))"
+                    class="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-zinc-300 text-sm transition-colors">
+              <%= icon "clipboard", class: "size-4" %>
+            </button>
+          </div>
+          <p data-share-status class="text-xs text-zinc-600 h-4"></p>
+        </div>
+
+        <%# Security note %>
+        <div class="flex items-start gap-2 p-3 bg-zinc-900/50 border border-zinc-800 rounded-lg">
+          <%= icon "shield-check", class: "size-4 text-emerald-500 mt-0.5 shrink-0" %>
+          <p class="text-xs text-zinc-400">
+            This link contains encrypted keys. Anyone with this link can connect to your hub.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <%# Footer %>
+    <div class="px-5 py-4 border-t border-zinc-800 bg-zinc-950/30">
+      <%= render Elements::ButtonComponent.new("Close",
+        color: :neutral,
+        variant: :ghost,
+        class: "w-full",
+        command: "close",
+        commandfor: "share-hub-modal"
+      ) %>
+    </div>
+  </div>
+<% end %>

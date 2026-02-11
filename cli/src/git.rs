@@ -1,135 +1,102 @@
+//! Git worktree management.
+//!
+//! Provides functionality for creating, managing, and deleting git worktrees
+//! for agent sessions. Each agent runs in an isolated worktree to prevent
+//! conflicts between concurrent tasks.
+
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSetBuilder};
-use serde_json;
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-/// Extension trait for safe path-to-string conversion
-trait PathExt {
-    fn to_str_safe(&self) -> Result<&str>;
-}
-
-impl PathExt for Path {
-    fn to_str_safe(&self) -> Result<&str> {
-        self.to_str()
-            .ok_or_else(|| anyhow::anyhow!("Path contains invalid UTF-8: {:?}", self))
+/// Returns the path for debug logging.
+/// In test mode, writes to project tmp/ to avoid leaking outside the project.
+fn debug_log_path() -> PathBuf {
+    if crate::env::is_any_test() {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.join("tmp/botster_debug.log"))
+            .unwrap_or_else(|| PathBuf::from("/tmp/botster_debug.log"))
+    } else {
+        PathBuf::from("/tmp/botster_debug.log")
     }
 }
 
-impl PathExt for PathBuf {
-    fn to_str_safe(&self) -> Result<&str> {
-        self.to_str()
-            .ok_or_else(|| anyhow::anyhow!("Path contains invalid UTF-8: {:?}", self))
-    }
-}
-
-/// Manages git worktrees for agent sessions
+/// Manages git worktrees for agent sessions.
+#[derive(Debug)]
 pub struct WorktreeManager {
+    /// Base directory for worktree storage.
     base_dir: PathBuf,
 }
 
 impl WorktreeManager {
+    /// Creates a new worktree manager with the specified base directory.
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
     }
 
-    /// Reads .botster_copy file and returns patterns
-    fn read_botster_copy_patterns(repo_path: &Path) -> Result<Vec<String>> {
-        let botster_copy_path = repo_path.join(".botster_copy");
+    /// Read workspace teardown commands from `.botster/shared/workspace_teardown`.
+    ///
+    /// Returns non-empty, non-comment lines from the teardown file.
+    /// Returns an empty vector if the file does not exist.
+    pub fn read_teardown_commands(repo_path: &Path) -> Result<Vec<String>> {
+        let teardown_path = repo_path.join(".botster/shared/workspace_teardown");
 
-        if !botster_copy_path.exists() {
+        if !teardown_path.exists() {
             return Ok(Vec::new());
         }
 
-        let content =
-            fs::read_to_string(&botster_copy_path).context("Failed to read .botster_copy")?;
-
-        let patterns: Vec<String> = content
-            .lines()
-            .map(|line| line.trim())
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| line.to_string())
-            .collect();
-
-        Ok(patterns)
-    }
-
-    /// Reads .botster_init file and returns commands to run in the shell
-    pub fn read_botster_init_commands(repo_path: &Path) -> Result<Vec<String>> {
-        let botster_init_path = repo_path.join(".botster_init");
-
-        if !botster_init_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let content =
-            fs::read_to_string(&botster_init_path).context("Failed to read .botster_init")?;
+        let content = fs::read_to_string(&teardown_path)
+            .context("Failed to read .botster/shared/workspace_teardown")?;
 
         let commands: Vec<String> = content
             .lines()
-            .map(|line| line.trim())
+            .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| line.to_string())
-            .collect();
-
-        log::info!("Read {} init command(s) from .botster_init", commands.len());
-        Ok(commands)
-    }
-
-    /// Reads .botster_teardown file and returns commands to run before deletion
-    pub fn read_botster_teardown_commands(repo_path: &Path) -> Result<Vec<String>> {
-        let botster_teardown_path = repo_path.join(".botster_teardown");
-
-        if !botster_teardown_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let content = fs::read_to_string(&botster_teardown_path)
-            .context("Failed to read .botster_teardown")?;
-
-        let commands: Vec<String> = content
-            .lines()
-            .map(|line| line.trim())
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| line.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
 
         log::info!(
-            "Read {} teardown command(s) from .botster_teardown",
+            "Read {} teardown command(s) from workspace_teardown",
             commands.len()
         );
         Ok(commands)
     }
 
-    /// Copies files matching .botster_copy patterns from source to destination
-    fn copy_botster_files(source_repo: &Path, dest_worktree: &Path) -> Result<()> {
-        let patterns = Self::read_botster_copy_patterns(source_repo)?;
+    /// Copy files from `source_repo` to `dest` matching glob patterns in `patterns_file`.
+    ///
+    /// Reads one glob pattern per line from `patterns_file` (ignoring blanks and
+    /// `#`-comments), then recursively walks `source_repo` and copies every
+    /// matching file into `dest`, preserving relative paths.
+    pub fn copy_from_patterns(
+        source_repo: &Path,
+        dest: &Path,
+        patterns_file: &Path,
+    ) -> Result<()> {
+        let content =
+            fs::read_to_string(patterns_file).context("Failed to read patterns file")?;
+
+        let patterns: Vec<String> = content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(std::string::ToString::to_string)
+            .collect();
 
         if patterns.is_empty() {
-            log::debug!("No .botster_copy patterns found, skipping file copy");
+            log::debug!("No patterns in {}, skipping file copy", patterns_file.display());
             return Ok(());
         }
 
         log::info!(
-            "Found {} patterns in .botster_copy: {:?}",
+            "Copying {} pattern(s) from {} into {}",
             patterns.len(),
-            patterns
+            patterns_file.display(),
+            dest.display(),
         );
-        log::info!("Source repo: {}", source_repo.display());
-        log::info!("Dest worktree: {}", dest_worktree.display());
 
-        // Write debug info to file for troubleshooting
-        let debug_log = format!(
-            "[copy_botster_files] patterns={:?}, source={}, dest={}\n",
-            patterns,
-            source_repo.display(),
-            dest_worktree.display()
-        );
-        std::fs::write("/tmp/botster_debug.log", &debug_log).ok();
-
-        // Build globset from patterns
         let mut builder = GlobSetBuilder::new();
         for pattern in &patterns {
             match Glob::new(pattern) {
@@ -137,17 +104,16 @@ impl WorktreeManager {
                     builder.add(glob);
                 }
                 Err(e) => {
-                    log::warn!("Invalid pattern in .botster_copy: '{}' - {}", pattern, e);
+                    log::warn!("Invalid glob pattern '{}': {}", pattern, e);
                     continue;
                 }
             }
         }
         let globset = builder.build()?;
 
-        // Walk the source repo and copy matching files
-        Self::copy_matching_files(source_repo, dest_worktree, source_repo, &globset)?;
+        Self::copy_matching_files(source_repo, dest, source_repo, &globset)?;
 
-        log::info!("Copied {} pattern(s) from .botster_copy", patterns.len());
+        log::info!("Copied {} pattern(s) into {}", patterns.len(), dest.display());
         Ok(())
     }
 
@@ -168,7 +134,7 @@ impl WorktreeManager {
             return Ok(()); // Continue despite errors
         }
 
-        for entry in read_result.unwrap() {
+        for entry in read_result.expect("checked is_ok() above") {
             let entry = match entry {
                 Ok(e) => e,
                 Err(err) => {
@@ -197,9 +163,9 @@ impl WorktreeManager {
                     path.display(),
                     rel_path.display()
                 );
-                if globset.is_match(&rel_path) {
+                if globset.is_match(rel_path) {
                     // Copy matching file
-                    let dest_path = dest_root.join(&rel_path);
+                    let dest_path = dest_root.join(rel_path);
 
                     // Create parent directories if needed
                     if let Some(parent) = dest_path.parent() {
@@ -228,9 +194,9 @@ impl WorktreeManager {
                             if let Ok(mut file) = std::fs::OpenOptions::new()
                                 .create(true)
                                 .append(true)
-                                .open("/tmp/botster_debug.log")
+                                .open(debug_log_path())
                             {
-                                file.write_all(debug_msg.as_bytes()).ok();
+                                let _ = file.write_all(debug_msg.as_bytes());
                             }
                         }
                         Err(e) => {
@@ -252,6 +218,11 @@ impl WorktreeManager {
     }
 
     /// Detects the current git repository
+    ///
+    /// Repo name is determined from (in order):
+    /// 1. BOTSTER_REPO env var (for tests and explicit override)
+    /// 2. Origin remote URL
+    /// 3. Directory name
     pub fn detect_current_repo() -> Result<(PathBuf, String)> {
         let current_dir = std::env::current_dir().context("Failed to get current directory")?;
 
@@ -264,8 +235,11 @@ impl WorktreeManager {
             .context("Failed to get repo path")?
             .to_path_buf();
 
-        // Get the repo name from the remote URL or directory name
-        let repo_name = if let Ok(remote) = repo.find_remote("origin") {
+        // Get the repo name: env var > origin remote > directory name
+        let repo_name = if let Ok(env_repo) = std::env::var("BOTSTER_REPO") {
+            // Explicit override (used in tests)
+            env_repo
+        } else if let Ok(remote) = repo.find_remote("origin") {
             if let Some(url) = remote.url() {
                 // Extract owner/repo from URL like "https://github.com/owner/repo.git"
                 url.trim_end_matches(".git")
@@ -319,10 +293,10 @@ impl WorktreeManager {
         let output = if branch_exists {
             log::info!("Using existing branch: {}", branch_name);
             std::process::Command::new("git")
-                .args(&[
+                .args([
                     "worktree",
                     "add",
-                    worktree_path.to_str().unwrap(),
+                    worktree_path.to_str().expect("path is valid UTF-8"),
                     branch_name,
                 ])
                 .current_dir(&repo_path)
@@ -330,12 +304,12 @@ impl WorktreeManager {
         } else {
             log::info!("Creating new branch: {}", branch_name);
             std::process::Command::new("git")
-                .args(&[
+                .args([
                     "worktree",
                     "add",
                     "-b",
                     branch_name,
-                    worktree_path.to_str().unwrap(),
+                    worktree_path.to_str().expect("path is valid UTF-8"),
                 ])
                 .current_dir(&repo_path)
                 .output()?
@@ -346,22 +320,8 @@ impl WorktreeManager {
             anyhow::bail!("Failed to create worktree: {}", stderr);
         }
 
-        // Mark as trusted for Claude
-        let claude_dir = worktree_path.join(".claude");
-        fs::create_dir_all(&claude_dir)?;
-
-        // Create settings.local.json to pre-authorize the directory
-        let settings = serde_json::json!({
-            "allowedDirectories": [worktree_path.to_str().unwrap()],
-            "permissionMode": "acceptEdits"
-        });
-        fs::write(
-            claude_dir.join("settings.local.json"),
-            serde_json::to_string_pretty(&settings)?,
-        )?;
-
-        // Copy files matching .botster_copy patterns
-        Self::copy_botster_files(&repo_path, &worktree_path)?;
+        // File copying is now Lua-driven via worktree.copy_from_patterns()
+        // using the resolved workspace_include from .botster/ config.
 
         Ok(worktree_path)
     }
@@ -406,10 +366,10 @@ impl WorktreeManager {
             // Branch exists - checkout existing branch (no -b flag)
             log::info!("Using existing branch: {}", branch_name);
             std::process::Command::new("git")
-                .args(&[
+                .args([
                     "worktree",
                     "add",
-                    worktree_path.to_str().unwrap(),
+                    worktree_path.to_str().expect("path is valid UTF-8"),
                     &branch_name,
                 ])
                 .current_dir(&clone_dir)
@@ -418,12 +378,12 @@ impl WorktreeManager {
             // Branch doesn't exist - create new branch with -b flag
             log::info!("Creating new branch: {}", branch_name);
             std::process::Command::new("git")
-                .args(&[
+                .args([
                     "worktree",
                     "add",
                     "-b",
                     &branch_name,
-                    worktree_path.to_str().unwrap(),
+                    worktree_path.to_str().expect("path is valid UTF-8"),
                 ])
                 .current_dir(&clone_dir)
                 .output()?
@@ -440,7 +400,7 @@ impl WorktreeManager {
 
         // Create settings.local.json to pre-authorize the directory
         let settings = serde_json::json!({
-            "allowedDirectories": [worktree_path.to_str().unwrap()],
+            "allowedDirectories": [worktree_path.to_str().expect("path is valid UTF-8")],
             "permissionMode": "acceptEdits"
         });
         fs::write(
@@ -458,27 +418,28 @@ impl WorktreeManager {
 
             // Try to remove with git worktree remove
             let remove_result = std::process::Command::new("git")
-                .args(&[
+                .args([
                     "worktree",
                     "remove",
-                    worktree_path.to_str().unwrap(),
+                    worktree_path.to_str().expect("path is valid UTF-8"),
                     "--force",
                 ])
                 .current_dir(clone_dir)
                 .output();
 
             // If git command fails, try to prune and remove directory manually
-            if remove_result.is_err() || !remove_result.as_ref().unwrap().status.success() {
+            if remove_result.as_ref().is_err()
+                || remove_result.as_ref().is_ok_and(|r| !r.status.success())
+            {
                 log::warn!("Git worktree remove failed, trying prune...");
-                std::process::Command::new("git")
-                    .args(&["worktree", "prune"])
+                let _ = std::process::Command::new("git")
+                    .args(["worktree", "prune"])
                     .current_dir(clone_dir)
-                    .output()
-                    .ok();
+                    .output();
 
                 // Manually remove the directory if it still exists
                 if worktree_path.exists() {
-                    std::fs::remove_dir_all(worktree_path).ok();
+                    let _ = std::fs::remove_dir_all(worktree_path);
                 }
             }
         }
@@ -495,17 +456,20 @@ impl WorktreeManager {
         }
 
         let output = std::process::Command::new("git")
-            .args(&["worktree", "list"])
+            .args(["worktree", "list"])
             .current_dir(&clone_dir)
             .output()?;
 
         let list = String::from_utf8_lossy(&output.stdout);
-        Ok(list.lines().map(|s| s.to_string()).collect())
+        Ok(list.lines().map(std::string::ToString::to_string).collect())
     }
 
     /// Finds an existing worktree for a given issue number
     /// Returns the worktree path and branch name if found
-    pub fn find_existing_worktree_for_issue(&self, issue_number: u32) -> Result<Option<(PathBuf, String)>> {
+    pub fn find_existing_worktree_for_issue(
+        &self,
+        issue_number: u32,
+    ) -> Result<Option<(PathBuf, String)>> {
         let (repo_path, repo_name) = Self::detect_current_repo()?;
         let repo_safe = repo_name.replace('/', "-");
         let branch_name = format!("botster-issue-{}", issue_number);
@@ -520,13 +484,16 @@ impl WorktreeManager {
         // Verify it's actually a git worktree
         let git_file = worktree_path.join(".git");
         if !git_file.exists() {
-            log::warn!("Directory exists but is not a git worktree: {}", worktree_path.display());
+            log::warn!(
+                "Directory exists but is not a git worktree: {}",
+                worktree_path.display()
+            );
             return Ok(None);
         }
 
         // Verify the worktree is valid by checking if git recognizes it
         let output = std::process::Command::new("git")
-            .args(&["worktree", "list", "--porcelain"])
+            .args(["worktree", "list", "--porcelain"])
             .current_dir(&repo_path)
             .output()?;
 
@@ -543,7 +510,11 @@ impl WorktreeManager {
             if line.starts_with("worktree ") {
                 let path = line.strip_prefix("worktree ").unwrap_or("");
                 if path == worktree_path_str {
-                    log::info!("Found existing worktree for issue #{} at {}", issue_number, worktree_path.display());
+                    log::info!(
+                        "Found existing worktree for issue #{} at {}",
+                        issue_number,
+                        worktree_path.display()
+                    );
                     return Ok(Some((worktree_path, branch_name)));
                 }
             }
@@ -560,16 +531,17 @@ impl WorktreeManager {
 
         if clone_dir.exists() {
             std::process::Command::new("git")
-                .args(&["worktree", "prune"])
+                .args(["worktree", "prune"])
                 .current_dir(&clone_dir)
                 .output()?;
         }
         Ok(())
     }
 
-    /// Deletes a worktree by path, running teardown scripts first
+    /// Deletes a worktree by path, running teardown scripts first.
     ///
-    /// # Safety
+    /// # Note
+    ///
     /// This function has multiple defense-in-depth checks to prevent accidental
     /// deletion of the main repository or other important directories.
     pub fn delete_worktree_by_path(
@@ -578,9 +550,12 @@ impl WorktreeManager {
         branch_name: &str,
     ) -> Result<()> {
         // DEFENSE-IN-DEPTH CHECK 1: Verify path is within managed base directory
-        let canonical_worktree = worktree_path.canonicalize()
+        let canonical_worktree = worktree_path
+            .canonicalize()
             .context("Failed to canonicalize worktree path")?;
-        let canonical_base = self.base_dir.canonicalize()
+        let canonical_base = self
+            .base_dir
+            .canonicalize()
             .unwrap_or_else(|_| self.base_dir.clone());
 
         if !canonical_worktree.starts_with(&canonical_base) {
@@ -701,7 +676,7 @@ impl WorktreeManager {
         log::info!("Deleting worktree at {}", worktree_path.display());
 
         // Read and run teardown commands
-        let teardown_commands = Self::read_botster_teardown_commands(&repo_path)?;
+        let teardown_commands = Self::read_teardown_commands(&repo_path)?;
 
         if !teardown_commands.is_empty() {
             log::info!("Running {} teardown command(s)", teardown_commands.len());
@@ -726,25 +701,28 @@ impl WorktreeManager {
                     .env("BOTSTER_REPO", &repo_name)
                     .env("BOTSTER_ISSUE_NUMBER", issue_number.to_string())
                     .env("BOTSTER_BRANCH_NAME", branch_name)
-                    .env("BOTSTER_WORKTREE_PATH", worktree_path.to_str().unwrap())
+                    .env(
+                        "BOTSTER_WORKTREE_PATH",
+                        worktree_path.to_str().expect("path is valid UTF-8"),
+                    )
                     .env(
                         "BOTSTER_HUB_BIN",
                         std::env::current_exe()
                             .ok()
-                            .and_then(|p| p.to_str().map(|s| s.to_string()))
+                            .and_then(|p| p.to_str().map(std::string::ToString::to_string))
                             .unwrap_or_else(|| "botster-hub".to_string()),
                     )
                     .output()?;
 
-                if !output.status.success() {
-                    log::warn!(
-                        "Teardown command failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                } else {
+                if output.status.success() {
                     log::debug!(
                         "Teardown output: {}",
                         String::from_utf8_lossy(&output.stdout)
+                    );
+                } else {
+                    log::warn!(
+                        "Teardown command failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
                     );
                 }
             }
@@ -763,10 +741,10 @@ impl WorktreeManager {
         );
 
         let output = std::process::Command::new("git")
-            .args(&[
+            .args([
                 "worktree",
                 "remove",
-                worktree_path.to_str().unwrap(),
+                worktree_path.to_str().expect("path is valid UTF-8"),
                 "--force",
             ])
             .current_dir(&repo_path)
@@ -790,7 +768,7 @@ impl WorktreeManager {
         // Delete the branch
         log::info!("Deleting branch {}", branch_name);
         let output = std::process::Command::new("git")
-            .args(&["branch", "-D", branch_name])
+            .args(["branch", "-D", branch_name])
             .current_dir(&repo_path)
             .output()?;
 
@@ -829,7 +807,7 @@ impl WorktreeManager {
         log::info!("Deleting worktree for issue #{}", issue_number);
 
         // Read and run teardown commands
-        let teardown_commands = Self::read_botster_teardown_commands(&repo_path)?;
+        let teardown_commands = Self::read_teardown_commands(&repo_path)?;
 
         if !teardown_commands.is_empty() {
             log::info!("Running {} teardown command(s)", teardown_commands.len());
@@ -844,25 +822,28 @@ impl WorktreeManager {
                     .env("BOTSTER_REPO", &repo_name)
                     .env("BOTSTER_ISSUE_NUMBER", issue_number.to_string())
                     .env("BOTSTER_BRANCH_NAME", &branch_name)
-                    .env("BOTSTER_WORKTREE_PATH", worktree_path.to_str().unwrap())
+                    .env(
+                        "BOTSTER_WORKTREE_PATH",
+                        worktree_path.to_str().expect("path is valid UTF-8"),
+                    )
                     .env(
                         "BOTSTER_HUB_BIN",
                         std::env::current_exe()
                             .ok()
-                            .and_then(|p| p.to_str().map(|s| s.to_string()))
+                            .and_then(|p| p.to_str().map(std::string::ToString::to_string))
                             .unwrap_or_else(|| "botster-hub".to_string()),
                     )
                     .output()?;
 
-                if !output.status.success() {
-                    log::warn!(
-                        "Teardown command failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                } else {
+                if output.status.success() {
                     log::debug!(
                         "Teardown output: {}",
                         String::from_utf8_lossy(&output.stdout)
+                    );
+                } else {
+                    log::warn!(
+                        "Teardown command failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
                     );
                 }
             }
@@ -871,10 +852,10 @@ impl WorktreeManager {
         // Remove the worktree using git
         log::info!("Removing worktree at {}", worktree_path.display());
         let output = std::process::Command::new("git")
-            .args(&[
+            .args([
                 "worktree",
                 "remove",
-                worktree_path.to_str().unwrap(),
+                worktree_path.to_str().expect("path is valid UTF-8"),
                 "--force",
             ])
             .current_dir(&repo_path)
@@ -888,7 +869,7 @@ impl WorktreeManager {
         // Delete the branch
         log::info!("Deleting branch {}", branch_name);
         let output = std::process::Command::new("git")
-            .args(&["branch", "-D", &branch_name])
+            .args(["branch", "-D", &branch_name])
             .current_dir(&repo_path)
             .output()?;
 

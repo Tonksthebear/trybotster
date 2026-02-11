@@ -241,6 +241,44 @@ increment() {
 | `Object`  | `{"key": "value"}`                     | Parsed as JSON                |
 | `Array`   | `[1, 2, 3]`                            | Parsed as JSON                |
 
+### Passing Asset URLs to Controllers
+
+**Never put assets in `public/`.** Rails assets get fingerprinted for cache-busting. Use `asset_path` helper to get the correct URL and pass it via a Stimulus value.
+
+```erb
+<%# Pass asset URLs via values - Rails handles fingerprinting %>
+<div data-controller="signal"
+     data-signal-wasm-url-value="<%= asset_path('libsignal_wasm_bg.wasm') %>"
+     data-signal-worker-url-value="<%= asset_path('workers/signal.js') %>">
+</div>
+```
+
+```javascript
+// app/javascript/controllers/signal_controller.js
+import { Controller } from "@hotwired/stimulus";
+
+export default class extends Controller {
+  static values = {
+    wasmUrl: String,
+    workerUrl: String,
+  };
+
+  connect() {
+    // URLs are fingerprinted: /assets/workers/signal-a1b2c3d4.js
+    this.worker = new Worker(this.workerUrlValue, { type: "module" });
+  }
+}
+```
+
+**Asset locations and config** (see `config/initializers/assets.rb`):
+
+```ruby
+# WASM files - app/assets/wasm/
+Rails.application.config.assets.paths << Rails.root.join("app/assets/wasm")
+```
+
+- **WASM files** - Need direct URL for `WebAssembly.instantiate()`
+
 ---
 
 ## Classes

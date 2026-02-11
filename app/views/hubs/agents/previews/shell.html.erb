@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Preview</title>
+  <%= csrf_meta_tags %>
+  <%= csp_meta_tag %>
+  <meta name="crypto-worker-url" content="<%= asset_path('workers/olm_crypto.js') %>">
+  <meta name="crypto-wasm-js-url" content="/wasm/vodozemac/vodozemac_wasm.js">
+  <%= stylesheet_link_tag "application", "data-turbo-track": "reload" %>
+  <%= javascript_importmap_tags %>
+  <style>
+    .preview-frame {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+    .status-bar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      padding: 8px 16px;
+      background: rgba(17, 24, 39, 0.95);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      z-index: 1000;
+    }
+    .status-bar.connected {
+      background: rgba(5, 46, 22, 0.95);
+      border-bottom-color: rgba(34, 197, 94, 0.3);
+    }
+    .status-bar.error {
+      background: rgba(69, 10, 10, 0.95);
+      border-bottom-color: rgba(239, 68, 68, 0.3);
+    }
+    .status-text {
+      color: #9ca3af;
+    }
+    .status-bar.connected .status-text {
+      color: #86efac;
+    }
+    .status-bar.error .status-text {
+      color: #fca5a5;
+    }
+    .preview-container {
+      position: fixed;
+      top: 41px;
+      left: 0;
+      right: 0;
+      bottom: 0;
+    }
+  </style>
+</head>
+<body class="h-full bg-zinc-950">
+  <%# Connection container - establishes E2E WebSocket %>
+  <div id="preview-connection"
+       data-controller="preview"
+       data-preview-hub-id-value="<%= Current.hub.id %>"
+       data-preview-agent-index-value="<%= Current.agent_index %>"
+       data-preview-pty-index-value="<%= Current.pty_index %>"
+       data-preview-scope-value="<%= @scope %>"
+       data-preview-initial-url-value="/">
+
+    <%# Status bar %>
+    <div class="status-bar">
+      <span data-preview-target="status" class="status-text">Connecting...</span>
+      <a href="<%= hub_agent_path(Current.hub, Current.agent_index) %>"
+         class="text-zinc-500 hover:text-zinc-300 text-xs">
+        Back to Terminal
+      </a>
+    </div>
+
+    <%# Error display %>
+    <div data-preview-target="error" class="hidden text-red-400 text-sm px-4 py-2"></div>
+
+    <%# Preview iframe - loads proxied content %>
+    <div class="preview-container">
+      <iframe
+        data-preview-target="iframe"
+        class="preview-frame"
+        sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-modals">
+      </iframe>
+    </div>
+  </div>
+</body>
+</html>

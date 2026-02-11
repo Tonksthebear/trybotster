@@ -1,47 +1,56 @@
-// Comprehensive tests for environment variable handling
-// Run with: cargo test --test environment_variables_test -- --test-threads=1
-//
-// IMPORTANT: Run with --test-threads=1 to avoid env var contamination between tests
-//
-// KNOWN LIMITATION: Config::load() will load from ~/.botster_hub/config.json
-// if it exists on the system. This means tests may fail if you have a real
-// config file with non-default values. This is a testing limitation that should
-// be fixed by making Config use a test-specific directory.
-//
-// TODO: Make Config::config_dir() respect TEST_CONFIG_DIR environment variable
-// so tests can use a temporary directory instead of ~/.botster_hub
+//! Comprehensive tests for environment variable handling.
+//!
+//! Tests use BOTSTER_CONFIG_DIR to isolate from real user config at ~/.botster_hub.
+//! Tests are serialized via ENV_LOCK mutex to prevent env var contamination.
+
+// Rust guideline compliant 2025-01
 
 use botster_hub::Config;
 use std::env;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tempfile::TempDir;
 
-/// Helper to create a config that only uses env vars, not config file
-fn load_config_from_env_only() -> Config {
-    let mut config = Config::default();
-    // We can't call apply_env_overrides directly as it's private
-    // So we use Config::load() which does it for us
-    // But this will also load from file, which we don't want in tests
-    // For now, we'll document this limitation
-    Config::load().unwrap_or_else(|_| Config::default())
-}
+/// Global lock to prevent env var pollution between tests (run serially).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Helper to set environment variables for a test and clean them up after
+/// Helper to set environment variables for a test and clean them up after.
+/// Also sets BOTSTER_CONFIG_DIR to a temp directory to isolate from real config.
 struct EnvGuard {
     keys: Vec<String>,
+    _temp_dir: TempDir,
+    _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl EnvGuard {
     fn new() -> Self {
+        // Acquire lock to serialize tests (prevents env var race conditions)
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Create a temp directory for config isolation
+        let temp_dir = TempDir::new().expect("Failed to create temp dir for test");
+
+        // Set config dir to temp directory to avoid reading real config
+        env::set_var("BOTSTER_CONFIG_DIR", temp_dir.path());
+
         // Clear all known botster env vars when creating a new guard
         env::remove_var("BOTSTER_SERVER_URL");
-        env::remove_var("BOTSTER_API_KEY");
+        env::remove_var("BOTSTER_TOKEN");
         env::remove_var("BOTSTER_WORKTREE_BASE");
         env::remove_var("BOTSTER_POLL_INTERVAL");
         env::remove_var("BOTSTER_MAX_SESSIONS");
         env::remove_var("BOTSTER_AGENT_TIMEOUT");
 
-        Self { keys: Vec::new() }
+        // Clear any token from keyring to ensure test isolation
+        if let Ok(mut config) = Config::load() {
+            let _ = config.clear_token();
+        }
+
+        Self {
+            keys: vec!["BOTSTER_CONFIG_DIR".to_string()],
+            _temp_dir: temp_dir,
+            _guard: guard,
+        }
     }
 
     fn set(&mut self, key: &str, value: &str) {
@@ -58,11 +67,12 @@ impl Drop for EnvGuard {
         }
         // Also ensure these common ones are cleaned
         env::remove_var("BOTSTER_SERVER_URL");
-        env::remove_var("BOTSTER_API_KEY");
+        env::remove_var("BOTSTER_TOKEN");
         env::remove_var("BOTSTER_WORKTREE_BASE");
         env::remove_var("BOTSTER_POLL_INTERVAL");
         env::remove_var("BOTSTER_MAX_SESSIONS");
         env::remove_var("BOTSTER_AGENT_TIMEOUT");
+        env::remove_var("BOTSTER_CONFIG_DIR");
     }
 }
 
@@ -74,7 +84,7 @@ fn test_default_config_no_env_vars() {
 
     // Verify default values
     assert_eq!(config.server_url, "https://trybotster.com");
-    assert_eq!(config.api_key, "");
+    assert_eq!(config.token, "");
     assert_eq!(config.poll_interval, 5);
     assert_eq!(config.agent_timeout, 3600);
     assert_eq!(config.max_sessions, 20);
@@ -97,13 +107,13 @@ fn test_env_override_server_url() {
 }
 
 #[test]
-fn test_env_override_api_key() {
+fn test_env_override_token() {
     let mut guard = EnvGuard::new();
-    guard.set("BOTSTER_API_KEY", "test_api_key_12345");
+    guard.set("BOTSTER_TOKEN", "btstr_test_token_12345");
 
     let config = Config::load().unwrap();
 
-    assert_eq!(config.api_key, "test_api_key_12345");
+    assert_eq!(config.token, "btstr_test_token_12345");
 }
 
 #[test]
@@ -186,7 +196,7 @@ fn test_all_env_overrides_together() {
     let mut guard = EnvGuard::new();
 
     guard.set("BOTSTER_SERVER_URL", "https://test.example.com");
-    guard.set("BOTSTER_API_KEY", "test_key");
+    guard.set("BOTSTER_TOKEN", "btstr_test_key");
     guard.set("BOTSTER_WORKTREE_BASE", temp_dir.path().to_str().unwrap());
     guard.set("BOTSTER_POLL_INTERVAL", "15");
     guard.set("BOTSTER_MAX_SESSIONS", "100");
@@ -195,7 +205,7 @@ fn test_all_env_overrides_together() {
     let config = Config::load().unwrap();
 
     assert_eq!(config.server_url, "https://test.example.com");
-    assert_eq!(config.api_key, "test_key");
+    assert_eq!(config.token, "btstr_test_key");
     assert_eq!(config.worktree_base, temp_dir.path());
     assert_eq!(config.poll_interval, 15);
     assert_eq!(config.max_sessions, 100);
@@ -206,22 +216,17 @@ fn test_all_env_overrides_together() {
 fn test_partial_env_overrides() {
     let mut guard = EnvGuard::new();
 
-    // Debug: check what's in the environment before we set anything
-    let before_url = env::var("BOTSTER_SERVER_URL").ok();
-    eprintln!("BOTSTER_SERVER_URL before setting: {:?}", before_url);
-
     // Only set some variables
-    guard.set("BOTSTER_API_KEY", "partial_key");
+    guard.set("BOTSTER_TOKEN", "btstr_partial_key");
     guard.set("BOTSTER_POLL_INTERVAL", "8");
 
     let config = Config::load().unwrap();
 
     // Overridden values
-    assert_eq!(config.api_key, "partial_key");
+    assert_eq!(config.token, "btstr_partial_key");
     assert_eq!(config.poll_interval, 8);
 
     // Default values for non-overridden
-    eprintln!("Actual server_url: {}", config.server_url);
     assert_eq!(
         config.server_url, "https://trybotster.com",
         "Server URL should be default"
@@ -287,39 +292,42 @@ fn test_env_negative_values_rejected() {
 fn test_env_empty_string_values() {
     let mut guard = EnvGuard::new();
     guard.set("BOTSTER_SERVER_URL", "");
-    guard.set("BOTSTER_API_KEY", "");
+    guard.set("BOTSTER_TOKEN", "");
 
     let config = Config::load().unwrap();
 
     // Empty strings should be accepted (they override defaults)
     assert_eq!(config.server_url, "");
-    assert_eq!(config.api_key, "");
+    assert_eq!(config.token, "");
 }
 
 #[test]
 fn test_env_whitespace_values() {
     let mut guard = EnvGuard::new();
     guard.set("BOTSTER_SERVER_URL", "  https://example.com  ");
-    guard.set("BOTSTER_API_KEY", " key ");
+    guard.set("BOTSTER_TOKEN", " key ");
 
     let config = Config::load().unwrap();
 
     // Whitespace is preserved (not trimmed)
     assert_eq!(config.server_url, "  https://example.com  ");
-    assert_eq!(config.api_key, " key ");
+    assert_eq!(config.token, " key ");
 }
 
 #[test]
-fn test_env_special_characters_in_api_key() {
+fn test_env_special_characters_in_token() {
     let mut guard = EnvGuard::new();
     guard.set(
-        "BOTSTER_API_KEY",
-        "key-with-special!@#$%^&*()_+=[]{}|;:,.<>?",
+        "BOTSTER_TOKEN",
+        "btstr_key-with-special!@#$%^&*()_+=[]{}|;:,.<>?",
     );
 
     let config = Config::load().unwrap();
 
-    assert_eq!(config.api_key, "key-with-special!@#$%^&*()_+=[]{}|;:,.<>?");
+    assert_eq!(
+        config.token,
+        "btstr_key-with-special!@#$%^&*()_+=[]{}|;:,.<>?"
+    );
 }
 
 #[test]
@@ -385,7 +393,7 @@ fn test_config_save_and_load_preserves_values() {
     // Create a config with custom values
     let mut config = Config::default();
     config.server_url = "https://saved.example.com".to_string();
-    config.api_key = "saved_key".to_string();
+    // Note: token is #[serde(skip)] - stored in keyring, not file
     config.poll_interval = 42;
     config.max_sessions = 77;
     config.agent_timeout = 1234;
@@ -398,7 +406,8 @@ fn test_config_save_and_load_preserves_values() {
     let loaded: Config = serde_json::from_str(&json).unwrap();
 
     assert_eq!(loaded.server_url, "https://saved.example.com");
-    assert_eq!(loaded.api_key, "saved_key");
+    // token is not serialized (uses keyring)
+    assert_eq!(loaded.token, ""); // Skipped field defaults to empty
     assert_eq!(loaded.poll_interval, 42);
     assert_eq!(loaded.max_sessions, 77);
     assert_eq!(loaded.agent_timeout, 1234);
@@ -411,15 +420,16 @@ fn test_config_serialization_format() {
     let json = serde_json::to_string_pretty(&config).unwrap();
 
     // Verify JSON contains expected fields
+    // Note: token is NOT serialized (it uses keyring via #[serde(skip)])
     assert!(json.contains("server_url"));
-    assert!(json.contains("api_key"));
+    assert!(!json.contains("token"), "token should not be serialized");
     assert!(json.contains("poll_interval"));
     assert!(json.contains("agent_timeout"));
     assert!(json.contains("max_sessions"));
     assert!(json.contains("worktree_base"));
 }
 
-/// Document all expected environment variables
+/// Document all expected environment variables.
 #[test]
 fn test_documented_environment_variables() {
     // This test serves as documentation for all environment variables
@@ -432,10 +442,10 @@ fn test_documented_environment_variables() {
             "URL of the botster server",
         ),
         (
-            "BOTSTER_API_KEY",
+            "BOTSTER_TOKEN",
             "string",
             "",
-            "API key for authentication",
+            "API token for authentication (btstr_ prefix)",
         ),
         (
             "BOTSTER_WORKTREE_BASE",
@@ -495,4 +505,33 @@ fn test_environment_variable_types_and_validation() {
             var_name
         );
     }
+}
+
+#[test]
+fn test_get_api_key_returns_token() {
+    let mut guard = EnvGuard::new();
+    guard.set("BOTSTER_TOKEN", "btstr_test_token");
+
+    let config = Config::load().unwrap();
+
+    // get_api_key() is a legacy accessor that returns &self.token
+    assert_eq!(config.get_api_key(), "btstr_test_token");
+}
+
+#[test]
+fn test_has_token_validates_prefix() {
+    let _guard = EnvGuard::new();
+
+    let mut config = Config::default();
+
+    // No token
+    assert!(!config.has_token());
+
+    // Valid token with btstr_ prefix
+    config.token = "btstr_valid_token".to_string();
+    assert!(config.has_token());
+
+    // Invalid token without prefix
+    config.token = "invalid_no_prefix".to_string();
+    assert!(!config.has_token());
 }

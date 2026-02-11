@@ -180,7 +180,13 @@ fn test_bug_scenario_with_logging() {
 
     let result = manager.delete_worktree_by_path(&worktree_path, branch_name);
 
-    env::set_current_dir(&original_cwd).expect("Failed to restore cwd");
+    // Restore cwd - handle case where original dir was deleted by another test
+    if original_cwd.exists() {
+        env::set_current_dir(&original_cwd).expect("Failed to restore cwd");
+    } else {
+        // Fall back to temp dir if original is gone
+        env::set_current_dir(env::temp_dir()).expect("Failed to restore cwd to temp");
+    }
 
     if let Err(e) = &result {
         println!("ERROR: {}", e);

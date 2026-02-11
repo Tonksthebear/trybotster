@@ -1,0 +1,12 @@
+# Cargo configuration for botster-hub
+#
+# IMPORTANT FOR AGENTS: Do NOT run `cargo test` directly!
+# Instead, use: ./test.sh
+#
+# This ensures BOTSTER_ENV=test is set, which prevents macOS keyring
+# access prompts during test runs.
+#
+# Examples:
+#   ./test.sh              # Run all tests
+#   ./test.sh --unit       # Run unit tests only (cargo test --lib)
+#   ./test.sh -- scroll    # Run tests matching 'scroll'

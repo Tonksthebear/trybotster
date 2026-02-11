@@ -10,10 +10,9 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2025_12_18_042928) do
+ActiveRecord::Schema[8.1].define(version: 2026_02_10_051852) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
-  enable_extension "vector"
 
   create_table "action_mcp_session_messages", force: :cascade do |t|
     t.datetime "created_at", null: false
@@ -83,22 +82,103 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_18_042928) do
     t.index ["session_id"], name: "index_action_mcp_sse_events_on_session_id"
   end
 
-  create_table "bot_messages", force: :cascade do |t|
-    t.datetime "acknowledged_at"
-    t.datetime "claimed_at"
-    t.bigint "claimed_by_user_id"
+  create_table "device_authorizations", force: :cascade do |t|
     t.datetime "created_at", null: false
-    t.string "event_type", null: false
-    t.jsonb "payload", default: {}, null: false
-    t.datetime "sent_at"
+    t.string "device_code", null: false
+    t.string "device_name"
+    t.datetime "expires_at", null: false
     t.string "status", default: "pending", null: false
     t.datetime "updated_at", null: false
-    t.index ["acknowledged_at"], name: "index_bot_messages_on_acknowledged_at"
-    t.index ["claimed_at"], name: "index_bot_messages_on_claimed_at"
-    t.index ["claimed_by_user_id"], name: "index_bot_messages_on_claimed_by_user_id"
-    t.index ["event_type"], name: "index_bot_messages_on_event_type"
-    t.index ["sent_at"], name: "index_bot_messages_on_sent_at"
-    t.index ["status"], name: "index_bot_messages_on_status"
+    t.string "user_code", null: false
+    t.bigint "user_id"
+    t.index ["device_code"], name: "index_device_authorizations_on_device_code", unique: true
+    t.index ["user_code"], name: "index_device_authorizations_on_user_code", unique: true
+    t.index ["user_id"], name: "index_device_authorizations_on_user_id"
+  end
+
+  create_table "device_tokens", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.bigint "device_id", null: false
+    t.string "last_ip"
+    t.datetime "last_used_at"
+    t.string "name"
+    t.string "token", null: false
+    t.datetime "updated_at", null: false
+    t.index ["device_id"], name: "index_device_tokens_on_device_id"
+    t.index ["token"], name: "index_device_tokens_on_token", unique: true
+  end
+
+  create_table "devices", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.string "device_type", null: false
+    t.string "fingerprint", null: false
+    t.datetime "last_seen_at"
+    t.string "name", null: false
+    t.string "public_key"
+    t.datetime "updated_at", null: false
+    t.bigint "user_id", null: false
+    t.index ["fingerprint"], name: "index_devices_on_fingerprint"
+    t.index ["public_key"], name: "index_devices_on_public_key", unique: true, where: "(public_key IS NOT NULL)"
+    t.index ["user_id", "device_type"], name: "index_devices_on_user_id_and_device_type"
+    t.index ["user_id"], name: "index_devices_on_user_id"
+  end
+
+  create_table "github_messages", force: :cascade do |t|
+    t.datetime "acknowledged_at"
+    t.datetime "created_at", null: false
+    t.string "event_type", null: false
+    t.integer "issue_number"
+    t.jsonb "payload", default: {}, null: false
+    t.string "repo", null: false
+    t.string "status", default: "pending", null: false
+    t.datetime "updated_at", null: false
+    t.index ["event_type"], name: "index_github_messages_on_event_type"
+    t.index ["repo", "status"], name: "index_github_messages_on_repo_and_status"
+    t.index ["repo"], name: "index_github_messages_on_repo"
+    t.index ["status"], name: "index_github_messages_on_status"
+  end
+
+  create_table "hub_agents", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.bigint "hub_id", null: false
+    t.string "last_invocation_url"
+    t.string "session_key", null: false
+    t.datetime "tunnel_connected_at"
+    t.datetime "tunnel_last_request_at"
+    t.integer "tunnel_port"
+    t.string "tunnel_status", default: "disconnected"
+    t.datetime "updated_at", null: false
+    t.index ["hub_id", "session_key"], name: "index_hub_agents_on_hub_id_and_session_key", unique: true
+    t.index ["hub_id"], name: "index_hub_agents_on_hub_id"
+  end
+
+  create_table "hub_commands", force: :cascade do |t|
+    t.datetime "acknowledged_at"
+    t.datetime "created_at", null: false
+    t.string "event_type", null: false
+    t.bigint "hub_id", null: false
+    t.jsonb "payload", default: {}, null: false
+    t.bigint "sequence", null: false
+    t.string "status", default: "pending", null: false
+    t.datetime "updated_at", null: false
+    t.index ["hub_id", "sequence"], name: "index_hub_commands_on_hub_id_and_sequence", unique: true
+    t.index ["hub_id"], name: "index_hub_commands_on_hub_id"
+    t.index ["status"], name: "index_hub_commands_on_status"
+  end
+
+  create_table "hubs", force: :cascade do |t|
+    t.boolean "alive", default: false, null: false
+    t.datetime "created_at", null: false
+    t.bigint "device_id"
+    t.string "identifier", null: false
+    t.datetime "last_seen_at", null: false
+    t.bigint "message_sequence", default: 0, null: false
+    t.string "name"
+    t.datetime "updated_at", null: false
+    t.bigint "user_id", null: false
+    t.index ["device_id"], name: "index_hubs_on_device_id"
+    t.index ["identifier"], name: "index_hubs_on_identifier", unique: true
+    t.index ["user_id"], name: "index_hubs_on_user_id"
   end
 
   create_table "idempotency_keys", force: :cascade do |t|
@@ -114,53 +194,16 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_18_042928) do
     t.index ["key"], name: "index_idempotency_keys_on_key", unique: true
   end
 
-  create_table "memories", force: :cascade do |t|
-    t.text "content", null: false
+  create_table "integrations_github_mcp_tokens", force: :cascade do |t|
     t.datetime "created_at", null: false
-    t.vector "embedding", limit: 1536
-    t.string "memory_type", default: "other"
-    t.jsonb "metadata", default: {}
-    t.bigint "parent_id"
-    t.string "source"
-    t.bigint "team_id"
-    t.datetime "updated_at", null: false
-    t.bigint "user_id", null: false
-    t.string "visibility", default: "private", null: false
-    t.index ["created_at"], name: "index_memories_on_created_at"
-    t.index ["memory_type"], name: "index_memories_on_memory_type"
-    t.index ["metadata"], name: "index_memories_on_metadata", using: :gin
-    t.index ["parent_id"], name: "index_memories_on_parent_id"
-    t.index ["source"], name: "index_memories_on_source"
-    t.index ["team_id"], name: "index_memories_on_team_id"
-    t.index ["user_id"], name: "index_memories_on_user_id"
-    t.index ["visibility"], name: "index_memories_on_visibility"
-  end
-
-  create_table "memory_tags", force: :cascade do |t|
-    t.datetime "created_at", null: false
-    t.bigint "memory_id", null: false
-    t.bigint "tag_id", null: false
-    t.datetime "updated_at", null: false
-    t.index ["memory_id", "tag_id"], name: "index_memory_tags_on_memory_id_and_tag_id", unique: true
-    t.index ["memory_id"], name: "index_memory_tags_on_memory_id"
-    t.index ["tag_id"], name: "index_memory_tags_on_tag_id"
-  end
-
-  create_table "solid_mcp_messages", force: :cascade do |t|
-    t.datetime "created_at", null: false
-    t.text "data"
-    t.datetime "delivered_at"
-    t.string "event_type", limit: 50, null: false
-    t.string "session_id", limit: 36, null: false
-    t.index ["delivered_at", "created_at"], name: "idx_solid_mcp_messages_on_delivered_and_created"
-    t.index ["session_id", "id"], name: "idx_solid_mcp_messages_on_session_and_id"
-  end
-
-  create_table "tags", force: :cascade do |t|
-    t.datetime "created_at", null: false
+    t.bigint "device_id", null: false
+    t.string "last_ip"
+    t.datetime "last_used_at"
     t.string "name"
+    t.string "token"
     t.datetime "updated_at", null: false
-    t.index ["name"], name: "index_tags_on_name", unique: true
+    t.index ["device_id"], name: "index_integrations_github_mcp_tokens_on_device_id"
+    t.index ["token"], name: "index_integrations_github_mcp_tokens_on_token", unique: true
   end
 
   create_table "teams", force: :cascade do |t|
@@ -183,6 +226,7 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_18_042928) do
     t.string "last_sign_in_ip"
     t.string "provider"
     t.datetime "remember_created_at"
+    t.boolean "server_assisted_pairing", default: false, null: false
     t.integer "sign_in_count", default: 0, null: false
     t.bigint "team_id"
     t.string "uid"
@@ -199,10 +243,13 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_18_042928) do
   add_foreign_key "action_mcp_session_resources", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_session_subscriptions", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_sse_events", "action_mcp_sessions", column: "session_id"
-  add_foreign_key "memories", "memories", column: "parent_id"
-  add_foreign_key "memories", "teams"
-  add_foreign_key "memories", "users"
-  add_foreign_key "memory_tags", "memories"
-  add_foreign_key "memory_tags", "tags"
+  add_foreign_key "device_authorizations", "users"
+  add_foreign_key "device_tokens", "devices"
+  add_foreign_key "devices", "users"
+  add_foreign_key "hub_agents", "hubs"
+  add_foreign_key "hub_commands", "hubs"
+  add_foreign_key "hubs", "devices"
+  add_foreign_key "hubs", "users"
+  add_foreign_key "integrations_github_mcp_tokens", "devices"
   add_foreign_key "users", "teams"
 end

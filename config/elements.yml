@@ -1,0 +1,126 @@
+dialog:
+  main: "fixed inset-0 size-auto max-h-none max-w-none overflow-y-auto bg-transparent backdrop:bg-transparent"
+  backdrop: "fixed inset-0 bg-black/80 backdrop-blur-sm transition-opacity data-closed:opacity-0 data-enter:duration-200 data-enter:ease-out data-leave:duration-150 data-leave:ease-in"
+  container:
+    base: "flex min-h-full p-4 focus:outline-hidden items-end sm:p-0"
+    centered: "justify-center text-center sm:items-center"
+    bottom: "justify-center text-center sm:items-end group-data-[transition]/dialog:overflow-hidden"
+  panel:
+    base: "relative transform overflow-hidden rounded-md text-left shadow-2xl transition-all data-closed:opacity-0 data-enter:duration-200 data-enter:ease-out data-leave:duration-150 data-leave:ease-in sm:w-full sm:max-w-md bg-zinc-900 border border-zinc-700/50"
+    centered: "sm:my-8 data-closed:translate-y-4 data-closed:sm:translate-y-0 data-closed:sm:scale-95"
+    bottom: "rounded-b-none data-closed:translate-y-full"
+
+btn:
+  base: "inline-flex items-center justify-center gap-x-1.5 font-semibold disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-2 focus-visible:outline-offset-2"
+  # Sizes with shape variants
+  xs:
+    base: "rounded-sm px-2 py-1 text-xs"
+    rounded: "rounded-full px-2.5 py-1 text-xs"
+    circular: "rounded-full p-1"
+  sm:
+    base: "rounded-sm px-2 py-1 text-sm"
+    rounded: "rounded-full px-2.5 py-1 text-sm"
+    circular: "rounded-full p-1"
+  md:
+    base: "rounded-md px-2.5 py-1.5 text-sm"
+    rounded: "rounded-full px-3 py-1.5 text-sm"
+    circular: "rounded-full p-1.5"
+  lg:
+    base: "rounded-md px-3 py-2 text-sm"
+    rounded: "rounded-full px-3.5 py-2 text-sm"
+    circular: "rounded-full p-2"
+  xl:
+    base: "rounded-md px-3.5 py-2.5 text-sm"
+    rounded: "rounded-full px-4 py-2.5 text-sm"
+    circular: "rounded-full p-2.5"
+  # Colors with variant modifiers
+  primary:
+    solid: "bg-primary-600 text-white shadow-xs hover:bg-primary-500 focus-visible:outline-primary-600 dark:bg-primary-500 dark:shadow-none dark:hover:bg-primary-400 dark:focus-visible:outline-primary-500"
+    soft: "bg-primary-50 text-primary-600 shadow-xs hover:bg-primary-100 focus-visible:outline-primary-600 dark:bg-primary-500/20 dark:text-primary-400 dark:shadow-none dark:hover:bg-primary-500/30 dark:focus-visible:outline-primary-500"
+    outline: "bg-transparent text-primary-600 inset-ring inset-ring-primary-600 hover:bg-primary-50 focus-visible:outline-primary-600 dark:text-primary-400 dark:inset-ring-primary-400 dark:hover:bg-primary-500/20 dark:focus-visible:outline-primary-500"
+    ghost: "bg-transparent text-primary-600 hover:bg-primary-50 focus-visible:outline-primary-600 dark:text-primary-400 dark:hover:bg-primary-500/20 dark:focus-visible:outline-primary-500"
+  secondary:
+    solid: "bg-secondary-600 text-white shadow-xs hover:bg-secondary-500 focus-visible:outline-secondary-600 dark:bg-secondary-500 dark:shadow-none dark:hover:bg-secondary-400 dark:focus-visible:outline-secondary-500"
+    soft: "bg-secondary-50 text-secondary-600 shadow-xs hover:bg-secondary-100 focus-visible:outline-secondary-600 dark:bg-secondary-500/20 dark:text-secondary-400 dark:shadow-none dark:hover:bg-secondary-500/30 dark:focus-visible:outline-secondary-500"
+    outline: "bg-transparent text-secondary-600 inset-ring inset-ring-secondary-600 hover:bg-secondary-50 focus-visible:outline-secondary-600 dark:text-secondary-400 dark:inset-ring-secondary-400 dark:hover:bg-secondary-500/20 dark:focus-visible:outline-secondary-500"
+    ghost: "bg-transparent text-secondary-600 hover:bg-secondary-50 focus-visible:outline-secondary-600 dark:text-secondary-400 dark:hover:bg-secondary-500/20 dark:focus-visible:outline-secondary-500"
+  neutral:
+    solid: "bg-white text-gray-900 shadow-xs inset-ring inset-ring-gray-300 hover:bg-gray-50 focus-visible:outline-gray-600 dark:bg-white/10 dark:text-white dark:shadow-none dark:inset-ring-white/5 dark:hover:bg-white/20 dark:focus-visible:outline-gray-500"
+    soft: "bg-gray-100 text-gray-700 shadow-xs hover:bg-gray-200 focus-visible:outline-gray-600 dark:bg-gray-700 dark:text-gray-200 dark:shadow-none dark:hover:bg-gray-600 dark:focus-visible:outline-gray-500"
+    outline: "bg-transparent text-gray-700 inset-ring inset-ring-gray-300 hover:bg-gray-50 focus-visible:outline-gray-600 dark:text-gray-300 dark:inset-ring-gray-600 dark:hover:bg-gray-800 dark:focus-visible:outline-gray-500"
+    ghost: "bg-transparent text-gray-600 hover:bg-gray-100 focus-visible:outline-gray-600 dark:text-gray-400 dark:hover:bg-gray-800 dark:focus-visible:outline-gray-500"
+  warning:
+    solid: "bg-warning-500 text-white shadow-xs hover:bg-warning-400 focus-visible:outline-warning-500 dark:bg-warning-600 dark:shadow-none dark:hover:bg-warning-500 dark:focus-visible:outline-warning-500"
+    soft: "bg-warning-50 text-warning-700 shadow-xs hover:bg-warning-100 focus-visible:outline-warning-500 dark:bg-warning-500/20 dark:text-warning-400 dark:shadow-none dark:hover:bg-warning-500/30 dark:focus-visible:outline-warning-500"
+    outline: "bg-transparent text-warning-600 inset-ring inset-ring-warning-500 hover:bg-warning-50 focus-visible:outline-warning-500 dark:text-warning-400 dark:inset-ring-warning-400 dark:hover:bg-warning-500/20 dark:focus-visible:outline-warning-500"
+    ghost: "bg-transparent text-warning-600 hover:bg-warning-50 focus-visible:outline-warning-500 dark:text-warning-400 dark:hover:bg-warning-500/20 dark:focus-visible:outline-warning-500"
+  danger:
+    solid: "bg-danger-600 text-white shadow-xs hover:bg-danger-500 focus-visible:outline-danger-600 dark:bg-danger-500 dark:shadow-none dark:hover:bg-danger-400 dark:focus-visible:outline-danger-500"
+    soft: "bg-danger-50 text-danger-600 shadow-xs hover:bg-danger-100 focus-visible:outline-danger-600 dark:bg-danger-500/20 dark:text-danger-400 dark:shadow-none dark:hover:bg-danger-500/30 dark:focus-visible:outline-danger-500"
+    outline: "bg-transparent text-danger-600 inset-ring inset-ring-danger-600 hover:bg-danger-50 focus-visible:outline-danger-600 dark:text-danger-400 dark:inset-ring-danger-400 dark:hover:bg-danger-500/20 dark:focus-visible:outline-danger-500"
+    ghost: "bg-transparent text-danger-600 hover:bg-danger-50 focus-visible:outline-danger-600 dark:text-danger-400 dark:hover:bg-danger-500/20 dark:focus-visible:outline-danger-500"
+  success:
+    solid: "bg-success-600 text-white shadow-xs hover:bg-success-500 focus-visible:outline-success-600 dark:bg-success-500 dark:shadow-none dark:hover:bg-success-400 dark:focus-visible:outline-success-500"
+    soft: "bg-success-50 text-success-600 shadow-xs hover:bg-success-100 focus-visible:outline-success-600 dark:bg-success-500/20 dark:text-success-400 dark:shadow-none dark:hover:bg-success-500/30 dark:focus-visible:outline-success-500"
+    outline: "bg-transparent text-success-600 inset-ring inset-ring-success-600 hover:bg-success-50 focus-visible:outline-success-600 dark:text-success-400 dark:inset-ring-success-400 dark:hover:bg-success-500/20 dark:focus-visible:outline-success-500"
+    ghost: "bg-transparent text-success-600 hover:bg-success-50 focus-visible:outline-success-600 dark:text-success-400 dark:hover:bg-success-500/20 dark:focus-visible:outline-success-500"
+
+sidebar:
+  container: "lg:pl-(--sidebar-width)"
+  header: "sticky top-0 z-40 flex items-center gap-x-4 px-4 py-3 bg-zinc-900 border-b border-zinc-800 lg:hidden"
+
+stacked:
+  mobile_button: "relative inline-flex items-center justify-center rounded-md p-2 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 focus:outline-2 focus:outline-offset-2 focus:outline-primary-500"
+  border:
+    nav: "border-b border-zinc-800 bg-zinc-900/80 backdrop-blur-sm sticky top-0 z-40"
+    container: "mx-auto max-w-7xl px-4 sm:px-6 lg:px-8"
+    inner: "flex h-14 justify-between"
+    main: "flex-1"
+  overlap:
+    zone: "relative bg-zinc-900 pb-32"
+    nav: "bg-transparent"
+    container: "mx-auto max-w-7xl sm:px-6 lg:px-8"
+    inner: "flex h-16 items-center justify-between border-b border-zinc-800 px-4 sm:px-0"
+    main: "relative -mt-32"
+
+dropdown:
+  menu:
+    panel: "divide-y divide-gray-100 rounded-md bg-white shadow-lg outline-1 outline-black/5 dark:divide-white/10 dark:bg-gray-800 dark:shadow-none dark:-outline-offset-1 dark:outline-white/10"
+    animation: "transition transition-discrete data-enter:duration-100 data-enter:ease-out data-closed:scale-95 data-closed:transform data-closed:opacity-0 data-leave:duration-75 data-leave:ease-in"
+    spacing: "[--anchor-gap:--spacing(2)]"
+
+select:
+  default:
+    button:
+      base: "grid w-full cursor-default grid-cols-1 rounded-md bg-white py-1.5 pr-2 pl-3 text-left text-gray-900 outline-1 -outline-offset-1 outline-gray-300 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-primary-600 sm:text-sm/6 dark:bg-white/5 dark:text-white dark:outline-white/10 dark:focus-visible:outline-primary-500"
+    selected:
+      base: "col-start-1 row-start-1 truncate pr-6"
+    menu:
+      base: "max-h-60 w-(--button-width) overflow-auto rounded-md bg-white py-1 text-base shadow-lg outline-1 outline-black/5 [--anchor-gap:--spacing(1)] data-leave:transition data-leave:transition-discrete data-leave:duration-100 data-leave:ease-in data-closed:data-leave:opacity-0 sm:text-sm dark:bg-gray-800 dark:shadow-none dark:-outline-offset-1 dark:outline-white/10"
+    option:
+      base: "group/option relative block cursor-default py-2 pr-9 pl-3 text-gray-900 select-none focus:bg-primary-600 focus:text-white focus:outline-hidden dark:text-white dark:focus:bg-primary-500"
+  primary:
+    button:
+      base: "grid w-full cursor-default grid-cols-1 rounded-md bg-primary-50 py-1.5 pr-2 pl-3 text-left text-primary-900 outline-1 -outline-offset-1 outline-primary-300 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-primary-600 sm:text-sm/6 border-primary-300"
+    selected:
+      base: "col-start-1 row-start-1 truncate pr-6"
+    menu:
+      base: "max-h-60 w-(--button-width) overflow-auto rounded-md bg-white py-1 text-base shadow-lg outline-1 outline-black/5 [--anchor-gap:--spacing(1)] data-leave:transition data-leave:transition-discrete data-leave:duration-100 data-leave:ease-in data-closed:data-leave:opacity-0 sm:text-sm"
+    option:
+      base: "group/option relative block cursor-default py-2 pr-9 pl-3 text-gray-900 select-none focus:bg-primary-600 focus:text-white focus:outline-hidden"
+
+label: "block text-sm/6 font-medium text-gray-900 dark:text-white"
+text_field:
+  - "block w-full rounded-md bg-white py-1.5 text-base outline-1 -outline-offset-1 focus:outline-2 focus:-outline-offset-2 sm:text-sm/6"
+  - "px-3 text-gray-900 outline-gray-300 placeholder:text-gray-400 focus:outline-primary-600"
+  - "dark:bg-white/5 dark:text-white dark:outline-white/10 dark:placeholder:text-gray-500 dark:focus:outline-primary-500"
+  - "aria-invalid:col-start-1 aria-invalid:row-start-1 aria-invalid:pr-10 aria-invalid:pl-3 aria-invalid:text-red-900 aria-invalid:outline-red-300 aria-invalid:placeholder:text-red-300 aria-invalid:focus:outline-red-600 aria-invalid:sm:pr-9"
+  - "aria-invalid:dark:text-red-400 aria-invalid:dark:outline-red-500/50 aria-invalid:dark:placeholder:text-red-400/70 aria-invalid:dark:focus:outline-red-400"
+subtext:
+  - "mt-2 text-sm text-gray-500 dark:text-gray-400"
+  - "group-has-[[aria-invalid]]/input:text-red-600 group-has-[[aria-invalid='true']]/input:dark:text-red-400"
+
+toggle:
+  container: "group relative inline-flex w-11 shrink-0 rounded-full bg-gray-200 p-0.5 inset-ring inset-ring-gray-900/5 outline-offset-2 outline-primary-600 transition-colors duration-200 ease-in-out has-checked:bg-primary-600 has-focus-visible:outline-2 dark:bg-white/5 dark:inset-ring-white/10 dark:outline-primary-500 dark:has-checked:bg-primary-500"
+  span: "size-5 rounded-full bg-white shadow-xs ring-1 ring-gray-900/5 transition-transform duration-200 ease-in-out group-has-checked:translate-x-5"
+  input: "absolute inset-0 appearance-none focus:outline-hidden"

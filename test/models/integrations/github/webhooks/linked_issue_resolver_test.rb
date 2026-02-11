@@ -1,0 +1,218 @@
+# frozen_string_literal: true
+
+require "test_helper"
+require "minitest/mock"
+
+class Integrations::Github::Webhooks::LinkedIssueResolverTest < ActiveSupport::TestCase
+  setup do
+    @repo = "owner/test-repo"
+    @pr_number = 42
+    @resolver = Integrations::Github::Webhooks::LinkedIssueResolver.new(@repo, @pr_number)
+  end
+
+  # === Regex extraction (unit tests for parsing logic) ===
+
+  test "extracts issue number from 'Fixes #123'" do
+    assert_equal 123, extract("Fixes #123")
+  end
+
+  test "extracts issue number from 'Closes #456'" do
+    assert_equal 456, extract("Closes #456")
+  end
+
+  test "extracts issue number from 'Resolves #789'" do
+    assert_equal 789, extract("Resolves #789")
+  end
+
+  test "extracts issue number from 'References #100'" do
+    assert_equal 100, extract("References #100")
+  end
+
+  test "extracts issue number from 'Reference #55'" do
+    assert_equal 55, extract("Reference #55")
+  end
+
+  test "handles past tense: Fixed, Closed, Resolved" do
+    assert_equal 1, extract("Fixed #1")
+    assert_equal 2, extract("Closed #2")
+    assert_equal 3, extract("Resolved #3")
+  end
+
+  test "handles base form: Fix, Close, Resolve" do
+    assert_equal 10, extract("Fix #10")
+    assert_equal 20, extract("Close #20")
+    assert_equal 30, extract("Resolve #30")
+  end
+
+  test "case insensitive - uppercase FIXES" do
+    assert_equal 123, extract("FIXES #123")
+  end
+
+  test "case insensitive - lowercase fixes" do
+    assert_equal 123, extract("fixes #123")
+  end
+
+  test "case insensitive - mixed case Fixes" do
+    assert_equal 123, extract("Fixes #123")
+  end
+
+  test "case insensitive - mixed case cLoSeS" do
+    assert_equal 456, extract("cLoSeS #456")
+  end
+
+  test "returns nil when no linked issue found" do
+    assert_nil extract("This PR improves performance")
+  end
+
+  test "returns nil for empty body" do
+    assert_nil extract("")
+  end
+
+  test "returns nil for nil body" do
+    assert_nil extract(nil)
+  end
+
+  test "returns first issue when multiple linked issues present" do
+    body = "Fixes #100\nCloses #200\nResolves #300"
+    assert_equal 100, extract(body)
+  end
+
+  test "deduplicates issue numbers before returning first" do
+    body = "Fixes #100\nCloses #100"
+    assert_equal 100, extract(body)
+  end
+
+  test "extracts issue from multiline PR body with other content" do
+    body = <<~BODY
+      ## Summary
+      This PR adds a new feature.
+
+      Fixes #42
+
+      ## Test Plan
+      - Run the tests
+    BODY
+    assert_equal 42, extract(body)
+  end
+
+  test "does not match bare issue references without keyword" do
+    assert_nil extract("Related to #123")
+  end
+
+  test "keyword mid-word still matches because regex lacks word boundary" do
+    # NOTE: The regex does not enforce word boundaries, so "prefix" contains "fix"
+    # and will match. This documents the current behavior. If word boundaries are
+    # desired, the regex should be updated to use \b.
+    assert_equal 123, extract("prefix #123")
+  end
+
+  # === Full call flow with stubs ===
+
+  test "call returns issue number when PR body contains linked issue" do
+    stub_github_api(pr_body: "Fixes #99") do
+      result = @resolver.call
+      assert_equal 99, result
+    end
+  end
+
+  test "call returns nil when no valid github token" do
+    chain = WhereChain.new(nil)
+
+    User.stub :where, chain do
+      result = @resolver.call
+      assert_nil result
+    end
+  end
+
+  test "call returns nil when installation not found" do
+    stub_valid_token do
+      Github::App.stub :get_installation_for_repo, { success: false } do
+        result = @resolver.call
+        assert_nil result
+      end
+    end
+  end
+
+  test "call returns nil when installation token fails" do
+    stub_valid_token do
+      Github::App.stub :get_installation_for_repo, { success: true, installation_id: 111 } do
+        Github::App.stub :get_installation_token, { success: false, error: "bad token" } do
+          result = @resolver.call
+          assert_nil result
+        end
+      end
+    end
+  end
+
+  test "call returns nil when PR body is blank" do
+    stub_github_api(pr_body: "") do
+      result = @resolver.call
+      assert_nil result
+    end
+  end
+
+  test "call returns nil when PR body has no linking keywords" do
+    stub_github_api(pr_body: "Just some refactoring, no linked issues") do
+      result = @resolver.call
+      assert_nil result
+    end
+  end
+
+  test "call returns nil and does not raise on API error" do
+    stub_valid_token do
+      Github::App.stub :get_installation_for_repo, ->(*) { raise StandardError, "boom" } do
+        result = @resolver.call
+        assert_nil result
+      end
+    end
+  end
+
+  private
+
+  # Directly test the regex extraction without hitting any APIs.
+  def extract(pr_body)
+    @resolver.send(:extract_first_linked_issue, pr_body)
+  end
+
+  # Stubs the full GitHub API chain: token lookup, installation, and PR fetch.
+  def stub_github_api(pr_body:)
+    pr_double = OpenStruct.new(body: pr_body)
+    client_double = Minitest::Mock.new
+    client_double.expect(:pull_request, pr_double, [ @repo, @pr_number ])
+
+    stub_valid_token do
+      Github::App.stub :get_installation_for_repo, { success: true, installation_id: 111 } do
+        Github::App.stub :get_installation_token, { success: true, token: "inst_token_123" } do
+          Github::App.stub :client, client_double do
+            yield
+          end
+        end
+      end
+    end
+
+    client_double.verify
+  end
+
+  # Builds a chainable double for User.where.not(github_app_token: nil).first
+  class WhereChain
+    def initialize(user)
+      @user = user
+    end
+
+    def not(*)
+      self
+    end
+
+    def first
+      @user
+    end
+  end
+
+  # Stubs User.where.not(github_app_token: nil).first to return a user with a valid token.
+  def stub_valid_token(&block)
+    user_double = OpenStruct.new(valid_github_app_token: "test_token_abc")
+    chain = WhereChain.new(user_double)
+
+    User.stub :where, chain, &block
+  end
+end
