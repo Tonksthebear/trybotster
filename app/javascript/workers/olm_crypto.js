@@ -95,6 +95,22 @@ function dbDelete(key) {
   }))
 }
 
+/** Delete all hub:* keys from IndexedDB, preserving __pickle_key__. */
+function dbDeleteAllHubs() {
+  return openDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite")
+    const store = tx.objectStore(STORE_NAME)
+    const req = store.getAllKeys()
+    req.onsuccess = () => {
+      const hubKeys = req.result.filter(k => typeof k === "string" && k.startsWith("hub:"))
+      for (const key of hubKeys) store.delete(key)
+      tx.oncomplete = () => resolve(hubKeys.length)
+      tx.onerror = () => reject(tx.error)
+    }
+    req.onerror = () => reject(req.error)
+  }))
+}
+
 /** Get or create a 32-byte pickle key (stored in IndexedDB). */
 let pickleKeyCache = null
 
@@ -477,20 +493,32 @@ async function handleClearSession(hubId) {
 /**
  * Clear ALL session state (memory + IndexedDB).
  * Used by test teardown to prevent session leakage between tests.
+ *
+ * Nuclear cleanup: clears in-memory Maps, ALL hub:* IndexedDB entries,
+ * pickle key cache, and closes the IDB connection to prevent stale handles.
  */
 async function handleClearAllSessions() {
-  const hubIds = [...sessions.keys()]
   accounts.clear()
   sessions.clear()
   bundles.clear()
+  pickleKeyCache = null
 
-  // Clear all hub entries from IndexedDB
-  for (const hubId of hubIds) {
-    await dbDelete(`hub:${hubId}`)
+  // Clear all hub:* entries from IndexedDB (preserving __pickle_key__)
+  let deleted = 0
+  try {
+    deleted = await dbDeleteAllHubs()
+  } catch {
+    // IDB may have been deleted externally — that's fine
   }
 
-  console.log(`[VodozemacCrypto] Cleared all sessions (${hubIds.length} hubs)`)
-  return { cleared: true, count: hubIds.length }
+  // Close IDB connection so it can be cleanly deleted/reopened
+  if (dbInstance) {
+    dbInstance.close()
+    dbInstance = null
+  }
+
+  console.log(`[VodozemacCrypto] Cleared all sessions (${deleted} IDB entries)`)
+  return { cleared: true, count: deleted }
 }
 
 // =============================================================================

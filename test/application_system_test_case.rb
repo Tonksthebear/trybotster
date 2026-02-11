@@ -40,49 +40,50 @@ class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
     # Without clearing its in-memory sessions Map, hasSession() returns true
     # for hubs from previous tests, preventing "unpaired" state transitions.
     page.driver.browser.execute_async_script(<<~JS)
-      const done = arguments[arguments.length - 1];
+      var done = arguments[arguments.length - 1];
 
       localStorage.clear();
       sessionStorage.clear();
 
-      // Send clearAllSessions directly to the crypto SharedWorker.
-      // We open a fresh port to the same named SharedWorker and send the
-      // command. This works even if the page's bridge was never initialized.
-      const clearWorker = new Promise((resolve) => {
-        try {
-          const worker = new SharedWorker(
-            document.querySelector('meta[name="crypto-worker-url"]')?.content,
-            { type: "module", name: "vodozemac-crypto" }
-          );
-          worker.port.onmessage = (e) => {
-            if (e.data.id === 999999) resolve();
-          };
-          worker.port.start();
-          worker.port.postMessage({ id: 999999, action: "clearAllSessions" });
-          // Timeout safety net
-          setTimeout(resolve, 2000);
-        } catch { resolve(); }
-      });
+      // Step 1: Tell SharedWorker to clear all sessions + close its IDB connection.
+      // Must complete BEFORE deleting IDB, otherwise deleteDatabase gets blocked.
+      function clearWorker() {
+        return new Promise(function(resolve) {
+          try {
+            var workerUrl = document.querySelector('meta[name="crypto-worker-url"]');
+            if (!workerUrl || !workerUrl.content) { resolve(); return; }
+            var worker = new SharedWorker(workerUrl.content, { type: "module", name: "vodozemac-crypto" });
+            worker.port.onmessage = function(e) { if (e.data.id === 999999) resolve(); };
+            worker.port.start();
+            worker.port.postMessage({ id: 999999, action: "clearAllSessions" });
+            setTimeout(resolve, 3000);
+          } catch(e) { resolve(); }
+        });
+      }
 
-      // Also clear IndexedDB as a safety net
-      const clearIDB = new Promise((resolve) => {
-        if (window.indexedDB && indexedDB.databases) {
-          indexedDB.databases().then(databases => {
-            return Promise.all(
-              databases.map(db => new Promise((r) => {
-                const req = indexedDB.deleteDatabase(db.name);
-                req.onsuccess = r;
-                req.onerror = r;
-                req.onblocked = r;
-              }))
-            );
-          }).then(resolve).catch(resolve);
-        } else {
-          resolve();
-        }
-      });
+      // Step 2: Delete IndexedDB databases (SharedWorker closed its connection in step 1).
+      function clearIDB() {
+        return new Promise(function(resolve) {
+          try {
+            if (window.indexedDB && indexedDB.databases) {
+              indexedDB.databases().then(function(databases) {
+                return Promise.all(
+                  databases.map(function(db) {
+                    return new Promise(function(r) {
+                      var req = indexedDB.deleteDatabase(db.name);
+                      req.onsuccess = r;
+                      req.onerror = r;
+                      req.onblocked = r;
+                    });
+                  })
+                );
+              }).then(resolve).catch(resolve);
+            } else { resolve(); }
+          } catch(e) { resolve(); }
+        });
+      }
 
-      Promise.all([clearWorker, clearIDB]).then(() => done());
+      clearWorker().then(clearIDB).then(done);
     JS
 
     # Navigate to about:blank to destroy all JS singletons
