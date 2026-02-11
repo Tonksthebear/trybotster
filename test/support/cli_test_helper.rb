@@ -284,8 +284,10 @@ module CliTestHelper
     # Fixture loading resets Postgres sequences via TRUNCATE RESTART IDENTITY,
     # causing all tests to get the same hub ID. SharedWorker sessions (keyed by
     # hub ID) persist across test page loads and cause stale session collisions.
+    # Use SecureRandom (not rand) because Minitest's srand(seed) makes Kernel#rand
+    # deterministic — repeated seeds can produce duplicate IDs across tests.
     ActiveRecord::Base.connection.execute(
-      "SELECT setval('hubs_id_seq', #{rand(2_000_000_000)}, false)"
+      "SELECT setval('hubs_id_seq', #{SecureRandom.random_number(2_000_000_000)}, false)"
     )
 
     Hub.create!(

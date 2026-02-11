@@ -235,7 +235,7 @@ export class HubConnection extends Connection {
    * Send a template request and wait for the correlated response.
    * Same pattern as fsRequest but for template:* commands.
    */
-  templateRequest(type, params = {}, timeout = 10000) {
+  templateRequest(type, params = {}, timeout = 15000) {
     const requestId = crypto.randomUUID();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
