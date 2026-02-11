@@ -5,20 +5,24 @@
 //! connections managed through the Lua subscribe/unsubscribe protocol (same
 //! path as browser clients).
 //!
+//! Agent selection eagerly subscribes to the focused PTY for immediate
+//! responsiveness. `sync_subscriptions()` in the render loop handles
+//! additional bindings (e.g., multi-PTY layouts) and cleans up stale ones.
+//!
 //! # Navigation Flow
 //!
 //! 1. User presses Ctrl+J/K (next/previous)
 //! 2. TuiRunner computes next agent index from local cache
-//! 3. TuiRunner sends `unsubscribe` for current terminal (if any)
-//! 4. TuiRunner sends `subscribe` for new terminal
-//! 5. Lua `Client:on_message()` handles subscription, creates PTY forwarder
-//! 6. TuiRunner updates local state from cached agent info
+//! 3. TuiRunner sends `unsubscribe` for current PTY, `subscribe` for new PTY
+//! 4. TuiRunner updates local state (indices, parser pointer, sub ID)
+//! 5. Next render: `sync_subscriptions()` reconciles any additional bindings
 
 // Rust guideline compliant 2026-02
 
+use std::sync::{Arc, Mutex};
+
 use ratatui::backend::Backend;
 use vt100::Parser;
-
 
 use super::runner::{TuiRunner, DEFAULT_SCROLLBACK};
 
@@ -40,7 +44,6 @@ where
 
         let next_idx = match &self.selected_agent {
             Some(current) => {
-                // Find current index and select next
                 let current_idx = self.agents.iter().position(|a| a.id == *current);
                 match current_idx {
                     Some(idx) => (idx + 1) % self.agents.len(),
@@ -64,7 +67,6 @@ where
 
         let prev_idx = match &self.selected_agent {
             Some(current) => {
-                // Find current index and select previous
                 let current_idx = self.agents.iter().position(|a| a.id == *current);
                 match current_idx {
                     Some(idx) if idx > 0 => idx - 1,
@@ -94,19 +96,16 @@ where
         self.request_select_agent_by_index(index);
     }
 
-    /// Request to select a specific agent by index via Lua subscription protocol.
+    /// Select a specific agent by index via Lua subscription protocol.
     ///
-    /// Uses the same subscribe/unsubscribe protocol as browser clients:
-    /// 1. Looks up agent metadata from local cache
-    /// 2. Unsubscribes from current terminal (if any)
-    /// 3. Subscribes to new agent's terminal
-    /// 4. Updates local state from cached agent info
+    /// Eagerly subscribes to the new agent's CLI PTY for immediate
+    /// responsiveness (keyboard input, PTY output). Updates `active_subscriptions`
+    /// so `sync_subscriptions()` stays consistent.
     ///
     /// # Arguments
     ///
     /// * `index` - The display index of the agent to select (0-based)
     pub fn request_select_agent_by_index(&mut self, index: usize) {
-        // Look up agent from local cache
         let Some(agent_info) = self.agents.get(index) else {
             log::warn!("Agent at index {} not found in local cache", index);
             return;
@@ -114,26 +113,31 @@ where
 
         let agent_id = agent_info.id.clone();
 
-        // Unsubscribe from current terminal (if any)
+        // Unsubscribe from current focused PTY (if any)
         if let Some(ref sub_id) = self.current_terminal_sub_id {
             self.send_msg(serde_json::json!({
                 "type": "unsubscribe",
                 "subscriptionId": sub_id,
             }));
+            // Remove from active set (sync_subscriptions will re-add if still in tree)
+            if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
+                self.active_subscriptions.remove(&(ai, pi));
+            }
         }
 
         // Reset to CLI view when switching agents
         self.active_pty_index = 0;
 
-        // Reset parser for fresh output
-        {
-            let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-            let (rows, cols) = self.terminal_dims;
-            *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
-        }
+        // Point vt100_parser at the pool entry for the new agent's CLI PTY.
+        let (rows, cols) = self.terminal_dims;
+        let parser = self.parser_pool
+            .entry((index, 0))
+            .or_insert_with(|| Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK))))
+            .clone();
+        self.vt100_parser = parser;
 
-        // Subscribe to new terminal via Lua protocol
-        let sub_id = "tui_term".to_string();
+        // Eagerly subscribe to new PTY via Lua protocol
+        let sub_id = format!("tui:{}:{}", index, 0);
         self.send_msg(serde_json::json!({
             "type": "subscribe",
             "channel": "terminal",
@@ -144,10 +148,11 @@ where
             }
         }));
 
-        // Update local state from cached agent info
+        // Update local state and active subscriptions
         self.current_terminal_sub_id = Some(sub_id);
         self.selected_agent = Some(agent_id);
         self.current_agent_index = Some(index);
         self.current_pty_index = Some(0);
+        self.active_subscriptions.insert((index, 0));
     }
 }

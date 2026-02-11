@@ -10,15 +10,69 @@
 --   <widget> — leaf widget rendered by Rust (agent_list, terminal, menu, etc.)
 --
 -- Constraint formats: "30%" (percentage), "20" (fixed), "min:10" (min), "max:80" (max)
+--
+-- Styled span syntax:
+--   Plain string:  "title text"
+--   Styled spans:  { { text = "bold", style = "bold" }, { text = " dim", style = "dim" } }
+--   Style table:   { text = "colored", style = { fg = "cyan", bold = true } }
+--   Shorthand:     "bold" = { bold = true }, "dim" = { dim = true }
 
---- Main layout: 30/70 horizontal split with agent list and terminal.
+--- Main layout: 20/80 horizontal split with agent list and terminal.
 function render(state)
+  -- Agent list title: count + poll indicator
+  local poll_icon = state.seconds_since_poll < 1 and "*" or "o"
+  local agent_title = {
+    { text = string.format(" Agents (%d) ", state.agent_count) },
+    { text = poll_icon .. " ", style = { fg = "cyan" } },
+  }
+
+  -- Terminal title: branch name, session view, scroll indicator
+  local term_title = " Terminal [No agent selected] "
+  if state.selected_agent then
+    local sa = state.selected_agent
+    local session = sa.session_names[state.active_pty_index + 1] or "agent"
+    local view = string.upper(session)
+    if sa.session_count > 1 then
+      view = "[" .. view .. " | Ctrl+]: next]"
+    else
+      view = "[" .. view .. "]"
+    end
+    local scroll = ""
+    if state.is_scrolled then
+      scroll = string.format(" [SCROLLBACK +%d | Shift+End: live]", state.scroll_offset)
+    end
+    term_title = string.format(" %s %s%s [Ctrl+P | Ctrl+J/K | Shift+PgUp/Dn scroll] ",
+      sa.branch_name, view, scroll)
+  end
+
+  -- Build terminal panel: side-by-side if 2+ agents, single otherwise
+  local terminal_panel
+  if state.agent_count >= 2 then
+    local function agent_label(idx)
+      local a = state.agents and state.agents[idx + 1]
+      if a then return " " .. (a.display_name or a.branch_name or "Agent " .. idx) .. " " end
+      return string.format(" Agent %d ", idx)
+    end
+    terminal_panel = {
+      type = "vsplit",
+      constraints = { "50%", "50%" },
+      children = {
+        { type = "terminal", props = { agent_index = 0, pty_index = 0 },
+          block = { title = agent_label(0), borders = "all" } },
+        { type = "terminal", props = { agent_index = 1, pty_index = 0 },
+          block = { title = agent_label(1), borders = "all" } },
+      },
+    }
+  else
+    terminal_panel = { type = "terminal", block = { title = term_title, borders = "all" } }
+  end
+
   return {
     type = "hsplit",
-    constraints = { "20%", "80%" },
+    constraints = { "10%", "90%" },
     children = {
-      { type = "agent_list" },
-      { type = "terminal" },
+      { type = "agent_list", block = { title = agent_title, borders = "all" } },
+      terminal_panel,
     },
   }
 end

@@ -6,55 +6,6 @@
 
 // Rust guideline compliant 2026-01
 
-/// Result of processing a keyboard/mouse event.
-///
-/// Separates TUI-local actions from data that needs to go to Hub.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InputResult {
-    /// TUI-local action (menu, modal, scroll, etc.).
-    Action(TuiAction),
-
-    /// Raw bytes to send to the selected agent's PTY.
-    PtyInput(Vec<u8>),
-
-    /// Terminal resize event.
-    Resize {
-        /// Number of rows.
-        rows: u16,
-        /// Number of columns.
-        cols: u16,
-    },
-
-    /// No action needed.
-    None,
-}
-
-impl InputResult {
-    /// Create a PTY input result.
-    #[must_use]
-    pub fn pty_input(data: Vec<u8>) -> Self {
-        Self::PtyInput(data)
-    }
-
-    /// Create an action result.
-    #[must_use]
-    pub fn action(action: TuiAction) -> Self {
-        Self::Action(action)
-    }
-
-    /// Check if this is a no-op.
-    #[must_use]
-    pub fn is_none(&self) -> bool {
-        matches!(self, Self::None)
-    }
-}
-
-impl From<TuiAction> for InputResult {
-    fn from(action: TuiAction) -> Self {
-        Self::Action(action)
-    }
-}
-
 /// Actions handled entirely within the TUI.
 ///
 /// These are pure UI state changes - menus, modals, text input, scrolling.
