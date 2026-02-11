@@ -65,8 +65,14 @@ fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join(CONFIG_DIR).join(CONFIG_FILE))
 }
 
-/// Get the data directory path: `~/.botster`.
+/// Get the data directory path.
+///
+/// Checks `BOTSTER_CONFIG_DIR` first (used by system tests to isolate
+/// the data directory), then falls back to `~/.botster`.
 fn data_dir_path() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("BOTSTER_CONFIG_DIR") {
+        return Some(PathBuf::from(custom));
+    }
     dirs::home_dir().map(|d| d.join(DATA_DIR))
 }
 

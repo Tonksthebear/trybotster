@@ -41,7 +41,7 @@ clap = { version = "4.5.51", features = ["derive"] }
 mimalloc = "0.1"
 
 # Lua scripting runtime
-mlua = { version = "0.10", features = ["lua54", "async", "serialize"] }
+mlua = { version = "0.10", features = ["lua54", "async", "serialize", "vendored"] }
 
 # File watching for Lua hot-reload
 notify = "6"

@@ -157,8 +157,10 @@ export default class extends Controller {
 
       this.#syncAllStates();
       this.feedbackTarget.textContent = "";
+      this.element.dataset.hubTemplatesReady = "true";
     } catch {
       this.feedbackTarget.textContent = "";
+      this.element.dataset.hubTemplatesReady = "true";
     }
   }
 
