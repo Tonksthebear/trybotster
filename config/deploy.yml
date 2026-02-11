@@ -26,7 +26,7 @@ registry:
 env:
   secret:
     - RAILS_MASTER_KEY
-    - TRYBOTSTER_DATABASE_PASSWORD
+    - POSTGRES_PASSWORD
     - TURN_SECRET
     - GITHUB_APP_ID
     - GITHUB_APP_CLIENT_ID
@@ -64,7 +64,7 @@ accessories:
         POSTGRES_DB: trybotster_production
         POSTGRES_USER: trybotster
       secret:
-        - TRYBOTSTER_DATABASE_PASSWORD
+        - POSTGRES_PASSWORD
     directories:
       - trybotster_pgdata:/var/lib/postgresql/data
 
