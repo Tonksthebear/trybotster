@@ -6,7 +6,7 @@
 //!
 //! # Design Principle: "Query freely. Mutate via queue."
 //!
-//! - **State queries** (`get_worktrees`, `server_id`, `detect_repo`, `agent_list`)
+//! - **State queries** (`get_worktrees`, `server_id`, `detect_repo`)
 //!   read directly from shared state or environment
 //! - **Registration** (`register_agent`, `unregister_agent`) manages PTY handles
 //! - **Operations** (`quit`, `handle_webrtc_offer`, `handle_ice_candidate`)
@@ -26,9 +26,6 @@
 //!
 //! -- Detect current repo (owner/name format)
 //! local repo = hub.detect_repo()
-//!
-//! -- Get list of active agents
-//! local agents = hub.agent_list()
 //!
 //! -- Handle WebRTC signaling
 //! hub.handle_webrtc_offer(browser_identity, sdp)
@@ -90,7 +87,6 @@ pub fn new_request_queue() -> HubRequestQueue {
 /// - `hub.server_id()` - Get server-assigned hub ID
 /// - `hub.detect_repo()` - Detect current repo name
 /// - `hub.api_token()` - Get hub's API bearer token for authenticated requests
-/// - `hub.agent_list()` - Get list of active agents with metadata
 /// - `hub.handle_webrtc_offer(browser_identity, sdp)` - Queue WebRTC offer
 /// - `hub.handle_ice_candidate(browser_identity, candidate)` - Queue ICE candidate
 /// - `hub.quit()` - Request Hub shutdown
@@ -277,30 +273,6 @@ pub fn register(
     hub.set("api_token", api_token_fn)
         .map_err(|e| anyhow!("Failed to set hub.api_token: {e}"))?;
 
-    // hub.agent_list() - Returns array of {session_key} for active agents.
-    //
-    // Reads from HandleCache (the authoritative agent registry after Lua migration).
-    // Lua manages agent metadata; this only provides session keys for heartbeat sync.
-    let cache4 = Arc::clone(&handle_cache);
-    let agent_list_fn = lua
-        .create_function(move |lua, ()| {
-            let agents: Vec<serde_json::Value> = cache4
-                .get_all_agents()
-                .iter()
-                .map(|agent| {
-                    serde_json::json!({
-                        "session_key": agent.agent_key()
-                    })
-                })
-                .collect();
-
-            lua.to_value(&agents)
-        })
-        .map_err(|e| anyhow!("Failed to create hub.agent_list function: {e}"))?;
-
-    hub.set("agent_list", agent_list_fn)
-        .map_err(|e| anyhow!("Failed to set hub.agent_list: {e}"))?;
-
     // hub.handle_webrtc_offer(browser_identity, sdp) - Queue a WebRTC SDP offer for processing.
     let queue_offer = Arc::clone(&request_queue);
     let handle_webrtc_offer_fn = lua
@@ -393,7 +365,6 @@ mod tests {
         assert!(hub.contains_key("unregister_agent").unwrap());
         assert!(hub.contains_key("server_id").unwrap());
         assert!(hub.contains_key("detect_repo").unwrap());
-        assert!(hub.contains_key("agent_list").unwrap());
         assert!(hub.contains_key("handle_webrtc_offer").unwrap());
         assert!(hub.contains_key("handle_ice_candidate").unwrap());
         assert!(hub.contains_key("quit").unwrap());
@@ -462,19 +433,6 @@ mod tests {
 
         let id: LuaValue = lua.load("return hub.server_id()").eval().unwrap();
         assert!(id.is_nil());
-    }
-
-    #[test]
-    fn test_agent_list_returns_empty_array() {
-        let lua = Lua::new();
-        let (queue, cache, sid, state) = create_test_deps();
-
-        register(&lua, queue, cache, sid, state).expect("Should register");
-
-        let agents: LuaValue = lua.load("return hub.agent_list()").eval().unwrap();
-        let json: serde_json::Value = lua.from_value(agents).unwrap();
-        assert!(json.is_array());
-        assert_eq!(json.as_array().unwrap().len(), 0);
     }
 
     #[test]

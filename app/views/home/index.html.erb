@@ -1,61 +1,306 @@
-<div class="flex flex-col items-center justify-center min-h-[calc(100vh-8rem)] px-4 py-12">
-  <%# Terminal-style hero %>
-  <div class="max-w-2xl mx-auto text-center mb-12">
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<%# HERO                                                                      %>
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<div class="flex flex-col items-center justify-center min-h-[calc(100vh-8rem)] px-4 py-20">
+  <div class="max-w-3xl mx-auto text-center">
     <div class="inline-flex items-center gap-2 px-4 py-2 bg-zinc-900 border border-zinc-800 rounded-full mb-8">
       <span class="size-2 rounded-full bg-primary-500 animate-pulse"></span>
-      <span class="text-sm font-mono text-zinc-400">Autonomous agents for GitHub</span>
+      <span class="text-sm font-mono text-zinc-400">Local-first agent platform</span>
     </div>
 
-    <h1 class="text-5xl sm:text-6xl lg:text-7xl font-bold text-zinc-100 mb-6 tracking-tight">
-      <span class="text-primary-400">@mention</span> an agent.<br>
-      <span class="text-zinc-500">It handles the rest.</span>
+    <h1 class="text-5xl sm:text-6xl lg:text-7xl font-bold text-zinc-100 mb-6 tracking-tight leading-tight">
+      Your agents. Your machine.<br>
+      <span class="text-primary-400">From anywhere.</span>
     </h1>
 
-    <p class="text-xl text-zinc-400 mb-10 max-w-xl mx-auto">
-      GitHub mention triggers a Claude agent in an isolated worktree.
-      E2E encrypted. Zero configuration.
+    <p class="text-xl text-zinc-400 mb-10 max-w-2xl mx-auto leading-relaxed">
+      Run autonomous AI agents on your machine. Monitor them from any device
+      through P2P encrypted connections the server can never read.
     </p>
 
-    <%= link_to new_github_authorization_path,
-                data: { turbo: false },
-                class: "inline-flex items-center gap-3 px-8 py-4 bg-zinc-100 hover:bg-white text-zinc-950 font-semibold text-lg rounded transition-colors" do %>
-      <svg class="size-6" fill="currentColor" viewBox="0 0 24 24">
-        <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.203 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.942.359.31.678.921.678 1.856 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"/>
-      </svg>
-      Sign in with GitHub
-    <% end %>
+    <div class="flex flex-col sm:flex-row items-center justify-center gap-4">
+      <%= link_to new_github_authorization_path,
+                  data: { turbo: false },
+                  class: "inline-flex items-center gap-3 px-8 py-4 bg-zinc-100 hover:bg-white text-zinc-950 font-semibold text-lg rounded transition-colors" do %>
+        <svg class="size-6" fill="currentColor" viewBox="0 0 24 24">
+          <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.203 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.942.359.31.678.921.678 1.856 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"/>
+        </svg>
+        Sign in with GitHub
+      <% end %>
+
+      <%= link_to "https://github.com/trybotster/botster",
+                  class: "inline-flex items-center gap-2 px-6 py-4 text-zinc-400 hover:text-zinc-200 font-medium text-lg transition-colors",
+                  target: "_blank" do %>
+        View GitHub
+        <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+        </svg>
+      <% end %>
+    </div>
   </div>
+</div>
 
-  <%# Feature cards %>
-  <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 max-w-4xl mx-auto w-full">
-    <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-6">
-      <div class="size-10 bg-primary-500/10 rounded-lg flex items-center justify-center mb-4">
-        <svg class="size-5 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-        </svg>
-      </div>
-      <h3 class="font-semibold text-zinc-100 mb-2">Instant Spawn</h3>
-      <p class="text-sm text-zinc-500">Mention triggers agent in isolated git worktree within seconds.</p>
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<%# FEATURES (2x2 grid)                                                       %>
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<div class="px-4 py-20 border-t border-zinc-800/50">
+  <div class="max-w-5xl mx-auto">
+    <div class="text-center mb-16">
+      <h2 class="text-3xl sm:text-4xl font-bold text-zinc-100 mb-4 tracking-tight">
+        Built different
+      </h2>
+      <p class="text-lg text-zinc-500 max-w-2xl mx-auto">
+        Not another cloud platform. Botster runs on your machine.
+        The server only exists to negotiate encrypted handshakes between your devices.
+      </p>
     </div>
 
-    <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-6">
-      <div class="size-10 bg-primary-500/10 rounded-lg flex items-center justify-center mb-4">
-        <svg class="size-5 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-        </svg>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <%# Zero-Knowledge %>
+      <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-6">
+        <div class="size-10 bg-primary-500/10 rounded-lg flex items-center justify-center mb-4">
+          <svg class="size-5 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+          </svg>
+        </div>
+        <h3 class="font-semibold text-zinc-100 mb-2">Zero-Knowledge Architecture</h3>
+        <p class="text-sm text-zinc-500 leading-relaxed">
+          Keys exchanged offline via QR code. The server relays encrypted blobs it
+          can never read. Not "we don't look" &mdash; we <em class="text-zinc-400 not-italic font-medium">can't</em>.
+        </p>
       </div>
-      <h3 class="font-semibold text-zinc-100 mb-2">E2E Encrypted</h3>
-      <p class="text-sm text-zinc-500">Browser terminal access with MITM-proof key exchange.</p>
+
+      <%# Multi-Agent %>
+      <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-6">
+        <div class="size-10 bg-primary-500/10 rounded-lg flex items-center justify-center mb-4">
+          <svg class="size-5 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+          </svg>
+        </div>
+        <h3 class="font-semibold text-zinc-100 mb-2">Multi-Agent Management</h3>
+        <p class="text-sm text-zinc-500 leading-relaxed">
+          Run 20+ agents simultaneously, each in isolated git worktrees.
+          Manage from the TUI or your browser.
+        </p>
+      </div>
+
+      <%# Plugins %>
+      <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-6">
+        <div class="size-10 bg-primary-500/10 rounded-lg flex items-center justify-center mb-4">
+          <svg class="size-5 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 4a2 2 0 114 0v1a1 1 0 001 1h3a1 1 0 011 1v3a1 1 0 01-1 1h-1a2 2 0 100 4h1a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-1a2 2 0 10-4 0v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-3a1 1 0 00-1-1H4a2 2 0 110-4h1a1 1 0 001-1V7a1 1 0 011-1h3a1 1 0 001-1V4z" />
+          </svg>
+        </div>
+        <h3 class="font-semibold text-zinc-100 mb-2">Plugin System</h3>
+        <p class="text-sm text-zinc-500 leading-relaxed">
+          Extensible architecture. GitHub is a first-party plugin &mdash;
+          <span class="font-mono text-zinc-400">@botster</span> triggers agents automatically.
+        </p>
+      </div>
+
+      <%# Local-First %>
+      <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-6">
+        <div class="size-10 bg-primary-500/10 rounded-lg flex items-center justify-center mb-4">
+          <svg class="size-5 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" />
+          </svg>
+        </div>
+        <h3 class="font-semibold text-zinc-100 mb-2">Local-First Execution</h3>
+        <p class="text-sm text-zinc-500 leading-relaxed">
+          Agents run on your hardware. Keys live in your OS keychain.
+          No cloud execution, no vendor lock-in.
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<%# PRIVACY DEEP-DIVE                                                         %>
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<div class="px-4 py-20 border-t border-zinc-800/50">
+  <div class="max-w-4xl mx-auto">
+    <div class="border border-zinc-700/50 rounded-xl p-8 sm:p-12 bg-zinc-900/30">
+      <div class="text-center mb-10">
+        <p class="text-sm font-mono text-primary-400 mb-3 tracking-wider uppercase">Privacy model</p>
+        <h2 class="text-3xl sm:text-4xl font-bold text-zinc-100 tracking-tight">
+          The server sees nothing
+        </h2>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-8">
+        <div>
+          <div class="flex items-start gap-3 mb-1">
+            <span class="mt-1 size-5 shrink-0 rounded-full bg-primary-500/20 flex items-center justify-center">
+              <span class="size-2 rounded-full bg-primary-400"></span>
+            </span>
+            <h3 class="font-semibold text-zinc-200">Offline key exchange</h3>
+          </div>
+          <p class="text-sm text-zinc-500 ml-8 leading-relaxed">
+            Encryption keys are shared via QR code using URL hash parameters.
+            They never touch the server &mdash; not in transit, not in logs, nowhere.
+          </p>
+        </div>
+
+        <div>
+          <div class="flex items-start gap-3 mb-1">
+            <span class="mt-1 size-5 shrink-0 rounded-full bg-primary-500/20 flex items-center justify-center">
+              <span class="size-2 rounded-full bg-primary-400"></span>
+            </span>
+            <h3 class="font-semibold text-zinc-200">Encrypted signaling</h3>
+          </div>
+          <p class="text-sm text-zinc-500 ml-8 leading-relaxed">
+            The server's only job is negotiating handshakes &mdash; and even those
+            are encrypted blobs it relays without any ability to read.
+          </p>
+        </div>
+
+        <div>
+          <div class="flex items-start gap-3 mb-1">
+            <span class="mt-1 size-5 shrink-0 rounded-full bg-primary-500/20 flex items-center justify-center">
+              <span class="size-2 rounded-full bg-primary-400"></span>
+            </span>
+            <h3 class="font-semibold text-zinc-200">P2P data channel</h3>
+          </div>
+          <p class="text-sm text-zinc-500 ml-8 leading-relaxed">
+            After the handshake, connections are direct P2P. Data is encrypted with
+            <a href="https://matrix.org/blog/2022/05/16/independent-public-audit-of-vodozemac-a-native-rust-reference-implementation-of-matrix-end-to-end-encryption/" target="_blank" class="text-primary-400 hover:text-primary-300 underline underline-offset-2">vodozemac</a>
+            &mdash; the Matrix Foundation's independently audited Rust implementation of Olm &mdash;
+            on top of WebRTC encryption, so even TURN relay servers see nothing.
+          </p>
+        </div>
+
+        <div>
+          <div class="flex items-start gap-3 mb-1">
+            <span class="mt-1 size-5 shrink-0 rounded-full bg-primary-500/20 flex items-center justify-center">
+              <span class="size-2 rounded-full bg-primary-400"></span>
+            </span>
+            <h3 class="font-semibold text-zinc-200">No trust required</h3>
+          </div>
+          <p class="text-sm text-zinc-500 ml-8 leading-relaxed">
+            The server <em class="text-zinc-400 not-italic font-medium">cannot</em> decrypt
+            your data, even if compromised. Privacy by architecture, not policy.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<%# HOW IT WORKS                                                               %>
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<div class="px-4 py-20 border-t border-zinc-800/50">
+  <div class="max-w-5xl mx-auto">
+    <div class="text-center mb-16">
+      <h2 class="text-3xl sm:text-4xl font-bold text-zinc-100 mb-4 tracking-tight">
+        How it works
+      </h2>
     </div>
 
-    <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-6">
-      <div class="size-10 bg-primary-500/10 rounded-lg flex items-center justify-center mb-4">
-        <svg class="size-5 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-        </svg>
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-8">
+      <div class="text-center sm:text-left">
+        <div class="inline-flex items-center justify-center size-10 rounded-full border border-zinc-700 text-primary-400 font-mono font-bold text-sm mb-4">
+          1
+        </div>
+        <h3 class="font-semibold text-zinc-100 mb-2">Install the CLI</h3>
+        <p class="text-sm text-zinc-500 leading-relaxed">
+          Download the binary and pair your device in seconds.
+          Keys are stored in your OS keychain automatically.
+        </p>
       </div>
-      <h3 class="font-semibold text-zinc-100 mb-2">Full Terminal</h3>
-      <p class="text-sm text-zinc-500">TUI or web interface with live preview tunnels.</p>
+
+      <div class="text-center sm:text-left">
+        <div class="inline-flex items-center justify-center size-10 rounded-full border border-zinc-700 text-primary-400 font-mono font-bold text-sm mb-4">
+          2
+        </div>
+        <h3 class="font-semibold text-zinc-100 mb-2">Assign work</h3>
+        <p class="text-sm text-zinc-500 leading-relaxed">
+          Create agents from any browser, the TUI, or via
+          <span class="font-mono text-zinc-400">@botster</span> on GitHub.
+        </p>
+      </div>
+
+      <div class="text-center sm:text-left">
+        <div class="inline-flex items-center justify-center size-10 rounded-full border border-zinc-700 text-primary-400 font-mono font-bold text-sm mb-4">
+          3
+        </div>
+        <h3 class="font-semibold text-zinc-100 mb-2">Monitor from anywhere</h3>
+        <p class="text-sm text-zinc-500 leading-relaxed">
+          Watch agents work in real-time through your browser or phone.
+          E2E encrypted, always.
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<%# TERMINAL PREVIEW                                                           %>
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<div class="px-4 py-20 border-t border-zinc-800/50">
+  <div class="max-w-3xl mx-auto">
+    <div class="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden">
+      <div class="flex items-center gap-2 px-4 py-3 border-b border-zinc-800">
+        <span class="size-3 rounded-full bg-zinc-700"></span>
+        <span class="size-3 rounded-full bg-zinc-700"></span>
+        <span class="size-3 rounded-full bg-zinc-700"></span>
+        <span class="ml-2 text-xs font-mono text-zinc-600">botster-hub</span>
+      </div>
+      <div class="flex font-mono text-xs sm:text-sm leading-relaxed overflow-hidden">
+        <%# Left panel — agent list %>
+        <div class="w-2/5 border-r border-zinc-800 p-4 text-zinc-500">
+          <p class="text-zinc-600 mb-2">Agents (3) * 10s V:-</p>
+          <p class="bg-primary-500/20 text-primary-300 px-1 -mx-1">&gt; fix-auth-flow &gt;:8080</p>
+          <p class="px-1">&nbsp; update-api-docs</p>
+          <p class="px-1">&nbsp; refactor-payments &gt;:3000</p>
+        </div>
+        <%# Right panel — terminal output %>
+        <div class="w-3/5 p-4 text-zinc-400">
+          <p class="text-zinc-600 mb-2 truncate">fix-auth-flow [Ctrl+P | Ctrl+J/K | Shift+PgUp scroll]</p>
+          <p>bash-5.2$ <span class="text-zinc-300">claude --prompt "$BOTSTER_PROMPT"</span></p>
+          <p class="text-success-400 mt-1">&#10003; Read app/controllers/sessions_controller.rb</p>
+          <p class="text-success-400">&#10003; Read app/models/user.rb</p>
+          <p class="text-zinc-300 mt-1">Fixing token refresh logic in sessions#create...</p>
+          <p class="text-zinc-500 mt-1">Writing to app/controllers/sessions_controller.rb</p>
+        </div>
+      </div>
+    </div>
+    <p class="text-center text-xs text-zinc-600 mt-4 font-mono">
+      TUI with real-time agent output &middot; Ctrl+J/K to navigate agents
+    </p>
+  </div>
+</div>
+
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<%# BOTTOM CTA                                                                 %>
+<%# ═══════════════════════════════════════════════════════════════════════════ %>
+<div class="px-4 py-24 border-t border-zinc-800/50">
+  <div class="max-w-2xl mx-auto text-center">
+    <h2 class="text-3xl sm:text-4xl font-bold text-zinc-100 mb-4 tracking-tight">
+      Ready to run agents locally?
+    </h2>
+    <p class="text-lg text-zinc-500 mb-8">
+      No cloud execution. No data collection. Just your machine, your agents, your control.
+    </p>
+    <div class="flex flex-col sm:flex-row items-center justify-center gap-4">
+      <%= link_to new_github_authorization_path,
+                  data: { turbo: false },
+                  class: "inline-flex items-center gap-3 px-8 py-4 bg-zinc-100 hover:bg-white text-zinc-950 font-semibold text-lg rounded transition-colors" do %>
+        <svg class="size-6" fill="currentColor" viewBox="0 0 24 24">
+          <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.203 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.942.359.31.678.921.678 1.856 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"/>
+        </svg>
+        Sign in with GitHub
+      <% end %>
+
+      <%= link_to "https://github.com/trybotster/botster",
+                  class: "inline-flex items-center gap-2 px-6 py-4 text-zinc-400 hover:text-zinc-200 font-medium text-lg transition-colors",
+                  target: "_blank" do %>
+        View GitHub
+        <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+        </svg>
+      <% end %>
     </div>
   </div>
 </div>

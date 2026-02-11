@@ -9,7 +9,39 @@ permissions:
   contents: write # Needed to create releases
 
 jobs:
+  ci-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install packages
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            cli/target/
+          key: ${{ runner.os }}-cargo-ci-gate-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ci-gate-
+
+      - name: Run CLI tests
+        working-directory: cli
+        env:
+          BOTSTER_ENV: test
+        run: cargo test --all-targets -- --test-threads=1
+
   build-and-release:
+    needs: ci-gate
     strategy:
       fail-fast: false # Continue building other platforms if one fails
       matrix:
@@ -23,6 +55,10 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: botster-hub-linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: botster-hub-linux-arm64
+            use_cross: true
 
     runs-on: ${{ matrix.os }}
 
@@ -35,10 +71,20 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
       - name: Build release binary
         run: |
           cd cli
-          cargo build --release --target ${{ matrix.target }}
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Rename binary
         run: |

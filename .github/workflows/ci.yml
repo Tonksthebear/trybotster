@@ -87,7 +87,7 @@ jobs:
 
     steps:
       - name: Install packages
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev liblua5.4-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev pkg-config
 
       - name: Checkout code
         uses: actions/checkout@v5
@@ -129,7 +129,7 @@ jobs:
 
     steps:
       - name: Install packages
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev liblua5.4-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev pkg-config
 
       - name: Checkout code
         uses: actions/checkout@v5
@@ -162,7 +162,7 @@ jobs:
 
     steps:
       - name: Install packages
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y liblua5.4-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config
 
       - name: Checkout code
         uses: actions/checkout@v5

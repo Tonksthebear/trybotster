@@ -11,6 +11,8 @@
 -- action_cable primitive (Rust). The 30s heartbeat here is application-
 -- level HubCommandChannel business logic, NOT protocol-level.
 
+local Agent = require("lib.agent")
+
 -- Table stores channel_id for use outside the callback (heartbeat, signal relay).
 -- Inside the callback, channel_id is passed as the second argument by the primitive.
 local ch = {}
@@ -88,10 +90,23 @@ ch.hub = action_cable.subscribe(conn, "HubCommandChannel",
     end
 )
 
+-- Build agent list from Lua's agent registry (the source of truth).
+-- Returns the format Rails expects: [{ session_key, last_invocation_url? }]
+local function agent_list()
+    local result = {}
+    for _, agent in ipairs(Agent.list()) do
+        result[#result + 1] = {
+            session_key = agent:agent_key(),
+            last_invocation_url = agent.invocation_url,
+        }
+    end
+    return result
+end
+
 -- Send heartbeat helper (used by timer and agent lifecycle hooks)
 local function send_heartbeat()
     if ch.hub then
-        action_cable.perform(ch.hub, "heartbeat", { agents = hub.agent_list() })
+        action_cable.perform(ch.hub, "heartbeat", { agents = agent_list() })
     end
 end
 

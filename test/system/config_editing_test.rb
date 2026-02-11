@@ -197,9 +197,11 @@ class ConfigEditingTest < ApplicationSystemTestCase
     sign_in_and_connect
     visit hub_settings_path(@hub)
 
-    # Switch to templates tab
+    # Switch to templates tab and wait for DataChannel installed-check to complete.
+    # The hub-templates controller sets data-hub-templates-ready after #checkInstalled,
+    # ensuring the connection is live before we try to install.
     find("[data-tab='templates']").click
-    assert_selector "[data-hub-templates-target='catalog']", wait: 10
+    assert_selector "[data-hub-templates-ready]", wait: 15
 
     # Click a plugin template card (plugins are tracked by template:list,
     # unlike non-plugin templates like user/init.lua which aren't detected)
