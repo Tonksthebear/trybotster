@@ -1,1 +1,60 @@
 @import "tailwindcss";
+@import "./theme.css";
+
+/* JetBrains Mono Nerd Font for terminal - includes Nerd Font glyphs */
+@font-face {
+  font-family: 'JetBrainsMono NF';
+  src: url('JetBrainsMonoNerdFont-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Force dark mode - always apply dark: variants regardless of system preference */
+@variant dark (&);
+@source "../../../app/components";
+@source "../../../config/elements.yml";
+
+/*
+ * xterm.js container styling
+ * Minimal overrides - let xterm handle its own internals
+ */
+.terminal-container {
+  padding: 8px;
+  /* Enable smooth touch scrolling on iOS */
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Allow touch scrolling in xterm viewport */
+.terminal-container .xterm-viewport {
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+}
+
+/* Hide iOS native cursor on xterm's hidden input textarea */
+.terminal-container .xterm-helper-textarea {
+  @apply caret-transparent select-none;
+}
+
+/*
+ * iOS safe area insets for touch controls
+ * Uses CSS env() function which has no Tailwind equivalent
+ */
+@supports (padding: env(safe-area-inset-bottom)) {
+  .touch-controls-container {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+/*
+ * Hide scrollbar while keeping scroll functionality
+ * No Tailwind equivalent - used for horizontal scroll UIs
+ */
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+

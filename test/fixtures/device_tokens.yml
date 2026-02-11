@@ -1,0 +1,14 @@
+# Device tokens for API authentication in tests
+# Token format: btstr_<base64>
+
+cli_device_token:
+  device: cli_device
+  name: "CLI Device Token"
+  token: "btstr_test_token_cli_device_12345678"
+  last_used_at: <%= 1.hour.ago %>
+
+browser_device_token:
+  device: browser_device
+  name: "Browser Device Token"
+  token: "btstr_test_token_browser_device_87654321"
+  last_used_at: <%= 2.hours.ago %>

@@ -50,4 +50,10 @@ Rails.application.configure do
 
   # Raise error when a before_action's only/except options reference missing actions.
   config.action_controller.raise_on_missing_callback_actions = true
+
+  # Allow reading unencrypted fixture data for encrypted attributes
+  config.active_record.encryption.support_unencrypted_data = true
+
+  # Use test adapter for jobs - runs inline without queue infrastructure
+  config.active_job.queue_adapter = :test
 end

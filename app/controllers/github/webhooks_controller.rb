@@ -8,10 +8,10 @@ module Github
 
     # Event type to handler class mapping
     HANDLERS = {
-      "issue_comment" => Webhooks::IssueCommentHandler,
-      "pull_request_review_comment" => Webhooks::PrReviewCommentHandler,
-      "issues" => Webhooks::IssueHandler,
-      "pull_request" => Webhooks::PullRequestHandler
+      "issue_comment" => Integrations::Github::Webhooks::IssueCommentHandler,
+      "pull_request_review_comment" => Integrations::Github::Webhooks::PrReviewCommentHandler,
+      "issues" => Integrations::Github::Webhooks::IssueHandler,
+      "pull_request" => Integrations::Github::Webhooks::PullRequestHandler
     }.freeze
 
     # POST /webhooks/github

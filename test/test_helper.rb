@@ -1,13 +1,80 @@
 ENV["RAILS_ENV"] ||= "test"
 require_relative "../config/environment"
 require "rails/test_help"
+require "webmock/minitest"
+
+# Load support files
+Dir[Rails.root.join("test/support/**/*.rb")].each { |f| require f }
+
+# Allow localhost connections for ActionCable tests
+WebMock.disable_net_connect!(allow_localhost: true)
+
+# Clean up stale CLI processes from previous test runs
+# This prevents orphaned botster-hub processes from consuming CPU
+module CliProcessCleanup
+  CLI_BINARY_NAME = "botster-hub"
+
+  def self.cleanup_stale_processes
+    # Find any running botster-hub processes
+    pids = `pgrep -f #{CLI_BINARY_NAME} 2>/dev/null`.strip.split("\n").map(&:to_i).reject(&:zero?)
+    return if pids.empty?
+
+    puts "[CliProcessCleanup] Found #{pids.length} stale #{CLI_BINARY_NAME} processes: #{pids.join(', ')}"
+
+    pids.each do |pid|
+      begin
+        Process.kill("TERM", pid)
+        sleep 0.2
+        Process.kill("KILL", pid) if process_running?(pid)
+        puts "[CliProcessCleanup] Killed stale process #{pid}"
+      rescue Errno::ESRCH, Errno::EPERM
+        # Process already gone or permission denied
+      end
+    end
+  end
+
+  def self.cleanup_test_config_dir
+    test_config_dir = Rails.root.join("tmp/botster-test")
+    return unless test_config_dir.exist?
+
+    FileUtils.rm_rf(test_config_dir)
+    puts "[CliProcessCleanup] Cleaned up test config directory: #{test_config_dir}"
+  rescue => e
+    puts "[CliProcessCleanup] Warning: Failed to clean up test config: #{e.message}"
+  end
+
+  def self.process_running?(pid)
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH, Errno::EPERM
+    false
+  end
+end
+
+# Set default host for URL generation in tests
+Rails.application.routes.default_url_options[:host] = "test.host"
 
 module ActiveSupport
   class TestCase
+    include WaitHelper
+
     # Run tests in parallel with specified workers
     parallelize(workers: :number_of_processors)
 
+    # Clean up stale CLI processes ONCE before forking workers.
+    # This prevents orphaned processes from previous runs without
+    # workers killing each other's processes during parallel testing.
+    parallelize_before_fork do
+      CliProcessCleanup.cleanup_stale_processes
+    end
+
+    # Clean up config dir after workers complete
+    parallelize_teardown do |_worker|
+      CliProcessCleanup.cleanup_test_config_dir
+    end
+
     # Setup all fixtures in test/fixtures/*.yml for all tests in alphabetical order.
+    set_fixture_class "integrations/github/mcp_tokens" => Integrations::Github::MCPToken
     fixtures :all
 
     # Add more helper methods to be used by all tests here...

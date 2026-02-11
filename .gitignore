@@ -50,6 +50,6 @@ mise.toml
 # macOS files
 .DS_Store
 
-# Rust build artifacts
-/cli/target/
+# Rust build artifacts (all projects)
+**/target/
 /cli/Cargo.lock

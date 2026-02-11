@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Loading Preview...</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #111827;
+      color: white;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0;
+    }
+    .container { text-align: center; }
+    .spinner {
+      width: 48px;
+      height: 48px;
+      border: 3px solid transparent;
+      border-top-color: white;
+      border-radius: 50%;
+      margin: 0 auto 16px;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .title { font-size: 18px; font-weight: 500; margin: 0 0 8px; }
+    .subtitle { font-size: 14px; color: #9ca3af; margin: 0; }
+    .error { color: #ef4444; }
+  </style>
+</head>
+<body>
+  <div class="container" id="status">
+    <div class="spinner"></div>
+    <p class="title">Initializing preview...</p>
+    <p class="subtitle">Setting up service worker</p>
+  </div>
+
+  <script>
+    (function() {
+      const SW_PATH = '<%= @sw_path %>';
+      const SCOPE = '<%= @scope %>';
+      const SHELL_PATH = '<%= @shell_path %>';
+      const SW_VERSION = '<%= @sw_version %>';
+
+      if (!('serviceWorker' in navigator)) {
+        showError('Service Workers not supported in this browser');
+        return;
+      }
+
+      initServiceWorker();
+
+      async function initServiceWorker() {
+        try {
+          updateStatus('Clearing old service workers...');
+
+          // Unregister any existing SW for this scope to ensure fresh install
+          const registrations = await navigator.serviceWorker.getRegistrations();
+          for (const reg of registrations) {
+            if (reg.scope.includes(SCOPE)) {
+              await reg.unregister();
+            }
+          }
+
+          updateStatus('Registering service worker...');
+
+          // Register fresh SW with cache bypass
+          const registration = await navigator.serviceWorker.register(SW_PATH + '?v=' + SW_VERSION, { scope: SCOPE + '/' });
+
+          // Handle install failures
+          if (registration.installing) {
+            const sw = registration.installing;
+            sw.addEventListener('statechange', function() {
+              console.log('SW state:', sw.state);
+              if (sw.state === 'activated') {
+                onReady();
+              } else if (sw.state === 'redundant') {
+                showError('Service worker failed to install. Check console for errors.');
+              }
+            });
+          } else if (registration.waiting) {
+            // SW is waiting, skip waiting
+            registration.waiting.postMessage({ type: 'SKIP_WAITING' });
+            onReady();
+          } else if (registration.active) {
+            onReady();
+          }
+        } catch (error) {
+          console.error('SW initialization failed:', error);
+          showError('Failed to initialize preview: ' + error.message);
+        }
+      }
+
+      function updateStatus(message) {
+        document.querySelector('.subtitle').textContent = message;
+      }
+
+      function onReady() {
+        // Navigate to shell page (under SW scope, so controlled by SW)
+        location.href = SHELL_PATH;
+      }
+
+      function showError(message) {
+        document.getElementById('status').innerHTML =
+          '<p class="title error">Preview Error</p>' +
+          '<p class="subtitle">' + message + '</p>';
+      }
+    })();
+  </script>
+</body>
+</html>

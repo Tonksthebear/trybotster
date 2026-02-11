@@ -1,0 +1,50 @@
+[2026-01-11T22:48:29Z INFO  botster_hub] Skipping authentication (BOTSTER_SKIP_AUTH set)
+[2026-01-11T22:48:29Z INFO  botster_hub::hub] Hub identifier (from env): test-123...
+[2026-01-11T22:48:29Z DEBUG botster_hub::device] Loaded signing key from file (test mode, keyring skipped)
+[2026-01-11T22:48:29Z INFO  botster_hub::device] Loaded device identity: fingerprint=0c:09:c3:5e:1c:4f:91:0c
+[2026-01-11T22:48:29Z INFO  botster_hub::hub] Device fingerprint: 0c:09:c3:5e:1c:4f:91:0c
+[2026-01-11T22:48:29Z DEBUG reqwest::connect] starting new connection: https://trybotster.com/
+[2026-01-11T22:48:29Z WARN  botster_hub::hub::registration] Device registration failed: Device registration failed: 404 Not Found - <html>
+    <head><title>404 Not Found</title></head>
+    <body>
+    <center><h1>404 Not Found</h1></center>
+    <hr><center>nginx/1.29.4</center>
+    </body>
+    </html>
+     - will retry later
+[2026-01-11T22:48:29Z INFO  botster_hub::hub::registration] Registering hub with server before channel connections...
+[2026-01-11T22:48:29Z DEBUG reqwest::connect] starting new connection: https://trybotster.com/
+[2026-01-11T22:48:30Z WARN  botster_hub::hub::registration] Hub registration returned status: 405 Method Not Allowed
+[2026-01-11T22:48:30Z INFO  botster_hub::tunnel] [Tunnel] Connecting to wss://trybotster.com/cable
+[2026-01-11T22:48:30Z INFO  botster_hub::relay::persistence] Loaded Signal store (encrypted) for hub test-123
+[2026-01-11T22:48:30Z INFO  botster_hub::relay::signal] Loaded existing SignalProtocolManager for hub test-123
+[2026-01-11T22:48:30Z DEBUG botster_hub::relay::signal] Using PreKey 1 for bundle (100 remaining)
+[2026-01-11T22:48:30Z INFO  botster_hub::hub::registration] Signal Protocol ready: identity=BQm4g8Rv...
+[2026-01-11T22:48:30Z INFO  botster_hub::relay::connection] Connecting to Action Cable: wss://trybotster.com/cable
+[2026-01-11T22:48:30Z DEBUG botster_hub::relay::persistence] Wrote connection URL to "/Users/jasonconigliari/Rails/trybotster/cli/tmp/test-run/hubs/test-123/connection_url.txt"
+[2026-01-11T22:48:30Z INFO  botster_hub::hub::registration] Connection URL available for external access
+[2026-01-11T22:48:30Z ERROR botster_hub::tunnel] [Tunnel] WebSocket connection failed: HTTP error: 404 Not Found
+[2026-01-11T22:48:30Z WARN  botster_hub::hub::registration] Tunnel connection error: HTTP error: 404 Not Found, reconnecting in 5s...
+[2026-01-11T22:48:30Z WARN  botster_hub::hub::registration] Failed to connect to terminal relay: Failed to connect to Action Cable - browser access disabled
+[2026-01-11T22:48:30Z WARN  botster_hub::hub::registration] Relay connection failed
+[2026-01-11T22:48:30Z INFO  botster_hub] Botster Hub v0.5.2 started in headless mode
+[2026-01-11T22:48:35Z INFO  botster_hub::tunnel] [Tunnel] Connecting to wss://trybotster.com/cable
+[2026-01-11T22:48:35Z ERROR botster_hub::tunnel] [Tunnel] WebSocket connection failed: HTTP error: 404 Not Found
+[2026-01-11T22:48:35Z WARN  botster_hub::hub::registration] Tunnel connection error: HTTP error: 404 Not Found, reconnecting in 5s...
+[2026-01-11T22:48:40Z INFO  botster_hub::tunnel] [Tunnel] Connecting to wss://trybotster.com/cable
+[2026-01-11T22:48:40Z ERROR botster_hub::tunnel] [Tunnel] WebSocket connection failed: HTTP error: 404 Not Found
+[2026-01-11T22:48:40Z WARN  botster_hub::hub::registration] Tunnel connection error: HTTP error: 404 Not Found, reconnecting in 5s...
+[2026-01-11T22:48:45Z INFO  botster_hub::tunnel] [Tunnel] Connecting to wss://trybotster.com/cable
+[2026-01-11T22:48:46Z ERROR botster_hub::tunnel] [Tunnel] WebSocket connection failed: HTTP error: 404 Not Found
+[2026-01-11T22:48:46Z WARN  botster_hub::hub::registration] Tunnel connection error: HTTP error: 404 Not Found, reconnecting in 5s...
+[2026-01-11T22:48:51Z INFO  botster_hub::tunnel] [Tunnel] Connecting to wss://trybotster.com/cable
+[2026-01-11T22:48:51Z ERROR botster_hub::tunnel] [Tunnel] WebSocket connection failed: HTTP error: 404 Not Found
+[2026-01-11T22:48:51Z WARN  botster_hub::hub::registration] Tunnel connection error: HTTP error: 404 Not Found, reconnecting in 5s...
+[2026-01-11T22:48:56Z INFO  botster_hub::tunnel] [Tunnel] Connecting to wss://trybotster.com/cable
+[2026-01-11T22:48:56Z ERROR botster_hub::tunnel] [Tunnel] WebSocket connection failed: HTTP error: 404 Not Found
+[2026-01-11T22:48:56Z WARN  botster_hub::hub::registration] Tunnel connection error: HTTP error: 404 Not Found, reconnecting in 5s...
+[2026-01-11T22:49:01Z INFO  botster_hub::tunnel] [Tunnel] Connecting to wss://trybotster.com/cable
+[2026-01-11T22:49:02Z ERROR botster_hub::tunnel] [Tunnel] WebSocket connection failed: HTTP error: 404 Not Found
+[2026-01-11T22:49:02Z WARN  botster_hub::hub::registration] Tunnel connection error: HTTP error: 404 Not Found, reconnecting in 5s...
+[2026-01-11T22:49:04Z INFO  botster_hub::hub::registration] Sending shutdown notification to server...
+[2026-01-11T22:49:04Z WARN  botster_hub::hub::registration] Failed to unregister hub: 405 Method Not Allowed

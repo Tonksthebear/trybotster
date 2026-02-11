@@ -1,0 +1,196 @@
+// Preview Service Worker
+// Intercepts HTTP requests and proxies them through the E2E WebSocket connection
+// via postMessage to the preview shell page.
+
+const SW_VERSION = '<%= Digest::MD5.hexdigest(File.read(Rails.root.join("app/views/hubs/agents/previews/service_worker.js.erb")))[0..7] %>';
+const SCOPE = '<%= @proxy_base %>';
+
+// Take control immediately
+self.addEventListener('activate', (event) => {
+  event.waitUntil(clients.claim());
+});
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(self.skipWaiting());
+});
+
+// Map of pending requests waiting for responses
+const pendingRequests = new Map();
+let requestIdCounter = 0;
+
+// Handle messages from the preview shell page
+self.addEventListener('message', (event) => {
+  const { type, requestId, response, error } = event.data;
+
+  // Handle skip waiting request from bootstrap
+  if (type === 'SKIP_WAITING') {
+    self.skipWaiting();
+    return;
+  }
+
+  if (type === 'http_response') {
+    const pending = pendingRequests.get(requestId);
+    if (pending) {
+      pendingRequests.delete(requestId);
+      if (error) {
+        pending.reject(new Error(error));
+      } else {
+        pending.resolve(response);
+      }
+    }
+  }
+});
+
+// Intercept fetch requests
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+
+  // Only intercept same-origin requests
+  if (url.origin !== location.origin) {
+    return;
+  }
+
+  const scopePath = SCOPE;
+
+  // Pass through the shell page (/preview/shell) and bootstrap (/preview)
+  // Shell is at a distinct path so /preview/ can proxy to dev server root
+  if (url.pathname === scopePath || url.pathname === scopePath + '/shell') {
+    return;
+  }
+
+  // Pass through service worker requests
+  if (url.pathname.endsWith('/sw.js')) {
+    return;
+  }
+
+  // Check if this is a preview-scoped request OR an asset request from the preview iframe
+  let relativePath;
+
+  if (url.pathname.startsWith(scopePath + '/')) {
+    // Preview-scoped request: /hubs/123/agents/0/1/preview/api/users -> /api/users
+    relativePath = url.pathname.slice(scopePath.length) || '/';
+  } else if (url.pathname.startsWith('/assets/')) {
+    // Asset request - only proxy if from proxied iframe content, NOT from shell page
+    const referrer = event.request.referrer;
+    // Shell page assets should NOT be proxied (they're from trybotster.com)
+    // Only proxy assets when referrer is proxied content (not /shell)
+    if (referrer && referrer.includes(scopePath) && !referrer.endsWith('/shell')) {
+      relativePath = url.pathname;
+    } else {
+      // Shell page assets or no referrer - don't proxy
+      return;
+    }
+  } else {
+    // Not ours to proxy
+    return;
+  }
+
+  event.respondWith(proxyRequest(event.request, relativePath, url.search));
+});
+
+async function proxyRequest(request, path, queryString) {
+  // Get a client (the preview shell page) to communicate with
+  const clients = await self.clients.matchAll({ type: 'window' });
+  const client = clients.find(c => c.url.includes(SCOPE));
+
+  if (!client) {
+    return new Response('Preview shell not loaded. Please refresh the page.', {
+      status: 503,
+      statusText: 'Service Unavailable'
+    });
+  }
+
+  // Generate unique request ID
+  const requestId = `req_${++requestIdCounter}_${Date.now()}`;
+
+  // Read request body if present
+  let body = null;
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    try {
+      body = await request.text();
+    } catch (e) {
+      // No body or couldn't read it
+    }
+  }
+
+  // Collect headers
+  const headers = {};
+  request.headers.forEach((value, key) => {
+    // Skip headers that shouldn't be forwarded
+    if (!['host', 'connection', 'upgrade'].includes(key.toLowerCase())) {
+      headers[key] = value;
+    }
+  });
+
+  // Create promise for the response
+  const responsePromise = new Promise((resolve, reject) => {
+    pendingRequests.set(requestId, { resolve, reject });
+
+    // Timeout after 30 seconds
+    setTimeout(() => {
+      if (pendingRequests.has(requestId)) {
+        pendingRequests.delete(requestId);
+        reject(new Error('Request timeout'));
+      }
+    }, 30000);
+  });
+
+  // Send request to preview shell via postMessage
+  client.postMessage({
+    type: 'http_request',
+    requestId,
+    method: request.method,
+    path: path + queryString,
+    headers,
+    body
+  });
+
+  try {
+    const response = await responsePromise;
+
+    // Decode body from base64 if present
+    let responseBody = null;
+    if (response.body) {
+      try {
+        // Body is base64 encoded
+        const binaryString = atob(response.body);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        // Decompress gzip if needed (browser won't auto-decompress programmatic Response)
+        const contentEncoding = (response.headers || {})['content-encoding'] || '';
+        if (contentEncoding.includes('gzip')) {
+          try {
+            const ds = new DecompressionStream('gzip');
+            const decompressed = new Response(bytes).body.pipeThrough(ds);
+            responseBody = await new Response(decompressed).arrayBuffer();
+            responseBody = new Uint8Array(responseBody);
+            // Remove content-encoding since we decompressed
+            delete response.headers['content-encoding'];
+          } catch (decompressErr) {
+            console.warn('[SW] Decompression failed, using raw bytes:', decompressErr);
+            responseBody = bytes;
+          }
+        } else {
+          responseBody = bytes;
+        }
+      } catch (e) {
+        // Plain text fallback
+        responseBody = response.body;
+      }
+    }
+
+    return new Response(responseBody, {
+      status: response.status || 200,
+      statusText: response.statusText || 'OK',
+      headers: response.headers || {}
+    });
+  } catch (error) {
+    return new Response(`Proxy error: ${error.message}`, {
+      status: 502,
+      statusText: 'Bad Gateway'
+    });
+  }
+}

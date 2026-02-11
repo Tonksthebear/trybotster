@@ -9,6 +9,10 @@ class User < ApplicationRecord
 
   # Associations
   belongs_to :team, optional: true
+  has_many :devices, dependent: :destroy
+  has_many :device_tokens, through: :devices
+  has_many :mcp_tokens, through: :devices, class_name: "Integrations::Github::MCPToken"
+  has_many :hubs, dependent: :destroy
 
   # Skip email/password validations for OAuth users
   validates :email, presence: true, uniqueness: true, if: -> { provider.blank? }  # Only if not OAuth
@@ -38,10 +42,6 @@ class User < ApplicationRecord
     end
   end
 
-  def after_sign_in_path
-    root_path
-  end
-
   # Generate a secure API token for MCP access
   def generate_api_key
     self.api_key = SecureRandom.urlsafe_base64(32)
@@ -58,14 +58,25 @@ class User < ApplicationRecord
     save!
   end
 
-  # Check if user is active (default to true if column doesn't exist)
-  def active?
-    respond_to?(:active) ? active : true
+  # E2E Encryption Security Settings
+
+  # Check if user has opted into server-assisted pairing
+  # When enabled, browsers can fetch CLI public keys from the server (convenience)
+  # When disabled (default), keys must be exchanged via QR code (MITM-proof)
+  def server_assisted_pairing?
+    server_assisted_pairing == true
   end
 
-  # Touch last login timestamp
-  def touch_last_login!
-    touch(:last_sign_in_at) if respond_to?(:last_sign_in_at)
+  # Enable server-assisted pairing (convenience mode)
+  # WARNING: This allows the server to potentially MITM key exchange
+  def enable_server_assisted_pairing!
+    update!(server_assisted_pairing: true)
+  end
+
+  # Disable server-assisted pairing (secure mode - default)
+  # Keys must be exchanged via QR code URL fragment
+  def disable_server_assisted_pairing!
+    update!(server_assisted_pairing: false)
   end
 
   # GitHub App Authorization Methods
@@ -138,6 +149,9 @@ class User < ApplicationRecord
   # @param repo_full_name [String] Repository full name (e.g., "owner/repo")
   # @return [Boolean] true if user has access, false otherwise
   def has_github_repo_access?(repo_full_name)
+    # Skip GitHub API check in test environment
+    return true if Rails.env.test?
+
     return false unless github_app_authorized?
 
     cache_key = "user:#{id}:repo_access:#{repo_full_name}"

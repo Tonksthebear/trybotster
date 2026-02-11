@@ -1,0 +1,20 @@
+<el-dialog>
+  <dialog id="sidebar" class="backdrop:bg-transparent lg:hidden">
+    <el-dialog-backdrop class="fixed inset-0 bg-black/80 backdrop-blur-sm transition-opacity data-closed:opacity-0 data-enter:duration-200 data-enter:ease-out data-leave:duration-150 data-leave:ease-in"></el-dialog-backdrop>
+
+    <div tabindex="0" class="fixed inset-0 flex focus:outline-hidden">
+      <el-dialog-panel class="group/dialog-panel relative mr-16 flex w-full max-w-xs flex-1 transform transition-all data-closed:-translate-x-full data-enter:duration-200 data-enter:ease-out data-leave:duration-150 data-leave:ease-in">
+        <div class="absolute top-0 left-full flex w-16 justify-center pt-5 duration-200 ease-out group-data-closed/dialog-panel:opacity-0">
+          <button type="button" command="close" commandfor="sidebar" class="-m-2.5 p-2.5">
+            <span class="sr-only">Close sidebar</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" class="size-6 text-zinc-400 hover:text-zinc-200">
+              <path d="M6 18 18 6M6 6l12 12" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+        </div>
+
+        <%= content %>
+      </el-dialog-panel>
+    </div>
+  </dialog>
+</el-dialog>

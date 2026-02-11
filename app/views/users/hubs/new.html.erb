@@ -1,0 +1,57 @@
+<div class="min-h-[calc(100vh-8rem)] flex items-center justify-center px-4 py-12">
+  <div class="max-w-md w-full">
+    <%# Header %>
+    <div class="text-center mb-8">
+      <div class="inline-flex items-center justify-center w-16 h-16 bg-primary-500/10 rounded-2xl mb-6">
+        <svg class="w-8 h-8 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+        </svg>
+      </div>
+      <h1 class="text-3xl font-bold text-zinc-100 mb-2">Connect Hub</h1>
+      <p class="text-zinc-400">
+        Enter the code displayed in your CLI terminal
+      </p>
+    </div>
+
+    <% if flash[:alert] %>
+      <div class="bg-danger-500/10 border border-danger-500/20 rounded-lg p-4 mb-6">
+        <div class="flex items-center gap-3">
+          <svg class="w-5 h-5 text-danger-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+          <p class="text-sm text-danger-300"><%= flash[:alert] %></p>
+        </div>
+      </div>
+    <% end %>
+
+    <%# Code entry form %>
+    <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-6">
+      <%= form_with url: users_hubs_path, method: :post, class: "space-y-6" do |f| %>
+        <div>
+          <label for="user_code" class="block text-sm font-medium text-zinc-300 mb-2">
+            Device Code
+          </label>
+          <input type="text"
+                 name="user_code"
+                 id="user_code"
+                 autofocus
+                 autocomplete="off"
+                 placeholder="XXXX-XXXX"
+                 class="w-full px-4 py-4 bg-zinc-950 border border-zinc-700 rounded-lg text-zinc-100 placeholder-zinc-600 font-mono text-2xl text-center tracking-widest uppercase focus:outline-hidden focus:border-primary-500 focus:ring-1 focus:ring-primary-500 transition-colors">
+          <p class="mt-3 text-xs text-zinc-500">
+            Run <code class="px-1.5 py-0.5 bg-zinc-800 rounded font-mono text-primary-400">botster</code> in your terminal to get the code
+          </p>
+        </div>
+
+        <%= render Elements::ButtonComponent.new("Continue", as: :button, type: :submit, size: :lg, class: "w-full") %>
+      <% end %>
+    </div>
+
+    <%# Back link %>
+    <div class="text-center mt-6">
+      <%= link_to root_path, class: "text-sm text-zinc-500 hover:text-zinc-300 transition-colors" do %>
+        &larr; Back to home
+      <% end %>
+    </div>
+  </div>
+</div>

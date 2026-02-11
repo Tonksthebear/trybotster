@@ -78,11 +78,11 @@ IMPORTANT:
 
 Start by fetching the issue details using the trybotster MCP server."
 
-message = Bot::Message.create!(
+message = Integrations::Github::Message.create!(
   event_type: 'github_mention',
+  repo: ENV['TEST_REPO'],
+  issue_number: ENV['TEST_ISSUE_NUMBER'].to_i,
   payload: {
-    repo: ENV['TEST_REPO'],
-    issue_number: ENV['TEST_ISSUE_NUMBER'].to_i,
     comment_id: 999999,
     comment_body: '@trybotster test spawn',
     comment_author: 'test-user',
@@ -90,13 +90,12 @@ message = Bot::Message.create!(
     issue_body: 'Test issue body',
     issue_url: "https://github.com/#{ENV['TEST_REPO']}/issues/#{ENV['TEST_ISSUE_NUMBER']}",
     is_pr: false,
-    context: context
+    prompt: context
   }
 )
 
-puts "Created Bot::Message #{message.id}"
+puts "Created Integrations::Github::Message #{message.id}"
 puts "Status: #{message.status}"
-puts "Claimed: #{message.claimed? ? 'yes' : 'no'}"
 RUBY_SCRIPT
 
 # Run with environment variables

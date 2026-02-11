@@ -1,0 +1,146 @@
+<% content_for :head do %>
+  <%= stylesheet_link_tag "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" %>
+<% end %>
+
+<%#
+  Agent Terminal View
+
+  Controllers:
+  - terminal-display: xterm.js rendering, acquires TerminalConnection via ConnectionManager
+  - connection-status: Unified connection state display (three-column view)
+  - agent-list: Sidebar agent list (uses template)
+%>
+
+<%# Main terminal view %>
+<div class="h-full flex flex-col overflow-hidden"
+     data-controller="terminal-display"
+     data-terminal-display-hub-id-value="<%= Current.hub.id %>"
+     data-terminal-display-agent-index-value="<%= Current.agent_index %>"
+     data-terminal-display-pty-index-value="<%= Current.pty_index %>">
+
+  <%# Header %>
+  <div class="shrink-0 border-b border-zinc-800 bg-zinc-900/50">
+    <%# Mobile header - compact %>
+    <div class="lg:hidden px-3 py-2">
+      <div class="flex items-center justify-between gap-2">
+        <%# Hub/Agent label %>
+        <span class="text-sm font-mono text-zinc-300 truncate min-w-0">
+          <%= Current.hub.device&.name || Current.hub.identifier.truncate(16) %>
+        </span>
+
+        <%# Connection status %>
+        <%= render "shared/connection_status",
+                   hub: Current.hub,
+                   connection_type: "terminal",
+                   agent_index: Current.agent_index,
+                   pty_index: Current.pty_index %>
+      </div>
+    </div>
+
+    <%# Desktop header - full %>
+    <div class="hidden lg:block px-4 py-3">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-4 min-w-0">
+          <div class="min-w-0">
+            <h1 class="text-lg font-bold text-zinc-100 font-mono truncate">
+              <%= Current.hub.device&.name || Current.hub.identifier.truncate(24) %>
+            </h1>
+            <p class="text-xs text-zinc-500 truncate">
+              <%= Current.hub.identifier %>
+            </p>
+          </div>
+        </div>
+
+<%# Connection status - three-column view %>
+        <%= render "shared/connection_status",
+                   hub: Current.hub,
+                   connection_type: "terminal",
+                   agent_index: Current.agent_index,
+                   pty_index: Current.pty_index %>
+      </div>
+    </div>
+  </div>
+
+  <%# Terminal Panel %>
+  <div class="flex-1 min-h-0 flex flex-col">
+
+    <div class="flex-1 flex flex-col min-h-0 bg-zinc-950 overflow-hidden">
+      <%# Terminal header bar %>
+      <div class="shrink-0 px-2 lg:px-4 py-1.5 lg:py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900"
+           data-controller="pty-tabs"
+           data-pty-tabs-hub-id-value="<%= Current.hub.id %>"
+           data-pty-tabs-agent-index-value="<%= Current.agent_index %>"
+           data-pty-tabs-pty-index-value="<%= Current.pty_index %>">
+        <div class="flex items-center gap-2 lg:gap-3">
+          <%# Traffic lights - desktop only %>
+          <div class="hidden lg:flex items-center gap-1.5">
+            <span class="size-3 rounded-full bg-red-500/80"></span>
+            <span class="size-3 rounded-full bg-yellow-500/80"></span>
+            <span class="size-3 rounded-full bg-green-500/80"></span>
+          </div>
+
+          <%# Dynamic PTY session tabs (populated from sessions[] via Stimulus) %>
+          <div>
+            <div data-pty-tabs-target="tabBar"
+                 class="flex items-center bg-zinc-800/50 rounded p-0.5">
+              <%# Default tab rendered server-side; replaced dynamically when session data arrives %>
+              <%= link_to hub_agent_pty_path(Current.hub, Current.agent_index, 0),
+                          class: "px-2 py-1 text-xs font-medium rounded transition-colors #{Current.pty_index == 0 ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}",
+                          data: { turbo_action: "replace" } do %>
+                Agent
+              <% end %>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2 lg:gap-3">
+          <%# Preview button - shown only when current PTY has port forwarding %>
+          <div data-pty-tabs-target="preview" hidden>
+            <%= link_to hub_agent_pty_preview_path(Current.hub, Current.agent_index, Current.pty_index),
+                        class: "inline-flex items-center gap-1.5 px-2 py-1 text-xs font-medium bg-zinc-700/50 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 rounded transition-colors",
+                        target: "_blank" do %>
+              <%= icon "eye", class: "size-3" %>
+              <span class="hidden sm:inline">Preview</span>
+            <% end %>
+          </div>
+
+          <span class="text-xs text-zinc-600 hidden lg:inline">scroll: mouse wheel</span>
+        </div>
+      </div>
+
+      <%# Terminal content %>
+      <div data-terminal-display-target="container" class="terminal-container flex-1 min-h-0 bg-zinc-950"></div>
+    </div>
+  </div>
+
+  <%# Mobile Touch Controls %>
+  <div class="shrink-0 lg:hidden border-t border-zinc-800 bg-zinc-900 touch-controls-container"
+       data-controller="keyboard-viewport">
+    <div class="flex gap-1.5 px-2 py-2 overflow-x-auto scrollbar-none">
+      <%# Primary keys %>
+      <%= render Elements::ButtonComponent.new("^C", color: :neutral, variant: :soft, size: :sm, class: "shrink-0 font-mono", data: { action: "terminal-display#sendCtrlC" }) %>
+      <%= render Elements::ButtonComponent.new("Enter", color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendEnter" }) %>
+      <%= render Elements::ButtonComponent.new("Tab", color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendTab" }) %>
+      <%= render Elements::ButtonComponent.new("Esc", color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendEscape" }) %>
+
+      <%# Separator %>
+      <div class="shrink-0 w-px bg-zinc-700 mx-0.5"></div>
+
+      <%# Arrow keys %>
+      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowUp" }) do %>
+        <%= icon "chevron-up", class: "size-4" %>
+      <% end %>
+      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowDown" }) do %>
+        <%= icon "chevron-down", class: "size-4" %>
+      <% end %>
+      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowLeft" }) do %>
+        <%= icon "chevron-left", class: "size-4" %>
+      <% end %>
+      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowRight" }) do %>
+        <%= icon "chevron-right", class: "size-4" %>
+      <% end %>
+
+      <div class="shrink-0 w-4"></div>
+    </div>
+  </div>
+</div>

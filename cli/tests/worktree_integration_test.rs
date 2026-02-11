@@ -1,4 +1,6 @@
 use botster_hub::Agent;
+use botster_hub::agent::spawn::PtySpawnConfig;
+use std::collections::HashMap;
 use std::process::Command;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -55,8 +57,8 @@ fn test_worktree_creation_with_real_git() {
     assert!(worktrees.contains("test-repo"));
 }
 
-#[test]
-fn test_agent_spawns_with_echo_command() {
+#[tokio::test]
+async fn test_agent_spawns_with_echo_command() {
     let temp_dir = TempDir::new().unwrap();
     let worktree = temp_dir.path().to_path_buf();
 
@@ -66,21 +68,29 @@ fn test_agent_spawns_with_echo_command() {
         "test/repo".to_string(),
         Some(1),
         "test-branch".to_string(),
-        worktree,
+        worktree.clone(),
     );
 
     // Spawn with echo command (simple, won't fail)
-    let result = agent.spawn("echo test", "", vec![], std::collections::HashMap::new());
+    let config = PtySpawnConfig {
+        worktree_path: worktree,
+        command: "echo test".to_string(),
+        env: HashMap::new(),
+        init_commands: vec![],
+        detect_notifications: false,
+        port: None,
+        context: String::new(),
+    };
+    let result = agent.cli_pty.spawn(config);
 
     // Should succeed in spawning
     assert!(result.is_ok());
 
     // Give it a moment to run
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Buffer should have spawn messages
-    let snapshot = agent.get_buffer_snapshot();
-    assert!(snapshot.iter().any(|line| line.contains("Spawning agent")));
+    // Verify PTY is spawned and has a master
+    assert!(agent.cli_pty.is_spawned());
 }
 
 #[test]
@@ -103,8 +113,8 @@ fn test_multiple_agents_different_issues() {
         temp_dir.path().to_path_buf(),
     );
 
-    // Different issue numbers should have different session keys
-    assert_ne!(agent1.session_key(), agent2.session_key());
-    assert_eq!(agent1.session_key(), "owner-repo-1");
-    assert_eq!(agent2.session_key(), "owner-repo-2");
+    // Different issue numbers should have different agent IDs
+    assert_ne!(agent1.agent_id(), agent2.agent_id());
+    assert_eq!(agent1.agent_id(), "owner-repo-1");
+    assert_eq!(agent2.agent_id(), "owner-repo-2");
 }

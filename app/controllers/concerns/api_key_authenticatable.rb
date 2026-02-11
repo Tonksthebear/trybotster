@@ -18,7 +18,7 @@ module ApiKeyAuthenticatable
       return
     end
 
-    @current_api_user = User.find_by(api_key: api_key)
+    @current_api_user = find_user_by_token(api_key)
 
     unless @current_api_user
       render_unauthorized("Invalid API key")
@@ -30,11 +30,28 @@ module ApiKeyAuthenticatable
   end
 
   def extract_api_key
-    # Support both header and query parameter
-    request.headers["X-API-Key"] || params[:api_key]
+    # Support Authorization: Bearer header (preferred, Fizzy-style)
+    # Falls back to X-API-Key header and query param for backwards compatibility
+    if (auth_header = request.headers["Authorization"])
+      auth_header.delete_prefix("Bearer ")
+    else
+      request.headers["X-API-Key"] || params[:api_key]
+    end
+  end
+
+  def api_key_present?
+    extract_api_key.present?
   end
 
   def render_unauthorized(message)
     render json: { error: message }, status: :unauthorized
+  end
+
+  def find_user_by_token(token)
+    device_token = DeviceToken.find_by(token: token)
+    return nil unless device_token
+
+    device_token.touch_usage!(ip: request.remote_ip)
+    device_token.device&.user
   end
 end

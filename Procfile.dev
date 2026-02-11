@@ -1,2 +1,4 @@
-web: bin/rails server -b 0.0.0.0
+web: bin/rails server -b 0.0.0.0 -p ${PORT:-3000}
 css: bin/rails tailwindcss:watch
+jobs: bin/jobs
+# turn: turnserver (disabled - using metered.co hosted TURN)

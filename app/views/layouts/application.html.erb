@@ -1,18 +1,16 @@
 <!DOCTYPE html>
-<html>
+<html class="dark">
   <head>
-    <title><%= content_for(:title) || "Llm Memories" %></title>
-    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title><%= content_for(:title) || "Botster" %></title>
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="application-name" content="Llm Memories">
+    <meta name="application-name" content="Botster">
     <meta name="mobile-web-app-capable" content="yes">
     <%= csrf_meta_tags %>
     <%= csp_meta_tag %>
+    <%= action_cable_meta_tag %>
 
     <%= yield :head %>
-
-    <%# Enable PWA manifest for installable apps (make sure to enable in config/routes.rb too!) %>
-    <%#= tag.link rel: "manifest", href: pwa_manifest_path(format: :json) %>
 
     <link rel="icon" href="/icon.png" type="image/png">
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
@@ -23,9 +21,80 @@
     <%= javascript_importmap_tags %>
   </head>
 
-  <body>
-    <main class="container mx-auto mt-28 px-5 flex">
+  <body class="bg-zinc-950 text-zinc-100 min-h-dvh font-sans antialiased flex flex-col">
+    <%= render Elements::StackedLayoutComponent.new(style: :border) do |layout| %>
+      <% layout.with_navbar do %>
+        <%# Logo & Nav Links %>
+        <div class="flex items-center gap-8">
+          <%= link_to root_path, class: "flex items-center gap-2 text-primary-400 hover:text-primary-300 transition-colors" do %>
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+            <span class="font-mono font-bold text-lg tracking-tight">botster</span>
+          <% end %>
+
+          <% if user_signed_in? %>
+            <div class="hidden sm:flex items-center gap-1">
+              <%= link_to hubs_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path == hubs_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
+                Hubs
+              <% end %>
+              <%= link_to settings_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path == settings_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
+                Settings
+              <% end %>
+            </div>
+          <% end %>
+        </div>
+
+        <%# User Info & Logout (desktop) %>
+        <div class="hidden sm:flex items-center gap-4">
+          <% if user_signed_in? %>
+            <span class="text-sm text-zinc-500 font-mono">
+              <%= current_user.username || current_user.email %>
+            </span>
+            <%= link_to destroy_user_session_path,
+                        data: { turbo_method: :delete },
+                        class: "text-sm text-zinc-400 hover:text-zinc-200 transition-colors" do %>
+              Logout
+            <% end %>
+          <% end %>
+        </div>
+      <% end %>
+
+      <% layout.with_mobile_menu do %>
+        <div class="space-y-1 px-4 py-3 border-t border-zinc-800">
+          <% if user_signed_in? %>
+            <%= link_to hubs_path, class: "block px-3 py-2 rounded text-base font-medium transition-colors #{request.path == hubs_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100'}" do %>
+              Hubs
+            <% end %>
+            <%= link_to settings_path, class: "block px-3 py-2 rounded text-base font-medium transition-colors #{request.path == settings_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100'}" do %>
+              Settings
+            <% end %>
+            <div class="border-t border-zinc-800 mt-3 pt-3">
+              <div class="px-3 py-2 text-sm text-zinc-500 font-mono">
+                <%= current_user.username || current_user.email %>
+              </div>
+              <%= link_to destroy_user_session_path,
+                          data: { turbo_method: :delete },
+                          class: "block px-3 py-2 rounded text-base font-medium text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition-colors" do %>
+                Logout
+              <% end %>
+            </div>
+          <% end %>
+        </div>
+      <% end %>
+
       <%= yield %>
-    </main>
+    <% end %>
+
+    <% unless content_for?(:no_footer) %>
+      <%# Footer %>
+      <footer class="border-t border-zinc-800 mt-auto py-6">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <p class="text-center text-xs text-zinc-600 font-mono">
+            botster &middot; local-first agent platform
+          </p>
+        </div>
+      </footer>
+    <% end %>
   </body>
 </html>

@@ -38,6 +38,8 @@ GitHub Issue/PR Comment
 - **🧹 Auto-cleanup**: Closes agents and deletes worktrees when issues are closed
 - **🔄 Smart Deduplication**: Multiple mentions to the same issue ping the existing agent
 - **📡 MCP Integration**: Agents interact with GitHub via Model Context Protocol
+- **🔐 E2E Encrypted**: Signal Protocol encryption - server cannot read terminal content
+- **🖥️ Web GUI**: Remote view/control agents from any browser via QR code pairing
 
 ## 📦 Architecture
 
@@ -49,37 +51,36 @@ GitHub Issue/PR Comment
                       │ Webhook
                       ↓
 ┌──────────────────────────────────────────────────────────────┐
-│              Rails Server (Message Broker)                    │
+│              Rails Server (Message Broker + Relay)            │
 │                                                               │
 │  • Receives GitHub webhooks                                  │
-│  • Creates Bot::Message records                              │
+│  • Creates Integrations::Github::Message records              │
 │  • Verifies repo access via GitHub API                       │
 │  • Provides MCP tools for agents                             │
+│  • Relays E2E encrypted terminal data (cannot decrypt)       │
 │  • Auto-cleanup on issue/PR close                            │
 │                                                               │
 │  Event Types:                                                │
 │  • github_mention - New @trybotster mention                  │
 │  • agent_cleanup - Issue/PR closed, cleanup agent            │
 └─────────────────────┬────────────────────────────────────────┘
-                      │ HTTP Polling
+                      │ HTTP Polling + ActionCable WebSocket
                       ↓
 ┌──────────────────────────────────────────────────────────────┐
 │               Rust Daemon (botster-hub)                       │
 │                                                               │
 │  • Interactive TUI (ratatui)                                 │
-│  • Polls Rails API every 5 seconds                           │
-│  • Manages agents in HashMap by session key                  │
+│  • Polls Rails API for GitHub messages                       │
+│  • Signal Protocol encryption for browser streaming          │
 │  • Creates/deletes git worktrees                             │
 │  • Spawns Claude in PTY for each agent                       │
 │  • Routes keyboard input to selected agent                   │
-│  • Handles cleanup on issue/PR close                         │
-│  • Pings existing agents on duplicate mentions               │
+│  • QR code pairing for browser connections                   │
 │                                                               │
 │  Agent Sessions:                                             │
 │  • Key: "repo-safe-issue_number"                            │
 │  • Worktree: ~/botster-sessions/org-repo-123/              │
 │  • Full VT100 terminal emulation                            │
-│  • Environment variables for context                         │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -98,6 +99,11 @@ GitHub Issue/PR Comment
 - Rust (for building the daemon)
 - Claude Code CLI
 - Git
+- **Supported Terminals:**
+  - Ghostty (recommended)
+  - iTerm2
+  - Other terminals that support OSC 9 notifications
+  - Note: macOS Terminal.app does not support agent notifications
 
 ### 1. Server Setup
 
@@ -149,12 +155,7 @@ GITHUB_WEBHOOK_SECRET=your_webhook_secret
 rails server
 
 # Visit http://localhost:3000 and login with GitHub
-# Generate your API key in Rails console:
-
-rails console
-user = User.find_by(username: "your_github_username")
-user.regenerate_api_key!
-puts user.api_key  # Save this!
+# Your account is now ready - no API key generation needed!
 ```
 
 ### 4. Daemon Setup
@@ -168,20 +169,27 @@ cargo build --release
 
 The binary will be at `target/release/botster-hub`.
 
-Configure via environment variables:
-
-```bash
-export BOTSTER_API_KEY="your_api_key_from_step_3"
-# Optional overrides:
-# export BOTSTER_SERVER_URL="https://your-domain.com"  # default: https://trybotster.com
-# export BOTSTER_WORKTREE_BASE="$HOME/my-worktrees"    # default: ~/botster-sessions
-# export BOTSTER_POLL_INTERVAL="10"                    # default: 5 seconds
-```
-
-Start the daemon:
+**First-time setup** - The CLI uses device authorization (like signing into a TV):
 
 ```bash
 ./target/release/botster-hub start
+
+# CLI will display:
+#   To authorize this device, visit: https://trybotster.com/users/hubs/new
+#   And enter code: ABCD-1234
+#   [QR code displayed]
+#
+# Scan QR or visit URL, enter the code, and approve.
+# Token is saved securely in your OS keychain.
+```
+
+**Optional environment overrides:**
+
+```bash
+# export BOTSTER_SERVER_URL="https://your-domain.com"  # default: https://trybotster.com
+# export BOTSTER_WORKTREE_BASE="$HOME/my-worktrees"    # default: ~/botster-sessions
+# export BOTSTER_POLL_INTERVAL="10"                    # default: 5 seconds
+# export BOTSTER_TOKEN="btstr_..."                     # CI/CD: skip device flow
 ```
 
 ### 5. Repository Setup
@@ -208,6 +216,23 @@ claude --permission-mode acceptEdits "$BOTSTER_PROMPT"
 #!/bin/bash
 # Remove worktree from Claude's trusted projects
 "$BOTSTER_HUB_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
+```
+
+**`.botster_server`** - Background dev server for tunnel preview (optional):
+
+```bash
+#!/bin/bash
+# Runs when agent spawns with BOTSTER_TUNNEL_PORT set
+# Customize for your project (Rails, Node, Python, etc.)
+
+# For Rails with bin/dev (foreman/overmind):
+PORT=$BOTSTER_TUNNEL_PORT bin/dev
+
+# Or for Rails server only:
+# bin/rails server -p "$BOTSTER_TUNNEL_PORT" -b 127.0.0.1
+
+# Or for Node:
+# npm run dev -- --port $BOTSTER_TUNNEL_PORT
 ```
 
 **`.botster_copy`** - Files to copy to each worktree:
@@ -287,15 +312,30 @@ BOTSTER_PROMPT="User's request text"
 BOTSTER_MESSAGE_ID=42
 BOTSTER_HUB_BIN=/path/to/botster-hub
 BOTSTER_TOKEN=your_api_key  # For MCP server auth
+BOTSTER_TUNNEL_PORT=4001    # Port for HTTP tunnel (if available)
 ```
+
+### Web GUI
+
+View and control agents from any browser with E2E encryption.
+
+**How it works:**
+
+1. CLI displays QR code in the TUI containing its Signal Protocol public keys
+2. Open https://trybotster.com/hubs in your browser
+3. Scan the QR code with your phone or click "Connect" and scan with webcam
+4. Browser and CLI establish encrypted Signal Protocol session
+5. Terminal output streams in real-time - server only sees encrypted blobs
+
+**Pairing is per-device:** Each browser/device scans and pairs independently. The server never has access to decryption keys.
 
 ## 🛠️ Configuration
 
 ### Environment Variables
 
-**Required:**
+**Authentication (optional - device flow is preferred):**
 
-- `BOTSTER_API_KEY` - Your API key from Rails
+- `BOTSTER_TOKEN` - Skip device authorization flow (for CI/CD)
 
 **Optional (with defaults):**
 
@@ -312,7 +352,6 @@ Create `~/.botster_hub/config.json` to set defaults:
 ```json
 {
   "server_url": "https://trybotster.com",
-  "api_key": "your_key_here",
   "poll_interval": 5,
   "agent_timeout": 3600,
   "max_sessions": 20,
@@ -320,7 +359,7 @@ Create `~/.botster_hub/config.json` to set defaults:
 }
 ```
 
-Environment variables override config file values.
+**Note:** Tokens are stored in your OS keychain (macOS Keychain, Linux Secret Service), not in this config file. Environment variables override config file values.
 
 ## 🔧 MCP Tools
 
@@ -345,43 +384,145 @@ trybotster/
 ├── app/
 │   ├── models/
 │   │   ├── bot/message.rb           # Message queue
+│   │   ├── device_token.rb          # btstr_ auth tokens
+│   │   ├── hub.rb                   # Hub records
 │   │   ├── github/app.rb            # GitHub API wrapper
 │   │   └── user.rb                  # User auth
 │   │
+│   ├── channels/
+│   │   ├── hub_command_channel.rb     # Hub command channel (signaling)
+│   │   └── preview_channel.rb         # Preview relay (legacy ActionCable)
+│   │
 │   ├── controllers/
-│   │   ├── bots/messages_controller.rb     # API for daemon
+│   │   ├── hubs_controller.rb              # Hub management
+│   │   ├── hubs/messages_controller.rb     # Message polling
+│   │   ├── hubs/codes_controller.rb        # Device authorization
 │   │   └── github/webhooks_controller.rb   # Webhook receiver
+│   │
+│   ├── javascript/
+│   │   ├── signal/                  # Signal Protocol WASM wrapper
+│   │   ├── workers/                 # Web Worker for crypto isolation
+│   │   └── controllers/             # Stimulus controllers
 │   │
 │   └── mcp/tools/                   # MCP tool implementations
 │
-├── cli/                             # Rust daemon (CLI)
+├── cli/                             # Rust daemon
 │   ├── src/
-│   │   ├── main.rs                  # TUI and daemon logic
-│   │   ├── agent.rs                 # Agent PTY management
+│   │   ├── main.rs                  # Entry point
+│   │   ├── config.rs                # Configuration + keyring
+│   │   ├── auth.rs                  # Device authorization flow
 │   │   ├── git.rs                   # Worktree operations
-│   │   └── config.rs                # Configuration
+│   │   ├── hub/                     # Hub management
+│   │   ├── relay/                   # Browser relay + Signal Protocol
+│   │   │   ├── signal.rs            # X3DH + Double Ratchet + Kyber
+│   │   │   └── connection.rs        # ActionCable WebSocket
+│   │   ├── agent/                   # Agent/PTY management
+│   │   └── tui/                     # Terminal UI (ratatui)
 │   └── Cargo.toml
 │
-└── README.md                        # This file
+└── README.md
 ```
 
 ## 🔒 Security
 
-### Webhook Verification
+### End-to-End Encrypted Terminal Streaming
 
-GitHub webhooks are verified using HMAC-SHA256 signatures.
+When you view agents through the Web GUI, terminal content is **end-to-end encrypted** using the Signal Protocol. The server acts as a pure relay and **cannot decrypt your terminal output**.
 
-### API Authentication
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Security Architecture                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   ┌──────────────┐                                    ┌──────────────┐      │
+│   │   Browser    │                                    │     CLI      │      │
+│   │              │                                    │              │      │
+│   │  ┌────────┐  │      1. QR Code Scan (Visual)      │  ┌────────┐  │      │
+│   │  │ Signal │  │◄──────────────────────────────────►│  │ Signal │  │      │
+│   │  │Protocol│  │      (Keys exchanged locally)      │  │Protocol│  │      │
+│   │  └────────┘  │                                    │  └────────┘  │      │
+│   │      │       │                                    │      │       │      │
+│   │      │       │   2. Encrypted Terminal Data       │      │       │      │
+│   │      ▼       │         (ciphertext only)          │      ▼       │      │
+│   │  [Decrypt]   │◄──────────────────────────────────►│  [Encrypt]   │      │
+│   │      │       │                │                   │      ▲       │      │
+│   │      ▼       │                │                   │      │       │      │
+│   │  Terminal    │                │                   │  PTY Output  │      │
+│   │   Display    │                │                   │              │      │
+│   └──────────────┘                │                   └──────────────┘      │
+│                                   │                                          │
+│                    ┌──────────────▼──────────────┐                          │
+│                    │      Rails Server           │                          │
+│                    │      (Pure Relay)           │                          │
+│                    │                             │                          │
+│                    │  ✓ Sees: connection timing  │                          │
+│                    │  ✓ Sees: message sizes      │                          │
+│                    │  ✗ Cannot see: plaintext    │                          │
+│                    │  ✗ Cannot see: keystrokes   │                          │
+│                    │  ✗ Cannot decrypt anything  │                          │
+│                    └─────────────────────────────┘                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-Daemon authenticates to Rails using `X-API-Key` header.
+**Cryptographic Details:**
 
-### Repository Access
+| Component | Algorithm | Purpose |
+|-----------|-----------|---------|
+| Key Exchange | X3DH (Extended Triple Diffie-Hellman) | Initial session establishment |
+| Message Encryption | Double Ratchet + AES-256-GCM | Forward secrecy per message |
+| Post-Quantum | Kyber1024 | Resistance to future quantum attacks |
+| Signing | Ed25519 | Identity verification |
 
-Users must have GitHub access to a repository to receive messages for it. The Rails server verifies access via GitHub API before delivering messages.
+**How Pairing Works:**
 
-### Bot Attribution
+1. CLI displays QR code containing its public keys
+2. You scan QR with your browser (visual channel - hard to MITM)
+3. Browser and CLI perform X3DH key exchange
+4. All subsequent messages encrypted with Double Ratchet
+5. Server only sees encrypted blobs it cannot decrypt
 
-All GitHub actions show as `@trybotster[bot]` using GitHub App installation tokens.
+### Browser Security
+
+- **Web Worker Isolation**: All cryptographic operations run in a Web Worker. Even if XSS compromises the main page, session keys remain isolated in the worker thread.
+- **Non-Extractable Keys**: Browser encryption keys are marked non-extractable via Web Crypto API.
+- **Session Encryption**: IndexedDB sessions encrypted with AES-256-GCM using keys derived from non-extractable CryptoKey.
+
+### CLI Token Security
+
+- **OS Keyring Storage**: API tokens stored in macOS Keychain or Linux Secret Service, not plaintext config files.
+- **No Query Parameters**: Authentication via `Authorization: Bearer` header only. Tokens never appear in URLs or server logs.
+
+### Server-Side Security
+
+**Webhook Verification:** GitHub webhooks verified using HMAC-SHA256 signatures.
+
+**API Authentication:** CLI authenticates using device tokens with `btstr_` prefix, validated per-request.
+
+**Repository Access:** Users must have GitHub access to a repository to receive messages for it. Rails verifies access via GitHub API before delivering messages.
+
+**Bot Attribution:** All GitHub actions show as `@trybotster[bot]` using GitHub App installation tokens.
+
+### Trust Model
+
+**You trust:**
+- The CLI binary you run (verify source/build)
+- Browser JavaScript served by trybotster.com
+- That you scanned the correct QR code
+
+**You don't need to trust:**
+- The server with your terminal content (E2E encrypted)
+- Network infrastructure (encrypted in transit)
+
+**The server knows:**
+- When you connect and disconnect
+- How much data flows (message sizes)
+- Which hub you're connected to
+
+**The server cannot know:**
+- What commands you run
+- What output appears in your terminal
+- Your keystrokes
 
 ## 🧪 Testing
 
@@ -400,18 +541,18 @@ Create a test message in Rails console:
 
 ```ruby
 user = User.find_by(username: "your_username")
-Bot::Message.create!(
+Integrations::Github::Message.create!(
   event_type: "github_mention",
+  repo: "owner/repo",
+  issue_number: 999,
   payload: {
-    repo: "owner/repo",
-    issue_number: 999,
     comment_body: "@trybotster test this",
     comment_author: "testuser",
     issue_title: "Test Issue",
     issue_body: "Description",
     issue_url: "https://github.com/owner/repo/issues/999",
     is_pr: false,
-    context: "Work on issue #999"
+    prompt: "Work on issue #999"
   }
 )
 ```
@@ -421,10 +562,13 @@ Bot::Message.create!(
 - [x] Auto-cleanup on issue/PR close
 - [x] Smart agent deduplication
 - [x] Interactive TUI
+- [x] Web GUI with E2E encrypted terminal streaming
+- [x] Signal Protocol encryption (X3DH + Double Ratchet + Kyber)
+- [x] Device authorization flow (no manual API keys)
+- [x] OS keychain token storage
 - [ ] Agent timeout handling
 - [ ] Metrics and monitoring
 - [ ] Multi-repo support in single daemon
-- [ ] Linux support (X11/Wayland terminals)
 
 ## 🤝 Contributing
 

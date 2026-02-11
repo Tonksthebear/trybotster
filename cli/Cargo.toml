@@ -11,9 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 # TUI framework
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.29"
-tui-term = "0.2"
+# Terminal emulation - 0.16+ has working scrollback (fixes scrollback panic)
+vt100 = "0.16"
 
 # PTY handling
 portable-pty = "0.9"
@@ -26,8 +27,8 @@ tokio-util = { version = "0.7.17", features = ["io"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# HTTP client
-reqwest = { version = "0.12.24", features = ["json", "blocking"] }
+# HTTP client (gzip/deflate/brotli for automatic response decompression)
+reqwest = { version = "0.12.24", features = ["json", "blocking", "gzip", "deflate", "brotli"] }
 
 # Git operations
 git2 = "0.20"
@@ -36,24 +37,141 @@ globset = "0.4"
 # CLI argument parsing
 clap = { version = "4.5.51", features = ["derive"] }
 
+# Performance - global allocator (M-MIMALLOC-APPS)
+mimalloc = "0.1"
+
+# Lua scripting runtime
+mlua = { version = "0.10", features = ["lua54", "async", "serialize", "vendored"] }
+
+# File watching for Lua hot-reload
+notify = "6"
+
 # Error handling & utilities
 anyhow = "1.0"
 log = "0.4"
+scopeguard = "1.2"  # RAII guards for cleanup
 env_logger = "0.11"
+ctrlc = { version = "3.4", features = ["termination"] }
+signal-hook = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
-vt100 = "0.15"
 bytes = "1.0"
 shellexpand = "3.1"
 sha2 = "0.10"
 semver = "1.0"
+hostname = "0.4"
+
+# Async trait (used by Channel trait)
+async-trait = "0.1"
+
+# E2E encryption (vodozemac - direct Olm/Megolm without matrix-sdk-crypto overhead)
+vodozemac = "0.9"
+rand = "0.9"
+base64 = "0.22"
+data-encoding = "2.6"  # Base32 encoding for QR-friendly URLs
+
+# Security hardening
+keyring = { version = "3", features = ["apple-native"] }  # OS keychain for secret key storage
+ed25519-dalek = "2"            # Ed25519 signing for device identity
+zeroize = { version = "1.8", features = ["derive"] }  # Secure memory zeroing
+aes-gcm = "0.10"               # AES-GCM for encrypting state at rest
+
+# WebSocket (kept for potential future use)
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# WebRTC for peer-to-peer communication
+webrtc = "0.12"
+
+# QR code generation for browser connection (qrcodegen supports alphanumeric mode for smaller QR)
+qrcodegen = "1.8"
+
+# Clipboard support for copying URLs
+arboard = "3.4"
+
+# TTY detection for interactive prompts
+atty = "0.2"
+flate2 = "1.1.8"
 
 [dev-dependencies]
 tempfile = "3.23"
+libc = "0.2"
+portable-pty = "0.9"
+wiremock = "0.6"
+keyring = "3"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[profile.bench]
+debug = 1  # Enable symbols for profiling (M-HOTPATH)
+
+# Lint configuration (M-STATIC-VERIFICATION)
+[lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+# Enable major lint categories (M-STATIC-VERIFICATION)
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+# Restriction lints for consistency and quality (M-STATIC-VERIFICATION)
+allow_attributes_without_reason = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+if_then_some_else_none = "warn"
+map_err_ignore = "warn"
+redundant_type_annotations = "warn"
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unneeded_field_pattern = "warn"
+unused_result_ok = "warn"
+
+# Additional quality lints
+unwrap_used = "warn"
+large_futures = "warn"
+
+# Allow lints that are too noisy for this codebase
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
+multiple_crate_versions = "allow"
+literal_string_with_formatting_args = "allow"
+
+# Cosmetic lints - allow for now, can revisit later
+uninlined_format_args = "allow"       # ~180 instances, purely cosmetic
+doc_markdown = "allow"                # ~80 instances, documentation formatting
+similar_names = "allow"               # Intentional: last_fg/last_bg, our_pid/our_ppid
+cargo_common_metadata = "allow"       # Internal crate, not publishing
+items_after_statements = "allow"      # Style preference
+return_self_not_must_use = "allow"    # Builder pattern doesn't need #[must_use]
+semicolon_outside_block = "allow"     # Style preference
+cast_possible_truncation = "allow"    # Terminal dimensions are safely bounded
+cast_sign_loss = "allow"              # Terminal dimensions are always positive
+needless_continue = "allow"           # Explicit continue can improve readability
+match_same_arms = "allow"             # Sometimes explicit arms improve clarity
+

@@ -1,0 +1,11 @@
+#!/bin/bash
+# Background dev server for tunnel preview
+# This runs when an agent spawns with BOTSTER_TUNNEL_PORT set
+#
+# Available environment variables:
+#   BOTSTER_TUNNEL_PORT - Port to run the server on
+#   BOTSTER_WORKTREE_PATH - Path to the worktree
+#
+# Customize this file for your project (Rails, Node, Python, etc.)
+
+PORT=$BOTSTER_TUNNEL_PORT bin/dev
