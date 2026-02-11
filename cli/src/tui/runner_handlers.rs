@@ -372,9 +372,13 @@ where
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
 
+                    let qr_width = qr_lines.first().map(|l| l.chars().count() as u16).unwrap_or(0);
+                    let qr_height = qr_lines.len() as u16;
                     self.connection_code = Some(crate::tui::ConnectionCodeData {
                         url: url.to_string(),
                         qr_ascii: qr_lines,
+                        qr_width,
+                        qr_height,
                     });
                 } else {
                     log::warn!("connection_code message missing url or qr_ascii");

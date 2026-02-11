@@ -68,6 +68,7 @@ use crate::tui::layout::terminal_widget_inner_area;
 use super::actions::InputResult;
 use super::events::CreationStage;
 use super::input::{process_event, InputContext};
+use super::layout_lua::LayoutLua;
 use super::qr::ConnectionCodeData;
 
 /// Default scrollback lines for VT100 parser.
@@ -189,6 +190,17 @@ pub struct TuiRunner<B: Backend> {
     // === Dimensions ===
     /// Terminal dimensions (rows, cols).
     pub(super) terminal_dims: (u16, u16),
+
+    // === Lua Layout ===
+    /// Lua layout source code, loaded into a LayoutLua state after thread spawn.
+    ///
+    /// Stored as String (Send) rather than LayoutLua (!Send) so TuiRunner
+    /// can be moved across threads. Converted to LayoutLua in run().
+    layout_lua_source: Option<String>,
+
+    /// Filesystem path to layout.lua for hot-reload watching.
+    /// None if loaded from embedded (no watching needed).
+    layout_lua_fs_path: Option<std::path::PathBuf>,
 }
 
 impl<B: Backend> std::fmt::Debug for TuiRunner<B>
@@ -258,7 +270,17 @@ where
             shutdown,
             quit: false,
             terminal_dims,
+            layout_lua_source: None,
+            layout_lua_fs_path: None,
         }
+    }
+
+    /// Set the Lua layout source for declarative UI.
+    ///
+    /// The source is stored as a string and loaded into a `LayoutLua` state
+    /// when `run()` is called (after the TuiRunner is moved to its thread).
+    pub fn set_layout_lua_source(&mut self, lua_source: String) {
+        self.layout_lua_source = Some(lua_source);
     }
 
     /// Get the VT100 parser handle.
@@ -303,6 +325,45 @@ where
     pub fn run(&mut self) -> Result<()> {
         log::info!("TuiRunner event loop starting");
 
+        // Create LayoutLua from stored source (if any).
+        // Done here (after thread::spawn) because mlua::Lua is !Send.
+        let mut layout_lua = self.layout_lua_source.take().and_then(|source| {
+            match LayoutLua::new(&source) {
+                Ok(lua) => {
+                    log::info!("Lua layout engine initialized");
+                    Some(lua)
+                }
+                Err(e) => {
+                    log::warn!("Failed to initialize Lua layout engine: {e}");
+                    None
+                }
+            }
+        });
+
+        // Set up file watcher for hot-reload (only if loaded from filesystem)
+        let layout_watcher = self.layout_lua_fs_path.take().and_then(|path| {
+            match crate::file_watcher::FileWatcher::new() {
+                Ok(mut watcher) => {
+                    // Watch the parent directory (ui/) since notify needs a directory
+                    if let Some(parent) = path.parent() {
+                        if let Err(e) = watcher.watch(parent, false) {
+                            log::warn!("Failed to watch layout directory: {e}");
+                            return None;
+                        }
+                    }
+                    log::info!("Hot-reload watching: {}", path.display());
+                    Some((watcher, path))
+                }
+                Err(e) => {
+                    log::warn!("Failed to create layout file watcher: {e}");
+                    None
+                }
+            }
+        });
+
+        // Error tracking for layout Lua failures
+        let mut layout_error: Option<String> = None;
+
         // Initialize parser with terminal dimensions
         let (rows, cols) = self.terminal_dims;
         log::info!("Initial TUI dimensions: {}cols x {}rows", cols, rows);
@@ -330,8 +391,62 @@ where
             // 2. Poll PTY output and Lua events (via Hub output channel)
             self.poll_pty_events();
 
+            // 3. Hot-reload layout.lua if changed
+            if let Some((ref watcher, ref path)) = layout_watcher {
+                let events = watcher.poll();
+                if !events.is_empty() {
+                    log::debug!("FileWatcher events: {:?}", events);
+                    log::debug!("Comparing against path: {:?}", path);
+                }
+                let layout_changed = events.iter().any(|evt| {
+                    matches!(
+                        evt.kind,
+                        crate::file_watcher::FileEventKind::Create
+                            | crate::file_watcher::FileEventKind::Modify
+                            | crate::file_watcher::FileEventKind::Rename
+                    ) && evt.path.file_name() == path.file_name()
+                });
+
+                if layout_changed {
+                    match std::fs::read_to_string(path) {
+                        Ok(new_source) => {
+                            if let Some(ref mut lua) = layout_lua {
+                                match lua.reload(&new_source) {
+                                    Ok(()) => {
+                                        log::info!("Layout hot-reloaded");
+                                        layout_error = None;
+                                    }
+                                    Err(e) => {
+                                        let msg = format!("{e}");
+                                        log::warn!("Layout reload failed: {msg}");
+                                        layout_error = Some(truncate_error(&msg, 80));
+                                    }
+                                }
+                            } else {
+                                // No LayoutLua yet (initial load failed) — try creating one
+                                match LayoutLua::new(&new_source) {
+                                    Ok(lua) => {
+                                        log::info!("Layout engine recovered via hot-reload");
+                                        layout_lua = Some(lua);
+                                        layout_error = None;
+                                    }
+                                    Err(e) => {
+                                        let msg = format!("{e}");
+                                        log::warn!("Layout reload failed: {msg}");
+                                        layout_error = Some(truncate_error(&msg, 80));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to read layout.lua: {e}");
+                        }
+                    }
+                }
+            }
+
             // 4. Render
-            self.render()?;
+            self.render(layout_lua.as_ref(), layout_error.as_deref())?;
 
             // Small sleep to prevent CPU spinning (60 FPS max)
             std::thread::sleep(Duration::from_millis(16));
@@ -485,7 +600,11 @@ where
     }
 
     /// Render the TUI.
-    fn render(&mut self) -> Result<()> {
+    fn render(
+        &mut self,
+        layout_lua: Option<&LayoutLua>,
+        layout_error: Option<&str>,
+    ) -> Result<()> {
         use super::render::{render, AgentRenderInfo, RenderContext};
 
         // Build agent render info from cached agents
@@ -557,9 +676,33 @@ where
             seconds_since_poll: 0,
             poll_interval: 10,
             vpn_status: None,
+
+            // Terminal dimensions for responsive layout
+            terminal_cols: self.terminal_dims.1,
+            terminal_rows: self.terminal_dims.0,
         };
 
-        render(&mut self.terminal, &ctx, None)?;
+        // Try Lua-driven render, fall back to hardcoded Rust layout
+        let lua_render_ok = if let Some(layout_lua) = layout_lua {
+            match render_with_lua(&mut self.terminal, layout_lua, &ctx) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("Lua layout render failed, using fallback: {e}");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if !lua_render_ok {
+            render(&mut self.terminal, &ctx, None)?;
+        }
+
+        // Render error indicator overlay if there's a layout error
+        if let Some(err_msg) = layout_error {
+            render_layout_error_indicator(&mut self.terminal, err_msg)?;
+        }
 
         Ok(())
     }
@@ -588,6 +731,87 @@ where
         self.mode = AppMode::Normal;
     }
 
+}
+
+/// Render using the Lua layout engine (free function to avoid borrow conflicts).
+///
+/// Calls Lua `render(state)` and `render_overlay(state)`, interprets
+/// the returned render trees into ratatui calls.
+fn render_with_lua<B>(
+    terminal: &mut Terminal<B>,
+    layout_lua: &LayoutLua,
+    ctx: &super::render::RenderContext,
+) -> Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    use super::render_tree::interpret_tree;
+
+    // Get main layout tree from Lua
+    let tree = layout_lua.call_render(ctx)?;
+
+    // Get optional overlay tree from Lua
+    let overlay = layout_lua.call_render_overlay(ctx)?;
+
+    // Render to terminal
+    terminal.draw(|f| {
+        let area = f.area();
+        interpret_tree(&tree, f, ctx, area);
+
+        if let Some(ref overlay_tree) = overlay {
+            interpret_tree(overlay_tree, f, ctx, area);
+        }
+    })?;
+
+    Ok(())
+}
+
+/// Render a dim error indicator in the bottom-right corner of the terminal.
+///
+/// Overlaid on top of whatever was already rendered. Shows layout errors
+/// so the user knows the Lua layout has issues.
+fn render_layout_error_indicator<B>(terminal: &mut Terminal<B>, error_msg: &str) -> Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::Span;
+    use ratatui::widgets::Paragraph;
+
+    terminal.draw(|f| {
+        let area = f.area();
+        let text = format!(" [Layout: {error_msg}] ");
+        let width = text.len() as u16;
+
+        // Position in bottom-right corner
+        if area.width >= width && area.height >= 1 {
+            let indicator_area = ratatui::layout::Rect::new(
+                area.x + area.width - width,
+                area.y + area.height - 1,
+                width,
+                1,
+            );
+            let indicator = Paragraph::new(Span::styled(
+                text,
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            f.render_widget(indicator, indicator_area);
+        }
+    })?;
+
+    Ok(())
+}
+
+/// Truncate an error message to a maximum length, adding ellipsis if needed.
+fn truncate_error(msg: &str, max_len: usize) -> String {
+    let trimmed = msg.lines().next().unwrap_or(msg);
+    if trimmed.len() <= max_len {
+        trimmed.to_string()
+    } else {
+        format!("{}...", &trimmed[..max_len.saturating_sub(3)])
+    }
 }
 
 /// Run the TUI alongside a Hub.
@@ -658,6 +882,13 @@ pub fn run_with_hub(
         terminal_dims,
     );
 
+    // Load Lua layout source: try filesystem first, then embedded.
+    // Filesystem allows hot-reload in dev; embedded is the release fallback.
+    if let Some(layout) = load_layout_lua_source() {
+        tui_runner.set_layout_lua_source(layout.source);
+        tui_runner.layout_lua_fs_path = layout.fs_path;
+    }
+
     // Spawn TUI thread
     let tui_handle = thread::Builder::new()
         .name("tui-runner".to_string())
@@ -690,6 +921,53 @@ pub fn run_with_hub(
 
     log::info!("Hub event loop exiting");
     Ok(())
+}
+
+/// Result of loading Lua layout source.
+struct LayoutSource {
+    /// The Lua source code.
+    source: String,
+    /// Filesystem path if loaded from disk (for hot-reload watching).
+    /// None if loaded from embedded (no watching needed).
+    fs_path: Option<std::path::PathBuf>,
+}
+
+/// Load the Lua layout source from filesystem or embedded.
+///
+/// Priority: filesystem (`~/.botster/lua/ui/layout.lua` or `BOTSTER_LUA_PATH`)
+/// then embedded (release builds). Returns None if neither is available.
+fn load_layout_lua_source() -> Option<LayoutSource> {
+    // Try filesystem first (enables hot-reload and user overrides)
+    let lua_base = std::env::var("BOTSTER_LUA_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .map(|h| h.join(".botster").join("lua"))
+                .unwrap_or_else(|| std::path::PathBuf::from(".botster/lua"))
+        });
+
+    let fs_path = lua_base.join("ui").join("layout.lua");
+    if let Ok(source) = std::fs::read_to_string(&fs_path) {
+        // Canonicalize so FileWatcher (notify) gets an absolute path on macOS
+        let fs_path = fs_path.canonicalize().unwrap_or(fs_path);
+        log::info!("Loaded layout.lua from filesystem: {}", fs_path.display());
+        return Some(LayoutSource {
+            source,
+            fs_path: Some(fs_path),
+        });
+    }
+
+    // Fall back to embedded (release builds)
+    if let Some(source) = crate::lua::embedded::get("ui/layout.lua") {
+        log::info!("Loaded layout.lua from embedded");
+        return Some(LayoutSource {
+            source: source.to_string(),
+            fs_path: None,
+        });
+    }
+
+    log::info!("No layout.lua found, using hardcoded fallback");
+    None
 }
 
 #[cfg(test)]
@@ -1925,7 +2203,7 @@ mod tests {
         runner.connection_code = None;
 
         // Render should not panic even without cached connection code
-        let result = runner.render();
+        let result = runner.render(None, None);
         assert!(
             result.is_ok(),
             "Render should succeed even without cached connection code"
@@ -1946,7 +2224,7 @@ mod tests {
         assert_eq!(runner.mode, AppMode::Normal);
 
         // Render in Normal mode should succeed without any Hub calls
-        let result = runner.render();
+        let result = runner.render(None, None);
         assert!(result.is_ok(), "Render should succeed in Normal mode");
     }
 
@@ -2349,7 +2627,80 @@ mod tests {
         assert_eq!(runner.terminal_dims, (40, 120));
     }
 
+    // === Hot-Reload & Error UX ===
+
+    #[test]
+    fn test_truncate_error_short() {
+        assert_eq!(truncate_error("short error", 80), "short error");
+    }
+
+    #[test]
+    fn test_truncate_error_long() {
+        let long = "a".repeat(100);
+        let result = truncate_error(&long, 20);
+        assert_eq!(result.len(), 20);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_error_multiline() {
+        let msg = "first line\nsecond line\nthird line";
+        assert_eq!(truncate_error(msg, 80), "first line");
+    }
+
+    #[test]
+    fn test_layout_lua_reload_valid() {
+        let lua = LayoutLua::new("function render(s) return { type = 'empty' } end").unwrap();
+        let result = lua.reload("function render(s) return { type = 'empty' } end");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_layout_lua_reload_invalid() {
+        let lua = LayoutLua::new("function render(s) return { type = 'empty' } end").unwrap();
+        let result = lua.reload("this is not valid lua!!!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_layout_lua_reload_preserves_old_on_error() {
+        let lua =
+            LayoutLua::new("function render(s) return { type = 'empty' } end\nfunction render_overlay(s) return nil end").unwrap();
+        // Reload with bad source — should fail
+        let _ = lua.reload("broken!!!");
+        // But the old functions should still be callable... actually mlua replaces
+        // on exec, so a failed load doesn't clear the old functions. Verify:
+        let ctx = make_test_render_context();
+        let result = lua.call_render(&ctx);
+        assert!(result.is_ok(), "Old render function should still work after failed reload");
+    }
+
+    fn make_test_render_context() -> super::super::render::RenderContext<'static> {
+        use crate::app::AppMode;
+        super::super::render::RenderContext {
+            mode: AppMode::Normal,
+            menu_selected: 0,
+            input_buffer: "",
+            worktree_selected: 0,
+            available_worktrees: &[],
+            error_message: None,
+            creating_agent: None,
+            connection_code: None,
+            bundle_used: false,
+            agent_ids: &[],
+            agents: &[],
+            selected_agent_index: 0,
+            active_parser: None,
+            active_pty_index: 0,
+            scroll_offset: 0,
+            is_scrolled: false,
+            seconds_since_poll: 0,
+            poll_interval: 10,
+            vpn_status: None,
+            terminal_cols: 80,
+            terminal_rows: 24,
+        }
+    }
+
     // Rust guideline compliant 2026-02
 }
-
-
