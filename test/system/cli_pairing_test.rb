@@ -101,8 +101,6 @@ class CliPairingTest < ApplicationSystemTestCase
 
     # Connection section should show "unpaired" (bundle parse failure -> no Olm session).
     # The state transitions: connecting -> (ActionCable subscribes) -> unpaired.
-    # In the full test suite, ActionCable subscription + WASM init can take longer
-    # due to SharedWorker reinitialization overhead.
     assert_selector(
       "[data-connection-status-target='connectionSection'][data-state='unpaired']",
       wait: 45
@@ -171,8 +169,6 @@ class CliPairingTest < ApplicationSystemTestCase
 
     # Connection section should show "unpaired" (no bundle -> no Olm session).
     # The state transitions: connecting -> (ActionCable subscribes) -> unpaired.
-    # In the full test suite, ActionCable subscription + WASM init can take longer
-    # due to SharedWorker reinitialization overhead.
     assert_selector(
       "[data-connection-status-target='connectionSection'][data-state='unpaired']",
       wait: 45
