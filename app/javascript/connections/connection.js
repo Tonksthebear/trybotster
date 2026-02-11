@@ -111,7 +111,7 @@ export class Connection {
     this.#visibilityHandler = () => {
       if (document.visibilityState !== "visible") return
       if (!this.#hubConnected || !this.identityKey) return
-      if (this.state === ConnectionState.ERROR && this.errorCode === "session_invalid") return
+      if (this.state === ConnectionState.ERROR && (this.errorCode === "session_invalid" || this.errorCode === "unpaired")) return
       this.#ensureConnected()
     }
     document.addEventListener("visibilitychange", this.#visibilityHandler)
@@ -639,6 +639,8 @@ export class Connection {
     if (!hasSession) {
       this.#hubConnected = false
       this.subscriptionId = null
+      this.identityKey = null
+      this.#setError("unpaired", "Scan connection code")
       return
     }
 
@@ -935,6 +937,9 @@ export class Connection {
    * Per-browser: { type: "health", cli: "connected" | "disconnected" } - CLI on E2E channel
    */
   #handleHealthMessage(message) {
+    // Don't process health events when session is unpaired/invalid — user must re-pair
+    if (this.errorCode === "unpaired" || this.errorCode === "session_invalid") return
+
     const cliStatusMap = {
       offline: CliStatus.OFFLINE,
       online: CliStatus.ONLINE,

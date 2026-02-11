@@ -372,7 +372,12 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
   def assert_message_acknowledged(message, timeout: 15)
     wait_until(
       timeout: timeout,
-      message: -> { "Message #{message.id} was not acknowledged within #{timeout}s (status: #{message.reload.status})" }
+      message: -> {
+        cli_log = @git_repo_path && File.exist?(File.join(@git_repo_path, "botster-hub.log")) ?
+          File.read(File.join(@git_repo_path, "botster-hub.log")).lines.last(80).join : "no log file"
+        cli_output = @started_clis&.first&.recent_output || "no output"
+        "Message #{message.id} not acked within #{timeout}s (status: #{message.reload.status})\n\nCLI LOG:\n#{cli_log}\n\nCLI OUTPUT:\n#{cli_output}"
+      }
     ) { message.reload.status == "acknowledged" }
   end
 

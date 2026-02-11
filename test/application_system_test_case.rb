@@ -84,6 +84,12 @@ class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
 
       Promise.all([clearWorker, clearIDB]).then(() => done());
     JS
+
+    # Navigate to about:blank to destroy all JS singletons
+    # (ConnectionManager, bridge, etc.) between tests.
+    # SharedWorkers persist across navigations in the same origin,
+    # but module-level singletons are destroyed on full page unload.
+    page.driver.browser.navigate.to("about:blank")
   rescue => e
     # Don't fail test if cleanup fails
     Rails.logger.warn "[Test Cleanup] Failed to clear browser storage: #{e.message}"

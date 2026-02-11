@@ -11,16 +11,19 @@
 -- action_cable primitive (Rust). The 30s heartbeat here is application-
 -- level HubCommandChannel business logic, NOT protocol-level.
 
-local hub_ch = nil
+-- Table stores channel_id for use outside the callback (heartbeat, signal relay).
+-- Inside the callback, channel_id is passed as the second argument by the primitive.
+local ch = {}
 local conn = nil
 
 -- Connect with E2E encryption enabled (transparent OlmEnvelope handling)
 conn = action_cable.connect({ crypto = true })
 
 -- Subscribe to HubCommandChannel
-hub_ch = action_cable.subscribe(conn, "HubCommandChannel",
+-- The callback receives (message, channel_id) from the primitive.
+ch.hub = action_cable.subscribe(conn, "HubCommandChannel",
     { hub_id = hub.server_id(), start_from = 0 },
-    function(message)
+    function(message, channel_id)
         local msg_type = message.type
 
         if msg_type == "signal" then
@@ -29,12 +32,10 @@ hub_ch = action_cable.subscribe(conn, "HubCommandChannel",
             if message.decrypt_failed then
                 log.warn("Signal decryption failed for browser " ..
                     tostring(message.browser_identity) .. ", sending session_invalid")
-                if hub_ch then
-                    action_cable.perform(hub_ch, "signal", {
-                        browser_identity = message.browser_identity,
-                        envelope = { type = "session_invalid", message = "Crypto session expired. Please re-pair." }
-                    })
-                end
+                action_cable.perform(channel_id, "signal", {
+                    browser_identity = message.browser_identity,
+                    envelope = { type = "session_invalid", message = "Crypto session expired. Please re-pair." }
+                })
                 return
             end
 
@@ -81,24 +82,36 @@ hub_ch = action_cable.subscribe(conn, "HubCommandChannel",
 
             -- Ack by sequence
             if message.sequence then
-                action_cable.perform(hub_ch, "ack", { sequence = message.sequence })
+                action_cable.perform(channel_id, "ack", { sequence = message.sequence })
             end
         end
     end
 )
 
+-- Send heartbeat helper (used by timer and agent lifecycle hooks)
+local function send_heartbeat()
+    if ch.hub then
+        action_cable.perform(ch.hub, "heartbeat", { agents = hub.agent_list() })
+    end
+end
+
 -- Application-level heartbeat (30s interval, 3 chances before 90s timeout)
 -- This syncs agent status with Rails — NOT an ActionCable protocol heartbeat
-timer.every(30, function()
-    if hub_ch then
-        action_cable.perform(hub_ch, "heartbeat", { agents = hub.agent_list() })
-    end
+timer.every(30, send_heartbeat)
+
+-- Immediately sync agent list when agents are created or deleted
+hooks.on("agent_created", "heartbeat_on_agent_created", function()
+    send_heartbeat()
+end)
+
+hooks.on("agent_deleted", "heartbeat_on_agent_deleted", function()
+    send_heartbeat()
 end)
 
 -- Relay outgoing WebRTC signals (pre-encrypted by Rust) through ActionCable
 events.on("outgoing_signal", function(data)
-    if hub_ch then
-        action_cable.perform(hub_ch, "signal", data)
+    if ch.hub then
+        action_cable.perform(ch.hub, "signal", data)
     end
 end)
 

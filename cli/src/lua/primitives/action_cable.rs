@@ -40,9 +40,11 @@
 //! local conn = action_cable.connect({ crypto = true })
 //!
 //! -- Subscribe to a channel with a message callback
+//! -- The callback receives the message AND the channel_id as arguments,
+//! -- so you can use channel_id directly without upvalue capture.
 //! local ch = action_cable.subscribe(conn, "HubCommandChannel",
 //!     { hub_id = hub.server_id(), start_from = 0 },
-//!     function(message) log.info("Got: " .. json.encode(message)) end)
+//!     function(message, channel_id) log.info("Got: " .. json.encode(message)) end)
 //!
 //! -- Perform an action on the channel
 //! action_cable.perform(ch, "ack", { sequence = 42 })
@@ -339,8 +341,11 @@ pub fn poll_lua_action_cable_channels(
     connections: &HashMap<String, LuaAcConnection>,
     crypto_service: Option<&CryptoService>,
 ) -> usize {
-    // Phase 1: collect all pending messages with their callback keys
-    let mut pending: Vec<(mlua::RegistryKey, serde_json::Value)> = Vec::new();
+    // Phase 1: collect all pending messages with their callback keys and channel IDs.
+    // The channel_id is passed as a second argument to the Lua callback, eliminating
+    // the need for Lua scripts to capture channel_id via upvalues (which don't survive
+    // mlua's registry-stored closures reliably).
+    let mut pending: Vec<(mlua::RegistryKey, serde_json::Value, String)> = Vec::new();
 
     for (channel_id, channel) in channels.iter_mut() {
         // Look up crypto status for this channel's connection
@@ -367,7 +372,7 @@ pub fn poll_lua_action_cable_channels(
 
             // Clone the registry key reference for the callback.
             // We re-use the same key for every message on this channel.
-            // Collect as (key_ref, message) pairs for firing.
+            // Collect as (key_ref, message, channel_id) tuples for firing.
             pending.push((
                 lua.create_registry_value(
                     lua.registry_value::<mlua::Function>(&channel.callback_key)
@@ -375,6 +380,7 @@ pub fn poll_lua_action_cable_channels(
                 )
                 .expect("Failed to clone callback registry key"),
                 msg,
+                channel_id.clone(),
             ));
         }
     }
@@ -382,11 +388,13 @@ pub fn poll_lua_action_cable_channels(
     // Phase 2: fire callbacks
     let count = pending.len();
 
-    for (callback_key, msg) in &pending {
+    for (callback_key, msg, channel_id) in &pending {
         let result: mlua::Result<()> = (|| {
             let callback: mlua::Function = lua.registry_value(callback_key)?;
             let lua_msg = lua.to_value(msg)?;
-            callback.call::<()>(lua_msg)?;
+            // Pass (message, channel_id) so Lua callbacks can use channel_id directly
+            // without relying on upvalue capture from the subscribe() return value.
+            callback.call::<()>((lua_msg, channel_id.as_str()))?;
             Ok(())
         })();
 
@@ -396,7 +404,7 @@ pub fn poll_lua_action_cable_channels(
     }
 
     // Phase 3: clean up temporary registry keys
-    for (callback_key, _) in pending {
+    for (callback_key, _, _) in pending {
         let _ = lua.remove_registry_value(callback_key);
     }
 
@@ -487,7 +495,7 @@ fn decrypt_signal_envelope(
 ///
 /// Creates functions:
 /// - `action_cable.connect(opts?)` - Open a new ActionCable connection
-/// - `action_cable.subscribe(conn_id, channel_name, params, callback)` - Subscribe to a channel
+/// - `action_cable.subscribe(conn_id, channel_name, params, callback(msg, ch_id))` - Subscribe to a channel
 /// - `action_cable.perform(channel_id, action, data)` - Perform an action
 /// - `action_cable.unsubscribe(channel_id)` - Unsubscribe from a channel
 /// - `action_cable.close(conn_id)` - Close a connection
