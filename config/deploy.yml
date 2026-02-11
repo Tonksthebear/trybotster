@@ -11,6 +11,7 @@ servers:
     proxy:
       ssl: true
       host: mcp.trybotster.com
+      app_port: 62770
 
 proxy:
   ssl: true
