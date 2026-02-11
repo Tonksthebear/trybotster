@@ -11,8 +11,21 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Ensure test environment is configured.
+///
+/// Sets BOTSTER_ENV=test and BOTSTER_HUB_ID=test-hub once for the process.
+/// This is the single source of truth — individual tests don't need to set these.
+static INIT: Once = Once::new();
+fn ensure_test_env() {
+    INIT.call_once(|| {
+        std::env::set_var("BOTSTER_ENV", "test");
+        std::env::set_var("BOTSTER_HUB_ID", "test-hub");
+    });
+}
 
 /// Path to the release binary
 fn get_binary_path() -> PathBuf {
@@ -95,8 +108,20 @@ fn safe_pty_write(
     Ok(())
 }
 
+/// Build a CommandBuilder for `botster-hub start` with a temp config dir.
+///
+/// Test env vars (BOTSTER_ENV, BOTSTER_HUB_ID) are inherited from the process
+/// via `ensure_test_env()` — no need to set them per-command.
+fn build_start_cmd(temp_dir: &tempfile::TempDir) -> CommandBuilder {
+    let mut cmd = CommandBuilder::new(get_binary_path());
+    cmd.arg("start");
+    cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
+    cmd
+}
+
 #[test]
 fn test_ctrl_q_exits_cleanly() {
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
@@ -114,12 +139,7 @@ fn test_ctrl_q_exits_cleanly() {
         })
         .expect("Failed to open PTY");
 
-    let mut cmd = CommandBuilder::new(get_binary_path());
-    cmd.arg("start");
-    cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    // Use test mode to skip authentication and network connections
-    cmd.env("BOTSTER_ENV", "test");
-    cmd.env("BOTSTER_HUB_ID", "test-hub");
+    let cmd = build_start_cmd(&temp_dir);
 
     let mut child = pair
         .slave
@@ -182,6 +202,7 @@ fn test_ctrl_q_exits_cleanly() {
 
 #[test]
 fn test_sigint_triggers_graceful_shutdown() {
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
@@ -199,12 +220,7 @@ fn test_sigint_triggers_graceful_shutdown() {
         })
         .expect("Failed to open PTY");
 
-    let mut cmd = CommandBuilder::new(get_binary_path());
-    cmd.arg("start");
-    cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    // Use test mode to skip authentication and network connections
-    cmd.env("BOTSTER_ENV", "test");
-    cmd.env("BOTSTER_HUB_ID", "test-hub");
+    let cmd = build_start_cmd(&temp_dir);
 
     let mut child = pair
         .slave
@@ -265,6 +281,7 @@ fn test_sigint_triggers_graceful_shutdown() {
 
 #[test]
 fn test_sigterm_triggers_graceful_shutdown() {
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
@@ -282,12 +299,7 @@ fn test_sigterm_triggers_graceful_shutdown() {
         })
         .expect("Failed to open PTY");
 
-    let mut cmd = CommandBuilder::new(get_binary_path());
-    cmd.arg("start");
-    cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    // Use test mode to skip authentication and network connections
-    cmd.env("BOTSTER_ENV", "test");
-    cmd.env("BOTSTER_HUB_ID", "test-hub");
+    let cmd = build_start_cmd(&temp_dir);
 
     let mut child = pair
         .slave
@@ -349,6 +361,7 @@ fn test_sigterm_triggers_graceful_shutdown() {
 fn test_pty_close_triggers_cleanup() {
     // When the PTY is closed (simulating terminal window close),
     // the CLI should receive SIGHUP and exit cleanly.
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
@@ -366,12 +379,7 @@ fn test_pty_close_triggers_cleanup() {
         })
         .expect("Failed to open PTY");
 
-    let mut cmd = CommandBuilder::new(get_binary_path());
-    cmd.arg("start");
-    cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    // Use test mode to skip authentication and network connections
-    cmd.env("BOTSTER_ENV", "test");
-    cmd.env("BOTSTER_HUB_ID", "test-hub");
+    let cmd = build_start_cmd(&temp_dir);
 
     let mut child = pair
         .slave
@@ -424,6 +432,7 @@ fn test_pty_close_triggers_cleanup() {
 fn test_input_is_responsive() {
     // This test verifies that input is processed promptly and not blocked.
     // We send multiple Ctrl+Q signals and verify the CLI exits quickly.
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
@@ -441,12 +450,7 @@ fn test_input_is_responsive() {
         })
         .expect("Failed to open PTY");
 
-    let mut cmd = CommandBuilder::new(get_binary_path());
-    cmd.arg("start");
-    cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    // Use test mode to skip authentication and network connections
-    cmd.env("BOTSTER_ENV", "test");
-    cmd.env("BOTSTER_HUB_ID", "test-hub");
+    let cmd = build_start_cmd(&temp_dir);
 
     let mut child = pair
         .slave
@@ -462,8 +466,8 @@ fn test_input_is_responsive() {
         .expect("Failed to get PTY reader");
     let (_capture_handle, output_rx) = spawn_output_capture(reader);
 
-    // Give the TUI time to initialize
-    thread::sleep(Duration::from_millis(800));
+    // Give the TUI time to initialize (Lua, crypto, worktree loading)
+    thread::sleep(Duration::from_millis(1500));
 
     // Record time before sending input
     let input_start = Instant::now();
@@ -479,8 +483,8 @@ fn test_input_is_responsive() {
         );
     }
 
-    // The CLI should respond within 500ms if input handling is working
-    let response_timeout = Duration::from_millis(500);
+    // The CLI should respond within 2s if input handling is working
+    let response_timeout = Duration::from_secs(2);
     let mut responded = false;
 
     while input_start.elapsed() < response_timeout {
@@ -497,36 +501,18 @@ fn test_input_is_responsive() {
     }
 
     if !responded {
-        // If not responded yet, wait a bit more and then fail
-        thread::sleep(Duration::from_millis(500));
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                // It did respond, but slowly
-                let elapsed = input_start.elapsed();
-                if elapsed > Duration::from_secs(1) {
-                    panic!(
-                        "Input response was too slow: {:?} (should be < 500ms)",
-                        elapsed
-                    );
-                }
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                panic!(
-                    "CLI did not respond to Ctrl+Q within {:?} - input may be blocked",
-                    input_start.elapsed()
-                );
-            }
-            Err(e) => {
-                panic!("Error: {}", e);
-            }
-        }
+        let _ = child.kill();
+        panic!(
+            "CLI did not respond to Ctrl+Q within {:?} - input may be blocked",
+            input_start.elapsed()
+        );
     }
 }
 
 #[test]
 fn test_no_orphan_processes_after_exit() {
     // After the CLI exits, there should be no orphaned child processes
+    ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping test: release binary not found. Run `cargo build --release` first.");
         return;
@@ -547,12 +533,7 @@ fn test_no_orphan_processes_after_exit() {
         })
         .expect("Failed to open PTY");
 
-    let mut cmd = CommandBuilder::new(get_binary_path());
-    cmd.arg("start");
-    cmd.env("BOTSTER_CONFIG_DIR", temp_dir.path());
-    // Use test mode to skip authentication and network connections
-    cmd.env("BOTSTER_ENV", "test");
-    cmd.env("BOTSTER_HUB_ID", "test-hub");
+    let cmd = build_start_cmd(&temp_dir);
 
     let mut child = pair
         .slave

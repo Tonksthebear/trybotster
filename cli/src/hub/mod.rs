@@ -427,8 +427,10 @@ impl Hub {
     /// URL is first requested (TUI QR display, external automation, etc.).
     /// This avoids blocking boot on bundle generation.
     pub fn setup(&mut self) {
-        self.register_device();
-        self.register_hub_with_server();
+        if !crate::env::is_test_mode() {
+            self.register_device();
+            self.register_hub_with_server();
+        }
         self.init_crypto_service();
 
         // ActionCable connections are now managed by Lua plugins
