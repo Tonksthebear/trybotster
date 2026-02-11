@@ -194,8 +194,9 @@ end
 -- @param client table|nil       Requesting client (for dimensions)
 -- @param agent_key string       Pre-computed agent key for status broadcasts
 -- @param profile_name string    Profile to use for config resolution
+-- @param instance_suffix string|nil  Instance suffix for multi-agent (nil, "-2", "-3")
 -- @return Agent|nil             The created agent, or nil on error
-local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name)
+local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name, instance_suffix)
     local repo = config.env("BOTSTER_REPO") or "unknown/repo"
     local repo_root = worktree.repo_root()
 
@@ -302,8 +303,10 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     -- Main repo mode: no issue_or_branch AND no from_worktree
     if not issue_or_branch and not from_worktree then
         local repo = config.env("BOTSTER_REPO") or "unknown/repo"
-        local agent_key = build_agent_key(repo, nil, "main")
-        return spawn_agent("main", nil, repo_root, prompt or "Work on the main branch", client, agent_key, profile_name)
+        local base_key = build_agent_key(repo, nil, "main")
+        local suffix = Agent.next_instance_suffix(base_key)
+        local agent_key = base_key .. (suffix or "")
+        return spawn_agent("main", nil, repo_root, prompt or "Work on the main branch", client, agent_key, profile_name, suffix)
     end
 
     local issue_number, branch_name = parse_issue_or_branch(issue_or_branch)
@@ -357,7 +360,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         log.info(string.format("Worktree found for %s at %s", branch_name, wt_path))
     end
 
-    return spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name)
+    return spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name, suffix)
 end
 
 --- Handle a request to delete an agent.
@@ -444,15 +447,18 @@ events.on("command_message", function(message)
     if msg_type == "create_agent" then
         local issue_or_branch = message.issue_or_branch or message.branch
 
-        -- Check if an agent already exists for this issue — notify instead of creating
+        -- Check if any agents already exist for this issue — notify all of them
         if issue_or_branch then
             local repo = message.repo or config.env("BOTSTER_REPO") or "unknown/repo"
             local issue_number, branch_name = parse_issue_or_branch(issue_or_branch)
-            local agent_key = build_agent_key(repo, issue_number, branch_name)
-            local existing = Agent.get(agent_key)
-            if existing then
-                log.info("Agent exists for " .. agent_key .. ", sending notification")
-                notify_existing_agent(existing, format_notification(message))
+            local base_key = build_agent_key(repo, issue_number, branch_name)
+            local existing = Agent.find_by_base_key(base_key)
+            if #existing > 0 then
+                local notification = format_notification(message)
+                for _, agent in ipairs(existing) do
+                    log.info("Agent exists for " .. agent:agent_key() .. ", sending notification")
+                    notify_existing_agent(agent, notification)
+                end
                 return
             end
         end

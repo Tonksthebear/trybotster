@@ -280,4 +280,46 @@ mod tests {
             vec!["owner-repo-1", "owner-repo-2", "owner-repo-3"]
         );
     }
+
+    #[test]
+    fn test_multiple_agents_same_worktree() {
+        let mut state = HubState::new(PathBuf::from("/tmp/worktrees"));
+
+        // Simulate Lua-side instance suffixes: first agent has no suffix,
+        // subsequent agents get "-2", "-3", etc.
+        let agent1 = create_test_agent("owner/repo", Some(42), "botster-issue-42");
+        let agent2 = create_test_agent("owner/repo", Some(42), "botster-issue-42");
+        let agent3 = create_test_agent("owner/repo", Some(42), "botster-issue-42");
+
+        state.add_agent("owner-repo-42".to_string(), agent1);
+        state.add_agent("owner-repo-42-2".to_string(), agent2);
+        state.add_agent("owner-repo-42-3".to_string(), agent3);
+
+        assert_eq!(state.agent_count(), 3);
+        assert!(state.agents.contains_key("owner-repo-42"));
+        assert!(state.agents.contains_key("owner-repo-42-2"));
+        assert!(state.agents.contains_key("owner-repo-42-3"));
+
+        // Remove middle agent — others remain
+        let removed = state.remove_agent("owner-repo-42-2");
+        assert!(removed.is_some());
+        assert_eq!(state.agent_count(), 2);
+        assert!(state.agents.contains_key("owner-repo-42"));
+        assert!(state.agents.contains_key("owner-repo-42-3"));
+    }
+
+    #[test]
+    fn test_multiple_agents_main_branch() {
+        let mut state = HubState::new(PathBuf::from("/tmp/worktrees"));
+
+        let agent1 = create_test_agent("owner/repo", None, "main");
+        let agent2 = create_test_agent("owner/repo", None, "main");
+
+        state.add_agent("owner-repo-main".to_string(), agent1);
+        state.add_agent("owner-repo-main-2".to_string(), agent2);
+
+        assert_eq!(state.agent_count(), 2);
+        assert!(state.agents.contains_key("owner-repo-main"));
+        assert!(state.agents.contains_key("owner-repo-main-2"));
+    }
 }
