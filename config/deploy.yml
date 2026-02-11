@@ -71,10 +71,11 @@ accessories:
   turn:
     image: coturn/coturn:latest
     host: 5.78.156.108
-    port:
-      - "3478:3478"
-      - "3478:3478/udp"
-      - "49152-49252:49152-49252/udp"
+    options:
+      publish:
+        - "3478:3478"
+        - "3478:3478/udp"
+        - "49152-49252:49152-49252/udp"
     files:
       - config/turnserver.conf:/etc/turnserver.conf:ro
     env:
