@@ -62,6 +62,7 @@ function Agent.new(config)
         worktree_path = config.worktree_path,
         prompt = config.prompt,
         invocation_url = config.invocation_url,
+        instance_suffix = config.instance_suffix, -- nil for first, "-2", "-3", etc.
         created_at = os.time(),
         status = "running",
         sessions = {},        -- name -> PtySessionHandle (for lookup by name)
@@ -180,16 +181,23 @@ end
 -- =============================================================================
 
 --- Generate the agent key.
--- Format: repo-name-issue_number (slashes replaced with dashes)
+-- Format: repo-name-issue_number[-N] (slashes replaced with dashes)
+-- The instance_suffix (e.g. "-2", "-3") distinguishes multiple agents
+-- sharing the same worktree/branch.
 -- @return string agent key
 function Agent:agent_key()
     local repo_safe = self.repo:gsub("/", "-")
+    local base
     if self.issue_number then
-        return repo_safe .. "-" .. tostring(self.issue_number)
+        base = repo_safe .. "-" .. tostring(self.issue_number)
     else
         local branch_safe = self.branch_name:gsub("/", "-")
-        return repo_safe .. "-" .. branch_safe
+        base = repo_safe .. "-" .. branch_safe
     end
+    if self.instance_suffix then
+        return base .. self.instance_suffix
+    end
+    return base
 end
 
 --- Close the agent and clean up resources.
@@ -359,6 +367,55 @@ function Agent.list()
         return (a.created_at or 0) < (b.created_at or 0)
     end)
     return result
+end
+
+--- Find all agents matching a base key (ignoring instance suffix).
+-- Returns agents whose key equals base_key or starts with base_key followed by "-".
+-- @param base_key string The base agent key (without instance suffix)
+-- @return array of Agent instances
+function Agent.find_by_base_key(base_key)
+    local result = {}
+    for key, agent in pairs(agents) do
+        if key == base_key or key:sub(1, #base_key + 1) == base_key .. "-" then
+            -- Verify the suffix part is a number (avoid matching base keys that
+            -- happen to share a prefix, e.g. "owner-repo-1" vs "owner-repo-10")
+            if key == base_key then
+                result[#result + 1] = agent
+            else
+                local suffix = key:sub(#base_key + 1)
+                if suffix:match("^%-(%d+)$") then
+                    result[#result + 1] = agent
+                end
+            end
+        end
+    end
+    return result
+end
+
+--- Compute the next available instance suffix for a base key.
+-- Returns nil if no agent exists with this base key (first instance),
+-- or "-N" where N is the next available number.
+-- @param base_key string The base agent key
+-- @return string|nil The instance suffix (nil, "-2", "-3", ...)
+function Agent.next_instance_suffix(base_key)
+    local existing = Agent.find_by_base_key(base_key)
+    if #existing == 0 then
+        return nil
+    end
+    -- Find highest existing suffix number
+    local max_n = 1 -- the first agent (no suffix) counts as 1
+    for _, agent in ipairs(existing) do
+        local key = agent:agent_key()
+        if key == base_key then
+            -- first instance, number = 1
+        else
+            local n = tonumber(key:sub(#base_key + 2)) -- skip the "-"
+            if n and n > max_n then
+                max_n = n
+            end
+        end
+    end
+    return "-" .. tostring(max_n + 1)
 end
 
 --- Count active agents.
