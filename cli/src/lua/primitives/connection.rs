@@ -57,7 +57,7 @@ pub enum ConnectionRequest {
     /// Copy the connection URL to the system clipboard.
     ///
     /// Hub generates the URL (fresh from current crypto bundle) and
-    /// copies it to clipboard via `arboard::Clipboard`.
+    /// copies it to clipboard via OSC 52 terminal escape sequence.
     CopyToClipboard,
 }
 
