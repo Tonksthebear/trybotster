@@ -4,9 +4,11 @@
 -- Rust calls handle_key() for every keypress; the return value tells Rust
 -- what to do:
 --
---   { action = "open_menu" }     -- Rust maps to TuiAction
---   { action = "input_char", char = "a" }  -- action with extra data
---   nil                          -- normal mode: forward to PTY; modal: ignore
+--   { action = "open_menu" }              -- generic: Rust maps to TuiAction directly
+--   { action = "list_select", index = 2 } -- compound: Rust calls actions.on_action()
+--   { action = "input_char", char = "a" } -- generic with extra data
+--   nil                                   -- normal: forward raw bytes to PTY
+--                                         -- modal: swallow key (no-op)
 --
 -- Key descriptor format (built by Rust):
 --   Modifiers prefix-sorted: ctrl+shift+alt+<key>
@@ -17,7 +19,7 @@
 local M = {}
 
 -- =============================================================================
--- Binding Tables (one per app mode)
+-- Binding Tables (one per mode string)
 -- =============================================================================
 
 M.normal = {
@@ -35,33 +37,40 @@ M.normal = {
 M.menu = {
   ["escape"]  = "close_modal",
   ["q"]       = "close_modal",
-  ["up"]      = "menu_up",
-  ["k"]       = "menu_up",
-  ["down"]    = "menu_down",
-  ["j"]       = "menu_down",
-  ["enter"]   = "menu_select",
-  ["space"]   = "menu_select",
+  ["up"]      = "list_up",
+  ["k"]       = "list_up",
+  ["down"]    = "list_down",
+  ["j"]       = "list_down",
+  ["enter"]   = "list_select",
+  ["space"]   = "list_select",
   -- 1-9 number shortcuts handled in fallback logic below
 }
 
-M.worktree_select = {
+-- List navigation table (shared by worktree and similar list modes)
+local list_nav = {
   ["escape"] = "close_modal",
   ["q"]      = "close_modal",
-  ["up"]     = "worktree_up",
-  ["k"]      = "worktree_up",
-  ["down"]   = "worktree_down",
-  ["j"]      = "worktree_down",
-  ["enter"]  = "worktree_select",
-  ["space"]  = "worktree_select",
+  ["up"]     = "list_up",
+  ["k"]      = "list_up",
+  ["down"]   = "list_down",
+  ["j"]      = "list_down",
+  ["enter"]  = "list_select",
+  ["space"]  = "list_select",
 }
 
-M.text_input = {
+-- Text input table (shared by text entry modes)
+local text_input = {
   ["escape"] = "close_modal",
   ["enter"]  = "input_submit",
   -- Characters and backspace handled in fallback logic below
 }
 
-M.close_confirm = {
+-- Mode table aliases — mode strings match Lua layout mode names
+M.new_agent_select_worktree = list_nav
+M.new_agent_create_worktree = text_input
+M.new_agent_prompt = text_input
+
+M.close_agent_confirm = {
   ["escape"] = "close_modal",
   ["n"]      = "close_modal",
   ["q"]      = "close_modal",
@@ -90,8 +99,8 @@ M.error = {
 
 --- Handle a key event. Called by Rust for every keypress (except Ctrl+Q).
 -- @param key string Key descriptor (e.g., "ctrl+p", "shift+enter")
--- @param mode string Current app mode (matches Lua binding table names)
--- @param context table { menu_selected, menu_count, worktree_selected, terminal_rows }
+-- @param mode string Current mode (matches Lua binding table names)
+-- @param context table { list_selected, list_count, terminal_rows }
 -- @return table|nil Action table or nil for default PTY forwarding
 function M.handle_key(key, mode, context)
   -- Mode-specific binding lookup
@@ -104,38 +113,35 @@ function M.handle_key(key, mode, context)
   end
 
   -- Mode-specific fallback logic
-  if mode == "text_input" then
+  if mode == "new_agent_create_worktree" or mode == "new_agent_prompt" then
     if key == "backspace" then
       return { action = "input_backspace" }
     end
-    -- Space is encoded as "space" descriptor
     if key == "space" then
       return { action = "input_char", char = " " }
     end
-    -- Single printable character -> input_char
     if #key == 1 then
       return { action = "input_char", char = key }
     end
-    return nil  -- ignore unbound keys in text input
+    return nil
   end
 
-  if mode == "menu" or mode == "worktree_select" then
-    -- Number shortcuts 1-9 for menu selection
+  if mode == "menu" or mode == "new_agent_select_worktree" then
+    -- Number shortcuts 1-9 for list selection
     if mode == "menu" and #key == 1 and key:match("%d") then
       local idx = tonumber(key) - 1
-      if idx < (context.menu_count or 0) then
-        return { action = "menu_select", index = idx }
+      if idx < (context.list_count or 0) then
+        return { action = "list_select", index = idx }
       end
     end
-    return nil  -- ignore unbound keys in modals
+    return nil
   end
 
-  if mode == "close_confirm" or mode == "connection_code" or mode == "error" then
-    return nil  -- ignore unbound keys in these modals
+  if mode == "close_agent_confirm" or mode == "connection_code" or mode == "error" then
+    return nil
   end
 
   -- Normal mode: unbound keys -> PTY forwarding (return nil)
-  -- Rust will convert the key to ANSI bytes and send to PTY
   return nil
 end
 

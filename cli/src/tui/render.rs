@@ -32,7 +32,7 @@ use ratatui::{
 };
 use vt100::Parser;
 
-use crate::app::{buffer_to_ansi, AppMode};
+use crate::app::buffer_to_ansi;
 
 use super::render_tree::{
     InputProps, ListItemProps, ListProps, ParagraphAlignment, ParagraphProps, SpanStyle,
@@ -40,7 +40,7 @@ use super::render_tree::{
 };
 use crate::compat::{BrowserDimensions, VpnStatus};
 
-use super::events::CreationStage;
+use std::collections::HashMap;
 
 /// Information about an agent for rendering.
 ///
@@ -73,20 +73,18 @@ pub struct AgentRenderInfo {
 /// and the renderer, making dependencies explicit.
 pub struct RenderContext<'a> {
     // === UI State ===
-    /// Current application mode (Normal, Menu, etc.).
-    pub mode: AppMode,
-    /// Currently selected menu item index.
-    pub menu_selected: usize,
+    /// Current UI mode string (e.g., "normal", "menu").
+    pub mode: String,
+    /// Currently selected overlay list item index.
+    pub list_selected: usize,
     /// Text input buffer for text entry modes.
     pub input_buffer: &'a str,
-    /// Currently selected worktree index in selection modal.
-    pub worktree_selected: usize,
     /// Available worktrees for agent creation (path, branch).
     pub available_worktrees: &'a [(String, String)],
     /// Error message to display in Error mode.
     pub error_message: Option<&'a str>,
-    /// Agent creation progress (identifier, stage).
-    pub creating_agent: Option<(&'a str, CreationStage)>,
+    /// Generic key-value store for pending operations (e.g., creating_agent_id, creating_agent_stage).
+    pub pending_fields: &'a HashMap<String, String>,
     /// Connection code data (URL + QR ASCII) for display.
     pub connection_code: Option<&'a super::qr::ConnectionCodeData>,
     /// Whether the connection bundle has been used.
@@ -138,7 +136,7 @@ impl<'a> std::fmt::Debug for RenderContext<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RenderContext")
             .field("mode", &self.mode)
-            .field("menu_selected", &self.menu_selected)
+            .field("list_selected", &self.list_selected)
             .field("selected_agent_index", &self.selected_agent_index)
             .field("agents_count", &self.agents.len())
             .field("has_active_parser", &self.active_parser.is_some())
@@ -255,12 +253,16 @@ fn render_frame(f: &mut Frame, ctx: &RenderContext) {
 
     // Build agent list as generic ListProps
     let mut items: Vec<ListItemProps> = Vec::new();
-    if let Some((identifier, stage)) = &ctx.creating_agent {
-        let stage_label = match stage {
-            CreationStage::CreatingWorktree => "Creating worktree...",
-            CreationStage::CopyingConfig => "Copying config...",
-            CreationStage::SpawningAgent => "Starting agent...",
-            CreationStage::Ready => "Ready",
+    if let (Some(identifier), Some(stage)) = (
+        ctx.pending_fields.get("creating_agent_id"),
+        ctx.pending_fields.get("creating_agent_stage"),
+    ) {
+        let stage_label = match stage.as_str() {
+            "creating_worktree" => "Creating worktree...",
+            "copying_config" => "Copying config...",
+            "spawning_agent" => "Starting agent...",
+            "ready" => "Ready",
+            other => other,
         };
         items.push(ListItemProps {
             content: StyledContent::Plain(format!("-> {} ({})", identifier, stage_label)),
@@ -288,7 +290,7 @@ fn render_frame(f: &mut Frame, ctx: &RenderContext) {
         });
     }
 
-    let creating_offset = if ctx.creating_agent.is_some() { 1 } else { 0 };
+    let creating_offset = if ctx.pending_fields.contains_key("creating_agent_id") { 1 } else { 0 };
     let selected = ctx.selected_agent_index + creating_offset;
 
     let list_props = ListProps {
@@ -553,13 +555,12 @@ mod tests {
         ];
 
         let ctx = RenderContext {
-            mode: AppMode::Normal,
-            menu_selected: 0,
+            mode: "normal".to_string(),
+            list_selected: 0,
             input_buffer: "",
-            worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-            creating_agent: None,
+            pending_fields: &std::collections::HashMap::new(),
             connection_code: None,
             bundle_used: false,
             agent_ids: &[],
