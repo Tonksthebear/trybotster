@@ -1,31 +1,32 @@
-/// Debug test to understand what paths git2 returns for worktrees
+/// Debug test to verify worktree path detection using git CLI.
+use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
 fn setup_test_repo(path: &std::path::Path) {
     Command::new("git")
-        .args(&["init"])
+        .args(["init"])
         .current_dir(path)
         .output()
         .unwrap();
     Command::new("git")
-        .args(&["config", "user.email", "test@test.com"])
+        .args(["config", "user.email", "test@test.com"])
         .current_dir(path)
         .output()
         .unwrap();
     Command::new("git")
-        .args(&["config", "user.name", "Test"])
+        .args(["config", "user.name", "Test"])
         .current_dir(path)
         .output()
         .unwrap();
     std::fs::write(path.join("README.md"), "test").unwrap();
     Command::new("git")
-        .args(&["add", "."])
+        .args(["add", "."])
         .current_dir(path)
         .output()
         .unwrap();
     Command::new("git")
-        .args(&["commit", "-m", "init"])
+        .args(["commit", "-m", "init"])
         .current_dir(path)
         .output()
         .unwrap();
@@ -41,7 +42,7 @@ fn debug_worktree_path_detection() {
     let worktree_path = temp_dir.path().join("my_worktree");
 
     let output = Command::new("git")
-        .args(&[
+        .args([
             "worktree",
             "add",
             "-b",
@@ -58,51 +59,50 @@ fn debug_worktree_path_detection() {
     println!("Main repo: {}", main_repo.display());
     println!("Worktree: {}", worktree_path.display());
 
-    // Open worktree with git2
-    let repo = git2::Repository::open(&worktree_path).unwrap();
+    // Worktrees have a .git *file*, main repos have a .git *directory*
+    let git_path = worktree_path.join(".git");
+    let is_worktree = git_path.is_file();
+    println!("\n=== Worktree detection ===");
+    println!(".git is file (worktree): {}", is_worktree);
+    assert!(is_worktree, "Worktree should have .git as a file");
 
-    println!("\n=== git2 Info ===");
-    println!("is_worktree(): {}", repo.is_worktree());
-    println!("path(): {:?}", repo.path());
+    // Main repo should have .git as a directory
+    let main_git = main_repo.join(".git");
+    assert!(main_git.is_dir(), "Main repo should have .git as a directory");
 
-    println!("commondir(): {:?}", repo.commondir());
+    // Resolve common dir via git CLI
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(&worktree_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
 
-    println!("\n=== Path navigation ===");
-    let path = repo.path();
-    println!("repo.path() = {:?}", path);
+    let git_common = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    println!("git-common-dir: {}", git_common);
 
-    if let Some(parent1) = path.parent() {
-        println!("repo.path().parent() = {:?}", parent1);
-
-        if let Some(parent2) = parent1.parent() {
-            println!("repo.path().parent().parent() = {:?}", parent2);
-        }
-    }
-
-    println!("\n=== Expected ===");
-    println!("Should find main repo at: {}", main_repo.display());
-
-    // What does the actual implementation calculate?
-    let calculated_repo_path = if repo.is_worktree() {
-        let common_dir = repo.commondir();
-        common_dir.parent().unwrap().to_path_buf()
+    let git_common_path = PathBuf::from(&git_common);
+    let absolute = if git_common_path.is_absolute() {
+        git_common_path
     } else {
-        repo.path().parent().unwrap().to_path_buf()
+        worktree_path.join(&git_common_path)
     };
 
-    println!("\n=== Calculated by current code ===");
+    let calculated_repo_path = absolute
+        .canonicalize()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    println!("\n=== Calculated ===");
     println!("Calculated repo_path: {}", calculated_repo_path.display());
-    println!(
-        "Is this the main repo? {}",
-        calculated_repo_path == main_repo
-    );
 
     // Canonicalize both paths to handle /var vs /private/var symlink on macOS
-    let calculated_canonical = std::fs::canonicalize(&calculated_repo_path).unwrap();
     let expected_canonical = std::fs::canonicalize(&main_repo).unwrap();
 
     assert_eq!(
-        calculated_canonical, expected_canonical,
+        calculated_repo_path, expected_canonical,
         "Should calculate correct main repo path"
     );
 }
