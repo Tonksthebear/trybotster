@@ -100,8 +100,12 @@ if [ "$RUN_UNIT" = true ]; then
 fi
 
 if [ "$RUN_INTEGRATION" = true ]; then
+    # Touch Lua dir so cargo detects changes (git operations can preserve mtimes)
+    touch lua/
     echo "Building release binary (required by PTY integration tests)..."
     cargo build --release
+    # Clear cached Lua so the binary re-extracts fresh embedded files
+    rm -f ~/.botster/lua/.version
     echo ""
     echo "Running integration tests..."
     cargo test --test '*' $CARGO_ARGS
