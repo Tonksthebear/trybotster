@@ -25,7 +25,8 @@ fn test_hub() -> Hub {
     let mut hub = Hub::new(config).unwrap();
 
     // Register TUI via Lua (Hub-side processing)
-    let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let (_request_tx, request_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::client::TuiRequest>();
     let _output_rx = hub.register_tui_via_lua(request_rx);
 
     // Initialize crypto service for browser client tests

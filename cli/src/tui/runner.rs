@@ -54,7 +54,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event};
+use crossterm::execute;
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 use vt100::Parser;
@@ -62,15 +62,15 @@ use vt100::Parser;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::AppMode;
-use crate::client::TuiOutput;
+use crate::client::{TuiOutput, TuiRequest};
 use crate::hub::Hub;
 use crate::relay::AgentInfo;
 use crate::tui::layout::terminal_widget_inner_area;
 
 use super::actions::TuiAction;
 use super::events::CreationStage;
-use super::input::{key_event_to_descriptor, key_to_pty_bytes};
 use super::layout_lua::{KeyContext, LayoutLua, LuaKeyAction};
+use super::raw_input::{InputEvent, RawInputReader, ScrollDirection};
 use super::qr::ConnectionCodeData;
 
 /// Default scrollback lines for VT100 parser.
@@ -95,8 +95,8 @@ pub(super) const DEFAULT_SCROLLBACK: usize = 1000;
 ///                                            ──► vt100_parser ──► render
 /// ```
 ///
-/// TuiRunner sends JSON messages through `request_tx`. Hub routes all messages
-/// through Lua `client.lua` — the same protocol as browser clients.
+/// TuiRunner sends `TuiRequest` messages through `request_tx`: control messages
+/// go through Lua `client.lua`, PTY keyboard input goes directly to the PTY.
 pub struct TuiRunner<B: Backend> {
     // === Terminal ===
     /// VT100 parser for the currently active PTY.
@@ -149,9 +149,10 @@ pub struct TuiRunner<B: Backend> {
     // === Channels ===
     /// Request sender to Hub.
     ///
-    /// All TUI operations flow through this channel as JSON messages,
-    /// routed through Lua `client.lua` — the same path as browser clients.
-    pub(super) request_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    /// Control messages (resize, subscriptions, agent lifecycle) are wrapped
+    /// in `TuiRequest::LuaMessage` and routed through Lua. PTY keyboard input
+    /// is sent as `TuiRequest::PtyInput` and written directly to the PTY.
+    pub(super) request_tx: tokio::sync::mpsc::UnboundedSender<TuiRequest>,
 
     // === Selection State ===
     /// Currently selected agent ID.
@@ -230,6 +231,26 @@ pub struct TuiRunner<B: Backend> {
 
     /// Filesystem path to keybindings.lua for hot-reload watching.
     keybinding_lua_fs_path: Option<std::path::PathBuf>,
+
+    // === Raw Input ===
+    /// Raw stdin reader — replaces crossterm's event reader for keyboard input.
+    raw_reader: RawInputReader,
+
+    /// SIGWINCH flag for terminal resize detection.
+    pub(super) resize_flag: Arc<AtomicBool>,
+
+    // === Terminal Mode Mirroring ===
+    /// Whether we've pushed application cursor mode (DECCKM) to the outer terminal.
+    outer_app_cursor: bool,
+    /// Whether we've pushed bracketed paste mode to the outer terminal.
+    outer_bracketed_paste: bool,
+
+    // === Kitty Keyboard Protocol Mirroring ===
+    /// Whether the active PTY has pushed Kitty keyboard protocol.
+    /// Detected by scanning PTY output for CSI > flags u (push) / CSI < u (pop).
+    inner_kitty_enabled: bool,
+    /// Whether we've pushed Kitty to the outer terminal.
+    outer_kitty_enabled: bool,
 }
 
 impl<B: Backend> std::fmt::Debug for TuiRunner<B>
@@ -267,7 +288,7 @@ where
     /// A new TuiRunner ready to run.
     pub fn new(
         terminal: Terminal<B>,
-        request_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+        request_tx: tokio::sync::mpsc::UnboundedSender<TuiRequest>,
         output_rx: tokio::sync::mpsc::UnboundedReceiver<TuiOutput>,
         shutdown: Arc<AtomicBool>,
         terminal_dims: (u16, u16),
@@ -306,6 +327,12 @@ where
             layout_lua_fs_path: None,
             keybinding_lua_source: None,
             keybinding_lua_fs_path: None,
+            raw_reader: RawInputReader::new(),
+            resize_flag: Arc::new(AtomicBool::new(false)),
+            outer_app_cursor: false,
+            outer_bracketed_paste: false,
+            inner_kitty_enabled: false,
+            outer_kitty_enabled: false,
         }
     }
 
@@ -556,7 +583,7 @@ where
 
         while !self.should_quit() {
             // 1. Handle keyboard/mouse input
-            self.poll_input(layout_lua.as_ref())?;
+            self.poll_input(layout_lua.as_ref());
 
             if self.should_quit() {
                 break;
@@ -564,6 +591,9 @@ where
 
             // 2. Poll PTY output and Lua events (via Hub output channel)
             self.poll_pty_events();
+
+            // 2b. Mirror terminal modes from PTY to outer terminal
+            self.sync_terminal_modes();
 
             // 3. Hot-reload layout.lua and keybindings.lua if changed
             if let Some((ref watcher, ref path)) = layout_watcher {
@@ -661,38 +691,36 @@ where
 
     /// Poll for keyboard/mouse input and handle it.
     ///
-    /// Drains all available events per frame to prevent scroll stall when
-    /// rapid input (e.g., mouse wheel) queues events faster than render rate.
-    fn poll_input(&mut self, layout_lua: Option<&LayoutLua>) -> Result<()> {
-        // Drain all available events (0ms timeout = non-blocking check)
-        while event::poll(Duration::from_millis(0))? {
-            let ev = event::read()?;
-            self.handle_input_event(&ev, layout_lua);
+    /// Reads raw bytes from stdin and parses them into events. Also checks
+    /// the SIGWINCH flag for terminal resize. This replaces crossterm's
+    /// event reader to preserve raw bytes for PTY passthrough.
+    fn poll_input(&mut self, layout_lua: Option<&LayoutLua>) {
+        let events = self.raw_reader.drain_events();
+        for event in events {
+            self.handle_raw_input_event(event, layout_lua);
         }
-        Ok(())
+        // Check SIGWINCH resize flag
+        if self.resize_flag.swap(false, Ordering::SeqCst) {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            let (inner_rows, inner_cols) = terminal_widget_inner_area(cols, rows);
+            self.handle_resize(inner_rows, inner_cols);
+        }
     }
 
-    /// Handle a terminal input event.
+    /// Handle a raw input event from the stdin reader.
     ///
     /// Key events go through Lua keybinding dispatch:
-    /// 1. Convert crossterm `KeyEvent` to descriptor string
+    /// 1. Use descriptor from raw byte parser (same format Lua expects)
     /// 2. Ctrl+Q is hardcoded as Quit (safety — works even if Lua is broken)
     /// 3. Call Lua `handle_key(descriptor, mode, context)`
     /// 4. If Lua returns an action → map to `TuiAction` and handle
-    /// 5. If Lua returns `nil` in Normal mode → forward key to PTY
+    /// 5. If Lua returns `nil` in Normal mode → forward original raw bytes to PTY
     /// 6. If Lua returns `nil` in modal mode → ignore (swallow key)
     ///
-    /// Mouse and resize events are handled directly in Rust.
-    fn handle_input_event(&mut self, event: &Event, layout_lua: Option<&LayoutLua>) {
+    /// Mouse scroll events are handled directly.
+    fn handle_raw_input_event(&mut self, event: InputEvent, layout_lua: Option<&LayoutLua>) {
         match event {
-            Event::Key(key) => {
-                // Only process key press events
-                if key.kind != crossterm::event::KeyEventKind::Press {
-                    return;
-                }
-
-                let descriptor = key_event_to_descriptor(key);
-
+            InputEvent::Key { descriptor, raw_bytes } => {
                 // Safety: Ctrl+Q always works, even if Lua is broken
                 if descriptor == "ctrl+q" {
                     self.handle_tui_action(TuiAction::Quit);
@@ -721,23 +749,16 @@ where
                                 return;
                             }
                             Ok(None) => {
-                                // Unbound key
-                                if self.mode == AppMode::Normal {
-                                    // Forward to PTY
-                                    if let Some(bytes) = key_to_pty_bytes(key) {
-                                        self.handle_pty_input(&bytes);
-                                    }
+                                // Unbound key — forward raw bytes to PTY in Normal mode
+                                if self.mode == AppMode::Normal && !raw_bytes.is_empty() {
+                                    self.handle_pty_input(&raw_bytes);
                                 }
-                                // In modal modes, unbound keys are swallowed
                                 return;
                             }
                             Err(e) => {
                                 log::warn!("Lua handle_key failed: {e}");
-                                // Fall through to PTY forwarding in normal mode
-                                if self.mode == AppMode::Normal {
-                                    if let Some(bytes) = key_to_pty_bytes(key) {
-                                        self.handle_pty_input(&bytes);
-                                    }
+                                if self.mode == AppMode::Normal && !raw_bytes.is_empty() {
+                                    self.handle_pty_input(&raw_bytes);
                                 }
                                 return;
                             }
@@ -745,33 +766,23 @@ where
                     }
                 }
 
-                // No Lua keybindings loaded — fall back to PTY forwarding in normal mode
-                if self.mode == AppMode::Normal {
-                    if let Some(bytes) = key_to_pty_bytes(key) {
-                        self.handle_pty_input(&bytes);
-                    }
+                // No Lua keybindings loaded — forward raw bytes in Normal mode
+                if self.mode == AppMode::Normal && !raw_bytes.is_empty() {
+                    self.handle_pty_input(&raw_bytes);
                 }
             }
-            Event::Mouse(mouse) => {
-                // Mouse scroll only in normal mode
+            InputEvent::MouseScroll { direction } => {
                 if self.mode == AppMode::Normal {
-                    match mouse.kind {
-                        crossterm::event::MouseEventKind::ScrollUp => {
+                    match direction {
+                        ScrollDirection::Up => {
                             self.handle_tui_action(TuiAction::ScrollUp(3));
                         }
-                        crossterm::event::MouseEventKind::ScrollDown => {
+                        ScrollDirection::Down => {
                             self.handle_tui_action(TuiAction::ScrollDown(3));
                         }
-                        _ => {}
                     }
                 }
             }
-            Event::Resize(cols, rows) => {
-                let (inner_rows, inner_cols) =
-                    crate::tui::layout::terminal_widget_inner_area(*cols, *rows);
-                self.handle_resize(inner_rows, inner_cols);
-            }
-            _ => {}
         }
     }
 
@@ -844,16 +855,82 @@ where
         self.handle_tui_action(action);
     }
 
-    /// Handle PTY input (send to connected agent via Lua terminal subscription).
+    /// Send raw PTY input bytes directly to the PTY writer.
+    ///
+    /// Bypasses Lua entirely — no JSON serialization, no `from_utf8_lossy`.
+    /// Uses `current_agent_index` and `current_pty_index` to route to the
+    /// correct PTY. No-op if no PTY is currently focused.
     fn handle_pty_input(&mut self, data: &[u8]) {
-        if let Some(ref sub_id) = self.current_terminal_sub_id {
-            self.send_msg(serde_json::json!({
-                "subscriptionId": sub_id,
-                "data": {
-                    "type": "input",
-                    "data": String::from_utf8_lossy(data),
-                }
-            }));
+        if let (Some(agent_index), Some(pty_index)) =
+            (self.current_agent_index, self.current_pty_index)
+        {
+            if let Err(e) = self.request_tx.send(TuiRequest::PtyInput {
+                agent_index,
+                pty_index,
+                data: data.to_vec(),
+            }) {
+                log::error!("Failed to send PTY input: {e}");
+            }
+        }
+    }
+
+    /// Mirror terminal modes from PTY to the outer terminal.
+    ///
+    /// When PTY apps (vim, less) change terminal modes via escape sequences,
+    /// we push those same modes to the outer terminal. This makes raw stdin
+    /// passthrough work correctly — the outer terminal generates the same
+    /// byte sequences that the PTY app expects.
+    ///
+    /// Tracked modes:
+    /// - DECCKM (application cursor): arrow keys send ESC O x vs ESC [ x
+    /// - Bracketed paste: paste is wrapped in ESC [200~ / ESC [201~
+    fn sync_terminal_modes(&mut self) {
+        let parser = self.vt100_parser.lock().expect("parser lock poisoned");
+        let screen = parser.screen();
+
+        let app_cursor = screen.application_cursor();
+        if app_cursor != self.outer_app_cursor {
+            self.outer_app_cursor = app_cursor;
+            let seq = if app_cursor {
+                b"\x1b[?1h" as &[u8]
+            } else {
+                b"\x1b[?1l" as &[u8]
+            };
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), seq);
+        }
+
+        let bp = screen.bracketed_paste();
+        if bp != self.outer_bracketed_paste {
+            self.outer_bracketed_paste = bp;
+            let seq = if bp {
+                b"\x1b[?2004h" as &[u8]
+            } else {
+                b"\x1b[?2004l" as &[u8]
+            };
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), seq);
+        }
+
+        // Drop the parser lock before writing Kitty sequences (which use execute!())
+        drop(parser);
+
+        // Kitty keyboard protocol: only push when PTY wants it AND we're in Normal mode.
+        // In modal modes (menu, input, etc.) we want traditional bytes for our keybindings.
+        let desired_kitty = self.inner_kitty_enabled && self.mode == AppMode::Normal;
+        if desired_kitty != self.outer_kitty_enabled {
+            self.outer_kitty_enabled = desired_kitty;
+            if desired_kitty {
+                let _ = execute!(
+                    std::io::stdout(),
+                    crossterm::event::PushKeyboardEnhancementFlags(
+                        crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    )
+                );
+            } else {
+                let _ = execute!(
+                    std::io::stdout(),
+                    crossterm::event::PopKeyboardEnhancementFlags
+                );
+            }
         }
     }
 
@@ -906,6 +983,14 @@ where
                     log::debug!("Processed {} bytes of scrollback", data.len());
                 }
                 Ok(TuiOutput::Output { agent_index, pty_index, data }) => {
+                    // Scan active PTY output for Kitty keyboard protocol push/pop
+                    let is_active = agent_index.unwrap_or(0) == self.current_agent_index.unwrap_or(0)
+                        && pty_index.unwrap_or(0) == self.current_pty_index.unwrap_or(0);
+                    if is_active {
+                        if let Some(kitty_state) = scan_kitty_keyboard_state(&data) {
+                            self.inner_kitty_enabled = kitty_state;
+                        }
+                    }
                     let parser = self.resolve_parser(agent_index, pty_index);
                     parser.lock().expect("parser lock poisoned").process(&data);
                 }
@@ -1072,12 +1157,14 @@ where
 
     /// Send a JSON message to Hub via the Lua client protocol.
     ///
-    /// Hub routes these to `lua.call_tui_message()` which processes them
-    /// through the same `Client:on_message()` path as browser clients.
+    /// Wraps the JSON in `TuiRequest::LuaMessage` for routing through
+    /// `lua.call_tui_message()` — the same `Client:on_message()` path
+    /// as browser clients. Used for resize, subscriptions, agent lifecycle.
     ///
-    /// This is the sole method for TuiRunner to communicate with Hub.
+    /// For PTY keyboard input, use `handle_pty_input()` instead — it sends
+    /// raw bytes via `TuiRequest::PtyInput`, bypassing Lua.
     pub(super) fn send_msg(&self, msg: serde_json::Value) {
-        if let Err(e) = self.request_tx.send(msg) {
+        if let Err(e) = self.request_tx.send(TuiRequest::LuaMessage(msg)) {
             log::error!("Failed to send Lua message: {}", e);
         }
     }
@@ -1228,8 +1315,8 @@ pub fn run_with_hub(
         inner_rows
     );
 
-    // Create JSON channel for TuiRunner -> Hub communication
-    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    // Create channel for TuiRunner -> Hub communication
+    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<TuiRequest>();
 
     // Register TUI via Lua for Hub-side request processing.
     // Hub processes JSONs directly in its tick loop.
@@ -1257,6 +1344,17 @@ pub fn run_with_hub(
     if let Some(kb) = load_keybinding_lua_source() {
         tui_runner.set_keybinding_lua_source(kb.source);
         tui_runner.keybinding_lua_fs_path = kb.fs_path;
+    }
+
+    // Register SIGWINCH to set the resize flag (TuiRunner polls this each tick)
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::signal::SIGWINCH;
+        if let Err(e) =
+            signal_hook::flag::register(SIGWINCH, Arc::clone(&tui_runner.resize_flag))
+        {
+            log::warn!("Failed to register SIGWINCH handler: {e}");
+        }
     }
 
     // Spawn TUI thread
@@ -1295,6 +1393,51 @@ pub fn run_with_hub(
 
 /// Map `AppMode` to the Lua mode string used in keybinding tables.
 ///
+/// Scan PTY output bytes for Kitty keyboard protocol push/pop sequences.
+///
+/// Returns `Some(true)` if the last relevant sequence is a push (`CSI > flags u`),
+/// `Some(false)` if it's a pop (`CSI < u`), or `None` if no Kitty sequences found.
+///
+/// We scan for the *last* occurrence because a single output chunk could contain
+/// multiple push/pop sequences (e.g., during shell startup).
+fn scan_kitty_keyboard_state(data: &[u8]) -> Option<bool> {
+    let mut result = None;
+
+    // Scan for ESC [ > ... u (push) and ESC [ < ... u (pop)
+    let mut i = 0;
+    while i + 2 < data.len() {
+        if data[i] == 0x1b && data[i + 1] == b'[' {
+            let start = i + 2;
+            if start < data.len() && data[start] == b'>' {
+                // Potential push: ESC [ > <digits> u
+                let mut j = start + 1;
+                while j < data.len() && data[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j < data.len() && data[j] == b'u' {
+                    result = Some(true);
+                    i = j + 1;
+                    continue;
+                }
+            } else if start < data.len() && data[start] == b'<' {
+                // Potential pop: ESC [ < u  (or ESC [ < <digits> u)
+                let mut j = start + 1;
+                while j < data.len() && data[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j < data.len() && data[j] == b'u' {
+                    result = Some(false);
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    result
+}
+
 /// These strings match the table names in `ui/keybindings.lua`.
 /// Both `NewAgentCreateWorktree` and `NewAgentPrompt` map to `"text_input"`.
 fn mode_to_lua_string(mode: &AppMode) -> &'static str {
@@ -1401,7 +1544,7 @@ mod tests {
     //! # Test Philosophy
     //!
     //! Tests in this module exercise real code paths via:
-    //! 1. Keyboard events through Lua `handle_key()` -> `handle_input_event()` -> `handle_tui_action()`
+    //! 1. Keyboard events through Lua `handle_key()` -> `handle_raw_input_event()` -> `handle_tui_action()`
     //! 2. Verification of commands sent through channels
     //! 3. Real PTY event polling through `poll_pty_events()`
     //!
@@ -1425,7 +1568,7 @@ mod tests {
     use super::*;
     use crate::client::{CreateAgentRequest, DeleteAgentRequest};
     use crate::tui::actions::TuiAction;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::tui::raw_input::InputEvent;
     use ratatui::backend::TestBackend;
     use tokio::sync::mpsc;
 
@@ -1444,11 +1587,11 @@ mod tests {
     /// (e.g., `runner.available_worktrees`) directly for tests needing data.
     /// Use `create_test_runner_with_mock_client` for flows requiring a
     /// responder thread.
-    fn create_test_runner() -> (TuiRunner<TestBackend>, mpsc::UnboundedReceiver<serde_json::Value>) {
+    fn create_test_runner() -> (TuiRunner<TestBackend>, mpsc::UnboundedReceiver<TuiRequest>) {
         let backend = TestBackend::new(80, 24);
         let terminal = Terminal::new(backend).expect("Failed to create test terminal");
 
-        let (request_tx, request_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        let (request_tx, request_rx) = mpsc::unbounded_channel::<TuiRequest>();
 
         // Create output channel (Hub would send here, but we don't have one in tests)
         let (_output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1481,20 +1624,19 @@ mod tests {
     fn create_test_runner_with_mock_client() -> (
         TuiRunner<TestBackend>,
         mpsc::UnboundedSender<TuiOutput>,
-        mpsc::UnboundedReceiver<serde_json::Value>,
+        mpsc::UnboundedReceiver<TuiRequest>,
         Arc<AtomicBool>,
     ) {
         // Create our own request channel that we control
         // TuiRunner sends requests here, and the responder handles them
-        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<serde_json::Value>();
-        let (passthrough_tx, passthrough_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<TuiRequest>();
+        let (passthrough_tx, passthrough_rx) = mpsc::unbounded_channel::<TuiRequest>();
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let responder_shutdown = Arc::clone(&shutdown);
 
-        // Spawn request responder thread that passthroughs all JSON messages
-        // for test verification. All TUI operations are now JSON messages
-        // routed through the Lua client protocol.
+        // Spawn request responder thread that passthroughs all messages
+        // for test verification.
         thread::spawn(move || {
             while !responder_shutdown.load(Ordering::Relaxed) {
                 match request_rx.try_recv() {
@@ -1526,19 +1668,59 @@ mod tests {
         (runner, output_tx, passthrough_rx, shutdown)
     }
 
-    /// Creates a key event without modifiers.
-    fn make_key(code: KeyCode) -> Event {
-        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    /// Creates an `InputEvent::Key` for a plain character.
+    fn make_key_char(c: char) -> InputEvent {
+        InputEvent::Key {
+            descriptor: c.to_string(),
+            raw_bytes: c.to_string().into_bytes(),
+        }
     }
 
-    /// Creates a key event with Ctrl modifier.
-    fn make_key_ctrl(code: KeyCode) -> Event {
-        Event::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
+    /// Creates an `InputEvent::Key` for a special key by descriptor.
+    fn make_key_desc(descriptor: &str, raw_bytes: &[u8]) -> InputEvent {
+        InputEvent::Key {
+            descriptor: descriptor.to_string(),
+            raw_bytes: raw_bytes.to_vec(),
+        }
     }
 
-    /// Creates a key event with Shift modifier.
-    fn make_key_shift(code: KeyCode) -> Event {
-        Event::Key(KeyEvent::new(code, KeyModifiers::SHIFT))
+    /// Creates an `InputEvent::Key` for Enter.
+    fn make_key_enter() -> InputEvent {
+        make_key_desc("enter", b"\r")
+    }
+
+    /// Creates an `InputEvent::Key` for Escape.
+    fn make_key_escape() -> InputEvent {
+        make_key_desc("escape", &[0x1b])
+    }
+
+    /// Creates an `InputEvent::Key` for Up arrow.
+    fn make_key_up() -> InputEvent {
+        make_key_desc("up", &[0x1b, b'[', b'A'])
+    }
+
+    /// Creates an `InputEvent::Key` for Down arrow.
+    fn make_key_down() -> InputEvent {
+        make_key_desc("down", &[0x1b, b'[', b'B'])
+    }
+
+    /// Creates an `InputEvent::Key` for Ctrl+<char>.
+    fn make_key_ctrl(c: char) -> InputEvent {
+        let ctrl_byte = (c.to_ascii_uppercase() as u8).wrapping_sub(b'@');
+        InputEvent::Key {
+            descriptor: format!("ctrl+{}", c.to_ascii_lowercase()),
+            raw_bytes: vec![ctrl_byte],
+        }
+    }
+
+    /// Extract the JSON value from a `TuiRequest::LuaMessage`.
+    ///
+    /// Panics if the request is not a `LuaMessage` variant.
+    fn unwrap_lua_msg(request: TuiRequest) -> serde_json::Value {
+        match request {
+            TuiRequest::LuaMessage(msg) => msg,
+            other => panic!("Expected LuaMessage, got {other:?}"),
+        }
     }
 
     /// Creates a `LayoutLua` with keybindings loaded from the actual file.
@@ -1553,10 +1735,10 @@ mod tests {
 
     /// Processes a keyboard event through the full Lua-driven input pipeline.
     ///
-    /// This exercises: `Event` -> `handle_input_event()` with Lua keybindings
-    fn process_key(runner: &mut TuiRunner<TestBackend>, event: Event) {
+    /// This exercises: `InputEvent` -> `handle_raw_input_event()` with Lua keybindings
+    fn process_key(runner: &mut TuiRunner<TestBackend>, event: InputEvent) {
         let lua = make_test_layout_with_keybindings();
-        runner.handle_input_event(&event, Some(&lua));
+        runner.handle_raw_input_event(event, Some(&lua));
     }
 
     // =========================================================================
@@ -1681,7 +1863,7 @@ mod tests {
     /// ```ignore
     /// let idx = find_menu_action_index(&runner, MenuAction::NewAgent).unwrap();
     /// navigate_to_menu_index(&mut runner, idx);
-    /// process_key(&mut runner, make_key(KeyCode::Enter));
+    /// process_key(&mut runner, make_key_enter());
     /// ```
     fn find_menu_action_index(
         runner: &TuiRunner<TestBackend>,
@@ -1712,7 +1894,7 @@ mod tests {
     /// * `target_idx` - The target selection index to navigate to
     fn navigate_to_menu_index(runner: &mut TuiRunner<TestBackend>, target_idx: usize) {
         for _ in 0..target_idx {
-            process_key(runner, make_key(KeyCode::Down));
+            process_key(runner, make_key_down());
         }
     }
 
@@ -1794,7 +1976,7 @@ mod tests {
 
         assert_eq!(runner.mode(), AppMode::Normal);
 
-        process_key(&mut runner, make_key_ctrl(KeyCode::Char('p')));
+        process_key(&mut runner, make_key_ctrl('p'));
 
         assert_eq!(runner.mode(), AppMode::Menu, "Ctrl+P should open menu");
     }
@@ -1805,24 +1987,24 @@ mod tests {
         let (mut runner, _cmd_rx) = create_test_runner();
 
         // Open menu
-        process_key(&mut runner, make_key_ctrl(KeyCode::Char('p')));
+        process_key(&mut runner, make_key_ctrl('p'));
         assert_eq!(runner.mode(), AppMode::Menu);
         assert_eq!(runner.menu_selected, 0);
 
         // Navigate down (menu has 2 items: New Agent, Connection Code)
-        process_key(&mut runner, make_key(KeyCode::Down));
+        process_key(&mut runner, make_key_down());
         assert_eq!(runner.menu_selected, 1);
 
         // Should clamp at max (1)
-        process_key(&mut runner, make_key(KeyCode::Down));
+        process_key(&mut runner, make_key_down());
         assert_eq!(runner.menu_selected, 1);
 
         // Navigate up
-        process_key(&mut runner, make_key(KeyCode::Up));
+        process_key(&mut runner, make_key_up());
         assert_eq!(runner.menu_selected, 0);
 
         // Close with Escape
-        process_key(&mut runner, make_key(KeyCode::Esc));
+        process_key(&mut runner, make_key_escape());
         assert_eq!(runner.mode(), AppMode::Normal);
     }
 
@@ -1831,10 +2013,10 @@ mod tests {
     fn test_e2e_menu_up_clamps_at_zero() {
         let (mut runner, _cmd_rx) = create_test_runner();
 
-        process_key(&mut runner, make_key_ctrl(KeyCode::Char('p')));
+        process_key(&mut runner, make_key_ctrl('p'));
         assert_eq!(runner.menu_selected, 0);
 
-        process_key(&mut runner, make_key(KeyCode::Up));
+        process_key(&mut runner, make_key_up());
         assert_eq!(runner.menu_selected, 0, "Should not go below 0");
     }
 
@@ -1853,7 +2035,7 @@ mod tests {
         let (mut runner, _cmd_rx) = create_test_runner();
 
         // Open menu (no agent selected)
-        process_key(&mut runner, make_key_ctrl(KeyCode::Char('p')));
+        process_key(&mut runner, make_key_ctrl('p'));
         assert_eq!(runner.mode(), AppMode::Menu);
 
         // Find what action is at index 1 (which corresponds to pressing '2')
@@ -1865,7 +2047,7 @@ mod tests {
         );
 
         // Press '2' to select the item at index 1
-        process_key(&mut runner, make_key(KeyCode::Char('2')));
+        process_key(&mut runner, make_key_char('2'));
 
         assert_eq!(
             runner.mode(),
@@ -1881,7 +2063,7 @@ mod tests {
 
         assert!(!runner.quit);
 
-        process_key(&mut runner, make_key_ctrl(KeyCode::Char('q')));
+        process_key(&mut runner, make_key_ctrl('q'));
 
         assert!(runner.quit, "Ctrl+Q should set quit flag");
     }
@@ -1927,7 +2109,7 @@ mod tests {
         let (mut runner, _cmd_rx) = create_test_runner();
 
         // 1. Open menu
-        process_key(&mut runner, make_key_ctrl(KeyCode::Char('p')));
+        process_key(&mut runner, make_key_ctrl('p'));
         assert_eq!(runner.mode(), AppMode::Menu);
 
         // 2. Find and navigate to Connection Code using dynamic menu lookup
@@ -1937,11 +2119,11 @@ mod tests {
         assert_eq!(runner.menu_selected, connection_idx);
 
         // 3. Select with Enter
-        process_key(&mut runner, make_key(KeyCode::Enter));
+        process_key(&mut runner, make_key_enter());
         assert_eq!(runner.mode(), AppMode::ConnectionCode);
 
         // 4. Close with Escape
-        process_key(&mut runner, make_key(KeyCode::Esc));
+        process_key(&mut runner, make_key_escape());
         assert_eq!(runner.mode(), AppMode::Normal);
     }
 
@@ -1987,14 +2169,14 @@ mod tests {
         runner.available_worktrees = vec![("/path/worktree-1".to_string(), "feature-1".to_string())];
 
         // 1. Open menu and navigate to New Agent using dynamic lookup
-        process_key(&mut runner, make_key_ctrl(KeyCode::Char('p')));
+        process_key(&mut runner, make_key_ctrl('p'));
 
         let new_agent_idx = find_menu_action_index(&runner, MenuAction::NewAgent)
             .expect("NewAgent should be in menu");
         navigate_to_menu_index(&mut runner, new_agent_idx);
         assert_eq!(runner.menu_selected, new_agent_idx);
 
-        process_key(&mut runner, make_key(KeyCode::Enter));
+        process_key(&mut runner, make_key_enter());
 
         // Small delay to let responder process messages
         thread::sleep(Duration::from_millis(10));
@@ -2007,34 +2189,35 @@ mod tests {
 
         // 2. Select "Create new worktree" (index 0)
         assert_eq!(runner.worktree_selected, 0);
-        process_key(&mut runner, make_key(KeyCode::Enter));
+        process_key(&mut runner, make_key_enter());
 
         assert_eq!(runner.mode(), AppMode::NewAgentCreateWorktree);
 
         // 3. Type issue name
         for c in "issue-42".chars() {
-            process_key(&mut runner, make_key(KeyCode::Char(c)));
+            process_key(&mut runner, make_key_char(c));
         }
         assert_eq!(runner.input_buffer, "issue-42");
 
         // 4. Submit issue name
-        process_key(&mut runner, make_key(KeyCode::Enter));
+        process_key(&mut runner, make_key_enter());
 
         assert_eq!(runner.mode(), AppMode::NewAgentPrompt);
         assert_eq!(runner.pending_issue_or_branch, Some("issue-42".to_string()));
 
         // 5. Type prompt and submit
         for c in "Fix bug".chars() {
-            process_key(&mut runner, make_key(KeyCode::Char(c)));
+            process_key(&mut runner, make_key_char(c));
         }
-        process_key(&mut runner, make_key(KeyCode::Enter));
+        process_key(&mut runner, make_key_enter());
 
         // Wait for responder to process
         thread::sleep(Duration::from_millis(10));
 
         // Verify create_agent JSON message (skip list_worktrees request)
         let mut found_create = false;
-        while let Ok(msg) = request_rx.try_recv() {
+        while let Ok(req) = request_rx.try_recv() {
+            let msg = unwrap_lua_msg(req);
             if let Some(data) = msg.get("data") {
                 if data.get("type").and_then(|t| t.as_str()) == Some("create_agent") {
                     assert_eq!(
@@ -2096,24 +2279,24 @@ mod tests {
         ];
 
         // Open menu and navigate to New Agent using dynamic lookup
-        process_key(&mut runner, make_key_ctrl(KeyCode::Char('p')));
+        process_key(&mut runner, make_key_ctrl('p'));
 
         let new_agent_idx = find_menu_action_index(&runner, MenuAction::NewAgent)
             .expect("NewAgent should be in menu");
         navigate_to_menu_index(&mut runner, new_agent_idx);
         assert_eq!(runner.menu_selected, new_agent_idx);
 
-        process_key(&mut runner, make_key(KeyCode::Enter));
+        process_key(&mut runner, make_key_enter());
 
         thread::sleep(Duration::from_millis(10));
         assert_eq!(runner.mode(), AppMode::NewAgentSelectWorktree);
 
         // Navigate to first existing worktree (index 1)
-        process_key(&mut runner, make_key(KeyCode::Down));
+        process_key(&mut runner, make_key_down());
         assert_eq!(runner.worktree_selected, 1);
 
         // Select existing worktree
-        process_key(&mut runner, make_key(KeyCode::Enter));
+        process_key(&mut runner, make_key_enter());
 
         thread::sleep(Duration::from_millis(10));
 
@@ -2137,7 +2320,8 @@ mod tests {
 
         // Verify reopen_worktree JSON message with path
         let mut found_create = false;
-        while let Ok(msg) = request_rx.try_recv() {
+        while let Ok(req) = request_rx.try_recv() {
+            let msg = unwrap_lua_msg(req);
             if let Some(data) = msg.get("data") {
                 if data.get("type").and_then(|t| t.as_str()) == Some("reopen_worktree") {
                     assert_eq!(
@@ -2168,7 +2352,7 @@ mod tests {
         runner.mode = AppMode::NewAgentCreateWorktree;
 
         // Submit empty input
-        process_key(&mut runner, make_key(KeyCode::Enter));
+        process_key(&mut runner, make_key_enter());
 
         // Should stay in same mode
         assert_eq!(
@@ -2185,20 +2369,20 @@ mod tests {
 
         // Cancel at worktree selection
         runner.mode = AppMode::NewAgentSelectWorktree;
-        process_key(&mut runner, make_key(KeyCode::Esc));
+        process_key(&mut runner, make_key_escape());
         assert_eq!(runner.mode(), AppMode::Normal);
 
         // Cancel at issue input
         runner.mode = AppMode::NewAgentCreateWorktree;
         runner.input_buffer = "partial".to_string();
-        process_key(&mut runner, make_key(KeyCode::Esc));
+        process_key(&mut runner, make_key_escape());
         assert_eq!(runner.mode(), AppMode::Normal);
         assert!(runner.input_buffer.is_empty(), "Buffer should be cleared");
 
         // Cancel at prompt
         runner.mode = AppMode::NewAgentPrompt;
         runner.pending_issue_or_branch = Some("issue-123".to_string());
-        process_key(&mut runner, make_key(KeyCode::Esc));
+        process_key(&mut runner, make_key_escape());
         assert_eq!(runner.mode(), AppMode::Normal);
 
         // No commands sent
@@ -2217,21 +2401,21 @@ mod tests {
         runner.mode = AppMode::NewAgentCreateWorktree;
 
         // Type characters
-        process_key(&mut runner, make_key(KeyCode::Char('a')));
-        process_key(&mut runner, make_key(KeyCode::Char('b')));
-        process_key(&mut runner, make_key(KeyCode::Char('c')));
+        process_key(&mut runner, make_key_char('a'));
+        process_key(&mut runner, make_key_char('b'));
+        process_key(&mut runner, make_key_char('c'));
         assert_eq!(runner.input_buffer, "abc");
 
         // Backspace
-        process_key(&mut runner, make_key(KeyCode::Backspace));
+        process_key(&mut runner, make_key_desc("backspace", &[0x7f]));
         assert_eq!(runner.input_buffer, "ab");
 
-        process_key(&mut runner, make_key(KeyCode::Backspace));
-        process_key(&mut runner, make_key(KeyCode::Backspace));
+        process_key(&mut runner, make_key_desc("backspace", &[0x7f]));
+        process_key(&mut runner, make_key_desc("backspace", &[0x7f]));
         assert_eq!(runner.input_buffer, "");
 
         // Backspace on empty is safe
-        process_key(&mut runner, make_key(KeyCode::Backspace));
+        process_key(&mut runner, make_key_desc("backspace", &[0x7f]));
         assert_eq!(runner.input_buffer, "");
     }
 
@@ -2248,25 +2432,25 @@ mod tests {
         runner.worktree_selected = 0;
 
         // Navigate down
-        process_key(&mut runner, make_key(KeyCode::Down));
+        process_key(&mut runner, make_key_down());
         assert_eq!(runner.worktree_selected, 1);
 
-        process_key(&mut runner, make_key(KeyCode::Down));
+        process_key(&mut runner, make_key_down());
         assert_eq!(runner.worktree_selected, 2);
 
         // Should not exceed max
-        process_key(&mut runner, make_key(KeyCode::Down));
+        process_key(&mut runner, make_key_down());
         assert_eq!(runner.worktree_selected, 2);
 
         // Navigate up
-        process_key(&mut runner, make_key(KeyCode::Up));
+        process_key(&mut runner, make_key_up());
         assert_eq!(runner.worktree_selected, 1);
 
-        process_key(&mut runner, make_key(KeyCode::Up));
+        process_key(&mut runner, make_key_up());
         assert_eq!(runner.worktree_selected, 0);
 
         // Should not go below 0
-        process_key(&mut runner, make_key(KeyCode::Up));
+        process_key(&mut runner, make_key_up());
         assert_eq!(runner.worktree_selected, 0);
     }
 
@@ -2391,7 +2575,8 @@ mod tests {
 
         // JSON message tells Hub to quit via Lua
         match cmd_rx.try_recv() {
-            Ok(msg) => {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
                 assert_eq!(
                     msg.get("subscriptionId").and_then(|v| v.as_str()),
                     Some("tui_hub"),
@@ -2684,7 +2869,8 @@ mod tests {
 
         // Verify: JSON message sent via Lua client protocol
         match request_rx.try_recv() {
-            Ok(msg) => {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
                 let data = msg.get("data").expect("Should have data field");
                 assert_eq!(
                     data.get("type").and_then(|t| t.as_str()),
@@ -2812,7 +2998,8 @@ mod tests {
 
         // Verify: subscribe message sent for agent index 1
         match request_rx.try_recv() {
-            Ok(msg) => {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
                 assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
                 assert_eq!(msg.get("channel").and_then(|v| v.as_str()), Some("terminal"));
                 let params = msg.get("params").expect("should have params");
@@ -2849,7 +3036,8 @@ mod tests {
 
         // Verify: subscribe message sent for agent index 2
         match request_rx.try_recv() {
-            Ok(msg) => {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
                 assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
                 let params = msg.get("params").expect("should have params");
                 assert_eq!(params.get("agent_index").and_then(|v| v.as_u64()), Some(2));
@@ -2881,7 +3069,8 @@ mod tests {
 
         // Verify subscribe for agent 0
         match request_rx.try_recv() {
-            Ok(msg) => {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
                 assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
                 let params = msg.get("params").expect("should have params");
                 assert_eq!(params.get("agent_index").and_then(|v| v.as_u64()), Some(0));
@@ -2918,7 +3107,8 @@ mod tests {
 
         // Verify: first message is unsubscribe
         match request_rx.try_recv() {
-            Ok(msg) => {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
                 assert_eq!(
                     msg.get("type").and_then(|v| v.as_str()),
                     Some("unsubscribe"),
@@ -2934,7 +3124,8 @@ mod tests {
 
         // Verify: second message is subscribe
         match request_rx.try_recv() {
-            Ok(msg) => {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
                 assert_eq!(
                     msg.get("type").and_then(|v| v.as_str()),
                     Some("subscribe"),
@@ -3006,7 +3197,8 @@ mod tests {
 
         // Verify: only hub-level resize sent (per-PTY resize deferred to sync_widget_dims)
         match request_rx.try_recv() {
-            Ok(msg) => {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
                 assert_eq!(msg["subscriptionId"], "tui_hub");
                 assert_eq!(msg["data"]["type"], "resize");
                 assert_eq!(msg["data"]["rows"], 40);
@@ -3036,7 +3228,8 @@ mod tests {
 
         // Verify: hub-level resize sent (client dims tracking)
         match request_rx.try_recv() {
-            Ok(msg) => {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
                 assert_eq!(msg["subscriptionId"], "tui_hub");
                 assert_eq!(msg["data"]["type"], "resize");
             }
@@ -3156,7 +3349,8 @@ mod tests {
 
         // Should have sent a subscribe message for (0, 0)
         match request_rx.try_recv() {
-            Ok(msg) => {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
                 assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
                 assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:0:0"));
                 let params = msg.get("params").expect("should have params");
@@ -3199,7 +3393,8 @@ mod tests {
 
         // Should have sent unsubscribe for (0, 1)
         let mut found_unsubscribe = false;
-        while let Ok(msg) = request_rx.try_recv() {
+        while let Ok(req) = request_rx.try_recv() {
+            let msg = unwrap_lua_msg(req);
             if msg.get("type").and_then(|v| v.as_str()) == Some("unsubscribe") {
                 assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:0:1"));
                 found_unsubscribe = true;

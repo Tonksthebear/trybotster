@@ -22,7 +22,7 @@
 //! - [`actions`] - TUI-local action types (`TuiAction`)
 //! - [`events`] - TUI-specific event types (creation stages)
 //! - [`guard`] - Terminal state RAII guard for cleanup
-//! - [`input`] - Key descriptor and PTY byte conversion
+//! - [`raw_input`] - Raw stdin reader and byte-to-descriptor parser
 //! - [`layout`] - Layout calculations
 //! - [`qr`] - QR code generation for browser connection
 //! - [`render`] - Main rendering function
@@ -33,16 +33,16 @@
 //! - [`menu`] - Context-aware menu system
 //! - [`view`] - View state types
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-02
 
 pub mod actions;
 pub mod events;
 pub mod guard;
-pub mod input;
 pub mod layout;
 pub mod layout_lua;
 pub mod menu;
 pub mod qr;
+pub mod raw_input;
 pub mod render;
 pub mod render_tree;
 pub mod runner;
@@ -60,7 +60,7 @@ pub use events::CreationStage;
 #[doc(inline)]
 pub use guard::TerminalGuard;
 #[doc(inline)]
-pub use input::{key_event_to_descriptor, key_to_pty_bytes};
+pub use raw_input::{InputEvent, RawInputReader};
 #[doc(inline)]
 pub use layout::terminal_widget_inner_area;
 #[doc(inline)]
