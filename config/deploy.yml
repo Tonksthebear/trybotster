@@ -32,7 +32,6 @@ env:
     - GITHUB_APP_ID
     - GITHUB_APP_CLIENT_ID
     - GITHUB_APP_CLIENT_SECRET
-    - GITHUB_APP_PRIVATE_KEY
     - GITHUB_WEBHOOK_SECRET
   clear:
     SOLID_QUEUE_IN_PUMA: true
@@ -40,9 +39,11 @@ env:
     DB_PORT: 5433
     HOST_URL: trybotster.com
     TURN_SERVER_URL: "turn:turn.trybotster.com:3478"
+    GITHUB_APP_PRIVATE_KEY_PATH: /rails/config/github_app_private_key.pem
 
 volumes:
   - "trybotster_storage:/rails/storage"
+  - "/root/trybotster-github-app.pem:/rails/config/github_app_private_key.pem:ro"
 
 asset_path: /rails/public/assets
 
@@ -82,4 +83,4 @@ accessories:
     env:
       secret:
         - TURN_SECRET
-    cmd: sh -c "sed 's/TURN_SECRET_PLACEHOLDER/'\"$TURN_SECRET\"'/' /etc/turnserver.conf > /tmp/turnserver.conf && turnserver -c /tmp/turnserver.conf"
+    cmd: -c /etc/turnserver.conf --static-auth-secret=$TURN_SECRET
