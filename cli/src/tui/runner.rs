@@ -34,15 +34,15 @@
 //!
 //! # Module Organization
 //!
-//! Handler methods are split across several modules for maintainability:
-//! - [`super::runner_handlers`] - `handle_tui_action()`, `handle_lua_message()`
-//! - [`super::runner_agent`] - Agent navigation (`request_select_next()`, etc.)
+//! Handler methods are split across modules for maintainability:
+//! - [`super::runner_handlers`] - `handle_tui_action()` for generic UI actions
 //!
 //! # Event Flow
 //!
 //! Agent lifecycle events flow through Lua (`broadcast_hub_event()` in
 //! `connections.lua`) and arrive as `TuiOutput::Message` JSON. TuiRunner
-//! processes these in `handle_lua_message()` to update its cached state.
+//! dispatches these through `events.lua` via `call_on_hub_event()`, which
+//! returns ops that update cached state mechanically.
 
 // Rust guideline compliant 2026-02
 
@@ -234,6 +234,21 @@ pub struct TuiRunner<B: Backend> {
     /// Filesystem path to actions.lua for hot-reload watching.
     actions_lua_fs_path: Option<std::path::PathBuf>,
 
+    // === Lua Events ===
+    /// Lua events source code for hub event handling.
+    events_lua_source: Option<String>,
+
+    /// Filesystem path to events.lua for hot-reload watching.
+    events_lua_fs_path: Option<std::path::PathBuf>,
+
+    // === Lua Extensions ===
+    /// Botster API source (loaded after built-ins, before extensions).
+    botster_api_source: Option<String>,
+
+    /// UI extension sources from plugins and user directory.
+    /// Loaded in order after botster API: plugins first, then user.
+    extension_sources: Vec<ExtensionSource>,
+
     // === Raw Input ===
     /// Raw stdin reader — replaces crossterm's event reader for keyboard input.
     raw_reader: RawInputReader,
@@ -344,6 +359,10 @@ where
             keybinding_lua_fs_path: None,
             actions_lua_source: None,
             actions_lua_fs_path: None,
+            events_lua_source: None,
+            events_lua_fs_path: None,
+            botster_api_source: None,
+            extension_sources: Vec::new(),
             raw_reader: RawInputReader::new(),
             resize_flag: Arc::new(AtomicBool::new(false)),
             outer_app_cursor: false,
@@ -371,6 +390,11 @@ where
     /// Set the Lua actions source for compound action dispatch.
     pub fn set_actions_lua_source(&mut self, lua_source: String) {
         self.actions_lua_source = Some(lua_source);
+    }
+
+    /// Set the Lua events source for hub event handling.
+    pub fn set_events_lua_source(&mut self, lua_source: String) {
+        self.events_lua_source = Some(lua_source);
     }
 
     /// Get the VT100 parser handle for the active PTY.
@@ -523,6 +547,43 @@ where
         &self.agents
     }
 
+    /// Build an `ActionContext` from current TuiRunner state.
+    ///
+    /// Shared by action dispatch and hub event dispatch so both Lua
+    /// callbacks receive the same context shape.
+    pub(super) fn build_action_context(
+        &self,
+        list_selected: usize,
+    ) -> super::layout_lua::ActionContext {
+        let selected_agent_index = self
+            .selected_agent
+            .as_ref()
+            .and_then(|key| self.agents.iter().position(|a| a.id == *key));
+
+        super::layout_lua::ActionContext {
+            mode: self.mode.clone(),
+            input_buffer: self.input_buffer.clone(),
+            list_selected,
+            overlay_actions: self.overlay_list_actions.clone(),
+            pending_fields: self.pending_fields.clone(),
+            selected_agent: self.selected_agent.clone(),
+            available_worktrees: self.available_worktrees.clone(),
+            agents: self
+                .agents
+                .iter()
+                .map(|a| super::layout_lua::ActionContextAgent {
+                    id: a.id.clone(),
+                    session_count: a
+                        .sessions
+                        .as_ref()
+                        .map_or(1, |s| s.len().max(1)),
+                })
+                .collect(),
+            selected_agent_index,
+            active_pty_index: self.active_pty_index,
+        }
+    }
+
     /// Check if the runner should quit.
     #[must_use]
     pub fn should_quit(&self) -> bool {
@@ -568,23 +629,81 @@ where
                     Err(e) => log::warn!("Failed to load Lua actions: {e}"),
                 }
             }
+            if let Some(events_source) = self.events_lua_source.take() {
+                match lua.load_events(&events_source) {
+                    Ok(()) => log::info!("Lua events loaded"),
+                    Err(e) => log::warn!("Failed to load Lua events: {e}"),
+                }
+            }
+
+            // Load botster API (provides botster.keymap, botster.action, botster.ui, etc.)
+            if let Some(ref botster_source) = self.botster_api_source {
+                match lua.load_extension(botster_source, "botster") {
+                    Ok(()) => log::info!("Botster API loaded"),
+                    Err(e) => log::warn!("Failed to load botster API: {e}"),
+                }
+            }
+
+            // Load UI extensions (plugins first, then user overrides)
+            for ext in &self.extension_sources {
+                match lua.load_extension(&ext.source, &ext.name) {
+                    Ok(()) => log::info!("Loaded UI extension: {}", ext.name),
+                    Err(e) => log::warn!("Failed to load UI extension '{}': {e}", ext.name),
+                }
+            }
+
+            // Wire botster action/keymap dispatch after all extensions loaded
+            let _ = lua.load_extension(
+                "if type(botster) == 'table' then botster._wire_actions() botster._wire_keybindings() end",
+                "_wire_botster",
+            );
 
             // Let Lua declare the initial mode (Rust has no opinion on mode names)
             self.mode = lua.call_initial_mode();
         }
 
-        // Set up file watcher for hot-reload (watches ui/ directory for both files)
+        // Set up file watcher for hot-reload.
+        // Watches: built-in ui/ directory, user ui/ directory, and plugin ui/ directories.
         let keybinding_fs_path = self.keybinding_lua_fs_path.take();
+        let actions_fs_path = self.actions_lua_fs_path.take();
+        let events_fs_path = self.events_lua_fs_path.take();
+        let extension_sources = std::mem::take(&mut self.extension_sources);
+        let botster_api_source = self.botster_api_source.take();
+
         let layout_watcher = self.layout_lua_fs_path.take().and_then(|path| {
             match crate::file_watcher::FileWatcher::new() {
                 Ok(mut watcher) => {
-                    // Watch the parent directory (ui/) since notify needs a directory
+                    // Watch the built-in ui/ directory
                     if let Some(parent) = path.parent() {
                         if let Err(e) = watcher.watch(parent, false) {
                             log::warn!("Failed to watch layout directory: {e}");
                             return None;
                         }
                     }
+
+                    // Watch user ui/ directory for extension hot-reload
+                    let lua_base = resolve_lua_base_path();
+                    let user_ui_dir = lua_base.join("user").join("ui");
+                    if user_ui_dir.exists() {
+                        if let Err(e) = watcher.watch(&user_ui_dir, false) {
+                            log::warn!("Failed to watch user UI directory: {e}");
+                        } else {
+                            log::info!("Hot-reload watching user UI: {}", user_ui_dir.display());
+                        }
+                    }
+
+                    // Watch plugin ui/ directories
+                    let mut watched_plugin_dirs = std::collections::HashSet::new();
+                    for ext in &extension_sources {
+                        if let Some(parent) = ext.fs_path.parent() {
+                            if watched_plugin_dirs.insert(parent.to_path_buf()) {
+                                if let Err(e) = watcher.watch(parent, false) {
+                                    log::warn!("Failed to watch plugin UI dir {}: {e}", parent.display());
+                                }
+                            }
+                        }
+                    }
+
                     log::info!("Hot-reload watching: {}", path.display());
                     Some((watcher, path))
                 }
@@ -623,89 +742,174 @@ where
             }
 
             // 2. Poll PTY output and Lua events (via Hub output channel)
-            self.poll_pty_events();
+            self.poll_pty_events(layout_lua.as_ref());
 
             // 2b. Mirror terminal modes from PTY to outer terminal
             self.sync_terminal_modes();
 
-            // 3. Hot-reload layout.lua and keybindings.lua if changed
-            if let Some((ref watcher, ref path)) = layout_watcher {
+            // 3. Hot-reload: built-in UI files and extensions
+            if let Some((ref watcher, ref layout_path)) = layout_watcher {
                 let events = watcher.poll();
                 if !events.is_empty() {
-                    log::debug!("FileWatcher events: {:?}", events);
-                    log::debug!("Comparing against layout path: {:?}", path);
-                }
+                    let is_modify = |evt: &crate::file_watcher::FileEvent| {
+                        matches!(
+                            evt.kind,
+                            crate::file_watcher::FileEventKind::Create
+                                | crate::file_watcher::FileEventKind::Modify
+                                | crate::file_watcher::FileEventKind::Rename
+                        )
+                    };
 
-                let is_modify = |evt: &crate::file_watcher::FileEvent| {
-                    matches!(
-                        evt.kind,
-                        crate::file_watcher::FileEventKind::Create
-                            | crate::file_watcher::FileEventKind::Modify
-                            | crate::file_watcher::FileEventKind::Rename
-                    )
-                };
+                    let layout_changed = events.iter().any(|evt| {
+                        is_modify(evt) && evt.path.file_name() == layout_path.file_name()
+                    });
 
-                let layout_changed = events.iter().any(|evt| {
-                    is_modify(evt) && evt.path.file_name() == path.file_name()
-                });
+                    let keybinding_changed = keybinding_fs_path.as_ref().map_or(false, |kb_path| {
+                        events.iter().any(|evt| {
+                            is_modify(evt) && evt.path.file_name() == kb_path.file_name()
+                        })
+                    });
 
-                let keybinding_changed = keybinding_fs_path.as_ref().map_or(false, |kb_path| {
-                    events.iter().any(|evt| {
-                        is_modify(evt) && evt.path.file_name() == kb_path.file_name()
-                    })
-                });
+                    let actions_changed = actions_fs_path.as_ref().map_or(false, |a_path| {
+                        events.iter().any(|evt| {
+                            is_modify(evt) && evt.path.file_name() == a_path.file_name()
+                        })
+                    });
 
-                if layout_changed {
-                    match std::fs::read_to_string(path) {
-                        Ok(new_source) => {
-                            if let Some(ref mut lua) = layout_lua {
-                                match lua.reload(&new_source) {
-                                    Ok(()) => {
-                                        log::info!("Layout hot-reloaded");
-                                        layout_error = None;
-                                    }
-                                    Err(e) => {
-                                        let msg = format!("{e}");
-                                        log::warn!("Layout reload failed: {msg}");
-                                        layout_error = Some(truncate_error(&msg, 80));
-                                    }
-                                }
-                            } else {
-                                // No LayoutLua yet (initial load failed) — try creating one
-                                match LayoutLua::new(&new_source) {
-                                    Ok(lua) => {
-                                        log::info!("Layout engine recovered via hot-reload");
-                                        layout_lua = Some(lua);
-                                        layout_error = None;
-                                    }
-                                    Err(e) => {
-                                        let msg = format!("{e}");
-                                        log::warn!("Layout reload failed: {msg}");
-                                        layout_error = Some(truncate_error(&msg, 80));
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to read layout.lua: {e}");
-                        }
-                    }
-                }
+                    let events_changed = events_fs_path.as_ref().map_or(false, |e_path| {
+                        events.iter().any(|evt| {
+                            is_modify(evt) && evt.path.file_name() == e_path.file_name()
+                        })
+                    });
 
-                if keybinding_changed {
-                    if let Some(ref kb_path) = keybinding_fs_path {
-                        match std::fs::read_to_string(kb_path) {
+                    // Check if any extension file changed
+                    let extension_changed = extension_sources.iter().any(|ext| {
+                        events.iter().any(|evt| is_modify(evt) && evt.path == ext.fs_path)
+                    });
+
+                    // Also check if a new extension file appeared in user/ui/
+                    let user_ui_changed = events.iter().any(|evt| {
+                        is_modify(evt)
+                            && evt.path.extension().is_some_and(|e| e == "lua")
+                            && evt.path.parent().map_or(false, |p| {
+                                p.ends_with("user/ui")
+                            })
+                    });
+
+                    let any_builtin_changed = layout_changed || keybinding_changed || actions_changed || events_changed;
+                    let any_extension_changed = extension_changed || user_ui_changed;
+
+                    // Reload built-in files if they changed
+                    if layout_changed {
+                        match std::fs::read_to_string(layout_path) {
                             Ok(new_source) => {
                                 if let Some(ref mut lua) = layout_lua {
-                                    match lua.reload_keybindings(&new_source) {
-                                        Ok(()) => log::info!("Keybindings hot-reloaded"),
-                                        Err(e) => log::warn!("Keybindings reload failed: {e}"),
+                                    match lua.reload(&new_source) {
+                                        Ok(()) => {
+                                            log::info!("Layout hot-reloaded");
+                                            layout_error = None;
+                                        }
+                                        Err(e) => {
+                                            let msg = format!("{e}");
+                                            log::warn!("Layout reload failed: {msg}");
+                                            layout_error = Some(truncate_error(&msg, 80));
+                                        }
+                                    }
+                                } else {
+                                    match LayoutLua::new(&new_source) {
+                                        Ok(lua) => {
+                                            log::info!("Layout engine recovered via hot-reload");
+                                            layout_lua = Some(lua);
+                                            layout_error = None;
+                                        }
+                                        Err(e) => {
+                                            let msg = format!("{e}");
+                                            log::warn!("Layout reload failed: {msg}");
+                                            layout_error = Some(truncate_error(&msg, 80));
+                                        }
                                     }
                                 }
                             }
-                            Err(e) => {
-                                log::warn!("Failed to read keybindings.lua: {e}");
+                            Err(e) => log::warn!("Failed to read layout.lua: {e}"),
+                        }
+                    }
+
+                    if keybinding_changed {
+                        if let Some(ref kb_path) = keybinding_fs_path {
+                            match std::fs::read_to_string(kb_path) {
+                                Ok(new_source) => {
+                                    if let Some(ref mut lua) = layout_lua {
+                                        match lua.reload_keybindings(&new_source) {
+                                            Ok(()) => log::info!("Keybindings hot-reloaded"),
+                                            Err(e) => log::warn!("Keybindings reload failed: {e}"),
+                                        }
+                                    }
+                                }
+                                Err(e) => log::warn!("Failed to read keybindings.lua: {e}"),
                             }
+                        }
+                    }
+
+                    if actions_changed {
+                        if let Some(ref a_path) = actions_fs_path {
+                            match std::fs::read_to_string(a_path) {
+                                Ok(new_source) => {
+                                    if let Some(ref mut lua) = layout_lua {
+                                        match lua.reload_actions(&new_source) {
+                                            Ok(()) => log::info!("Actions hot-reloaded"),
+                                            Err(e) => log::warn!("Actions reload failed: {e}"),
+                                        }
+                                    }
+                                }
+                                Err(e) => log::warn!("Failed to read actions.lua: {e}"),
+                            }
+                        }
+                    }
+
+                    if events_changed {
+                        if let Some(ref e_path) = events_fs_path {
+                            match std::fs::read_to_string(e_path) {
+                                Ok(new_source) => {
+                                    if let Some(ref mut lua) = layout_lua {
+                                        match lua.reload_events(&new_source) {
+                                            Ok(()) => log::info!("Events hot-reloaded"),
+                                            Err(e) => log::warn!("Events reload failed: {e}"),
+                                        }
+                                    }
+                                }
+                                Err(e) => log::warn!("Failed to read events.lua: {e}"),
+                            }
+                        }
+                    }
+
+                    // Replay extensions if any built-in or extension changed
+                    if (any_builtin_changed || any_extension_changed) && layout_lua.is_some() {
+                        if let Some(ref lua) = layout_lua {
+                            // Re-discover extensions (picks up new files)
+                            let lua_base = resolve_lua_base_path();
+                            let fresh_extensions = discover_ui_extensions(&lua_base);
+
+                            // Reload botster API
+                            if let Some(ref bs) = botster_api_source {
+                                if let Err(e) = lua.load_extension(bs, "botster") {
+                                    log::warn!("Failed to reload botster API: {e}");
+                                }
+                            }
+
+                            // Replay all extensions (freshly read by discover_ui_extensions)
+                            for ext in &fresh_extensions {
+                                if let Err(e) = lua.load_extension(&ext.source, &ext.name) {
+                                    log::warn!("Failed to reload extension '{}': {e}", ext.name);
+                                }
+                            }
+
+                            // Re-wire dispatch
+                            let _ = lua.load_extension(
+                                "if type(botster) == 'table' then botster._wire_actions() botster._wire_keybindings() end",
+                                "_wire_botster",
+                            );
+
+                            log::info!("Extensions replayed ({} total)", fresh_extensions.len());
                         }
                     }
                 }
@@ -781,15 +985,15 @@ where
                                 return;
                             }
                             Ok(None) => {
-                                // Unbound key — forward raw bytes to PTY in Normal mode
-                                if !self.has_overlay && !raw_bytes.is_empty() {
+                                // Unbound key — forward raw bytes to PTY only in insert mode
+                                if self.mode == "insert" && !self.has_overlay && !raw_bytes.is_empty() {
                                     self.handle_pty_input(&raw_bytes);
                                 }
                                 return;
                             }
                             Err(e) => {
                                 log::warn!("Lua handle_key failed: {e}");
-                                if !self.has_overlay && !raw_bytes.is_empty() {
+                                if self.mode == "insert" && !self.has_overlay && !raw_bytes.is_empty() {
                                     self.handle_pty_input(&raw_bytes);
                                 }
                                 return;
@@ -798,8 +1002,8 @@ where
                     }
                 }
 
-                // No Lua keybindings loaded — forward raw bytes in Normal mode
-                if !self.has_overlay && !raw_bytes.is_empty() {
+                // No Lua keybindings loaded — forward raw bytes only in insert mode
+                if self.mode == "insert" && !self.has_overlay && !raw_bytes.is_empty() {
                     self.handle_pty_input(&raw_bytes);
                 }
             }
@@ -866,15 +1070,9 @@ where
 
         // Application-specific actions — dispatch through Lua actions.on_action()
         if layout_lua.has_actions() {
-            let context = super::layout_lua::ActionContext {
-                mode: self.mode.clone(),
-                input_buffer: self.input_buffer.clone(),
-                list_selected: lua_action.index.unwrap_or(self.overlay_list_selected),
-                overlay_actions: self.overlay_list_actions.clone(),
-                pending_fields: self.pending_fields.clone(),
-                selected_agent: self.selected_agent.clone(),
-                available_worktrees: self.available_worktrees.clone(),
-            };
+            let context = self.build_action_context(
+                lua_action.index.unwrap_or(self.overlay_list_selected),
+            );
 
             match layout_lua.call_on_action(action_str, &context) {
                 Ok(Some(ops)) => {
@@ -1009,7 +1207,7 @@ where
     /// Hub sends `TuiOutput` messages through the channel: binary PTY data
     /// from Lua forwarder tasks and JSON events from `tui.send()`. TuiRunner
     /// processes them here (feeding to vt100 parser, handling Lua messages, etc.).
-    fn poll_pty_events(&mut self) {
+    fn poll_pty_events(&mut self, layout_lua: Option<&LayoutLua>) {
         use tokio::sync::mpsc::error::TryRecvError;
 
         // Process up to 100 events per tick
@@ -1037,7 +1235,7 @@ where
                     // Process exited - we remain connected for any final output
                 }
                 Ok(TuiOutput::Message(value)) => {
-                    self.handle_lua_message(value);
+                    self.dispatch_hub_event(value, layout_lua);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -1060,6 +1258,42 @@ where
                 }
             }
         }
+    }
+
+    /// Dispatch a hub event message through Lua events module.
+    ///
+    /// Extracts the event type from the message and passes it to Lua's
+    /// `on_hub_event()`. If Lua returns ops, executes them. Falls back
+    /// to logging for unhandled events.
+    fn dispatch_hub_event(
+        &mut self,
+        msg: serde_json::Value,
+        layout_lua: Option<&LayoutLua>,
+    ) {
+        let event_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if let Some(lua) = layout_lua {
+            if lua.has_events() {
+                let context = self.build_action_context(self.overlay_list_selected);
+                match lua.call_on_hub_event(event_type, &msg, &context) {
+                    Ok(Some(ops)) => {
+                        self.execute_lua_ops(ops);
+                        return;
+                    }
+                    Ok(None) => {
+                        log::trace!("Lua on_hub_event returned nil for '{event_type}'");
+                        return;
+                    }
+                    Err(e) => {
+                        log::warn!("Lua on_hub_event failed for '{event_type}': {e}");
+                        return;
+                    }
+                }
+            }
+        }
+
+        // No Lua events module — log unhandled events
+        log::trace!("Unhandled hub event (no Lua events module): {event_type}");
     }
 
     /// Render the TUI.
@@ -1248,25 +1482,163 @@ where
                 "quit" => {
                     self.quit = true;
                 }
-                "toggle_pty" => {
-                    self.handle_pty_view_toggle();
+                "focus_terminal" => {
+                    self.execute_focus_terminal(&op);
                 }
-                "switch_pty" => {
-                    if let Some(index) = op.get("index").and_then(|v| v.as_u64()) {
-                        self.switch_to_pty(index as usize);
+                "upsert_agent" => {
+                    if let Some(agent_val) = op.get("agent") {
+                        if let Some(info) = super::runner_handlers::parse_agent_info(agent_val) {
+                            self.agents.retain(|a| a.id != info.id);
+                            self.agents.push(info);
+                        }
                     }
                 }
-                "select_next" => {
-                    self.request_select_next();
+                "remove_agent" => {
+                    if let Some(agent_id) = op.get("agent_id").and_then(|v| v.as_str()) {
+                        self.agents.retain(|a| a.id != agent_id);
+                    }
                 }
-                "select_previous" => {
-                    self.request_select_previous();
+                "update_agent_status" => {
+                    if let (Some(agent_id), Some(status)) = (
+                        op.get("agent_id").and_then(|v| v.as_str()),
+                        op.get("status").and_then(|v| v.as_str()),
+                    ) {
+                        if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
+                            agent.status = Some(status.to_string());
+                        }
+                    }
+                }
+                "set_agents" => {
+                    if let Some(agents) = op.get("agents").and_then(|v| v.as_array()) {
+                        self.agents = agents
+                            .iter()
+                            .filter_map(|a| super::runner_handlers::parse_agent_info(a))
+                            .collect();
+                        log::debug!("Updated agent list: {} agents", self.agents.len());
+                    }
+                }
+                "set_worktrees" => {
+                    if let Some(worktrees) = op.get("worktrees").and_then(|v| v.as_array()) {
+                        self.available_worktrees = worktrees
+                            .iter()
+                            .filter_map(|w| {
+                                let path = w.get("path").and_then(|v| v.as_str())?;
+                                let branch = w.get("branch").and_then(|v| v.as_str())?;
+                                Some((path.to_string(), branch.to_string()))
+                            })
+                            .collect();
+                    }
+                }
+                "set_connection_code" => {
+                    let url = op.get("url").and_then(|v| v.as_str());
+                    let qr_ascii = op.get("qr_ascii").and_then(|v| v.as_array());
+
+                    if let (Some(url), Some(qr_array)) = (url, qr_ascii) {
+                        let qr_lines: Vec<String> = qr_array
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect();
+
+                        let qr_width = qr_lines.first().map(|l| l.chars().count() as u16).unwrap_or(0);
+                        let qr_height = qr_lines.len() as u16;
+                        self.connection_code = Some(ConnectionCodeData {
+                            url: url.to_string(),
+                            qr_ascii: qr_lines,
+                            qr_width,
+                            qr_height,
+                        });
+                    } else {
+                        log::warn!("set_connection_code op missing url or qr_ascii");
+                    }
+                }
+                "clear_connection_code" => {
+                    self.connection_code = None;
                 }
                 _ => {
                     log::warn!("Unknown Lua compound op: {op_name}");
                 }
             }
         }
+    }
+
+    /// Execute the `focus_terminal` op — switch to a specific agent and PTY.
+    ///
+    /// If `agent_id` is absent/null, clears the current selection.
+    /// Otherwise, looks up the agent by ID, unsubscribes from the current
+    /// focused PTY, switches the parser pointer, and subscribes to the new one.
+    fn execute_focus_terminal(&mut self, op: &serde_json::Value) {
+        let agent_id = op.get("agent_id").and_then(|v| v.as_str());
+        let pty_index = op.get("pty_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        // Clear selection if no agent_id
+        let Some(agent_id) = agent_id else {
+            // Unsubscribe from current focused PTY
+            if let Some(ref sub_id) = self.current_terminal_sub_id {
+                self.send_msg(serde_json::json!({
+                    "type": "unsubscribe",
+                    "subscriptionId": sub_id,
+                }));
+                if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
+                    self.active_subscriptions.remove(&(ai, pi));
+                }
+            }
+            self.selected_agent = None;
+            self.current_agent_index = None;
+            self.current_pty_index = None;
+            self.current_terminal_sub_id = None;
+            return;
+        };
+
+        // Find agent index
+        let Some(index) = self.agents.iter().position(|a| a.id == agent_id) else {
+            log::warn!("focus_terminal: agent not found: {agent_id}");
+            return;
+        };
+
+        // Skip if already focused on same agent + pty
+        if self.current_agent_index == Some(index) && self.current_pty_index == Some(pty_index) {
+            log::debug!("focus_terminal: already focused on agent {agent_id} pty {pty_index}");
+            return;
+        }
+
+        // Unsubscribe from current focused PTY
+        if let Some(ref sub_id) = self.current_terminal_sub_id {
+            self.send_msg(serde_json::json!({
+                "type": "unsubscribe",
+                "subscriptionId": sub_id,
+            }));
+            if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
+                self.active_subscriptions.remove(&(ai, pi));
+            }
+        }
+
+        // Point vt100_parser at the pool entry for the target PTY
+        let (rows, cols) = self.terminal_dims;
+        let parser = self.parser_pool
+            .entry((index, pty_index))
+            .or_insert_with(|| Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK))))
+            .clone();
+        self.vt100_parser = parser;
+
+        // Subscribe to new PTY via Lua protocol
+        let sub_id = format!("tui:{}:{}", index, pty_index);
+        self.send_msg(serde_json::json!({
+            "type": "subscribe",
+            "channel": "terminal",
+            "subscriptionId": sub_id,
+            "params": {
+                "agent_index": index,
+                "pty_index": pty_index,
+            }
+        }));
+
+        // Update state
+        self.selected_agent = Some(agent_id.to_string());
+        self.current_agent_index = Some(index);
+        self.current_pty_index = Some(pty_index);
+        self.active_pty_index = pty_index;
+        self.current_terminal_sub_id = Some(sub_id);
+        self.active_subscriptions.insert((index, pty_index));
     }
 
 }
@@ -1448,6 +1820,17 @@ pub fn run_with_hub(
         tui_runner.actions_lua_fs_path = actions.fs_path;
     }
 
+    // Load Lua events source for hub event handling.
+    if let Some(events) = load_events_lua_source() {
+        tui_runner.set_events_lua_source(events.source);
+        tui_runner.events_lua_fs_path = events.fs_path;
+    }
+
+    // Load botster API and discover UI extensions (plugins + user overrides).
+    tui_runner.botster_api_source = load_botster_api_source();
+    let lua_base = resolve_lua_base_path();
+    tui_runner.extension_sources = discover_ui_extensions(&lua_base);
+
     // Register SIGWINCH to set the resize flag (TuiRunner polls this each tick)
     #[cfg(unix)]
     {
@@ -1549,19 +1932,24 @@ struct LayoutSource {
     fs_path: Option<std::path::PathBuf>,
 }
 
+/// A UI extension source loaded from a plugin or user directory.
+#[derive(Debug)]
+struct ExtensionSource {
+    /// Lua source code.
+    source: String,
+    /// Human-readable name for error messages (e.g., "plugin:my-plugin/layout").
+    name: String,
+    /// Filesystem path for hot-reload watching.
+    fs_path: std::path::PathBuf,
+}
+
 /// Load the Lua layout source from filesystem or embedded.
 ///
 /// Priority: filesystem (`~/.botster/lua/ui/layout.lua` or `BOTSTER_LUA_PATH`)
 /// then embedded (release builds). Returns None if neither is available.
 fn load_layout_lua_source() -> Option<LayoutSource> {
     // Try filesystem first (enables hot-reload and user overrides)
-    let lua_base = std::env::var("BOTSTER_LUA_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .map(|h| h.join(".botster").join("lua"))
-                .unwrap_or_else(|| std::path::PathBuf::from(".botster/lua"))
-        });
+    let lua_base = resolve_lua_base_path();
 
     let fs_path = lua_base.join("ui").join("layout.lua");
     if let Ok(source) = std::fs::read_to_string(&fs_path) {
@@ -1591,13 +1979,7 @@ fn load_layout_lua_source() -> Option<LayoutSource> {
 ///
 /// Same priority as layout: filesystem first, then embedded fallback.
 fn load_keybinding_lua_source() -> Option<LayoutSource> {
-    let lua_base = std::env::var("BOTSTER_LUA_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .map(|h| h.join(".botster").join("lua"))
-                .unwrap_or_else(|| std::path::PathBuf::from(".botster/lua"))
-        });
+    let lua_base = resolve_lua_base_path();
 
     let fs_path = lua_base.join("ui").join("keybindings.lua");
     if let Ok(source) = std::fs::read_to_string(&fs_path) {
@@ -1629,13 +2011,7 @@ fn load_keybinding_lua_source() -> Option<LayoutSource> {
 ///
 /// Same priority as layout: filesystem first, then embedded fallback.
 fn load_actions_lua_source() -> Option<LayoutSource> {
-    let lua_base = std::env::var("BOTSTER_LUA_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .map(|h| h.join(".botster").join("lua"))
-                .unwrap_or_else(|| std::path::PathBuf::from(".botster/lua"))
-        });
+    let lua_base = resolve_lua_base_path();
 
     let fs_path = lua_base.join("ui").join("actions.lua");
     if let Ok(source) = std::fs::read_to_string(&fs_path) {
@@ -1661,6 +2037,130 @@ fn load_actions_lua_source() -> Option<LayoutSource> {
 
     log::info!("No actions.lua found, compound actions disabled");
     None
+}
+
+/// Load the events Lua source from filesystem or embedded.
+///
+/// Follows the same pattern as `load_actions_lua_source`: tries filesystem
+/// first (for hot-reload in dev), falls back to embedded for release.
+fn load_events_lua_source() -> Option<LayoutSource> {
+    let lua_base = resolve_lua_base_path();
+
+    let fs_path = lua_base.join("ui").join("events.lua");
+    if let Ok(source) = std::fs::read_to_string(&fs_path) {
+        let fs_path = fs_path.canonicalize().unwrap_or(fs_path);
+        log::info!(
+            "Loaded events.lua from filesystem: {}",
+            fs_path.display()
+        );
+        return Some(LayoutSource {
+            source,
+            fs_path: Some(fs_path),
+        });
+    }
+
+    // Fall back to embedded (release builds)
+    if let Some(source) = crate::lua::embedded::get("ui/events.lua") {
+        log::info!("Loaded events.lua from embedded");
+        return Some(LayoutSource {
+            source: source.to_string(),
+            fs_path: None,
+        });
+    }
+
+    log::info!("No events.lua found, hub event handling disabled");
+    None
+}
+
+/// Load the botster API source from filesystem or embedded.
+///
+/// The botster API module is loaded into the TUI Lua state after built-in
+/// modules and before extensions. It provides the `botster.*` global API.
+fn load_botster_api_source() -> Option<String> {
+    let lua_base = resolve_lua_base_path();
+
+    let fs_path = lua_base.join("ui").join("botster.lua");
+    if let Ok(source) = std::fs::read_to_string(&fs_path) {
+        log::info!("Loaded botster.lua from filesystem: {}", fs_path.display());
+        return Some(source);
+    }
+
+    if let Some(source) = crate::lua::embedded::get("ui/botster.lua") {
+        log::info!("Loaded botster.lua from embedded");
+        return Some(source.to_string());
+    }
+
+    log::info!("No botster.lua found, extension API unavailable");
+    None
+}
+
+/// Discover UI extension files from plugins and user directories.
+///
+/// Returns extensions in load order:
+/// 1. Plugin `ui/` files (alphabetical by plugin name)
+/// 2. User `~/.botster/lua/user/ui/` files (highest priority)
+fn discover_ui_extensions(lua_base: &std::path::Path) -> Vec<ExtensionSource> {
+    let mut extensions = Vec::new();
+    let ui_files = ["layout.lua", "keybindings.lua", "actions.lua"];
+
+    // Plugin UI extensions: ~/.botster/plugins/*/ui/{layout,keybindings,actions}.lua
+    // lua_base is ~/.botster/lua, plugins are at ~/.botster/plugins
+    let plugins_dir = lua_base
+        .parent()
+        .unwrap_or(lua_base)
+        .join("plugins");
+
+    if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
+        let mut plugin_dirs: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        plugin_dirs.sort_by_key(|e| e.file_name());
+
+        for entry in plugin_dirs {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let plugin_name = entry.file_name().to_string_lossy().to_string();
+
+            for ui_file in &ui_files {
+                let ui_path = path.join("ui").join(ui_file);
+                if let Ok(source) = std::fs::read_to_string(&ui_path) {
+                    log::info!("Discovered plugin UI extension: {plugin_name}/{ui_file}");
+                    extensions.push(ExtensionSource {
+                        source,
+                        name: format!("plugin:{plugin_name}/{ui_file}"),
+                        fs_path: ui_path,
+                    });
+                }
+            }
+        }
+    }
+
+    // User UI overrides: ~/.botster/lua/user/ui/{layout,keybindings,actions}.lua
+    let user_ui_dir = lua_base.join("user").join("ui");
+    for ui_file in &ui_files {
+        let path = user_ui_dir.join(ui_file);
+        if let Ok(source) = std::fs::read_to_string(&path) {
+            log::info!("Discovered user UI extension: {ui_file}");
+            extensions.push(ExtensionSource {
+                source,
+                name: format!("user/{ui_file}"),
+                fs_path: path,
+            });
+        }
+    }
+
+    extensions
+}
+
+/// Resolve the Lua base path from env or default.
+fn resolve_lua_base_path() -> std::path::PathBuf {
+    std::env::var("BOTSTER_LUA_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .map(|h| h.join(".botster").join("lua"))
+                .unwrap_or_else(|| std::path::PathBuf::from(".botster/lua"))
+        })
 }
 
 #[cfg(test)]
@@ -2198,8 +2698,9 @@ mod tests {
             "Should enter worktree selection"
         );
 
-        // 2. Select "Create new worktree" (index 0)
-        assert_eq!(runner.overlay_list_selected, 0);
+        // 2. Select "Create new worktree" (index 1, after "Use Main Branch")
+        process_key(&mut runner, make_key_down());
+        assert_eq!(runner.overlay_list_selected, 1);
         process_key(&mut runner, make_key_enter());
 
         assert_eq!(runner.mode(), "new_agent_create_worktree");
@@ -2246,11 +2747,12 @@ mod tests {
         }
         assert!(found_create, "create_agent JSON message should be sent");
 
-        // Modal closes immediately after submit - progress shown in sidebar
+        // Modal closes after submit — stays in normal mode until agent_created
+        // event arrives and selects the agent (which sets insert mode).
         assert_eq!(
             runner.mode(),
             "normal",
-            "Modal should close immediately after submit"
+            "Should be normal mode until agent_created event selects the agent"
         );
 
         // creating_agent should be set to indicate pending creation (shown in sidebar)
@@ -2301,20 +2803,29 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
         assert_eq!(runner.mode(), "new_agent_select_worktree");
 
-        // Navigate to first existing worktree (index 1)
+        // Navigate to first existing worktree (index 2, after "Use Main Branch" and "Create New Worktree")
+        // Stub overlay_list_actions to match new layout: [main, create_new, worktree_0, worktree_1]
+        runner.overlay_list_actions = vec![
+            "main".to_string(),
+            "create_new".to_string(),
+            "worktree_0".to_string(),
+            "worktree_1".to_string(),
+        ];
         process_key(&mut runner, make_key_down());
-        assert_eq!(runner.overlay_list_selected, 1);
+        process_key(&mut runner, make_key_down());
+        assert_eq!(runner.overlay_list_selected, 2);
 
         // Select existing worktree
         process_key(&mut runner, make_key_enter());
 
         thread::sleep(Duration::from_millis(10));
 
-        // Modal closes immediately after selection - progress shown in sidebar
+        // Modal closes after selection — stays in normal mode until agent_created
+        // event arrives from the hub and switches to insert mode.
         assert_eq!(
             runner.mode(),
             "normal",
-            "Modal should close immediately after worktree selection"
+            "Should be normal mode until agent_created event selects the agent"
         );
 
         // creating_agent should be set to indicate pending creation (shown in sidebar)
@@ -2438,8 +2949,9 @@ mod tests {
             ("/path/1".to_string(), "branch-1".to_string()),
             ("/path/2".to_string(), "branch-2".to_string()),
         ];
-        // Stub overlay_list_actions: [Create New] + 2 worktrees = 3 items
+        // Stub overlay_list_actions: [Main] + [Create New] + 2 worktrees = 4 items
         runner.overlay_list_actions = vec![
+            "main".to_string(),
             "create_new".to_string(),
             "worktree_0".to_string(),
             "worktree_1".to_string(),
@@ -2454,11 +2966,18 @@ mod tests {
         process_key(&mut runner, make_key_down());
         assert_eq!(runner.overlay_list_selected, 2);
 
+        // Continue to max
+        process_key(&mut runner, make_key_down());
+        assert_eq!(runner.overlay_list_selected, 3);
+
         // Should not exceed max
         process_key(&mut runner, make_key_down());
-        assert_eq!(runner.overlay_list_selected, 2);
+        assert_eq!(runner.overlay_list_selected, 3);
 
         // Navigate up
+        process_key(&mut runner, make_key_up());
+        assert_eq!(runner.overlay_list_selected, 2);
+
         process_key(&mut runner, make_key_up());
         assert_eq!(runner.overlay_list_selected, 1);
 
@@ -2752,23 +3271,25 @@ mod tests {
             .collect()
     }
 
-    /// Verifies `request_select_next()` eagerly subscribes and updates state.
+    /// Verifies `focus_terminal` op subscribes and updates state.
     ///
     /// # Scenario
     ///
-    /// Given 3 agents with agent 0 currently selected, pressing "next" should
-    /// advance to agent 1. A subscribe message is sent immediately for
-    /// responsive keyboard input routing.
+    /// Given 3 agents, `focus_terminal` with agent-1 should subscribe to
+    /// that agent's PTY and update all selection state.
     #[test]
-    fn test_select_next_agent_subscribes_and_updates_state() {
+    fn test_focus_terminal_subscribes_and_updates_state() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Setup: 3 agents, agent 0 selected
+        // Setup: 3 agents, none selected
         runner.agents = make_test_agents(3);
-        runner.selected_agent = Some("agent-0".to_string());
 
-        // Action: select next agent
-        runner.request_select_next();
+        // Action: focus agent-1
+        runner.execute_focus_terminal(&serde_json::json!({
+            "op": "focus_terminal",
+            "agent_id": "agent-1",
+            "pty_index": 0,
+        }));
 
         // Verify: subscribe message sent for agent index 1
         match request_rx.try_recv() {
@@ -2791,81 +3312,14 @@ mod tests {
         assert!(runner.active_subscriptions.contains(&(1, 0)));
     }
 
-    /// Verifies `request_select_previous()` wraps from agent 0 to last agent (index 2).
+    /// Verifies `focus_terminal` with nil agent_id clears selection.
     ///
     /// # Scenario
     ///
-    /// Given 3 agents with agent 0 selected, pressing "previous" should wrap
-    /// around to agent 2 (the last agent).
+    /// When an agent is deleted, Lua returns `focus_terminal` with no agent_id
+    /// to clear the current selection.
     #[test]
-    fn test_select_previous_agent_wraps_around() {
-        let (mut runner, mut request_rx) = create_test_runner();
-
-        // Setup: 3 agents, agent 0 selected
-        runner.agents = make_test_agents(3);
-        runner.selected_agent = Some("agent-0".to_string());
-
-        // Action: select previous (should wrap to last)
-        runner.request_select_previous();
-
-        // Verify: subscribe message sent for agent index 2
-        match request_rx.try_recv() {
-            Ok(req) => {
-                let msg = unwrap_lua_msg(req);
-                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
-                let params = msg.get("params").expect("should have params");
-                assert_eq!(params.get("agent_index").and_then(|v| v.as_u64()), Some(2));
-            }
-            Err(_) => panic!("Expected subscribe message to be sent"),
-        }
-
-        assert_eq!(runner.selected_agent.as_deref(), Some("agent-2"));
-        assert_eq!(runner.current_agent_index, Some(2));
-        assert_eq!(runner.current_terminal_sub_id, Some("tui:2:0".to_string()));
-    }
-
-    /// Verifies `request_select_next()` wraps from last agent (index 2) to first (index 0).
-    ///
-    /// # Scenario
-    ///
-    /// Given 3 agents with agent 2 (last) selected, pressing "next" should wrap
-    /// around to agent 0 (the first agent).
-    #[test]
-    fn test_select_next_wraps_around() {
-        let (mut runner, mut request_rx) = create_test_runner();
-
-        // Setup: 3 agents, last agent selected
-        runner.agents = make_test_agents(3);
-        runner.selected_agent = Some("agent-2".to_string());
-
-        // Action: select next (should wrap to first)
-        runner.request_select_next();
-
-        // Verify subscribe for agent 0
-        match request_rx.try_recv() {
-            Ok(req) => {
-                let msg = unwrap_lua_msg(req);
-                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
-                let params = msg.get("params").expect("should have params");
-                assert_eq!(params.get("agent_index").and_then(|v| v.as_u64()), Some(0));
-            }
-            Err(_) => panic!("Expected subscribe message to be sent"),
-        }
-
-        assert_eq!(runner.selected_agent.as_deref(), Some("agent-0"));
-        assert_eq!(runner.current_agent_index, Some(0));
-        assert_eq!(runner.current_terminal_sub_id, Some("tui:0:0".to_string()));
-    }
-
-    /// Verifies `request_select_next()` sends unsubscribe then subscribe when switching.
-    ///
-    /// # Scenario
-    ///
-    /// When switching from one agent to another, the TUI must unsubscribe from
-    /// the current terminal before subscribing to the new one, and update
-    /// `active_subscriptions` accordingly.
-    #[test]
-    fn test_select_agent_unsubscribes_then_subscribes() {
+    fn test_focus_terminal_nil_clears_selection() {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: 3 agents, agent 0 selected with active subscription
@@ -2876,8 +3330,51 @@ mod tests {
         runner.current_terminal_sub_id = Some("tui:0:0".to_string());
         runner.active_subscriptions.insert((0, 0));
 
-        // Action: select next agent
-        runner.request_select_next();
+        // Action: focus_terminal with no agent_id (clear selection)
+        runner.execute_focus_terminal(&serde_json::json!({
+            "op": "focus_terminal",
+        }));
+
+        // Verify: unsubscribe sent
+        match request_rx.try_recv() {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
+                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("unsubscribe"));
+            }
+            Err(_) => panic!("Expected unsubscribe message to be sent"),
+        }
+
+        // Verify selection cleared
+        assert_eq!(runner.selected_agent, None);
+        assert_eq!(runner.current_agent_index, None);
+        assert_eq!(runner.current_pty_index, None);
+        assert_eq!(runner.current_terminal_sub_id, None);
+    }
+
+    /// Verifies `focus_terminal` sends unsubscribe then subscribe when switching.
+    ///
+    /// # Scenario
+    ///
+    /// When switching from one agent to another, the TUI must unsubscribe from
+    /// the current terminal before subscribing to the new one.
+    #[test]
+    fn test_focus_terminal_unsubscribes_then_subscribes() {
+        let (mut runner, mut request_rx) = create_test_runner();
+
+        // Setup: 3 agents, agent 0 selected with active subscription
+        runner.agents = make_test_agents(3);
+        runner.selected_agent = Some("agent-0".to_string());
+        runner.current_agent_index = Some(0);
+        runner.current_pty_index = Some(0);
+        runner.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.active_subscriptions.insert((0, 0));
+
+        // Action: focus agent-1
+        runner.execute_focus_terminal(&serde_json::json!({
+            "op": "focus_terminal",
+            "agent_id": "agent-1",
+            "pty_index": 0,
+        }));
 
         // Verify: first message is unsubscribe
         match request_rx.try_recv() {
@@ -2918,26 +3415,62 @@ mod tests {
         assert!(runner.active_subscriptions.contains(&(1, 0)), "New sub should be added");
     }
 
-    /// Verifies `request_select_next()` is a no-op when agent list is empty.
+    /// Verifies `focus_terminal` with unknown agent_id is a no-op.
     ///
     /// # Scenario
     ///
-    /// With 0 agents, navigation should short-circuit without sending any
-    /// JSON. This avoids index-out-of-bounds and unnecessary channel traffic.
+    /// When the agent doesn't exist in the cache, focus_terminal should log
+    /// a warning and not change any state.
     #[test]
-    fn test_select_agent_with_empty_list_is_noop() {
+    fn test_focus_terminal_unknown_agent_is_noop() {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: no agents
         assert!(runner.agents.is_empty());
 
-        // Action: select next with no agents
-        runner.request_select_next();
+        // Action: focus unknown agent
+        runner.execute_focus_terminal(&serde_json::json!({
+            "op": "focus_terminal",
+            "agent_id": "nonexistent",
+            "pty_index": 0,
+        }));
 
-        // Verify: no request sent (early return in request_select_next)
+        // Verify: no request sent
         assert!(
             request_rx.try_recv().is_err(),
-            "No JSON should be sent when agent list is empty"
+            "No JSON should be sent when agent not found"
+        );
+    }
+
+    /// Verifies `focus_terminal` skips when already focused on same agent+pty.
+    ///
+    /// # Scenario
+    ///
+    /// When already focused on agent-0 pty 0, calling focus_terminal for the
+    /// same agent+pty should be a no-op (no unsub/resub).
+    #[test]
+    fn test_focus_terminal_same_target_is_noop() {
+        let (mut runner, mut request_rx) = create_test_runner();
+
+        // Setup: 3 agents, agent 0 already focused
+        runner.agents = make_test_agents(3);
+        runner.selected_agent = Some("agent-0".to_string());
+        runner.current_agent_index = Some(0);
+        runner.current_pty_index = Some(0);
+        runner.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.active_subscriptions.insert((0, 0));
+
+        // Action: focus same agent+pty
+        runner.execute_focus_terminal(&serde_json::json!({
+            "op": "focus_terminal",
+            "agent_id": "agent-0",
+            "pty_index": 0,
+        }));
+
+        // Verify: no messages sent (already focused)
+        assert!(
+            request_rx.try_recv().is_err(),
+            "No JSON should be sent when already focused on target"
         );
     }
 
