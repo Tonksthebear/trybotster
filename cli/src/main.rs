@@ -155,11 +155,11 @@ fn save_tokens(
 fn run_headless() -> Result<()> {
     println!("Starting Botster Hub v{} in headless mode...", VERSION);
 
+    // Check for updates first (non-interactive — logs warning only)
+    let _ = commands::update::check_on_boot_headless();
+
     // Ensure we have a valid authentication token
     ensure_authenticated()?;
-
-    // Check for updates (non-interactive — logs warning only)
-    let _ = commands::update::check_on_boot_headless();
 
     // Set up signal handlers
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
@@ -233,11 +233,11 @@ fn run_with_tui() -> Result<()> {
         );
     }
 
+    // Check for updates first (at most once per 24h, never blocks startup on failure)
+    let _ = commands::update::check_on_boot();
+
     // Ensure we have a valid authentication token
     ensure_authenticated()?;
-
-    // Check for updates (at most once per 24h, never blocks startup on failure)
-    let _ = commands::update::check_on_boot();
 
     // Set up signal handlers
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
