@@ -18,6 +18,12 @@ local Agent = require("lib.agent")
 local ch = {}
 local conn = nil
 
+-- Skip network connections in unit test mode (BOTSTER_ENV=test)
+if config.env("BOTSTER_ENV") == "test" then
+    log.info("Test mode: skipping ActionCable connection")
+    return {}
+end
+
 -- Connect with E2E encryption enabled (transparent OlmEnvelope handling)
 conn = action_cable.connect({ crypto = true })
 
