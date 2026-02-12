@@ -32,15 +32,15 @@ class CliIntegrationTestCase < ActionDispatch::IntegrationTest
   self.use_transactional_tests = false
 
   setup do
+    @started_clis = []
     boot_server
     @user = users(:jason)
     @hub = create_test_hub(user: @user)
-    @started_clis = []
   end
 
   teardown do
     # Stop all CLI processes
-    @started_clis.each { |cli| stop_cli(cli) }
+    @started_clis&.each { |cli| stop_cli(cli) }
 
     # Clean up test data (non-transactional, so manual cleanup needed)
     @hub&.reload&.destroy rescue nil
@@ -57,11 +57,22 @@ class CliIntegrationTestCase < ActionDispatch::IntegrationTest
 
   # Boot a real Puma server for CLI to connect to.
   # Uses Capybara's server infrastructure without browser overhead.
+  # Retries on EADDRINUSE since stale processes from prior runs may
+  # still be releasing their ports.
   def boot_server
     return if @server
 
     Capybara.server = :puma, { Silent: true }
-    @server = Capybara::Server.new(Rails.application).boot
+    retries = 0
+    begin
+      @server = Capybara::Server.new(Rails.application).boot
+    rescue Errno::EADDRINUSE => e
+      retries += 1
+      raise if retries > 3
+
+      sleep retries
+      retry
+    end
   end
 
   # Override CliTestHelper's server_url to use our booted server
