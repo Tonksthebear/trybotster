@@ -125,6 +125,8 @@ pub struct BlockConfig {
     pub title: Option<StyledContent>,
     /// Border style.
     pub borders: BorderStyle,
+    /// Border styling (color, bold, etc.). Applied via `Block::border_style()`.
+    pub border_style: Option<SpanStyle>,
 }
 
 /// Border style for blocks.
@@ -488,7 +490,12 @@ fn parse_block_config(table: &LuaTable) -> Option<BlockConfig> {
         _ => BorderStyle::All,
     };
 
-    Some(BlockConfig { title, borders })
+    let border_style = block_table
+        .get::<LuaValue>("border_style")
+        .ok()
+        .and_then(|v| parse_span_style(&v).ok());
+
+    Some(BlockConfig { title, borders, border_style })
 }
 
 // =============================================================================
@@ -646,6 +653,10 @@ impl BlockConfig {
 
         if let Some(ref title) = self.title {
             block = block.title(title.to_line());
+        }
+
+        if let Some(ref style) = self.border_style {
+            block = block.border_style(style.to_ratatui_style());
         }
 
         block
@@ -1051,6 +1062,7 @@ mod tests {
         let config = BlockConfig {
             title: Some(StyledContent::Plain(" Test ".to_string())),
             borders: BorderStyle::All,
+            border_style: None,
         };
         // Just verify it doesn't panic — Block doesn't implement PartialEq
         let _block = config.to_block();
@@ -1061,6 +1073,20 @@ mod tests {
         let config = BlockConfig {
             title: None,
             borders: BorderStyle::None,
+            border_style: None,
+        };
+        let _block = config.to_block();
+    }
+
+    #[test]
+    fn test_block_config_with_border_style() {
+        let config = BlockConfig {
+            title: Some(StyledContent::Plain(" Focused ".to_string())),
+            borders: BorderStyle::All,
+            border_style: Some(SpanStyle {
+                fg: Some(SpanColor::Cyan),
+                ..SpanStyle::default()
+            }),
         };
         let _block = config.to_block();
     }

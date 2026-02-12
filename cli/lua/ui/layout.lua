@@ -53,14 +53,22 @@ function render(state)
       if a then return " " .. (a.display_name or a.branch_name or "Agent " .. idx) .. " " end
       return string.format(" Agent %d ", idx)
     end
+    local function terminal_block(idx, pty)
+      local is_focused = (idx == state.selected_agent_index and pty == state.active_pty_index)
+      return {
+        title = agent_label(idx),
+        borders = "all",
+        border_style = is_focused and { fg = "cyan" } or nil,
+      }
+    end
     terminal_panel = {
       type = "vsplit",
       constraints = { "50%", "50%" },
       children = {
         { type = "terminal", props = { agent_index = 0, pty_index = 0 },
-          block = { title = agent_label(0), borders = "all" } },
+          block = terminal_block(0, 0) },
         { type = "terminal", props = { agent_index = 1, pty_index = 0 },
-          block = { title = agent_label(1), borders = "all" } },
+          block = terminal_block(1, 0) },
       },
     }
   else

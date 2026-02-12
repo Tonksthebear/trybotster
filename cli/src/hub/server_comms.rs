@@ -1295,23 +1295,50 @@ impl Hub {
 
     /// Poll TUI requests from TuiRunner (non-blocking).
     ///
-    /// All TUI messages are JSON routed through Lua `client.lua` — the same
-    /// path as browser clients. Each message goes to `lua.call_tui_message()`
-    /// which routes through `Client:on_message()` in Lua.
+    /// JSON control messages go through Lua `client.lua` — the same path as
+    /// browser clients. Raw PTY input bytes are written directly to the PTY,
+    /// bypassing Lua entirely.
     fn poll_tui_requests(&mut self) {
+        use crate::client::TuiRequest;
+
         let Some(ref mut rx) = self.tui_request_rx else {
             return;
         };
 
         // Drain into Vec to release the mutable borrow on self before
         // calling lua.call_tui_message() and flush_lua_queues().
-        let messages: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let requests: Vec<TuiRequest> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
 
-        for msg in messages {
-            if let Err(e) = self.lua.call_tui_message(msg) {
-                log::error!("[TUI] Lua message handling error: {}", e);
+        for request in requests {
+            match request {
+                TuiRequest::LuaMessage(msg) => {
+                    if let Err(e) = self.lua.call_tui_message(msg) {
+                        log::error!("[TUI] Lua message handling error: {}", e);
+                    }
+                    self.flush_lua_queues();
+                }
+                TuiRequest::PtyInput {
+                    agent_index,
+                    pty_index,
+                    data,
+                } => {
+                    if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
+                        if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
+                            if let Err(e) = pty_handle.write_input_direct(&data) {
+                                log::error!("[PTY-INPUT] Write failed: {e}");
+                            }
+                        } else {
+                            log::warn!(
+                                "[PTY-INPUT] No PTY at index {} for agent {}",
+                                pty_index,
+                                agent_index
+                            );
+                        }
+                    } else {
+                        log::warn!("[PTY-INPUT] No agent at index {}", agent_index);
+                    }
+                }
             }
-            self.flush_lua_queues();
         }
     }
 
