@@ -251,6 +251,15 @@ pub struct TuiRunner<B: Backend> {
     inner_kitty_enabled: bool,
     /// Whether we've pushed Kitty to the outer terminal.
     outer_kitty_enabled: bool,
+
+    // === Cached Overlay State ===
+    /// Action strings for selectable items in the current overlay list widget.
+    ///
+    /// Populated after each Lua render pass by extracting actions from the
+    /// overlay render tree. Indexed by selectable item index (matches
+    /// `menu_selected`). Used by `handle_menu_select()` to map selection
+    /// to an action without rebuilding the menu.
+    pub(super) overlay_list_actions: Vec<String>,
 }
 
 impl<B: Backend> std::fmt::Debug for TuiRunner<B>
@@ -333,6 +342,7 @@ where
             outer_bracketed_paste: false,
             inner_kitty_enabled: false,
             outer_kitty_enabled: false,
+            overlay_list_actions: Vec::new(),
         }
     }
 
@@ -733,12 +743,7 @@ where
                         let mode_str = mode_to_lua_string(&self.mode);
                         let context = KeyContext {
                             menu_selected: self.menu_selected,
-                            menu_count: {
-                                let ctx = self.build_menu_context();
-                                crate::tui::menu::selectable_count(
-                                    &crate::tui::menu::build_menu(&ctx),
-                                )
-                            },
+                            menu_count: self.overlay_list_actions.len(),
                             worktree_selected: self.worktree_selected,
                             terminal_rows: self.terminal_dims.0,
                         };
@@ -1117,9 +1122,9 @@ where
         };
 
         // Try Lua-driven render, fall back to hardcoded Rust layout
-        let lua_tree = if let Some(layout_lua) = layout_lua {
+        let lua_result = if let Some(layout_lua) = layout_lua {
             match render_with_lua(&mut self.terminal, layout_lua, &ctx) {
-                Ok(tree) => Some(tree),
+                Ok(result) => Some(result),
                 Err(e) => {
                     log::warn!("Lua layout render failed, using fallback: {e}");
                     None
@@ -1129,7 +1134,7 @@ where
             None
         };
 
-        if lua_tree.is_none() {
+        if lua_result.is_none() {
             render(&mut self.terminal, &ctx, None)?;
         }
 
@@ -1137,9 +1142,16 @@ where
         let rendered_areas = ctx.terminal_areas.borrow().clone();
         drop(ctx);
 
-        if let Some(ref tree) = lua_tree {
+        if let Some(ref result) = lua_result {
             // Sync subscriptions to match what the render tree declares
-            self.sync_subscriptions(tree);
+            self.sync_subscriptions(&result.tree);
+
+            // Cache overlay list actions for menu selection dispatch
+            self.overlay_list_actions = result
+                .overlay
+                .as_ref()
+                .map(super::render_tree::extract_list_actions)
+                .unwrap_or_default();
         }
 
         // Resize parsers and PTYs to match actual widget areas from the render pass
@@ -1183,16 +1195,24 @@ where
 
 }
 
+/// Result from Lua layout rendering.
+struct LuaRenderResult {
+    /// Main layout tree (used for subscription sync).
+    tree: super::render_tree::RenderNode,
+    /// Optional overlay tree (used for action extraction).
+    overlay: Option<super::render_tree::RenderNode>,
+}
+
 /// Render using the Lua layout engine (free function to avoid borrow conflicts).
 ///
 /// Calls Lua `render(state)` and `render_overlay(state)`, interprets
-/// the returned render trees into ratatui calls. Returns the main render
-/// tree on success so the caller can sync subscriptions from it.
+/// the returned render trees into ratatui calls. Returns both trees
+/// so the caller can sync subscriptions and extract overlay actions.
 fn render_with_lua<B>(
     terminal: &mut Terminal<B>,
     layout_lua: &LayoutLua,
     ctx: &super::render::RenderContext,
-) -> Result<super::render_tree::RenderNode>
+) -> Result<LuaRenderResult>
 where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -1215,7 +1235,7 @@ where
         }
     })?;
 
-    Ok(tree)
+    Ok(LuaRenderResult { tree, overlay })
 }
 
 /// Render a dim error indicator in the bottom-right corner of the terminal.
@@ -1797,90 +1817,22 @@ mod tests {
     /// Tests that the menu structure adapts based on context (agent selected,
     /// server PTY available, etc.) and that actions can be correctly retrieved
     /// by selection index.
-    #[test]
-    fn test_dynamic_menu_builds_correctly() {
-        use crate::tui::menu::{build_menu, get_action_for_selection, MenuAction, MenuContext};
-
-        // Menu without agent selected - should have Hub items only
-        let ctx_no_agent = MenuContext {
-            has_agent: false,
-            active_pty_index: 0,
-            session_count: 0,
-        };
-        let menu = build_menu(&ctx_no_agent);
-
-        // First selectable should be New Agent (after Hub header)
-        assert_eq!(
-            get_action_for_selection(&menu, 0),
-            Some(MenuAction::NewAgent)
-        );
-        assert_eq!(
-            get_action_for_selection(&menu, 1),
-            Some(MenuAction::ShowConnectionCode)
-        );
-
-        // Menu with agent selected and multiple sessions - shows Next Session toggle
-        let ctx_with_agent = MenuContext {
-            has_agent: true,
-            active_pty_index: 0,
-            session_count: 2,
-        };
-        let menu = build_menu(&ctx_with_agent);
-
-        // First selectable should be Next Session (PTY toggle), then Close Agent
-        assert_eq!(
-            get_action_for_selection(&menu, 0),
-            Some(MenuAction::TogglePtyView)
-        );
-        assert_eq!(
-            get_action_for_selection(&menu, 1),
-            Some(MenuAction::CloseAgent)
-        );
-        // Then Hub items
-        assert_eq!(
-            get_action_for_selection(&menu, 2),
-            Some(MenuAction::NewAgent)
-        );
+    /// Stub overlay_list_actions with a test fixture.
+    ///
+    /// In production, Lua renders the menu overlay and Rust extracts action
+    /// strings from the render tree. Tests don't run Lua, so we stub the
+    /// cache with a fixed set of actions. This is pure test fixture data —
+    /// Lua owns the real menu content.
+    fn stub_menu_actions(runner: &mut TuiRunner<TestBackend>) {
+        runner.overlay_list_actions = vec![
+            "new_agent".to_string(),
+            "show_connection_code".to_string(),
+        ];
     }
 
-    /// Find the selection index for a given `MenuAction` in the current dynamic menu.
-    ///
-    /// The menu structure changes based on context (agent selected, server PTY available,
-    /// etc.), so tests must use this helper instead of assuming fixed indices.
-    ///
-    /// # Arguments
-    ///
-    /// * `runner` - The `TuiRunner` whose state determines the menu context
-    /// * `target_action` - The action to find in the menu
-    ///
-    /// # Returns
-    ///
-    /// The selection index (0-based among selectable items) if the action exists,
-    /// or `None` if the action is not in the current menu configuration.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let idx = find_menu_action_index(&runner, MenuAction::NewAgent).unwrap();
-    /// navigate_to_menu_index(&mut runner, idx);
-    /// process_key(&mut runner, make_key_enter());
-    /// ```
-    fn find_menu_action_index(
-        runner: &TuiRunner<TestBackend>,
-        target_action: crate::tui::menu::MenuAction,
-    ) -> Option<usize> {
-        use crate::tui::menu::{build_menu, get_action_for_selection, selectable_count};
-
-        let menu_context = runner.build_menu_context();
-        let menu_items = build_menu(&menu_context);
-        let count = selectable_count(&menu_items);
-
-        for idx in 0..count {
-            if get_action_for_selection(&menu_items, idx) == Some(target_action) {
-                return Some(idx);
-            }
-        }
-        None
+    /// Find the index of an action string in overlay_list_actions.
+    fn find_action_index(runner: &TuiRunner<TestBackend>, action: &str) -> Option<usize> {
+        runner.overlay_list_actions.iter().position(|a| a == action)
     }
 
     /// Navigate to a specific menu selection index from index 0.
@@ -1990,8 +1942,9 @@ mod tests {
         process_key(&mut runner, make_key_ctrl('p'));
         assert_eq!(runner.mode(), AppMode::Menu);
         assert_eq!(runner.menu_selected, 0);
+        stub_menu_actions(&mut runner);
 
-        // Navigate down (menu has 2 items: New Agent, Connection Code)
+        // Navigate down (menu has 2 items: new_agent, show_connection_code)
         process_key(&mut runner, make_key_down());
         assert_eq!(runner.menu_selected, 1);
 
@@ -2030,20 +1983,19 @@ mod tests {
     /// The actual action at each index depends on the dynamic menu context.
     #[test]
     fn test_e2e_menu_number_shortcuts() {
-        use crate::tui::menu::MenuAction;
-
         let (mut runner, _cmd_rx) = create_test_runner();
 
         // Open menu (no agent selected)
         process_key(&mut runner, make_key_ctrl('p'));
         assert_eq!(runner.mode(), AppMode::Menu);
+        stub_menu_actions(&mut runner);
 
         // Find what action is at index 1 (which corresponds to pressing '2')
-        let action_at_1 = find_menu_action_index(&runner, MenuAction::ShowConnectionCode);
+        let action_at_1 = find_action_index(&runner, "show_connection_code");
         assert_eq!(
             action_at_1,
             Some(1),
-            "ShowConnectionCode should be at index 1 when no agent selected"
+            "show_connection_code should be at index 1 when no agent selected"
         );
 
         // Press '2' to select the item at index 1
@@ -2104,17 +2056,16 @@ mod tests {
     /// the refresh behavior.
     #[test]
     fn test_e2e_connection_code_full_flow() {
-        use crate::tui::menu::MenuAction;
-
         let (mut runner, _cmd_rx) = create_test_runner();
 
         // 1. Open menu
         process_key(&mut runner, make_key_ctrl('p'));
         assert_eq!(runner.mode(), AppMode::Menu);
+        stub_menu_actions(&mut runner);
 
-        // 2. Find and navigate to Connection Code using dynamic menu lookup
-        let connection_idx = find_menu_action_index(&runner, MenuAction::ShowConnectionCode)
-            .expect("ShowConnectionCode should be in menu");
+        // 2. Find and navigate to Connection Code using cached overlay actions
+        let connection_idx = find_action_index(&runner, "show_connection_code")
+            .expect("show_connection_code should be in menu");
         navigate_to_menu_index(&mut runner, connection_idx);
         assert_eq!(runner.menu_selected, connection_idx);
 
@@ -2161,18 +2112,17 @@ mod tests {
     /// 3. Sends AgentCreated event via TuiOutput channel to verify TUI transitions
     #[test]
     fn test_e2e_new_agent_full_flow() {
-        use crate::tui::menu::MenuAction;
-
         let (mut runner, _output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client();
 
         // Pre-populate worktrees (normally delivered via Lua worktree_list event)
         runner.available_worktrees = vec![("/path/worktree-1".to_string(), "feature-1".to_string())];
 
-        // 1. Open menu and navigate to New Agent using dynamic lookup
+        // 1. Open menu and navigate to New Agent using cached overlay actions
         process_key(&mut runner, make_key_ctrl('p'));
+        stub_menu_actions(&mut runner);
 
-        let new_agent_idx = find_menu_action_index(&runner, MenuAction::NewAgent)
-            .expect("NewAgent should be in menu");
+        let new_agent_idx = find_action_index(&runner, "new_agent")
+            .expect("new_agent should be in menu");
         navigate_to_menu_index(&mut runner, new_agent_idx);
         assert_eq!(runner.menu_selected, new_agent_idx);
 
@@ -2268,8 +2218,6 @@ mod tests {
     /// 2. Verifies request includes from_worktree path
     #[test]
     fn test_e2e_reopen_existing_worktree() {
-        use crate::tui::menu::MenuAction;
-
         let (mut runner, _output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client();
 
         // Pre-populate worktrees (normally delivered via Lua worktree_list event)
@@ -2278,11 +2226,12 @@ mod tests {
             ("/path/worktree-2".to_string(), "bugfix-branch".to_string()),
         ];
 
-        // Open menu and navigate to New Agent using dynamic lookup
+        // Open menu and navigate to New Agent using cached overlay actions
         process_key(&mut runner, make_key_ctrl('p'));
+        stub_menu_actions(&mut runner);
 
-        let new_agent_idx = find_menu_action_index(&runner, MenuAction::NewAgent)
-            .expect("NewAgent should be in menu");
+        let new_agent_idx = find_action_index(&runner, "new_agent")
+            .expect("new_agent should be in menu");
         navigate_to_menu_index(&mut runner, new_agent_idx);
         assert_eq!(runner.menu_selected, new_agent_idx);
 
@@ -2629,13 +2578,12 @@ mod tests {
     /// received yet, the list is empty, allowing graceful degradation.
     #[test]
     fn test_list_worktrees_empty_cache_graceful_handling() {
-        use crate::tui::menu::MenuAction;
-
         let (mut runner, _cmd_rx) = create_test_runner();
+        stub_menu_actions(&mut runner);
 
-        // Find the menu selection index for NewAgent using dynamic lookup
-        let new_agent_idx = find_menu_action_index(&runner, MenuAction::NewAgent)
-            .expect("NewAgent should always be in menu");
+        // Find the menu selection index for new_agent
+        let new_agent_idx = find_action_index(&runner, "new_agent")
+            .expect("new_agent should always be in menu");
 
         // Select "New Agent" which uses cached worktrees (empty)
         runner.handle_menu_select(new_agent_idx);

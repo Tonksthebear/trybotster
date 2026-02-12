@@ -269,6 +269,7 @@ fn render_frame(f: &mut Frame, ctx: &RenderContext) {
                 fg: Some(super::render_tree::SpanColor::Cyan),
                 ..SpanStyle::default()
             }),
+            action: None,
         });
     }
     for agent in ctx.agents {
@@ -283,6 +284,7 @@ fn render_frame(f: &mut Frame, ctx: &RenderContext) {
             content: StyledContent::Plain(format!("{}{}", base_text, server_info)),
             header: false,
             style: None,
+            action: None,
         });
     }
 

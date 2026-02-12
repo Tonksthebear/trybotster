@@ -75,10 +75,7 @@ where
             }
 
             TuiAction::MenuDown => {
-                // Use dynamic menu's selectable item count, not static constant
-                let menu_context = self.build_menu_context();
-                let menu_items = crate::tui::menu::build_menu(&menu_context);
-                let max_idx = crate::tui::menu::selectable_count(&menu_items).saturating_sub(1);
+                let max_idx = self.overlay_list_actions.len().saturating_sub(1);
                 self.menu_selected = (self.menu_selected + 1).min(max_idx);
             }
 
