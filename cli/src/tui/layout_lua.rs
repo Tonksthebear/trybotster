@@ -436,7 +436,7 @@ mod tests {
                     type = "hsplit",
                     constraints = { "30%", "70%" },
                     children = {
-                        { type = "agent_list" },
+                        { type = "list" },
                         { type = "terminal" },
                     }
                 }
@@ -486,7 +486,7 @@ mod tests {
                     type = "hsplit",
                     constraints = { "30%", "70%" },
                     children = {
-                        { type = "agent_list", block = { title = title, borders = "all" } },
+                        { type = "list", block = { title = title, borders = "all" } },
                         { type = "terminal" },
                     }
                 }
@@ -593,7 +593,7 @@ mod tests {
                 if state.mode == "menu" then
                     return {
                         type = "centered", width = 50, height = 40,
-                        child = { type = "menu", block = { title = " Menu ", borders = "all" } }
+                        child = { type = "list", block = { title = " Menu ", borders = "all" } }
                     }
                 end
                 return nil
@@ -713,13 +713,13 @@ mod tests {
 
         // Each modal mode and its expected inner widget type (as Debug string contains)
         let mode_widgets: Vec<(AppMode, &str)> = vec![
-            (AppMode::Menu, "Menu"),
-            (AppMode::NewAgentSelectWorktree, "WorktreeSelect"),
-            (AppMode::NewAgentCreateWorktree, "TextInput"),
-            (AppMode::NewAgentPrompt, "TextInput"),
-            (AppMode::CloseAgentConfirm, "CloseConfirm"),
+            (AppMode::Menu, "List"),
+            (AppMode::NewAgentSelectWorktree, "List"),
+            (AppMode::NewAgentCreateWorktree, "Input"),
+            (AppMode::NewAgentPrompt, "Input"),
+            (AppMode::CloseAgentConfirm, "Paragraph"),
             (AppMode::ConnectionCode, "ConnectionCode"),
-            (AppMode::Error, "Error"),
+            (AppMode::Error, "Paragraph"),
         ];
 
         for (mode, expected_widget) in &mode_widgets {
@@ -824,7 +824,7 @@ mod tests {
                     type = "hsplit",
                     constraints = { "50%", "50%" },
                     children = {
-                        { type = "agent_list" },
+                        { type = "list" },
                         { type = "terminal" },
                     }
                 }
