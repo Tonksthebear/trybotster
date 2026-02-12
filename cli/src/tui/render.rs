@@ -27,17 +27,20 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap},
     Frame, Terminal,
 };
 use vt100::Parser;
 
-use crate::app::{buffer_to_ansi, centered_rect, AppMode};
+use crate::app::buffer_to_ansi;
 
-use super::menu::{build_menu, MenuContext, MenuItem};
+use super::render_tree::{
+    InputProps, ListItemProps, ListProps, ParagraphAlignment, ParagraphProps, SpanStyle,
+    StyledContent,
+};
 use crate::compat::{BrowserDimensions, VpnStatus};
 
-use super::events::CreationStage;
+use std::collections::HashMap;
 
 /// Information about an agent for rendering.
 ///
@@ -46,6 +49,8 @@ use super::events::CreationStage;
 pub struct AgentRenderInfo {
     /// Unique key for this agent (e.g., "repo-42").
     pub key: String,
+    /// Display name for agent list (e.g., "refactor-tui-2"). Computed by Lua.
+    pub display_name: Option<String>,
     /// Repository name.
     pub repo: String,
     /// Issue number (if issue-based agent).
@@ -68,20 +73,18 @@ pub struct AgentRenderInfo {
 /// and the renderer, making dependencies explicit.
 pub struct RenderContext<'a> {
     // === UI State ===
-    /// Current application mode (Normal, Menu, etc.).
-    pub mode: AppMode,
-    /// Currently selected menu item index.
-    pub menu_selected: usize,
+    /// Current UI mode string (e.g., "normal", "menu").
+    pub mode: String,
+    /// Currently selected overlay list item index.
+    pub list_selected: usize,
     /// Text input buffer for text entry modes.
     pub input_buffer: &'a str,
-    /// Currently selected worktree index in selection modal.
-    pub worktree_selected: usize,
     /// Available worktrees for agent creation (path, branch).
     pub available_worktrees: &'a [(String, String)],
     /// Error message to display in Error mode.
     pub error_message: Option<&'a str>,
-    /// Agent creation progress (identifier, stage).
-    pub creating_agent: Option<(&'a str, CreationStage)>,
+    /// Generic key-value store for pending operations (e.g., creating_agent_id, creating_agent_stage).
+    pub pending_fields: &'a HashMap<String, String>,
     /// Connection code data (URL + QR ASCII) for display.
     pub connection_code: Option<&'a super::qr::ConnectionCodeData>,
     /// Whether the connection bundle has been used.
@@ -99,6 +102,9 @@ pub struct RenderContext<'a> {
     /// The VT100 parser for the currently selected agent's active PTY.
     /// This is the parser that should be rendered in the terminal area.
     pub active_parser: Option<Arc<Mutex<Parser>>>,
+    /// Pool of VT100 parsers keyed by `(agent_index, pty_index)`.
+    /// Used by terminal widgets with explicit PTY bindings.
+    pub parser_pool: &'a std::collections::HashMap<(usize, usize), Arc<Mutex<Parser>>>,
     /// Index of the currently active PTY session (0 = first session).
     pub active_pty_index: usize,
     /// Current scroll offset for the active PTY.
@@ -113,13 +119,24 @@ pub struct RenderContext<'a> {
     pub poll_interval: u64,
     /// VPN connection status.
     pub vpn_status: Option<VpnStatus>,
+
+    // === Terminal Dimensions ===
+    /// Terminal width in columns.
+    pub terminal_cols: u16,
+    /// Terminal height in rows.
+    pub terminal_rows: u16,
+
+    // === Widget Area Tracking ===
+    /// Actual rendered area (rows, cols) of each terminal widget, keyed by (agent_index, pty_index).
+    /// Populated during rendering so the runner can resize parsers and PTYs to match.
+    pub terminal_areas: std::cell::RefCell<std::collections::HashMap<(usize, usize), (u16, u16)>>,
 }
 
 impl<'a> std::fmt::Debug for RenderContext<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RenderContext")
             .field("mode", &self.mode)
-            .field("menu_selected", &self.menu_selected)
+            .field("list_selected", &self.list_selected)
             .field("selected_agent_index", &self.selected_agent_index)
             .field("agents_count", &self.agents.len())
             .field("has_active_parser", &self.active_parser.is_some())
@@ -137,19 +154,6 @@ impl<'a> RenderContext<'a> {
         self.agents.get(self.selected_agent_index)
     }
 
-    /// Build menu context from current state.
-    #[must_use]
-    pub fn menu_context(&self) -> MenuContext {
-        let session_count = self
-            .selected_agent()
-            .map(|a| a.session_names.len())
-            .unwrap_or(0);
-        MenuContext {
-            has_agent: self.selected_agent().is_some(),
-            active_pty_index: self.active_pty_index,
-            session_count,
-        }
-    }
 }
 
 /// Render result containing ANSI output for browser streaming.
@@ -186,11 +190,8 @@ where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Build menu items from context
-    let menu_items = build_menu(&ctx.menu_context());
-
     // Helper to render UI to a frame
-    let render_ui = |f: &mut Frame| { render_frame(f, ctx, &menu_items) };
+    let render_ui = |f: &mut Frame| { render_frame(f, ctx) };
 
     // Always render to real terminal for local display
     terminal.draw(render_ui)?;
@@ -239,176 +240,123 @@ where
     })
 }
 
-/// Render the full TUI frame.
+/// Render the full TUI frame (fallback when Lua layout is unavailable).
 ///
-/// Internal function that does the actual rendering work.
-fn render_frame(f: &mut Frame, ctx: &RenderContext, menu_items: &[MenuItem]) {
+/// Builds a minimal layout using generic primitives. When Lua is
+/// working, `interpret_tree()` handles rendering instead.
+fn render_frame(f: &mut Frame, ctx: &RenderContext) {
     let frame_area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
+        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
         .split(frame_area);
 
-    // Log frame and chunk sizes once for debugging
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let block = Block::default().borders(Borders::ALL);
-        let inner = block.inner(chunks[1]);
-        log::info!(
-            "Render areas - Frame: {}x{}, Right chunk: {}x{}, Inner (visible): {}x{}",
-            frame_area.width,
-            frame_area.height,
-            chunks[1].width,
-            chunks[1].height,
-            inner.width,
-            inner.height
-        );
-    }
-
-    // Render agent list
-    render_agent_list(f, ctx, chunks[0]);
-
-    // Render terminal view
-    render_terminal_panel(f, ctx, chunks[1]);
-
-    // Render modal overlays based on mode
-    match ctx.mode {
-        AppMode::Menu => render_menu_modal(f, menu_items, ctx.menu_selected),
-        AppMode::NewAgentSelectWorktree => {
-            render_worktree_select_modal(f, ctx.available_worktrees, ctx.worktree_selected);
-        }
-        AppMode::NewAgentCreateWorktree => render_create_worktree_modal(f, ctx.input_buffer),
-        AppMode::NewAgentPrompt => render_prompt_modal(f, ctx.input_buffer),
-        AppMode::CloseAgentConfirm => render_close_confirm_modal(f),
-        AppMode::ConnectionCode => render_connection_code_modal(f, ctx.connection_code, ctx.bundle_used),
-        AppMode::Error => render_error_modal(f, ctx.error_message),
-        AppMode::Normal => {}
-    }
-}
-
-/// Render the agent list panel.
-fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect) {
-    let mut items: Vec<ListItem> = Vec::new();
-
-    // Add creating indicator at top if agent creation is in progress
-    if let Some((identifier, stage)) = &ctx.creating_agent {
-        let stage_label = match stage {
-            CreationStage::CreatingWorktree => "Creating worktree...",
-            CreationStage::CopyingConfig => "Copying config...",
-            CreationStage::SpawningAgent => "Starting agent...",
-            CreationStage::Ready => "Ready",
+    // Build agent list as generic ListProps
+    let mut items: Vec<ListItemProps> = Vec::new();
+    if let (Some(identifier), Some(stage)) = (
+        ctx.pending_fields.get("creating_agent_id"),
+        ctx.pending_fields.get("creating_agent_stage"),
+    ) {
+        let stage_label = match stage.as_str() {
+            "creating_worktree" => "Creating worktree...",
+            "copying_config" => "Copying config...",
+            "spawning_agent" => "Starting agent...",
+            "ready" => "Ready",
+            other => other,
         };
-        let creating_text = format!("-> {} ({})", identifier, stage_label);
-        items.push(
-            ListItem::new(creating_text).style(Style::default().fg(ratatui::style::Color::Cyan)),
-        );
+        items.push(ListItemProps {
+            content: StyledContent::Plain(format!("-> {} ({})", identifier, stage_label)),
+            header: false,
+            style: Some(SpanStyle {
+                fg: Some(super::render_tree::SpanColor::Cyan),
+                ..SpanStyle::default()
+            }),
+            action: None,
+        });
     }
-
-    // Add existing agents
-    items.extend(ctx.agents.iter().map(|agent| {
-        // Display branch name only (simpler, one agent per branch)
-        let base_text = agent.branch_name.clone();
-
-        // Add server status indicator if HTTP forwarding port is assigned
+    for agent in ctx.agents {
+        let base_text = agent.display_name.as_deref().unwrap_or(&agent.branch_name);
         let server_info = if let Some(p) = agent.port {
-            let server_icon = if agent.server_running {
-                ">" // Server running
-            } else {
-                "o" // Server not running
-            };
-            format!(" {}:{}", server_icon, p)
+            let icon = if agent.server_running { ">" } else { "o" };
+            format!(" {}:{}", icon, p)
         } else {
             String::new()
         };
+        items.push(ListItemProps {
+            content: StyledContent::Plain(format!("{}{}", base_text, server_info)),
+            header: false,
+            style: None,
+            action: None,
+        });
+    }
 
-        ListItem::new(format!("{}{}", base_text, server_info))
-    }));
+    let creating_offset = if ctx.pending_fields.contains_key("creating_agent_id") { 1 } else { 0 };
+    let selected = ctx.selected_agent_index + creating_offset;
 
-    let mut state = ListState::default();
-    // Offset selection by 1 if creating indicator is shown
-    let creating_offset = if ctx.creating_agent.is_some() { 1 } else { 0 };
-    state.select(Some(
-        (ctx.selected_agent_index + creating_offset).min(items.len().saturating_sub(1)),
-    ));
+    let list_props = ListProps {
+        items,
+        selected: Some(selected),
+        highlight_style: None,
+        highlight_symbol: None,
+    };
 
-    // Add polling indicator
-    let poll_status = if ctx.seconds_since_poll < 1 {
-        "*"
+    let poll_status = if ctx.seconds_since_poll < 1 { "*" } else { "o" };
+    let agent_title = format!(" Agents ({}) {} ", ctx.agents.len(), poll_status);
+    let agent_block = Block::default().borders(Borders::ALL).title(agent_title);
+    render_list_widget(f, chunks[0], agent_block, &list_props);
+
+    // Render terminal view
+    let term_title = if let Some(agent) = ctx.selected_agent() {
+        format!(" {} [AGENT] ", agent.branch_name)
     } else {
-        "o"
+        " Terminal [No agent selected] ".to_string()
     };
-
-    // Add VPN status indicator (if VPN manager is available)
-    let vpn_indicator = match ctx.vpn_status {
-        Some(VpnStatus::Connected) => "*",    // Filled = connected
-        Some(VpnStatus::Connecting) => "~",   // Half = connecting
-        Some(VpnStatus::Error) => "x",        // X = error
-        Some(VpnStatus::Disconnected) => "o", // Empty = disconnected
-        None => "-",                          // Dash = VPN disabled
-    };
-
-    let agent_title = format!(
-        " Agents ({}) {} {}s V:{} ",
-        ctx.agents.len(),
-        poll_status,
-        ctx.poll_interval - ctx.seconds_since_poll.min(ctx.poll_interval),
-        vpn_indicator
-    );
-
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(agent_title))
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
-        .highlight_symbol("> ");
-
-    f.render_stateful_widget(list, area, &mut state);
+    let term_block = Block::default().borders(Borders::ALL).title(term_title);
+    render_terminal_panel(f, ctx, chunks[1], term_block, None);
 }
 
-/// Render the terminal panel showing the selected agent's PTY output.
-fn render_terminal_panel(f: &mut Frame, ctx: &RenderContext, area: Rect) {
-    let Some(agent) = ctx.selected_agent() else {
-        // No agent selected - show placeholder
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Terminal [No agent selected] ");
-        f.render_widget(block, area);
-        return;
-    };
-
-    // Build terminal title with view indicator from sessions array
-    let session_name = agent
-        .session_names
-        .get(ctx.active_pty_index)
-        .map(String::as_str)
-        .unwrap_or("agent");
-    let view_indicator = if agent.session_names.len() > 1 {
-        format!("[{} | Ctrl+]: next]", session_name.to_uppercase())
+/// Render the terminal panel showing PTY output.
+///
+/// The `block` parameter provides the pre-built block with title from Lua
+/// (or the fallback). The optional `binding` specifies which PTY to render;
+/// if `None`, renders the currently active PTY.
+pub(super) fn render_terminal_panel(
+    f: &mut Frame,
+    ctx: &RenderContext,
+    area: Rect,
+    block: Block,
+    binding: Option<&super::render_tree::TerminalBinding>,
+) {
+    // Resolve which parser to use: explicit binding → pool lookup, else active parser
+    let (agent_idx, pty_idx) = if let Some(b) = binding {
+        (
+            b.agent_index.unwrap_or(ctx.selected_agent_index),
+            b.pty_index.unwrap_or(ctx.active_pty_index),
+        )
     } else {
-        format!("[{}]", session_name.to_uppercase())
+        (ctx.selected_agent_index, ctx.active_pty_index)
     };
 
-    // Add scroll indicator if scrolled
-    let scroll_indicator = if ctx.is_scrolled {
-        format!(" [SCROLLBACK +{} | Shift+End: live]", ctx.scroll_offset)
+    let parser = if binding.is_some() {
+        ctx.parser_pool.get(&(agent_idx, pty_idx)).cloned()
     } else {
-        String::new()
+        ctx.active_parser.clone()
     };
 
-    let terminal_title = format!(
-        " {} {}{} [Ctrl+P | Ctrl+J/K | Shift+PgUp/Dn scroll] ",
-        agent.branch_name, view_indicator, scroll_indicator
-    );
+    // Record the inner area (minus borders) so the runner can resize parsers/PTYs
+    let inner = block.inner(area);
+    if inner.width > 0 && inner.height > 0 {
+        ctx.terminal_areas
+            .borrow_mut()
+            .insert((agent_idx, pty_idx), (inner.height, inner.width));
+    }
 
-    let block = Block::default().borders(Borders::ALL).title(terminal_title);
-
-    // Render the parser content if available
-    if let Some(ref parser) = ctx.active_parser {
+    if let Some(ref parser) = parser {
         let parser_lock = parser.lock().expect("parser lock not poisoned");
         let screen = parser_lock.screen();
 
         let widget = crate::TerminalWidget::new(screen).block(block);
-
-        // Hide cursor if scrolled
-        let widget = if ctx.is_scrolled {
+        let widget = if binding.is_none() && ctx.is_scrolled {
             widget.hide_cursor()
         } else {
             widget
@@ -416,287 +364,165 @@ fn render_terminal_panel(f: &mut Frame, ctx: &RenderContext, area: Rect) {
 
         widget.render(area, f.buffer_mut());
     } else {
-        // No parser - just show the bordered block
         f.render_widget(block, area);
     }
 }
 
-// === Modal Rendering Helpers ===
+// === Generic Widget Renderers ===
+//
+// These render generic primitives with zero application knowledge.
+// All content, styling, and behavior comes from Lua via props.
 
-fn render_menu_modal(f: &mut Frame, menu_items: &[MenuItem], menu_selected: usize) {
-    use super::menu::selectable_count;
+/// Render a generic list widget with optional selection and headers.
+///
+/// Headers are non-selectable items rendered dim+bold. The `selected` index
+/// in `ListProps` counts only selectable items; this function maps it to
+/// an absolute index accounting for headers.
+pub(super) fn render_list_widget(f: &mut Frame, area: Rect, block: Block, props: &ListProps) {
+    let mut list_items: Vec<ListItem> = Vec::new();
+    let mut selectable_to_absolute: Vec<usize> = Vec::new();
 
-    // Build display lines with selection indicator
-    let mut lines: Vec<Line> = Vec::new();
-    let mut selectable_idx = 0;
-
-    for item in menu_items {
-        if item.is_header {
-            // Section headers are dimmed and not selectable (use terminal default with DIM modifier)
-            lines.push(Line::from(Span::styled(
-                item.label.clone(),
+    for (i, item) in props.items.iter().enumerate() {
+        if item.header {
+            // Headers: dim + bold, non-selectable
+            let line = item.content.to_line();
+            let li = ListItem::new(line).style(
                 Style::default()
                     .add_modifier(Modifier::DIM)
                     .add_modifier(Modifier::BOLD),
-            )));
+            );
+            list_items.push(li);
         } else {
-            // Selectable items with cursor indicator
-            let is_selected = selectable_idx == menu_selected;
-            let cursor = if is_selected { ">" } else { " " };
-            let style = if is_selected {
-                // Use REVERSED modifier to invert terminal colors instead of hardcoding
-                Style::default()
-                    .add_modifier(Modifier::REVERSED)
-                    .add_modifier(Modifier::BOLD)
+            selectable_to_absolute.push(i);
+            let line = item.content.to_line();
+            let li = if let Some(ref style) = item.style {
+                ListItem::new(line).style(style.to_ratatui_style())
             } else {
-                // Use terminal default colors
-                Style::default()
+                ListItem::new(line)
             };
-            lines.push(Line::from(Span::styled(
-                format!("{} {}", cursor, item.label),
-                style,
-            )));
-            selectable_idx += 1;
+            list_items.push(li);
         }
     }
 
-    // Calculate modal height as percentage of terminal
-    // Need enough space for content + borders (lines.len() + 4 padding)
-    let content_rows = lines.len() as u16 + 4;
-    let terminal_height = f.area().height;
-    // Convert absolute rows to percentage, with minimum 30% for visibility
-    let height_percent = ((content_rows * 100) / terminal_height.max(1))
-        .max(30)
-        .min(60);
+    let highlight_style = props
+        .highlight_style
+        .as_ref()
+        .map(SpanStyle::to_ratatui_style)
+        .unwrap_or_else(|| Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED));
 
-    let area = centered_rect(50, height_percent, f.area());
-    f.render_widget(Clear, area);
+    let highlight_symbol = props.highlight_symbol.as_deref().unwrap_or("> ");
 
-    let menu = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Menu [Up/Down navigate | Enter select | Esc cancel] "),
-        )
-        .alignment(Alignment::Left);
+    let list = List::new(list_items)
+        .block(block)
+        .highlight_style(highlight_style)
+        .highlight_symbol(highlight_symbol);
 
-    f.render_widget(menu, area);
-
-    // Suppress unused warning - selectable_count is used for validation elsewhere
-    let _ = selectable_count(menu_items);
-}
-
-fn render_worktree_select_modal(
-    f: &mut Frame,
-    available_worktrees: &[(String, String)],
-    worktree_selected: usize,
-) {
-    let mut worktree_items: Vec<String> = vec![format!(
-        "{} [Create New Worktree]",
-        if worktree_selected == 0 { ">" } else { " " }
-    )];
-
-    // Add existing worktrees (index offset by 1)
-    for (i, (path, branch)) in available_worktrees.iter().enumerate() {
-        worktree_items.push(format!(
-            "{} {} ({})",
-            if i + 1 == worktree_selected { ">" } else { " " },
-            branch,
-            path
-        ));
+    let mut state = ListState::default();
+    if let Some(sel) = props.selected {
+        // Map selectable index to absolute index (past headers)
+        let abs = selectable_to_absolute
+            .get(sel)
+            .copied()
+            .unwrap_or(sel.min(props.items.len().saturating_sub(1)));
+        state.select(Some(abs));
     }
 
-    let area = centered_rect(70, 50, f.area());
-    f.render_widget(Clear, area);
-
-    let worktree_text: Vec<Line> = worktree_items
-        .iter()
-        .map(|item| Line::from(item.clone()))
-        .collect();
-
-    let worktree_list = Paragraph::new(worktree_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Select Worktree [Up/Down navigate | Enter select | Esc cancel] "),
-        )
-        .alignment(Alignment::Left)
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(worktree_list, area);
+    f.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_create_worktree_modal(f: &mut Frame, input_buffer: &str) {
-    let area = centered_rect(60, 30, f.area());
-    f.render_widget(Clear, area);
-
-    let prompt_text = vec![
-        Line::from("Enter branch name or issue number:"),
-        Line::from(""),
-        Line::from("Examples: 123, feature-auth, bugfix-login"),
-        Line::from(""),
-        Line::from(Span::raw(input_buffer)),
-    ];
-
-    let prompt_widget = Paragraph::new(prompt_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Create Worktree [Enter confirm | Esc cancel] "),
-        )
-        .alignment(Alignment::Left);
-
-    f.render_widget(prompt_widget, area);
-}
-
-fn render_prompt_modal(f: &mut Frame, input_buffer: &str) {
-    let area = centered_rect(60, 20, f.area());
-    f.render_widget(Clear, area);
-
-    let prompt_text = vec![
-        Line::from("Enter prompt for agent (leave empty for default):"),
-        Line::from(""),
-        Line::from(Span::raw(input_buffer)),
-    ];
-
-    let prompt_widget = Paragraph::new(prompt_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Agent Prompt [Enter confirm | Esc cancel] "),
-        )
-        .alignment(Alignment::Left);
-
-    f.render_widget(prompt_widget, area);
-}
-
-fn render_close_confirm_modal(f: &mut Frame) {
-    let area = centered_rect(50, 20, f.area());
-    f.render_widget(Clear, area);
-
-    let confirm_text = vec![
-        Line::from("Close selected agent?"),
-        Line::from(""),
-        Line::from("Y - Close agent (keep worktree)"),
-        Line::from("D - Close agent and delete worktree"),
-        Line::from("N/Esc - Cancel"),
-    ];
-
-    let confirm_widget = Paragraph::new(confirm_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Confirm Close "),
-        )
-        .alignment(Alignment::Left);
-
-    f.render_widget(confirm_widget, area);
-}
-
-fn render_connection_code_modal(
+/// Render a paragraph widget with styled lines, alignment, and optional wrapping.
+pub(super) fn render_paragraph_widget(
     f: &mut Frame,
-    connection_code: Option<&super::qr::ConnectionCodeData>,
-    bundle_used: bool,
+    area: Rect,
+    block: Block,
+    props: &ParagraphProps,
 ) {
-    let terminal = f.area();
+    let lines: Vec<Line> = props.lines.iter().map(StyledContent::to_line).collect();
 
-    // Get QR lines from connection code, or show error
-    let qr_lines: Vec<String> = connection_code
+    let alignment = match props.alignment {
+        ParagraphAlignment::Left => Alignment::Left,
+        ParagraphAlignment::Center => Alignment::Center,
+        ParagraphAlignment::Right => Alignment::Right,
+    };
+
+    let mut widget = Paragraph::new(lines).block(block).alignment(alignment);
+
+    if props.wrap {
+        widget = widget.wrap(Wrap { trim: false });
+    }
+
+    f.render_widget(widget, area);
+}
+
+/// Render a text input widget with prompt lines and current value.
+pub(super) fn render_input_widget(f: &mut Frame, area: Rect, block: Block, props: &InputProps) {
+    let mut lines: Vec<Line> = props.lines.iter().map(StyledContent::to_line).collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::raw(props.value.clone())));
+
+    let alignment = match props.alignment {
+        ParagraphAlignment::Left => Alignment::Left,
+        ParagraphAlignment::Center => Alignment::Center,
+        ParagraphAlignment::Right => Alignment::Right,
+    };
+
+    let widget = Paragraph::new(lines).block(block).alignment(alignment);
+
+    f.render_widget(widget, area);
+}
+
+/// Render connection code / QR display into a given area.
+///
+/// When `custom_lines` is `Some`, uses those for header/footer text around the
+/// QR code. Expected format: first line = header, second line = footer. Falls
+/// back to hardcoded text when `None`.
+pub(super) fn render_connection_code_widget(
+    f: &mut Frame,
+    ctx: &RenderContext,
+    area: Rect,
+    block: Block,
+    custom_lines: Option<&[StyledContent]>,
+) {
+    let qr_lines: Vec<String> = ctx
+        .connection_code
         .map(|c| c.qr_ascii.clone())
         .unwrap_or_else(|| vec!["Error: No connection code".to_string()]);
 
-    let qr_fits = !qr_lines.iter().any(|l| l.contains("Terminal") || l.contains("Error"));
-
-    let qr_width = qr_lines
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0) as u16;
-    let qr_height = qr_lines.len() as u16;
-
-    let header = if bundle_used {
-        "Link used - [r] to pair new device"
+    // Custom lines format: [header, used_header, footer]
+    let (header, footer) = if let Some(lines) = custom_lines {
+        let h = if ctx.bundle_used {
+            lines.get(1).map(StyledContent::to_line)
+                .unwrap_or_else(|| Line::from("Link used - [r] to pair new device"))
+        } else {
+            lines.first().map(StyledContent::to_line)
+                .unwrap_or_else(|| Line::from("Scan QR to connect securely"))
+        };
+        let f = lines.last().map(StyledContent::to_line)
+            .unwrap_or_else(|| Line::from("[r] new link  [c] copy  [Esc] close"));
+        (h, f)
     } else {
-        "Scan QR to connect securely"
+        let h = if ctx.bundle_used {
+            Line::from("Link used - [r] to pair new device")
+        } else {
+            Line::from("Scan QR to connect securely")
+        };
+        (h, Line::from("[r] new link  [c] copy  [Esc] close"))
     };
-    let footer = "[r] new link  [c] copy  [Esc] close";
 
-    let content_width = qr_width.max(header.len() as u16).max(footer.len() as u16);
-    let modal_width = content_width + 4;
-    let modal_height = qr_height + 6;
-
-    let x = terminal.x + (terminal.width.saturating_sub(modal_width)) / 2;
-    let y = terminal.y + (terminal.height.saturating_sub(modal_height)) / 2;
-    let area = Rect::new(
-        x,
-        y,
-        modal_width.min(terminal.width),
-        modal_height.min(terminal.height),
-    );
-
-    f.render_widget(Clear, area);
-
-    let mut text_lines = vec![
-        Line::from(Span::styled(
-            header,
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+    let mut text_lines = vec![header, Line::from("")];
 
     for qr_line in &qr_lines {
         text_lines.push(Line::from(qr_line.clone()));
     }
 
     text_lines.push(Line::from(""));
-    text_lines.push(Line::from(Span::styled(
-        footer,
-        if qr_fits {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default().add_modifier(Modifier::BOLD)
-        },
-    )));
+    text_lines.push(footer);
 
-    let code_widget = Paragraph::new(text_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Secure Connection "),
-        )
+    let widget = Paragraph::new(text_lines)
+        .block(block)
         .alignment(Alignment::Center);
 
-    f.render_widget(code_widget, area);
-}
-
-/// Render an error modal.
-fn render_error_modal(f: &mut Frame, error_message: Option<&str>) {
-    let area = centered_rect(60, 30, f.area());
-    f.render_widget(Clear, area);
-
-    let message = error_message.unwrap_or("An error occurred");
-
-    let text_lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "Error",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(message),
-        Line::from(""),
-        Line::from(Span::styled(
-            "[Esc/Enter] dismiss",
-            Style::default().add_modifier(Modifier::DIM),
-        )),
-    ];
-
-    let error_widget = Paragraph::new(text_lines)
-        .block(Block::default().borders(Borders::ALL).title(" Error "))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(error_widget, area);
+    f.render_widget(widget, area);
 }
 
 #[cfg(test)]
@@ -708,6 +534,7 @@ mod tests {
         let agents = vec![
             AgentRenderInfo {
                 key: "test-1".to_string(),
+                display_name: None,
                 repo: "test/repo".to_string(),
                 issue_number: Some(1),
                 branch_name: "botster-issue-1".to_string(),
@@ -717,6 +544,7 @@ mod tests {
             },
             AgentRenderInfo {
                 key: "test-2".to_string(),
+                display_name: None,
                 repo: "test/repo".to_string(),
                 issue_number: Some(2),
                 branch_name: "botster-issue-2".to_string(),
@@ -727,71 +555,34 @@ mod tests {
         ];
 
         let ctx = RenderContext {
-            mode: AppMode::Normal,
-            menu_selected: 0,
+            mode: "normal".to_string(),
+            list_selected: 0,
             input_buffer: "",
-            worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-            creating_agent: None,
+            pending_fields: &std::collections::HashMap::new(),
             connection_code: None,
             bundle_used: false,
             agent_ids: &[],
             agents: &agents,
             selected_agent_index: 1,
             active_parser: None,
+            parser_pool: &std::collections::HashMap::new(),
             active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
             seconds_since_poll: 0,
             poll_interval: 10,
             vpn_status: None,
+            terminal_cols: 80,
+            terminal_rows: 24,
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         let selected = ctx.selected_agent();
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().key, "test-2");
         assert_eq!(selected.unwrap().issue_number, Some(2));
-    }
-
-    #[test]
-    fn test_render_context_menu_context() {
-        let agents = vec![AgentRenderInfo {
-            key: "test-1".to_string(),
-            repo: "test/repo".to_string(),
-            issue_number: Some(1),
-            branch_name: "botster-issue-1".to_string(),
-            port: None,
-            server_running: false,
-            session_names: vec!["agent".to_string(), "server".to_string()],
-        }];
-
-        let ctx = RenderContext {
-            mode: AppMode::Normal,
-            menu_selected: 0,
-            input_buffer: "",
-            worktree_selected: 0,
-            available_worktrees: &[],
-            error_message: None,
-            creating_agent: None,
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &[],
-            agents: &agents,
-            selected_agent_index: 0,
-            active_parser: None,
-            active_pty_index: 1,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 5,
-            poll_interval: 10,
-            vpn_status: None,
-        };
-
-        let menu_ctx = ctx.menu_context();
-        assert!(menu_ctx.has_agent);
-        assert_eq!(menu_ctx.active_pty_index, 1);
-        assert_eq!(menu_ctx.session_count, 2);
     }
 
     #[test]

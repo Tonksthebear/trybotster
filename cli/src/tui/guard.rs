@@ -4,7 +4,7 @@
 //! properly restored even if the application panics.
 
 use crossterm::{
-    event::DisableMouseCapture,
+    event::{DisableMouseCapture, PopKeyboardEnhancementFlags},
     execute,
     terminal::{disable_raw_mode, LeaveAlternateScreen},
 };
@@ -55,6 +55,12 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Always attempt to restore terminal state, ignoring errors
         let _ = disable_raw_mode();
+
+        // Reset mirrored terminal modes (may have been pushed by sync_terminal_modes)
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1l");    // Reset DECCKM (application cursor)
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?2004l"); // Reset bracketed paste
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+
         let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
         // Try to show cursor
         let _ = execute!(std::io::stdout(), crossterm::cursor::Show);

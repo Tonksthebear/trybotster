@@ -1,8 +1,7 @@
 //! UI rendering utilities for the botster-hub TUI.
 //!
 //! This module provides helper functions for rendering the TUI,
-//! including layout helpers, ANSI conversion for WebRTC streaming,
-//! and browser keyboard input conversion.
+//! including layout helpers and ANSI conversion for WebRTC streaming.
 //!
 //! # Overview
 //!
@@ -13,30 +12,14 @@
 //! Modal dialogs are positioned using [`centered_rect`] which calculates
 //! a centered rectangle within a parent area.
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-02
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier},
 };
 use std::fmt::Write;
-
-/// Browser keyboard input - sent from browser terminal to CLI.
-#[derive(Debug, Clone)]
-pub struct KeyInput {
-    /// The key pressed (e.g., "a", "Enter", "Escape").
-    pub key: String,
-    /// Whether Ctrl was held.
-    pub ctrl: bool,
-    /// Whether Alt was held.
-    pub alt: bool,
-    /// Whether Shift was held.
-    pub shift: bool,
-    /// Whether Meta/Cmd was held.
-    pub meta: bool,
-}
 
 /// Creates a centered rectangle within a parent area.
 ///
@@ -240,103 +223,6 @@ fn apply_background_color(output: &mut String, color: Color) {
     }
 }
 
-/// Converts browser keyboard input to a crossterm KeyEvent.
-///
-/// Browser keyboards report keys differently than terminals. This function
-/// maps browser key names (from JavaScript KeyboardEvent.key) to crossterm
-/// KeyCodes for processing by the TUI.
-///
-/// # Arguments
-///
-/// * `input` - The browser keyboard input from WebRTC
-///
-/// # Returns
-///
-/// A crossterm KeyEvent if the key is recognized, or `None` for unknown keys.
-///
-/// # Example
-///
-/// ```ignore
-/// use botster_hub::app::ui::convert_browser_key_to_crossterm;
-/// use botster_hub::webrtc_handler::KeyInput;
-///
-/// let input = KeyInput {
-///     key: "Enter".to_string(),
-///     ctrl: false,
-///     alt: false,
-///     shift: false,
-///     meta: false,
-/// };
-/// let event = convert_browser_key_to_crossterm(&input);
-/// assert!(event.is_some());
-/// ```
-pub fn convert_browser_key_to_crossterm(input: &KeyInput) -> Option<KeyEvent> {
-    let mut modifiers = KeyModifiers::empty();
-    if input.ctrl {
-        modifiers |= KeyModifiers::CONTROL;
-    }
-    if input.alt {
-        modifiers |= KeyModifiers::ALT;
-    }
-    if input.shift {
-        modifiers |= KeyModifiers::SHIFT;
-    }
-
-    // Map browser key names to crossterm KeyCode
-    let key_code = match input.key.as_str() {
-        // Single character keys
-        k if k.len() == 1 => {
-            let c = k
-                .chars()
-                .next()
-                .expect("single char string has at least one char");
-            KeyCode::Char(c)
-        }
-        // Special keys
-        "Enter" => KeyCode::Enter,
-        "Escape" => KeyCode::Esc,
-        "Backspace" => KeyCode::Backspace,
-        "Tab" => KeyCode::Tab,
-        "ArrowUp" => KeyCode::Up,
-        "ArrowDown" => KeyCode::Down,
-        "ArrowLeft" => KeyCode::Left,
-        "ArrowRight" => KeyCode::Right,
-        "Home" => KeyCode::Home,
-        "End" => KeyCode::End,
-        "PageUp" => KeyCode::PageUp,
-        "PageDown" => KeyCode::PageDown,
-        "Delete" => KeyCode::Delete,
-        "Insert" => KeyCode::Insert,
-        // Function keys
-        "F1" => KeyCode::F(1),
-        "F2" => KeyCode::F(2),
-        "F3" => KeyCode::F(3),
-        "F4" => KeyCode::F(4),
-        "F5" => KeyCode::F(5),
-        "F6" => KeyCode::F(6),
-        "F7" => KeyCode::F(7),
-        "F8" => KeyCode::F(8),
-        "F9" => KeyCode::F(9),
-        "F10" => KeyCode::F(10),
-        "F11" => KeyCode::F(11),
-        "F12" => KeyCode::F(12),
-        // Space
-        " " => KeyCode::Char(' '),
-        // Unknown keys - ignore
-        _ => {
-            log::debug!("Unknown browser key: {}", input.key);
-            return None;
-        }
-    };
-
-    Some(KeyEvent {
-        code: key_code,
-        modifiers,
-        kind: KeyEventKind::Press,
-        state: KeyEventState::empty(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,99 +267,6 @@ mod tests {
         let line_count = result.matches("\x1b[").count();
         // Each line has at least one cursor positioning escape
         assert!(line_count > 0);
-    }
-
-    #[test]
-    fn test_convert_browser_key_enter() {
-        let input = KeyInput {
-            key: "Enter".to_string(),
-            ctrl: false,
-            alt: false,
-            shift: false,
-            meta: false,
-        };
-        let result = convert_browser_key_to_crossterm(&input);
-
-        assert!(result.is_some());
-        let event = result.unwrap();
-        assert_eq!(event.code, KeyCode::Enter);
-        assert_eq!(event.modifiers, KeyModifiers::empty());
-    }
-
-    #[test]
-    fn test_convert_browser_key_with_modifiers() {
-        let input = KeyInput {
-            key: "c".to_string(),
-            ctrl: true,
-            alt: false,
-            shift: false,
-            meta: false,
-        };
-        let result = convert_browser_key_to_crossterm(&input);
-
-        assert!(result.is_some());
-        let event = result.unwrap();
-        assert_eq!(event.code, KeyCode::Char('c'));
-        assert!(event.modifiers.contains(KeyModifiers::CONTROL));
-    }
-
-    #[test]
-    fn test_convert_browser_key_arrow() {
-        let input = KeyInput {
-            key: "ArrowUp".to_string(),
-            ctrl: false,
-            alt: false,
-            shift: false,
-            meta: false,
-        };
-        let result = convert_browser_key_to_crossterm(&input);
-
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().code, KeyCode::Up);
-    }
-
-    #[test]
-    fn test_convert_browser_key_function() {
-        let input = KeyInput {
-            key: "F5".to_string(),
-            ctrl: false,
-            alt: false,
-            shift: false,
-            meta: false,
-        };
-        let result = convert_browser_key_to_crossterm(&input);
-
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().code, KeyCode::F(5));
-    }
-
-    #[test]
-    fn test_convert_browser_key_unknown() {
-        let input = KeyInput {
-            key: "UnknownKey123".to_string(),
-            ctrl: false,
-            alt: false,
-            shift: false,
-            meta: false,
-        };
-        let result = convert_browser_key_to_crossterm(&input);
-
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_convert_browser_key_space() {
-        let input = KeyInput {
-            key: " ".to_string(),
-            ctrl: false,
-            alt: false,
-            shift: false,
-            meta: false,
-        };
-        let result = convert_browser_key_to_crossterm(&input);
-
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().code, KeyCode::Char(' '));
     }
 
     #[test]

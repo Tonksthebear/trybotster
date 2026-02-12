@@ -52,6 +52,7 @@ scopeguard = "1.2"  # RAII guards for cleanup
 env_logger = "0.11"
 ctrlc = { version = "3.4", features = ["termination"] }
 signal-hook = "0.3"
+libc = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
@@ -86,16 +87,12 @@ webrtc = "0.12"
 # QR code generation for browser connection (qrcodegen supports alphanumeric mode for smaller QR)
 qrcodegen = "1.8"
 
-# Clipboard support for copying URLs
-arboard = "3.4"
-
 # TTY detection for interactive prompts
 atty = "0.2"
 flate2 = "1.1.8"
 
 [dev-dependencies]
 tempfile = "3.23"
-libc = "0.2"
 portable-pty = "0.9"
 wiremock = "0.6"
 keyring = "3"

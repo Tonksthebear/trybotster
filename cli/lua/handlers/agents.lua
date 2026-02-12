@@ -74,6 +74,22 @@ local function build_agent_key(repo, issue_number, branch_name)
     end
 end
 
+--- Find the next available agent key by appending a suffix if needed.
+-- If base_key is free, returns it as-is. Otherwise tries base_key-2, -3, etc.
+--
+-- @param base_key string  The base agent key
+-- @return string          An unused agent key
+local function next_available_key(base_key)
+    if not Agent.get(base_key) then
+        return base_key
+    end
+    local i = 2
+    while Agent.get(base_key .. "-" .. i) do
+        i = i + 1
+    end
+    return base_key .. "-" .. i
+end
+
 -- ============================================================================
 -- Profile Resolution
 -- ============================================================================
@@ -217,7 +233,7 @@ local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, a
         prompt = prompt,
         sessions = sessions,
         dims = dims,
-        instance_suffix = instance_suffix,
+        agent_key = agent_key,
     })
 
     if not ok then
@@ -303,10 +319,11 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     -- Detect repo
     local repo = config.env("BOTSTER_REPO") or "unknown/repo"
 
-    -- Build base agent key, then find next available instance
-    local base_key = build_agent_key(repo, issue_number, branch_name)
-    local suffix = Agent.next_instance_suffix(base_key)
-    local agent_key = base_key .. (suffix or "")
+    -- Build agent key for status broadcasts and duplicate checking
+    local agent_key = build_agent_key(repo, issue_number, branch_name)
+
+    -- Allow multiple agents on the same branch by suffixing the key
+    agent_key = next_available_key(agent_key)
 
     -- Find or create worktree
     local wt_path = from_worktree or worktree.find(branch_name)
