@@ -478,24 +478,14 @@ impl Hub {
     /// Load the Lua initialization script.
     ///
     /// Loading priority:
-    /// 1. User overrides in `~/.botster/lua/` - filesystem with hot-reload
-    /// 2. Dev mode (debug build) - `cli/lua/` filesystem with hot-reload
-    /// 3. Release mode - embedded files from binary (no hot-reload)
+    /// 1. Dev mode (debug build) - `cli/lua/` filesystem with hot-reload
+    /// 2. Release mode - extract embedded files to `~/.botster/lua/`, load from there
+    ///
+    /// In release mode, embedded Lua is always extracted first (content-hash
+    /// checked) so that on-disk files stay in sync with the binary. Users can
+    /// still edit the extracted files for hot-reload; edits persist until the
+    /// next binary update changes the content hash.
     fn load_lua_init(&mut self) {
-        use std::path::Path;
-
-        // Check if user has their own Lua files (always takes priority)
-        let user_init_path = self.lua.base_path().join("core").join("init.lua");
-        if user_init_path.exists() {
-            let init_path = Path::new("core/init.lua");
-            if let Err(e) = self.lua.load_file(init_path) {
-                log::warn!("Failed to load user init.lua: {}", e);
-            } else {
-                log::info!("Loaded Lua from user path: {}", user_init_path.display());
-                return;
-            }
-        }
-
         // In debug builds, use source directory for hot-reload during development
         #[cfg(debug_assertions)]
         {
@@ -522,7 +512,8 @@ impl Hub {
         }
 
         // Release mode: extract embedded Lua to filesystem, then load from there.
-        // This enables hot-reload even in release builds (agent can edit Lua on disk).
+        // Extraction uses a content hash so it only re-writes when files actually change.
+        // This enables hot-reload even in release builds (users can edit Lua on disk).
         #[cfg(not(debug_assertions))]
         {
             match self.lua.ensure_lua_on_filesystem() {
