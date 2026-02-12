@@ -71,7 +71,7 @@ base64 = "0.22"
 data-encoding = "2.6"  # Base32 encoding for QR-friendly URLs
 
 # Security hardening
-keyring = { version = "3", features = ["apple-native"] }  # OS keychain for secret key storage
+keyring = { version = "3", features = ["apple-native", "linux-native"] }  # OS keychain for secret key storage
 ed25519-dalek = "2"            # Ed25519 signing for device identity
 zeroize = { version = "1.8", features = ["derive"] }  # Secure memory zeroing
 aes-gcm = "0.10"               # AES-GCM for encrypting state at rest

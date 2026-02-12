@@ -3,12 +3,18 @@
 //! Stores all secrets in a single keyring entry to avoid multiple
 //! macOS keychain prompts when the binary changes (new builds).
 //!
-//! # Storage
+//! # Storage Hierarchy
 //!
-//! Production: Single OS keyring entry `botster/credentials` containing JSON.
-//! Test mode: File at `{config_dir}/credentials.json`.
+//! 1. OS keyring (macOS Keychain, GNOME Keyring, KDE Wallet) — encrypted, preferred
+//! 2. File fallback `{config_dir}/credentials.json` — `0600` permissions, used when
+//!    keyring is unavailable (headless Linux, WSL2, etc.)
+//! 3. Test mode always uses the file fallback.
 //!
 //! # Graceful Degradation
+//!
+//! When the OS keyring is unavailable (e.g., headless server without GNOME Keyring),
+//! the user is prompted once to confirm file-based storage. On subsequent runs,
+//! credentials are loaded from whichever backend has them.
 //!
 //! macOS keychain may block access when binary signature changes (new builds).
 //! This module implements retry logic and distinguishes between:
@@ -122,9 +128,57 @@ fn should_skip_keyring() -> bool {
     }
 }
 
-/// Get the credentials file path for test mode.
+/// Get the credentials file path (used for file-based fallback and test mode).
 fn credentials_file_path() -> Result<PathBuf> {
     crate::config::Config::config_dir().map(|d| d.join("credentials.json"))
+}
+
+/// Prompt the user about keyring unavailability and ask to continue with file storage.
+///
+/// On non-interactive sessions (no TTY), automatically falls back without prompting.
+fn prompt_keyring_fallback() -> Result<()> {
+    use std::io::{self, Write};
+
+    let path = credentials_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~/.config/botster/credentials.json".to_string());
+
+    eprintln!();
+    eprintln!("  System keyring is not available on this device.");
+    eprintln!();
+    eprintln!("  To enable encrypted credential storage, install a keyring service:");
+    eprintln!("    Ubuntu/Debian:  sudo apt install gnome-keyring libsecret-1-0 dbus-x11");
+    eprintln!("    Then start it:  eval $(dbus-launch --sh-syntax) && \\");
+    eprintln!("                    echo \"\" | gnome-keyring-daemon --unlock --start --components=secrets");
+    eprintln!();
+    eprintln!("  Note: WSL2 keyring support is unreliable and not recommended.");
+    eprintln!();
+    eprintln!("  Without a keyring, credentials will be stored in:");
+    eprintln!("    {} (protected by file permissions 0600 only)", path);
+    eprintln!();
+
+    // Non-interactive: fall back automatically
+    if !atty::is(atty::Stream::Stdin) {
+        eprintln!("  Non-interactive session detected, using file storage.");
+        eprintln!();
+        return Ok(());
+    }
+
+    print!("  Continue without keyring? [Y/n] ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_lowercase();
+
+    if input == "n" || input == "no" {
+        anyhow::bail!(
+            "Keyring required. Install a keyring service and try again, \
+             or set BOTSTER_TOKEN env var to skip keyring entirely."
+        );
+    }
+
+    Ok(())
 }
 
 /// Consolidated credentials stored in a single keyring entry.
@@ -166,9 +220,9 @@ fn default_version() -> u8 {
 }
 
 impl Credentials {
-    /// Load credentials from keyring (or file in test mode).
+    /// Load credentials from the best available backend.
     ///
-    /// Implements retry logic for transient keyring access failures.
+    /// Tries in order: test file (if test mode), OS keyring, file fallback.
     /// On macOS, keychain access may fail temporarily when:
     /// - Keychain is locked and awaiting user interaction
     /// - Binary signature changed (new build)
@@ -177,7 +231,24 @@ impl Credentials {
             return Self::load_from_file();
         }
 
-        Self::load_from_keyring_with_retry()
+        // Try OS keyring first
+        let keyring_result = Self::load_from_keyring_with_retry();
+        if let Ok(ref creds) = keyring_result {
+            if creds.api_token.is_some() || creds.signing_key.is_some() {
+                return keyring_result;
+            }
+        }
+
+        // Keyring returned empty or failed — check file fallback
+        match Self::load_from_file() {
+            Ok(file_creds)
+                if file_creds.api_token.is_some() || file_creds.signing_key.is_some() =>
+            {
+                log::debug!("Loaded credentials from file fallback");
+                Ok(file_creds)
+            }
+            _ => keyring_result,
+        }
     }
 
     /// Load from keyring with retry logic for transient failures.
@@ -264,27 +335,46 @@ impl Credentials {
         }
     }
 
-    /// Load credentials from file (test mode).
+    /// Load credentials from file (fallback when keyring is unavailable, or test mode).
     fn load_from_file() -> Result<Self> {
         let path = credentials_file_path()?;
         if path.exists() {
             let content = fs::read_to_string(&path)?;
             let creds: Credentials = serde_json::from_str(&content)?;
-            log::debug!("Loaded credentials from file (test mode)");
+            log::debug!("Loaded credentials from file: {}", path.display());
             Ok(creds)
         } else {
-            // No credentials yet - return empty
-            log::debug!("No credentials file found, returning empty");
+            log::debug!("No credentials file found at {}", path.display());
             Ok(Credentials::default())
         }
     }
 
-    /// Save credentials to keyring (or file in test mode).
+    /// Save credentials to the best available backend.
+    ///
+    /// Tries OS keyring first. If keyring is unavailable, prompts the user
+    /// once and falls back to file-based storage.
     pub fn save(&self) -> Result<()> {
         if should_skip_keyring() {
             return self.save_to_file();
         }
 
+        // Try OS keyring
+        let keyring_err = match Self::try_save_to_keyring(self) {
+            Ok(()) => {
+                log::info!("Saved consolidated credentials to OS keyring");
+                return Ok(());
+            }
+            Err(e) => e,
+        };
+
+        // Keyring failed — prompt user for file fallback
+        log::warn!("Keyring save failed: {keyring_err}");
+        prompt_keyring_fallback()?;
+        self.save_to_file()
+    }
+
+    /// Attempt to save credentials to the OS keyring.
+    fn try_save_to_keyring(&self) -> Result<()> {
         let entry = Entry::new(KEYRING_SERVICE, KEYRING_CREDENTIALS)
             .map_err(|e| anyhow::anyhow!("Failed to create keyring entry: {e:?}"))?;
 
@@ -293,38 +383,48 @@ impl Credentials {
             .set_password(&json)
             .map_err(|e| anyhow::anyhow!("Failed to store credentials in keyring: {e:?}"))?;
 
-        log::info!("Saved consolidated credentials to OS keyring");
         Ok(())
     }
 
-    /// Save credentials to file (test mode).
+    /// Save credentials to file (fallback when keyring is unavailable, or test mode).
     fn save_to_file(&self) -> Result<()> {
         let path = credentials_file_path()?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(&path, json)?;
+        fs::write(&path, &json)?;
 
         #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
-        log::debug!("Saved credentials to file (test mode)");
+        log::info!("Saved credentials to file: {}", path.display());
         Ok(())
     }
 
-    /// Delete all credentials from keyring.
+    /// Delete all credentials from both keyring and file fallback.
     pub fn delete() -> Result<()> {
-        if should_skip_keyring() {
-            let path = credentials_file_path()?;
+        // Always try to clean up the file fallback
+        if let Ok(path) = credentials_file_path() {
             if path.exists() {
                 fs::remove_file(&path)?;
+                log::info!("Deleted credentials file: {}", path.display());
             }
+        }
+
+        if should_skip_keyring() {
             return Ok(());
         }
 
-        let entry = Entry::new(KEYRING_SERVICE, KEYRING_CREDENTIALS)
-            .map_err(|e| anyhow::anyhow!("Failed to create keyring entry: {e:?}"))?;
+        // Also try to clean up the keyring entry
+        if let Ok(entry) = Entry::new(KEYRING_SERVICE, KEYRING_CREDENTIALS) {
+            let _ = entry.delete_credential();
+            log::info!("Deleted credentials from OS keyring");
+        }
 
-        let _ = entry.delete_credential();
-        log::info!("Deleted credentials from OS keyring");
         Ok(())
     }
 
