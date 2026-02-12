@@ -225,6 +225,14 @@ fn run_headless() -> Result<()> {
 /// The TUI module now owns TuiRunner instantiation, maintaining proper layer separation
 /// (Hub should not know about TUI implementation details).
 fn run_with_tui() -> Result<()> {
+    // Require an interactive terminal for TUI mode
+    if !atty::is(atty::Stream::Stdin) {
+        anyhow::bail!(
+            "Error: 'start' requires an interactive terminal (stdin is not a TTY).\n\
+             Use 'botster-hub start --headless' for non-interactive mode."
+        );
+    }
+
     // Ensure we have a valid authentication token
     ensure_authenticated()?;
 
