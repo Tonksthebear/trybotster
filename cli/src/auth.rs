@@ -90,98 +90,125 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
     println!("  Code: {}", device_code.user_code);
     println!();
 
-    // Open browser on Enter (synchronous — no background thread)
+    // Step 3: Start polling in background thread immediately.
+    // This allows the server to detect approval even before the user presses Enter,
+    // which is critical for headless servers where there's no browser to open.
+    let poll_url = format!("{}/hubs/codes/{}", server_url, device_code.device_code);
+    let poll_interval = Duration::from_secs(device_code.interval.max(5));
+    let max_attempts = device_code.expires_in / device_code.interval.max(5);
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<TokenResponse, String>>();
+    let poll_client = client.clone();
+    let poll_url_clone = poll_url.clone();
+
+    thread::spawn(move || {
+        for attempt in 0..max_attempts {
+            thread::sleep(poll_interval);
+
+            let response = match poll_client.get(&poll_url_clone).send() {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("Poll attempt {} failed: {}", attempt + 1, e);
+                    continue;
+                }
+            };
+
+            match response.status().as_u16() {
+                200 => {
+                    match response.json::<TokenResponse>() {
+                        Ok(token) => {
+                            let _ = tx.send(Ok(token));
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!("Invalid token response: {e}")));
+                            return;
+                        }
+                    }
+                }
+                202 => continue, // Still pending
+                400 | 401 | 403 => {
+                    let error: ErrorResponse = response.json().unwrap_or(ErrorResponse {
+                        error: "unknown".to_string(),
+                    });
+                    match error.error.as_str() {
+                        "authorization_pending" => continue,
+                        other => {
+                            let _ = tx.send(Err(format!("Authorization failed: {other}")));
+                            return;
+                        }
+                    }
+                }
+                status => {
+                    log::warn!("Unexpected status {} on poll attempt {}", status, attempt + 1);
+                    continue;
+                }
+            }
+        }
+        let _ = tx.send(Err("Authorization timed out. Please try again.".to_string()));
+    });
+
+    // Step 4: Show browser prompt (interactive) while polling runs in background
     let interactive = atty::is(atty::Stream::Stdin)
         && std::env::var("BOTSTER_NO_BROWSER").is_err()
         && std::env::var("CI").is_err();
 
     if interactive {
-        print!("  Press Enter to open browser...");
+        println!("  Press Enter to open browser (or visit the URL above)...");
         io::stdout().flush()?;
-        let mut input = String::new();
-        let _ = io::stdin().read_line(&mut input);
-        match open_browser(&device_code.verification_uri) {
-            Ok(()) => println!("  Browser opened."),
-            Err(e) => println!("  Could not open browser: {}", e),
+
+        // Wait for either Enter key or poll result, whichever comes first
+        let stdin_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stdin_flag = std::sync::Arc::clone(&stdin_done);
+
+        // Read stdin in a separate thread so we can check poll results concurrently
+        thread::spawn(move || {
+            let mut input = String::new();
+            let _ = io::stdin().read_line(&mut input);
+            stdin_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        // Check for Enter or poll result
+        let mut browser_opened = false;
+        loop {
+            // Check if polling thread got a result
+            if let Ok(result) = rx.try_recv() {
+                return handle_poll_result(result);
+            }
+
+            // Check if user pressed Enter
+            if !browser_opened && stdin_done.load(std::sync::atomic::Ordering::Relaxed) {
+                browser_opened = true;
+                match open_browser(&device_code.verification_uri) {
+                    Ok(()) => println!("  Browser opened."),
+                    Err(e) => println!("  Could not open browser: {}", e),
+                }
+                print!("  Waiting for approval");
+                io::stdout().flush()?;
+            }
+
+            thread::sleep(Duration::from_millis(100));
         }
     }
 
+    // Non-interactive: just wait for the polling thread result
     print!("  Waiting for approval");
     io::stdout().flush()?;
 
-    // Step 3: Poll for authorization
-    let poll_url = format!("{}/hubs/codes/{}", server_url, device_code.device_code);
-    let poll_interval = Duration::from_secs(device_code.interval.max(5));
-    let max_attempts = device_code.expires_in / device_code.interval.max(5);
-
-    for attempt in 0..max_attempts {
-        thread::sleep(poll_interval);
-
-        let response = client
-            .get(&poll_url)
-            .send()
-            .context("Failed to poll for authorization")?;
-
-        let status = response.status();
-
-        match status.as_u16() {
-            200 => {
-                // Success - we got the tokens
-                let token: TokenResponse = response.json().context("Invalid token response")?;
-                println!();
-                println!();
-                println!("  Authorized successfully!");
-                println!();
-                return Ok(token);
-            }
-            202 => {
-                // Still pending - continue polling
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return handle_poll_result(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
                 print!(".");
                 io::stdout().flush()?;
-                continue;
+                thread::sleep(poll_interval);
             }
-            400 | 401 | 403 => {
-                // Check error type
-                let error: ErrorResponse = response.json().unwrap_or(ErrorResponse {
-                    error: "unknown".to_string(),
-                });
-
-                match error.error.as_str() {
-                    "authorization_pending" => {
-                        // Shouldn't happen with 400, but handle it
-                        print!(".");
-                        io::stdout().flush()?;
-                        continue;
-                    }
-                    "expired_token" => {
-                        println!();
-                        anyhow::bail!("Authorization code expired. Please try again.");
-                    }
-                    "access_denied" => {
-                        println!();
-                        anyhow::bail!("Authorization was denied.");
-                    }
-                    _ => {
-                        println!();
-                        anyhow::bail!("Authorization failed: {}", error.error);
-                    }
-                }
-            }
-            _ => {
-                log::warn!(
-                    "Unexpected status {} on poll attempt {}, retrying...",
-                    status,
-                    attempt
-                );
-                print!(".");
-                io::stdout().flush()?;
-                continue;
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                println!();
+                anyhow::bail!("Authorization polling thread terminated unexpectedly");
             }
         }
     }
-
-    println!();
-    anyhow::bail!("Authorization timed out. Please try again.")
 }
 
 /// Prompt the user to name their hub during first-time setup.
@@ -221,6 +248,23 @@ pub fn prompt_hub_name() -> Result<String> {
 
     println!();
     Ok(name)
+}
+
+/// Process the result from the background polling thread.
+fn handle_poll_result(result: Result<TokenResponse, String>) -> Result<TokenResponse> {
+    match result {
+        Ok(token) => {
+            println!();
+            println!();
+            println!("  Authorized successfully!");
+            println!();
+            Ok(token)
+        }
+        Err(msg) => {
+            println!();
+            anyhow::bail!("{msg}")
+        }
+    }
 }
 
 /// Try to open the verification URL in the user's browser.
