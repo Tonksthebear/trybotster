@@ -46,7 +46,7 @@ M.normal["i"] = "enter_insert_mode"
 -- Insert mode: PTY forwarding, only modifier combos
 M.insert = {}
 for k, v in pairs(shared_bindings) do M.insert[k] = v end
-M.insert["escape"] = "enter_normal_mode"
+-- Escape is NOT bound in insert mode — it forwards to PTY (vim, etc.)
 
 M.menu = {
   ["escape"]  = "close_modal",

@@ -682,7 +682,7 @@ where
                     }
 
                     // Watch user ui/ directory for extension hot-reload
-                    let lua_base = resolve_lua_base_path();
+                    let lua_base = resolve_lua_user_path();
                     let user_ui_dir = lua_base.join("user").join("ui");
                     if user_ui_dir.exists() {
                         if let Err(e) = watcher.watch(&user_ui_dir, false) {
@@ -886,7 +886,7 @@ where
                     if (any_builtin_changed || any_extension_changed) && layout_lua.is_some() {
                         if let Some(ref lua) = layout_lua {
                             // Re-discover extensions (picks up new files)
-                            let lua_base = resolve_lua_base_path();
+                            let lua_base = resolve_lua_user_path();
                             let fresh_extensions = discover_ui_extensions(&lua_base);
 
                             // Reload botster API
@@ -1277,11 +1277,12 @@ where
                 let context = self.build_action_context(self.overlay_list_selected);
                 match lua.call_on_hub_event(event_type, &msg, &context) {
                     Ok(Some(ops)) => {
+                        log::info!("Hub event '{event_type}' → {} ops", ops.len());
                         self.execute_lua_ops(ops);
                         return;
                     }
                     Ok(None) => {
-                        log::trace!("Lua on_hub_event returned nil for '{event_type}'");
+                        log::debug!("Lua on_hub_event returned nil for '{event_type}'");
                         return;
                     }
                     Err(e) => {
@@ -1289,11 +1290,12 @@ where
                         return;
                     }
                 }
+            } else {
+                log::warn!("Hub event '{event_type}' dropped: events module not loaded");
             }
+        } else {
+            log::warn!("Hub event '{event_type}' dropped: no layout_lua");
         }
-
-        // No Lua events module — log unhandled events
-        log::trace!("Unhandled hub event (no Lua events module): {event_type}");
     }
 
     /// Render the TUI.
@@ -1569,6 +1571,10 @@ where
     fn execute_focus_terminal(&mut self, op: &serde_json::Value) {
         let agent_id = op.get("agent_id").and_then(|v| v.as_str());
         let pty_index = op.get("pty_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        log::info!(
+            "focus_terminal: agent_id={:?}, pty_index={}, agents_count={}",
+            agent_id, pty_index, self.agents.len()
+        );
 
         // Clear selection if no agent_id
         let Some(agent_id) = agent_id else {
@@ -1828,7 +1834,7 @@ pub fn run_with_hub(
 
     // Load botster API and discover UI extensions (plugins + user overrides).
     tui_runner.botster_api_source = load_botster_api_source();
-    let lua_base = resolve_lua_base_path();
+    let lua_base = resolve_lua_user_path();
     tui_runner.extension_sources = discover_ui_extensions(&lua_base);
 
     // Register SIGWINCH to set the resize flag (TuiRunner polls this each tick)
@@ -1943,155 +1949,57 @@ struct ExtensionSource {
     fs_path: std::path::PathBuf,
 }
 
-/// Load the Lua layout source from filesystem or embedded.
+/// Load a Lua UI module by name, searching all candidate paths then embedded.
 ///
-/// Priority: filesystem (`~/.botster/lua/ui/layout.lua` or `BOTSTER_LUA_PATH`)
-/// then embedded (release builds). Returns None if neither is available.
+/// Search order per `resolve_lua_search_paths()`:
+/// 1. `~/.botster/lua/ui/{name}` (user overrides)
+/// 2. `./lua/ui/{name}` (dev defaults)
+/// 3. Embedded in binary (release builds)
+fn load_lua_ui_source(name: &str) -> Option<LayoutSource> {
+    let rel_path = format!("ui/{name}");
+
+    for base in resolve_lua_search_paths() {
+        let fs_path = base.join(&rel_path);
+        if let Ok(source) = std::fs::read_to_string(&fs_path) {
+            let fs_path = fs_path.canonicalize().unwrap_or(fs_path);
+            log::info!("Loaded {name} from filesystem: {}", fs_path.display());
+            return Some(LayoutSource {
+                source,
+                fs_path: Some(fs_path),
+            });
+        }
+    }
+
+    if let Some(source) = crate::lua::embedded::get(&rel_path) {
+        log::info!("Loaded {name} from embedded");
+        return Some(LayoutSource {
+            source: source.to_string(),
+            fs_path: None,
+        });
+    }
+
+    log::warn!("No {name} found in any search path");
+    None
+}
+
 fn load_layout_lua_source() -> Option<LayoutSource> {
-    // Try filesystem first (enables hot-reload and user overrides)
-    let lua_base = resolve_lua_base_path();
-
-    let fs_path = lua_base.join("ui").join("layout.lua");
-    if let Ok(source) = std::fs::read_to_string(&fs_path) {
-        // Canonicalize so FileWatcher (notify) gets an absolute path on macOS
-        let fs_path = fs_path.canonicalize().unwrap_or(fs_path);
-        log::info!("Loaded layout.lua from filesystem: {}", fs_path.display());
-        return Some(LayoutSource {
-            source,
-            fs_path: Some(fs_path),
-        });
-    }
-
-    // Fall back to embedded (release builds)
-    if let Some(source) = crate::lua::embedded::get("ui/layout.lua") {
-        log::info!("Loaded layout.lua from embedded");
-        return Some(LayoutSource {
-            source: source.to_string(),
-            fs_path: None,
-        });
-    }
-
-    log::info!("No layout.lua found, using hardcoded fallback");
-    None
+    load_lua_ui_source("layout.lua")
 }
 
-/// Load the Lua keybinding source from filesystem or embedded.
-///
-/// Same priority as layout: filesystem first, then embedded fallback.
 fn load_keybinding_lua_source() -> Option<LayoutSource> {
-    let lua_base = resolve_lua_base_path();
-
-    let fs_path = lua_base.join("ui").join("keybindings.lua");
-    if let Ok(source) = std::fs::read_to_string(&fs_path) {
-        let fs_path = fs_path.canonicalize().unwrap_or(fs_path);
-        log::info!(
-            "Loaded keybindings.lua from filesystem: {}",
-            fs_path.display()
-        );
-        return Some(LayoutSource {
-            source,
-            fs_path: Some(fs_path),
-        });
-    }
-
-    // Fall back to embedded (release builds)
-    if let Some(source) = crate::lua::embedded::get("ui/keybindings.lua") {
-        log::info!("Loaded keybindings.lua from embedded");
-        return Some(LayoutSource {
-            source: source.to_string(),
-            fs_path: None,
-        });
-    }
-
-    log::info!("No keybindings.lua found, using Rust-only key handling");
-    None
+    load_lua_ui_source("keybindings.lua")
 }
 
-/// Load the Lua actions source from filesystem or embedded.
-///
-/// Same priority as layout: filesystem first, then embedded fallback.
 fn load_actions_lua_source() -> Option<LayoutSource> {
-    let lua_base = resolve_lua_base_path();
-
-    let fs_path = lua_base.join("ui").join("actions.lua");
-    if let Ok(source) = std::fs::read_to_string(&fs_path) {
-        let fs_path = fs_path.canonicalize().unwrap_or(fs_path);
-        log::info!(
-            "Loaded actions.lua from filesystem: {}",
-            fs_path.display()
-        );
-        return Some(LayoutSource {
-            source,
-            fs_path: Some(fs_path),
-        });
-    }
-
-    // Fall back to embedded (release builds)
-    if let Some(source) = crate::lua::embedded::get("ui/actions.lua") {
-        log::info!("Loaded actions.lua from embedded");
-        return Some(LayoutSource {
-            source: source.to_string(),
-            fs_path: None,
-        });
-    }
-
-    log::info!("No actions.lua found, compound actions disabled");
-    None
+    load_lua_ui_source("actions.lua")
 }
 
-/// Load the events Lua source from filesystem or embedded.
-///
-/// Follows the same pattern as `load_actions_lua_source`: tries filesystem
-/// first (for hot-reload in dev), falls back to embedded for release.
 fn load_events_lua_source() -> Option<LayoutSource> {
-    let lua_base = resolve_lua_base_path();
-
-    let fs_path = lua_base.join("ui").join("events.lua");
-    if let Ok(source) = std::fs::read_to_string(&fs_path) {
-        let fs_path = fs_path.canonicalize().unwrap_or(fs_path);
-        log::info!(
-            "Loaded events.lua from filesystem: {}",
-            fs_path.display()
-        );
-        return Some(LayoutSource {
-            source,
-            fs_path: Some(fs_path),
-        });
-    }
-
-    // Fall back to embedded (release builds)
-    if let Some(source) = crate::lua::embedded::get("ui/events.lua") {
-        log::info!("Loaded events.lua from embedded");
-        return Some(LayoutSource {
-            source: source.to_string(),
-            fs_path: None,
-        });
-    }
-
-    log::info!("No events.lua found, hub event handling disabled");
-    None
+    load_lua_ui_source("events.lua")
 }
 
-/// Load the botster API source from filesystem or embedded.
-///
-/// The botster API module is loaded into the TUI Lua state after built-in
-/// modules and before extensions. It provides the `botster.*` global API.
 fn load_botster_api_source() -> Option<String> {
-    let lua_base = resolve_lua_base_path();
-
-    let fs_path = lua_base.join("ui").join("botster.lua");
-    if let Ok(source) = std::fs::read_to_string(&fs_path) {
-        log::info!("Loaded botster.lua from filesystem: {}", fs_path.display());
-        return Some(source);
-    }
-
-    if let Some(source) = crate::lua::embedded::get("ui/botster.lua") {
-        log::info!("Loaded botster.lua from embedded");
-        return Some(source.to_string());
-    }
-
-    log::info!("No botster.lua found, extension API unavailable");
-    None
+    load_lua_ui_source("botster.lua").map(|s| s.source)
 }
 
 /// Discover UI extension files from plugins and user directories.
@@ -2152,15 +2060,45 @@ fn discover_ui_extensions(lua_base: &std::path::Path) -> Vec<ExtensionSource> {
     extensions
 }
 
-/// Resolve the Lua base path from env or default.
-fn resolve_lua_base_path() -> std::path::PathBuf {
-    std::env::var("BOTSTER_LUA_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .map(|h| h.join(".botster").join("lua"))
-                .unwrap_or_else(|| std::path::PathBuf::from(".botster/lua"))
-        })
+/// Resolve candidate Lua base paths for loading UI modules.
+///
+/// Returns paths in priority order — loaders check each until the file is
+/// found. This allows `~/.botster/lua/` overrides to coexist with dev
+/// defaults in `./lua/`, like Neovim's runtimepath.
+///
+/// Resolution order:
+/// 1. `BOTSTER_LUA_PATH` env var (explicit override — sole path if set)
+/// 2. `~/.botster/lua/` (user overrides — highest priority for installed builds)
+/// 3. `./lua/` relative to CWD (development defaults — `cargo run` from `cli/`)
+fn resolve_lua_search_paths() -> Vec<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("BOTSTER_LUA_PATH") {
+        return vec![std::path::PathBuf::from(path)];
+    }
+
+    let mut paths = Vec::new();
+
+    // User overrides (like ~/.config/nvim/)
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".botster").join("lua"));
+    }
+
+    // Development defaults (running from cli/)
+    let local = std::path::PathBuf::from("lua");
+    if local.is_dir() {
+        paths.push(local);
+    }
+
+    paths
+}
+
+/// Resolve the user-level Lua path (`~/.botster/lua/`).
+///
+/// Used for discovering extensions and user overrides — not for loading
+/// core UI modules (which use `resolve_lua_search_paths`).
+fn resolve_lua_user_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".botster").join("lua"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".botster/lua"))
 }
 
 #[cfg(test)]
