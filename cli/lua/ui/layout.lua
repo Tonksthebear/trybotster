@@ -70,15 +70,15 @@ local function build_menu_items(state)
   if sa then
     table.insert(items, { text = "── Agent ──", header = true })
     if (sa.session_count or 0) > 1 then
-      table.insert(items, { text = "Next Session (Ctrl+])" })
+      table.insert(items, { text = "Next Session (Ctrl+])", action = "toggle_pty" })
     end
-    table.insert(items, { text = "Close Agent" })
+    table.insert(items, { text = "Close Agent", action = "close_agent" })
   end
 
   -- Hub section (always shown)
   table.insert(items, { text = "── Hub ──", header = true })
-  table.insert(items, { text = "New Agent" })
-  table.insert(items, { text = "Show Connection Code" })
+  table.insert(items, { text = "New Agent", action = "new_agent" })
+  table.insert(items, { text = "Show Connection Code", action = "show_connection_code" })
 
   return items
 end

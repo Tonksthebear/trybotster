@@ -30,7 +30,6 @@
 //! - [`runner_agent`] - Agent navigation methods for TuiRunner
 //! - [`runner_handlers`] - Action and event handlers for TuiRunner
 //! - [`runner_input`] - Input submission handlers for TuiRunner
-//! - [`menu`] - Context-aware menu system
 //! - [`view`] - View state types
 
 // Rust guideline compliant 2026-02
@@ -40,7 +39,6 @@ pub mod events;
 pub mod guard;
 pub mod layout;
 pub mod layout_lua;
-pub mod menu;
 pub mod qr;
 pub mod raw_input;
 pub mod render;
@@ -63,8 +61,6 @@ pub use guard::TerminalGuard;
 pub use raw_input::{InputEvent, RawInputReader};
 #[doc(inline)]
 pub use layout::terminal_widget_inner_area;
-#[doc(inline)]
-pub use menu::{build_menu, MenuAction, MenuContext, MenuItem};
 #[doc(inline)]
 pub use qr::{generate_qr_code_lines, ConnectionCodeData};
 #[doc(inline)]

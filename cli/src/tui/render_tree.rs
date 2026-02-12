@@ -143,6 +143,8 @@ pub struct ListItemProps {
     pub header: bool,
     /// Optional per-item style override.
     pub style: Option<SpanStyle>,
+    /// Optional action identifier triggered when this item is selected.
+    pub action: Option<String>,
 }
 
 /// Props for a paragraph widget.
@@ -552,6 +554,7 @@ fn parse_list_props(table: &LuaTable) -> Option<WidgetProps> {
                     content: StyledContent::Plain(s.to_string_lossy().to_string()),
                     header: false,
                     style: None,
+                    action: None,
                 });
             }
             LuaValue::Table(item_table) => {
@@ -568,7 +571,8 @@ fn parse_list_props(table: &LuaTable) -> Option<WidgetProps> {
                     .get::<LuaValue>("style")
                     .ok()
                     .and_then(|v| parse_span_style(&v).ok());
-                items.push(ListItemProps { content, header, style });
+                let action: Option<String> = item_table.get("action").ok();
+                items.push(ListItemProps { content, header, style, action });
             }
             _ => continue,
         }
@@ -993,6 +997,54 @@ fn collect_bindings_recursive(
             }
         }
     }
+}
+
+// =============================================================================
+// List Action Extraction
+// =============================================================================
+
+/// Extract action strings from the first list widget found in a render tree.
+///
+/// Walks the tree depth-first, finds the first `List` widget, and returns
+/// the `action` strings for selectable (non-header) items in order.
+/// Used to cache menu actions after rendering so Rust can map selection
+/// index → action without rebuilding the menu.
+pub fn extract_list_actions(node: &RenderNode) -> Vec<String> {
+    let mut actions = Vec::new();
+    extract_list_actions_recursive(node, &mut actions);
+    actions
+}
+
+fn extract_list_actions_recursive(node: &RenderNode, actions: &mut Vec<String>) -> bool {
+    match node {
+        RenderNode::HSplit { children, .. } | RenderNode::VSplit { children, .. } => {
+            for child in children {
+                if extract_list_actions_recursive(child, actions) {
+                    return true;
+                }
+            }
+        }
+        RenderNode::Centered { child, .. } => {
+            return extract_list_actions_recursive(child, actions);
+        }
+        RenderNode::Widget {
+            widget_type,
+            props,
+            ..
+        } => {
+            if matches!(widget_type, WidgetType::List) {
+                if let Some(WidgetProps::List(list_props)) = props {
+                    for item in &list_props.items {
+                        if !item.header {
+                            actions.push(item.action.clone().unwrap_or_default());
+                        }
+                    }
+                }
+                return true; // Stop after first list
+            }
+        }
+    }
+    false
 }
 
 // =============================================================================

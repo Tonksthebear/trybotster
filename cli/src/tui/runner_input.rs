@@ -17,7 +17,6 @@ use ratatui::backend::Backend;
 
 use crate::app::AppMode;
 use crate::tui::events::CreationStage;
-use crate::tui::menu::{build_menu, get_action_for_selection, MenuAction, MenuContext};
 
 use super::runner::TuiRunner;
 
@@ -26,30 +25,24 @@ where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    /// Handle menu selection using the dynamic menu system.
+    /// Handle menu selection using cached overlay actions.
     ///
-    /// Builds a `MenuContext` from current state and uses `menu::get_action_for_selection()`
-    /// to determine which action to execute. This ensures menu behavior stays consistent
-    /// with the dynamic menu structure (which changes based on whether an agent is selected,
-    /// etc.).
+    /// Looks up the action string from `overlay_list_actions` (populated
+    /// during the last Lua render pass) by selection index. This avoids
+    /// rebuilding the menu — Lua is the single source of truth for menu
+    /// items and their actions.
     ///
     /// # Arguments
     ///
     /// * `idx` - The selection index (0-based among selectable items)
     pub fn handle_menu_select(&mut self, idx: usize) {
-        // Build menu context from current state
-        let menu_context = self.build_menu_context();
-        let menu_items = build_menu(&menu_context);
-
-        // Get the action for this selection index
-        let Some(action) = get_action_for_selection(&menu_items, idx) else {
-            // Invalid selection - close menu and return to normal
+        let Some(action) = self.overlay_list_actions.get(idx) else {
             self.mode = AppMode::Normal;
             return;
         };
 
-        match action {
-            MenuAction::NewAgent => {
+        match action.as_str() {
+            "new_agent" => {
                 self.mode = AppMode::NewAgentSelectWorktree;
                 self.worktree_selected = 0;
                 // Request a fresh worktree list via Lua (non-blocking, response updates cache)
@@ -57,48 +50,28 @@ where
                     "subscriptionId": "tui_hub",
                     "data": { "type": "list_worktrees" }
                 }));
-                // Use cached list (already populated by hub subscription events)
                 log::debug!("Using {} cached worktrees", self.available_worktrees.len());
             }
-            MenuAction::CloseAgent => {
+            "close_agent" => {
                 if self.selected_agent.is_some() {
                     self.mode = AppMode::CloseAgentConfirm;
                 }
             }
-            MenuAction::ShowConnectionCode => {
+            "show_connection_code" => {
                 self.mode = AppMode::ConnectionCode;
-                // Request connection code via Lua protocol
                 self.send_msg(serde_json::json!({
                     "subscriptionId": "tui_hub",
                     "data": { "type": "get_connection_code" }
                 }));
             }
-            MenuAction::TogglePtyView => {
+            "toggle_pty" => {
                 self.handle_pty_view_toggle();
                 self.mode = AppMode::Normal;
             }
-        }
-    }
-
-    /// Build a `MenuContext` from current TuiRunner state.
-    ///
-    /// Used by `handle_menu_select()` to determine which menu action maps to a given
-    /// selection index.
-    ///
-    /// # Returns
-    ///
-    /// A `MenuContext` reflecting the current TUI state for dynamic menu building.
-    pub fn build_menu_context(&self) -> MenuContext {
-        let session_count = self
-            .selected_agent
-            .as_ref()
-            .and_then(|key| self.agents.iter().find(|a| a.id == *key))
-            .and_then(|a| a.sessions.as_ref())
-            .map_or(1, |s| s.len());
-        MenuContext {
-            has_agent: self.selected_agent.is_some(),
-            active_pty_index: self.active_pty_index,
-            session_count,
+            _ => {
+                log::warn!("Unknown menu action: {action}");
+                self.mode = AppMode::Normal;
+            }
         }
     }
 
