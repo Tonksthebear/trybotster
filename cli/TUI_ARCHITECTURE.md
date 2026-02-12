@@ -259,7 +259,7 @@ KeyCode::Tab => Some(vec![9]),                // TAB
 ## File Structure
 
 ```
-botster_hub_rs/
+botster_rs/
 ├── src/
 │   ├── main.rs              # TUI application, event loop, rendering
 │   ├── agent.rs             # Agent struct, PTY management, VT100 parser
@@ -395,7 +395,7 @@ Bottom status bar displays:
 
 - Usually from running in background without proper TTY
 - Run directly in terminal: `cargo run -- start`
-- Not from `./target/release/botster-hub` (rebuild with `cargo build --release`)
+- Not from `./target/release/botster` (rebuild with `cargo build --release`)
 
 ## References
 
@@ -411,12 +411,12 @@ Bottom status bar displays:
 
 ```bash
 # Development build and run
-cd botster_hub_rs
+cd botster_rs
 cargo run -- start
 
 # Release build
 cargo build --release
-./target/release/botster-hub start
+./target/release/botster start
 
 # With debug logging
 RUST_LOG=debug cargo run -- start

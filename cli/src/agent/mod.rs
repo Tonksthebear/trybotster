@@ -1,4 +1,4 @@
-//! Agent management for the botster-hub.
+//! Agent management for the botster.
 //!
 //! This module provides the core agent types for managing PTY sessions.
 //! Each agent runs in its own git worktree with dedicated PTY sessions

@@ -1,10 +1,10 @@
 //! Botster Hub CLI - manages autonomous Claude agents for GitHub issues.
 //!
-//! This is the main binary entry point. See the `botster_hub` library
+//! This is the main binary entry point. See the `botster` library
 //! for the core functionality.
 
 use anyhow::Result;
-use botster_hub::{commands, tui, Config, Hub};
+use botster::{commands, tui, Config, Hub};
 use mimalloc::MiMalloc;
 
 /// Global allocator configured per M-MIMALLOC-APPS guideline.
@@ -35,10 +35,10 @@ static SHUTDOWN_FLAG: std::sync::LazyLock<Arc<AtomicBool>> =
 /// 1. A valid token exists in the keyring (or env var)
 /// 2. The token has been verified against the server
 fn ensure_authenticated() -> Result<()> {
-    use botster_hub::auth;
+    use botster::auth;
 
     // Skip auth validation in test mode (BOTSTER_ENV=test)
-    if botster_hub::env::is_test_mode() {
+    if botster::env::is_test_mode() {
         log::info!("Skipping authentication (BOTSTER_ENV=test)");
         return Ok(());
     }
@@ -128,9 +128,9 @@ fn ensure_authenticated() -> Result<()> {
 /// Save both hub and MCP tokens from auth response.
 fn save_tokens(
     config: &mut Config,
-    token_response: &botster_hub::auth::TokenResponse,
+    token_response: &botster::auth::TokenResponse,
 ) -> Result<()> {
-    use botster_hub::keyring::Credentials;
+    use botster::keyring::Credentials;
 
     // Save hub token via config (which updates Credentials internally)
     config.save_token(&token_response.access_token)?;
@@ -173,11 +173,11 @@ fn run_headless() -> Result<()> {
 
     // Verify token is available after load - catches keyring save/load issues
     // Skip in test mode since ensure_authenticated() skips auth entirely
-    if !botster_hub::env::is_test_mode() && !config.has_token() {
+    if !botster::env::is_test_mode() && !config.has_token() {
         anyhow::bail!(
             "Authentication token not found after auth flow. \
              This may indicate a keyring access issue. \
-             Try running 'botster-hub reset' and re-authenticating."
+             Try running 'botster reset' and re-authenticating."
         );
     }
 
@@ -229,7 +229,7 @@ fn run_with_tui() -> Result<()> {
     if !atty::is(atty::Stream::Stdin) {
         anyhow::bail!(
             "Error: 'start' requires an interactive terminal (stdin is not a TTY).\n\
-             Use 'botster-hub start --headless' for non-interactive mode."
+             Use 'botster start --headless' for non-interactive mode."
         );
     }
 
@@ -252,11 +252,11 @@ fn run_with_tui() -> Result<()> {
 
     // Verify token is available after load - catches keyring save/load issues
     // Skip in test mode since ensure_authenticated() skips auth entirely
-    if !botster_hub::env::is_test_mode() && !config.has_token() {
+    if !botster::env::is_test_mode() && !config.has_token() {
         anyhow::bail!(
             "Authentication token not found after auth flow. \
              This may indicate a keyring access issue. \
-             Try running 'botster-hub reset' and re-authenticating."
+             Try running 'botster reset' and re-authenticating."
         );
     }
 
@@ -301,7 +301,7 @@ fn run_with_tui() -> Result<()> {
 
 // CLI
 #[derive(Parser)]
-#[command(name = "botster-hub")]
+#[command(name = "botster")]
 #[command(version = VERSION)]
 #[command(about = "Interactive PTY-based daemon for GitHub automation")]
 struct Cli {
@@ -355,7 +355,7 @@ enum Commands {
         /// Path to the worktree
         worktree_path: String,
     },
-    /// Update botster-hub to the latest version
+    /// Update botster to the latest version
     Update {
         /// Show version without updating
         #[arg(long)]
@@ -377,19 +377,19 @@ enum Commands {
 
 fn main() -> Result<()> {
     // Set up file logging so TUI doesn't interfere with log output
-    // Use BOTSTER_LOG_FILE or BOTSTER_CONFIG_DIR/botster-hub.log or fallback
+    // Use BOTSTER_LOG_FILE or BOTSTER_CONFIG_DIR/botster.log or fallback
     let log_path = if let Ok(path) = std::env::var("BOTSTER_LOG_FILE") {
         std::path::PathBuf::from(path)
     } else if let Ok(config_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
-        std::path::PathBuf::from(config_dir).join("botster-hub.log")
-    } else if botster_hub::env::is_any_test() {
+        std::path::PathBuf::from(config_dir).join("botster.log")
+    } else if botster::env::is_any_test() {
         // Test mode: use project tmp/ to avoid leaking outside the project
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .map(|p| p.join("tmp/botster-hub.log"))
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/botster-hub.log"))
+            .map(|p| p.join("tmp/botster.log"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/botster.log"))
     } else {
-        std::path::PathBuf::from("/tmp/botster-hub.log")
+        std::path::PathBuf::from("/tmp/botster.log")
     };
     let log_file = std::fs::File::create(&log_path)
         .unwrap_or_else(|_| panic!("Failed to create log file at {:?}", log_path));
@@ -472,7 +472,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::GetConnectionUrl { hub } => {
-            use botster_hub::relay::read_connection_url;
+            use botster::relay::read_connection_url;
             match read_connection_url(&hub)? {
                 Some(url) => {
                     println!("{}", url);

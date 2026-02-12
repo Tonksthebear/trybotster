@@ -1,12 +1,12 @@
 [package]
-name = "botster-hub"
+name = "botster"
 version = "0.6.3"
 edition = "2021"
 authors = ["Jason Conigliari"]
 description = "Interactive PTY-based daemon for GitHub mention → local agent automation"
 
 [[bin]]
-name = "botster-hub"
+name = "botster"
 path = "src/main.rs"
 
 [dependencies]

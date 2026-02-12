@@ -6,7 +6,7 @@
 //! # Usage
 //!
 //! ```rust
-//! use botster_hub::env::{Environment, is_test_mode};
+//! use botster::env::{Environment, is_test_mode};
 //!
 //! // Check current environment
 //! if Environment::current().is_test() {

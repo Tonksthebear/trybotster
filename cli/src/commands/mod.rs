@@ -1,4 +1,4 @@
-//! CLI subcommand implementations for botster-hub.
+//! CLI subcommand implementations for botster.
 //!
 //! This module contains the business logic for all CLI subcommands that don't
 //! involve the interactive TUI. Commands are organized into submodules by domain:
@@ -14,7 +14,7 @@
 //! Commands are invoked from the main CLI dispatcher:
 //!
 //! ```ignore
-//! use botster_hub::commands;
+//! use botster::commands;
 //!
 //! commands::json::get(&file_path, &key_path)?;
 //! commands::worktree::list()?;

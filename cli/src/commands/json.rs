@@ -12,13 +12,13 @@
 //!
 //! ```bash
 //! # Get a value
-//! botster-hub json-get ~/.config/claude/projects.json "projects.myproject.hasTrust"
+//! botster json-get ~/.config/claude/projects.json "projects.myproject.hasTrust"
 //!
 //! # Set a value (creates intermediate objects if needed)
-//! botster-hub json-set ~/.config/claude/projects.json "projects.myproject.hasTrust" "true"
+//! botster json-set ~/.config/claude/projects.json "projects.myproject.hasTrust" "true"
 //!
 //! # Delete a key
-//! botster-hub json-delete ~/.config/claude/projects.json "projects.myproject.hasTrust"
+//! botster json-delete ~/.config/claude/projects.json "projects.myproject.hasTrust"
 //! ```
 
 use anyhow::{Context, Result};

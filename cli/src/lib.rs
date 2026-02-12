@@ -1,6 +1,6 @@
 //! Botster Hub - Agent orchestration daemon.
 //!
-//! This crate provides the core functionality for the botster-hub CLI,
+//! This crate provides the core functionality for the botster CLI,
 //! managing agent lifecycles, TUI rendering, and remote client communication.
 //!
 //! # Architecture

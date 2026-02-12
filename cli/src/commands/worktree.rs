@@ -1,16 +1,16 @@
 //! Git worktree management commands.
 //!
 //! Provides CLI utilities for listing and deleting git worktrees managed by
-//! botster-hub. Worktrees are used to isolate agent work on separate branches.
+//! botster. Worktrees are used to isolate agent work on separate branches.
 //!
 //! # Examples
 //!
 //! ```bash
 //! # List all worktrees for the current repository
-//! botster-hub list-worktrees
+//! botster list-worktrees
 //!
 //! # Delete a worktree by issue number
-//! botster-hub delete-worktree 42
+//! botster delete-worktree 42
 //! ```
 
 use crate::{Config, WorktreeManager};

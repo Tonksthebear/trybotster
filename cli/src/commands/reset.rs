@@ -98,7 +98,7 @@ pub fn run(skip_confirm: bool) -> Result<()> {
     }
 
     println!();
-    println!("Reset complete. Run 'botster-hub start' to set up fresh.");
+    println!("Reset complete. Run 'botster start' to set up fresh.");
 
     Ok(())
 }

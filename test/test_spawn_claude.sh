@@ -28,17 +28,17 @@ fi
 
 echo -e "${GREEN}✓ Rails server is running${NC}"
 
-# Check if botster_hub is running (Ruby or Rust version)
-if pgrep -f "bin/botster_hub" > /dev/null || pgrep -f "botster-hub" > /dev/null; then
-    if pgrep -f "botster-hub" > /dev/null; then
-        echo -e "${GREEN}✓ botster_hub daemon is running (Rust version)${NC}"
+# Check if botster is running (Ruby or Rust version)
+if pgrep -f "bin/botster" > /dev/null || pgrep -f "botster" > /dev/null; then
+    if pgrep -f "botster" > /dev/null; then
+        echo -e "${GREEN}✓ botster daemon is running (Rust version)${NC}"
     else
-        echo -e "${GREEN}✓ botster_hub daemon is running (Ruby version)${NC}"
+        echo -e "${GREEN}✓ botster daemon is running (Ruby version)${NC}"
     fi
 else
-    echo -e "${RED}✗ botster_hub daemon not running${NC}"
-    echo "  Start with Ruby: bin/botster_hub start"
-    echo "  Or start with Rust: cd botster_hub_rs && ./target/release/botster-hub start"
+    echo -e "${RED}✗ botster daemon not running${NC}"
+    echo "  Start with Ruby: bin/botster start"
+    echo "  Or start with Rust: cd botster_rs && ./target/release/botster start"
     exit 1
 fi
 echo
@@ -113,10 +113,10 @@ else
 fi
 
 echo
-echo "Waiting for botster_hub to process the message..."
+echo "Waiting for botster to process the message..."
 echo "(Watch for a new Terminal window to spawn)"
 echo
 echo "Press Ctrl+C to stop watching..."
 
 # Watch the logs for spawn activity
-tail -f log/botster_hub.log 2>/dev/null || echo "Note: No log file yet"
+tail -f log/botster.log 2>/dev/null || echo "Note: No log file yet"

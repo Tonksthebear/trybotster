@@ -1,4 +1,4 @@
-//! Build script for botster-hub CLI.
+//! Build script for botster CLI.
 //!
 //! Embeds all Lua files from the `lua/` directory into the binary at compile time.
 //! This allows the CLI to run without external Lua files in release mode.

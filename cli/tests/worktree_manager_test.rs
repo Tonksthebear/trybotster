@@ -1,5 +1,5 @@
 /// Integration test for WorktreeManager that reproduces and validates the bug fix
-use botster_hub::WorktreeManager;
+use botster::WorktreeManager;
 use std::process::Command;
 use tempfile::TempDir;
 

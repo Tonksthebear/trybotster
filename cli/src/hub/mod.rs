@@ -1,6 +1,6 @@
 //! Hub - Central orchestrator for agent management.
 //!
-//! The Hub is the core of botster-hub, owning all state and running the main
+//! The Hub is the core of botster, owning all state and running the main
 //! event loop. It follows the centralized state store pattern where TUI and
 //! Relay adapters query the Hub for state rather than owning it themselves.
 //!
@@ -130,7 +130,7 @@ pub(crate) fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
     hash[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Central orchestrator for the botster-hub application.
+/// Central orchestrator for the botster application.
 ///
 /// The Hub owns all application state and coordinates between the TUI,
 /// server polling, and browser relay components. It can run in either

@@ -30,7 +30,7 @@ module CliTestHelper
   include WaitHelper
 
   CLI_PATH = Rails.root.join("cli").freeze
-  CLI_BINARY = CLI_PATH.join("target/debug/botster-hub").freeze
+  CLI_BINARY = CLI_PATH.join("target/debug/botster").freeze
 
   # Represents a running CLI instance
   class CliProcess
@@ -186,7 +186,7 @@ module CliTestHelper
       "BOTSTER_TOKEN" => api_key,  # Use BOTSTER_TOKEN (takes precedence over BOTSTER_API_KEY)
       "BOTSTER_HUB_ID" => hub.identifier,  # Use string identifier for find_or_initialize_by lookup
       "BOTSTER_REPO" => "test/repo",  # Optional — used for GitHub event subscription
-      "RUST_LOG" => options[:log_level] || "info,botster_hub=debug"
+      "RUST_LOG" => options[:log_level] || "info,botster=debug"
     }
 
     Rails.logger.info "[CliTestHelper] Starting CLI for hub #{hub.identifier}"
@@ -216,7 +216,7 @@ module CliTestHelper
     stderr_w.close
 
     # Store log file path for debugging
-    log_file_path = File.join(temp_dir, "botster-hub.log")
+    log_file_path = File.join(temp_dir, "botster.log")
     Rails.logger.info "[CliTestHelper] CLI log file: #{log_file_path}"
 
     # Capture start time for heartbeat-based readiness detection

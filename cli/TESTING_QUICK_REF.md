@@ -39,7 +39,7 @@ mod tests {
 ### Integration Test (tests/file.rs)
 
 ```rust
-use botster_hub::Agent;
+use botster::Agent;
 use tempfile::TempDir;
 
 #[test]
@@ -88,7 +88,7 @@ use assert_cmd::Command;
 
 #[test]
 fn test_status_command() {
-    Command::cargo_bin("botster-hub").unwrap()
+    Command::cargo_bin("botster").unwrap()
         .arg("status")
         .assert()
         .success();

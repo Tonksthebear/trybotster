@@ -187,7 +187,7 @@ jobs:
         working-directory: cli
         run: |
           # Ensure no config file exists that would interfere with tests
-          rm -rf ~/.botster_hub
+          rm -rf ~/.botster
           # Run tests with single thread to avoid env var race conditions
           cargo test --all-targets -- --test-threads=1
 

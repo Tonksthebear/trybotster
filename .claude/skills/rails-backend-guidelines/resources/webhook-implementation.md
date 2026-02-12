@@ -391,7 +391,7 @@ message = Integrations::Github::Message.create!(
 
 ### Key Fields
 
-- **`prompt`**: Complete formatted prompt ready for AI consumption (used by botster-hub)
+- **`prompt`**: Complete formatted prompt ready for AI consumption (used by botster)
 - **`structured_context`**: Hash with structured routing information
 - **Raw fields**: Individual data points for custom prompt construction
 - **`context`**: Legacy field, same as `prompt` for backwards compatibility
@@ -512,7 +512,7 @@ end
 
 ### Why Both `prompt` and `structured_context`?
 
-1. **`prompt`**: Optimized for botster-hub consumption - complete, formatted, ready to use
+1. **`prompt`**: Optimized for botster consumption - complete, formatted, ready to use
 2. **`structured_context`**: Allows programmatic access to routing metadata for debugging and custom processing
 3. **Raw fields**: Enables custom prompt construction if needed in the future
 

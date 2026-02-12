@@ -23,23 +23,22 @@ The server sees nothing. Privacy by architecture, not policy.
 
 ## Install
 
-### Download pre-built binary
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tonksthebear/trybotster/main/install.sh | sh
+```
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/Tonksthebear/trybotster/releases/latest):
+Detects your platform, downloads the latest release, verifies the checksum, and installs to `/usr/local/bin`.
+
+### Manual download
 
 | Platform | Binary |
 |----------|--------|
-| macOS (Apple Silicon) | `botster-hub-macos-arm64` |
-| macOS (Intel) | `botster-hub-macos-x86_64` |
-| Linux (x86_64) | `botster-hub-linux-x86_64` |
-| Linux (ARM64) | `botster-hub-linux-arm64` |
+| macOS (Apple Silicon) | `botster-macos-arm64` |
+| macOS (Intel) | `botster-macos-x86_64` |
+| Linux (x86_64) | `botster-linux-x86_64` |
+| Linux (ARM64) | `botster-linux-arm64` |
 
-```bash
-# Example: macOS Apple Silicon
-curl -L -o botster-hub https://github.com/Tonksthebear/trybotster/releases/latest/download/botster-hub-macos-arm64
-chmod +x botster-hub
-mv botster-hub /usr/local/bin/  # or ~/bin/
-```
+Download from [GitHub Releases](https://github.com/Tonksthebear/trybotster/releases/latest), `chmod +x`, and move to a directory in your PATH.
 
 ### Build from source
 
@@ -49,7 +48,7 @@ Requires Rust toolchain:
 git clone https://github.com/Tonksthebear/trybotster.git
 cd trybotster/cli
 cargo build --release
-# Binary at: target/release/botster-hub
+# Binary at: target/release/botster
 ```
 
 ### Update
@@ -57,8 +56,8 @@ cargo build --release
 The CLI checks for updates on launch. You can also update manually:
 
 ```bash
-botster-hub update       # Download and install latest
-botster-hub update-check # Check without installing
+botster update       # Download and install latest
+botster update-check # Check without installing
 ```
 
 ## Getting Started
@@ -66,7 +65,7 @@ botster-hub update-check # Check without installing
 ### 1. Pair your device
 
 ```bash
-botster-hub start
+botster start
 
 # CLI will display:
 #   To authorize this device, visit: https://trybotster.com/users/hubs/new
@@ -126,7 +125,7 @@ GitHub webhook -> Rails server -> Message queue -> Rust daemon polls
 
 **Rails server** ([trybotster.com](https://trybotster.com)) — Receives GitHub webhooks, creates message records, provides MCP tools for agents, relays E2E encrypted data (cannot decrypt).
 
-**Rust daemon** (botster-hub) — Interactive TUI with ratatui, polls for messages, manages agent lifecycle in isolated git worktrees, spawns Claude in PTY, routes keyboard input, streams terminal over encrypted WebRTC.
+**Rust daemon** (botster) — Interactive TUI with ratatui, polls for messages, manages agent lifecycle in isolated git worktrees, spawns Claude in PTY, routes keyboard input, streams terminal over encrypted WebRTC.
 
 ## TUI Controls
 
@@ -146,7 +145,7 @@ In each repository where you want to use Botster, create these files:
 
 ```bash
 #!/bin/bash
-"$BOTSTER_HUB_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
+"$BOTSTER_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
 claude mcp add trybotster --transport http https://trybotster.com --header "Authorization: Bearer $BOTSTER_TOKEN"
 claude --permission-mode acceptEdits "$BOTSTER_PROMPT"
 ```
@@ -155,7 +154,7 @@ claude --permission-mode acceptEdits "$BOTSTER_PROMPT"
 
 ```bash
 #!/bin/bash
-"$BOTSTER_HUB_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
+"$BOTSTER_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
 ```
 
 **`.botster_copy`** — Files to copy to each worktree:
@@ -200,7 +199,7 @@ BOTSTER_BRANCH_NAME=botster-issue-123
 BOTSTER_WORKTREE_PATH=/path/to/worktree
 BOTSTER_PROMPT="User's request text"
 BOTSTER_MESSAGE_ID=42
-BOTSTER_HUB_BIN=/path/to/botster-hub
+BOTSTER_BIN=/path/to/botster
 BOTSTER_TOKEN=your_api_key
 BOTSTER_TUNNEL_PORT=4001
 ```

@@ -2,7 +2,7 @@
 /// "Failed to remove worktree: fatal: '/Users/jasonconigliari/Rails/trybotster' is a main working tree"
 ///
 /// The issue is that delete_worktree_by_path is receiving the MAIN repo path instead of the worktree path
-use botster_hub::WorktreeManager;
+use botster::WorktreeManager;
 use std::env;
 use std::process::Command;
 use tempfile::TempDir;

@@ -1,4 +1,4 @@
-//! Integration tests for botster-hub
+//! Integration tests for botster
 //!
 //! These tests verify the rendering and scrollback flow using standalone parsers
 //! (as clients do) and real PTYs for spawn behavior.
@@ -9,8 +9,8 @@
 //! - Scroll operations work on parser references
 //! - Agents track PTY lifecycle and scrollback buffer, not terminal emulation
 
-use botster_hub::tui::scroll;
-use botster_hub::{Agent, PtyView, TerminalWidget};
+use botster::tui::scroll;
+use botster::{Agent, PtyView, TerminalWidget};
 use ratatui::{
     backend::TestBackend,
     layout::{Constraint, Direction, Layout},
@@ -125,7 +125,7 @@ fn test_scroll_then_render() {
 /// Test that switching PTY views works (scroll is now per-parser)
 #[test]
 fn test_pty_view_switch() {
-    use botster_hub::agent::PtySession;
+    use botster::agent::PtySession;
 
     let (mut agent, _temp_dir) = create_test_agent();
     agent.server_pty = Some(PtySession::new(24, 80));
@@ -391,7 +391,7 @@ fn test_spawn_real_pty_with_init_script() {
         env_vars.insert("BOTSTER_BRANCH_NAME".to_string(), "test-branch".to_string());
 
         // Spawn bash and source the init script
-        use botster_hub::agent::spawn::PtySpawnConfig;
+        use botster::agent::spawn::PtySpawnConfig;
         agent
             .cli_pty.spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
@@ -448,8 +448,8 @@ fn test_spawn_server_pty() {
         );
 
         // First set up the CLI PTY (as would happen in normal operation)
-        use botster_hub::agent::spawn::PtySpawnConfig;
-        use botster_hub::agent::pty::PtySession;
+        use botster::agent::spawn::PtySpawnConfig;
+        use botster::agent::pty::PtySession;
         agent
             .cli_pty.spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
@@ -524,8 +524,8 @@ fn test_real_pty_view_switching() {
         );
 
         // Spawn CLI PTY
-        use botster_hub::agent::spawn::PtySpawnConfig;
-        use botster_hub::agent::pty::PtySession;
+        use botster::agent::spawn::PtySpawnConfig;
+        use botster::agent::pty::PtySession;
         agent
             .cli_pty.spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
@@ -690,7 +690,7 @@ fn test_agent_pty_handle_subscription() {
 /// viewing the same agent should all receive PTY output.
 #[test]
 fn test_pty_broadcast_to_multiple_subscribers() {
-    use botster_hub::agent::pty::PtySession;
+    use botster::agent::pty::PtySession;
 
     // Create a PTY session directly for testing broadcast
     let session = PtySession::new(24, 80);
@@ -702,7 +702,7 @@ fn test_pty_broadcast_to_multiple_subscribers() {
     let mut rx3 = event_tx.subscribe();
 
     // Send an event through the broadcast channel
-    use botster_hub::agent::pty::PtyEvent;
+    use botster::agent::pty::PtyEvent;
     let _ = event_tx.send(PtyEvent::Output(b"test output".to_vec()));
 
     // All subscribers should receive the event
@@ -717,8 +717,8 @@ fn test_pty_broadcast_to_multiple_subscribers() {
 /// is written to the PTY via the command channel.
 #[test]
 fn test_pty_input_via_command_channel() {
-    use botster_hub::agent::pty::PtySession;
-    use botster_hub::agent::pty::PtyCommand;
+    use botster::agent::pty::PtySession;
+    use botster::agent::pty::PtyCommand;
 
     // Create a PTY session
     let session = PtySession::new(24, 80);
@@ -742,7 +742,7 @@ fn test_pty_input_via_command_channel() {
 /// Resize is performed directly on PtySession rather than via the command channel.
 #[test]
 fn test_pty_resize_direct() {
-    use botster_hub::agent::pty::PtySession;
+    use botster::agent::pty::PtySession;
 
     let session = PtySession::new(24, 80);
 
@@ -800,7 +800,7 @@ fn test_spawned_pty_output_reaches_scrollback() {
         );
 
         // Spawn a simple command that produces output
-        use botster_hub::agent::spawn::PtySpawnConfig;
+        use botster::agent::spawn::PtySpawnConfig;
         agent
             .cli_pty.spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
@@ -864,7 +864,7 @@ fn test_input_written_to_pty_appears_in_scrollback() {
         );
 
         // Spawn bash with no initial commands
-        use botster_hub::agent::spawn::PtySpawnConfig;
+        use botster::agent::spawn::PtySpawnConfig;
         agent
             .cli_pty.spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),

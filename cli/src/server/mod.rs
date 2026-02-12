@@ -1,4 +1,4 @@
-//! Server communication module for botster-hub.
+//! Server communication module for botster.
 //!
 //! This module provides types for communicating with the Rails server:
 //!

@@ -1,6 +1,6 @@
 //! TUI rendering functions.
 //!
-//! This module provides the main rendering function for the botster-hub TUI.
+//! This module provides the main rendering function for the botster TUI.
 //! It renders TuiRunner state to a terminal and optionally produces ANSI output
 //! for browser streaming.
 //!

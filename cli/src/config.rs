@@ -1,6 +1,6 @@
 //! Configuration loading and persistence.
 //!
-//! Handles reading and writing the botster-hub configuration file.
+//! Handles reading and writing the botster configuration file.
 //! Sensitive tokens are stored in OS keyring via the keyring module.
 
 use anyhow::{Context, Result};
@@ -11,7 +11,7 @@ use std::{fs, path::PathBuf};
 
 use crate::keyring::Credentials;
 
-/// Configuration for the botster-hub CLI.
+/// Configuration for the botster CLI.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
     /// URL of the botster server.

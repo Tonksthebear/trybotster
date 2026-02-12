@@ -32,7 +32,7 @@ fn get_binary_path() -> PathBuf {
     path.pop(); // Remove deps
     path.pop(); // Remove debug
     path.push("release");
-    path.push("botster-hub");
+    path.push("botster");
     path
 }
 
@@ -114,7 +114,7 @@ fn safe_pty_write(
     Ok(())
 }
 
-/// Build a CommandBuilder for `botster-hub start` with a temp config dir.
+/// Build a CommandBuilder for `botster start` with a temp config dir.
 fn build_start_cmd(temp_dir: &tempfile::TempDir) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(get_binary_path());
     cmd.arg("start");
