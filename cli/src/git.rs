@@ -226,38 +226,36 @@ impl WorktreeManager {
     pub fn detect_current_repo() -> Result<(PathBuf, String)> {
         let current_dir = std::env::current_dir().context("Failed to get current directory")?;
 
-        // Find the git repository root
-        let repo = git2::Repository::discover(&current_dir).context("Not in a git repository")?;
+        // Find the git repository root via `git rev-parse --show-toplevel`
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&current_dir)
+            .output()
+            .context("Failed to run git rev-parse")?;
 
-        let repo_path = repo
-            .path()
-            .parent()
-            .context("Failed to get repo path")?
-            .to_path_buf();
+        if !output.status.success() {
+            anyhow::bail!("Not in a git repository");
+        }
+
+        let repo_path = PathBuf::from(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        );
 
         // Get the repo name: env var > origin remote > directory name
         let repo_name = if let Ok(env_repo) = std::env::var("BOTSTER_REPO") {
             // Explicit override (used in tests)
             env_repo
-        } else if let Ok(remote) = repo.find_remote("origin") {
-            if let Some(url) = remote.url() {
-                // Extract owner/repo from URL like "https://github.com/owner/repo.git"
-                url.trim_end_matches(".git")
-                    .split('/')
-                    .rev()
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("/")
-            } else {
-                repo_path
-                    .file_name()
-                    .context("No repo name")?
-                    .to_string_lossy()
-                    .to_string()
-            }
+        } else if let Ok(url) = git_remote_url(&repo_path) {
+            // Extract owner/repo from URL like "https://github.com/owner/repo.git"
+            url.trim_end_matches(".git")
+                .split('/')
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("/")
         } else {
             repo_path
                 .file_name()
@@ -282,12 +280,7 @@ impl WorktreeManager {
         // Remove existing worktree if present
         self.cleanup_worktree(&repo_path, &worktree_path)?;
 
-        let repo_obj = git2::Repository::open(&repo_path)?;
-
-        // Check if branch exists
-        let branch_exists = repo_obj
-            .find_branch(branch_name, git2::BranchType::Local)
-            .is_ok();
+        let branch_exists = git_branch_exists(&repo_path, branch_name);
 
         // Create worktree using git command
         let output = if branch_exists {
@@ -343,7 +336,14 @@ impl WorktreeManager {
         if !clone_dir.exists() {
             log::info!("Cloning {}...", repo);
             let url = format!("https://github.com/{}.git", repo);
-            git2::Repository::clone(&url, &clone_dir).context("Failed to clone repository")?;
+            let output = std::process::Command::new("git")
+                .args(["clone", &url, clone_dir.to_str().expect("path is valid UTF-8")])
+                .output()
+                .context("Failed to run git clone")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("Failed to clone repository: {}", stderr);
+            }
         }
 
         let branch_name = format!("botster-{}-{}", repo_safe, issue_number);
@@ -351,15 +351,10 @@ impl WorktreeManager {
             .base_dir
             .join(format!("{}-{}", repo_safe, issue_number));
 
-        let repo_obj = git2::Repository::open(&clone_dir)?;
-
-        // Remove existing worktree if present - use git command as git2 API is unreliable
+        // Remove existing worktree if present
         self.cleanup_worktree(&clone_dir, &worktree_path)?;
 
-        // Check if branch exists
-        let branch_exists = repo_obj
-            .find_branch(&branch_name, git2::BranchType::Local)
-            .is_ok();
+        let branch_exists = git_branch_exists(&clone_dir, &branch_name);
 
         // Create worktree using git command (git2 API doesn't handle existing branches properly)
         let output = if branch_exists {
@@ -590,16 +585,14 @@ impl WorktreeManager {
             // Don't bail - just warn
         }
 
-        // Find the main repository from the worktree
-        // Worktrees have a .git file (not directory) that points to the main repo
-        let repo_obj = git2::Repository::open(worktree_path)
-            .context("Failed to open worktree as git repository")?;
-
         log::debug!("worktree_path = {}", worktree_path.display());
-        log::debug!("is_worktree() = {}", repo_obj.is_worktree());
 
-        // DEFENSE-IN-DEPTH CHECK 4: Git's is_worktree check
-        if !repo_obj.is_worktree() {
+        // DEFENSE-IN-DEPTH CHECK 4: Worktrees have a .git *file* (not directory)
+        // pointing to the main repo. A main repo has a .git *directory*.
+        let is_worktree = git_is_worktree(worktree_path);
+        log::debug!("is_worktree() = {}", is_worktree);
+
+        if !is_worktree {
             log::error!(
                 "CRITICAL: Refusing to delete main repository at {}. This is not a worktree!",
                 worktree_path.display()
@@ -610,53 +603,26 @@ impl WorktreeManager {
             );
         }
 
-        let repo_path = if repo_obj.is_worktree() {
-            // This is a worktree - find the main repository
-            // Use commondir() which returns the path to the main repo's .git directory
-            let common_dir = repo_obj.commondir();
-            let result = common_dir
-                .parent()
-                .context("Failed to find main repository from commondir")?
-                .to_path_buf();
-            log::info!(
-                "DEBUG: Calculated repo_path from worktree = {}",
-                result.display()
-            );
-            result
-        } else {
-            // This is the main repository
-            let result = repo_obj
-                .path()
-                .parent()
-                .context("Failed to get repo path")?
-                .to_path_buf();
-            log::info!(
-                "DEBUG: Calculated repo_path from main repo = {}",
-                result.display()
-            );
-            result
-        };
+        // Find the main repository via `git rev-parse --git-common-dir`
+        let repo_path = git_common_dir(worktree_path)
+            .context("Failed to find main repository from worktree")?;
+        log::info!(
+            "DEBUG: Calculated repo_path from worktree = {}",
+            repo_path.display()
+        );
 
         // Get repo name from the remote URL or directory name
-        let repo_name = if let Ok(remote) = repo_obj.find_remote("origin") {
-            if let Some(url) = remote.url() {
-                // Extract owner/repo from URL like "https://github.com/owner/repo.git"
-                url.trim_end_matches(".git")
-                    .split('/')
-                    .rev()
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("/")
-            } else {
-                repo_path
-                    .file_name()
-                    .context("No repo name")?
-                    .to_string_lossy()
-                    .to_string()
-            }
+        let repo_name = if let Ok(url) = git_remote_url(worktree_path) {
+            // Extract owner/repo from URL like "https://github.com/owner/repo.git"
+            url.trim_end_matches(".git")
+                .split('/')
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("/")
         } else {
             repo_path
                 .file_name()
@@ -881,6 +847,72 @@ impl WorktreeManager {
         log::info!("Successfully deleted worktree for issue #{}", issue_number);
         Ok(())
     }
+}
+
+/// Checks whether a path is a git worktree (has a `.git` file, not directory).
+fn git_is_worktree(path: &Path) -> bool {
+    let git_path = path.join(".git");
+    // Worktrees have a .git *file* pointing to the main repo's worktree directory.
+    // Main repos have a .git *directory*.
+    git_path.is_file()
+}
+
+/// Returns the origin remote URL for the repo at `path`.
+fn git_remote_url(path: &Path) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git remote get-url")?;
+
+    if !output.status.success() {
+        anyhow::bail!("No origin remote configured");
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Checks whether a local branch exists in the repo at `path`.
+fn git_branch_exists(path: &Path, branch_name: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch_name}")])
+        .current_dir(path)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Returns the path to the main repository from a worktree via `git-common-dir`.
+///
+/// For worktrees, `git rev-parse --git-common-dir` returns the main repo's `.git`
+/// directory. This function returns its parent (the repo root).
+fn git_common_dir(path: &Path) -> Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git rev-parse --git-common-dir")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Not in a git repository");
+    }
+
+    let git_common = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+    // `--git-common-dir` returns the .git directory; we want its parent (repo root)
+    // The path may be relative to `path`, so canonicalize from there
+    let absolute = if git_common.is_absolute() {
+        git_common
+    } else {
+        path.join(&git_common)
+    };
+
+    absolute
+        .canonicalize()
+        .context("Failed to canonicalize git common dir")?
+        .parent()
+        .context("Failed to get parent of .git directory")?
+        .canonicalize()
+        .context("Failed to canonicalize repo root")
 }
 
 #[cfg(test)]

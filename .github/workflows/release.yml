@@ -49,7 +49,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: botster-hub-macos-arm64
-          - os: macos-13 # Intel runner for x86_64
+          - os: macos-15-intel # Intel runner (available until Aug 2027)
             target: x86_64-apple-darwin
             artifact_name: botster-hub-macos-x86_64
           - os: ubuntu-latest

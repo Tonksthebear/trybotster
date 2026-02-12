@@ -28,10 +28,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # HTTP client (gzip/deflate/brotli for automatic response decompression)
-reqwest = { version = "0.12.24", features = ["json", "blocking", "gzip", "deflate", "brotli"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "blocking", "gzip", "deflate", "brotli", "rustls-tls"] }
 
 # Git operations
-git2 = "0.20"
 globset = "0.4"
 
 # CLI argument parsing
@@ -78,7 +77,7 @@ zeroize = { version = "1.8", features = ["derive"] }  # Secure memory zeroing
 aes-gcm = "0.10"               # AES-GCM for encrypting state at rest
 
 # WebSocket (kept for potential future use)
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
 # WebRTC for peer-to-peer communication

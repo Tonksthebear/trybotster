@@ -214,10 +214,10 @@ impl HubState {
                 if open_paths.contains(path) {
                     return false;
                 }
-                if let Ok(repo) = git2::Repository::open(path) {
-                    if !repo.is_worktree() {
-                        return false;
-                    }
+                // Worktrees have a .git *file*, main repos have a .git *directory*
+                let git_path = std::path::Path::new(path).join(".git");
+                if !git_path.is_file() {
+                    return false;
                 }
                 true
             })
