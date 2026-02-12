@@ -7,22 +7,27 @@
 --   { action = "open_menu" }              -- generic: Rust maps to TuiAction directly
 --   { action = "list_select", index = 2 } -- compound: Rust calls actions.on_action()
 --   { action = "input_char", char = "a" } -- generic with extra data
---   nil                                   -- normal: forward raw bytes to PTY
+--   nil                                   -- insert: forward raw bytes to PTY
 --                                         -- modal: swallow key (no-op)
+--                                         -- normal: swallow key (Rust gates PTY on mode)
 --
 -- Key descriptor format (built by Rust):
 --   Modifiers prefix-sorted: ctrl+shift+alt+<key>
 --   Examples: "a", "enter", "ctrl+p", "shift+enter", "shift+pageup"
 --
 -- Safety: Ctrl+Q is hardcoded in Rust and never reaches Lua.
+--
+-- Modes:
+--   normal  - Command mode. Single-key bindings available. No PTY forwarding.
+--   insert  - PTY mode. Keys forward to terminal. Only modifier combos bound.
 
 local M = {}
 
 -- =============================================================================
--- Binding Tables (one per mode string)
+-- Shared modifier bindings (used in both normal and insert)
 -- =============================================================================
 
-M.normal = {
+local shared_bindings = {
   ["ctrl+p"]         = "open_menu",
   ["ctrl+j"]         = "select_next",
   ["ctrl+k"]         = "select_previous",
@@ -31,8 +36,17 @@ M.normal = {
   ["shift+pagedown"] = "scroll_half_down",
   ["shift+home"]     = "scroll_top",
   ["shift+end"]      = "scroll_bottom",
-  -- Everything else falls through to PTY forwarding
 }
+
+-- Normal mode: command mode, single-key bindings available
+M.normal = {}
+for k, v in pairs(shared_bindings) do M.normal[k] = v end
+M.normal["i"] = "enter_insert_mode"
+
+-- Insert mode: PTY forwarding, only modifier combos
+M.insert = {}
+for k, v in pairs(shared_bindings) do M.insert[k] = v end
+M.insert["escape"] = "enter_normal_mode"
 
 M.menu = {
   ["escape"]  = "close_modal",
@@ -101,7 +115,7 @@ M.error = {
 -- @param key string Key descriptor (e.g., "ctrl+p", "shift+enter")
 -- @param mode string Current mode (matches Lua binding table names)
 -- @param context table { list_selected, list_count, terminal_rows }
--- @return table|nil Action table or nil for default PTY forwarding
+-- @return table|nil Action table or nil (insert: PTY forward; other: swallow)
 function M.handle_key(key, mode, context)
   -- Mode-specific binding lookup
   local bindings = M[mode]
@@ -141,7 +155,8 @@ function M.handle_key(key, mode, context)
     return nil
   end
 
-  -- Normal mode: unbound keys -> PTY forwarding (return nil)
+  -- Normal/insert: unbound keys return nil.
+  -- Rust gates PTY forwarding on mode == "insert".
   return nil
 end
 

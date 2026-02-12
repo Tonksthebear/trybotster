@@ -308,8 +308,9 @@ async function handleEncrypt(hubId, message) {
     envelope.k = account.curve25519Key()
   }
 
-  // Persist ratchet advancement (fire-and-forget for performance)
-  persistState(hubId)
+  // Persist ratchet advancement before returning so page eviction
+  // (phone lock/unlock) cannot leave stale ratchet state in IndexedDB.
+  await persistState(hubId)
 
   return { encrypted: envelope }
 }
@@ -352,8 +353,9 @@ async function handleDecrypt(hubId, encryptedData) {
     plaintextBytes = session.decrypt(envelope.t, ciphertext)
   }
 
-  // Persist ratchet advancement (fire-and-forget for performance)
-  persistState(hubId)
+  // Persist ratchet advancement before returning so page eviction
+  // cannot leave stale ratchet state in IndexedDB.
+  await persistState(hubId)
 
   // Decode UTF-8 and parse JSON
   const plaintextStr = new TextDecoder().decode(plaintextBytes)
@@ -405,7 +407,7 @@ async function handleEncryptBinary(hubId, plaintext) {
     frame.set(ciphertext, 1)
   }
 
-  persistState(hubId)
+  await persistState(hubId)
   return { data: frame }
 }
 
@@ -440,7 +442,7 @@ async function handleDecryptBinary(hubId, data) {
     if (session) {
       try {
         plaintextBytes = session.decrypt(0, ciphertext)
-        persistState(hubId)
+        await persistState(hubId)
         return { data: new Uint8Array(plaintextBytes) }
       } catch {
         // Session couldn't decrypt — new pairing, create inbound
@@ -460,7 +462,7 @@ async function handleDecryptBinary(hubId, data) {
     plaintextBytes = session.decrypt(1, ciphertext)
   }
 
-  persistState(hubId)
+  await persistState(hubId)
   return { data: new Uint8Array(plaintextBytes) }
 }
 

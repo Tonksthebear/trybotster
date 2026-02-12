@@ -614,6 +614,8 @@ impl LuaRuntime {
                 .context("Failed to create plugins directory")?;
             std::fs::create_dir_all(data_dir.join("improvements"))
                 .context("Failed to create improvements directory")?;
+            std::fs::create_dir_all(data_dir.join("user").join("ui"))
+                .context("Failed to create user/ui directory")?;
 
             // Write version marker last (so partial extraction retries)
             std::fs::write(&version_file, &version_marker)

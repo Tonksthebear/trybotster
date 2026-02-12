@@ -41,6 +41,16 @@ use webrtc::peer_connection::RTCPeerConnection;
 use crate::relay::crypto_service::CryptoService;
 use crate::relay::olm_crypto::{CONTENT_MSG, CONTENT_PTY, CONTENT_STREAM};
 
+/// Maximum bytes allowed in the SCTP send buffer before skipping encryption.
+///
+/// When a peer disconnects (e.g., phone locks), SCTP buffers and retries for
+/// ~30 seconds. Each `encrypt()` call irreversibly advances the Olm ratchet.
+/// At high throughput this can exceed Olm's ~2000-message skip limit, causing
+/// permanent session desync. Gating on `buffered_amount()` keeps the ratchet
+/// close to what was actually delivered. 256 KB ≈ 100-200 queued messages,
+/// well within the skip limit.
+const DC_BUFFER_FULL_BYTES: usize = 256 * 1024;
+
 /// Incoming stream frame from browser via DataChannel.
 #[derive(Debug)]
 pub struct StreamIncoming {
@@ -719,6 +729,11 @@ impl Channel for WebRtcChannel {
 
         let peer_key = self.get_peer_olm_key().await?;
 
+        // Gate: skip encrypt if SCTP buffer is backing up (peer unreachable)
+        if dc.buffered_amount().await > DC_BUFFER_FULL_BYTES {
+            return Err(ChannelError::BufferFull);
+        }
+
         // Binary inner: [0x00][JSON bytes] (control message)
         let mut plaintext = Vec::with_capacity(1 + msg.len());
         plaintext.push(CONTENT_MSG);
@@ -836,6 +851,12 @@ impl WebRtcChannel {
             .as_ref()
             .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
 
+        // Gate: skip encrypt if SCTP buffer is backing up (peer unreachable).
+        // Checked before compression to avoid wasted work on the discard path.
+        if dc.buffered_amount().await > DC_BUFFER_FULL_BYTES {
+            return Err(ChannelError::BufferFull);
+        }
+
         // Compress raw bytes (gzip is very effective on terminal output)
         let config_guard = self.config.lock().await;
         let threshold = config_guard
@@ -904,6 +925,11 @@ impl WebRtcChannel {
             .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
 
         let peer_key = self.get_peer_olm_key().await?;
+
+        // Gate: skip encrypt if SCTP buffer is backing up (peer unreachable)
+        if dc.buffered_amount().await > DC_BUFFER_FULL_BYTES {
+            return Err(ChannelError::BufferFull);
+        }
 
         let stream_id_bytes = stream_id.to_be_bytes();
         let mut plaintext = Vec::with_capacity(4 + payload.len());
