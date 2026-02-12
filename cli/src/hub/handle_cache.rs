@@ -65,7 +65,7 @@ pub struct HandleCache {
     /// Cached connection URL for browser pairing.
     ///
     /// Hub updates this whenever the device key bundle changes (initialization,
-    /// refresh, or ShowConnectionCode action).
+    /// refresh, or show_connection_code action).
     connection_url: RwLock<Option<Result<String, String>>>,
 }
 
@@ -217,7 +217,7 @@ impl HandleCache {
     /// Update the cached connection URL.
     ///
     /// Called by Hub when the device key bundle changes (initialization, refresh,
-    /// or ShowConnectionCode action).
+    /// or show_connection_code action).
     pub fn set_connection_url(&self, result: Result<String, String>) {
         if let Ok(mut url) = self.connection_url.write() {
             *url = Some(result);

@@ -4,44 +4,33 @@
 //! For client operations (agent selection, PTY input, resize), TuiRunner uses
 //! JSON messages through the Lua client protocol to communicate with Hub.
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-02
 
 /// Actions handled entirely within the TUI.
 ///
-/// These are pure UI state changes - menus, modals, text input, scrolling.
-/// Client operations send JSON through the Lua client protocol.
+/// These are pure UI state changes - generic primitives that Rust handles
+/// without application knowledge. Application-specific workflow logic
+/// lives in Lua (`actions.lua`), which returns compound operations that
+/// Rust executes generically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
     // === Application Control ===
     /// Request quit.
     Quit,
 
-    // === Modal State ===
-    /// Open the command menu.
-    OpenMenu,
+    // === Mode ===
+    /// Set the UI mode (e.g., "normal", "menu").
+    SetMode(String),
 
-    /// Close any open modal/dialog.
-    CloseModal,
+    // === List Navigation (for current overlay list) ===
+    /// Move overlay list selection up.
+    ListUp,
 
-    // === Menu Navigation ===
-    /// Move menu selection up.
-    MenuUp,
+    /// Move overlay list selection down.
+    ListDown,
 
-    /// Move menu selection down.
-    MenuDown,
-
-    /// Select menu item at index.
-    MenuSelect(usize),
-
-    // === Worktree Selection ===
-    /// Move worktree selection up.
-    WorktreeUp,
-
-    /// Move worktree selection down.
-    WorktreeDown,
-
-    /// Select worktree at index.
-    WorktreeSelect(usize),
+    /// Select overlay list item at index.
+    ListSelect(usize),
 
     // === Text Input ===
     /// Add character to input buffer.
@@ -49,26 +38,6 @@ pub enum TuiAction {
 
     /// Delete last character from input buffer.
     InputBackspace,
-
-    /// Submit the input buffer.
-    InputSubmit,
-
-    // === Connection Code ===
-    /// Show the connection code modal.
-    ShowConnectionCode,
-
-    /// Regenerate the connection code/QR.
-    RegenerateConnectionCode,
-
-    /// Copy connection URL to clipboard.
-    CopyConnectionUrl,
-
-    // === Agent Close Confirmation ===
-    /// Confirm closing agent (keep worktree).
-    ConfirmCloseAgent,
-
-    /// Confirm closing agent and delete worktree.
-    ConfirmCloseAgentDeleteWorktree,
 
     // === Scrolling (TUI-local parser state) ===
     /// Scroll up by N lines.
@@ -83,15 +52,26 @@ pub enum TuiAction {
     /// Scroll to bottom (live view).
     ScrollToBottom,
 
-    // === Agent Navigation (sends Lua subscribe/unsubscribe) ===
-    /// Select next agent in list.
-    SelectNext,
+    // === Generic Operations ===
+    /// Send a JSON message to Hub.
+    SendMessage(serde_json::Value),
 
-    /// Select previous agent in list.
-    SelectPrevious,
+    /// Store a key-value pair in pending fields.
+    StoreField {
+        /// Field key.
+        key: String,
+        /// Field value.
+        value: String,
+    },
 
-    /// Toggle between CLI and Server PTY view.
-    TogglePtyView,
+    /// Remove a key from pending fields.
+    ClearField(String),
+
+    /// Clear the input buffer.
+    ClearInput,
+
+    /// Reset overlay list selection to 0.
+    ResetList,
 
     /// No action.
     None,
@@ -103,8 +83,8 @@ mod tests {
 
     #[test]
     fn test_tui_action_equality() {
-        assert_eq!(TuiAction::OpenMenu, TuiAction::OpenMenu);
-        assert_ne!(TuiAction::MenuUp, TuiAction::MenuDown);
+        assert_eq!(TuiAction::ListUp, TuiAction::ListUp);
+        assert_ne!(TuiAction::ListUp, TuiAction::ListDown);
         assert_eq!(TuiAction::ScrollUp(10), TuiAction::ScrollUp(10));
         assert_ne!(TuiAction::ScrollUp(10), TuiAction::ScrollUp(5));
     }

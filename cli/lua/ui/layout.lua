@@ -30,8 +30,8 @@
 local function build_agent_items(state)
   local items = {}
 
-  -- Creating indicator at top
-  if state.creating_agent then
+  -- Creating indicator at top (creating_agent is a table with .identifier and .stage)
+  if state.creating_agent and type(state.creating_agent) == "table" then
     local stages = {
       creating_worktree = "Creating worktree...",
       copying_config = "Copying config...",
@@ -70,7 +70,13 @@ local function build_menu_items(state)
   if sa then
     table.insert(items, { text = "── Agent ──", header = true })
     if (sa.session_count or 0) > 1 then
-      table.insert(items, { text = "Next Session (Ctrl+])", action = "toggle_pty" })
+      for idx, name in ipairs(sa.session_names) do
+        local label = string.upper(name)
+        if (idx - 1) == state.active_pty_index then
+          label = label .. " *"
+        end
+        table.insert(items, { text = label, action = "switch_session:" .. (idx - 1) })
+      end
     end
     table.insert(items, { text = "Close Agent", action = "close_agent" })
   end
@@ -105,7 +111,9 @@ function render(state)
 
   -- Agent list: selection offset accounts for creating indicator
   local agent_selected = state.selected_agent_index
-  if state.creating_agent then agent_selected = agent_selected + 1 end
+  if state.creating_agent and type(state.creating_agent) == "table" then
+    agent_selected = agent_selected + 1
+  end
 
   -- Terminal title: branch name, session view, scroll indicator
   local term_title = " Terminal [No agent selected] "
@@ -158,7 +166,7 @@ function render(state)
 
   return {
     type = "hsplit",
-    constraints = { "10%", "90%" },
+    constraints = { "15%", "85%" },
     children = {
       {
         type = "list",
@@ -177,13 +185,13 @@ end
 function render_overlay(state)
   if state.mode == "menu" then
     return {
-      type = "centered", width = 50, height = 40,
+      type = "centered", width = 35, height = 30,
       child = {
         type = "list",
         block = { title = " Menu [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
         props = {
           items = build_menu_items(state),
-          selected = state.menu_selected,
+          selected = state.list_selected,
         },
       },
     }
@@ -195,7 +203,7 @@ function render_overlay(state)
         block = { title = " Select Worktree [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
         props = {
           items = build_worktree_items(state),
-          selected = state.worktree_selected,
+          selected = state.list_selected,
         },
       },
     }
@@ -289,4 +297,9 @@ function render_overlay(state)
   end
 
   return nil
+end
+
+--- Initial UI mode at boot. Rust calls this once during initialization.
+function initial_mode()
+  return "normal"
 end

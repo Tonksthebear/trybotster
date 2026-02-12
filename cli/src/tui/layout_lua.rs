@@ -3,9 +3,10 @@
 //! Creates a separate, lightweight `mlua::Lua` state owned by TuiRunner's thread.
 //! This avoids threading issues (the Hub's LuaRuntime is `!Send`).
 //!
-//! Loads two Lua modules:
+//! Loads three Lua modules:
 //! - `ui/layout.lua` — calls `render(state)` and `render_overlay(state)` each frame
 //! - `ui/keybindings.lua` — calls `handle_key(descriptor, mode, context)` per keypress
+//! - `ui/actions.lua` — calls `on_action(action, context)` for compound workflow dispatch
 
 use anyhow::{anyhow, Result};
 use mlua::{Lua, Table as LuaTable, Value as LuaValue};
@@ -31,18 +32,38 @@ pub struct LuaKeyAction {
 
 /// Context passed to Lua `handle_key()` for mode-specific logic.
 ///
-/// Contains state that keybinding fallback logic needs (e.g., menu item
+/// Contains state that keybinding fallback logic needs (e.g., list item
 /// count for number shortcut validation).
 #[derive(Debug, Clone, Default)]
 pub struct KeyContext {
-    /// Currently selected menu item index.
-    pub menu_selected: usize,
-    /// Total number of selectable menu items.
-    pub menu_count: usize,
-    /// Currently selected worktree index.
-    pub worktree_selected: usize,
+    /// Currently selected overlay list item index.
+    pub list_selected: usize,
+    /// Total number of selectable list items.
+    pub list_count: usize,
     /// Terminal height in rows (for scroll amount calculation).
     pub terminal_rows: u16,
+}
+
+/// Context passed to Lua `actions.on_action()` for workflow dispatch.
+///
+/// Contains all state that Lua needs to decide what compound operations
+/// to return for application-specific actions.
+#[derive(Debug, Clone, Default)]
+pub struct ActionContext {
+    /// Current mode string.
+    pub mode: String,
+    /// Current text input buffer contents.
+    pub input_buffer: String,
+    /// Currently selected overlay list item index.
+    pub list_selected: usize,
+    /// Action strings from the overlay list (extracted from render tree).
+    pub overlay_actions: Vec<String>,
+    /// Generic key-value store for in-progress operations.
+    pub pending_fields: std::collections::HashMap<String, String>,
+    /// Currently selected agent ID (if any).
+    pub selected_agent: Option<String>,
+    /// Available worktrees as (path, branch) pairs.
+    pub available_worktrees: Vec<(String, String)>,
 }
 
 /// TUI-owned Lua state for layout rendering and keybinding dispatch.
@@ -54,6 +75,8 @@ pub struct LayoutLua {
     lua: Lua,
     /// Whether keybindings module is loaded (handle_key available).
     keybindings_loaded: bool,
+    /// Whether actions module is loaded (on_action available).
+    actions_loaded: bool,
 }
 
 impl LayoutLua {
@@ -70,6 +93,7 @@ impl LayoutLua {
         Ok(Self {
             lua,
             keybindings_loaded: false,
+            actions_loaded: false,
         })
     }
 
@@ -124,6 +148,18 @@ impl LayoutLua {
         }
     }
 
+    /// Call Lua `initial_mode()` to get the boot mode string.
+    ///
+    /// Returns the mode Lua wants the TUI to start in. Falls back to
+    /// empty string if the function isn't defined.
+    pub fn call_initial_mode(&self) -> String {
+        let globals = self.lua.globals();
+        let Ok(func) = globals.get::<mlua::Function>("initial_mode") else {
+            return String::new();
+        };
+        func.call::<String>(()).unwrap_or_default()
+    }
+
     // === Keybinding Support ===
 
     /// Load the keybindings Lua module.
@@ -155,6 +191,147 @@ impl LayoutLua {
     #[must_use]
     pub fn has_keybindings(&self) -> bool {
         self.keybindings_loaded
+    }
+
+    /// Load the Lua actions module (`actions.lua`).
+    ///
+    /// The module is stored as `_actions` global so `call_on_action()` can
+    /// invoke `on_action()` on it.
+    pub fn load_actions(&mut self, lua_source: &str) -> Result<()> {
+        let chunk = self
+            .lua
+            .load(lua_source)
+            .eval::<LuaTable>()
+            .map_err(|e| anyhow!("Failed to load actions Lua: {e}"))?;
+
+        self.lua
+            .globals()
+            .set("_actions", chunk)
+            .map_err(|e| anyhow!("Failed to store actions module: {e}"))?;
+
+        self.actions_loaded = true;
+        Ok(())
+    }
+
+    /// Reload the actions module from new source (for hot-reload).
+    pub fn reload_actions(&mut self, lua_source: &str) -> Result<()> {
+        self.load_actions(lua_source)
+    }
+
+    /// Whether actions module is loaded and available.
+    #[must_use]
+    pub fn has_actions(&self) -> bool {
+        self.actions_loaded
+    }
+
+    /// Call Lua `actions.on_action(action, context)`.
+    ///
+    /// Returns `Ok(Some(ops))` if Lua returned a list of compound ops,
+    /// `Ok(None)` if Lua returned `nil` (action handled generically by Rust).
+    ///
+    /// # Arguments
+    ///
+    /// * `action` - Action name string from keybindings
+    /// * `context` - Action context (mode, input_buffer, selected items, etc.)
+    pub fn call_on_action(
+        &self,
+        action: &str,
+        context: &ActionContext,
+    ) -> Result<Option<Vec<serde_json::Value>>> {
+        if !self.actions_loaded {
+            return Ok(None);
+        }
+
+        let globals = self.lua.globals();
+        let actions_module: LuaTable = globals
+            .get("_actions")
+            .map_err(|e| anyhow!("Actions module not found: {e}"))?;
+
+        let on_action_fn: mlua::Function = actions_module
+            .get("on_action")
+            .map_err(|e| anyhow!("on_action function not found: {e}"))?;
+
+        // Build context table
+        let ctx_table = self
+            .lua
+            .create_table()
+            .map_err(|e| anyhow!("Failed to create action context table: {e}"))?;
+        set_field(&ctx_table, "mode", context.mode.as_str())?;
+        set_field(&ctx_table, "input_buffer", context.input_buffer.as_str())?;
+        set_field(&ctx_table, "list_selected", context.list_selected)?;
+
+        // overlay_actions array
+        let actions_arr = self
+            .lua
+            .create_table()
+            .map_err(|e| anyhow!("Failed to create overlay_actions table: {e}"))?;
+        for (i, a) in context.overlay_actions.iter().enumerate() {
+            actions_arr
+                .set(i + 1, a.as_str())
+                .map_err(|e| anyhow!("Failed to set overlay_action: {e}"))?;
+        }
+        ctx_table
+            .set("overlay_actions", actions_arr)
+            .map_err(|e| anyhow!("Failed to set overlay_actions: {e}"))?;
+
+        // pending_fields table
+        let pending = self
+            .lua
+            .create_table()
+            .map_err(|e| anyhow!("Failed to create pending_fields table: {e}"))?;
+        for (key, value) in &context.pending_fields {
+            set_field(&pending, key.as_str(), value.as_str())?;
+        }
+        ctx_table
+            .set("pending_fields", pending)
+            .map_err(|e| anyhow!("Failed to set pending_fields: {e}"))?;
+
+        // selected_agent (string or nil)
+        if let Some(ref agent) = context.selected_agent {
+            set_field(&ctx_table, "selected_agent", agent.as_str())?;
+        }
+
+        // available_worktrees array of {path, branch}
+        let worktrees = self
+            .lua
+            .create_table()
+            .map_err(|e| anyhow!("Failed to create worktrees table: {e}"))?;
+        for (i, (path, branch)) in context.available_worktrees.iter().enumerate() {
+            let w = self
+                .lua
+                .create_table()
+                .map_err(|e| anyhow!("Failed to create worktree table: {e}"))?;
+            set_field(&w, "path", path.as_str())?;
+            set_field(&w, "branch", branch.as_str())?;
+            worktrees
+                .set(i + 1, w)
+                .map_err(|e| anyhow!("Failed to set worktree: {e}"))?;
+        }
+        ctx_table
+            .set("available_worktrees", worktrees)
+            .map_err(|e| anyhow!("Failed to set available_worktrees: {e}"))?;
+
+        let result: LuaValue = on_action_fn
+            .call((action, ctx_table))
+            .map_err(|e| anyhow!("Lua on_action() failed: {e}"))?;
+
+        match result {
+            LuaValue::Nil => Ok(None),
+            LuaValue::Table(table) => {
+                // Convert Lua table array to Vec<serde_json::Value>
+                let mut ops = Vec::new();
+                for pair in table.sequence_values::<LuaTable>() {
+                    let op_table = pair.map_err(|e| anyhow!("Invalid op in actions result: {e}"))?;
+                    let json_val = lua_table_to_json(&self.lua, &op_table)?;
+                    ops.push(json_val);
+                }
+                Ok(Some(ops))
+            }
+            _ => Err(anyhow!(
+                "on_action() must return a table or nil, got {:?}",
+                result
+            )),
+        }
     }
 
     /// Call Lua `handle_key(descriptor, mode, context)`.
@@ -192,9 +369,8 @@ impl LayoutLua {
             .lua
             .create_table()
             .map_err(|e| anyhow!("Failed to create context table: {e}"))?;
-        set_field(&ctx_table, "menu_selected", context.menu_selected)?;
-        set_field(&ctx_table, "menu_count", context.menu_count)?;
-        set_field(&ctx_table, "worktree_selected", context.worktree_selected)?;
+        set_field(&ctx_table, "list_selected", context.list_selected)?;
+        set_field(&ctx_table, "list_count", context.list_count)?;
         set_field(&ctx_table, "terminal_rows", context.terminal_rows)?;
 
         let result: LuaValue = handle_key_fn
@@ -234,18 +410,8 @@ fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
         .create_table()
         .map_err(|e| anyhow!("Failed to create state table: {e}"))?;
 
-    // Mode (as lowercase string for Lua matching)
-    let mode_str = match ctx.mode {
-        crate::app::AppMode::Normal => "normal",
-        crate::app::AppMode::Menu => "menu",
-        crate::app::AppMode::NewAgentSelectWorktree => "new_agent_select_worktree",
-        crate::app::AppMode::NewAgentCreateWorktree => "new_agent_create_worktree",
-        crate::app::AppMode::NewAgentPrompt => "new_agent_prompt",
-        crate::app::AppMode::CloseAgentConfirm => "close_agent_confirm",
-        crate::app::AppMode::ConnectionCode => "connection_code",
-        crate::app::AppMode::Error => "error",
-    };
-    set_field(&state, "mode", mode_str)?;
+    // Mode (passed directly as string — Lua owns mode names)
+    set_field(&state, "mode", ctx.mode.as_str())?;
 
     // Agent state
     set_field(&state, "agent_count", ctx.agents.len())?;
@@ -345,7 +511,7 @@ fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
     set_field(&state, "vpn_status", vpn_str)?;
 
     // Modal-specific state
-    set_field(&state, "menu_selected", ctx.menu_selected)?;
+    set_field(&state, "list_selected", ctx.list_selected)?;
     set_field(&state, "input_buffer", ctx.input_buffer)?;
     set_field(&state, "bundle_used", ctx.bundle_used)?;
 
@@ -359,26 +525,31 @@ fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
         set_field(&state, "error_message", error_msg)?;
     }
 
-    // Creating agent info
-    if let Some((identifier, stage)) = &ctx.creating_agent {
+    // Pending fields (generic key-value store for in-progress operations)
+    let pending = lua
+        .create_table()
+        .map_err(|e| anyhow!("Failed to create pending_fields table: {e}"))?;
+    for (key, value) in ctx.pending_fields {
+        set_field(&pending, key.as_str(), value.as_str())?;
+    }
+    state
+        .set("pending_fields", pending)
+        .map_err(|e| anyhow!("Failed to set pending_fields: {e}"))?;
+
+    // Legacy creating_agent table (for Lua layout backward compat)
+    if let (Some(identifier), Some(stage)) = (
+        ctx.pending_fields.get("creating_agent_id"),
+        ctx.pending_fields.get("creating_agent_stage"),
+    ) {
         let creating = lua
             .create_table()
             .map_err(|e| anyhow!("Failed to create creating_agent table: {e}"))?;
-        set_field(&creating, "identifier", *identifier)?;
-        let stage_str = match stage {
-            super::events::CreationStage::CreatingWorktree => "creating_worktree",
-            super::events::CreationStage::CopyingConfig => "copying_config",
-            super::events::CreationStage::SpawningAgent => "spawning_agent",
-            super::events::CreationStage::Ready => "ready",
-        };
-        set_field(&creating, "stage", stage_str)?;
+        set_field(&creating, "identifier", identifier.as_str())?;
+        set_field(&creating, "stage", stage.as_str())?;
         state
             .set("creating_agent", creating)
             .map_err(|e| anyhow!("Failed to set creating_agent: {e}"))?;
     }
-
-    // Worktree selection
-    set_field(&state, "worktree_selected", ctx.worktree_selected)?;
     let worktrees = lua
         .create_table()
         .map_err(|e| anyhow!("Failed to create worktrees table: {e}"))?;
@@ -406,10 +577,62 @@ fn set_field<V: mlua::IntoLua>(table: &LuaTable, key: &str, value: V) -> Result<
         .map_err(|e| anyhow!("Failed to set field '{key}': {e}"))
 }
 
+/// Convert a Lua table to a `serde_json::Value`.
+///
+/// Handles nested tables, strings, numbers, and booleans. Used to convert
+/// compound action ops from Lua into JSON that `execute_lua_ops()` can process.
+fn lua_table_to_json(lua: &Lua, table: &LuaTable) -> Result<serde_json::Value> {
+    use serde_json::{Map, Value};
+
+    let mut map = Map::new();
+    for pair in table.pairs::<String, LuaValue>() {
+        let (key, value) = pair.map_err(|e| anyhow!("Failed to iterate Lua table: {e}"))?;
+        let json_val = lua_value_to_json(lua, &value)?;
+        map.insert(key, json_val);
+    }
+    Ok(Value::Object(map))
+}
+
+/// Convert a single Lua value to a `serde_json::Value`.
+fn lua_value_to_json(lua: &Lua, value: &LuaValue) -> Result<serde_json::Value> {
+    use serde_json::Value;
+
+    match value {
+        LuaValue::Nil => Ok(Value::Null),
+        LuaValue::Boolean(b) => Ok(Value::Bool(*b)),
+        LuaValue::Integer(n) => Ok(Value::Number((*n).into())),
+        LuaValue::Number(n) => {
+            serde_json::Number::from_f64(*n)
+                .map(Value::Number)
+                .ok_or_else(|| anyhow!("Cannot convert NaN/Inf to JSON"))
+        }
+        LuaValue::String(s) => {
+            let s = s.to_str().map_err(|e| anyhow!("Non-UTF8 Lua string: {e}"))?;
+            Ok(Value::String(s.to_string()))
+        }
+        LuaValue::Table(t) => {
+            // Check if it's an array (sequential integer keys starting at 1)
+            let len = t.raw_len();
+            if len > 0 {
+                // Try as array first
+                let mut arr = Vec::with_capacity(len);
+                for i in 1..=len {
+                    let v: LuaValue = t.get(i).map_err(|e| anyhow!("Array index {i}: {e}"))?;
+                    arr.push(lua_value_to_json(lua, &v)?);
+                }
+                Ok(Value::Array(arr))
+            } else {
+                // Object/map
+                lua_table_to_json(lua, t)
+            }
+        }
+        _ => Ok(Value::Null), // Functions, userdata, etc. → null
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::AppMode;
     use crate::tui::render::AgentRenderInfo;
 
     fn make_test_ctx() -> (Vec<AgentRenderInfo>, Vec<String>) {
@@ -447,13 +670,12 @@ mod tests {
 
         let (agents, agent_ids) = make_test_ctx();
         let ctx = RenderContext {
-            mode: AppMode::Normal,
-            menu_selected: 0,
+            mode: "normal".to_string(),
+            list_selected: 0,
             input_buffer: "",
-            worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-            creating_agent: None,
+            pending_fields: &std::collections::HashMap::new(),
             connection_code: None,
             bundle_used: false,
             agent_ids: &agent_ids,
@@ -497,13 +719,12 @@ mod tests {
 
         let (agents, agent_ids) = make_test_ctx();
         let ctx = RenderContext {
-            mode: AppMode::Normal,
-            menu_selected: 0,
+            mode: "normal".to_string(),
+            list_selected: 0,
             input_buffer: "",
-            worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-            creating_agent: None,
+            pending_fields: &std::collections::HashMap::new(),
             connection_code: None,
             bundle_used: false,
             agent_ids: &agent_ids,
@@ -553,13 +774,12 @@ mod tests {
 
         let (agents, agent_ids) = make_test_ctx();
         let ctx = RenderContext {
-            mode: AppMode::Normal,
-            menu_selected: 0,
+            mode: "normal".to_string(),
+            list_selected: 0,
             input_buffer: "",
-            worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-            creating_agent: None,
+            pending_fields: &std::collections::HashMap::new(),
             connection_code: None,
             bundle_used: false,
             agent_ids: &agent_ids,
@@ -604,13 +824,12 @@ mod tests {
 
         let (agents, agent_ids) = make_test_ctx();
         let ctx = RenderContext {
-            mode: AppMode::Menu,
-            menu_selected: 0,
+            mode: "menu".to_string(),
+            list_selected: 0,
             input_buffer: "",
-            worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-            creating_agent: None,
+            pending_fields: &std::collections::HashMap::new(),
             connection_code: None,
             bundle_used: false,
             agent_ids: &agent_ids,
@@ -634,12 +853,10 @@ mod tests {
         assert!(matches!(overlay.unwrap(), RenderNode::Centered { .. }));
     }
 
-    /// Verifies that the actual layout.lua handles every AppMode correctly.
+    /// Verifies that the actual layout.lua handles every mode string correctly.
     ///
-    /// This is the key consistency test: Rust serializes mode strings in
-    /// `render_context_to_lua()`, and layout.lua must handle each one.
-    /// If a new AppMode is added but not handled in layout.lua, this test
-    /// catches the drift.
+    /// This is the key consistency test: Rust passes mode strings directly
+    /// to Lua, and layout.lua must handle each one.
     #[test]
     fn test_mode_string_consistency_with_actual_layout() {
         let layout_source = include_str!("../../lua/ui/layout.lua");
@@ -647,27 +864,26 @@ mod tests {
 
         let (agents, agent_ids) = make_test_ctx();
 
-        // Map of every AppMode to whether it should produce an overlay
-        let mode_expectations: Vec<(AppMode, bool, &str)> = vec![
-            (AppMode::Normal, false, "normal"),
-            (AppMode::Menu, true, "menu"),
-            (AppMode::NewAgentSelectWorktree, true, "new_agent_select_worktree"),
-            (AppMode::NewAgentCreateWorktree, true, "new_agent_create_worktree"),
-            (AppMode::NewAgentPrompt, true, "new_agent_prompt"),
-            (AppMode::CloseAgentConfirm, true, "close_agent_confirm"),
-            (AppMode::ConnectionCode, true, "connection_code"),
-            (AppMode::Error, true, "error"),
+        // Map of every mode string to whether it should produce an overlay
+        let mode_expectations: Vec<(&str, bool)> = vec![
+            ("normal", false),
+            ("menu", true),
+            ("new_agent_select_worktree", true),
+            ("new_agent_create_worktree", true),
+            ("new_agent_prompt", true),
+            ("close_agent_confirm", true),
+            ("connection_code", true),
+            ("error", true),
         ];
 
-        for (mode, expect_overlay, label) in &mode_expectations {
+        for (label, expect_overlay) in &mode_expectations {
             let ctx = RenderContext {
-                mode: *mode,
-                menu_selected: 0,
+                mode: label.to_string(),
+                list_selected: 0,
                 input_buffer: "",
-                worktree_selected: 0,
                 available_worktrees: &[],
                 error_message: Some("test error"),
-                creating_agent: None,
+                pending_fields: &std::collections::HashMap::new(),
                 connection_code: None,
                 bundle_used: false,
                 agent_ids: &agent_ids,
@@ -712,25 +928,24 @@ mod tests {
         let (agents, agent_ids) = make_test_ctx();
 
         // Each modal mode and its expected inner widget type (as Debug string contains)
-        let mode_widgets: Vec<(AppMode, &str)> = vec![
-            (AppMode::Menu, "List"),
-            (AppMode::NewAgentSelectWorktree, "List"),
-            (AppMode::NewAgentCreateWorktree, "Input"),
-            (AppMode::NewAgentPrompt, "Input"),
-            (AppMode::CloseAgentConfirm, "Paragraph"),
-            (AppMode::ConnectionCode, "ConnectionCode"),
-            (AppMode::Error, "Paragraph"),
+        let mode_widgets: Vec<(&str, &str)> = vec![
+            ("menu", "List"),
+            ("new_agent_select_worktree", "List"),
+            ("new_agent_create_worktree", "Input"),
+            ("new_agent_prompt", "Input"),
+            ("close_agent_confirm", "Paragraph"),
+            ("connection_code", "ConnectionCode"),
+            ("error", "Paragraph"),
         ];
 
         for (mode, expected_widget) in &mode_widgets {
             let ctx = RenderContext {
-                mode: *mode,
-                menu_selected: 0,
+                mode: mode.to_string(),
+                list_selected: 0,
                 input_buffer: "",
-                worktree_selected: 0,
                 available_worktrees: &[],
                 error_message: Some("test"),
-                creating_agent: None,
+                pending_fields: &std::collections::HashMap::new(),
                 connection_code: None,
                 bundle_used: false,
                 agent_ids: &agent_ids,
@@ -777,13 +992,12 @@ mod tests {
 
         let (agents, agent_ids) = make_test_ctx();
         let ctx = RenderContext {
-            mode: AppMode::Normal,
-            menu_selected: 0,
+            mode: "normal".to_string(),
+            list_selected: 0,
             input_buffer: "",
-            worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-            creating_agent: None,
+            pending_fields: &std::collections::HashMap::new(),
             connection_code: None,
             bundle_used: false,
             agent_ids: &agent_ids,
@@ -835,13 +1049,12 @@ mod tests {
 
         let (agents, agent_ids) = make_test_ctx();
         let ctx = RenderContext {
-            mode: AppMode::Normal,
-            menu_selected: 0,
+            mode: "normal".to_string(),
+            list_selected: 0,
             input_buffer: "",
-            worktree_selected: 0,
             available_worktrees: &[],
             error_message: None,
-            creating_agent: None,
+            pending_fields: &std::collections::HashMap::new(),
             connection_code: None,
             bundle_used: false,
             agent_ids: &agent_ids,
