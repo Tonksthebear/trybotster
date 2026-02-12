@@ -100,6 +100,9 @@ if [ "$RUN_UNIT" = true ]; then
 fi
 
 if [ "$RUN_INTEGRATION" = true ]; then
+    echo "Building release binary (required by PTY integration tests)..."
+    cargo build --release
+    echo ""
     echo "Running integration tests..."
     cargo test --test '*' $CARGO_ARGS
     echo ""
