@@ -78,9 +78,10 @@ accessories:
         - "3478:3478"
         - "3478:3478/udp"
         - "49152-49252:49152-49252/udp"
+      entrypoint: ""
     files:
       - config/turnserver.conf:/etc/turnserver.conf:ro
     env:
       secret:
         - TURN_SECRET
-    cmd: -c /etc/turnserver.conf --static-auth-secret=$TURN_SECRET
+    cmd: sh -c 'exec turnserver -c /etc/turnserver.conf --static-auth-secret="$TURN_SECRET"'
