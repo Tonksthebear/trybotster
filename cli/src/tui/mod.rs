@@ -1,7 +1,7 @@
 //! TUI - Terminal User Interface.
 //!
 //! This module provides the terminal rendering, input handling, and event loop
-//! for the botster-hub TUI. The TUI runs independently from the Hub, communicating
+//! for the botster TUI. The TUI runs independently from the Hub, communicating
 //! via channels.
 //!
 //! # Architecture
@@ -27,8 +27,7 @@
 //! - [`qr`] - QR code generation for browser connection
 //! - [`render`] - Main rendering function
 //! - [`runner`] - TuiRunner struct, event loop, and `run_with_hub()`
-//! - [`runner_agent`] - Agent navigation methods for TuiRunner
-//! - [`runner_handlers`] - Action and event handlers for TuiRunner
+//! - [`runner_handlers`] - Generic UI action handlers for TuiRunner
 
 // Rust guideline compliant 2026-02
 
@@ -41,7 +40,6 @@ pub mod raw_input;
 pub mod render;
 pub mod render_tree;
 pub mod runner;
-mod runner_agent;
 mod runner_handlers;
 pub mod screen;
 pub mod scroll;
