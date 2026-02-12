@@ -27,15 +27,17 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap},
     Frame, Terminal,
 };
 use vt100::Parser;
 
-use crate::app::{buffer_to_ansi, centered_rect, AppMode};
+use crate::app::{buffer_to_ansi, AppMode};
 
-use super::menu::{build_menu, MenuContext};
-use super::render_tree::StyledContent;
+use super::render_tree::{
+    InputProps, ListItemProps, ListProps, ParagraphAlignment, ParagraphProps, SpanStyle,
+    StyledContent,
+};
 use crate::compat::{BrowserDimensions, VpnStatus};
 
 use super::events::CreationStage;
@@ -154,19 +156,6 @@ impl<'a> RenderContext<'a> {
         self.agents.get(self.selected_agent_index)
     }
 
-    /// Build menu context from current state.
-    #[must_use]
-    pub fn menu_context(&self) -> MenuContext {
-        let session_count = self
-            .selected_agent()
-            .map(|a| a.session_names.len())
-            .unwrap_or(0);
-        MenuContext {
-            has_agent: self.selected_agent().is_some(),
-            active_pty_index: self.active_pty_index,
-            session_count,
-        }
-    }
 }
 
 /// Render result containing ANSI output for browser streaming.
@@ -253,9 +242,10 @@ where
     })
 }
 
-/// Render the full TUI frame.
+/// Render the full TUI frame (fallback when Lua layout is unavailable).
 ///
-/// Internal function that does the actual rendering work.
+/// Builds a minimal layout using generic primitives. When Lua is
+/// working, `interpret_tree()` handles rendering instead.
 fn render_frame(f: &mut Frame, ctx: &RenderContext) {
     let frame_area = f.area();
     let chunks = Layout::default()
@@ -263,84 +253,8 @@ fn render_frame(f: &mut Frame, ctx: &RenderContext) {
         .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
         .split(frame_area);
 
-    // Log frame and chunk sizes once for debugging
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let block = Block::default().borders(Borders::ALL);
-        let inner = block.inner(chunks[1]);
-        log::info!(
-            "Render areas - Frame: {}x{}, Right chunk: {}x{}, Inner (visible): {}x{}",
-            frame_area.width,
-            frame_area.height,
-            chunks[1].width,
-            chunks[1].height,
-            inner.width,
-            inner.height
-        );
-    }
-
-    // Render agent list with fallback title
-    let agent_block = {
-        let poll_status = if ctx.seconds_since_poll < 1 { "*" } else { "o" };
-        let agent_title = format!(" Agents ({}) {} ", ctx.agents.len(), poll_status);
-        Block::default().borders(Borders::ALL).title(agent_title)
-    };
-    render_agent_list(f, ctx, chunks[0], agent_block);
-
-    // Render terminal view with fallback title
-    let term_block = {
-        let title = if let Some(agent) = ctx.selected_agent() {
-            format!(" {} [AGENT] ", agent.branch_name)
-        } else {
-            " Terminal [No agent selected] ".to_string()
-        };
-        Block::default().borders(Borders::ALL).title(title)
-    };
-    render_terminal_panel(f, ctx, chunks[1], term_block, None);
-
-    // Render modal overlays based on mode (using area-based widget functions)
-    let modal_params: Option<(u16, u16, &str)> = match ctx.mode {
-        AppMode::Menu => Some((50, 40, "menu")),
-        AppMode::NewAgentSelectWorktree => Some((70, 50, "worktree_select")),
-        AppMode::NewAgentCreateWorktree => Some((60, 30, "text_input")),
-        AppMode::NewAgentPrompt => Some((60, 20, "text_input")),
-        AppMode::CloseAgentConfirm => Some((50, 20, "close_confirm")),
-        AppMode::ConnectionCode => Some((70, 80, "connection_code")),
-        AppMode::Error => Some((60, 30, "error")),
-        AppMode::Normal => None,
-    };
-
-    if let Some((width_pct, height_pct, widget)) = modal_params {
-        let area = centered_rect(width_pct, height_pct, f.area());
-        f.render_widget(Clear, area);
-        let block = Block::default().borders(Borders::ALL);
-        match widget {
-            "menu" => render_menu_widget(f, ctx, area, block.title(" Menu [Up/Down navigate | Enter select | Esc cancel] ")),
-            "worktree_select" => render_worktree_select_widget(f, ctx, area, block.title(" Select Worktree [Up/Down navigate | Enter select | Esc cancel] ")),
-            "text_input" => {
-                let title = if ctx.mode == AppMode::NewAgentCreateWorktree {
-                    " Create Worktree [Enter confirm | Esc cancel] "
-                } else {
-                    " Agent Prompt [Enter confirm | Esc cancel] "
-                };
-                render_text_input_widget(f, ctx, area, block.title(title), None);
-            }
-            "close_confirm" => render_close_confirm_widget(f, area, block.title(" Confirm Close "), None),
-            "connection_code" => render_connection_code_widget(f, ctx, area, block.title(" Secure Connection "), None),
-            "error" => render_error_widget(f, ctx, area, block.title(" Error "), None),
-            _ => {}
-        }
-    }
-}
-
-/// Render the agent list panel.
-///
-/// The `block` parameter provides the pre-built block with title from Lua
-/// (or the fallback). This function handles list items and selection state.
-pub(super) fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect, block: Block) {
-    let mut items: Vec<ListItem> = Vec::new();
-
-    // Add creating indicator at top if agent creation is in progress
+    // Build agent list as generic ListProps
+    let mut items: Vec<ListItemProps> = Vec::new();
     if let Some((identifier, stage)) = &ctx.creating_agent {
         let stage_label = match stage {
             CreationStage::CreatingWorktree => "Creating worktree...",
@@ -348,36 +262,53 @@ pub(super) fn render_agent_list(f: &mut Frame, ctx: &RenderContext, area: Rect, 
             CreationStage::SpawningAgent => "Starting agent...",
             CreationStage::Ready => "Ready",
         };
-        let creating_text = format!("-> {} ({})", identifier, stage_label);
-        items.push(
-            ListItem::new(creating_text).style(Style::default().fg(ratatui::style::Color::Cyan)),
-        );
+        items.push(ListItemProps {
+            content: StyledContent::Plain(format!("-> {} ({})", identifier, stage_label)),
+            header: false,
+            style: Some(SpanStyle {
+                fg: Some(super::render_tree::SpanColor::Cyan),
+                ..SpanStyle::default()
+            }),
+        });
     }
-
-    // Add existing agents
-    items.extend(ctx.agents.iter().map(|agent| {
+    for agent in ctx.agents {
         let base_text = agent.display_name.as_deref().unwrap_or(&agent.branch_name);
         let server_info = if let Some(p) = agent.port {
-            let server_icon = if agent.server_running { ">" } else { "o" };
-            format!(" {}:{}", server_icon, p)
+            let icon = if agent.server_running { ">" } else { "o" };
+            format!(" {}:{}", icon, p)
         } else {
             String::new()
         };
-        ListItem::new(format!("{}{}", base_text, server_info))
-    }));
+        items.push(ListItemProps {
+            content: StyledContent::Plain(format!("{}{}", base_text, server_info)),
+            header: false,
+            style: None,
+        });
+    }
 
-    let mut state = ListState::default();
     let creating_offset = if ctx.creating_agent.is_some() { 1 } else { 0 };
-    state.select(Some(
-        (ctx.selected_agent_index + creating_offset).min(items.len().saturating_sub(1)),
-    ));
+    let selected = ctx.selected_agent_index + creating_offset;
 
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
-        .highlight_symbol("> ");
+    let list_props = ListProps {
+        items,
+        selected: Some(selected),
+        highlight_style: None,
+        highlight_symbol: None,
+    };
 
-    f.render_stateful_widget(list, area, &mut state);
+    let poll_status = if ctx.seconds_since_poll < 1 { "*" } else { "o" };
+    let agent_title = format!(" Agents ({}) {} ", ctx.agents.len(), poll_status);
+    let agent_block = Block::default().borders(Borders::ALL).title(agent_title);
+    render_list_widget(f, chunks[0], agent_block, &list_props);
+
+    // Render terminal view
+    let term_title = if let Some(agent) = ctx.selected_agent() {
+        format!(" {} [AGENT] ", agent.branch_name)
+    } else {
+        " Terminal [No agent selected] ".to_string()
+    };
+    let term_block = Block::default().borders(Borders::ALL).title(term_title);
+    render_terminal_panel(f, ctx, chunks[1], term_block, None);
 }
 
 /// Render the terminal panel showing PTY output.
@@ -433,153 +364,105 @@ pub(super) fn render_terminal_panel(
     }
 }
 
-// === Area-based Widget Renderers ===
+// === Generic Widget Renderers ===
 //
-// These render content into a given area without self-centering.
-// Used by both the Lua render tree (via render_tree.rs) and the
-// fallback render_frame() path.
+// These render generic primitives with zero application knowledge.
+// All content, styling, and behavior comes from Lua via props.
 
-/// Render menu items with selection into a given area.
-pub(super) fn render_menu_widget(f: &mut Frame, ctx: &RenderContext, area: Rect, block: Block) {
-    let menu_items = build_menu(&ctx.menu_context());
+/// Render a generic list widget with optional selection and headers.
+///
+/// Headers are non-selectable items rendered dim+bold. The `selected` index
+/// in `ListProps` counts only selectable items; this function maps it to
+/// an absolute index accounting for headers.
+pub(super) fn render_list_widget(f: &mut Frame, area: Rect, block: Block, props: &ListProps) {
+    let mut list_items: Vec<ListItem> = Vec::new();
+    let mut selectable_to_absolute: Vec<usize> = Vec::new();
 
-    let mut lines: Vec<Line> = Vec::new();
-    let mut selectable_idx = 0;
-
-    for item in &menu_items {
-        if item.is_header {
-            lines.push(Line::from(Span::styled(
-                item.label.clone(),
+    for (i, item) in props.items.iter().enumerate() {
+        if item.header {
+            // Headers: dim + bold, non-selectable
+            let line = item.content.to_line();
+            let li = ListItem::new(line).style(
                 Style::default()
                     .add_modifier(Modifier::DIM)
                     .add_modifier(Modifier::BOLD),
-            )));
+            );
+            list_items.push(li);
         } else {
-            let is_selected = selectable_idx == ctx.menu_selected;
-            let cursor = if is_selected { ">" } else { " " };
-            let style = if is_selected {
-                Style::default()
-                    .add_modifier(Modifier::REVERSED)
-                    .add_modifier(Modifier::BOLD)
+            selectable_to_absolute.push(i);
+            let line = item.content.to_line();
+            let li = if let Some(ref style) = item.style {
+                ListItem::new(line).style(style.to_ratatui_style())
             } else {
-                Style::default()
+                ListItem::new(line)
             };
-            lines.push(Line::from(Span::styled(
-                format!("{} {}", cursor, item.label),
-                style,
-            )));
-            selectable_idx += 1;
+            list_items.push(li);
         }
     }
 
-    let menu = Paragraph::new(lines)
+    let highlight_style = props
+        .highlight_style
+        .as_ref()
+        .map(SpanStyle::to_ratatui_style)
+        .unwrap_or_else(|| Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED));
+
+    let highlight_symbol = props.highlight_symbol.as_deref().unwrap_or("> ");
+
+    let list = List::new(list_items)
         .block(block)
-        .alignment(Alignment::Left);
+        .highlight_style(highlight_style)
+        .highlight_symbol(highlight_symbol);
 
-    f.render_widget(menu, area);
-}
-
-/// Render worktree selection list into a given area.
-pub(super) fn render_worktree_select_widget(
-    f: &mut Frame,
-    ctx: &RenderContext,
-    area: Rect,
-    block: Block,
-) {
-    let mut items: Vec<String> = vec![format!(
-        "{} [Create New Worktree]",
-        if ctx.worktree_selected == 0 { ">" } else { " " }
-    )];
-
-    for (i, (path, branch)) in ctx.available_worktrees.iter().enumerate() {
-        items.push(format!(
-            "{} {} ({})",
-            if i + 1 == ctx.worktree_selected {
-                ">"
-            } else {
-                " "
-            },
-            branch,
-            path
-        ));
+    let mut state = ListState::default();
+    if let Some(sel) = props.selected {
+        // Map selectable index to absolute index (past headers)
+        let abs = selectable_to_absolute
+            .get(sel)
+            .copied()
+            .unwrap_or(sel.min(props.items.len().saturating_sub(1)));
+        state.select(Some(abs));
     }
 
-    let text: Vec<Line> = items.iter().map(|s| Line::from(s.clone())).collect();
+    f.render_stateful_widget(list, area, &mut state);
+}
 
-    let widget = Paragraph::new(text)
-        .block(block)
-        .alignment(Alignment::Left)
-        .wrap(Wrap { trim: false });
+/// Render a paragraph widget with styled lines, alignment, and optional wrapping.
+pub(super) fn render_paragraph_widget(
+    f: &mut Frame,
+    area: Rect,
+    block: Block,
+    props: &ParagraphProps,
+) {
+    let lines: Vec<Line> = props.lines.iter().map(StyledContent::to_line).collect();
+
+    let alignment = match props.alignment {
+        ParagraphAlignment::Left => Alignment::Left,
+        ParagraphAlignment::Center => Alignment::Center,
+        ParagraphAlignment::Right => Alignment::Right,
+    };
+
+    let mut widget = Paragraph::new(lines).block(block).alignment(alignment);
+
+    if props.wrap {
+        widget = widget.wrap(Wrap { trim: false });
+    }
 
     f.render_widget(widget, area);
 }
 
-/// Render text input field into a given area.
-///
-/// When `custom_lines` is `Some`, uses those lines as prompt text (appending
-/// the input buffer). Otherwise falls back to mode-specific hardcoded text.
-pub(super) fn render_text_input_widget(
-    f: &mut Frame,
-    ctx: &RenderContext,
-    area: Rect,
-    block: Block,
-    custom_lines: Option<&[StyledContent]>,
-) {
-    let prompt_lines = if let Some(lines) = custom_lines {
-        let mut result: Vec<Line> = lines.iter().map(StyledContent::to_line).collect();
-        result.push(Line::from(""));
-        result.push(Line::from(Span::raw(ctx.input_buffer)));
-        result
-    } else {
-        match ctx.mode {
-            AppMode::NewAgentCreateWorktree => vec![
-                Line::from("Enter branch name or issue number:"),
-                Line::from(""),
-                Line::from("Examples: 123, feature-auth, bugfix-login"),
-                Line::from(""),
-                Line::from(Span::raw(ctx.input_buffer)),
-            ],
-            AppMode::NewAgentPrompt => vec![
-                Line::from("Enter prompt for agent (leave empty for default):"),
-                Line::from(""),
-                Line::from(Span::raw(ctx.input_buffer)),
-            ],
-            _ => vec![Line::from(Span::raw(ctx.input_buffer))],
-        }
+/// Render a text input widget with prompt lines and current value.
+pub(super) fn render_input_widget(f: &mut Frame, area: Rect, block: Block, props: &InputProps) {
+    let mut lines: Vec<Line> = props.lines.iter().map(StyledContent::to_line).collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::raw(props.value.clone())));
+
+    let alignment = match props.alignment {
+        ParagraphAlignment::Left => Alignment::Left,
+        ParagraphAlignment::Center => Alignment::Center,
+        ParagraphAlignment::Right => Alignment::Right,
     };
 
-    let widget = Paragraph::new(prompt_lines)
-        .block(block)
-        .alignment(Alignment::Left);
-
-    f.render_widget(widget, area);
-}
-
-/// Render close agent confirmation dialog into a given area.
-///
-/// When `custom_lines` is `Some`, uses those lines instead of the
-/// hardcoded defaults.
-pub(super) fn render_close_confirm_widget(
-    f: &mut Frame,
-    area: Rect,
-    block: Block,
-    custom_lines: Option<&[StyledContent]>,
-) {
-    let text: Vec<Line> = if let Some(lines) = custom_lines {
-        lines.iter().map(StyledContent::to_line).collect()
-    } else {
-        vec![
-            Line::from("Close selected agent?"),
-            Line::from(""),
-            Line::from("Y - Close agent (keep worktree)"),
-            Line::from("D - Close agent and delete worktree"),
-            Line::from("N/Esc - Cancel"),
-        ]
-    };
-
-    let widget = Paragraph::new(text)
-        .block(block)
-        .alignment(Alignment::Left);
+    let widget = Paragraph::new(lines).block(block).alignment(alignment);
 
     f.render_widget(widget, area);
 }
@@ -634,55 +517,6 @@ pub(super) fn render_connection_code_widget(
     let widget = Paragraph::new(text_lines)
         .block(block)
         .alignment(Alignment::Center);
-
-    f.render_widget(widget, area);
-}
-
-/// Render error message into a given area.
-///
-/// When `custom_lines` is `Some`, uses those as the template. Any line
-/// containing `{error}` is replaced with the actual error message. Falls
-/// back to hardcoded layout when `None`.
-pub(super) fn render_error_widget(
-    f: &mut Frame,
-    ctx: &RenderContext,
-    area: Rect,
-    block: Block,
-    custom_lines: Option<&[StyledContent]>,
-) {
-    let message = ctx.error_message.unwrap_or("An error occurred");
-
-    let text_lines: Vec<Line> = if let Some(lines) = custom_lines {
-        lines
-            .iter()
-            .map(|l| match l {
-                StyledContent::Plain(s) if s.contains("{error}") => {
-                    Line::from(s.replace("{error}", message))
-                }
-                _ => l.to_line(),
-            })
-            .collect()
-    } else {
-        vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "Error",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(message),
-            Line::from(""),
-            Line::from(Span::styled(
-                "[Esc/Enter] dismiss",
-                Style::default().add_modifier(Modifier::DIM),
-            )),
-        ]
-    };
-
-    let widget = Paragraph::new(text_lines)
-        .block(block)
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: false });
 
     f.render_widget(widget, area);
 }
@@ -746,51 +580,6 @@ mod tests {
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().key, "test-2");
         assert_eq!(selected.unwrap().issue_number, Some(2));
-    }
-
-    #[test]
-    fn test_render_context_menu_context() {
-        let agents = vec![AgentRenderInfo {
-            key: "test-1".to_string(),
-            display_name: None,
-            repo: "test/repo".to_string(),
-            issue_number: Some(1),
-            branch_name: "botster-issue-1".to_string(),
-            port: None,
-            server_running: false,
-            session_names: vec!["agent".to_string(), "server".to_string()],
-        }];
-
-        let ctx = RenderContext {
-            mode: AppMode::Normal,
-            menu_selected: 0,
-            input_buffer: "",
-            worktree_selected: 0,
-            available_worktrees: &[],
-            error_message: None,
-            creating_agent: None,
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &[],
-            agents: &agents,
-            selected_agent_index: 0,
-            active_parser: None,
-            parser_pool: &std::collections::HashMap::new(),
-            active_pty_index: 1,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 5,
-            poll_interval: 10,
-            vpn_status: None,
-            terminal_cols: 80,
-            terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
-
-        let menu_ctx = ctx.menu_context();
-        assert!(menu_ctx.has_agent);
-        assert_eq!(menu_ctx.active_pty_index, 1);
-        assert_eq!(menu_ctx.session_count, 2);
     }
 
     #[test]

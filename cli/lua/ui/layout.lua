@@ -2,12 +2,19 @@
 --
 -- Defines the structure (splits, sizes, widget placement) of the TUI.
 -- Rust interprets the returned tables into ratatui rendering calls.
+-- Rust is a generic UI toolkit with zero application knowledge —
+-- all content, styling, and behavior wiring lives here.
 --
 -- Available node types:
---   hsplit  — horizontal split with constraints and children
---   vsplit  — vertical split with constraints and children
---   centered — centered overlay with width/height percentages
---   <widget> — leaf widget rendered by Rust (agent_list, terminal, menu, etc.)
+--   hsplit     — horizontal split with constraints and children
+--   vsplit     — vertical split with constraints and children
+--   centered   — centered overlay with width/height percentages
+--   list       — generic selectable list with optional headers
+--   paragraph  — static styled text block
+--   input      — text input with prompt lines
+--   terminal   — PTY output panel
+--   connection_code — QR code display (special rendering)
+--   empty      — renders just the block border/title
 --
 -- Constraint formats: "30%" (percentage), "20" (fixed), "min:10" (min), "max:80" (max)
 --
@@ -17,7 +24,77 @@
 --   Style table:   { text = "colored", style = { fg = "cyan", bold = true } }
 --   Shorthand:     "bold" = { bold = true }, "dim" = { dim = true }
 
---- Main layout: 20/80 horizontal split with agent list and terminal.
+-- =============================================================================
+-- Helper: Build agent list items from state
+-- =============================================================================
+local function build_agent_items(state)
+  local items = {}
+
+  -- Creating indicator at top
+  if state.creating_agent then
+    local stages = {
+      creating_worktree = "Creating worktree...",
+      copying_config = "Copying config...",
+      spawning_agent = "Starting agent...",
+      ready = "Ready",
+    }
+    table.insert(items, {
+      text = string.format("-> %s (%s)", state.creating_agent.identifier,
+             stages[state.creating_agent.stage] or "..."),
+      style = { fg = "cyan" },
+    })
+  end
+
+  -- Existing agents
+  for _, agent in ipairs(state.agents or {}) do
+    local name = agent.display_name or agent.branch_name
+    local si = ""
+    if agent.port then
+      local icon = agent.server_running and ">" or "o"
+      si = string.format(" %s:%d", icon, agent.port)
+    end
+    table.insert(items, { text = name .. si })
+  end
+
+  return items
+end
+
+-- =============================================================================
+-- Helper: Build menu items from state
+-- =============================================================================
+local function build_menu_items(state)
+  local items = {}
+  local sa = state.selected_agent
+
+  -- Agent section (only if agent selected)
+  if sa then
+    table.insert(items, { text = "── Agent ──", header = true })
+    if (sa.session_count or 0) > 1 then
+      table.insert(items, { text = "Next Session (Ctrl+])" })
+    end
+    table.insert(items, { text = "Close Agent" })
+  end
+
+  -- Hub section (always shown)
+  table.insert(items, { text = "── Hub ──", header = true })
+  table.insert(items, { text = "New Agent" })
+  table.insert(items, { text = "Show Connection Code" })
+
+  return items
+end
+
+-- =============================================================================
+-- Helper: Build worktree items from state
+-- =============================================================================
+local function build_worktree_items(state)
+  local items = { { text = "[Create New Worktree]" } }
+  for _, wt in ipairs(state.available_worktrees or {}) do
+    table.insert(items, { text = string.format("%s (%s)", wt.branch, wt.path) })
+  end
+  return items
+end
+
+--- Main layout: agent list + terminal panel.
 function render(state)
   -- Agent list title: count + poll indicator
   local poll_icon = state.seconds_since_poll < 1 and "*" or "o"
@@ -25,6 +102,10 @@ function render(state)
     { text = string.format(" Agents (%d) ", state.agent_count) },
     { text = poll_icon .. " ", style = { fg = "cyan" } },
   }
+
+  -- Agent list: selection offset accounts for creating indicator
+  local agent_selected = state.selected_agent_index
+  if state.creating_agent then agent_selected = agent_selected + 1 end
 
   -- Terminal title: branch name, session view, scroll indicator
   local term_title = " Terminal [No agent selected] "
@@ -79,7 +160,14 @@ function render(state)
     type = "hsplit",
     constraints = { "10%", "90%" },
     children = {
-      { type = "agent_list", block = { title = agent_title, borders = "all" } },
+      {
+        type = "list",
+        block = { title = agent_title, borders = "all" },
+        props = {
+          items = build_agent_items(state),
+          selected = agent_selected,
+        },
+      },
       terminal_panel,
     },
   }
@@ -91,28 +179,39 @@ function render_overlay(state)
     return {
       type = "centered", width = 50, height = 40,
       child = {
-        type = "menu",
+        type = "list",
         block = { title = " Menu [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
+        props = {
+          items = build_menu_items(state),
+          selected = state.menu_selected,
+        },
       },
     }
   elseif state.mode == "new_agent_select_worktree" then
     return {
       type = "centered", width = 70, height = 50,
       child = {
-        type = "worktree_select",
+        type = "list",
         block = { title = " Select Worktree [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
+        props = {
+          items = build_worktree_items(state),
+          selected = state.worktree_selected,
+        },
       },
     }
   elseif state.mode == "new_agent_create_worktree" then
     return {
       type = "centered", width = 60, height = 30,
       child = {
-        type = "text_input",
+        type = "input",
         block = { title = " Create Worktree [Enter confirm | Esc cancel] ", borders = "all" },
-        lines = {
-          "Enter branch name or issue number:",
-          "",
-          "Examples: 123, feature-auth, bugfix-login",
+        props = {
+          lines = {
+            "Enter branch name or issue number:",
+            "",
+            "Examples: 123, feature-auth, bugfix-login",
+          },
+          value = state.input_buffer or "",
         },
       },
     }
@@ -120,10 +219,13 @@ function render_overlay(state)
     return {
       type = "centered", width = 60, height = 20,
       child = {
-        type = "text_input",
+        type = "input",
         block = { title = " Agent Prompt [Enter confirm | Esc cancel] ", borders = "all" },
-        lines = {
-          "Enter prompt for agent (leave empty for default):",
+        props = {
+          lines = {
+            "Enter prompt for agent (leave empty for default):",
+          },
+          value = state.input_buffer or "",
         },
       },
     }
@@ -131,14 +233,16 @@ function render_overlay(state)
     return {
       type = "centered", width = 50, height = 20,
       child = {
-        type = "close_confirm",
+        type = "paragraph",
         block = { title = " Confirm Close ", borders = "all" },
-        lines = {
-          "Close selected agent?",
-          "",
-          "Y - Close agent (keep worktree)",
-          "D - Close agent and delete worktree",
-          "N/Esc - Cancel",
+        props = {
+          lines = {
+            "Close selected agent?",
+            "",
+            "Y - Close agent (keep worktree)",
+            "D - Close agent and delete worktree",
+            "N/Esc - Cancel",
+          },
         },
       },
     }
@@ -166,15 +270,19 @@ function render_overlay(state)
     return {
       type = "centered", width = 60, height = 30,
       child = {
-        type = "error",
+        type = "paragraph",
         block = { title = " Error ", borders = "all" },
-        lines = {
-          "",
-          "Error",
-          "",
-          "{error}",
-          "",
-          "[Esc/Enter] dismiss",
+        props = {
+          lines = {
+            "",
+            { { text = "Error", style = "bold" } },
+            "",
+            state.error_message or "An error occurred",
+            "",
+            { { text = "[Esc/Enter] dismiss", style = "dim" } },
+          },
+          alignment = "center",
+          wrap = true,
         },
       },
     }

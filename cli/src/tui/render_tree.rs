@@ -88,34 +88,95 @@ pub struct TerminalBinding {
 pub enum WidgetProps {
     /// Terminal widget binding to a specific PTY.
     Terminal(TerminalBinding),
+    /// List widget props.
+    List(ListProps),
+    /// Paragraph widget props.
+    Paragraph(ParagraphProps),
+    /// Input widget props.
+    Input(InputProps),
 }
 
-/// Named widget types implemented in Rust.
+/// Generic UI widget types.
 ///
-/// Lua refers to these by string name. Each maps to existing rendering logic.
+/// Lua refers to these by string name. Rust renders them with zero
+/// application knowledge — all content, styling, and behavior comes
+/// from Lua via props.
 #[derive(Debug, Clone)]
 pub enum WidgetType {
-    /// Agent list panel with stateful selection.
-    AgentList,
     /// Terminal panel showing vt100 PTY output.
     Terminal,
-    /// Menu modal with selectable items.
-    Menu,
-    /// Worktree selection list for agent creation.
-    WorktreeSelect,
-    /// Text input field (worktree creation, agent prompt).
-    TextInput,
-    /// Close agent confirmation dialog (Y/D/N).
-    CloseConfirm,
-    /// QR code / connection code display.
+    /// Generic selectable list with optional headers.
+    List,
+    /// Static styled text block.
+    Paragraph,
+    /// Text input with prompt lines.
+    Input,
+    /// QR code / connection code display (special rendering).
     ConnectionCode,
-    /// Error message display.
-    Error,
-    /// Empty placeholder or static text block.
-    ///
-    /// With no `custom_lines`, renders just the block border/title.
-    /// With `custom_lines`, renders a paragraph of those lines inside the block.
+    /// Empty placeholder — renders just the block border/title.
     Empty,
+}
+
+// =============================================================================
+// Generic Widget Props
+// =============================================================================
+
+/// Props for a generic list widget.
+#[derive(Debug, Clone)]
+pub struct ListProps {
+    /// Items to display.
+    pub items: Vec<ListItemProps>,
+    /// Index of the selected item among selectable (non-header) items.
+    pub selected: Option<usize>,
+    /// Style applied to the highlighted item.
+    pub highlight_style: Option<SpanStyle>,
+    /// Symbol prepended to the highlighted item (e.g., "> ").
+    pub highlight_symbol: Option<String>,
+}
+
+/// A single item in a generic list.
+#[derive(Debug, Clone)]
+pub struct ListItemProps {
+    /// The display content (plain string or styled spans).
+    pub content: StyledContent,
+    /// If true, this item is a non-selectable header (rendered dim+bold).
+    pub header: bool,
+    /// Optional per-item style override.
+    pub style: Option<SpanStyle>,
+}
+
+/// Props for a paragraph widget.
+#[derive(Debug, Clone)]
+pub struct ParagraphProps {
+    /// Lines of styled content.
+    pub lines: Vec<StyledContent>,
+    /// Text alignment.
+    pub alignment: ParagraphAlignment,
+    /// Whether to wrap long lines.
+    pub wrap: bool,
+}
+
+/// Paragraph text alignment.
+#[derive(Debug, Clone, Default)]
+pub enum ParagraphAlignment {
+    /// Left-aligned text.
+    #[default]
+    Left,
+    /// Center-aligned text.
+    Center,
+    /// Right-aligned text.
+    Right,
+}
+
+/// Props for a text input widget.
+#[derive(Debug, Clone)]
+pub struct InputProps {
+    /// Prompt lines displayed above the input.
+    pub lines: Vec<StyledContent>,
+    /// Current input value.
+    pub value: String,
+    /// Text alignment.
+    pub alignment: ParagraphAlignment,
 }
 
 /// Configuration for a ratatui Block (border + title).
@@ -335,7 +396,7 @@ impl RenderNode {
     /// Expected table format:
     /// ```lua
     /// { type = "hsplit", constraints = { "30%", "70%" }, children = { ... } }
-    /// { type = "agent_list", block = { title = "Agents", borders = "all" } }
+    /// { type = "list", block = { title = "Agents", borders = "all" }, props = { items = {...} } }
     /// { type = "centered", width = 50, height = 40, child = { ... } }
     /// ```
     pub fn from_lua_table(table: &LuaTable) -> Result<Self> {
@@ -417,15 +478,12 @@ impl RenderNode {
 
     fn parse_widget(table: &LuaTable, type_name: &str) -> Result<Self> {
         let widget_type = match type_name {
-            "agent_list" => WidgetType::AgentList,
             "terminal" => WidgetType::Terminal,
-            "menu" => WidgetType::Menu,
-            "worktree_select" => WidgetType::WorktreeSelect,
-            "text_input" => WidgetType::TextInput,
-            "close_confirm" => WidgetType::CloseConfirm,
+            "list" => WidgetType::List,
+            "paragraph" => WidgetType::Paragraph,
+            "input" => WidgetType::Input,
             "connection_code" => WidgetType::ConnectionCode,
-            "error" => WidgetType::Error,
-            "paragraph" | "empty" => WidgetType::Empty,
+            "empty" => WidgetType::Empty,
             _ => {
                 return Err(anyhow!("Unknown widget type: '{type_name}'"));
             }
@@ -433,10 +491,12 @@ impl RenderNode {
 
         let block = parse_block_config(table);
         let custom_lines = parse_styled_lines(table, "lines").ok();
-        let props = if matches!(widget_type, WidgetType::Terminal) {
-            parse_terminal_props(table)
-        } else {
-            None
+        let props = match widget_type {
+            WidgetType::Terminal => parse_terminal_props(table),
+            WidgetType::List => parse_list_props(table),
+            WidgetType::Paragraph => parse_paragraph_props(table),
+            WidgetType::Input => parse_input_props(table),
+            _ => None,
         };
 
         Ok(RenderNode::Widget {
@@ -469,6 +529,109 @@ fn parse_terminal_props(table: &LuaTable) -> Option<WidgetProps> {
     } else {
         None
     }
+}
+
+/// Parse list widget props from a Lua table.
+///
+/// Items can be plain strings or tables with `text`, `header`, and `style` fields.
+fn parse_list_props(table: &LuaTable) -> Option<WidgetProps> {
+    let props_value: LuaValue = table.get("props").ok()?;
+    let LuaValue::Table(props_table) = props_value else { return None; };
+
+    let items_table: LuaTable = props_table.get("items").ok()?;
+    let mut items = Vec::new();
+
+    for val in items_table.sequence_values::<LuaValue>() {
+        let v = match val {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match v {
+            LuaValue::String(s) => {
+                items.push(ListItemProps {
+                    content: StyledContent::Plain(s.to_string_lossy().to_string()),
+                    header: false,
+                    style: None,
+                });
+            }
+            LuaValue::Table(item_table) => {
+                let text_val: LuaValue = match item_table.get("text") {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let content = match parse_styled_content(&text_val) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let header: bool = item_table.get("header").unwrap_or(false);
+                let style = item_table
+                    .get::<LuaValue>("style")
+                    .ok()
+                    .and_then(|v| parse_span_style(&v).ok());
+                items.push(ListItemProps { content, header, style });
+            }
+            _ => continue,
+        }
+    }
+
+    let selected: Option<usize> = props_table.get("selected").ok();
+    let highlight_style = props_table
+        .get::<LuaValue>("highlight_style")
+        .ok()
+        .and_then(|v| parse_span_style(&v).ok());
+    let highlight_symbol: Option<String> = props_table.get("highlight_symbol").ok();
+
+    Some(WidgetProps::List(ListProps {
+        items,
+        selected,
+        highlight_style,
+        highlight_symbol,
+    }))
+}
+
+/// Parse paragraph widget props from a Lua table.
+fn parse_paragraph_props(table: &LuaTable) -> Option<WidgetProps> {
+    let props_value: LuaValue = table.get("props").ok()?;
+    let LuaValue::Table(props_table) = props_value else { return None; };
+
+    let lines = parse_styled_lines(&props_table, "lines").unwrap_or_default();
+
+    let alignment_str: Option<String> = props_table.get("alignment").ok();
+    let alignment = match alignment_str.as_deref() {
+        Some("center") => ParagraphAlignment::Center,
+        Some("right") => ParagraphAlignment::Right,
+        _ => ParagraphAlignment::Left,
+    };
+
+    let wrap: bool = props_table.get("wrap").unwrap_or(false);
+
+    Some(WidgetProps::Paragraph(ParagraphProps {
+        lines,
+        alignment,
+        wrap,
+    }))
+}
+
+/// Parse input widget props from a Lua table.
+fn parse_input_props(table: &LuaTable) -> Option<WidgetProps> {
+    let props_value: LuaValue = table.get("props").ok()?;
+    let LuaValue::Table(props_table) = props_value else { return None; };
+
+    let lines = parse_styled_lines(&props_table, "lines").unwrap_or_default();
+    let value: String = props_table.get("value").unwrap_or_default();
+
+    let alignment_str: Option<String> = props_table.get("alignment").ok();
+    let alignment = match alignment_str.as_deref() {
+        Some("center") => ParagraphAlignment::Center,
+        Some("right") => ParagraphAlignment::Right,
+        _ => ParagraphAlignment::Left,
+    };
+
+    Some(WidgetProps::Input(InputProps {
+        lines,
+        value,
+        alignment,
+    }))
 }
 
 /// Parse optional block config from a table.
@@ -732,35 +895,25 @@ fn render_widget(
     let block = block_cfg.map(BlockConfig::to_block).unwrap_or_default();
 
     match widget_type {
-        WidgetType::AgentList => {
-            super::render::render_agent_list(f, ctx, area, block);
-        }
         WidgetType::Terminal => {
             let binding = props.and_then(|p| match p {
                 WidgetProps::Terminal(b) => Some(b),
+                _ => None,
             });
             super::render::render_terminal_panel(f, ctx, area, block, binding);
         }
-        WidgetType::Menu => {
-            super::render::render_menu_widget(f, ctx, area, block);
+        WidgetType::List => {
+            if let Some(WidgetProps::List(list_props)) = props {
+                super::render::render_list_widget(f, area, block, list_props);
+            } else {
+                f.render_widget(block, area);
+            }
         }
-        WidgetType::WorktreeSelect => {
-            super::render::render_worktree_select_widget(f, ctx, area, block);
-        }
-        WidgetType::TextInput => {
-            super::render::render_text_input_widget(f, ctx, area, block, custom_lines);
-        }
-        WidgetType::CloseConfirm => {
-            super::render::render_close_confirm_widget(f, area, block, custom_lines);
-        }
-        WidgetType::ConnectionCode => {
-            super::render::render_connection_code_widget(f, ctx, area, block, custom_lines);
-        }
-        WidgetType::Error => {
-            super::render::render_error_widget(f, ctx, area, block, custom_lines);
-        }
-        WidgetType::Empty => {
-            if let Some(lines) = custom_lines {
+        WidgetType::Paragraph => {
+            if let Some(WidgetProps::Paragraph(para_props)) = props {
+                super::render::render_paragraph_widget(f, area, block, para_props);
+            } else if let Some(lines) = custom_lines {
+                // Fallback: use custom_lines if no props
                 let text: Vec<Line> = lines.iter().map(StyledContent::to_line).collect();
                 let paragraph = ratatui::widgets::Paragraph::new(text)
                     .block(block)
@@ -770,6 +923,19 @@ fn render_widget(
             } else {
                 f.render_widget(block, area);
             }
+        }
+        WidgetType::Input => {
+            if let Some(WidgetProps::Input(input_props)) = props {
+                super::render::render_input_widget(f, area, block, input_props);
+            } else {
+                f.render_widget(block, area);
+            }
+        }
+        WidgetType::ConnectionCode => {
+            super::render::render_connection_code_widget(f, ctx, area, block, custom_lines);
+        }
+        WidgetType::Empty => {
+            f.render_widget(block, area);
         }
     }
 }
@@ -821,7 +987,7 @@ fn collect_bindings_recursive(
                         b.agent_index.unwrap_or(default_agent),
                         b.pty_index.unwrap_or(default_pty),
                     ),
-                    None => (default_agent, default_pty),
+                    _ => (default_agent, default_pty),
                 };
                 set.insert((agent_idx, pty_idx));
             }
@@ -881,7 +1047,7 @@ mod tests {
         let lua = mlua::Lua::new();
         lua.load(
             r#"
-            return { type = "agent_list", block = { title = " Agents ", borders = "all" } }
+            return { type = "empty", block = { title = " Agents ", borders = "all" } }
         "#,
         )
         .eval::<LuaTable>()
@@ -889,7 +1055,7 @@ mod tests {
             let node = RenderNode::from_lua_table(&table).unwrap();
             match node {
                 RenderNode::Widget { widget_type, block, .. } => {
-                    assert!(matches!(widget_type, WidgetType::AgentList));
+                    assert!(matches!(widget_type, WidgetType::Empty));
                     assert!(block.is_some());
                     let block = block.unwrap();
                     assert_eq!(block.title.as_ref().and_then(|t| t.as_plain_str()), Some(" Agents "));
@@ -912,7 +1078,7 @@ mod tests {
                 type = "hsplit",
                 constraints = { "30%", "70%" },
                 children = {
-                    { type = "agent_list" },
+                    { type = "empty" },
                     { type = "terminal" },
                 }
             }
@@ -978,7 +1144,7 @@ mod tests {
                 type = "hsplit",
                 constraints = { "30%", "70%" },
                 children = {
-                    { type = "agent_list" },
+                    { type = "empty" },
                 }
             }
         "#,
@@ -1014,7 +1180,7 @@ mod tests {
                 r#"
             return {
                 type = "paragraph",
-                lines = { "Line 1", "Line 2", "Line 3" },
+                props = { lines = { "Line 1", "Line 2", "Line 3" } },
                 block = { title = " Info ", borders = "all" }
             }
         "#,
@@ -1026,13 +1192,97 @@ mod tests {
         match node {
             RenderNode::Widget {
                 widget_type,
-                custom_lines,
+                props,
                 ..
             } => {
-                assert!(matches!(widget_type, WidgetType::Empty));
-                let lines = custom_lines.expect("paragraph should have custom_lines");
-                assert_eq!(lines.len(), 3);
-                assert_eq!(lines[0], "Line 1");
+                assert!(matches!(widget_type, WidgetType::Paragraph));
+                let WidgetProps::Paragraph(para) = props.expect("should have props") else {
+                    panic!("Expected Paragraph props");
+                };
+                assert_eq!(para.lines.len(), 3);
+                assert_eq!(para.lines[0], "Line 1");
+            }
+            _ => panic!("Expected Widget node"),
+        }
+    }
+
+    #[test]
+    fn test_parse_list_widget() {
+        let lua = mlua::Lua::new();
+        let table: LuaTable = lua
+            .load(
+                r#"
+            return {
+                type = "list",
+                block = { title = " Items ", borders = "all" },
+                props = {
+                    items = {
+                        "plain item",
+                        { text = "Header", header = true },
+                        { text = "styled", style = { fg = "cyan" } },
+                    },
+                    selected = 1,
+                    highlight_symbol = ">> ",
+                },
+            }
+        "#,
+            )
+            .eval()
+            .unwrap();
+
+        let node = RenderNode::from_lua_table(&table).unwrap();
+        match node {
+            RenderNode::Widget {
+                widget_type,
+                props,
+                ..
+            } => {
+                assert!(matches!(widget_type, WidgetType::List));
+                let WidgetProps::List(list) = props.expect("should have props") else {
+                    panic!("Expected List props");
+                };
+                assert_eq!(list.items.len(), 3);
+                assert!(!list.items[0].header);
+                assert!(list.items[1].header);
+                assert_eq!(list.selected, Some(1));
+                assert_eq!(list.highlight_symbol.as_deref(), Some(">> "));
+            }
+            _ => panic!("Expected Widget node"),
+        }
+    }
+
+    #[test]
+    fn test_parse_input_widget() {
+        let lua = mlua::Lua::new();
+        let table: LuaTable = lua
+            .load(
+                r#"
+            return {
+                type = "input",
+                block = { title = " Enter name ", borders = "all" },
+                props = {
+                    lines = { "Type a name:" },
+                    value = "hello",
+                },
+            }
+        "#,
+            )
+            .eval()
+            .unwrap();
+
+        let node = RenderNode::from_lua_table(&table).unwrap();
+        match node {
+            RenderNode::Widget {
+                widget_type,
+                props,
+                ..
+            } => {
+                assert!(matches!(widget_type, WidgetType::Input));
+                let WidgetProps::Input(input) = props.expect("should have props") else {
+                    panic!("Expected Input props");
+                };
+                assert_eq!(input.lines.len(), 1);
+                assert_eq!(input.value, "hello");
             }
             _ => panic!("Expected Widget node"),
         }
@@ -1107,7 +1357,7 @@ mod tests {
                         type = "hsplit",
                         constraints = { "30%", "70%" },
                         children = {
-                            { type = "agent_list", block = { title = " Agents ", borders = "all" } },
+                            { type = "empty", block = { title = " Agents ", borders = "all" } },
                             { type = "terminal", block = { title = " Terminal ", borders = "all" } },
                         }
                     },
@@ -1136,17 +1386,15 @@ mod tests {
         }
     }
 
-    // === Modal Widget Type Parsing ===
+    // === Widget Type Parsing ===
 
     #[test]
-    fn test_parse_modal_widget_types() {
+    fn test_parse_all_widget_types() {
         let lua = mlua::Lua::new();
         let types = [
-            ("worktree_select", "WorktreeSelect"),
-            ("text_input", "TextInput"),
-            ("close_confirm", "CloseConfirm"),
+            ("terminal", "Terminal"),
             ("connection_code", "ConnectionCode"),
-            ("error", "Error"),
+            ("empty", "Empty"),
         ];
 
         for (type_str, label) in &types {
@@ -1169,7 +1417,7 @@ mod tests {
         let lua = mlua::Lua::new();
 
         let child = lua.create_table().unwrap();
-        child.set("type", "menu").unwrap();
+        child.set("type", "list").unwrap();
         let block_t = lua.create_table().unwrap();
         block_t.set("title", " Menu ").unwrap();
         block_t.set("borders", "all").unwrap();
@@ -1192,7 +1440,7 @@ mod tests {
                 assert_eq!(*height_pct, 40);
                 match child.as_ref() {
                     RenderNode::Widget { widget_type, block, .. } => {
-                        assert!(matches!(widget_type, WidgetType::Menu));
+                        assert!(matches!(widget_type, WidgetType::List));
                         let b = block.as_ref().unwrap();
                         assert_eq!(b.title.as_ref().and_then(|t| t.as_plain_str()), Some(" Menu "));
                     }
@@ -1293,7 +1541,7 @@ mod tests {
             ],
             children: vec![
                 RenderNode::Widget {
-                    widget_type: WidgetType::AgentList,
+                    widget_type: WidgetType::List,
                     block: None,
                     custom_lines: None,
                     props: None,
