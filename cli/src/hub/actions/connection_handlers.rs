@@ -4,21 +4,22 @@
 
 use crate::hub::Hub;
 
-/// Handle copying connection URL to clipboard.
+/// Handle copying connection URL to clipboard via OSC 52.
 ///
-/// Generates the connection URL fresh from the current device key bundle rather than
-/// using a cache. This ensures the copied URL always contains the current bundle.
+/// Uses the OSC 52 terminal escape sequence to set the clipboard on the
+/// user's local terminal. Works over SSH, tmux, and other remote sessions
+/// (unlike arboard which requires a local display server).
 pub fn handle_copy_connection_url(hub: &mut Hub) {
-    // Generate URL fresh from current device key bundle (canonical source)
+    use base64::Engine;
+
     match hub.generate_connection_url() {
-        Ok(url) => match arboard::Clipboard::new() {
-            Ok(mut clipboard) => {
-                if clipboard.set_text(url).is_ok() {
-                    log::info!("Connection URL copied to clipboard");
-                }
-            }
-            Err(e) => log::warn!("Could not access clipboard: {}", e),
-        },
+        Ok(url) => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&url);
+            // OSC 52: \x1b]52;c;<base64>\x07
+            // "c" = clipboard selection, BEL (\x07) terminates
+            print!("\x1b]52;c;{}\x07", encoded);
+            log::info!("Connection URL sent to clipboard via OSC 52");
+        }
         Err(e) => log::warn!("Cannot copy connection URL: {}", e),
     }
 }

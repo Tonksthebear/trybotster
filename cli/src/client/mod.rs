@@ -2,6 +2,7 @@
 //!
 //! This module provides:
 //! - `ClientId` — unique identifier for client sessions (TUI, browser, internal)
+//! - `TuiRequest` — messages from TuiRunner to Hub (JSON control + raw PTY input)
 //! - `TuiOutput` — messages from Hub to TuiRunner (PTY output, Lua events)
 //! - `CreateAgentRequest` / `DeleteAgentRequest` — client-layer agent operation types
 //!
@@ -10,20 +11,21 @@
 //! ```text
 //! TuiRunner (rendering, keyboard)
 //!   │
-//!   ├── serde_json::Value ──► Hub ──► lua.call_tui_message() ──► client.lua
-//!   ◄── TuiOutput::Message  ◄── Lua tui.send() (events, subscriptions)
-//!   ◄── TuiOutput::Output   ◄── Lua PTY forwarder tasks
+//!   ├── TuiRequest::LuaMessage ──► Hub ──► lua.call_tui_message() ──► client.lua
+//!   ├── TuiRequest::PtyInput   ──► Hub ──► pty.write_input_direct() (raw bytes)
+//!   ◄── TuiOutput::Message     ◄── Lua tui.send() (events, subscriptions)
+//!   ◄── TuiOutput::Output      ◄── Lua PTY forwarder tasks
 //! ```
 //!
-//! ALL TUI operations flow as JSON through `client.lua` — the same
-//! protocol as browser clients. No Rust-side shortcuts.
+//! Control operations (resize, subscriptions, agent lifecycle) flow as JSON
+//! through `client.lua`. PTY keyboard input bypasses Lua as raw bytes.
 
 // Rust guideline compliant 2026-02
 
 mod tui;
 mod types;
 
-pub use tui::TuiOutput;
+pub use tui::{TuiOutput, TuiRequest};
 pub use types::{CreateAgentRequest, DeleteAgentRequest};
 
 /// Unique identifier for a client session.

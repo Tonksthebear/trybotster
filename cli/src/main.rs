@@ -13,7 +13,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableMouseCapture, EnableMouseCapture, PopKeyboardEnhancementFlags},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -279,6 +279,10 @@ fn run_with_tui() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
+    // Kitty keyboard protocol is NOT pushed here — it's mirrored dynamically
+    // from the inner PTY's state by sync_terminal_modes() in the event loop.
+
     let _terminal_guard = tui::TerminalGuard::new();
 
     let backend = CrosstermBackend::new(stdout);
@@ -402,6 +406,12 @@ fn main() -> Result<()> {
 
         // Ensure terminal is cleaned up before printing panic
         let _ = disable_raw_mode();
+
+        // Reset mirrored terminal modes
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1l");    // Reset DECCKM
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?2004l"); // Reset bracketed paste
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+
         let _ = execute!(
             std::io::stdout(),
             LeaveAlternateScreen,

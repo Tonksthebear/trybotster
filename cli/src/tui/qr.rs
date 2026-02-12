@@ -21,6 +21,10 @@ pub struct ConnectionCodeData {
     pub url: String,
     /// ASCII art lines of the QR code using Unicode half-blocks.
     pub qr_ascii: Vec<String>,
+    /// QR code width in terminal columns.
+    pub qr_width: u16,
+    /// QR code height in terminal rows.
+    pub qr_height: u16,
 }
 
 /// Build mixed-mode QR segments: byte for URL, alphanumeric for Base32 bundle.

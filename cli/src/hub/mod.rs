@@ -250,7 +250,7 @@ pub struct Hub {
     /// Receiver for TUI requests from TuiRunner.
     ///
     /// Set by `register_tui_via_lua()`. Polled by `poll_tui_requests()`.
-    tui_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>,
+    tui_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::TuiRequest>>,
 }
 
 impl std::fmt::Debug for Hub {
@@ -640,14 +640,14 @@ impl Hub {
     ///
     /// # Arguments
     ///
-    /// * `request_rx` - Receiver for JSON messages from TuiRunner
+    /// * `request_rx` - Receiver for TUI requests (JSON + raw PTY input)
     ///
     /// # Returns
     ///
     /// Receiver for TuiOutput messages to TuiRunner.
     pub fn register_tui_via_lua(
         &mut self,
-        request_rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+        request_rx: tokio::sync::mpsc::UnboundedReceiver<crate::client::TuiRequest>,
     ) -> tokio::sync::mpsc::UnboundedReceiver<crate::client::TuiOutput> {
         use crate::client::TuiOutput;
 

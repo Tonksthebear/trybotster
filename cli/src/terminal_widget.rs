@@ -104,6 +104,12 @@ fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer) {
     for row in 0..area.height {
         for col in 0..area.width {
             if let Some(cell) = screen.cell(row, col) {
+                // Skip continuation cells — the wide char was already rendered
+                // by its first cell via set_symbol (which handles multi-width).
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+
                 let buf_x = area.x + col;
                 let buf_y = area.y + row;
 
@@ -171,6 +177,9 @@ fn apply_cell(vt_cell: &vt100::Cell, buf_cell: &mut ratatui::buffer::Cell) {
     }
     if vt_cell.inverse() {
         style = style.add_modifier(Modifier::REVERSED);
+    }
+    if vt_cell.dim() {
+        style = style.add_modifier(Modifier::DIM);
     }
 
     buf_cell.set_style(style);
