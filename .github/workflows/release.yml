@@ -77,6 +77,13 @@ jobs:
         with:
           tool: cross
 
+      - name: Set version from git tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" cli/Cargo.toml
+          rm -f cli/Cargo.toml.bak
+          echo "Building version: ${VERSION}"
+
       - name: Build release binary
         run: |
           cd cli
