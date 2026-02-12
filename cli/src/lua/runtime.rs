@@ -574,9 +574,19 @@ impl LuaRuntime {
         let version_file = data_dir.join(".version");
         let current_version = env!("CARGO_PKG_VERSION");
 
+        // Include a content hash so Lua changes during development (same version) trigger re-extraction
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (path, content) in files {
+            path.hash(&mut hasher);
+            content.hash(&mut hasher);
+        }
+        let content_hash = hasher.finish();
+        let version_marker = format!("{}-{:016x}", current_version, content_hash);
+
         let needs_extract = if version_file.exists() {
             let existing = std::fs::read_to_string(&version_file).unwrap_or_default();
-            existing.trim() != current_version
+            existing.trim() != version_marker
         } else {
             true
         };
@@ -606,7 +616,7 @@ impl LuaRuntime {
                 .context("Failed to create improvements directory")?;
 
             // Write version marker last (so partial extraction retries)
-            std::fs::write(&version_file, current_version)
+            std::fs::write(&version_file, &version_marker)
                 .context("Failed to write version file")?;
 
             log::info!("Lua extraction complete");
