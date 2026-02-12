@@ -93,7 +93,10 @@ end
 -- Helper: Build worktree items from state
 -- =============================================================================
 local function build_worktree_items(state)
-  local items = { { text = "[Create New Worktree]" } }
+  local items = {
+    { text = "[Use Main Branch]" },
+    { text = "[Create New Worktree]" },
+  }
   for _, wt in ipairs(state.available_worktrees or {}) do
     table.insert(items, { text = string.format("%s (%s)", wt.branch, wt.path) })
   end
@@ -115,7 +118,7 @@ function render(state)
     agent_selected = agent_selected + 1
   end
 
-  -- Terminal title: branch name, session view, scroll indicator
+  -- Terminal title: branch name, session view, scroll indicator, mode
   local term_title = " Terminal [No agent selected] "
   if state.selected_agent then
     local sa = state.selected_agent
@@ -130,8 +133,16 @@ function render(state)
     if state.is_scrolled then
       scroll = string.format(" [SCROLLBACK +%d | Shift+End: live]", state.scroll_offset)
     end
-    term_title = string.format(" %s %s%s [Ctrl+P | Ctrl+J/K | Shift+PgUp/Dn scroll] ",
-      sa.branch_name, view, scroll)
+    local mode_hint = ""
+    if state.mode == "normal" then
+      mode_hint = " NORMAL [i: insert] "
+    elseif state.mode == "insert" then
+      mode_hint = " INSERT [Esc: normal] "
+    end
+    term_title = {
+      { text = string.format(" %s %s%s ", sa.branch_name, view, scroll) },
+      { text = mode_hint, style = { fg = state.mode == "insert" and "green" or "yellow" } },
+    }
   end
 
   -- Build terminal panel: side-by-side if 2+ agents, single otherwise

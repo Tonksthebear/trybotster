@@ -428,7 +428,11 @@ impl Hub {
                         let peer = crate::channel::PeerId(peer_id.clone());
                         let _guard = self.tokio_runtime.enter();
                         if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&payload, &peer)) {
-                            log::warn!("[WebRTC] Lua send failed: {e}");
+                            if matches!(e, crate::channel::ChannelError::BufferFull) {
+                                log::trace!("[WebRTC] Lua send skipped (buffer full)");
+                            } else {
+                                log::warn!("[WebRTC] Lua send failed: {e}");
+                            }
                         }
                     } else {
                         log::debug!("[WebRTC] Lua send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
@@ -439,7 +443,11 @@ impl Hub {
                         let peer = crate::channel::PeerId(peer_id.clone());
                         let _guard = self.tokio_runtime.enter();
                         if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&data, &peer)) {
-                            log::warn!("[WebRTC] Lua binary send failed: {e}");
+                            if matches!(e, crate::channel::ChannelError::BufferFull) {
+                                log::trace!("[WebRTC] Lua binary send skipped (buffer full)");
+                            } else {
+                                log::warn!("[WebRTC] Lua binary send failed: {e}");
+                            }
                         }
                     } else {
                         log::debug!("[WebRTC] Lua binary send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
@@ -1180,7 +1188,11 @@ impl Hub {
                 if let Err(e) = self.tokio_runtime.block_on(
                     channel.send_stream_raw(frame.frame_type, frame.stream_id, &frame.payload, &peer),
                 ) {
-                    log::warn!("[StreamMux] Failed to send frame: {e}");
+                    if matches!(e, crate::channel::ChannelError::BufferFull) {
+                        log::trace!("[StreamMux] Frame send skipped (buffer full)");
+                    } else {
+                        log::warn!("[StreamMux] Failed to send frame: {e}");
+                    }
                 }
             }
         }
@@ -1209,7 +1221,13 @@ impl Hub {
         if let Err(e) = self.tokio_runtime.block_on(
             channel.send_pty_raw(subscription_id, &data, &peer)
         ) {
-            log::warn!("[WebRTC] Failed to send PTY data: {e}");
+            // Buffer-full is expected when peer is unreachable (phone locked);
+            // log at trace to avoid spamming during normal disconnects.
+            if matches!(e, crate::channel::ChannelError::BufferFull) {
+                log::trace!("[WebRTC] PTY send skipped (buffer full)");
+            } else {
+                log::warn!("[WebRTC] Failed to send PTY data: {e}");
+            }
         }
     }
 
