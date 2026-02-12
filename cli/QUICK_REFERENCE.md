@@ -3,12 +3,12 @@
 ## Starting the TUI
 
 ```bash
-cd botster_hub_rs
+cd botster_rs
 cargo run -- start
 
 # Or with release build
 cargo build --release
-./target/release/botster-hub start
+./target/release/botster start
 ```
 
 ## Keyboard Shortcuts

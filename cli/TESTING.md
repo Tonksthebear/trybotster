@@ -1,6 +1,6 @@
-# Rust Testing Guide for botster-hub
+# Rust Testing Guide for botster
 
-Complete guide to testing the botster-hub Rust CLI application.
+Complete guide to testing the botster Rust CLI application.
 
 ## Table of Contents
 
@@ -55,7 +55,7 @@ cargo test -- --test-threads=4
 ### Project Structure
 
 ```
-botster_hub/
+botster/
 ├── src/
 │   ├── main.rs          # CLI entry point
 │   ├── lib.rs           # Library exports
@@ -170,7 +170,7 @@ Create files in `tests/` directory:
 ```rust
 // tests/agent_test.rs
 
-use botster_hub::Agent;
+use botster::Agent;
 use std::path::PathBuf;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -332,7 +332,7 @@ use predicates::prelude::*;
 
 #[test]
 fn test_status_command() {
-    let mut cmd = Command::cargo_bin("botster-hub").unwrap();
+    let mut cmd = Command::cargo_bin("botster").unwrap();
     cmd.arg("status")
         .assert()
         .success();
@@ -340,12 +340,12 @@ fn test_status_command() {
 
 #[test]
 fn test_config_set_and_get() {
-    let mut cmd = Command::cargo_bin("botster-hub").unwrap();
+    let mut cmd = Command::cargo_bin("botster").unwrap();
     cmd.args(&["config", "test_key", "test_value"])
         .assert()
         .success();
 
-    let mut cmd = Command::cargo_bin("botster-hub").unwrap();
+    let mut cmd = Command::cargo_bin("botster").unwrap();
     cmd.args(&["config", "test_key"])
         .assert()
         .success()
@@ -429,7 +429,7 @@ fn test_worktree_operations() {
 ```rust
 // tests/git_test.rs
 
-use botster_hub::WorktreeManager;
+use botster::WorktreeManager;
 use std::path::PathBuf;
 
 #[test]
@@ -668,7 +668,7 @@ fn test_concurrent_agent_access() {
 ```rust
 // tests/agent_test.rs
 
-use botster_hub::Agent;
+use botster::Agent;
 
 #[test]
 fn test_agent_lifecycle() {
@@ -695,7 +695,7 @@ fn test_agent_lifecycle() {
 ```rust
 // tests/config_test.rs
 
-use botster_hub::Config;
+use botster::Config;
 
 #[test]
 fn test_config_set_and_get() {
@@ -710,7 +710,7 @@ fn test_config_set_and_get() {
 ```rust
 // tests/prompt_test.rs
 
-use botster_hub::PromptManager;
+use botster::PromptManager;
 
 #[test]
 fn test_prompt_generation() {
@@ -753,7 +753,7 @@ jobs:
 
 ## Summary
 
-### Test Strategy for botster-hub
+### Test Strategy for botster
 
 1. **Unit Tests** (`#[cfg(test)]` in source files):
    - Pure functions

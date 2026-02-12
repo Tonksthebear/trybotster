@@ -33,13 +33,13 @@ fn ensure_test_env() {
 /// Path to the release binary (built by cargo build --release)
 fn get_binary_path() -> std::path::PathBuf {
     // current_exe() returns something like target/debug/deps/signal_handling_test-xxx
-    // We need to get to target/release/botster-hub
+    // We need to get to target/release/botster
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // Remove test binary name (signal_handling_test-xxx)
     path.pop(); // Remove deps
     path.pop(); // Remove debug
     path.push("release");
-    path.push("botster-hub");
+    path.push("botster");
     path
 }
 
@@ -110,7 +110,7 @@ fn test_help_command_exits_immediately() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("botster-hub") || stdout.contains("Usage"),
+        stdout.contains("botster") || stdout.contains("Usage"),
         "Unexpected --help output: {}",
         stdout
     );
@@ -146,7 +146,7 @@ fn test_version_command_exits_immediately() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("botster-hub"),
+        stdout.contains("botster"),
         "Unexpected --version output: {}",
         stdout
     );
@@ -288,7 +288,7 @@ fn test_invalid_command_fails() {
 //    $ cargo build --release
 //
 // 2. Start the CLI in a terminal:
-//    $ ./target/release/botster-hub start
+//    $ ./target/release/botster start
 //
 // 3. Test Ctrl+Q (application quit):
 //    - Press Ctrl+Q

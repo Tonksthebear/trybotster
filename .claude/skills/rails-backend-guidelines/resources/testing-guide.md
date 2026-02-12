@@ -45,7 +45,7 @@ Standard transactional tests. Use fixtures. Test validations, scopes, instance m
 Test API endpoints the CLI calls. Include `ApiTestHelper` for auth. Transactional.
 
 ### CLI integration tests (`CliIntegrationTestCase`)
-Spawn a real `botster-hub` binary against a real Puma server. **Non-transactional** because the CLI process is a separate OS process that needs to see committed data. Inherit from `CliIntegrationTestCase`.
+Spawn a real `botster` binary against a real Puma server. **Non-transactional** because the CLI process is a separate OS process that needs to see committed data. Inherit from `CliIntegrationTestCase`.
 
 ### System tests (`ApplicationSystemTestCase`)
 Selenium + headless Chrome + real CLI. **Non-transactional**. Use Warden test helpers for auth.
@@ -161,7 +161,7 @@ wait_until(timeout: 10, message: -> { "Status: #{record.status}" }) { record.don
 
 ### `CliTestHelper` — spawn real CLI binary
 
-Used by `CliIntegrationTestCase` and system tests. Spawns `target/debug/botster-hub` as an OS process.
+Used by `CliIntegrationTestCase` and system tests. Spawns `target/debug/botster` as an OS process.
 
 ```ruby
 class MyCliTest < CliIntegrationTestCase

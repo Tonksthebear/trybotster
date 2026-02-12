@@ -12,7 +12,7 @@
 //! # Example
 //!
 //! ```
-//! use botster_hub::agent::notification::{detect_notifications, AgentNotification};
+//! use botster::agent::notification::{detect_notifications, AgentNotification};
 //!
 //! let data = b"\x1b]9;Build complete\x07";
 //! let notifications = detect_notifications(data);

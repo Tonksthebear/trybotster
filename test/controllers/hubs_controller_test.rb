@@ -34,7 +34,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_response :success
 
     assert_select "h2", text: /No Active Hubs/
-    assert_match "botster-hub", response.body
+    assert_match "botster", response.body
   end
 
   # === Show HTML Tests ===

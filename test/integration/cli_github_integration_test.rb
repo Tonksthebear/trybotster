@@ -216,7 +216,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       "BOTSTER_HUB_ID" => hub.identifier,
       "BOTSTER_REPO" => TEST_REPO,
       "BOTSTER_WORKTREE_BASE" => worktree_base,
-      "RUST_LOG" => options[:log_level] || "info,botster_hub=debug"
+      "RUST_LOG" => options[:log_level] || "info,botster=debug"
     }
 
     Rails.logger.info "[CliGithubTest] Starting CLI in git repo: #{temp_dir}"
@@ -238,7 +238,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     stdout_w.close
     stderr_w.close
 
-    log_file_path = File.join(temp_dir, "botster-hub.log")
+    log_file_path = File.join(temp_dir, "botster.log")
 
     cli = CliTestHelper::CliProcess.new(
       pid: pid,
@@ -373,8 +373,8 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     wait_until(
       timeout: timeout,
       message: -> {
-        cli_log = @git_repo_path && File.exist?(File.join(@git_repo_path, "botster-hub.log")) ?
-          File.read(File.join(@git_repo_path, "botster-hub.log")).lines.last(80).join : "no log file"
+        cli_log = @git_repo_path && File.exist?(File.join(@git_repo_path, "botster.log")) ?
+          File.read(File.join(@git_repo_path, "botster.log")).lines.last(80).join : "no log file"
         cli_output = @started_clis&.first&.recent_output || "no output"
         "Message #{message.id} not acked within #{timeout}s (status: #{message.reload.status})\n\nCLI LOG:\n#{cli_log}\n\nCLI OUTPUT:\n#{cli_output}"
       }

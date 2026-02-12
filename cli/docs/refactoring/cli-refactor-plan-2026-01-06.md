@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-The botster-hub CLI has evolved organically and now contains several large modules that violate the single responsibility principle. The primary issues are:
+The botster CLI has evolved organically and now contains several large modules that violate the single responsibility principle. The primary issues are:
 
 1. **Hub as God Object** (1,769 LOC) - Mixes orchestration, server polling, browser communication, and UI state
 2. **Agent doing too much** (1,335 LOC) - PTY management, screen rendering, scrolling, and notifications intertwined
@@ -868,7 +868,7 @@ After the previous phases, evaluate whether to split into crates:
 | `botster-agent` | Agent, PtySession, ScrollState | vt100, portable-pty |
 | `botster-relay` | TerminalRelay, crypto, protocol | crypto_box, tokio-tungstenite |
 | `botster-git` | WorktreeManager | git2, globset |
-| `botster-hub-core` | Hub, HubAction, HubState | botster-agent, botster-relay |
+| `botster-core` | Hub, HubAction, HubState | botster-agent, botster-relay |
 
 ### Decision Criteria
 

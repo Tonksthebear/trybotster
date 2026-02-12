@@ -24,11 +24,11 @@ description = "Starts the MCP server"
 
 [tasks.build_hub]
 run = "cd cli && cargo build --release"
-description = "Build botster-hub release binary"
+description = "Build botster release binary"
 
 [tasks.install_hub]
-run = "cd cli && cargo build --release && cp target/release/botster-hub ~/bin/"
-description = "Build and install botster-hub to ~/bin"
+run = "cd cli && cargo build --release && cp target/release/botster ~/bin/"
+description = "Build and install botster to ~/bin"
 
 [tasks.install_hub_release]
 run = '''
@@ -53,19 +53,19 @@ fi
 LATEST_VERSION=$(curl -s https://api.github.com/repos/Tonksthebear/trybotster/releases/latest | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
 echo "Latest version: $LATEST_VERSION"
 
-BINARY_NAME="botster-hub-$PLATFORM"
+BINARY_NAME="botster-$PLATFORM"
 DOWNLOAD_URL="https://github.com/Tonksthebear/trybotster/releases/download/v${LATEST_VERSION}/${BINARY_NAME}"
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 
 # Download binary
 echo "Downloading $BINARY_NAME..."
-curl -L -o "/tmp/botster-hub" "$DOWNLOAD_URL"
+curl -L -o "/tmp/botster" "$DOWNLOAD_URL"
 
 # Download and verify checksum
 echo "Verifying checksum..."
-curl -L -o "/tmp/botster-hub.sha256" "$CHECKSUM_URL"
+curl -L -o "/tmp/botster.sha256" "$CHECKSUM_URL"
 cd /tmp
-if shasum -a 256 -c botster-hub.sha256; then
+if shasum -a 256 -c botster.sha256; then
   echo "✓ Checksum verified"
 else
   echo "✗ Checksum verification failed!"
@@ -74,13 +74,13 @@ fi
 
 # Install to ~/bin
 mkdir -p ~/bin
-mv /tmp/botster-hub ~/bin/botster-hub
-chmod +x ~/bin/botster-hub
-rm /tmp/botster-hub.sha256
+mv /tmp/botster ~/bin/botster
+chmod +x ~/bin/botster
+rm /tmp/botster.sha256
 
-echo "✓ Installed botster-hub v$LATEST_VERSION to ~/bin/botster-hub"
+echo "✓ Installed botster v$LATEST_VERSION to ~/bin/botster"
 '''
-description = "Download and install latest botster-hub release from GitHub"
+description = "Download and install latest botster release from GitHub"
 
 [tasks.release_hub]
 run = '''

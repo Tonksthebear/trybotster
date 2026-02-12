@@ -23,7 +23,7 @@ fn ensure_test_env() {
 
 /// Helper to set up a temporary config directory for tests
 fn setup_test_env() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
-    use botster_hub::Config;
+    use botster::Config;
 
     // Ensure BOTSTER_ENV=test is set before any keyring operations
     ensure_test_env();
@@ -90,7 +90,7 @@ fn create_empty_config(config_dir: &PathBuf, server_url: &str) {
 
 mod validate_token_tests {
     use super::*;
-    use botster_hub::auth;
+    use botster::auth;
 
     #[test]
     fn returns_false_for_empty_token() {
@@ -108,7 +108,7 @@ mod validate_token_tests {
 
 mod config_tests {
     use super::*;
-    use botster_hub::Config;
+    use botster::Config;
 
     // NOTE: Token is stored in the system keyring and can be overridden via BOTSTER_TOKEN env var.
     // These tests verify the env var override behavior which is the supported path for CI/CD.
@@ -208,7 +208,7 @@ mod config_tests {
 
 /// Tests that verify the auth module response parsing
 mod auth_response_parsing {
-    use botster_hub::auth::{DeviceCodeResponse, ErrorResponse, TokenResponse};
+    use botster::auth::{DeviceCodeResponse, ErrorResponse, TokenResponse};
 
     #[test]
     fn parses_device_code_response() {

@@ -1,4 +1,4 @@
-//! UI rendering utilities for the botster-hub TUI.
+//! UI rendering utilities for the botster TUI.
 //!
 //! This module provides helper functions for rendering the TUI,
 //! including layout helpers and ANSI conversion for WebRTC streaming.
@@ -39,7 +39,7 @@ use std::fmt::Write;
 ///
 /// ```ignore
 /// use ratatui::layout::Rect;
-/// use botster_hub::app::ui::centered_rect;
+/// use botster::app::ui::centered_rect;
 ///
 /// let parent = Rect::new(0, 0, 100, 50);
 /// let modal = centered_rect(50, 30, parent);

@@ -13,8 +13,8 @@ else
   echo "Using prompt from BOTSTER_TASK_DESCRIPTION env var"
 fi
 
-# Auto-trust the worktree in Claude config using botster-hub's JSON tools
-"$BOTSTER_HUB_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
+# Auto-trust the worktree in Claude config using botster's JSON tools
+"$BOTSTER_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
 
 # Note: We detect when Claude asks questions by scanning for UI patterns like
 # "Enter to select" and "Tab/Arrow keys to navigate" in the terminal output.
@@ -37,7 +37,7 @@ else
 fi
 echo "Worktree: $BOTSTER_WORKTREE_PATH"
 
-# Server is now spawned in a separate PTY by botster-hub (Ctrl+T to toggle view)
+# Server is now spawned in a separate PTY by botster (Ctrl+T to toggle view)
 
 # Start Claude with the prompt
 claude --permission-mode acceptEdits "$BOTSTER_PROMPT"

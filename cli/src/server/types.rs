@@ -1,4 +1,4 @@
-//! Server communication types for the botster-hub API.
+//! Server communication types for the botster API.
 //!
 //! This module defines the data structures used for serialization and
 //! deserialization when communicating with the Rails server.

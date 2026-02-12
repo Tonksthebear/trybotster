@@ -672,11 +672,11 @@ impl WorktreeManager {
                         worktree_path.to_str().expect("path is valid UTF-8"),
                     )
                     .env(
-                        "BOTSTER_HUB_BIN",
+                        "BOTSTER_BIN",
                         std::env::current_exe()
                             .ok()
                             .and_then(|p| p.to_str().map(std::string::ToString::to_string))
-                            .unwrap_or_else(|| "botster-hub".to_string()),
+                            .unwrap_or_else(|| "botster".to_string()),
                     )
                     .output()?;
 
@@ -793,11 +793,11 @@ impl WorktreeManager {
                         worktree_path.to_str().expect("path is valid UTF-8"),
                     )
                     .env(
-                        "BOTSTER_HUB_BIN",
+                        "BOTSTER_BIN",
                         std::env::current_exe()
                             .ok()
                             .and_then(|p| p.to_str().map(std::string::ToString::to_string))
-                            .unwrap_or_else(|| "botster-hub".to_string()),
+                            .unwrap_or_else(|| "botster".to_string()),
                     )
                     .output()?;
 

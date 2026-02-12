@@ -48,16 +48,16 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: botster-hub-macos-arm64
+            artifact_name: botster-macos-arm64
           - os: macos-15-intel # Intel runner (available until Aug 2027)
             target: x86_64-apple-darwin
-            artifact_name: botster-hub-macos-x86_64
+            artifact_name: botster-macos-x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: botster-hub-linux-x86_64
+            artifact_name: botster-linux-x86_64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact_name: botster-hub-linux-arm64
+            artifact_name: botster-linux-arm64
             use_cross: true
 
     runs-on: ${{ matrix.os }}
@@ -95,7 +95,7 @@ jobs:
 
       - name: Rename binary
         run: |
-          cp cli/target/${{ matrix.target }}/release/botster-hub ${{ matrix.artifact_name }}
+          cp cli/target/${{ matrix.target }}/release/botster ${{ matrix.artifact_name }}
 
       - name: Create checksum
         run: |

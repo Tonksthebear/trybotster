@@ -8,7 +8,7 @@
 
 ## 1. Overview
 
-This document describes a refactor of the client/PTY architecture in botster-hub to achieve:
+This document describes a refactor of the client/PTY architecture in botster to achieve:
 
 - **Clean separation of concerns** - PTY Sessions handle I/O, Clients handle transport
 - **Event-driven pub/sub** - Components communicate via broadcast events, not direct calls

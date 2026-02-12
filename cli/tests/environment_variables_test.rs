@@ -1,11 +1,11 @@
 //! Comprehensive tests for environment variable handling.
 //!
-//! Tests use BOTSTER_CONFIG_DIR to isolate from real user config at ~/.botster_hub.
+//! Tests use BOTSTER_CONFIG_DIR to isolate from real user config at ~/.botster.
 //! Tests are serialized via ENV_LOCK mutex to prevent env var contamination.
 
 // Rust guideline compliant 2025-01
 
-use botster_hub::Config;
+use botster::Config;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Mutex;

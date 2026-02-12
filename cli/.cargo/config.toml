@@ -1,4 +1,4 @@
-# Cargo configuration for botster-hub
+# Cargo configuration for botster
 #
 # IMPORTANT FOR AGENTS: Do NOT run `cargo test` directly!
 # Instead, use: ./test.sh

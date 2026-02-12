@@ -19,7 +19,7 @@ GitHub webhook → Rails server → Message queue → Rust daemon polls
 - MCP tools for agents (GitHub operations)
 - User auth via GitHub OAuth
 
-**Rust daemon** (botster-hub):
+**Rust daemon** (botster):
 
 - TUI with ratatui
 - Polls Rails for messages, manages agent lifecycle

@@ -1,4 +1,4 @@
-//! Application utilities for the botster-hub TUI.
+//! Application utilities for the botster TUI.
 //!
 //! This module contains UI utility functions used by the TUI rendering layer.
 

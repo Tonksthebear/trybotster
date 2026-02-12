@@ -1,6 +1,6 @@
 /// Test that reproduces the exact bug: "Failed to remove worktree: fatal: '/path' is a main working tree"
 /// This happens when delete_worktree_by_path is called while cwd is the main repo
-use botster_hub::WorktreeManager;
+use botster::WorktreeManager;
 use std::env;
 use std::process::Command;
 use tempfile::TempDir;

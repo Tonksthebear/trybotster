@@ -1,4 +1,4 @@
-//! Self-update functionality for botster-hub.
+//! Self-update functionality for botster.
 //!
 //! Provides commands to check for updates and automatically download/install
 //! new versions from GitHub releases. Includes a boot-time update check that
@@ -12,10 +12,10 @@
 //!
 //! ```bash
 //! # Check if updates are available
-//! botster-hub update-check
+//! botster update-check
 //!
 //! # Download and install the latest version
-//! botster-hub update
+//! botster update
 //! ```
 
 use anyhow::Result;
@@ -23,7 +23,7 @@ use semver::Version;
 use serde_json::Value;
 use std::time::Duration;
 
-/// The current version of botster-hub, derived from Cargo.toml.
+/// The current version of botster, derived from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// GitHub API URL for fetching the latest release information.
@@ -35,7 +35,7 @@ const GITHUB_RELEASES_DOWNLOAD: &str =
     "https://github.com/Tonksthebear/trybotster/releases/download";
 
 /// User-Agent header value for GitHub API requests.
-const USER_AGENT: &str = "botster-hub";
+const USER_AGENT: &str = "botster";
 
 /// Timeout for the boot-time version fetch.
 /// Short to avoid delaying startup when offline or GitHub is slow.
@@ -144,7 +144,7 @@ pub fn check_on_boot_headless() -> Result<()> {
 
     if let (Some(cur), Some(lat)) = (current, latest) {
         if lat > cur {
-            log::warn!("Update available: v{VERSION} -> v{latest_str}. Run 'botster-hub update' to install.");
+            log::warn!("Update available: v{VERSION} -> v{latest_str}. Run 'botster update' to install.");
         }
     }
 
@@ -177,7 +177,7 @@ fn exec_restart() -> Result<()> {
     #[cfg(not(unix))]
     {
         // Fallback for non-Unix: just tell the user to restart
-        println!("Please restart botster-hub to use the new version.");
+        println!("Please restart botster to use the new version.");
         Ok(())
     }
 }
@@ -231,7 +231,7 @@ pub fn check() -> Result<()> {
         UpdateStatus::UpdateAvailable { current, latest } => {
             println!("Current version: {}", current);
             println!("Latest version: {}", latest);
-            println!("→ Update available! Run 'botster-hub update' to install");
+            println!("→ Update available! Run 'botster update' to install");
         }
         UpdateStatus::UpToDate { version } => {
             println!("Current version: {}", version);
@@ -351,7 +351,7 @@ pub fn install() -> Result<()> {
 
     // Determine platform
     let platform = get_platform()?;
-    let binary_name = format!("botster-hub-{}", platform);
+    let binary_name = format!("botster-{}", platform);
     let download_url = format!(
         "{}/v{}/{}",
         GITHUB_RELEASES_DOWNLOAD, latest_version_str, binary_name
@@ -440,6 +440,8 @@ fn get_platform() -> Result<&'static str> {
         Ok("macos-x86_64")
     } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
         Ok("linux-x86_64")
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
+        Ok("linux-arm64")
     } else {
         anyhow::bail!("Unsupported platform")
     }

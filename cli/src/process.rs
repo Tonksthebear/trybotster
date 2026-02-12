@@ -1,4 +1,4 @@
-//! Process management utilities for botster-hub.
+//! Process management utilities for botster.
 //!
 //! This module provides utilities for managing child processes,
 //! including orphan detection and cleanup.
@@ -52,7 +52,7 @@ use std::time::Duration;
 ///
 /// ```ignore
 /// use std::path::Path;
-/// use botster_hub::process::kill_orphaned_processes;
+/// use botster::process::kill_orphaned_processes;
 ///
 /// let worktree = Path::new("/home/user/botster-sessions/repo-issue-42");
 /// kill_orphaned_processes(worktree);

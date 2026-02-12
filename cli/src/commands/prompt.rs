@@ -8,7 +8,7 @@
 //!
 //! ```bash
 //! # Get the prompt for a specific worktree
-//! botster-hub get-prompt /path/to/worktree
+//! botster get-prompt /path/to/worktree
 //! ```
 
 use crate::PromptManager;

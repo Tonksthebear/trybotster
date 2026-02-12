@@ -10,12 +10,12 @@ Dir[Rails.root.join("test/support/**/*.rb")].each { |f| require f }
 WebMock.disable_net_connect!(allow_localhost: true)
 
 # Clean up stale CLI processes from previous test runs
-# This prevents orphaned botster-hub processes from consuming CPU
+# This prevents orphaned botster processes from consuming CPU
 module CliProcessCleanup
-  CLI_BINARY_NAME = "botster-hub"
+  CLI_BINARY_NAME = "botster"
 
   def self.cleanup_stale_processes
-    # Find any running botster-hub processes
+    # Find any running botster processes
     pids = `pgrep -f #{CLI_BINARY_NAME} 2>/dev/null`.strip.split("\n").map(&:to_i).reject(&:zero?)
     return if pids.empty?
 

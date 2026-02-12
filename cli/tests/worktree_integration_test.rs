@@ -1,5 +1,5 @@
-use botster_hub::Agent;
-use botster_hub::agent::spawn::PtySpawnConfig;
+use botster::Agent;
+use botster::agent::spawn::PtySpawnConfig;
 use std::collections::HashMap;
 use std::process::Command;
 use tempfile::TempDir;

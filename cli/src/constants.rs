@@ -1,4 +1,4 @@
-//! Application-wide constants for botster-hub.
+//! Application-wide constants for botster.
 //!
 //! This module centralizes all magic numbers and configuration constants
 //! to improve maintainability and discoverability. Constants are grouped
@@ -21,7 +21,7 @@ use std::time::Duration;
 /// Includes the CLI version so Rails can track which versions are in the wild
 /// and gate compatibility if needed.
 pub fn user_agent() -> String {
-    format!("botster-hub/{}", crate::commands::update::VERSION)
+    format!("botster/{}", crate::commands::update::VERSION)
 }
 
 // ============================================================================

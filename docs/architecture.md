@@ -38,7 +38,7 @@ GitHub @mention → Rails server → Message queue → Rust CLI polls
 - Decrypt any terminal content
 - Have access to agent conversations
 
-### Rust CLI (botster-hub)
+### Rust CLI (botster)
 
 **Role:** Local daemon that manages agents and PTY sessions.
 

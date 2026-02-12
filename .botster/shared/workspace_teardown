@@ -2,7 +2,7 @@
 # Run before worktree is deleted
 
 # Remove the worktree from Claude's trusted projects
-"$BOTSTER_HUB_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
+"$BOTSTER_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
 
 if [ "$BOTSTER_ISSUE_NUMBER" != "0" ]; then
   echo "Cleaned up worktree for issue #$BOTSTER_ISSUE_NUMBER"
