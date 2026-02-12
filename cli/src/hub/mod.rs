@@ -452,8 +452,11 @@ impl Hub {
         }
 
         // Load Lua init script and start file watching for hot-reload
-        self.load_lua_init();
-        self.start_lua_file_watching();
+        // Skip in test mode — Lua init opens ActionCable connections at load time
+        if !crate::env::is_test_mode() {
+            self.load_lua_init();
+            self.start_lua_file_watching();
+        }
 
         // Bundle generation is deferred - don't call generate_connection_url() here.
         // The bundle will be generated lazily when:
