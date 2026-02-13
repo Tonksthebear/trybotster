@@ -42,17 +42,18 @@ class WorkerBridge {
    * Initialize the workers (idempotent)
    * @param {Object} options
    * @param {string} options.cryptoWorkerUrl - URL to the crypto SharedWorker
-   * @param {string} options.wasmJsUrl - URL to vodozemac-wasm JS
+   * @param {string} options.wasmJsUrl - URL to vodozemac-wasm JS glue
+   * @param {string} options.wasmBinaryUrl - URL to vodozemac-wasm binary (.wasm)
    */
-  async init({ cryptoWorkerUrl, wasmJsUrl }) {
+  async init({ cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl }) {
     if (this.#initialized) return
     if (this.#initPromise) return this.#initPromise
 
-    this.#initPromise = this.#doInit({ cryptoWorkerUrl, wasmJsUrl })
+    this.#initPromise = this.#doInit({ cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl })
     return this.#initPromise
   }
 
-  async #doInit({ cryptoWorkerUrl, wasmJsUrl }) {
+  async #doInit({ cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl }) {
     try {
       // 1. Create crypto SharedWorker first and initialize WASM
       this.#cryptoWorker = new SharedWorker(cryptoWorkerUrl, { type: "module", name: "vodozemac-crypto" })
@@ -61,7 +62,7 @@ class WorkerBridge {
       this.#cryptoWorkerPort.start()
 
       // Initialize WASM via crypto worker
-      await this.sendCrypto("init", { wasmJsUrl })
+      await this.sendCrypto("init", { wasmJsUrl, wasmBinaryUrl })
 
       // 2. Create WebRTC transport (runs in main thread - RTCPeerConnection not available in Workers)
       console.debug(`[WorkerBridge] Using WebRTC transport`)

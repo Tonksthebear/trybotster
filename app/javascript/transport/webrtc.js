@@ -882,12 +882,6 @@ class WebRTCTransport {
     }
 
     if (data.type === "signal") {
-      // Unencrypted session_invalid from CLI — Olm session mismatch on signaling path
-      if (data.envelope?.type === "session_invalid") {
-        this.#emit("session:invalid", { hubId, message: data.envelope.message || "Session expired" })
-        return
-      }
-
       // Bundle refresh (type 2) from CLI — ratchet restart via ActionCable
       if (data.envelope?.t === 2 && data.envelope?.b) {
         console.debug("[WebRTCTransport] Received bundle refresh from CLI via ActionCable")
@@ -1032,7 +1026,7 @@ class WebRTCTransport {
         return
       }
 
-      // First byte distinguishes binary Olm frame (0x00/0x01) from plaintext JSON (0x7B = '{')
+      // First byte: 0x00 = PreKey Olm frame, 0x01 = Normal Olm frame
       if (raw.length > 0 && raw[0] <= 0x01) {
         // Binary Olm frame — decrypt
         let plaintext
@@ -1084,16 +1078,7 @@ class WebRTCTransport {
         return
       }
 
-      // Plaintext JSON fallback (session_invalid from CLI)
-      const text = new TextDecoder().decode(raw)
-      const parsed = JSON.parse(text)
-      if (parsed.type === "session_invalid") {
-        console.warn("[WebRTCTransport] Session invalid:", parsed.reason)
-        this.#emit("session:invalid", { hubId, message: parsed.message || parsed.reason || "Session invalid" })
-        return
-      }
-
-      console.warn("[WebRTCTransport] Unexpected plaintext message:", parsed)
+      console.warn("[WebRTCTransport] Unexpected non-Olm message on DataChannel, dropping")
     } catch (e) {
       console.error("[WebRTCTransport] Failed to handle message:", e)
     }
@@ -1141,13 +1126,6 @@ class WebRTCTransport {
     // Subscription confirmation
     if (msg.type === "subscribed" && msg.subscriptionId) {
       this.#handleSubscriptionConfirmed(msg.subscriptionId)
-      return
-    }
-
-    // Session invalid (sent encrypted from CLI)
-    if (msg.type === "session_invalid") {
-      console.warn("[WebRTCTransport] Session invalid:", msg.reason)
-      this.#emit("session:invalid", { hubId, message: msg.message || msg.reason || "Session invalid" })
       return
     }
 

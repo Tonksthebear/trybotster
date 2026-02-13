@@ -752,6 +752,29 @@ mod tests {
         assert_eq!(bundle.signature, restored.signature);
     }
 
+    /// Verify the browser's signature verification approach works:
+    /// extract raw bytes from the binary bundle and verify with Ed25519.
+    #[test]
+    fn test_bundle_signature_verification_raw_bytes() {
+        use vodozemac::{Ed25519PublicKey, Ed25519Signature};
+
+        let mut crypto = VodozemacCrypto::new("test-hub-sig-verify");
+        let bundle = crypto.build_device_key_bundle().unwrap();
+        let bytes = bundle.to_binary().unwrap();
+
+        // Mimic browser's parseBinaryBundle():
+        // signedData = bytes[0..97], signingKeyRaw = bytes[33..65], signatureRaw = bytes[97..161]
+        let signed_data = &bytes[0..97];
+        let signing_key_raw: &[u8; 32] = bytes[33..65].try_into().unwrap();
+        let signature_raw = &bytes[97..161];
+
+        let key = Ed25519PublicKey::from_slice(signing_key_raw).unwrap();
+        let sig = Ed25519Signature::from_slice(signature_raw).unwrap();
+
+        key.verify(signed_data, &sig)
+            .expect("Bundle signature should verify with raw byte extraction");
+    }
+
     #[test]
     fn test_bundle_fixed_size() {
         let mut crypto = VodozemacCrypto::new("test-hub-size");

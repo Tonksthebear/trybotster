@@ -34,6 +34,7 @@ impl Hub {
         self.poll_lua_action_cable_channels();
 
         self.poll_outgoing_webrtc_signals();
+        self.poll_webrtc_dc_opens();
         self.poll_webrtc_channels();
         self.cleanup_disconnected_webrtc_channels();
         self.poll_webrtc_pty_output();
@@ -237,49 +238,93 @@ impl Hub {
                         &browser_identity[..browser_identity.len().min(8)]
                     );
                     channel.reset_decrypt_failures();
-
-                    let peer_olm_key = crate::relay::extract_olm_key(&browser_identity).to_string();
-                    if let Some(ref cs) = self.browser.crypto_service {
-                        match cs.lock() {
-                            Ok(mut guard) => {
-                                match guard.refresh_bundle_for_peer(&peer_olm_key) {
-                                    Ok(bundle_bytes) => {
-                                        if let Err(e) = guard.persist() {
-                                            log::warn!("[WebRTC] Failed to persist after refresh: {e}");
-                                        }
-                                        drop(guard); // Release lock before async send
-
-                                        // Send type 2 via DataChannel
-                                        let _guard = self.tokio_runtime.enter();
-                                        if let Err(e) = self.tokio_runtime.block_on(
-                                            channel.send_bundle_refresh(&bundle_bytes)
-                                        ) {
-                                            log::warn!("[WebRTC] Failed to send bundle refresh via DC: {e}");
-                                        }
-
-                                        // Also send via ActionCable (belt and suspenders)
-                                        let envelope = serde_json::json!({
-                                            "t": 2,
-                                            "b": base64::engine::general_purpose::STANDARD_NO_PAD
-                                                .encode(&bundle_bytes),
-                                        });
-                                        let data = serde_json::json!({
-                                            "browser_identity": browser_identity,
-                                            "envelope": envelope,
-                                        });
-                                        if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
-                                            log::warn!("[WebRTC] Failed to send bundle refresh via AC: {e}");
-                                        }
-                                    }
-                                    Err(e) => log::error!("[WebRTC] Failed to generate refresh bundle: {e}"),
-                                }
-                            }
-                            Err(e) => log::error!("[WebRTC] Crypto mutex poisoned: {e}"),
-                        }
-                    }
+                    self.send_ratchet_restart(&browser_identity);
                 }
             }
         }
+    }
+
+    /// Check for WebRTC DataChannels that have just opened and fire `peer_connected`.
+    ///
+    /// This is the correct place to notify Lua — the DC is usable, so PTY forwarders
+    /// started by the Lua callback can actually send data.
+    fn poll_webrtc_dc_opens(&mut self) {
+        let browser_ids: Vec<String> = self.webrtc_channels.keys().cloned().collect();
+        for browser_identity in browser_ids {
+            if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
+                if channel.take_dc_opened() {
+                    log::info!(
+                        "[WebRTC] DataChannel opened for {}, firing peer_connected",
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
+                    if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
+                        log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
+                    }
+                    self.flush_lua_queues();
+                }
+            }
+        }
+    }
+
+    /// Send a fresh Olm bundle (type 2) to a browser peer via both DataChannel and ActionCable.
+    ///
+    /// Generates a new OTK, builds a 161-byte `DeviceKeyBundle`, removes the stale Olm session,
+    /// and delivers the bundle over both transport paths (belt and suspenders).
+    fn send_ratchet_restart(&mut self, browser_identity: &str) {
+        let peer_olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
+        let Some(ref cs) = self.browser.crypto_service else {
+            log::warn!("[RatchetRestart] No crypto service available");
+            return;
+        };
+
+        let bundle_bytes = match cs.lock() {
+            Ok(mut guard) => match guard.refresh_bundle_for_peer(&peer_olm_key) {
+                Ok(bytes) => {
+                    if let Err(e) = guard.persist() {
+                        log::warn!("[RatchetRestart] Failed to persist after refresh: {e}");
+                    }
+                    bytes
+                }
+                Err(e) => {
+                    log::error!("[RatchetRestart] Failed to generate refresh bundle: {e}");
+                    return;
+                }
+            },
+            Err(e) => {
+                log::error!("[RatchetRestart] Crypto mutex poisoned: {e}");
+                return;
+            }
+        };
+
+        // Send type 2 via DataChannel (if available)
+        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
+            let _guard = self.tokio_runtime.enter();
+            if let Err(e) = self
+                .tokio_runtime
+                .block_on(channel.send_bundle_refresh(&bundle_bytes))
+            {
+                log::warn!("[RatchetRestart] Failed to send bundle refresh via DC: {e}");
+            }
+        }
+
+        // Also send via ActionCable
+        let envelope = serde_json::json!({
+            "t": 2,
+            "b": base64::engine::general_purpose::STANDARD_NO_PAD
+                .encode(&bundle_bytes),
+        });
+        let data = serde_json::json!({
+            "browser_identity": browser_identity,
+            "envelope": envelope,
+        });
+        if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
+            log::warn!("[RatchetRestart] Failed to send bundle refresh via AC: {e}");
+        }
+
+        log::info!(
+            "[RatchetRestart] Sent fresh bundle to {}",
+            &browser_identity[..browser_identity.len().min(8)]
+        );
     }
 
     /// Clean up WebRTC channels that have disconnected or timed out.
@@ -440,10 +485,12 @@ impl Hub {
     fn process_lua_webrtc_sends(&mut self) {
         use crate::lua::primitives::WebRtcSendRequest;
 
+        /// Send timeout to prevent SCTP congestion from blocking the tick loop.
+        const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
         for send_req in self.lua.drain_webrtc_sends() {
             match send_req {
                 WebRtcSendRequest::Json { peer_id, data } => {
-                    // Find the HubChannel subscription for this peer (if any)
                     // For Lua sends, we send directly without subscription wrapping
                     // since Lua handles its own message framing.
                     if let Some(channel) = self.webrtc_channels.get(&peer_id) {
@@ -457,8 +504,12 @@ impl Hub {
 
                         let peer = crate::channel::PeerId(peer_id.clone());
                         let _guard = self.tokio_runtime.enter();
-                        if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&payload, &peer)) {
-                            log::warn!("[WebRTC] Lua send failed: {e}");
+                        match self.tokio_runtime.block_on(
+                            tokio::time::timeout(SEND_TIMEOUT, channel.send_to(&payload, &peer))
+                        ) {
+                            Ok(Err(e)) => log::warn!("[WebRTC] Lua send failed: {e}"),
+                            Err(_) => log::warn!("[WebRTC] Lua send timed out for {}", &peer_id[..peer_id.len().min(8)]),
+                            Ok(Ok(())) => {}
                         }
                     } else {
                         log::debug!("[WebRTC] Lua send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
@@ -468,8 +519,12 @@ impl Hub {
                     if let Some(channel) = self.webrtc_channels.get(&peer_id) {
                         let peer = crate::channel::PeerId(peer_id.clone());
                         let _guard = self.tokio_runtime.enter();
-                        if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&data, &peer)) {
-                            log::warn!("[WebRTC] Lua binary send failed: {e}");
+                        match self.tokio_runtime.block_on(
+                            tokio::time::timeout(SEND_TIMEOUT, channel.send_to(&data, &peer))
+                        ) {
+                            Ok(Err(e)) => log::warn!("[WebRTC] Lua binary send failed: {e}"),
+                            Err(_) => log::warn!("[WebRTC] Lua binary send timed out for {}", &peer_id[..peer_id.len().min(8)]),
+                            Ok(Ok(())) => {}
                         }
                     } else {
                         log::debug!("[WebRTC] Lua binary send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
@@ -557,6 +612,10 @@ impl Hub {
     fn process_lua_hub_requests(&mut self) {
         use crate::lua::primitives::HubRequest;
 
+        // Track peers that already received a ratchet restart this batch
+        // to avoid burning multiple OTKs for the same decrypt failure storm.
+        let mut restarted_peers = std::collections::HashSet::<String>::new();
+
         for request in self.lua.drain_hub_requests() {
             match request {
                 HubRequest::Quit => {
@@ -599,6 +658,20 @@ impl Hub {
                             "[Lua] ICE candidate for unknown browser {}",
                             &browser_identity[..browser_identity.len().min(8)]
                         );
+                    }
+                }
+                HubRequest::RatchetRestart { browser_identity } => {
+                    // Deduplicate: only restart once per Olm key per batch.
+                    // Multiple queued signals from the same peer all fail decryption,
+                    // but we only need one fresh OTK per restart.
+                    let olm_key = crate::relay::extract_olm_key(&browser_identity).to_string();
+                    if !restarted_peers.contains(&olm_key) {
+                        log::warn!(
+                            "[Lua] Signaling decrypt failed for {}, initiating ratchet restart",
+                            &browser_identity[..browser_identity.len().min(8)]
+                        );
+                        self.send_ratchet_restart(&browser_identity);
+                        restarted_peers.insert(olm_key);
                     }
                 }
             }
@@ -1220,26 +1293,45 @@ impl Hub {
     ///
     /// Uses the hot path: compress → base64 → Olm encrypt → binary DataChannel.
     /// The browser decrypts and routes by subscription ID + msgtype.
+    /// Returns `false` if the DataChannel is not open (circuit breaker signal).
     fn send_webrtc_raw(
         &self,
         subscription_id: &str,
         browser_identity: &str,
         data: Vec<u8>,
-    ) {
+    ) -> bool {
+        /// Send timeout to prevent SCTP congestion from blocking the tick loop.
+        /// Dead peers cause SCTP retransmit backpressure that can block `dc.send()`
+        /// for 60+ seconds. This timeout ensures the tick loop stays responsive.
+        const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
         let Some(channel) = self.webrtc_channels.get(browser_identity) else {
-            log::warn!(
-                "[WebRTC] No channel for browser {} when sending raw data",
-                &browser_identity[..browser_identity.len().min(8)]
-            );
-            return;
+            return false;
         };
 
         let peer = crate::channel::PeerId(browser_identity.to_string());
         let _guard = self.tokio_runtime.enter();
-        if let Err(e) = self.tokio_runtime.block_on(
-            channel.send_pty_raw(subscription_id, &data, &peer)
-        ) {
-            log::warn!("[WebRTC] Failed to send PTY data: {e}");
+        let send_future = channel.send_pty_raw(subscription_id, &data, &peer);
+        match self.tokio_runtime.block_on(tokio::time::timeout(SEND_TIMEOUT, send_future)) {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                if msg.contains("not opened") || msg.contains("No data channel") {
+                    // DataChannel dead — caller should stop sending to this peer
+                    false
+                } else {
+                    log::warn!("[WebRTC] Failed to send PTY data: {e}");
+                    true // Transient error, keep trying
+                }
+            }
+            Err(_elapsed) => {
+                // Send timed out — SCTP is congested or peer is dead
+                log::warn!(
+                    "[WebRTC] Send timed out for {} (SCTP congestion), treating as dead",
+                    &browser_identity[..browser_identity.len().min(8)]
+                );
+                false
+            }
         }
     }
 
@@ -1249,18 +1341,37 @@ impl Hub {
     /// sends them. If interceptors are registered, they run synchronously
     /// (opt-in blocking). If observers are registered, notifications are
     /// queued for [`Self::poll_pty_observers`] — never inline.
+    ///
+    /// Uses a circuit breaker: if a send fails because the DataChannel is not
+    /// open, all remaining messages for that peer are skipped (prevents the
+    /// tick loop from being starved by hundreds of failed `block_on` calls).
     fn poll_webrtc_pty_output(&mut self) {
         use crate::hub::PtyObserverNotification;
         use crate::lua::primitives::PtyOutputContext;
 
-        // Drain all pending PTY output messages
-        let messages: Vec<WebRtcPtyOutput> =
-            std::iter::from_fn(|| self.webrtc_pty_output_rx.try_recv().ok()).collect();
+        /// Max messages to process per tick to keep the event loop responsive.
+        const DRAIN_BUDGET: usize = 256;
+
+        // Drain pending PTY output messages (budget-limited)
+        let messages: Vec<WebRtcPtyOutput> = std::iter::from_fn(|| {
+            self.webrtc_pty_output_rx.try_recv().ok()
+        })
+        .take(DRAIN_BUDGET)
+        .collect();
 
         let has_interceptors = self.lua.has_interceptors("pty_output");
         let has_observers = self.lua.has_observers("pty_output");
 
+        // Circuit breaker: peers whose DataChannel is dead (skip further sends)
+        let mut dead_peers: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for msg in messages {
+            // Skip peers with dead DataChannels
+            if dead_peers.contains(&msg.browser_identity) {
+                continue;
+            }
+
             let ctx = PtyOutputContext {
                 agent_index: msg.agent_index,
                 pty_index: msg.pty_index,
@@ -1282,7 +1393,14 @@ impl Hub {
             };
 
             // Fast path: send to browser immediately
-            self.send_webrtc_raw(&msg.subscription_id, &msg.browser_identity, final_data.clone());
+            if !self.send_webrtc_raw(&msg.subscription_id, &msg.browser_identity, final_data.clone()) {
+                log::warn!(
+                    "[WebRTC] DataChannel not open for {}, skipping remaining PTY output this tick",
+                    &msg.browser_identity[..msg.browser_identity.len().min(8)]
+                );
+                dead_peers.insert(msg.browser_identity.clone());
+                continue;
+            }
 
             // Observers: queue for async processing, never block here
             if has_observers {
@@ -1456,6 +1574,27 @@ impl Hub {
         let is_new_connection = !self.webrtc_channels.contains_key(browser_identity);
 
         if is_new_connection {
+            // Clean up stale channels from the same device (same Olm key, different tab UUID).
+            // When a browser refreshes, it generates a new tab UUID but keeps its Olm identity key.
+            // The old channel's SCTP association may still be alive and sends to it will block
+            // the tick loop for 60+ seconds waiting for retransmit timeouts.
+            let olm_key = crate::relay::extract_olm_key(browser_identity);
+            let stale: Vec<String> = self
+                .webrtc_channels
+                .keys()
+                .filter(|id| {
+                    *id != browser_identity
+                        && crate::relay::extract_olm_key(id) == olm_key
+                })
+                .cloned()
+                .collect();
+            for stale_id in stale {
+                log::info!(
+                    "[WebRTC] Replacing stale channel for same device: {}",
+                    &stale_id[..stale_id.len().min(8)]
+                );
+                self.cleanup_webrtc_channel(&stale_id, "replaced");
+            }
             let mut channel = WebRtcChannel::builder()
                 .server_url(&server_url)
                 .api_key(&api_key)
@@ -1495,13 +1634,9 @@ impl Hub {
             self.webrtc_connection_started
                 .insert(browser_identity.to_string(), Instant::now());
 
-            // Notify Lua of peer connection
-            if let Err(e) = self.lua.call_peer_connected(browser_identity) {
-                log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
-            }
-            self.process_lua_webrtc_sends();
-            self.process_lua_pty_requests();
-            self.process_lua_hub_requests();
+            // NOTE: peer_connected is NOT fired here — it fires when the
+            // DataChannel actually opens (polled in poll_webrtc_dc_opens).
+            // This prevents PTY forwarders from starting before the DC is usable.
         }
 
         // Handle the offer and get the answer

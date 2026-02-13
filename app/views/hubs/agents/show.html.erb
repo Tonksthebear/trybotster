@@ -1,12 +1,8 @@
-<% content_for :head do %>
-  <%= stylesheet_link_tag "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" %>
-<% end %>
-
 <%#
   Agent Terminal View
 
   Controllers:
-  - terminal-display: xterm.js rendering, acquires TerminalConnection via ConnectionManager
+  - terminal-display: ghostty-web rendering, acquires TerminalConnection via ConnectionManager
   - connection-status: Unified connection state display (three-column view)
   - agent-list: Sidebar agent list (uses template)
 %>
@@ -114,8 +110,7 @@
   </div>
 
   <%# Mobile Touch Controls %>
-  <div class="shrink-0 lg:hidden border-t border-zinc-800 bg-zinc-900 touch-controls-container"
-       data-controller="keyboard-viewport">
+  <div class="shrink-0 lg:hidden border-t border-zinc-800 bg-zinc-900 touch-controls-container">
     <div class="flex gap-1.5 px-2 py-2 overflow-x-auto scrollbar-none">
       <%# Primary keys %>
       <%= render Elements::ButtonComponent.new("^C", color: :neutral, variant: :soft, size: :sm, class: "shrink-0 font-mono", data: { action: "terminal-display#sendCtrlC" }) %>

@@ -36,25 +36,9 @@
 @source "../../../app/components";
 @source "../../../config/elements.yml";
 
-/*
- * xterm.js container styling
- * Minimal overrides - let xterm handle its own internals
- */
+/* Terminal container — no padding; ghostty-web canvas fills the space */
 .terminal-container {
-  padding: 8px;
-  /* Enable smooth touch scrolling on iOS */
-  -webkit-overflow-scrolling: touch;
-}
-
-/* Allow touch scrolling in xterm viewport */
-.terminal-container .xterm-viewport {
-  -webkit-overflow-scrolling: touch;
-  touch-action: pan-y;
-}
-
-/* Hide iOS native cursor on xterm's hidden input textarea */
-.terminal-container .xterm-helper-textarea {
-  @apply caret-transparent select-none;
+  overflow: hidden;
 }
 
 /*

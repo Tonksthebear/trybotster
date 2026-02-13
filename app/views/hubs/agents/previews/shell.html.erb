@@ -7,7 +7,8 @@
   <%= csrf_meta_tags %>
   <%= csp_meta_tag %>
   <meta name="crypto-worker-url" content="<%= asset_path('workers/olm_crypto.js') %>">
-  <meta name="crypto-wasm-js-url" content="/wasm/vodozemac/vodozemac_wasm.js">
+  <meta name="crypto-wasm-js-url" content="<%= asset_path('vodozemac/vodozemac_wasm.js') %>">
+  <meta name="crypto-wasm-binary-url" content="<%= asset_path('vodozemac/vodozemac_wasm_bg.wasm') %>">
   <%= stylesheet_link_tag "application", "data-turbo-track": "reload" %>
   <%= javascript_importmap_tags %>
   <style>

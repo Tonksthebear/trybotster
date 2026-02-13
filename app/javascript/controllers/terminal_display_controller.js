@@ -1,28 +1,11 @@
 import { Controller } from "@hotwired/stimulus";
-import * as xterm from "@xterm/xterm";
-import * as xtermFit from "@xterm/addon-fit";
-import * as xtermUnicode from "@xterm/addon-unicode11";
-import * as xtermWebgl from "@xterm/addon-webgl";
-import * as xtermWebLinks from "@xterm/addon-web-links";
+import { init, Terminal, FitAddon } from "ghostty-web";
 import { ConnectionManager, TerminalConnection, HubConnection } from "connections";
-
-const Terminal = xterm.Terminal || xterm.default?.Terminal || xterm.default;
-const FitAddon =
-  xtermFit.FitAddon || xtermFit.default?.FitAddon || xtermFit.default;
-const Unicode11Addon =
-  xtermUnicode.Unicode11Addon || xtermUnicode.default?.Unicode11Addon || xtermUnicode.default;
-const WebglAddon =
-  xtermWebgl.WebglAddon || xtermWebgl.default?.WebglAddon || xtermWebgl.default;
-const WebLinksAddon =
-  xtermWebLinks.WebLinksAddon || xtermWebLinks.default?.WebLinksAddon || xtermWebLinks.default;
 
 /**
  * Terminal Display Controller
  *
- * Handles xterm.js rendering with custom touch scrolling for mobile.
- * xterm.js lacks proper touch support, so we overlay a transparent div
- * to capture touch events. See: https://github.com/xtermjs/xterm.js/issues/5377
- *
+ * Renders a terminal using ghostty-web (Ghostty's VT100 parser compiled to WASM).
  * Uses ConnectionManager to acquire connections directly.
  */
 export default class extends Controller {
@@ -34,20 +17,17 @@ export default class extends Controller {
     ptyIndex: { type: Number, default: 0 },
   };
 
-  // Private fields
   #terminal = null;
   #fitAddon = null;
   #terminalConn = null;
   #hubConn = null;
   #unsubscribers = [];
-  #touchOverlay = null;
-  #keyboardHandler = null;
   #boundHandleResize = null;
   #resizeDebounceTimer = null;
   #momentumAnimationId = null;
-  #isComposing = false;
-  #sentDuringComposition = "";
-  #isHandlingAutocorrect = false;
+  #keyboardHandler = null;
+  #textarea = null;        // ghostty's hidden textarea — we control its focusability
+  #isMobile = false;
 
   connect() {
     this.#boundHandleResize = this.#handleResize.bind(this);
@@ -56,32 +36,24 @@ export default class extends Controller {
   }
 
   disconnect() {
-
     window.removeEventListener("resize", this.#boundHandleResize);
-
-    this.#touchOverlay?.remove();
-    this.#touchOverlay = null;
-
-    if (this.#momentumAnimationId) {
-      cancelAnimationFrame(this.#momentumAnimationId);
-      this.#momentumAnimationId = null;
-    }
 
     if (this.#resizeDebounceTimer) {
       clearTimeout(this.#resizeDebounceTimer);
       this.#resizeDebounceTimer = null;
     }
 
+    if (this.#momentumAnimationId) {
+      cancelAnimationFrame(this.#momentumAnimationId);
+      this.#momentumAnimationId = null;
+    }
+
     if (this.#keyboardHandler) {
-      window.visualViewport?.removeEventListener(
-        "resize",
-        this.#keyboardHandler,
-      );
-      window.visualViewport?.removeEventListener(
-        "scroll",
-        this.#keyboardHandler,
-      );
+      window.visualViewport?.removeEventListener("resize", this.#keyboardHandler);
+      window.visualViewport?.removeEventListener("scroll", this.#keyboardHandler);
       this.#keyboardHandler = null;
+      this.element.style.height = "";
+      this.element.style.overflow = "";
     }
 
     this.#unsubscribers.forEach((unsub) => unsub());
@@ -97,10 +69,273 @@ export default class extends Controller {
     this.#terminal = null;
   }
 
+  async #initTerminal() {
+    await init();
+
+    this.#isMobile = "ontouchstart" in window;
+
+    this.#terminal = new Terminal({
+      cursorBlink: true,
+      fontFamily: "'JetBrainsMono NF', monospace",
+      fontSize: 14,
+      scrollback: 10000,
+      theme: {
+        background: "#09090b",
+      },
+    });
+
+    this.#fitAddon = new FitAddon();
+    this.#terminal.loadAddon(this.#fitAddon);
+
+    const container = this.hasContainerTarget
+      ? this.containerTarget
+      : this.element;
+    this.#terminal.open(container);
+
+    // Neutralize ghostty's focusable elements on mobile.
+    // ghostty-web creates a hidden <textarea tabindex="0"> and sets
+    // contenteditable="true" on the container. iOS Safari focuses these on
+    // ANY touch regardless of preventDefault. We make them unfocusable by
+    // touch (tabindex=-1) and only focus via script on a deliberate tap.
+    if (this.#isMobile) {
+      this.#textarea = container.querySelector("textarea");
+      if (this.#textarea) {
+        this.#textarea.setAttribute("tabindex", "-1");
+        // Hide iOS text caret — the terminal canvas cursor is sufficient
+        this.#textarea.style.caretColor = "transparent";
+        this.#textarea.addEventListener("blur", () => {
+          // Re-lock when keyboard dismisses
+          this.#textarea?.setAttribute("tabindex", "-1");
+        });
+      }
+      // Remove contenteditable + tabindex from the container
+      container.removeAttribute("contenteditable");
+      container.setAttribute("tabindex", "-1");
+
+      // Hide the canvas-rendered scrollbar — we handle scroll via touch.
+      // showScrollbar lives on the internal renderer, not the Terminal.
+      // Walk the object tree to find and patch it.
+      this.#disableScrollbar();
+    }
+
+    await new Promise((resolve) => {
+      requestAnimationFrame(() => {
+        this.#fitAddon.fit();
+        resolve();
+      });
+    });
+
+    this.#terminal.onData((data) => {
+      // Cancel any momentum scrolling when user starts typing
+      if (this.#momentumAnimationId) {
+        cancelAnimationFrame(this.#momentumAnimationId);
+        this.#momentumAnimationId = null;
+      }
+      if (this.#isMobile && data === "\r") {
+        // iOS keyboard Enter → newline (Shift+Enter equivalent).
+        // The touch "Enter" button sends \r directly via sendEnter().
+        this.#sendInput("\n");
+      } else {
+        this.#sendInput(data);
+      }
+    });
+
+    if (this.#isMobile) {
+      this.#setupTouchScroll();
+    }
+    this.#setupKeyboardHandler();
+  }
+
+  // Touch scrolling with tap-to-focus.
+  //
+  // ghostty-web sets contenteditable + tabindex on its element, so the browser
+  // will focus (and open the keyboard) on any touch. We prevent that on
+  // touchstart and only call focus() ourselves on a clean tap (short + small).
+  #setupTouchScroll() {
+    const el = this.#terminal?.element;
+    if (!el) return;
+
+    const SENSITIVITY = 15;
+    const FRICTION = 0.92;
+    const TAP_DISTANCE = 15;   // px — generous for iOS finger jitter
+    const TAP_DURATION = 250;  // ms — must be a quick tap, not a hold/scroll
+    const MAX_SAMPLES = 5;
+
+    let startY = 0;
+    let lastY = 0;
+    let lastTime = 0;
+    let touchStartTime = 0;
+    let isScrolling = false;
+    const velocityHistory = [];
+
+    // Use capture phase + stopImmediatePropagation to fully intercept touches
+    // before ghostty's internal handlers can focus the textarea.
+    el.addEventListener("touchstart", (e) => {
+      if (e.touches.length !== 1) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (this.#momentumAnimationId) {
+        cancelAnimationFrame(this.#momentumAnimationId);
+        this.#momentumAnimationId = null;
+      }
+      velocityHistory.length = 0;
+      startY = lastY = e.touches[0].clientY;
+      touchStartTime = lastTime = performance.now();
+      isScrolling = false;
+    }, { passive: false, capture: true });
+
+    el.addEventListener("touchmove", (e) => {
+      if (e.touches.length !== 1) return;
+      e.stopImmediatePropagation();
+
+      const now = performance.now();
+      const dt = Math.max(now - lastTime, 1);
+      const dy = e.touches[0].clientY - lastY;
+      const totalDelta = Math.abs(e.touches[0].clientY - startY);
+
+      lastY = e.touches[0].clientY;
+      lastTime = now;
+
+      if (totalDelta > TAP_DISTANCE) isScrolling = true;
+
+      if (isScrolling) {
+        const lines = Math.round(-dy / SENSITIVITY);
+        if (lines !== 0) this.#terminal.scrollLines(lines);
+
+        velocityHistory.push({ v: -dy / SENSITIVITY / dt, t: now });
+        while (velocityHistory.length > MAX_SAMPLES) velocityHistory.shift();
+
+        e.preventDefault();
+      }
+    }, { passive: false, capture: true });
+
+    el.addEventListener("touchend", (e) => {
+      e.stopImmediatePropagation();
+      const duration = performance.now() - touchStartTime;
+
+      if (!isScrolling && duration < TAP_DURATION) {
+        // Clean tap — make textarea focusable and focus it to open keyboard.
+        // tabindex="0" allows focus + keyboard; blur handler resets to -1.
+        if (this.#textarea) {
+          this.#textarea.setAttribute("tabindex", "0");
+          this.#textarea.focus();
+        } else {
+          this.#terminal?.focus();
+        }
+        return;
+      }
+
+      // Scroll gesture or long press — apply momentum, don't focus
+      let velocity = 0;
+      if (velocityHistory.length > 0) {
+        const now = performance.now();
+        let totalWeight = 0;
+        let weightedSum = 0;
+        for (const { v, t } of velocityHistory) {
+          const weight = Math.max(0, 1 - (now - t) / 150);
+          weightedSum += v * weight;
+          totalWeight += weight;
+        }
+        velocity = totalWeight > 0 ? weightedSum / totalWeight : 0;
+      }
+
+      if (Math.abs(velocity) > 0.01) {
+        const animate = () => {
+          if (Math.abs(velocity) < 0.005) {
+            this.#momentumAnimationId = null;
+            return;
+          }
+          const lines = Math.round(velocity * 16);
+          if (lines !== 0) this.#terminal.scrollLines(lines);
+          velocity *= FRICTION;
+          this.#momentumAnimationId = requestAnimationFrame(animate);
+        };
+        animate();
+      }
+    }, { passive: true, capture: true });
+  }
+
+  // iOS keyboard viewport adjustment.
+  //
+  // Resize the entire flex layout (this.element) to match the visual viewport
+  // so the terminal naturally shrinks and the touch controls stay visible.
+  // This avoids fighting iOS scroll behavior — the page never extends behind
+  // the keyboard because the layout simply fits within the visible area.
+  #setupKeyboardHandler() {
+    if (!window.visualViewport) return;
+
+    let isKeyboardOpen = false;
+    let debounceTimer = null;
+
+    const handleViewportChange = () => {
+      const vv = window.visualViewport;
+      const keyboardHeight = window.innerHeight - vv.height;
+
+      if (keyboardHeight > 100) {
+        // Keyboard is open — constrain the entire layout to the visual viewport
+        this.element.style.height = `${vv.height}px`;
+        // Prevent iOS from scrolling the page behind the keyboard
+        this.element.style.overflow = "hidden";
+        window.scrollTo(0, 0);
+        isKeyboardOpen = true;
+
+        requestAnimationFrame(() => {
+          this.#fitAddon?.fit();
+          this.#terminal?.scrollToBottom();
+          this.#sendResize();
+        });
+      } else if (isKeyboardOpen) {
+        // Keyboard closed — restore natural layout
+        this.element.style.height = "";
+        this.element.style.overflow = "";
+        isKeyboardOpen = false;
+
+        requestAnimationFrame(() => {
+          this.#fitAddon?.fit();
+          this.#sendResize();
+        });
+      }
+    };
+
+    this.#keyboardHandler = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(handleViewportChange, 50);
+    };
+
+    window.visualViewport.addEventListener("resize", this.#keyboardHandler);
+    window.visualViewport.addEventListener("scroll", this.#keyboardHandler);
+  }
+
+  // Disable the canvas-rendered scrollbar by patching the renderer.
+  // showScrollbar() lives on the internal CanvasRenderer, not the Terminal.
+  #disableScrollbar() {
+    const findRenderer = (obj, depth = 0) => {
+      if (depth > 3 || !obj) return null;
+      if (typeof obj.showScrollbar === "function" && typeof obj.hideScrollbar === "function") {
+        return obj;
+      }
+      for (const key of Object.keys(obj)) {
+        const val = obj[key];
+        if (val && typeof val === "object" && !(val instanceof HTMLElement)) {
+          const found = findRenderer(val, depth + 1);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+
+    const renderer = findRenderer(this.#terminal);
+    if (renderer) {
+      renderer.scrollbarVisible = false;
+      renderer.scrollbarOpacity = 0;
+      renderer.showScrollbar = () => {};
+      renderer.hideScrollbar = () => {};
+    }
+  }
+
   async #initConnections() {
     if (!this.hubIdValue) return;
 
-    // Acquire hub connection for control plane (resize updates client dims centrally)
     this.#hubConn = await ConnectionManager.acquire(
       HubConnection,
       this.hubIdValue,
@@ -125,7 +360,6 @@ export default class extends Controller {
       },
     );
 
-    // Subscribe to terminal events
     this.#unsubscribers.push(
       this.#terminalConn.onOutput((data) => {
         this.#handleMessage({ type: "output", data });
@@ -149,10 +383,6 @@ export default class extends Controller {
         this.#handleError(err);
       }),
     );
-
-    // No explicit subscribe() — health events drive the WebRTC lifecycle.
-    // When hub reports "online", connection.js connects peer + subscribes.
-    // Event listeners above will fire as the connection progresses.
   }
 
   // Public actions for touch control buttons
@@ -189,6 +419,7 @@ export default class extends Controller {
     this.#terminal?.writeln(text);
   }
   focus() {
+    if (this.#textarea) this.#textarea.setAttribute("tabindex", "0");
     this.#terminal?.focus();
   }
 
@@ -198,232 +429,9 @@ export default class extends Controller {
       : { cols: 80, rows: 24 };
   }
 
-  // Terminal initialization - returns promise that resolves when terminal is fit
-  async #initTerminal() {
-    this.#terminal = new Terminal({
-      cursorBlink: true,
-      fontFamily: "'JetBrainsMono NF', monospace",
-      fontSize: 14,
-      fontWeightBold: "bold",
-      scrollback: 10000,
-      drawBoldTextInBrightColors: false,
-      allowProposedApi: true,
-      theme: {
-        background: "#09090b",
-      },
-    });
-
-    this.#fitAddon = new FitAddon();
-    this.#terminal.loadAddon(this.#fitAddon);
-
-    const unicodeAddon = new Unicode11Addon();
-    this.#terminal.loadAddon(unicodeAddon);
-    this.#terminal.unicode.activeVersion = "11";
-
-    this.#terminal.loadAddon(new WebLinksAddon());
-
-    const container = this.hasContainerTarget
-      ? this.containerTarget
-      : this.element;
-    this.#terminal.open(container);
-
-    try {
-      this.#terminal.loadAddon(new WebglAddon());
-    } catch {
-      // WebGL unavailable — falls back to canvas renderer
-    }
-
-    // Wait for terminal to be rendered and fit before returning
-    await new Promise((resolve) => {
-      requestAnimationFrame(() => {
-        this.#fitAddon.fit();
-        resolve();
-      });
-    });
-
-    this.#terminal.onData((data) => {
-      // Cancel any momentum scrolling when user starts typing
-      if (this.#momentumAnimationId) {
-        cancelAnimationFrame(this.#momentumAnimationId);
-        this.#momentumAnimationId = null;
-      }
-      // Skip if we're handling autocorrect directly (prevents double-send)
-      if (this.#isHandlingAutocorrect) return;
-      // Track what xterm sends during composition for autocorrect handling
-      if (this.#isComposing) {
-        this.#sentDuringComposition += data;
-      }
-      this.#sendInput(data);
-    });
-    container.addEventListener("click", () => this.focus());
-
-    this.#setupTouchScroll();
-    this.#setupKeyboardHandler();
-    this.#setupMobileAutocorrect();
-  }
-
-  // Touch scrolling with momentum
-  #setupTouchScroll() {
-    const xtermEl = this.#terminal?.element;
-    if (!xtermEl) return;
-
-    const overlay = document.createElement("div");
-    overlay.style.cssText = `
-      position: absolute;
-      inset: 0;
-      touch-action: none;
-      z-index: 10;
-    `;
-    xtermEl.style.position = "relative";
-    xtermEl.appendChild(overlay);
-    this.#touchOverlay = overlay;
-
-    const SENSITIVITY = 15;
-    const FRICTION = 0.92;
-    const TAP_THRESHOLD = 10;
-    const MAX_VELOCITY_SAMPLES = 5;
-
-    let startY = 0;
-    let lastY = 0;
-    let lastTime = 0;
-    let isScrolling = false;
-    const velocityHistory = [];
-
-    overlay.addEventListener("touchstart", (e) => {
-      if (e.touches.length !== 1) return;
-
-      cancelAnimationFrame(this.#momentumAnimationId);
-      velocityHistory.length = 0;
-      startY = lastY = e.touches[0].clientY;
-      lastTime = performance.now();
-      isScrolling = false;
-    });
-
-    overlay.addEventListener("touchmove", (e) => {
-      if (e.touches.length !== 1) return;
-
-      const now = performance.now();
-      const deltaTime = Math.max(now - lastTime, 1);
-      const deltaY = e.touches[0].clientY - lastY;
-      const totalDelta = Math.abs(e.touches[0].clientY - startY);
-
-      lastY = e.touches[0].clientY;
-      lastTime = now;
-
-      if (totalDelta > TAP_THRESHOLD) {
-        isScrolling = true;
-      }
-
-      if (isScrolling) {
-        const lines = Math.round(-deltaY / SENSITIVITY);
-        if (lines !== 0) {
-          this.#terminal.scrollLines(lines);
-        }
-
-        velocityHistory.push({ v: -deltaY / SENSITIVITY / deltaTime, t: now });
-        while (velocityHistory.length > MAX_VELOCITY_SAMPLES) {
-          velocityHistory.shift();
-        }
-
-        e.preventDefault();
-      }
-    });
-
-    overlay.addEventListener("touchend", (e) => {
-      if (!isScrolling) {
-        // Pass tap through to terminal for focus/keyboard
-        // Only call focus() - calling click() can cause keyboard to close immediately
-        const xtermTextarea = this.#terminal?.element?.querySelector(
-          ".xterm-helper-textarea",
-        );
-        if (xtermTextarea) {
-          xtermTextarea.focus();
-        }
-        return;
-      }
-
-      // Calculate weighted velocity from recent samples
-      let velocity = 0;
-      if (velocityHistory.length > 0) {
-        const now = performance.now();
-        let totalWeight = 0;
-        let weightedSum = 0;
-
-        for (const { v, t } of velocityHistory) {
-          const weight = Math.max(0, 1 - (now - t) / 150);
-          weightedSum += v * weight;
-          totalWeight += weight;
-        }
-
-        velocity = totalWeight > 0 ? weightedSum / totalWeight : 0;
-      }
-
-      // Momentum animation
-      if (Math.abs(velocity) > 0.01) {
-        const animate = () => {
-          if (Math.abs(velocity) < 0.005) {
-            this.#momentumAnimationId = null;
-            return;
-          }
-
-          const lines = Math.round(velocity * 16);
-          if (lines !== 0) {
-            this.#terminal.scrollLines(lines);
-          }
-
-          velocity *= FRICTION;
-          this.#momentumAnimationId = requestAnimationFrame(animate);
-        };
-        animate();
-      }
-    });
-  }
-
-  // iOS keyboard viewport adjustment
-  #setupKeyboardHandler() {
-    if (!window.visualViewport) return;
-
-    const container = this.hasContainerTarget
-      ? this.containerTarget
-      : this.element;
-    let isKeyboardOpen = false;
-    let debounceTimer = null;
-
-    const handleViewportChange = () => {
-      const vh = window.visualViewport.height;
-      const offset = window.visualViewport.offsetTop;
-      const rect = container.getBoundingClientRect();
-      const availableHeight = vh - (rect.top + window.scrollY - offset);
-
-      if (availableHeight < rect.height && availableHeight > 100) {
-        container.style.maxHeight = `${availableHeight - 10}px`;
-        isKeyboardOpen = true;
-        requestAnimationFrame(() => {
-          this.#fitAddon?.fit();
-          this.#terminal?.scrollToBottom();
-        });
-      } else if (isKeyboardOpen) {
-        container.style.maxHeight = "";
-        isKeyboardOpen = false;
-        requestAnimationFrame(() => this.#fitAddon?.fit());
-      }
-    };
-
-    // Debounce to avoid rapid fire during keyboard animations
-    this.#keyboardHandler = () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(handleViewportChange, 50);
-    };
-
-    window.visualViewport.addEventListener("resize", this.#keyboardHandler);
-    window.visualViewport.addEventListener("scroll", this.#keyboardHandler);
-  }
-
   // Connection handlers
   #handleConnected() {
     if (!this.#terminal) return;
-
-    // Send dimensions immediately - terminal is already fit from #initTerminal
     this.#sendResize();
     this.focus();
   }
@@ -443,7 +451,6 @@ export default class extends Controller {
       case "agent_selected":
       case "agent_channel_switched":
       case "pty_channel_switched":
-        // Terminal channel is now ready - send resize
         this.#terminal?.clear();
         requestAnimationFrame(() => {
           this.#fitAddon?.fit();
@@ -454,7 +461,6 @@ export default class extends Controller {
   }
 
   #handleError(error) {
-    // Format error properly - error may be { reason, message } object from connection
     const message =
       typeof error === "object"
         ? error.message || error.reason || JSON.stringify(error)
@@ -474,21 +480,13 @@ export default class extends Controller {
     const cols = this.#terminal.cols;
     const rows = this.#terminal.rows;
 
-    // Send resize via terminal connection (guaranteed connected when
-    // called from #handleConnected). This directly resizes the PTY
-    // and updates client dims in Lua.
     this.#terminalConn?.sendResize(cols, rows);
-
-    // Also send via hub connection to update client dims centrally
-    // (resizes all PTYs for this client, not just the current one).
     this.#hubConn?.sendResize(cols, rows);
   }
 
   #handleResize() {
-    // Fit terminal immediately for visual feedback
     this.#fitAddon?.fit();
 
-    // Debounce sending resize to CLI - wait until resizing stops
     if (this.#resizeDebounceTimer) {
       clearTimeout(this.#resizeDebounceTimer);
     }
@@ -496,143 +494,5 @@ export default class extends Controller {
       this.#resizeDebounceTimer = null;
       this.#sendResize();
     }, 150);
-  }
-
-  // Mobile Autocorrect/Autocomplete Support (iOS and Android)
-  //
-  // xterm.js doesn't handle mobile autocorrect. iOS fires `insertReplacementText`
-  // but getTargetRanges() returns empty. We use two strategies:
-  //
-  // 1. Composition events (Android IME, some autocorrect): Track what xterm sends
-  //    during composition, delete that amount on compositionend
-  //
-  // 2. Word-based fallback (iOS): Autocorrect replaces the last word being typed,
-  //    so we find the last word in the textarea and delete that many chars
-  //
-  #setupMobileAutocorrect() {
-    // Only enable on mobile/touch devices
-    const isMobile =
-      /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
-      ("ontouchstart" in window && navigator.maxTouchPoints > 0);
-    if (!isMobile) return;
-
-    const textarea = this.#terminal?.element?.querySelector(
-      ".xterm-helper-textarea",
-    );
-    if (!textarea) return;
-
-    // Composition events (Android IME)
-    textarea.addEventListener("compositionstart", () => {
-      this.#isComposing = true;
-      this.#sentDuringComposition = "";
-    });
-
-    textarea.addEventListener("compositionend", (e) => {
-      this.#isComposing = false;
-      const deleteCount = this.#sentDuringComposition.length;
-      if (deleteCount > 0 && e.data) {
-        this.#sendInput("\x7f".repeat(deleteCount) + e.data);
-      }
-      this.#sentDuringComposition = "";
-    });
-
-    // iOS won't send delete events when textarea is empty
-    // Keep dummy content in the textarea so iOS always thinks there's something to delete
-    const DUMMY_CONTENT = "     "; // 5 spaces
-
-    // Initialize textarea with dummy content on focus
-    textarea.addEventListener("focus", () => {
-      if (textarea.value.length < 3) {
-        textarea.value = DUMMY_CONTENT;
-      }
-    });
-
-    // Unified beforeinput handler for iOS
-    textarea.addEventListener(
-      "beforeinput",
-      (e) => {
-        // Handle delete key
-        if (
-          e.inputType === "deleteContentBackward" ||
-          e.inputType === "deleteContentForward"
-        ) {
-          e.preventDefault();
-          this.#sendInput("\x7f");
-          setTimeout(() => {
-            if (textarea.value.length < 3) {
-              textarea.value = DUMMY_CONTENT;
-            }
-          }, 0);
-          return;
-        }
-
-        // Word-delete mode - iOS may use different inputTypes
-        if (
-          e.inputType === "deleteWordBackward" ||
-          e.inputType === "deleteWordForward" ||
-          e.inputType === "deleteSoftLineBackward" ||
-          e.inputType === "deleteHardLineBackward"
-        ) {
-          e.preventDefault();
-          this.#sendInput("\x17");
-          setTimeout(() => {
-            if (textarea.value.length < 3) {
-              textarea.value = DUMMY_CONTENT;
-            }
-          }, 0);
-          return;
-        }
-
-        // Autocorrect/replacement handler
-        if (this.#isComposing) return;
-        if (e.inputType !== "insertReplacementText") return;
-
-        // Block xterm's onData from double-sending
-        this.#isHandlingAutocorrect = true;
-
-        const text = textarea.value;
-        const replacement = e.data || "";
-
-        // Detect punctuation replacement (double-space-to-period, etc.)
-        // These replace just the trailing space, not a whole word
-        const isPunctuationReplacement = /^[.!?,;:]+\s*$/.test(replacement);
-
-        let deleteCount;
-        let textToSend;
-
-        if (isPunctuationReplacement) {
-          // Double-space-to-period: iOS sends space first, then replacement
-          // Terminal has TWO spaces, delete both then add ". "
-          e.preventDefault();
-          this.#sendInput("\x7f\x7f");
-          setTimeout(() => {
-            this.#sendInput(". ");
-            this.#isHandlingAutocorrect = false;
-          }, 50);
-          return;
-        }
-
-        // Autocomplete: delete the word being replaced
-        const words = text.trim().split(/\s+/);
-        const wordToReplace = words[words.length - 1] || "";
-        deleteCount = wordToReplace.length;
-        textToSend = replacement.trimStart();
-
-        if (deleteCount > 0) {
-          this.#sendInput("\x7f".repeat(deleteCount));
-        }
-        // Send replacement with trailing space for next word
-        if (textToSend) {
-          setTimeout(() => this.#sendInput(textToSend + " "), 50);
-        }
-
-        // Clear flag after iOS finishes updating
-        setTimeout(() => {
-          this.#isHandlingAutocorrect = false;
-          this.#terminal?.scrollToBottom();
-        }, 100);
-      },
-      { capture: true },
-    );
   }
 }

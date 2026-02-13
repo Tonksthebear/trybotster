@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_02_10_051852) do
+ActiveRecord::Schema[8.1].define(version: 2026_02_13_202100) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -226,6 +226,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_10_051852) do
     t.string "last_sign_in_ip"
     t.string "provider"
     t.datetime "remember_created_at"
+    t.string "remember_token"
     t.boolean "server_assisted_pairing", default: false, null: false
     t.integer "sign_in_count", default: 0, null: false
     t.bigint "team_id"

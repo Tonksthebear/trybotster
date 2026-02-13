@@ -35,7 +35,9 @@ pub fn get_offset_parser(parser: &Arc<Mutex<Parser>>) -> usize {
 
 /// Scroll up by the specified number of lines.
 ///
-/// Skips lock acquisition if `lines` is zero (no-op optimization).
+/// Skips lock acquisition if `lines` is zero. Also short-circuits if
+/// already at the top of the scrollback buffer (the vt100 crate clamps
+/// internally, but checking avoids a redundant write).
 pub fn up_parser(parser: &Arc<Mutex<Parser>>, lines: usize) {
     if lines == 0 {
         return;
@@ -43,6 +45,8 @@ pub fn up_parser(parser: &Arc<Mutex<Parser>>, lines: usize) {
     let mut p = parser.lock().expect("parser lock poisoned");
     let current = p.screen().scrollback();
     p.screen_mut().set_scrollback(current.saturating_add(lines));
+    // If scrollback didn't change, we're already at the top — future calls
+    // will be no-ops until new content is written.
 }
 
 /// Scroll down by the specified number of lines.

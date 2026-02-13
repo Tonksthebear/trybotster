@@ -11,7 +11,8 @@
 
     <meta name="bridge" content="<%= asset_path('workers/bridge.js') %>">
     <meta name="crypto-worker-url" content="<%= asset_path('workers/olm_crypto.js') %>">
-    <meta name="crypto-wasm-js-url" content="/wasm/vodozemac/vodozemac_wasm.js">
+    <meta name="crypto-wasm-js-url" content="<%= asset_path('vodozemac/vodozemac_wasm.js') %>">
+    <meta name="crypto-wasm-binary-url" content="<%= asset_path('vodozemac/vodozemac_wasm_bg.wasm') %>">
 
     <%= yield :head %>
 

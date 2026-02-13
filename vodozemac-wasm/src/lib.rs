@@ -3,9 +3,42 @@ use wasm_bindgen::prelude::*;
 use vodozemac::olm::{
     Account, InboundCreationResult, OlmMessage, Session, SessionConfig,
 };
-use vodozemac::{Curve25519PublicKey, KeyId};
+use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature, KeyId};
 
 use std::collections::HashMap;
+
+/// Verify an Ed25519 signature against a message using raw bytes.
+///
+/// All parameters are raw byte slices — no base64 encoding needed.
+///
+/// # Parameters
+/// - `signing_key` — 32-byte Ed25519 public key.
+/// - `message` — the bytes that were signed.
+/// - `signature` — 64-byte Ed25519 signature.
+///
+/// # Errors
+/// Returns `JsError` if the key or signature length is wrong.
+#[wasm_bindgen(js_name = "ed25519Verify")]
+pub fn ed25519_verify(
+    signing_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<bool, JsError> {
+    let key_bytes: &[u8; 32] = signing_key
+        .try_into()
+        .map_err(|_| JsError::new("signing_key must be exactly 32 bytes"))?;
+
+    let key = Ed25519PublicKey::from_slice(key_bytes)
+        .map_err(|e| JsError::new(&format!("bad signing_key: {e}")))?;
+
+    let sig = Ed25519Signature::from_slice(signature)
+        .map_err(|e| JsError::new(&format!("bad signature: {e}")))?;
+
+    match key.verify(message, &sig) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // VodozemacAccount

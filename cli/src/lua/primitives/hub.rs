@@ -64,6 +64,11 @@ pub enum HubRequest {
         /// ICE candidate data as JSON value.
         candidate: serde_json::Value,
     },
+    /// Initiate Olm ratchet restart for a browser whose session is desynced.
+    RatchetRestart {
+        /// Browser identity key (e.g., `identityKey:tabId`).
+        browser_identity: String,
+    },
 }
 
 /// Shared request queue for Hub operations from Lua.
@@ -308,6 +313,21 @@ pub fn register(
 
     hub.set("handle_ice_candidate", handle_ice_candidate_fn)
         .map_err(|e| anyhow!("Failed to set hub.handle_ice_candidate: {e}"))?;
+
+    // hub.request_ratchet_restart(browser_identity) - Initiate Olm ratchet restart for a peer.
+    let queue_restart = Arc::clone(&request_queue);
+    let request_ratchet_restart_fn = lua
+        .create_function(move |_, browser_identity: String| {
+            let mut q = queue_restart
+                .lock()
+                .expect("Hub request queue mutex poisoned");
+            q.push(HubRequest::RatchetRestart { browser_identity });
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create hub.request_ratchet_restart function: {e}"))?;
+
+    hub.set("request_ratchet_restart", request_ratchet_restart_fn)
+        .map_err(|e| anyhow!("Failed to set hub.request_ratchet_restart: {e}"))?;
 
     // hub.quit() - Request Hub shutdown
     let queue3 = request_queue;

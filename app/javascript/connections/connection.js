@@ -140,7 +140,8 @@ export class Connection {
 
       const cryptoWorkerUrl = document.querySelector('meta[name="crypto-worker-url"]')?.content
       const wasmJsUrl = document.querySelector('meta[name="crypto-wasm-js-url"]')?.content
-      await ensureMatrixReady(cryptoWorkerUrl, wasmJsUrl)
+      const wasmBinaryUrl = document.querySelector('meta[name="crypto-wasm-binary-url"]')?.content
+      await ensureMatrixReady(cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl)
 
       await this.#connectSignaling()
     } catch (error) {
@@ -518,7 +519,7 @@ export class Connection {
     this.#unsubscribers.push(unsubSession)
 
     // Listen for session refreshed (ratchet restart succeeded)
-    const unsubRefresh = bridge.on("session:refreshed", (event) => {
+    const unsubRefresh = bridge.on("session:refreshed", async (event) => {
       if (event.hubId !== hubId) return
       console.debug(`[${this.constructor.name}] Session refreshed via ratchet restart`)
 
@@ -528,10 +529,11 @@ export class Connection {
         this.errorReason = null
       }
 
-      // Re-subscribe to resume content delivery with the fresh session
-      if (this.subscriptionId) {
-        this.subscribe({ force: true })
-      }
+      // Tear down the dead WebRTC peer and reconnect with the fresh session.
+      // The old peer's offer was encrypted with the stale Olm session and was
+      // never answered, so we need a completely new peer connection + offer.
+      await this.#disconnectPeer()
+      await this.#ensureConnected()
     })
     this.#unsubscribers.push(unsubRefresh)
   }

@@ -900,14 +900,61 @@ where
     /// event reader to preserve raw bytes for PTY passthrough.
     fn poll_input(&mut self, layout_lua: Option<&LayoutLua>) {
         let events = self.raw_reader.drain_events();
+
+        // Coalesce consecutive mouse scroll events to prevent overscroll.
+        // Fast scrolling generates many events per tick; processing them
+        // individually causes unnecessary lag at scrollback boundaries.
+        let mut pending_scroll: i64 = 0;
+        // 3 lines per mouse scroll tick — matches the value in handle_raw_input_event.
+        const MOUSE_SCROLL_LINES: i64 = 3;
+
         for event in events {
-            self.handle_raw_input_event(event, layout_lua);
+            match &event {
+                InputEvent::MouseScroll { direction } if !self.has_overlay => {
+                    match direction {
+                        ScrollDirection::Up => pending_scroll += MOUSE_SCROLL_LINES,
+                        ScrollDirection::Down => pending_scroll -= MOUSE_SCROLL_LINES,
+                    }
+                }
+                InputEvent::MouseScroll { .. } => {
+                    // Overlay active — swallow scroll events.
+                }
+                InputEvent::Key { .. } => {
+                    // Flush accumulated scroll before processing the key event,
+                    // so key handlers see the correct scroll position.
+                    if pending_scroll != 0 {
+                        self.apply_coalesced_scroll(pending_scroll);
+                        pending_scroll = 0;
+                    }
+                    self.handle_raw_input_event(event, layout_lua);
+                }
+            }
+        }
+
+        // Flush any trailing scroll events.
+        if pending_scroll != 0 {
+            self.apply_coalesced_scroll(pending_scroll);
         }
         // Check SIGWINCH resize flag
         if self.resize_flag.swap(false, Ordering::SeqCst) {
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
             let (inner_rows, inner_cols) = terminal_widget_inner_area(cols, rows);
             self.handle_resize(inner_rows, inner_cols);
+        }
+    }
+
+    /// Apply a coalesced scroll delta from batched mouse scroll events.
+    ///
+    /// Positive delta scrolls up (into history), negative scrolls down.
+    /// Batching N scroll events into one call prevents redundant mutex
+    /// acquisitions and makes boundaries feel instant.
+    fn apply_coalesced_scroll(&mut self, delta: i64) {
+        if delta > 0 {
+            #[expect(clippy::cast_sign_loss, reason = "delta is positive, checked above")]
+            self.handle_tui_action(TuiAction::ScrollUp(delta as usize));
+        } else {
+            #[expect(clippy::cast_sign_loss, reason = "delta is negative, negated to positive")]
+            self.handle_tui_action(TuiAction::ScrollDown((-delta) as usize));
         }
     }
 
@@ -973,17 +1020,9 @@ where
                     self.handle_pty_input(&raw_bytes);
                 }
             }
-            InputEvent::MouseScroll { direction } => {
-                if !self.has_overlay {
-                    match direction {
-                        ScrollDirection::Up => {
-                            self.handle_tui_action(TuiAction::ScrollUp(3));
-                        }
-                        ScrollDirection::Down => {
-                            self.handle_tui_action(TuiAction::ScrollDown(3));
-                        }
-                    }
-                }
+            InputEvent::MouseScroll { .. } => {
+                // Mouse scroll events are coalesced in poll_input() and never
+                // reach here. This arm exists only for exhaustiveness.
             }
         }
     }
