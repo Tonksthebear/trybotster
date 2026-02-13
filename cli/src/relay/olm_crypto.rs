@@ -85,6 +85,13 @@ pub const MSG_TYPE_PREKEY: u8 = 0;
 /// Olm normal message type.
 pub const MSG_TYPE_NORMAL: u8 = 1;
 
+/// Bundle refresh message type (CLI → Browser, unencrypted).
+///
+/// Sent when the CLI detects session desync (consecutive decrypt failures).
+/// Contains a fresh `DeviceKeyBundle` (161 bytes) so the browser can
+/// re-establish the Olm session without rescanning the QR code.
+pub const MSG_TYPE_BUNDLE_REFRESH: u8 = 2;
+
 /// Binary inner content type: JSON control message.
 pub const CONTENT_MSG: u8 = 0x00;
 
@@ -638,6 +645,46 @@ impl VodozemacCrypto {
         Ok(())
     }
 
+    /// Remove the Olm session for a specific peer.
+    ///
+    /// Called during ratchet restart to clear stale session state
+    /// before the peer creates a new outbound session from a fresh bundle.
+    ///
+    /// Returns `true` if a session was removed.
+    pub fn remove_session(&mut self, peer_key: &str) -> bool {
+        let removed = self.sessions.remove(peer_key).is_some();
+        if removed {
+            log::info!(
+                "Removed Olm session for peer {}... ({} sessions remaining)",
+                &peer_key[..peer_key.len().min(16)],
+                self.sessions.len()
+            );
+        }
+        removed
+    }
+
+    /// Generate a fresh bundle and clear the old session for a peer.
+    ///
+    /// This is the core of ratchet restart: generates a new one-time key,
+    /// builds a `DeviceKeyBundle`, and removes the old session so the
+    /// peer can establish a fresh one.
+    ///
+    /// Returns the bundle as raw binary bytes (161 bytes) for sending
+    /// as a type-2 (bundle refresh) message.
+    pub fn refresh_bundle_for_peer(&mut self, peer_key: &str) -> Result<Vec<u8>> {
+        self.remove_session(peer_key);
+
+        let bundle = self.build_device_key_bundle()?;
+        let bundle_bytes = bundle.to_binary()?;
+
+        log::info!(
+            "Generated refresh bundle for peer {}... (identity: {}...)",
+            &peer_key[..peer_key.len().min(16)],
+            &self.identity_key[..self.identity_key.len().min(16)]
+        );
+
+        Ok(bundle_bytes)
+    }
 }
 
 #[cfg(test)]
@@ -1002,5 +1049,102 @@ mod tests {
         let parsed_sub = std::str::from_utf8(&content[3..3 + len]).unwrap();
         assert_eq!(parsed_sub, sub_id);
         assert_eq!(&content[3 + len..], payload);
+    }
+
+    #[test]
+    fn test_remove_session() {
+        let mut cli = VodozemacCrypto::new("test-remove-cli");
+        let mut browser = VodozemacCrypto::new("test-remove-browser");
+        let cli_key = cli.identity_key().to_string();
+        let browser_key = browser.identity_key().to_string();
+
+        // Establish session
+        let bundle = cli.build_device_key_bundle().unwrap();
+        browser
+            .create_outbound_session(&bundle.curve25519_key, &bundle.one_time_key)
+            .unwrap();
+        let env = browser.encrypt(b"hello", &cli_key).unwrap();
+        cli.decrypt(&env).unwrap();
+        assert!(cli.has_session());
+
+        // Remove session
+        assert!(cli.remove_session(&browser_key));
+        assert!(!cli.has_session());
+
+        // Removing again returns false
+        assert!(!cli.remove_session(&browser_key));
+    }
+
+    #[test]
+    fn test_refresh_bundle_for_peer() {
+        let mut cli = VodozemacCrypto::new("test-refresh-cli");
+        let mut browser = VodozemacCrypto::new("test-refresh-browser");
+        let cli_key = cli.identity_key().to_string();
+        let browser_key = browser.identity_key().to_string();
+
+        // Establish initial session
+        let bundle1 = cli.build_device_key_bundle().unwrap();
+        browser
+            .create_outbound_session(&bundle1.curve25519_key, &bundle1.one_time_key)
+            .unwrap();
+        let env = browser.encrypt(b"initial", &cli_key).unwrap();
+        cli.decrypt(&env).unwrap();
+
+        // Refresh bundle — old session cleared, new OTK generated
+        let refresh_bytes = cli.refresh_bundle_for_peer(&browser_key).unwrap();
+        assert_eq!(refresh_bytes.len(), binary_format::BUNDLE_SIZE);
+        assert!(!cli.has_session());
+
+        // Parse refresh bundle — identity key same, OTK different
+        let refresh_bundle = DeviceKeyBundle::from_binary(&refresh_bytes).unwrap();
+        assert_eq!(refresh_bundle.curve25519_key, bundle1.curve25519_key);
+        assert_ne!(refresh_bundle.one_time_key, bundle1.one_time_key);
+    }
+
+    /// Full ratchet restart round-trip: establish → desync → refresh → re-establish.
+    #[test]
+    fn test_ratchet_restart_full_flow() {
+        let mut cli = VodozemacCrypto::new("test-restart-cli");
+        let mut browser = VodozemacCrypto::new("test-restart-browser");
+        let cli_key = cli.identity_key().to_string();
+        let browser_key = browser.identity_key().to_string();
+
+        // Step 1: Normal session establishment
+        let bundle = cli.build_device_key_bundle().unwrap();
+        browser
+            .create_outbound_session(&bundle.curve25519_key, &bundle.one_time_key)
+            .unwrap();
+        let env = browser.encrypt(b"hello", &cli_key).unwrap();
+        cli.decrypt(&env).unwrap();
+        let reply = cli.encrypt(b"world", &browser_key).unwrap();
+        browser.decrypt(&reply).unwrap();
+
+        // Step 2: CLI refreshes bundle (simulates desync detection)
+        let refresh_bytes = cli.refresh_bundle_for_peer(&browser_key).unwrap();
+        let refresh_bundle = DeviceKeyBundle::from_binary(&refresh_bytes).unwrap();
+
+        // Step 3: Browser creates new outbound session from fresh bundle
+        // (In production, handleCreateSession clears old state and recreates)
+        let mut browser2 = VodozemacCrypto::new("test-restart-browser2");
+        browser2
+            .create_outbound_session(
+                &refresh_bundle.curve25519_key,
+                &refresh_bundle.one_time_key,
+            )
+            .unwrap();
+
+        // Step 4: Browser sends PreKey with new session
+        let prekey_env = browser2.encrypt(b"back online", &cli_key).unwrap();
+        assert_eq!(prekey_env.message_type, MSG_TYPE_PREKEY);
+
+        // CLI creates inbound session from PreKey
+        let dec = cli.decrypt(&prekey_env).unwrap();
+        assert_eq!(dec, b"back online");
+
+        // Step 5: Bidirectional communication restored
+        let browser2_key = browser2.identity_key().to_string();
+        let cli_reply = cli.encrypt(b"welcome back", &browser2_key).unwrap();
+        let dec2 = browser2.decrypt(&cli_reply).unwrap();
+        assert_eq!(dec2, b"welcome back");
     }
 }

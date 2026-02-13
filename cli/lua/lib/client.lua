@@ -9,11 +9,11 @@
 -- Transport-agnostic: works with any transport that provides send(msg)
 -- and send_binary(data) methods. Currently supports WebRTC and TUI transports.
 --
--- This module is hot-reloadable; state is persisted via core.state.
+-- This module is hot-reloadable; state is persisted via hub.state.
 -- Uses state.class() for persistent metatable — existing instances
 -- automatically see new/changed methods after hot-reload.
 
-local state = require("core.state")
+local state = require("hub.state")
 local Agent = require("lib.agent")
 
 local Client = state.class("client")

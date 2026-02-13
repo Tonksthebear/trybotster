@@ -5,28 +5,65 @@
 --   nil   -> Rust ignores the event (already logged)
 --   ops   -> Rust executes each op in sequence
 --
--- This module handles all hub lifecycle events that were previously
--- hardcoded in Rust's handle_lua_message(). Lua decides what state
--- changes to make; Rust executes them mechanically.
+-- The TUI is a client consuming hub events (same as the browser).
+-- Client-side state lives in _tui_state; events update it directly.
+-- Only primitive ops (send_msg, focus_terminal, quit) are returned to Rust.
 --
--- Supported operations (same as actions.lua, plus new data ops):
---   set_mode          { op, mode }
---   store_field       { op, key, value }
---   clear_field       { op, key }
+-- Supported operations:
+--   set_mode          { op, mode }                   - Update Rust's mode shadow
 --   send_msg          { op, data }
---   focus_terminal    { op, agent_id, pty_index }  - focus agent+pty (nil agent_id clears)
---   upsert_agent      { op, agent }                - add or update agent in cache
---   remove_agent      { op, agent_id }             - remove agent from cache
---   set_agents        { op, agents }               - full replace agent cache
---   set_worktrees     { op, worktrees }            - full replace worktree list
---   set_connection_code { op, url, qr_ascii }      - set connection code display
---   clear_connection_code { op }                    - clear connection code
---
--- Note: context fields:
---   mode, selected_agent, selected_agent_index, active_pty_index,
---   agents (array of {id, session_count}), pending_fields
+--   focus_terminal    { op, agent_id, pty_index, agent_index }
+--   set_connection_code { op, url, qr_ascii }
+--   clear_connection_code { op }
 
 local M = {}
+
+--- Set mode in _tui_state and return the set_mode op for Rust's shadow.
+local function set_mode_ops(mode)
+  _tui_state.mode = mode
+  _tui_state.list_selected = 0
+  _tui_state.input_buffer = ""
+  return { op = "set_mode", mode = mode }
+end
+
+-- =============================================================================
+-- Client-side agent state helpers (same pattern as browser JS)
+-- =============================================================================
+
+local function upsert_agent(agent)
+  for i, a in ipairs(_tui_state.agents) do
+    if a.id == agent.id then
+      _tui_state.agents[i] = agent
+      return
+    end
+  end
+  _tui_state.agents[#_tui_state.agents + 1] = agent
+end
+
+local function remove_agent(agent_id)
+  for i, a in ipairs(_tui_state.agents) do
+    if a.id == agent_id then
+      table.remove(_tui_state.agents, i)
+      return
+    end
+  end
+end
+
+local function update_agent_status(agent_id, status)
+  for _, a in ipairs(_tui_state.agents) do
+    if a.id == agent_id then
+      a.status = status
+      return
+    end
+  end
+end
+
+local function agent_index_for(agent_id)
+  for i, a in ipairs(_tui_state.agents) do
+    if a.id == agent_id then return i - 1 end -- 0-based for Rust
+  end
+  return nil
+end
 
 --- Return the appropriate base mode: "insert" if an agent is selected, "normal" otherwise.
 local function base_mode(context)
@@ -44,38 +81,39 @@ function M.on_hub_event(event_type, event_data, context)
     local agent = event_data.agent
     if not agent then return nil end
 
-    local ops = {
-      { op = "clear_field", key = "creating_agent_id" },
-      { op = "clear_field", key = "creating_agent_stage" },
-    }
-
-    -- Add the new agent to cache
-    table.insert(ops, { op = "upsert_agent", agent = agent })
+    -- Update client state
+    _tui_state.pending_fields.creating_agent_id = nil
+    _tui_state.pending_fields.creating_agent_stage = nil
+    upsert_agent(agent)
 
     -- Focus the new agent's terminal and enter insert mode
     if agent.id then
-      table.insert(ops, { op = "focus_terminal", agent_id = agent.id, pty_index = 0 })
-      table.insert(ops, { op = "set_mode", mode = "insert" })
+      local idx = agent_index_for(agent.id)
+      return {
+        { op = "focus_terminal", agent_id = agent.id, pty_index = 0, agent_index = idx },
+        set_mode_ops("insert"),
+      }
     end
 
-    return ops
+    return {}
   end
 
   if event_type == "agent_deleted" then
     local agent_id = event_data.agent_id
     if not agent_id then return nil end
 
-    local ops = {
-      { op = "remove_agent", agent_id = agent_id },
-    }
+    -- Update client state
+    remove_agent(agent_id)
 
     -- Clear focus if the deleted agent was selected
     if context.selected_agent == agent_id then
-      table.insert(ops, { op = "focus_terminal" })  -- nil agent_id clears selection
-      table.insert(ops, { op = "set_mode", mode = "normal" })
+      return {
+        { op = "focus_terminal" },  -- nil agent_id clears selection
+        set_mode_ops("normal"),
+      }
     end
 
-    return ops
+    return {}
   end
 
   if event_type == "agent_status_changed" then
@@ -83,47 +121,40 @@ function M.on_hub_event(event_type, event_data, context)
     local status = event_data.status
     if not agent_id or not status then return nil end
 
-    local ops = {}
-
-    -- Update creation progress display based on lifecycle status
+    -- Update creation progress display
     if status == "creating_worktree" then
-      table.insert(ops, { op = "store_field", key = "creating_agent_id", value = agent_id })
-      table.insert(ops, { op = "store_field", key = "creating_agent_stage", value = "creating_worktree" })
+      _tui_state.pending_fields.creating_agent_id = agent_id
+      _tui_state.pending_fields.creating_agent_stage = "creating_worktree"
     elseif status == "spawning_ptys" then
-      table.insert(ops, { op = "store_field", key = "creating_agent_id", value = agent_id })
-      table.insert(ops, { op = "store_field", key = "creating_agent_stage", value = "spawning_agent" })
+      _tui_state.pending_fields.creating_agent_id = agent_id
+      _tui_state.pending_fields.creating_agent_stage = "spawning_agent"
     elseif status == "running" or status == "failed" then
-      table.insert(ops, { op = "clear_field", key = "creating_agent_id" })
-      table.insert(ops, { op = "clear_field", key = "creating_agent_stage" })
+      _tui_state.pending_fields.creating_agent_id = nil
+      _tui_state.pending_fields.creating_agent_stage = nil
     elseif status == "stopping" or status == "removing_worktree" or status == "deleted" then
-      local pending = context.pending_fields or {}
-      if pending.creating_agent_id == agent_id then
-        table.insert(ops, { op = "clear_field", key = "creating_agent_id" })
-        table.insert(ops, { op = "clear_field", key = "creating_agent_stage" })
+      if _tui_state.pending_fields.creating_agent_id == agent_id then
+        _tui_state.pending_fields.creating_agent_id = nil
+        _tui_state.pending_fields.creating_agent_stage = nil
       end
     end
 
-    -- Update agent status in cache (upsert with just id + status)
-    table.insert(ops, { op = "update_agent_status", agent_id = agent_id, status = status })
-
-    if #ops == 0 then return nil end
-    return ops
+    -- Update agent status in client cache
+    update_agent_status(agent_id, status)
+    return {}
   end
 
   if event_type == "agent_list" then
     local agents = event_data.agents
     if not agents then return nil end
-    return {
-      { op = "set_agents", agents = agents },
-    }
+    _tui_state.agents = agents
+    return {}
   end
 
   if event_type == "worktree_list" then
     local worktrees = event_data.worktrees
     if not worktrees then return nil end
-    return {
-      { op = "set_worktrees", worktrees = worktrees },
-    }
+    _tui_state.available_worktrees = worktrees
+    return {}
   end
 
   if event_type == "connection_code" then

@@ -11,8 +11,8 @@
 //! ├── vt100_parser: Arc<Mutex<Parser>>  - alias into pool for focused PTY
 //! ├── active_subscriptions: HashSet<(agent, pty)>  - synced from render tree
 //! ├── terminal: Terminal<CrosstermBackend>  - ratatui terminal
-//! ├── mode, overlay_list_selected, input_buffer  - UI state
-//! ├── agents, selected_agent  - agent state cache
+//! ├── mode (shadow of Lua _tui_state.mode)  - for PTY routing
+//! ├── selected_agent, current_agent_index  - focus state
 //! ├── request_tx  - send requests to Hub
 //! └── output_rx  - receive PTY output and Lua events from Hub
 //! ```
@@ -62,7 +62,6 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::client::{TuiOutput, TuiRequest};
 use crate::hub::Hub;
-use crate::relay::AgentInfo;
 use crate::tui::layout::terminal_widget_inner_area;
 
 use super::actions::TuiAction;
@@ -111,35 +110,15 @@ pub struct TuiRunner<B: Backend> {
     /// Ratatui terminal for rendering.
     terminal: Terminal<B>,
 
-    // === UI State (TuiRunner-specific) ===
-    /// Current UI mode string (e.g., "normal", "menu"). Lua owns mode names.
+    // === UI State ===
+    /// Mode shadow for PTY routing. Canonical state is `_tui_state.mode` in Lua.
     pub(super) mode: String,
-
-
-    /// Currently selected overlay list item index (unified for all modals).
-    pub(super) overlay_list_selected: usize,
-
-    /// Text input buffer for text entry modes.
-    pub(super) input_buffer: String,
-
-    /// Available worktrees for agent creation.
-    pub(super) available_worktrees: Vec<(String, String)>,
 
     /// Current connection code data (URL + QR ASCII) for display.
     pub(super) connection_code: Option<ConnectionCodeData>,
 
     /// Error message to display in Error mode.
     pub(super) error_message: Option<String>,
-
-    /// Generic key-value store for pending operations.
-    ///
-    /// Keys like "creating_agent_id", "creating_agent_stage" are set by Lua
-    /// compound actions and read by layout rendering.
-    pub(super) pending_fields: std::collections::HashMap<String, String>,
-
-    // === Agent State ===
-    /// Cached agent list (updated via Lua event callbacks).
-    pub(super) agents: Vec<AgentInfo>,
 
     // === Channels ===
     /// Request sender to Hub.
@@ -274,7 +253,7 @@ pub struct TuiRunner<B: Backend> {
     ///
     /// Populated after each Lua render pass by extracting actions from the
     /// overlay render tree. Indexed by selectable item index (matches
-    /// `overlay_list_selected`). Used by Lua compound action dispatch.
+    /// `_tui_state.list_selected` in Lua). Used by Lua compound action dispatch.
     pub(super) overlay_list_actions: Vec<String>,
 
     /// Whether a Lua overlay is currently active (from last render pass).
@@ -293,7 +272,7 @@ where
         f.debug_struct("TuiRunner")
             .field("mode", &self.mode)
             .field("selected_agent", &self.selected_agent)
-            .field("agents_count", &self.agents.len())
+            .field("current_agent_index", &self.current_agent_index)
             .field("terminal_dims", &self.terminal_dims)
             .field("quit", &self.quit)
             .finish_non_exhaustive()
@@ -334,13 +313,8 @@ where
             parser_pool: std::collections::HashMap::new(),
             terminal,
             mode: String::new(),
-            overlay_list_selected: 0,
-            input_buffer: String::new(),
-            available_worktrees: Vec::new(),
             connection_code: None,
             error_message: None,
-            pending_fields: std::collections::HashMap::new(),
-            agents: Vec::new(),
             request_tx,
             selected_agent: None,
             active_pty_index: 0,
@@ -542,45 +516,17 @@ where
     }
 
     /// Get the agent list.
-    #[must_use]
-    pub fn agents(&self) -> &[AgentInfo] {
-        &self.agents
-    }
-
     /// Build an `ActionContext` from current TuiRunner state.
     ///
     /// Shared by action dispatch and hub event dispatch so both Lua
     /// callbacks receive the same context shape.
-    pub(super) fn build_action_context(
-        &self,
-        list_selected: usize,
-    ) -> super::layout_lua::ActionContext {
-        let selected_agent_index = self
-            .selected_agent
-            .as_ref()
-            .and_then(|key| self.agents.iter().position(|a| a.id == *key));
-
+    pub(super) fn build_action_context(&self) -> super::layout_lua::ActionContext {
         super::layout_lua::ActionContext {
-            mode: self.mode.clone(),
-            input_buffer: self.input_buffer.clone(),
-            list_selected,
             overlay_actions: self.overlay_list_actions.clone(),
-            pending_fields: self.pending_fields.clone(),
             selected_agent: self.selected_agent.clone(),
-            available_worktrees: self.available_worktrees.clone(),
-            agents: self
-                .agents
-                .iter()
-                .map(|a| super::layout_lua::ActionContextAgent {
-                    id: a.id.clone(),
-                    session_count: a
-                        .sessions
-                        .as_ref()
-                        .map_or(1, |s| s.len().max(1)),
-                })
-                .collect(),
-            selected_agent_index,
+            selected_agent_index: self.current_agent_index,
             active_pty_index: self.active_pty_index,
+            action_char: None,
         }
     }
 
@@ -636,6 +582,24 @@ where
                 }
             }
 
+            // Bootstrap TUI client-side state.
+            // _tui_state is LayoutLua's local state — same role as JavaScript
+            // state in the browser client. All UI modules read/write it directly.
+            let _ = lua.load_extension(
+                "_tui_state = _tui_state or {\
+                    agents = {},\
+                    pending_fields = {},\
+                    available_worktrees = {},\
+                    mode = 'normal',\
+                    input_buffer = '',\
+                    list_selected = 0,\
+                    selected_agent = nil,\
+                    active_pty_index = 0,\
+                    connection_code = nil,\
+                }",
+                "_tui_state_init",
+            );
+
             // Load botster API (provides botster.keymap, botster.action, botster.ui, etc.)
             if let Some(ref botster_source) = self.botster_api_source {
                 match lua.load_extension(botster_source, "botster") {
@@ -681,14 +645,16 @@ where
                         }
                     }
 
-                    // Watch user ui/ directory for extension hot-reload
+                    // Watch user directories for extension hot-reload
                     let lua_base = resolve_lua_user_path();
-                    let user_ui_dir = lua_base.join("user").join("ui");
-                    if user_ui_dir.exists() {
-                        if let Err(e) = watcher.watch(&user_ui_dir, false) {
-                            log::warn!("Failed to watch user UI directory: {e}");
-                        } else {
-                            log::info!("Hot-reload watching user UI: {}", user_ui_dir.display());
+                    for subdir in ["ui", "user/ui"] {
+                        let dir = lua_base.join(subdir);
+                        if dir.exists() {
+                            if let Err(e) = watcher.watch(&dir, false) {
+                                log::warn!("Failed to watch {}: {e}", dir.display());
+                            } else {
+                                log::info!("Hot-reload watching: {}", dir.display());
+                            }
                         }
                     }
 
@@ -787,12 +753,12 @@ where
                         events.iter().any(|evt| is_modify(evt) && evt.path == ext.fs_path)
                     });
 
-                    // Also check if a new extension file appeared in user/ui/
+                    // Also check if a file changed in user/ui/ or the user override ui/ dir
                     let user_ui_changed = events.iter().any(|evt| {
                         is_modify(evt)
                             && evt.path.extension().is_some_and(|e| e == "lua")
                             && evt.path.parent().map_or(false, |p| {
-                                p.ends_with("user/ui")
+                                p.ends_with("user/ui") || p.ends_with(".botster/lua/ui")
                             })
                     });
 
@@ -885,9 +851,10 @@ where
                     // Replay extensions if any built-in or extension changed
                     if (any_builtin_changed || any_extension_changed) && layout_lua.is_some() {
                         if let Some(ref lua) = layout_lua {
-                            // Re-discover extensions (picks up new files)
+                            // Re-discover extensions and user overrides (picks up new files)
                             let lua_base = resolve_lua_user_path();
-                            let fresh_extensions = discover_ui_extensions(&lua_base);
+                            let mut fresh_extensions = discover_ui_extensions(&lua_base);
+                            fresh_extensions.extend(discover_user_ui_overrides());
 
                             // Reload botster API
                             if let Some(ref bs) = botster_api_source {
@@ -974,7 +941,6 @@ where
                 if let Some(lua) = layout_lua {
                     if lua.has_keybindings() {
                         let context = KeyContext {
-                            list_selected: self.overlay_list_selected,
                             list_count: self.overlay_list_actions.len(),
                             terminal_rows: self.terminal_dims.0,
                         };
@@ -1033,23 +999,8 @@ where
         let action_str = lua_action.action.as_str();
 
         // Generic UI primitives that Rust handles directly.
-        // Everything else falls through to Lua compound action dispatch.
-        let action = match action_str {
-            // List navigation (unified for all overlay lists)
-            "list_up" => Some(TuiAction::ListUp),
-            "list_down" => Some(TuiAction::ListDown),
-
-            // Text input
-            "input_char" => {
-                if let Some(c) = lua_action.char {
-                    Some(TuiAction::InputChar(c))
-                } else {
-                    return;
-                }
-            }
-            "input_backspace" => Some(TuiAction::InputBackspace),
-
-            // Scrolling
+        // Scroll actions are handled directly by Rust (no Lua state involved).
+        let scroll_action = match action_str {
             "scroll_half_up" => {
                 Some(TuiAction::ScrollUp(self.terminal_dims.0 as usize / 2))
             }
@@ -1058,21 +1009,30 @@ where
             }
             "scroll_top" => Some(TuiAction::ScrollToTop),
             "scroll_bottom" => Some(TuiAction::ScrollToBottom),
-
-            // Everything else goes through Lua compound action dispatch
             _ => None,
         };
 
-        if let Some(tui_action) = action {
+        if let Some(tui_action) = scroll_action {
             self.handle_tui_action(tui_action);
             return;
         }
 
-        // Application-specific actions — dispatch through Lua actions.on_action()
+        // Everything else goes through Lua compound action dispatch.
+        // Lua owns mode, input_buffer, list_selected via _tui_state.
         if layout_lua.has_actions() {
-            let context = self.build_action_context(
-                lua_action.index.unwrap_or(self.overlay_list_selected),
-            );
+            let mut context = self.build_action_context();
+
+            // Pass character for input_char action
+            if action_str == "input_char" {
+                context.action_char = lua_action.char;
+            }
+
+            // Pass list_select index override
+            if let Some(idx) = lua_action.index {
+                // Number shortcut — temporarily set list_selected in _tui_state
+                // so actions.lua sees the right index
+                let _ = layout_lua.exec(&format!("_tui_state.list_selected = {idx}"));
+            }
 
             match layout_lua.call_on_action(action_str, &context) {
                 Ok(Some(ops)) => {
@@ -1274,7 +1234,7 @@ where
 
         if let Some(lua) = layout_lua {
             if lua.has_events() {
-                let context = self.build_action_context(self.overlay_list_selected);
+                let context = self.build_action_context();
                 match lua.call_on_hub_event(event_type, &msg, &context) {
                     Ok(Some(ops)) => {
                         log::info!("Hub event '{event_type}' → {} ops", ops.len());
@@ -1304,34 +1264,10 @@ where
         layout_lua: Option<&LayoutLua>,
         layout_error: Option<&str>,
     ) -> Result<()> {
-        use super::render::{render, AgentRenderInfo, RenderContext};
+        use super::render::{render, RenderContext};
 
-        // Build agent render info from cached agents
-        let agent_render_info: Vec<AgentRenderInfo> = self
-            .agents
-            .iter()
-            .map(|info| AgentRenderInfo {
-                key: info.id.clone(),
-                display_name: info.name.clone(),
-                repo: info.repo.clone().unwrap_or_default(),
-                issue_number: info.issue_number.map(|n| n as u32),
-                branch_name: info.branch_name.clone().unwrap_or_default(),
-                port: info.port,
-                server_running: info.server_running.unwrap_or(false),
-                session_names: info
-                    .sessions
-                    .as_ref()
-                    .map(|s| s.iter().map(|si| si.name.clone()).collect())
-                    .unwrap_or_default(),
-            })
-            .collect();
-
-        // Calculate selected agent index
-        let selected_agent_index = self
-            .selected_agent
-            .as_ref()
-            .and_then(|key| self.agents.iter().position(|a| a.id == *key))
-            .unwrap_or(0);
+        // Selected agent index from current_agent_index (set by focus_terminal)
+        let selected_agent_index = self.current_agent_index.unwrap_or(0);
 
         // Check scroll state from parser
         let (scroll_offset, is_scrolled) = {
@@ -1344,19 +1280,12 @@ where
 
         // Build render context from TuiRunner state
         let ctx = RenderContext {
-            // UI State
-            mode: self.mode.clone(),
-            list_selected: self.overlay_list_selected,
-            input_buffer: &self.input_buffer,
-            available_worktrees: &self.available_worktrees,
+            // Note: mode, list_selected, input_buffer live in Lua's _tui_state (not passed here)
             error_message: self.error_message.as_deref(),
-            pending_fields: &self.pending_fields,
             connection_code: self.connection_code.as_ref(),
             bundle_used: false, // TuiRunner doesn't track this - would need from Hub
 
-            // Agent State
-            agent_ids: &[], // Not needed for rendering
-            agents: &agent_render_info,
+            // Selection State
             selected_agent_index,
 
             // Terminal State - use TuiRunner's local parser
@@ -1451,10 +1380,9 @@ where
             let op_name = op.get("op").and_then(|v| v.as_str()).unwrap_or("");
             match op_name {
                 "set_mode" => {
+                    // Shadow update only — canonical state is _tui_state.mode in Lua.
                     if let Some(mode) = op.get("mode").and_then(|v| v.as_str()) {
                         self.mode = mode.to_string();
-                        self.overlay_list_selected = 0;
-                        self.input_buffer.clear();
                     }
                 }
                 "send_msg" => {
@@ -1462,74 +1390,11 @@ where
                         self.send_msg(data.clone());
                     }
                 }
-                "store_field" => {
-                    if let (Some(key), Some(value)) = (
-                        op.get("key").and_then(|v| v.as_str()),
-                        op.get("value").and_then(|v| v.as_str()),
-                    ) {
-                        self.pending_fields.insert(key.to_string(), value.to_string());
-                    }
-                }
-                "clear_field" => {
-                    if let Some(key) = op.get("key").and_then(|v| v.as_str()) {
-                        self.pending_fields.remove(key);
-                    }
-                }
-                "clear_input" => {
-                    self.input_buffer.clear();
-                }
-                "reset_list" => {
-                    self.overlay_list_selected = 0;
-                }
                 "quit" => {
                     self.quit = true;
                 }
                 "focus_terminal" => {
                     self.execute_focus_terminal(&op);
-                }
-                "upsert_agent" => {
-                    if let Some(agent_val) = op.get("agent") {
-                        if let Some(info) = super::runner_handlers::parse_agent_info(agent_val) {
-                            self.agents.retain(|a| a.id != info.id);
-                            self.agents.push(info);
-                        }
-                    }
-                }
-                "remove_agent" => {
-                    if let Some(agent_id) = op.get("agent_id").and_then(|v| v.as_str()) {
-                        self.agents.retain(|a| a.id != agent_id);
-                    }
-                }
-                "update_agent_status" => {
-                    if let (Some(agent_id), Some(status)) = (
-                        op.get("agent_id").and_then(|v| v.as_str()),
-                        op.get("status").and_then(|v| v.as_str()),
-                    ) {
-                        if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-                            agent.status = Some(status.to_string());
-                        }
-                    }
-                }
-                "set_agents" => {
-                    if let Some(agents) = op.get("agents").and_then(|v| v.as_array()) {
-                        self.agents = agents
-                            .iter()
-                            .filter_map(|a| super::runner_handlers::parse_agent_info(a))
-                            .collect();
-                        log::debug!("Updated agent list: {} agents", self.agents.len());
-                    }
-                }
-                "set_worktrees" => {
-                    if let Some(worktrees) = op.get("worktrees").and_then(|v| v.as_array()) {
-                        self.available_worktrees = worktrees
-                            .iter()
-                            .filter_map(|w| {
-                                let path = w.get("path").and_then(|v| v.as_str())?;
-                                let branch = w.get("branch").and_then(|v| v.as_str())?;
-                                Some((path.to_string(), branch.to_string()))
-                            })
-                            .collect();
-                    }
                 }
                 "set_connection_code" => {
                     let url = op.get("url").and_then(|v| v.as_str());
@@ -1571,9 +1436,10 @@ where
     fn execute_focus_terminal(&mut self, op: &serde_json::Value) {
         let agent_id = op.get("agent_id").and_then(|v| v.as_str());
         let pty_index = op.get("pty_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let agent_index = op.get("agent_index").and_then(|v| v.as_u64()).map(|v| v as usize);
         log::info!(
-            "focus_terminal: agent_id={:?}, pty_index={}, agents_count={}",
-            agent_id, pty_index, self.agents.len()
+            "focus_terminal: agent_id={:?}, agent_index={:?}, pty_index={}",
+            agent_id, agent_index, pty_index
         );
 
         // Clear selection if no agent_id
@@ -1595,9 +1461,9 @@ where
             return;
         };
 
-        // Find agent index
-        let Some(index) = self.agents.iter().position(|a| a.id == agent_id) else {
-            log::warn!("focus_terminal: agent not found: {agent_id}");
+        // Agent index provided by Lua (computed from _tui_state.agents)
+        let Some(index) = agent_index else {
+            log::warn!("focus_terminal: missing agent_index for agent {agent_id}");
             return;
         };
 
@@ -1835,7 +1701,11 @@ pub fn run_with_hub(
     // Load botster API and discover UI extensions (plugins + user overrides).
     tui_runner.botster_api_source = load_botster_api_source();
     let lua_base = resolve_lua_user_path();
-    tui_runner.extension_sources = discover_ui_extensions(&lua_base);
+    let mut extensions = discover_ui_extensions(&lua_base);
+    // User UI overrides (~/.botster/lua/ui/) layer on top of built-in modules.
+    // They redefine only the functions they want to customize.
+    extensions.extend(discover_user_ui_overrides());
+    tui_runner.extension_sources = extensions;
 
     // Register SIGWINCH to set the resize flag (TuiRunner polls this each tick)
     #[cfg(unix)]
@@ -1949,27 +1819,15 @@ struct ExtensionSource {
     fs_path: std::path::PathBuf,
 }
 
-/// Load a Lua UI module by name, searching all candidate paths then embedded.
+/// Load a Lua UI module by name.
 ///
-/// Search order per `resolve_lua_search_paths()`:
-/// 1. `~/.botster/lua/ui/{name}` (user overrides)
-/// 2. `./lua/ui/{name}` (dev defaults)
-/// 3. Embedded in binary (release builds)
+/// Returns the built-in source (embedded or source tree). User overrides
+/// in `~/.botster/lua/ui/` are loaded separately as extensions that layer
+/// on top — redefining only the functions they want to customize.
 fn load_lua_ui_source(name: &str) -> Option<LayoutSource> {
     let rel_path = format!("ui/{name}");
 
-    for base in resolve_lua_search_paths() {
-        let fs_path = base.join(&rel_path);
-        if let Ok(source) = std::fs::read_to_string(&fs_path) {
-            let fs_path = fs_path.canonicalize().unwrap_or(fs_path);
-            log::info!("Loaded {name} from filesystem: {}", fs_path.display());
-            return Some(LayoutSource {
-                source,
-                fs_path: Some(fs_path),
-            });
-        }
-    }
-
+    // 1. Embedded (release builds).
     if let Some(source) = crate::lua::embedded::get(&rel_path) {
         log::info!("Loaded {name} from embedded");
         return Some(LayoutSource {
@@ -1978,8 +1836,54 @@ fn load_lua_ui_source(name: &str) -> Option<LayoutSource> {
         });
     }
 
-    log::warn!("No {name} found in any search path");
+    // 2. Local source tree (debug builds where embedded is stubbed out).
+    let local = std::path::PathBuf::from("lua").join(&rel_path);
+    if let Ok(source) = std::fs::read_to_string(&local) {
+        let fs_path = local.canonicalize().unwrap_or(local);
+        log::info!("Loaded {name} from source tree: {}", fs_path.display());
+        return Some(LayoutSource {
+            source,
+            fs_path: Some(fs_path),
+        });
+    }
+
+    log::warn!("No {name} found");
     None
+}
+
+/// Discover user UI override files from `~/.botster/lua/ui/`.
+///
+/// These are loaded as extensions on top of the built-in UI modules,
+/// so they only need to redefine the functions they want to customize.
+/// For example, a user `layout.lua` containing only `function render_overlay(state) ... end`
+/// overrides just the overlay while `render()` stays built-in.
+fn discover_user_ui_overrides() -> Vec<ExtensionSource> {
+    let mut overrides = Vec::new();
+    let ui_dir = match dirs::home_dir() {
+        Some(home) => home.join(".botster").join("lua").join("ui"),
+        None => return overrides,
+    };
+
+    if let Ok(entries) = std::fs::read_dir(&ui_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "lua") {
+                if let Ok(source) = std::fs::read_to_string(&path) {
+                    let name = path.file_stem()
+                        .map(|s| format!("user_ui_{}", s.to_string_lossy()))
+                        .unwrap_or_else(|| "user_ui".to_string());
+                    log::info!("Found user UI override: {}", path.display());
+                    overrides.push(ExtensionSource {
+                        name,
+                        source,
+                        fs_path: path.canonicalize().unwrap_or(path),
+                    });
+                }
+            }
+        }
+    }
+
+    overrides
 }
 
 fn load_layout_lua_source() -> Option<LayoutSource> {
@@ -2066,31 +1970,6 @@ fn discover_ui_extensions(lua_base: &std::path::Path) -> Vec<ExtensionSource> {
 /// found. This allows `~/.botster/lua/` overrides to coexist with dev
 /// defaults in `./lua/`, like Neovim's runtimepath.
 ///
-/// Resolution order:
-/// 1. `BOTSTER_LUA_PATH` env var (explicit override — sole path if set)
-/// 2. `~/.botster/lua/` (user overrides — highest priority for installed builds)
-/// 3. `./lua/` relative to CWD (development defaults — `cargo run` from `cli/`)
-fn resolve_lua_search_paths() -> Vec<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("BOTSTER_LUA_PATH") {
-        return vec![std::path::PathBuf::from(path)];
-    }
-
-    let mut paths = Vec::new();
-
-    // User overrides (like ~/.config/nvim/)
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".botster").join("lua"));
-    }
-
-    // Development defaults (running from cli/)
-    let local = std::path::PathBuf::from("lua");
-    if local.is_dir() {
-        paths.push(local);
-    }
-
-    paths
-}
-
 /// Resolve the user-level Lua path (`~/.botster/lua/`).
 ///
 /// Used for discovering extensions and user overrides — not for loading
@@ -2121,9 +2000,8 @@ mod tests {
     //!
     //! 2. **`create_test_runner_with_mock_client()`**: Integration tests that need
     //!    request verification. Spawns a responder thread that passthroughs all
-    //!    `JSON` messages for inspection. Pre-populate `runner.agents`,
-    //!    `runner.available_worktrees`, or `runner.connection_code` directly
-    //!    in tests (these are normally delivered via Lua `TuiOutput::Message` events).
+    //!    `JSON` messages for inspection. Application state (agents, worktrees)
+    //!    lives in Lua's `_tui_state` — set it via `lua.exec()` in tests.
     //!
     //! # M-DESIGN-FOR-AI Compliance
     //!
@@ -2131,8 +2009,6 @@ mod tests {
 
     use super::*;
     use crate::client::{CreateAgentRequest, DeleteAgentRequest};
-    use crate::tui::actions::TuiAction;
-    use crate::tui::raw_input::InputEvent;
     use ratatui::backend::TestBackend;
     use tokio::sync::mpsc;
 
@@ -2147,8 +2023,8 @@ mod tests {
     ///
     /// # Note
     ///
-    /// This setup does NOT respond to messages. Pre-populate cached state
-    /// (e.g., `runner.available_worktrees`) directly for tests needing data.
+    /// This setup does NOT respond to messages. Application state lives in
+    /// Lua's `_tui_state` — use `process_key_with_lua()` for tests needing it.
     /// Use `create_test_runner_with_mock_client` for flows requiring a
     /// responder thread.
     fn create_test_runner() -> (TuiRunner<TestBackend>, mpsc::UnboundedReceiver<TuiRequest>) {
@@ -2179,9 +2055,8 @@ mod tests {
     /// Creates a `TuiRunner` with a mock Hub responder for testing.
     ///
     /// Spawns a responder thread that passthroughs all `JSON` messages
-    /// for verification. All request-response patterns have been migrated to
-    /// Lua events — pre-populate `runner.available_worktrees`, `runner.agents`,
-    /// or `runner.connection_code` directly in tests.
+    /// for verification. Application state (agents, worktrees) lives in
+    /// Lua's `_tui_state` — set it via `lua.exec()` in tests.
     ///
     /// # Returns
     ///
@@ -2300,20 +2175,36 @@ mod tests {
         let layout_source = "function render(s) return { type = 'empty' } end\nfunction render_overlay(s) return nil end\nfunction initial_mode() return 'normal' end";
         let kb_source = include_str!("../../lua/ui/keybindings.lua");
         let actions_source = include_str!("../../lua/ui/actions.lua");
+        let events_source = include_str!("../../lua/ui/events.lua");
         let mut lua = LayoutLua::new(layout_source).expect("test layout should load");
+        // Bootstrap _tui_state (actions.lua and events.lua read from it)
+        lua.load_extension(
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state_init",
+        ).expect("_tui_state bootstrap should succeed");
         lua.load_keybindings(kb_source)
             .expect("test keybindings should load");
         lua.load_actions(actions_source)
             .expect("test actions should load");
+        lua.load_events(events_source)
+            .expect("test events should load");
         lua
     }
 
     /// Processes a keyboard event through the full Lua-driven input pipeline.
     ///
-    /// This exercises: `InputEvent` -> `handle_raw_input_event()` with Lua keybindings
+    /// This exercises: `InputEvent` -> `handle_raw_input_event()` with Lua keybindings.
+    /// Uses a fresh LayoutLua per call — suitable for simple single-key tests.
     fn process_key(runner: &mut TuiRunner<TestBackend>, event: InputEvent) {
         let lua = make_test_layout_with_keybindings();
         runner.handle_raw_input_event(event, Some(&lua));
+    }
+
+    /// Processes a keyboard event with a persistent LayoutLua.
+    ///
+    /// For multi-step e2e tests that need `_tui_state` to persist between keys.
+    fn process_key_with_lua(runner: &mut TuiRunner<TestBackend>, event: InputEvent, lua: &LayoutLua) {
+        runner.handle_raw_input_event(event, Some(lua));
     }
 
     // =========================================================================
@@ -2344,18 +2235,24 @@ mod tests {
     }
 
     /// Navigate to a specific menu selection index from index 0.
-    ///
-    /// Presses Down the required number of times to reach the target index.
-    /// Assumes the menu is already open and `overlay_list_selected` is 0.
-    ///
-    /// # Arguments
-    ///
-    /// * `runner` - The TuiRunner to navigate
-    /// * `target_idx` - The target selection index to navigate to
-    fn navigate_to_menu_index(runner: &mut TuiRunner<TestBackend>, target_idx: usize) {
+    fn navigate_to_menu_index_with_lua(
+        runner: &mut TuiRunner<TestBackend>,
+        lua: &LayoutLua,
+        target_idx: usize,
+    ) {
         for _ in 0..target_idx {
-            process_key(runner, make_key_down());
+            process_key_with_lua(runner, make_key_down(), lua);
         }
+    }
+
+    /// Read `_tui_state.list_selected` from Lua.
+    fn lua_list_selected(lua: &LayoutLua) -> usize {
+        lua.eval_usize("return _tui_state.list_selected").unwrap_or(0)
+    }
+
+    /// Read `_tui_state.input_buffer` from Lua.
+    fn lua_input_buffer(lua: &LayoutLua) -> String {
+        lua.eval_string("return _tui_state.input_buffer").unwrap_or_default()
     }
 
     // =========================================================================
@@ -2436,27 +2333,28 @@ mod tests {
     #[test]
     fn test_e2e_menu_arrow_navigation() {
         let (mut runner, _cmd_rx) = create_test_runner();
+        let lua = make_test_layout_with_keybindings();
 
         // Open menu
-        process_key(&mut runner, make_key_ctrl('p'));
+        process_key_with_lua(&mut runner, make_key_ctrl('p'), &lua);
         assert_eq!(runner.mode(), "menu");
-        assert_eq!(runner.overlay_list_selected, 0);
+        assert_eq!(lua_list_selected(&lua), 0);
         stub_menu_actions(&mut runner);
 
         // Navigate down (menu has 2 items: new_agent, show_connection_code)
-        process_key(&mut runner, make_key_down());
-        assert_eq!(runner.overlay_list_selected, 1);
+        process_key_with_lua(&mut runner, make_key_down(), &lua);
+        assert_eq!(lua_list_selected(&lua), 1);
 
         // Should clamp at max (1)
-        process_key(&mut runner, make_key_down());
-        assert_eq!(runner.overlay_list_selected, 1);
+        process_key_with_lua(&mut runner, make_key_down(), &lua);
+        assert_eq!(lua_list_selected(&lua), 1);
 
         // Navigate up
-        process_key(&mut runner, make_key_up());
-        assert_eq!(runner.overlay_list_selected, 0);
+        process_key_with_lua(&mut runner, make_key_up(), &lua);
+        assert_eq!(lua_list_selected(&lua), 0);
 
         // Close with Escape
-        process_key(&mut runner, make_key_escape());
+        process_key_with_lua(&mut runner, make_key_escape(), &lua);
         assert_eq!(runner.mode(), "normal");
     }
 
@@ -2464,12 +2362,13 @@ mod tests {
     #[test]
     fn test_e2e_menu_up_clamps_at_zero() {
         let (mut runner, _cmd_rx) = create_test_runner();
+        let lua = make_test_layout_with_keybindings();
 
-        process_key(&mut runner, make_key_ctrl('p'));
-        assert_eq!(runner.overlay_list_selected, 0);
+        process_key_with_lua(&mut runner, make_key_ctrl('p'), &lua);
+        assert_eq!(lua_list_selected(&lua), 0);
 
-        process_key(&mut runner, make_key_up());
-        assert_eq!(runner.overlay_list_selected, 0, "Should not go below 0");
+        process_key_with_lua(&mut runner, make_key_up(), &lua);
+        assert_eq!(lua_list_selected(&lua), 0, "Should not go below 0");
     }
 
     /// Verifies menu number shortcuts select items directly.
@@ -2483,9 +2382,10 @@ mod tests {
     #[test]
     fn test_e2e_menu_number_shortcuts() {
         let (mut runner, _cmd_rx) = create_test_runner();
+        let lua = make_test_layout_with_keybindings();
 
         // Open menu (no agent selected)
-        process_key(&mut runner, make_key_ctrl('p'));
+        process_key_with_lua(&mut runner, make_key_ctrl('p'), &lua);
         assert_eq!(runner.mode(), "menu");
         stub_menu_actions(&mut runner);
 
@@ -2498,7 +2398,7 @@ mod tests {
         );
 
         // Press '2' to select the item at index 1
-        process_key(&mut runner, make_key_char('2'));
+        process_key_with_lua(&mut runner, make_key_char('2'), &lua);
 
         assert_eq!(
             runner.mode(),
@@ -2556,24 +2456,25 @@ mod tests {
     #[test]
     fn test_e2e_connection_code_full_flow() {
         let (mut runner, _cmd_rx) = create_test_runner();
+        let lua = make_test_layout_with_keybindings();
 
         // 1. Open menu
-        process_key(&mut runner, make_key_ctrl('p'));
+        process_key_with_lua(&mut runner, make_key_ctrl('p'), &lua);
         assert_eq!(runner.mode(), "menu");
         stub_menu_actions(&mut runner);
 
         // 2. Find and navigate to Connection Code using cached overlay actions
         let connection_idx = find_action_index(&runner, "show_connection_code")
             .expect("show_connection_code should be in menu");
-        navigate_to_menu_index(&mut runner, connection_idx);
-        assert_eq!(runner.overlay_list_selected, connection_idx);
+        navigate_to_menu_index_with_lua(&mut runner, &lua, connection_idx);
+        assert_eq!(lua_list_selected(&lua), connection_idx);
 
         // 3. Select with Enter
-        process_key(&mut runner, make_key_enter());
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
         assert_eq!(runner.mode(), "connection_code");
 
         // 4. Close with Escape
-        process_key(&mut runner, make_key_escape());
+        process_key_with_lua(&mut runner, make_key_escape(), &lua);
         assert_eq!(runner.mode(), "normal");
     }
 
@@ -2612,20 +2513,18 @@ mod tests {
     #[test]
     fn test_e2e_new_agent_full_flow() {
         let (mut runner, _output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client();
-
-        // Pre-populate worktrees (normally delivered via Lua worktree_list event)
-        runner.available_worktrees = vec![("/path/worktree-1".to_string(), "feature-1".to_string())];
+        let lua = make_test_layout_with_keybindings();
 
         // 1. Open menu and navigate to New Agent using cached overlay actions
-        process_key(&mut runner, make_key_ctrl('p'));
+        process_key_with_lua(&mut runner, make_key_ctrl('p'), &lua);
         stub_menu_actions(&mut runner);
 
         let new_agent_idx = find_action_index(&runner, "new_agent")
             .expect("new_agent should be in menu");
-        navigate_to_menu_index(&mut runner, new_agent_idx);
-        assert_eq!(runner.overlay_list_selected, new_agent_idx);
+        navigate_to_menu_index_with_lua(&mut runner, &lua, new_agent_idx);
+        assert_eq!(lua_list_selected(&lua), new_agent_idx);
 
-        process_key(&mut runner, make_key_enter());
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
 
         // Small delay to let responder process messages
         thread::sleep(Duration::from_millis(10));
@@ -2637,29 +2536,29 @@ mod tests {
         );
 
         // 2. Select "Create new worktree" (index 1, after "Use Main Branch")
-        process_key(&mut runner, make_key_down());
-        assert_eq!(runner.overlay_list_selected, 1);
-        process_key(&mut runner, make_key_enter());
+        process_key_with_lua(&mut runner, make_key_down(), &lua);
+        assert_eq!(lua_list_selected(&lua), 1);
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
 
         assert_eq!(runner.mode(), "new_agent_create_worktree");
 
         // 3. Type issue name
         for c in "issue-42".chars() {
-            process_key(&mut runner, make_key_char(c));
+            process_key_with_lua(&mut runner, make_key_char(c), &lua);
         }
-        assert_eq!(runner.input_buffer, "issue-42");
+        assert_eq!(lua_input_buffer(&lua), "issue-42");
 
         // 4. Submit issue name
-        process_key(&mut runner, make_key_enter());
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
 
         assert_eq!(runner.mode(), "new_agent_prompt");
-        assert_eq!(runner.pending_fields.get("pending_issue_or_branch").map(|s| s.as_str()), Some("issue-42"));
+        // pending_fields now live in Lua's _tui_state, verified by actions.lua tests
 
         // 5. Type prompt and submit
         for c in "Fix bug".chars() {
-            process_key(&mut runner, make_key_char(c));
+            process_key_with_lua(&mut runner, make_key_char(c), &lua);
         }
-        process_key(&mut runner, make_key_enter());
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
 
         // Wait for responder to process
         thread::sleep(Duration::from_millis(10));
@@ -2693,17 +2592,6 @@ mod tests {
             "Should be normal mode until agent_created event selects the agent"
         );
 
-        // creating_agent should be set to indicate pending creation (shown in sidebar)
-        assert!(
-            runner.pending_fields.contains_key("creating_agent_id"),
-            "creating_agent should be set to track pending creation"
-        );
-        assert_eq!(
-            runner.pending_fields.get("creating_agent_id").map(|s| s.as_str()),
-            Some("issue-42"),
-            "creating_agent should track the correct identifier"
-        );
-
         // Cleanup
         shutdown.store(true, Ordering::Relaxed);
     }
@@ -2720,61 +2608,52 @@ mod tests {
     #[test]
     fn test_e2e_reopen_existing_worktree() {
         let (mut runner, _output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client();
+        let lua = make_test_layout_with_keybindings();
 
-        // Pre-populate worktrees (normally delivered via Lua worktree_list event)
-        runner.available_worktrees = vec![
-            ("/path/worktree-1".to_string(), "feature-branch".to_string()),
-            ("/path/worktree-2".to_string(), "bugfix-branch".to_string()),
-        ];
+        // Pre-populate worktrees in _tui_state (normally delivered via worktree_list event)
+        lua.load_extension(
+            r#"_tui_state.available_worktrees = {
+                { path = "/path/worktree-1", branch = "feature-branch" },
+                { path = "/path/worktree-2", branch = "bugfix-branch" },
+            }"#,
+            "test_worktrees",
+        ).unwrap();
 
         // Open menu and navigate to New Agent using cached overlay actions
-        process_key(&mut runner, make_key_ctrl('p'));
+        process_key_with_lua(&mut runner, make_key_ctrl('p'), &lua);
         stub_menu_actions(&mut runner);
 
         let new_agent_idx = find_action_index(&runner, "new_agent")
             .expect("new_agent should be in menu");
-        navigate_to_menu_index(&mut runner, new_agent_idx);
-        assert_eq!(runner.overlay_list_selected, new_agent_idx);
+        navigate_to_menu_index_with_lua(&mut runner, &lua, new_agent_idx);
+        assert_eq!(lua_list_selected(&lua), new_agent_idx);
 
-        process_key(&mut runner, make_key_enter());
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
 
         thread::sleep(Duration::from_millis(10));
         assert_eq!(runner.mode(), "new_agent_select_worktree");
 
         // Navigate to first existing worktree (index 2, after "Use Main Branch" and "Create New Worktree")
-        // Stub overlay_list_actions to match new layout: [main, create_new, worktree_0, worktree_1]
         runner.overlay_list_actions = vec![
             "main".to_string(),
             "create_new".to_string(),
             "worktree_0".to_string(),
             "worktree_1".to_string(),
         ];
-        process_key(&mut runner, make_key_down());
-        process_key(&mut runner, make_key_down());
-        assert_eq!(runner.overlay_list_selected, 2);
+        process_key_with_lua(&mut runner, make_key_down(), &lua);
+        process_key_with_lua(&mut runner, make_key_down(), &lua);
+        assert_eq!(lua_list_selected(&lua), 2);
 
         // Select existing worktree
-        process_key(&mut runner, make_key_enter());
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
 
         thread::sleep(Duration::from_millis(10));
 
-        // Modal closes after selection — stays in normal mode until agent_created
-        // event arrives from the hub and switches to insert mode.
+        // Modal closes after selection — stays in normal mode until agent_created event
         assert_eq!(
             runner.mode(),
             "normal",
             "Should be normal mode until agent_created event selects the agent"
-        );
-
-        // creating_agent should be set to indicate pending creation (shown in sidebar)
-        assert!(
-            runner.pending_fields.contains_key("creating_agent_id"),
-            "creating_agent should be set to track pending creation"
-        );
-        assert_eq!(
-            runner.pending_fields.get("creating_agent_id").map(|s| s.as_str()),
-            Some("feature-branch"),
-            "creating_agent should track the correct identifier"
         );
 
         // Verify reopen_worktree JSON message with path
@@ -2806,12 +2685,14 @@ mod tests {
     #[test]
     fn test_e2e_empty_issue_name_rejected() {
         let (mut runner, _cmd_rx) = create_test_runner();
+        let lua = make_test_layout_with_keybindings();
 
         // Bypass to NewAgentCreateWorktree mode directly
         runner.mode = "new_agent_create_worktree".to_string();
+        let _ = lua.exec("_tui_state.mode = 'new_agent_create_worktree'");
 
         // Submit empty input
-        process_key(&mut runner, make_key_enter());
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
 
         // Should stay in same mode
         assert_eq!(
@@ -2825,23 +2706,25 @@ mod tests {
     #[test]
     fn test_e2e_cancel_agent_creation_at_each_stage() {
         let (mut runner, mut cmd_rx) = create_test_runner();
+        let lua = make_test_layout_with_keybindings();
 
         // Cancel at worktree selection
         runner.mode = "new_agent_select_worktree".to_string();
-        process_key(&mut runner, make_key_escape());
+        let _ = lua.exec("_tui_state.mode = 'new_agent_select_worktree'");
+        process_key_with_lua(&mut runner, make_key_escape(), &lua);
         assert_eq!(runner.mode(), "normal");
 
         // Cancel at issue input
         runner.mode = "new_agent_create_worktree".to_string();
-        runner.input_buffer = "partial".to_string();
-        process_key(&mut runner, make_key_escape());
+        let _ = lua.exec("_tui_state.mode = 'new_agent_create_worktree'; _tui_state.input_buffer = 'partial'");
+        process_key_with_lua(&mut runner, make_key_escape(), &lua);
         assert_eq!(runner.mode(), "normal");
-        assert!(runner.input_buffer.is_empty(), "Buffer should be cleared");
+        assert!(lua_input_buffer(&lua).is_empty(), "Buffer should be cleared");
 
         // Cancel at prompt
         runner.mode = "new_agent_prompt".to_string();
-        runner.pending_fields.insert("pending_issue_or_branch".to_string(), "issue-123".to_string());
-        process_key(&mut runner, make_key_escape());
+        let _ = lua.exec("_tui_state.mode = 'new_agent_prompt'");
+        process_key_with_lua(&mut runner, make_key_escape(), &lua);
         assert_eq!(runner.mode(), "normal");
 
         // No commands sent
@@ -2856,38 +2739,37 @@ mod tests {
     #[test]
     fn test_e2e_text_input_backspace() {
         let (mut runner, _cmd_rx) = create_test_runner();
+        let lua = make_test_layout_with_keybindings();
 
         runner.mode = "new_agent_create_worktree".to_string();
+        let _ = lua.exec("_tui_state.mode = 'new_agent_create_worktree'");
 
         // Type characters
-        process_key(&mut runner, make_key_char('a'));
-        process_key(&mut runner, make_key_char('b'));
-        process_key(&mut runner, make_key_char('c'));
-        assert_eq!(runner.input_buffer, "abc");
+        process_key_with_lua(&mut runner, make_key_char('a'), &lua);
+        process_key_with_lua(&mut runner, make_key_char('b'), &lua);
+        process_key_with_lua(&mut runner, make_key_char('c'), &lua);
+        assert_eq!(lua_input_buffer(&lua), "abc");
 
         // Backspace
-        process_key(&mut runner, make_key_desc("backspace", &[0x7f]));
-        assert_eq!(runner.input_buffer, "ab");
+        process_key_with_lua(&mut runner, make_key_desc("backspace", &[0x7f]), &lua);
+        assert_eq!(lua_input_buffer(&lua), "ab");
 
-        process_key(&mut runner, make_key_desc("backspace", &[0x7f]));
-        process_key(&mut runner, make_key_desc("backspace", &[0x7f]));
-        assert_eq!(runner.input_buffer, "");
+        process_key_with_lua(&mut runner, make_key_desc("backspace", &[0x7f]), &lua);
+        process_key_with_lua(&mut runner, make_key_desc("backspace", &[0x7f]), &lua);
+        assert_eq!(lua_input_buffer(&lua), "");
 
         // Backspace on empty is safe
-        process_key(&mut runner, make_key_desc("backspace", &[0x7f]));
-        assert_eq!(runner.input_buffer, "");
+        process_key_with_lua(&mut runner, make_key_desc("backspace", &[0x7f]), &lua);
+        assert_eq!(lua_input_buffer(&lua), "");
     }
 
     /// Verifies worktree navigation with arrow keys.
     #[test]
     fn test_e2e_worktree_navigation() {
         let (mut runner, _cmd_rx) = create_test_runner();
+        let lua = make_test_layout_with_keybindings();
 
-        runner.available_worktrees = vec![
-            ("/path/1".to_string(), "branch-1".to_string()),
-            ("/path/2".to_string(), "branch-2".to_string()),
-        ];
-        // Stub overlay_list_actions: [Main] + [Create New] + 2 worktrees = 4 items
+        // Stub overlay_list_actions for navigation test.
         runner.overlay_list_actions = vec![
             "main".to_string(),
             "create_new".to_string(),
@@ -2895,36 +2777,36 @@ mod tests {
             "worktree_1".to_string(),
         ];
         runner.mode = "new_agent_select_worktree".to_string();
-        runner.overlay_list_selected = 0;
+        let _ = lua.exec("_tui_state.mode = 'new_agent_select_worktree'; _tui_state.list_selected = 0");
 
         // Navigate down
-        process_key(&mut runner, make_key_down());
-        assert_eq!(runner.overlay_list_selected, 1);
+        process_key_with_lua(&mut runner, make_key_down(), &lua);
+        assert_eq!(lua_list_selected(&lua), 1);
 
-        process_key(&mut runner, make_key_down());
-        assert_eq!(runner.overlay_list_selected, 2);
+        process_key_with_lua(&mut runner, make_key_down(), &lua);
+        assert_eq!(lua_list_selected(&lua), 2);
 
         // Continue to max
-        process_key(&mut runner, make_key_down());
-        assert_eq!(runner.overlay_list_selected, 3);
+        process_key_with_lua(&mut runner, make_key_down(), &lua);
+        assert_eq!(lua_list_selected(&lua), 3);
 
         // Should not exceed max
-        process_key(&mut runner, make_key_down());
-        assert_eq!(runner.overlay_list_selected, 3);
+        process_key_with_lua(&mut runner, make_key_down(), &lua);
+        assert_eq!(lua_list_selected(&lua), 3);
 
         // Navigate up
-        process_key(&mut runner, make_key_up());
-        assert_eq!(runner.overlay_list_selected, 2);
+        process_key_with_lua(&mut runner, make_key_up(), &lua);
+        assert_eq!(lua_list_selected(&lua), 2);
 
-        process_key(&mut runner, make_key_up());
-        assert_eq!(runner.overlay_list_selected, 1);
+        process_key_with_lua(&mut runner, make_key_up(), &lua);
+        assert_eq!(lua_list_selected(&lua), 1);
 
-        process_key(&mut runner, make_key_up());
-        assert_eq!(runner.overlay_list_selected, 0);
+        process_key_with_lua(&mut runner, make_key_up(), &lua);
+        assert_eq!(lua_list_selected(&lua), 0);
 
         // Should not go below 0
-        process_key(&mut runner, make_key_up());
-        assert_eq!(runner.overlay_list_selected, 0);
+        process_key_with_lua(&mut runner, make_key_up(), &lua);
+        assert_eq!(lua_list_selected(&lua), 0);
     }
 
     // =========================================================================
@@ -3055,12 +2937,10 @@ mod tests {
         let (mut runner, _cmd_rx) = create_test_runner();
 
         let mode_before = runner.mode().to_string();
-        let selected_before = runner.overlay_list_selected;
 
         runner.handle_tui_action(TuiAction::None);
 
         assert_eq!(runner.mode(), mode_before);
-        assert_eq!(runner.overlay_list_selected, selected_before);
     }
 
     // =========================================================================
@@ -3187,28 +3067,6 @@ mod tests {
     // Agent navigation now uses the Lua subscribe/unsubscribe protocol (fire-and-forget),
     // so tests use `create_test_runner()` and verify subscribe messages directly.
 
-    /// Helper to create test `AgentInfo` entries for navigation tests.
-    ///
-    /// Returns a Vec of `AgentInfo` with unique IDs based on the given count.
-    fn make_test_agents(count: usize) -> Vec<AgentInfo> {
-        (0..count)
-            .map(|i| AgentInfo {
-                id: format!("agent-{}", i),
-                repo: None,
-                issue_number: None,
-                branch_name: Some(format!("branch-{}", i)),
-                name: None,
-                status: Some("Running".to_string()),
-                sessions: None,
-                port: None,
-                server_running: None,
-                has_server_pty: None,
-                scroll_offset: None,
-                hub_identifier: None,
-            })
-            .collect()
-    }
-
     /// Verifies `focus_terminal` op subscribes and updates state.
     ///
     /// # Scenario
@@ -3219,13 +3077,11 @@ mod tests {
     fn test_focus_terminal_subscribes_and_updates_state() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Setup: 3 agents, none selected
-        runner.agents = make_test_agents(3);
-
-        // Action: focus agent-1
+        // Action: focus agent-1 (Lua provides agent_index)
         runner.execute_focus_terminal(&serde_json::json!({
             "op": "focus_terminal",
             "agent_id": "agent-1",
+            "agent_index": 1,
             "pty_index": 0,
         }));
 
@@ -3260,8 +3116,7 @@ mod tests {
     fn test_focus_terminal_nil_clears_selection() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Setup: 3 agents, agent 0 selected with active subscription
-        runner.agents = make_test_agents(3);
+        // Setup: agent 0 selected with active subscription
         runner.selected_agent = Some("agent-0".to_string());
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
@@ -3299,18 +3154,18 @@ mod tests {
     fn test_focus_terminal_unsubscribes_then_subscribes() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Setup: 3 agents, agent 0 selected with active subscription
-        runner.agents = make_test_agents(3);
+        // Setup: agent 0 selected with active subscription
         runner.selected_agent = Some("agent-0".to_string());
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
         runner.current_terminal_sub_id = Some("tui:0:0".to_string());
         runner.active_subscriptions.insert((0, 0));
 
-        // Action: focus agent-1
+        // Action: focus agent-1 (Lua provides agent_index)
         runner.execute_focus_terminal(&serde_json::json!({
             "op": "focus_terminal",
             "agent_id": "agent-1",
+            "agent_index": 1,
             "pty_index": 0,
         }));
 
@@ -3360,13 +3215,10 @@ mod tests {
     /// When the agent doesn't exist in the cache, focus_terminal should log
     /// a warning and not change any state.
     #[test]
-    fn test_focus_terminal_unknown_agent_is_noop() {
+    fn test_focus_terminal_missing_agent_index_is_noop() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Setup: no agents
-        assert!(runner.agents.is_empty());
-
-        // Action: focus unknown agent
+        // Action: focus agent without agent_index (Lua bug or edge case)
         runner.execute_focus_terminal(&serde_json::json!({
             "op": "focus_terminal",
             "agent_id": "nonexistent",
@@ -3390,18 +3242,18 @@ mod tests {
     fn test_focus_terminal_same_target_is_noop() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Setup: 3 agents, agent 0 already focused
-        runner.agents = make_test_agents(3);
+        // Setup: agent 0 already focused
         runner.selected_agent = Some("agent-0".to_string());
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
         runner.current_terminal_sub_id = Some("tui:0:0".to_string());
         runner.active_subscriptions.insert((0, 0));
 
-        // Action: focus same agent+pty
+        // Action: focus same agent+pty (Lua provides agent_index)
         runner.execute_focus_terminal(&serde_json::json!({
             "op": "focus_terminal",
             "agent_id": "agent-0",
+            "agent_index": 0,
             "pty_index": 0,
         }));
 
@@ -3541,22 +3393,13 @@ mod tests {
     }
 
     fn make_test_render_context() -> super::super::render::RenderContext<'static> {
-        // 'static requires leaked references for the empty pool and pending_fields
+        // 'static requires leaked reference for the empty pool
         let pool: &'static std::collections::HashMap<(usize, usize), std::sync::Arc<std::sync::Mutex<vt100::Parser>>> =
             Box::leak(Box::new(std::collections::HashMap::new()));
-        let pending: &'static std::collections::HashMap<String, String> =
-            Box::leak(Box::new(std::collections::HashMap::new()));
         super::super::render::RenderContext {
-            mode: "normal".to_string(),
-            list_selected: 0,
-            input_buffer: "",
-            available_worktrees: &[],
             error_message: None,
-            pending_fields: pending,
             connection_code: None,
             bundle_used: false,
-            agent_ids: &[],
-            agents: &[],
             selected_agent_index: 0,
             active_parser: None,
             parser_pool: pool,

@@ -12,6 +12,8 @@ pin_all_from "app/javascript/channels", under: "channels"
 pin "@xterm/xterm", to: "https://esm.sh/@xterm/xterm@5.5.0"
 pin "@xterm/addon-fit", to: "https://esm.sh/@xterm/addon-fit@0.10.0"
 pin "@xterm/addon-unicode11", to: "https://esm.sh/@xterm/addon-unicode11@0.8.0"
+pin "@xterm/addon-webgl", to: "https://esm.sh/@xterm/addon-webgl@0.18.0"
+pin "@xterm/addon-web-links", to: "https://esm.sh/@xterm/addon-web-links@0.11.0"
 
 # Vodozemac crypto for E2E encryption (direct Olm)
 pin "matrix/bundle", to: "matrix/bundle.js"

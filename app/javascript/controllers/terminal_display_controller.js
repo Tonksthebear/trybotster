@@ -2,6 +2,8 @@ import { Controller } from "@hotwired/stimulus";
 import * as xterm from "@xterm/xterm";
 import * as xtermFit from "@xterm/addon-fit";
 import * as xtermUnicode from "@xterm/addon-unicode11";
+import * as xtermWebgl from "@xterm/addon-webgl";
+import * as xtermWebLinks from "@xterm/addon-web-links";
 import { ConnectionManager, TerminalConnection, HubConnection } from "connections";
 
 const Terminal = xterm.Terminal || xterm.default?.Terminal || xterm.default;
@@ -9,6 +11,10 @@ const FitAddon =
   xtermFit.FitAddon || xtermFit.default?.FitAddon || xtermFit.default;
 const Unicode11Addon =
   xtermUnicode.Unicode11Addon || xtermUnicode.default?.Unicode11Addon || xtermUnicode.default;
+const WebglAddon =
+  xtermWebgl.WebglAddon || xtermWebgl.default?.WebglAddon || xtermWebgl.default;
+const WebLinksAddon =
+  xtermWebLinks.WebLinksAddon || xtermWebLinks.default?.WebLinksAddon || xtermWebLinks.default;
 
 /**
  * Terminal Display Controller
@@ -122,7 +128,6 @@ export default class extends Controller {
     // Subscribe to terminal events
     this.#unsubscribers.push(
       this.#terminalConn.onOutput((data) => {
-        console.log("[TerminalDisplay] onOutput received, type:", typeof data, "len:", data?.length);
         this.#handleMessage({ type: "output", data });
       }),
     );
@@ -199,28 +204,34 @@ export default class extends Controller {
       cursorBlink: true,
       fontFamily: "'JetBrainsMono NF', monospace",
       fontSize: 14,
+      fontWeightBold: "bold",
       scrollback: 10000,
+      drawBoldTextInBrightColors: false,
       allowProposedApi: true,
       theme: {
         background: "#09090b",
-        foreground: "#d4d4d4",
-        cursor: "#ffffff",
-        selectionBackground: "#3a3a3a",
       },
     });
 
     this.#fitAddon = new FitAddon();
     this.#terminal.loadAddon(this.#fitAddon);
 
-    // Load unicode addon for box-drawing characters
     const unicodeAddon = new Unicode11Addon();
     this.#terminal.loadAddon(unicodeAddon);
     this.#terminal.unicode.activeVersion = "11";
+
+    this.#terminal.loadAddon(new WebLinksAddon());
 
     const container = this.hasContainerTarget
       ? this.containerTarget
       : this.element;
     this.#terminal.open(container);
+
+    try {
+      this.#terminal.loadAddon(new WebglAddon());
+    } catch {
+      // WebGL unavailable — falls back to canvas renderer
+    }
 
     // Wait for terminal to be rendered and fit before returning
     await new Promise((resolve) => {
@@ -231,7 +242,6 @@ export default class extends Controller {
     });
 
     this.#terminal.onData((data) => {
-      console.log(`[Terminal] onData fired, len=${data.length}, autocorrect=${this.#isHandlingAutocorrect}, composing=${this.#isComposing}`);
       // Cancel any momentum scrolling when user starts typing
       if (this.#momentumAnimationId) {
         cancelAnimationFrame(this.#momentumAnimationId);
@@ -413,7 +423,6 @@ export default class extends Controller {
   #handleConnected() {
     if (!this.#terminal) return;
 
-    console.log("[Terminal] handleConnected - cols:", this.#terminal.cols, "rows:", this.#terminal.rows);
     // Send dimensions immediately - terminal is already fit from #initTerminal
     this.#sendResize();
     this.focus();
@@ -455,15 +464,8 @@ export default class extends Controller {
 
   // I/O helpers
   async #sendInput(data) {
-    console.log(`[Terminal] sendInput called, data len=${data.length}, terminalConn=${!!this.#terminalConn}`);
-    if (!this.#terminalConn) {
-      console.warn(`[Terminal] sendInput: no terminal connection!`);
-      return;
-    }
-    const start = performance.now();
+    if (!this.#terminalConn) return;
     await this.#terminalConn.sendInput(data);
-    const elapsed = performance.now() - start;
-    console.log(`[Terminal] sendInput completed in ${elapsed.toFixed(1)}ms`);
   }
 
   async #sendResize() {
@@ -471,7 +473,6 @@ export default class extends Controller {
 
     const cols = this.#terminal.cols;
     const rows = this.#terminal.rows;
-    console.log("[Terminal] Sending resize:", cols, "x", rows);
 
     // Send resize via terminal connection (guaranteed connected when
     // called from #handleConnected). This directly resizes the PTY

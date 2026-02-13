@@ -32,13 +32,10 @@ pub struct LuaKeyAction {
 
 /// Context passed to Lua `handle_key()` for mode-specific logic.
 ///
-/// Contains state that keybinding fallback logic needs (e.g., list item
-/// count for number shortcut validation).
+/// Contains only Rust-owned state that keybinding fallback logic needs.
 #[derive(Debug, Clone, Default)]
 pub struct KeyContext {
-    /// Currently selected overlay list item index.
-    pub list_selected: usize,
-    /// Total number of selectable list items.
+    /// Total number of selectable list items (from Rust's overlay_list_actions).
     pub list_count: usize,
     /// Terminal height in rows (for scroll amount calculation).
     pub terminal_rows: u16,
@@ -46,39 +43,21 @@ pub struct KeyContext {
 
 /// Context passed to Lua `actions.on_action()` for workflow dispatch.
 ///
-/// Contains all state that Lua needs to decide what compound operations
-/// to return for application-specific actions.
+/// Contains only Rust-owned state that Lua needs. Application state
+/// (mode, input_buffer, list_selected, agents, pending_fields, worktrees)
+/// lives in Lua's `_tui_state` global — the TUI is a client like the browser.
 #[derive(Debug, Clone, Default)]
 pub struct ActionContext {
-    /// Current mode string.
-    pub mode: String,
-    /// Current text input buffer contents.
-    pub input_buffer: String,
-    /// Currently selected overlay list item index.
-    pub list_selected: usize,
     /// Action strings from the overlay list (extracted from render tree).
     pub overlay_actions: Vec<String>,
-    /// Generic key-value store for in-progress operations.
-    pub pending_fields: std::collections::HashMap<String, String>,
     /// Currently selected agent ID (if any).
     pub selected_agent: Option<String>,
-    /// Available worktrees as (path, branch) pairs.
-    pub available_worktrees: Vec<(String, String)>,
-    /// Agent IDs and session counts for navigation computation.
-    pub agents: Vec<ActionContextAgent>,
     /// Index of the currently selected agent (0-based).
     pub selected_agent_index: Option<usize>,
     /// Currently active PTY index within the selected agent.
     pub active_pty_index: usize,
-}
-
-/// Minimal agent info for Lua action context navigation.
-#[derive(Debug, Clone)]
-pub struct ActionContextAgent {
-    /// Agent ID string.
-    pub id: String,
-    /// Number of PTY sessions this agent has.
-    pub session_count: usize,
+    /// Character for `input_char` action (set by Rust when dispatching).
+    pub action_char: Option<char>,
 }
 
 /// TUI-owned Lua state for layout rendering and keybinding dispatch.
@@ -127,6 +106,30 @@ impl LayoutLua {
     ///
     /// Executes after built-in modules. Extension code can reference,
     /// wrap, or replace globals set by previously loaded modules.
+    /// Execute a Lua snippet. Used for setting `_tui_state` fields.
+    pub fn exec(&self, source: &str) -> Result<()> {
+        self.lua
+            .load(source)
+            .exec()
+            .map_err(|e| anyhow!("Lua exec failed: {e}"))
+    }
+
+    /// Evaluate a Lua expression and return the result as a string.
+    pub fn eval_string(&self, expr: &str) -> Result<String> {
+        self.lua
+            .load(expr)
+            .eval::<String>()
+            .map_err(|e| anyhow!("Lua eval failed: {e}"))
+    }
+
+    /// Evaluate a Lua expression and return the result as a usize.
+    pub fn eval_usize(&self, expr: &str) -> Result<usize> {
+        self.lua
+            .load(expr)
+            .eval::<usize>()
+            .map_err(|e| anyhow!("Lua eval failed: {e}"))
+    }
+
     pub fn load_extension(&self, source: &str, name: &str) -> Result<()> {
         self.lua
             .load(source)
@@ -293,7 +296,7 @@ impl LayoutLua {
     /// # Arguments
     ///
     /// * `action` - Action name string from keybindings
-    /// * `context` - Action context (mode, input_buffer, selected items, etc.)
+    /// * `context` - Action context (overlay actions, selected agent/PTY, etc.)
     pub fn call_on_action(
         &self,
         action: &str,
@@ -429,7 +432,6 @@ impl LayoutLua {
             .lua
             .create_table()
             .map_err(|e| anyhow!("Failed to create context table: {e}"))?;
-        set_field(&ctx_table, "list_selected", context.list_selected)?;
         set_field(&ctx_table, "list_count", context.list_count)?;
         set_field(&ctx_table, "terminal_rows", context.terminal_rows)?;
 
@@ -464,14 +466,16 @@ impl LayoutLua {
     ///
     /// Shared by `call_on_action()` and `call_on_hub_event()` so both
     /// Lua callbacks receive the same context shape.
+    /// Build a Lua table from an `ActionContext`.
+    ///
+    /// Only serializes Rust-owned state. Application state (agents,
+    /// pending_fields, worktrees) is accessed directly from `_tui_state`
+    /// by the Lua callbacks.
     fn build_action_context_table(&self, context: &ActionContext) -> Result<LuaTable> {
         let ctx_table = self
             .lua
             .create_table()
             .map_err(|e| anyhow!("Failed to create action context table: {e}"))?;
-        set_field(&ctx_table, "mode", context.mode.as_str())?;
-        set_field(&ctx_table, "input_buffer", context.input_buffer.as_str())?;
-        set_field(&ctx_table, "list_selected", context.list_selected)?;
         set_field(&ctx_table, "active_pty_index", context.active_pty_index)?;
 
         // overlay_actions array
@@ -488,18 +492,6 @@ impl LayoutLua {
             .set("overlay_actions", actions_arr)
             .map_err(|e| anyhow!("Failed to set overlay_actions: {e}"))?;
 
-        // pending_fields table
-        let pending = self
-            .lua
-            .create_table()
-            .map_err(|e| anyhow!("Failed to create pending_fields table: {e}"))?;
-        for (key, value) in &context.pending_fields {
-            set_field(&pending, key.as_str(), value.as_str())?;
-        }
-        ctx_table
-            .set("pending_fields", pending)
-            .map_err(|e| anyhow!("Failed to set pending_fields: {e}"))?;
-
         // selected_agent (string or nil)
         if let Some(ref agent) = context.selected_agent {
             set_field(&ctx_table, "selected_agent", agent.as_str())?;
@@ -510,45 +502,10 @@ impl LayoutLua {
             set_field(&ctx_table, "selected_agent_index", idx)?;
         }
 
-        // agents array with id and session_count for navigation
-        let agents_arr = self
-            .lua
-            .create_table()
-            .map_err(|e| anyhow!("Failed to create agents table: {e}"))?;
-        for (i, agent) in context.agents.iter().enumerate() {
-            let a = self
-                .lua
-                .create_table()
-                .map_err(|e| anyhow!("Failed to create agent table: {e}"))?;
-            set_field(&a, "id", agent.id.as_str())?;
-            set_field(&a, "session_count", agent.session_count)?;
-            agents_arr
-                .set(i + 1, a)
-                .map_err(|e| anyhow!("Failed to set agent: {e}"))?;
+        // _char for input_char action (optional)
+        if let Some(c) = context.action_char {
+            set_field(&ctx_table, "_char", c.to_string().as_str())?;
         }
-        ctx_table
-            .set("agents", agents_arr)
-            .map_err(|e| anyhow!("Failed to set agents: {e}"))?;
-
-        // available_worktrees array of {path, branch}
-        let worktrees = self
-            .lua
-            .create_table()
-            .map_err(|e| anyhow!("Failed to create worktrees table: {e}"))?;
-        for (i, (path, branch)) in context.available_worktrees.iter().enumerate() {
-            let w = self
-                .lua
-                .create_table()
-                .map_err(|e| anyhow!("Failed to create worktree table: {e}"))?;
-            set_field(&w, "path", path.as_str())?;
-            set_field(&w, "branch", branch.as_str())?;
-            worktrees
-                .set(i + 1, w)
-                .map_err(|e| anyhow!("Failed to set worktree: {e}"))?;
-        }
-        ctx_table
-            .set("available_worktrees", worktrees)
-            .map_err(|e| anyhow!("Failed to set available_worktrees: {e}"))?;
 
         Ok(ctx_table)
     }
@@ -556,90 +513,16 @@ impl LayoutLua {
 
 /// Serialize RenderContext into a Lua table for layout functions.
 ///
-/// Only includes fields needed for layout decisions (not Arc<Mutex<Parser>>
-/// or other non-serializable state).
+/// Only includes Rust-owned rendering state. Application state (agents,
+/// pending_fields, worktrees) lives in Lua's `_tui_state` global and is
+/// accessed directly by the layout functions.
 fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
     let state = lua
         .create_table()
         .map_err(|e| anyhow!("Failed to create state table: {e}"))?;
 
-    // Mode (passed directly as string — Lua owns mode names)
-    set_field(&state, "mode", ctx.mode.as_str())?;
-
-    // Agent state
-    set_field(&state, "agent_count", ctx.agents.len())?;
+    // Selection state (mode lives in Lua's _tui_state)
     set_field(&state, "selected_agent_index", ctx.selected_agent_index)?;
-
-    // Serialize agents array
-    let agents_arr = lua
-        .create_table()
-        .map_err(|e| anyhow!("Failed to create agents table: {e}"))?;
-    for (i, agent) in ctx.agents.iter().enumerate() {
-        let a = lua
-            .create_table()
-            .map_err(|e| anyhow!("Failed to create agent table: {e}"))?;
-        set_field(&a, "key", agent.key.as_str())?;
-        set_field(&a, "branch_name", agent.branch_name.as_str())?;
-        if let Some(ref dn) = agent.display_name {
-            set_field(&a, "display_name", dn.as_str())?;
-        }
-        set_field(&a, "repo", agent.repo.as_str())?;
-        if let Some(n) = agent.issue_number {
-            set_field(&a, "issue_number", n)?;
-        }
-        if let Some(p) = agent.port {
-            set_field(&a, "port", p)?;
-        }
-        set_field(&a, "server_running", agent.server_running)?;
-
-        // Session names
-        let sessions = lua
-            .create_table()
-            .map_err(|e| anyhow!("Failed to create sessions table: {e}"))?;
-        for (j, name) in agent.session_names.iter().enumerate() {
-            sessions
-                .set(j + 1, name.as_str())
-                .map_err(|e| anyhow!("Failed to set session name: {e}"))?;
-        }
-        a.set("session_names", sessions)
-            .map_err(|e| anyhow!("Failed to set session_names: {e}"))?;
-
-        agents_arr
-            .set(i + 1, a)
-            .map_err(|e| anyhow!("Failed to set agent: {e}"))?;
-    }
-    state
-        .set("agents", agents_arr)
-        .map_err(|e| anyhow!("Failed to set agents: {e}"))?;
-
-    // Selected agent info (shortcut)
-    if let Some(agent) = ctx.selected_agent() {
-        let sa = lua
-            .create_table()
-            .map_err(|e| anyhow!("Failed to create selected_agent table: {e}"))?;
-        set_field(&sa, "branch_name", agent.branch_name.as_str())?;
-        if let Some(p) = agent.port {
-            set_field(&sa, "port", p)?;
-        }
-        set_field(&sa, "server_running", agent.server_running)?;
-        set_field(&sa, "session_count", agent.session_names.len())?;
-
-        // Session names for terminal title computation
-        let sa_sessions = lua
-            .create_table()
-            .map_err(|e| anyhow!("Failed to create selected_agent sessions table: {e}"))?;
-        for (j, name) in agent.session_names.iter().enumerate() {
-            sa_sessions
-                .set(j + 1, name.as_str())
-                .map_err(|e| anyhow!("Failed to set selected_agent session name: {e}"))?;
-        }
-        sa.set("session_names", sa_sessions)
-            .map_err(|e| anyhow!("Failed to set selected_agent session_names: {e}"))?;
-
-        state
-            .set("selected_agent", sa)
-            .map_err(|e| anyhow!("Failed to set selected_agent: {e}"))?;
-    }
 
     // Terminal state
     set_field(&state, "active_pty_index", ctx.active_pty_index)?;
@@ -663,9 +546,7 @@ fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
     };
     set_field(&state, "vpn_status", vpn_str)?;
 
-    // Modal-specific state
-    set_field(&state, "list_selected", ctx.list_selected)?;
-    set_field(&state, "input_buffer", ctx.input_buffer)?;
+    // Modal-specific state (list_selected, input_buffer live in Lua's _tui_state)
     set_field(&state, "bundle_used", ctx.bundle_used)?;
 
     // QR code dimensions for responsive connection code modal
@@ -677,48 +558,6 @@ fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
     if let Some(error_msg) = ctx.error_message {
         set_field(&state, "error_message", error_msg)?;
     }
-
-    // Pending fields (generic key-value store for in-progress operations)
-    let pending = lua
-        .create_table()
-        .map_err(|e| anyhow!("Failed to create pending_fields table: {e}"))?;
-    for (key, value) in ctx.pending_fields {
-        set_field(&pending, key.as_str(), value.as_str())?;
-    }
-    state
-        .set("pending_fields", pending)
-        .map_err(|e| anyhow!("Failed to set pending_fields: {e}"))?;
-
-    // Legacy creating_agent table (for Lua layout backward compat)
-    if let (Some(identifier), Some(stage)) = (
-        ctx.pending_fields.get("creating_agent_id"),
-        ctx.pending_fields.get("creating_agent_stage"),
-    ) {
-        let creating = lua
-            .create_table()
-            .map_err(|e| anyhow!("Failed to create creating_agent table: {e}"))?;
-        set_field(&creating, "identifier", identifier.as_str())?;
-        set_field(&creating, "stage", stage.as_str())?;
-        state
-            .set("creating_agent", creating)
-            .map_err(|e| anyhow!("Failed to set creating_agent: {e}"))?;
-    }
-    let worktrees = lua
-        .create_table()
-        .map_err(|e| anyhow!("Failed to create worktrees table: {e}"))?;
-    for (i, (path, branch)) in ctx.available_worktrees.iter().enumerate() {
-        let w = lua
-            .create_table()
-            .map_err(|e| anyhow!("Failed to create worktree table: {e}"))?;
-        set_field(&w, "path", path.as_str())?;
-        set_field(&w, "branch", branch.as_str())?;
-        worktrees
-            .set(i + 1, w)
-            .map_err(|e| anyhow!("Failed to set worktree: {e}"))?;
-    }
-    state
-        .set("available_worktrees", worktrees)
-        .map_err(|e| anyhow!("Failed to set available_worktrees: {e}"))?;
 
     Ok(state)
 }
@@ -839,21 +678,27 @@ fn lua_value_to_json(lua: &Lua, value: &LuaValue) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::render::AgentRenderInfo;
 
-    fn make_test_ctx() -> (Vec<AgentRenderInfo>, Vec<String>) {
-        let agents = vec![AgentRenderInfo {
-            key: "test-1".to_string(),
-            display_name: None,
-            repo: "test/repo".to_string(),
-            issue_number: Some(42),
-            branch_name: "feature-branch".to_string(),
-            port: None,
-            server_running: false,
-            session_names: vec!["agent".to_string()],
-        }];
-        let agent_ids = vec!["test-1".to_string()];
-        (agents, agent_ids)
+    fn make_test_ctx(_mode: &str) -> RenderContext<'static> {
+        let pool: &'static std::collections::HashMap<(usize, usize), std::sync::Arc<std::sync::Mutex<vt100::Parser>>> =
+            Box::leak(Box::new(std::collections::HashMap::new()));
+        RenderContext {
+            error_message: None,
+            connection_code: None,
+            bundle_used: false,
+            selected_agent_index: 0,
+            active_parser: None,
+            parser_pool: pool,
+            active_pty_index: 0,
+            scroll_offset: 0,
+            is_scrolled: false,
+            seconds_since_poll: 0,
+            poll_interval: 10,
+            vpn_status: None,
+            terminal_cols: 80,
+            terminal_rows: 24,
+            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
     }
 
     #[test]
@@ -874,32 +719,7 @@ mod tests {
         )
         .unwrap();
 
-        let (agents, agent_ids) = make_test_ctx();
-        let ctx = RenderContext {
-            mode: "normal".to_string(),
-            list_selected: 0,
-            input_buffer: "",
-            available_worktrees: &[],
-            error_message: None,
-            pending_fields: &std::collections::HashMap::new(),
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &agent_ids,
-            agents: &agents,
-            selected_agent_index: 0,
-            active_parser: None,
-            parser_pool: &std::collections::HashMap::new(),
-            active_pty_index: 0,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 0,
-            poll_interval: 10,
-            vpn_status: None,
-            terminal_cols: 80,
-            terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
-
+        let ctx = make_test_ctx("normal");
         let tree = layout.call_render(&ctx).unwrap();
         assert!(matches!(tree, RenderNode::HSplit { .. }));
     }
@@ -908,8 +728,10 @@ mod tests {
     fn test_layout_lua_render_uses_state() {
         let layout = LayoutLua::new(
             r#"
+            _tui_state = { agents = { { id = "test-1", branch_name = "feature" } }, pending_fields = {} }
             function render(state)
-                local title = string.format(" Agents (%d) ", state.agent_count)
+                local agents = _tui_state and _tui_state.agents or {}
+                local title = string.format(" Agents (%d) ", #agents)
                 return {
                     type = "hsplit",
                     constraints = { "30%", "70%" },
@@ -923,32 +745,7 @@ mod tests {
         )
         .unwrap();
 
-        let (agents, agent_ids) = make_test_ctx();
-        let ctx = RenderContext {
-            mode: "normal".to_string(),
-            list_selected: 0,
-            input_buffer: "",
-            available_worktrees: &[],
-            error_message: None,
-            pending_fields: &std::collections::HashMap::new(),
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &agent_ids,
-            agents: &agents,
-            selected_agent_index: 0,
-            active_parser: None,
-            parser_pool: &std::collections::HashMap::new(),
-            active_pty_index: 0,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 0,
-            poll_interval: 10,
-            vpn_status: None,
-            terminal_cols: 80,
-            terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
-
+        let ctx = make_test_ctx("normal");
         let tree = layout.call_render(&ctx).unwrap();
         match tree {
             RenderNode::HSplit { children, .. } => {
@@ -978,32 +775,7 @@ mod tests {
         )
         .unwrap();
 
-        let (agents, agent_ids) = make_test_ctx();
-        let ctx = RenderContext {
-            mode: "normal".to_string(),
-            list_selected: 0,
-            input_buffer: "",
-            available_worktrees: &[],
-            error_message: None,
-            pending_fields: &std::collections::HashMap::new(),
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &agent_ids,
-            agents: &agents,
-            selected_agent_index: 0,
-            active_parser: None,
-            parser_pool: &std::collections::HashMap::new(),
-            active_pty_index: 0,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 0,
-            poll_interval: 10,
-            vpn_status: None,
-            terminal_cols: 80,
-            terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
-
+        let ctx = make_test_ctx("normal");
         let overlay = layout.call_render_overlay(&ctx).unwrap();
         assert!(overlay.is_none());
     }
@@ -1012,11 +784,12 @@ mod tests {
     fn test_layout_lua_overlay_menu() {
         let layout = LayoutLua::new(
             r#"
+            _tui_state = _tui_state or { mode = "normal" }
             function render(state)
                 return { type = "empty" }
             end
             function render_overlay(state)
-                if state.mode == "menu" then
+                if _tui_state.mode == "menu" then
                     return {
                         type = "centered", width = 50, height = 40,
                         child = { type = "list", block = { title = " Menu ", borders = "all" } }
@@ -1028,32 +801,8 @@ mod tests {
         )
         .unwrap();
 
-        let (agents, agent_ids) = make_test_ctx();
-        let ctx = RenderContext {
-            mode: "menu".to_string(),
-            list_selected: 0,
-            input_buffer: "",
-            available_worktrees: &[],
-            error_message: None,
-            pending_fields: &std::collections::HashMap::new(),
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &agent_ids,
-            agents: &agents,
-            selected_agent_index: 0,
-            active_parser: None,
-            parser_pool: &std::collections::HashMap::new(),
-            active_pty_index: 0,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 0,
-            poll_interval: 10,
-            vpn_status: None,
-            terminal_cols: 80,
-            terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
-
+        layout.exec("_tui_state.mode = 'menu'").unwrap();
+        let ctx = make_test_ctx("menu");
         let overlay = layout.call_render_overlay(&ctx).unwrap();
         assert!(overlay.is_some());
         assert!(matches!(overlay.unwrap(), RenderNode::Centered { .. }));
@@ -1068,7 +817,11 @@ mod tests {
         let layout_source = include_str!("../../lua/ui/layout.lua");
         let layout = LayoutLua::new(layout_source).expect("actual layout.lua should load");
 
-        let (agents, agent_ids) = make_test_ctx();
+        // Bootstrap _tui_state (layout.lua reads from it)
+        layout.load_extension(
+            "_tui_state = { agents = {}, pending_fields = {}, available_worktrees = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state_init",
+        ).unwrap();
 
         // Map of every mode string to whether it should produce an overlay
         let mode_expectations: Vec<(&str, bool)> = vec![
@@ -1083,30 +836,9 @@ mod tests {
         ];
 
         for (label, expect_overlay) in &mode_expectations {
-            let ctx = RenderContext {
-                mode: label.to_string(),
-                list_selected: 0,
-                input_buffer: "",
-                available_worktrees: &[],
-                error_message: Some("test error"),
-                pending_fields: &std::collections::HashMap::new(),
-                connection_code: None,
-                bundle_used: false,
-                agent_ids: &agent_ids,
-                agents: &agents,
-                selected_agent_index: 0,
-                active_parser: None,
-                parser_pool: &std::collections::HashMap::new(),
-                active_pty_index: 0,
-                scroll_offset: 0,
-                is_scrolled: false,
-                seconds_since_poll: 0,
-                poll_interval: 10,
-                vpn_status: None,
-                terminal_cols: 80,
-                terminal_rows: 24,
-                terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-            };
+            layout.exec(&format!("_tui_state.mode = '{label}'")).unwrap();
+            let mut ctx = make_test_ctx(label);
+            ctx.error_message = Some("test error");
 
             // Main render should always succeed
             let tree = layout.call_render(&ctx);
@@ -1131,7 +863,11 @@ mod tests {
         let layout_source = include_str!("../../lua/ui/layout.lua");
         let layout = LayoutLua::new(layout_source).expect("actual layout.lua should load");
 
-        let (agents, agent_ids) = make_test_ctx();
+        // Bootstrap _tui_state (layout.lua reads from it)
+        layout.load_extension(
+            "_tui_state = { agents = {}, pending_fields = {}, available_worktrees = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state_init",
+        ).unwrap();
 
         // Each modal mode and its expected inner widget type (as Debug string contains)
         let mode_widgets: Vec<(&str, &str)> = vec![
@@ -1145,30 +881,9 @@ mod tests {
         ];
 
         for (mode, expected_widget) in &mode_widgets {
-            let ctx = RenderContext {
-                mode: mode.to_string(),
-                list_selected: 0,
-                input_buffer: "",
-                available_worktrees: &[],
-                error_message: Some("test"),
-                pending_fields: &std::collections::HashMap::new(),
-                connection_code: None,
-                bundle_used: false,
-                agent_ids: &agent_ids,
-                agents: &agents,
-                selected_agent_index: 0,
-                active_parser: None,
-                parser_pool: &std::collections::HashMap::new(),
-                active_pty_index: 0,
-                scroll_offset: 0,
-                is_scrolled: false,
-                seconds_since_poll: 0,
-                poll_interval: 10,
-                vpn_status: None,
-                terminal_cols: 80,
-                terminal_rows: 24,
-                terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-            };
+            layout.exec(&format!("_tui_state.mode = '{mode}'")).unwrap();
+            let mut ctx = make_test_ctx(mode);
+            ctx.error_message = Some("test");
 
             let overlay = layout.call_render_overlay(&ctx).unwrap().unwrap();
             match overlay {
@@ -1196,31 +911,7 @@ mod tests {
         )
         .unwrap();
 
-        let (agents, agent_ids) = make_test_ctx();
-        let ctx = RenderContext {
-            mode: "normal".to_string(),
-            list_selected: 0,
-            input_buffer: "",
-            available_worktrees: &[],
-            error_message: None,
-            pending_fields: &std::collections::HashMap::new(),
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &agent_ids,
-            agents: &agents,
-            selected_agent_index: 0,
-            active_parser: None,
-            parser_pool: &std::collections::HashMap::new(),
-            active_pty_index: 0,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 0,
-            poll_interval: 10,
-            vpn_status: None,
-            terminal_cols: 80,
-            terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
+        let ctx = make_test_ctx("normal");
 
         let result = layout.call_render(&ctx);
         assert!(result.is_err());
@@ -1253,31 +944,7 @@ mod tests {
             )
             .unwrap();
 
-        let (agents, agent_ids) = make_test_ctx();
-        let ctx = RenderContext {
-            mode: "normal".to_string(),
-            list_selected: 0,
-            input_buffer: "",
-            available_worktrees: &[],
-            error_message: None,
-            pending_fields: &std::collections::HashMap::new(),
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &agent_ids,
-            agents: &agents,
-            selected_agent_index: 0,
-            active_parser: None,
-            parser_pool: &std::collections::HashMap::new(),
-            active_pty_index: 0,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 0,
-            poll_interval: 10,
-            vpn_status: None,
-            terminal_cols: 80,
-            terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
+        let ctx = make_test_ctx("normal");
 
         let tree = layout.call_render(&ctx).unwrap();
         assert!(matches!(tree, RenderNode::HSplit { .. }));
@@ -1314,31 +981,7 @@ mod tests {
             )
             .unwrap();
 
-        let (agents, agent_ids) = make_test_ctx();
-        let ctx = RenderContext {
-            mode: "normal".to_string(),
-            list_selected: 0,
-            input_buffer: "",
-            available_worktrees: &[],
-            error_message: None,
-            pending_fields: &std::collections::HashMap::new(),
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &agent_ids,
-            agents: &agents,
-            selected_agent_index: 0,
-            active_parser: None,
-            parser_pool: &std::collections::HashMap::new(),
-            active_pty_index: 0,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 0,
-            poll_interval: 10,
-            vpn_status: None,
-            terminal_cols: 80,
-            terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
+        let ctx = make_test_ctx("normal");
 
         let tree = layout.call_render(&ctx).unwrap();
         // Extension wrapped the terminal in a vsplit
@@ -1361,31 +1004,7 @@ mod tests {
         assert!(result.is_err());
 
         // Original render still works
-        let (agents, agent_ids) = make_test_ctx();
-        let ctx = RenderContext {
-            mode: "normal".to_string(),
-            list_selected: 0,
-            input_buffer: "",
-            available_worktrees: &[],
-            error_message: None,
-            pending_fields: &std::collections::HashMap::new(),
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &agent_ids,
-            agents: &agents,
-            selected_agent_index: 0,
-            active_parser: None,
-            parser_pool: &std::collections::HashMap::new(),
-            active_pty_index: 0,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 0,
-            poll_interval: 10,
-            vpn_status: None,
-            terminal_cols: 80,
-            terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
+        let ctx = make_test_ctx("normal");
 
         let tree = layout.call_render(&ctx).unwrap();
         assert!(matches!(tree, RenderNode::Widget { .. }));
@@ -1438,31 +1057,7 @@ mod tests {
             )
             .unwrap();
 
-        let (agents, agent_ids) = make_test_ctx();
-        let ctx = RenderContext {
-            mode: "normal".to_string(),
-            list_selected: 0,
-            input_buffer: "",
-            available_worktrees: &[],
-            error_message: None,
-            pending_fields: &std::collections::HashMap::new(),
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &agent_ids,
-            agents: &agents,
-            selected_agent_index: 0,
-            active_parser: None,
-            parser_pool: &std::collections::HashMap::new(),
-            active_pty_index: 0,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 0,
-            poll_interval: 10,
-            vpn_status: None,
-            terminal_cols: 80,
-            terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
+        let ctx = make_test_ctx("normal");
 
         // Second extension saw _test_value from first, so wrapped in hsplit
         let tree = layout.call_render(&ctx).unwrap();
@@ -1516,6 +1111,11 @@ mod tests {
         let botster_source = include_str!("../../lua/ui/botster.lua");
 
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
+        // Bootstrap _tui_state (layout.lua and actions.lua read from it)
+        lua.load_extension(
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {} }",
+            "_tui_state_init",
+        ).expect("_tui_state bootstrap should succeed");
         lua.load_keybindings(kb_source).expect("keybindings.lua should load");
         lua.load_actions(actions_source).expect("actions.lua should load");
         lua.load_extension(botster_source, "botster").expect("botster.lua should load");
@@ -1541,7 +1141,7 @@ mod tests {
         ).unwrap();
 
         // Verify the keybinding works
-        let ctx = KeyContext { list_selected: 0, list_count: 0, terminal_rows: 24 };
+        let ctx = KeyContext { list_count: 0, terminal_rows: 24 };
         let result = lua.call_handle_key("ctrl+n", "normal", &ctx).unwrap();
         assert!(result.is_some(), "ctrl+n should be bound");
         assert_eq!(result.unwrap().action, "open_menu");
@@ -1562,7 +1162,7 @@ mod tests {
         lua.load_extension("botster._wire_keybindings()", "_wire").unwrap();
 
         // Verify function-based keybinding resolves
-        let ctx = KeyContext { list_selected: 0, list_count: 0, terminal_rows: 24 };
+        let ctx = KeyContext { list_count: 0, terminal_rows: 24 };
         let result = lua.call_handle_key("ctrl+n", "normal", &ctx).unwrap();
         assert!(result.is_some(), "ctrl+n function binding should resolve");
         assert_eq!(result.unwrap().action, "toggle_pty");
@@ -1573,7 +1173,7 @@ mod tests {
         let lua = make_full_lua();
 
         // ctrl+p is bound to open_menu in built-in keybindings
-        let ctx = KeyContext { list_selected: 0, list_count: 0, terminal_rows: 24 };
+        let ctx = KeyContext { list_count: 0, terminal_rows: 24 };
         let result = lua.call_handle_key("ctrl+p", "normal", &ctx).unwrap();
         assert!(result.is_some(), "ctrl+p should be bound initially");
 
@@ -1600,7 +1200,7 @@ mod tests {
 
         lua.load_extension("botster._wire_keybindings()", "_wire").unwrap();
 
-        let ctx = KeyContext { list_selected: 0, list_count: 0, terminal_rows: 24 };
+        let ctx = KeyContext { list_count: 0, terminal_rows: 24 };
 
         // Both should be bound
         assert!(lua.call_handle_key("ctrl+n", "normal", &ctx).unwrap().is_some());
@@ -1635,10 +1235,7 @@ mod tests {
         lua.load_extension("botster._wire_actions()", "_wire").unwrap();
 
         // Dispatch the custom action
-        let ctx = ActionContext {
-            mode: "normal".to_string(),
-            ..Default::default()
-        };
+        let ctx = ActionContext::default();
         let result = lua.call_on_action("my_custom_action", &ctx).unwrap();
         assert!(result.is_some(), "Custom action should dispatch");
         let ops = result.unwrap();
@@ -1655,10 +1252,7 @@ mod tests {
         lua.load_extension("botster._wire_actions()", "_wire").unwrap();
 
         // Built-in "open_menu" should still work
-        let ctx = ActionContext {
-            mode: "normal".to_string(),
-            ..Default::default()
-        };
+        let ctx = ActionContext::default();
         let result = lua.call_on_action("open_menu", &ctx).unwrap();
         assert!(result.is_some(), "Built-in action should still dispatch");
         let ops = result.unwrap();
@@ -1718,10 +1312,7 @@ mod tests {
         lua.load_extension("botster._wire_actions() botster._wire_keybindings()", "_wire2").unwrap();
 
         // Custom action should still work (not infinite recursion)
-        let ctx = ActionContext {
-            mode: "normal".to_string(),
-            ..Default::default()
-        };
+        let ctx = ActionContext::default();
         let result = lua.call_on_action("test_action", &ctx).unwrap();
         assert!(result.is_some(), "Custom action should work after double-wire");
 
@@ -1769,5 +1360,140 @@ mod tests {
                 "test_merge",
             )
             .expect("tbl_deep_extend should work correctly");
+    }
+
+    /// Full TUI boot sequence: layout → keybindings → actions → events → bootstrap → render.
+    /// Verifies the complete init chain produces a renderable layout.
+    #[test]
+    fn test_full_tui_boot_sequence() {
+        let layout_source = include_str!("../../lua/ui/layout.lua");
+        let kb_source = include_str!("../../lua/ui/keybindings.lua");
+        let actions_source = include_str!("../../lua/ui/actions.lua");
+        let events_source = include_str!("../../lua/ui/events.lua");
+        let botster_source = include_str!("../../lua/ui/botster.lua");
+
+        // Mirror the exact init order from runner.rs run()
+        let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
+        lua.load_keybindings(kb_source).expect("keybindings.lua should load");
+        lua.load_actions(actions_source).expect("actions.lua should load");
+        lua.load_events(events_source).expect("events.lua should load");
+        lua.load_extension(
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state_init",
+        ).expect("bootstrap should succeed");
+        lua.load_extension(botster_source, "botster").expect("botster.lua should load");
+
+        // Render should succeed in normal mode
+        let ctx = make_test_ctx("normal");
+        let tree = lua.call_render(&ctx);
+        assert!(tree.is_ok(), "render() should succeed after full boot: {:?}", tree.err());
+
+        // Overlay should return None in normal mode
+        let overlay = lua.call_render_overlay(&ctx);
+        assert!(overlay.is_ok(), "render_overlay() should succeed");
+        assert!(overlay.unwrap().is_none(), "normal mode should have no overlay");
+
+        // Key handling should work
+        let key_ctx = KeyContext { list_count: 0, terminal_rows: 24 };
+        let result = lua.call_handle_key("ctrl+p", "normal", &key_ctx);
+        assert!(result.is_ok(), "handle_key should work: {:?}", result.err());
+    }
+
+    /// User override extension only replaces the function it redefines.
+    #[test]
+    fn test_user_override_layers_on_built_in() {
+        let layout_source = include_str!("../../lua/ui/layout.lua");
+        let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
+        lua.load_extension(
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state_init",
+        ).unwrap();
+
+        // Verify built-in render works
+        let ctx = make_test_ctx("normal");
+        let tree = lua.call_render(&ctx);
+        assert!(tree.is_ok(), "built-in render should work");
+
+        // User override: only redefine render_overlay, leave render() untouched
+        lua.load_extension(
+            r#"
+            function render_overlay(state)
+                if _tui_state.mode == "custom_mode" then
+                    return {
+                        type = "centered", width = 50, height = 30,
+                        child = { type = "paragraph", block = { title = " Custom! " } }
+                    }
+                end
+                return nil
+            end
+            "#,
+            "user_layout_override",
+        ).expect("user override should load");
+
+        // Built-in render() still works (wasn't replaced)
+        let tree = lua.call_render(&ctx);
+        assert!(tree.is_ok(), "render() should still work after overlay override");
+
+        // Custom overlay activates for custom mode
+        lua.exec("_tui_state.mode = 'custom_mode'").unwrap();
+        let overlay = lua.call_render_overlay(&ctx).unwrap();
+        assert!(overlay.is_some(), "custom overlay should appear for custom_mode");
+
+        // Built-in overlays still work (menu mode)
+        lua.exec("_tui_state.mode = 'menu'").unwrap();
+        let overlay = lua.call_render_overlay(&ctx).unwrap();
+        // Will be None because our override replaced render_overlay entirely —
+        // the user needs to include the built-in logic too, or call the original.
+        // This is expected: full function replacement, not merging.
+        assert!(overlay.is_none(), "override replaced entire render_overlay");
+    }
+
+    /// User can add keybindings via botster.keymap without replacing built-in ones.
+    #[test]
+    fn test_user_keybinding_extension() {
+        let lua = make_full_lua();
+
+        // Built-in: ctrl+p should map to "menu" action in normal mode
+        let key_ctx = KeyContext { list_count: 0, terminal_rows: 24 };
+        let result = lua.call_handle_key("ctrl+p", "normal", &key_ctx).unwrap();
+        assert!(result.is_some(), "built-in ctrl+p should be bound");
+
+        // User extension adds a new binding
+        lua.load_extension(
+            r#"botster.keymap.set("normal", "ctrl+t", "my_custom_action", { desc = "Test" })"#,
+            "user_keys",
+        ).expect("user keybinding extension should load");
+
+        // New binding works
+        let result = lua.call_handle_key("ctrl+t", "normal", &key_ctx).unwrap();
+        assert!(result.is_some(), "user ctrl+t should be bound");
+
+        // Built-in binding still works
+        let result = lua.call_handle_key("ctrl+p", "normal", &key_ctx).unwrap();
+        assert!(result.is_some(), "built-in ctrl+p should still work");
+    }
+
+    /// User can register custom actions via botster.action.
+    #[test]
+    fn test_user_action_extension() {
+        let lua = make_full_lua();
+
+        // Register a custom action that returns ops
+        lua.load_extension(
+            r#"
+            botster.action.register("my_action", function(ctx)
+                return { { op = "set_mode", mode = "custom" } }
+            end)
+            "#,
+            "user_actions",
+        ).expect("user action extension should load");
+
+        // Wire botster actions into _actions dispatch (runner.rs does this after extensions)
+        lua.exec("botster._wire_actions() botster._wire_keybindings()").unwrap();
+
+        // Dispatch the custom action
+        let action_ctx = ActionContext::default();
+        let result = lua.call_on_action("my_action", &action_ctx).unwrap();
+        assert!(result.is_some(), "custom action should return ops");
     }
 }

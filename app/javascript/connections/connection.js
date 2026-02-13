@@ -516,6 +516,24 @@ export class Connection {
       this.emit("error", { reason: "session_invalid", message: event.message })
     })
     this.#unsubscribers.push(unsubSession)
+
+    // Listen for session refreshed (ratchet restart succeeded)
+    const unsubRefresh = bridge.on("session:refreshed", (event) => {
+      if (event.hubId !== hubId) return
+      console.debug(`[${this.constructor.name}] Session refreshed via ratchet restart`)
+
+      // Clear any previous session_invalid error state
+      if (this.errorCode === "session_invalid") {
+        this.errorCode = null
+        this.errorReason = null
+      }
+
+      // Re-subscribe to resume content delivery with the fresh session
+      if (this.subscriptionId) {
+        this.subscribe({ force: true })
+      }
+    })
+    this.#unsubscribers.push(unsubRefresh)
   }
 
   /**

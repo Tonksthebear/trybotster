@@ -27,7 +27,7 @@ use crate::file_watcher::{FileEventKind, FileWatcher};
 ///
 /// Delegates to [`FileWatcher`] for OS-level watching, then filters
 /// for `.lua` files and converts paths to dot-notation module names
-/// (e.g., `core/handlers/foo.lua` becomes `core.handlers.foo`).
+/// (e.g., `hub/handlers/foo.lua` becomes `hub.handlers.foo`).
 pub struct LuaFileWatcher {
     /// Generic file watcher handling OS-level events.
     watcher: FileWatcher,
@@ -80,7 +80,7 @@ impl LuaFileWatcher {
     /// Poll for changed Lua modules (non-blocking).
     ///
     /// Returns deduplicated module names in dot notation
-    /// (e.g., `core.handlers.foo`). Only `.lua` file creates and
+    /// (e.g., `hub.handlers.foo`). Only `.lua` file creates and
     /// modifications are included; deletes are ignored.
     #[must_use]
     pub fn poll_changes(&self) -> Vec<String> {
@@ -144,8 +144,8 @@ mod tests {
     #[test]
     fn test_path_to_module_simple() {
         let fw = test_watcher("/home/user/.botster/lua");
-        let path = PathBuf::from("/home/user/.botster/lua/core/init.lua");
-        assert_eq!(fw.path_to_module(&path), Some("core.init".to_string()));
+        let path = PathBuf::from("/home/user/.botster/lua/hub/init.lua");
+        assert_eq!(fw.path_to_module(&path), Some("hub.init".to_string()));
     }
 
     #[test]

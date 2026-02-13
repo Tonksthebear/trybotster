@@ -15,7 +15,7 @@
 //! use crate::lua::embedded;
 //!
 //! // Get a specific file
-//! if let Some(content) = embedded::get("core/init.lua") {
+//! if let Some(content) = embedded::get("hub/init.lua") {
 //!     lua.load(content).exec()?;
 //! }
 //!
@@ -64,24 +64,24 @@ mod tests {
     fn test_debug_build_has_empty_stubs() {
         if cfg!(debug_assertions) {
             assert!(all().is_empty(), "Debug builds should not embed Lua files");
-            assert!(get("core/init.lua").is_none(), "Debug builds return None for all lookups");
+            assert!(get("hub/init.lua").is_none(), "Debug builds return None for all lookups");
         }
     }
 
     #[test]
     fn test_release_build_embeds_core_files() {
         if !cfg!(debug_assertions) {
-            assert!(contains("core/init.lua"), "Release build should embed core/init.lua");
-            let content = get("core/init.lua").unwrap();
+            assert!(contains("hub/init.lua"), "Release build should embed hub/init.lua");
+            let content = get("hub/init.lua").unwrap();
             assert!(content.contains("Botster"), "Should contain Botster identifier");
 
             let files = all();
             assert!(!files.is_empty(), "Release build should have embedded files");
 
             let paths: Vec<_> = files.iter().map(|(p, _)| *p).collect();
-            assert!(paths.contains(&"core/init.lua"));
-            assert!(paths.contains(&"core/state.lua"));
-            assert!(paths.contains(&"core/hooks.lua"));
+            assert!(paths.contains(&"hub/init.lua"));
+            assert!(paths.contains(&"hub/state.lua"));
+            assert!(paths.contains(&"hub/hooks.lua"));
             assert!(paths.contains(&"lib/client.lua"));
             assert!(paths.contains(&"handlers/webrtc.lua"));
         }

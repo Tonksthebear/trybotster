@@ -232,6 +232,17 @@ async function handleCreateSession(hubId, bundleJson) {
 
   const bundle = typeof bundleJson === "string" ? JSON.parse(bundleJson) : bundleJson
 
+  // If an existing session exists, verify identity key matches the original
+  // QR trust anchor before replacing. Different identity key = possible MITM.
+  const existingBundle = bundles.get(hubId)
+  if (existingBundle && bundle.identityKey !== existingBundle.identityKey) {
+    throw new Error(
+      `Identity key mismatch in session refresh! ` +
+      `Expected ${existingBundle.identityKey.substring(0, 16)}..., ` +
+      `got ${bundle.identityKey.substring(0, 16)}... — rejecting (possible MITM)`
+    )
+  }
+
   // Clear any existing state for this hub
   accounts.delete(hubId)
   sessions.delete(hubId)

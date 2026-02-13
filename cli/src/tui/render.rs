@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use ratatui::{
     backend::{Backend, TestBackend},
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap},
@@ -40,62 +40,27 @@ use super::render_tree::{
 };
 use crate::compat::{BrowserDimensions, VpnStatus};
 
-use std::collections::HashMap;
-
-/// Information about an agent for rendering.
-///
-/// Extracted subset of Agent data needed for TUI display.
-#[derive(Debug, Clone)]
-pub struct AgentRenderInfo {
-    /// Unique key for this agent (e.g., "repo-42").
-    pub key: String,
-    /// Display name for agent list (e.g., "refactor-tui-2"). Computed by Lua.
-    pub display_name: Option<String>,
-    /// Repository name.
-    pub repo: String,
-    /// Issue number (if issue-based agent).
-    pub issue_number: Option<u32>,
-    /// Branch name.
-    pub branch_name: String,
-    /// HTTP forwarding port if assigned.
-    pub port: Option<u16>,
-    /// Whether the server is running.
-    pub server_running: bool,
-    /// Ordered session names (e.g., ["agent", "server", "watcher"]).
-    /// Empty if sessions info not available (backward compat).
-    pub session_names: Vec<String>,
-}
-
 /// Context required for rendering the TUI.
 ///
 /// `TuiRunner` builds this struct from its internal state and passes it to
 /// the render function. This creates a clear interface between the runner
 /// and the renderer, making dependencies explicit.
+///
+/// Application state (agents, pending_fields, worktrees) lives in Lua's
+/// `_tui_state` global — the TUI is a client like the browser. RenderContext
+/// only carries terminal/rendering primitives that Rust owns.
 pub struct RenderContext<'a> {
     // === UI State ===
-    /// Current UI mode string (e.g., "normal", "menu").
-    pub mode: String,
-    /// Currently selected overlay list item index.
-    pub list_selected: usize,
-    /// Text input buffer for text entry modes.
-    pub input_buffer: &'a str,
-    /// Available worktrees for agent creation (path, branch).
-    pub available_worktrees: &'a [(String, String)],
+    // mode, list_selected, input_buffer live in Lua's _tui_state
     /// Error message to display in Error mode.
     pub error_message: Option<&'a str>,
-    /// Generic key-value store for pending operations (e.g., creating_agent_id, creating_agent_stage).
-    pub pending_fields: &'a HashMap<String, String>,
     /// Connection code data (URL + QR ASCII) for display.
     pub connection_code: Option<&'a super::qr::ConnectionCodeData>,
     /// Whether the connection bundle has been used.
     pub bundle_used: bool,
 
-    // === Agent State ===
-    /// Ordered list of agent IDs.
-    pub agent_ids: &'a [String],
-    /// Agent information for display.
-    pub agents: &'a [AgentRenderInfo],
-    /// Currently selected agent index.
+    // === Selection State ===
+    /// Currently selected agent index (0-based).
     pub selected_agent_index: usize,
 
     // === Terminal State ===
@@ -135,25 +100,13 @@ pub struct RenderContext<'a> {
 impl<'a> std::fmt::Debug for RenderContext<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RenderContext")
-            .field("mode", &self.mode)
-            .field("list_selected", &self.list_selected)
             .field("selected_agent_index", &self.selected_agent_index)
-            .field("agents_count", &self.agents.len())
             .field("has_active_parser", &self.active_parser.is_some())
             .field("active_pty_index", &self.active_pty_index)
             .field("scroll_offset", &self.scroll_offset)
             .field("is_scrolled", &self.is_scrolled)
             .finish_non_exhaustive()
     }
-}
-
-impl<'a> RenderContext<'a> {
-    /// Get the currently selected agent info.
-    #[must_use]
-    pub fn selected_agent(&self) -> Option<&AgentRenderInfo> {
-        self.agents.get(self.selected_agent_index)
-    }
-
 }
 
 /// Render result containing ANSI output for browser streaming.
@@ -242,77 +195,15 @@ where
 
 /// Render the full TUI frame (fallback when Lua layout is unavailable).
 ///
-/// Builds a minimal layout using generic primitives. When Lua is
-/// working, `interpret_tree()` handles rendering instead.
+/// Minimal layout — agent data lives in Lua's `_tui_state`, so this
+/// fallback can only show the terminal panel. When Lua is working,
+/// `interpret_tree()` handles full rendering instead.
 fn render_frame(f: &mut Frame, ctx: &RenderContext) {
     let frame_area = f.area();
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
-        .split(frame_area);
-
-    // Build agent list as generic ListProps
-    let mut items: Vec<ListItemProps> = Vec::new();
-    if let (Some(identifier), Some(stage)) = (
-        ctx.pending_fields.get("creating_agent_id"),
-        ctx.pending_fields.get("creating_agent_stage"),
-    ) {
-        let stage_label = match stage.as_str() {
-            "creating_worktree" => "Creating worktree...",
-            "copying_config" => "Copying config...",
-            "spawning_agent" => "Starting agent...",
-            "ready" => "Ready",
-            other => other,
-        };
-        items.push(ListItemProps {
-            content: StyledContent::Plain(format!("-> {} ({})", identifier, stage_label)),
-            header: false,
-            style: Some(SpanStyle {
-                fg: Some(super::render_tree::SpanColor::Cyan),
-                ..SpanStyle::default()
-            }),
-            action: None,
-        });
-    }
-    for agent in ctx.agents {
-        let base_text = agent.display_name.as_deref().unwrap_or(&agent.branch_name);
-        let server_info = if let Some(p) = agent.port {
-            let icon = if agent.server_running { ">" } else { "o" };
-            format!(" {}:{}", icon, p)
-        } else {
-            String::new()
-        };
-        items.push(ListItemProps {
-            content: StyledContent::Plain(format!("{}{}", base_text, server_info)),
-            header: false,
-            style: None,
-            action: None,
-        });
-    }
-
-    let creating_offset = if ctx.pending_fields.contains_key("creating_agent_id") { 1 } else { 0 };
-    let selected = ctx.selected_agent_index + creating_offset;
-
-    let list_props = ListProps {
-        items,
-        selected: Some(selected),
-        highlight_style: None,
-        highlight_symbol: None,
-    };
-
-    let poll_status = if ctx.seconds_since_poll < 1 { "*" } else { "o" };
-    let agent_title = format!(" Agents ({}) {} ", ctx.agents.len(), poll_status);
-    let agent_block = Block::default().borders(Borders::ALL).title(agent_title);
-    render_list_widget(f, chunks[0], agent_block, &list_props);
-
-    // Render terminal view
-    let term_title = if let Some(agent) = ctx.selected_agent() {
-        format!(" {} [AGENT] ", agent.branch_name)
-    } else {
-        " Terminal [No agent selected] ".to_string()
-    };
-    let term_block = Block::default().borders(Borders::ALL).title(term_title);
-    render_terminal_panel(f, ctx, chunks[1], term_block, None);
+    let term_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Terminal [Lua layout unavailable] ");
+    render_terminal_panel(f, ctx, frame_area, term_block, None);
 }
 
 /// Render the terminal panel showing PTY output.
@@ -528,62 +419,6 @@ pub(super) fn render_connection_code_widget(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_render_context_selected_agent() {
-        let agents = vec![
-            AgentRenderInfo {
-                key: "test-1".to_string(),
-                display_name: None,
-                repo: "test/repo".to_string(),
-                issue_number: Some(1),
-                branch_name: "botster-issue-1".to_string(),
-                port: None,
-                server_running: false,
-                session_names: vec!["agent".to_string()],
-            },
-            AgentRenderInfo {
-                key: "test-2".to_string(),
-                display_name: None,
-                repo: "test/repo".to_string(),
-                issue_number: Some(2),
-                branch_name: "botster-issue-2".to_string(),
-                port: Some(3000),
-                server_running: true,
-                session_names: vec!["agent".to_string(), "server".to_string()],
-            },
-        ];
-
-        let ctx = RenderContext {
-            mode: "normal".to_string(),
-            list_selected: 0,
-            input_buffer: "",
-            available_worktrees: &[],
-            error_message: None,
-            pending_fields: &std::collections::HashMap::new(),
-            connection_code: None,
-            bundle_used: false,
-            agent_ids: &[],
-            agents: &agents,
-            selected_agent_index: 1,
-            active_parser: None,
-            parser_pool: &std::collections::HashMap::new(),
-            active_pty_index: 0,
-            scroll_offset: 0,
-            is_scrolled: false,
-            seconds_since_poll: 0,
-            poll_interval: 10,
-            vpn_status: None,
-            terminal_cols: 80,
-            terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
-
-        let selected = ctx.selected_agent();
-        assert!(selected.is_some());
-        assert_eq!(selected.unwrap().key, "test-2");
-        assert_eq!(selected.unwrap().issue_number, Some(2));
-    }
 
     #[test]
     fn test_render_result_default() {

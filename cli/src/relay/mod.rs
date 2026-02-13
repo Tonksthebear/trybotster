@@ -56,7 +56,8 @@ pub use types::{AgentInfo, BrowserCommand, BrowserResize, SessionInfo, TerminalM
 
 pub use olm_crypto::{
     binary_format, extract_olm_key, DeviceKeyBundle, OlmEnvelope, VodozemacCrypto,
-    VodozemacCryptoState, MSG_TYPE_NORMAL, MSG_TYPE_PREKEY, PROTOCOL_VERSION,
+    VodozemacCryptoState, MSG_TYPE_BUNDLE_REFRESH, MSG_TYPE_NORMAL, MSG_TYPE_PREKEY,
+    PROTOCOL_VERSION,
 };
 
 pub use persistence::{delete_connection_url, read_connection_url, write_connection_url};

@@ -17,6 +17,7 @@
 
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use crate::channel::Channel;
 use crate::hub::actions::{self, HubAction};
 use crate::hub::{registration, Hub, WebRtcPtyOutput};
@@ -225,26 +226,55 @@ impl Hub {
                 }
             }
 
-            // Check for repeated decryption failures (session desync)
+            // Check for repeated decryption failures (session desync) —
+            // initiate ratchet restart by sending a fresh bundle (type 2).
             if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
                 let failures = channel.decrypt_failure_count();
                 if failures >= 3 {
                     log::warn!(
-                        "[WebRTC] {} consecutive decryption failures for {}, sending session_invalid",
+                        "[WebRTC] {} consecutive decryption failures for {}, initiating ratchet restart",
                         failures,
                         &browser_identity[..browser_identity.len().min(8)]
                     );
                     channel.reset_decrypt_failures();
 
-                    let msg = serde_json::json!({
-                        "type": "session_invalid",
-                        "reason": "decryption_failed",
-                        "message": "Crypto session out of sync. Please re-pair.",
-                    });
-                    if let Ok(payload) = serde_json::to_vec(&msg) {
-                        let _guard = self.tokio_runtime.enter();
-                        if let Err(e) = self.tokio_runtime.block_on(channel.send_session_recovery(&payload)) {
-                            log::warn!("[WebRTC] Failed to send session_invalid: {e}");
+                    let peer_olm_key = crate::relay::extract_olm_key(&browser_identity).to_string();
+                    if let Some(ref cs) = self.browser.crypto_service {
+                        match cs.lock() {
+                            Ok(mut guard) => {
+                                match guard.refresh_bundle_for_peer(&peer_olm_key) {
+                                    Ok(bundle_bytes) => {
+                                        if let Err(e) = guard.persist() {
+                                            log::warn!("[WebRTC] Failed to persist after refresh: {e}");
+                                        }
+                                        drop(guard); // Release lock before async send
+
+                                        // Send type 2 via DataChannel
+                                        let _guard = self.tokio_runtime.enter();
+                                        if let Err(e) = self.tokio_runtime.block_on(
+                                            channel.send_bundle_refresh(&bundle_bytes)
+                                        ) {
+                                            log::warn!("[WebRTC] Failed to send bundle refresh via DC: {e}");
+                                        }
+
+                                        // Also send via ActionCable (belt and suspenders)
+                                        let envelope = serde_json::json!({
+                                            "t": 2,
+                                            "b": base64::engine::general_purpose::STANDARD_NO_PAD
+                                                .encode(&bundle_bytes),
+                                        });
+                                        let data = serde_json::json!({
+                                            "browser_identity": browser_identity,
+                                            "envelope": envelope,
+                                        });
+                                        if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
+                                            log::warn!("[WebRTC] Failed to send bundle refresh via AC: {e}");
+                                        }
+                                    }
+                                    Err(e) => log::error!("[WebRTC] Failed to generate refresh bundle: {e}"),
+                                }
+                            }
+                            Err(e) => log::error!("[WebRTC] Crypto mutex poisoned: {e}"),
                         }
                     }
                 }
@@ -428,11 +458,7 @@ impl Hub {
                         let peer = crate::channel::PeerId(peer_id.clone());
                         let _guard = self.tokio_runtime.enter();
                         if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&payload, &peer)) {
-                            if matches!(e, crate::channel::ChannelError::BufferFull) {
-                                log::trace!("[WebRTC] Lua send skipped (buffer full)");
-                            } else {
-                                log::warn!("[WebRTC] Lua send failed: {e}");
-                            }
+                            log::warn!("[WebRTC] Lua send failed: {e}");
                         }
                     } else {
                         log::debug!("[WebRTC] Lua send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
@@ -443,11 +469,7 @@ impl Hub {
                         let peer = crate::channel::PeerId(peer_id.clone());
                         let _guard = self.tokio_runtime.enter();
                         if let Err(e) = self.tokio_runtime.block_on(channel.send_to(&data, &peer)) {
-                            if matches!(e, crate::channel::ChannelError::BufferFull) {
-                                log::trace!("[WebRTC] Lua binary send skipped (buffer full)");
-                            } else {
-                                log::warn!("[WebRTC] Lua binary send failed: {e}");
-                            }
+                            log::warn!("[WebRTC] Lua binary send failed: {e}");
                         }
                     } else {
                         log::debug!("[WebRTC] Lua binary send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
@@ -1188,11 +1210,7 @@ impl Hub {
                 if let Err(e) = self.tokio_runtime.block_on(
                     channel.send_stream_raw(frame.frame_type, frame.stream_id, &frame.payload, &peer),
                 ) {
-                    if matches!(e, crate::channel::ChannelError::BufferFull) {
-                        log::trace!("[StreamMux] Frame send skipped (buffer full)");
-                    } else {
-                        log::warn!("[StreamMux] Failed to send frame: {e}");
-                    }
+                    log::warn!("[StreamMux] Failed to send frame: {e}");
                 }
             }
         }
@@ -1221,13 +1239,7 @@ impl Hub {
         if let Err(e) = self.tokio_runtime.block_on(
             channel.send_pty_raw(subscription_id, &data, &peer)
         ) {
-            // Buffer-full is expected when peer is unreachable (phone locked);
-            // log at trace to avoid spamming during normal disconnects.
-            if matches!(e, crate::channel::ChannelError::BufferFull) {
-                log::trace!("[WebRTC] PTY send skipped (buffer full)");
-            } else {
-                log::warn!("[WebRTC] Failed to send PTY data: {e}");
-            }
+            log::warn!("[WebRTC] Failed to send PTY data: {e}");
         }
     }
 

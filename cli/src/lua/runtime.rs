@@ -273,7 +273,7 @@ impl LuaRuntime {
     /// Configure Lua package.path to include the base path and subdirectories.
     ///
     /// This allows:
-    /// - `require("core.hooks")` to find `{base_path}/core/hooks.lua`
+    /// - `require("hub.hooks")` to find `{base_path}/hub/hooks.lua`
     /// - `require("lib.client")` to find `{base_path}/lib/client.lua`
     /// - `require("handlers.webrtc")` to find `{base_path}/handlers/webrtc.lua`
     fn setup_package_path(lua: &Lua, base_path: &Path) -> Result<()> {
@@ -291,11 +291,11 @@ impl LuaRuntime {
         // - {base}/?/init.lua - package init files
         // - {base}/lib/?.lua - library modules (client, utils)
         // - {base}/handlers/?.lua - handler modules (webrtc)
-        // - {base}/core/?.lua - core modules (state, hooks, loader)
+        // - {base}/hub/?.lua - hub modules (state, hooks, loader)
         // - {base}/plugins/?.lua - user plugins
         // - {base}/plugins/?/init.lua - user plugin packages
         let new_path = format!(
-            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/core/?.lua;{path}/plugins/?.lua;{path}/plugins/?/init.lua;{current}",
+            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/hub/?.lua;{path}/plugins/?.lua;{path}/plugins/?/init.lua;{current}",
             path = base_path.display(),
             current = current_path
         );
@@ -337,7 +337,7 @@ impl LuaRuntime {
 
         // Prepend the additional path to package.path so embedded modules are found first
         let new_path = format!(
-            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/core/?.lua;{path}/plugins/?.lua;{path}/plugins/?/init.lua;{current}",
+            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/hub/?.lua;{path}/plugins/?.lua;{path}/plugins/?/init.lua;{current}",
             path = additional_path.display(),
             current = current_path
         );
@@ -386,7 +386,7 @@ impl LuaRuntime {
     ///
     /// # Arguments
     ///
-    /// * `relative_path` - Path relative to base path (e.g., `core/init.lua`)
+    /// * `relative_path` - Path relative to base path (e.g., `hub/init.lua`)
     ///
     /// # Errors
     ///
@@ -459,7 +459,7 @@ impl LuaRuntime {
     ///
     /// # Arguments
     ///
-    /// * `name` - Name for error messages (e.g., "core/init.lua")
+    /// * `name` - Name for error messages (e.g., "hub/init.lua")
     /// * `source` - The Lua source code
     ///
     /// # Errors
@@ -502,7 +502,6 @@ impl LuaRuntime {
     pub fn load_embedded(&self) -> Result<()> {
         use super::embedded;
 
-        // Get all embedded files
         let files = embedded::all();
         if files.is_empty() {
             log::warn!("No embedded Lua files found");
@@ -511,129 +510,43 @@ impl LuaRuntime {
 
         log::info!("Loading {} embedded Lua file(s)", files.len());
 
-        // Sort files by load order: core/ first, then lib/, then handlers/
-        let mut sorted: Vec<_> = files.iter().collect();
-        sorted.sort_by(|(a, _), (b, _)| {
-            let order = |p: &str| -> u8 {
-                if p.starts_with("core/") {
-                    0
-                } else if p.starts_with("lib/") {
-                    1
-                } else if p.starts_with("handlers/") {
-                    2
-                } else {
-                    3
-                }
-            };
-            order(a).cmp(&order(b)).then_with(|| a.cmp(b))
-        });
+        // Pre-seed package.loaded with all embedded modules so require()
+        // resolves from memory without needing files on disk.
+        // e.g., "hub/state.lua" → package.loaded["hub.state"] = (loaded module)
+        let package_loaded: mlua::Table = self
+            .lua
+            .globals()
+            .get::<mlua::Table>("package")
+            .and_then(|pkg| pkg.get::<mlua::Table>("loaded"))
+            .map_err(|e| anyhow!("Failed to get package.loaded: {e}"))?;
 
-        // Load core/init.lua first - it bootstraps everything else
-        if let Some(init_content) = embedded::get("core/init.lua") {
-            self.load_string("core/init.lua", init_content)?;
+        // Load non-init modules into package.loaded first (hub/init.lua will require them)
+        for (path, content) in files {
+            if *path == "hub/init.lua" || path.starts_with("ui/") {
+                continue; // init.lua loaded separately below; ui/ loaded by TUI
+            }
+            let module_name = path.trim_end_matches(".lua").replace('/', ".");
+            let chunk = self
+                .lua
+                .load(*content)
+                .set_name(*path)
+                .eval::<mlua::Value>()
+                .map_err(|e| anyhow!("Failed to load embedded {path}: {e}"))?;
+            package_loaded
+                .set(module_name.as_str(), chunk)
+                .map_err(|e| anyhow!("Failed to seed package.loaded[{module_name}]: {e}"))?;
+            log::debug!("Pre-loaded embedded module: {module_name}");
+        }
+
+        // Now load hub/init.lua — its require() calls will find pre-seeded modules
+        if let Some(init_content) = embedded::get("hub/init.lua") {
+            self.load_string("hub/init.lua", init_content)?;
         } else {
-            return Err(anyhow!("Missing embedded core/init.lua"));
+            return Err(anyhow!("Missing embedded hub/init.lua"));
         }
 
         log::info!("Embedded Lua loaded successfully");
         Ok(())
-    }
-
-    /// Extract embedded Lua files to the filesystem for hot-reload support.
-    ///
-    /// On first run (or version upgrade), extracts all embedded Lua files
-    /// to `~/.botster/lua/`. This enables hot-reload even in release builds:
-    /// the agent can modify Lua files on disk and the hub reloads them.
-    ///
-    /// Also creates `plugins/` and `improvements/` subdirectories for
-    /// user extensions.
-    ///
-    /// # Version Check
-    ///
-    /// A `.version` file tracks which binary version extracted the files.
-    /// Extraction is skipped if the version matches, preserving any user
-    /// edits. On upgrade, files are overwritten with the new version.
-    ///
-    /// # Returns
-    ///
-    /// The path where files were extracted (`~/.botster/lua/`), or an error
-    /// if extraction fails.
-    pub fn ensure_lua_on_filesystem(&mut self) -> Result<PathBuf> {
-        use super::embedded;
-
-        let files = embedded::all();
-        if files.is_empty() {
-            return Err(anyhow!("No embedded Lua files to extract"));
-        }
-
-        let data_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow!("Cannot determine home directory"))?
-            .join(".botster")
-            .join("lua");
-
-        let version_file = data_dir.join(".version");
-        let current_version = env!("CARGO_PKG_VERSION");
-
-        // Include a content hash so Lua changes during development (same version) trigger re-extraction
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for (path, content) in files {
-            path.hash(&mut hasher);
-            content.hash(&mut hasher);
-        }
-        let content_hash = hasher.finish();
-        let version_marker = format!("{}-{:016x}", current_version, content_hash);
-
-        let needs_extract = if version_file.exists() {
-            let existing = std::fs::read_to_string(&version_file).unwrap_or_default();
-            existing.trim() != version_marker
-        } else {
-            true
-        };
-
-        if needs_extract {
-            log::info!(
-                "Extracting {} embedded Lua files to {} (version {})",
-                files.len(),
-                data_dir.display(),
-                current_version
-            );
-
-            for (path, content) in files {
-                let full_path = data_dir.join(path);
-                if let Some(parent) = full_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
-                }
-                std::fs::write(&full_path, content)
-                    .with_context(|| format!("Failed to write: {}", full_path.display()))?;
-            }
-
-            // Create extension directories
-            std::fs::create_dir_all(data_dir.join("plugins"))
-                .context("Failed to create plugins directory")?;
-            std::fs::create_dir_all(data_dir.join("improvements"))
-                .context("Failed to create improvements directory")?;
-            std::fs::create_dir_all(data_dir.join("user").join("ui"))
-                .context("Failed to create user/ui directory")?;
-
-            // Write version marker last (so partial extraction retries)
-            std::fs::write(&version_file, &version_marker)
-                .context("Failed to write version file")?;
-
-            log::info!("Lua extraction complete");
-        } else {
-            log::debug!(
-                "Lua files already extracted (version {})",
-                current_version
-            );
-        }
-
-        // Update runtime to use the extracted path
-        self.set_base_path(data_dir.clone());
-        Self::setup_package_path(&self.lua, &data_dir)?;
-
-        Ok(data_dir)
     }
 
     /// Call a global Lua function.
@@ -732,7 +645,7 @@ impl LuaRuntime {
     ///
     /// ```ignore
     /// let mut lua = LuaRuntime::new()?;
-    /// lua.load_file(Path::new("core/init.lua"))?;
+    /// lua.load_file(Path::new("hub/init.lua"))?;
     /// lua.start_file_watching()?;
     /// ```
     pub fn start_file_watching(&mut self) -> Result<()> {
@@ -777,7 +690,7 @@ impl LuaRuntime {
     /// watching is not enabled.
     ///
     /// Uses the Lua `loader.reload()` function to reload modules, which
-    /// respects the protected module list (core.state, core.hooks, etc.)
+    /// respects the protected module list (hub.state, hub.hooks, etc.)
     /// and calls `_before_reload` / `_after_reload` lifecycle hooks.
     ///
     /// # Returns
@@ -2639,5 +2552,93 @@ mod tests {
             }
             _ => panic!("Expected Json request"),
         }
+    }
+
+    /// Verifies that pre-seeding package.loaded makes modules available via require().
+    /// This simulates what load_embedded() does in release builds.
+    #[test]
+    fn test_package_loaded_preseeding_enables_require() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+        let lua = runtime.lua();
+
+        // Simulate what load_embedded does: eval a module and put it in package.loaded
+        let module: mlua::Value = lua
+            .load(r#"
+                local M = {}
+                M.value = 42
+                function M.get_name() return "test_module" end
+                return M
+            "#)
+            .eval()
+            .expect("module should eval");
+
+        let package_loaded: mlua::Table = lua
+            .globals()
+            .get::<mlua::Table>("package")
+            .and_then(|pkg| pkg.get::<mlua::Table>("loaded"))
+            .expect("package.loaded should exist");
+
+        package_loaded
+            .set("hub.test_module", module)
+            .expect("should seed package.loaded");
+
+        // Now require() should find it without filesystem
+        let result: i32 = lua
+            .load(r#"return require("hub.test_module").value"#)
+            .eval()
+            .expect("require should resolve from package.loaded");
+        assert_eq!(result, 42);
+
+        let name: String = lua
+            .load(r#"return require("hub.test_module").get_name()"#)
+            .eval()
+            .expect("require should return full module");
+        assert_eq!(name, "test_module");
+    }
+
+    /// Verifies that pre-seeded modules can require each other (dependency chains).
+    #[test]
+    fn test_package_loaded_preseeding_cross_module_require() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+        let lua = runtime.lua();
+
+        let package_loaded: mlua::Table = lua
+            .globals()
+            .get::<mlua::Table>("package")
+            .and_then(|pkg| pkg.get::<mlua::Table>("loaded"))
+            .expect("package.loaded should exist");
+
+        // Seed "hub.state" first
+        let state: mlua::Value = lua
+            .load(r#"
+                local M = {}
+                M.agents = {}
+                return M
+            "#)
+            .eval()
+            .unwrap();
+        package_loaded.set("hub.state", state).unwrap();
+
+        // Seed "hub.hooks" that depends on nothing
+        let hooks: mlua::Value = lua
+            .load(r#"
+                local M = {}
+                function M.notify(event) end
+                return M
+            "#)
+            .eval()
+            .unwrap();
+        package_loaded.set("hub.hooks", hooks).unwrap();
+
+        // Now a script that requires both should work
+        let result: bool = lua
+            .load(r#"
+                local state = require("hub.state")
+                local hooks = require("hub.hooks")
+                return type(state.agents) == "table" and type(hooks.notify) == "function"
+            "#)
+            .eval()
+            .expect("cross-module require should work");
+        assert!(result, "Both modules should resolve from package.loaded");
     }
 }

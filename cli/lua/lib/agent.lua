@@ -11,12 +11,12 @@
 --
 -- Manages agent lifecycle: creation, tracking, metadata, and cleanup.
 --
--- This module is hot-reloadable; state is persisted via core.state.
+-- This module is hot-reloadable; state is persisted via hub.state.
 -- Uses state.class() for persistent metatable -- existing instances
 -- automatically see new/changed methods after hot-reload.
 
-local state = require("core.state")
-local hooks = require("core.hooks")
+local state = require("hub.state")
+local hooks = require("hub.hooks")
 
 local Agent = state.class("Agent")
 

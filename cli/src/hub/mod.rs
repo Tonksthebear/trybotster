@@ -490,7 +490,7 @@ impl Hub {
         #[cfg(debug_assertions)]
         {
             let dev_lua_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua");
-            let dev_init_path = dev_lua_dir.join("core").join("init.lua");
+            let dev_init_path = dev_lua_dir.join("hub").join("init.lua");
 
             if dev_init_path.exists() {
                 log::info!("Dev mode: using Lua files from {}", dev_lua_dir.display());
@@ -511,42 +511,10 @@ impl Hub {
             }
         }
 
-        // Release mode: extract embedded Lua to filesystem, then load from there.
-        // Extraction uses a content hash so it only re-writes when files actually change.
-        // This enables hot-reload even in release builds (users can edit Lua on disk).
-        #[cfg(not(debug_assertions))]
-        {
-            match self.lua.ensure_lua_on_filesystem() {
-                Ok(extracted_path) => {
-                    log::info!(
-                        "Release mode: Lua extracted to {}, loading from filesystem",
-                        extracted_path.display()
-                    );
-                    let init_path = std::path::Path::new("core/init.lua");
-                    if let Err(e) = self.lua.load_file(init_path) {
-                        log::warn!("Failed to load extracted init.lua: {}", e);
-                        // Fall back to in-memory embedded loading
-                        if let Err(e) = self.lua.load_embedded() {
-                            log::warn!("Fallback embedded load also failed: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Failed to extract Lua files: {}, using in-memory fallback", e);
-                    if let Err(e) = self.lua.load_embedded() {
-                        log::warn!("Failed to load embedded Lua: {}", e);
-                    }
-                }
-            }
-        }
-
-        // Fallback for debug builds where dev directory doesn't exist
-        #[cfg(debug_assertions)]
-        {
-            log::info!("Dev directory not found, using embedded Lua files");
-            if let Err(e) = self.lua.load_embedded() {
-                log::warn!("Failed to load embedded Lua: {}", e);
-            }
+        // No dev directory found — load embedded Lua directly from the binary.
+        log::info!("Loading embedded Lua files");
+        if let Err(e) = self.lua.load_embedded() {
+            log::warn!("Failed to load embedded Lua: {}", e);
         }
     }
 

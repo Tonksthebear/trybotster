@@ -71,7 +71,7 @@ function bytesToBase64(bytes) {
  *   [32] one_time_key (Curve25519)
  *   [64] signature (Ed25519)
  */
-function parseBinaryBundle(bytes) {
+export function parseBinaryBundle(bytes) {
   const BUNDLE_VERSION = 0x06
   const BUNDLE_SIZE = 161
 

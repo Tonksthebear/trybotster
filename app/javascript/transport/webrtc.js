@@ -22,6 +22,7 @@
  */
 
 import bridge from "workers/bridge"
+import { parseBinaryBundle } from "matrix/bundle"
 
 // Singleton instance
 let instance = null
@@ -49,8 +50,19 @@ const CONTENT_MSG = 0x00
 const CONTENT_PTY = 0x01
 const CONTENT_STREAM = 0x02
 
+// Olm session restart wire type (unencrypted control, CLI → Browser)
+const MSG_TYPE_BUNDLE_REFRESH = 0x02
+
 // Grace period before closing idle connections (ms)
 const DISCONNECT_GRACE_PERIOD_MS = 3000
+
+/**
+ * Decode unpadded Base64 to Uint8Array.
+ */
+function base64ToBytes(b64) {
+  const binary = atob(b64)
+  return Uint8Array.from(binary, c => c.charCodeAt(0))
+}
 
 /**
  * Build a binary control message frame: [CONTENT_MSG][JSON bytes].
@@ -876,6 +888,23 @@ class WebRTCTransport {
         return
       }
 
+      // Bundle refresh (type 2) from CLI — ratchet restart via ActionCable
+      if (data.envelope?.t === 2 && data.envelope?.b) {
+        console.debug("[WebRTCTransport] Received bundle refresh from CLI via ActionCable")
+        try {
+          const bundleBytes = base64ToBytes(data.envelope.b)
+          const bundle = parseBinaryBundle(bundleBytes)
+          await bridge.createSession(String(hubId), bundle)
+          const conn = this.#connections.get(hubId)
+          if (conn) conn.decryptFailures = 0
+          this.#emit("session:refreshed", { hubId })
+        } catch (err) {
+          console.error("[WebRTCTransport] Bundle refresh via AC failed:", err.message)
+          this.#emit("session:invalid", { hubId, message: err.message })
+        }
+        return
+      }
+
       try {
         const decrypted = await this.#decryptSignalEnvelope(hubId, data.envelope)
         if (!decrypted) return
@@ -986,6 +1015,23 @@ class WebRTCTransport {
       // [msg_type:1][raw ciphertext] or [msg_type:1][key:32][ciphertext]
       const raw = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data)
 
+      // Type 2: Bundle refresh from CLI (unencrypted ratchet restart)
+      if (raw.length > 0 && raw[0] === MSG_TYPE_BUNDLE_REFRESH) {
+        const bundleBytes = raw.slice(1)
+        console.debug("[WebRTCTransport] Received bundle refresh from CLI via DataChannel")
+        try {
+          const bundle = parseBinaryBundle(bundleBytes)
+          await bridge.createSession(String(hubId), bundle)
+          const conn = this.#connections.get(hubId)
+          if (conn) conn.decryptFailures = 0
+          this.#emit("session:refreshed", { hubId })
+        } catch (err) {
+          console.error("[WebRTCTransport] Bundle refresh failed:", err.message)
+          this.#emit("session:invalid", { hubId, message: err.message })
+        }
+        return
+      }
+
       // First byte distinguishes binary Olm frame (0x00/0x01) from plaintext JSON (0x7B = '{')
       if (raw.length > 0 && raw[0] <= 0x01) {
         // Binary Olm frame — decrypt
@@ -999,15 +1045,9 @@ class WebRTCTransport {
           if (conn) conn.decryptFailures = 0
         } catch (err) {
           console.error("[WebRTCTransport] Olm decryption failed:", err.message || err)
-          const conn = this.#connections.get(hubId)
-          if (conn) {
-            conn.decryptFailures++
-            if (conn.decryptFailures >= 3) {
-              console.warn(`[WebRTCTransport] ${conn.decryptFailures} consecutive decryption failures, session invalid`)
-              conn.decryptFailures = 0
-              this.#emit("session:invalid", { hubId, message: "Crypto session out of sync. Please re-pair." })
-            }
-          }
+          // Decrypt failures are handled by the CLI — it detects desync via its
+          // own failure counter and sends a bundle refresh (type 2). The browser
+          // just logs and drops the message.
           return
         }
 

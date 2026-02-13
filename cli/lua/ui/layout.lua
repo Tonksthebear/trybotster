@@ -25,35 +25,54 @@
 --   Shorthand:     "bold" = { bold = true }, "dim" = { dim = true }
 
 -- =============================================================================
+-- Client-side state helpers
+-- =============================================================================
+
+--- Get creating_agent indicator from client-side pending_fields.
+local function get_creating_agent()
+  local pf = _tui_state and _tui_state.pending_fields
+  if not pf then return nil end
+  if pf.creating_agent_id and pf.creating_agent_stage then
+    return { identifier = pf.creating_agent_id, stage = pf.creating_agent_stage }
+  end
+  return nil
+end
+
+--- Get selected agent info from client-side agent cache.
+local function get_selected_agent(state)
+  local agents = _tui_state and _tui_state.agents or {}
+  local idx = state.selected_agent_index
+  if idx == nil then return nil end
+  return agents[idx + 1]  -- Lua 1-based
+end
+
+-- =============================================================================
 -- Helper: Build agent list items from state
 -- =============================================================================
 local function build_agent_items(state)
   local items = {}
 
-  -- Creating indicator at top (creating_agent is a table with .identifier and .stage)
-  if state.creating_agent and type(state.creating_agent) == "table" then
+  -- Creating indicator at top
+  local creating = get_creating_agent()
+  if creating then
     local stages = {
       creating_worktree = "Creating worktree...",
       copying_config = "Copying config...",
       spawning_agent = "Starting agent...",
+      spawning = "Starting agent...",
       ready = "Ready",
     }
     table.insert(items, {
-      text = string.format("-> %s (%s)", state.creating_agent.identifier,
-             stages[state.creating_agent.stage] or "..."),
+      text = string.format("-> %s (%s)", creating.identifier,
+             stages[creating.stage] or "..."),
       style = { fg = "cyan" },
     })
   end
 
-  -- Existing agents
-  for _, agent in ipairs(state.agents or {}) do
+  -- Existing agents from client-side cache
+  for _, agent in ipairs(_tui_state and _tui_state.agents or {}) do
     local name = agent.display_name or agent.branch_name
-    local si = ""
-    if agent.port then
-      local icon = agent.server_running and ">" or "o"
-      si = string.format(" %s:%d", icon, agent.port)
-    end
-    table.insert(items, { text = name .. si })
+    table.insert(items, { text = name })
   end
 
   return items
@@ -64,13 +83,15 @@ end
 -- =============================================================================
 local function build_menu_items(state)
   local items = {}
-  local sa = state.selected_agent
+  local sa = get_selected_agent(state)
 
   -- Agent section (only if agent selected)
   if sa then
     table.insert(items, { text = "── Agent ──", header = true })
-    if (sa.session_count or 0) > 1 then
-      for idx, name in ipairs(sa.session_names) do
+    local sessions = sa.sessions or {}
+    if #sessions > 1 then
+      for idx, session in ipairs(sessions) do
+        local name = type(session) == "table" and session.name or session
         local label = string.upper(name)
         if (idx - 1) == state.active_pty_index then
           label = label .. " *"
@@ -92,12 +113,12 @@ end
 -- =============================================================================
 -- Helper: Build worktree items from state
 -- =============================================================================
-local function build_worktree_items(state)
+local function build_worktree_items()
   local items = {
     { text = "[Use Main Branch]" },
     { text = "[Create New Worktree]" },
   }
-  for _, wt in ipairs(state.available_worktrees or {}) do
+  for _, wt in ipairs(_tui_state and _tui_state.available_worktrees or {}) do
     table.insert(items, { text = string.format("%s (%s)", wt.branch, wt.path) })
   end
   return items
@@ -105,52 +126,73 @@ end
 
 --- Main layout: agent list + terminal panel.
 function render(state)
+  local agents = _tui_state and _tui_state.agents or {}
+  local agent_count = #agents
+  local creating = get_creating_agent()
+  local sa = get_selected_agent(state)
+
   -- Agent list title: count + poll indicator
   local poll_icon = state.seconds_since_poll < 1 and "*" or "o"
   local agent_title = {
-    { text = string.format(" Agents (%d) ", state.agent_count) },
+    { text = string.format(" Agents (%d) ", agent_count) },
     { text = poll_icon .. " ", style = { fg = "cyan" } },
   }
 
   -- Agent list: selection offset accounts for creating indicator
   local agent_selected = state.selected_agent_index
-  if state.creating_agent and type(state.creating_agent) == "table" then
+  if creating then
     agent_selected = agent_selected + 1
   end
 
   -- Terminal title: branch name, session view, scroll indicator, mode
   local term_title = " Terminal [No agent selected] "
-  if state.selected_agent then
-    local sa = state.selected_agent
-    local session = sa.session_names[state.active_pty_index + 1] or "agent"
-    local view = string.upper(session)
-    if sa.session_count > 1 then
-      view = "[" .. view .. " | Ctrl+]: next]"
+  if sa then
+    local session_names = sa.sessions or {}
+    local session_name = session_names[state.active_pty_index + 1]
+    if type(session_name) == "table" then session_name = session_name.name end
+    session_name = session_name or "agent"
+    local session_label = string.upper(session_name)
+    -- Show forwarded port if this session has one
+    local session_info = sa.sessions and sa.sessions[state.active_pty_index + 1]
+    if type(session_info) == "table" and session_info.port then
+      session_label = session_label .. " :" .. session_info.port
+    end
+    local view
+    local session_count = #session_names
+    if session_count > 1 then
+      view = "[" .. session_label .. " | Ctrl+]: next]"
     else
-      view = "[" .. view .. "]"
+      view = "[" .. session_label .. "]"
     end
     local scroll = ""
     if state.is_scrolled then
       scroll = string.format(" [SCROLLBACK +%d | Shift+End: live]", state.scroll_offset)
     end
     local mode_hint = ""
-    if state.mode == "normal" then
+    if _tui_state.mode == "normal" then
       mode_hint = " NORMAL [i: insert] "
-    elseif state.mode == "insert" then
+    elseif _tui_state.mode == "insert" then
       mode_hint = " INSERT [Esc: normal] "
     end
     term_title = {
-      { text = string.format(" %s %s%s ", sa.branch_name, view, scroll) },
-      { text = mode_hint, style = { fg = state.mode == "insert" and "green" or "yellow" } },
+      { text = string.format(" %s %s%s ", sa.branch_name or "main", view, scroll) },
+      { text = mode_hint, style = { fg = _tui_state.mode == "insert" and "green" or "yellow" } },
     }
   end
 
   -- Build terminal panel: side-by-side if 2+ agents, single otherwise
   local terminal_panel
-  if state.agent_count >= 2 then
+  if agent_count >= 2 then
     local function agent_label(idx)
-      local a = state.agents and state.agents[idx + 1]
-      if a then return " " .. (a.display_name or a.branch_name or "Agent " .. idx) .. " " end
+      local a = agents[idx + 1]
+      if a then
+        local label = a.display_name or a.branch_name or "Agent " .. idx
+        local si = a.sessions and a.sessions[1]
+        if type(si) == "table" and si.port then
+          label = label .. " :" .. si.port
+        end
+        return " " .. label .. " "
+      end
       return string.format(" Agent %d ", idx)
     end
     local function terminal_block(idx, pty)
@@ -194,7 +236,7 @@ end
 
 --- Overlay layout: returns a centered modal based on current mode, or nil.
 function render_overlay(state)
-  if state.mode == "menu" then
+  if _tui_state.mode == "menu" then
     return {
       type = "centered", width = 35, height = 30,
       child = {
@@ -202,23 +244,23 @@ function render_overlay(state)
         block = { title = " Menu [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
         props = {
           items = build_menu_items(state),
-          selected = state.list_selected,
+          selected = _tui_state.list_selected,
         },
       },
     }
-  elseif state.mode == "new_agent_select_worktree" then
+  elseif _tui_state.mode == "new_agent_select_worktree" then
     return {
       type = "centered", width = 70, height = 50,
       child = {
         type = "list",
         block = { title = " Select Worktree [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
         props = {
-          items = build_worktree_items(state),
-          selected = state.list_selected,
+          items = build_worktree_items(),
+          selected = _tui_state.list_selected,
         },
       },
     }
-  elseif state.mode == "new_agent_create_worktree" then
+  elseif _tui_state.mode == "new_agent_create_worktree" then
     return {
       type = "centered", width = 60, height = 30,
       child = {
@@ -230,11 +272,11 @@ function render_overlay(state)
             "",
             "Examples: 123, feature-auth, bugfix-login",
           },
-          value = state.input_buffer or "",
+          value = _tui_state.input_buffer or "",
         },
       },
     }
-  elseif state.mode == "new_agent_prompt" then
+  elseif _tui_state.mode == "new_agent_prompt" then
     return {
       type = "centered", width = 60, height = 20,
       child = {
@@ -244,28 +286,40 @@ function render_overlay(state)
           lines = {
             "Enter prompt for agent (leave empty for default):",
           },
-          value = state.input_buffer or "",
+          value = _tui_state.input_buffer or "",
         },
       },
     }
-  elseif state.mode == "close_agent_confirm" then
+  elseif _tui_state.mode == "close_agent_confirm" then
+    local sa = get_selected_agent(state)
+    local on_main = sa and sa.branch_name == "main"
+    local lines
+    if on_main then
+      lines = {
+        "Close selected agent?",
+        "",
+        "Y - Close agent",
+        "",
+        "N/Esc - Cancel",
+      }
+    else
+      lines = {
+        "Close selected agent?",
+        "",
+        "Y - Close agent (keep worktree)",
+        "D - Close agent and delete worktree",
+        "N/Esc - Cancel",
+      }
+    end
     return {
       type = "centered", width = 50, height = 20,
       child = {
         type = "paragraph",
         block = { title = " Confirm Close ", borders = "all" },
-        props = {
-          lines = {
-            "Close selected agent?",
-            "",
-            "Y - Close agent (keep worktree)",
-            "D - Close agent and delete worktree",
-            "N/Esc - Cancel",
-          },
-        },
+        props = { lines = lines },
       },
     }
-  elseif state.mode == "connection_code" then
+  elseif _tui_state.mode == "connection_code" then
     -- Responsive sizing: fit QR code + header/footer/border, min 60x70%
     local need_w = (state.qr_width or 75) + 4
     local need_h = (state.qr_height or 40) + 8
@@ -285,7 +339,7 @@ function render_overlay(state)
         },
       },
     }
-  elseif state.mode == "error" then
+  elseif _tui_state.mode == "error" then
     return {
       type = "centered", width = 60, height = 30,
       child = {
