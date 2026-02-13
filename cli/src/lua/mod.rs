@@ -29,7 +29,7 @@
 //!
 //! When file watching is enabled, the runtime monitors the Lua script directory
 //! for changes. Modified files are automatically reloaded via the Lua `loader`
-//! module. Core modules (`core.state`, `core.hooks`, `core.loader`) are protected
+//! module. Hub modules (`hub.state`, `hub.hooks`, `hub.loader`) are protected
 //! and cannot be reloaded - their state persists across reloads.
 //!
 //! # Usage

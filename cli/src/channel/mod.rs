@@ -168,11 +168,6 @@ pub enum ChannelError {
     NoSession(PeerId),
     /// Operation timed out.
     Timeout,
-    /// DataChannel SCTP buffer is full (peer unreachable).
-    ///
-    /// Returned instead of encrypting to protect the Olm ratchet from
-    /// advancing past the skip limit when the peer can't receive.
-    BufferFull,
 }
 
 impl std::fmt::Display for ChannelError {
@@ -186,7 +181,6 @@ impl std::fmt::Display for ChannelError {
             Self::Closed => write!(f, "Channel closed"),
             Self::NoSession(peer) => write!(f, "No session for peer: {peer}"),
             Self::Timeout => write!(f, "Operation timed out"),
-            Self::BufferFull => write!(f, "DataChannel buffer full"),
         }
     }
 }

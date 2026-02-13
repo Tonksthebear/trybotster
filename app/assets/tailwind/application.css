@@ -9,6 +9,27 @@
   font-style: normal;
   font-display: swap;
 }
+@font-face {
+  font-family: 'JetBrainsMono NF';
+  src: url('JetBrainsMonoNerdFont-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrainsMono NF';
+  src: url('JetBrainsMonoNerdFont-Italic.woff2') format('woff2');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrainsMono NF';
+  src: url('JetBrainsMonoNerdFont-BoldItalic.woff2') format('woff2');
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
 
 /* Force dark mode - always apply dark: variants regardless of system preference */
 @variant dark (&);

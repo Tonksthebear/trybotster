@@ -55,7 +55,7 @@ pub use layout::terminal_widget_inner_area;
 #[doc(inline)]
 pub use qr::{generate_qr_code_lines, ConnectionCodeData};
 #[doc(inline)]
-pub use render::{render, AgentRenderInfo, RenderContext, RenderResult};
+pub use render::{render, RenderContext, RenderResult};
 #[doc(inline)]
 pub use runner::{run_with_hub, TuiRunner};
 #[doc(inline)]

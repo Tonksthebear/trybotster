@@ -4,9 +4,9 @@
 -- Manages client lifecycle, broadcasts hub events to all connected clients.
 --
 -- Each transport handler (webrtc.lua, tui.lua) registers clients here.
--- State is persisted in core.state across hot-reloads.
+-- State is persisted in hub.state across hot-reloads.
 
-local state = require("core.state")
+local state = require("hub.state")
 local Agent = require("lib.agent")
 
 -- Shared client registry - all transports register here

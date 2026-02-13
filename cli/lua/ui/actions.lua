@@ -5,34 +5,62 @@
 -- state changes (mode transitions, messages, field storage), it returns
 -- a list of operations that Rust executes generically.
 --
+-- The TUI is a client consuming hub events (same as the browser).
+-- Client-side state lives in _tui_state; actions read/write it directly.
+-- Only primitive ops (send_msg, focus_terminal, quit) are returned to Rust.
+--
 -- Called from Rust: actions.on_action(action, context)
 -- Returns: list of ops | nil
---   nil   -> Rust handles action generically (scroll, list_up, input_char, etc.)
+--   nil   -> Rust ignores (no action needed)
 --   ops   -> Rust executes each op in sequence
 --
 -- Supported operations:
---   set_mode         { op, mode }                   - Set UI mode string, reset list selection
+--   set_mode         { op, mode }                   - Update Rust's mode shadow
 --   send_msg         { op, data }                   - Send JSON message to Hub via Lua protocol
---   store_field      { op, key, value }             - Store key-value in pending_fields
---   clear_field      { op, key }                    - Remove key from pending_fields
---   clear_input      { op }                         - Clear text input buffer
---   reset_list       { op }                         - Reset overlay list selection to 0
---   focus_terminal   { op, agent_id, pty_index }    - Focus a specific agent+PTY (nil clears)
---   quit             { op }                         - Request application quit (Lua should send_msg first)
+--   focus_terminal   { op, agent_id, pty_index, agent_index }
+--   quit             { op }                         - Request application quit
 --
--- Context fields:
---   mode, input_buffer, list_selected, overlay_actions, pending_fields,
---   selected_agent, available_worktrees,
---   agents (array of {id, session_count}), selected_agent_index, active_pty_index
+-- Context fields (Rust-owned):
+--   overlay_actions, selected_agent, selected_agent_index, active_pty_index
 --
--- Note: context.list_selected is 0-based (from Rust). Lua tables are 1-based,
+-- Client-side state (_tui_state):
+--   mode, input_buffer, list_selected, agents, pending_fields, available_worktrees
+--
+-- Note: _tui_state.list_selected is 0-based. Lua tables are 1-based,
 -- so add 1 when indexing into Lua arrays (e.g., overlay_actions[list_selected + 1]).
 
 local M = {}
 
+--- Set mode in _tui_state and return the set_mode op for Rust's shadow.
+--- Also resets list_selected and clears input_buffer (mode change side effects).
+local function set_mode_ops(mode)
+  _tui_state.mode = mode
+  _tui_state.list_selected = 0
+  _tui_state.input_buffer = ""
+  return { op = "set_mode", mode = mode }
+end
+
 --- Return the appropriate base mode: "insert" if an agent is selected, "normal" otherwise.
 local function base_mode(context)
   return context.selected_agent and "insert" or "normal"
+end
+
+--- Check if the currently selected agent is on the main branch.
+local function selected_agent_on_main(context)
+  local agent_id = context.selected_agent
+  if not agent_id then return false end
+  for _, a in ipairs(_tui_state.agents) do
+    if a.id == agent_id then return a.branch_name == "main" end
+  end
+  return false
+end
+
+--- Look up 0-based agent index from agent_id in client state.
+local function agent_index_for(agent_id)
+  for i, a in ipairs(_tui_state.agents) do
+    if a.id == agent_id then return i - 1 end
+  end
+  return nil
 end
 
 --- Dispatch an action string with context, returning compound ops or nil.
@@ -41,27 +69,54 @@ end
 -- @return table|nil List of op tables, or nil for generic Rust handling
 function M.on_action(action, context)
 
+  -- === UI primitives (Lua owns _tui_state directly) ===
+  if action == "input_char" then
+    local c = context._char
+    if c then _tui_state.input_buffer = _tui_state.input_buffer .. c end
+    return {}
+  end
+
+  if action == "input_backspace" then
+    local buf = _tui_state.input_buffer
+    _tui_state.input_buffer = buf:sub(1, #buf - 1)
+    return {}
+  end
+
+  if action == "list_up" then
+    if _tui_state.list_selected > 0 then
+      _tui_state.list_selected = _tui_state.list_selected - 1
+    end
+    return {}
+  end
+
+  if action == "list_down" then
+    local max_idx = math.max(0, #(context.overlay_actions or {}) - 1)
+    if _tui_state.list_selected < max_idx then
+      _tui_state.list_selected = _tui_state.list_selected + 1
+    end
+    return {}
+  end
+
   -- === Mode transitions ===
   if action == "enter_normal_mode" then
-    return { { op = "set_mode", mode = "normal" } }
+    return { set_mode_ops("normal") }
   end
 
   if action == "enter_insert_mode" then
     if context.selected_agent then
-      return { { op = "set_mode", mode = "insert" } }
+      return { set_mode_ops("insert") }
     end
     return nil  -- no agent, can't insert
   end
 
   -- === Menu selection ===
-  if action == "list_select" and context.mode == "menu" then
+  if action == "list_select" and _tui_state.mode == "menu" then
     local actions = context.overlay_actions or {}
-    local selected = actions[context.list_selected + 1]  -- Lua 1-based
+    local selected = actions[_tui_state.list_selected + 1]  -- Lua 1-based
 
     if selected == "new_agent" then
       return {
-        { op = "set_mode", mode = "new_agent_select_worktree" },
-        { op = "reset_list" },
+        set_mode_ops("new_agent_select_worktree"),
         { op = "send_msg", data = {
           subscriptionId = "tui_hub",
           data = { type = "list_worktrees" },
@@ -69,12 +124,12 @@ function M.on_action(action, context)
       }
     elseif selected == "close_agent" then
       if context.selected_agent then
-        return { { op = "set_mode", mode = "close_agent_confirm" } }
+        return { set_mode_ops("close_agent_confirm") }
       end
-      return { { op = "set_mode", mode = base_mode(context) } }
+      return { set_mode_ops(base_mode(context)) }
     elseif selected == "show_connection_code" then
       return {
-        { op = "set_mode", mode = "connection_code" },
+        set_mode_ops("connection_code"),
         { op = "send_msg", data = {
           subscriptionId = "tui_hub",
           data = { type = "get_connection_code" },
@@ -85,126 +140,121 @@ function M.on_action(action, context)
       local session_idx = selected and string.match(selected, "^switch_session:(%d+)$")
       if session_idx then
         return {
-          { op = "focus_terminal", agent_id = context.selected_agent, pty_index = tonumber(session_idx) },
-          { op = "set_mode", mode = base_mode(context) },
+          { op = "focus_terminal", agent_id = context.selected_agent, pty_index = tonumber(session_idx),
+            agent_index = agent_index_for(context.selected_agent) },
+          set_mode_ops(base_mode(context)),
         }
       end
     end
     -- Unknown or nil action: close menu
-    return { { op = "set_mode", mode = base_mode(context) } }
+    return { set_mode_ops(base_mode(context)) }
   end
 
   -- === Worktree selection ===
   -- List is 0-based: 0 = "Use Main Branch", 1 = "Create New Worktree", 2+ = existing worktrees
-  if action == "list_select" and context.mode == "new_agent_select_worktree" then
-    if context.list_selected == 0 then
+  if action == "list_select" and _tui_state.mode == "new_agent_select_worktree" then
+    local ls = _tui_state.list_selected
+    if ls == 0 then
       -- "Use Main Branch" — skip worktree, go straight to prompt
-      return {
-        { op = "clear_field", key = "pending_issue_or_branch" },
-        { op = "store_field", key = "use_main_branch", value = "true" },
-        { op = "clear_input" },
-        { op = "set_mode", mode = "new_agent_prompt" },
-      }
-    elseif context.list_selected == 1 then
+      _tui_state.pending_fields.pending_issue_or_branch = nil
+      _tui_state.pending_fields.use_main_branch = "true"
+      return { set_mode_ops("new_agent_prompt") }
+    elseif ls == 1 then
       -- "Create New Worktree"
-      return {
-        { op = "clear_field", key = "use_main_branch" },
-        { op = "set_mode", mode = "new_agent_create_worktree" },
-        { op = "clear_input" },
-      }
+      _tui_state.pending_fields.use_main_branch = nil
+      return { set_mode_ops("new_agent_create_worktree") }
     else
       -- Existing worktree. Index 2+ maps to available_worktrees[1+] (Lua 1-based).
-      local wt_idx = context.list_selected - 1
-      local worktrees = context.available_worktrees or {}
+      local wt_idx = ls - 1
+      local worktrees = _tui_state.available_worktrees or {}
       local wt = worktrees[wt_idx]
       if wt then
+        _tui_state.pending_fields.creating_agent_id = wt.branch
+        _tui_state.pending_fields.creating_agent_stage = "creating_worktree"
         return {
           { op = "send_msg", data = {
             subscriptionId = "tui_hub",
             data = { type = "reopen_worktree", path = wt.path, branch = wt.branch },
           }},
-          { op = "store_field", key = "creating_agent_id", value = wt.branch },
-          { op = "store_field", key = "creating_agent_stage", value = "creating_worktree" },
-          { op = "set_mode", mode = base_mode(context) },
+          set_mode_ops(base_mode(context)),
         }
       end
     end
-    return { { op = "set_mode", mode = base_mode(context) } }
+    return { set_mode_ops(base_mode(context)) }
   end
 
   -- === Text input submit ===
   if action == "input_submit" then
-    if context.mode == "new_agent_create_worktree" and (context.input_buffer or "") ~= "" then
-      return {
-        { op = "store_field", key = "pending_issue_or_branch", value = context.input_buffer },
-        { op = "clear_input" },
-        { op = "set_mode", mode = "new_agent_prompt" },
-      }
-    elseif context.mode == "new_agent_prompt" then
-      local pending = context.pending_fields or {}
-      local issue = pending.pending_issue_or_branch
-      local use_main = pending.use_main_branch
+    local input = _tui_state.input_buffer or ""
+    if _tui_state.mode == "new_agent_create_worktree" and input ~= "" then
+      _tui_state.pending_fields.pending_issue_or_branch = input
+      return { set_mode_ops("new_agent_prompt") }
+    elseif _tui_state.mode == "new_agent_prompt" then
+      local pf = _tui_state.pending_fields
+      local issue = pf.pending_issue_or_branch
+      local use_main = pf.use_main_branch
 
       -- Main branch mode: issue is nil, handler spawns in repo root
       -- Worktree mode: issue is set, handler creates/finds worktree
       if issue or use_main then
         local prompt = nil
-        if (context.input_buffer or "") ~= "" then
-          prompt = context.input_buffer
+        if input ~= "" then
+          prompt = input
         end
+        _tui_state.pending_fields.creating_agent_id = issue or "main"
+        _tui_state.pending_fields.creating_agent_stage = use_main and "spawning" or "creating_worktree"
+        _tui_state.pending_fields.pending_issue_or_branch = nil
+        _tui_state.pending_fields.use_main_branch = nil
         return {
           { op = "send_msg", data = {
             subscriptionId = "tui_hub",
             data = { type = "create_agent", issue_or_branch = issue, prompt = prompt },
           }},
-          { op = "store_field", key = "creating_agent_id", value = issue or "main" },
-          { op = "store_field", key = "creating_agent_stage", value = use_main and "spawning" or "creating_worktree" },
-          { op = "clear_field", key = "pending_issue_or_branch" },
-          { op = "clear_field", key = "use_main_branch" },
-          { op = "clear_input" },
-          { op = "set_mode", mode = base_mode(context) },
+          set_mode_ops(base_mode(context)),
         }
       else
-        return { { op = "set_mode", mode = base_mode(context) }, { op = "clear_input" } }
+        return { set_mode_ops(base_mode(context)) }
       end
     end
   end
 
   -- === Confirm close agent ===
-  if action == "confirm_close" and context.mode == "close_agent_confirm" then
+  if action == "confirm_close" and _tui_state.mode == "close_agent_confirm" then
     if context.selected_agent then
       return {
         { op = "send_msg", data = {
           subscriptionId = "tui_hub",
           data = { type = "delete_agent", agent_id = context.selected_agent, delete_worktree = false },
         }},
-        { op = "set_mode", mode = "normal" },
+        set_mode_ops("normal"),
       }
     end
-    return { { op = "set_mode", mode = base_mode(context) } }
+    return { set_mode_ops(base_mode(context)) }
   end
 
-  if action == "confirm_close_delete" and context.mode == "close_agent_confirm" then
+  if action == "confirm_close_delete" and _tui_state.mode == "close_agent_confirm" then
+    -- Don't allow deleting worktree when agent is on main branch
+    if selected_agent_on_main(context) then return nil end
     if context.selected_agent then
       return {
         { op = "send_msg", data = {
           subscriptionId = "tui_hub",
           data = { type = "delete_agent", agent_id = context.selected_agent, delete_worktree = true },
         }},
-        { op = "set_mode", mode = "normal" },
+        set_mode_ops("normal"),
       }
     end
-    return { { op = "set_mode", mode = base_mode(context) } }
+    return { set_mode_ops(base_mode(context)) }
   end
 
   -- === Connection code actions ===
   if action == "regenerate_connection_code" then
+    _tui_state.pending_fields.connection_code = nil
     return {
       { op = "send_msg", data = {
         subscriptionId = "tui_hub",
         data = { type = "regenerate_connection_code" },
       }},
-      { op = "clear_field", key = "connection_code" },
       { op = "send_msg", data = {
         subscriptionId = "tui_hub",
         data = { type = "get_connection_code" },
@@ -224,30 +274,34 @@ function M.on_action(action, context)
   -- === PTY session cycling (Ctrl+] in normal/insert mode) ===
   if action == "toggle_pty" then
     if not context.selected_agent then return nil end
-    local agents = context.agents or {}
-    local idx = context.selected_agent_index
-    if not idx then return nil end
-    local agent = agents[idx + 1]  -- Lua 1-based
-    if not agent then return nil end
-    local session_count = agent.session_count or 1
+    -- Read session count from client-side agent state
+    local agent_id = context.selected_agent
+    local session_count = 1
+    for _, a in ipairs(_tui_state.agents) do
+      if a.id == agent_id then
+        session_count = a.sessions and #a.sessions or 1
+        break
+      end
+    end
     local next_pty = ((context.active_pty_index or 0) + 1) % session_count
     return {
-      { op = "focus_terminal", agent_id = context.selected_agent, pty_index = next_pty },
+      { op = "focus_terminal", agent_id = agent_id, pty_index = next_pty,
+        agent_index = agent_index_for(agent_id) },
     }
   end
 
   -- === Modal state ===
   if action == "open_menu" then
-    return { { op = "set_mode", mode = "menu" } }
+    return { set_mode_ops("menu") }
   end
 
   if action == "close_modal" then
-    return { { op = "set_mode", mode = base_mode(context) } }
+    return { set_mode_ops(base_mode(context)) }
   end
 
   -- === Agent navigation ===
   if action == "select_next" then
-    local agents = context.agents or {}
+    local agents = _tui_state.agents
     if #agents == 0 then return nil end
     local current_idx = context.selected_agent_index  -- 0-based or nil
     local next_idx
@@ -259,13 +313,13 @@ function M.on_action(action, context)
     local next_agent = agents[next_idx + 1]  -- Lua 1-based
     if not next_agent then return nil end
     return {
-      { op = "focus_terminal", agent_id = next_agent.id, pty_index = 0 },
-      { op = "set_mode", mode = "insert" },
+      { op = "focus_terminal", agent_id = next_agent.id, pty_index = 0, agent_index = next_idx },
+      set_mode_ops("insert"),
     }
   end
 
   if action == "select_previous" then
-    local agents = context.agents or {}
+    local agents = _tui_state.agents
     if #agents == 0 then return nil end
     local current_idx = context.selected_agent_index  -- 0-based or nil
     local prev_idx
@@ -277,8 +331,8 @@ function M.on_action(action, context)
     local prev_agent = agents[prev_idx + 1]  -- Lua 1-based
     if not prev_agent then return nil end
     return {
-      { op = "focus_terminal", agent_id = prev_agent.id, pty_index = 0 },
-      { op = "set_mode", mode = "insert" },
+      { op = "focus_terminal", agent_id = prev_agent.id, pty_index = 0, agent_index = prev_idx },
+      set_mode_ops("insert"),
     }
   end
 
