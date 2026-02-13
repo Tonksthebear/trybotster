@@ -22,10 +22,11 @@ import bridge from "workers/bridge"
  * Call this before any crypto operations.
  *
  * @param {string} cryptoWorkerUrl - URL to crypto SharedWorker
- * @param {string} wasmJsUrl - URL to vodozemac-wasm JS
+ * @param {string} wasmJsUrl - URL to vodozemac-wasm JS glue
+ * @param {string} wasmBinaryUrl - URL to vodozemac-wasm binary (.wasm)
  */
-export async function ensureMatrixReady(cryptoWorkerUrl, wasmJsUrl) {
-  await bridge.init({ cryptoWorkerUrl, wasmJsUrl })
+export async function ensureMatrixReady(cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl) {
+  await bridge.init({ cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl })
 }
 
 /**
@@ -106,10 +107,11 @@ export function parseBinaryBundle(bytes) {
 
   return {
     version,
-    identityKey: bytesToBase64(identityKey),
-    signingKey: bytesToBase64(signingKey),
-    oneTimeKey: bytesToBase64(oneTimeKey),
-    signature: bytesToBase64(signature),
+    identityKey: bytesToBase64(identityKey),   // base64 — needed by createOutboundSession
+    oneTimeKey: bytesToBase64(oneTimeKey),      // base64 — needed by createOutboundSession
+    signedData: bytes.slice(0, 97),            // raw bytes [version][identity][signing][otk]
+    signingKeyRaw: signingKey,                 // raw 32 bytes for Ed25519 verify
+    signatureRaw: signature,                   // raw 64 bytes for Ed25519 verify
   }
 }
 

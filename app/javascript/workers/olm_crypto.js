@@ -111,7 +111,87 @@ function dbDeleteAllHubs() {
   }))
 }
 
-/** Get or create a 32-byte pickle key (stored in IndexedDB). */
+// =============================================================================
+// Storage Encryption (AES-GCM derived from pickle key)
+// =============================================================================
+
+/**
+ * Derive an AES-GCM CryptoKey from raw pickle key bytes at runtime.
+ *
+ * Safari has known bugs with storing CryptoKey objects in IndexedDB
+ * (WebKit #177350, #183167) — structured clone of non-extractable keys
+ * fails silently, breaking session restore. Instead, we store only raw
+ * bytes (the pickle key) and import as a CryptoKey on demand.
+ */
+async function deriveStorageKey(pickleKeyBytes) {
+  if (!crypto.subtle) return null
+  return crypto.subtle.importKey(
+    "raw",
+    pickleKeyBytes,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  )
+}
+
+/**
+ * Encrypt a JS object for IndexedDB storage.
+ * Returns `{ iv: Uint8Array, ciphertext: ArrayBuffer }` on success, or the
+ * plain data object if crypto.subtle is unavailable or fails.
+ */
+async function encryptForStorage(data, pickleKeyBytes) {
+  try {
+    const key = await deriveStorageKey(pickleKeyBytes)
+    if (!key) return data
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const encoded = new TextEncoder().encode(JSON.stringify(data))
+    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoded)
+    return { iv, ciphertext }
+  } catch (e) {
+    console.warn("[VodozemacCrypto] encryptForStorage failed, storing plain:", e.message)
+    return data
+  }
+}
+
+/**
+ * Decrypt a `{ iv, ciphertext }` envelope from IndexedDB back to a JS object.
+ * Returns `null` if decryption fails (caller should try plain format).
+ */
+async function decryptFromStorage(encrypted, pickleKeyBytes) {
+  try {
+    const key = await deriveStorageKey(pickleKeyBytes)
+    if (!key) return null
+    const plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: new Uint8Array(encrypted.iv) },
+      key,
+      encrypted.ciphertext
+    )
+    return JSON.parse(new TextDecoder().decode(plaintext))
+  } catch (e) {
+    console.warn("[VodozemacCrypto] decryptFromStorage failed:", e.message)
+    return null
+  }
+}
+
+/**
+ * Detect encrypted format ({ iv, ciphertext }) vs plain object.
+ */
+function isEncryptedFormat(value) {
+  return value && value.iv && value.ciphertext
+}
+
+// =============================================================================
+// Pickle Key & State Persistence
+// =============================================================================
+
+/**
+ * Get or create a 32-byte pickle key.
+ *
+ * Stored as raw bytes (Array) in IndexedDB — NOT as a CryptoKey, because
+ * Safari SharedWorkers can't structured-clone CryptoKey objects (WebKit #183167).
+ * The pickle key doubles as the AES-GCM storage encryption key (imported at
+ * runtime via crypto.subtle.importKey).
+ */
 let pickleKeyCache = null
 
 async function getPickleKey() {
@@ -119,6 +199,7 @@ async function getPickleKey() {
 
   const stored = await dbGet(PICKLE_KEY_ID)
   if (stored) {
+    // Handle both Array and Uint8Array (legacy) formats
     pickleKeyCache = new Uint8Array(stored)
     return pickleKeyCache
   }
@@ -129,45 +210,69 @@ async function getPickleKey() {
   return pickleKeyCache
 }
 
-/** Pickle account + session and write to IndexedDB. */
+/** Pickle account + session, encrypt, and write to IndexedDB. */
 async function persistState(hubId) {
   try {
-    const key = await getPickleKey()
+    const pickleKey = await getPickleKey()
     const account = accounts.get(hubId)
     if (!account) return
 
     const session = sessions.get(hubId)
     const bundle = bundles.get(hubId)
 
-    const state = {
-      accountPickle: account.pickle(key),
-      sessionPickle: session ? session.pickle(key) : null,
-      bundle: bundle || null,
+    // Strip raw byte fields before persisting — Uint8Arrays don't survive
+    // JSON round-tripping, and are only needed at session creation time for
+    // Ed25519 verification (fresh bundles always arrive with raw bytes).
+    let persistBundle = null
+    if (bundle) {
+      const { signedData, signingKeyRaw, signatureRaw, ...rest } = bundle
+      persistBundle = rest
     }
 
-    await dbPut(`hub:${hubId}`, state)
+    const state = {
+      accountPickle: account.pickle(pickleKey),
+      sessionPickle: session ? session.pickle(pickleKey) : null,
+      bundle: persistBundle,
+    }
+
+    const encrypted = await encryptForStorage(state, pickleKey)
+    await dbPut(`hub:${hubId}`, encrypted)
   } catch (e) {
     console.warn("[VodozemacCrypto] Persist failed:", e)
   }
 }
 
-/** Restore account + session from IndexedDB into memory. */
+/** Restore account + session from encrypted IndexedDB into memory. */
 async function restoreState(hubId) {
   if (accounts.has(hubId)) return true
 
   if (!wasmModule) return false
 
-  const state = await dbGet(`hub:${hubId}`)
+  const raw = await dbGet(`hub:${hubId}`)
+  if (!raw) return false
+
+  const pickleKey = await getPickleKey()
+
+  let state
+  if (isEncryptedFormat(raw)) {
+    state = await decryptFromStorage(raw, pickleKey)
+    // If decrypt failed (key mismatch, Safari bug, etc.), try as plain object
+    if (!state && raw.accountPickle) state = raw
+  } else if (raw.accountPickle) {
+    // Legacy unencrypted format — use directly, will be re-encrypted on next persist
+    state = raw
+  } else {
+    return false
+  }
+
   if (!state || !state.accountPickle) return false
 
-  const key = await getPickleKey()
-
   try {
-    const account = wasmModule.VodozemacAccount.fromPickle(state.accountPickle, key)
+    const account = wasmModule.VodozemacAccount.fromPickle(state.accountPickle, pickleKey)
     accounts.set(hubId, account)
 
     if (state.sessionPickle) {
-      const session = wasmModule.VodozemacSession.fromPickle(state.sessionPickle, key)
+      const session = wasmModule.VodozemacSession.fromPickle(state.sessionPickle, pickleKey)
       sessions.set(hubId, session)
     }
 
@@ -175,6 +280,7 @@ async function restoreState(hubId) {
       bundles.set(hubId, state.bundle)
     }
 
+    // Re-encrypt legacy unencrypted data on next persist
     console.log(`[VodozemacCrypto] Restored session for hub ${hubId.substring(0, 8)}...`)
     return true
   } catch (e) {
@@ -194,8 +300,9 @@ async function restoreState(hubId) {
 /**
  * Initialize the vodozemac WASM module.
  * @param {string} wasmJsUrl - Full URL to vodozemac-wasm JS glue module
+ * @param {string} wasmBinaryUrl - Full URL to vodozemac-wasm binary (.wasm)
  */
-async function handleInit(wasmJsUrl) {
+async function handleInit(wasmJsUrl, wasmBinaryUrl) {
   if (wasmModule) {
     return { alreadyInitialized: true }
   }
@@ -207,9 +314,11 @@ async function handleInit(wasmJsUrl) {
   console.log("[VodozemacCrypto] Loading WASM module from:", wasmJsUrl)
   wasmModule = await import(wasmJsUrl)
 
-  // If the module exports an init function (wasm-pack default), call it
+  // Pass the explicit .wasm binary URL so Propshaft-fingerprinted paths resolve correctly.
+  // Without this, the JS glue uses import.meta.url-relative resolution which breaks
+  // when the filename is fingerprinted (e.g., vodozemac_wasm-abc123.js).
   if (typeof wasmModule.default === "function") {
-    await wasmModule.default()
+    await wasmModule.default(wasmBinaryUrl || undefined)
   }
 
   console.log("[VodozemacCrypto] WASM module initialized")
@@ -241,6 +350,16 @@ async function handleCreateSession(hubId, bundleJson) {
       `Expected ${existingBundle.identityKey.substring(0, 16)}..., ` +
       `got ${bundle.identityKey.substring(0, 16)}... — rejecting (possible MITM)`
     )
+  }
+
+  // Verify Ed25519 signature over the bundle's signed payload (all raw bytes, no base64)
+  if (bundle.signedData && bundle.signingKeyRaw && bundle.signatureRaw) {
+    const valid = wasmModule.ed25519Verify(bundle.signingKeyRaw, bundle.signedData, bundle.signatureRaw)
+    if (!valid) {
+      throw new Error("Bundle Ed25519 signature verification failed — possible tampering")
+    }
+  } else {
+    throw new Error("Bundle missing signedData, signingKeyRaw, or signatureRaw — cannot verify")
   }
 
   // Clear any existing state for this hub
@@ -555,7 +674,7 @@ async function handleMessage(event, portId, replyFn) {
 
     switch (action) {
       case "init":
-        result = await handleInit(params.wasmJsUrl)
+        result = await handleInit(params.wasmJsUrl, params.wasmBinaryUrl)
         break
       case "createSession":
         result = await handleCreateSession(params.hubId, params.bundleJson)

@@ -46,9 +46,10 @@ module Github
             )
             Rails.logger.info "Tokens stored successfully"
 
-            # Sign in the user
+            # Sign in the user with persistent remember-me cookie
+            user.remember_me = true
             sign_in(user)
-            Rails.logger.info "User signed in with Devise"
+            Rails.logger.info "User signed in with Devise (remember_me enabled)"
 
             redirect_to root_path, notice: "Successfully authorized with GitHub!"
           else

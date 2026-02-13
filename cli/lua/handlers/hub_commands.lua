@@ -39,11 +39,8 @@ ch.hub = action_cable.subscribe(conn, "HubCommandChannel",
             -- tell the browser its session is stale so it can re-pair.
             if message.decrypt_failed then
                 log.warn("Signal decryption failed for browser " ..
-                    tostring(message.browser_identity) .. ", sending session_invalid")
-                action_cable.perform(channel_id, "signal", {
-                    browser_identity = message.browser_identity,
-                    envelope = { type = "session_invalid", message = "Crypto session expired. Please re-pair." }
-                })
+                    tostring(message.browser_identity) .. ", requesting ratchet restart")
+                hub.request_ratchet_restart(message.browser_identity)
                 return
             end
 

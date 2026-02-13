@@ -22,7 +22,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -195,6 +195,7 @@ impl WebRtcChannelBuilder {
             recv_tx: Arc::new(Mutex::new(None)),
             peer_olm_key: Arc::new(Mutex::new(None)),
             decrypt_failures: Arc::new(AtomicU32::new(0)),
+            dc_opened: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -231,6 +232,8 @@ pub struct WebRtcChannel {
     peer_olm_key: Arc<Mutex<Option<String>>>,
     /// Consecutive decryption failure count for session health monitoring.
     decrypt_failures: Arc<AtomicU32>,
+    /// Set to `true` when the DataChannel opens; consumed by `take_dc_opened()`.
+    dc_opened: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for WebRtcChannel {
@@ -382,6 +385,10 @@ impl WebRtcChannel {
             return Err(ChannelError::ConnectionFailed("Connection in progress".to_string()));
         }
 
+        // Reset DC-opened flag so a stale signal from the previous PC doesn't
+        // cause a premature peer_connected on the new connection.
+        self.dc_opened.store(false, Ordering::Relaxed);
+
         // Fetch ICE config and create peer connection
         let config_guard = self.config.lock().await;
         let hub_id = config_guard
@@ -428,6 +435,7 @@ impl WebRtcChannel {
         let data_channel = Arc::clone(&self.data_channel);
         let decrypt_failures = Arc::clone(&self.decrypt_failures);
         let stream_frame_tx = self.stream_frame_tx.clone();
+        let dc_opened = Arc::clone(&self.dc_opened);
 
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let recv_tx = Arc::clone(&recv_tx);
@@ -437,12 +445,14 @@ impl WebRtcChannel {
             let data_channel = Arc::clone(&data_channel);
             let decrypt_failures = Arc::clone(&decrypt_failures);
             let stream_frame_tx = stream_frame_tx.clone();
+            let dc_opened = Arc::clone(&dc_opened);
 
             Box::pin(async move {
                 log::info!("[WebRTC] Data channel opened: {}", dc.label());
 
-                // Store data channel
+                // Store data channel and signal readiness
                 *data_channel.lock().await = Some(Arc::clone(&dc));
+                dc_opened.store(true, Ordering::Relaxed);
 
                 // Set up message handler — every byte is Olm-encrypted
                 let recv_tx_inner = Arc::clone(&recv_tx);
@@ -794,6 +804,14 @@ impl WebRtcChannel {
     /// Reset decryption failure counter.
     pub fn reset_decrypt_failures(&self) {
         self.decrypt_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Returns `true` exactly once after the DataChannel opens.
+    ///
+    /// Polled by the tick loop to fire `on_peer_connected` at the right time
+    /// (when the DC is actually usable, not just when ICE connects).
+    pub fn take_dc_opened(&self) -> bool {
+        self.dc_opened.swap(false, Ordering::Relaxed)
     }
 
     /// Get the peer's Olm identity key for encrypting messages.
