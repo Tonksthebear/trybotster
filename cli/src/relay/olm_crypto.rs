@@ -19,7 +19,8 @@
 //!
 //! After Olm decryption, the first byte indicates content type:
 //! - `0x00` (CONTENT_MSG): `[0x00][JSON bytes]` — control messages
-//! - `0x01` (CONTENT_PTY): `[0x01][flags:1][sub_id_len:1][sub_id][payload]` — PTY output
+//! - `0x01` (CONTENT_PTY): `[0x01][flags:1][sub_id_len:1][sub_id][payload]` — PTY I/O
+//!   flags bit 0: compressed (gzip), bit 1: input direction (browser→CLI)
 //!
 //! # Protocol Flow
 //!

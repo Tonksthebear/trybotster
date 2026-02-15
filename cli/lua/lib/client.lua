@@ -215,6 +215,10 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
         -- TUI: Use direct session access (no HandleCache needed)
         local session = agent.sessions[session_name]
         if session then
+            -- Resize BEFORE creating forwarder so the snapshot is taken at the
+            -- client's dimensions (forwarder creation triggers get_snapshot()).
+            session:resize(self.rows, self.cols)
+
             local forwarder = tui.forward_session({
                 agent_key = agent:agent_key(),
                 session_name = session_name,
@@ -222,9 +226,6 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
                 subscription_id = sub_id,
             })
             self.forwarders[sub_id] = forwarder
-
-            -- Resize PTY to client's current dimensions using direct session method
-            session:resize(self.rows, self.cols)
 
             log.info(string.format("Terminal subscription %s: %s:%s (%dx%d) [direct]",
                 sub_id:sub(1, 16), agent:agent_key(), session_name, self.cols, self.rows))
@@ -235,6 +236,10 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
     end
 
     -- Fallback: Use index-based lookup (for WebRTC or if agent not found)
+    -- Resize PTY BEFORE creating forwarder so the snapshot is taken at the
+    -- browser's dimensions (forwarder creation triggers get_snapshot()).
+    hub.resize_pty(agent_index, pty_index, self.rows, self.cols)
+
     local forwarder = self.transport.create_pty_forwarder({
         agent_index = agent_index,
         pty_index = pty_index,
@@ -243,9 +248,6 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
     })
 
     self.forwarders[sub_id] = forwarder
-
-    -- Resize PTY to client's current dimensions
-    hub.resize_pty(agent_index, pty_index, self.rows, self.cols)
 
     log.info(string.format("Terminal subscription %s: agent=%d, pty=%d (%dx%d)",
         sub_id:sub(1, 16), agent_index, pty_index, self.cols, self.rows))
@@ -342,7 +344,8 @@ function Client:handle_data(msg)
     end
 end
 
---- Handle terminal data (input, resize, handshake).
+--- Handle terminal control messages (resize).
+--- Input is handled via binary CONTENT_PTY frames directly in Rust (poll_pty_input).
 -- @param sub The subscription info
 -- @param command The terminal command
 function Client:handle_terminal_data(sub, command)
@@ -353,17 +356,7 @@ function Client:handle_terminal_data(sub, command)
     log.debug(string.format("handle_terminal_data: cmd_type=%s, agent=%d, pty=%d",
         tostring(cmd_type), agent_index, pty_index))
 
-    if cmd_type == "input" or command.command == "input" then
-        -- Forward keyboard input to PTY
-        local data = command.data
-        if data then
-            log.debug(string.format("PTY input: agent=%d, pty=%d, len=%d",
-                agent_index, pty_index, #data))
-            hub.write_pty(agent_index, pty_index, data)
-        else
-            log.warn("PTY input: data is nil!")
-        end
-    elseif cmd_type == "resize" or command.command == "resize" then
+    if cmd_type == "resize" or command.command == "resize" then
         -- Resize PTY and update client dims
         local rows = command.rows or 24
         local cols = command.cols or 80

@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! TuiRunner (TUI thread)
-//! ├── owns: mode, overlay_list_selected, input_buffer, vt100_parser
+//! ├── owns: mode, widget_states (WidgetStateStore), vt100_parser
 //! ├── sends: JSON messages via request_tx (to Hub → Lua client.lua)
 //! └── receives: TuiOutput via output_rx (PTY output and Lua events from Hub)
 //! ```
@@ -43,6 +43,7 @@ pub mod runner;
 mod runner_handlers;
 pub mod screen;
 pub mod scroll;
+pub mod widget_state;
 
 #[doc(inline)]
 pub use actions::TuiAction;

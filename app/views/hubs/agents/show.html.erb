@@ -2,17 +2,18 @@
   Agent Terminal View
 
   Controllers:
-  - terminal-display: ghostty-web rendering, acquires TerminalConnection via ConnectionManager
+  - terminal-display: restty rendering, acquires TerminalConnection via ConnectionManager
   - connection-status: Unified connection state display (three-column view)
   - agent-list: Sidebar agent list (uses template)
 %>
 
 <%# Main terminal view %>
-<div class="h-full flex flex-col overflow-hidden"
+<div class="h-dvh flex flex-col overflow-hidden"
      data-controller="terminal-display"
      data-terminal-display-hub-id-value="<%= Current.hub.id %>"
      data-terminal-display-agent-index-value="<%= Current.agent_index %>"
-     data-terminal-display-pty-index-value="<%= Current.pty_index %>">
+     data-terminal-display-pty-index-value="<%= Current.pty_index %>"
+>
 
   <%# Header %>
   <div class="shrink-0 border-b border-zinc-800 bg-zinc-900/50">

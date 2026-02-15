@@ -193,6 +193,8 @@ class WorkerBridge {
         return webrtcTransport.sendEncrypted(params.hubId, params.encrypted)
       case "sendStreamFrame":
         return webrtcTransport.sendStreamFrame(params.hubId, params.frameType, params.streamId, params.payload)
+      case "sendPtyInput":
+        return webrtcTransport.sendPtyInput(params.hubId, params.subscriptionId, params.data)
       default:
         throw new Error(`Unknown action: ${action}`)
     }

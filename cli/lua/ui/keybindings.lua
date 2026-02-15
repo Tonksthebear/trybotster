@@ -74,8 +74,16 @@ local list_nav = {
 
 -- Text input table (shared by text entry modes)
 local text_input = {
-  ["escape"] = "close_modal",
-  ["enter"]  = "input_submit",
+  ["escape"]          = "close_modal",
+  ["enter"]           = "input_submit",
+  ["left"]            = "input_cursor_left",
+  ["right"]           = "input_cursor_right",
+  ["home"]            = "input_cursor_home",
+  ["end"]             = "input_cursor_end",
+  ["ctrl+left"]       = "input_word_left",
+  ["ctrl+right"]      = "input_word_right",
+  ["delete"]          = "input_delete",
+  ["ctrl+backspace"]  = "input_word_backspace",
   -- Characters and backspace handled in fallback logic below
 }
 

@@ -2,7 +2,7 @@
 //!
 //! Handles the WebSocket relay connection to browsers, including:
 //! - Connection state tracking
-//! - Builder functions for browser messages (AgentInfo, WorktreeInfo, Scrollback)
+//! - Builder functions for browser messages (AgentInfo, WorktreeInfo)
 //!
 //! # Architecture
 //!
@@ -12,13 +12,9 @@
 
 // Rust guideline compliant 2026-01
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use flate2::{write::GzEncoder, Compression};
-use std::io::Write;
-
 use super::crypto_service::CryptoService;
 use super::olm_crypto::DeviceKeyBundle;
-use crate::{AgentInfo, TerminalMessage, WorktreeInfo};
+use crate::{AgentInfo, WorktreeInfo};
 
 /// Browser connection state.
 ///
@@ -114,39 +110,6 @@ pub fn build_worktree_info(path: &str, branch: &str) -> WorktreeInfo {
     }
 }
 
-/// Build a scrollback message from raw bytes.
-///
-/// Compresses the raw PTY bytes with gzip and base64 encodes for transport.
-/// Browser decompresses with native DecompressionStream API.
-/// Typical compression ratio is 10:1 for terminal output.
-///
-/// This is a pure function for testability.
-#[must_use]
-pub fn build_scrollback_message(bytes: Vec<u8>) -> TerminalMessage {
-    // Compress with gzip
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    let compressed = if encoder.write_all(&bytes).is_ok() {
-        encoder.finish().unwrap_or_else(|_| bytes.clone())
-    } else {
-        bytes.clone()
-    };
-
-    // Base64 encode for JSON transport
-    let data = BASE64.encode(&compressed);
-
-    log::debug!(
-        "Scrollback compression: {} bytes -> {} bytes ({:.1}x)",
-        bytes.len(),
-        compressed.len(),
-        bytes.len() as f64 / compressed.len().max(1) as f64
-    );
-
-    TerminalMessage::Scrollback {
-        data,
-        compressed: true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,63 +161,6 @@ mod tests {
         state.handle_connected("Test Device");
 
         assert!(state.connected);
-    }
-
-    #[test]
-    fn test_build_scrollback_message() {
-        let bytes = b"First line\r\nSecond line\r\n\x1b[32mcolored\x1b[0m output".to_vec();
-        let message = build_scrollback_message(bytes);
-
-        match message {
-            TerminalMessage::Scrollback { data, compressed } => {
-                assert!(compressed, "Should be marked as compressed");
-                assert!(!data.is_empty(), "Data should not be empty");
-                // Small inputs won't compress well due to gzip header + base64 overhead
-                // Just verify it produces valid base64
-                assert!(data
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
-            }
-            _ => panic!("Expected Scrollback message"),
-        }
-    }
-
-    #[test]
-    fn test_build_scrollback_message_empty() {
-        let message = build_scrollback_message(vec![]);
-
-        match message {
-            TerminalMessage::Scrollback { data, compressed } => {
-                assert!(compressed, "Should be marked as compressed");
-                // Empty input still produces gzip header
-                assert!(!data.is_empty(), "Gzip of empty still has header");
-            }
-            _ => panic!("Expected Scrollback message"),
-        }
-    }
-
-    #[test]
-    fn test_build_scrollback_message_compression_ratio() {
-        // Terminal output with repeated patterns compresses very well
-        let repeated =
-            "$ ls -la\r\ntotal 0\r\ndrwxr-xr-x  2 user user  40 Jan  1 00:00 .\r\n".repeat(100);
-        let bytes = repeated.as_bytes().to_vec();
-        let original_len = bytes.len();
-        let message = build_scrollback_message(bytes);
-
-        match message {
-            TerminalMessage::Scrollback { data, .. } => {
-                // Base64 adds ~33% overhead, but gzip should give >5x compression
-                // So final size should be less than original
-                assert!(
-                    data.len() < original_len,
-                    "Compressed+encoded ({}) should be smaller than original ({})",
-                    data.len(),
-                    original_len
-                );
-            }
-            _ => panic!("Expected Scrollback message"),
-        }
     }
 
     #[test]

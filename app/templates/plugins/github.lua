@@ -22,7 +22,7 @@
 -- events are plaintext over TLS, no E2E encryption needed).
 
 local Agent = require("lib.agent")
-local hooks = require("core.hooks")
+local hooks = require("hub.hooks")
 
 local repo = hub.detect_repo()
 if not repo then

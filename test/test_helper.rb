@@ -9,28 +9,39 @@ Dir[Rails.root.join("test/support/**/*.rb")].each { |f| require f }
 # Allow localhost connections for ActionCable tests
 WebMock.disable_net_connect!(allow_localhost: true)
 
-# Clean up stale CLI processes from previous test runs
-# This prevents orphaned botster processes from consuming CPU
+# Clean up stale CLI processes from previous test runs.
+# Only kills processes whose PIDs were recorded in the tracking file
+# by CliTestHelper#start_cli — never touches a developer's real hub.
 module CliProcessCleanup
-  CLI_BINARY_NAME = "botster"
+  PID_FILE = Rails.root.join("tmp/pids/cli_test_pids.txt").freeze
+
+  def self.record_pid(pid)
+    FileUtils.mkdir_p(PID_FILE.dirname)
+    File.open(PID_FILE, "a") { |f| f.puts(pid) }
+  end
 
   def self.cleanup_stale_processes
-    # Find any running botster processes
-    pids = `pgrep -f #{CLI_BINARY_NAME} 2>/dev/null`.strip.split("\n").map(&:to_i).reject(&:zero?)
-    return if pids.empty?
+    return unless File.exist?(PID_FILE)
 
-    puts "[CliProcessCleanup] Found #{pids.length} stale #{CLI_BINARY_NAME} processes: #{pids.join(', ')}"
+    pids = File.readlines(PID_FILE).map(&:strip).reject(&:empty?).map(&:to_i).reject(&:zero?).uniq
+    living = pids.select { |pid| process_running?(pid) }
 
-    pids.each do |pid|
-      begin
-        Process.kill("TERM", pid)
-        sleep 0.2
-        Process.kill("KILL", pid) if process_running?(pid)
-        puts "[CliProcessCleanup] Killed stale process #{pid}"
-      rescue Errno::ESRCH, Errno::EPERM
-        # Process already gone or permission denied
+    if living.any?
+      puts "[CliProcessCleanup] Found #{living.length} stale test-spawned processes: #{living.join(', ')}"
+      living.each do |pid|
+        begin
+          Process.kill("TERM", pid)
+          sleep 0.2
+          Process.kill("KILL", pid) if process_running?(pid)
+          puts "[CliProcessCleanup] Killed stale process #{pid}"
+        rescue Errno::ESRCH, Errno::EPERM
+          # Process already gone or permission denied
+        end
       end
     end
+
+    # Clear the tracking file
+    File.delete(PID_FILE) if File.exist?(PID_FILE)
   end
 
   def self.cleanup_test_config_dir

@@ -212,6 +212,9 @@ module CliTestHelper
       err: stderr_w
     )
 
+    # Track PID so cleanup only kills test-spawned processes
+    CliProcessCleanup.record_pid(pid)
+
     stdout_w.close
     stderr_w.close
 

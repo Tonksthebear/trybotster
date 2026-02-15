@@ -89,6 +89,8 @@ function M.on_hub_event(event_type, event_data, context)
     -- Focus the new agent's terminal and enter insert mode
     if agent.id then
       local idx = agent_index_for(agent.id)
+      _tui_state.selected_agent_index = idx
+      _tui_state.active_pty_index = 0
       return {
         { op = "focus_terminal", agent_id = agent.id, pty_index = 0, agent_index = idx },
         set_mode_ops("insert"),
@@ -107,6 +109,8 @@ function M.on_hub_event(event_type, event_data, context)
 
     -- Clear focus if the deleted agent was selected
     if context.selected_agent == agent_id then
+      _tui_state.selected_agent_index = nil
+      _tui_state.active_pty_index = 0
       return {
         { op = "focus_terminal" },  -- nil agent_id clears selection
         set_mode_ops("normal"),

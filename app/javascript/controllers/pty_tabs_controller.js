@@ -19,14 +19,17 @@ export default class extends Controller {
 
   #hubConn = null;
   #unsubscribers = [];
+  #disconnected = false;
 
   connect() {
+    this.#disconnected = false;
     // Render default tab immediately (before data arrives)
     this.#renderTabs([{ name: "agent" }]);
     this.#initConnection();
   }
 
   disconnect() {
+    this.#disconnected = true;
     this.#unsubscribers.forEach((unsub) => unsub());
     this.#unsubscribers = [];
     this.#hubConn?.release();
@@ -41,6 +44,13 @@ export default class extends Controller {
       this.hubIdValue,
       { hubId: this.hubIdValue },
     );
+
+    // Guard: if disconnected during async acquire, release and bail
+    if (this.#disconnected) {
+      this.#hubConn.release();
+      this.#hubConn = null;
+      return;
+    }
 
     // Listen for agent list updates
     this.#unsubscribers.push(

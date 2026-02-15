@@ -12,9 +12,17 @@
 //!  ├── writer: Write (for input)
 //!  ├── reader_thread: JoinHandle (PTY output reader)
 //!  ├── child: Child (spawned process)
-//!  ├── scrollback_buffer: Arc<Mutex<VecDeque<u8>>> (raw byte history)
+//!  ├── shadow_screen: Arc<Mutex<vt100::Parser>> (parsed terminal state)
 //!  └── event_tx: broadcast::Sender<PtyEvent> (output + notification broadcast)
 //! ```
+//!
+//! # Shadow Terminal (zmx pattern)
+//!
+//! Each PTY session maintains a `vt100::Parser` shadow screen that receives
+//! the same bytes as live subscribers. On browser connect/reconnect, the shadow
+//! screen produces a clean ANSI snapshot via `contents_formatted()` instead of
+//! replaying raw byte history — eliminating escape sequence garbling and cursor
+//! desync. Live streaming still uses raw PTY bytes for efficiency.
 //!
 //! # Event Broadcasting
 //!
@@ -27,12 +35,12 @@
 //!
 //! Client connection tracking and size ownership are managed by Lua.
 //! Rust PTY sessions provide only the I/O primitives (resize, write,
-//! subscribe, scrollback).
+//! subscribe, snapshot).
 //!
 //! # Thread Safety
 //!
-//! The scrollback buffer is wrapped in `Arc<Mutex<>>` to allow concurrent
-//! reads from the PTY reader thread and writes from the main thread.
+//! The shadow screen is wrapped in `Arc<Mutex<>>` to allow concurrent
+//! access from the PTY reader thread and snapshot requests.
 
 // Rust guideline compliant 2026-02
 
@@ -47,7 +55,6 @@ pub use super::spawn::PtySpawnConfig;
 use anyhow::{Context, Result};
 use portable_pty::{Child, MasterPty, PtySize};
 use std::{
-    collections::VecDeque,
     io::Write,
     sync::{Arc, Mutex},
     thread,
@@ -60,12 +67,12 @@ use crate::agent::spawn;
 /// Default channel capacity for PTY command channels.
 const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
 
-/// Maximum bytes to keep in scrollback buffer.
+/// Number of scrollback lines tracked by the shadow terminal.
 ///
-/// 4MB balances memory usage with sufficient history for debugging.
-/// Based on typical agent session output rates, this provides
-/// several hours of scrollback.
-pub const MAX_SCROLLBACK_BYTES: usize = 4 * 1024 * 1024;
+/// 5000 lines at 80 cols produces ~400KB of formatted ANSI output
+/// on snapshot. This provides ample history for reconnecting browsers
+/// while keeping memory bounded by line count rather than raw bytes.
+const SHADOW_SCROLLBACK_LINES: usize = 5000;
 
 /// Default broadcast channel capacity.
 ///
@@ -113,43 +120,38 @@ impl std::fmt::Debug for SharedPtyState {
 ///
 /// Each PTY session manages:
 /// - A pseudo-terminal for process I/O
-/// - A raw byte scrollback buffer for history replay
+/// - A shadow terminal (`vt100::Parser`) for clean ANSI snapshots on reconnect
 /// - A broadcast channel for event distribution to clients
 /// - An optional port for HTTP forwarding (used by server PTY for dev server preview)
+///
+/// # Shadow Terminal
+///
+/// The shadow screen receives the same raw bytes as live subscribers and
+/// maintains parsed terminal state. On browser connect/reconnect,
+/// `get_snapshot()` returns clean ANSI output via `contents_formatted()`
+/// instead of replaying raw bytes — no garbling, correct cursor position.
 ///
 /// # Event Broadcasting
 ///
 /// Output and lifecycle events are broadcast to all subscribers via
 /// [`PtyEvent`]. Clients subscribe via [`subscribe()`](Self::subscribe).
 ///
-/// # Terminal Emulation
-///
-/// PtySession does NOT own a vt100 parser. It emits raw bytes via broadcast.
-/// Consumers (TuiRunner, browser via Lua) own their own parsers.
-/// This keeps PtySession as pure I/O.
-///
 /// # Client Tracking
 ///
 /// Client connection tracking and size ownership are managed by Lua.
-/// Rust provides only the I/O primitives (resize, write, subscribe, scrollback).
+/// Rust provides only the I/O primitives (resize, write, subscribe, snapshot).
 ///
 /// # Command Processing
 ///
 /// After spawning, call [`spawn_command_processor()`](Self::spawn_command_processor)
 /// to start the background task that processes commands from `PtyHandle` clients.
-/// The processor handles Input, Connect, and Disconnect commands.
+/// The processor handles Input commands.
 ///
 /// # Thread Safety
 ///
-/// The scrollback buffer and shared state are wrapped in `Arc<Mutex<>>` to allow
+/// The shadow screen and shared state are wrapped in `Arc<Mutex<>>` to allow
 /// concurrent access from the PTY reader thread, command processor task, and main
 /// event loop.
-///
-/// # Port Field
-///
-/// The `port` field stores the HTTP forwarding port for preview functionality.
-/// Used by sessions with `port_forward` enabled. When set, the port is
-/// passed via the `PORT` environment variable to the PTY process at spawn time.
 pub struct PtySession {
     /// Shared mutable state accessed by the command processor task.
     ///
@@ -165,11 +167,12 @@ pub struct PtySession {
     /// Child process handle - stored so we can kill it on drop.
     child: Option<Box<dyn Child + Send>>,
 
-    /// Raw byte scrollback buffer for history replay.
+    /// Shadow terminal for clean ANSI snapshots on reconnect.
     ///
-    /// Stores raw PTY output so xterm.js can interpret escape sequences correctly.
-    /// Clients can request a snapshot for session replay.
-    pub scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
+    /// Receives the same PTY bytes as live subscribers. On connect,
+    /// `contents_formatted()` produces clean ANSI output with correct
+    /// cursor position — no escape sequence garbling from raw replay.
+    pub shadow_screen: Arc<Mutex<vt100::Parser>>,
 
     /// Broadcast sender for PTY events.
     ///
@@ -247,7 +250,9 @@ impl PtySession {
             reader_thread: None,
             command_processor_handle: None,
             child: None,
-            scrollback_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_SCROLLBACK_BYTES))),
+            shadow_screen: Arc::new(Mutex::new(
+                vt100::Parser::new(rows, cols, SHADOW_SCROLLBACK_LINES),
+            )),
             event_tx,
             command_tx,
             command_rx: Some(command_rx),
@@ -372,7 +377,7 @@ impl PtySession {
         let reader = pair.master.try_clone_reader()?;
         self.reader_thread = Some(spawn::spawn_reader_thread(
             reader,
-            Arc::clone(&self.scrollback_buffer),
+            Arc::clone(&self.shadow_screen),
             self.event_sender(),
             config.detect_notifications,
         ));
@@ -430,18 +435,18 @@ impl PtySession {
     ///
     /// # Returns
     ///
-    /// Tuple of (shared_state, scrollback_buffer, event_tx) for direct access.
+    /// Tuple of (shared_state, shadow_screen, event_tx) for direct access.
     #[must_use]
     pub fn get_direct_access(
         &self,
     ) -> (
         Arc<Mutex<SharedPtyState>>,
-        Arc<Mutex<VecDeque<u8>>>,
+        Arc<Mutex<vt100::Parser>>,
         broadcast::Sender<PtyEvent>,
     ) {
         (
             Arc::clone(&self.shared_state),
-            Arc::clone(&self.scrollback_buffer),
+            Arc::clone(&self.shadow_screen),
             self.event_tx.clone(),
         )
     }
@@ -616,8 +621,9 @@ impl PtySession {
 
     /// Resize the PTY to new dimensions.
     ///
-    /// Updates the underlying PTY size and broadcasts a resize event.
-    /// Clients should update their own parsers when they receive the resize event.
+    /// Updates the underlying PTY size, resizes the shadow screen, and
+    /// broadcasts a resize event. Clients should update their own parsers
+    /// when they receive the resize event.
     pub fn resize(&self, rows: u16, cols: u16) {
         {
             let mut state = self
@@ -641,6 +647,13 @@ impl PtySession {
                 }
             }
         }
+
+        // Keep shadow screen in sync with PTY dimensions
+        self.shadow_screen
+            .lock()
+            .expect("shadow_screen lock poisoned")
+            .screen_mut()
+            .set_size(rows, cols);
 
         // Broadcast resize event
         self.broadcast(PtyEvent::resized(rows, cols));
@@ -673,38 +686,19 @@ impl PtySession {
     }
 
     // =========================================================================
-    // Scrollback
+    // Shadow Terminal Snapshot
     // =========================================================================
 
-    /// Add raw bytes to the scrollback buffer.
+    /// Get a clean ANSI snapshot of the current terminal state.
     ///
-    /// Bytes exceeding `MAX_SCROLLBACK_BYTES` are dropped from the front.
-    pub fn add_to_scrollback(&self, data: &[u8]) {
-        let mut buffer = self
-            .scrollback_buffer
-            .lock()
-            .expect("scrollback_buffer lock poisoned");
-
-        // Add new bytes
-        buffer.extend(data.iter().copied());
-
-        // Trim from front if over limit
-        while buffer.len() > MAX_SCROLLBACK_BYTES {
-            buffer.pop_front();
-        }
-    }
-
-    /// Get a snapshot of the scrollback buffer as raw bytes.
-    ///
-    /// Returns the complete scrollback history for session replay.
+    /// Locks the shadow screen and delegates to [`snapshot_with_scrollback`].
     #[must_use]
-    pub fn get_scrollback_snapshot(&self) -> Vec<u8> {
-        self.scrollback_buffer
+    pub fn get_snapshot(&self) -> Vec<u8> {
+        let mut parser = self
+            .shadow_screen
             .lock()
-            .expect("scrollback_buffer lock poisoned")
-            .iter()
-            .copied()
-            .collect()
+            .expect("shadow_screen lock poisoned");
+        snapshot_with_scrollback(parser.screen_mut())
     }
 }
 
@@ -768,13 +762,15 @@ fn process_single_command(
 
 /// Perform PTY resize operation.
 ///
-/// Updates dimensions, resizes the PTY, and broadcasts the resize event.
+/// Updates dimensions, resizes the PTY and shadow screen, and broadcasts
+/// the resize event.
 ///
 /// Exposed as `pub(crate)` for direct sync resize from `PtyHandle`.
 pub(crate) fn do_resize(
     rows: u16,
     cols: u16,
     shared_state: &Arc<Mutex<SharedPtyState>>,
+    shadow_screen: &Arc<Mutex<vt100::Parser>>,
     event_tx: &broadcast::Sender<PtyEvent>,
 ) {
     {
@@ -797,8 +793,99 @@ pub(crate) fn do_resize(
         }
     }
 
+    // Keep shadow screen in sync with PTY dimensions
+    shadow_screen
+        .lock()
+        .expect("shadow_screen lock poisoned")
+        .screen_mut()
+        .set_size(rows, cols);
+
     // Broadcast resize event
     let _ = event_tx.send(PtyEvent::resized(rows, cols));
+}
+
+/// Build a clean ANSI snapshot from a vt100 screen.
+///
+/// Returns the visible screen contents as formatted ANSI escape sequences
+/// with the cursor positioned correctly. Used for browser connect/reconnect
+/// instead of replaying raw byte history.
+///
+/// The snapshot includes:
+/// - Terminal state reset (clear screen, reset attributes)
+/// - Visible screen contents with correct colors/attributes
+/// - Cursor positioned where the PTY left it
+#[must_use]
+pub fn snapshot_from_screen(screen: &vt100::Screen) -> Vec<u8> {
+    let mut output = Vec::new();
+    // Reset terminal state and clear screen
+    output.extend(b"\x1b[H\x1b[2J\x1b[0m");
+    // Emit visible screen with ANSI attributes (colors, bold, etc.)
+    output.extend(screen.contents_formatted());
+    // Position cursor where the PTY left it
+    let (row, col) = screen.cursor_position();
+    output.extend(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+    output
+}
+
+/// Produces a snapshot that includes scrollback history plus the visible screen.
+///
+/// Scrollback rows are emitted as ANSI-formatted text (oldest first) so they
+/// flow through ghostty's VT core and naturally land in its scrollback buffer.
+/// After all history is sent, the screen is cleared and the visible state is
+/// rendered with precise cursor positioning.
+///
+/// Falls back to [`snapshot_from_screen`] when no scrollback exists.
+#[must_use]
+pub fn snapshot_with_scrollback(screen: &mut vt100::Screen) -> Vec<u8> {
+    let saved_offset = screen.scrollback();
+
+    // Discover how many scrollback lines the shadow terminal has accumulated.
+    screen.set_scrollback(usize::MAX);
+    let total_scrollback = screen.scrollback();
+    screen.set_scrollback(saved_offset);
+
+    if total_scrollback == 0 {
+        return snapshot_from_screen(screen);
+    }
+
+    let rows = screen.size().0 as usize;
+    let cols = screen.size().1;
+    // Pre-allocate: ~120 bytes per scrollback line is a reasonable estimate.
+    let mut output = Vec::with_capacity(total_scrollback * 120);
+
+    // Phase 1: Emit scrollback history (oldest → newest).
+    //
+    // At scrollback offset N, `visible_rows()` shows the last N rows of the
+    // scrollback buffer followed by screen rows. We step through in
+    // screen-height chunks from the top of history, emitting only the
+    // scrollback portion of each view.
+    output.extend(b"\x1b[0m");
+
+    let mut remaining = total_scrollback;
+    while remaining > 0 {
+        screen.set_scrollback(remaining);
+        let scrollback_rows_in_view = remaining.min(rows);
+
+        for (i, row_bytes) in screen.rows_formatted(0, cols).enumerate() {
+            if i >= scrollback_rows_in_view {
+                break;
+            }
+            output.extend(&row_bytes);
+            output.extend(b"\r\n");
+        }
+
+        remaining = remaining.saturating_sub(rows);
+    }
+
+    screen.set_scrollback(saved_offset);
+
+    // Phase 2: Visible screen with full ANSI formatting and cursor position.
+    output.extend(b"\x1b[H\x1b[2J\x1b[0m");
+    output.extend(screen.contents_formatted());
+    let (row, col) = screen.cursor_position();
+    output.extend(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+
+    output
 }
 
 #[cfg(test)]
@@ -841,28 +928,38 @@ mod tests {
     }
 
     #[test]
-    fn test_pty_session_scrollback() {
+    fn test_pty_session_snapshot() {
         let session = PtySession::new(24, 80);
 
-        session.add_to_scrollback(b"test line 1\n");
-        session.add_to_scrollback(b"test line 2\n");
+        // Feed some output to the shadow screen
+        session
+            .shadow_screen
+            .lock()
+            .unwrap()
+            .process(b"hello world");
 
-        let snapshot = session.get_scrollback_snapshot();
-        assert_eq!(snapshot, b"test line 1\ntest line 2\n");
+        let snapshot = session.get_snapshot();
+        // Snapshot should contain the text and ANSI reset/cursor sequences
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+        assert!(snapshot_str.contains("hello world"));
+        // Should start with reset sequence
+        assert!(snapshot_str.starts_with("\x1b[H\x1b[2J\x1b[0m"));
     }
 
     #[test]
-    fn test_pty_session_scrollback_limit() {
+    fn test_pty_session_snapshot_with_colors() {
         let session = PtySession::new(24, 80);
 
-        let chunk = vec![b'x'; 1024];
-        let num_chunks = MAX_SCROLLBACK_BYTES / 1024 + 100;
-        for _ in 0..num_chunks {
-            session.add_to_scrollback(&chunk);
-        }
+        // Feed colored output (green text)
+        session
+            .shadow_screen
+            .lock()
+            .unwrap()
+            .process(b"\x1b[32mgreen text\x1b[0m");
 
-        let snapshot = session.get_scrollback_snapshot();
-        assert!(snapshot.len() <= MAX_SCROLLBACK_BYTES);
+        let snapshot = session.get_snapshot();
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+        assert!(snapshot_str.contains("green text"));
     }
 
     #[test]

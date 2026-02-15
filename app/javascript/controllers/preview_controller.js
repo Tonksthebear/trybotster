@@ -40,12 +40,15 @@ export default class extends Controller {
   #connection = null;
   #swMessageHandler = null;
   #unsubscribers = [];
+  #disconnected = false;
 
   connect() {
+    this.#disconnected = false;
     this.#initialize();
   }
 
   disconnect() {
+    this.#disconnected = true;
     this.#cleanup();
   }
 
@@ -72,6 +75,13 @@ export default class extends Controller {
           port: this.portValue,
         },
       );
+
+      // Guard: if disconnected during async acquire, release and bail
+      if (this.#disconnected) {
+        this.#connection.release();
+        this.#connection = null;
+        return;
+      }
 
       // Set up connection event handlers
       this.#unsubscribers.push(

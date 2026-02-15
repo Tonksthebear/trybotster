@@ -205,6 +205,10 @@ pub struct Hub {
     stream_frame_rx: tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::StreamIncoming>,
     /// Sender for incoming stream frames (cloned into each WebRtcChannel).
     pub stream_frame_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::StreamIncoming>,
+    /// Receiver for binary PTY input from WebRTC DataChannels (bypasses JSON/Lua).
+    pty_input_rx: tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::PtyInputIncoming>,
+    /// Sender for binary PTY input (cloned into each WebRtcChannel).
+    pub pty_input_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::PtyInputIncoming>,
 
     // === Handle Cache ===
     /// Thread-safe cache of agent handles for non-blocking client access.
@@ -319,6 +323,8 @@ impl Hub {
         let (webrtc_outgoing_signal_tx, webrtc_outgoing_signal_rx) = tokio::sync::mpsc::unbounded_channel();
         // Create channel for incoming stream multiplexer frames from WebRTC DataChannels
         let (stream_frame_tx, stream_frame_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Create channel for binary PTY input from WebRTC DataChannels
+        let (pty_input_tx, pty_input_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Initialize Lua scripting runtime
         let lua = LuaRuntime::new()?;
@@ -345,6 +351,8 @@ impl Hub {
             stream_muxes: std::collections::HashMap::new(),
             stream_frame_rx,
             stream_frame_tx,
+            pty_input_rx,
+            pty_input_tx,
             lua,
             lua_ac_connections: std::collections::HashMap::new(),
             lua_ac_channels: std::collections::HashMap::new(),

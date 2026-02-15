@@ -41,6 +41,20 @@ use webrtc::peer_connection::RTCPeerConnection;
 use crate::relay::crypto_service::CryptoService;
 use crate::relay::olm_crypto::{CONTENT_MSG, CONTENT_PTY, CONTENT_STREAM};
 
+/// Incoming PTY input from browser via binary DataChannel frame.
+///
+/// Parsed from `CONTENT_PTY` with input flag set (flags & 0x02).
+/// Bypasses JSON/Lua for zero-overhead keystroke delivery.
+#[derive(Debug)]
+pub struct PtyInputIncoming {
+    /// Agent index parsed from subscription ID.
+    pub agent_index: usize,
+    /// PTY index parsed from subscription ID.
+    pub pty_index: usize,
+    /// Raw input bytes from browser.
+    pub data: Vec<u8>,
+}
+
 /// Incoming stream frame from browser via DataChannel.
 #[derive(Debug)]
 pub struct StreamIncoming {
@@ -106,6 +120,7 @@ pub struct WebRtcChannelBuilder {
     crypto_service: Option<CryptoService>,
     signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
     stream_frame_tx: Option<mpsc::UnboundedSender<StreamIncoming>>,
+    pty_input_tx: Option<mpsc::UnboundedSender<PtyInputIncoming>>,
 }
 
 impl std::fmt::Debug for WebRtcChannelBuilder {
@@ -115,6 +130,7 @@ impl std::fmt::Debug for WebRtcChannelBuilder {
             .field("crypto_service", &self.crypto_service.is_some())
             .field("signal_tx", &self.signal_tx.is_some())
             .field("stream_frame_tx", &self.stream_frame_tx.is_some())
+            .field("pty_input_tx", &self.pty_input_tx.is_some())
             .finish()
     }
 }
@@ -127,6 +143,7 @@ impl Default for WebRtcChannelBuilder {
             crypto_service: None,
             signal_tx: None,
             stream_frame_tx: None,
+            pty_input_tx: None,
         }
     }
 }
@@ -173,6 +190,13 @@ impl WebRtcChannelBuilder {
         self
     }
 
+    /// Set the PTY input sender for binary PTY input from browser.
+    #[must_use]
+    pub fn pty_input_tx(mut self, tx: mpsc::UnboundedSender<PtyInputIncoming>) -> Self {
+        self.pty_input_tx = Some(tx);
+        self
+    }
+
     /// Build the channel.
     ///
     /// # Panics
@@ -186,6 +210,7 @@ impl WebRtcChannelBuilder {
             crypto_service: self.crypto_service,
             signal_tx: self.signal_tx,
             stream_frame_tx: self.stream_frame_tx,
+            pty_input_tx: self.pty_input_tx,
             peer_connection: Arc::new(Mutex::new(None)),
             data_channel: Arc::new(Mutex::new(None)),
             state: SharedConnectionState::new(),
@@ -214,6 +239,8 @@ pub struct WebRtcChannel {
     signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
     /// Sender for incoming stream multiplexer frames.
     stream_frame_tx: Option<mpsc::UnboundedSender<StreamIncoming>>,
+    /// Sender for incoming PTY input from browser (binary, bypasses JSON/Lua).
+    pty_input_tx: Option<mpsc::UnboundedSender<PtyInputIncoming>>,
     /// WebRTC peer connection.
     peer_connection: Arc<Mutex<Option<Arc<RTCPeerConnection>>>>,
     /// WebRTC data channel.
@@ -243,6 +270,7 @@ impl std::fmt::Debug for WebRtcChannel {
             .field("crypto_service", &self.crypto_service.is_some())
             .field("signal_tx", &self.signal_tx.is_some())
             .field("stream_frame_tx", &self.stream_frame_tx.is_some())
+            .field("pty_input_tx", &self.pty_input_tx.is_some())
             .finish()
     }
 }
@@ -254,17 +282,26 @@ impl WebRtcChannel {
         WebRtcChannelBuilder::new()
     }
 
+    /// Timeout for the ICE config HTTP request. Keeps the tick loop responsive
+    /// even when the endpoint is slow or the runtime is under load from
+    /// concurrent WebRTC teardown tasks.
+    const ICE_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     /// Fetch ICE server configuration from Rails.
     async fn fetch_ice_config(&self, hub_id: &str) -> Result<Vec<RTCIceServer>, ChannelError> {
         let url = format!("{}/hubs/{}/webrtc", self.server_url, hub_id);
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(Self::ICE_CONFIG_TIMEOUT)
+            .build()
+            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to build HTTP client: {e:#}")))?;
+
         let response = client
             .get(&url)
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to fetch ICE config: {e}")))?;
+            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to fetch ICE config: {e:#}")))?;
 
         if !response.status().is_success() {
             return Err(ChannelError::ConnectionFailed(format!(
@@ -288,7 +325,7 @@ impl WebRtcChannel {
         let config: IceConfig = response
             .json()
             .await
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to parse ICE config: {e}")))?;
+            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to parse ICE config: {e:#}")))?;
 
         Ok(config
             .ice_servers
@@ -358,14 +395,42 @@ impl WebRtcChannel {
                     }
                     RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed => {
                         state.set(ConnectionState::Disconnected).await;
-                        // Clear data channel and peer connection so new offers can be accepted
-                        *data_channel.lock().await = None;
-                        *peer_connection.lock().await = None;
+                        // Take resources out (so new offers work immediately) and
+                        // spawn close task. Can't close inline — pc.close() triggers
+                        // a Closed state callback which would deadlock on the Mutex.
+                        // webrtc-rs Drop does NOT shut down SCTP; only close() does.
+                        let dc = data_channel.lock().await.take();
+                        let pc = peer_connection.lock().await.take();
+                        if dc.is_some() || pc.is_some() {
+                            tokio::spawn(async move {
+                                // close() may take up to ~60s if SCTP retransmits
+                                // exhaust their limit, but it WILL complete. No timeout —
+                                // dropping without close() leaks sockets (the original bug).
+                                if let Some(dc) = dc {
+                                    let _ = dc.close().await;
+                                }
+                                if let Some(pc) = pc {
+                                    let _ = pc.close().await;
+                                }
+                                log::debug!("[WebRTC] Closed stale peer connection resources");
+                            });
+                        }
                     }
                     RTCPeerConnectionState::Closed => {
                         state.set(ConnectionState::Disconnected).await;
-                        *data_channel.lock().await = None;
-                        *peer_connection.lock().await = None;
+                        // Resources may already be cleaned up by Disconnected/Failed handler
+                        let dc = data_channel.lock().await.take();
+                        let pc = peer_connection.lock().await.take();
+                        if dc.is_some() || pc.is_some() {
+                            tokio::spawn(async move {
+                                if let Some(dc) = dc {
+                                    let _ = dc.close().await;
+                                }
+                                if let Some(pc) = pc {
+                                    let _ = pc.close().await;
+                                }
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -435,6 +500,7 @@ impl WebRtcChannel {
         let data_channel = Arc::clone(&self.data_channel);
         let decrypt_failures = Arc::clone(&self.decrypt_failures);
         let stream_frame_tx = self.stream_frame_tx.clone();
+        let pty_input_tx = self.pty_input_tx.clone();
         let dc_opened = Arc::clone(&self.dc_opened);
 
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
@@ -445,6 +511,7 @@ impl WebRtcChannel {
             let data_channel = Arc::clone(&data_channel);
             let decrypt_failures = Arc::clone(&decrypt_failures);
             let stream_frame_tx = stream_frame_tx.clone();
+            let pty_input_tx = pty_input_tx.clone();
             let dc_opened = Arc::clone(&dc_opened);
 
             Box::pin(async move {
@@ -461,6 +528,7 @@ impl WebRtcChannel {
                 let browser_inner = browser_id.clone();
                 let decrypt_failures_inner = Arc::clone(&decrypt_failures);
                 let stream_frame_tx_inner = stream_frame_tx.clone();
+                let pty_input_tx_inner = pty_input_tx.clone();
 
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     let recv_tx = Arc::clone(&recv_tx_inner);
@@ -469,6 +537,7 @@ impl WebRtcChannel {
                     let browser_identity = browser_inner.clone();
                     let decrypt_failures = Arc::clone(&decrypt_failures_inner);
                     let stream_frame_tx = stream_frame_tx_inner.clone();
+                    let pty_input_tx = pty_input_tx_inner.clone();
 
                     Box::pin(async move {
                         let data = msg.data.to_vec();
@@ -511,9 +580,38 @@ impl WebRtcChannel {
                                 plaintext[1..].to_vec()
                             }
                             CONTENT_PTY => {
-                                // PTY: [CONTENT_PTY][flags][sub_len][sub_id][payload]
-                                // CLI doesn't receive PTY from browser, ignore
-                                log::warn!("[WebRTC-DC] Unexpected PTY content from browser");
+                                // PTY: [CONTENT_PTY][flags][sub_id_len][sub_id][payload]
+                                if plaintext.len() < 4 {
+                                    log::warn!("[WebRTC-DC] CONTENT_PTY frame too short");
+                                    return;
+                                }
+                                let flags = plaintext[1];
+                                let is_input = flags & 0x02 != 0;
+
+                                if !is_input {
+                                    log::warn!("[WebRTC-DC] Unexpected PTY output from browser");
+                                    return;
+                                }
+
+                                let sub_id_len = plaintext[2] as usize;
+                                if plaintext.len() < 3 + sub_id_len {
+                                    log::warn!("[WebRTC-DC] CONTENT_PTY sub_id truncated");
+                                    return;
+                                }
+                                let sub_id = std::str::from_utf8(&plaintext[3..3 + sub_id_len])
+                                    .unwrap_or("");
+                                let payload = plaintext[3 + sub_id_len..].to_vec();
+
+                                // Parse "terminal_{agent}_{pty}" and send directly to PTY
+                                if let Some(incoming) = parse_pty_input_sub_id(sub_id, payload) {
+                                    if let Some(ref tx) = pty_input_tx {
+                                        let _ = tx.send(incoming);
+                                    }
+                                } else {
+                                    log::warn!(
+                                        "[WebRTC-DC] Failed to parse PTY input sub_id: {sub_id}"
+                                    );
+                                }
                                 return;
                             }
                             CONTENT_STREAM => {
@@ -963,5 +1061,21 @@ impl WebRtcChannel {
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+/// Parse a terminal subscription ID ("terminal_{agent}_{pty}") into a [`PtyInputIncoming`].
+fn parse_pty_input_sub_id(sub_id: &str, data: Vec<u8>) -> Option<PtyInputIncoming> {
+    let parts: Vec<&str> = sub_id.split('_').collect();
+    if parts.len() == 3 && parts[0] == "terminal" {
+        let agent_index = parts[1].parse().ok()?;
+        let pty_index = parts[2].parse().ok()?;
+        Some(PtyInputIncoming {
+            agent_index,
+            pty_index,
+            data,
+        })
+    } else {
+        None
     }
 }

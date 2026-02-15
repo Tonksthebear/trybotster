@@ -8,6 +8,7 @@
     <meta name="mobile-web-app-capable" content="yes">
     <%= csrf_meta_tags %>
     <%= csp_meta_tag %>
+    <%= action_cable_meta_tag %>
 
     <meta name="bridge" content="<%= asset_path('workers/bridge.js') %>">
     <meta name="crypto-worker-url" content="<%= asset_path('workers/olm_crypto.js') %>">
