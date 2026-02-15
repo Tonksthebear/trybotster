@@ -33,8 +33,8 @@
 //! -- Get current dimensions
 //! local rows, cols = session:dimensions()
 //!
-//! -- Read scrollback buffer
-//! local scrollback = session:get_scrollback()
+//! -- Get clean ANSI snapshot for reconnect
+//! local snapshot = session:get_snapshot()
 //!
 //! -- Check forwarding port
 //! local port = session:port()  -- number or nil
@@ -85,7 +85,7 @@
 //! end, { timeout_ms = 10 })
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -106,7 +106,7 @@ use crate::agent::pty::events::PtyEvent;
 /// Lua-facing handle to a spawned PTY session.
 ///
 /// Wraps the thread-safe components of a [`PtySession`], allowing Lua to
-/// interact with the PTY (write input, resize, read scrollback, poll
+/// interact with the PTY (write input, resize, get snapshot, poll
 /// notifications, etc.) without holding a direct reference to the session.
 ///
 /// The `_session` field keeps the `PtySession` alive via `Arc` -- dropping
@@ -134,8 +134,8 @@ pub struct PtySessionHandle {
     /// Shared state for direct write/resize operations.
     shared_state: Arc<Mutex<SharedPtyState>>,
 
-    /// Scrollback buffer for session replay.
-    scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
+    /// Shadow terminal for clean ANSI snapshots on reconnect.
+    shadow_screen: Arc<Mutex<vt100::Parser>>,
 
     /// Event broadcast sender for subscribing to PTY output.
     event_tx: broadcast::Sender<PtyEvent>,
@@ -162,7 +162,7 @@ impl PtySessionHandle {
         crate::hub::agent_handle::PtyHandle::new(
             self.event_tx.clone(),
             Arc::clone(&self.shared_state),
-            Arc::clone(&self.scrollback_buffer),
+            Arc::clone(&self.shadow_screen),
             self.port,
         )
     }
@@ -220,14 +220,25 @@ impl LuaUserData for PtySessionHandle {
             Ok((rows, cols))
         });
 
-        // session:get_scrollback() -> string (raw bytes)
-        methods.add_method("get_scrollback", |lua, this, ()| {
-            let buffer = this
-                .scrollback_buffer
+        // session:get_snapshot() -> string (clean ANSI bytes)
+        // Also aliased as get_scrollback for backwards compatibility.
+        methods.add_method("get_snapshot", |lua, this, ()| {
+            let mut parser = this
+                .shadow_screen
                 .lock()
-                .expect("PtySessionHandle scrollback_buffer lock poisoned");
-            let bytes: Vec<u8> = buffer.iter().copied().collect();
-            lua.create_string(&bytes)
+                .expect("PtySessionHandle shadow_screen lock poisoned");
+            let output = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut());
+            lua.create_string(&output)
+        });
+
+        // Backwards-compatible alias
+        methods.add_method("get_scrollback", |lua, this, ()| {
+            let mut parser = this
+                .shadow_screen
+                .lock()
+                .expect("PtySessionHandle shadow_screen lock poisoned");
+            let output = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut());
+            lua.create_string(&output)
         });
 
         // session:port() -> number or nil
@@ -363,8 +374,8 @@ pub struct CreateTuiForwarderDirectRequest {
     pub active_flag: Arc<Mutex<bool>>,
     /// Event sender from the PTY session (for subscribing).
     pub event_tx: broadcast::Sender<PtyEvent>,
-    /// Scrollback buffer for initial replay.
-    pub scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
+    /// Shadow terminal for clean ANSI snapshots on reconnect.
+    pub shadow_screen: Arc<Mutex<vt100::Parser>>,
     /// HTTP port if this is a server session.
     pub port: Option<u16>,
 }
@@ -672,7 +683,7 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
                     subscription_id,
                     active_flag: Arc::clone(&active_flag),
                     event_tx: session_handle.event_tx.clone(),
-                    scrollback_buffer: Arc::clone(&session_handle.scrollback_buffer),
+                    shadow_screen: Arc::clone(&session_handle.shadow_screen),
                     port: session_handle.port,
                 }));
             }
@@ -833,7 +844,7 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
             })?;
 
             // Extract direct access handles before wrapping in Arc
-            let (shared_state, scrollback_buffer, event_tx) = session.get_direct_access();
+            let (shared_state, shadow_screen, event_tx) = session.get_direct_access();
             let session_port = session.port();
 
             // Auto-queue notification watcher if notifications enabled and identity provided
@@ -858,7 +869,7 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
             let handle = PtySessionHandle {
                 _session: session_arc,
                 shared_state,
-                scrollback_buffer,
+                shadow_screen,
                 event_tx,
                 port: session_port,
             };
@@ -1300,13 +1311,13 @@ mod tests {
     /// manually.
     fn create_test_session_handle() -> PtySessionHandle {
         let session = PtySession::new(24, 80);
-        let (shared_state, scrollback_buffer, event_tx) = session.get_direct_access();
+        let (shared_state, shadow_screen, event_tx) = session.get_direct_access();
         let session_arc = Arc::new(Mutex::new(session));
 
         PtySessionHandle {
             _session: session_arc,
             shared_state,
-            scrollback_buffer,
+            shadow_screen,
             event_tx,
             port: None,
         }
@@ -1351,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pty_session_handle_get_scrollback_empty() {
+    fn test_pty_session_handle_get_snapshot_empty() {
         let lua = Lua::new();
         let handle = create_test_session_handle();
 
@@ -1359,37 +1370,64 @@ mod tests {
             .set("session", handle)
             .expect("Failed to set session");
 
-        // Empty scrollback returns empty string
+        // Empty shadow screen returns reset + cursor position
         let result: LuaString = lua
-            .load("return session:get_scrollback()")
+            .load("return session:get_snapshot()")
             .eval()
-            .expect("get_scrollback should work");
-        assert_eq!(result.as_bytes(), b"");
+            .expect("get_snapshot should work");
+        // Should at least contain the reset sequence
+        let bytes = result.as_bytes();
+        assert!(bytes.starts_with(b"\x1b[H\x1b[2J\x1b[0m"));
     }
 
     #[test]
-    fn test_pty_session_handle_get_scrollback_with_data() {
+    fn test_pty_session_handle_get_snapshot_with_data() {
         let lua = Lua::new();
         let handle = create_test_session_handle();
 
-        // Add data to scrollback buffer directly
-        {
-            let mut buffer = handle
-                .scrollback_buffer
-                .lock()
-                .expect("scrollback lock");
-            buffer.extend(b"hello world".iter());
-        }
+        // Feed data to shadow screen directly
+        handle
+            .shadow_screen
+            .lock()
+            .expect("shadow_screen lock")
+            .process(b"hello world");
 
         lua.globals()
             .set("session", handle)
             .expect("Failed to set session");
 
         let result: LuaString = lua
+            .load("return session:get_snapshot()")
+            .eval()
+            .expect("get_snapshot should work");
+        let bytes = result.as_bytes();
+        let result_str = String::from_utf8_lossy(&bytes);
+        assert!(result_str.contains("hello world"));
+    }
+
+    #[test]
+    fn test_pty_session_handle_get_scrollback_alias() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle();
+
+        handle
+            .shadow_screen
+            .lock()
+            .expect("shadow_screen lock")
+            .process(b"alias test");
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // get_scrollback should work as an alias for get_snapshot
+        let result: LuaString = lua
             .load("return session:get_scrollback()")
             .eval()
-            .expect("get_scrollback should work");
-        assert_eq!(result.as_bytes(), b"hello world");
+            .expect("get_scrollback alias should work");
+        let bytes = result.as_bytes();
+        let result_str = String::from_utf8_lossy(&bytes);
+        assert!(result_str.contains("alias test"));
     }
 
     #[test]
@@ -1672,7 +1710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pty_spawn_write_and_scrollback() {
+    async fn test_pty_spawn_write_and_snapshot() {
         let lua = Lua::new();
         let queue = new_request_queue();
 
@@ -1704,14 +1742,15 @@ mod tests {
         // Give the PTY a moment to process
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // Scrollback should have some data (at least the shell prompt)
-        let scrollback: LuaString = lua
-            .load("return session:get_scrollback()")
+        // Snapshot should have some data (at least the shell prompt + reset sequence)
+        let snapshot: LuaString = lua
+            .load("return session:get_snapshot()")
             .eval()
-            .expect("get_scrollback should work");
+            .expect("get_snapshot should work");
         assert!(
-            !scrollback.as_bytes().is_empty(),
-            "Scrollback should have data after writing"
+            snapshot.as_bytes().len() > 10,
+            "Snapshot should have data after writing (got {} bytes)",
+            snapshot.as_bytes().len()
         );
 
         // Kill the session

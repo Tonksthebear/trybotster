@@ -38,6 +38,7 @@ impl Hub {
         self.poll_webrtc_channels();
         self.cleanup_disconnected_webrtc_channels();
         self.poll_webrtc_pty_output();
+        self.poll_pty_input();
         self.poll_stream_frames_incoming();
         self.poll_stream_frames_outgoing();
         self.poll_pty_observers();
@@ -405,10 +406,15 @@ impl Hub {
             &browser_identity[..browser_identity.len().min(8)]
         );
 
-        // Remove and disconnect the channel (fire-and-forget to avoid deadlock)
+        // Remove and disconnect the channel.
+        // After the state handler fix, disconnect() is usually a no-op
+        // (dc/pc already taken and closed), but this is belt-and-suspenders.
+        // No timeout — close() will complete when SCTP gives up retransmitting,
+        // and dropping without close() leaks sockets.
         if let Some(mut channel) = self.webrtc_channels.remove(browser_identity) {
             self.tokio_runtime.spawn(async move {
                 channel.disconnect().await;
+                log::debug!("[WebRTC] Channel disconnect completed");
             });
         }
 
@@ -816,11 +822,11 @@ impl Hub {
             log::debug!("[Lua] Aborted existing PTY forwarder for {}", forwarder_key);
         }
 
-        // Subscribe to PTY events
+        // Get snapshot BEFORE subscribing to avoid duplicate data.
+        // If we subscribe first, PTY output between subscribe and snapshot
+        // gets both captured in the snapshot AND buffered as a live event.
+        let snapshot = pty_handle.get_snapshot();
         let pty_rx = pty_handle.subscribe();
-
-        // Get scrollback buffer to send initially
-        let scrollback = pty_handle.get_scrollback();
 
         // Spawn forwarder task
         let output_tx = self.webrtc_pty_output_tx.clone();
@@ -844,31 +850,39 @@ impl Hub {
                 pty_index
             );
 
-            // Send scrollback buffer first (if any)
-            if !scrollback.is_empty() {
-                let mut raw_message = Vec::with_capacity(prefix.len() + scrollback.len());
-                raw_message.extend(&prefix);
-                raw_message.extend(&scrollback);
-
+            // Send terminal snapshot first (if any), chunked to fit within
+            // SCTP max message size (DataChannel limit ~256KB, we use 64KB chunks
+            // to leave room for encryption overhead and OlmEnvelope framing).
+            // The snapshot is clean ANSI from contents_formatted() — no garbling.
+            if !snapshot.is_empty() {
+                const CHUNK_SIZE: usize = 64 * 1024;
+                let num_chunks = (snapshot.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
                 log::debug!(
-                    "[Lua] Sending {} bytes of scrollback for agent {} pty {}",
-                    scrollback.len(),
+                    "[Lua] Sending {} bytes of snapshot in {} chunks for agent {} pty {}",
+                    snapshot.len(),
+                    num_chunks,
                     agent_index,
                     pty_index
                 );
 
-                if output_tx
-                    .send(WebRtcPtyOutput {
-                        subscription_id: subscription_id.clone(),
-                        browser_identity: peer_id.clone(),
-                        data: raw_message,
-                        agent_index,
-                        pty_index,
-                    })
-                    .is_err()
-                {
-                    log::trace!("[Lua] PTY output queue closed before scrollback sent");
-                    return;
+                for chunk in snapshot.chunks(CHUNK_SIZE) {
+                    let mut raw_message = Vec::with_capacity(prefix.len() + chunk.len());
+                    raw_message.extend(&prefix);
+                    raw_message.extend(chunk);
+
+                    if output_tx
+                        .send(WebRtcPtyOutput {
+                            subscription_id: subscription_id.clone(),
+                            browser_identity: peer_id.clone(),
+                            data: raw_message,
+                            agent_index,
+                            pty_index,
+                        })
+                        .is_err()
+                    {
+                        log::trace!("[Lua] PTY output queue closed during snapshot send");
+                        return;
+                    }
                 }
             }
 
@@ -987,11 +1001,9 @@ impl Hub {
             log::debug!("[Lua-TUI] Aborted existing PTY forwarder for {}", forwarder_key);
         }
 
-        // Subscribe to PTY events
+        // Get snapshot BEFORE subscribing to avoid duplicate data.
+        let snapshot = pty_handle.get_snapshot();
         let pty_rx = pty_handle.subscribe();
-
-        // Get scrollback buffer to send initially
-        let scrollback = pty_handle.get_scrollback();
 
         let sink = output_tx.clone();
         let agent_index = req.agent_index;
@@ -1007,18 +1019,18 @@ impl Hub {
                 agent_index, pty_index
             );
 
-            // Send scrollback buffer first (if any)
-            if !scrollback.is_empty() {
+            // Send terminal snapshot first (if any)
+            if !snapshot.is_empty() {
                 log::debug!(
-                    "[Lua-TUI] Sending {} bytes of scrollback for agent {} pty {}",
-                    scrollback.len(), agent_index, pty_index
+                    "[Lua-TUI] Sending {} bytes of snapshot for agent {} pty {}",
+                    snapshot.len(), agent_index, pty_index
                 );
                 if sink.send(TuiOutput::Scrollback {
                     agent_index: Some(agent_index),
                     pty_index: Some(pty_index),
-                    data: scrollback,
+                    data: snapshot,
                 }).is_err() {
-                    log::trace!("[Lua-TUI] Output channel closed before scrollback sent");
+                    log::trace!("[Lua-TUI] Output channel closed before snapshot sent");
                     return;
                 }
             }
@@ -1110,14 +1122,12 @@ impl Hub {
             log::debug!("[Lua-TUI-Direct] Aborted existing PTY forwarder for {}", forwarder_key);
         }
 
-        // Subscribe to PTY events directly from the session handle's event_tx
-        let pty_rx = req.event_tx.subscribe();
-
-        // Get scrollback buffer
-        let scrollback: Vec<u8> = {
-            let buffer = req.scrollback_buffer.lock().expect("Scrollback buffer mutex poisoned");
-            buffer.iter().copied().collect()
+        // Get snapshot BEFORE subscribing to avoid duplicate data.
+        let snapshot: Vec<u8> = {
+            let mut parser = req.shadow_screen.lock().expect("shadow_screen mutex poisoned");
+            crate::agent::pty::snapshot_with_scrollback(parser.screen_mut())
         };
+        let pty_rx = req.event_tx.subscribe();
 
         let sink = output_tx.clone();
         let agent_key = req.agent_key.clone();
@@ -1133,18 +1143,18 @@ impl Hub {
                 agent_key, session_name
             );
 
-            // Send scrollback buffer first (if any)
-            if !scrollback.is_empty() {
+            // Send terminal snapshot first (if any)
+            if !snapshot.is_empty() {
                 log::debug!(
-                    "[Lua-TUI-Direct] Sending {} bytes of scrollback for {}:{}",
-                    scrollback.len(), agent_key, session_name
+                    "[Lua-TUI-Direct] Sending {} bytes of snapshot for {}:{}",
+                    snapshot.len(), agent_key, session_name
                 );
                 if sink.send(TuiOutput::Scrollback {
                     agent_index: None,
                     pty_index: None,
-                    data: scrollback,
+                    data: snapshot,
                 }).is_err() {
-                    log::trace!("[Lua-TUI-Direct] Output channel closed before scrollback sent");
+                    log::trace!("[Lua-TUI-Direct] Output channel closed before snapshot sent");
                     return;
                 }
             }
@@ -1224,6 +1234,22 @@ impl Hub {
 
     /// Poll for incoming stream frames from WebRTC DataChannels.
     ///
+    /// Drain binary PTY input from browser (bypasses JSON/Lua).
+    ///
+    /// Handles `CONTENT_PTY` frames with the input direction flag set.
+    /// Writes directly to PTY handles for zero-overhead keystroke delivery.
+    fn poll_pty_input(&mut self) {
+        while let Ok(input) = self.pty_input_rx.try_recv() {
+            if let Some(agent_handle) = self.handle_cache.get_agent(input.agent_index) {
+                if let Some(pty_handle) = agent_handle.get_pty(input.pty_index) {
+                    if let Err(e) = pty_handle.write_input_direct(&input.data) {
+                        log::error!("[PTY-INPUT] Write failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Drains `stream_frame_rx`, gets or creates a `StreamMultiplexer` per
     /// browser identity, and dispatches each frame.
     fn poll_stream_frames_incoming(&mut self) {
@@ -1606,6 +1632,7 @@ impl Hub {
                 )
                 .signal_tx(self.webrtc_outgoing_signal_tx.clone())
                 .stream_frame_tx(self.stream_frame_tx.clone())
+                .pty_input_tx(self.pty_input_tx.clone())
                 .build();
 
             // Configure the channel with hub_id

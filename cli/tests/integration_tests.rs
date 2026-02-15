@@ -408,7 +408,7 @@ fn test_spawn_real_pty_with_init_script() {
         thread::sleep(Duration::from_millis(500));
 
         // Verify we received some output via scrollback buffer
-        let buffer = agent.get_scrollback_snapshot(PtyView::Cli);
+        let buffer = agent.get_snapshot(PtyView::Cli);
         assert!(!buffer.is_empty(), "PTY should have produced output");
 
         tx.send(()).unwrap();
@@ -485,7 +485,7 @@ fn test_spawn_server_pty() {
         thread::sleep(Duration::from_secs(3));
 
         // Check server PTY content
-        let server_buffer = agent.server_pty.as_ref().unwrap().get_scrollback_snapshot();
+        let server_buffer = agent.server_pty.as_ref().unwrap().get_snapshot();
         assert!(!server_buffer.is_empty(), "Server PTY should have output");
 
         tx.send(()).unwrap();
@@ -756,20 +756,20 @@ fn test_pty_resize_direct() {
     assert_eq!(session.dimensions(), (50, 100));
 }
 
-/// Test that Agent's get_scrollback_snapshot works correctly.
+/// Test that Agent's get_snapshot works correctly.
 ///
 /// This is used to send initial scrollback to newly connected browsers.
 #[test]
 fn test_agent_scrollback_snapshot_for_browser() {
     let (agent, _temp_dir) = create_test_agent();
 
-    // Get scrollback snapshot for CLI view
-    let snapshot = agent.get_scrollback_snapshot(PtyView::Cli);
-
-    // Without spawned process, snapshot should be empty
+    // Get snapshot for CLI view — always non-empty (contains ANSI reset/clear).
+    // Verify it doesn't contain any real terminal output.
+    let snapshot = agent.get_snapshot(PtyView::Cli);
+    let snapshot_str = String::from_utf8_lossy(&snapshot);
     assert!(
-        snapshot.is_empty(),
-        "Scrollback should be empty before spawn"
+        !snapshot_str.contains("$") && !snapshot_str.contains("~"),
+        "Snapshot should have no shell content before spawn, got: {snapshot_str}"
     );
 }
 
@@ -816,7 +816,7 @@ fn test_spawned_pty_output_reaches_scrollback() {
         // Wait for output to appear in scrollback
         let mut found_output = false;
         for _ in 0..50 {
-            let scrollback = agent.get_scrollback_snapshot(PtyView::Cli);
+            let scrollback = agent.get_snapshot(PtyView::Cli);
             let scrollback_str = String::from_utf8_lossy(&scrollback);
             if scrollback_str.contains("Hello from PTY output test") {
                 found_output = true;
@@ -890,7 +890,7 @@ fn test_input_written_to_pty_appears_in_scrollback() {
         thread::sleep(Duration::from_secs(1));
 
         // Check scrollback contains our input
-        let scrollback = agent.get_scrollback_snapshot(PtyView::Cli);
+        let scrollback = agent.get_snapshot(PtyView::Cli);
         let scrollback_str = String::from_utf8_lossy(&scrollback);
         let contains_echo = scrollback_str.contains("Browser input test");
 

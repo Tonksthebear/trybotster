@@ -52,10 +52,6 @@ pub struct ActionContext {
     pub overlay_actions: Vec<String>,
     /// Currently selected agent ID (if any).
     pub selected_agent: Option<String>,
-    /// Index of the currently selected agent (0-based).
-    pub selected_agent_index: Option<usize>,
-    /// Currently active PTY index within the selected agent.
-    pub active_pty_index: usize,
     /// Character for `input_char` action (set by Rust when dispatching).
     pub action_char: Option<char>,
 }
@@ -476,8 +472,6 @@ impl LayoutLua {
             .lua
             .create_table()
             .map_err(|e| anyhow!("Failed to create action context table: {e}"))?;
-        set_field(&ctx_table, "active_pty_index", context.active_pty_index)?;
-
         // overlay_actions array
         let actions_arr = self
             .lua
@@ -495,11 +489,6 @@ impl LayoutLua {
         // selected_agent (string or nil)
         if let Some(ref agent) = context.selected_agent {
             set_field(&ctx_table, "selected_agent", agent.as_str())?;
-        }
-
-        // selected_agent_index (0-based, or nil)
-        if let Some(idx) = context.selected_agent_index {
-            set_field(&ctx_table, "selected_agent_index", idx)?;
         }
 
         // _char for input_char action (optional)
@@ -521,11 +510,7 @@ fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
         .create_table()
         .map_err(|e| anyhow!("Failed to create state table: {e}"))?;
 
-    // Selection state (mode lives in Lua's _tui_state)
-    set_field(&state, "selected_agent_index", ctx.selected_agent_index)?;
-
-    // Terminal state
-    set_field(&state, "active_pty_index", ctx.active_pty_index)?;
+    // Terminal state (selection lives in Lua's _tui_state)
     set_field(&state, "scroll_offset", ctx.scroll_offset)?;
     set_field(&state, "is_scrolled", ctx.is_scrolled)?;
 
@@ -686,7 +671,6 @@ mod tests {
             error_message: None,
             connection_code: None,
             bundle_used: false,
-            selected_agent_index: 0,
             active_parser: None,
             parser_pool: pool,
             active_pty_index: 0,

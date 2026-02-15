@@ -122,16 +122,39 @@ fn build_start_cmd(temp_dir: &tempfile::TempDir) -> CommandBuilder {
     cmd
 }
 
-/// Open a PTY pair with standard dimensions.
+/// Open a PTY pair with standard dimensions and XON/XOFF flow control disabled.
+///
+/// By default, a new PTY has IXON enabled in its termios, which causes the
+/// kernel line discipline to intercept Ctrl+Q (0x11, XON) and Ctrl+S (0x13,
+/// XOFF) for flow control — these bytes never reach the child process.
+///
+/// The CLI disables IXON via `enable_raw_mode()` during startup, but the test
+/// must also clear it on the master side to ensure bytes written to the master
+/// are not consumed by the line discipline before the child's raw mode takes
+/// effect.
 fn open_pty() -> portable_pty::PtyPair {
-    native_pty_system()
+    let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
             cols: 80,
             pixel_width: 0,
             pixel_height: 0,
         })
-        .expect("Failed to open PTY")
+        .expect("Failed to open PTY");
+
+    // Disable IXON/IXOFF on the PTY so Ctrl+Q (0x11) passes through
+    // to the child process instead of being consumed by flow control.
+    if let Some(fd) = pair.master.as_raw_fd() {
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut termios) == 0 {
+                termios.c_iflag &= !(libc::IXON | libc::IXOFF | libc::IXANY);
+                libc::tcsetattr(fd, libc::TCSANOW, &termios);
+            }
+        }
+    }
+
+    pair
 }
 
 /// How long to wait for the TUI to start rendering.

@@ -39,9 +39,9 @@ local function get_creating_agent()
 end
 
 --- Get selected agent info from client-side agent cache.
-local function get_selected_agent(state)
+local function get_selected_agent()
   local agents = _tui_state and _tui_state.agents or {}
-  local idx = state.selected_agent_index
+  local idx = _tui_state and _tui_state.selected_agent_index
   if idx == nil then return nil end
   return agents[idx + 1]  -- Lua 1-based
 end
@@ -83,7 +83,7 @@ end
 -- =============================================================================
 local function build_menu_items(state)
   local items = {}
-  local sa = get_selected_agent(state)
+  local sa = get_selected_agent()
 
   -- Agent section (only if agent selected)
   if sa then
@@ -93,7 +93,7 @@ local function build_menu_items(state)
       for idx, session in ipairs(sessions) do
         local name = type(session) == "table" and session.name or session
         local label = string.upper(name)
-        if (idx - 1) == state.active_pty_index then
+        if (idx - 1) == _tui_state.active_pty_index then
           label = label .. " *"
         end
         table.insert(items, { text = label, action = "switch_session:" .. (idx - 1) })
@@ -129,7 +129,7 @@ function render(state)
   local agents = _tui_state and _tui_state.agents or {}
   local agent_count = #agents
   local creating = get_creating_agent()
-  local sa = get_selected_agent(state)
+  local sa = get_selected_agent()
 
   -- Agent list title: count + poll indicator
   local poll_icon = state.seconds_since_poll < 1 and "*" or "o"
@@ -139,8 +139,8 @@ function render(state)
   }
 
   -- Agent list: selection offset accounts for creating indicator
-  local agent_selected = state.selected_agent_index
-  if creating then
+  local agent_selected = _tui_state.selected_agent_index
+  if agent_selected and creating then
     agent_selected = agent_selected + 1
   end
 
@@ -148,12 +148,13 @@ function render(state)
   local term_title = " Terminal [No agent selected] "
   if sa then
     local session_names = sa.sessions or {}
-    local session_name = session_names[state.active_pty_index + 1]
+    local pty_idx = _tui_state.active_pty_index or 0
+    local session_name = session_names[pty_idx + 1]
     if type(session_name) == "table" then session_name = session_name.name end
     session_name = session_name or "agent"
     local session_label = string.upper(session_name)
     -- Show forwarded port if this session has one
-    local session_info = sa.sessions and sa.sessions[state.active_pty_index + 1]
+    local session_info = sa.sessions and sa.sessions[pty_idx + 1]
     if type(session_info) == "table" and session_info.port then
       session_label = session_label .. " :" .. session_info.port
     end
@@ -196,7 +197,7 @@ function render(state)
       return string.format(" Agent %d ", idx)
     end
     local function terminal_block(idx, pty)
-      local is_focused = (idx == state.selected_agent_index and pty == state.active_pty_index)
+      local is_focused = (idx == _tui_state.selected_agent_index and pty == _tui_state.active_pty_index)
       return {
         title = agent_label(idx),
         borders = "all",
@@ -214,7 +215,11 @@ function render(state)
       },
     }
   else
-    terminal_panel = { type = "terminal", block = { title = term_title, borders = "all" } }
+    terminal_panel = {
+      type = "terminal",
+      props = { agent_index = _tui_state.selected_agent_index or 0, pty_index = _tui_state.active_pty_index or 0 },
+      block = { title = term_title, borders = "all" },
+    }
   end
 
   return {
@@ -241,10 +246,10 @@ function render_overlay(state)
       type = "centered", width = 35, height = 30,
       child = {
         type = "list",
+        id = "menu",
         block = { title = " Menu [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
         props = {
           items = build_menu_items(state),
-          selected = _tui_state.list_selected,
         },
       },
     }
@@ -253,10 +258,10 @@ function render_overlay(state)
       type = "centered", width = 70, height = 50,
       child = {
         type = "list",
+        id = "worktree_list",
         block = { title = " Select Worktree [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
         props = {
           items = build_worktree_items(),
-          selected = _tui_state.list_selected,
         },
       },
     }
@@ -265,6 +270,7 @@ function render_overlay(state)
       type = "centered", width = 60, height = 30,
       child = {
         type = "input",
+        id = "worktree_input",
         block = { title = " Create Worktree [Enter confirm | Esc cancel] ", borders = "all" },
         props = {
           lines = {
@@ -272,7 +278,7 @@ function render_overlay(state)
             "",
             "Examples: 123, feature-auth, bugfix-login",
           },
-          value = _tui_state.input_buffer or "",
+          placeholder = "e.g. 123, feature-auth, bugfix-login",
         },
       },
     }
@@ -281,17 +287,18 @@ function render_overlay(state)
       type = "centered", width = 60, height = 20,
       child = {
         type = "input",
+        id = "prompt_input",
         block = { title = " Agent Prompt [Enter confirm | Esc cancel] ", borders = "all" },
         props = {
           lines = {
             "Enter prompt for agent (leave empty for default):",
           },
-          value = _tui_state.input_buffer or "",
+          placeholder = "Leave empty for default prompt",
         },
       },
     }
   elseif _tui_state.mode == "close_agent_confirm" then
-    local sa = get_selected_agent(state)
+    local sa = get_selected_agent()
     local on_main = sa and sa.branch_name == "main"
     local lines
     if on_main then

@@ -37,7 +37,6 @@
 
 // Rust guideline compliant 2026-01
 
-use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
@@ -161,6 +160,7 @@ impl AgentPtys {
 /// - `subscribe()` to receive PTY events (output, resize, exit)
 /// - `write_input()` to send input to the PTY
 /// - `resize()` to notify PTY of client resize
+/// - `get_snapshot()` to get clean ANSI snapshot for reconnect
 /// - `port()` to get the HTTP forwarding port (if assigned)
 ///
 /// # Example
@@ -200,8 +200,11 @@ pub struct PtyHandle {
     /// Enables immediate input/connect/resize without async channel hop.
     shared_state: Arc<Mutex<SharedPtyState>>,
 
-    /// Direct access to scrollback buffer for sync connect.
-    scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
+    /// Shadow terminal for clean ANSI snapshots on reconnect.
+    ///
+    /// Shared with `PtySession` and the reader thread. On connect,
+    /// `get_snapshot()` produces clean ANSI output with correct cursor.
+    shadow_screen: Arc<Mutex<vt100::Parser>>,
 
     /// HTTP forwarding port for preview proxying.
     ///
@@ -223,25 +226,26 @@ impl PtyHandle {
     ///
     /// Direct access enables immediate I/O operations without async channel delays:
     /// - `write_input_direct()` - sync input, no channel hop
-    /// - `resize_direct()` - sync resize
+    /// - `resize_direct()` - sync resize, also resizes shadow screen
+    /// - `get_snapshot()` - clean ANSI snapshot for reconnect
     ///
     /// # Arguments
     ///
     /// * `event_tx` - Broadcast sender for PTY events
     /// * `shared_state` - Direct access to PTY writer and state
-    /// * `scrollback_buffer` - Direct access to scrollback
+    /// * `shadow_screen` - Shadow terminal for ANSI snapshots
     /// * `port` - HTTP forwarding port (for server PTYs), or `None`
     #[must_use]
     pub fn new(
         event_tx: broadcast::Sender<PtyEvent>,
         shared_state: Arc<Mutex<SharedPtyState>>,
-        scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
+        shadow_screen: Arc<Mutex<vt100::Parser>>,
         port: Option<u16>,
     ) -> Self {
         Self {
             event_tx,
             shared_state,
-            scrollback_buffer,
+            shadow_screen,
             port,
         }
     }
@@ -283,15 +287,16 @@ impl PtyHandle {
         self.port
     }
 
-    /// Get a copy of the current scrollback buffer.
+    /// Get a clean ANSI snapshot of the current terminal state.
     ///
-    /// Returns the accumulated terminal output for replay on connect.
+    /// Locks the shadow screen and delegates to [`crate::agent::pty::snapshot_with_scrollback`].
     #[must_use]
-    pub fn get_scrollback(&self) -> Vec<u8> {
-        self.scrollback_buffer
+    pub fn get_snapshot(&self) -> Vec<u8> {
+        let mut parser = self
+            .shadow_screen
             .lock()
-            .map(|buf| buf.iter().copied().collect())
-            .unwrap_or_default()
+            .expect("shadow_screen lock poisoned");
+        crate::agent::pty::snapshot_with_scrollback(parser.screen_mut())
     }
 
     // =========================================================================
@@ -326,10 +331,10 @@ impl PtyHandle {
 
     /// Resize the PTY directly.
     ///
-    /// Unconditionally resizes the PTY. Lua is the trusted coordinator —
-    /// client-level ownership is managed there, not in the PTY.
+    /// Unconditionally resizes the PTY and shadow screen. Lua is the trusted
+    /// coordinator — client-level ownership is managed there, not in the PTY.
     pub fn resize_direct(&self, rows: u16, cols: u16) {
-        do_resize(rows, cols, &self.shared_state, &self.event_tx);
+        do_resize(rows, cols, &self.shared_state, &self.shadow_screen, &self.event_tx);
     }
 }
 
@@ -346,10 +351,10 @@ mod tests {
     /// Helper to create a PTY handle for testing with a specific port.
     fn create_test_pty_with_port(port: Option<u16>) -> PtyHandle {
         let pty_session = PtySession::new(24, 80);
-        let (shared_state, scrollback, event_tx) = pty_session.get_direct_access();
+        let (shared_state, shadow_screen, event_tx) = pty_session.get_direct_access();
         // Leak the session to keep the state alive for tests
         std::mem::forget(pty_session);
-        PtyHandle::new(event_tx, shared_state, scrollback, port)
+        PtyHandle::new(event_tx, shared_state, shadow_screen, port)
     }
 
     #[test]

@@ -22,7 +22,7 @@
  *   const term = await ConnectionManager.acquire(TerminalConnection, key, {
  *     hubId, agentIndex, ptyIndex
  *   });
- *   term.onOutput((data) => xterm.write(data));
+ *   term.onOutput((data) => terminal.write(data));
  *   term.sendInput("ls -la\n");
  */
 
@@ -70,18 +70,17 @@ export class TerminalConnection extends Connection {
       return;
     }
 
-    console.log(`[TerminalConnection] handleMessage:`, message.type, message.data?.length || message);
+    // console.log(`[TerminalConnection] handleMessage:`, message.type, message.data?.length || message);
 
     switch (message.type) {
       case "raw_output":
-        // Raw bytes from CLI (Uint8Array with 0x01 prefix) - pass to xterm
+        // Raw bytes from CLI (Uint8Array with 0x01 prefix) - pass to terminal
         // Strip the 0x01 prefix byte before emitting
         if (message.data && message.data.length > 0) {
           const prefix = message.data[0];
           if (prefix === 0x01) {
             // Raw terminal data - strip prefix
             const terminalData = message.data.slice(1);
-            console.log(`[TerminalConnection] Emitting raw_output, ${terminalData.length} bytes (stripped 0x01 prefix)`);
             this.emit("output", terminalData);
           } else {
             // JSON control message (0x00 prefix) - parse and handle
@@ -120,7 +119,7 @@ export class TerminalConnection extends Connection {
   // ========== Terminal Commands ==========
 
   sendInput(data) {
-    return this.send("input", { data });
+    return this.sendBinaryPty(data);
   }
 
   sendResize(cols, rows) {

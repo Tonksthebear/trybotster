@@ -45,8 +45,11 @@ export default class extends Controller {
     selectedId: String,
   };
 
+  #disconnected = false;
+
   connect() {
     if (!this.hubIdValue) return;
+    this.#disconnected = false;
 
     // Track unsubscribe functions for cleanup
     this.unsubscribers = [];
@@ -57,6 +60,10 @@ export default class extends Controller {
     ConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
     }).then(async (hub) => {
+      if (this.#disconnected) {
+        hub.release();
+        return;
+      }
       this.hub = hub;
 
       this.unsubscribers.push(
@@ -92,6 +99,8 @@ export default class extends Controller {
   }
 
   disconnect() {
+    this.#disconnected = true;
+
     // Clean up event subscriptions before releasing
     this.unsubscribers?.forEach((unsub) => unsub());
     this.unsubscribers = null;

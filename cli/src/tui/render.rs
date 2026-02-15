@@ -27,7 +27,10 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap},
+    widgets::{
+        Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, StatefulWidget, Widget, Wrap,
+    },
     Frame, Terminal,
 };
 use vt100::Parser;
@@ -35,9 +38,10 @@ use vt100::Parser;
 use crate::app::buffer_to_ansi;
 
 use super::render_tree::{
-    InputProps, ListItemProps, ListProps, ParagraphAlignment, ParagraphProps, SpanStyle,
+    InputProps, ListProps, ParagraphAlignment, ParagraphProps, SpanStyle,
     StyledContent,
 };
+use super::widget_state::WidgetStateStore;
 use crate::compat::{BrowserDimensions, VpnStatus};
 
 /// Context required for rendering the TUI.
@@ -51,7 +55,8 @@ use crate::compat::{BrowserDimensions, VpnStatus};
 /// only carries terminal/rendering primitives that Rust owns.
 pub struct RenderContext<'a> {
     // === UI State ===
-    // mode, list_selected, input_buffer live in Lua's _tui_state
+    // mode lives in Lua's _tui_state; widget state (selection, input)
+    // is owned by WidgetStateStore, synced back to Lua for workflow actions
     /// Error message to display in Error mode.
     pub error_message: Option<&'a str>,
     /// Connection code data (URL + QR ASCII) for display.
@@ -59,13 +64,10 @@ pub struct RenderContext<'a> {
     /// Whether the connection bundle has been used.
     pub bundle_used: bool,
 
-    // === Selection State ===
-    /// Currently selected agent index (0-based).
-    pub selected_agent_index: usize,
-
     // === Terminal State ===
-    /// The VT100 parser for the currently selected agent's active PTY.
-    /// This is the parser that should be rendered in the terminal area.
+    /// The VT100 parser for the currently focused agent's active PTY.
+    /// Used by the fallback renderer and as default for terminal widgets
+    /// without explicit bindings.
     pub active_parser: Option<Arc<Mutex<Parser>>>,
     /// Pool of VT100 parsers keyed by `(agent_index, pty_index)`.
     /// Used by terminal widgets with explicit PTY bindings.
@@ -100,7 +102,6 @@ pub struct RenderContext<'a> {
 impl<'a> std::fmt::Debug for RenderContext<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RenderContext")
-            .field("selected_agent_index", &self.selected_agent_index)
             .field("has_active_parser", &self.active_parser.is_some())
             .field("active_pty_index", &self.active_pty_index)
             .field("scroll_offset", &self.scroll_offset)
@@ -221,15 +222,20 @@ pub(super) fn render_terminal_panel(
     // Resolve which parser to use: explicit binding → pool lookup, else active parser
     let (agent_idx, pty_idx) = if let Some(b) = binding {
         (
-            b.agent_index.unwrap_or(ctx.selected_agent_index),
+            b.agent_index.unwrap_or(0),
             b.pty_index.unwrap_or(ctx.active_pty_index),
         )
     } else {
-        (ctx.selected_agent_index, ctx.active_pty_index)
+        // Fallback: no binding — only used by Rust fallback renderer (Lua is broken)
+        (0, ctx.active_pty_index)
     };
 
-    let parser = if binding.is_some() {
-        ctx.parser_pool.get(&(agent_idx, pty_idx)).cloned()
+    let parser = if let Some(b) = binding {
+        if b.agent_index.is_some() || b.pty_index.is_some() {
+            ctx.parser_pool.get(&(agent_idx, pty_idx)).cloned()
+        } else {
+            ctx.active_parser.clone()
+        }
     } else {
         ctx.active_parser.clone()
     };
@@ -243,17 +249,38 @@ pub(super) fn render_terminal_panel(
     }
 
     if let Some(ref parser) = parser {
-        let parser_lock = parser.lock().expect("parser lock not poisoned");
-        let screen = parser_lock.screen();
+        let mut parser_lock = parser.lock().expect("parser lock not poisoned");
+        let scroll_offset = parser_lock.screen().scrollback();
+        let is_scrolled = scroll_offset > 0;
 
+        let screen = parser_lock.screen();
         let widget = crate::TerminalWidget::new(screen).block(block);
-        let widget = if binding.is_none() && ctx.is_scrolled {
+        let widget = if is_scrolled {
             widget.hide_cursor()
         } else {
             widget
         };
 
         widget.render(area, f.buffer_mut());
+
+        // Scrollbar overlay when scrolled
+        if is_scrolled {
+            // Get total scrollback by seeking to max, reading clamped value, restoring
+            parser_lock.screen_mut().set_scrollback(usize::MAX);
+            let scroll_total = parser_lock.screen().scrollback();
+            parser_lock.screen_mut().set_scrollback(scroll_offset);
+
+            if scroll_total > 0 {
+                let content_length = scroll_total + inner.height as usize;
+                // scroll_offset=max means top of history; position=0 means scrollbar at top
+                let position =
+                    content_length.saturating_sub(scroll_offset + inner.height as usize);
+                let mut scrollbar_state =
+                    ScrollbarState::new(content_length).position(position);
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+                scrollbar.render(inner, f.buffer_mut(), &mut scrollbar_state);
+            }
+        }
     } else {
         f.render_widget(block, area);
     }
@@ -264,12 +291,23 @@ pub(super) fn render_terminal_panel(
 // These render generic primitives with zero application knowledge.
 // All content, styling, and behavior comes from Lua via props.
 
-/// Render a generic list widget with optional selection and headers.
+/// Render a generic list widget with selection and headers.
 ///
-/// Headers are non-selectable items rendered dim+bold. The `selected` index
-/// in `ListProps` counts only selectable items; this function maps it to
-/// an absolute index accounting for headers.
-pub(super) fn render_list_widget(f: &mut Frame, area: Rect, block: Block, props: &ListProps) {
+/// Headers are non-selectable items rendered dim+bold. Selection is resolved
+/// from either:
+/// - **Controlled**: `ListProps.selected` (Lua owns state)
+/// - **Uncontrolled**: `WidgetStateStore` keyed by `widget_id` (Rust owns state)
+///
+/// The selectable item count is synced to the widget state store each frame
+/// for bounds clamping.
+pub(super) fn render_list_widget(
+    f: &mut Frame,
+    area: Rect,
+    block: Block,
+    props: &ListProps,
+    widget_id: Option<&str>,
+    widget_states: &mut WidgetStateStore,
+) {
     let mut list_items: Vec<ListItem> = Vec::new();
     let mut selectable_to_absolute: Vec<usize> = Vec::new();
 
@@ -295,6 +333,8 @@ pub(super) fn render_list_widget(f: &mut Frame, area: Rect, block: Block, props:
         }
     }
 
+    let selectable_count = selectable_to_absolute.len();
+
     let highlight_style = props
         .highlight_style
         .as_ref()
@@ -308,17 +348,33 @@ pub(super) fn render_list_widget(f: &mut Frame, area: Rect, block: Block, props:
         .highlight_style(highlight_style)
         .highlight_symbol(highlight_symbol);
 
-    let mut state = ListState::default();
+    // Resolve selection: controlled (props.selected) vs uncontrolled (widget state)
     if let Some(sel) = props.selected {
-        // Map selectable index to absolute index (past headers)
+        // Controlled: Lua owns selection
         let abs = selectable_to_absolute
             .get(sel)
             .copied()
             .unwrap_or(sel.min(props.items.len().saturating_sub(1)));
+        let mut state = ListState::default();
         state.select(Some(abs));
+        f.render_stateful_widget(list, area, &mut state);
+    } else if let Some(id) = widget_id {
+        // Uncontrolled: Rust owns selection via WidgetStateStore
+        let ws = widget_states.list_state(id);
+        ws.set_selectable_count(selectable_count);
+        let sel = ws.selected();
+        let abs = selectable_to_absolute
+            .get(sel)
+            .copied()
+            .unwrap_or(sel.min(props.items.len().saturating_sub(1)));
+        let rstate = ws.ratatui_state_mut();
+        rstate.select(Some(abs));
+        f.render_stateful_widget(list, area, rstate);
+    } else {
+        // No selection at all
+        let mut state = ListState::default();
+        f.render_stateful_widget(list, area, &mut state);
     }
-
-    f.render_stateful_widget(list, area, &mut state);
 }
 
 /// Render a paragraph widget with styled lines, alignment, and optional wrapping.
@@ -346,10 +402,22 @@ pub(super) fn render_paragraph_widget(
 }
 
 /// Render a text input widget with prompt lines and current value.
-pub(super) fn render_input_widget(f: &mut Frame, area: Rect, block: Block, props: &InputProps) {
+///
+/// Supports controlled and uncontrolled modes:
+/// - **Controlled**: `InputProps.value` is `Some` — renders that value directly.
+/// - **Uncontrolled**: `InputProps.value` is `None` — reads from `WidgetStateStore`,
+///   renders with cursor position and visual scrolling.
+pub(super) fn render_input_widget(
+    f: &mut Frame,
+    area: Rect,
+    block: Block,
+    props: &InputProps,
+    widget_id: Option<&str>,
+    widget_states: &mut WidgetStateStore,
+) {
+    let inner = block.inner(area);
     let mut lines: Vec<Line> = props.lines.iter().map(StyledContent::to_line).collect();
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::raw(props.value.clone())));
 
     let alignment = match props.alignment {
         ParagraphAlignment::Left => Alignment::Left,
@@ -357,9 +425,50 @@ pub(super) fn render_input_widget(f: &mut Frame, area: Rect, block: Block, props
         ParagraphAlignment::Right => Alignment::Right,
     };
 
-    let widget = Paragraph::new(lines).block(block).alignment(alignment);
+    if let Some(ref value) = props.value {
+        // Controlled: Lua owns value
+        lines.push(Line::from(Span::raw(value.clone())));
+        let widget = Paragraph::new(lines).block(block).alignment(alignment);
+        f.render_widget(widget, area);
+    } else if let Some(id) = widget_id {
+        // Uncontrolled: Rust owns value via WidgetStateStore + tui-input
+        let ws = widget_states.input_state(id);
+        let input_width = inner.width.saturating_sub(1) as usize; // Leave room for cursor
+        let scroll = ws.visual_scroll(input_width);
+        let value = ws.value();
 
-    f.render_widget(widget, area);
+        if value.is_empty() {
+            if let Some(ref placeholder) = props.placeholder {
+                lines.push(Line::from(Span::styled(
+                    placeholder.clone(),
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+            } else {
+                lines.push(Line::from(""));
+            }
+        } else {
+            lines.push(Line::from(Span::raw(value.to_string())));
+        }
+
+        let widget = Paragraph::new(lines)
+            .block(block)
+            .alignment(alignment)
+            .scroll((0, scroll as u16));
+        f.render_widget(widget, area);
+
+        // Place cursor at correct position within the input area
+        let prompt_lines = props.lines.len() + 1; // +1 for the blank line
+        let cursor_y = inner.y + prompt_lines as u16;
+        let cursor_x = inner.x + (ws.visual_cursor().saturating_sub(scroll)) as u16;
+        if cursor_y < inner.y + inner.height {
+            f.set_cursor_position((cursor_x, cursor_y));
+        }
+    } else {
+        // No state: render empty
+        lines.push(Line::from(""));
+        let widget = Paragraph::new(lines).block(block).alignment(alignment);
+        f.render_widget(widget, area);
+    }
 }
 
 /// Render connection code / QR display into a given area.

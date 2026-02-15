@@ -8,8 +8,8 @@ pin "@hotwired/stimulus-loading", to: "stimulus-loading.js"
 pin "turbo_stream_update_attribute"
 pin_all_from "app/javascript/controllers", under: "controllers"
 pin_all_from "app/javascript/channels", under: "channels"
-# ghostty-web: Ghostty's VT100 parser compiled to WASM (replaces xterm.js)
-pin "ghostty-web", to: "https://esm.sh/ghostty-web@0.4.0"
+# Restty terminal (libghostty-vt WASM + WebGPU/WebGL2 rendering)
+pin "restty", to: "https://esm.sh/restty@0.1.28"
 
 # Vodozemac crypto for E2E encryption (direct Olm)
 pin "matrix/bundle", to: "matrix/bundle.js"

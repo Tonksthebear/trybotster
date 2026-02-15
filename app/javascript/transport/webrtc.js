@@ -541,6 +541,32 @@ class WebRTCTransport {
   }
 
   /**
+   * Send binary PTY input through the encrypted DataChannel.
+   * Bypasses JSON serialization for the keystroke hot path.
+   * @param {string} hubId - Hub identifier
+   * @param {string} subscriptionId - Terminal subscription ID (e.g., "terminal_0_0")
+   * @param {string|Uint8Array} data - Raw input data
+   */
+  async sendPtyInput(hubId, subscriptionId, data) {
+    const conn = this.#connections.get(hubId)
+    if (!conn) throw new Error(`No connection for hub ${hubId}`)
+    if (conn.dataChannel?.readyState !== "open") throw new Error("DataChannel not open")
+
+    // Build plaintext: [CONTENT_PTY][flags=0x02 input][sub_id_len][sub_id][payload]
+    const subIdBytes = new TextEncoder().encode(subscriptionId)
+    const dataBytes = typeof data === "string" ? new TextEncoder().encode(data) : data
+    const plaintext = new Uint8Array(3 + subIdBytes.length + dataBytes.length)
+    plaintext[0] = CONTENT_PTY      // 0x01
+    plaintext[1] = 0x02             // flags: input direction
+    plaintext[2] = subIdBytes.length
+    plaintext.set(subIdBytes, 3)
+    plaintext.set(dataBytes, 3 + subIdBytes.length)
+
+    const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
+    conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+  }
+
+  /**
    * Get the current connection mode for a hub.
    * @returns {string} ConnectionMode value (direct, relayed, unknown)
    */
@@ -1086,7 +1112,13 @@ class WebRTCTransport {
 
   /**
    * Handle binary PTY output (zero base64, zero JSON).
-   * Format: [0x01][flags:1][sub_id_len:1][sub_id][raw payload]
+   * Format: [CONTENT_PTY][flags:1][sub_id_len:1][sub_id][raw payload]
+   *
+   * Emits payload as raw Uint8Array — NOT decoded to text here.
+   * The payload includes the CLI's 0x01 prefix byte which gets stripped
+   * downstream by TerminalConnection's raw_output handler. Text decoding
+   * happens in WebRtcPtyTransport's TextDecoder({ stream: true }) which
+   * correctly handles multi-byte UTF-8 split across chunk boundaries.
    */
   async #handlePtyBinary(hubId, plaintext) {
     if (plaintext.length < 4) return // Minimum: type + flags + len + at least 0
@@ -1102,19 +1134,19 @@ class WebRTCTransport {
     const subscriptionId = new TextDecoder().decode(plaintext.slice(subIdStart, payloadStart))
     const payload = plaintext.slice(payloadStart)
 
-    let outputText
+    let rawBytes
     if (compressed) {
       const stream = new Blob([payload])
         .stream()
         .pipeThrough(new DecompressionStream("gzip"))
-      outputText = await new Response(stream).text()
+      rawBytes = new Uint8Array(await new Response(stream).arrayBuffer())
     } else {
-      outputText = new TextDecoder().decode(payload)
+      rawBytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload)
     }
 
     this.#emit("subscription:message", {
       subscriptionId,
-      message: { type: "output", data: outputText },
+      message: rawBytes,
     })
   }
 

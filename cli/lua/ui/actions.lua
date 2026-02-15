@@ -21,7 +21,7 @@
 --   quit             { op }                         - Request application quit
 --
 -- Context fields (Rust-owned):
---   overlay_actions, selected_agent, selected_agent_index, active_pty_index
+--   overlay_actions, selected_agent
 --
 -- Client-side state (_tui_state):
 --   mode, input_buffer, list_selected, agents, pending_fields, available_worktrees
@@ -69,33 +69,10 @@ end
 -- @return table|nil List of op tables, or nil for generic Rust handling
 function M.on_action(action, context)
 
-  -- === UI primitives (Lua owns _tui_state directly) ===
-  if action == "input_char" then
-    local c = context._char
-    if c then _tui_state.input_buffer = _tui_state.input_buffer .. c end
-    return {}
-  end
-
-  if action == "input_backspace" then
-    local buf = _tui_state.input_buffer
-    _tui_state.input_buffer = buf:sub(1, #buf - 1)
-    return {}
-  end
-
-  if action == "list_up" then
-    if _tui_state.list_selected > 0 then
-      _tui_state.list_selected = _tui_state.list_selected - 1
-    end
-    return {}
-  end
-
-  if action == "list_down" then
-    local max_idx = math.max(0, #(context.overlay_actions or {}) - 1)
-    if _tui_state.list_selected < max_idx then
-      _tui_state.list_selected = _tui_state.list_selected + 1
-    end
-    return {}
-  end
+  -- Note: Widget-intrinsic actions (list_up, list_down, input_char, input_backspace,
+  -- cursor movement) are handled by Rust's WidgetStateStore and synced back to
+  -- _tui_state.list_selected / _tui_state.input_buffer automatically.
+  -- Only workflow actions (list_select, input_submit, mode transitions) remain here.
 
   -- === Mode transitions ===
   if action == "enter_normal_mode" then
@@ -283,7 +260,8 @@ function M.on_action(action, context)
         break
       end
     end
-    local next_pty = ((context.active_pty_index or 0) + 1) % session_count
+    local next_pty = ((_tui_state.active_pty_index or 0) + 1) % session_count
+    _tui_state.active_pty_index = next_pty
     return {
       { op = "focus_terminal", agent_id = agent_id, pty_index = next_pty,
         agent_index = agent_index_for(agent_id) },
@@ -303,7 +281,7 @@ function M.on_action(action, context)
   if action == "select_next" then
     local agents = _tui_state.agents
     if #agents == 0 then return nil end
-    local current_idx = context.selected_agent_index  -- 0-based or nil
+    local current_idx = _tui_state.selected_agent_index  -- 0-based or nil
     local next_idx
     if current_idx then
       next_idx = (current_idx + 1) % #agents
@@ -312,6 +290,8 @@ function M.on_action(action, context)
     end
     local next_agent = agents[next_idx + 1]  -- Lua 1-based
     if not next_agent then return nil end
+    _tui_state.selected_agent_index = next_idx
+    _tui_state.active_pty_index = 0
     return {
       { op = "focus_terminal", agent_id = next_agent.id, pty_index = 0, agent_index = next_idx },
       set_mode_ops("insert"),
@@ -321,7 +301,7 @@ function M.on_action(action, context)
   if action == "select_previous" then
     local agents = _tui_state.agents
     if #agents == 0 then return nil end
-    local current_idx = context.selected_agent_index  -- 0-based or nil
+    local current_idx = _tui_state.selected_agent_index  -- 0-based or nil
     local prev_idx
     if current_idx then
       prev_idx = (current_idx - 1 + #agents) % #agents
@@ -330,6 +310,8 @@ function M.on_action(action, context)
     end
     local prev_agent = agents[prev_idx + 1]  -- Lua 1-based
     if not prev_agent then return nil end
+    _tui_state.selected_agent_index = prev_idx
+    _tui_state.active_pty_index = 0
     return {
       { op = "focus_terminal", agent_id = prev_agent.id, pty_index = 0, agent_index = prev_idx },
       set_mode_ops("insert"),

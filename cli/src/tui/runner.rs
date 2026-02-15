@@ -9,6 +9,7 @@
 //! TuiRunner (TUI thread)
 //! ├── parser_pool: HashMap<(agent, pty), Parser>  - per-PTY terminal emulation
 //! ├── vt100_parser: Arc<Mutex<Parser>>  - alias into pool for focused PTY
+//! ├── widget_states: WidgetStateStore  - persistent state for uncontrolled widgets
 //! ├── active_subscriptions: HashSet<(agent, pty)>  - synced from render tree
 //! ├── terminal: Terminal<CrosstermBackend>  - ratatui terminal
 //! ├── mode (shadow of Lua _tui_state.mode)  - for PTY routing
@@ -262,6 +263,25 @@ pub struct TuiRunner<B: Backend> {
     /// consumed by keybindings (overlay active). Derived from Lua
     /// `render_overlay()` returning non-nil.
     has_overlay: bool,
+
+    // === Widget State ===
+    /// Persistent state store for uncontrolled widgets (list selection, input buffer).
+    ///
+    /// Widgets with an `id` prop and no explicit `selected`/`value` prop are
+    /// **uncontrolled** — Rust owns their mechanical state here. Garbage
+    /// collected after each render pass via `retain_seen()`.
+    pub(super) widget_states: super::widget_state::WidgetStateStore,
+
+    /// ID of the focused uncontrolled list widget (from last render pass).
+    ///
+    /// Used to route `list_up`/`list_down` actions to the correct widget state.
+    pub(super) focused_list_id: Option<String>,
+
+    /// ID of the focused uncontrolled input widget (from last render pass).
+    ///
+    /// Used to route `input_char`/`input_backspace`/cursor actions to the
+    /// correct widget state.
+    pub(super) focused_input_id: Option<String>,
 }
 
 impl<B: Backend> std::fmt::Debug for TuiRunner<B>
@@ -345,6 +365,9 @@ where
             outer_kitty_enabled: false,
             overlay_list_actions: Vec::new(),
             has_overlay: false,
+            widget_states: super::widget_state::WidgetStateStore::new(),
+            focused_list_id: None,
+            focused_input_id: None,
         }
     }
 
@@ -524,8 +547,6 @@ where
         super::layout_lua::ActionContext {
             overlay_actions: self.overlay_list_actions.clone(),
             selected_agent: self.selected_agent.clone(),
-            selected_agent_index: self.current_agent_index,
-            active_pty_index: self.active_pty_index,
             action_char: None,
         }
     }
@@ -594,6 +615,7 @@ where
                     input_buffer = '',\
                     list_selected = 0,\
                     selected_agent = nil,\
+                    selected_agent_index = nil,\
                     active_pty_index = 0,\
                     connection_code = nil,\
                 }",
@@ -889,7 +911,9 @@ where
             std::thread::sleep(Duration::from_millis(16));
         }
 
-        log::info!("TuiRunner event loop exiting");
+        // Signal main thread to exit too (bidirectional shutdown)
+        self.shutdown.store(true, Ordering::SeqCst);
+        log::info!("TuiRunner event loop exiting (quit={}, shutdown=true)", self.quit);
         Ok(())
     }
 
@@ -901,19 +925,23 @@ where
     fn poll_input(&mut self, layout_lua: Option<&LayoutLua>) {
         let events = self.raw_reader.drain_events();
 
-        // Coalesce consecutive mouse scroll events to prevent overscroll.
-        // Fast scrolling generates many events per tick; processing them
-        // individually causes unnecessary lag at scrollback boundaries.
+        // Coalesce consecutive mouse scroll events with acceleration.
+        // Single notch = 1 line (fine control). When events batch up within
+        // a tick (fast scrolling), each additional event adds more lines,
+        // giving natural acceleration without sacrificing precision.
         let mut pending_scroll: i64 = 0;
-        // 3 lines per mouse scroll tick — matches the value in handle_raw_input_event.
-        const MOUSE_SCROLL_LINES: i64 = 3;
+        let mut scroll_event_count: i64 = 0;
 
         for event in events {
             match &event {
                 InputEvent::MouseScroll { direction } if !self.has_overlay => {
+                    scroll_event_count += 1;
+                    // Acceleration: first event = 1 line, then ramp up.
+                    // 1, 2, 3, 4... lines per successive event in the same tick.
+                    let lines = scroll_event_count;
                     match direction {
-                        ScrollDirection::Up => pending_scroll += MOUSE_SCROLL_LINES,
-                        ScrollDirection::Down => pending_scroll -= MOUSE_SCROLL_LINES,
+                        ScrollDirection::Up => pending_scroll += lines,
+                        ScrollDirection::Down => pending_scroll -= lines,
                     }
                 }
                 InputEvent::MouseScroll { .. } => {
@@ -925,6 +953,7 @@ where
                     if pending_scroll != 0 {
                         self.apply_coalesced_scroll(pending_scroll);
                         pending_scroll = 0;
+                        scroll_event_count = 0;
                     }
                     self.handle_raw_input_event(event, layout_lua);
                 }
@@ -1056,8 +1085,13 @@ where
             return;
         }
 
+        // Widget-intrinsic actions: route to Rust WidgetStateStore when an
+        // uncontrolled widget is focused, then sync back to Lua's _tui_state.
+        if self.handle_widget_action(action_str, lua_action.char, layout_lua) {
+            return;
+        }
+
         // Everything else goes through Lua compound action dispatch.
-        // Lua owns mode, input_buffer, list_selected via _tui_state.
         if layout_lua.has_actions() {
             let mut context = self.build_action_context();
 
@@ -1088,6 +1122,70 @@ where
         } else {
             log::warn!("No Lua actions module loaded, cannot handle '{action_str}'");
         }
+    }
+
+    /// Handle widget-intrinsic actions (list navigation, text input) via Rust state.
+    ///
+    /// Returns `true` if the action was consumed by a focused uncontrolled widget,
+    /// meaning it should NOT fall through to Lua's `on_action()`.
+    ///
+    /// After handling, syncs the result back to Lua's `_tui_state` so workflow
+    /// actions (`list_select`, `input_submit`) see the correct values.
+    fn handle_widget_action(
+        &mut self,
+        action: &str,
+        action_char: Option<char>,
+        layout_lua: &LayoutLua,
+    ) -> bool {
+        use tui_input::InputRequest;
+
+        // List widget actions
+        if let Some(ref list_id) = self.focused_list_id.clone() {
+            let new_idx = match action {
+                "list_up" => Some(self.widget_states.list_state(list_id).select_up()),
+                "list_down" => Some(self.widget_states.list_state(list_id).select_down()),
+                _ => None,
+            };
+            if let Some(idx) = new_idx {
+                // Sync back to Lua so list_select/workflow code reads correct index
+                if let Err(e) = layout_lua.exec(&format!("_tui_state.list_selected = {idx}")) {
+                    log::warn!("Failed to sync list_selected to Lua: {e}");
+                }
+                return true;
+            }
+        }
+
+        // Input widget actions
+        if let Some(ref input_id) = self.focused_input_id.clone() {
+            let request = match action {
+                "input_char" => action_char.map(InputRequest::InsertChar),
+                "input_backspace" => Some(InputRequest::DeletePrevChar),
+                "input_delete" => Some(InputRequest::DeleteNextChar),
+                "input_cursor_left" => Some(InputRequest::GoToPrevChar),
+                "input_cursor_right" => Some(InputRequest::GoToNextChar),
+                "input_cursor_home" => Some(InputRequest::GoToStart),
+                "input_cursor_end" => Some(InputRequest::GoToEnd),
+                "input_word_left" => Some(InputRequest::GoToPrevWord),
+                "input_word_right" => Some(InputRequest::GoToNextWord),
+                "input_word_backspace" => Some(InputRequest::DeletePrevWord),
+                _ => None,
+            };
+            if let Some(req) = request {
+                self.widget_states.input_state(input_id).handle(req);
+                // Sync back to Lua so input_submit reads correct buffer
+                let value = self.widget_states.input_state(input_id).value().to_string();
+                let escaped = value
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
+                if let Err(e) = layout_lua.exec(&format!("_tui_state.input_buffer = \"{escaped}\"")) {
+                    log::warn!("Failed to sync input_buffer to Lua: {e}");
+                }
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Send raw PTY input bytes directly to the PTY writer.
@@ -1226,6 +1324,15 @@ where
                             self.inner_kitty_enabled = kitty_state;
                         }
                     }
+                    let key = (
+                        agent_index.or(self.current_agent_index).unwrap_or(0),
+                        pty_index.or(self.current_pty_index).unwrap_or(0),
+                    );
+                    log::debug!(
+                        "PTY output: agent={:?} pty={:?} -> pool key={:?}, {} bytes, pool_has={}",
+                        agent_index, pty_index, key, data.len(),
+                        self.parser_pool.contains_key(&key)
+                    );
                     let parser = self.resolve_parser(agent_index, pty_index);
                     parser.lock().expect("parser lock poisoned").process(&data);
                 }
@@ -1305,9 +1412,6 @@ where
     ) -> Result<()> {
         use super::render::{render, RenderContext};
 
-        // Selected agent index from current_agent_index (set by focus_terminal)
-        let selected_agent_index = self.current_agent_index.unwrap_or(0);
-
         // Check scroll state from parser
         let (scroll_offset, is_scrolled) = {
             let parser = self.vt100_parser.lock().expect("parser lock poisoned");
@@ -1319,13 +1423,10 @@ where
 
         // Build render context from TuiRunner state
         let ctx = RenderContext {
-            // Note: mode, list_selected, input_buffer live in Lua's _tui_state (not passed here)
+            // Note: mode, list_selected, input_buffer, selected_agent_index live in Lua's _tui_state
             error_message: self.error_message.as_deref(),
             connection_code: self.connection_code.as_ref(),
             bundle_used: false, // TuiRunner doesn't track this - would need from Hub
-
-            // Selection State
-            selected_agent_index,
 
             // Terminal State - use TuiRunner's local parser
             active_parser: Some(self.parser_handle()),
@@ -1349,7 +1450,7 @@ where
 
         // Try Lua-driven render, fall back to hardcoded Rust layout
         let lua_result = if let Some(layout_lua) = layout_lua {
-            match render_with_lua(&mut self.terminal, layout_lua, &ctx) {
+            match render_with_lua(&mut self.terminal, layout_lua, &ctx, &mut self.widget_states) {
                 Ok(result) => Some(result),
                 Err(e) => {
                     log::warn!("Lua layout render failed, using fallback: {e}");
@@ -1370,7 +1471,15 @@ where
 
         if let Some(ref result) = lua_result {
             // Sync subscriptions to match what the render tree declares
+            let bindings_before = self.active_subscriptions.clone();
             self.sync_subscriptions(&result.tree);
+            if self.active_subscriptions != bindings_before {
+                log::info!(
+                    "sync_subscriptions: {:?} -> {:?}, parser_pool keys: {:?}",
+                    bindings_before, self.active_subscriptions,
+                    self.parser_pool.keys().collect::<Vec<_>>()
+                );
+            }
 
             // Track overlay presence for input routing (PTY vs keybindings)
             self.has_overlay = result.overlay.is_some();
@@ -1381,6 +1490,21 @@ where
                 .as_ref()
                 .map(super::render_tree::extract_list_actions)
                 .unwrap_or_default();
+
+            // Extract focused uncontrolled widgets from the active tree
+            // (overlay takes priority if present, otherwise main tree)
+            let focus_tree = result.overlay.as_ref().unwrap_or(&result.tree);
+            let (focused_list, focused_input) =
+                super::render_tree::extract_focused_widgets(focus_tree);
+            self.focused_list_id = focused_list;
+            self.focused_input_id = focused_input;
+
+            // Garbage collect widget state for IDs no longer in either tree
+            let mut seen_ids = super::render_tree::collect_widget_ids(&result.tree);
+            if let Some(ref overlay_tree) = result.overlay {
+                seen_ids.extend(super::render_tree::collect_widget_ids(overlay_tree));
+            }
+            self.widget_states.retain_seen(&seen_ids);
         }
 
         // Resize parsers and PTYs to match actual widget areas from the render pass
@@ -1422,6 +1546,13 @@ where
                     // Shadow update only — canonical state is _tui_state.mode in Lua.
                     if let Some(mode) = op.get("mode").and_then(|v| v.as_str()) {
                         self.mode = mode.to_string();
+                        // Reset Rust-side widget state on mode transition
+                        // (mirrors Lua's set_mode_ops resetting list_selected/input_buffer)
+                        self.widget_states.reset_all();
+                        // Clear focused widget IDs — new mode may have different widgets.
+                        // In production, the next render pass re-extracts these.
+                        self.focused_list_id = None;
+                        self.focused_input_id = None;
                     }
                 }
                 "send_msg" => {
@@ -1571,6 +1702,7 @@ fn render_with_lua<B>(
     terminal: &mut Terminal<B>,
     layout_lua: &LayoutLua,
     ctx: &super::render::RenderContext,
+    widget_states: &mut super::widget_state::WidgetStateStore,
 ) -> Result<LuaRenderResult>
 where
     B: Backend,
@@ -1587,10 +1719,10 @@ where
     // Render to terminal
     terminal.draw(|f| {
         let area = f.area();
-        interpret_tree(&tree, f, ctx, area);
+        interpret_tree(&tree, f, ctx, area, widget_states);
 
         if let Some(ref overlay_tree) = overlay {
-            interpret_tree(overlay_tree, f, ctx, area);
+            interpret_tree(overlay_tree, f, ctx, area, widget_states);
         }
     })?;
 
@@ -1770,7 +1902,9 @@ pub fn run_with_hub(
 
     // Main thread: Hub tick loop for non-TUI operations.
     // Client request processing is handled by each client's async run_task().
-    while !hub.quit && !shutdown_flag.load(Ordering::SeqCst) {
+    // The `shutdown` Arc is bidirectional: main→TUI (for signal-triggered shutdown)
+    // and TUI→main (for Ctrl+Q quit). Either side setting it to true ends both loops.
+    while !hub.quit && !shutdown_flag.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) {
         // Periodic tasks (command channel, heartbeat, Lua queues, notifications)
         hub.tick();
 
@@ -1778,7 +1912,7 @@ pub fn run_with_hub(
         thread::sleep(Duration::from_millis(16));
     }
 
-    // Signal TUI thread to shutdown
+    // Signal TUI thread to shutdown (in case main exited first via hub.quit or signal)
     shutdown.store(true, Ordering::SeqCst);
 
     // Wait for TUI thread to finish
@@ -2255,17 +2389,24 @@ mod tests {
     /// Tests that the menu structure adapts based on context (agent selected,
     /// server PTY available, etc.) and that actions can be correctly retrieved
     /// by selection index.
-    /// Stub overlay_list_actions with a test fixture.
+    /// Stub overlay_list_actions and focused list widget for tests.
     ///
     /// In production, Lua renders the menu overlay and Rust extracts action
-    /// strings from the render tree. Tests don't run Lua, so we stub the
-    /// cache with a fixed set of actions. This is pure test fixture data —
-    /// Lua owns the real menu content.
+    /// strings from the render tree + focused widget IDs. Tests don't run
+    /// the render pass, so we stub both the action cache and focused widget.
     fn stub_menu_actions(runner: &mut TuiRunner<TestBackend>) {
         runner.overlay_list_actions = vec![
             "new_agent".to_string(),
             "show_connection_code".to_string(),
         ];
+        // Set up focused list widget so Rust handles list_up/list_down
+        runner.focused_list_id = Some("menu".to_string());
+        runner.widget_states.list_state("menu").set_selectable_count(2);
+    }
+
+    /// Stub focused input widget for text entry tests.
+    fn stub_input_focus(runner: &mut TuiRunner<TestBackend>, id: &str) {
+        runner.focused_input_id = Some(id.to_string());
     }
 
     /// Find the index of an action string in overlay_list_actions.
@@ -2575,6 +2716,9 @@ mod tests {
         );
 
         // 2. Select "Create new worktree" (index 1, after "Use Main Branch")
+        // Set up worktree list focus (2 items: "Use Main Branch", "Create new worktree")
+        runner.focused_list_id = Some("worktree_list".to_string());
+        runner.widget_states.list_state("worktree_list").set_selectable_count(2);
         process_key_with_lua(&mut runner, make_key_down(), &lua);
         assert_eq!(lua_list_selected(&lua), 1);
         process_key_with_lua(&mut runner, make_key_enter(), &lua);
@@ -2582,6 +2726,7 @@ mod tests {
         assert_eq!(runner.mode(), "new_agent_create_worktree");
 
         // 3. Type issue name
+        stub_input_focus(&mut runner, "worktree_input");
         for c in "issue-42".chars() {
             process_key_with_lua(&mut runner, make_key_char(c), &lua);
         }
@@ -2594,6 +2739,7 @@ mod tests {
         // pending_fields now live in Lua's _tui_state, verified by actions.lua tests
 
         // 5. Type prompt and submit
+        stub_input_focus(&mut runner, "prompt_input");
         for c in "Fix bug".chars() {
             process_key_with_lua(&mut runner, make_key_char(c), &lua);
         }
@@ -2679,6 +2825,8 @@ mod tests {
             "worktree_0".to_string(),
             "worktree_1".to_string(),
         ];
+        runner.focused_list_id = Some("worktree_list".to_string());
+        runner.widget_states.list_state("worktree_list").set_selectable_count(4);
         process_key_with_lua(&mut runner, make_key_down(), &lua);
         process_key_with_lua(&mut runner, make_key_down(), &lua);
         assert_eq!(lua_list_selected(&lua), 2);
@@ -2782,6 +2930,7 @@ mod tests {
 
         runner.mode = "new_agent_create_worktree".to_string();
         let _ = lua.exec("_tui_state.mode = 'new_agent_create_worktree'");
+        stub_input_focus(&mut runner, "worktree_input");
 
         // Type characters
         process_key_with_lua(&mut runner, make_key_char('a'), &lua);
@@ -2808,7 +2957,7 @@ mod tests {
         let (mut runner, _cmd_rx) = create_test_runner();
         let lua = make_test_layout_with_keybindings();
 
-        // Stub overlay_list_actions for navigation test.
+        // Stub overlay_list_actions and focused list for navigation test.
         runner.overlay_list_actions = vec![
             "main".to_string(),
             "create_new".to_string(),
@@ -2817,6 +2966,8 @@ mod tests {
         ];
         runner.mode = "new_agent_select_worktree".to_string();
         let _ = lua.exec("_tui_state.mode = 'new_agent_select_worktree'; _tui_state.list_selected = 0");
+        runner.focused_list_id = Some("worktree_list".to_string());
+        runner.widget_states.list_state("worktree_list").set_selectable_count(4);
 
         // Navigate down
         process_key_with_lua(&mut runner, make_key_down(), &lua);
@@ -3439,7 +3590,6 @@ mod tests {
             error_message: None,
             connection_code: None,
             bundle_used: false,
-            selected_agent_index: 0,
             active_parser: None,
             parser_pool: pool,
             active_pty_index: 0,
@@ -3467,6 +3617,7 @@ mod tests {
         // Tree with a single terminal widget (no explicit binding → defaults)
         let tree = crate::tui::render_tree::RenderNode::Widget {
             widget_type: crate::tui::render_tree::WidgetType::Terminal,
+            id: None,
             block: None,
             custom_lines: None,
             props: None,
@@ -3506,6 +3657,7 @@ mod tests {
         // Tree only has terminal for PTY 0 — PTY 1 should be unsubscribed
         let tree = crate::tui::render_tree::RenderNode::Widget {
             widget_type: crate::tui::render_tree::WidgetType::Terminal,
+            id: None,
             block: None,
             custom_lines: None,
             props: Some(crate::tui::render_tree::WidgetProps::Terminal(
@@ -3544,6 +3696,7 @@ mod tests {
 
         let tree = crate::tui::render_tree::RenderNode::Widget {
             widget_type: crate::tui::render_tree::WidgetType::Terminal,
+            id: None,
             block: None,
             custom_lines: None,
             props: None,

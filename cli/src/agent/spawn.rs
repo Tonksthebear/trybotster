@@ -15,7 +15,7 @@
 
 // Rust guideline compliant 2026-02
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -26,7 +26,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use tokio::sync::broadcast;
 
 use super::notification::detect_notifications;
-use super::pty::{PtyEvent, MAX_SCROLLBACK_BYTES};
+use super::pty::PtyEvent;
 
 /// Configuration for spawning a process in a PtySession.
 ///
@@ -120,15 +120,18 @@ pub fn build_command(
 ///   as [`PtyEvent::Notification`] events (CLI session behavior).
 /// - When `false`, notification detection is skipped (server session behavior).
 ///
+/// The reader thread feeds every PTY byte to both the shadow screen (for
+/// reconnect snapshots) and the broadcast channel (for live subscribers).
+///
 /// # Arguments
 ///
 /// * `reader` - PTY output reader
-/// * `scrollback_buffer` - Raw byte buffer for session replay
+/// * `shadow_screen` - Shadow terminal for parsed state snapshots
 /// * `event_tx` - Broadcast channel for PtyEvent notifications
 /// * `detect_notifs` - Enable OSC notification detection
 pub fn spawn_reader_thread(
     reader: Box<dyn Read + Send>,
-    scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
+    shadow_screen: Arc<Mutex<vt100::Parser>>,
     event_tx: broadcast::Sender<PtyEvent>,
     detect_notifs: bool,
 ) -> thread::JoinHandle<()> {
@@ -158,20 +161,15 @@ pub fn spawn_reader_thread(
                         }
                     }
 
-                    // Add raw bytes to scrollback buffer
-                    {
-                        let mut buffer = scrollback_buffer
-                            .lock()
-                            .expect("scrollback_buffer lock poisoned");
-                        buffer.extend(buf[..n].iter().copied());
-                        // Trim from front if over limit
-                        while buffer.len() > MAX_SCROLLBACK_BYTES {
-                            buffer.pop_front();
-                        }
-                    }
+                    // Feed PTY bytes to shadow screen for parsed state tracking.
+                    // vt100 handles scrollback limits internally by line count.
+                    shadow_screen
+                        .lock()
+                        .expect("shadow_screen lock poisoned")
+                        .process(&buf[..n]);
 
-                    // Broadcast output event to all subscribers
-                    // Clients parse bytes in their own parsers when they receive this event
+                    // Broadcast raw output to all live subscribers.
+                    // Clients parse bytes in their own parsers (xterm.js, TUI vt100).
                     let _ = event_tx.send(PtyEvent::output(buf[..n].to_vec()));
                 }
                 Err(e) => {
@@ -233,15 +231,19 @@ mod tests {
         }
     }
 
+    /// Helper: create a shadow screen for testing.
+    fn test_shadow_screen() -> Arc<Mutex<vt100::Parser>> {
+        Arc::new(Mutex::new(vt100::Parser::new(24, 80, 100)))
+    }
+
     #[test]
     fn test_unified_reader_broadcasts_output_without_notifications() {
-        // Tests spawn_reader_thread with detect_notifs=false (server mode)
         let test_data = b"Hello from unified reader (server mode)";
         let reader = MockReader::new(test_data);
-        let scrollback = Arc::new(Mutex::new(VecDeque::new()));
+        let shadow = test_shadow_screen();
         let (tx, mut rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, scrollback.clone(), tx, false);
+        let handle = spawn_reader_thread(reader, shadow.clone(), tx, false);
         handle.join().expect("Reader thread panicked");
 
         // Verify event was broadcast
@@ -253,24 +255,24 @@ mod tests {
             _ => panic!("Expected Output event"),
         }
 
-        // Verify scrollback was populated
-        let buffer = scrollback.lock().unwrap();
-        let snapshot: Vec<u8> = buffer.iter().copied().collect();
-        assert_eq!(snapshot, test_data, "Scrollback should contain input data");
+        // Verify shadow screen was fed
+        let screen_text = shadow.lock().unwrap().screen().contents();
+        assert!(
+            screen_text.contains("Hello from unified reader"),
+            "Shadow screen should contain the output"
+        );
     }
 
     #[test]
     fn test_unified_reader_broadcasts_output_with_notifications() {
-        // Tests spawn_reader_thread with detect_notifs=true (CLI mode)
         let test_data = b"Hello from unified reader (CLI mode)";
         let reader = MockReader::new(test_data);
-        let scrollback = Arc::new(Mutex::new(VecDeque::new()));
+        let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, scrollback.clone(), event_tx, true);
+        let handle = spawn_reader_thread(reader, shadow, event_tx, true);
         handle.join().expect("Reader thread panicked");
 
-        // Verify output event was broadcast
         let event = event_rx.try_recv().expect("Should receive Output event");
         match event {
             PtyEvent::Output(data) => {
@@ -282,17 +284,15 @@ mod tests {
 
     #[test]
     fn test_unified_reader_detects_notifications_when_enabled() {
-        // Tests that spawn_reader_thread broadcasts PtyEvent::Notification when detect_notifs=true
         // OSC 9 notification: ESC ] 9 ; message BEL
         let test_data = b"\x1b]9;Build complete\x07";
         let reader = MockReader::new(test_data);
-        let scrollback = Arc::new(Mutex::new(VecDeque::new()));
+        let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, scrollback, event_tx, true);
+        let handle = spawn_reader_thread(reader, shadow, event_tx, true);
         handle.join().expect("Reader thread panicked");
 
-        // Should receive the Notification event first (broadcast before Output)
         let event = event_rx.try_recv().expect("Should receive Notification event");
         match event {
             PtyEvent::Notification(notif) => {
@@ -306,27 +306,23 @@ mod tests {
             _ => panic!("Expected Notification event, got {:?}", event),
         }
 
-        // Should also receive the Output event
         let output = event_rx.try_recv().expect("Should receive Output event");
         assert!(matches!(output, PtyEvent::Output(_)));
     }
 
     #[test]
     fn test_unified_reader_skips_notifications_when_disabled() {
-        // Tests that spawn_reader_thread does NOT broadcast notifications when detect_notifs=false
         let test_data = b"\x1b]9;Build complete\x07";
         let reader = MockReader::new(test_data);
-        let scrollback = Arc::new(Mutex::new(VecDeque::new()));
+        let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, scrollback, event_tx, false);
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false);
         handle.join().expect("Reader thread panicked");
 
-        // Output should still be broadcast (the raw bytes including the OSC sequence)
         let event = event_rx.try_recv().expect("Should receive Output event");
         assert!(matches!(event, PtyEvent::Output(_)));
 
-        // No Notification event should be queued (channel may be empty or closed)
         match event_rx.try_recv() {
             Err(broadcast::error::TryRecvError::Empty)
             | Err(broadcast::error::TryRecvError::Closed) => {}

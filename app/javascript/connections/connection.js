@@ -77,6 +77,8 @@ export class Connection {
   #subscribeLockResolve = null
   #resubscribing = false    // Lock to prevent concurrent resubscribe on stale send
   #visibilityHandler = null // Cleanup ref for visibilitychange listener
+  #initRetryCount = 0       // Retry counter for failed initialize()
+  #initRetryTimer = null    // Pending retry timer
 
   constructor(key, options, manager) {
     this.key = key
@@ -156,10 +158,34 @@ export class Connection {
           this.errorReason = "Scan connection code"
           this.emit("error", { reason: "unpaired", message: "Scan connection code" })
         } else {
-          this.#setError("init_failed", error.message)
+          // Retry transient failures (WASM timeout, ActionCable timeout) with backoff.
+          // Non-retryable errors (unpaired, session_invalid) are handled above.
+          this.#scheduleInitRetry(error)
         }
       }
     }
+  }
+
+  /**
+   * Schedule a retry of initialize() with exponential backoff.
+   * Retries up to 3 times: 2s, 4s, 8s.
+   */
+  #scheduleInitRetry(error) {
+    const MAX_RETRIES = 3
+    if (this.#initRetryCount >= MAX_RETRIES) {
+      console.error(`[${this.constructor.name}] Init failed after ${MAX_RETRIES} retries`)
+      this.#setError("init_failed", error.message)
+      return
+    }
+
+    this.#initRetryCount++
+    const delay = 2000 * Math.pow(2, this.#initRetryCount - 1) // 2s, 4s, 8s
+    console.debug(`[${this.constructor.name}] Retrying init in ${delay}ms (attempt ${this.#initRetryCount}/${MAX_RETRIES})`)
+
+    this.#initRetryTimer = setTimeout(() => {
+      this.#initRetryTimer = null
+      this.initialize()
+    }, delay)
   }
 
   /**
@@ -376,6 +402,14 @@ export class Connection {
       // This allows both sides to derive the same ID independently
       const subscriptionId = this.computeSubscriptionId()
 
+      // Register listener BEFORE sending subscribe so scrollback chunks
+      // that arrive immediately after CLI confirms aren't dropped.
+      // Without this, the CLI can send snapshot data between the
+      // "subscribed" confirmation and listener registration — a race
+      // that causes missing scrollback on slow clients (phones).
+      this.subscriptionId = subscriptionId
+      this.#setupSubscriptionEventListeners()
+
       const subscribeResult = await bridge.send("subscribe", {
         hubId,
         channel: this.channelName(),
@@ -383,15 +417,17 @@ export class Connection {
         subscriptionId,
       })
 
-      this.subscriptionId = subscriptionId
-      this.#setupSubscriptionEventListeners()
-
       // WebRTC: DataChannel open = ready, complete handshake FIRST
       // so input isn't buffered when listeners fire
       this.#completeHandshake()
 
       this.#setState(ConnectionState.CONNECTED)
       this.emit("subscribed", this)
+    } catch (e) {
+      // Subscribe failed — clean up the listener we registered eagerly
+      this.#clearSubscriptionEventListeners()
+      this.subscriptionId = null
+      throw e
     } finally {
       this.#subscribing = false
       this.#subscribeLockResolve?.()
@@ -585,6 +621,12 @@ export class Connection {
    * NOTE: Cleanup is done asynchronously to avoid blocking other operations.
    */
   destroy() {
+    // Cancel any pending init retry
+    if (this.#initRetryTimer) {
+      clearTimeout(this.#initRetryTimer)
+      this.#initRetryTimer = null
+    }
+
     // Clear state immediately to prevent any new operations
     const oldSubscriptionId = this.subscriptionId
     const hubId = this.getHubId()
@@ -697,7 +739,7 @@ export class Connection {
     }
 
     // Always clear subscription on reacquire. Turbo navigation destroys the DOM
-    // (xterm.js instance, etc.) so the CLI must re-send initial content via a
+    // (terminal instance, etc.) so the CLI must re-send initial content via a
     // fresh subscription. #ensureConnected() will re-subscribe below.
     if (this.subscriptionId) {
       this.#clearSubscriptionEventListeners()
@@ -837,6 +879,32 @@ export class Connection {
       }
 
       console.error(`[${this.constructor.name}] Send failed:`, error)
+      return false
+    }
+  }
+
+  /**
+   * Send binary PTY data through the encrypted channel.
+   * Bypasses JSON serialization for the keystroke hot path.
+   * @param {string|Uint8Array} data - Raw PTY input data
+   * @returns {Promise<boolean>}
+   */
+  async sendBinaryPty(data) {
+    if (!this.subscriptionId) {
+      await this.#ensureConnected()
+      if (!this.subscriptionId) return false
+    }
+
+    try {
+      const hubId = this.getHubId()
+      await bridge.send("sendPtyInput", {
+        hubId,
+        subscriptionId: this.subscriptionId,
+        data,
+      })
+      return true
+    } catch (error) {
+      console.error(`[${this.constructor.name}] sendBinaryPty failed:`, error)
       return false
     }
   }

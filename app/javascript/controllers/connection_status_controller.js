@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager, HubConnection, TerminalConnection, BrowserStatus, CliStatus, ConnectionMode } from "connections";
+import { ConnectionManager, HubConnection, BrowserStatus, CliStatus, ConnectionMode } from "connections";
 
 /**
  * Connection Status Controller
@@ -36,15 +36,18 @@ export default class extends Controller {
   static targets = ["browserSection", "connectionSection", "hubSection"];
 
   #modePolling = false;
+  #disconnected = false;
 
   connect() {
     if (!this.hubIdValue) return;
+    this.#disconnected = false;
     this.unsubscribers = [];
     this.#modePolling = false;
     this.#acquireConnection();
   }
 
   disconnect() {
+    this.#disconnected = true;
     this.unsubscribers?.forEach(unsub => unsub());
     this.unsubscribers = [];
     this.connection?.release();
@@ -65,6 +68,13 @@ export default class extends Controller {
       const options = this.#getConnectionOptions();
 
       this.connection = await ConnectionManager.acquire(ConnectionClass, key, options);
+
+      // Guard: if disconnected during async acquire, release and bail
+      if (this.#disconnected) {
+        this.connection.release();
+        this.connection = null;
+        return;
+      }
 
       // Listen for browser status changes
       this.unsubscribers.push(
@@ -137,35 +147,15 @@ export default class extends Controller {
   }
 
   #getConnectionClass() {
-    switch (this.typeValue) {
-      case "terminal":
-      case "preview":
-        return TerminalConnection;
-      default:
-        return HubConnection;
-    }
+    return HubConnection;
   }
 
   #getConnectionKey() {
-    switch (this.typeValue) {
-      case "terminal":
-      case "preview":
-        return TerminalConnection.key(this.hubIdValue, this.agentIndexValue, this.ptyIndexValue);
-      default:
-        return this.hubIdValue;
-    }
+    return this.hubIdValue;
   }
 
   #getConnectionOptions() {
-    const base = { hubId: this.hubIdValue };
-
-    switch (this.typeValue) {
-      case "terminal":
-      case "preview":
-        return { ...base, agentIndex: this.agentIndexValue, ptyIndex: this.ptyIndexValue };
-      default:
-        return base;
-    }
+    return { hubId: this.hubIdValue };
   }
 
   // ========== Status Handlers ==========

@@ -10,8 +10,16 @@
 //!   ├── HSplit { constraints, children }
 //!   ├── VSplit { constraints, children }
 //!   ├── Centered { width_pct, height_pct, child }
-//!   └── Widget { widget_type, block_config }
+//!   └── Widget { widget_type, id, block_config }
 //! ```
+//!
+//! # Widget State
+//!
+//! Widgets with an `id` prop are **stateful**. State ownership depends on
+//! whether explicit state props (`selected`, `value`) are provided:
+//!
+//! - **Controlled**: `id` + `selected`/`value` → Lua owns state
+//! - **Uncontrolled**: `id` without state props → Rust owns via `WidgetStateStore`
 //!
 //! # Flow
 //!
@@ -30,6 +38,7 @@ use ratatui::{
 };
 
 use super::render::RenderContext;
+use super::widget_state::WidgetStateStore;
 use crate::app::centered_rect;
 
 /// A node in the declarative render tree.
@@ -62,6 +71,9 @@ pub enum RenderNode {
     Widget {
         /// Which Rust widget to render.
         widget_type: WidgetType,
+        /// Optional widget identity for persistent state across frames.
+        /// Required for uncontrolled (stateful) widgets.
+        id: Option<String>,
         /// Optional block (border/title) wrapping the widget.
         block: Option<BlockConfig>,
         /// Optional custom text lines from Lua, overriding Rust defaults.
@@ -171,12 +183,18 @@ pub enum ParagraphAlignment {
 }
 
 /// Props for a text input widget.
+///
+/// When `value` is `None`, the widget is **uncontrolled** — Rust owns the
+/// text buffer via `WidgetStateStore`. When `value` is `Some`, Lua owns
+/// the value (controlled mode, legacy behavior).
 #[derive(Debug, Clone)]
 pub struct InputProps {
     /// Prompt lines displayed above the input.
     pub lines: Vec<StyledContent>,
-    /// Current input value.
-    pub value: String,
+    /// Current input value. `None` = uncontrolled (Rust owns via `WidgetStateStore`).
+    pub value: Option<String>,
+    /// Placeholder text shown when the input is empty.
+    pub placeholder: Option<String>,
     /// Text alignment.
     pub alignment: ParagraphAlignment,
 }
@@ -491,6 +509,7 @@ impl RenderNode {
             }
         };
 
+        let id: Option<String> = table.get("id").ok();
         let block = parse_block_config(table);
         let custom_lines = parse_styled_lines(table, "lines").ok();
         let props = match widget_type {
@@ -503,6 +522,7 @@ impl RenderNode {
 
         Ok(RenderNode::Widget {
             widget_type,
+            id,
             block,
             custom_lines,
             props,
@@ -622,7 +642,8 @@ fn parse_input_props(table: &LuaTable) -> Option<WidgetProps> {
     let LuaValue::Table(props_table) = props_value else { return None; };
 
     let lines = parse_styled_lines(&props_table, "lines").unwrap_or_default();
-    let value: String = props_table.get("value").unwrap_or_default();
+    let value: Option<String> = props_table.get("value").ok();
+    let placeholder: Option<String> = props_table.get("placeholder").ok();
 
     let alignment_str: Option<String> = props_table.get("alignment").ok();
     let alignment = match alignment_str.as_deref() {
@@ -634,6 +655,7 @@ fn parse_input_props(table: &LuaTable) -> Option<WidgetProps> {
     Some(WidgetProps::Input(InputProps {
         lines,
         value,
+        placeholder,
         alignment,
     }))
 }
@@ -838,7 +860,16 @@ impl BlockConfig {
 ///
 /// Recursively walks the tree, splitting areas for layout nodes and
 /// dispatching to Rust widget implementations for leaf nodes.
-pub fn interpret_tree(node: &RenderNode, f: &mut Frame, ctx: &RenderContext, area: Rect) {
+///
+/// The `widget_states` store provides persistent state for uncontrolled
+/// widgets (those with an `id` but no explicit `selected`/`value` prop).
+pub fn interpret_tree(
+    node: &RenderNode,
+    f: &mut Frame,
+    ctx: &RenderContext,
+    area: Rect,
+    widget_states: &mut WidgetStateStore,
+) {
     match node {
         RenderNode::HSplit {
             constraints,
@@ -850,7 +881,7 @@ pub fn interpret_tree(node: &RenderNode, f: &mut Frame, ctx: &RenderContext, are
                 .split(area);
 
             for (child, chunk) in children.iter().zip(chunks.iter()) {
-                interpret_tree(child, f, ctx, *chunk);
+                interpret_tree(child, f, ctx, *chunk, widget_states);
             }
         }
         RenderNode::VSplit {
@@ -863,7 +894,7 @@ pub fn interpret_tree(node: &RenderNode, f: &mut Frame, ctx: &RenderContext, are
                 .split(area);
 
             for (child, chunk) in children.iter().zip(chunks.iter()) {
-                interpret_tree(child, f, ctx, *chunk);
+                interpret_tree(child, f, ctx, *chunk, widget_states);
             }
         }
         RenderNode::Centered {
@@ -873,28 +904,32 @@ pub fn interpret_tree(node: &RenderNode, f: &mut Frame, ctx: &RenderContext, are
         } => {
             let centered_area = centered_rect(*width_pct, *height_pct, area);
             f.render_widget(Clear, centered_area);
-            interpret_tree(child, f, ctx, centered_area);
+            interpret_tree(child, f, ctx, centered_area, widget_states);
         }
         RenderNode::Widget {
             widget_type,
+            id,
             block,
             custom_lines,
             props,
         } => {
-            render_widget(widget_type, block.as_ref(), custom_lines.as_deref(), props.as_ref(), f, ctx, area);
+            render_widget(widget_type, id.as_deref(), block.as_ref(), custom_lines.as_deref(), props.as_ref(), f, ctx, area, widget_states);
         }
     }
 }
 
 /// Render a leaf widget using existing Rust rendering functions.
+#[allow(clippy::too_many_arguments)]
 fn render_widget(
     widget_type: &WidgetType,
+    widget_id: Option<&str>,
     block_cfg: Option<&BlockConfig>,
     custom_lines: Option<&[StyledContent]>,
     props: Option<&WidgetProps>,
     f: &mut Frame,
     ctx: &RenderContext,
     area: Rect,
+    widget_states: &mut WidgetStateStore,
 ) {
     let block = block_cfg.map(BlockConfig::to_block).unwrap_or_default();
 
@@ -908,7 +943,7 @@ fn render_widget(
         }
         WidgetType::List => {
             if let Some(WidgetProps::List(list_props)) = props {
-                super::render::render_list_widget(f, area, block, list_props);
+                super::render::render_list_widget(f, area, block, list_props, widget_id, widget_states);
             } else {
                 f.render_widget(block, area);
             }
@@ -930,7 +965,7 @@ fn render_widget(
         }
         WidgetType::Input => {
             if let Some(WidgetProps::Input(input_props)) = props {
-                super::render::render_input_widget(f, area, block, input_props);
+                super::render::render_input_widget(f, area, block, input_props, widget_id, widget_states);
             } else {
                 f.render_widget(block, area);
             }
@@ -1045,6 +1080,107 @@ fn extract_list_actions_recursive(node: &RenderNode, actions: &mut Vec<String>) 
         }
     }
     false
+}
+
+// =============================================================================
+// Focused Widget Extraction
+// =============================================================================
+
+/// Identify the focused uncontrolled list and input widgets in the render tree.
+///
+/// An **uncontrolled** widget has an `id` prop but no explicit state prop
+/// (`selected` for lists, `value` for inputs). Returns the `id` of the first
+/// such widget found for each type (depth-first).
+///
+/// Used by the runner to route widget-intrinsic actions (up/down, typing) to
+/// the correct `WidgetStateStore` entry.
+pub fn extract_focused_widgets(node: &RenderNode) -> (Option<String>, Option<String>) {
+    let mut focused_list: Option<String> = None;
+    let mut focused_input: Option<String> = None;
+    extract_focused_recursive(node, &mut focused_list, &mut focused_input);
+    (focused_list, focused_input)
+}
+
+fn extract_focused_recursive(
+    node: &RenderNode,
+    focused_list: &mut Option<String>,
+    focused_input: &mut Option<String>,
+) {
+    // Early return if both already found.
+    if focused_list.is_some() && focused_input.is_some() {
+        return;
+    }
+
+    match node {
+        RenderNode::HSplit { children, .. } | RenderNode::VSplit { children, .. } => {
+            for child in children {
+                extract_focused_recursive(child, focused_list, focused_input);
+            }
+        }
+        RenderNode::Centered { child, .. } => {
+            extract_focused_recursive(child, focused_list, focused_input);
+        }
+        RenderNode::Widget {
+            widget_type,
+            id,
+            props,
+            ..
+        } => {
+            if let Some(widget_id) = id {
+                match widget_type {
+                    WidgetType::List if focused_list.is_none() => {
+                        // Uncontrolled: has id but no explicit `selected` prop
+                        let is_uncontrolled = match props {
+                            Some(WidgetProps::List(lp)) => lp.selected.is_none(),
+                            _ => true,
+                        };
+                        if is_uncontrolled {
+                            *focused_list = Some(widget_id.clone());
+                        }
+                    }
+                    WidgetType::Input if focused_input.is_none() => {
+                        // Uncontrolled: has id but no explicit `value` prop
+                        let is_uncontrolled = match props {
+                            Some(WidgetProps::Input(ip)) => ip.value.is_none(),
+                            _ => true,
+                        };
+                        if is_uncontrolled {
+                            *focused_input = Some(widget_id.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Collect all widget IDs present in the render tree.
+///
+/// Used for garbage collection — `WidgetStateStore::retain_seen()` removes
+/// state for widgets no longer in the tree.
+pub fn collect_widget_ids(node: &RenderNode) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    collect_widget_ids_recursive(node, &mut ids);
+    ids
+}
+
+fn collect_widget_ids_recursive(node: &RenderNode, ids: &mut std::collections::HashSet<String>) {
+    match node {
+        RenderNode::HSplit { children, .. } | RenderNode::VSplit { children, .. } => {
+            for child in children {
+                collect_widget_ids_recursive(child, ids);
+            }
+        }
+        RenderNode::Centered { child, .. } => {
+            collect_widget_ids_recursive(child, ids);
+        }
+        RenderNode::Widget { id, .. } => {
+            if let Some(widget_id) = id {
+                ids.insert(widget_id.clone());
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -1334,7 +1470,7 @@ mod tests {
                     panic!("Expected Input props");
                 };
                 assert_eq!(input.lines.len(), 1);
-                assert_eq!(input.value, "hello");
+                assert_eq!(input.value.as_deref(), Some("hello"));
             }
             _ => panic!("Expected Widget node"),
         }
@@ -1509,6 +1645,7 @@ mod tests {
     fn test_collect_bindings_single_terminal_no_props() {
         let tree = RenderNode::Widget {
             widget_type: WidgetType::Terminal,
+            id: None,
             block: None,
             custom_lines: None,
             props: None,
@@ -1522,6 +1659,7 @@ mod tests {
     fn test_collect_bindings_explicit_props() {
         let tree = RenderNode::Widget {
             widget_type: WidgetType::Terminal,
+            id: None,
             block: None,
             custom_lines: None,
             props: Some(WidgetProps::Terminal(TerminalBinding {
@@ -1538,6 +1676,7 @@ mod tests {
     fn test_collect_bindings_partial_props() {
         let tree = RenderNode::Widget {
             widget_type: WidgetType::Terminal,
+            id: None,
             block: None,
             custom_lines: None,
             props: Some(WidgetProps::Terminal(TerminalBinding {
@@ -1560,6 +1699,7 @@ mod tests {
             children: vec![
                 RenderNode::Widget {
                     widget_type: WidgetType::Terminal,
+                    id: None,
                     block: None,
                     custom_lines: None,
                     props: Some(WidgetProps::Terminal(TerminalBinding {
@@ -1569,6 +1709,7 @@ mod tests {
                 },
                 RenderNode::Widget {
                     widget_type: WidgetType::Terminal,
+                    id: None,
                     block: None,
                     custom_lines: None,
                     props: Some(WidgetProps::Terminal(TerminalBinding {
@@ -1594,12 +1735,14 @@ mod tests {
             children: vec![
                 RenderNode::Widget {
                     widget_type: WidgetType::List,
+                    id: None,
                     block: None,
                     custom_lines: None,
                     props: None,
                 },
                 RenderNode::Widget {
                     widget_type: WidgetType::Terminal,
+                    id: None,
                     block: None,
                     custom_lines: None,
                     props: None,
@@ -1618,6 +1761,7 @@ mod tests {
             height_pct: 80,
             child: Box::new(RenderNode::Widget {
                 widget_type: WidgetType::Terminal,
+                id: None,
                 block: None,
                 custom_lines: None,
                 props: Some(WidgetProps::Terminal(TerminalBinding {
@@ -1642,6 +1786,7 @@ mod tests {
             children: vec![
                 RenderNode::Widget {
                     widget_type: WidgetType::Terminal,
+                    id: None,
                     block: None,
                     custom_lines: None,
                     props: Some(WidgetProps::Terminal(TerminalBinding {
@@ -1651,6 +1796,7 @@ mod tests {
                 },
                 RenderNode::Widget {
                     widget_type: WidgetType::Terminal,
+                    id: None,
                     block: None,
                     custom_lines: None,
                     props: Some(WidgetProps::Terminal(TerminalBinding {

@@ -1,12 +1,25 @@
 import { Controller } from "@hotwired/stimulus";
-import { init, Terminal, FitAddon } from "ghostty-web";
-import { ConnectionManager, TerminalConnection, HubConnection } from "connections";
+import { Restty } from "restty";
+import { ConnectionManager, HubConnection } from "connections";
+import { WebRtcPtyTransport } from "transport/webrtc_pty_transport";
 
 /**
  * Terminal Display Controller
  *
- * Renders a terminal using ghostty-web (Ghostty's VT100 parser compiled to WASM).
- * Uses ConnectionManager to acquire connections directly.
+ * Renders a terminal using Restty (libghostty-vt WASM + WebGPU/WebGL2).
+ * WebRtcPtyTransport bridges our E2E-encrypted WebRTC DataChannel into
+ * Restty's native transport layer for SSH-like terminal integration.
+ *
+ * Init sequence:
+ *   1. Acquire HubConnection (establishes WebRTC peer)
+ *   2. Create Restty with transport (loads WASM, renders canvas)
+ *   3. onBackend fires (WASM ready) → connectPty()
+ *   4. connectPty() → transport.connect() → acquires TerminalConnection → data flows
+ *
+ * Mobile: Tap vs swipe detection prevents virtual keyboard from appearing
+ * during scroll. Only deliberate taps (< 10px movement) trigger keyboard.
+ *
+ * Restty handles: GPU rendering, auto-resize, touch selection, font shaping.
  */
 export default class extends Controller {
   static targets = ["container"];
@@ -17,482 +30,305 @@ export default class extends Controller {
     ptyIndex: { type: Number, default: 0 },
   };
 
-  #terminal = null;
-  #fitAddon = null;
-  #terminalConn = null;
+  #restty = null;
+  #transport = null;
   #hubConn = null;
-  #unsubscribers = [];
-  #boundHandleResize = null;
-  #resizeDebounceTimer = null;
-  #momentumAnimationId = null;
-  #keyboardHandler = null;
-  #textarea = null;        // ghostty's hidden textarea — we control its focusability
-  #isMobile = false;
+  #imeInput = null;
+  #touchStart = null;
+  #viewportHandler = null;
+  #momentumRafId = null;
+  #disconnected = false;
 
   connect() {
-    this.#boundHandleResize = this.#handleResize.bind(this);
-    window.addEventListener("resize", this.#boundHandleResize);
-    this.#initTerminal().then(() => this.#initConnections());
+    this.#disconnected = false;
+    this.#initTerminal();
+    this.#bindViewport();
   }
 
   disconnect() {
-    window.removeEventListener("resize", this.#boundHandleResize);
+    this.#disconnected = true;
+    this.#unbindViewport();
 
-    if (this.#resizeDebounceTimer) {
-      clearTimeout(this.#resizeDebounceTimer);
-      this.#resizeDebounceTimer = null;
+    if (this.#momentumRafId) {
+      cancelAnimationFrame(this.#momentumRafId);
+      this.#momentumRafId = null;
     }
-
-    if (this.#momentumAnimationId) {
-      cancelAnimationFrame(this.#momentumAnimationId);
-      this.#momentumAnimationId = null;
-    }
-
-    if (this.#keyboardHandler) {
-      window.visualViewport?.removeEventListener("resize", this.#keyboardHandler);
-      window.visualViewport?.removeEventListener("scroll", this.#keyboardHandler);
-      this.#keyboardHandler = null;
-      this.element.style.height = "";
-      this.element.style.overflow = "";
-    }
-
-    this.#unsubscribers.forEach((unsub) => unsub());
-    this.#unsubscribers = [];
-
-    this.#terminalConn?.release();
-    this.#terminalConn = null;
 
     this.#hubConn?.release();
     this.#hubConn = null;
 
-    this.#terminal?.dispose();
-    this.#terminal = null;
+    this.#restty?.destroy();
+    this.#restty = null;
+
+    this.#transport?.destroy();
+    this.#transport = null;
+  }
+
+  /**
+   * Shift the terminal view when the virtual keyboard opens.
+   * On iOS Safari, dvh doesn't shrink when the keyboard appears — it overlays
+   * the page. Instead of resizing (which triggers Restty to re-layout the grid),
+   * we translate the container up so the bottom (buttons + input area) stays
+   * above the keyboard. The top of the terminal clips off-screen, which is fine
+   * since the user is interacting at the bottom.
+   */
+  #bindViewport() {
+    if (!window.visualViewport) return;
+    this.#viewportHandler = () => {
+      const vv = window.visualViewport;
+      // How much the keyboard covers: full layout height minus visible viewport
+      const keyboardHeight = window.innerHeight - vv.height;
+      // Shift up by keyboard height + account for iOS scroll offset
+      const offset = keyboardHeight > 0 ? -(keyboardHeight - vv.offsetTop) : 0;
+      this.element.style.transform = offset ? `translateY(${offset}px)` : "";
+    };
+    window.visualViewport.addEventListener("resize", this.#viewportHandler);
+    window.visualViewport.addEventListener("scroll", this.#viewportHandler);
+  }
+
+  #unbindViewport() {
+    if (!this.#viewportHandler || !window.visualViewport) return;
+    window.visualViewport.removeEventListener("resize", this.#viewportHandler);
+    window.visualViewport.removeEventListener("scroll", this.#viewportHandler);
+    this.element.style.transform = "";
+    this.#viewportHandler = null;
   }
 
   async #initTerminal() {
-    await init();
+    if (!this.hubIdValue) return;
 
-    this.#isMobile = "ontouchstart" in window;
-
-    this.#terminal = new Terminal({
-      cursorBlink: true,
-      fontFamily: "'JetBrainsMono NF', monospace",
-      fontSize: 14,
-      scrollback: 10000,
-      theme: {
-        background: "#09090b",
-      },
-    });
-
-    this.#fitAddon = new FitAddon();
-    this.#terminal.loadAddon(this.#fitAddon);
-
+    const isMobile = "ontouchstart" in window;
     const container = this.hasContainerTarget
       ? this.containerTarget
       : this.element;
-    this.#terminal.open(container);
 
-    // Neutralize ghostty's focusable elements on mobile.
-    // ghostty-web creates a hidden <textarea tabindex="0"> and sets
-    // contenteditable="true" on the container. iOS Safari focuses these on
-    // ANY touch regardless of preventDefault. We make them unfocusable by
-    // touch (tabindex=-1) and only focus via script on a deliberate tap.
-    if (this.#isMobile) {
-      this.#textarea = container.querySelector("textarea");
-      if (this.#textarea) {
-        this.#textarea.setAttribute("tabindex", "-1");
-        // Hide iOS text caret — the terminal canvas cursor is sufficient
-        this.#textarea.style.caretColor = "transparent";
-        this.#textarea.addEventListener("blur", () => {
-          // Re-lock when keyboard dismisses
-          this.#textarea?.setAttribute("tabindex", "-1");
-        });
-      }
-      // Remove contenteditable + tabindex from the container
-      container.removeAttribute("contenteditable");
-      container.setAttribute("tabindex", "-1");
-
-      // Hide the canvas-rendered scrollbar — we handle scroll via touch.
-      // showScrollbar lives on the internal renderer, not the Terminal.
-      // Walk the object tree to find and patch it.
-      this.#disableScrollbar();
-    }
-
-    await new Promise((resolve) => {
-      requestAnimationFrame(() => {
-        this.#fitAddon.fit();
-        resolve();
-      });
-    });
-
-    this.#terminal.onData((data) => {
-      // Cancel any momentum scrolling when user starts typing
-      if (this.#momentumAnimationId) {
-        cancelAnimationFrame(this.#momentumAnimationId);
-        this.#momentumAnimationId = null;
-      }
-      if (this.#isMobile && data === "\r") {
-        // iOS keyboard Enter → newline (Shift+Enter equivalent).
-        // The touch "Enter" button sends \r directly via sendEnter().
-        this.#sendInput("\n");
-      } else {
-        this.#sendInput(data);
-      }
-    });
-
-    if (this.#isMobile) {
-      this.#setupTouchScroll();
-    }
-    this.#setupKeyboardHandler();
-  }
-
-  // Touch scrolling with tap-to-focus.
-  //
-  // ghostty-web sets contenteditable + tabindex on its element, so the browser
-  // will focus (and open the keyboard) on any touch. We prevent that on
-  // touchstart and only call focus() ourselves on a clean tap (short + small).
-  #setupTouchScroll() {
-    const el = this.#terminal?.element;
-    if (!el) return;
-
-    const SENSITIVITY = 15;
-    const FRICTION = 0.92;
-    const TAP_DISTANCE = 15;   // px — generous for iOS finger jitter
-    const TAP_DURATION = 250;  // ms — must be a quick tap, not a hold/scroll
-    const MAX_SAMPLES = 5;
-
-    let startY = 0;
-    let lastY = 0;
-    let lastTime = 0;
-    let touchStartTime = 0;
-    let isScrolling = false;
-    const velocityHistory = [];
-
-    // Use capture phase + stopImmediatePropagation to fully intercept touches
-    // before ghostty's internal handlers can focus the textarea.
-    el.addEventListener("touchstart", (e) => {
-      if (e.touches.length !== 1) return;
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      if (this.#momentumAnimationId) {
-        cancelAnimationFrame(this.#momentumAnimationId);
-        this.#momentumAnimationId = null;
-      }
-      velocityHistory.length = 0;
-      startY = lastY = e.touches[0].clientY;
-      touchStartTime = lastTime = performance.now();
-      isScrolling = false;
-    }, { passive: false, capture: true });
-
-    el.addEventListener("touchmove", (e) => {
-      if (e.touches.length !== 1) return;
-      e.stopImmediatePropagation();
-
-      const now = performance.now();
-      const dt = Math.max(now - lastTime, 1);
-      const dy = e.touches[0].clientY - lastY;
-      const totalDelta = Math.abs(e.touches[0].clientY - startY);
-
-      lastY = e.touches[0].clientY;
-      lastTime = now;
-
-      if (totalDelta > TAP_DISTANCE) isScrolling = true;
-
-      if (isScrolling) {
-        const lines = Math.round(-dy / SENSITIVITY);
-        if (lines !== 0) this.#terminal.scrollLines(lines);
-
-        velocityHistory.push({ v: -dy / SENSITIVITY / dt, t: now });
-        while (velocityHistory.length > MAX_SAMPLES) velocityHistory.shift();
-
-        e.preventDefault();
-      }
-    }, { passive: false, capture: true });
-
-    el.addEventListener("touchend", (e) => {
-      e.stopImmediatePropagation();
-      const duration = performance.now() - touchStartTime;
-
-      if (!isScrolling && duration < TAP_DURATION) {
-        // Clean tap — make textarea focusable and focus it to open keyboard.
-        // tabindex="0" allows focus + keyboard; blur handler resets to -1.
-        if (this.#textarea) {
-          this.#textarea.setAttribute("tabindex", "0");
-          this.#textarea.focus();
-        } else {
-          this.#terminal?.focus();
-        }
-        return;
-      }
-
-      // Scroll gesture or long press — apply momentum, don't focus
-      let velocity = 0;
-      if (velocityHistory.length > 0) {
-        const now = performance.now();
-        let totalWeight = 0;
-        let weightedSum = 0;
-        for (const { v, t } of velocityHistory) {
-          const weight = Math.max(0, 1 - (now - t) / 150);
-          weightedSum += v * weight;
-          totalWeight += weight;
-        }
-        velocity = totalWeight > 0 ? weightedSum / totalWeight : 0;
-      }
-
-      if (Math.abs(velocity) > 0.01) {
-        const animate = () => {
-          if (Math.abs(velocity) < 0.005) {
-            this.#momentumAnimationId = null;
-            return;
-          }
-          const lines = Math.round(velocity * 16);
-          if (lines !== 0) this.#terminal.scrollLines(lines);
-          velocity *= FRICTION;
-          this.#momentumAnimationId = requestAnimationFrame(animate);
-        };
-        animate();
-      }
-    }, { passive: true, capture: true });
-  }
-
-  // iOS keyboard viewport adjustment.
-  //
-  // Resize the entire flex layout (this.element) to match the visual viewport
-  // so the terminal naturally shrinks and the touch controls stay visible.
-  // This avoids fighting iOS scroll behavior — the page never extends behind
-  // the keyboard because the layout simply fits within the visible area.
-  #setupKeyboardHandler() {
-    if (!window.visualViewport) return;
-
-    let isKeyboardOpen = false;
-    let debounceTimer = null;
-
-    const handleViewportChange = () => {
-      const vv = window.visualViewport;
-      const keyboardHeight = window.innerHeight - vv.height;
-
-      if (keyboardHeight > 100) {
-        // Keyboard is open — constrain the entire layout to the visual viewport
-        this.element.style.height = `${vv.height}px`;
-        // Prevent iOS from scrolling the page behind the keyboard
-        this.element.style.overflow = "hidden";
-        window.scrollTo(0, 0);
-        isKeyboardOpen = true;
-
-        requestAnimationFrame(() => {
-          this.#fitAddon?.fit();
-          this.#terminal?.scrollToBottom();
-          this.#sendResize();
-        });
-      } else if (isKeyboardOpen) {
-        // Keyboard closed — restore natural layout
-        this.element.style.height = "";
-        this.element.style.overflow = "";
-        isKeyboardOpen = false;
-
-        requestAnimationFrame(() => {
-          this.#fitAddon?.fit();
-          this.#sendResize();
-        });
-      }
-    };
-
-    this.#keyboardHandler = () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(handleViewportChange, 50);
-    };
-
-    window.visualViewport.addEventListener("resize", this.#keyboardHandler);
-    window.visualViewport.addEventListener("scroll", this.#keyboardHandler);
-  }
-
-  // Disable the canvas-rendered scrollbar by patching the renderer.
-  // showScrollbar() lives on the internal CanvasRenderer, not the Terminal.
-  #disableScrollbar() {
-    const findRenderer = (obj, depth = 0) => {
-      if (depth > 3 || !obj) return null;
-      if (typeof obj.showScrollbar === "function" && typeof obj.hideScrollbar === "function") {
-        return obj;
-      }
-      for (const key of Object.keys(obj)) {
-        const val = obj[key];
-        if (val && typeof val === "object" && !(val instanceof HTMLElement)) {
-          const found = findRenderer(val, depth + 1);
-          if (found) return found;
-        }
-      }
-      return null;
-    };
-
-    const renderer = findRenderer(this.#terminal);
-    if (renderer) {
-      renderer.scrollbarVisible = false;
-      renderer.scrollbarOpacity = 0;
-      renderer.showScrollbar = () => {};
-      renderer.hideScrollbar = () => {};
-    }
-  }
-
-  async #initConnections() {
-    if (!this.hubIdValue) return;
-
+    // 1. Acquire hub connection (establishes WebRTC peer)
     this.#hubConn = await ConnectionManager.acquire(
       HubConnection,
       this.hubIdValue,
       { hubId: this.hubIdValue },
     );
 
-    const termKey = TerminalConnection.key(
-      this.hubIdValue,
-      this.agentIndexValue,
-      this.ptyIndexValue,
-    );
+    // Guard: if disconnected during async acquire, release and bail
+    if (this.#disconnected) {
+      this.#hubConn.release();
+      this.#hubConn = null;
+      return;
+    }
 
-    this.#terminalConn = await ConnectionManager.acquire(
-      TerminalConnection,
-      termKey,
-      {
-        hubId: this.hubIdValue,
-        agentIndex: this.agentIndexValue,
-        ptyIndex: this.ptyIndexValue,
-        rows: this.#terminal?.rows || 24,
-        cols: this.#terminal?.cols || 80,
+    // 2. Create transport (stores params, no connection yet)
+    this.#transport = new WebRtcPtyTransport({
+      hubId: this.hubIdValue,
+      agentIndex: this.agentIndexValue,
+      ptyIndex: this.ptyIndexValue,
+    });
+
+    // 3. Create Restty — loads WASM, renders canvas
+    //    onBackend fires after WASM init → connectPty() subscribes terminal channel
+    this.#restty = new Restty({
+      root: container,
+      onPaneCreated: (pane) => {
+        if (isMobile) {
+          this.#imeInput = pane.imeInput;
+          this.#bindTapDetection(pane.canvas);
+          this.#bindMobileEnter(pane.imeInput);
+        }
       },
-    );
+      appOptions: {
+        ptyTransport: this.#transport,
+        autoResize: true,
+        fontSize: 14,
+        fontPreset: "none",
+        fontSources: [
+          // Primary font — JetBrains Mono with Nerd Font glyphs (~9.5MB for all 4 variants)
+          // Tries local install first, falls back to CDN
+          { type: "local", matchers: ["jetbrainsmono nerd font", "jetbrains mono nerd font", "jetbrains mono"], label: "JetBrains Mono (Local)" },
+          { type: "url", url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/Regular/JetBrainsMonoNLNerdFontMono-Regular.ttf", label: "JetBrains Mono Nerd Font Regular" },
+          { type: "url", url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/Bold/JetBrainsMonoNLNerdFontMono-Bold.ttf", label: "JetBrains Mono Nerd Font Bold" },
+          { type: "url", url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/Italic/JetBrainsMonoNLNerdFontMono-Italic.ttf", label: "JetBrains Mono Nerd Font Italic" },
+          { type: "url", url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/BoldItalic/JetBrainsMonoNLNerdFontMono-BoldItalic.ttf", label: "JetBrains Mono Nerd Font Bold Italic" },
+          // Nerd Font symbols — powerline, devicons, etc. (~2.5MB)
+          { type: "local", matchers: ["symbols nerd font mono", "symbols nerd font"], label: "Symbols Nerd Font (Local)" },
+          { type: "url", url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/NerdFontsSymbolsOnly/SymbolsNerdFontMono-Regular.ttf" },
+          // Symbol fallbacks (~3MB total) — misc Unicode symbols, arrows, box drawing, etc.
+          { type: "local", matchers: ["apple symbols", "applesymbols"], label: "Apple Symbols (Local)" },
+          { type: "url", url: "https://cdn.jsdelivr.net/gh/notofonts/noto-fonts@main/unhinted/ttf/NotoSansSymbols2/NotoSansSymbols2-Regular.ttf" },
+          { type: "url", url: "https://cdn.jsdelivr.net/gh/ChiefMikeK/ttf-symbola@master/Symbola.ttf" },
+        ],
+        touchSelectionMode: "long-press",
+        callbacks: {
+          onBackend: () => {
+            this.#restty?.connectPty();
+            if (!isMobile) this.#restty?.focus();
+          },
+          onTermSize: (cols, rows) => {
+            this.#hubConn?.sendResize(cols, rows);
+          },
+        },
+      },
+    });
+  }
 
-    this.#unsubscribers.push(
-      this.#terminalConn.onOutput((data) => {
-        this.#handleMessage({ type: "output", data });
-      }),
-    );
+  /**
+   * Detect tap vs swipe on the canvas. Handles three concerns:
+   *
+   * 1. Keyboard gating: Restty calls imeInput.focus() on pointerdown, opening
+   *    the keyboard on every touch. We wrap focus() so it only fires after we
+   *    confirm a tap (< 10px movement) on pointerup.
+   *
+   * 2. Momentum scrolling: Track touch velocity during the gesture. On release,
+   *    dispatch synthetic WheelEvents in a rAF loop with deceleration. Restty's
+   *    wheel handler converts pixel deltaY to scroll lines.
+   */
+  #bindTapDetection(canvas) {
+    const TAP_THRESHOLD = 10;
+    const FRICTION = 0.92;
+    const MIN_VELOCITY = 0.5;
+    const ime = this.#imeInput;
+    if (!ime) return;
 
-    this.#unsubscribers.push(
-      this.#terminalConn.onConnected(() => {
-        this.#handleConnected();
-      }),
-    );
+    // Gate imeInput.focus() — Restty's calls become no-ops during touch gestures
+    const nativeFocus = ime.focus.bind(ime);
+    let focusGated = false;
 
-    this.#unsubscribers.push(
-      this.#terminalConn.onDisconnected(() => {
-        this.#handleDisconnected();
-      }),
-    );
+    ime.focus = (opts) => {
+      if (!focusGated) nativeFocus(opts);
+    };
 
-    this.#unsubscribers.push(
-      this.#terminalConn.onError((err) => {
-        this.#handleError(err);
-      }),
-    );
+    // Velocity tracking for momentum
+    let lastY = 0;
+    let lastTime = 0;
+    let velocity = 0;
+
+    canvas.addEventListener("pointerdown", (e) => {
+      if (e.pointerType !== "touch") return;
+      this.#touchStart = { x: e.clientX, y: e.clientY };
+      focusGated = true;
+      lastY = e.clientY;
+      lastTime = e.timeStamp;
+      velocity = 0;
+      // Cancel any in-progress momentum
+      if (this.#momentumRafId) {
+        cancelAnimationFrame(this.#momentumRafId);
+        this.#momentumRafId = null;
+      }
+    }, true);
+
+    canvas.addEventListener("pointermove", (e) => {
+      if (e.pointerType !== "touch" || !this.#touchStart) return;
+      const dt = e.timeStamp - lastTime;
+      if (dt > 0) {
+        // Weighted average: blend new velocity with previous for smoothing
+        const instantVelocity = (lastY - e.clientY) / dt;
+        velocity = velocity * 0.4 + instantVelocity * 0.6;
+      }
+      lastY = e.clientY;
+      lastTime = e.timeStamp;
+    });
+
+    canvas.addEventListener("pointerup", (e) => {
+      if (e.pointerType !== "touch" || !this.#touchStart) {
+        focusGated = false;
+        return;
+      }
+
+      const dx = Math.abs(e.clientX - this.#touchStart.x);
+      const dy = Math.abs(e.clientY - this.#touchStart.y);
+      this.#touchStart = null;
+      focusGated = false;
+
+      if (dx < TAP_THRESHOLD && dy < TAP_THRESHOLD) {
+        // Deliberate tap — show keyboard
+        nativeFocus({ preventScroll: true });
+      } else if (Math.abs(velocity) > MIN_VELOCITY) {
+        // Scroll gesture with momentum — start inertia animation
+        this.#startMomentum(canvas, velocity);
+      }
+
+      velocity = 0;
+    });
+
+    canvas.addEventListener("pointercancel", () => {
+      this.#touchStart = null;
+      focusGated = false;
+      velocity = 0;
+    });
+  }
+
+  /**
+   * Mobile Enter → Shift+Enter. On mobile there's no Shift key, so Enter
+   * always submits (e.g. in Claude). Intercept at both keydown AND
+   * beforeinput levels — mobile IME processes Enter through the Input
+   * Events API, not keydown alone.
+   *
+   * Sends \n (0x0A / LF) which the CLI maps to "shift+enter" (see
+   * raw_input.rs:236). This works regardless of kitty keyboard protocol
+   * state. The touch button `sendEnter` still sends bare \r for submitting.
+   */
+  #bindMobileEnter(imeInput) {
+    let enterHandled = false;
+
+    imeInput.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" || e.shiftKey) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      enterHandled = true;
+      this.#restty?.sendKeyInput("\n");
+    }, true);
+
+    imeInput.addEventListener("beforeinput", (e) => {
+      if (e.inputType === "insertLineBreak" || e.inputType === "insertParagraph") {
+        e.preventDefault();
+        if (!enterHandled) {
+          this.#restty?.sendKeyInput("\n");
+        }
+        enterHandled = false;
+      }
+    }, true);
+  }
+
+  /**
+   * Momentum scroll: dispatches synthetic WheelEvents with decaying velocity.
+   * Restty's onWheel handler picks these up and calls scrollViewportByLines().
+   */
+  #startMomentum(canvas, initialVelocity) {
+    const FRICTION = 0.96;
+    const MIN_VELOCITY = 0.2;
+    let vel = initialVelocity * 32; // Convert px/ms → px/frame
+
+    const tick = () => {
+      vel *= FRICTION;
+      if (Math.abs(vel) < MIN_VELOCITY) {
+        this.#momentumRafId = null;
+        return;
+      }
+
+      canvas.dispatchEvent(new WheelEvent("wheel", {
+        deltaY: vel,
+        deltaMode: 0,  // DOM_DELTA_PIXEL
+        bubbles: true,
+        cancelable: true,
+      }));
+
+      this.#momentumRafId = requestAnimationFrame(tick);
+    };
+
+    this.#momentumRafId = requestAnimationFrame(tick);
   }
 
   // Public actions for touch control buttons
-  sendCtrlC() {
-    this.#sendInput("\x03");
-  }
-  sendEnter() {
-    this.#sendInput("\r");
-  }
-  sendEscape() {
-    this.#sendInput("\x1b");
-  }
-  sendTab() {
-    this.#sendInput("\t");
-  }
-  sendArrowUp() {
-    this.#sendInput("\x1b[A");
-  }
-  sendArrowDown() {
-    this.#sendInput("\x1b[B");
-  }
-  sendArrowLeft() {
-    this.#sendInput("\x1b[D");
-  }
-  sendArrowRight() {
-    this.#sendInput("\x1b[C");
-  }
+  // sendKeyInput routes directly to ptyTransport.sendInput() (same path as keyboard events).
+  // sendInput() writes to WASM as "program" input which doesn't produce PTY output for control chars.
+  sendCtrlC() { this.#restty?.sendKeyInput("\x03"); }
+  sendEnter() { this.#restty?.sendKeyInput("\r"); }
+  sendEscape() { this.#restty?.sendKeyInput("\x1b"); }
+  sendTab() { this.#restty?.sendKeyInput("\t"); }
+  sendArrowUp() { this.#restty?.sendKeyInput("\x1b[A"); }
+  sendArrowDown() { this.#restty?.sendKeyInput("\x1b[B"); }
+  sendArrowLeft() { this.#restty?.sendKeyInput("\x1b[D"); }
+  sendArrowRight() { this.#restty?.sendKeyInput("\x1b[C"); }
 
   // Public API
-  clear() {
-    this.#terminal?.clear();
-  }
-  writeln(text) {
-    this.#terminal?.writeln(text);
-  }
-  focus() {
-    if (this.#textarea) this.#textarea.setAttribute("tabindex", "0");
-    this.#terminal?.focus();
-  }
-
-  getDimensions() {
-    return this.#terminal
-      ? { cols: this.#terminal.cols, rows: this.#terminal.rows }
-      : { cols: 80, rows: 24 };
-  }
-
-  // Connection handlers
-  #handleConnected() {
-    if (!this.#terminal) return;
-    this.#sendResize();
-    this.focus();
-  }
-
-  #handleDisconnected() {
-    this.#terminal?.writeln("\r\n[Disconnected]");
-  }
-
-  #handleMessage(message) {
-    switch (message.type) {
-      case "output":
-        this.#terminal?.write(message.data);
-        break;
-      case "clear":
-        this.#terminal?.clear();
-        break;
-      case "agent_selected":
-      case "agent_channel_switched":
-      case "pty_channel_switched":
-        this.#terminal?.clear();
-        requestAnimationFrame(() => {
-          this.#fitAddon?.fit();
-          this.#sendResize();
-        });
-        break;
-    }
-  }
-
-  #handleError(error) {
-    const message =
-      typeof error === "object"
-        ? error.message || error.reason || JSON.stringify(error)
-        : error;
-    this.#terminal?.writeln(`\r\n[Error: ${message}]`);
-  }
-
-  // I/O helpers
-  async #sendInput(data) {
-    if (!this.#terminalConn) return;
-    await this.#terminalConn.sendInput(data);
-  }
-
-  async #sendResize() {
-    if (!this.#terminal) return;
-
-    const cols = this.#terminal.cols;
-    const rows = this.#terminal.rows;
-
-    this.#terminalConn?.sendResize(cols, rows);
-    this.#hubConn?.sendResize(cols, rows);
-  }
-
-  #handleResize() {
-    this.#fitAddon?.fit();
-
-    if (this.#resizeDebounceTimer) {
-      clearTimeout(this.#resizeDebounceTimer);
-    }
-    this.#resizeDebounceTimer = setTimeout(() => {
-      this.#resizeDebounceTimer = null;
-      this.#sendResize();
-    }, 150);
-  }
+  clear() { this.#restty?.clearScreen(); }
+  focus() { this.#restty?.focus(); }
 }

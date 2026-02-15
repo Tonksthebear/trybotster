@@ -87,6 +87,9 @@ webrtc = "0.12"
 # QR code generation for browser connection (qrcodegen supports alphanumeric mode for smaller QR)
 qrcodegen = "1.8"
 
+# Headless single-line text input (buffer + cursor management)
+tui-input = "0.15"
+
 # TTY detection for interactive prompts
 atty = "0.2"
 flate2 = "1.1.8"

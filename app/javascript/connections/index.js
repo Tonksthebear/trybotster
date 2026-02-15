@@ -13,7 +13,7 @@
  *   const term = await ConnectionManager.acquire(TerminalConnection, key, {
  *     hubId, agentIndex, ptyIndex
  *   });
- *   term.onOutput((data) => xterm.write(data));
+ *   term.onOutput((data) => terminal.write(data));
  *
  *   // Preview connection (HTTP proxy)
  *   const previewKey = PreviewConnection.key(hubId, agentIndex, ptyIndex);
