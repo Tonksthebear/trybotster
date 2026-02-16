@@ -8,7 +8,7 @@
 %>
 
 <%# Main terminal view %>
-<div class="h-dvh flex flex-col overflow-hidden mobile-keyboard:-translate-y-(--kb-shift)"
+<div class="h-dvh flex flex-col overflow-hidden mobile-keyboard:h-(--kb-height)"
      data-controller="terminal-display"
      data-terminal-display-hub-id-value="<%= Current.hub.id %>"
      data-terminal-display-agent-index-value="<%= Current.agent_index %>"
@@ -16,7 +16,7 @@
 >
 
   <%# Header %>
-  <div class="shrink-0 border-b border-zinc-800 bg-zinc-900/50">
+  <div class="shrink-0 border-b border-zinc-800 bg-zinc-900/50 mobile-keyboard:hidden">
     <%# Mobile header - compact %>
     <div class="lg:hidden px-3 py-2">
       <div class="flex items-center justify-between gap-2">
@@ -63,7 +63,7 @@
 
     <div class="flex-1 flex flex-col min-h-0 bg-zinc-950 overflow-hidden">
       <%# Terminal header bar %>
-      <div class="shrink-0 px-2 lg:px-4 py-1.5 lg:py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900"
+      <div class="shrink-0 px-2 lg:px-4 py-1.5 lg:py-2 border-b border-zinc-800 flex items-center justify-between bg-zinc-900 mobile-keyboard:hidden"
            data-controller="pty-tabs"
            data-pty-tabs-hub-id-value="<%= Current.hub.id %>"
            data-pty-tabs-agent-index-value="<%= Current.agent_index %>"
