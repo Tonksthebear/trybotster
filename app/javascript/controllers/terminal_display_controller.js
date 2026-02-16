@@ -39,8 +39,6 @@ export default class extends Controller {
   #momentumRafId = null;
   #resizeFixTimer = null;
   #disconnected = false;
-  #cursorRow = 0;
-  #cellH = 0;
 
   connect() {
     this.#disconnected = false;
@@ -70,10 +68,9 @@ export default class extends Controller {
 
   /**
    * Track the virtual keyboard on iOS Safari.
-   * Sets --kb-shift CSS variable and data-mobile-keyboard attribute on body.
-   * --kb-shift is the pixel amount needed to keep the cursor row and mobile
-   * buttons visible above the keyboard. Consumers use the mobile-keyboard:
-   * Tailwind variant and --kb-shift variable for styling.
+   * Sets --kb-height CSS variable to the visible viewport height and
+   * data-mobile-keyboard attribute on body. Consumers use the
+   * mobile-keyboard: Tailwind variant to resize the terminal container.
    */
   #bindViewport() {
     if (!window.visualViewport) return;
@@ -81,33 +78,12 @@ export default class extends Controller {
       const vv = window.visualViewport;
       const keyboardHeight = window.innerHeight - vv.height;
       if (keyboardHeight <= 0) {
-        document.body.style.removeProperty("--kb-shift");
+        document.body.style.removeProperty("--kb-height");
         delete document.body.dataset.mobileKeyboard;
         return;
       }
-      // Find the cursor's absolute Y position on screen.
-      // The container target holds the terminal canvas; its top is where
-      // row 0 starts. Cursor is at (cursorRow + 1) * cellH below that
-      // (the +1 accounts for the row itself needing to be fully visible).
-      const container = this.hasContainerTarget ? this.containerTarget : this.element;
-      const termTop = container.getBoundingClientRect().top;
-      const dpr = window.devicePixelRatio || 1;
-      const cellH = this.#cellH / dpr;
-      const cursorBottom = termTop + (this.#cursorRow + 1) * cellH;
-      // How far below the visible viewport is the cursor?
-      const cursorOverflow = cursorBottom - vv.height + vv.offsetTop;
-      // Always shift enough to keep the mobile buttons above the keyboard.
-      // The buttons are at the bottom of the element, so they need the full
-      // keyboard shift to stay visible.
-      const buttonsShift = keyboardHeight - vv.offsetTop;
-      const shift = Math.max(0, cursorOverflow, buttonsShift);
-      // Set CSS variable and data attribute on body for consumers
-      document.body.style.setProperty("--kb-shift", `${shift}px`);
-      if (shift > 0) {
-        document.body.dataset.mobileKeyboard = "";
-      } else {
-        delete document.body.dataset.mobileKeyboard;
-      }
+      document.body.style.setProperty("--kb-height", `${vv.height}px`);
+      document.body.dataset.mobileKeyboard = "";
     };
     window.visualViewport.addEventListener("resize", this.#viewportHandler);
     window.visualViewport.addEventListener("scroll", this.#viewportHandler);
@@ -117,7 +93,7 @@ export default class extends Controller {
     if (!this.#viewportHandler || !window.visualViewport) return;
     window.visualViewport.removeEventListener("resize", this.#viewportHandler);
     window.visualViewport.removeEventListener("scroll", this.#viewportHandler);
-    document.body.style.removeProperty("--kb-shift");
+    document.body.style.removeProperty("--kb-height");
     delete document.body.dataset.mobileKeyboard;
     this.#viewportHandler = null;
   }
@@ -221,8 +197,6 @@ export default class extends Controller {
               this.#restty?.updateSize(true);
             }, 100);
           },
-          onCursor: (_col, row) => { this.#cursorRow = row; },
-          onCellSize: (_cellW, cellH) => { this.#cellH = cellH; },
         },
       },
     });

@@ -26,7 +26,7 @@
   </head>
 
   <body class="bg-zinc-950 text-zinc-100 h-dvh font-sans antialiased flex flex-col" data-controller="hub" data-hub>
-    <%= render Elements::SidebarComponent.new(class: "flex-1 min-h-0 flex flex-col overflow-y-auto mobile-keyboard:overflow-y-visible") do |layout| %>
+    <%= render Elements::SidebarComponent.new(class: "flex-1 min-h-0 flex flex-col overflow-y-auto") do |layout| %>
       <% layout.with_desktop_sidebar do %>
         <%= render "layouts/sidebar_content", sidebar_id: "desktop" %>
       <% end %>
@@ -34,7 +34,7 @@
         <%= render "layouts/sidebar_content", sidebar_id: "mobile" %>
       <% end %>
 
-      <% layout.with_header class: "bg-white dark:border-white/5 dark:bg-gray-900 lg:flex mobile-keyboard:-z-1" do %>
+      <% layout.with_header class: "bg-white dark:border-white/5 dark:bg-gray-900 lg:flex mobile-keyboard:hidden" do %>
         <%= turbo_stream_from [Current.user, :hubs] %>
         <%# Mobile header content - logo %>
         <%= link_to root_path, class: "flex items-center gap-2 text-primary-400" do %>
