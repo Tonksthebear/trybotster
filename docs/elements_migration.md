@@ -512,64 +512,7 @@ class="bg-success-500/10 text-success-400"
 
 ---
 
-### 4.2 `app/views/settings/show.html.erb` (108 lines)
-
-**Priority:** Medium
-
-#### Toggle (Lines 34-52)
-
-**Current:**
-```erb
-<label class="flex items-start gap-4 cursor-pointer group">
-  <div class="relative flex items-center justify-center shrink-0 mt-0.5">
-    <%= f.check_box :server_assisted_pairing, class: "peer sr-only" %>
-    <div class="w-5 h-5 border-2 border-zinc-600 rounded peer-checked:border-cyan-500 peer-checked:bg-cyan-500 transition-colors">
-      <svg>...</svg>
-    </div>
-  </div>
-  <div class="flex-1">
-    <span>Enable Convenience Mode</span>
-    <span>Description...</span>
-  </div>
-</label>
-```
-
-**After (with FormBuilder):**
-```erb
-<%= form_with model: current_user, url: settings_path, method: :patch, builder: Elements::FormBuilder, class: "space-y-6" do |f| %>
-  ...
-  <label class="flex items-start gap-4 cursor-pointer group">
-    <div class="shrink-0 mt-1">
-      <%= f.toggle :server_assisted_pairing %>
-    </div>
-    <div class="flex-1">
-      <span class="block font-medium text-zinc-200 group-hover:text-zinc-100 transition-colors">
-        Enable Convenience Mode
-      </span>
-      <span class="block text-sm text-zinc-500 mt-1">
-        Click hubs in the dashboard to connect directly. Less secure because the server sees encryption keys.
-      </span>
-    </div>
-  </label>
-  ...
-<% end %>
-```
-
-#### Submit Button (Lines 70-73)
-
-**After:**
-```erb
-<%= render Elements::ButtonComponent.new(
-  as: :button,
-  type: :submit,
-  color: :primary,
-  size: :lg
-) { "Save Settings" } %>
-```
-
----
-
-### 4.3 `app/views/home/index.html.erb` (164 lines)
+### 4.2 `app/views/home/index.html.erb` (164 lines)
 
 **Priority:** Medium
 

@@ -37,7 +37,10 @@ export default class extends Controller {
   #touchStart = null;
   #viewportHandler = null;
   #momentumRafId = null;
+  #resizeFixTimer = null;
   #disconnected = false;
+  #cursorRow = 0;
+  #cellH = 0;
 
   connect() {
     this.#disconnected = false;
@@ -53,6 +56,7 @@ export default class extends Controller {
       cancelAnimationFrame(this.#momentumRafId);
       this.#momentumRafId = null;
     }
+    clearTimeout(this.#resizeFixTimer);
 
     this.#hubConn?.release();
     this.#hubConn = null;
@@ -65,22 +69,45 @@ export default class extends Controller {
   }
 
   /**
-   * Shift the terminal view when the virtual keyboard opens.
-   * On iOS Safari, dvh doesn't shrink when the keyboard appears — it overlays
-   * the page. Instead of resizing (which triggers Restty to re-layout the grid),
-   * we translate the container up so the bottom (buttons + input area) stays
-   * above the keyboard. The top of the terminal clips off-screen, which is fine
-   * since the user is interacting at the bottom.
+   * Track the virtual keyboard on iOS Safari.
+   * Sets --kb-shift CSS variable and data-mobile-keyboard attribute on body.
+   * --kb-shift is the pixel amount needed to keep the cursor row and mobile
+   * buttons visible above the keyboard. Consumers use the mobile-keyboard:
+   * Tailwind variant and --kb-shift variable for styling.
    */
   #bindViewport() {
     if (!window.visualViewport) return;
     this.#viewportHandler = () => {
       const vv = window.visualViewport;
-      // How much the keyboard covers: full layout height minus visible viewport
       const keyboardHeight = window.innerHeight - vv.height;
-      // Shift up by keyboard height + account for iOS scroll offset
-      const offset = keyboardHeight > 0 ? -(keyboardHeight - vv.offsetTop) : 0;
-      this.element.style.transform = offset ? `translateY(${offset}px)` : "";
+      if (keyboardHeight <= 0) {
+        document.body.style.removeProperty("--kb-shift");
+        delete document.body.dataset.mobileKeyboard;
+        return;
+      }
+      // Find the cursor's absolute Y position on screen.
+      // The container target holds the terminal canvas; its top is where
+      // row 0 starts. Cursor is at (cursorRow + 1) * cellH below that
+      // (the +1 accounts for the row itself needing to be fully visible).
+      const container = this.hasContainerTarget ? this.containerTarget : this.element;
+      const termTop = container.getBoundingClientRect().top;
+      const dpr = window.devicePixelRatio || 1;
+      const cellH = this.#cellH / dpr;
+      const cursorBottom = termTop + (this.#cursorRow + 1) * cellH;
+      // How far below the visible viewport is the cursor?
+      const cursorOverflow = cursorBottom - vv.height + vv.offsetTop;
+      // Always shift enough to keep the mobile buttons above the keyboard.
+      // The buttons are at the bottom of the element, so they need the full
+      // keyboard shift to stay visible.
+      const buttonsShift = keyboardHeight - vv.offsetTop;
+      const shift = Math.max(0, cursorOverflow, buttonsShift);
+      // Set CSS variable and data attribute on body for consumers
+      document.body.style.setProperty("--kb-shift", `${shift}px`);
+      if (shift > 0) {
+        document.body.dataset.mobileKeyboard = "";
+      } else {
+        delete document.body.dataset.mobileKeyboard;
+      }
     };
     window.visualViewport.addEventListener("resize", this.#viewportHandler);
     window.visualViewport.addEventListener("scroll", this.#viewportHandler);
@@ -90,7 +117,8 @@ export default class extends Controller {
     if (!this.#viewportHandler || !window.visualViewport) return;
     window.visualViewport.removeEventListener("resize", this.#viewportHandler);
     window.visualViewport.removeEventListener("scroll", this.#viewportHandler);
-    this.element.style.transform = "";
+    document.body.style.removeProperty("--kb-shift");
+    delete document.body.dataset.mobileKeyboard;
     this.#viewportHandler = null;
   }
 
@@ -128,8 +156,16 @@ export default class extends Controller {
     this.#restty = new Restty({
       root: container,
       onPaneCreated: (pane) => {
+        container.addEventListener("contextmenu", (e) => e.preventDefault());
         if (isMobile) {
           this.#imeInput = pane.imeInput;
+          // Suppress iOS autocorrect/QuickType bar — not useful for terminal input
+          Object.assign(pane.imeInput, {
+            autocorrect: "off",
+            autocomplete: "off",
+            autocapitalize: "off",
+            spellcheck: false,
+          });
           this.#bindTapDetection(pane.canvas);
           this.#bindMobileEnter(pane.imeInput);
         }
@@ -155,15 +191,38 @@ export default class extends Controller {
           { type: "url", url: "https://cdn.jsdelivr.net/gh/notofonts/noto-fonts@main/unhinted/ttf/NotoSansSymbols2/NotoSansSymbols2-Regular.ttf" },
           { type: "url", url: "https://cdn.jsdelivr.net/gh/ChiefMikeK/ttf-symbola@master/Symbola.ttf" },
         ],
+        maxScrollback: 10_000_000, // 10MB — ~7,000 lines at 175 cols
         touchSelectionMode: "long-press",
         callbacks: {
+          onLog: (line) => {
+            if (line.includes("StringAllocOutOfMemory")) {
+              console.warn("[terminal] WASM OOM detected (should not happen with patched ghostty-vt)");
+            }
+          },
           onBackend: () => {
             this.#restty?.connectPty();
             if (!isMobile) this.#restty?.focus();
           },
           onTermSize: (cols, rows) => {
-            this.#hubConn?.sendResize(cols, rows);
+            if (this.#hubConn?.handshakeComplete) {
+              this.#hubConn.sendResize(cols, rows);
+            } else if (this.#hubConn) {
+              // Queue initial resize — fires before DataChannel is open.
+              const handler = () => {
+                this.#hubConn?.off("connected", handler);
+                this.#hubConn?.sendResize(cols, rows);
+              };
+              this.#hubConn.on("connected", handler);
+            }
+            // Force re-layout after resize settles to fix garbled rendering.
+            // Restty's internal grid can desync from the canvas after resize.
+            clearTimeout(this.#resizeFixTimer);
+            this.#resizeFixTimer = setTimeout(() => {
+              this.#restty?.updateSize(true);
+            }, 100);
           },
+          onCursor: (_col, row) => { this.#cursorRow = row; },
+          onCellSize: (_cellW, cellH) => { this.#cellH = cellH; },
         },
       },
     });
@@ -182,12 +241,11 @@ export default class extends Controller {
    */
   #bindTapDetection(canvas) {
     const TAP_THRESHOLD = 10;
-    const FRICTION = 0.92;
-    const MIN_VELOCITY = 0.5;
     const ime = this.#imeInput;
     if (!ime) return;
 
-    // Gate imeInput.focus() — Restty's calls become no-ops during touch gestures
+    // Gate imeInput.focus() — Restty calls focus on pointerdown which opens
+    // the keyboard on every touch. We only want keyboard on deliberate taps.
     const nativeFocus = ime.focus.bind(ime);
     let focusGated = false;
 
@@ -195,7 +253,10 @@ export default class extends Controller {
       if (!focusGated) nativeFocus(opts);
     };
 
-    // Velocity tracking for momentum
+    // Restty handles live drag scrolling natively in long-press mode — its
+    // onPointerMove calls scrollViewportByLines() on pan gestures.
+    // We add: focus gating, velocity tracking, and momentum on release.
+
     let lastY = 0;
     let lastTime = 0;
     let velocity = 0;
@@ -207,18 +268,18 @@ export default class extends Controller {
       lastY = e.clientY;
       lastTime = e.timeStamp;
       velocity = 0;
-      // Cancel any in-progress momentum
       if (this.#momentumRafId) {
         cancelAnimationFrame(this.#momentumRafId);
         this.#momentumRafId = null;
       }
     }, true);
 
+    // Track velocity during drag for momentum on release.
+    // Restty's onPointerMove handles the actual live scrolling.
     canvas.addEventListener("pointermove", (e) => {
       if (e.pointerType !== "touch" || !this.#touchStart) return;
       const dt = e.timeStamp - lastTime;
       if (dt > 0) {
-        // Weighted average: blend new velocity with previous for smoothing
         const instantVelocity = (lastY - e.clientY) / dt;
         velocity = velocity * 0.4 + instantVelocity * 0.6;
       }
@@ -238,13 +299,17 @@ export default class extends Controller {
       focusGated = false;
 
       if (dx < TAP_THRESHOLD && dy < TAP_THRESHOLD) {
-        // Deliberate tap — show keyboard
         nativeFocus({ preventScroll: true });
-      } else if (Math.abs(velocity) > MIN_VELOCITY) {
-        // Scroll gesture with momentum — start inertia animation
-        this.#startMomentum(canvas, velocity);
+      } else {
+        // Scroll gesture — start momentum if fast enough
+        if (Math.abs(velocity) > 0.5) {
+          this.#startMomentum(canvas, velocity);
+        }
+        if (document.body.hasAttribute("data-mobile-keyboard")) {
+          // iOS dismisses keyboard during scroll — re-focus to bring it back
+          nativeFocus({ preventScroll: true });
+        }
       }
-
       velocity = 0;
     });
 
@@ -253,6 +318,39 @@ export default class extends Controller {
       focusGated = false;
       velocity = 0;
     });
+  }
+
+  /**
+   * Momentum scroll after touch release. Dispatches synthetic WheelEvents
+   * with shiftKey=true to bypass Restty's mouse mode routing (apps like
+   * Claude TUI capture mouse events, but shift+wheel falls through to
+   * viewport scrolling). The 0.5x speed from shiftKey is compensated
+   * by the 6x deltaY multiplier (net 3x vs native wheel).
+   */
+  #startMomentum(canvas, initialVelocity) {
+    const FRICTION = 0.96;
+    const MIN_VELOCITY = 0.2;
+    let vel = initialVelocity * 32; // Convert px/ms → px/frame
+
+    const tick = () => {
+      vel *= FRICTION;
+      if (Math.abs(vel) < MIN_VELOCITY) {
+        this.#momentumRafId = null;
+        return;
+      }
+
+      canvas.dispatchEvent(new WheelEvent("wheel", {
+        deltaY: vel * 6, // Compensate for shiftKey's 0.5x speed
+        deltaMode: 0,
+        shiftKey: true,  // Bypass mouse mode → viewport scroll
+        bubbles: true,
+        cancelable: true,
+      }));
+
+      this.#momentumRafId = requestAnimationFrame(tick);
+    };
+
+    this.#momentumRafId = requestAnimationFrame(tick);
   }
 
   /**
@@ -285,35 +383,6 @@ export default class extends Controller {
         enterHandled = false;
       }
     }, true);
-  }
-
-  /**
-   * Momentum scroll: dispatches synthetic WheelEvents with decaying velocity.
-   * Restty's onWheel handler picks these up and calls scrollViewportByLines().
-   */
-  #startMomentum(canvas, initialVelocity) {
-    const FRICTION = 0.96;
-    const MIN_VELOCITY = 0.2;
-    let vel = initialVelocity * 32; // Convert px/ms → px/frame
-
-    const tick = () => {
-      vel *= FRICTION;
-      if (Math.abs(vel) < MIN_VELOCITY) {
-        this.#momentumRafId = null;
-        return;
-      }
-
-      canvas.dispatchEvent(new WheelEvent("wheel", {
-        deltaY: vel,
-        deltaMode: 0,  // DOM_DELTA_PIXEL
-        bubbles: true,
-        cancelable: true,
-      }));
-
-      this.#momentumRafId = requestAnimationFrame(tick);
-    };
-
-    this.#momentumRafId = requestAnimationFrame(tick);
   }
 
   // Public actions for touch control buttons

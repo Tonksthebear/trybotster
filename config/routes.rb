@@ -31,7 +31,6 @@ Rails.application.routes.draw do
     scope module: :hubs do
       resource :heartbeat, only: [ :update ]
       resources :notifications, only: [ :create ]
-      resource :connection, only: [ :show ]
       resource :webrtc, only: [ :show ], controller: :webrtc  # GET config
       resource :settings, only: [ :show ], controller: :settings
       # Agent terminal view by index
@@ -63,7 +62,7 @@ Rails.application.routes.draw do
   resources :devices, only: [ :index, :create, :destroy ]
 
   # User settings
-  resource :settings, only: [ :show, :update ]
+  resource :settings, only: [ :show ]
 
   root to: "home#index"
 

@@ -406,12 +406,16 @@ impl Hub {
             &browser_identity[..browser_identity.len().min(8)]
         );
 
-        // Remove and disconnect the channel.
-        // After the state handler fix, disconnect() is usually a no-op
-        // (dc/pc already taken and closed), but this is belt-and-suspenders.
-        // No timeout — close() will complete when SCTP gives up retransmitting,
-        // and dropping without close() leaks sockets.
+        // Remove the channel and track its close notification.
+        // The state handler (Disconnected/Failed) already takes pc/dc and spawns
+        // a close task — disconnect() here is belt-and-suspenders. We store the
+        // close_complete Notify so the offer handler can await socket release
+        // before creating a replacement channel (prevents fd exhaustion).
         if let Some(mut channel) = self.webrtc_channels.remove(browser_identity) {
+            let close_rx = channel.close_receiver();
+            let olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
+            self.webrtc_pending_closes.insert(olm_key, close_rx);
+
             self.tokio_runtime.spawn(async move {
                 channel.disconnect().await;
                 log::debug!("[WebRTC] Channel disconnect completed");
@@ -853,21 +857,32 @@ impl Hub {
             // Send terminal snapshot first (if any), chunked to fit within
             // SCTP max message size (DataChannel limit ~256KB, we use 64KB chunks
             // to leave room for encryption overhead and OlmEnvelope framing).
-            // The snapshot is clean ANSI from contents_formatted() — no garbling.
+            //
+            // Snapshot chunks use prefix 0x02 with an 8-byte header:
+            //   [0x02][snapshot_id:4 LE][chunk_idx:2 LE][total_chunks:2 LE][data]
+            // The browser buffers chunks and only feeds data to the terminal
+            // when all chunks arrive, preventing garbled output from partial
+            // delivery if the connection drops mid-snapshot.
             if !snapshot.is_empty() {
                 const CHUNK_SIZE: usize = 64 * 1024;
                 let num_chunks = (snapshot.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+                let snapshot_id: u32 = rand::random();
                 log::debug!(
-                    "[Lua] Sending {} bytes of snapshot in {} chunks for agent {} pty {}",
+                    "[Lua] Sending {} bytes of snapshot in {} chunks (id={:#010x}) for agent {} pty {}",
                     snapshot.len(),
                     num_chunks,
+                    snapshot_id,
                     agent_index,
                     pty_index
                 );
 
-                for chunk in snapshot.chunks(CHUNK_SIZE) {
-                    let mut raw_message = Vec::with_capacity(prefix.len() + chunk.len());
-                    raw_message.extend(&prefix);
+                for (i, chunk) in snapshot.chunks(CHUNK_SIZE).enumerate() {
+                    // 9-byte header: prefix + snapshot_id + chunk_idx + total_chunks
+                    let mut raw_message = Vec::with_capacity(9 + chunk.len());
+                    raw_message.push(0x02); // snapshot chunk prefix
+                    raw_message.extend_from_slice(&snapshot_id.to_le_bytes());
+                    raw_message.extend_from_slice(&(i as u16).to_le_bytes());
+                    raw_message.extend_from_slice(&(num_chunks as u16).to_le_bytes());
                     raw_message.extend(chunk);
 
                     if output_tx
@@ -1621,6 +1636,33 @@ impl Hub {
                 );
                 self.cleanup_webrtc_channel(&stale_id, "replaced");
             }
+
+            // Wait for the previous connection's sockets to be released before
+            // creating a replacement. Each WebRTC connection opens ~15 UDP sockets
+            // for ICE gathering; without this, rapid reconnection cycles (e.g. phone
+            // lock/unlock) accumulate sockets and exhaust the fd limit.
+            // 500ms timeout: enough for the common case where close just completed,
+            // but not long enough to block signaling. If the old connection hasn't
+            // detected the disconnect yet (ICE timeout takes 30-60s), waiting longer
+            // won't help — proceed and let cleanup happen in the background.
+            if let Some(mut close_rx) = self.webrtc_pending_closes.remove(olm_key) {
+                if *close_rx.borrow() {
+                    log::debug!("[WebRTC] Previous connection already closed");
+                } else {
+                    let _guard = self.tokio_runtime.enter();
+                    match self.tokio_runtime.block_on(
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            close_rx.wait_for(|v| *v),
+                        )
+                    ) {
+                        Ok(Ok(_)) => log::debug!("[WebRTC] Previous connection sockets released"),
+                        Ok(Err(_)) => log::debug!("[WebRTC] Close channel dropped, proceeding"),
+                        Err(_) => log::debug!("[WebRTC] Previous connection still closing, proceeding anyway"),
+                    }
+                }
+            }
+
             let mut channel = WebRtcChannel::builder()
                 .server_url(&server_url)
                 .api_key(&api_key)

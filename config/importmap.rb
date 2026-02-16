@@ -9,7 +9,9 @@ pin "turbo_stream_update_attribute"
 pin_all_from "app/javascript/controllers", under: "controllers"
 pin_all_from "app/javascript/channels", under: "channels"
 # Restty terminal (libghostty-vt WASM + WebGPU/WebGL2 rendering)
-pin "restty", to: "https://esm.sh/restty@0.1.28"
+# Local restty build (testing maxScrollback fix)
+pin "restty", to: "restty-entry.js"
+pin "restty-chunk", to: "restty-chunk.js"
 
 # Vodozemac crypto for E2E encryption (direct Olm)
 pin "matrix/bundle", to: "matrix/bundle.js"

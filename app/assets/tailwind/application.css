@@ -3,6 +3,8 @@
 
 /* Force dark mode - always apply dark: variants regardless of system preference */
 @variant dark (&);
+/* Mobile keyboard open — matches when body has data-mobile-keyboard */
+@custom-variant mobile-keyboard (body[data-mobile-keyboard] &);
 @source "../../../app/components";
 @source "../../../config/elements.yml";
 
@@ -33,4 +35,5 @@
 .scrollbar-none::-webkit-scrollbar {
   display: none;
 }
+
 

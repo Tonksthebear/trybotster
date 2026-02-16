@@ -2,13 +2,6 @@
 
 # Device represents a registered client (CLI or browser) with E2E encryption keys.
 #
-# Two security modes:
-# 1. Secure mode (CLI default): public_key is NULL on server.
-#    Key exchange happens via QR code URL fragment - server cannot MITM.
-#
-# 2. Convenience mode: public_key IS stored on server.
-#    Enables server-assisted pairing but allows potential MITM.
-#
 # Browser devices always store public_key (they need it for bidirectional key exchange).
 class Device < ApplicationRecord
   belongs_to :user
@@ -47,11 +40,6 @@ class Device < ApplicationRecord
   # In secure mode, key exchange must happen via QR code URL fragment
   def secure_mode?
     cli? && public_key.blank?
-  end
-
-  # Device supports server-assisted pairing if public_key IS stored
-  def server_assisted_pairing?
-    public_key.present?
   end
 
   def touch_last_seen!

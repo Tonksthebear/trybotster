@@ -178,6 +178,16 @@ pub struct Hub {
     /// Connections that don't reach "Connected" within 30 seconds are cleaned up.
     webrtc_connection_started: std::collections::HashMap<String, Instant>,
 
+    /// Pending close notifications keyed by Olm identity key.
+    ///
+    /// When a WebRTC channel is cleaned up, its `close_complete` watch receiver
+    /// is stored here. Before creating a replacement channel for the same device,
+    /// the offer handler awaits `wait_for(|v| *v)` (with timeout) to ensure old
+    /// sockets are released first, preventing fd exhaustion from rapid reconnection
+    /// cycles. Using `watch` instead of `Notify` avoids the race where the close
+    /// signal fires before anyone is waiting.
+    webrtc_pending_closes: std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>,
+
     /// Sender for PTY output messages from forwarder tasks.
     ///
     /// Forwarder tasks send PTY output here; main loop drains and sends via WebRTC.
@@ -343,6 +353,7 @@ impl Hub {
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
             webrtc_connection_started: std::collections::HashMap::new(),
+            webrtc_pending_closes: std::collections::HashMap::new(),
             webrtc_pty_output_tx,
             webrtc_pty_output_rx,
             webrtc_pty_forwarders: std::collections::HashMap::new(),

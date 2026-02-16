@@ -40,25 +40,6 @@ class UserTest < ActiveSupport::TestCase
     assert_not_equal old_key, @user.api_key
   end
 
-  # === Server-Assisted Pairing ===
-
-  test "server_assisted_pairing defaults to false" do
-    user = User.new(email: "sap@example.com")
-    assert_not user.server_assisted_pairing?
-  end
-
-  test "enable_server_assisted_pairing! sets to true" do
-    @user.update!(server_assisted_pairing: false)
-    @user.enable_server_assisted_pairing!
-    assert @user.server_assisted_pairing?
-  end
-
-  test "disable_server_assisted_pairing! sets to false" do
-    @user.update!(server_assisted_pairing: true)
-    @user.disable_server_assisted_pairing!
-    assert_not @user.server_assisted_pairing?
-  end
-
   # === GitHub App Token ===
 
   test "github_app_authorized? returns true when token present" do

@@ -72,7 +72,7 @@ const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
 /// 5000 lines at 80 cols produces ~400KB of formatted ANSI output
 /// on snapshot. This provides ample history for reconnecting browsers
 /// while keeping memory bounded by line count rather than raw bytes.
-const SHADOW_SCROLLBACK_LINES: usize = 5000;
+pub(crate) const SHADOW_SCROLLBACK_LINES: usize = 5000;
 
 /// Default broadcast channel capacity.
 ///

@@ -8,7 +8,7 @@
 %>
 
 <%# Main terminal view %>
-<div class="h-dvh flex flex-col overflow-hidden"
+<div class="h-dvh flex flex-col overflow-hidden mobile-keyboard:-translate-y-(--kb-shift)"
      data-controller="terminal-display"
      data-terminal-display-hub-id-value="<%= Current.hub.id %>"
      data-terminal-display-agent-index-value="<%= Current.agent_index %>"
@@ -111,32 +111,31 @@
   </div>
 
   <%# Mobile Touch Controls %>
-  <div class="shrink-0 lg:hidden border-t border-zinc-800 bg-zinc-900 touch-controls-container">
-    <div class="flex gap-1.5 px-2 py-2 overflow-x-auto scrollbar-none">
-      <%# Primary keys %>
-      <%= render Elements::ButtonComponent.new("^C", color: :neutral, variant: :soft, size: :sm, class: "shrink-0 font-mono", data: { action: "terminal-display#sendCtrlC" }) %>
-      <%= render Elements::ButtonComponent.new("Enter", color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendEnter" }) %>
-      <%= render Elements::ButtonComponent.new("Tab", color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendTab" }) %>
-      <%= render Elements::ButtonComponent.new("Esc", color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendEscape" }) %>
-
-      <%# Separator %>
-      <div class="shrink-0 w-px bg-zinc-700 mx-0.5"></div>
+  <div class="shrink-0 hidden [@media(pointer:coarse)]:block border-t border-zinc-700/50 bg-zinc-900/95 backdrop-blur-sm pb-[env(safe-area-inset-bottom)]">
+    <div class="flex items-center justify-between px-2 py-1">
+      <%# Command keys — color-coded by intent %>
+      <div class="flex items-center gap-0.5">
+        <%= render Elements::ButtonComponent.new("^C", color: :danger, variant: :ghost, size: :sm, class: "font-mono tracking-tight", data: { action: "terminal-display#sendCtrlC" }) %>
+        <%= render Elements::ButtonComponent.new("Esc", color: :neutral, variant: :ghost, size: :sm, data: { action: "terminal-display#sendEscape" }) %>
+        <%= render Elements::ButtonComponent.new("Tab", color: :neutral, variant: :ghost, size: :sm, data: { action: "terminal-display#sendTab" }) %>
+        <%= render Elements::ButtonComponent.new("Enter", color: :primary, variant: :soft, size: :sm, data: { action: "terminal-display#sendEnter" }) %>
+      </div>
 
       <%# Arrow keys %>
-      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowUp" }) do %>
-        <%= icon "chevron-up", class: "size-4" %>
-      <% end %>
-      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowDown" }) do %>
-        <%= icon "chevron-down", class: "size-4" %>
-      <% end %>
-      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowLeft" }) do %>
-        <%= icon "chevron-left", class: "size-4" %>
-      <% end %>
-      <%= render Elements::ButtonComponent.new(color: :neutral, variant: :soft, size: :sm, class: "shrink-0", data: { action: "terminal-display#sendArrowRight" }) do %>
-        <%= icon "chevron-right", class: "size-4" %>
-      <% end %>
-
-      <div class="shrink-0 w-4"></div>
+      <div class="flex items-center gap-0.5">
+        <%= render Elements::ButtonComponent.new(color: :neutral, variant: :ghost, size: :xs, shape: :circular, data: { action: "terminal-display#sendArrowLeft" }) do %>
+          <%= icon "chevron-left", class: "size-4" %>
+        <% end %>
+        <%= render Elements::ButtonComponent.new(color: :neutral, variant: :ghost, size: :xs, shape: :circular, data: { action: "terminal-display#sendArrowDown" }) do %>
+          <%= icon "chevron-down", class: "size-4" %>
+        <% end %>
+        <%= render Elements::ButtonComponent.new(color: :neutral, variant: :ghost, size: :xs, shape: :circular, data: { action: "terminal-display#sendArrowUp" }) do %>
+          <%= icon "chevron-up", class: "size-4" %>
+        <% end %>
+        <%= render Elements::ButtonComponent.new(color: :neutral, variant: :ghost, size: :xs, shape: :circular, data: { action: "terminal-display#sendArrowRight" }) do %>
+          <%= icon "chevron-right", class: "size-4" %>
+        <% end %>
+      </div>
     </div>
   </div>
 </div>
