@@ -163,10 +163,29 @@ pub fn spawn_reader_thread(
 
                     // Feed PTY bytes to shadow screen for parsed state tracking.
                     // vt100 handles scrollback limits internally by line count.
-                    shadow_screen
-                        .lock()
-                        .expect("shadow_screen lock poisoned")
-                        .process(&buf[..n]);
+                    {
+                        let mut parser = shadow_screen
+                            .lock()
+                            .expect("shadow_screen lock poisoned");
+                        parser.process(&buf[..n]);
+
+                        // CSI 3 J (\x1b[3J) = "Erase Saved Lines" (clear scrollback).
+                        // The vt100 crate ignores this sequence, so we handle it manually
+                        // by replacing the parser with a fresh one seeded with the current
+                        // visible screen state. This ensures `clear` drops stale history
+                        // from reconnect snapshots.
+                        if contains_clear_scrollback(&buf[..n]) {
+                            let (rows, cols) = parser.screen().size();
+                            let visible = parser.screen().contents_formatted();
+                            *parser = vt100::Parser::new(
+                                rows,
+                                cols,
+                                super::pty::SHADOW_SCROLLBACK_LINES,
+                            );
+                            parser.process(&visible);
+                            log::info!("{label} shadow screen scrollback cleared (CSI 3 J)");
+                        }
+                    }
 
                     // Broadcast raw output to all live subscribers.
                     // Clients parse bytes in their own parsers (xterm.js, TUI vt100).
@@ -180,6 +199,17 @@ pub fn spawn_reader_thread(
         }
         log::info!("{label} PTY reader thread exiting");
     })
+}
+
+/// Check if a byte buffer contains the CSI 3 J (clear scrollback) sequence.
+///
+/// Scans for `\x1b[3J` which terminals emit when the user runs `clear` or
+/// equivalent commands. The vt100 crate does not handle this sequence, so
+/// callers must clear scrollback manually when this returns true.
+fn contains_clear_scrollback(data: &[u8]) -> bool {
+    // CSI 3 J = ESC [ 3 J = [0x1b, 0x5b, 0x33, 0x4a]
+    data.windows(4)
+        .any(|w| w == b"\x1b[3J")
 }
 
 #[cfg(test)]
@@ -328,5 +358,72 @@ mod tests {
             | Err(broadcast::error::TryRecvError::Closed) => {}
             other => panic!("Expected no more events, got {:?}", other),
         }
+    }
+
+    // =========================================================================
+    // Clear Scrollback Detection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_contains_clear_scrollback_detects_csi_3j() {
+        assert!(contains_clear_scrollback(b"\x1b[3J"));
+        // Embedded in larger output (typical `clear` command output)
+        assert!(contains_clear_scrollback(b"\x1b[H\x1b[2J\x1b[3J"));
+        assert!(contains_clear_scrollback(b"some text\x1b[3Jmore text"));
+    }
+
+    #[test]
+    fn test_contains_clear_scrollback_ignores_other_sequences() {
+        assert!(!contains_clear_scrollback(b"\x1b[2J"));
+        assert!(!contains_clear_scrollback(b"\x1b[H"));
+        assert!(!contains_clear_scrollback(b"plain text"));
+        assert!(!contains_clear_scrollback(b""));
+        // Partial sequence should not match
+        assert!(!contains_clear_scrollback(b"\x1b[3"));
+    }
+
+    #[test]
+    fn test_reader_clears_scrollback_on_csi_3j() {
+        // Phase 1: Write some lines that generate scrollback
+        let mut data = Vec::new();
+        for i in 0..30 {
+            data.extend(format!("line {i}\r\n").as_bytes());
+        }
+        // Phase 2: Send clear command (CSI H + CSI 2J + CSI 3J)
+        data.extend(b"\x1b[H\x1b[2J\x1b[3J");
+        // Phase 3: Write new content after clear
+        data.extend(b"fresh start");
+
+        let reader = MockReader::new(&data);
+        let shadow = test_shadow_screen();
+        let (event_tx, _event_rx) = broadcast::channel::<PtyEvent>(64);
+
+        let handle = spawn_reader_thread(reader, shadow.clone(), event_tx, false);
+        handle.join().expect("Reader thread panicked");
+
+        // Scrollback should have been cleared — only visible screen remains
+        let parser = shadow.lock().unwrap();
+        let screen = parser.screen();
+
+        // Verify fresh content is visible
+        let contents = screen.contents();
+        assert!(
+            contents.contains("fresh start"),
+            "Screen should contain post-clear content"
+        );
+
+        // Verify scrollback is empty (the pre-clear lines were dropped).
+        // Probe total scrollback lines the same way snapshot_with_scrollback does.
+        drop(parser);
+        let mut parser = shadow.lock().unwrap();
+        let screen = parser.screen_mut();
+        let saved = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let total_scrollback = screen.scrollback();
+        screen.set_scrollback(saved);
+        assert_eq!(
+            total_scrollback, 0,
+            "Scrollback should be empty after CSI 3 J"
+        );
     }
 }

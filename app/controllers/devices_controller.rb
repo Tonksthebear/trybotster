@@ -1,13 +1,6 @@
 # frozen_string_literal: true
 
 # Manages device registration for E2E encrypted terminal access.
-#
-# Two modes:
-# 1. Secure mode (default): public_key is NOT stored on server.
-#    Key exchange happens via QR code URL fragment (MITM-proof).
-#
-# 2. Convenience mode: public_key IS stored on server.
-#    Browser can fetch key from API for easier pairing (potential MITM).
 class DevicesController < ApplicationController
   include ApiKeyAuthenticatable
 
@@ -30,7 +23,6 @@ class DevicesController < ApplicationController
     public_key = params[:public_key]
 
     # Browser devices always send public_key (they need it for key exchange)
-    # CLI devices only send it if server_assisted_pairing is enabled
     if params[:device_type] == "browser"
       device = current_device_user.devices.find_or_initialize_by(public_key: public_key)
     elsif fingerprint.present?
@@ -54,8 +46,7 @@ class DevicesController < ApplicationController
       render json: {
         device_id: device.id,
         fingerprint: device.fingerprint,
-        created: device.previously_new_record?,
-        server_assisted_pairing: public_key.present?
+        created: device.previously_new_record?
       }, status: device.previously_new_record? ? :created : :ok
     else
       render json: { errors: device.errors.full_messages }, status: :unprocessable_entity

@@ -79,6 +79,7 @@ export class Connection {
   #visibilityHandler = null // Cleanup ref for visibilitychange listener
   #initRetryCount = 0       // Retry counter for failed initialize()
   #initRetryTimer = null    // Pending retry timer
+  #peerReconnectTimer = null  // Pending peer reconnect timer
 
   constructor(key, options, manager) {
     this.key = key
@@ -345,6 +346,12 @@ export class Connection {
       clearTimeout(this.handshakeTimer)
       this.handshakeTimer = null
     }
+
+    // Cancel any pending peer reconnect so next online transition starts fresh
+    if (this.#peerReconnectTimer) {
+      clearTimeout(this.#peerReconnectTimer)
+      this.#peerReconnectTimer = null
+    }
   }
 
   /**
@@ -501,13 +508,16 @@ export class Connection {
           return
         }
 
-        // Peer connection lost — don't auto-reconnect, let health events drive it.
-        // If hub is still online, health listener will trigger reconnect.
+        // Peer connection lost — retry after a short delay if hub is still online.
+        // CLI-side fd management (watch-based close tracking) prevents fd exhaustion
+        // from rapid reconnection cycles, so we don't need aggressive backoff here.
+        // Phone unlock reconnects instantly via visibilitychange (separate path).
         this.emit("disconnected")
 
-        // If hub is online but peer failed (ICE exhaustion), retry via ensureConnected
         if (this.cliStatus === CliStatus.ONLINE || this.cliStatus === CliStatus.NOTIFIED) {
-          setTimeout(() => {
+          if (this.#peerReconnectTimer) return // already scheduled
+          this.#peerReconnectTimer = setTimeout(() => {
+            this.#peerReconnectTimer = null
             if (!this.handshakeComplete) {
               console.debug(`[${this.constructor.name}] Peer lost but hub online, reconnecting peer...`)
               this.#ensureConnected()
@@ -515,6 +525,10 @@ export class Connection {
           }, 2000)
         }
       } else if (event.state === "connected") {
+        if (this.#peerReconnectTimer) {
+          clearTimeout(this.#peerReconnectTimer)
+          this.#peerReconnectTimer = null
+        }
         if (event.mode) {
           this.#setConnectionMode(event.mode)
         }
@@ -625,6 +639,12 @@ export class Connection {
     if (this.#initRetryTimer) {
       clearTimeout(this.#initRetryTimer)
       this.#initRetryTimer = null
+    }
+
+    // Cancel any pending peer reconnect
+    if (this.#peerReconnectTimer) {
+      clearTimeout(this.#peerReconnectTimer)
+      this.#peerReconnectTimer = null
     }
 
     // Clear state immediately to prevent any new operations

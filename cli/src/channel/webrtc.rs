@@ -204,6 +204,7 @@ impl WebRtcChannelBuilder {
     /// Panics if required fields are not set.
     #[must_use]
     pub fn build(self) -> WebRtcChannel {
+        let (close_tx, close_rx) = tokio::sync::watch::channel(false);
         WebRtcChannel {
             server_url: self.server_url.expect("server_url required"),
             api_key: self.api_key.expect("api_key required"),
@@ -221,6 +222,8 @@ impl WebRtcChannelBuilder {
             peer_olm_key: Arc::new(Mutex::new(None)),
             decrypt_failures: Arc::new(AtomicU32::new(0)),
             dc_opened: Arc::new(AtomicBool::new(false)),
+            close_complete_tx: close_tx,
+            close_complete_rx: close_rx,
         }
     }
 }
@@ -261,6 +264,11 @@ pub struct WebRtcChannel {
     decrypt_failures: Arc<AtomicU32>,
     /// Set to `true` when the DataChannel opens; consumed by `take_dc_opened()`.
     dc_opened: Arc<AtomicBool>,
+    /// Set to `true` when the state handler's close task completes (pc/dc sockets released).
+    /// Uses `watch` so late subscribers see the value even if the close already happened
+    /// (unlike `Notify`, which is fire-and-forget).
+    close_complete_tx: tokio::sync::watch::Sender<bool>,
+    close_complete_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl std::fmt::Debug for WebRtcChannel {
@@ -381,12 +389,14 @@ impl WebRtcChannel {
         let state = Arc::clone(&self.state);
         let data_channel = Arc::clone(&self.data_channel);
         let peer_connection = Arc::clone(&self.peer_connection);
+        let close_complete = self.close_complete_tx.clone();
 
         // Connection state change handler
         pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             let state = Arc::clone(&state);
             let data_channel = Arc::clone(&data_channel);
             let peer_connection = Arc::clone(&peer_connection);
+            let close_complete = close_complete.clone();
             Box::pin(async move {
                 log::info!("[WebRTC] Connection state changed: {s}");
                 match s {
@@ -402,6 +412,7 @@ impl WebRtcChannel {
                         let dc = data_channel.lock().await.take();
                         let pc = peer_connection.lock().await.take();
                         if dc.is_some() || pc.is_some() {
+                            let close_complete = close_complete.clone();
                             tokio::spawn(async move {
                                 // close() may take up to ~60s if SCTP retransmits
                                 // exhaust their limit, but it WILL complete. No timeout —
@@ -413,7 +424,11 @@ impl WebRtcChannel {
                                     let _ = pc.close().await;
                                 }
                                 log::debug!("[WebRTC] Closed stale peer connection resources");
+                                let _ = close_complete.send(true);
                             });
+                        } else {
+                            // No resources to close — signal immediately
+                            let _ = close_complete.send(true);
                         }
                     }
                     RTCPeerConnectionState::Closed => {
@@ -422,6 +437,7 @@ impl WebRtcChannel {
                         let dc = data_channel.lock().await.take();
                         let pc = peer_connection.lock().await.take();
                         if dc.is_some() || pc.is_some() {
+                            let close_complete = close_complete.clone();
                             tokio::spawn(async move {
                                 if let Some(dc) = dc {
                                     let _ = dc.close().await;
@@ -429,6 +445,7 @@ impl WebRtcChannel {
                                 if let Some(pc) = pc {
                                     let _ = pc.close().await;
                                 }
+                                let _ = close_complete.send(true);
                             });
                         }
                     }
@@ -910,6 +927,17 @@ impl WebRtcChannel {
     /// (when the DC is actually usable, not just when ICE connects).
     pub fn take_dc_opened(&self) -> bool {
         self.dc_opened.swap(false, Ordering::Relaxed)
+    }
+
+    /// Returns a watch receiver for close-complete signaling.
+    ///
+    /// The value transitions to `true` when the state handler's close task
+    /// finishes releasing pc/dc sockets. Callers can `wait_for(|v| *v)`
+    /// (with a timeout) before creating a replacement connection to prevent
+    /// fd exhaustion. Unlike `Notify`, `watch` retains the last value so
+    /// late subscribers see it immediately.
+    pub fn close_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.close_complete_rx.clone()
     }
 
     /// Get the peer's Olm identity key for encrypting messages.

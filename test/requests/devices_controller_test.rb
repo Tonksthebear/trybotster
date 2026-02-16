@@ -186,9 +186,7 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
       headers: auth_headers_for(:jason)
 
     assert_response :created
-    json = assert_json_keys(:device_id, :created, :server_assisted_pairing)
-
-    assert_equal true, json["server_assisted_pairing"]
+    json = assert_json_keys(:device_id, :created)
   end
 
   # ==========================================================================

@@ -29,6 +29,10 @@
 import { Connection } from "connections/connection";
 
 export class TerminalConnection extends Connection {
+  // Snapshot buffering: chunks are held until all arrive, preventing garbled
+  // output from partial delivery if the connection drops mid-snapshot.
+  #snapshotBuffer = null; // { id, total, chunks: Map<index, Uint8Array>, timer }
+
   constructor(key, options, manager) {
     super(key, options, manager);
     this.agentIndex = options.agentIndex;
@@ -74,16 +78,19 @@ export class TerminalConnection extends Connection {
 
     switch (message.type) {
       case "raw_output":
-        // Raw bytes from CLI (Uint8Array with 0x01 prefix) - pass to terminal
-        // Strip the 0x01 prefix byte before emitting
+        // Raw bytes from CLI with prefix byte routing:
+        //   0x00 = JSON control message
+        //   0x01 = live PTY output (immediate passthrough)
+        //   0x02 = snapshot chunk (buffered until complete)
         if (message.data && message.data.length > 0) {
           const prefix = message.data[0];
           if (prefix === 0x01) {
-            // Raw terminal data - strip prefix
             const terminalData = message.data.slice(1);
             this.emit("output", terminalData);
+          } else if (prefix === 0x02) {
+            this.#handleSnapshotChunk(message.data);
           } else {
-            // JSON control message (0x00 prefix) - parse and handle
+            // JSON control message (0x00 prefix)
             const jsonData = new TextDecoder().decode(message.data.slice(1));
             try {
               const parsed = JSON.parse(jsonData);
@@ -134,6 +141,77 @@ export class TerminalConnection extends Connection {
 
   getPtyIndex() {
     return this.ptyIndex;
+  }
+
+  destroy() {
+    if (this.#snapshotBuffer) {
+      clearTimeout(this.#snapshotBuffer.timer);
+      this.#snapshotBuffer = null;
+    }
+    super.destroy();
+  }
+
+  // ========== Snapshot buffering ==========
+
+  /**
+   * Handle a snapshot chunk (prefix 0x02).
+   * Header: [0x02][snapshot_id:4 LE][chunk_idx:2 LE][total_chunks:2 LE][data]
+   *
+   * Chunks are buffered until the complete set arrives, then concatenated
+   * and emitted as a single output. If a new snapshot_id arrives, any
+   * partial buffer from the previous snapshot is discarded.
+   */
+  #handleSnapshotChunk(data) {
+    if (data.length < 9) return; // too short for header
+
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const snapshotId = view.getUint32(1, true);
+    const chunkIdx = view.getUint16(5, true);
+    const totalChunks = view.getUint16(7, true);
+    const chunkData = data.slice(9);
+
+    // New snapshot supersedes any in-progress buffer
+    if (this.#snapshotBuffer && this.#snapshotBuffer.id !== snapshotId) {
+      clearTimeout(this.#snapshotBuffer.timer);
+      this.#snapshotBuffer = null;
+    }
+
+    // Initialize buffer for this snapshot
+    if (!this.#snapshotBuffer) {
+      this.#snapshotBuffer = {
+        id: snapshotId,
+        total: totalChunks,
+        chunks: new Map(),
+        timer: setTimeout(() => {
+          // Discard incomplete snapshot after 10s
+          console.debug(`[TerminalConnection] Snapshot ${snapshotId.toString(16)} timed out (${this.#snapshotBuffer?.chunks.size}/${totalChunks} chunks)`);
+          this.#snapshotBuffer = null;
+        }, 10000),
+      };
+    }
+
+    this.#snapshotBuffer.chunks.set(chunkIdx, chunkData);
+
+    // All chunks received — concatenate and emit
+    if (this.#snapshotBuffer.chunks.size === totalChunks) {
+      clearTimeout(this.#snapshotBuffer.timer);
+
+      let totalLen = 0;
+      for (let i = 0; i < totalChunks; i++) {
+        totalLen += this.#snapshotBuffer.chunks.get(i).length;
+      }
+
+      const combined = new Uint8Array(totalLen);
+      let offset = 0;
+      for (let i = 0; i < totalChunks; i++) {
+        const chunk = this.#snapshotBuffer.chunks.get(i);
+        combined.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      this.#snapshotBuffer = null;
+      this.emit("output", combined);
+    }
   }
 
   // ========== Private helpers ==========

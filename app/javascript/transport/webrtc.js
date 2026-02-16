@@ -172,7 +172,15 @@ class WebRTCTransport {
     this.#cancelGracePeriod(hubId)
 
     let conn = this.#connections.get(hubId)
-    if (conn) return { state: conn.state }
+    if (conn) {
+      // Re-emit cached health so new Connections (Turbo navigation) get the
+      // current CLI status. Without this, cliStatus stays UNKNOWN because no
+      // new ActionCable subscription is created (no server-side transmit).
+      if (conn.lastHealth) {
+        queueMicrotask(() => this.#emit("health", { hubId, ...conn.lastHealth }))
+      }
+      return { state: conn.state }
+    }
 
     const newConn = {
       pc: null,
@@ -831,69 +839,49 @@ class WebRTCTransport {
   // ========== ActionCable Signaling ==========
 
   /**
-   * Lazily create ActionCable consumer (shared across all hub connections).
+   * Get the shared ActionCable consumer (same one Turbo uses).
+   * Uses getConsumer() instead of createConsumer() to share the existing
+   * WebSocket connection that Turbo already manages, avoiding a redundant
+   * second WebSocket that may fail to connect independently.
    */
   async #getConsumer() {
     if (!cableConsumer) {
-      const { createConsumer } = await import("@rails/actioncable")
-      cableConsumer = createConsumer()
+      const { cable } = await import("@hotwired/turbo-rails")
+      cableConsumer = await cable.getConsumer()
     }
     return cableConsumer
   }
 
   /**
    * Subscribe to HubSignalingChannel via ActionCable.
-   * Resolves when subscription is confirmed (connected callback fires).
-   * Receives encrypted signal envelopes and health status messages.
+   * Returns immediately — ActionCable buffers subscriptions and confirms
+   * them when the WebSocket opens (same pattern as Turbo's subscribeTo).
+   * Health events arrive via `received` once the subscription is confirmed.
    */
   async #createSignalingChannel(hubId, browserIdentity) {
     const consumer = await this.#getConsumer()
 
     console.debug(`[WebRTCTransport] Creating signaling channel: hub=${hubId}, identity=${browserIdentity?.slice(0, 16)}...`)
 
-    return new Promise((resolve, reject) => {
-      let settled = false
-
-      const timeout = setTimeout(() => {
-        if (!settled) {
-          settled = true
-          console.error(`[WebRTCTransport] Signaling channel TIMEOUT for hub ${hubId} (15s — WebSocket may not be connected)`)
-          reject(new Error(`Signaling channel timeout for hub ${hubId}`))
-        }
-      }, 15000)
-
-      const subscription = consumer.subscriptions.create(
-        { channel: "HubSignalingChannel", hub_id: hubId, browser_identity: browserIdentity },
-        {
-          received: (data) => {
-            this.#handleSignalingMessage(hubId, data)
-          },
-          connected: () => {
-            if (!settled) {
-              settled = true
-              clearTimeout(timeout)
-              console.debug(`[WebRTCTransport] Signaling channel connected for hub ${hubId}`)
-              resolve(subscription)
-            }
-          },
-          disconnected: () => {
-            console.debug(`[WebRTCTransport] Signaling channel disconnected for hub ${hubId}`)
-          },
-          rejected: () => {
-            if (!settled) {
-              settled = true
-              clearTimeout(timeout)
-              console.error(`[WebRTCTransport] Signaling channel REJECTED for hub ${hubId} (auth or hub not found)`)
-              reject(new Error(`Signaling channel rejected for hub ${hubId}`))
-            }
-          },
-        }
-      )
-      // Store subscription immediately — ActionCable can deliver `received`
-      // before `connected` fires (initial health transmit). connectPeer()
-      // needs the subscription in #cableSubscriptions to send signals.
-      this.#cableSubscriptions.set(hubId, subscription)
-    })
+    const subscription = consumer.subscriptions.create(
+      { channel: "HubSignalingChannel", hub_id: hubId, browser_identity: browserIdentity },
+      {
+        received: (data) => {
+          this.#handleSignalingMessage(hubId, data)
+        },
+        connected: () => {
+          console.debug(`[WebRTCTransport] Signaling channel connected for hub ${hubId}`)
+        },
+        disconnected: () => {
+          console.debug(`[WebRTCTransport] Signaling channel disconnected for hub ${hubId}`)
+        },
+        rejected: () => {
+          console.error(`[WebRTCTransport] Signaling channel REJECTED for hub ${hubId} (auth or hub not found)`)
+        },
+      }
+    )
+    this.#cableSubscriptions.set(hubId, subscription)
+    return subscription
   }
 
   /**
@@ -903,6 +891,9 @@ class WebRTCTransport {
    */
   async #handleSignalingMessage(hubId, data) {
     if (data.type === "health") {
+      // Cache last health status so reconnecting Connections get it immediately
+      const conn = this.#connections.get(hubId)
+      if (conn) conn.lastHealth = data
       this.#emit("health", { hubId, ...data })
       return
     }

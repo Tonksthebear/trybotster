@@ -181,46 +181,12 @@ function render(state)
     }
   end
 
-  -- Build terminal panel: side-by-side if 2+ agents, single otherwise
-  local terminal_panel
-  if agent_count >= 2 then
-    local function agent_label(idx)
-      local a = agents[idx + 1]
-      if a then
-        local label = a.display_name or a.branch_name or "Agent " .. idx
-        local si = a.sessions and a.sessions[1]
-        if type(si) == "table" and si.port then
-          label = label .. " :" .. si.port
-        end
-        return " " .. label .. " "
-      end
-      return string.format(" Agent %d ", idx)
-    end
-    local function terminal_block(idx, pty)
-      local is_focused = (idx == _tui_state.selected_agent_index and pty == _tui_state.active_pty_index)
-      return {
-        title = agent_label(idx),
-        borders = "all",
-        border_style = is_focused and { fg = "cyan" } or nil,
-      }
-    end
-    terminal_panel = {
-      type = "vsplit",
-      constraints = { "50%", "50%" },
-      children = {
-        { type = "terminal", props = { agent_index = 0, pty_index = 0 },
-          block = terminal_block(0, 0) },
-        { type = "terminal", props = { agent_index = 1, pty_index = 0 },
-          block = terminal_block(1, 0) },
-      },
-    }
-  else
-    terminal_panel = {
-      type = "terminal",
-      props = { agent_index = _tui_state.selected_agent_index or 0, pty_index = _tui_state.active_pty_index or 0 },
-      block = { title = term_title, borders = "all" },
-    }
-  end
+  -- Build terminal panel: always show selected agent only
+  local terminal_panel = {
+    type = "terminal",
+    props = { agent_index = _tui_state.selected_agent_index or 0, pty_index = _tui_state.active_pty_index or 0 },
+    block = { title = term_title, borders = "all" },
+  }
 
   return {
     type = "hsplit",

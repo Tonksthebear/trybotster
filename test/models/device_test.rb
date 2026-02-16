@@ -375,21 +375,6 @@ class DeviceTest < ActiveSupport::TestCase
     assert_not device.secure_mode?
   end
 
-  test "server_assisted_pairing? returns true when public_key present" do
-    device = Device.new(public_key: "some_key")
-    assert device.server_assisted_pairing?
-  end
-
-  test "server_assisted_pairing? returns false when public_key nil" do
-    device = Device.new(public_key: nil)
-    assert_not device.server_assisted_pairing?
-  end
-
-  test "server_assisted_pairing? returns false when public_key blank" do
-    device = Device.new(public_key: "")
-    assert_not device.server_assisted_pairing?
-  end
-
   test "touch_last_seen! updates last_seen_at without running validations" do
     device = @user.devices.create!(
       name: "Touch Test",

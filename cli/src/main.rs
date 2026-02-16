@@ -375,7 +375,34 @@ enum Commands {
     },
 }
 
+/// Raise the process file descriptor limit to accommodate WebRTC connections.
+///
+/// Each WebRTC peer connection opens ~15 UDP sockets for ICE candidate
+/// gathering. Combined with webrtc-rs's 60s graceful SCTP shutdown, the
+/// default macOS limit of 256 fds exhausts after just a few rapid reconnects.
+fn raise_fd_limit() {
+    unsafe {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+            let target = 4096.min(rlim.rlim_max);
+            if rlim.rlim_cur < target {
+                rlim.rlim_cur = target;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    // Raise fd limit for WebRTC. Each peer connection opens ~15 UDP sockets
+    // for ICE gathering, and webrtc-rs close() takes up to 60s for SCTP
+    // shutdown. macOS defaults to 256 fds which exhausts after ~4 rapid
+    // reconnects. Every production WebRTC server raises this.
+    raise_fd_limit();
+
     // Set up file logging so TUI doesn't interfere with log output
     // Use BOTSTER_LOG_FILE or BOTSTER_CONFIG_DIR/botster.log or fallback
     let log_path = if let Ok(path) = std::env::var("BOTSTER_LOG_FILE") {

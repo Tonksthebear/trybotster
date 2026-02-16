@@ -58,27 +58,6 @@ class User < ApplicationRecord
     save!
   end
 
-  # E2E Encryption Security Settings
-
-  # Check if user has opted into server-assisted pairing
-  # When enabled, browsers can fetch CLI public keys from the server (convenience)
-  # When disabled (default), keys must be exchanged via QR code (MITM-proof)
-  def server_assisted_pairing?
-    server_assisted_pairing == true
-  end
-
-  # Enable server-assisted pairing (convenience mode)
-  # WARNING: This allows the server to potentially MITM key exchange
-  def enable_server_assisted_pairing!
-    update!(server_assisted_pairing: true)
-  end
-
-  # Disable server-assisted pairing (secure mode - default)
-  # Keys must be exchanged via QR code URL fragment
-  def disable_server_assisted_pairing!
-    update!(server_assisted_pairing: false)
-  end
-
   # GitHub App Authorization Methods
 
 
