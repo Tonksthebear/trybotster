@@ -350,11 +350,6 @@ enum Commands {
     },
     /// List all git worktrees for the current repository
     ListWorktrees,
-    /// Get the system prompt for an agent
-    GetPrompt {
-        /// Path to the worktree
-        worktree_path: String,
-    },
     /// Update botster to the latest version
     Update {
         /// Show version without updating
@@ -487,9 +482,6 @@ fn main() -> Result<()> {
         }
         Commands::ListWorktrees => {
             commands::worktree::list()?;
-        }
-        Commands::GetPrompt { worktree_path } => {
-            commands::prompt::get(&worktree_path)?;
         }
         Commands::Update { check } => {
             if check {

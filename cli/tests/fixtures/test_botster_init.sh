@@ -4,8 +4,6 @@
 
 echo "=== Test Botster Init ==="
 echo "BOTSTER_WORKTREE_PATH: $BOTSTER_WORKTREE_PATH"
-echo "BOTSTER_TASK_DESCRIPTION: $BOTSTER_TASK_DESCRIPTION"
-echo "BOTSTER_BRANCH_NAME: $BOTSTER_BRANCH_NAME"
 
 # Change to worktree if set
 if [ -n "$BOTSTER_WORKTREE_PATH" ]; then
