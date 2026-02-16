@@ -4,7 +4,6 @@
 //! involve the interactive TUI. Commands are organized into submodules by domain:
 //!
 //! - [`json`] - JSON file manipulation (get, set, delete)
-//! - [`prompt`] - Agent prompt retrieval
 //! - [`reset`] - Remove all botster data from the system
 //! - [`update`] - Self-update functionality
 //! - [`worktree`] - Git worktree management (list, delete)
@@ -23,7 +22,6 @@
 //! ```
 
 pub mod json;
-pub mod prompt;
 pub mod reset;
 pub mod update;
 pub mod worktree;
@@ -31,8 +29,6 @@ pub mod worktree;
 // Re-export commonly used functions for convenience
 #[doc(inline)]
 pub use json::{delete as json_delete, get as json_get, set as json_set};
-#[doc(inline)]
-pub use prompt::get as get_prompt;
 #[doc(inline)]
 pub use reset::run as reset;
 #[doc(inline)]

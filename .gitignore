@@ -50,6 +50,9 @@ mise.toml
 # macOS files
 .DS_Store
 
+# Agent worktree context (written at runtime, never committed)
+.botster/context.json
+
 # Rust build artifacts (all projects)
 **/target/
 /cli/Cargo.lock

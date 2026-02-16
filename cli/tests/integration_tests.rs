@@ -379,16 +379,19 @@ fn test_spawn_real_pty_with_init_script() {
 
         // Spawn using bash with our test script
         let init_script = fixture_path("test_botster_init.sh");
+        // Write context.json to simulate agent setup
+        let botster_dir = temp_dir.path().join(".botster");
+        std::fs::create_dir_all(&botster_dir).unwrap();
+        std::fs::write(
+            botster_dir.join("context.json"),
+            r#"{"repo":"test/repo","issue_number":1,"branch_name":"test-branch","prompt":"Test task","created_at":"2025-01-01T00:00:00Z"}"#,
+        ).unwrap();
+
         let mut env_vars = HashMap::new();
         env_vars.insert(
             "BOTSTER_WORKTREE_PATH".to_string(),
             temp_dir.path().to_string_lossy().to_string(),
         );
-        env_vars.insert(
-            "BOTSTER_TASK_DESCRIPTION".to_string(),
-            "Test task".to_string(),
-        );
-        env_vars.insert("BOTSTER_BRANCH_NAME".to_string(), "test-branch".to_string());
 
         // Spawn bash and source the init script
         use botster::agent::spawn::PtySpawnConfig;
