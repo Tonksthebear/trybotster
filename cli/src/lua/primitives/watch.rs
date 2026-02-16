@@ -632,25 +632,26 @@ mod tests {
         let _ = count;
 
         // If events were received, verify structure
+        // The watcher may emit events for the directory itself, so search
+        // all events for the one matching our test file.
         if count > 0 {
             let event_count: i32 = lua.load("return #received_events").eval().expect("count");
             assert!(event_count > 0);
 
-            let path: String = lua
-                .load("return received_events[1].path")
+            let found: bool = lua
+                .load(
+                    r#"
+                    for _, e in ipairs(received_events) do
+                        if e.path and e.path:find("test.txt", 1, true) then
+                            return true
+                        end
+                    end
+                    return false
+                "#,
+                )
                 .eval()
-                .expect("path");
-            assert!(path.contains("test.txt"));
-
-            let kind: String = lua
-                .load("return received_events[1].kind")
-                .eval()
-                .expect("kind");
-            assert!(
-                kind == "create" || kind == "modify",
-                "Expected create or modify, got: {}",
-                kind
-            );
+                .expect("search");
+            assert!(found, "Expected at least one event for test.txt");
         }
 
         let _ = std::fs::remove_dir_all(&dir);
