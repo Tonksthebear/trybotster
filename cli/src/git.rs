@@ -611,26 +611,6 @@ impl WorktreeManager {
             repo_path.display()
         );
 
-        // Get repo name from the remote URL or directory name
-        let repo_name = if let Ok(url) = git_remote_url(worktree_path) {
-            // Extract owner/repo from URL like "https://github.com/owner/repo.git"
-            url.trim_end_matches(".git")
-                .split('/')
-                .rev()
-                .take(2)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("/")
-        } else {
-            repo_path
-                .file_name()
-                .context("No repo name")?
-                .to_string_lossy()
-                .to_string()
-        };
-
         if !worktree_path.exists() {
             log::warn!(
                 "Worktree at {} does not exist, skipping deletion",
@@ -650,23 +630,11 @@ impl WorktreeManager {
             for cmd in teardown_commands {
                 log::info!("Running teardown: {}", cmd);
 
-                // Parse issue number from branch name if it's an issue-based branch
-                let issue_number = if branch_name.starts_with("botster-issue-") {
-                    branch_name
-                        .strip_prefix("botster-issue-")
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-
                 // Run the command in a shell with environment variables
+                // Task context (repo, issue, branch) lives in .botster/context.json
                 let output = std::process::Command::new("sh")
                     .arg("-c")
                     .arg(&cmd)
-                    .env("BOTSTER_REPO", &repo_name)
-                    .env("BOTSTER_ISSUE_NUMBER", issue_number.to_string())
-                    .env("BOTSTER_BRANCH_NAME", branch_name)
                     .env(
                         "BOTSTER_WORKTREE_PATH",
                         worktree_path.to_str().expect("path is valid UTF-8"),
@@ -782,12 +750,10 @@ impl WorktreeManager {
                 log::info!("Running teardown: {}", cmd);
 
                 // Run the command in a shell with environment variables
+                // Task context (repo, issue, branch) lives in .botster/context.json
                 let output = std::process::Command::new("sh")
                     .arg("-c")
                     .arg(&cmd)
-                    .env("BOTSTER_REPO", &repo_name)
-                    .env("BOTSTER_ISSUE_NUMBER", issue_number.to_string())
-                    .env("BOTSTER_BRANCH_NAME", &branch_name)
                     .env(
                         "BOTSTER_WORKTREE_PATH",
                         worktree_path.to_str().expect("path is valid UTF-8"),

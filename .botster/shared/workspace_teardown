@@ -4,6 +4,20 @@
 # Remove the worktree from Claude's trusted projects
 "$BOTSTER_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
 
+# Helper to read values from .botster/context.json (worktrees only).
+# Falls back to env vars when running on main (no context file).
+botster_context() {
+  local val
+  val=$("$BOTSTER_BIN" json-get .botster/context.json "$1" 2>/dev/null | tr -d '"')
+  echo "$val"
+}
+
+BOTSTER_ISSUE_NUMBER=$(botster_context "issue_number")
+BOTSTER_ISSUE_NUMBER="${BOTSTER_ISSUE_NUMBER:-$BOTSTER_ISSUE_NUMBER}"
+
+BOTSTER_BRANCH_NAME=$(botster_context "branch_name")
+BOTSTER_BRANCH_NAME="${BOTSTER_BRANCH_NAME:-$BOTSTER_BRANCH_NAME}"
+
 if [ "$BOTSTER_ISSUE_NUMBER" != "0" ]; then
   echo "Cleaned up worktree for issue #$BOTSTER_ISSUE_NUMBER"
 else

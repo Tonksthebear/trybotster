@@ -72,12 +72,27 @@ function Agent.new(config)
 
     local key = self:agent_key()
 
-    -- Write prompt file to worktree if prompt provided
-    if config.prompt then
-        local prompt_path = config.worktree_path .. "/.botster_prompt"
-        local ok, err = pcall(fs.write, prompt_path, config.prompt)
-        if not ok then
-            log.warn(string.format("Failed to write prompt file: %s", tostring(err)))
+    -- Write context.json to worktree for init scripts and post-mortem inspection.
+    -- Skip on main checkout (where .git is a directory) to avoid polluting the
+    -- repo's .botster/ config directory. In worktrees, .git is a file.
+    local git_path = config.worktree_path .. "/.git"
+    self._has_context_file = fs.exists(git_path) and not fs.is_dir(git_path)
+    if self._has_context_file then
+        local context = {
+            repo = config.repo,
+            issue_number = config.issue_number,
+            branch_name = config.branch_name,
+            prompt = config.prompt,
+            invocation_url = config.invocation_url,
+            created_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        }
+        local context_dir = config.worktree_path .. "/.botster"
+        if not fs.exists(context_dir) then
+            fs.mkdir(context_dir)
+        end
+        local ok_ctx, err_ctx = pcall(fs.write, context_dir .. "/context.json", json.encode(context))
+        if not ok_ctx then
+            log.warn(string.format("Failed to write context.json: %s", tostring(err_ctx)))
         end
     end
 
@@ -265,14 +280,16 @@ function Agent:build_env(base_env)
             env[k] = v
         end
     end
-    env.BOTSTER_REPO = self.repo
-    if self.issue_number then
-        env.BOTSTER_ISSUE_NUMBER = tostring(self.issue_number)
-    end
-    env.BOTSTER_BRANCH_NAME = self.branch_name
     env.BOTSTER_WORKTREE_PATH = self.worktree_path
-    if self.prompt then
-        env.BOTSTER_TASK_DESCRIPTION = self.prompt
+    -- On main checkout (no context.json), pass task context via env vars
+    if not self._has_context_file then
+        if self.prompt then
+            env.BOTSTER_TASK_DESCRIPTION = self.prompt
+        end
+        if self.issue_number then
+            env.BOTSTER_ISSUE_NUMBER = tostring(self.issue_number)
+        end
+        env.BOTSTER_BRANCH_NAME = self.branch_name
     end
     -- Fire filter hook for customization
     env = hooks.call("filter_agent_env", env, self) or env

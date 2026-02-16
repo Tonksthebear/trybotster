@@ -4,14 +4,23 @@ mise trust
 # Change to the worktree directory
 cd "$BOTSTER_WORKTREE_PATH"
 
-# Read prompt from .botster_prompt file if it exists, otherwise use env var
-if [ -f ".botster_prompt" ]; then
-  BOTSTER_PROMPT=$(cat .botster_prompt)
-  echo "Using prompt from .botster_prompt file"
-else
-  BOTSTER_PROMPT="$BOTSTER_TASK_DESCRIPTION"
-  echo "Using prompt from BOTSTER_TASK_DESCRIPTION env var"
-fi
+# Helper to read values from .botster/context.json (worktrees only).
+# Falls back to env vars when running on main (no context file).
+botster_context() {
+  local val
+  val=$("$BOTSTER_BIN" json-get .botster/context.json "$1" 2>/dev/null | tr -d '"')
+  echo "$val"
+}
+
+# Read task context — context.json in worktrees, env vars on main
+BOTSTER_PROMPT=$(botster_context "prompt")
+BOTSTER_PROMPT="${BOTSTER_PROMPT:-$BOTSTER_TASK_DESCRIPTION}"
+
+BOTSTER_ISSUE_NUMBER=$(botster_context "issue_number")
+BOTSTER_ISSUE_NUMBER="${BOTSTER_ISSUE_NUMBER:-$BOTSTER_ISSUE_NUMBER}"
+
+BOTSTER_BRANCH_NAME=$(botster_context "branch_name")
+BOTSTER_BRANCH_NAME="${BOTSTER_BRANCH_NAME:-$BOTSTER_BRANCH_NAME}"
 
 # Auto-trust the worktree in Claude config using botster's JSON tools
 "$BOTSTER_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"

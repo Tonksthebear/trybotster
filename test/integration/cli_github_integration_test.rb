@@ -76,31 +76,6 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     end
   end
 
-  test "agent receives prompt file in worktree" do
-    with_stubbed_github do
-      message = create_github_message(
-        issue_number: 789,
-        prompt: "Check environment",
-        extra_payload: { invocation_url: "https://github.com/test/repo/issues/789#issuecomment-123" }
-      )
-
-      cli = start_cli_in_git_repo(@hub, timeout: 30)
-      assert_message_acknowledged(message, timeout: 20)
-
-      repo_safe = @test_repo.tr("/", "-")
-      worktree_path = File.join(@worktree_base, "#{repo_safe}-botster-issue-789")
-      prompt_file = File.join(worktree_path, ".botster_prompt")
-
-      wait_until(
-        timeout: 15,
-        message: -> { "Prompt file should be written at #{prompt_file}.\nCLI logs:\n#{cli.log_contents(lines: 50)}" }
-      ) { File.exist?(prompt_file) }
-
-      prompt_content = File.read(prompt_file)
-      assert_includes prompt_content, "Check environment", "Prompt file should contain task description"
-    end
-  end
-
   # === Agent Cleanup via GitHub Plugin ===
 
   test "agent_cleanup message removes agent session" do
@@ -337,11 +312,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       #!/bin/bash
       # Test init script - verifies environment and exits
       echo "=== Test Botster Init ==="
-      echo "BOTSTER_REPO: $BOTSTER_REPO"
-      echo "BOTSTER_ISSUE_NUMBER: $BOTSTER_ISSUE_NUMBER"
-      echo "BOTSTER_BRANCH_NAME: $BOTSTER_BRANCH_NAME"
       echo "BOTSTER_WORKTREE_PATH: $BOTSTER_WORKTREE_PATH"
-      echo "BOTSTER_TASK_DESCRIPTION: $BOTSTER_TASK_DESCRIPTION"
 
       for i in $(seq 1 10); do
         echo "Test line $i"

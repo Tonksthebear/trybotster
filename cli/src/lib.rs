@@ -43,7 +43,6 @@ pub mod env;
 pub mod git;
 pub mod keyring;
 pub mod process;
-pub mod prompt;
 pub mod server;
 pub mod terminal_widget;
 
@@ -51,7 +50,6 @@ pub mod terminal_widget;
 pub use agent::{Agent, PtyView};
 pub use config::Config;
 pub use git::WorktreeManager;
-pub use prompt::PromptManager;
 pub use relay::{AgentInfo, TerminalMessage, WorktreeInfo};
 pub use terminal_widget::TerminalWidget;
 
