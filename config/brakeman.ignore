@@ -2,9 +2,13 @@
   "ignored_warnings": [
     {
       "fingerprint": "691a2bc5a1deb96ad1c4a5253c9931862ab07c9945287cf58b3cd1936b76932e",
-      "note": "This redirect is intentional - it's part of the OAuth flow to GitHub's authorization URL"
+      "note": "Intentional OAuth redirect to GitHub authorization URL"
+    },
+    {
+      "fingerprint": "ed92cfa9d803bd067d1c1209cffd8118b382d3bb9ce1b661bb7ba83c66f1772c",
+      "note": "Render path is validated against hardcoded SECTIONS allowlist in DocsController#show"
     }
   ],
-  "updated": "2025-12-18",
-  "brakeman_version": "7.1.1"
+  "updated": "2026-02-17",
+  "brakeman_version": "8.0.2"
 }

@@ -32,19 +32,13 @@ class DocsController < ApplicationController
   def show
     @path = params[:path] || first_page_path
     @sections = SECTIONS
-    @current_section = @path.split("/").first
 
-    # Path "getting-started/installation" → partial "docs/getting-started/installation"
-    # Split into prefix path and partial name for lookup_context
-    parts = @path.split("/")
-    partial_name = parts.pop
-    prefix = ([ "docs" ] + parts).join("/")
-
-    if lookup_context.exists?(partial_name, [ prefix ], true)
-      @page_partial = "docs/#{@path}"
-    else
-      redirect_to doc_path(path: first_page_path)
+    unless valid_page_paths.include?(@path)
+      redirect_to doc_path(path: first_page_path) and return
     end
+
+    @current_section = @path.split("/").first
+    @page_partial = "docs/#{@path}"
   end
 
   private
@@ -52,5 +46,11 @@ class DocsController < ApplicationController
   def first_page_path
     s = SECTIONS.first
     "#{s[:slug]}/#{s[:pages].first[:slug]}"
+  end
+
+  def valid_page_paths
+    @valid_page_paths ||= SECTIONS.flat_map do |section|
+      section[:pages].map { |page| "#{section[:slug]}/#{page[:slug]}" }
+    end
   end
 end
