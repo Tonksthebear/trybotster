@@ -1,0 +1,44 @@
+<h1 class="text-2xl font-bold text-zinc-100 mb-6">Directory Structure</h1>
+
+<p class="text-zinc-400 mb-6">
+  The <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">.botster/</code> directory
+  holds all project and device configuration. It can exist at two levels.
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Device level</h2>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>~/.botster/
+  shared/                            # Merged into every profile
+    workspace_include                # Files to copy into worktrees
+    workspace_teardown               # Cleanup script
+    sessions/
+      agent/                         # Required session (always index 0)
+        initialization               # Startup script
+    plugins/
+      my-plugin/
+        init.lua
+
+  profiles/
+    standard/
+      sessions/
+        server/
+          initialization
+          port_forward               # Enables port forwarding
+      plugins/
+        another-plugin/
+          init.lua</code></pre>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Repo level</h2>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>your-repo/.botster/
+  shared/                            # Same structure as device shared
+  profiles/
+    web/
+      sessions/
+        agent/initialization
+        server/
+          initialization
+          port_forward</code></pre>
+
+<p class="text-zinc-400">
+  Repo-level config overrides device-level config for the same keys. This lets you commit
+  project-specific agent setup while keeping personal defaults at the device level.
+</p>

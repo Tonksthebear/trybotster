@@ -63,8 +63,7 @@ pub use connection::{
 pub use hub::{new_request_queue as new_hub_queue, HubRequest, HubRequestQueue, SharedServerId};
 pub use pty::{
     new_request_queue as new_pty_queue, CreateForwarderRequest, CreateTuiForwarderRequest,
-    CreateTuiForwarderDirectRequest, PtyForwarder, PtyOutputContext, PtyRequest, PtyRequestQueue,
-    PtySessionHandle,
+    PtyForwarder, PtyOutputContext, PtyRequest, PtyRequestQueue, PtySessionHandle,
 };
 pub use tui::{new_send_queue as new_tui_queue, TuiSendQueue, TuiSendRequest};
 pub use webrtc::{new_send_queue, WebRtcSendQueue, WebRtcSendRequest};
@@ -77,7 +76,8 @@ pub use action_cable::{
 };
 pub use websocket::{new_websocket_registry, WebSocketRegistry};
 pub use worktree::{
-    new_request_queue as new_worktree_queue, WorktreeRequest, WorktreeRequestQueue,
+    WorktreeCreateResult, WorktreeRequest, WorktreeRequestQueue, WorktreeResultReceiver,
+    WorktreeResultSender, new_request_queue as new_worktree_queue,
 };
 
 /// Register all primitive functions with the Lua state.
@@ -249,8 +249,8 @@ pub fn register_events(lua: &Lua, callbacks: SharedEventCallbacks) -> Result<()>
 ///
 /// Call this after `register_all()` to set up HTTP request functions.
 /// Sync functions (`http.get/post/put/delete`) block the caller.
-/// The async function (`http.request`) spawns a background thread and
-/// the registry is polled each tick to fire Lua callbacks.
+/// The async function (`http.request`) spawns a background thread that
+/// sends `HubEvent::HttpResponse` to the Hub event loop.
 ///
 /// # Arguments
 ///
@@ -268,7 +268,7 @@ pub fn register_http(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
 /// Register timer primitives with a timer registry.
 ///
 /// Call this after `register_all()` to set up one-shot and repeating timers.
-/// The registry is polled each tick to fire Lua callbacks.
+/// Each timer spawns a tokio task that sends `HubEvent::TimerFired`.
 ///
 /// # Arguments
 ///
@@ -286,7 +286,7 @@ pub fn register_timer(lua: &Lua, registry: TimerRegistry) -> Result<()> {
 /// Register file watch primitives with a watcher registry.
 ///
 /// Call this after `register_all()` to set up user-facing file watching.
-/// The registry is polled each tick to fire Lua callbacks.
+/// Each watch spawns a blocking forwarder that sends `HubEvent::UserFileWatch`.
 ///
 /// # Arguments
 ///
@@ -304,8 +304,8 @@ pub fn register_watch(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
 /// Register WebSocket primitives with a connection registry.
 ///
 /// Call this after `register_all()` to set up persistent WebSocket connections.
-/// Each `websocket.connect()` spawns a background thread. The registry is
-/// polled each tick to fire Lua callbacks for incoming events.
+/// Each `websocket.connect()` spawns a background thread that sends
+/// `HubEvent::WebSocketEvent` to the Hub event loop.
 ///
 /// # Errors
 ///
@@ -318,9 +318,8 @@ pub fn register_websocket(lua: &Lua, registry: WebSocketRegistry) -> Result<()> 
 /// Register ActionCable primitives with a request queue.
 ///
 /// Call this after `register_all()` to set up ActionCable connection management.
-/// The request queue is drained by Hub each tick via
-/// `process_lua_action_cable_requests`. Channel messages are polled via
-/// `poll_lua_action_cable_channels`.
+/// The request queue is drained by `flush_lua_queues()`. In production,
+/// a forwarding task per channel sends `HubEvent::AcChannelMessage`.
 ///
 /// # Arguments
 ///

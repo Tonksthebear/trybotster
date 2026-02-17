@@ -49,6 +49,9 @@ fn ensure_authenticated() -> Result<()> {
 
     // Check if we have a token at all
     if !config.has_token() {
+        // Check credential storage before first save — warns once during auth
+        botster::keyring::check_credential_storage()?;
+
         // Name the hub first, then authenticate
         let hub_name = auth::prompt_hub_name()?;
         config.hub_name = Some(hub_name);
@@ -87,6 +90,8 @@ fn ensure_authenticated() -> Result<()> {
 
     if !auth::validate_token(&config.server_url, config.get_api_key()) {
         println!("Token invalid or expired. Re-authenticating...");
+        // Check credential storage before saving — no-op if already checked
+        botster::keyring::check_credential_storage()?;
         let token_response = auth::device_flow(&config.server_url)?;
 
         if using_env_var {
@@ -202,16 +207,9 @@ fn run_headless() -> Result<()> {
     println!("Hub ready. Waiting for connections...");
     log::info!("Botster Hub v{} started in headless mode", VERSION);
 
-    // In headless mode, run a simplified event loop
-    // - Poll for messages and send heartbeats via tick()
-    // - Route PTY output to viewing clients
-    while !SHUTDOWN_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
-        // Poll for messages and send heartbeats
-        hub.tick();
-
-        // Sleep to avoid busy-looping (100ms = 10 ticks/sec is plenty for headless)
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    // Fully event-driven headless loop — uses tokio::select! to sleep
+    // between events. No periodic polling.
+    hub.run_headless(&SHUTDOWN_FLAG)?;
 
     println!("Shutting down...");
     hub.shutdown();

@@ -63,7 +63,6 @@ function Agent.new(config)
         worktree_path = config.worktree_path,
         prompt = config.prompt,
         invocation_url = config.invocation_url,
-        instance_suffix = config.instance_suffix, -- nil for first, "-2", "-3", etc.
         created_at = os.time(),
         status = "running",
         sessions = {},        -- name -> PtySessionHandle (for lookup by name)
@@ -198,25 +197,19 @@ end
 
 --- Generate the agent key.
 -- Format: repo-name-issue_number[-N] (slashes replaced with dashes)
--- The instance_suffix (e.g. "-2", "-3") distinguishes multiple agents
--- sharing the same worktree/branch.
 -- @return string agent key
 function Agent:agent_key()
     if self._agent_key then
         return self._agent_key
     end
+    -- Fallback: derive from repo + issue/branch (only if _agent_key not set)
     local repo_safe = self.repo:gsub("/", "-")
-    local base
     if self.issue_number then
-        base = repo_safe .. "-" .. tostring(self.issue_number)
+        return repo_safe .. "-" .. tostring(self.issue_number)
     else
         local branch_safe = self.branch_name:gsub("/", "-")
-        base = repo_safe .. "-" .. branch_safe
+        return repo_safe .. "-" .. branch_safe
     end
-    if self.instance_suffix then
-        return base .. self.instance_suffix
-    end
-    return base
 end
 
 --- Close the agent and clean up resources.

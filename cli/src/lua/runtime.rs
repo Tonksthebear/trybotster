@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use mlua::{IntoLuaMulti, Lua, LuaSerdeExt};
+use mlua::{IntoLuaMulti, Lua};
 
 use crate::hub::handle_cache::HandleCache;
 
@@ -42,20 +42,9 @@ use super::primitives::action_cable::{ActionCableRequest, ActionCableRequestQueu
 ///
 /// # Hot-Reload
 ///
-/// Call `start_file_watching()` to enable hot-reload, then call
-/// `poll_and_reload()` periodically in the event loop.
-///
-/// # Example
-///
-/// ```ignore
-/// let mut lua = LuaRuntime::new()?;
-/// lua.load_file(Path::new("init.lua"))?;
-/// lua.start_file_watching()?;
-///
-/// // In event loop:
-/// lua.poll_and_reload();
-/// lua.call_function("on_startup", ())?;
-/// ```
+/// Call `start_file_watching()` to enable hot-reload. In production,
+/// a blocking forwarder task sends `HubEvent::LuaFileChange` events
+/// to the Hub event loop for instant module reloading.
 pub struct LuaRuntime {
     /// The Lua interpreter state.
     lua: Lua,
@@ -93,6 +82,16 @@ pub struct LuaRuntime {
     pty_hook_fn: Option<mlua::RegistryKey>,
     /// Cached reusable context table for PTY output interceptor calls.
     pty_hook_ctx: Option<mlua::RegistryKey>,
+    /// Hub event channel for spawning file watcher forwarder tasks.
+    hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
+    /// Tokio runtime handle for spawning blocking forwarder tasks.
+    ///
+    /// Needed because file watcher forwarders may be spawned during
+    /// initialization (before `block_on`), when no implicit runtime
+    /// context exists.
+    tokio_handle: Option<tokio::runtime::Handle>,
+    /// Blocking forwarder task for Lua hot-reload file watcher.
+    lua_file_watch_forwarder: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for LuaRuntime {
@@ -267,6 +266,9 @@ impl LuaRuntime {
             action_cable_queue,
             pty_hook_fn: None,
             pty_hook_ctx: None,
+            hub_event_tx: None,
+            tokio_handle: None,
+            lua_file_watch_forwarder: None,
         })
     }
 
@@ -510,35 +512,13 @@ impl LuaRuntime {
 
         log::info!("Loading {} embedded Lua file(s)", files.len());
 
-        // Pre-seed package.loaded with all embedded modules so require()
-        // resolves from memory without needing files on disk.
-        // e.g., "hub/state.lua" → package.loaded["hub.state"] = (loaded module)
-        let package_loaded: mlua::Table = self
-            .lua
-            .globals()
-            .get::<mlua::Table>("package")
-            .and_then(|pkg| pkg.get::<mlua::Table>("loaded"))
-            .map_err(|e| anyhow!("Failed to get package.loaded: {e}"))?;
+        // Install a custom searcher in package.searchers so require() resolves
+        // from embedded files. This handles arbitrary dependency graphs naturally —
+        // Lua loads modules on-demand and detects cycles itself.
+        self.install_embedded_searcher()?;
 
-        // Load non-init modules into package.loaded first (hub/init.lua will require them)
-        for (path, content) in files {
-            if *path == "hub/init.lua" || path.starts_with("ui/") {
-                continue; // init.lua loaded separately below; ui/ loaded by TUI
-            }
-            let module_name = path.trim_end_matches(".lua").replace('/', ".");
-            let chunk = self
-                .lua
-                .load(*content)
-                .set_name(*path)
-                .eval::<mlua::Value>()
-                .map_err(|e| anyhow!("Failed to load embedded {path}: {e}"))?;
-            package_loaded
-                .set(module_name.as_str(), chunk)
-                .map_err(|e| anyhow!("Failed to seed package.loaded[{module_name}]: {e}"))?;
-            log::debug!("Pre-loaded embedded module: {module_name}");
-        }
-
-        // Now load hub/init.lua — its require() calls will find pre-seeded modules
+        // Now load hub/init.lua — its require() calls trigger the embedded
+        // searcher, which lazily loads each module and its transitive deps.
         if let Some(init_content) = embedded::get("hub/init.lua") {
             self.load_string("hub/init.lua", init_content)?;
         } else {
@@ -546,6 +526,70 @@ impl LuaRuntime {
         }
 
         log::info!("Embedded Lua loaded successfully");
+        Ok(())
+    }
+
+    /// Install a custom Lua searcher for embedded modules.
+    ///
+    /// Prepends a searcher to `package.searchers` that maps module names
+    /// (e.g., `"lib.agent"`) to embedded source files (e.g., `"lib/agent.lua"`).
+    /// When `require("lib.agent")` is called, this searcher returns a loader
+    /// function that compiles and executes the embedded source.
+    ///
+    /// This replaces the previous eager `eval()` approach, which broke when
+    /// modules had cross-tier dependencies (e.g., `lib/` requiring `hub/`).
+    fn install_embedded_searcher(&self) -> Result<()> {
+        use super::embedded;
+
+        let lua = &self.lua;
+
+        // Build a Lua table mapping module names to their source
+        let embedded_modules: mlua::Table = lua.create_table()
+            .map_err(|e| anyhow!("Failed to create embedded modules table: {e}"))?;
+
+        for (path, content) in embedded::all() {
+            // Skip ui/ (loaded by TUI separately) and hub/init.lua (loaded explicitly)
+            if path.starts_with("ui/") || *path == "hub/init.lua" {
+                continue;
+            }
+            let module_name = path.trim_end_matches(".lua").replace('/', ".");
+            embedded_modules
+                .set(module_name.as_str(), *content)
+                .map_err(|e| anyhow!("Failed to populate embedded table: {e}"))?;
+        }
+
+        // Set the table as a global so the searcher closure can access it
+        lua.globals()
+            .set("_EMBEDDED_MODULES", embedded_modules)
+            .map_err(|e| anyhow!("Failed to set _EMBEDDED_MODULES: {e}"))?;
+
+        // Install the searcher via Lua code — this is the cleanest way to
+        // prepend to package.searchers and return a proper loader function.
+        lua.load(
+            r#"
+            local embedded = _EMBEDDED_MODULES
+            -- Prepend our searcher so embedded modules are found before filesystem
+            table.insert(package.searchers, 2, function(module_name)
+                local source = embedded[module_name]
+                if source then
+                    local fn, err = load(source, "=" .. module_name:gsub("%.", "/") .. ".lua")
+                    if fn then
+                        return fn
+                    else
+                        return "\n\tembedded load error: " .. (err or "unknown")
+                    end
+                end
+                return "\n\tno embedded module '" .. module_name .. "'"
+            end)
+            -- Clean up the global reference (searcher captured it via upvalue)
+            _EMBEDDED_MODULES = nil
+            "#,
+        )
+        .set_name("embedded_searcher_setup")
+        .exec()
+        .map_err(|e| anyhow!("Failed to install embedded searcher: {e}"))?;
+
+        log::debug!("Installed embedded module searcher");
         Ok(())
     }
 
@@ -632,22 +676,15 @@ impl LuaRuntime {
 
     /// Start watching the Lua script directory for changes.
     ///
-    /// After calling this, use `poll_and_reload()` in the event loop to
-    /// check for changes and reload modified modules.
+    /// If a Hub event channel is available (production mode), spawns a
+    /// blocking forwarder task that sends `HubEvent::LuaFileChange`
+    /// events. Otherwise, the caller must use `poll_and_reload()`.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The base path directory does not exist
     /// - File watcher creation fails
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let mut lua = LuaRuntime::new()?;
-    /// lua.load_file(Path::new("hub/init.lua"))?;
-    /// lua.start_file_watching()?;
-    /// ```
     pub fn start_file_watching(&mut self) -> Result<()> {
         if self.file_watcher.is_some() {
             log::warn!("File watching already started");
@@ -665,6 +702,37 @@ impl LuaRuntime {
 
         let mut watcher = LuaFileWatcher::new(self.base_path.clone())?;
         watcher.start_watching()?;
+
+        // Spawn a blocking forwarder task if the event channel and tokio
+        // handle are available. Uses the stored handle because this method
+        // may be called during initialization (before block_on).
+        if let (Some(ref tx), Some(ref handle)) = (&self.hub_event_tx, &self.tokio_handle) {
+            if let Some(rx) = watcher.take_rx() {
+                let tx = tx.clone();
+                let base_path = self.base_path.clone();
+                self.lua_file_watch_forwarder = Some(handle.spawn_blocking(move || {
+                    use super::file_watcher::events_to_modules;
+
+                    // Blocking recv — wakes only when the OS delivers an event.
+                    while let Ok(result) = rx.recv() {
+                        match result {
+                            Ok(event) => {
+                                let modules = events_to_modules(&base_path, &[event]);
+                                if !modules.is_empty() {
+                                    if tx.send(crate::hub::events::HubEvent::LuaFileChange { modules }).is_err() {
+                                        break; // Hub shut down
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("[lua-watch] File watcher error: {e}");
+                            }
+                        }
+                    }
+                }));
+            }
+        }
+
         self.file_watcher = Some(watcher);
 
         Ok(())
@@ -672,6 +740,9 @@ impl LuaRuntime {
 
     /// Stop watching the Lua script directory.
     pub fn stop_file_watching(&mut self) {
+        if let Some(handle) = self.lua_file_watch_forwarder.take() {
+            handle.abort();
+        }
         if let Some(mut watcher) = self.file_watcher.take() {
             watcher.stop_watching();
             log::info!("Stopped Lua file watching");
@@ -684,18 +755,25 @@ impl LuaRuntime {
         self.file_watcher.is_some()
     }
 
-    /// Poll for file changes and reload modified modules.
+    /// Stop all blocking watcher tasks (Lua hot-reload + user watches).
     ///
-    /// Call this periodically in the event loop. Does nothing if file
-    /// watching is not enabled.
+    /// Must be called before the tokio runtime drops to prevent a deadlock.
+    /// Each watcher's `spawn_blocking` forwarder blocks on `rx.recv()` — the
+    /// sender lives inside the `FileWatcher`. Aborting the forwarder and
+    /// dropping the watcher closes the channel, allowing the runtime's
+    /// blocking pool to shut down cleanly.
+    pub fn stop_all_watchers(&mut self) {
+        self.stop_file_watching();
+        self.watcher_registry
+            .lock()
+            .expect("WatcherEntries mutex poisoned")
+            .stop_all();
+    }
+
+    /// Poll for Lua file changes via periodic drain (test-only fallback).
     ///
-    /// Uses the Lua `loader.reload()` function to reload modules, which
-    /// respects the protected module list (hub.state, hub.hooks, etc.)
-    /// and calls `_before_reload` / `_after_reload` lifecycle hooks.
-    ///
-    /// # Returns
-    ///
-    /// The number of modules that were reloaded.
+    /// Production uses `HubEvent::LuaFileChange` from a blocking forwarder task.
+    #[cfg(test)]
     pub fn poll_and_reload(&self) -> usize {
         let Some(ref watcher) = self.file_watcher else {
             return 0;
@@ -718,45 +796,54 @@ impl LuaRuntime {
         reloaded
     }
 
-    /// Poll user file watches and fire Lua callbacks.
+    /// Poll user file watches via periodic drain (test-only fallback).
     ///
-    /// Drains OS events from all watches created by `watch.directory()`,
-    /// applies glob filtering, and calls registered Lua callbacks. Also
-    /// fires `hooks.notify("file_changed", ...)` for each event.
-    ///
-    /// Call this periodically in the event loop (each tick).
-    ///
-    /// # Returns
-    ///
-    /// The number of file events fired.
+    /// Production uses `HubEvent::UserFileWatch` from blocking forwarder tasks.
+    #[cfg(test)]
     pub fn poll_user_file_watches(&self) -> usize {
         use super::primitives::watch;
         watch::poll_user_watches(&self.lua, &self.watcher_registry)
     }
 
-    /// Poll timers and fire Lua callbacks for any that have expired.
+    /// Reload Lua modules by name (event-driven path).
     ///
-    /// Checks all registered timers against the current time, fires callbacks
-    /// for expired timers, reschedules repeating timers, and removes completed
-    /// or cancelled entries.
+    /// Called from `handle_hub_event()` for `HubEvent::LuaFileChange` events.
+    pub(crate) fn reload_lua_modules(&self, modules: &[String]) -> usize {
+        log::debug!("Detected {} Lua file change(s)", modules.len());
+        let mut reloaded = 0;
+        for module_name in modules {
+            if self.reload_module(module_name) {
+                reloaded += 1;
+            }
+        }
+        reloaded
+    }
+
+    /// Fire Lua callbacks for a user file watch event (event-driven path).
     ///
-    /// Call this periodically in the event loop (each tick).
+    /// Called from `handle_hub_event()` for `HubEvent::UserFileWatch` events.
+    pub(crate) fn fire_user_file_watch(
+        &self,
+        watch_id: &str,
+        events: Vec<crate::file_watcher::FileEvent>,
+    ) -> usize {
+        use super::primitives::watch;
+        watch::fire_user_watch_events(&self.lua, &self.watcher_registry, watch_id, events)
+    }
+
+    /// Poll timers via deadline scanning (test-only fallback).
     ///
-    /// # Returns
-    ///
-    /// The number of timer callbacks fired.
+    /// Production uses `HubEvent::TimerFired` from spawned tokio tasks.
+    #[cfg(test)]
     pub fn poll_timers(&self) -> usize {
         use super::primitives::timer;
         timer::poll_timers(&self.lua, &self.timer_registry)
     }
 
-    /// Poll for completed async HTTP responses and fire Lua callbacks.
+    /// Poll HTTP responses via shared vec (test-only fallback).
     ///
-    /// Call this each tick in the Hub event loop.
-    ///
-    /// # Returns
-    ///
-    /// The number of HTTP callbacks fired.
+    /// Production uses `HubEvent::HttpResponse` from background threads.
+    #[cfg(test)]
     pub fn poll_http_responses(&self) -> usize {
         use super::primitives::http;
         http::poll_http_responses(&self.lua, &self.http_registry)
@@ -1024,8 +1111,8 @@ impl LuaRuntime {
             let callback: mlua::Function = self.lua.registry_value(&key)
                 .map_err(|e| anyhow!("Failed to get webrtc_message callback: {e}"))?;
 
-            // Convert JSON to Lua value using mlua's serialize feature
-            let lua_value = self.lua.to_value(&message)
+            // Convert JSON to Lua value, mapping null → nil (not userdata)
+            let lua_value = crate::lua::primitives::json::json_to_lua(&self.lua, &message)
                 .map_err(|e| anyhow!("Failed to convert JSON to Lua value: {e}"))?;
 
             callback.call::<()>((peer_id, lua_value))
@@ -1221,9 +1308,7 @@ impl LuaRuntime {
                 .registry_value(&key)
                 .map_err(|e| anyhow!("Failed to get tui_message callback: {e}"))?;
 
-            let lua_value = self
-                .lua
-                .to_value(&message)
+            let lua_value = crate::lua::primitives::json::json_to_lua(&self.lua, &message)
                 .map_err(|e| anyhow!("Failed to convert JSON to Lua value: {e}"))?;
 
             callback
@@ -1573,14 +1658,86 @@ impl LuaRuntime {
         std::mem::take(&mut *queue)
     }
 
-    /// Poll WebSocket connections for pending events and fire Lua callbacks.
+    /// Poll WebSocket events via shared vec (test-only fallback).
     ///
-    /// Returns the number of events processed.
+    /// Production uses `HubEvent::WebSocketEvent` from background threads.
+    #[cfg(test)]
     pub fn poll_websocket_events(&self) -> usize {
         primitives::websocket::poll_websocket_events(
             &self.lua,
             &self.websocket_registry,
         )
+    }
+
+    /// Inject the Hub event channel sender into primitive registries.
+    ///
+    /// Called once during Hub initialization after the `LuaRuntime` is created.
+    /// Enables background threads and spawned tasks to send events directly to
+    /// the Hub event loop instead of pushing to shared vecs.
+    pub(crate) fn set_hub_event_tx(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
+        tokio_handle: tokio::runtime::Handle,
+    ) {
+        self.http_registry
+            .lock()
+            .expect("HttpAsyncEntries mutex poisoned")
+            .set_hub_event_tx(tx.clone());
+        self.websocket_registry
+            .lock()
+            .expect("WebSocketRegistry mutex poisoned")
+            .set_hub_event_tx(tx.clone());
+        self.timer_registry
+            .lock()
+            .expect("TimerEntries mutex poisoned")
+            .set_event_channel(tx.clone(), tokio_handle.clone());
+        self.watcher_registry
+            .lock()
+            .expect("WatcherEntries mutex poisoned")
+            .set_hub_event_tx(tx.clone(), tokio_handle.clone());
+        self.hub_event_tx = Some(tx);
+        self.tokio_handle = Some(tokio_handle);
+    }
+
+    /// Fire the Lua callback for a single completed HTTP response.
+    ///
+    /// Called from `handle_hub_event()` for `HubEvent::HttpResponse` events.
+    pub(crate) fn fire_http_callback(
+        &self,
+        response: primitives::http::CompletedHttpResponse,
+    ) {
+        primitives::http::fire_single_http_callback(
+            &self.lua,
+            &self.http_registry,
+            response,
+        );
+    }
+
+    /// Fire the Lua callback for a single WebSocket event.
+    ///
+    /// Called from `handle_hub_event()` for `HubEvent::WebSocketEvent` events.
+    pub(crate) fn fire_websocket_event(
+        &self,
+        event: primitives::websocket::WsEvent,
+    ) {
+        primitives::websocket::fire_single_websocket_event(
+            &self.lua,
+            &self.websocket_registry,
+            event,
+        );
+    }
+
+    /// Fire the Lua callback for a single timer event.
+    ///
+    /// Called from `handle_hub_event()` for `HubEvent::TimerFired` events.
+    /// Looks up the callback in the timer registry, fires it, and cleans up
+    /// one-shot entries.
+    pub(crate) fn fire_timer_callback(&self, timer_id: &str) {
+        primitives::timer::fire_single_timer(
+            &self.lua,
+            &self.timer_registry,
+            timer_id,
+        );
     }
 
     /// Get a reference to the ActionCable request queue.
@@ -1736,7 +1893,8 @@ impl LuaRuntime {
         let value = value.clone();
 
         self.fire_event(event, |lua| {
-            lua.to_value(&value).map_err(|e| anyhow!("to_value: {e}"))
+            crate::lua::primitives::json::json_to_lua(lua, &value)
+                .map_err(|e| anyhow!("json_to_lua: {e}"))
         })
     }
 
@@ -2640,5 +2798,390 @@ mod tests {
             .eval()
             .expect("cross-module require should work");
         assert!(result, "Both modules should resolve from package.loaded");
+    }
+
+    /// Verifies the embedded searcher resolves cross-dependent modules lazily.
+    ///
+    /// Simulates the real dependency graph where handlers require lib modules,
+    /// and lib modules require hub modules. The searcher must resolve these
+    /// on-demand regardless of iteration order.
+    #[test]
+    fn test_embedded_searcher_resolves_cross_dependencies() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+        let lua = runtime.lua();
+
+        // Build a fake _EMBEDDED_MODULES table with cross-tier dependencies:
+        // handlers.agents requires lib.agent, lib.agent requires hub.state
+        lua.load(
+            r#"
+            _EMBEDDED_MODULES = {
+                ["hub.state"] = 'local M = {}; M.agents = {}; return M',
+                ["hub.hooks"] = 'local M = {}; function M.notify() end; return M',
+                ["lib.agent"] = [[
+                    local state = require("hub.state")
+                    local hooks = require("hub.hooks")
+                    local M = {}
+                    M.state_ref = state
+                    return M
+                ]],
+                ["lib.config_resolver"] = 'local M = {}; return M',
+                ["handlers.agents"] = [[
+                    local Agent = require("lib.agent")
+                    local ConfigResolver = require("lib.config_resolver")
+                    local M = {}
+                    M.agent_ref = Agent
+                    return M
+                ]],
+            }
+
+            -- Install the same searcher logic as install_embedded_searcher
+            local embedded = _EMBEDDED_MODULES
+            table.insert(package.searchers, 2, function(module_name)
+                local source = embedded[module_name]
+                if source then
+                    local fn, err = load(source, "=" .. module_name:gsub("%.", "/") .. ".lua")
+                    if fn then
+                        return fn
+                    else
+                        return "\n\tembedded load error: " .. (err or "unknown")
+                    end
+                end
+                return "\n\tno embedded module '" .. module_name .. "'"
+            end)
+            _EMBEDDED_MODULES = nil
+            "#,
+        )
+        .exec()
+        .expect("Searcher setup should succeed");
+
+        // Now require handlers.agents — this triggers the full dependency chain:
+        // handlers.agents → lib.agent → hub.state, hub.hooks
+        // handlers.agents → lib.config_resolver
+        let result: bool = lua
+            .load(
+                r#"
+                local agents_handler = require("handlers.agents")
+                local agent_lib = require("lib.agent")
+                local state = require("hub.state")
+                -- Verify the chain resolved correctly
+                return agents_handler.agent_ref == agent_lib
+                   and agent_lib.state_ref == state
+                   and type(state.agents) == "table"
+                "#,
+            )
+            .eval()
+            .expect("Cross-dependency require chain should resolve");
+        assert!(
+            result,
+            "Embedded searcher should resolve transitive dependencies lazily"
+        );
+    }
+
+    /// Verify that `start_file_watching` works outside a tokio runtime context
+    /// when a hub_event_tx is configured. This simulates the production
+    /// initialization path where `start_file_watching` is called before
+    /// `block_on` enters the async context.
+    #[test]
+    fn test_start_file_watching_outside_tokio_context() {
+        // Create a tokio runtime (simulating Hub's tokio_runtime field).
+        let rt = tokio::runtime::Runtime::new().expect("create runtime");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut runtime = LuaRuntime::new().expect("create lua runtime");
+
+        // Inject event channel with handle — NOT inside block_on.
+        runtime.set_hub_event_tx(tx, rt.handle().clone());
+
+        // This must not panic with "must be called from the context of a Tokio runtime".
+        // The base path likely doesn't exist in test, so this is a no-op, but it
+        // exercises the code path.
+        runtime.start_file_watching().expect("start_file_watching should not panic");
+
+        // Also test with a real directory to exercise the forwarder spawn path.
+        let dir = std::env::temp_dir().join("botster_lua_fw_spawn_test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("init.lua"), "-- test").expect("write");
+
+        runtime.base_path = dir.clone();
+        runtime.stop_file_watching(); // reset state
+        runtime.start_file_watching().expect("start_file_watching with real dir");
+
+        // Verify the forwarder was spawned.
+        assert!(
+            runtime.lua_file_watch_forwarder.is_some(),
+            "Blocking forwarder should be spawned when event channel is set"
+        );
+
+        runtime.stop_file_watching();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // Delivery Pipeline Tests — NULL Userdata & Event Routing
+    // =========================================================================
+
+    /// Verifies `fire_json_event` converts JSON null to Lua nil, not userdata.
+    ///
+    /// `lua.to_value()` maps JSON null to `Value::NULL` (light-userdata),
+    /// which is truthy in Lua. This causes crashes when Lua code concatenates
+    /// or compares nil-expected fields (e.g., `config_resolver.lua:238`).
+    /// The fix is to use `json_to_lua()` from `primitives/json.rs`.
+    #[test]
+    fn test_fire_json_event_null_is_nil_not_userdata() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        // Register callback that checks the type of a null field
+        runtime
+            .lua()
+            .load(
+                r#"
+            null_field_type = "not_set"
+            null_field_is_nil = false
+            events.on("test_null", function(data)
+                null_field_type = type(data.nullable_field)
+                null_field_is_nil = (data.nullable_field == nil)
+            end)
+        "#,
+            )
+            .exec()
+            .unwrap();
+
+        let payload = serde_json::json!({
+            "name": "test",
+            "nullable_field": null
+        });
+
+        runtime
+            .fire_json_event("test_null", &payload)
+            .expect("Should fire event");
+
+        // JSON null should become Lua nil (type "nil"), not userdata
+        let field_type: String = runtime
+            .lua()
+            .globals()
+            .get("null_field_type")
+            .unwrap();
+        let is_nil: bool = runtime
+            .lua()
+            .globals()
+            .get("null_field_is_nil")
+            .unwrap();
+
+        assert_eq!(
+            field_type, "nil",
+            "JSON null should map to Lua nil, got '{}' (userdata = mlua NULL sentinel)",
+            field_type
+        );
+        assert!(
+            is_nil,
+            "JSON null field should be == nil in Lua"
+        );
+    }
+
+    /// Verifies `call_tui_message` converts JSON null to Lua nil, not userdata.
+    ///
+    /// Same root cause as `fire_json_event` — both use `lua.to_value()`.
+    /// TUI messages with null fields (e.g., optional `profile_name`) must
+    /// arrive as nil in Lua, not as truthy userdata.
+    #[test]
+    fn test_call_tui_message_null_is_nil_not_userdata() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        runtime
+            .lua()
+            .load(
+                r#"
+            tui_null_type = "not_set"
+            tui_null_is_nil = false
+            tui.on_message(function(msg)
+                tui_null_type = type(msg.optional_field)
+                tui_null_is_nil = (msg.optional_field == nil)
+            end)
+        "#,
+            )
+            .exec()
+            .unwrap();
+
+        let msg = serde_json::json!({
+            "type": "test",
+            "optional_field": null
+        });
+
+        runtime
+            .call_tui_message(msg)
+            .expect("Should call callback");
+
+        let field_type: String = runtime
+            .lua()
+            .globals()
+            .get("tui_null_type")
+            .unwrap();
+        let is_nil: bool = runtime
+            .lua()
+            .globals()
+            .get("tui_null_is_nil")
+            .unwrap();
+
+        assert_eq!(
+            field_type, "nil",
+            "JSON null in TUI message should map to Lua nil, got '{}'",
+            field_type
+        );
+        assert!(
+            is_nil,
+            "JSON null field in TUI message should be == nil in Lua"
+        );
+    }
+
+    /// Verifies `fire_json_event` skips null values in nested objects.
+    ///
+    /// `json_to_lua()` skips null keys entirely in objects (they become
+    /// absent = nil in Lua). This test ensures nested null fields don't
+    /// leak as userdata through the conversion.
+    #[test]
+    fn test_fire_json_event_nested_null_fields_absent() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        runtime
+            .lua()
+            .load(
+                r#"
+            nested_has_key = true
+            events.on("test_nested_null", function(data)
+                -- rawget avoids __index metamethods; absent key = nil
+                nested_has_key = rawget(data.config, "profile") ~= nil
+            end)
+        "#,
+            )
+            .exec()
+            .unwrap();
+
+        let payload = serde_json::json!({
+            "config": {
+                "name": "test",
+                "profile": null
+            }
+        });
+
+        runtime
+            .fire_json_event("test_nested_null", &payload)
+            .expect("Should fire event");
+
+        let has_key: bool = runtime
+            .lua()
+            .globals()
+            .get("nested_has_key")
+            .unwrap();
+
+        assert!(
+            !has_key,
+            "Null field in nested object should be absent (nil), not present as userdata"
+        );
+    }
+
+    /// Verifies that `call_tui_message` delivers JSON to Lua callbacks and
+    /// that the callback can successfully queue a `HubRequest::Quit`.
+    ///
+    /// This exercises the TUI→Hub message delivery pipeline:
+    /// `call_tui_message()` → Lua callback → `hub.quit()` → `HubRequest::Quit`.
+    ///
+    /// NOTE: `hub.quit()` is registered by `register_hub_primitives()`, which
+    /// requires `HandleCache` etc. In tests, we verify the Lua callback receives
+    /// the message correctly and can interact with hub primitives. The quit test
+    /// in `primitives/hub.rs` already proves `hub.quit()` queues `HubRequest::Quit`.
+    #[test]
+    fn test_tui_message_delivers_nested_json_to_callback() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        // Verify the callback receives the full nested JSON structure
+        runtime
+            .lua()
+            .load(
+                r#"
+            received_sub_id = nil
+            received_data_type = nil
+            tui.on_message(function(msg)
+                received_sub_id = msg.subscriptionId
+                if msg.data then
+                    received_data_type = msg.data.type
+                end
+            end)
+        "#,
+            )
+            .exec()
+            .unwrap();
+
+        let msg = serde_json::json!({
+            "subscriptionId": "tui_hub",
+            "data": { "type": "quit" }
+        });
+
+        runtime
+            .call_tui_message(msg)
+            .expect("Should call callback");
+
+        let sub_id: String = runtime
+            .lua()
+            .globals()
+            .get("received_sub_id")
+            .unwrap();
+        let data_type: String = runtime
+            .lua()
+            .globals()
+            .get("received_data_type")
+            .unwrap();
+
+        assert_eq!(sub_id, "tui_hub");
+        assert_eq!(data_type, "quit");
+    }
+
+    /// Verifies that a Hub event fires through to the TUI send queue.
+    ///
+    /// When `fire_json_event("agent_created", ...)` fires, Lua observers
+    /// (e.g., `connections.lua`) should call `tui.send()` to relay the event
+    /// to the TUI. This test verifies that chain works end-to-end at the
+    /// Rust↔Lua boundary.
+    #[test]
+    fn test_hub_event_reaches_tui_send_queue() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        // Set up an event handler that relays to TUI
+        runtime
+            .lua()
+            .load(
+                r#"
+            events.on("agent_created", function(data)
+                tui.send({
+                    type = "agent_created",
+                    agent_id = data.id,
+                })
+            end)
+        "#,
+            )
+            .exec()
+            .unwrap();
+
+        let payload = serde_json::json!({
+            "id": "owner-repo-42",
+            "status": "running"
+        });
+
+        runtime
+            .fire_json_event("agent_created", &payload)
+            .expect("Should fire event");
+
+        let sends = runtime.drain_tui_sends();
+        assert!(
+            !sends.is_empty(),
+            "Hub event should produce TUI send messages"
+        );
+
+        match &sends[0] {
+            TuiSendRequest::Json { data } => {
+                assert_eq!(data["type"], "agent_created");
+                assert_eq!(data["agent_id"], "owner-repo-42");
+            }
+            _ => panic!("Expected Json TUI send request"),
+        }
     }
 }

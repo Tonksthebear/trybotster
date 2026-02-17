@@ -33,16 +33,19 @@
             <span class="font-mono font-bold text-lg tracking-tight">botster</span>
           <% end %>
 
-          <% if user_signed_in? %>
-            <div class="hidden sm:flex items-center gap-1">
+          <div class="hidden sm:flex items-center gap-1">
+            <%= link_to docs_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path.start_with?('/docs') ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
+              Docs
+            <% end %>
+            <% if user_signed_in? %>
               <%= link_to hubs_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path == hubs_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
                 Hubs
               <% end %>
               <%= link_to settings_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path == settings_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
                 Settings
               <% end %>
-            </div>
-          <% end %>
+            <% end %>
+          </div>
         </div>
 
         <%# User Info & Logout (desktop) %>
@@ -62,6 +65,9 @@
 
       <% layout.with_mobile_menu do %>
         <div class="space-y-1 px-4 py-3 border-t border-zinc-800">
+          <%= link_to docs_path, class: "block px-3 py-2 rounded text-base font-medium transition-colors #{request.path.start_with?('/docs') ? 'bg-zinc-800 text-primary-400' : 'text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100'}" do %>
+            Docs
+          <% end %>
           <% if user_signed_in? %>
             <%= link_to hubs_path, class: "block px-3 py-2 rounded text-base font-medium transition-colors #{request.path == hubs_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100'}" do %>
               Hubs

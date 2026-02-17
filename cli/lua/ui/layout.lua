@@ -219,6 +219,25 @@ function render_overlay(state)
         },
       },
     }
+  elseif _tui_state.mode == "new_agent_select_profile" then
+    local profile_items = {}
+    for _, p in ipairs(_tui_state.available_profiles or {}) do
+      table.insert(profile_items, { text = p })
+    end
+    if #profile_items == 0 then
+      profile_items = { { text = "Loading profiles...", style = "dim" } }
+    end
+    return {
+      type = "centered", width = 50, height = 30,
+      child = {
+        type = "list",
+        id = "profile_list",
+        block = { title = " Select Profile [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
+        props = {
+          items = profile_items,
+        },
+      },
+    }
   elseif _tui_state.mode == "new_agent_select_worktree" then
     return {
       type = "centered", width = 70, height = 50,

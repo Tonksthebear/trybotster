@@ -3,11 +3,14 @@
 //! Exposes git worktree queries and operations to Lua, allowing scripts to
 //! list, find, create, and delete worktrees.
 //!
-//! # Design Principle: "Query freely. Create synchronously. Delete via queue."
+//! # Design Principle: "Query freely. Mutate via queue."
 //!
 //! - **Queries** (`list`, `exists`, `find`, `repo_root`) read directly from
 //!   `HandleCache` - non-blocking, thread-safe snapshots
-//! - **Create** (`create`) runs synchronously (git worktree add is fast)
+//! - **Create** (`create`) runs synchronously (legacy, blocks Hub event loop)
+//! - **Create async** (`create_async`) queues request for Hub to process on a
+//!   blocking threadpool. Hub fires `worktree_created` or `worktree_create_failed`
+//!   Lua events when done.
 //! - **Delete** (`delete`) queues request for Hub to process asynchronously
 //!
 //! # Usage in Lua
@@ -33,6 +36,9 @@
 //! -- Create worktree synchronously (returns path or errors)
 //! local path = worktree.create("feature-branch")
 //!
+//! -- Create worktree asynchronously (returns immediately, fires event on completion)
+//! worktree.create_async({ agent_key = "key", branch = "feature-branch", prompt = "..." })
+//!
 //! -- Delete worktree (queues request for async processing)
 //! worktree.delete("/path/to/worktree", "feature-branch")
 //! ```
@@ -49,8 +55,31 @@ use crate::hub::handle_cache::HandleCache;
 /// Worktree operation requests queued from Lua.
 ///
 /// These are processed by Hub in its event loop after Lua callbacks return.
+/// `Create` requests are dispatched to a blocking threadpool via
+/// `tokio::task::spawn_blocking` so the Hub event loop stays responsive.
 #[derive(Debug, Clone)]
 pub enum WorktreeRequest {
+    /// Create a worktree asynchronously.
+    ///
+    /// Hub spawns the git operation on a blocking thread and fires
+    /// `worktree_created` or `worktree_create_failed` Lua events on completion.
+    /// All context fields are carried through so Lua can resume agent spawning.
+    Create {
+        /// Agent key for lifecycle broadcasts.
+        agent_key: String,
+        /// Git branch name for the worktree.
+        branch: String,
+        /// GitHub issue number (if launched from an issue).
+        issue_number: Option<u32>,
+        /// Task prompt for the agent.
+        prompt: String,
+        /// Profile name for config resolution.
+        profile_name: Option<String>,
+        /// Terminal rows from the requesting client.
+        client_rows: u16,
+        /// Terminal cols from the requesting client.
+        client_cols: u16,
+    },
     /// Delete a worktree by path.
     Delete {
         /// Filesystem path of the worktree to delete.
@@ -59,6 +88,36 @@ pub enum WorktreeRequest {
         branch: String,
     },
 }
+
+/// Result of an async worktree creation, sent back to Hub via channel.
+///
+/// Carries all the context needed for Lua to resume agent spawning
+/// after the blocking git operation completes.
+#[derive(Debug)]
+pub struct WorktreeCreateResult {
+    /// Agent key for lifecycle broadcasts.
+    pub agent_key: String,
+    /// Git branch name.
+    pub branch: String,
+    /// `Ok(path)` on success, `Err(message)` on failure.
+    pub result: Result<std::path::PathBuf, String>,
+    /// GitHub issue number (carried forward from request).
+    pub issue_number: Option<u32>,
+    /// Task prompt (carried forward from request).
+    pub prompt: String,
+    /// Profile name (carried forward from request).
+    pub profile_name: Option<String>,
+    /// Terminal rows (carried forward from request).
+    pub client_rows: u16,
+    /// Terminal cols (carried forward from request).
+    pub client_cols: u16,
+}
+
+/// Channel type for receiving async worktree creation results.
+pub type WorktreeResultReceiver = tokio::sync::mpsc::UnboundedReceiver<WorktreeCreateResult>;
+
+/// Channel type for sending async worktree creation results.
+pub type WorktreeResultSender = tokio::sync::mpsc::UnboundedSender<WorktreeCreateResult>;
 
 /// Shared request queue for worktree operations from Lua.
 pub type WorktreeRequestQueue = Arc<Mutex<Vec<WorktreeRequest>>>;
@@ -119,8 +178,8 @@ pub fn register(
                 })
                 .collect();
 
-            // Convert to Lua - Vec serializes as array
-            lua.to_value(&worktrees_data)
+            // Convert to Lua via json_to_lua (null-safe, unlike lua.to_value)
+            super::json::json_to_lua(lua, &serde_json::Value::Array(worktrees_data))
         })
         .map_err(|e| anyhow!("Failed to create worktree.list function: {e}"))?;
 
@@ -197,6 +256,51 @@ pub fn register(
     worktree
         .set("create", create_fn)
         .map_err(|e| anyhow!("Failed to set worktree.create: {e}"))?;
+
+    // worktree.create_async(params) - Queue async worktree creation
+    //
+    // Queues a worktree creation request for Hub to process on a blocking
+    // threadpool. Returns immediately. Hub fires `worktree_created` or
+    // `worktree_create_failed` Lua events on completion.
+    //
+    // params is a table with: agent_key, branch, issue_number, prompt,
+    // profile_name, client_rows, client_cols
+    let create_async_queue = Arc::clone(&request_queue);
+    let create_async_fn = lua
+        .create_function(move |_, params: LuaTable| {
+            let agent_key: String = params.get("agent_key").map_err(|e| {
+                mlua::Error::runtime(format!("create_async: missing agent_key: {e}"))
+            })?;
+            let branch: String = params.get("branch").map_err(|e| {
+                mlua::Error::runtime(format!("create_async: missing branch: {e}"))
+            })?;
+            let prompt: String = params.get::<Option<String>>("prompt")
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let issue_number: Option<u32> = params.get("issue_number").unwrap_or(None);
+            let profile_name: Option<String> = params.get("profile_name").unwrap_or(None);
+            let client_rows: u16 = params.get("client_rows").unwrap_or(24);
+            let client_cols: u16 = params.get("client_cols").unwrap_or(80);
+
+            let mut q = create_async_queue
+                .lock()
+                .expect("Worktree request queue mutex poisoned");
+            q.push(WorktreeRequest::Create {
+                agent_key,
+                branch,
+                issue_number,
+                prompt,
+                profile_name,
+                client_rows,
+                client_cols,
+            });
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create worktree.create_async function: {e}"))?;
+
+    worktree
+        .set("create_async", create_async_fn)
+        .map_err(|e| anyhow!("Failed to set worktree.create_async: {e}"))?;
 
     // worktree.repo_root() -> path string or nil
     //
@@ -293,6 +397,7 @@ mod tests {
         assert!(wt.contains_key("exists").unwrap());
         assert!(wt.contains_key("find").unwrap());
         assert!(wt.contains_key("create").unwrap());
+        assert!(wt.contains_key("create_async").unwrap());
         assert!(wt.contains_key("copy_from_patterns").unwrap());
         assert!(wt.contains_key("delete").unwrap());
         assert!(wt.contains_key("repo_root").unwrap());
@@ -309,22 +414,16 @@ mod tests {
         assert_eq!(worktrees.len().unwrap(), 0);
     }
 
+    /// Empty worktree list returns an empty Lua table (iterable, length 0).
     #[test]
-    fn test_list_serializes_as_json_array() {
+    fn test_list_empty_returns_table() {
         let lua = Lua::new();
         let (queue, cache, base) = create_test_queue_and_cache();
 
         register(&lua, queue, cache, base).expect("Should register");
 
-        let worktrees: LuaValue = lua.load("return worktree.list()").eval().unwrap();
-        let json: serde_json::Value = lua.from_value(worktrees).unwrap();
-
-        assert!(
-            json.is_array(),
-            "Empty worktrees should serialize as JSON array, got: {}",
-            json
-        );
-        assert_eq!(json.as_array().unwrap().len(), 0);
+        let worktrees: LuaTable = lua.load("return worktree.list()").eval().unwrap();
+        assert_eq!(worktrees.len().unwrap(), 0, "Empty worktree list should have length 0");
     }
 
     #[test]
@@ -507,6 +606,55 @@ mod tests {
     }
 
     #[test]
+    fn test_create_async_queues_request() {
+        let lua = Lua::new();
+        let (queue, cache, base) = create_test_queue_and_cache();
+
+        register(&lua, Arc::clone(&queue), cache, base).expect("Should register");
+
+        lua.load(
+            r#"worktree.create_async({
+                agent_key = "test-repo-42",
+                branch = "feature-branch",
+                issue_number = 42,
+                prompt = "Fix the bug",
+                profile_name = "default",
+                client_rows = 30,
+                client_cols = 120,
+            })"#,
+        )
+        .exec()
+        .expect("Should queue create_async request");
+
+        let requests = queue
+            .lock()
+            .expect("Worktree request queue mutex poisoned");
+        assert_eq!(requests.len(), 1);
+
+        match &requests[0] {
+            WorktreeRequest::Create {
+                agent_key,
+                branch,
+                issue_number,
+                prompt,
+                profile_name,
+                client_rows,
+                client_cols,
+                ..
+            } => {
+                assert_eq!(agent_key, "test-repo-42");
+                assert_eq!(branch, "feature-branch");
+                assert_eq!(*issue_number, Some(42));
+                assert_eq!(prompt, "Fix the bug");
+                assert_eq!(profile_name.as_deref(), Some("default"));
+                assert_eq!(*client_rows, 30);
+                assert_eq!(*client_cols, 120);
+            }
+            _ => panic!("Expected Create request"),
+        }
+    }
+
+    #[test]
     fn test_create_returns_error_for_invalid_branch() {
         let lua = Lua::new();
         let (queue, cache, base) = create_test_queue_and_cache();
@@ -536,5 +684,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Proves that `worktree.list()` converts data to proper Lua tables
+    /// (not userdata). The conversion path must use `json_to_lua` for safety.
+    #[test]
+    fn test_list_returns_proper_lua_tables() {
+        let lua = Lua::new();
+        let (queue, cache, base) = create_test_queue_and_cache();
+
+        // Inject a worktree so list returns data
+        cache.set_worktrees(vec![("/tmp/wt".to_string(), "main".to_string())]);
+
+        register(&lua, queue, cache, base).expect("Should register");
+
+        let result: LuaValue = lua.load("return worktree.list()").eval().unwrap();
+        assert!(
+            result.is_table(),
+            "worktree.list() should return a table, got: {:?}",
+            result
+        );
+        let tbl = result.as_table().unwrap();
+        assert_eq!(tbl.len().unwrap(), 1);
+
+        // Verify nested entry is a proper table (not userdata)
+        let entry: LuaValue = tbl.get(1).unwrap();
+        assert!(
+            entry.is_table(),
+            "worktree entry should be a table, got: {:?}",
+            entry
+        );
+
+        // Verify fields are accessible as strings
+        let entry_tbl = entry.as_table().unwrap();
+        let path: String = entry_tbl.get("path").unwrap();
+        let branch: String = entry_tbl.get("branch").unwrap();
+        assert_eq!(path, "/tmp/wt");
+        assert_eq!(branch, "main");
     }
 }

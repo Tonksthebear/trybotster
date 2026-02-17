@@ -39,10 +39,8 @@
 //! lua.load_file(Path::new("init.lua"))?;
 //! lua.call_function("my_handler", ())?;
 //!
-//! // Hot-reload support
+//! // Hot-reload support (event-driven via HubEvent::LuaFileChange)
 //! lua.start_file_watching()?;
-//! // In event loop:
-//! lua.poll_and_reload();
 //! ```
 
 pub mod embedded;

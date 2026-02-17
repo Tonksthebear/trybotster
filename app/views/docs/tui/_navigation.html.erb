@@ -1,0 +1,52 @@
+<h1 class="text-2xl font-bold text-zinc-100 mb-6">Navigation</h1>
+
+<p class="text-zinc-400 mb-6">
+  The TUI displays your agents and their PTY sessions. Navigate between them using keyboard shortcuts or the menu.
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Agents</h2>
+<p class="text-zinc-400 mb-4">
+  Switch between agents with <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">Ctrl+J</code>
+  (next) and <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">Ctrl+K</code> (previous).
+  Each agent runs in its own isolated worktree.
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">PTY sessions</h2>
+<p class="text-zinc-400 mb-4">
+  Each agent can have multiple PTY sessions (e.g., an agent session and a dev server).
+  Toggle between them with <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">Ctrl+]</code>.
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Menu</h2>
+<p class="text-zinc-400 mb-4">
+  Press <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">Ctrl+P</code> to open the
+  command menu. From here you can create agents, manage worktrees, and access other commands.
+</p>
+<div class="overflow-x-auto">
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-zinc-800">
+        <th class="text-left py-2 pr-4 text-zinc-400 font-medium">Key</th>
+        <th class="text-left py-2 text-zinc-400 font-medium">Action</th>
+      </tr>
+    </thead>
+    <tbody class="text-zinc-400">
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">Esc / q</td>
+        <td class="py-2">Close menu</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">j / k or arrows</td>
+        <td class="py-2">Navigate items</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">Enter / Space</td>
+        <td class="py-2">Select item</td>
+      </tr>
+      <tr>
+        <td class="py-2 pr-4 font-mono text-zinc-300">1-9</td>
+        <td class="py-2">Jump to item by number</td>
+      </tr>
+    </tbody>
+  </table>
+</div>

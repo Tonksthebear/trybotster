@@ -165,16 +165,6 @@ export class HubConnection extends Connection {
     return this.send("get_connection_code");
   }
 
-  /**
-   * Update client terminal dimensions.
-   * Resizes all active PTY sessions for this client.
-   * @param {number} cols - Number of columns
-   * @param {number} rows - Number of rows
-   */
-  sendResize(cols, rows) {
-    return this.send("resize", { cols, rows });
-  }
-
   // ========== File System API ==========
 
   /**

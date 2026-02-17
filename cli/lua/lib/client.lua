@@ -15,6 +15,7 @@
 
 local state = require("hub.state")
 local Agent = require("lib.agent")
+local pty_clients = require("lib.pty_clients")
 
 local Client = state.class("client")
 
@@ -32,9 +33,6 @@ function Client.new(peer_id, transport)
         subscriptions = {},
         forwarders = {},
         connected_at = os.time(),
-        -- Terminal dimensions (updated via hub channel resize messages)
-        rows = 24,
-        cols = 80,
     }, Client)
 
     log.info(string.format("Client created: %s...", peer_id:sub(1, 8)))
@@ -54,32 +52,6 @@ function Client:send_binary(data)
         self.transport.send_binary(data)
     else
         log.warn(string.format("Client %s... transport has no send_binary", self.peer_id:sub(1, 8)))
-    end
-end
-
---- Update client terminal dimensions and resize active PTY forwarders.
--- Called when browser sends resize via hub channel.
--- @param rows Number of rows
--- @param cols Number of columns
-function Client:update_dims(rows, cols)
-    local old_rows, old_cols = self.rows, self.cols
-    self.rows = rows
-    self.cols = cols
-
-    if old_rows == rows and old_cols == cols then
-        return  -- No change
-    end
-
-    log.debug(string.format("Client %s... dims updated: %dx%d -> %dx%d",
-        self.peer_id:sub(1, 8), old_cols, old_rows, cols, rows))
-
-    -- Resize all active PTY forwarders for this client
-    for sub_id, sub in pairs(self.subscriptions) do
-        if sub.channel == "terminal" and sub.agent_index ~= nil and sub.pty_index ~= nil then
-            hub.resize_pty(sub.agent_index, sub.pty_index, rows, cols)
-            log.debug(string.format("Resized PTY for subscription %s: %dx%d",
-                sub_id:sub(1, 16), cols, rows))
-        end
     end
 end
 
@@ -138,17 +110,9 @@ function Client:handle_subscribe(msg)
     local agent_index = params.agent_index
     local pty_index = params.pty_index
 
-    -- Update client dims from subscribe params (browser embeds terminal
-    -- dimensions so PTY gets correct size immediately at subscription time,
-    -- eliminating the race between subscribe and resize messages).
-    if params.rows and params.cols then
-        self.rows = params.rows
-        self.cols = params.cols
-    end
-
-    log.debug(string.format("Subscribe: %s -> %s (agent=%s, pty=%s, dims=%dx%d)",
+    log.debug(string.format("Subscribe: %s -> %s (agent=%s, pty=%s)",
         sub_id:sub(1, 16), channel,
-        tostring(agent_index), tostring(pty_index), self.cols, self.rows))
+        tostring(agent_index), tostring(pty_index)))
 
     -- Store subscription info
     self.subscriptions[sub_id] = {
@@ -179,6 +143,12 @@ function Client:handle_subscribe(msg)
 
     -- Channel-specific setup
     if channel == "terminal" then
+        -- Register with pty_clients for dimension tracking.
+        -- This resizes the PTY before the forwarder is created.
+        if agent_index ~= nil and pty_index ~= nil then
+            pty_clients.register(agent_index, pty_index, self.peer_id,
+                params.rows or 24, params.cols or 80)
+        end
         self:setup_terminal_subscription(sub_id, agent_index, pty_index)
     elseif channel == "hub" then
         -- Send initial agent and worktree lists
@@ -192,11 +162,10 @@ end
 
 --- Set up terminal subscription with PTY forwarder.
 -- Creates a transport-agnostic forwarder that streams PTY output to the client.
+-- Both TUI and WebRTC use the same code path: pty_clients handles resize,
+-- transport.create_pty_forwarder handles output streaming.
 --
--- For TUI clients, uses direct session access (tui.forward_session) which
--- bypasses HandleCache. For WebRTC clients, uses index-based lookup.
---
--- @param sub_id The subscription ID (browser-generated, e.g., "sub_2_1770164017")
+-- @param sub_id The subscription ID
 -- @param agent_index The agent index
 -- @param pty_index The PTY index (0=CLI, 1=Server)
 function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
@@ -205,40 +174,11 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
         return
     end
 
-    -- Map pty_index to session name
-    local session_name = pty_index == 0 and "cli" or "server"
-
-    -- Get agent by HandleCache index (stable across deletions)
-    local agent = Agent.get_by_index(agent_index)
-
-    if agent and self.transport.type == "tui" then
-        -- TUI: Use direct session access (no HandleCache needed)
-        local session = agent.sessions[session_name]
-        if session then
-            -- Resize BEFORE creating forwarder so the snapshot is taken at the
-            -- client's dimensions (forwarder creation triggers get_snapshot()).
-            session:resize(self.rows, self.cols)
-
-            local forwarder = tui.forward_session({
-                agent_key = agent:agent_key(),
-                session_name = session_name,
-                session = session,
-                subscription_id = sub_id,
-            })
-            self.forwarders[sub_id] = forwarder
-
-            log.info(string.format("Terminal subscription %s: %s:%s (%dx%d) [direct]",
-                sub_id:sub(1, 16), agent:agent_key(), session_name, self.cols, self.rows))
-            return
-        else
-            log.warn(string.format("No session '%s' on agent %s", session_name, agent:agent_key()))
-        end
-    end
-
-    -- Fallback: Use index-based lookup (for WebRTC or if agent not found)
-    -- Resize PTY BEFORE creating forwarder so the snapshot is taken at the
-    -- browser's dimensions (forwarder creation triggers get_snapshot()).
-    hub.resize_pty(agent_index, pty_index, self.rows, self.cols)
+    -- PTY was already resized by pty_clients.register() in handle_subscribe().
+    -- Now create the forwarder to stream output to this client.
+    local rows, cols = pty_clients.get_active_dims(agent_index, pty_index)
+    rows = rows or 24
+    cols = cols or 80
 
     local forwarder = self.transport.create_pty_forwarder({
         agent_index = agent_index,
@@ -250,7 +190,7 @@ function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
     self.forwarders[sub_id] = forwarder
 
     log.info(string.format("Terminal subscription %s: agent=%d, pty=%d (%dx%d)",
-        sub_id:sub(1, 16), agent_index, pty_index, self.cols, self.rows))
+        sub_id:sub(1, 16), agent_index, pty_index, cols, rows))
 end
 
 --- Send agent list to a HubChannel subscription.
@@ -300,6 +240,11 @@ function Client:handle_unsubscribe(msg)
         forwarder:stop()
         self.forwarders[sub_id] = nil
         log.debug(string.format("Stopped forwarder for subscription: %s", sub_id:sub(1, 16)))
+    end
+
+    -- Unregister from pty_clients (auto-resizes to next client if any)
+    if sub.channel == "terminal" and sub.agent_index ~= nil and sub.pty_index ~= nil then
+        pty_clients.unregister(sub.agent_index, sub.pty_index, self.peer_id)
     end
 
     hooks.notify("client_unsubscribed", {
@@ -357,12 +302,9 @@ function Client:handle_terminal_data(sub, command)
         tostring(cmd_type), agent_index, pty_index))
 
     if cmd_type == "resize" or command.command == "resize" then
-        -- Resize PTY and update client dims
         local rows = command.rows or 24
         local cols = command.cols or 80
-        self.rows = rows
-        self.cols = cols
-        hub.resize_pty(agent_index, pty_index, rows, cols)
+        pty_clients.update(agent_index, pty_index, self.peer_id, rows, cols)
     else
         log.debug(string.format("Unknown terminal command: %s", tostring(cmd_type)))
     end
@@ -397,7 +339,7 @@ function Client:count_subscriptions()
 end
 
 --- Clean up client on disconnect.
--- Stops all forwarders and clears subscriptions.
+-- Stops all forwarders, unregisters from pty_clients, and clears subscriptions.
 function Client:disconnect()
     hooks.notify("before_client_disconnect", { peer_id = self.peer_id })
 
@@ -411,6 +353,13 @@ function Client:disconnect()
         end
     end
     self.forwarders = {}
+
+    -- Unregister from all terminal PTYs (auto-resizes to next client)
+    for _, sub in pairs(self.subscriptions) do
+        if sub.channel == "terminal" and sub.agent_index ~= nil and sub.pty_index ~= nil then
+            pty_clients.unregister(sub.agent_index, sub.pty_index, self.peer_id)
+        end
+    end
     self.subscriptions = {}
 
     local duration = os.time() - self.connected_at

@@ -1,0 +1,35 @@
+<h1 class="text-2xl font-bold text-zinc-100 mb-6">Sessions</h1>
+
+<p class="text-zinc-400 mb-6">
+  Sessions are the PTY processes that run inside each agent. Every agent has at least one session
+  (the <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">agent</code> session),
+  and can have additional sessions like a dev server.
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">The agent session</h2>
+<p class="text-zinc-400 mb-4">
+  The <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">agent</code> session is
+  required and always runs at PTY index 0. Its initialization script is the entry point for your agent.
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code># .botster/shared/sessions/agent/initialization
+#!/bin/bash
+claude --dangerously-skip-permissions</code></pre>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Additional sessions</h2>
+<p class="text-zinc-400 mb-4">
+  Add more sessions by creating directories under <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">sessions/</code>:
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code># .botster/profiles/web/sessions/server/initialization
+#!/bin/bash
+bin/dev</code></pre>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Port forwarding</h2>
+<p class="text-zinc-400 mb-4">
+  To enable port forwarding for a session, create a
+  <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">port_forward</code> sentinel
+  file next to the initialization script. This makes the session's port accessible via the preview UI
+  and sets the <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">$PORT</code> environment variable.
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto"><code>sessions/server/
+  initialization     # Startup script
+  port_forward       # Empty file - enables port forwarding</code></pre>

@@ -1,24 +1,17 @@
 //! Cross-platform file system event monitoring.
 //!
 //! Provides a generic [`FileWatcher`] backed by OS-native mechanisms
-//! (kqueue on macOS, inotify on Linux) via the `notify` crate. Events
-//! are buffered in a channel and consumed via non-blocking [`FileWatcher::poll`].
+//! (kqueue on macOS, inotify on Linux) via the `notify` crate. Supports
+//! two consumption modes:
+//!
+//! - **Polling**: Call [`FileWatcher::poll`] to drain buffered events.
+//! - **Event-driven**: Call [`FileWatcher::take_rx`] to extract the raw
+//!   receiver, then spawn a blocking forwarder task that sends events
+//!   to the Hub event channel.
 //!
 //! This module is the foundation for both Lua hot-reload
-//! ([`crate::lua::file_watcher::LuaFileWatcher`]) and future Lua `watch`
+//! ([`crate::lua::file_watcher::LuaFileWatcher`]) and the Lua `watch`
 //! primitives.
-//!
-//! # Usage
-//!
-//! ```ignore
-//! let mut watcher = FileWatcher::new()?;
-//! watcher.watch(Path::new("/some/dir"), true)?;
-//!
-//! // In event loop:
-//! for event in watcher.poll() {
-//!     println!("{:?} {:?}", event.kind, event.path);
-//! }
-//! ```
 
 use std::path::Path;
 use std::sync::mpsc;
@@ -55,12 +48,13 @@ pub struct FileEvent {
 
 /// Non-blocking file system watcher using OS-native mechanisms.
 ///
-/// Wraps `notify::RecommendedWatcher` with a channel-based polling
-/// interface. Events accumulate between [`poll`](Self::poll) calls
-/// and are drained non-blocking.
+/// Wraps `notify::RecommendedWatcher` with a channel-based event interface.
+/// Events can be consumed either by polling via [`poll`](Self::poll) or by
+/// extracting the receiver via [`take_rx`](Self::take_rx) for event-driven
+/// delivery through a blocking forwarder task.
 pub struct FileWatcher {
     watcher: RecommendedWatcher,
-    rx: mpsc::Receiver<Result<Event, notify::Error>>,
+    rx: Option<mpsc::Receiver<Result<Event, notify::Error>>>,
 }
 
 impl std::fmt::Debug for FileWatcher {
@@ -86,7 +80,7 @@ impl FileWatcher {
         })
         .context("Failed to create file watcher")?;
 
-        Ok(Self { watcher, rx })
+        Ok(Self { watcher, rx: Some(rx) })
     }
 
     /// Start watching `path` for file system events.
@@ -119,16 +113,32 @@ impl FileWatcher {
         let _ = self.watcher.unwatch(path);
     }
 
+    /// Extract the raw receiver for event-driven delivery.
+    ///
+    /// After calling this, [`poll`](Self::poll) will return empty results.
+    /// The caller owns the receiver and should drain it in a blocking
+    /// forwarder task that sends events to the Hub event channel.
+    ///
+    /// Returns `None` if the receiver was already taken.
+    pub fn take_rx(&mut self) -> Option<mpsc::Receiver<Result<Event, notify::Error>>> {
+        self.rx.take()
+    }
+
     /// Drain all buffered events (non-blocking).
     ///
     /// Returns every event that arrived since the last call. Returns
-    /// an empty `Vec` if nothing changed. Errors from the underlying
+    /// an empty `Vec` if nothing changed or if the receiver was taken
+    /// via [`take_rx`](Self::take_rx). Errors from the underlying
     /// watcher are logged and skipped.
     #[must_use]
     pub fn poll(&self) -> Vec<FileEvent> {
+        let Some(ref rx) = self.rx else {
+            return Vec::new();
+        };
+
         let mut events = Vec::new();
 
-        while let Ok(result) = self.rx.try_recv() {
+        while let Ok(result) = rx.try_recv() {
             match result {
                 Ok(event) => {
                     let kind = Self::classify(&event.kind);
@@ -143,6 +153,15 @@ impl FileWatcher {
         }
 
         events
+    }
+
+    /// Classify a raw `notify::Event` into [`FileEvent`] items.
+    ///
+    /// Utility for event-driven consumers that receive raw events from
+    /// the extracted receiver (via [`take_rx`](Self::take_rx)).
+    pub fn classify_event(event: &notify::Event) -> Vec<FileEvent> {
+        let kind = Self::classify(&event.kind);
+        event.paths.iter().map(|p| FileEvent { path: p.clone(), kind }).collect()
     }
 
     /// Map `notify::EventKind` to [`FileEventKind`].

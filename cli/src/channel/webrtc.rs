@@ -76,9 +76,9 @@ use super::{
 
 /// Internal message for the receive queue.
 #[derive(Debug)]
-struct RawIncoming {
-    payload: Vec<u8>,
-    sender: PeerId,
+pub(crate) struct RawIncoming {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) sender: PeerId,
 }
 
 /// Outgoing signal destined for a browser, sent via ActionCable relay.
@@ -121,6 +121,7 @@ pub struct WebRtcChannelBuilder {
     signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
     stream_frame_tx: Option<mpsc::UnboundedSender<StreamIncoming>>,
     pty_input_tx: Option<mpsc::UnboundedSender<PtyInputIncoming>>,
+    hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
 }
 
 impl std::fmt::Debug for WebRtcChannelBuilder {
@@ -131,6 +132,7 @@ impl std::fmt::Debug for WebRtcChannelBuilder {
             .field("signal_tx", &self.signal_tx.is_some())
             .field("stream_frame_tx", &self.stream_frame_tx.is_some())
             .field("pty_input_tx", &self.pty_input_tx.is_some())
+            .field("hub_event_tx", &self.hub_event_tx.is_some())
             .finish()
     }
 }
@@ -144,6 +146,7 @@ impl Default for WebRtcChannelBuilder {
             signal_tx: None,
             stream_frame_tx: None,
             pty_input_tx: None,
+            hub_event_tx: None,
         }
     }
 }
@@ -197,6 +200,16 @@ impl WebRtcChannelBuilder {
         self
     }
 
+    /// Set the Hub event channel sender for DC opened notifications.
+    #[must_use]
+    pub(crate) fn hub_event_tx(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
+    ) -> Self {
+        self.hub_event_tx = Some(tx);
+        self
+    }
+
     /// Build the channel.
     ///
     /// # Panics
@@ -222,6 +235,7 @@ impl WebRtcChannelBuilder {
             peer_olm_key: Arc::new(Mutex::new(None)),
             decrypt_failures: Arc::new(AtomicU32::new(0)),
             dc_opened: Arc::new(AtomicBool::new(false)),
+            hub_event_tx: self.hub_event_tx,
             close_complete_tx: close_tx,
             close_complete_rx: close_rx,
         }
@@ -263,7 +277,12 @@ pub struct WebRtcChannel {
     /// Consecutive decryption failure count for session health monitoring.
     decrypt_failures: Arc<AtomicU32>,
     /// Set to `true` when the DataChannel opens; consumed by `take_dc_opened()`.
+    /// Kept as test-only fallback when `hub_event_tx` is None.
     dc_opened: Arc<AtomicBool>,
+    /// Event channel sender for DC opened notifications.
+    /// When set, `on_data_channel` sends `HubEvent::DcOpened` instead of
+    /// setting the atomic bool.
+    hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
     /// Set to `true` when the state handler's close task completes (pc/dc sockets released).
     /// Uses `watch` so late subscribers see the value even if the close already happened
     /// (unlike `Notify`, which is fire-and-forget).
@@ -519,6 +538,7 @@ impl WebRtcChannel {
         let stream_frame_tx = self.stream_frame_tx.clone();
         let pty_input_tx = self.pty_input_tx.clone();
         let dc_opened = Arc::clone(&self.dc_opened);
+        let hub_event_tx = self.hub_event_tx.clone();
 
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let recv_tx = Arc::clone(&recv_tx);
@@ -530,13 +550,24 @@ impl WebRtcChannel {
             let stream_frame_tx = stream_frame_tx.clone();
             let pty_input_tx = pty_input_tx.clone();
             let dc_opened = Arc::clone(&dc_opened);
+            let hub_event_tx = hub_event_tx.clone();
 
             Box::pin(async move {
                 log::info!("[WebRTC] Data channel opened: {}", dc.label());
 
                 // Store data channel and signal readiness
                 *data_channel.lock().await = Some(Arc::clone(&dc));
-                dc_opened.store(true, Ordering::Relaxed);
+
+                // Notify the Hub event loop that the DC is open.
+                // Event channel path (production): instant delivery.
+                // Atomic bool path (tests): polled by tick().
+                if let Some(ref tx) = hub_event_tx {
+                    let _ = tx.send(crate::hub::events::HubEvent::DcOpened {
+                        browser_identity: browser_id.clone(),
+                    });
+                } else {
+                    dc_opened.store(true, Ordering::Relaxed);
+                }
 
                 // Set up message handler — every byte is Olm-encrypted
                 let recv_tx_inner = Arc::clone(&recv_tx);
@@ -909,6 +940,17 @@ impl WebRtcChannel {
                 Err(_) => None,
             }
         })
+    }
+
+    /// Get a clone of the `recv_rx` Arc for spawning a forwarding task.
+    ///
+    /// The forwarding task takes the `Option<Receiver>` from inside the Arc
+    /// and reads from it, sending each message as a `HubEvent::WebRtcMessage`.
+    /// After the receiver is taken, [`try_recv`] will return `None`.
+    pub(crate) fn recv_rx_arc(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<RawIncoming>>>> {
+        Arc::clone(&self.recv_rx)
     }
 
     /// Get consecutive decryption failure count.

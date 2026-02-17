@@ -42,6 +42,7 @@
 pub mod action_cable_connection;
 pub mod actions;
 pub mod agent_handle;
+pub(crate) mod events;
 pub mod handle_cache;
 pub mod lifecycle;
 pub mod registration;
@@ -133,7 +134,7 @@ pub(crate) fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
 /// Central orchestrator for the botster application.
 ///
 /// The Hub owns all application state and coordinates between the TUI,
-/// server polling, and browser relay components. It can run in either
+/// server integration, and browser relay components. It can run in either
 /// TUI mode (with terminal rendering) or headless mode (for CI/daemon use).
 pub struct Hub {
     // === Core State ===
@@ -193,7 +194,9 @@ pub struct Hub {
     /// Forwarder tasks send PTY output here; main loop drains and sends via WebRTC.
     pub webrtc_pty_output_tx: tokio::sync::mpsc::UnboundedSender<WebRtcPtyOutput>,
     /// Receiver for PTY output messages.
-    pub webrtc_pty_output_rx: tokio::sync::mpsc::UnboundedReceiver<WebRtcPtyOutput>,
+    ///
+    /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
+    pub webrtc_pty_output_rx: Option<tokio::sync::mpsc::UnboundedReceiver<WebRtcPtyOutput>>,
 
     /// Active PTY forwarder task handles for cleanup on unsubscribe.
     ///
@@ -207,16 +210,22 @@ pub struct Hub {
     /// the receiver and relays via `ChannelHandle::perform("signal", ...)`.
     pub webrtc_outgoing_signal_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::OutgoingSignal>,
     /// Receiver for outgoing WebRTC signals. Drained in `tick()`.
-    webrtc_outgoing_signal_rx: tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::OutgoingSignal>,
+    ///
+    /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
+    webrtc_outgoing_signal_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::OutgoingSignal>>,
 
     /// TCP stream multiplexers per browser identity for preview tunneling.
     stream_muxes: std::collections::HashMap<String, crate::relay::stream_mux::StreamMultiplexer>,
     /// Receiver for incoming stream frames from WebRTC DataChannels.
-    stream_frame_rx: tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::StreamIncoming>,
+    ///
+    /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
+    stream_frame_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::StreamIncoming>>,
     /// Sender for incoming stream frames (cloned into each WebRtcChannel).
     pub stream_frame_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::StreamIncoming>,
     /// Receiver for binary PTY input from WebRTC DataChannels (bypasses JSON/Lua).
-    pty_input_rx: tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::PtyInputIncoming>,
+    ///
+    /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
+    pty_input_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::PtyInputIncoming>>,
     /// Sender for binary PTY input (cloned into each WebRtcChannel).
     pub pty_input_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::PtyInputIncoming>,
 
@@ -245,12 +254,21 @@ pub struct Hub {
     /// never block the WebRTC fast path.
     pty_observer_queue: std::collections::VecDeque<PtyObserverNotification>,
 
-    /// Pending PTY notification events from watcher tasks.
+    /// Pending PTY notification events from watcher tasks (test-only fallback).
     ///
-    /// Watcher tasks subscribe to PTY broadcast channels, filter for
-    /// `PtyEvent::Notification`, and push events here. Drained in
-    /// `poll_pty_notifications()` which fires the `pty_notification` Lua hook.
+    /// Production path uses `HubEvent::PtyNotification` via the event channel.
+    /// Tests without the event bus still push to this queue and drain it
+    /// in the `#[cfg(test)]` `tick()` method.
+    #[cfg(test)]
     pty_notification_queue: std::sync::Arc<std::sync::Mutex<Vec<PtyNotificationEvent>>>,
+
+    /// Count of PTY output messages processed by `poll_webrtc_pty_output`.
+    ///
+    /// Incremented for each message drained from the channel, regardless of
+    /// whether the WebRTC send succeeds. Used by regression tests to verify
+    /// that messages are not silently dropped by the `select!` pattern.
+    #[cfg(test)]
+    pub(crate) pty_output_messages_drained: usize,
 
     /// Handles for notification watcher tasks, keyed by "{agent_key}:{session_name}".
     notification_watcher_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
@@ -261,10 +279,38 @@ pub struct Hub {
     /// Set by `register_tui_via_lua()`. Hub sends `TuiOutput` messages
     /// through this channel directly.
     tui_output_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::client::TuiOutput>>,
+    /// Write end of the TUI wake pipe.
+    ///
+    /// When set, Hub writes 1 byte after sending to `tui_output_tx` to wake
+    /// the TUI thread from its blocking `libc::poll()`. This replaces
+    /// the old `thread::sleep(16ms)` polling in TuiRunner.
+    pub(crate) tui_wake_fd: Option<std::os::unix::io::RawFd>,
     /// Receiver for TUI requests from TuiRunner.
     ///
     /// Set by `register_tui_via_lua()`. Polled by `poll_tui_requests()`.
     tui_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::TuiRequest>>,
+
+    // === Async Worktree Creation ===
+    /// Sender for async worktree creation results from blocking tasks.
+    ///
+    /// Cloned into each `spawn_blocking` task. Results are polled in
+    /// `poll_worktree_results()` during `tick()`.
+    worktree_result_tx: crate::lua::primitives::WorktreeResultSender,
+    /// Receiver for async worktree creation results.
+    ///
+    /// Drained in `poll_worktree_results()` which fires Lua events
+    /// to resume agent spawning. Wrapped in `Option` so the event loop
+    /// can extract it for `tokio::select!`.
+    worktree_result_rx: Option<crate::lua::primitives::WorktreeResultReceiver>,
+
+    // === Unified Event Channel ===
+    /// Sender for the unified event bus. Cloned to background producers
+    /// (HTTP threads, WebSocket threads, timer tasks, etc.) so they can
+    /// deliver events to the Hub event loop without polling.
+    pub(crate) hub_event_tx: tokio::sync::mpsc::UnboundedSender<events::HubEvent>,
+    /// Receiver for the unified event bus. Extracted into the `select!`
+    /// loop by `run_event_loop()`.
+    hub_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<events::HubEvent>>,
 }
 
 impl std::fmt::Debug for Hub {
@@ -335,9 +381,17 @@ impl Hub {
         let (stream_frame_tx, stream_frame_rx) = tokio::sync::mpsc::unbounded_channel();
         // Create channel for binary PTY input from WebRTC DataChannels
         let (pty_input_tx, pty_input_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Create channel for async worktree creation results
+        let (worktree_result_tx, worktree_result_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Unified event bus for background producers (HTTP, WS, timers, etc.)
+        let (hub_event_tx, hub_event_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Initialize Lua scripting runtime
-        let lua = LuaRuntime::new()?;
+        let mut lua = LuaRuntime::new()?;
+
+        // Wire the unified event bus into Lua primitive registries so background
+        // threads can send events directly instead of pushing to shared vecs.
+        lua.set_hub_event_tx(hub_event_tx.clone(), tokio_runtime.handle().clone());
 
         Ok(Self {
             state,
@@ -355,23 +409,31 @@ impl Hub {
             webrtc_connection_started: std::collections::HashMap::new(),
             webrtc_pending_closes: std::collections::HashMap::new(),
             webrtc_pty_output_tx,
-            webrtc_pty_output_rx,
+            webrtc_pty_output_rx: Some(webrtc_pty_output_rx),
             webrtc_pty_forwarders: std::collections::HashMap::new(),
             webrtc_outgoing_signal_tx,
-            webrtc_outgoing_signal_rx,
+            webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
             stream_muxes: std::collections::HashMap::new(),
-            stream_frame_rx,
+            stream_frame_rx: Some(stream_frame_rx),
             stream_frame_tx,
-            pty_input_rx,
+            pty_input_rx: Some(pty_input_rx),
             pty_input_tx,
             lua,
             lua_ac_connections: std::collections::HashMap::new(),
             lua_ac_channels: std::collections::HashMap::new(),
             pty_observer_queue: std::collections::VecDeque::new(),
+            #[cfg(test)]
             pty_notification_queue: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            pty_output_messages_drained: 0,
             notification_watcher_handles: std::collections::HashMap::new(),
             tui_output_tx: None,
+            tui_wake_fd: None,
             tui_request_rx: None,
+            worktree_result_tx,
+            worktree_result_rx: Some(worktree_result_rx),
+            hub_event_tx,
+            hub_event_rx: Some(hub_event_rx),
         })
     }
 
@@ -504,7 +566,7 @@ impl Hub {
     /// checked) so that on-disk files stay in sync with the binary. Users can
     /// still edit the extracted files for hot-reload; edits persist until the
     /// next binary update changes the content hash.
-    fn load_lua_init(&mut self) {
+    pub(crate) fn load_lua_init(&mut self) {
         // In debug builds, use source directory for hot-reload during development
         #[cfg(debug_assertions)]
         {
@@ -571,6 +633,13 @@ impl Hub {
         if let Err(e) = self.lua.fire_shutdown() {
             log::warn!("Lua shutdown event error: {}", e);
         }
+
+        // Stop all file watcher forwarder tasks (Lua hot-reload + user watches).
+        // These are spawn_blocking tasks that block on rx.recv() — the senders
+        // live inside FileWatcher (owned by LuaRuntime). If we don't stop them
+        // here, tokio::Runtime::drop will deadlock waiting for tasks that can
+        // never complete (the senders drop AFTER the runtime in struct field order).
+        self.lua.stop_all_watchers();
 
         // Abort all PTY forwarder tasks
         for (_key, task) in self.webrtc_pty_forwarders.drain() {
@@ -655,6 +724,16 @@ impl Hub {
         output_rx
     }
 
+    /// Write 1 byte to the TUI wake pipe to unblock its `libc::poll()`.
+    ///
+    /// Safe to call from any thread — pipe writes ≤ PIPE_BUF are atomic.
+    /// No-op if no TUI wake pipe is configured (headless mode).
+    pub(crate) fn wake_tui(&self) {
+        if let Some(fd) = self.tui_wake_fd {
+            wake_tui_pipe(fd);
+        }
+    }
+
     /// Generate connection URL, lazily generating bundle if needed.
     ///
     /// Format: `{server_url}/hubs/{id}#{base32_binary_bundle}`
@@ -674,6 +753,24 @@ impl Hub {
         result
     }
 
+}
+
+impl Drop for Hub {
+    /// Safety net: stop all blocking watcher tasks before the runtime drops.
+    ///
+    /// Rust drops struct fields in declaration order. `tokio_runtime` is
+    /// declared before `lua`, so it drops first. But `lua` owns file watcher
+    /// forwarder tasks (`spawn_blocking`) that block on `rx.recv()` — the
+    /// senders live inside `FileWatcher` (also owned by `lua`). If those
+    /// tasks aren't stopped before the runtime drops, `Runtime::drop` blocks
+    /// forever waiting for tasks that can never complete.
+    ///
+    /// `shutdown()` handles this in the normal path. This `Drop` impl is the
+    /// safety net for panic unwinds, early returns, or any path that skips
+    /// `shutdown()`.
+    fn drop(&mut self) {
+        self.lua.stop_all_watchers();
+    }
 }
 
 #[cfg(test)]
@@ -700,6 +797,116 @@ mod tests {
 
         assert!(!hub.should_quit());
         assert_eq!(hub.agent_count(), 0);
+    }
+
+    /// Verifies Hub drop completes without deadlocking.
+    ///
+    /// Regression test for a drop-order deadlock: `tokio_runtime` is declared
+    /// before `lua` in Hub, so it drops first. But `lua` owns `spawn_blocking`
+    /// file watcher tasks that block on `rx.recv()` — the senders live inside
+    /// `FileWatcher` (also owned by `lua`). Without the `Drop` impl, runtime
+    /// drop blocks forever waiting for tasks that can never complete.
+    ///
+    /// The fix: `Hub::drop()` calls `lua.stop_all_watchers()` before the
+    /// runtime drops, aborting forwarder tasks and dropping watchers so the
+    /// blocking pool can shut down cleanly.
+    #[test]
+    fn test_hub_drop_completes_with_file_watching() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
+
+        let handle = std::thread::spawn(move || {
+            let config = test_config();
+            let mut hub = Hub::new(config).unwrap();
+
+            // Wire up event channel + tokio handle so file watching
+            // spawns a blocking forwarder task (production path).
+            let tx = hub.hub_event_tx.clone();
+            hub.lua.set_hub_event_tx(tx, hub.tokio_runtime.handle().clone());
+
+            // Create a real directory to watch (file watcher skips nonexistent).
+            let dir = std::env::temp_dir().join("botster_deadlock_test");
+            let _ = std::fs::create_dir_all(&dir);
+            std::fs::write(dir.join("init.lua"), "-- test").unwrap();
+            hub.lua.set_base_path(dir.clone());
+
+            hub.lua.start_file_watching().unwrap();
+            assert!(hub.lua.is_file_watching());
+
+            // Simulate the shutdown path: call shutdown then drop.
+            // shutdown() stops watchers, and Drop is the safety net.
+            hub.shutdown();
+            drop(hub);
+
+            let _ = std::fs::remove_dir_all(&dir);
+            done_clone.store(true, Ordering::SeqCst);
+        });
+
+        // Wait up to 5 seconds for Hub drop to complete.
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(
+            done.load(Ordering::SeqCst),
+            "Hub::drop deadlocked — file watcher forwarder tasks were not stopped \
+             before the tokio runtime dropped"
+        );
+
+        handle.join().expect("Hub drop thread should not panic");
+    }
+
+    /// Verifies Hub drop completes even without calling shutdown().
+    ///
+    /// The `Drop` impl must handle this case (panic unwind, early return).
+    #[test]
+    fn test_hub_drop_without_shutdown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
+
+        let handle = std::thread::spawn(move || {
+            let config = test_config();
+            let mut hub = Hub::new(config).unwrap();
+
+            let tx = hub.hub_event_tx.clone();
+            hub.lua.set_hub_event_tx(tx, hub.tokio_runtime.handle().clone());
+
+            let dir = std::env::temp_dir().join("botster_deadlock_test_no_shutdown");
+            let _ = std::fs::create_dir_all(&dir);
+            std::fs::write(dir.join("init.lua"), "-- test").unwrap();
+            hub.lua.set_base_path(dir.clone());
+
+            hub.lua.start_file_watching().unwrap();
+
+            // Drop WITHOUT calling shutdown() — Drop impl must handle it.
+            drop(hub);
+
+            let _ = std::fs::remove_dir_all(&dir);
+            done_clone.store(true, Ordering::SeqCst);
+        });
+
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(
+            done.load(Ordering::SeqCst),
+            "Hub::drop deadlocked without shutdown() — Drop impl did not stop watchers"
+        );
+
+        handle.join().expect("Hub drop thread should not panic");
     }
 
     #[test]
@@ -966,4 +1173,14 @@ mod tests {
         }, Duration::from_secs(5));
     }
 
+}
+
+/// Write 1 byte to a wake pipe fd to unblock a `libc::poll()` waiter.
+///
+/// Pipe writes ≤ PIPE_BUF bytes are atomic per POSIX, so this is safe
+/// to call from any thread (Hub main thread or tokio forwarder tasks).
+pub(crate) fn wake_tui_pipe(fd: std::os::unix::io::RawFd) {
+    unsafe {
+        libc::write(fd, [1u8].as_ptr() as *const libc::c_void, 1);
+    }
 }

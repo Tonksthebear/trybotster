@@ -1,0 +1,30 @@
+<h1 class="text-2xl font-bold text-zinc-100 mb-6">Plugins</h1>
+
+<p class="text-zinc-400 mb-6">
+  Plugins extend botster with custom behavior. They're Lua scripts loaded at hub startup.
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Plugin location</h2>
+<p class="text-zinc-400 mb-4">
+  Place plugins in the <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">plugins/</code>
+  directory at any config layer:
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>~/.botster/shared/plugins/my-plugin/init.lua        # All profiles
+~/.botster/profiles/standard/plugins/my-plugin/     # Specific profile
+your-repo/.botster/shared/plugins/my-plugin/        # Repo-wide
+your-repo/.botster/profiles/web/plugins/my-plugin/  # Repo + profile</code></pre>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Plugin structure</h2>
+<p class="text-zinc-400 mb-4">
+  Each plugin is a directory with an <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">init.lua</code> entry point:
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>plugins/
+  my-plugin/
+    init.lua    # Entry point, loaded at startup</code></pre>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Load order</h2>
+<p class="text-zinc-400">
+  Plugins are loaded in alphabetical order within each config layer. The 4-layer merge applies:
+  device shared first, then device profile, repo shared, and repo profile last.
+  Plugins support hot reload &mdash; changes take effect without restarting the hub.
+</p>

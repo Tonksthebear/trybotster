@@ -1,9 +1,9 @@
 //! User-facing file watch primitives for Lua scripts.
 //!
-//! Unlike queue-based primitives (PTY, WebRTC, Hub), this flows OS events
-//! into Lua: each `watch.directory()` call creates an OS-level file watcher
-//! and registers a Lua callback. The Hub tick loop calls
-//! [`poll_user_watches`] to drain events and fire callbacks.
+//! Each `watch.directory()` call creates an OS-level file watcher and
+//! registers a Lua callback. In production, a blocking forwarder task
+//! per watch sends `HubEvent::UserFileWatch` events to the Hub event
+//! loop, which dispatches via [`fire_user_watch_events`].
 //!
 //! # Lua API
 //!
@@ -37,17 +37,24 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use globset::{Glob, GlobMatcher};
 use mlua::prelude::*;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinHandle;
 
 use crate::file_watcher::{FileEventKind, FileWatcher};
+use crate::hub::events::HubEvent;
 
 /// A single active directory watch with its OS watcher and Lua callback.
 struct WatchEntry {
-    /// OS-level file watcher.
+    /// OS-level file watcher (keeps the `notify` subscription alive).
     watcher: FileWatcher,
     /// Lua registry key for the callback function.
     callback_key: LuaRegistryKey,
     /// Optional glob pattern for filtering events.
     glob: Option<GlobMatcher>,
+    /// Blocking forwarder task handle (event-driven mode).
+    ///
+    /// Aborted on unwatch to stop the forwarder.
+    forwarder_handle: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for WatchEntry {
@@ -60,14 +67,24 @@ impl std::fmt::Debug for WatchEntry {
 
 /// Registry of active user file watches.
 ///
-/// Shared between Lua (for creating/removing watches) and the Hub tick
-/// loop (for polling events and firing callbacks).
+/// Shared between Lua (for creating/removing watches) and the Hub event
+/// loop (for dispatching file watch events and firing callbacks).
 #[derive(Debug, Default)]
 pub struct WatcherEntries {
     /// Active watches keyed by unique ID.
     entries: HashMap<String, WatchEntry>,
     /// Counter for generating unique watch IDs.
     next_id: u64,
+    /// Hub event channel for event-driven delivery.
+    ///
+    /// When set, new watches spawn a blocking forwarder task that sends
+    /// `HubEvent::UserFileWatch` instead of relying on periodic polling.
+    hub_event_tx: Option<UnboundedSender<HubEvent>>,
+    /// Tokio runtime handle for spawning blocking forwarder tasks.
+    ///
+    /// Needed because `watch.directory()` may be called during initialization
+    /// (before `block_on`), when no implicit runtime context exists.
+    tokio_handle: Option<tokio::runtime::Handle>,
 }
 
 impl WatcherEntries {
@@ -81,6 +98,31 @@ impl WatcherEntries {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Set the Hub event channel and tokio handle for event-driven delivery.
+    pub(crate) fn set_hub_event_tx(
+        &mut self,
+        tx: UnboundedSender<HubEvent>,
+        handle: tokio::runtime::Handle,
+    ) {
+        self.hub_event_tx = Some(tx);
+        self.tokio_handle = Some(handle);
+    }
+
+    /// Stop all active watches, aborting forwarder tasks and dropping watchers.
+    ///
+    /// Must be called before the tokio runtime drops to prevent a deadlock:
+    /// forwarder tasks block on `rx.recv()` where the sender lives inside
+    /// each `FileWatcher`. Dropping the watcher closes the sender, unblocking
+    /// the forwarder so the runtime can shut down cleanly.
+    pub(crate) fn stop_all(&mut self) {
+        for (_id, entry) in self.entries.drain() {
+            if let Some(handle) = entry.forwarder_handle {
+                handle.abort();
+            }
+            // entry.watcher drops here, closing the sender
+        }
     }
 }
 
@@ -206,12 +248,51 @@ pub fn register(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
             let id = format!("watch_{}", entries.next_id);
             entries.next_id += 1;
 
+            // Spawn a blocking forwarder task if the event channel and tokio
+            // handle are available. Uses the stored handle because this may
+            // be called during initialization (before block_on).
+            let forwarder_handle = if let (Some(ref tx), Some(ref handle)) =
+                (&entries.hub_event_tx, &entries.tokio_handle)
+            {
+                let rx = watcher.take_rx();
+                if let Some(rx) = rx {
+                    let tx = tx.clone();
+                    let watch_id = id.clone();
+                    Some(handle.spawn_blocking(move || {
+                        // Blocking recv — wakes only when the OS delivers an event.
+                        while let Ok(result) = rx.recv() {
+                            let events = match result {
+                                Ok(event) => FileWatcher::classify_event(&event),
+                                Err(e) => {
+                                    log::warn!("[watch] File watcher error: {e}");
+                                    continue;
+                                }
+                            };
+                            if events.is_empty() {
+                                continue;
+                            }
+                            if tx.send(HubEvent::UserFileWatch {
+                                watch_id: watch_id.clone(),
+                                events,
+                            }).is_err() {
+                                break; // Hub shut down
+                            }
+                        }
+                    }))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             entries.entries.insert(
                 id.clone(),
                 WatchEntry {
                     watcher,
                     callback_key,
                     glob,
+                    forwarder_handle,
                 },
             );
 
@@ -238,6 +319,10 @@ pub fn register(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
             let mut entries = reg2.lock().expect("WatcherEntries mutex poisoned");
 
             if let Some(entry) = entries.entries.remove(&watch_id) {
+                // Abort the forwarder task if running.
+                if let Some(handle) = entry.forwarder_handle {
+                    handle.abort();
+                }
                 // Remove callback from Lua registry
                 if let Err(e) = lua.remove_registry_value(entry.callback_key) {
                     log::warn!("[watch] Failed to remove callback for {}: {}", watch_id, e);
@@ -395,6 +480,104 @@ pub fn poll_user_watches(lua: &Lua, registry: &WatcherRegistry) -> usize {
     }
 
     total_events
+}
+
+/// Fire Lua callbacks for a single user file watch event (event-driven path).
+///
+/// Called by `handle_hub_event` when a `HubEvent::UserFileWatch` arrives.
+/// Applies glob filtering and fires the registered Lua callback, same as
+/// [`poll_user_watches`] but for a single watch ID.
+///
+/// # Deadlock Prevention
+///
+/// The registry lock is held only to read the glob pattern and clone the
+/// callback key. Lua callbacks are fired after the lock is released.
+pub fn fire_user_watch_events(
+    lua: &Lua,
+    registry: &WatcherRegistry,
+    watch_id: &str,
+    events: Vec<crate::file_watcher::FileEvent>,
+) -> usize {
+    // Phase 1: read glob + clone callback key under lock.
+    let (glob, callback_key) = {
+        let entries = registry.lock().expect("WatcherEntries mutex poisoned");
+        let Some(entry) = entries.entries.get(watch_id) else {
+            return 0; // Watch was removed between event and dispatch
+        };
+
+        let glob = entry.glob.as_ref().map(|g| g.clone());
+        let key = match lua.registry_value::<LuaFunction>(&entry.callback_key) {
+            Ok(cb) => match lua.create_registry_value(cb) {
+                Ok(k) => k,
+                Err(_) => return 0,
+            },
+            Err(_) => return 0,
+        };
+
+        (glob, key)
+    };
+    // Lock released — safe to call Lua.
+
+    // Phase 2: filter and fire callbacks.
+    let mut fired = 0;
+
+    for event in events {
+        if event.kind == FileEventKind::Other {
+            continue;
+        }
+
+        // Apply glob filter.
+        if let Some(ref glob) = glob {
+            let matches = event
+                .path
+                .file_name()
+                .map_or(false, |name| glob.is_match(name.to_string_lossy().as_ref()));
+            if !matches {
+                continue;
+            }
+        }
+
+        let result: LuaResult<()> = (|| {
+            let event_table = lua.create_table()?;
+            event_table.set("path", event.path.to_string_lossy().to_string())?;
+            event_table.set("kind", kind_to_str(event.kind))?;
+            event_table.set("watch_id", watch_id)?;
+
+            let callback: LuaFunction = lua.registry_value(&callback_key)?;
+            callback.call::<()>(event_table.clone())?;
+
+            // Fire hooks.notify("file_changed", event) for the hook system.
+            let hooks_result: LuaResult<()> = (|| {
+                let hooks: LuaTable = lua.globals().get("hooks")?;
+                let notify: LuaFunction = hooks.get("notify")?;
+                notify.call::<()>(("file_changed", event_table))?;
+                Ok(())
+            })();
+
+            if let Err(e) = hooks_result {
+                log::trace!("[watch] hooks.notify failed (may not be loaded): {e}");
+            }
+
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            log::warn!(
+                "[watch] Callback error for {} (path={}, kind={}): {}",
+                watch_id,
+                event.path.display(),
+                kind_to_str(event.kind),
+                e
+            );
+        }
+
+        fired += 1;
+    }
+
+    // Clean up temporary registry key.
+    let _ = lua.remove_registry_value(callback_key);
+
+    fired
 }
 
 #[cfg(test)]

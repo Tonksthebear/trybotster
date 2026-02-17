@@ -107,12 +107,6 @@ end, { description = "Copy connection URL to clipboard" })
 -- Hub Control Commands
 -- ============================================================================
 
-commands.register("resize", function(client, _sub_id, command)
-    local rows = command.rows or 24
-    local cols = command.cols or 80
-    client:update_dims(rows, cols)
-end, { description = "Update client terminal dimensions" })
-
 commands.register("quit", function(_client, _sub_id, _command)
     hub.quit()
 end, { description = "Shut down the hub" })

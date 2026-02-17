@@ -1,0 +1,25 @@
+<h1 class="text-2xl font-bold text-zinc-100 mb-6">Workspace Files</h1>
+
+<p class="text-zinc-400 mb-6">
+  Control which files are copied into agent worktrees and what happens when worktrees are cleaned up.
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">workspace_include</h2>
+<p class="text-zinc-400 mb-4">
+  A file containing glob patterns (one per line) for files that should be copied from your main repo
+  into each agent's worktree. Useful for files that aren't tracked by git.
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code># .botster/shared/workspace_include
+.env
+config/secrets.yml
+node_modules</code></pre>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">workspace_teardown</h2>
+<p class="text-zinc-400 mb-4">
+  A bash script that runs before a worktree is deleted. Use it for cleanup tasks like stopping
+  services or removing generated files.
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto"><code># .botster/shared/workspace_teardown
+#!/bin/bash
+docker compose down 2>/dev/null
+rm -rf tmp/pids</code></pre>

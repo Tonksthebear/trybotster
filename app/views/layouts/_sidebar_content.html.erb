@@ -78,8 +78,17 @@
     <% end %>
   </div>
 
-  <%# Bottom section - Settings & User %>
+  <%# Bottom section - Docs, Settings & User %>
   <div class="shrink-0 border-t border-zinc-800">
+    <%# Docs %>
+    <%= link_to docs_path,
+        target: "_blank",
+        class: "flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
+        <%= icon "book-open", class: "size-5" %>
+      <span>Docs</span>
+      <%= icon "arrow-top-right-on-square", class: "size-3 text-zinc-600" %>
+    <% end %>
+
     <%# Settings %>
     <%= link_to settings_path,
         class: "flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>

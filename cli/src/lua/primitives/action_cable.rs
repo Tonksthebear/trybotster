@@ -2,25 +2,26 @@
 //!
 //! Exposes ActionCable connection management to Lua scripts via a request
 //! queue pattern. Lua enqueues requests (connect, subscribe, perform, close)
-//! which the Hub processes in its tick loop. Incoming channel messages are
-//! polled each tick and dispatched to registered Lua callbacks.
+//! which the Hub processes via `flush_lua_queues()`. In production, a
+//! forwarding task per channel sends `HubEvent::AcChannelMessage` events
+//! to the Hub event loop for instant callback dispatch.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Lua script                    Hub tick loop
+//! Lua script                    Hub event loop
 //!     │                              │
 //!     │ action_cable.connect()       │
 //!     │ ───────────────────────►     │ process_lua_action_cable_requests()
 //!     │                              │   → creates ActionCableConnection
 //!     │ action_cable.subscribe()     │
-//!     │ ───────────────────────►     │   → calls connection.subscribe()
+//!     │ ───────────────────────►     │   → spawns forwarding task
 //!     │                              │
 //!     │ action_cable.perform()       │
 //!     │ ───────────────────────►     │   → calls handle.perform()
 //!     │                              │
-//!     │                              │ poll_lua_action_cable_channels()
-//!     │   ◄──────────────────────    │   → drains handle.try_recv()
+//!     │                              │ HubEvent::AcChannelMessage
+//!     │   ◄──────────────────────    │   → fire_single_ac_message()
 //!     │   callback(message)          │   → auto-decrypts if crypto=true
 //!     │                              │
 //!     │ action_cable.close()         │
@@ -149,6 +150,9 @@ pub struct LuaAcChannel {
     pub callback_key: mlua::RegistryKey,
     /// The connection this channel belongs to (for crypto lookup).
     pub connection_id: String,
+    /// Handle for the forwarding task that reads from `message_rx` and sends
+    /// [`HubEvent::AcChannelMessage`]. `None` in test mode (poll-based).
+    pub(crate) forwarder_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for LuaAcChannel {
@@ -156,7 +160,17 @@ impl std::fmt::Debug for LuaAcChannel {
         f.debug_struct("LuaAcChannel")
             .field("handle", &self.handle)
             .field("connection_id", &self.connection_id)
+            .field("has_forwarder", &self.forwarder_handle.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LuaAcChannel {
+    fn drop(&mut self) {
+        // Abort the forwarding task when the channel is dropped (unsubscribe/close).
+        if let Some(handle) = self.forwarder_handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -170,8 +184,13 @@ impl std::fmt::Debug for LuaAcChannel {
 /// - `Connect`: creates a new `ActionCableConnection` via tokio runtime
 /// - `Subscribe`: subscribes to a channel on an existing connection
 /// - `Perform`: sends an action on a subscribed channel
-/// - `Unsubscribe`: drops a channel handle
+/// - `Unsubscribe`: drops a channel handle (aborts forwarder via `Drop`)
 /// - `Close`: shuts down a connection and removes all its channels
+///
+/// When `hub_event_tx` is `Some` (production), newly subscribed channels
+/// have their `message_rx` taken and a forwarding task spawned that sends
+/// [`HubEvent::AcChannelMessage`] for each received message. When `None`
+/// (tests), channels use poll-based `try_recv()`.
 ///
 /// # Arguments
 ///
@@ -181,13 +200,15 @@ impl std::fmt::Debug for LuaAcChannel {
 /// * `server_url` - Server URL for new connections
 /// * `api_key` - API key for authentication
 /// * `tokio_runtime` - Tokio runtime handle for spawning async connection tasks
-pub fn process_lua_action_cable_requests(
+/// * `hub_event_tx` - Event channel sender for spawning forwarding tasks
+pub(crate) fn process_lua_action_cable_requests(
     requests: &ActionCableRequestQueue,
     connections: &mut HashMap<String, LuaAcConnection>,
     channels: &mut HashMap<String, LuaAcChannel>,
     server_url: &str,
     api_key: &str,
     tokio_runtime: &tokio::runtime::Handle,
+    hub_event_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
 ) {
     let reqs: Vec<ActionCableRequest> = {
         let mut queue = requests.lock().expect("ActionCable request queue mutex poisoned");
@@ -234,13 +255,37 @@ pub fn process_lua_action_cable_requests(
                         }
                     }
 
-                    let handle = conn.connection.subscribe(identifier);
+                    let mut handle = conn.connection.subscribe(identifier);
+
+                    // Spawn a forwarding task if the event channel is available.
+                    let forwarder_handle = if let Some(tx) = hub_event_tx {
+                        if let Some(mut rx) = handle.take_message_rx() {
+                            let tx = tx.clone();
+                            let ch_id = channel_id.clone();
+                            Some(tokio_runtime.spawn(async move {
+                                while let Some(msg) = rx.recv().await {
+                                    if tx.send(crate::hub::events::HubEvent::AcChannelMessage {
+                                        channel_id: ch_id.clone(),
+                                        message: msg,
+                                    }).is_err() {
+                                        break;
+                                    }
+                                }
+                            }))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
                     channels.insert(
                         channel_id.clone(),
                         LuaAcChannel {
                             handle,
                             callback_key,
                             connection_id,
+                            forwarder_handle,
                         },
                     );
                     log::info!(
@@ -391,7 +436,7 @@ pub fn poll_lua_action_cable_channels(
     for (callback_key, msg, channel_id) in &pending {
         let result: mlua::Result<()> = (|| {
             let callback: mlua::Function = lua.registry_value(callback_key)?;
-            let lua_msg = lua.to_value(msg)?;
+            let lua_msg = super::json::json_to_lua(lua, msg)?;
             // Pass (message, channel_id) so Lua callbacks can use channel_id directly
             // without relying on upvalue capture from the subscribe() return value.
             callback.call::<()>((lua_msg, channel_id.as_str()))?;
@@ -409,6 +454,78 @@ pub fn poll_lua_action_cable_channels(
     }
 
     count
+}
+
+/// Fire the Lua callback for a single ActionCable channel message.
+///
+/// Called from [`handle_hub_event`] for [`HubEvent::AcChannelMessage`] events.
+/// Performs crypto decryption if enabled for the channel's connection, then
+/// fires the Lua callback with `(message, channel_id)`.
+///
+/// Does nothing if the channel has been removed (unsubscribed between send
+/// and receive — benign race).
+pub(crate) fn fire_single_ac_message(
+    lua: &Lua,
+    channels: &HashMap<String, LuaAcChannel>,
+    connections: &HashMap<String, LuaAcConnection>,
+    crypto_service: Option<&CryptoService>,
+    channel_id: &str,
+    mut message: serde_json::Value,
+) {
+    let Some(channel) = channels.get(channel_id) else {
+        // Channel was unsubscribed between send and receive — benign race.
+        return;
+    };
+
+    // Auto-decrypt signal envelopes when crypto is enabled for this connection.
+    let crypto_enabled = connections
+        .get(&channel.connection_id)
+        .map_or(false, |c| c.crypto_enabled);
+
+    if crypto_enabled {
+        if let Some(msg_type) = message.get("type").and_then(|t| t.as_str()) {
+            if msg_type == "signal" {
+                if let Some(envelope_val) = message.get("envelope").cloned() {
+                    message = decrypt_signal_envelope(
+                        &message,
+                        &envelope_val,
+                        crypto_service,
+                        channel_id,
+                    );
+                }
+            }
+        }
+    }
+
+    // Clone the callback key for firing.
+    let callback_key = match lua.registry_value::<mlua::Function>(&channel.callback_key) {
+        Ok(cb) => match lua.create_registry_value(cb) {
+            Ok(key) => key,
+            Err(e) => {
+                log::warn!("[ActionCable-Lua] Failed to clone callback key for {channel_id}: {e}");
+                return;
+            }
+        },
+        Err(e) => {
+            log::warn!("[ActionCable-Lua] Failed to retrieve callback for {channel_id}: {e}");
+            return;
+        }
+    };
+
+    // Fire callback.
+    let result: mlua::Result<()> = (|| {
+        let callback: mlua::Function = lua.registry_value(&callback_key)?;
+        let lua_msg = super::json::json_to_lua(lua, &message)?;
+        callback.call::<()>((lua_msg, channel_id))?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        log::warn!("[ActionCable-Lua] Callback error for {channel_id}: {e}");
+    }
+
+    // Clean up temporary registry key.
+    let _ = lua.remove_registry_value(callback_key);
 }
 
 /// Decrypt a signal envelope and replace it in the message.

@@ -194,9 +194,8 @@ end
 -- @param client table|nil       Requesting client (for dimensions)
 -- @param agent_key string       Pre-computed agent key for status broadcasts
 -- @param profile_name string    Profile to use for config resolution
--- @param instance_suffix string|nil  Instance suffix for multi-agent (nil, "-2", "-3")
 -- @return Agent|nil             The created agent, or nil on error
-local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name, instance_suffix)
+local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name)
     local repo = config.env("BOTSTER_REPO") or "unknown/repo"
     local repo_root = worktree.repo_root()
 
@@ -219,11 +218,9 @@ local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, a
 
     local sessions = build_sessions_from_resolved(resolved)
 
-    -- Get dimensions from requesting client if available
-    local dims = nil
-    if client then
-        dims = { rows = client.rows or 24, cols = client.cols or 80 }
-    end
+    -- Default dimensions for PTY creation. The actual client dimensions
+    -- are set when the client subscribes to the terminal channel via pty_clients.
+    local dims = { rows = 24, cols = 80 }
 
     local ok, agent = pcall(Agent.new, {
         repo = repo,
@@ -269,6 +266,10 @@ end
 -- @param profile_name string|nil     Profile name (auto-selected if only one)
 -- @return Agent|nil                  The created agent, or nil on error
 local function handle_create_agent(issue_or_branch, prompt, from_worktree, client, profile_name)
+    -- Early identifier for lifecycle events on error paths (matches what TUI
+    -- sets for creating_agent_id in actions.lua).
+    local early_id = issue_or_branch or "main"
+
     -- Interceptor: plugins can transform params or block creation (return nil)
     local params = hooks.call("before_agent_create", {
         issue_or_branch = issue_or_branch,
@@ -278,6 +279,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     })
     if params == nil then
         log.info("before_agent_create interceptor blocked agent creation")
+        notify_lifecycle(early_id, "failed", { error = "Blocked by interceptor" })
         return nil
     end
     -- Allow interceptors to modify fields
@@ -292,11 +294,13 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         local resolved_profile, profile_err = resolve_profile_name(repo_root, profile_name)
         if profile_err then
             log.error(string.format("Profile resolution failed: %s", profile_err))
+            notify_lifecycle(early_id, "failed", { error = profile_err })
             return nil
         end
         profile_name = resolved_profile  -- nil for shared-only, or a profile name
     else
         log.error("Cannot resolve profile: no repo root detected")
+        notify_lifecycle(early_id, "failed", { error = "No repo root detected" })
         return nil
     end
 
@@ -306,7 +310,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         local base_key = build_agent_key(repo, nil, "main")
         local suffix = Agent.next_instance_suffix(base_key)
         local agent_key = base_key .. (suffix or "")
-        return spawn_agent("main", nil, repo_root, prompt or "Work on the main branch", client, agent_key, profile_name, suffix)
+        return spawn_agent("main", nil, repo_root, prompt or "Work on the main branch", client, agent_key, profile_name)
     end
 
     local issue_number, branch_name = parse_issue_or_branch(issue_or_branch)
@@ -328,39 +332,29 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     -- Find or create worktree
     local wt_path = from_worktree or worktree.find(branch_name)
     if not wt_path then
-        -- Broadcast: creating worktree
+        -- Broadcast: creating worktree (sent immediately to clients)
         notify_lifecycle(agent_key, "creating_worktree")
-        log.info(string.format("No worktree found for %s, creating...", branch_name))
+        log.info(string.format("No worktree found for %s, queueing async creation...", branch_name))
 
-        local ok, result = pcall(worktree.create, branch_name)
-        if ok then
-            wt_path = result
-            log.info(string.format("Created worktree for %s at %s", branch_name, wt_path))
-
-            -- Copy workspace files into new worktree
-            local device_root_copy = config.data_dir and config.data_dir() or nil
-            local resolved_for_copy, _ = ConfigResolver.resolve_all({
-                device_root = device_root_copy,
-                repo_root = repo_root,
-                profile = profile_name,
-            })
-            if resolved_for_copy and resolved_for_copy.workspace_include then
-                local ok_copy, copy_err = pcall(worktree.copy_from_patterns,
-                    repo_root, wt_path, resolved_for_copy.workspace_include.path)
-                if not ok_copy then
-                    log.warn(string.format("Failed to copy workspace files: %s", tostring(copy_err)))
-                end
-            end
-        else
-            log.error(string.format("Failed to create worktree for %s: %s", branch_name, tostring(result)))
-            notify_lifecycle(agent_key, "failed", { error = tostring(result) })
-            return nil
-        end
+        -- Queue async creation — returns immediately, Hub fires worktree_created
+        -- or worktree_create_failed event when git completes on blocking thread.
+        local client_rows = 24
+        local client_cols = 80
+        worktree.create_async({
+            agent_key = agent_key,
+            branch = branch_name,
+            issue_number = issue_number,
+            prompt = prompt,
+            profile_name = profile_name,
+            client_rows = client_rows,
+            client_cols = client_cols,
+        })
+        return nil  -- Agent spawning continues in worktree_created event handler
     else
         log.info(string.format("Worktree found for %s at %s", branch_name, wt_path))
     end
 
-    return spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name, suffix)
+    return spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name)
 end
 
 --- Handle a request to delete an agent.
@@ -476,6 +470,56 @@ events.on("command_message", function(message)
             log.warn("command_message delete_agent missing agent_id")
         end
     end
+end)
+
+-- ============================================================================
+-- Async Worktree Creation Callbacks
+-- ============================================================================
+
+--- Resume agent spawning after async worktree creation completes.
+-- Fired by Hub when spawn_blocking finishes the git worktree add.
+-- Carries all context needed to continue where handle_create_agent left off.
+events.on("worktree_created", function(info)
+    log.info(string.format("Worktree created for %s at %s, resuming agent spawn",
+        info.branch, info.path))
+
+    local repo_root = worktree.repo_root()
+
+    -- Copy workspace files into new worktree (same logic as was in handle_create_agent)
+    local device_root_copy = config.data_dir and config.data_dir() or nil
+    local resolved_for_copy, _ = ConfigResolver.resolve_all({
+        device_root = device_root_copy,
+        repo_root = repo_root,
+        profile = info.profile_name,
+    })
+    if resolved_for_copy and resolved_for_copy.workspace_include then
+        local ok_copy, copy_err = pcall(worktree.copy_from_patterns,
+            repo_root, info.path, resolved_for_copy.workspace_include.path)
+        if not ok_copy then
+            log.warn(string.format("Failed to copy workspace files: %s", tostring(copy_err)))
+        end
+    end
+
+    -- Reconstruct a minimal client table for dimensions
+    local client = { rows = info.client_rows, cols = info.client_cols }
+
+    spawn_agent(
+        info.branch,
+        info.issue_number,
+        info.path,
+        info.prompt,
+        client,
+        info.agent_key,
+        info.profile_name
+    )
+end)
+
+--- Handle async worktree creation failure.
+-- Fired by Hub when the blocking git operation fails.
+events.on("worktree_create_failed", function(info)
+    log.error(string.format("Async worktree creation failed for %s: %s",
+        info.branch, info.error))
+    notify_lifecycle(info.agent_key, "failed", { error = info.error })
 end)
 
 -- ============================================================================

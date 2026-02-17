@@ -1,0 +1,31 @@
+<h1 class="text-2xl font-bold text-zinc-100 mb-6">Profiles</h1>
+
+<p class="text-zinc-400 mb-6">
+  Profiles let you define different agent configurations for different workflows. A profile groups
+  sessions, plugins, and workspace settings together.
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">How profiles work</h2>
+<p class="text-zinc-400 mb-4">
+  Profiles live in the <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">profiles/</code>
+  directory at either the device or repo level:
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>~/.botster/profiles/standard/    # Device-level profile
+your-repo/.botster/profiles/web/ # Repo-level profile</code></pre>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Profile selection</h2>
+<p class="text-zinc-400 mb-4">
+  If only one profile exists, it's selected automatically. With multiple profiles, specify one when creating an agent:
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>create_agent(profile: "web")</code></pre>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Config resolution</h2>
+<p class="text-zinc-400 mb-4">
+  Botster merges configuration from four layers, most specific wins:
+</p>
+<ol class="list-decimal list-inside text-zinc-400 space-y-1">
+  <li>Device shared (<code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">~/.botster/shared/</code>)</li>
+  <li>Device profile (<code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">~/.botster/profiles/{name}/</code>)</li>
+  <li>Repo shared (<code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">{repo}/.botster/shared/</code>)</li>
+  <li>Repo profile (<code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">{repo}/.botster/profiles/{name}/</code>)</li>
+</ol>

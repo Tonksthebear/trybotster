@@ -9,9 +9,6 @@ pin "turbo_stream_update_attribute"
 pin_all_from "app/javascript/controllers", under: "controllers"
 pin_all_from "app/javascript/channels", under: "channels"
 # Restty terminal (libghostty-vt WASM + WebGPU/WebGL2 rendering)
-# Local restty build (testing maxScrollback fix)
-pin "restty", to: "restty-entry.js"
-pin "restty-chunk", to: "restty-chunk.js"
 
 # Vodozemac crypto for E2E encryption (direct Olm)
 pin "matrix/bundle", to: "matrix/bundle.js"
@@ -26,3 +23,5 @@ pin_all_from "app/javascript/transport", under: "transport"
 pin_all_from "app/javascript/preview", under: "preview"
 pin_all_from "app/javascript/channels", under: "channels"
 pin "@tailwindplus/elements", to: "@tailwindplus--elements.js" # @1.0.22
+pin "restty" # @0.1.31
+pin "chunk-2dwtwwy6" # @0.1.31

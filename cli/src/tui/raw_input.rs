@@ -84,14 +84,14 @@ impl RawInputReader {
     /// Drain all available input events (non-blocking).
     ///
     /// Reads all available bytes from stdin using `libc::poll` + `read`,
-    /// then parses them into events. Returns an empty vec if no input
-    /// is available.
-    pub fn drain_events(&mut self) -> Vec<InputEvent> {
+    /// then parses them into events. Returns `(events, stdin_dead)` where
+    /// `stdin_dead` is true if stdin returned a permanent error (EIO).
+    pub fn drain_events(&mut self) -> (Vec<InputEvent>, bool) {
         // Read available bytes from stdin (non-blocking)
-        self.read_available();
+        let stdin_dead = self.read_available();
 
         // Parse pending bytes into events
-        self.parse_events()
+        (self.parse_events(), stdin_dead)
     }
 
     /// Non-blocking read of all available bytes from stdin.
@@ -103,10 +103,13 @@ impl RawInputReader {
     /// bytes into its own buffer, causing poll to report "no data" when
     /// there are actually bytes waiting in BufReader.
     ///
+    /// Returns `true` if stdin has a permanent error (EIO, EOF) — the
+    /// caller should stop polling stdin to avoid a tight spin loop.
+    ///
     // NOTE: If we add more POSIX syscall usage, consider switching from
     // raw `libc` to the `nix` crate for safe Rust wrappers (Result<T, Errno>
     // instead of manual errno checking). Zellij uses this pattern.
-    fn read_available(&mut self) {
+    fn read_available(&mut self) -> bool {
         let mut buf = [0u8; 1024];
 
         loop {
@@ -119,6 +122,17 @@ impl RawInputReader {
 
             let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
             if ready <= 0 || (pollfd.revents & libc::POLLIN) == 0 {
+                // Check for error flags even when POLLIN is not set — a permanent
+                // error (POLLERR/POLLHUP/POLLNVAL) means stdin is dead.
+                if ready > 0
+                    && (pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0)
+                {
+                    log::error!(
+                        "stdin poll error (revents=0x{:x}), stdin is dead",
+                        pollfd.revents
+                    );
+                    return true;
+                }
                 break;
             }
 
@@ -134,20 +148,24 @@ impl RawInputReader {
 
             if n <= 0 {
                 // 0 = EOF, negative = error (EAGAIN/EINTR/etc.)
-                if n < 0 {
-                    let errno = std::io::Error::last_os_error();
-                    if errno.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    if errno.kind() != std::io::ErrorKind::WouldBlock {
-                        log::error!("stdin read error: {errno}");
-                    }
+                if n == 0 {
+                    log::error!("stdin EOF — stdin is dead");
+                    return true;
                 }
-                break;
+                let errno = std::io::Error::last_os_error();
+                if errno.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if errno.kind() == std::io::ErrorKind::WouldBlock {
+                    break;
+                }
+                log::error!("stdin read error: {errno}");
+                return true;
             }
 
             self.pending.extend_from_slice(&buf[..n as usize]);
         }
+        false
     }
 
     /// Parse pending bytes into events.

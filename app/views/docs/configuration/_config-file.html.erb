@@ -1,0 +1,59 @@
+<h1 class="text-2xl font-bold text-zinc-100 mb-6">Config File</h1>
+
+<p class="text-zinc-400 mb-6">
+  Botster stores its configuration at <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">~/.config/botster/config.json</code>.
+  You can edit it directly or use the <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">botster config</code> command.
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Options</h2>
+
+<div class="overflow-x-auto mb-6">
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-zinc-800">
+        <th class="text-left py-2 pr-4 text-zinc-400 font-medium">Key</th>
+        <th class="text-left py-2 pr-4 text-zinc-400 font-medium">Default</th>
+        <th class="text-left py-2 text-zinc-400 font-medium">Description</th>
+      </tr>
+    </thead>
+    <tbody class="text-zinc-400">
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">server_url</td>
+        <td class="py-2 pr-4 font-mono">https://trybotster.com</td>
+        <td class="py-2">Server URL for hub registration</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">poll_interval</td>
+        <td class="py-2 pr-4 font-mono">5</td>
+        <td class="py-2">Seconds between server polls</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">max_sessions</td>
+        <td class="py-2 pr-4 font-mono">20</td>
+        <td class="py-2">Maximum concurrent agents</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">agent_timeout</td>
+        <td class="py-2 pr-4 font-mono">3600</td>
+        <td class="py-2">Agent idle timeout in seconds</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">worktree_base</td>
+        <td class="py-2 pr-4 font-mono">~/botster-sessions</td>
+        <td class="py-2">Directory for agent worktrees</td>
+      </tr>
+      <tr>
+        <td class="py-2 pr-4 font-mono text-zinc-300">hub_name</td>
+        <td class="py-2 pr-4 font-mono italic">repo name</td>
+        <td class="py-2">Display name for your hub</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">CLI Usage</h2>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto"><code># Get a value
+botster config poll_interval
+
+# Set a value
+botster config poll_interval 10</code></pre>

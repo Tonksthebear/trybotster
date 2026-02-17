@@ -92,7 +92,9 @@ pub struct ActionCableConnection {
 /// ActionCable channel. Messages arrive as raw `serde_json::Value` -- the
 /// consumer is responsible for parsing into domain types.
 pub struct ChannelHandle {
-    message_rx: mpsc::Receiver<serde_json::Value>,
+    /// Message receiver. `Some` in poll mode, `None` after [`take_message_rx`]
+    /// extracts it for a forwarding task.
+    message_rx: Option<mpsc::Receiver<serde_json::Value>>,
     identifier: String,
     perform_tx: mpsc::UnboundedSender<ChannelPerform>,
 }
@@ -168,7 +170,7 @@ impl ActionCableConnection {
         let _ = self.subscribe_tx.send(request);
 
         ChannelHandle {
-            message_rx,
+            message_rx: Some(message_rx),
             identifier: identifier_str,
             perform_tx: self.perform_tx.clone(),
         }
@@ -189,9 +191,18 @@ impl Drop for ActionCableConnection {
 impl ChannelHandle {
     /// Try to receive the next message (non-blocking).
     ///
-    /// Returns `None` if no messages are pending.
+    /// Returns `None` if no messages are pending or the receiver has been
+    /// taken by [`take_message_rx`].
     pub fn try_recv(&mut self) -> Option<serde_json::Value> {
-        self.message_rx.try_recv().ok()
+        self.message_rx.as_mut()?.try_recv().ok()
+    }
+
+    /// Take the message receiver for use in a forwarding task.
+    ///
+    /// After calling this, [`try_recv`] will always return `None`.
+    /// The caller is responsible for reading from the returned receiver.
+    pub(crate) fn take_message_rx(&mut self) -> Option<mpsc::Receiver<serde_json::Value>> {
+        self.message_rx.take()
     }
 
     /// Send an ActionCable perform action on this channel.
@@ -666,7 +677,7 @@ mod tests {
         });
 
         let handle = ChannelHandle {
-            message_rx,
+            message_rx: Some(message_rx),
             identifier: identifier.to_string(),
             perform_tx,
         };

@@ -1,15 +1,9 @@
 //! Timer primitives for Lua scripts.
 //!
 //! Provides one-shot and repeating timers that fire Lua callbacks.
-//! Timers are stored in a shared registry and polled each tick from
-//! the Hub loop, similar to file watches.
-//!
-//! # Design
-//!
-//! Each `timer.after()` or `timer.every()` creates a `TimerEntry`
-//! in the registry. The Hub tick loop calls [`poll_timers`] to check
-//! deadlines, fire callbacks, reschedule repeating timers, and remove
-//! completed or cancelled entries.
+//! In production, each timer spawns a tokio task that sends
+//! `HubEvent::TimerFired` after the delay. Tests use deadline-based
+//! polling via [`poll_timers`] as a fallback.
 //!
 //! # Usage in Lua
 //!
@@ -40,29 +34,55 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::hub::events::HubEvent;
 
 /// A single timer entry in the registry.
 struct TimerEntry {
     /// Lua registry key for the callback function.
     callback_key: LuaRegistryKey,
-    /// When this timer should next fire.
+    /// When this timer should next fire (used by test-mode polling).
     fire_at: Instant,
     /// If `Some`, the timer repeats with this interval.
     repeat_interval: Option<Duration>,
     /// Whether this timer has been cancelled.
     cancelled: bool,
+    /// Handle for the spawned tokio timer task (production mode).
+    ///
+    /// `None` in test mode where timers use deadline-based polling via
+    /// [`poll_timers`]. Aborted on [`timer.cancel()`] to stop the task.
+    task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Registry of active timers.
 ///
 /// Shared between Lua (for creating/cancelling timers) and the Hub tick
 /// loop (for polling and firing callbacks).
-#[derive(Default)]
 pub struct TimerEntries {
     /// Active timers keyed by unique ID.
     entries: Vec<(String, TimerEntry)>,
     /// Counter for generating unique timer IDs.
     next_id: u64,
+    /// Event channel for instant timer delivery (production mode).
+    ///
+    /// When `Some`, `timer.after()` and `timer.every()` spawn tokio tasks
+    /// that send [`HubEvent::TimerFired`] instead of relying on deadline
+    /// scanning in [`poll_timers`].
+    hub_event_tx: Option<UnboundedSender<HubEvent>>,
+    /// Tokio runtime handle for spawning timer tasks from sync Lua closures.
+    tokio_handle: Option<tokio::runtime::Handle>,
+}
+
+impl Default for TimerEntries {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_id: 0,
+            hub_event_tx: None,
+            tokio_handle: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for TimerEntries {
@@ -70,6 +90,7 @@ impl std::fmt::Debug for TimerEntries {
         f.debug_struct("TimerEntries")
             .field("active_count", &self.len())
             .field("next_id", &self.next_id)
+            .field("event_driven", &self.hub_event_tx.is_some())
             .finish()
     }
 }
@@ -85,6 +106,19 @@ impl TimerEntries {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Inject the event channel and tokio handle for instant timer delivery.
+    ///
+    /// Called once during Hub initialization. After this, `timer.after()` and
+    /// `timer.every()` spawn tokio tasks instead of relying on deadline polling.
+    pub(crate) fn set_event_channel(
+        &mut self,
+        tx: UnboundedSender<HubEvent>,
+        handle: tokio::runtime::Handle,
+    ) {
+        self.hub_event_tx = Some(tx);
+        self.tokio_handle = Some(handle);
     }
 }
 
@@ -123,6 +157,8 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
     // timer.after(seconds, callback) -> timer_id
     //
     // Creates a one-shot timer that fires the callback after `seconds` seconds.
+    // In production (event channel available), spawns a tokio task that sleeps
+    // then sends `HubEvent::TimerFired`. In test mode, uses deadline-based polling.
     let reg = Arc::clone(&registry);
     let after_fn = lua
         .create_function(move |lua, (seconds, callback): (f64, LuaFunction)| {
@@ -134,13 +170,29 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
             let id = format!("timer_{}", entries.next_id);
             entries.next_id += 1;
 
+            let duration = Duration::from_secs_f64(seconds);
+
+            // Spawn tokio task for instant delivery if event channel is available.
+            let task_handle = match (&entries.hub_event_tx, &entries.tokio_handle) {
+                (Some(tx), Some(handle)) => {
+                    let tx = tx.clone();
+                    let timer_id = id.clone();
+                    Some(handle.spawn(async move {
+                        tokio::time::sleep(duration).await;
+                        let _ = tx.send(HubEvent::TimerFired { timer_id });
+                    }))
+                }
+                _ => None,
+            };
+
             entries.entries.push((
                 id.clone(),
                 TimerEntry {
                     callback_key,
-                    fire_at: Instant::now() + Duration::from_secs_f64(seconds),
+                    fire_at: Instant::now() + duration,
                     repeat_interval: None,
                     cancelled: false,
+                    task_handle,
                 },
             ));
 
@@ -155,6 +207,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
     // timer.every(seconds, callback) -> timer_id
     //
     // Creates a repeating timer that fires the callback every `seconds` seconds.
+    // In production, spawns a looping tokio task. In test mode, uses polling.
     let reg2 = Arc::clone(&registry);
     let every_fn = lua
         .create_function(move |lua, (seconds, callback): (f64, LuaFunction)| {
@@ -167,6 +220,26 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
             let id = format!("timer_{}", entries.next_id);
             entries.next_id += 1;
 
+            // Spawn looping tokio task for instant delivery if event channel
+            // is available. The task runs until cancelled via `handle.abort()`.
+            let task_handle = match (&entries.hub_event_tx, &entries.tokio_handle) {
+                (Some(tx), Some(handle)) => {
+                    let tx = tx.clone();
+                    let timer_id = id.clone();
+                    Some(handle.spawn(async move {
+                        loop {
+                            tokio::time::sleep(interval).await;
+                            if tx.send(HubEvent::TimerFired {
+                                timer_id: timer_id.clone(),
+                            }).is_err() {
+                                break;
+                            }
+                        }
+                    }))
+                }
+                _ => None,
+            };
+
             entries.entries.push((
                 id.clone(),
                 TimerEntry {
@@ -174,6 +247,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     fire_at: Instant::now() + interval,
                     repeat_interval: Some(interval),
                     cancelled: false,
+                    task_handle,
                 },
             ));
 
@@ -187,7 +261,8 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
 
     // timer.cancel(timer_id) -> boolean
     //
-    // Marks a timer as cancelled. Returns true if the timer was found.
+    // Marks a timer as cancelled and aborts its spawned task (if any).
+    // Returns true if the timer was found.
     let reg3 = registry;
     let cancel_fn = lua
         .create_function(move |_, timer_id: String| {
@@ -196,6 +271,10 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
             for (id, entry) in &mut entries.entries {
                 if *id == timer_id && !entry.cancelled {
                     entry.cancelled = true;
+                    // Abort the spawned timer task if running (production mode).
+                    if let Some(handle) = entry.task_handle.take() {
+                        handle.abort();
+                    }
                     return Ok(true);
                 }
             }
@@ -303,6 +382,87 @@ pub fn poll_timers(lua: &Lua, registry: &TimerRegistry) -> usize {
     }
 
     count
+}
+
+/// Fire the Lua callback for a single timer event.
+///
+/// Called from [`handle_hub_event`] for [`HubEvent::TimerFired`] events.
+/// Looks up the timer entry by ID, clones the callback key, releases the
+/// lock, fires the callback, then cleans up.
+///
+/// For one-shot timers, the entry is marked cancelled and removed.
+/// For repeating timers, the entry stays alive (the looping tokio task
+/// will send another `TimerFired` after the next interval).
+///
+/// # Deadlock Prevention
+///
+/// The registry lock is released before firing the Lua callback, allowing
+/// the callback to call `timer.cancel()` or create new timers.
+pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &str) {
+    // Phase 1: look up entry under lock, clone callback, handle one-shot.
+    let callback_key = {
+        let mut entries = registry.lock().expect("TimerEntries mutex poisoned");
+
+        let entry_pos = entries
+            .entries
+            .iter()
+            .position(|(id, e)| id == timer_id && !e.cancelled);
+
+        let Some(pos) = entry_pos else {
+            // Timer was cancelled between send and receive — race is benign.
+            return;
+        };
+
+        let entry = &mut entries.entries[pos].1;
+
+        // Clone the callback for firing outside the lock.
+        let callback = match lua.registry_value::<LuaFunction>(&entry.callback_key) {
+            Ok(cb) => cb,
+            Err(e) => {
+                log::warn!("[timer] Failed to retrieve callback for {timer_id}: {e}");
+                return;
+            }
+        };
+        let cloned_key = match lua.create_registry_value(callback) {
+            Ok(k) => k,
+            Err(e) => {
+                log::warn!("[timer] Failed to clone callback for {timer_id}: {e}");
+                return;
+            }
+        };
+
+        if entry.repeat_interval.is_none() {
+            // One-shot: mark for removal.
+            entry.cancelled = true;
+        }
+        // Repeating timers keep the entry alive; the looping task sends again.
+
+        cloned_key
+    };
+    // Lock released — callback can safely call timer functions.
+
+    // Phase 2: fire callback.
+    let result: LuaResult<()> = (|| {
+        let callback: LuaFunction = lua.registry_value(&callback_key)?;
+        callback.call::<()>(())?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        log::warn!("[timer] Callback error for {timer_id}: {e}");
+    }
+
+    // Phase 3: clean up temporary registry key.
+    let _ = lua.remove_registry_value(callback_key);
+
+    // Phase 4: remove cancelled entries and clean up their registry keys.
+    {
+        let mut entries = registry.lock().expect("TimerEntries mutex poisoned");
+        let removed: Vec<_> = entries.entries.drain_filter_compat();
+        for (_, entry) in removed {
+            let _ = lua.remove_registry_value(entry.callback_key);
+        }
+    }
 }
 
 /// Helper trait to emulate `Vec::drain_filter` on stable Rust.

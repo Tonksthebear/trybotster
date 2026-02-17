@@ -227,24 +227,23 @@ impl Device {
         let signing_key = match Self::load_signing_key(&stored.fingerprint) {
             Ok(sk) => sk,
             Err(e) => {
-                // Provide actionable error message
                 let err_str = e.to_string();
                 if err_str.contains("not found") {
                     log::error!(
-                        "Signing key not found in keyring. \
+                        "Signing key not found in credential storage. \
                          This may happen if:\n  \
-                         - The keychain is locked (try unlocking it)\n  \
-                         - macOS blocked access due to binary signature change\n  \
-                         - The keychain entry was deleted"
+                         - Credentials were stored in a keyring that is no longer accessible\n  \
+                         - The credential file was deleted\n  \
+                         - On macOS: the keychain is locked or blocked the binary"
                     );
                     anyhow::bail!(
-                        "Signing key not found in keyring. \
-                         Try unlocking your keychain or re-authenticate with 'botster auth'."
+                        "Signing key not found. Your credentials may have been lost.\n\
+                         Re-authenticate with 'botster auth'."
                     );
                 }
                 anyhow::bail!(
-                    "Failed to load signing key: {}. \
-                     Device may need to be recreated with 'botster auth'.",
+                    "Failed to load signing key: {}.\n\
+                     Re-authenticate with 'botster auth'.",
                     e
                 );
             }

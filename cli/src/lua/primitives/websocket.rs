@@ -28,8 +28,8 @@
 //! Each `websocket.connect()` spawns one OS thread that owns a single-threaded
 //! tokio runtime. The thread reads from the WebSocket and pushes `WsEvent`
 //! values into the shared registry. It also listens on an `mpsc` channel for
-//! outgoing messages (`send` / `close`). The Hub tick loop calls
-//! `poll_websocket_events()` to drain pending events and fire Lua callbacks.
+//! outgoing messages (`send` / `close`). In production, background threads
+//! send `HubEvent::WebSocketEvent` directly to the Hub event loop.
 //!
 //! # Deadlock Prevention
 //!
@@ -53,6 +53,7 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 // =============================================================================
 
 /// Outgoing command from Lua to a WebSocket connection thread.
+#[derive(Debug)]
 enum WsOutgoing {
     /// Send a UTF-8 text frame.
     Text(String),
@@ -61,15 +62,28 @@ enum WsOutgoing {
 }
 
 /// An event produced by a background WebSocket thread.
-struct WsEvent {
+///
+/// Sent through `HubEvent::WebSocketEvent` for instant delivery (production)
+/// or pushed to `pending_events` vec (tests without event channel).
+pub(crate) struct WsEvent {
     /// Which connection produced this event.
-    connection_id: String,
+    pub(crate) connection_id: String,
     /// The event payload.
-    kind: WsEventKind,
+    pub(crate) kind: WsEventKind,
+}
+
+impl std::fmt::Debug for WsEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsEvent")
+            .field("connection_id", &self.connection_id)
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 /// Discriminant for WebSocket events delivered to Lua.
-enum WsEventKind {
+#[derive(Debug)]
+pub(crate) enum WsEventKind {
     /// Connection successfully established.
     Open,
     /// A text message was received.
@@ -86,7 +100,7 @@ enum WsEventKind {
 }
 
 /// Per-connection state held in the registry.
-struct WsConnectionState {
+pub(crate) struct WsConnectionState {
     /// Lua callback for `on_message` events.
     on_message_key: Option<RegistryKey>,
     /// Lua callback for `on_open` events.
@@ -102,11 +116,14 @@ struct WsConnectionState {
 /// Inner state of the WebSocket registry, protected by a mutex.
 pub struct WebSocketRegistryInner {
     /// Active connections keyed by connection ID.
-    connections: HashMap<String, WsConnectionState>,
-    /// Events waiting to be delivered to Lua on the next tick.
+    pub(crate) connections: HashMap<String, WsConnectionState>,
+    /// Events waiting to be delivered to Lua on the next tick (test-only fallback).
     pending_events: Vec<WsEvent>,
     /// Monotonic counter for generating unique connection IDs.
     next_id: u64,
+    /// Event channel sender for instant delivery to the Hub event loop.
+    /// `None` in tests that don't wire up the full event bus.
+    hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
 }
 
 impl Default for WebSocketRegistryInner {
@@ -115,6 +132,7 @@ impl Default for WebSocketRegistryInner {
             connections: HashMap::new(),
             pending_events: Vec::new(),
             next_id: 0,
+            hub_event_tx: None,
         }
     }
 }
@@ -130,6 +148,26 @@ impl WebSocketRegistryInner {
     #[must_use]
     pub fn pending_event_count(&self) -> usize {
         self.pending_events.len()
+    }
+
+    /// Set the Hub event channel sender for event-driven delivery.
+    pub(crate) fn set_hub_event_tx(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
+    ) {
+        self.hub_event_tx = Some(tx);
+    }
+
+    /// Emit a WebSocket event through the event channel or shared vec.
+    ///
+    /// If `hub_event_tx` is set (production), sends via the channel for
+    /// instant delivery. Otherwise falls back to the shared vec (tests).
+    fn emit_event(&mut self, event: WsEvent) {
+        if let Some(ref tx) = self.hub_event_tx {
+            let _ = tx.send(crate::hub::events::HubEvent::WebSocketEvent(event));
+        } else {
+            self.pending_events.push(event);
+        }
     }
 }
 
@@ -175,7 +213,7 @@ fn run_ws_thread(
         Ok(rt) => rt,
         Err(e) => {
             let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
-            inner.pending_events.push(WsEvent {
+            inner.emit_event(WsEvent {
                 connection_id,
                 kind: WsEventKind::Error(format!("Failed to create tokio runtime: {e}")),
             });
@@ -193,7 +231,7 @@ fn run_ws_thread(
             Ok(pair) => pair,
             Err(e) => {
                 let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
-                inner.pending_events.push(WsEvent {
+                inner.emit_event(WsEvent {
                     connection_id,
                     kind: WsEventKind::Error(format!("{e}")),
                 });
@@ -204,7 +242,7 @@ fn run_ws_thread(
         // Notify Lua that the connection is open
         {
             let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
-            inner.pending_events.push(WsEvent {
+            inner.emit_event(WsEvent {
                 connection_id: connection_id.clone(),
                 kind: WsEventKind::Open,
             });
@@ -217,7 +255,7 @@ fn run_ws_thread(
                     match frame {
                         Some(Ok(crate::ws::WsMessage::Text(text))) => {
                             let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
-                            inner.pending_events.push(WsEvent {
+                            inner.emit_event(WsEvent {
                                 connection_id: connection_id.clone(),
                                 kind: WsEventKind::Message(text),
                             });
@@ -226,14 +264,14 @@ fn run_ws_thread(
                             // Deliver binary as a lossy UTF-8 string for Lua compatibility
                             let text = String::from_utf8_lossy(&data).into_owned();
                             let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
-                            inner.pending_events.push(WsEvent {
+                            inner.emit_event(WsEvent {
                                 connection_id: connection_id.clone(),
                                 kind: WsEventKind::Message(text),
                             });
                         }
                         Some(Ok(crate::ws::WsMessage::Close { code, reason })) => {
                             let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
-                            inner.pending_events.push(WsEvent {
+                            inner.emit_event(WsEvent {
                                 connection_id: connection_id.clone(),
                                 kind: WsEventKind::Close { code, reason },
                             });
@@ -244,7 +282,7 @@ fn run_ws_thread(
                         }
                         Some(Err(e)) => {
                             let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
-                            inner.pending_events.push(WsEvent {
+                            inner.emit_event(WsEvent {
                                 connection_id: connection_id.clone(),
                                 kind: WsEventKind::Error(format!("{e}")),
                             });
@@ -253,7 +291,7 @@ fn run_ws_thread(
                         None => {
                             // Stream ended without a Close frame
                             let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
-                            inner.pending_events.push(WsEvent {
+                            inner.emit_event(WsEvent {
                                 connection_id: connection_id.clone(),
                                 kind: WsEventKind::Close { code: 1006, reason: "stream ended".to_string() },
                             });
@@ -267,7 +305,7 @@ fn run_ws_thread(
                         Some(WsOutgoing::Text(text)) => {
                             if let Err(e) = writer.send_text(&text).await {
                                 let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
-                                inner.pending_events.push(WsEvent {
+                                inner.emit_event(WsEvent {
                                     connection_id: connection_id.clone(),
                                     kind: WsEventKind::Error(format!("WebSocket send failed: {e}")),
                                 });
@@ -277,7 +315,7 @@ fn run_ws_thread(
                         Some(WsOutgoing::Close) => {
                             let _ = writer.send_close().await;
                             let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
-                            inner.pending_events.push(WsEvent {
+                            inner.emit_event(WsEvent {
                                 connection_id: connection_id.clone(),
                                 kind: WsEventKind::Close { code: 1000, reason: "client requested close".to_string() },
                             });
@@ -295,7 +333,7 @@ fn run_ws_thread(
 }
 
 // =============================================================================
-// Tick polling
+// Event dispatch
 // =============================================================================
 
 /// Drain pending WebSocket events and fire Lua callbacks.
@@ -457,6 +495,147 @@ struct CallbackKeys {
     /// Whether these keys are owned (taken from a removed connection)
     /// and should be cleaned up after dispatch.
     owned: bool,
+}
+
+/// Fire the Lua callback for a single WebSocket event.
+///
+/// Called from `handle_hub_event()` when an `HubEvent::WebSocketEvent` arrives
+/// via the event channel. Looks up the connection's callback keys, fires the
+/// appropriate callback, and cleans up on terminal events.
+///
+/// This is the event-driven counterpart of [`poll_websocket_events`], which
+/// batch-drains the shared vec.
+///
+/// # Deadlock Prevention
+///
+/// The registry lock is released before any Lua callback is invoked, matching
+/// the same pattern used in [`poll_websocket_events`].
+pub(crate) fn fire_single_websocket_event(
+    lua: &Lua,
+    registry: &WebSocketRegistry,
+    event: WsEvent,
+) {
+    let is_terminal = matches!(
+        event.kind,
+        WsEventKind::Close { .. } | WsEventKind::Error(_)
+    );
+
+    if is_terminal {
+        fire_terminal_ws_event(lua, registry, event);
+    } else {
+        fire_nonterminal_ws_event(lua, registry, event);
+    }
+}
+
+/// Handle a non-terminal WebSocket event (Open, Message).
+///
+/// Locks the registry to resolve the Lua callback `Function` from the
+/// stored `RegistryKey`, drops the lock, then fires the callback.
+fn fire_nonterminal_ws_event(
+    lua: &Lua,
+    registry: &WebSocketRegistry,
+    event: WsEvent,
+) {
+    // Resolve callback Function under the lock, then drop the lock.
+    let callback_result: mlua::Result<()> = (|| {
+        match &event.kind {
+            WsEventKind::Open => {
+                let inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
+                if let Some(conn) = inner.connections.get(&event.connection_id) {
+                    if let Some(ref key) = conn.on_open_key {
+                        let callback: mlua::Function = lua.registry_value(key)?;
+                        drop(inner);
+                        callback.call::<()>(())?;
+                    }
+                }
+            }
+            WsEventKind::Message(data) => {
+                let inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
+                if let Some(conn) = inner.connections.get(&event.connection_id) {
+                    if let Some(ref key) = conn.on_message_key {
+                        let callback: mlua::Function = lua.registry_value(key)?;
+                        drop(inner);
+                        callback.call::<()>(data.as_str())?;
+                    }
+                }
+            }
+            _ => {} // Terminal events handled separately.
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = callback_result {
+        log::warn!(
+            "[websocket] Event callback error for {}: {e}",
+            event.connection_id
+        );
+    }
+}
+
+/// Handle a terminal WebSocket event (Close, Error).
+///
+/// Removes the connection under the lock (taking ownership of callback keys),
+/// drops the lock, fires the callback, then cleans up all owned keys.
+fn fire_terminal_ws_event(
+    lua: &Lua,
+    registry: &WebSocketRegistry,
+    event: WsEvent,
+) {
+    // Phase 1: remove connection and take ownership of keys under the lock.
+    let conn = {
+        let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
+        if let Some(conn) = inner.connections.remove(&event.connection_id) {
+            conn
+        } else {
+            log::warn!(
+                "[websocket] Terminal event for unknown connection: {}",
+                event.connection_id
+            );
+            return;
+        }
+    };
+    // Lock released.
+
+    // Phase 2: fire the appropriate callback.
+    let callback_result: mlua::Result<()> = (|| {
+        match &event.kind {
+            WsEventKind::Close { code, reason } => {
+                if let Some(ref key) = conn.on_close_key {
+                    let callback: mlua::Function = lua.registry_value(key)?;
+                    callback.call::<()>((*code, reason.as_str()))?;
+                }
+            }
+            WsEventKind::Error(err) => {
+                if let Some(ref key) = conn.on_error_key {
+                    let callback: mlua::Function = lua.registry_value(key)?;
+                    callback.call::<()>(err.as_str())?;
+                }
+            }
+            _ => {} // Non-terminal events handled separately.
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = callback_result {
+        log::warn!(
+            "[websocket] Event callback error for {}: {e}",
+            event.connection_id
+        );
+    }
+
+    // Phase 3: clean up all owned callback keys.
+    if let Some(key) = conn.on_open_key {
+        let _ = lua.remove_registry_value(key);
+    }
+    if let Some(key) = conn.on_message_key {
+        let _ = lua.remove_registry_value(key);
+    }
+    if let Some(key) = conn.on_close_key {
+        let _ = lua.remove_registry_value(key);
+    }
+    if let Some(key) = conn.on_error_key {
+        let _ = lua.remove_registry_value(key);
+    }
 }
 
 // =============================================================================
