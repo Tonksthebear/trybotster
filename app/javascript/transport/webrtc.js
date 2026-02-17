@@ -212,7 +212,15 @@ class WebRTCTransport {
   async connectPeer(hubId) {
     const conn = this.#connections.get(hubId)
     if (!conn) throw new Error(`No signaling connection for hub ${hubId}`)
-    if (conn.pc) return { state: conn.state }
+
+    if (conn.pc) {
+      // Dead peer — clean up so we can create a fresh one
+      if (conn.pc.connectionState === "closed" || conn.pc.connectionState === "failed") {
+        this.#teardownPeer(conn)
+      } else {
+        return { state: conn.state }
+      }
+    }
 
     // Deduplicate: if another caller is already creating the peer, wait for it
     const pending = this.#peerConnectPromises.get(hubId)
