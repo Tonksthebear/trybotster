@@ -229,21 +229,23 @@ impl Agent {
     pub fn get_pty_handle(&self, pty_index: usize) -> Option<crate::hub::agent_handle::PtyHandle> {
         match pty_index {
             0 => {
-                let (shared_state, shadow_screen, event_tx) = self.cli_pty.get_direct_access();
+                let (shared_state, shadow_screen, event_tx, kitty) = self.cli_pty.get_direct_access();
                 Some(crate::hub::agent_handle::PtyHandle::new(
                     event_tx,
                     shared_state,
                     shadow_screen,
+                    kitty,
                     self.cli_pty.port(),
                 ))
             }
             1 => {
                 let server_pty = self.server_pty.as_ref()?;
-                let (shared_state, shadow_screen, event_tx) = server_pty.get_direct_access();
+                let (shared_state, shadow_screen, event_tx, kitty) = server_pty.get_direct_access();
                 Some(crate::hub::agent_handle::PtyHandle::new(
                     event_tx,
                     shared_state,
                     shadow_screen,
+                    kitty,
                     server_pty.port(),
                 ))
             }

@@ -18,7 +18,10 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -129,11 +132,13 @@ pub fn build_command(
 /// * `shadow_screen` - Shadow terminal for parsed state snapshots
 /// * `event_tx` - Broadcast channel for PtyEvent notifications
 /// * `detect_notifs` - Enable OSC notification detection
+/// * `kitty_enabled` - Shared flag updated when kitty keyboard protocol is pushed/popped
 pub fn spawn_reader_thread(
     reader: Box<dyn Read + Send>,
     shadow_screen: Arc<Mutex<vt100::Parser>>,
     event_tx: broadcast::Sender<PtyEvent>,
     detect_notifs: bool,
+    kitty_enabled: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     let label = if detect_notifs { "CLI" } else { "Server" };
 
@@ -141,17 +146,11 @@ pub fn spawn_reader_thread(
         let mut reader = reader;
         log::info!("{label} PTY reader thread started");
         let mut buf = [0u8; 4096];
-        let mut total_bytes_read: usize = 0;
 
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    total_bytes_read += n;
-                    if total_bytes_read % 10240 < n {
-                        log::info!("{label} PTY reader: {total_bytes_read} total bytes read");
-                    }
-
                     // Detect notifications and broadcast as PtyEvent::Notification
                     if detect_notifs {
                         let notifications = detect_notifications(&buf[..n]);
@@ -159,6 +158,13 @@ pub fn spawn_reader_thread(
                             log::info!("Broadcasting PTY notification: {:?}", notif);
                             let _ = event_tx.send(PtyEvent::notification(notif));
                         }
+                    }
+
+                    // Track kitty keyboard protocol state from raw PTY output.
+                    // The vt100 crate doesn't parse kitty sequences, so we scan
+                    // the raw bytes for CSI > flags u (push) / CSI < u (pop).
+                    if let Some(state) = scan_kitty_keyboard_state(&buf[..n]) {
+                        kitty_enabled.store(state, Ordering::Relaxed);
                     }
 
                     // Feed PTY bytes to shadow screen for parsed state tracking.
@@ -210,6 +216,53 @@ fn contains_clear_scrollback(data: &[u8]) -> bool {
     // CSI 3 J = ESC [ 3 J = [0x1b, 0x5b, 0x33, 0x4a]
     data.windows(4)
         .any(|w| w == b"\x1b[3J")
+}
+
+/// Scan PTY output for kitty keyboard protocol push/pop sequences.
+///
+/// Returns `Some(true)` if the last relevant sequence is a push (`CSI > flags u`),
+/// `Some(false)` if it's a pop (`CSI < u`), or `None` if no kitty sequences found.
+///
+/// The vt100 crate does not track kitty keyboard protocol state, so we scan
+/// the raw byte stream directly. We check the *last* occurrence because a
+/// single output chunk may contain multiple push/pop sequences (e.g. during
+/// shell startup).
+pub fn scan_kitty_keyboard_state(data: &[u8]) -> Option<bool> {
+    let mut result = None;
+
+    // Scan for ESC [ > ... u (push) and ESC [ < ... u (pop)
+    let mut i = 0;
+    while i + 2 < data.len() {
+        if data[i] == 0x1b && data[i + 1] == b'[' {
+            let start = i + 2;
+            if start < data.len() && data[start] == b'>' {
+                // Potential push: ESC [ > <digits> u
+                let mut j = start + 1;
+                while j < data.len() && data[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j < data.len() && data[j] == b'u' {
+                    result = Some(true);
+                    i = j + 1;
+                    continue;
+                }
+            } else if start < data.len() && data[start] == b'<' {
+                // Potential pop: ESC [ < u  (or ESC [ < <digits> u)
+                let mut j = start + 1;
+                while j < data.len() && data[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j < data.len() && data[j] == b'u' {
+                    result = Some(false);
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -266,6 +319,11 @@ mod tests {
         Arc::new(Mutex::new(vt100::Parser::new(24, 80, 100)))
     }
 
+    /// Helper: create a kitty flag for testing.
+    fn test_kitty_flag() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     #[test]
     fn test_unified_reader_broadcasts_output_without_notifications() {
         let test_data = b"Hello from unified reader (server mode)";
@@ -273,7 +331,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (tx, mut rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, shadow.clone(), tx, false);
+        let handle = spawn_reader_thread(reader, shadow.clone(), tx, false, test_kitty_flag());
         handle.join().expect("Reader thread panicked");
 
         // Verify event was broadcast
@@ -300,7 +358,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, true);
+        let handle = spawn_reader_thread(reader, shadow, event_tx, true, test_kitty_flag());
         handle.join().expect("Reader thread panicked");
 
         let event = event_rx.try_recv().expect("Should receive Output event");
@@ -320,7 +378,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, true);
+        let handle = spawn_reader_thread(reader, shadow, event_tx, true, test_kitty_flag());
         handle.join().expect("Reader thread panicked");
 
         let event = event_rx.try_recv().expect("Should receive Notification event");
@@ -347,7 +405,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, false);
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag());
         handle.join().expect("Reader thread panicked");
 
         let event = event_rx.try_recv().expect("Should receive Output event");
@@ -398,7 +456,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, _event_rx) = broadcast::channel::<PtyEvent>(64);
 
-        let handle = spawn_reader_thread(reader, shadow.clone(), event_tx, false);
+        let handle = spawn_reader_thread(reader, shadow.clone(), event_tx, false, test_kitty_flag());
         handle.join().expect("Reader thread panicked");
 
         // Scrollback should have been cleared — only visible screen remains
@@ -425,5 +483,126 @@ mod tests {
             total_scrollback, 0,
             "Scrollback should be empty after CSI 3 J"
         );
+    }
+
+    // =========================================================================
+    // Kitty Keyboard Protocol Scanner Tests
+    // =========================================================================
+
+    #[test]
+    fn test_scan_kitty_detects_push() {
+        // CSI > 1 u = push with DISAMBIGUATE_ESCAPE_CODES
+        assert_eq!(scan_kitty_keyboard_state(b"\x1b[>1u"), Some(true));
+    }
+
+    #[test]
+    fn test_scan_kitty_detects_pop() {
+        // CSI < u = pop
+        assert_eq!(scan_kitty_keyboard_state(b"\x1b[<u"), Some(false));
+        // CSI < 1 u = pop with count
+        assert_eq!(scan_kitty_keyboard_state(b"\x1b[<1u"), Some(false));
+    }
+
+    #[test]
+    fn test_scan_kitty_embedded_in_output() {
+        // Kitty push buried in normal terminal output
+        let mut data = Vec::new();
+        data.extend(b"\x1b[32msome green text\x1b[0m");
+        data.extend(b"\x1b[>1u"); // kitty push
+        data.extend(b"more text");
+        assert_eq!(scan_kitty_keyboard_state(&data), Some(true));
+    }
+
+    #[test]
+    fn test_scan_kitty_last_wins() {
+        // Push then pop → pop wins
+        let mut data = Vec::new();
+        data.extend(b"\x1b[>1u"); // push
+        data.extend(b"\x1b[<u");  // pop
+        assert_eq!(scan_kitty_keyboard_state(&data), Some(false));
+
+        // Pop then push → push wins
+        let mut data2 = Vec::new();
+        data2.extend(b"\x1b[<u");  // pop
+        data2.extend(b"\x1b[>1u"); // push
+        assert_eq!(scan_kitty_keyboard_state(&data2), Some(true));
+    }
+
+    #[test]
+    fn test_scan_kitty_no_sequences() {
+        assert_eq!(scan_kitty_keyboard_state(b"plain text"), None);
+        assert_eq!(scan_kitty_keyboard_state(b"\x1b[32m"), None);
+        assert_eq!(scan_kitty_keyboard_state(b""), None);
+    }
+
+    #[test]
+    fn test_scan_kitty_partial_sequences() {
+        // Incomplete sequences should not match
+        assert_eq!(scan_kitty_keyboard_state(b"\x1b[>1"), None);
+        assert_eq!(scan_kitty_keyboard_state(b"\x1b[>"), None);
+        assert_eq!(scan_kitty_keyboard_state(b"\x1b[<"), None);
+    }
+
+    #[test]
+    fn test_scan_kitty_various_flags() {
+        // Different flag values
+        assert_eq!(scan_kitty_keyboard_state(b"\x1b[>0u"), Some(true));
+        assert_eq!(scan_kitty_keyboard_state(b"\x1b[>3u"), Some(true));
+        assert_eq!(scan_kitty_keyboard_state(b"\x1b[>31u"), Some(true));
+    }
+
+    // =========================================================================
+    // Reader Thread Kitty State Tracking Tests
+    // =========================================================================
+
+    #[test]
+    fn test_reader_sets_kitty_flag_on_push() {
+        // PTY output containing a kitty push sequence
+        let mut data = Vec::new();
+        data.extend(b"some output\r\n");
+        data.extend(b"\x1b[>1u"); // kitty push
+        data.extend(b"more output");
+
+        let reader = MockReader::new(&data);
+        let shadow = test_shadow_screen();
+        let (event_tx, _rx) = broadcast::channel::<PtyEvent>(16);
+        let kitty = test_kitty_flag();
+
+        assert!(!kitty.load(Ordering::Relaxed), "kitty should start false");
+
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, Arc::clone(&kitty));
+        handle.join().expect("Reader thread panicked");
+
+        assert!(kitty.load(Ordering::Relaxed), "kitty should be true after push");
+    }
+
+    #[test]
+    fn test_reader_clears_kitty_flag_on_pop() {
+        let mut data = Vec::new();
+        data.extend(b"\x1b[>1u"); // push
+        data.extend(b"\x1b[<u");  // pop
+
+        let reader = MockReader::new(&data);
+        let shadow = test_shadow_screen();
+        let (event_tx, _rx) = broadcast::channel::<PtyEvent>(16);
+        let kitty = test_kitty_flag();
+
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, Arc::clone(&kitty));
+        handle.join().expect("Reader thread panicked");
+
+        assert!(!kitty.load(Ordering::Relaxed), "kitty should be false after pop");
+    }
+
+    #[test]
+    fn test_reader_kitty_flag_unset_for_normal_output() {
+        let reader = MockReader::new(b"hello world\r\n");
+        let shadow = test_shadow_screen();
+        let (event_tx, _rx) = broadcast::channel::<PtyEvent>(16);
+        let kitty = test_kitty_flag();
+
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, Arc::clone(&kitty));
+        handle.join().expect("Reader thread panicked");
+
+        assert!(!kitty.load(Ordering::Relaxed), "kitty should remain false");
     }
 }

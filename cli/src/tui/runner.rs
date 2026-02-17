@@ -1435,7 +1435,7 @@ where
                     let is_active = agent_index.unwrap_or(0) == self.current_agent_index.unwrap_or(0)
                         && pty_index.unwrap_or(0) == self.current_pty_index.unwrap_or(0);
                     if is_active {
-                        if let Some(kitty_state) = scan_kitty_keyboard_state(&data) {
+                        if let Some(kitty_state) = crate::agent::spawn::scan_kitty_keyboard_state(&data) {
                             self.inner_kitty_enabled = kitty_state;
                         }
                     }
@@ -2065,53 +2065,6 @@ pub fn run_with_hub(
 
     log::info!("Hub event loop exiting");
     Ok(())
-}
-
-/// Scan PTY output bytes for Kitty keyboard protocol push/pop sequences.
-///
-/// Scan PTY output bytes for Kitty keyboard protocol push/pop sequences.
-///
-/// Returns `Some(true)` if the last relevant sequence is a push (`CSI > flags u`),
-/// `Some(false)` if it's a pop (`CSI < u`), or `None` if no Kitty sequences found.
-///
-/// We scan for the *last* occurrence because a single output chunk could contain
-/// multiple push/pop sequences (e.g., during shell startup).
-fn scan_kitty_keyboard_state(data: &[u8]) -> Option<bool> {
-    let mut result = None;
-
-    // Scan for ESC [ > ... u (push) and ESC [ < ... u (pop)
-    let mut i = 0;
-    while i + 2 < data.len() {
-        if data[i] == 0x1b && data[i + 1] == b'[' {
-            let start = i + 2;
-            if start < data.len() && data[start] == b'>' {
-                // Potential push: ESC [ > <digits> u
-                let mut j = start + 1;
-                while j < data.len() && data[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j < data.len() && data[j] == b'u' {
-                    result = Some(true);
-                    i = j + 1;
-                    continue;
-                }
-            } else if start < data.len() && data[start] == b'<' {
-                // Potential pop: ESC [ < u  (or ESC [ < <digits> u)
-                let mut j = start + 1;
-                while j < data.len() && data[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j < data.len() && data[j] == b'u' {
-                    result = Some(false);
-                    i = j + 1;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-
-    result
 }
 
 /// Result of loading Lua layout source.
