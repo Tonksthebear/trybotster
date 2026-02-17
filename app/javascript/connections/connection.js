@@ -80,6 +80,7 @@ export class Connection {
   #initRetryCount = 0       // Retry counter for failed initialize()
   #initRetryTimer = null    // Pending retry timer
   #peerReconnectTimer = null  // Pending peer reconnect timer
+  #peerReconnectAttempts = 0  // Retry counter for peer reconnection
 
   constructor(key, options, manager) {
     this.key = key
@@ -115,7 +116,7 @@ export class Connection {
       if (document.visibilityState !== "visible") return
       if (!this.#hubConnected || !this.identityKey) return
       if (this.state === ConnectionState.ERROR && (this.errorCode === "session_invalid" || this.errorCode === "unpaired")) return
-      this.#ensureConnected()
+      this.#ensureConnected().catch(() => {})
     }
     document.addEventListener("visibilitychange", this.#visibilityHandler)
   }
@@ -320,7 +321,17 @@ export class Connection {
 
     // Step 2: Subscribe virtual channel
     if (cliOnline && !this.subscriptionId) {
-      await this.subscribe()  // has its own lock, early-returns if subscribed
+      try {
+        await this.subscribe()  // has its own lock, early-returns if subscribed
+      } catch (e) {
+        // DataChannel/transport failures are retriable — the disconnected event
+        // handler will schedule a peer reconnect. Don't propagate.
+        if (e.message?.includes("DataChannel") || e.message?.includes("No connection") || e.message?.includes("timeout")) {
+          console.debug(`[${this.constructor.name}] Subscribe deferred (peer not ready): ${e.message}`)
+          return
+        }
+        throw e  // Re-throw non-transport errors (auth, crypto, etc.)
+      }
     }
   }
 
@@ -508,27 +519,36 @@ export class Connection {
           return
         }
 
-        // Peer connection lost — retry after a short delay if hub is still online.
-        // CLI-side fd management (watch-based close tracking) prevents fd exhaustion
-        // from rapid reconnection cycles, so we don't need aggressive backoff here.
+        // Peer connection lost — retry with backoff if hub is still online.
+        // Exponential backoff prevents hammering when offers are being dropped
+        // (e.g., server just rebooted, async adapter not ready).
         // Phone unlock reconnects instantly via visibilitychange (separate path).
         this.emit("disconnected")
 
         if (this.cliStatus === CliStatus.ONLINE || this.cliStatus === CliStatus.NOTIFIED) {
           if (this.#peerReconnectTimer) return // already scheduled
+          this.#peerReconnectAttempts++
+
+          if (this.#peerReconnectAttempts > 5) {
+            console.debug(`[${this.constructor.name}] Peer reconnect exhausted after ${this.#peerReconnectAttempts} attempts, waiting for health event`)
+            return
+          }
+
+          const delay = Math.min(2000 * Math.pow(1.5, this.#peerReconnectAttempts - 1), 15000)
           this.#peerReconnectTimer = setTimeout(() => {
             this.#peerReconnectTimer = null
             if (!this.handshakeComplete) {
-              console.debug(`[${this.constructor.name}] Peer lost but hub online, reconnecting peer...`)
-              this.#ensureConnected()
+              console.debug(`[${this.constructor.name}] Peer lost but hub online, reconnecting peer (attempt ${this.#peerReconnectAttempts})...`)
+              this.#ensureConnected().catch(() => {})
             }
-          }, 2000)
+          }, delay)
         }
       } else if (event.state === "connected") {
         if (this.#peerReconnectTimer) {
           clearTimeout(this.#peerReconnectTimer)
           this.#peerReconnectTimer = null
         }
+        this.#peerReconnectAttempts = 0
         if (event.mode) {
           this.#setConnectionMode(event.mode)
         }
@@ -1090,7 +1110,8 @@ export class Connection {
       const isActive = newCliStatus === CliStatus.ONLINE || newCliStatus === CliStatus.NOTIFIED ||
                        newCliStatus === CliStatus.CONNECTING || newCliStatus === CliStatus.CONNECTED
       if (isActive && wasInactive) {
-        this.#ensureConnected()
+        this.#peerReconnectAttempts = 0  // fresh health cycle, reset backoff
+        this.#ensureConnected().catch(() => {})
       }
 
       // CLI connected to E2E channel while we're already subscribed — initiate handshake.
