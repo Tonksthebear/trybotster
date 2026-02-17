@@ -88,7 +88,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 use crate::agent::pty::{PtySession, SharedPtyState};
 use crate::agent::spawn::PtySpawnConfig;
@@ -140,6 +140,9 @@ pub struct PtySessionHandle {
     /// Event broadcast sender for subscribing to PTY output.
     event_tx: broadcast::Sender<PtyEvent>,
 
+    /// Whether the inner PTY has kitty keyboard protocol active.
+    kitty_enabled: Arc<AtomicBool>,
+
     /// Forwarding port (if configured).
     port: Option<u16>,
 }
@@ -163,6 +166,7 @@ impl PtySessionHandle {
             self.event_tx.clone(),
             Arc::clone(&self.shared_state),
             Arc::clone(&self.shadow_screen),
+            Arc::clone(&self.kitty_enabled),
             self.port,
         )
     }
@@ -739,7 +743,7 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
             })?;
 
             // Extract direct access handles before wrapping in Arc
-            let (shared_state, shadow_screen, event_tx) = session.get_direct_access();
+            let (shared_state, shadow_screen, event_tx, kitty_enabled) = session.get_direct_access();
             let session_port = session.port();
 
             // Auto-queue notification watcher if notifications enabled and identity provided
@@ -766,6 +770,7 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
                 shared_state,
                 shadow_screen,
                 event_tx,
+                kitty_enabled,
                 port: session_port,
             };
 
@@ -1206,7 +1211,7 @@ mod tests {
     /// manually.
     fn create_test_session_handle() -> PtySessionHandle {
         let session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx) = session.get_direct_access();
+        let (shared_state, shadow_screen, event_tx, kitty_enabled) = session.get_direct_access();
         let session_arc = Arc::new(Mutex::new(session));
 
         PtySessionHandle {
@@ -1214,6 +1219,7 @@ mod tests {
             shared_state,
             shadow_screen,
             event_tx,
+            kitty_enabled,
             port: None,
         }
     }

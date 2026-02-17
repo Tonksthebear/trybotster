@@ -56,7 +56,10 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, MasterPty, PtySize};
 use std::{
     io::Write,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
 };
 use tokio::sync::{broadcast, mpsc};
@@ -198,6 +201,14 @@ pub struct PtySession {
     /// events for detected OSC 9 / OSC 777 sequences.
     detect_notifications: bool,
 
+    /// Whether the inner PTY application has pushed kitty keyboard protocol.
+    ///
+    /// Set by the reader thread when it detects `CSI > flags u` (push) or
+    /// `CSI < u` (pop) in the PTY output stream. Used by `get_snapshot()`
+    /// to include the kitty push sequence so browser terminals enter kitty
+    /// mode on connect/reconnect.
+    kitty_enabled: Arc<AtomicBool>,
+
     /// Allocated port for HTTP forwarding.
     ///
     /// Used by sessions with `port_forward` enabled to expose the dev server
@@ -257,6 +268,7 @@ impl PtySession {
             command_tx,
             command_rx: Some(command_rx),
             detect_notifications: false,
+            kitty_enabled: Arc::new(AtomicBool::new(false)),
             port: None,
         }
     }
@@ -380,6 +392,7 @@ impl PtySession {
             Arc::clone(&self.shadow_screen),
             self.event_sender(),
             config.detect_notifications,
+            Arc::clone(&self.kitty_enabled),
         ));
 
         self.set_master_pty(pair.master);
@@ -435,7 +448,7 @@ impl PtySession {
     ///
     /// # Returns
     ///
-    /// Tuple of (shared_state, shadow_screen, event_tx) for direct access.
+    /// Tuple of (shared_state, shadow_screen, event_tx, kitty_enabled) for direct access.
     #[must_use]
     pub fn get_direct_access(
         &self,
@@ -443,11 +456,13 @@ impl PtySession {
         Arc<Mutex<SharedPtyState>>,
         Arc<Mutex<vt100::Parser>>,
         broadcast::Sender<PtyEvent>,
+        Arc<AtomicBool>,
     ) {
         (
             Arc::clone(&self.shared_state),
             Arc::clone(&self.shadow_screen),
             self.event_tx.clone(),
+            Arc::clone(&self.kitty_enabled),
         )
     }
 
@@ -692,13 +707,31 @@ impl PtySession {
     /// Get a clean ANSI snapshot of the current terminal state.
     ///
     /// Locks the shadow screen and delegates to [`snapshot_with_scrollback`].
+    /// Appends the kitty keyboard push sequence when the inner PTY has
+    /// activated kitty mode, so connecting terminals enter kitty mode.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
         let mut parser = self
             .shadow_screen
             .lock()
             .expect("shadow_screen lock poisoned");
-        snapshot_with_scrollback(parser.screen_mut())
+        let mut snapshot = snapshot_with_scrollback(parser.screen_mut());
+
+        // Restore kitty keyboard protocol state in the snapshot.
+        // The vt100 shadow screen doesn't track kitty mode, so we append
+        // the push sequence from our own tracking of the raw PTY output.
+        if self.kitty_enabled.load(Ordering::Relaxed) {
+            // CSI > 1 u = push kitty keyboard with DISAMBIGUATE_ESCAPE_CODES flag.
+            snapshot.extend(b"\x1b[>1u");
+        }
+
+        snapshot
+    }
+
+    /// Whether the inner PTY has kitty keyboard protocol active.
+    #[must_use]
+    pub fn kitty_enabled(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.kitty_enabled)
     }
 }
 
@@ -960,6 +993,68 @@ mod tests {
         let snapshot = session.get_snapshot();
         let snapshot_str = String::from_utf8_lossy(&snapshot);
         assert!(snapshot_str.contains("green text"));
+    }
+
+    // =========================================================================
+    // Kitty Keyboard Protocol in Snapshots
+    // =========================================================================
+
+    #[test]
+    fn test_snapshot_includes_kitty_push_when_enabled() {
+        let session = PtySession::new(24, 80);
+
+        session
+            .shadow_screen
+            .lock()
+            .unwrap()
+            .process(b"hello");
+
+        // Simulate reader thread detecting kitty push
+        session.kitty_enabled.store(true, Ordering::Relaxed);
+
+        let snapshot = session.get_snapshot();
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(snapshot_str.contains("hello"), "snapshot should contain screen content");
+        assert!(
+            snapshot.windows(5).any(|w| w == b"\x1b[>1u"),
+            "snapshot should end with kitty push sequence (CSI > 1 u)"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_excludes_kitty_when_disabled() {
+        let session = PtySession::new(24, 80);
+
+        session
+            .shadow_screen
+            .lock()
+            .unwrap()
+            .process(b"hello");
+
+        // kitty_enabled defaults to false
+        let snapshot = session.get_snapshot();
+
+        assert!(
+            !snapshot.windows(5).any(|w| w == b"\x1b[>1u"),
+            "snapshot should NOT contain kitty push when kitty is disabled"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_excludes_kitty_after_pop() {
+        let session = PtySession::new(24, 80);
+
+        // Push then pop
+        session.kitty_enabled.store(true, Ordering::Relaxed);
+        session.kitty_enabled.store(false, Ordering::Relaxed);
+
+        let snapshot = session.get_snapshot();
+
+        assert!(
+            !snapshot.windows(5).any(|w| w == b"\x1b[>1u"),
+            "snapshot should NOT contain kitty push after pop"
+        );
     }
 
     #[test]

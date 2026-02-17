@@ -38,7 +38,10 @@
 // Rust guideline compliant 2026-01
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use tokio::sync::broadcast;
 
@@ -206,6 +209,12 @@ pub struct PtyHandle {
     /// `get_snapshot()` produces clean ANSI output with correct cursor.
     shadow_screen: Arc<Mutex<vt100::Parser>>,
 
+    /// Whether the inner PTY has kitty keyboard protocol active.
+    ///
+    /// Shared with the reader thread which updates this from raw PTY output.
+    /// Used by `get_snapshot()` to include the kitty push sequence.
+    kitty_enabled: Arc<AtomicBool>,
+
     /// HTTP forwarding port for preview proxying.
     ///
     /// Primarily used by server PTYs (pty_index=1) to expose the dev server
@@ -234,18 +243,21 @@ impl PtyHandle {
     /// * `event_tx` - Broadcast sender for PTY events
     /// * `shared_state` - Direct access to PTY writer and state
     /// * `shadow_screen` - Shadow terminal for ANSI snapshots
+    /// * `kitty_enabled` - Shared kitty keyboard protocol state flag
     /// * `port` - HTTP forwarding port (for server PTYs), or `None`
     #[must_use]
     pub fn new(
         event_tx: broadcast::Sender<PtyEvent>,
         shared_state: Arc<Mutex<SharedPtyState>>,
         shadow_screen: Arc<Mutex<vt100::Parser>>,
+        kitty_enabled: Arc<AtomicBool>,
         port: Option<u16>,
     ) -> Self {
         Self {
             event_tx,
             shared_state,
             shadow_screen,
+            kitty_enabled,
             port,
         }
     }
@@ -290,13 +302,26 @@ impl PtyHandle {
     /// Get a clean ANSI snapshot of the current terminal state.
     ///
     /// Locks the shadow screen and delegates to [`crate::agent::pty::snapshot_with_scrollback`].
+    /// Appends the kitty keyboard push sequence when the inner PTY has
+    /// activated kitty mode, so connecting terminals enter kitty mode.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
         let mut parser = self
             .shadow_screen
             .lock()
             .expect("shadow_screen lock poisoned");
-        crate::agent::pty::snapshot_with_scrollback(parser.screen_mut())
+        let mut snapshot = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut());
+
+        // Restore kitty keyboard protocol state in the snapshot.
+        // The vt100 shadow screen doesn't track kitty mode, so we append
+        // the push sequence from our own tracking of the raw PTY output.
+        let kitty = self.kitty_enabled.load(Ordering::Relaxed);
+        if kitty {
+            // CSI > 1 u = push kitty keyboard with DISAMBIGUATE_ESCAPE_CODES flag.
+            snapshot.extend(b"\x1b[>1u");
+        }
+
+        snapshot
     }
 
     // =========================================================================
@@ -351,10 +376,10 @@ mod tests {
     /// Helper to create a PTY handle for testing with a specific port.
     fn create_test_pty_with_port(port: Option<u16>) -> PtyHandle {
         let pty_session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx) = pty_session.get_direct_access();
+        let (shared_state, shadow_screen, event_tx, kitty_enabled) = pty_session.get_direct_access();
         // Leak the session to keep the state alive for tests
         std::mem::forget(pty_session);
-        PtyHandle::new(event_tx, shared_state, shadow_screen, port)
+        PtyHandle::new(event_tx, shared_state, shadow_screen, kitty_enabled, port)
     }
 
     #[test]
