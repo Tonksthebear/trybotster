@@ -1,0 +1,127 @@
+<h1 class="text-2xl font-bold text-zinc-100 mb-6">Environment Variables</h1>
+
+<p class="text-zinc-400 mb-6">
+  Environment variables override config file values and are useful for CI, scripting, and development.
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Authentication</h2>
+<div class="overflow-x-auto mb-6">
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-zinc-800">
+        <th class="text-left py-2 pr-4 text-zinc-400 font-medium">Variable</th>
+        <th class="text-left py-2 text-zinc-400 font-medium">Description</th>
+      </tr>
+    </thead>
+    <tbody class="text-zinc-400">
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_TOKEN</td>
+        <td class="py-2">API token (bypasses keyring)</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_MCP_TOKEN</td>
+        <td class="py-2">MCP token for plugins</td>
+      </tr>
+      <tr>
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_NO_BROWSER</td>
+        <td class="py-2">Skip browser launch during device auth flow</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Server</h2>
+<div class="overflow-x-auto mb-6">
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-zinc-800">
+        <th class="text-left py-2 pr-4 text-zinc-400 font-medium">Variable</th>
+        <th class="text-left py-2 text-zinc-400 font-medium">Description</th>
+      </tr>
+    </thead>
+    <tbody class="text-zinc-400">
+      <tr>
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_SERVER_URL</td>
+        <td class="py-2">Override server URL (default: https://trybotster.com)</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Paths</h2>
+<div class="overflow-x-auto mb-6">
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-zinc-800">
+        <th class="text-left py-2 pr-4 text-zinc-400 font-medium">Variable</th>
+        <th class="text-left py-2 text-zinc-400 font-medium">Description</th>
+      </tr>
+    </thead>
+    <tbody class="text-zinc-400">
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_CONFIG_DIR</td>
+        <td class="py-2">Config directory (default: platform-specific)</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_LOG_FILE</td>
+        <td class="py-2">Log file path</td>
+      </tr>
+      <tr>
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_WORKTREE_BASE</td>
+        <td class="py-2">Worktree directory (default: ~/botster-sessions)</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Behavior</h2>
+<div class="overflow-x-auto mb-6">
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-zinc-800">
+        <th class="text-left py-2 pr-4 text-zinc-400 font-medium">Variable</th>
+        <th class="text-left py-2 text-zinc-400 font-medium">Description</th>
+      </tr>
+    </thead>
+    <tbody class="text-zinc-400">
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_POLL_INTERVAL</td>
+        <td class="py-2">Server poll interval in seconds (default: 5)</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_MAX_SESSIONS</td>
+        <td class="py-2">Max concurrent agents (default: 20)</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_AGENT_TIMEOUT</td>
+        <td class="py-2">Agent idle timeout in seconds (default: 3600)</td>
+      </tr>
+      <tr>
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_HUB_ID</td>
+        <td class="py-2">Hub identifier override (default: git repo name)</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Lua</h2>
+<div class="overflow-x-auto">
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-zinc-800">
+        <th class="text-left py-2 pr-4 text-zinc-400 font-medium">Variable</th>
+        <th class="text-left py-2 text-zinc-400 font-medium">Description</th>
+      </tr>
+    </thead>
+    <tbody class="text-zinc-400">
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_LUA_PATH</td>
+        <td class="py-2">Override Lua scripts path (default: ~/.botster/lua)</td>
+      </tr>
+      <tr>
+        <td class="py-2 pr-4 font-mono text-zinc-300">BOTSTER_LUA_STRICT</td>
+        <td class="py-2">If "1", Lua errors panic instead of logging</td>
+      </tr>
+    </tbody>
+  </table>
+</div>

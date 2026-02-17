@@ -178,6 +178,11 @@ pub struct TuiRunner<B: Backend> {
     /// from Lua forwarder tasks and JSON events from `tui.send()` in Lua.
     output_rx: tokio::sync::mpsc::UnboundedReceiver<TuiOutput>,
 
+    // === Wake Pipe ===
+    /// Read end of the wake pipe. Hub/forwarders write 1 byte to the write
+    /// end after sending to `output_rx`, unblocking the TUI `libc::poll()`.
+    wake_fd: Option<std::os::unix::io::RawFd>,
+
     // === Control ===
     /// Shutdown flag (shared with Hub for coordinated shutdown).
     shutdown: Arc<AtomicBool>,
@@ -232,6 +237,11 @@ pub struct TuiRunner<B: Backend> {
     // === Raw Input ===
     /// Raw stdin reader — replaces crossterm's event reader for keyboard input.
     raw_reader: RawInputReader,
+
+    /// True when stdin has a permanent error (EIO). Prevents `poll_wait()`
+    /// from including stdin in `libc::poll`, which would cause a tight spin
+    /// loop since `POLLERR` triggers immediate readiness.
+    stdin_dead: bool,
 
     /// SIGWINCH flag for terminal resize detection.
     pub(super) resize_flag: Arc<AtomicBool>,
@@ -323,6 +333,7 @@ where
         output_rx: tokio::sync::mpsc::UnboundedReceiver<TuiOutput>,
         shutdown: Arc<AtomicBool>,
         terminal_dims: (u16, u16),
+        wake_fd: Option<std::os::unix::io::RawFd>,
     ) -> Self {
         let (rows, cols) = terminal_dims;
         let parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
@@ -344,6 +355,7 @@ where
             active_subscriptions: std::collections::HashSet::new(),
             widget_dims: std::collections::HashMap::new(),
             output_rx,
+            wake_fd,
             shutdown,
             quit: false,
             terminal_dims,
@@ -358,6 +370,7 @@ where
             botster_api_source: None,
             extension_sources: Vec::new(),
             raw_reader: RawInputReader::new(),
+            stdin_dead: false,
             resize_flag: Arc::new(AtomicBool::new(false)),
             outer_app_cursor: false,
             outer_bracketed_paste: false,
@@ -442,6 +455,12 @@ where
         // Subscribe to new pairs
         for &(agent_idx, pty_idx) in &desired {
             if !self.active_subscriptions.contains(&(agent_idx, pty_idx)) {
+                // Use per-widget dims if known (from previous render), else full terminal dims.
+                let (rows, cols) = self.widget_dims
+                    .get(&(agent_idx, pty_idx))
+                    .copied()
+                    .unwrap_or(self.terminal_dims);
+
                 let sub_id = format!("tui:{}:{}", agent_idx, pty_idx);
                 self.send_msg(serde_json::json!({
                     "type": "subscribe",
@@ -450,15 +469,12 @@ where
                     "params": {
                         "agent_index": agent_idx,
                         "pty_index": pty_idx,
+                        "rows": rows,
+                        "cols": cols,
                     }
                 }));
 
                 // Ensure parser exists for this binding.
-                // Use per-widget dims if known (from previous render), else full terminal dims.
-                let (rows, cols) = self.widget_dims
-                    .get(&(agent_idx, pty_idx))
-                    .copied()
-                    .unwrap_or(self.terminal_dims);
                 self.parser_pool
                     .entry((agent_idx, pty_idx))
                     .or_insert_with(|| Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK))));
@@ -611,6 +627,7 @@ where
                     agents = {},\
                     pending_fields = {},\
                     available_worktrees = {},\
+                    available_profiles = {},\
                     mode = 'normal',\
                     input_buffer = '',\
                     list_selected = 0,\
@@ -907,8 +924,10 @@ where
             // 4. Render
             self.render(layout_lua.as_ref(), layout_error.as_deref())?;
 
-            // Small sleep to prevent CPU spinning (60 FPS max)
-            std::thread::sleep(Duration::from_millis(16));
+            // Block until stdin has input, wake pipe signals, or timeout.
+            // Replaces the old `thread::sleep(16ms)` with event-driven wakeup:
+            // zero CPU when idle, instant response when events arrive.
+            self.poll_wait();
         }
 
         // Signal main thread to exit too (bidirectional shutdown)
@@ -917,13 +936,104 @@ where
         Ok(())
     }
 
+    /// Block until stdin has data, the wake pipe signals, or the timeout
+    /// expires. Replaces `thread::sleep(16ms)` with event-driven wakeup.
+    ///
+    /// When a wake pipe is configured, polls both stdin (fd 0) and the wake
+    /// pipe read end. Hub and forwarder tasks write 1 byte to the wake pipe
+    /// after sending to `output_rx`, providing instant TUI wakeup.
+    ///
+    /// When stdin has a permanent error (`stdin_dead`), only polls the wake
+    /// pipe to avoid a tight spin loop from `POLLERR` on stdin.
+    ///
+    /// Falls back to a 16ms sleep when no wake pipe is available (tests).
+    fn poll_wait(&mut self) {
+        let Some(wake_read_fd) = self.wake_fd else {
+            // No wake pipe (tests) — fall back to original sleep behavior
+            std::thread::sleep(Duration::from_millis(16));
+            return;
+        };
+
+        if self.stdin_dead {
+            // stdin has a permanent error — poll only the wake pipe.
+            // Without this guard, POLLERR on stdin causes immediate return
+            // from poll(), creating a tight spin loop.
+            let mut fds = [libc::pollfd {
+                fd: wake_read_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            unsafe { libc::poll(fds.as_mut_ptr(), 1, 100) };
+
+            if fds[0].revents & libc::POLLIN != 0 {
+                Self::drain_wake_pipe(wake_read_fd);
+            }
+            return;
+        }
+
+        let mut fds = [
+            libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_read_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+
+        // 100ms timeout as backstop for SIGWINCH resize (signal_hook uses
+        // SA_RESTART so poll isn't interrupted), file watcher, and other
+        // periodic checks. 6x fewer wakeups than the old 16ms sleep.
+        unsafe { libc::poll(fds.as_mut_ptr(), 2, 100) };
+
+        // Detect permanent stdin error — POLLERR or POLLHUP without POLLIN
+        // means stdin is dead (terminal closed, fd invalid, etc.).
+        if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+            && fds[0].revents & libc::POLLIN == 0
+        {
+            log::warn!(
+                "stdin poll returned error flags (revents=0x{:x}), disabling stdin polling",
+                fds[0].revents
+            );
+            self.stdin_dead = true;
+        }
+
+        // Drain wake pipe to prevent accumulation (non-blocking read)
+        if fds[1].revents & libc::POLLIN != 0 {
+            Self::drain_wake_pipe(wake_read_fd);
+        }
+    }
+
+    /// Drain the wake pipe to prevent accumulation (non-blocking reads).
+    fn drain_wake_pipe(wake_read_fd: i32) {
+        let mut drain_buf = [0u8; 256];
+        loop {
+            let n = unsafe {
+                libc::read(
+                    wake_read_fd,
+                    drain_buf.as_mut_ptr() as *mut libc::c_void,
+                    drain_buf.len(),
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+        }
+    }
+
     /// Poll for keyboard/mouse input and handle it.
     ///
     /// Reads raw bytes from stdin and parses them into events. Also checks
     /// the SIGWINCH flag for terminal resize. This replaces crossterm's
     /// event reader to preserve raw bytes for PTY passthrough.
     fn poll_input(&mut self, layout_lua: Option<&LayoutLua>) {
-        let events = self.raw_reader.drain_events();
+        let (events, stdin_dead) = self.raw_reader.drain_events();
+        if stdin_dead {
+            self.stdin_dead = true;
+        }
 
         // Coalesce consecutive mouse scroll events with acceleration.
         // Single notch = 1 line (fine control). When events batch up within
@@ -1023,6 +1133,11 @@ where
 
                         match lua.call_handle_key(&descriptor, &self.mode, &context) {
                             Ok(Some(lua_action)) => {
+                                log::info!(
+                                    "[TUI-KEY] '{}' in mode '{}' -> action='{}' char={:?}",
+                                    descriptor, self.mode, lua_action.action,
+                                    lua_action.char
+                                );
                                 self.handle_lua_key_action(&lua_action, lua);
                                 return;
                             }
@@ -1107,13 +1222,26 @@ where
                 let _ = layout_lua.exec(&format!("_tui_state.list_selected = {idx}"));
             }
 
+            // Diagnostic: log all workflow actions with context
+            if matches!(action_str, "list_select" | "input_submit" | "open_menu" | "close_modal") {
+                log::info!(
+                    "[TUI-ACTION] action='{}' mode='{}' overlay_actions={:?} focused_list={:?} focused_input={:?}",
+                    action_str, self.mode, context.overlay_actions,
+                    self.focused_list_id, self.focused_input_id
+                );
+            }
+
             match layout_lua.call_on_action(action_str, &context) {
                 Ok(Some(ops)) => {
+                    log::info!(
+                        "[TUI-ACTION] action='{}' returned {} ops",
+                        action_str, ops.len()
+                    );
                     self.execute_lua_ops(ops);
                     return;
                 }
                 Ok(None) => {
-                    log::debug!("Lua actions returned nil for '{action_str}', no-op");
+                    log::info!("Lua actions returned nil for '{}' in mode '{}', no-op", action_str, self.mode);
                 }
                 Err(e) => {
                     log::warn!("Lua on_action failed for '{action_str}': {e}");
@@ -1269,11 +1397,9 @@ where
 
     /// Handle resize event.
     ///
-    /// Updates both local state and propagates to the connected PTY:
-    /// 1. Updates `terminal_dims` for TuiRunner's own use
-    /// 2. Resizes the vt100 parser so output is interpreted correctly
-    /// 3. If connected, sends resize through Lua terminal subscription
-    /// 4. Sends client-level resize through hub subscription for dims tracking
+    /// Updates local state only. The next render cycle will call
+    /// `sync_widget_dims()` which sends per-terminal resize through
+    /// terminal subscriptions → `pty_clients.update()`.
     fn handle_resize(&mut self, rows: u16, cols: u16) {
         self.terminal_dims = (rows, cols);
 
@@ -1286,17 +1412,6 @@ where
             let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
             parser.screen_mut().set_size(rows, cols);
         }
-
-        // Update client-level dims via hub subscription so
-        // client.lua tracks dimensions for future PTY subscriptions.
-        self.send_msg(serde_json::json!({
-            "subscriptionId": "tui_hub",
-            "data": {
-                "type": "resize",
-                "rows": rows,
-                "cols": cols,
-            }
-        }));
     }
 
     /// Poll PTY output and Lua events from Hub output channel.
@@ -1545,6 +1660,7 @@ where
                 "set_mode" => {
                     // Shadow update only — canonical state is _tui_state.mode in Lua.
                     if let Some(mode) = op.get("mode").and_then(|v| v.as_str()) {
+                        log::info!("[TUI-OP] set_mode: {} -> {}", self.mode, mode);
                         self.mode = mode.to_string();
                         // Reset Rust-side widget state on mode transition
                         // (mirrors Lua's set_mode_ops resetting list_selected/input_buffer)
@@ -1557,6 +1673,7 @@ where
                 }
                 "send_msg" => {
                     if let Some(data) = op.get("data") {
+                        log::info!("[TUI-OP] send_msg: {}", data);
                         self.send_msg(data.clone());
                     }
                 }
@@ -1833,6 +1950,28 @@ pub fn run_with_hub(
     // Hub processes JSONs directly in its tick loop.
     let output_rx = hub.register_tui_via_lua(request_rx);
 
+    // Create wake pipe for event-driven TUI wakeup.
+    // Hub/forwarders write to wake_write_fd after sending to output_rx,
+    // TuiRunner polls wake_read_fd alongside stdin.
+    let mut pipe_fds = [0i32; 2];
+    let pipe_ok = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == 0;
+    let (wake_read_fd, wake_write_fd) = if pipe_ok {
+        // Set both ends to non-blocking: read end so drain never blocks,
+        // write end so forwarder tasks never stall if pipe buffer is full.
+        unsafe {
+            let flags = libc::fcntl(pipe_fds[0], libc::F_GETFL);
+            libc::fcntl(pipe_fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            let flags = libc::fcntl(pipe_fds[1], libc::F_GETFL);
+            libc::fcntl(pipe_fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        hub.tui_wake_fd = Some(pipe_fds[1]);
+        log::info!("TUI wake pipe created: read={}, write={}", pipe_fds[0], pipe_fds[1]);
+        (Some(pipe_fds[0]), Some(pipe_fds[1]))
+    } else {
+        log::warn!("Failed to create TUI wake pipe, falling back to sleep-based polling");
+        (None, None)
+    };
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let tui_shutdown = Arc::clone(&shutdown);
 
@@ -1842,6 +1981,7 @@ pub fn run_with_hub(
         output_rx,
         tui_shutdown,
         terminal_dims,
+        wake_read_fd,
     );
 
     // Load Lua layout source: try filesystem first, then embedded.
@@ -1900,17 +2040,10 @@ pub fn run_with_hub(
 
     log::info!("TuiRunner spawned in dedicated thread");
 
-    // Main thread: Hub tick loop for non-TUI operations.
-    // Client request processing is handled by each client's async run_task().
+    // Main thread: event-driven Hub loop using tokio::select!.
     // The `shutdown` Arc is bidirectional: main→TUI (for signal-triggered shutdown)
     // and TUI→main (for Ctrl+Q quit). Either side setting it to true ends both loops.
-    while !hub.quit && !shutdown_flag.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) {
-        // Periodic tasks (command channel, heartbeat, Lua queues, notifications)
-        hub.tick();
-
-        // Small sleep to prevent CPU spinning (60 FPS max)
-        thread::sleep(Duration::from_millis(16));
-    }
+    crate::hub::run::run_event_loop(hub, shutdown_flag, Some(&shutdown))?;
 
     // Signal TUI thread to shutdown (in case main exited first via hub.quit or signal)
     shutdown.store(true, Ordering::SeqCst);
@@ -1920,6 +2053,15 @@ pub fn run_with_hub(
     if let Err(e) = tui_handle.join() {
         log::error!("TuiRunner thread panicked: {:?}", e);
     }
+
+    // Close wake pipe fds
+    if let Some(fd) = wake_read_fd {
+        unsafe { libc::close(fd); }
+    }
+    if let Some(fd) = wake_write_fd {
+        unsafe { libc::close(fd); }
+    }
+    hub.tui_wake_fd = None;
 
     log::info!("Hub event loop exiting");
     Ok(())
@@ -2216,6 +2358,7 @@ mod tests {
             output_rx,
             shutdown,
             (24, 80), // rows, cols
+            None,     // no wake pipe in tests
         );
 
         // Initialize mode from Lua (same as production boot path)
@@ -2279,6 +2422,7 @@ mod tests {
             output_rx,
             Arc::clone(&shutdown),
             (24, 80),
+            None, // no wake pipe in tests
         );
 
         // Initialize mode from Lua (same as production boot path)
@@ -2352,7 +2496,7 @@ mod tests {
         let mut lua = LayoutLua::new(layout_source).expect("test layout should load");
         // Bootstrap _tui_state (actions.lua and events.lua read from it)
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
         lua.load_keybindings(kb_source)
@@ -2711,8 +2855,23 @@ mod tests {
 
         assert_eq!(
             runner.mode(),
+            "new_agent_select_profile",
+            "Should enter profile selection"
+        );
+
+        // Simulate single-profile response (auto-skips to worktree selection)
+        {
+            let profiles_event = serde_json::json!({ "profiles": ["claude"] });
+            let ctx = crate::tui::layout_lua::ActionContext::default();
+            let ops = lua.call_on_hub_event("profiles", &profiles_event, &ctx)
+                .unwrap().unwrap();
+            runner.execute_lua_ops(ops);
+        }
+
+        assert_eq!(
+            runner.mode(),
             "new_agent_select_worktree",
-            "Should enter worktree selection"
+            "Should auto-advance to worktree selection"
         );
 
         // 2. Select "Create new worktree" (index 1, after "Use Main Branch")
@@ -2816,6 +2975,16 @@ mod tests {
         process_key_with_lua(&mut runner, make_key_enter(), &lua);
 
         thread::sleep(Duration::from_millis(10));
+        assert_eq!(runner.mode(), "new_agent_select_profile");
+
+        // Simulate single-profile response (auto-skips to worktree selection)
+        {
+            let profiles_event = serde_json::json!({ "profiles": ["claude"] });
+            let ctx = crate::tui::layout_lua::ActionContext::default();
+            let ops = lua.call_on_hub_event("profiles", &profiles_event, &ctx)
+                .unwrap().unwrap();
+            runner.execute_lua_ops(ops);
+        }
         assert_eq!(runner.mode(), "new_agent_select_worktree");
 
         // Navigate to first existing worktree (index 2, after "Use Main Branch" and "Create New Worktree")
@@ -3469,7 +3638,7 @@ mod tests {
     /// Per-PTY resize is NOT sent here — it's deferred to `sync_widget_dims()`
     /// after the next render pass, which knows the actual widget dimensions.
     #[test]
-    fn test_handle_resize_sends_resize_via_lua() {
+    fn test_handle_resize_updates_local_state_and_clears_widget_dims() {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Set up connected state with active subscription and cached widget dims
@@ -3482,53 +3651,27 @@ mod tests {
         // Action: resize to 40 rows x 120 cols
         runner.handle_resize(40, 120);
 
-        // Verify: only hub-level resize sent (per-PTY resize deferred to sync_widget_dims)
-        match request_rx.try_recv() {
-            Ok(req) => {
-                let msg = unwrap_lua_msg(req);
-                assert_eq!(msg["subscriptionId"], "tui_hub");
-                assert_eq!(msg["data"]["type"], "resize");
-                assert_eq!(msg["data"]["rows"], 40);
-                assert_eq!(msg["data"]["cols"], 120);
-            }
-            Err(_) => panic!("Expected hub resize message to be sent"),
-        }
-
-        // Verify: no additional messages (per-PTY resize is deferred)
-        assert!(request_rx.try_recv().is_err(), "No per-PTY resize should be sent during handle_resize");
+        // Verify: no messages sent (resize flows through sync_widget_dims on next render)
+        assert!(request_rx.try_recv().is_err(), "handle_resize should not send any messages");
 
         // Verify: local state updated
         assert_eq!(runner.terminal_dims, (40, 120));
 
-        // Verify: widget_dims cleared so next render triggers resize
+        // Verify: widget_dims cleared so next render triggers per-PTY resize
         assert!(runner.widget_dims.is_empty());
     }
 
-    /// Verifies `handle_resize()` sends only hub-level resize (not terminal)
+    /// Verifies `handle_resize()` updates state without sending messages
     /// when no terminal subscription is active.
     #[test]
-    fn test_handle_resize_without_terminal_sub_sends_hub_only() {
+    fn test_handle_resize_without_terminal_sub_updates_state_only() {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // No terminal subscription (not connected to a PTY)
         runner.handle_resize(40, 120);
 
-        // Verify: hub-level resize sent (client dims tracking)
-        match request_rx.try_recv() {
-            Ok(req) => {
-                let msg = unwrap_lua_msg(req);
-                assert_eq!(msg["subscriptionId"], "tui_hub");
-                assert_eq!(msg["data"]["type"], "resize");
-            }
-            _ => panic!("Expected hub resize message"),
-        }
-
-        // Verify: no terminal resize sent (active_subscriptions is empty)
-        // The hub resize was the first and only message
-        assert!(
-            request_rx.try_recv().is_err(),
-            "No additional messages should be sent"
-        );
+        // Verify: no messages sent (PTY resize handled by pty_clients via terminal channel)
+        assert!(request_rx.try_recv().is_err(), "handle_resize should not send any messages");
 
         // Verify: local state still updated
         assert_eq!(runner.terminal_dims, (40, 120));
@@ -3710,6 +3853,359 @@ mod tests {
             "No messages should be sent when subscriptions unchanged"
         );
         assert_eq!(runner.active_subscriptions.len(), 1);
+    }
+
+    // =========================================================================
+    // Full Render Pipeline E2E Tests (no stubs)
+    // =========================================================================
+
+    /// Create a LayoutLua with ALL real Lua sources — no stubs.
+    ///
+    /// Uses the actual layout.lua, keybindings.lua, actions.lua, events.lua.
+    /// This means render_overlay() returns real overlays based on _tui_state.mode.
+    fn make_real_layout_lua() -> LayoutLua {
+        let layout_source = include_str!("../../lua/ui/layout.lua");
+        let kb_source = include_str!("../../lua/ui/keybindings.lua");
+        let actions_source = include_str!("../../lua/ui/actions.lua");
+        let events_source = include_str!("../../lua/ui/events.lua");
+        let botster_source = include_str!("../../lua/ui/botster.lua");
+
+        let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
+        lua.load_extension(
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil, active_pty_index = 0 }",
+            "_tui_state_init",
+        ).expect("_tui_state bootstrap should succeed");
+        lua.load_keybindings(kb_source).expect("keybindings.lua should load");
+        lua.load_actions(actions_source).expect("actions.lua should load");
+        lua.load_events(events_source).expect("events.lua should load");
+        lua.load_extension(botster_source, "botster").expect("botster.lua should load");
+        lua
+    }
+
+    /// Helper: process a key AND run the render pass, just like production.
+    ///
+    /// In production, the loop is: poll_input → render → poll_wait.
+    /// The render pass populates overlay_list_actions, focused_list_id,
+    /// and focused_input_id from the actual Lua render tree.
+    /// Tests that skip render() are testing with stale/missing widget state.
+    fn press_key_and_render(
+        runner: &mut TuiRunner<TestBackend>,
+        event: InputEvent,
+        lua: &LayoutLua,
+    ) {
+        runner.handle_raw_input_event(event, Some(lua));
+        runner
+            .render(Some(lua), None)
+            .expect("render should succeed");
+    }
+
+    /// Full new-agent flow using real render pipeline — no stubs.
+    ///
+    /// Exercises the EXACT production code path:
+    /// 1. Ctrl+P → menu overlay rendered → list actions + focused list extracted
+    /// 2. Enter → list_select dispatched with real overlay_actions
+    /// 3. Enter on worktree list → list_select with real worktree items
+    /// 4. Type prompt → input_char handled via real focused_input_id
+    /// 5. Enter → input_submit sends create_agent message
+    ///
+    /// This test catches bugs that stubbed tests miss, such as:
+    /// - Render tree not producing the expected widget structure
+    /// - extract_list_actions or extract_focused_widgets failing
+    /// - Widget state not syncing between render and input handling
+    #[test]
+    fn test_e2e_full_render_new_agent_main_branch() {
+        let (mut runner, _output_tx, mut request_rx, shutdown) =
+            create_test_runner_with_mock_client();
+        let lua = make_real_layout_lua();
+
+        // Initial render to establish baseline state
+        runner
+            .render(Some(&lua), None)
+            .expect("initial render should succeed");
+
+        assert_eq!(runner.mode(), "normal");
+        assert!(
+            !runner.has_overlay,
+            "no overlay in normal mode"
+        );
+
+        // === Step 1: Ctrl+P opens menu ===
+        press_key_and_render(&mut runner, make_key_ctrl('p'), &lua);
+
+        assert_eq!(runner.mode(), "menu", "Ctrl+P should open menu");
+        assert!(runner.has_overlay, "menu should produce overlay");
+        assert!(
+            !runner.overlay_list_actions.is_empty(),
+            "menu overlay should have list actions, got: {:?}",
+            runner.overlay_list_actions
+        );
+        assert!(
+            runner.focused_list_id.is_some(),
+            "menu overlay should have focused list widget"
+        );
+        // Find "new_agent" in the real overlay actions
+        let new_agent_idx = runner
+            .overlay_list_actions
+            .iter()
+            .position(|a| a == "new_agent")
+            .expect("new_agent should be in overlay_list_actions");
+
+        // === Step 2: Navigate to New Agent and select ===
+        for _ in 0..new_agent_idx {
+            press_key_and_render(&mut runner, make_key_down(), &lua);
+        }
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
+
+        // Small delay to let responder process messages
+        thread::sleep(Duration::from_millis(10));
+
+        assert_eq!(
+            runner.mode(),
+            "new_agent_select_profile",
+            "Selecting New Agent should enter profile selection"
+        );
+
+        // Simulate single-profile response (auto-skips to worktree selection)
+        {
+            let profiles_event = serde_json::json!({ "profiles": ["claude"] });
+            let ctx = crate::tui::layout_lua::ActionContext::default();
+            let ops = lua.call_on_hub_event("profiles", &profiles_event, &ctx)
+                .unwrap().unwrap();
+            runner.execute_lua_ops(ops);
+        }
+        runner.render(Some(&lua), None).expect("render after profile skip");
+
+        assert_eq!(
+            runner.mode(),
+            "new_agent_select_worktree",
+            "Should auto-advance to worktree selection"
+        );
+        assert!(
+            runner.focused_list_id.is_some(),
+            "worktree list should be focused after render, got focused_list_id={:?}",
+            runner.focused_list_id
+        );
+
+        // === Step 3: Select "Use Main Branch" (index 0 — first item) ===
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
+
+        assert_eq!(
+            runner.mode(),
+            "new_agent_prompt",
+            "Selecting Use Main Branch should enter prompt mode"
+        );
+        assert!(
+            runner.focused_input_id.is_some(),
+            "prompt input should be focused after render, got focused_input_id={:?}",
+            runner.focused_input_id
+        );
+
+        // === Step 4: Type prompt ===
+        for c in "test prompt".chars() {
+            press_key_and_render(&mut runner, make_key_char(c), &lua);
+        }
+
+        // Verify input was captured (check Lua state directly)
+        let buffer = lua
+            .eval_string("return _tui_state.input_buffer")
+            .expect("should read input_buffer");
+        assert_eq!(buffer, "test prompt", "typed text should be in input_buffer");
+
+        // === Step 5: Submit prompt ===
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
+
+        // Wait for responder
+        thread::sleep(Duration::from_millis(10));
+
+        // Verify create_agent message was sent
+        let mut found_create = false;
+        while let Ok(req) = request_rx.try_recv() {
+            let msg = unwrap_lua_msg(req);
+            if let Some(data) = msg.get("data") {
+                if data.get("type").and_then(|t| t.as_str()) == Some("create_agent") {
+                    assert_eq!(
+                        data.get("prompt").and_then(|v| v.as_str()),
+                        Some("test prompt"),
+                        "prompt should match typed text"
+                    );
+                    // Main branch mode: issue_or_branch should be absent or null
+                    assert!(
+                        data.get("issue_or_branch").is_none()
+                            || data.get("issue_or_branch").unwrap().is_null(),
+                        "main branch mode should have nil issue_or_branch"
+                    );
+                    found_create = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_create,
+            "create_agent message should be sent through real render pipeline"
+        );
+
+        // Mode should return to normal after submit
+        assert_eq!(
+            runner.mode(),
+            "normal",
+            "Should return to normal mode after agent creation"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Full new-agent flow with new worktree (branch name) — no stubs.
+    ///
+    /// Tests the path: menu → new agent → create new worktree → type branch → prompt → submit.
+    #[test]
+    fn test_e2e_full_render_new_agent_new_worktree() {
+        let (mut runner, _output_tx, mut request_rx, shutdown) =
+            create_test_runner_with_mock_client();
+        let lua = make_real_layout_lua();
+
+        // Initial render
+        runner
+            .render(Some(&lua), None)
+            .expect("initial render should succeed");
+
+        // Step 1: Ctrl+P → menu
+        press_key_and_render(&mut runner, make_key_ctrl('p'), &lua);
+        assert_eq!(runner.mode(), "menu");
+
+        // Step 2: Navigate to New Agent and select
+        let new_agent_idx = runner
+            .overlay_list_actions
+            .iter()
+            .position(|a| a == "new_agent")
+            .expect("new_agent in actions");
+        for _ in 0..new_agent_idx {
+            press_key_and_render(&mut runner, make_key_down(), &lua);
+        }
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(runner.mode(), "new_agent_select_profile");
+
+        // Simulate single-profile response (auto-skips to worktree selection)
+        {
+            let profiles_event = serde_json::json!({ "profiles": ["claude"] });
+            let ctx = crate::tui::layout_lua::ActionContext::default();
+            let ops = lua.call_on_hub_event("profiles", &profiles_event, &ctx)
+                .unwrap().unwrap();
+            runner.execute_lua_ops(ops);
+        }
+        runner.render(Some(&lua), None).expect("render after profile skip");
+        assert_eq!(runner.mode(), "new_agent_select_worktree");
+
+        // Step 3: Navigate to "Create New Worktree" (index 1) and select
+        press_key_and_render(&mut runner, make_key_down(), &lua);
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
+
+        assert_eq!(
+            runner.mode(),
+            "new_agent_create_worktree",
+            "Should enter create worktree mode"
+        );
+        assert!(
+            runner.focused_input_id.is_some(),
+            "worktree input should be focused"
+        );
+
+        // Step 4: Type branch name
+        for c in "fix-123".chars() {
+            press_key_and_render(&mut runner, make_key_char(c), &lua);
+        }
+        let buffer = lua
+            .eval_string("return _tui_state.input_buffer")
+            .expect("should read input_buffer");
+        assert_eq!(buffer, "fix-123");
+
+        // Step 5: Submit branch name → should go to prompt
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
+        assert_eq!(
+            runner.mode(),
+            "new_agent_prompt",
+            "Should enter prompt mode after branch name"
+        );
+        assert!(
+            runner.focused_input_id.is_some(),
+            "prompt input should be focused"
+        );
+
+        // Step 6: Type prompt and submit
+        for c in "fix the bug".chars() {
+            press_key_and_render(&mut runner, make_key_char(c), &lua);
+        }
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
+        thread::sleep(Duration::from_millis(10));
+
+        // Verify create_agent message
+        let mut found_create = false;
+        while let Ok(req) = request_rx.try_recv() {
+            let msg = unwrap_lua_msg(req);
+            if let Some(data) = msg.get("data") {
+                if data.get("type").and_then(|t| t.as_str()) == Some("create_agent") {
+                    assert_eq!(
+                        data.get("issue_or_branch").and_then(|v| v.as_str()),
+                        Some("fix-123"),
+                        "branch name should match"
+                    );
+                    assert_eq!(
+                        data.get("prompt").and_then(|v| v.as_str()),
+                        Some("fix the bug"),
+                        "prompt should match"
+                    );
+                    found_create = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_create,
+            "create_agent with worktree should be sent"
+        );
+        assert_eq!(runner.mode(), "normal");
+
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Escape cancels at every stage — real render pipeline.
+    #[test]
+    fn test_e2e_full_render_escape_cancels() {
+        let (mut runner, _output_tx, _request_rx, shutdown) =
+            create_test_runner_with_mock_client();
+        let lua = make_real_layout_lua();
+
+        runner
+            .render(Some(&lua), None)
+            .expect("initial render");
+
+        // Open menu, then escape
+        press_key_and_render(&mut runner, make_key_ctrl('p'), &lua);
+        assert_eq!(runner.mode(), "menu");
+        press_key_and_render(&mut runner, make_key_escape(), &lua);
+        assert_eq!(runner.mode(), "normal", "Escape from menu should return to normal");
+
+        // Open menu → New Agent → escape from profile selection
+        press_key_and_render(&mut runner, make_key_ctrl('p'), &lua);
+        let new_agent_idx = runner
+            .overlay_list_actions
+            .iter()
+            .position(|a| a == "new_agent")
+            .expect("new_agent in actions");
+        for _ in 0..new_agent_idx {
+            press_key_and_render(&mut runner, make_key_down(), &lua);
+        }
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(runner.mode(), "new_agent_select_profile");
+        press_key_and_render(&mut runner, make_key_escape(), &lua);
+        assert_eq!(
+            runner.mode(),
+            "normal",
+            "Escape from profile selection should return to normal"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
     }
 
     // Rust guideline compliant 2026-02

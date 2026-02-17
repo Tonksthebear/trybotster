@@ -64,6 +64,10 @@ Rails.application.routes.draw do
   # User settings
   resource :settings, only: [ :show ]
 
+  # Documentation (public)
+  get "docs", to: "docs#show", as: :docs
+  get "docs/*path", to: "docs#show", as: :doc
+
   root to: "home#index"
 
   # Health check for load balancers and uptime monitors

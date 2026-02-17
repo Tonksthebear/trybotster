@@ -161,6 +161,25 @@ function M.on_hub_event(event_type, event_data, context)
     return {}
   end
 
+  if event_type == "profiles" then
+    local profiles = event_data.profiles
+    if not profiles then return nil end
+    _tui_state.available_profiles = profiles
+    if #profiles <= 1 then
+      -- Single or no profile: auto-select and skip to worktree selection
+      _tui_state.pending_fields.profile = profiles[1]
+      return {
+        set_mode_ops("new_agent_select_worktree"),
+        { op = "send_msg", data = {
+          subscriptionId = "tui_hub",
+          data = { type = "list_worktrees" },
+        }},
+      }
+    end
+    -- Multiple profiles: populate list for user selection (mode already set)
+    return {}
+  end
+
   if event_type == "connection_code" then
     local url = event_data.url
     local qr_ascii = event_data.qr_ascii

@@ -1,0 +1,32 @@
+<h1 class="text-2xl font-bold text-zinc-100 mb-6">Custom Commands</h1>
+
+<p class="text-zinc-400 mb-6">
+  Register custom commands to extend botster's built-in functionality. Commands can be triggered
+  from the browser UI or the TUI menu.
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">User init file</h2>
+<p class="text-zinc-400 mb-4">
+  Your entry point for all customization is
+  <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">~/.botster/lua/user/init.lua</code>,
+  similar to Neovim's init.lua:
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>-- ~/.botster/lua/user/init.lua
+local commands = require("commands")
+local hooks = require("hooks")
+
+-- Register a custom command
+commands.register("my_command", function(args)
+  -- Your logic here
+end)
+
+-- Register a hook
+hooks.on("agent_created", function(agent)
+  -- React to events
+end)</code></pre>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Available APIs</h2>
+<ul class="list-disc list-inside text-zinc-400 space-y-1">
+  <li><code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">commands.register(name, handler)</code> &mdash; register a command</li>
+  <li><code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">hooks.on(event, handler)</code> &mdash; listen for events</li>
+</ul>

@@ -70,32 +70,52 @@ const MAX_CONCURRENT_HTTP_REQUESTS: usize = 16;
 // =============================================================================
 
 /// Completed HTTP response data (plain Rust types, no Lua references).
-struct CompletedHttpResponse {
-    request_id: String,
-    result: std::result::Result<HttpResponseData, String>,
+///
+/// Sent through the `HubEvent::HttpResponse` channel by background threads,
+/// or pushed to the shared vec in test mode.
+pub(crate) struct CompletedHttpResponse {
+    /// Request ID for matching against pending callbacks.
+    pub(crate) request_id: String,
+    /// Response payload or error message.
+    pub(crate) result: std::result::Result<HttpResponseData, String>,
+}
+
+impl std::fmt::Debug for CompletedHttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletedHttpResponse")
+            .field("request_id", &self.request_id)
+            .field("is_ok", &self.result.is_ok())
+            .finish()
+    }
 }
 
 /// Successful HTTP response payload.
-struct HttpResponseData {
-    status: u16,
-    body: String,
-    headers: Vec<(String, String)>,
+pub(crate) struct HttpResponseData {
+    /// HTTP status code (e.g., 200, 404).
+    pub(crate) status: u16,
+    /// Response body text.
+    pub(crate) body: String,
+    /// Response headers as key-value pairs.
+    pub(crate) headers: Vec<(String, String)>,
 }
 
 /// Async HTTP registry tracking in-flight requests and completed responses.
 ///
 /// Pending callbacks are stored as `LuaRegistryKey` (main-thread only).
-/// Background threads push `CompletedHttpResponse` to the responses queue.
-/// The tick loop drains responses and fires callbacks.
+/// Background threads send `HubEvent::HttpResponse` via the event channel
+/// (production) or push to the responses vec (tests without a channel).
 pub struct HttpAsyncEntries {
     /// Callbacks awaiting responses, keyed by request_id.
-    pending: HashMap<String, mlua::RegistryKey>,
-    /// Completed responses waiting to fire callbacks.
+    pub(crate) pending: HashMap<String, mlua::RegistryKey>,
+    /// Completed responses waiting to fire callbacks (test-only fallback).
     responses: Vec<CompletedHttpResponse>,
     /// Counter for generating unique request IDs.
     next_id: u64,
     /// Number of background threads currently executing HTTP requests.
     in_flight: usize,
+    /// Event channel sender for instant delivery to the Hub event loop.
+    /// `None` in tests that don't wire up the full event bus.
+    hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
 }
 
 impl Default for HttpAsyncEntries {
@@ -105,6 +125,32 @@ impl Default for HttpAsyncEntries {
             responses: Vec::new(),
             next_id: 0,
             in_flight: 0,
+            hub_event_tx: None,
+        }
+    }
+}
+
+impl HttpAsyncEntries {
+    /// Set the Hub event channel sender for event-driven delivery.
+    ///
+    /// When set, background threads send `HubEvent::HttpResponse` through
+    /// this channel instead of pushing to the shared vec.
+    pub(crate) fn set_hub_event_tx(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
+    ) {
+        self.hub_event_tx = Some(tx);
+    }
+
+    /// Emit a completed response through the event channel or shared vec.
+    ///
+    /// If `hub_event_tx` is set (production), sends via the channel for
+    /// instant delivery. Otherwise falls back to the shared vec (tests).
+    fn emit_response(&mut self, response: CompletedHttpResponse) {
+        if let Some(ref tx) = self.hub_event_tx {
+            let _ = tx.send(crate::hub::events::HubEvent::HttpResponse(response));
+        } else {
+            self.responses.push(response);
         }
     }
 }
@@ -456,7 +502,7 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
                             Err(e) => {
                                 let mut entries =
                                     thread_registry.lock().expect("HttpAsyncEntries mutex poisoned");
-                                entries.responses.push(CompletedHttpResponse {
+                                entries.emit_response(CompletedHttpResponse {
                                     request_id: thread_request_id,
                                     result: Err(format!("Failed to create HTTP client: {e}")),
                                 });
@@ -475,7 +521,7 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
                             other => {
                                 let mut entries =
                                     thread_registry.lock().expect("HttpAsyncEntries mutex poisoned");
-                                entries.responses.push(CompletedHttpResponse {
+                                entries.emit_response(CompletedHttpResponse {
                                     request_id: thread_request_id,
                                     result: Err(format!("Unsupported HTTP method: {other}")),
                                 });
@@ -520,10 +566,10 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
                             Err(e) => Err(format!("HTTP {thread_method} failed: {e}")),
                         };
 
-                        // Push completed response and decrement in-flight counter
+                        // Emit completed response and decrement in-flight counter
                         let mut entries =
                             thread_registry.lock().expect("HttpAsyncEntries mutex poisoned");
-                        entries.responses.push(CompletedHttpResponse {
+                        entries.emit_response(CompletedHttpResponse {
                             request_id: thread_request_id,
                             result,
                         });
@@ -646,6 +692,69 @@ pub fn poll_http_responses(lua: &Lua, registry: &HttpAsyncRegistry) -> usize {
     }
 
     count
+}
+
+/// Fire the Lua callback for a single completed HTTP response.
+///
+/// Called from `handle_hub_event()` when an `HubEvent::HttpResponse` arrives
+/// via the event channel. Looks up the pending callback by `request_id`,
+/// fires it with the response data, and cleans up the registry key.
+///
+/// This is the event-driven counterpart of [`poll_http_responses`], which
+/// batch-drains the shared vec. Both use the same callback-firing logic.
+pub(crate) fn fire_single_http_callback(
+    lua: &Lua,
+    registry: &HttpAsyncRegistry,
+    response: CompletedHttpResponse,
+) {
+    // Look up and remove the callback key under the lock.
+    let callback_key = {
+        let mut entries = registry.lock().expect("HttpAsyncEntries mutex poisoned");
+        entries.pending.remove(&response.request_id)
+    };
+
+    let Some(callback_key) = callback_key else {
+        log::warn!(
+            "[http] Event response for unknown request_id: {}",
+            response.request_id
+        );
+        return;
+    };
+
+    // Fire callback without holding the lock (allows re-entrant http.request).
+    let callback_result: mlua::Result<()> = (|| {
+        let callback: mlua::Function = lua.registry_value(&callback_key)?;
+
+        match &response.result {
+            Ok(data) => {
+                let table = lua.create_table()?;
+                table.set("status", data.status)?;
+                table.set("body", lua.create_string(&data.body)?)?;
+
+                let headers_table = lua.create_table()?;
+                for (k, v) in &data.headers {
+                    headers_table.set(
+                        lua.create_string(k.as_str())?,
+                        lua.create_string(v.as_str())?,
+                    )?;
+                }
+                table.set("headers", headers_table)?;
+
+                callback.call::<()>((table, mlua::Value::Nil))?;
+            }
+            Err(err_msg) => {
+                callback.call::<()>((mlua::Value::Nil, err_msg.as_str()))?;
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = callback_result {
+        log::warn!("[http] Async event callback error: {e}");
+    }
+
+    // Clean up the registry key.
+    let _ = lua.remove_registry_value(callback_key);
 }
 
 #[cfg(test)]

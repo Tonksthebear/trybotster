@@ -358,39 +358,6 @@ pub struct CreateTuiForwarderRequest {
     pub active_flag: Arc<Mutex<bool>>,
 }
 
-/// Request to create a TUI PTY forwarder with direct session access.
-///
-/// This variant takes the PTY components directly from Lua's PtySessionHandle,
-/// avoiding the need to register agents with HandleCache.
-#[derive(Clone)]
-pub struct CreateTuiForwarderDirectRequest {
-    /// Agent key for identification.
-    pub agent_key: String,
-    /// Session name (e.g., "cli", "server").
-    pub session_name: String,
-    /// Subscription ID for tracking.
-    pub subscription_id: String,
-    /// Shared active flag for the forwarder handle.
-    pub active_flag: Arc<Mutex<bool>>,
-    /// Event sender from the PTY session (for subscribing).
-    pub event_tx: broadcast::Sender<PtyEvent>,
-    /// Shadow terminal for clean ANSI snapshots on reconnect.
-    pub shadow_screen: Arc<Mutex<vt100::Parser>>,
-    /// HTTP port if this is a server session.
-    pub port: Option<u16>,
-}
-
-impl std::fmt::Debug for CreateTuiForwarderDirectRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CreateTuiForwarderDirectRequest")
-            .field("agent_key", &self.agent_key)
-            .field("session_name", &self.session_name)
-            .field("subscription_id", &self.subscription_id)
-            .field("port", &self.port)
-            .finish()
-    }
-}
-
 /// PTY operations queued from Lua.
 ///
 /// These are processed by Hub in its event loop after Lua callbacks return.
@@ -399,11 +366,8 @@ pub enum PtyRequest {
     /// Create a new PTY forwarder for streaming to WebRTC.
     CreateForwarder(CreateForwarderRequest),
 
-    /// Create a new PTY forwarder for streaming to TUI (legacy index-based).
+    /// Create a new PTY forwarder for streaming to TUI (index-based).
     CreateTuiForwarder(CreateTuiForwarderRequest),
-
-    /// Create a new PTY forwarder for streaming to TUI (direct session access).
-    CreateTuiForwarderDirect(CreateTuiForwarderDirectRequest),
 
     /// Stop an existing PTY forwarder.
     StopForwarder {
@@ -453,7 +417,6 @@ impl Clone for PtyRequest {
         match self {
             Self::CreateForwarder(req) => Self::CreateForwarder(req.clone()),
             Self::CreateTuiForwarder(req) => Self::CreateTuiForwarder(req.clone()),
-            Self::CreateTuiForwarderDirect(req) => Self::CreateTuiForwarderDirect(req.clone()),
             Self::StopForwarder { forwarder_id } => Self::StopForwarder {
                 forwarder_id: forwarder_id.clone(),
             },
@@ -637,74 +600,6 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
 
     tui.set("create_pty_forwarder", create_tui_forwarder_fn)
         .map_err(|e| anyhow!("Failed to set tui.create_pty_forwarder: {e}"))?;
-
-    // tui.forward_session({ agent_key, session_name, session, subscription_id })
-    //
-    // Create a PTY forwarder by passing the session handle directly.
-    // This is the preferred method - no HandleCache registration needed.
-    //
-    // Arguments:
-    //   agent_key: string - Agent key for identification
-    //   session_name: string - Session name (e.g., "cli", "server")
-    //   session: PtySessionHandle - The session userdata from pty.spawn()
-    //   subscription_id: string - Subscription ID for message routing
-    let queue_direct = request_queue.clone();
-    let forward_session_fn = lua
-        .create_function(move |_lua, opts: LuaTable| {
-            let agent_key: String = opts
-                .get("agent_key")
-                .map_err(|_| LuaError::runtime("agent_key is required"))?;
-            let session_name: String = opts
-                .get("session_name")
-                .map_err(|_| LuaError::runtime("session_name is required"))?;
-            let subscription_id: String = opts
-                .get("subscription_id")
-                .map_err(|_| LuaError::runtime("subscription_id is required"))?;
-
-            // Extract the PtySessionHandle userdata
-            let session_ud: LuaAnyUserData = opts
-                .get("session")
-                .map_err(|_| LuaError::runtime("session is required"))?;
-            let session_handle = session_ud
-                .borrow::<PtySessionHandle>()
-                .map_err(|e| LuaError::runtime(format!("session must be a PtySessionHandle: {e}")))?;
-
-            let forwarder_id = format!("tui:{}:{}", agent_key, session_name);
-            let active_flag = Arc::new(Mutex::new(true));
-
-            // Queue the request with direct PTY access
-            {
-                let mut q = queue_direct
-                    .lock()
-                    .expect("PTY request queue mutex poisoned");
-                q.push(PtyRequest::CreateTuiForwarderDirect(CreateTuiForwarderDirectRequest {
-                    agent_key: agent_key.clone(),
-                    session_name: session_name.clone(),
-                    subscription_id,
-                    active_flag: Arc::clone(&active_flag),
-                    event_tx: session_handle.event_tx.clone(),
-                    shadow_screen: Arc::clone(&session_handle.shadow_screen),
-                    port: session_handle.port,
-                }));
-            }
-
-            log::info!("[Lua] Queued TUI forwarder for {}:{}", agent_key, session_name);
-
-            // Return forwarder handle immediately
-            let forwarder = PtyForwarder {
-                id: forwarder_id,
-                peer_id: "tui".to_string(),
-                agent_index: 0, // Not used for direct forwarders
-                pty_index: 0,
-                active: active_flag,
-            };
-
-            Ok(forwarder)
-        })
-        .map_err(|e| anyhow!("Failed to create tui.forward_session function: {e}"))?;
-
-    tui.set("forward_session", forward_session_fn)
-        .map_err(|e| anyhow!("Failed to set tui.forward_session: {e}"))?;
 
     // Ensure tui table is globally registered
     lua.globals()

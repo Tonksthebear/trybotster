@@ -37,7 +37,6 @@ export default class extends Controller {
   #touchStart = null;
   #viewportHandler = null;
   #momentumRafId = null;
-  #resizeFixTimer = null;
   #disconnected = false;
 
   connect() {
@@ -54,8 +53,6 @@ export default class extends Controller {
       cancelAnimationFrame(this.#momentumRafId);
       this.#momentumRafId = null;
     }
-    clearTimeout(this.#resizeFixTimer);
-
     this.#hubConn?.release();
     this.#hubConn = null;
 
@@ -179,24 +176,9 @@ export default class extends Controller {
             this.#restty?.connectPty();
             if (!isMobile) this.#restty?.focus();
           },
-          onTermSize: (cols, rows) => {
-            if (this.#hubConn?.handshakeComplete) {
-              this.#hubConn.sendResize(cols, rows);
-            } else if (this.#hubConn) {
-              // Queue initial resize — fires before DataChannel is open.
-              const handler = () => {
-                this.#hubConn?.off("connected", handler);
-                this.#hubConn?.sendResize(cols, rows);
-              };
-              this.#hubConn.on("connected", handler);
-            }
-            // Force re-layout after resize settles to fix garbled rendering.
-            // Restty's internal grid can desync from the canvas after resize.
-            clearTimeout(this.#resizeFixTimer);
-            this.#resizeFixTimer = setTimeout(() => {
-              this.#restty?.updateSize(true);
-            }, 100);
-          },
+          // Restty handles resize internally — calls ptyTransport.resize()
+          // directly on grid change and on connect (restty-chunk.js:61035).
+          // No onTermSize handler needed.
         },
       },
     });
@@ -230,18 +212,20 @@ export default class extends Controller {
     // Restty handles live drag scrolling natively in long-press mode — its
     // onPointerMove calls scrollViewportByLines() on pan gestures.
     // We add: focus gating, velocity tracking, and momentum on release.
+    //
+    // Velocity tracking uses a sliding window of recent samples instead of
+    // a simple EMA. This filters out jitter from finger-lift deceleration
+    // and gives a more accurate "intent velocity" at release time.
 
-    let lastY = 0;
-    let lastTime = 0;
-    let velocity = 0;
+    const VELOCITY_WINDOW_MS = 100; // Only consider samples from last 100ms
+    const VELOCITY_MAX_SAMPLES = 8;
+    let velocitySamples = []; // { y, t } ring buffer
 
     canvas.addEventListener("pointerdown", (e) => {
       if (e.pointerType !== "touch") return;
       this.#touchStart = { x: e.clientX, y: e.clientY };
       focusGated = true;
-      lastY = e.clientY;
-      lastTime = e.timeStamp;
-      velocity = 0;
+      velocitySamples = [{ y: e.clientY, t: e.timeStamp }];
       if (this.#momentumRafId) {
         cancelAnimationFrame(this.#momentumRafId);
         this.#momentumRafId = null;
@@ -252,13 +236,8 @@ export default class extends Controller {
     // Restty's onPointerMove handles the actual live scrolling.
     canvas.addEventListener("pointermove", (e) => {
       if (e.pointerType !== "touch" || !this.#touchStart) return;
-      const dt = e.timeStamp - lastTime;
-      if (dt > 0) {
-        const instantVelocity = (lastY - e.clientY) / dt;
-        velocity = velocity * 0.4 + instantVelocity * 0.6;
-      }
-      lastY = e.clientY;
-      lastTime = e.timeStamp;
+      velocitySamples.push({ y: e.clientY, t: e.timeStamp });
+      if (velocitySamples.length > VELOCITY_MAX_SAMPLES) velocitySamples.shift();
     });
 
     canvas.addEventListener("pointerup", (e) => {
@@ -275,46 +254,75 @@ export default class extends Controller {
       if (dx < TAP_THRESHOLD && dy < TAP_THRESHOLD) {
         nativeFocus({ preventScroll: true });
       } else {
-        // Scroll gesture — start momentum if fast enough
-        if (Math.abs(velocity) > 0.5) {
+        // Compute velocity from recent samples within the time window.
+        // Discard stale samples (finger paused before lifting).
+        const now = e.timeStamp;
+        const cutoff = now - VELOCITY_WINDOW_MS;
+        const recent = velocitySamples.filter((s) => s.t >= cutoff);
+        let velocity = 0;
+        if (recent.length >= 2) {
+          const first = recent[0];
+          const last = recent[recent.length - 1];
+          const dt = last.t - first.t;
+          if (dt > 0) velocity = (first.y - last.y) / dt; // px/ms, positive = scroll down
+        }
+
+        if (Math.abs(velocity) > 0.3) {
           this.#startMomentum(canvas, velocity);
         }
         if (document.body.hasAttribute("data-mobile-keyboard")) {
-          // iOS dismisses keyboard during scroll — re-focus to bring it back
           nativeFocus({ preventScroll: true });
         }
       }
-      velocity = 0;
+      velocitySamples = [];
     });
 
     canvas.addEventListener("pointercancel", () => {
       this.#touchStart = null;
       focusGated = false;
-      velocity = 0;
+      velocitySamples = [];
     });
   }
 
   /**
-   * Momentum scroll after touch release. Dispatches synthetic WheelEvents
-   * with shiftKey=true to bypass Restty's mouse mode routing (apps like
-   * Claude TUI capture mouse events, but shift+wheel falls through to
-   * viewport scrolling). The 0.5x speed from shiftKey is compensated
-   * by the 6x deltaY multiplier (net 3x vs native wheel).
+   * Time-based momentum scroll after touch release. Uses iOS-style
+   * exponential deceleration that's frame-rate independent — behaves
+   * identically on 60Hz phones and 120Hz ProMotion iPads.
+   *
+   * Dispatches synthetic WheelEvents with shiftKey=true to bypass
+   * Restty's mouse mode routing (apps like Claude TUI capture mouse
+   * events, but shift+wheel falls through to viewport scrolling).
+   *
+   * Physics: v(t) = v0 * e^(-k*t) where k controls deceleration rate.
+   * The deceleration constant (5.0) was tuned to match iOS Safari's
+   * scroll feel — fast flicks coast far, gentle swipes stop quickly.
    */
   #startMomentum(canvas, initialVelocity) {
-    const FRICTION = 0.96;
-    const MIN_VELOCITY = 0.2;
-    let vel = initialVelocity * 32; // Convert px/ms → px/frame
+    const DECEL_RATE = 1.8;        // Exponential decay constant (higher = stops faster)
+    const MAX_VELOCITY = 20.0;     // Cap px/ms to prevent absurd scroll speeds
+    const MIN_VELOCITY_PX = 0.15;  // Stop threshold in px/ms
 
-    const tick = () => {
-      vel *= FRICTION;
-      if (Math.abs(vel) < MIN_VELOCITY) {
+    // Clamp initial velocity to prevent extreme scroll from fast flicks
+    const v0 = Math.sign(initialVelocity) * Math.min(Math.abs(initialVelocity), MAX_VELOCITY);
+    const startTime = performance.now();
+
+    const tick = (now) => {
+      const elapsed = (now - startTime) / 1000; // seconds
+      // Exponential decay: velocity diminishes smoothly over time
+      const currentVelocity = v0 * Math.exp(-DECEL_RATE * elapsed);
+
+      if (Math.abs(currentVelocity) < MIN_VELOCITY_PX) {
         this.#momentumRafId = null;
         return;
       }
 
+      // Convert px/ms velocity to pixel delta for this frame.
+      // currentVelocity is px/ms, multiply by ~16ms for per-frame delta,
+      // then 6x to compensate for shiftKey's 0.5x speed modifier.
+      const deltaY = currentVelocity * 16 * 6;
+
       canvas.dispatchEvent(new WheelEvent("wheel", {
-        deltaY: vel * 6, // Compensate for shiftKey's 0.5x speed
+        deltaY,
         deltaMode: 0,
         shiftKey: true,  // Bypass mouse mode → viewport scroll
         bubbles: true,

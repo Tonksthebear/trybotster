@@ -126,6 +126,11 @@ impl LayoutLua {
             .map_err(|e| anyhow!("Lua eval failed: {e}"))
     }
 
+    /// Load a Lua UI extension by evaluating its source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Lua source fails to parse or execute.
     pub fn load_extension(&self, source: &str, name: &str) -> Result<()> {
         self.lua
             .load(source)
@@ -803,7 +808,7 @@ mod tests {
 
         // Bootstrap _tui_state (layout.lua reads from it)
         layout.load_extension(
-            "_tui_state = { agents = {}, pending_fields = {}, available_worktrees = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state = { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).unwrap();
 
@@ -849,7 +854,7 @@ mod tests {
 
         // Bootstrap _tui_state (layout.lua reads from it)
         layout.load_extension(
-            "_tui_state = { agents = {}, pending_fields = {}, available_worktrees = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state = { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).unwrap();
 
@@ -1092,16 +1097,18 @@ mod tests {
         let layout_source = include_str!("../../lua/ui/layout.lua");
         let kb_source = include_str!("../../lua/ui/keybindings.lua");
         let actions_source = include_str!("../../lua/ui/actions.lua");
+        let events_source = include_str!("../../lua/ui/events.lua");
         let botster_source = include_str!("../../lua/ui/botster.lua");
 
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         // Bootstrap _tui_state (layout.lua and actions.lua read from it)
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {} }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil, active_pty_index = 0 }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
         lua.load_keybindings(kb_source).expect("keybindings.lua should load");
         lua.load_actions(actions_source).expect("actions.lua should load");
+        lua.load_events(events_source).expect("events.lua should load");
         lua.load_extension(botster_source, "botster").expect("botster.lua should load");
         lua
     }
@@ -1362,7 +1369,7 @@ mod tests {
         lua.load_actions(actions_source).expect("actions.lua should load");
         lua.load_events(events_source).expect("events.lua should load");
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).expect("bootstrap should succeed");
         lua.load_extension(botster_source, "botster").expect("botster.lua should load");
@@ -1387,9 +1394,9 @@ mod tests {
     #[test]
     fn test_user_override_layers_on_built_in() {
         let layout_source = include_str!("../../lua/ui/layout.lua");
-        let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
+        let lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).unwrap();
 
@@ -1479,5 +1486,872 @@ mod tests {
         let action_ctx = ActionContext::default();
         let result = lua.call_on_action("my_action", &action_ctx).unwrap();
         assert!(result.is_some(), "custom action should return ops");
+    }
+
+    // ========================================================================
+    // Create Agent Event Flow Tests
+    //
+    // These tests prove the VISUAL feedback chain: hub events arrive,
+    // update _tui_state, and the layout renders the correct output.
+    // This is the path that makes agent creation visible to the user.
+    // ========================================================================
+
+    /// Helper: create full Lua env with events module loaded.
+    fn make_full_lua_with_events() -> LayoutLua {
+        let layout_source = include_str!("../../lua/ui/layout.lua");
+        let kb_source = include_str!("../../lua/ui/keybindings.lua");
+        let actions_source = include_str!("../../lua/ui/actions.lua");
+        let events_source = include_str!("../../lua/ui/events.lua");
+        let botster_source = include_str!("../../lua/ui/botster.lua");
+
+        let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
+        lua.load_extension(
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil, active_pty_index = 0 }",
+            "_tui_state_init",
+        ).expect("_tui_state bootstrap should succeed");
+        lua.load_keybindings(kb_source).expect("keybindings.lua should load");
+        lua.load_actions(actions_source).expect("actions.lua should load");
+        lua.load_events(events_source).expect("events.lua should load");
+        lua.load_extension(botster_source, "botster").expect("botster.lua should load");
+        lua
+    }
+
+    /// After user submits create_agent, lifecycle events should update
+    /// _tui_state.pending_fields to show creation progress.
+    #[test]
+    fn test_lifecycle_creating_worktree_updates_pending_fields() {
+        let lua = make_full_lua_with_events();
+        let ctx = ActionContext::default();
+
+        // Simulate the hub broadcasting agent_status_changed: creating_worktree
+        let event = serde_json::json!({
+            "type": "agent_status_changed",
+            "agent_id": "my-repo-feature-auth",
+            "status": "creating_worktree",
+        });
+        let ops = lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+        assert!(ops.is_some(), "agent_status_changed should return ops");
+
+        // Verify _tui_state was updated for the creating indicator
+        let creating_id = lua.eval_string(
+            "return _tui_state.pending_fields.creating_agent_id or 'NIL'"
+        ).unwrap();
+        assert_eq!(creating_id, "my-repo-feature-auth",
+            "creating_agent_id should be set after creating_worktree event");
+
+        let stage = lua.eval_string(
+            "return _tui_state.pending_fields.creating_agent_stage or 'NIL'"
+        ).unwrap();
+        assert_eq!(stage, "creating_worktree",
+            "creating_agent_stage should be 'creating_worktree'");
+    }
+
+    /// spawning_ptys lifecycle event should update stage to spawning_agent.
+    #[test]
+    fn test_lifecycle_spawning_ptys_updates_stage() {
+        let lua = make_full_lua_with_events();
+        let ctx = ActionContext::default();
+
+        // First: creating_worktree
+        let event = serde_json::json!({
+            "type": "agent_status_changed",
+            "agent_id": "my-repo-42",
+            "status": "creating_worktree",
+        });
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+
+        // Then: spawning_ptys
+        let event = serde_json::json!({
+            "type": "agent_status_changed",
+            "agent_id": "my-repo-42",
+            "status": "spawning_ptys",
+        });
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+
+        let stage = lua.eval_string(
+            "return _tui_state.pending_fields.creating_agent_stage or 'NIL'"
+        ).unwrap();
+        assert_eq!(stage, "spawning_agent",
+            "spawning_ptys should map to 'spawning_agent' stage for display");
+    }
+
+    /// agent_created event should add agent to _tui_state.agents and clear
+    /// pending_fields, making the agent visible in the sidebar.
+    #[test]
+    fn test_agent_created_event_adds_agent_to_state() {
+        let lua = make_full_lua_with_events();
+        let ctx = ActionContext::default();
+
+        // Pre-condition: pending creation in progress
+        lua.exec(r#"
+            _tui_state.pending_fields.creating_agent_id = "my-repo-feature-auth"
+            _tui_state.pending_fields.creating_agent_stage = "spawning_agent"
+        "#).unwrap();
+
+        // Simulate agent_created event from hub
+        let event = serde_json::json!({
+            "type": "agent_created",
+            "agent": {
+                "id": "my-repo-feature-auth",
+                "display_name": "feature-auth",
+                "repo": "my/repo",
+                "branch_name": "feature-auth",
+                "worktree_path": "/tmp/worktrees/feature-auth",
+                "status": "running",
+                "sessions": [
+                    { "name": "agent", "port_forward": false },
+                ],
+                "created_at": 1707833400,
+            }
+        });
+        let ops = lua.call_on_hub_event("agent_created", &event, &ctx).unwrap();
+        assert!(ops.is_some(), "agent_created should return ops");
+
+        // Verify agent was added to _tui_state.agents
+        let agent_count = lua.eval_usize("return #_tui_state.agents").unwrap();
+        assert_eq!(agent_count, 1, "Should have 1 agent after agent_created event");
+
+        let agent_id = lua.eval_string("return _tui_state.agents[1].id").unwrap();
+        assert_eq!(agent_id, "my-repo-feature-auth");
+
+        let branch = lua.eval_string("return _tui_state.agents[1].branch_name").unwrap();
+        assert_eq!(branch, "feature-auth");
+
+        // Verify pending_fields were cleared
+        let creating_id = lua.eval_string(
+            "return _tui_state.pending_fields.creating_agent_id and 'SET' or 'NIL'"
+        ).unwrap();
+        assert_eq!(creating_id, "NIL",
+            "creating_agent_id should be cleared after agent_created");
+
+        let stage = lua.eval_string(
+            "return _tui_state.pending_fields.creating_agent_stage and 'SET' or 'NIL'"
+        ).unwrap();
+        assert_eq!(stage, "NIL",
+            "creating_agent_stage should be cleared after agent_created");
+
+        // Verify ops include focus_terminal (auto-select new agent)
+        let ops = ops.unwrap();
+        let focus_op = ops.iter().find(|op| op["op"] == "focus_terminal");
+        assert!(focus_op.is_some(),
+            "agent_created should return focus_terminal op to show the agent");
+        assert_eq!(focus_op.unwrap()["agent_id"], "my-repo-feature-auth");
+
+        // Verify mode switches to insert
+        let mode_op = ops.iter().find(|op| op["op"] == "set_mode");
+        assert!(mode_op.is_some(), "Should switch to insert mode");
+        assert_eq!(mode_op.unwrap()["mode"], "insert");
+    }
+
+    /// Extract list item plain-text strings from the sidebar (first child of HSplit).
+    fn extract_sidebar_items(tree: &RenderNode) -> Vec<String> {
+        use crate::tui::render_tree::{WidgetProps, ListProps, StyledContent};
+        match tree {
+            RenderNode::HSplit { children, .. } => {
+                match &children[0] {
+                    RenderNode::Widget { props, .. } => {
+                        if let Some(WidgetProps::List(ListProps { items, .. })) = props {
+                            items.iter().map(|item| {
+                                match &item.content {
+                                    StyledContent::Plain(s) => s.clone(),
+                                    StyledContent::Styled(spans) => {
+                                        spans.iter().map(|s| s.text.clone()).collect::<String>()
+                                    }
+                                }
+                            }).collect()
+                        } else {
+                            panic!("Expected List props on sidebar widget");
+                        }
+                    }
+                    _ => panic!("Expected Widget (list) as first child"),
+                }
+            }
+            _ => panic!("Expected HSplit root layout"),
+        }
+    }
+
+    /// Layout should render the creating indicator during creation.
+    #[test]
+    fn test_layout_renders_creating_indicator() {
+        let lua = make_full_lua_with_events();
+
+        lua.exec(r#"
+            _tui_state.pending_fields.creating_agent_id = "feature-auth"
+            _tui_state.pending_fields.creating_agent_stage = "creating_worktree"
+        "#).unwrap();
+
+        let ctx = make_test_ctx("normal");
+        let tree = lua.call_render(&ctx).unwrap();
+        let items = extract_sidebar_items(&tree);
+
+        assert!(!items.is_empty(), "Should have at least the creating indicator");
+        assert!(items[0].contains("feature-auth"),
+            "Creating indicator should show agent identifier, got: {}", items[0]);
+        assert!(items[0].contains("Creating worktree"),
+            "Creating indicator should show stage, got: {}", items[0]);
+    }
+
+    /// Layout should render the agent in the sidebar after creation completes.
+    #[test]
+    fn test_layout_renders_created_agent_in_sidebar() {
+        let lua = make_full_lua_with_events();
+
+        lua.exec(r#"
+            _tui_state.agents = {
+                {
+                    id = "my-repo-feature-auth",
+                    display_name = "feature-auth",
+                    branch_name = "feature-auth",
+                    status = "running",
+                    sessions = { { name = "agent" } },
+                }
+            }
+            _tui_state.selected_agent_index = 0
+        "#).unwrap();
+
+        let ctx = make_test_ctx("insert");
+        let tree = lua.call_render(&ctx).unwrap();
+        let items = extract_sidebar_items(&tree);
+
+        assert_eq!(items.len(), 1, "Should have exactly 1 agent item");
+        assert_eq!(items[0], "feature-auth", "Agent item should show display name");
+    }
+
+    /// Full end-to-end: user creates agent → lifecycle events → agent appears.
+    /// This is the complete visual flow test.
+    #[test]
+    fn test_full_visual_flow_create_agent_on_main() {
+        let lua = make_full_lua_with_events();
+        let ctx = ActionContext::default();
+
+        // Step 1: User triggers create_agent (main branch flow)
+        lua.call_on_action("open_menu", &ctx).unwrap();
+        let menu_ctx = ActionContext {
+            overlay_actions: vec!["new_agent".to_string()],
+            ..Default::default()
+        };
+        lua.call_on_action("list_select", &menu_ctx).unwrap(); // → profile select
+        // Simulate single-profile response (auto-skips to worktree)
+        let profiles_event = serde_json::json!({ "profiles": ["claude"] });
+        lua.call_on_hub_event("profiles", &profiles_event, &ctx).unwrap();
+        lua.call_on_action("list_select", &ctx).unwrap(); // → Use Main Branch
+        lua.exec("_tui_state.input_buffer = 'Fix bug'").unwrap();
+        lua.call_on_action("input_submit", &ctx).unwrap(); // → sends create_agent
+
+        // Verify creating indicator is set
+        let creating_id = lua.eval_string(
+            "return _tui_state.pending_fields.creating_agent_id or 'NIL'"
+        ).unwrap();
+        assert_eq!(creating_id, "main");
+
+        // Step 2: Hub sends spawning_ptys lifecycle event
+        let event = serde_json::json!({
+            "type": "agent_status_changed",
+            "agent_id": "main",
+            "status": "spawning_ptys",
+        });
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+        let stage = lua.eval_string(
+            "return _tui_state.pending_fields.creating_agent_stage or 'NIL'"
+        ).unwrap();
+        assert_eq!(stage, "spawning_agent");
+
+        // Step 3: Hub sends agent_created event
+        let event = serde_json::json!({
+            "type": "agent_created",
+            "agent": {
+                "id": "my-repo-main",
+                "display_name": "main",
+                "repo": "my/repo",
+                "branch_name": "main",
+                "worktree_path": "/home/user/repo",
+                "status": "running",
+                "sessions": [{ "name": "agent", "port_forward": false }],
+                "created_at": 1707833400,
+            }
+        });
+        let ops = lua.call_on_hub_event("agent_created", &event, &ctx).unwrap();
+
+        // Verify: agent is in state
+        let count = lua.eval_usize("return #_tui_state.agents").unwrap();
+        assert_eq!(count, 1, "Agent should be in _tui_state.agents");
+
+        // Verify: creating indicator cleared
+        let creating = lua.eval_string(
+            "return _tui_state.pending_fields.creating_agent_id and 'SET' or 'NIL'"
+        ).unwrap();
+        assert_eq!(creating, "NIL", "Creating indicator should be cleared");
+
+        // Verify: ops auto-focus the agent
+        let ops = ops.unwrap();
+        assert!(ops.iter().any(|op| op["op"] == "focus_terminal"),
+            "Should auto-focus the new agent");
+        assert!(ops.iter().any(|op| op["op"] == "set_mode" && op["mode"] == "insert"),
+            "Should enter insert mode");
+
+        // Verify: layout renders the agent
+        let render_ctx = make_test_ctx("insert");
+        let tree = lua.call_render(&render_ctx).unwrap();
+        let items = extract_sidebar_items(&tree);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0], "main", "Sidebar should show the agent");
+    }
+
+    /// Full end-to-end: new worktree flow with all lifecycle stages visible.
+    #[test]
+    fn test_full_visual_flow_create_agent_new_worktree() {
+        let lua = make_full_lua_with_events();
+        let ctx = ActionContext::default();
+
+        // User creates agent with new worktree
+        lua.call_on_action("open_menu", &ctx).unwrap();
+        let menu_ctx = ActionContext {
+            overlay_actions: vec!["new_agent".to_string()],
+            ..Default::default()
+        };
+        lua.call_on_action("list_select", &menu_ctx).unwrap(); // → profile select
+        // Simulate single-profile response (auto-skips to worktree)
+        let profiles_event = serde_json::json!({ "profiles": ["claude"] });
+        lua.call_on_hub_event("profiles", &profiles_event, &ctx).unwrap();
+        lua.exec("_tui_state.list_selected = 1").unwrap(); // Create New Worktree
+        lua.call_on_action("list_select", &ctx).unwrap();
+        lua.exec("_tui_state.input_buffer = '42'").unwrap();
+        lua.call_on_action("input_submit", &ctx).unwrap(); // → branch input
+        lua.exec("_tui_state.input_buffer = ''").unwrap();
+        lua.call_on_action("input_submit", &ctx).unwrap(); // → empty prompt OK
+
+        // Lifecycle: creating_worktree
+        let event = serde_json::json!({
+            "type": "agent_status_changed",
+            "agent_id": "42",
+            "status": "creating_worktree",
+        });
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+
+        // Verify creating indicator renders
+        let render_ctx = make_test_ctx("normal");
+        let tree = lua.call_render(&render_ctx).unwrap();
+        let items = extract_sidebar_items(&tree);
+        assert!(!items.is_empty(), "Should show creating indicator");
+        assert!(items[0].contains("42"), "Should show agent identifier: {}", items[0]);
+        assert!(items[0].contains("Creating worktree"), "Should show stage: {}", items[0]);
+
+        // Lifecycle: spawning_ptys
+        let event = serde_json::json!({
+            "type": "agent_status_changed",
+            "agent_id": "42",
+            "status": "spawning_ptys",
+        });
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+
+        let tree = lua.call_render(&render_ctx).unwrap();
+        let items = extract_sidebar_items(&tree);
+        assert!(items[0].contains("Starting agent"),
+            "Should show 'Starting agent' stage: {}", items[0]);
+
+        // agent_created
+        let event = serde_json::json!({
+            "type": "agent_created",
+            "agent": {
+                "id": "my-repo-42",
+                "display_name": "botster-issue-42",
+                "repo": "my/repo",
+                "issue_number": 42,
+                "branch_name": "botster-issue-42",
+                "worktree_path": "/tmp/worktrees/botster-issue-42",
+                "status": "running",
+                "sessions": [{ "name": "agent", "port_forward": false }],
+                "created_at": 1707833400,
+            }
+        });
+        lua.call_on_hub_event("agent_created", &event, &ctx).unwrap();
+
+        // Creating indicator gone, agent in list
+        let tree = lua.call_render(&render_ctx).unwrap();
+        let items = extract_sidebar_items(&tree);
+        assert_eq!(items.len(), 1, "Should have 1 agent, no creating indicator");
+        assert_eq!(items[0], "botster-issue-42",
+            "Should show agent display name, not creating indicator");
+    }
+
+    /// Failed creation should clear the creating indicator.
+    #[test]
+    fn test_lifecycle_failed_clears_creating_indicator() {
+        let lua = make_full_lua_with_events();
+        let ctx = ActionContext::default();
+
+        // Set creating state
+        lua.exec(r#"
+            _tui_state.pending_fields.creating_agent_id = "my-repo-feature"
+            _tui_state.pending_fields.creating_agent_stage = "creating_worktree"
+        "#).unwrap();
+
+        // Hub sends failed
+        let event = serde_json::json!({
+            "type": "agent_status_changed",
+            "agent_id": "my-repo-feature",
+            "status": "failed",
+        });
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+
+        let creating = lua.eval_string(
+            "return _tui_state.pending_fields.creating_agent_id and 'SET' or 'NIL'"
+        ).unwrap();
+        assert_eq!(creating, "NIL", "Failed status should clear creating indicator");
+    }
+
+    // ========================================================================
+    // Create Agent Flow Tests
+    //
+    // These tests prove the full create-agent state machine by driving the
+    // Lua keybinding + actions layers through each step of the flow.
+    // Three scenarios: main branch, new worktree, existing worktree.
+    // ========================================================================
+
+    /// Helper: open the menu and select "new_agent" to enter worktree selection.
+    /// Returns the ops from the "new_agent" selection.
+    fn enter_new_agent_flow(lua: &LayoutLua) -> Vec<serde_json::Value> {
+        // Step 1: Open menu (ctrl+p → open_menu action)
+        let ctx = ActionContext::default();
+        let ops = lua.call_on_action("open_menu", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["op"], "set_mode");
+        assert_eq!(ops[0]["mode"], "menu");
+
+        // Step 2: Select "new_agent" from menu (list_select with overlay_actions)
+        let ctx = ActionContext {
+            overlay_actions: vec![
+                "new_agent".to_string(),
+                "close_agent".to_string(),
+                "show_connection_code".to_string(),
+            ],
+            selected_agent: None,
+            action_char: None,
+        };
+        // list_selected defaults to 0 (first item = new_agent)
+        let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["op"], "set_mode");
+        assert_eq!(ops[0]["mode"], "new_agent_select_profile");
+        // Should send list_profiles message
+        assert_eq!(ops[1]["op"], "send_msg");
+        let msg_data = &ops[1]["data"]["data"];
+        assert_eq!(msg_data["type"], "list_profiles");
+
+        // Step 3: Simulate profiles event with single profile (auto-skips to worktree)
+        let event_data = serde_json::json!({ "profiles": ["claude"] });
+        let event_ops = lua.call_on_hub_event("profiles", &event_data, &ctx).unwrap().unwrap();
+        assert_eq!(event_ops[0]["op"], "set_mode");
+        assert_eq!(event_ops[0]["mode"], "new_agent_select_worktree");
+        assert_eq!(event_ops[1]["op"], "send_msg");
+        let msg_data = &event_ops[1]["data"]["data"];
+        assert_eq!(msg_data["type"], "list_worktrees");
+
+        event_ops
+    }
+
+    /// Helper: Enter new-agent flow with multiple profiles (requires manual selection).
+    fn enter_new_agent_flow_multi_profile(lua: &LayoutLua) -> Vec<serde_json::Value> {
+        // Steps 1-2: Open menu → select new_agent → enters profile selection
+        let ctx = ActionContext::default();
+        lua.call_on_action("open_menu", &ctx).unwrap().unwrap();
+
+        let ctx = ActionContext {
+            overlay_actions: vec!["new_agent".to_string()],
+            selected_agent: None,
+            action_char: None,
+        };
+        lua.call_on_action("list_select", &ctx).unwrap();
+
+        // Step 3: Multi-profile response — stays in profile selection
+        let event_data = serde_json::json!({ "profiles": ["claude", "web"] });
+        let event_ops = lua.call_on_hub_event("profiles", &event_data, &ctx).unwrap().unwrap();
+        // Multi-profile: no mode change, just populates list
+        assert!(event_ops.is_empty(),
+            "Multi-profile should return empty ops (mode stays new_agent_select_profile)");
+
+        let mode = lua.eval_string("return _tui_state.mode").unwrap();
+        assert_eq!(mode, "new_agent_select_profile");
+
+        event_ops
+    }
+
+    /// Multi-profile: User selects second profile, then completes flow.
+    #[test]
+    fn test_create_agent_flow_multi_profile_selection() {
+        let lua = make_full_lua();
+        enter_new_agent_flow_multi_profile(&lua);
+
+        // Select second profile (index 1 = "web")
+        lua.exec("_tui_state.list_selected = 1").unwrap();
+        let ctx = ActionContext::default();
+        let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
+
+        // Should transition to worktree selection
+        assert_eq!(ops[0]["op"], "set_mode");
+        assert_eq!(ops[0]["mode"], "new_agent_select_worktree");
+
+        // Profile should be stored in pending_fields
+        let profile = lua.eval_string("return _tui_state.pending_fields.profile").unwrap();
+        assert_eq!(profile, "web");
+
+        // Select "Use Main Branch"
+        lua.exec("_tui_state.list_selected = 0").unwrap();
+        lua.call_on_action("list_select", &ctx).unwrap();
+
+        // Submit with a prompt
+        lua.exec("_tui_state.input_buffer = 'test prompt'").unwrap();
+        let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
+
+        // Verify create_agent includes the selected profile
+        let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
+        let data = &send_op["data"]["data"];
+        assert_eq!(data["type"], "create_agent");
+        assert_eq!(data["profile"], "web",
+            "Selected profile should be included in create_agent message");
+        assert_eq!(data["prompt"], "test prompt");
+    }
+
+    /// Scenario 1: Open agent on main branch.
+    ///
+    /// Flow: menu → new_agent → select "Use Main Branch" (index 0) →
+    ///       enter prompt → submit → create_agent with issue_or_branch=null
+    #[test]
+    fn test_create_agent_flow_main_branch() {
+        let lua = make_full_lua();
+
+        // Enter the new agent flow (menu → new_agent → worktree selection)
+        enter_new_agent_flow(&lua);
+
+        // Step 3: Select "Use Main Branch" (list_selected = 0, the default)
+        let ctx = ActionContext::default();
+        let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["op"], "set_mode");
+        assert_eq!(ops[0]["mode"], "new_agent_prompt",
+            "Selecting 'Use Main Branch' should transition to prompt mode");
+
+        // Verify pending state: use_main_branch should be set
+        let use_main = lua.eval_string("return _tui_state.pending_fields.use_main_branch").unwrap();
+        assert_eq!(use_main, "true");
+
+        // pending_issue_or_branch should be nil (main branch has no issue)
+        let has_issue = lua.eval_string(
+            "return _tui_state.pending_fields.pending_issue_or_branch and 'set' or 'nil'"
+        ).unwrap();
+        assert_eq!(has_issue, "nil");
+
+        // Step 4: Type a prompt and submit
+        lua.exec("_tui_state.input_buffer = 'Fix the login bug'").unwrap();
+        let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
+
+        // Should send create_agent message
+        let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
+        let data = &send_op["data"]["data"];
+        assert_eq!(data["type"], "create_agent");
+        assert!(data["issue_or_branch"].is_null(),
+            "Main branch mode should have null issue_or_branch");
+        assert_eq!(data["prompt"], "Fix the login bug");
+
+        // Should transition back to base mode (normal, since no agent selected)
+        let mode_op = ops.iter().find(|op| op["op"] == "set_mode").unwrap();
+        assert_eq!(mode_op["mode"], "normal");
+
+        // Verify creating_agent_id was set for progress tracking
+        let creating_id = lua.eval_string("return _tui_state.pending_fields.creating_agent_id").unwrap();
+        assert_eq!(creating_id, "main");
+
+        // Verify creating_agent_stage is "spawning" (main skips worktree creation)
+        let stage = lua.eval_string("return _tui_state.pending_fields.creating_agent_stage").unwrap();
+        assert_eq!(stage, "spawning");
+    }
+
+    /// Scenario 1b: Open agent on main with empty prompt (optional prompt).
+    #[test]
+    fn test_create_agent_flow_main_branch_no_prompt() {
+        let lua = make_full_lua();
+        enter_new_agent_flow(&lua);
+
+        // Select "Use Main Branch"
+        let ctx = ActionContext::default();
+        lua.call_on_action("list_select", &ctx).unwrap();
+
+        // Submit with empty prompt
+        lua.exec("_tui_state.input_buffer = ''").unwrap();
+        let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
+
+        let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
+        let data = &send_op["data"]["data"];
+        assert_eq!(data["type"], "create_agent");
+        assert!(data["prompt"].is_null(),
+            "Empty prompt should be sent as null (handler applies default)");
+    }
+
+    /// Scenario 2: Open agent in new worktree (branch name).
+    ///
+    /// Flow: menu → new_agent → select "Create New Worktree" (index 1) →
+    ///       enter branch name → enter prompt → submit → create_agent
+    #[test]
+    fn test_create_agent_flow_new_worktree_branch() {
+        let lua = make_full_lua();
+        enter_new_agent_flow(&lua);
+
+        // Step 3: Select "Create New Worktree" (list_selected = 1)
+        lua.exec("_tui_state.list_selected = 1").unwrap();
+        let ctx = ActionContext::default();
+        let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["op"], "set_mode");
+        assert_eq!(ops[0]["mode"], "new_agent_create_worktree",
+            "Selecting 'Create New Worktree' should enter branch name input");
+
+        // Verify use_main_branch is cleared
+        let use_main = lua.eval_string(
+            "return _tui_state.pending_fields.use_main_branch and 'set' or 'nil'"
+        ).unwrap();
+        assert_eq!(use_main, "nil");
+
+        // Step 4: Type branch name and submit
+        lua.exec("_tui_state.input_buffer = 'feature-auth'").unwrap();
+        let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["op"], "set_mode");
+        assert_eq!(ops[0]["mode"], "new_agent_prompt",
+            "Submitting branch name should transition to prompt mode");
+
+        // Verify branch was stored
+        let branch = lua.eval_string(
+            "return _tui_state.pending_fields.pending_issue_or_branch"
+        ).unwrap();
+        assert_eq!(branch, "feature-auth");
+
+        // Step 5: Type prompt and submit
+        lua.exec("_tui_state.input_buffer = 'Implement OAuth login'").unwrap();
+        let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
+
+        let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
+        let data = &send_op["data"]["data"];
+        assert_eq!(data["type"], "create_agent");
+        assert_eq!(data["issue_or_branch"], "feature-auth");
+        assert_eq!(data["prompt"], "Implement OAuth login");
+
+        // Should set creating_agent_stage to "creating_worktree" (not "spawning")
+        let stage = lua.eval_string("return _tui_state.pending_fields.creating_agent_stage").unwrap();
+        assert_eq!(stage, "creating_worktree",
+            "New worktree flow should set stage to creating_worktree");
+    }
+
+    /// Scenario 2b: Open agent in new worktree (issue number).
+    #[test]
+    fn test_create_agent_flow_new_worktree_issue_number() {
+        let lua = make_full_lua();
+        enter_new_agent_flow(&lua);
+
+        // Select "Create New Worktree"
+        lua.exec("_tui_state.list_selected = 1").unwrap();
+        let ctx = ActionContext::default();
+        lua.call_on_action("list_select", &ctx).unwrap();
+
+        // Type issue number
+        lua.exec("_tui_state.input_buffer = '42'").unwrap();
+        lua.call_on_action("input_submit", &ctx).unwrap();
+
+        // Type prompt and submit
+        lua.exec("_tui_state.input_buffer = 'Fix reported crash'").unwrap();
+        let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
+
+        let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
+        let data = &send_op["data"]["data"];
+        assert_eq!(data["type"], "create_agent");
+        assert_eq!(data["issue_or_branch"], "42",
+            "Issue number should be passed as-is (handler parses it)");
+        assert_eq!(data["prompt"], "Fix reported crash");
+    }
+
+    /// Scenario 2c: Empty branch name should NOT advance.
+    #[test]
+    fn test_create_agent_flow_new_worktree_empty_branch_rejected() {
+        let lua = make_full_lua();
+        enter_new_agent_flow(&lua);
+
+        lua.exec("_tui_state.list_selected = 1").unwrap();
+        let ctx = ActionContext::default();
+        lua.call_on_action("list_select", &ctx).unwrap();
+
+        // Submit with empty branch name — should return nil (no-op)
+        lua.exec("_tui_state.input_buffer = ''").unwrap();
+        let result = lua.call_on_action("input_submit", &ctx).unwrap();
+        assert!(result.is_none(),
+            "Empty branch name should not advance the flow");
+
+        // Mode should still be new_agent_create_worktree
+        let mode = lua.eval_string("return _tui_state.mode").unwrap();
+        assert_eq!(mode, "new_agent_create_worktree");
+    }
+
+    /// Scenario 3: Open agent in existing worktree.
+    ///
+    /// Flow: menu → new_agent → select existing worktree (index 2+) →
+    ///       sends reopen_worktree directly (no prompt step)
+    #[test]
+    fn test_create_agent_flow_existing_worktree() {
+        let lua = make_full_lua();
+        enter_new_agent_flow(&lua);
+
+        // Set up available_worktrees (populated by list_worktrees response)
+        lua.exec(r#"
+            _tui_state.available_worktrees = {
+                { branch = "feature-auth", path = "/tmp/worktrees/feature-auth" },
+                { branch = "bugfix-login", path = "/tmp/worktrees/bugfix-login" },
+            }
+        "#).unwrap();
+
+        // Select first existing worktree (index 2 in the list:
+        //   0 = "Use Main Branch", 1 = "Create New Worktree", 2 = first worktree)
+        lua.exec("_tui_state.list_selected = 2").unwrap();
+        let ctx = ActionContext::default();
+        let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
+
+        // Should send reopen_worktree message (NOT create_agent — no prompt step)
+        let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
+        let data = &send_op["data"]["data"];
+        assert_eq!(data["type"], "reopen_worktree");
+        assert_eq!(data["path"], "/tmp/worktrees/feature-auth");
+        assert_eq!(data["branch"], "feature-auth");
+
+        // Should set creating_agent_id for progress tracking
+        let creating_id = lua.eval_string("return _tui_state.pending_fields.creating_agent_id").unwrap();
+        assert_eq!(creating_id, "feature-auth");
+
+        // Should set stage to creating_worktree
+        let stage = lua.eval_string("return _tui_state.pending_fields.creating_agent_stage").unwrap();
+        assert_eq!(stage, "creating_worktree");
+
+        // Should transition back to base mode (skips prompt entirely)
+        let mode_op = ops.iter().find(|op| op["op"] == "set_mode").unwrap();
+        assert_eq!(mode_op["mode"], "normal",
+            "Existing worktree should return to normal mode (no prompt step)");
+    }
+
+    /// Scenario 3b: Select second existing worktree.
+    #[test]
+    fn test_create_agent_flow_existing_worktree_second_item() {
+        let lua = make_full_lua();
+        enter_new_agent_flow(&lua);
+
+        lua.exec(r#"
+            _tui_state.available_worktrees = {
+                { branch = "feature-auth", path = "/tmp/worktrees/feature-auth" },
+                { branch = "bugfix-login", path = "/tmp/worktrees/bugfix-login" },
+            }
+        "#).unwrap();
+
+        // Select second existing worktree (index 3)
+        lua.exec("_tui_state.list_selected = 3").unwrap();
+        let ctx = ActionContext::default();
+        let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
+
+        let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
+        let data = &send_op["data"]["data"];
+        assert_eq!(data["type"], "reopen_worktree");
+        assert_eq!(data["path"], "/tmp/worktrees/bugfix-login");
+        assert_eq!(data["branch"], "bugfix-login");
+    }
+
+    /// Escape at any point in the flow should return to base mode.
+    #[test]
+    fn test_create_agent_flow_escape_cancels() {
+        let lua = make_full_lua();
+        enter_new_agent_flow(&lua);
+
+        // Escape from worktree selection
+        let ctx = ActionContext::default();
+        let ops = lua.call_on_action("close_modal", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["op"], "set_mode");
+        assert_eq!(ops[0]["mode"], "normal",
+            "Escape should return to normal mode (no agent selected)");
+
+        // Start over and escape from branch name input
+        enter_new_agent_flow(&lua);
+        lua.exec("_tui_state.list_selected = 1").unwrap();
+        lua.call_on_action("list_select", &ctx).unwrap();
+        let ops = lua.call_on_action("close_modal", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["mode"], "normal");
+
+        // Start over and escape from prompt input
+        enter_new_agent_flow(&lua);
+        lua.call_on_action("list_select", &ctx).unwrap(); // Use Main Branch
+        let ops = lua.call_on_action("close_modal", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["mode"], "normal");
+    }
+
+    /// When an agent is selected, escape returns to insert mode (not normal).
+    #[test]
+    fn test_create_agent_flow_escape_returns_to_insert_when_agent_selected() {
+        let lua = make_full_lua();
+        enter_new_agent_flow(&lua);
+
+        let ctx = ActionContext {
+            overlay_actions: vec![],
+            selected_agent: Some("test-agent-1".to_string()),
+            action_char: None,
+        };
+        let ops = lua.call_on_action("close_modal", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["mode"], "insert",
+            "Escape with selected agent should return to insert mode");
+    }
+
+    /// Full keypress-level test: ctrl+p → enter → enter → type → enter.
+    /// Proves the flow works end-to-end through handle_key → on_action.
+    #[test]
+    fn test_create_agent_flow_main_branch_via_keypresses() {
+        let lua = make_full_lua();
+        let key_ctx = KeyContext { list_count: 3, terminal_rows: 24 };
+
+        // ctrl+p in normal mode → open_menu
+        let action = lua.call_handle_key("ctrl+p", "normal", &key_ctx).unwrap().unwrap();
+        assert_eq!(action.action, "open_menu");
+
+        // Dispatch open_menu → mode becomes "menu"
+        let ctx = ActionContext::default();
+        lua.call_on_action("open_menu", &ctx).unwrap();
+
+        // enter in menu mode → list_select
+        let action = lua.call_handle_key("enter", "menu", &key_ctx).unwrap().unwrap();
+        assert_eq!(action.action, "list_select");
+
+        // Dispatch list_select with new_agent → mode becomes "new_agent_select_profile"
+        let ctx = ActionContext {
+            overlay_actions: vec!["new_agent".to_string()],
+            selected_agent: None,
+            action_char: None,
+        };
+        lua.call_on_action("list_select", &ctx).unwrap();
+
+        // Simulate single-profile response (auto-skips to worktree selection)
+        let profiles_event = serde_json::json!({ "profiles": ["claude"] });
+        lua.call_on_hub_event("profiles", &profiles_event, &ctx).unwrap();
+
+        // enter in worktree selection → list_select (selects "Use Main Branch")
+        let action = lua.call_handle_key("enter", "new_agent_select_worktree", &key_ctx).unwrap().unwrap();
+        assert_eq!(action.action, "list_select");
+        let ctx = ActionContext::default();
+        lua.call_on_action("list_select", &ctx).unwrap();
+
+        // Type prompt characters
+        let action = lua.call_handle_key("H", "new_agent_prompt", &key_ctx).unwrap().unwrap();
+        assert_eq!(action.action, "input_char");
+        assert_eq!(action.char, Some('H'));
+
+        let action = lua.call_handle_key("i", "new_agent_prompt", &key_ctx).unwrap().unwrap();
+        assert_eq!(action.action, "input_char");
+
+        // Simulate typed text
+        lua.exec("_tui_state.input_buffer = 'Hi'").unwrap();
+
+        // enter in prompt mode → input_submit
+        let action = lua.call_handle_key("enter", "new_agent_prompt", &key_ctx).unwrap().unwrap();
+        assert_eq!(action.action, "input_submit");
+
+        let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
+        let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
+        let data = &send_op["data"]["data"];
+        assert_eq!(data["type"], "create_agent");
+        assert_eq!(data["prompt"], "Hi");
     }
 }

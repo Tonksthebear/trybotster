@@ -5,19 +5,12 @@
 //! watcher handles all OS-level concerns; this module adds only the
 //! Lua-specific transformations.
 //!
-//! # Usage
-//!
-//! ```ignore
-//! let mut watcher = LuaFileWatcher::new(PathBuf::from("~/.botster/lua"))?;
-//! watcher.start_watching()?;
-//!
-//! // In event loop:
-//! for module_name in watcher.poll_changes() {
-//!     lua.call_function("loader.reload", module_name)?;
-//! }
-//! ```
+//! In production, the receiver is extracted via [`LuaFileWatcher::take_rx`]
+//! and a blocking forwarder task sends `HubEvent::LuaFileChange` events
+//! to the Hub event loop. Module name conversion uses [`events_to_modules`].
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use anyhow::Result;
 
@@ -110,16 +103,16 @@ impl LuaFileWatcher {
     ///
     /// Returns `None` if the path is outside `base_path`.
     fn path_to_module(&self, path: &Path) -> Option<String> {
-        let relative = path.strip_prefix(&self.base_path).ok()?;
-        let without_ext = relative.with_extension("");
+        path_to_module(&self.base_path, path)
+    }
 
-        let module_name = without_ext
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(".");
-
-        Some(module_name)
+    /// Extract the raw receiver for event-driven delivery.
+    ///
+    /// After calling this, [`poll_changes`](Self::poll_changes) will return
+    /// empty results. The caller should drain the receiver in a blocking
+    /// forwarder task.
+    pub fn take_rx(&mut self) -> Option<mpsc::Receiver<Result<notify::Event, notify::Error>>> {
+        self.watcher.take_rx()
     }
 
     /// Get the base path being watched.
@@ -127,6 +120,50 @@ impl LuaFileWatcher {
     pub fn base_path(&self) -> &PathBuf {
         &self.base_path
     }
+}
+
+/// Convert a file path to a Lua module name given a base path.
+///
+/// Strips `base_path`, removes the `.lua` extension, and replaces
+/// path separators with dots. Returns `None` if the path is outside
+/// `base_path`.
+pub fn path_to_module(base_path: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(base_path).ok()?;
+    let without_ext = relative.with_extension("");
+
+    let module_name = without_ext
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(".");
+
+    Some(module_name)
+}
+
+/// Convert raw `notify::Event` items into deduplicated Lua module names.
+///
+/// Applies `.lua` extension filter and path-to-module conversion. Used by
+/// blocking forwarder tasks that receive raw events from an extracted receiver.
+pub fn events_to_modules(base_path: &Path, raw_events: &[notify::Event]) -> Vec<String> {
+    let mut modules = Vec::new();
+
+    for event in raw_events {
+        let file_events = FileWatcher::classify_event(event);
+        for fe in file_events {
+            if !matches!(fe.kind, FileEventKind::Create | FileEventKind::Modify | FileEventKind::Rename) {
+                continue;
+            }
+            if fe.path.extension().is_some_and(|ext| ext == "lua") {
+                if let Some(module_name) = path_to_module(base_path, &fe.path) {
+                    if !modules.contains(&module_name) {
+                        modules.push(module_name);
+                    }
+                }
+            }
+        }
+    }
+
+    modules
 }
 
 #[cfg(test)]

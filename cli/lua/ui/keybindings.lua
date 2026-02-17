@@ -36,6 +36,7 @@ local shared_bindings = {
   ["shift+pagedown"] = "scroll_half_down",
   ["shift+home"]     = "scroll_top",
   ["shift+end"]      = "scroll_bottom",
+  ["ctrl+r"]         = "refresh_agents",
 }
 
 -- Normal mode: command mode, single-key bindings available
@@ -89,6 +90,7 @@ local text_input = {
 
 -- Mode table aliases — mode strings match Lua layout mode names
 M.new_agent_select_worktree = list_nav
+M.new_agent_select_profile = list_nav
 M.new_agent_create_worktree = text_input
 M.new_agent_prompt = text_input
 
@@ -148,7 +150,7 @@ function M.handle_key(key, mode, context)
     return nil
   end
 
-  if mode == "menu" or mode == "new_agent_select_worktree" then
+  if mode == "menu" or mode == "new_agent_select_worktree" or mode == "new_agent_select_profile" then
     -- Number shortcuts 1-9 for list selection
     if mode == "menu" and #key == 1 and key:match("%d") then
       local idx = tonumber(key) - 1

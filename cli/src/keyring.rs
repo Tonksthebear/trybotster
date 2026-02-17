@@ -1,21 +1,26 @@
 //! Consolidated keyring storage for all CLI credentials.
 //!
-//! Stores all secrets in a single keyring entry to avoid multiple
-//! macOS keychain prompts when the binary changes (new builds).
+//! Stores all secrets in a single keyring entry to minimize OS keychain prompts.
 //!
-//! # Storage Hierarchy
+//! # Storage Backends
 //!
-//! 1. OS keyring (macOS Keychain, GNOME Keyring, KDE Wallet) — encrypted, preferred
-//! 2. File fallback `{config_dir}/credentials.json` — `0600` permissions, used when
-//!    keyring is unavailable (headless Linux, WSL2, etc.)
-//! 3. Test mode always uses the file fallback.
+//! - **macOS**: Keychain (`apple-native`) — always available, encrypted at rest.
+//! - **Linux**: D-Bus Secret Service via zbus (`async-secret-service`) — requires
+//!   `gnome-keyring` or KDE Wallet with an active D-Bus session bus.
+//! - **File fallback**: `{config_dir}/credentials.json` with `0600` permissions,
+//!   used when no keyring service is available (headless Linux, WSL2, etc.).
+//! - **Test mode**: always uses the file fallback.
+//!
+//! # Auth-time Storage Check
+//!
+//! During `botster auth`, [`check_credential_storage`] probes the keyring with a
+//! round-trip test. If the probe fails, the user is warned once with distro-specific
+//! installation instructions and offered file-based fallback. This is the only time
+//! the warning is shown.
 //!
 //! # Graceful Degradation
 //!
-//! When the OS keyring is unavailable (e.g., headless server without GNOME Keyring),
-//! the user is prompted once to confirm file-based storage. On subsequent runs,
-//! credentials are loaded from whichever backend has them.
-//!
+//! On subsequent runs, credentials are loaded from whichever backend has them.
 //! macOS keychain may block access when binary signature changes (new builds).
 //! This module implements retry logic and distinguishes between:
 //! - Keyring locked (user can unlock)
@@ -30,8 +35,17 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
+
+/// Whether `check_credential_storage` has already run this process.
+/// Prevents repeated prompts when `save()` is called multiple times during auth.
+static STORAGE_CHECKED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the user accepted file-based storage for this process.
+/// When set, `save()` skips the keyring attempt and goes straight to file.
+static FILE_STORAGE_ACCEPTED: AtomicBool = AtomicBool::new(false);
 
 /// Keyring service name.
 const KEYRING_SERVICE: &str = "botster";
@@ -73,26 +87,33 @@ impl std::fmt::Display for KeyringAccessError {
 impl std::error::Error for KeyringAccessError {}
 
 /// Categorize a keyring error for better user feedback.
+///
+/// Handles error patterns from both macOS Keychain (`apple-native`)
+/// and D-Bus Secret Service (`async-secret-service` / zbus).
 fn categorize_keyring_error(err: &keyring::Error) -> KeyringAccessError {
     let msg = format!("{err:?}");
     let msg_lower = msg.to_lowercase();
 
-    // Check for common macOS keychain error patterns
+    // Not-found patterns (macOS + D-Bus)
     if msg_lower.contains("no password")
         || msg_lower.contains("not found")
         || msg_lower.contains("nopassword")
+        || msg_lower.contains("nosuchobject")
     {
         return KeyringAccessError::NotFound;
     }
 
+    // Locked / user-interaction patterns (macOS)
     if msg_lower.contains("user interaction") || msg_lower.contains("user canceled") {
         return KeyringAccessError::Locked(msg);
     }
 
+    // Access denied patterns (macOS + D-Bus)
     if msg_lower.contains("denied")
         || msg_lower.contains("codesign")
         || msg_lower.contains("authorization")
         || msg_lower.contains("not allowed")
+        || msg_lower.contains("not provided")
     {
         return KeyringAccessError::AccessDenied(msg);
     }
@@ -133,38 +154,123 @@ fn credentials_file_path() -> Result<PathBuf> {
     crate::config::Config::config_dir().map(|d| d.join("credentials.json"))
 }
 
-/// Prompt the user about keyring unavailability and ask to continue with file storage.
+/// Check credential storage availability and warn the user during auth.
 ///
-/// On non-interactive sessions (no TTY), automatically falls back without prompting.
-fn prompt_keyring_fallback() -> Result<()> {
+/// Runs once per process. On macOS, keychain is always available.
+/// On Linux, probes the D-Bus Secret Service (gnome-keyring / KDE Wallet).
+/// If unavailable, warns the user and offers file-based fallback.
+///
+/// # Errors
+///
+/// Returns `Err` only if the user explicitly declines file-based storage.
+pub fn check_credential_storage() -> Result<()> {
+    if should_skip_keyring() || STORAGE_CHECKED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    // macOS Keychain is always available
+    if cfg!(target_os = "macos") {
+        return Ok(());
+    }
+
+    // On Linux, probe D-Bus Secret Service with a round-trip test
+    match probe_keyring() {
+        Ok(()) => {
+            log::info!("Secure credential storage available (D-Bus Secret Service)");
+            Ok(())
+        }
+        Err(e) => {
+            log::warn!("Secure credential storage unavailable: {e}");
+            prompt_file_storage_fallback()
+        }
+    }
+}
+
+/// Probe the keyring with a write → read → delete round-trip.
+///
+/// Uses a dedicated test entry so we don't interfere with real credentials.
+fn probe_keyring() -> Result<()> {
+    /// Probe entry name, distinct from real credentials.
+    const PROBE_ENTRY: &str = "credentials_probe";
+    /// Value written during the round-trip test.
+    const PROBE_VALUE: &str = "probe";
+
+    let entry = Entry::new(KEYRING_SERVICE, PROBE_ENTRY)
+        .map_err(|e| anyhow::anyhow!("Failed to create probe entry: {e:?}"))?;
+
+    entry
+        .set_password(PROBE_VALUE)
+        .map_err(|e| anyhow::anyhow!("Keyring write failed: {e:?}"))?;
+
+    let readback = entry
+        .get_password()
+        .map_err(|e| anyhow::anyhow!("Keyring read failed: {e:?}"))?;
+
+    // Clean up probe entry regardless of result
+    let _ = entry.delete_credential();
+
+    if readback != PROBE_VALUE {
+        anyhow::bail!("Keyring round-trip mismatch");
+    }
+
+    Ok(())
+}
+
+/// Warn that secure storage is unavailable and offer file-based fallback.
+///
+/// Detects what's missing on Linux and gives distro-specific install instructions.
+/// Non-interactive sessions auto-accept file storage.
+fn prompt_file_storage_fallback() -> Result<()> {
     use std::io::{self, Write};
 
     let path = credentials_file_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "~/.config/botster/credentials.json".to_string());
 
+    let has_dbus = std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok();
+
     eprintln!();
-    eprintln!("  System keyring is not available on this device.");
+    eprintln!("  WARNING: Secure credential storage is not available.");
     eprintln!();
+
+    if !has_dbus {
+        eprintln!("  No D-Bus session bus detected. A keyring service requires D-Bus.");
+        eprintln!();
+    }
+
     eprintln!("  To enable encrypted credential storage, install a keyring service:");
-    eprintln!("    Ubuntu/Debian:  sudo apt install gnome-keyring libsecret-1-0 dbus-x11");
-    eprintln!("    Then start it:  eval $(dbus-launch --sh-syntax) && \\");
-    eprintln!("                    echo \"\" | gnome-keyring-daemon --unlock --start --components=secrets");
+    eprintln!();
+    eprintln!("    Ubuntu/Debian:");
+    eprintln!("      sudo apt install gnome-keyring libsecret-1-0 dbus-x11");
+    eprintln!();
+    eprintln!("    Fedora/RHEL:");
+    eprintln!("      sudo dnf install gnome-keyring libsecret dbus-x11");
+    eprintln!();
+    eprintln!("    Arch:");
+    eprintln!("      sudo pacman -S gnome-keyring libsecret");
+    eprintln!();
+    eprintln!("    Then start the keyring:");
+    eprintln!("      eval $(dbus-launch --sh-syntax) && \\");
+    eprintln!(
+        "        echo \"\" | gnome-keyring-daemon --unlock --start --components=secrets"
+    );
     eprintln!();
     eprintln!("  Note: WSL2 keyring support is unreliable and not recommended.");
     eprintln!();
     eprintln!("  Without a keyring, credentials will be stored in:");
-    eprintln!("    {} (protected by file permissions 0600 only)", path);
+    eprintln!("    {path}");
+    eprintln!("  Protected by file permissions (0600) only — NOT a secure enclave.");
     eprintln!();
 
     // Non-interactive: fall back automatically
     if !atty::is(atty::Stream::Stdin) {
         eprintln!("  Non-interactive session detected, using file storage.");
         eprintln!();
+        FILE_STORAGE_ACCEPTED.store(true, Ordering::SeqCst);
         return Ok(());
     }
 
-    print!("  Continue without keyring? [Y/n] ");
+    print!("  Continue without secure credential storage? [Y/n] ");
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -173,11 +279,12 @@ fn prompt_keyring_fallback() -> Result<()> {
 
     if input == "n" || input == "no" {
         anyhow::bail!(
-            "Keyring required. Install a keyring service and try again, \
-             or set BOTSTER_TOKEN env var to skip keyring entirely."
+            "Secure credential storage required. Install a keyring service and try again, \
+             or set BOTSTER_TOKEN env var to bypass credential storage entirely."
         );
     }
 
+    FILE_STORAGE_ACCEPTED.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -227,7 +334,7 @@ impl Credentials {
     /// - Keychain is locked and awaiting user interaction
     /// - Binary signature changed (new build)
     pub fn load() -> Result<Self> {
-        if should_skip_keyring() {
+        if should_skip_keyring() || FILE_STORAGE_ACCEPTED.load(Ordering::SeqCst) {
             return Self::load_from_file();
         }
 
@@ -277,13 +384,13 @@ impl Credentials {
                 Err(err) => {
                     log::debug!("Keyring access attempt {} failed: {}", attempt + 1, err);
 
-                    // Don't retry for NotFound - that's expected on first run
+                    // Don't retry for NotFound — expected on first run
                     if matches!(err, KeyringAccessError::NotFound) {
                         log::debug!("No credentials found in keyring, returning empty");
                         return Ok(Credentials::default());
                     }
 
-                    // Don't retry for corrupted data - it won't fix itself
+                    // Don't retry for corrupted data — it won't fix itself
                     if matches!(err, KeyringAccessError::Corrupted(_)) {
                         log::warn!(
                             "Keyring data corrupted, returning empty credentials: {}",
@@ -292,13 +399,21 @@ impl Credentials {
                         return Ok(Credentials::default());
                     }
 
+                    // Don't retry for Other — typically a permanent failure
+                    // (e.g., no D-Bus session bus on headless Linux). Retrying
+                    // only makes sense for Locked/AccessDenied (macOS keychain
+                    // awaiting user interaction or binary signature change).
+                    if matches!(err, KeyringAccessError::Other(_)) {
+                        log::debug!("Keyring unavailable (permanent failure), returning empty");
+                        return Ok(Credentials::default());
+                    }
+
                     last_error = Some(err);
                 }
             }
         }
 
-        // All retries exhausted - log warning and return empty
-        // This allows the app to continue and potentially re-authenticate
+        // All retries exhausted (only Locked/AccessDenied reach here)
         if let Some(err) = &last_error {
             log::warn!(
                 "Keyring access failed after {} attempts: {}. \
@@ -307,7 +422,6 @@ impl Credentials {
                 err
             );
 
-            // For access denied, provide a helpful hint
             if matches!(err, KeyringAccessError::AccessDenied(_)) {
                 log::info!(
                     "Hint: Binary signature may have changed. \
@@ -351,26 +465,29 @@ impl Credentials {
 
     /// Save credentials to the best available backend.
     ///
-    /// Tries OS keyring first. If keyring is unavailable, prompts the user
-    /// once and falls back to file-based storage.
+    /// Uses OS keyring when available. If the user already accepted file-based
+    /// storage during `check_credential_storage()`, skips the keyring attempt.
+    /// If keyring fails unexpectedly, falls back to file without re-prompting.
     pub fn save(&self) -> Result<()> {
-        if should_skip_keyring() {
+        if should_skip_keyring() || FILE_STORAGE_ACCEPTED.load(Ordering::SeqCst) {
             return self.save_to_file();
         }
 
         // Try OS keyring
-        let keyring_err = match Self::try_save_to_keyring(self) {
+        match Self::try_save_to_keyring(self) {
             Ok(()) => {
                 log::info!("Saved consolidated credentials to OS keyring");
-                return Ok(());
+                Ok(())
             }
-            Err(e) => e,
-        };
-
-        // Keyring failed — prompt user for file fallback
-        log::warn!("Keyring save failed: {keyring_err}");
-        prompt_keyring_fallback()?;
-        self.save_to_file()
+            Err(e) => {
+                // Keyring failed after passing the auth-time probe, or
+                // check_credential_storage was never called (e.g., env var token).
+                // Fall back to file without prompting — the auth-time check
+                // is the only place we show the warning.
+                log::warn!("Keyring save failed: {e}");
+                self.save_to_file()
+            }
+        }
     }
 
     /// Attempt to save credentials to the OS keyring.

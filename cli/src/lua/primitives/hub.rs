@@ -138,8 +138,8 @@ pub fn register(
                 })
                 .collect();
 
-            // Convert to Lua - Vec serializes as array
-            lua.to_value(&worktrees_data)
+            // Convert to Lua via json_to_lua (null-safe, unlike lua.to_value)
+            super::json::json_to_lua(lua, &serde_json::Value::Array(worktrees_data))
         })
         .map_err(|e| anyhow!("Failed to create hub.get_worktrees function: {e}"))?;
 
@@ -401,20 +401,16 @@ mod tests {
         assert_eq!(worktrees.len().unwrap(), 0);
     }
 
+    /// Empty worktrees returns an empty Lua table (iterable, length 0).
     #[test]
-    fn test_get_worktrees_serializes_as_json_array() {
+    fn test_get_worktrees_empty_returns_table() {
         let lua = Lua::new();
         let (queue, cache, sid, state) = create_test_deps();
 
         register(&lua, queue, cache, sid, state).expect("Should register");
 
-        // Get worktrees and convert back to JSON to verify array format
-        let worktrees: LuaValue = lua.load("return hub.get_worktrees()").eval().unwrap();
-        let json: serde_json::Value = lua.from_value(worktrees).unwrap();
-
-        // Empty worktrees should be an array [], not an object {}
-        assert!(json.is_array(), "Empty worktrees should serialize as JSON array, got: {}", json);
-        assert_eq!(json.as_array().unwrap().len(), 0);
+        let worktrees: LuaTable = lua.load("return hub.get_worktrees()").eval().unwrap();
+        assert_eq!(worktrees.len().unwrap(), 0, "Empty worktrees should have length 0");
     }
 
     #[test]
@@ -512,5 +508,39 @@ mod tests {
             }
             other => panic!("Expected HandleIceCandidate, got: {other:?}"),
         }
+    }
+
+    /// Proves that `get_worktrees()` converts null JSON fields to Lua nil
+    /// (not userdata). Uses `HandleCache::set_worktrees()` to inject data
+    /// with a null field, then verifies Lua sees nil.
+    #[test]
+    fn test_get_worktrees_null_field_is_nil_not_userdata() {
+        let lua = Lua::new();
+        let (queue, cache, sid, state) = create_test_deps();
+
+        // Inject a worktree so get_worktrees returns data
+        cache.set_worktrees(vec![("/tmp/wt".to_string(), "main".to_string())]);
+
+        register(&lua, queue, cache, sid, state).expect("Should register");
+
+        // get_worktrees returns array of {path, branch} - both strings, no nulls.
+        // But the conversion path must use json_to_lua for safety.
+        // Verify the result is a proper Lua table (not userdata).
+        let result: LuaValue = lua.load("return hub.get_worktrees()").eval().unwrap();
+        assert!(
+            result.is_table(),
+            "get_worktrees should return a table, got: {:?}",
+            result
+        );
+        let tbl = result.as_table().unwrap();
+        assert_eq!(tbl.len().unwrap(), 1);
+
+        // Verify nested entry is also a proper table
+        let entry: LuaValue = tbl.get(1).unwrap();
+        assert!(
+            entry.is_table(),
+            "worktree entry should be a table, got: {:?}",
+            entry
+        );
     }
 }

@@ -1,0 +1,82 @@
+<h1 class="text-2xl font-bold text-zinc-100 mb-6">Keybindings</h1>
+
+<p class="text-zinc-400 mb-6">
+  The TUI has two modes: <span class="text-zinc-300 font-medium">normal mode</span> (command mode) and
+  <span class="text-zinc-300 font-medium">insert mode</span> (PTY forwarding).
+</p>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Normal mode</h2>
+<p class="text-zinc-400 mb-4">Default mode. Keys control the TUI.</p>
+<div class="overflow-x-auto mb-6">
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-zinc-800">
+        <th class="text-left py-2 pr-4 text-zinc-400 font-medium">Key</th>
+        <th class="text-left py-2 text-zinc-400 font-medium">Action</th>
+      </tr>
+    </thead>
+    <tbody class="text-zinc-400">
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">i</td>
+        <td class="py-2">Enter insert mode</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">Ctrl+P</td>
+        <td class="py-2">Open menu</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">Ctrl+J / Ctrl+K</td>
+        <td class="py-2">Select next / previous agent</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">Ctrl+]</td>
+        <td class="py-2">Toggle PTY session</td>
+      </tr>
+      <tr class="border-b border-zinc-800/50">
+        <td class="py-2 pr-4 font-mono text-zinc-300">Shift+PageUp/Down</td>
+        <td class="py-2">Scroll half page</td>
+      </tr>
+      <tr>
+        <td class="py-2 pr-4 font-mono text-zinc-300">Shift+Home/End</td>
+        <td class="py-2">Scroll to top / bottom</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Insert mode</h2>
+<p class="text-zinc-400 mb-4">All keystrokes are forwarded to the active PTY.</p>
+<div class="overflow-x-auto mb-6">
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-zinc-800">
+        <th class="text-left py-2 pr-4 text-zinc-400 font-medium">Key</th>
+        <th class="text-left py-2 text-zinc-400 font-medium">Action</th>
+      </tr>
+    </thead>
+    <tbody class="text-zinc-400">
+      <tr>
+        <td class="py-2 pr-4 font-mono text-zinc-300">Ctrl+P</td>
+        <td class="py-2">Open menu (same modifiers work as in normal mode)</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Global</h2>
+<div class="overflow-x-auto">
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-zinc-800">
+        <th class="text-left py-2 pr-4 text-zinc-400 font-medium">Key</th>
+        <th class="text-left py-2 text-zinc-400 font-medium">Action</th>
+      </tr>
+    </thead>
+    <tbody class="text-zinc-400">
+      <tr>
+        <td class="py-2 pr-4 font-mono text-zinc-300">Ctrl+Q</td>
+        <td class="py-2">Quit botster</td>
+      </tr>
+    </tbody>
+  </table>
+</div>

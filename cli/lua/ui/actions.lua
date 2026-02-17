@@ -45,6 +45,18 @@ local function base_mode(context)
   return context.selected_agent and "insert" or "normal"
 end
 
+--- Transition from profile selection to worktree selection.
+--- Sends list_worktrees request and returns ops for the mode change.
+local function transition_to_worktree_selection()
+  return {
+    set_mode_ops("new_agent_select_worktree"),
+    { op = "send_msg", data = {
+      subscriptionId = "tui_hub",
+      data = { type = "list_worktrees" },
+    }},
+  }
+end
+
 --- Check if the currently selected agent is on the main branch.
 local function selected_agent_on_main(context)
   local agent_id = context.selected_agent
@@ -92,11 +104,12 @@ function M.on_action(action, context)
     local selected = actions[_tui_state.list_selected + 1]  -- Lua 1-based
 
     if selected == "new_agent" then
+      _tui_state.pending_fields.profile = nil
       return {
-        set_mode_ops("new_agent_select_worktree"),
+        set_mode_ops("new_agent_select_profile"),
         { op = "send_msg", data = {
           subscriptionId = "tui_hub",
-          data = { type = "list_worktrees" },
+          data = { type = "list_profiles" },
         }},
       }
     elseif selected == "close_agent" then
@@ -132,7 +145,7 @@ function M.on_action(action, context)
   if action == "list_select" and _tui_state.mode == "new_agent_select_worktree" then
     local ls = _tui_state.list_selected
     if ls == 0 then
-      -- "Use Main Branch" — skip worktree, go straight to prompt
+      -- "Use Main Branch" — skip worktree, go to profile selection or prompt
       _tui_state.pending_fields.pending_issue_or_branch = nil
       _tui_state.pending_fields.use_main_branch = "true"
       return { set_mode_ops("new_agent_prompt") }
@@ -160,6 +173,17 @@ function M.on_action(action, context)
     return { set_mode_ops(base_mode(context)) }
   end
 
+  -- === Profile selection ===
+  -- Shown when multiple profiles exist. List is 0-based, maps to available_profiles.
+  if action == "list_select" and _tui_state.mode == "new_agent_select_profile" then
+    local profiles = _tui_state.available_profiles or {}
+    local selected = profiles[_tui_state.list_selected + 1]  -- Lua 1-based
+    if selected then
+      _tui_state.pending_fields.profile = selected
+    end
+    return transition_to_worktree_selection()
+  end
+
   -- === Text input submit ===
   if action == "input_submit" then
     local input = _tui_state.input_buffer or ""
@@ -178,14 +202,16 @@ function M.on_action(action, context)
         if input ~= "" then
           prompt = input
         end
+        local profile = pf.profile
         _tui_state.pending_fields.creating_agent_id = issue or "main"
         _tui_state.pending_fields.creating_agent_stage = use_main and "spawning" or "creating_worktree"
         _tui_state.pending_fields.pending_issue_or_branch = nil
         _tui_state.pending_fields.use_main_branch = nil
+        _tui_state.pending_fields.profile = nil
         return {
           { op = "send_msg", data = {
             subscriptionId = "tui_hub",
-            data = { type = "create_agent", issue_or_branch = issue, prompt = prompt },
+            data = { type = "create_agent", issue_or_branch = issue, prompt = prompt, profile = profile },
           }},
           set_mode_ops(base_mode(context)),
         }
@@ -315,6 +341,16 @@ function M.on_action(action, context)
     return {
       { op = "focus_terminal", agent_id = prev_agent.id, pty_index = 0, agent_index = prev_idx },
       set_mode_ops("insert"),
+    }
+  end
+
+  -- === Refresh agent list ===
+  if action == "refresh_agents" then
+    return {
+      { op = "send_msg", data = {
+        subscriptionId = "tui_hub",
+        data = { type = "list_agents" },
+      }},
     }
   end
 
