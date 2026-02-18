@@ -8,9 +8,9 @@ Run autonomous AI agents on your machine. Monitor them from any device through P
 
 - **Zero-Knowledge Architecture** — Keys exchanged offline via QR code. The server relays encrypted blobs it can never read.
 - **Multi-Agent Management** — Run 20+ agents simultaneously, each in isolated git worktrees. Manage from the TUI or your browser.
-- **Plugin System** — Extensible architecture. GitHub is a first-party plugin — `@botster` triggers agents automatically.
+- **Plugin System** — Extensible Lua plugin architecture with a template catalog for one-click install from the browser.
 - **Local-First Execution** — Agents run on your hardware. Keys live in your OS keychain. No cloud execution, no vendor lock-in.
-- **Agent Accessories** — Configure accessory processes per agent with port forwarding and web app previewing over encrypted WebRTC.
+- **Profiles & Sessions** — Configure multiple named profiles per repo or device. Each agent can run multiple sessions (e.g., agent + dev server) with optional port forwarding over encrypted WebRTC.
 
 ## Privacy Model
 
@@ -56,122 +56,198 @@ cargo build --release
 The CLI checks for updates on launch. You can also update manually:
 
 ```bash
-botster update       # Download and install latest
-botster update-check # Check without installing
+botster update         # Download and install latest
+botster update --check # Check without installing
 ```
 
 ## Getting Started
 
-### 1. Pair your device
+### 1. Start the daemon
+
+Run `botster start` from the root of the project you want agents to work in:
 
 ```bash
+cd ~/projects/my-app
 botster start
-
-# CLI will display:
-#   To authorize this device, visit: https://trybotster.com/users/hubs/new
-#   And enter code: ABCD-1234
-#   [QR code displayed]
-#
-# Scan QR or visit URL, enter the code, and approve.
-# Token is saved securely in your OS keychain.
 ```
 
-### 2. Assign work
-
-Create agents from any browser at [trybotster.com/hubs](https://trybotster.com/hubs), from the TUI, or by mentioning `@botster` in a GitHub issue or PR:
+On first run, the CLI will prompt you to name your hub (defaults to the repo name) and walk you through device authorization:
 
 ```
-@botster can you investigate this memory leak in the worker process?
+  Setting up a new Botster hub.
+
+  Name this hub (Enter for "my-app"):
+
+  To authorize, visit:
+
+    https://trybotster.com/hubs/codes/WDJB-MJHT
+
+  Code: WDJB-MJHT
+
+  Press Enter to open browser (or visit the URL above)...
 ```
 
-The agent will create a git worktree, spawn Claude, investigate, and create a PR or comment with findings.
+Visit the URL, sign in with GitHub, and approve. Token is saved securely in your OS keychain.
 
-### 3. Monitor from anywhere
+### 2. Configure your repository
 
-Open [trybotster.com/hubs](https://trybotster.com/hubs) in your browser and scan the QR code displayed in the TUI. Terminal output streams in real-time over E2E encrypted P2P connections.
+Set up a `.botster/` directory in your repo (see [Repository Setup](#repository-setup)) or use the browser Settings page to configure sessions and install templates.
 
-## How It Works
+### 3. Connect your browser
 
-```
-GitHub Issue/PR Comment
-  "@botster can you fix this bug?"
-        |
-  Rails webhook receives mention
-        |
-  Creates message in queue
-        |
-  Rust daemon polls and detects message
-        |
-  Creates git worktree
-        |
-  Spawns Claude agent in PTY
-        |
-  Agent investigates and fixes issue
-        |
-  Creates PR or comments on issue
-        |
-  Issue/PR closed -> automatic cleanup
-```
+Open [trybotster.com/hubs](https://trybotster.com/hubs) and scan the QR code displayed in the TUI. This establishes the E2E encrypted P2P connection — the server never sees your data.
+
+### 4. Create agents
+
+Create agents from the browser or from the TUI menu (`Ctrl+P`). Terminal output streams in real-time over the encrypted connection.
 
 ## Architecture
 
 ```
-GitHub webhook -> Rails server -> Message queue -> Rust daemon polls
-                                                        |
-                                                Creates worktree
-                                                        |
-                                                Spawns Claude in PTY
+Browser / TUI
+      |
+  Create agent (manual or plugin-triggered)
+      |
+  Rust daemon receives command
+      |
+  Creates git worktree
+      |
+  Spawns session PTYs (agent, server, etc.)
+      |
+  Agent works in isolation
+      |
+  Monitor via E2E encrypted WebRTC
 ```
 
-**Rails server** ([trybotster.com](https://trybotster.com)) — Receives GitHub webhooks, creates message records, provides MCP tools for agents, relays E2E encrypted data (cannot decrypt).
+**Rails server** ([trybotster.com](https://trybotster.com)) — User auth, hub management, template catalog, plugin event channels. Relays E2E encrypted data it cannot decrypt.
 
-**Rust daemon** (botster) — Interactive TUI with ratatui, polls for messages, manages agent lifecycle in isolated git worktrees, spawns Claude in PTY, routes keyboard input, streams terminal over encrypted WebRTC.
+**Rust daemon** (botster) — Interactive TUI with ratatui, event-driven Lua runtime for agent lifecycle, creates isolated git worktrees, spawns sessions in PTYs, streams terminal over encrypted WebRTC.
+
+**Lua runtime** — Hot-reloadable event-driven plugin system. Core handlers manage agent lifecycle, WebRTC signaling, hub commands, and TUI keybindings. User-extensible via plugins in `.botster/`.
 
 ## TUI Controls
 
+The TUI has two primary modes:
+
+**Normal mode** — Command mode, no PTY forwarding:
+
 ```
-Ctrl+P  - Open menu
-Ctrl+J  - Next agent
-Ctrl+K  - Previous agent
-Ctrl+X  - Kill selected agent
-Ctrl+Q  - Quit daemon
+i           - Enter insert mode (forward keys to PTY)
+Ctrl+P      - Open menu
+Ctrl+J      - Next agent
+Ctrl+K      - Previous agent
+Ctrl+]      - Toggle PTY session
+Ctrl+R      - Refresh agents
+Ctrl+Q      - Quit daemon
+```
+
+**Insert mode** — Keys forward to the active PTY. Modifier combos still work:
+
+```
+Ctrl+P          - Open menu
+Ctrl+J / Ctrl+K - Switch agents
+Ctrl+]          - Toggle PTY session
+Shift+PageUp    - Scroll half page up
+Shift+PageDown  - Scroll half page down
+Shift+Home      - Scroll to top
+Shift+End       - Scroll to bottom
+Ctrl+Q          - Quit daemon
 ```
 
 ## Repository Setup
 
-In each repository where you want to use Botster, create these files:
+Each repository that uses Botster needs a `.botster/` configuration directory. You can set this up manually or use the browser Settings page (Settings > Config tab) to create and edit files over E2E encrypted connections. Session and plugin templates are available for one-click install from the Settings > Templates tab.
 
-**`.botster_init`** — Runs when agent starts:
-
-```bash
-#!/bin/bash
-"$BOTSTER_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
-claude mcp add trybotster --transport http https://trybotster.com --header "Authorization: Bearer $BOTSTER_TOKEN"
-claude --permission-mode acceptEdits "$BOTSTER_PROMPT"
-```
-
-**`.botster_teardown`** — Runs before worktree deletion:
-
-```bash
-#!/bin/bash
-"$BOTSTER_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
-```
-
-**`.botster_copy`** — Files to copy to each worktree:
+### Directory structure
 
 ```
-.env
+.botster/
+  shared/                          # merged into EVERY profile
+    workspace_include              # glob patterns for files to copy into worktrees
+    workspace_teardown             # script run before worktree deletion
+    sessions/
+      agent/                       # REQUIRED — the primary agent session
+        initialization             # startup script
+    plugins/
+      {name}/init.lua              # Lua plugins
+  profiles/
+    {profile-name}/                # named profile (e.g., "web", "api")
+      sessions/
+        {session-name}/
+          initialization           # startup script for this session
+          port_forward             # sentinel file — session gets $PORT
+      plugins/
+        {name}/init.lua
+```
+
+### Config resolution
+
+Configuration is resolved across 4 layers (most specific wins):
+
+1. **Device shared** (`~/.botster/shared/`) — Global defaults for all repos
+2. **Device profile** (`~/.botster/profiles/{profile}/`) — Global profile overrides
+3. **Repo shared** (`{repo}/.botster/shared/`) — Repo-specific defaults
+4. **Repo profile** (`{repo}/.botster/profiles/{profile}/`) — Repo + profile overrides
+
+Profile files win on collision. The `agent` session is required (in shared or profile) and always runs first.
+
+### Example: `shared/workspace_include`
+
+```
+# Glob patterns for files to copy into worktrees
 config/credentials/*.key
-.bundle
+.claude/settings.local.json
 mise.toml
 ```
 
-**`.botster_server`** — Background dev server for tunnel preview (optional):
+### Example: `shared/workspace_teardown`
 
 ```bash
-#!/bin/bash
-PORT=$BOTSTER_TUNNEL_PORT bin/dev
+# Remove the worktree from Claude's trusted projects
+"$BOTSTER_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
 ```
+
+### Example: profile with dev server
+
+A profile called `web` that adds a dev server session with port forwarding:
+
+```
+.botster/profiles/web/sessions/server/initialization   # contains: bin/dev
+.botster/profiles/web/sessions/server/port_forward      # empty sentinel file
+```
+
+The `port_forward` sentinel file tells Botster to assign a `$PORT` and tunnel it over encrypted WebRTC for browser preview.
+
+## Plugins
+
+Plugins are Lua scripts that extend Botster's behavior. They live in `.botster/{shared,profiles}/plugins/{name}/init.lua` and are resolved across all 4 config layers like sessions.
+
+### Installing plugins
+
+The easiest way to install plugins is from the browser: go to your hub's **Settings > Templates** tab, which shows a catalog of available plugins. One click installs to either device or repo scope.
+
+You can also create plugins manually by adding an `init.lua` to the appropriate plugins directory.
+
+### GitHub plugin
+
+The GitHub plugin subscribes to webhook events for your repository and automatically creates agents when `@botster` is mentioned in issues or PRs. Install it from the Templates catalog.
+
+Once installed, mentioning `@botster` in a GitHub issue or PR will:
+
+1. Create a git worktree for the issue
+2. Spawn an agent with the mention context
+3. Agent investigates and creates a PR or comments with findings
+4. Issue/PR closed triggers automatic cleanup
+
+The plugin also:
+
+- Fetches a scoped MCP token so agents can use GitHub tools (showing as `@trybotster[bot]`)
+- Routes new mentions to existing agents instead of spawning duplicates
+- Posts notifications back to GitHub when agents ask questions
+
+### Writing custom plugins
+
+Plugins have access to the full Lua runtime API: `events`, `hooks`, `action_cable`, `http`, `json`, `secrets`, `log`, and more. See the GitHub plugin source for a comprehensive example.
 
 ## Configuration
 
@@ -204,17 +280,17 @@ BOTSTER_TOKEN=your_api_key
 BOTSTER_TUNNEL_PORT=4001
 ```
 
-## MCP Tools
+Additional env vars may be injected by plugins (e.g., the GitHub plugin adds `BOTSTER_MCP_TOKEN` and `BOTSTER_MCP_URL`).
 
-Agents have access to GitHub operations via the trybotster MCP server:
+## Templates
 
-- `github_get_issue` / `github_get_pull_request` — Get issue/PR details
-- `github_list_issues` / `github_list_repos` — List issues and repos
-- `github_create_pull_request` — Create a PR
-- `github_update_issue` — Update issue status/labels
-- `github_comment_issue` — Comment on issue/PR
+The Settings > Templates tab in the browser provides a catalog of installable templates:
 
-All operations use the GitHub App, showing as `@trybotster[bot]` on GitHub.
+- **Sessions** — Pre-configured session initialization scripts (e.g., Claude agent session)
+- **Plugins** — Lua plugins (e.g., GitHub integration)
+- **Initialization** — User init.lua for custom hooks and commands
+
+Templates can be installed to either device scope (`~/.botster/`) or repo scope (`{repo}/.botster/`) and are transferred over E2E encrypted connections.
 
 ## Testing
 
@@ -235,4 +311,4 @@ Contributions welcome! See the [GitHub repository](https://github.com/Tonksthebe
 
 ## License
 
-MIT License
+[O'Saasy License](LICENSE) — Free to use, modify, and distribute. Cannot be repackaged as a competing hosted/SaaS product.
