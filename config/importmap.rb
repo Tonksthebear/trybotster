@@ -6,6 +6,7 @@ pin "@hotwired/turbo-rails", to: "turbo.min.js"
 pin "@hotwired/stimulus", to: "stimulus.min.js"
 pin "@hotwired/stimulus-loading", to: "stimulus-loading.js"
 pin "turbo_stream_update_attribute"
+pin "turbo_stream_redirect"
 pin_all_from "app/javascript/controllers", under: "controllers"
 pin_all_from "app/javascript/channels", under: "channels"
 # Restty terminal (libghostty-vt WASM + WebGPU/WebGL2 rendering)

@@ -3,3 +3,4 @@ import "@hotwired/turbo-rails";
 import "controllers";
 import "@tailwindplus/elements";
 import "turbo_stream_update_attribute";
+import "turbo_stream_redirect";

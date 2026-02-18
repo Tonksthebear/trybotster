@@ -4,6 +4,12 @@ module TurboStreamBuilderOverrides
     action :update_attribute, target, content, method: method, stream_attributes: { attribute: attribute }, **rendering, &block
   end
 
+  def redirect(url, from: nil)
+    attrs = { url: url }
+    attrs[:from] = from if from
+    turbo_stream_action_tag :redirect, **attrs
+  end
+
   def action(name, target, content = nil, method: nil, allow_inferred_rendering: true, stream_attributes: {}, **rendering, &block)
     template = render_template(target, content, allow_inferred_rendering: allow_inferred_rendering, **rendering, &block)
 
