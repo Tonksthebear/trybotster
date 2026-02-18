@@ -79,6 +79,23 @@
         </dl>
       </div>
 
+      <%# Scan QR Prompt - shown when connection needs pairing %>
+      <div data-controller="scan-prompt"
+           data-scan-prompt-hub-id-value="<%= Current.hub.id %>"
+           class="hidden bg-amber-500/10 border border-amber-500/20 rounded-lg p-4 lg:p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="shrink-0 size-10 rounded-lg bg-amber-500/10 flex items-center justify-center">
+            <%= icon "qr-code", class: "size-5 text-amber-400" %>
+          </div>
+          <div>
+            <h3 class="text-sm font-medium text-amber-300">Scan Connection Code</h3>
+            <p class="text-sm text-zinc-400 mt-1">
+              Open the hub's terminal and scan the QR code displayed there to establish a secure connection.
+            </p>
+          </div>
+        </div>
+      </div>
+
       <%# Agents Section %>
       <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6"
            data-controller="agent-list"

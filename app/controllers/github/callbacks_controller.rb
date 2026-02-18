@@ -51,7 +51,7 @@ module Github
             sign_in(user)
             Rails.logger.info "User signed in with Devise (remember_me enabled)"
 
-            redirect_to root_path, notice: "Successfully authorized with GitHub!"
+            redirect_to stored_location_for(:user) || root_path, notice: "Successfully authorized with GitHub!"
           else
             Rails.logger.error "Failed to find/create user"
             redirect_to root_path, alert: "Failed to create user account."
