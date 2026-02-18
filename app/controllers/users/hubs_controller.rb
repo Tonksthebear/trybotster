@@ -47,7 +47,7 @@ module Users
       end
 
       @authorization.approve!(current_user)
-      redirect_to hubs_path, notice: "Hub connected! The CLI should now be connected."
+      redirect_to hubs_path, flash: { hub_booting: true }
     end
 
     def lookup_and_redirect
