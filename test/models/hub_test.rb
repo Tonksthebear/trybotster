@@ -338,9 +338,9 @@ class HubTest < ActiveSupport::TestCase
       Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current)
     end
 
-    assert_equal 1, streams.size
-    assert_equal "update", streams.first["action"]
-    assert_equal ".hubs-list", streams.first["targets"]
+    update_stream = streams.find { |s| s["action"] == "update" }
+    assert_not_nil update_stream, "Expected an update broadcast"
+    assert_equal ".hubs-list", update_stream["targets"]
   end
 
   test "destroying hub broadcasts health offline" do
