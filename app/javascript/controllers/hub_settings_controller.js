@@ -33,6 +33,7 @@ export default class extends Controller {
     "saveBtn",
     "createBtn",
     "deleteBtn",
+    "renameBtn",
     "promptPanel",
     "promptTitle",
     "promptMessage",
@@ -229,6 +230,36 @@ export default class extends Controller {
       this.#showError(`Delete failed: ${error.message}`);
     } finally {
       this.deleteBtnTarget.textContent = "Delete";
+    }
+  }
+
+  async renameFile() {
+    if (!this.currentFilePath || !this.hub) return;
+
+    const newPath = await this.#promptUser(
+      "Rename",
+      `Enter the new path:`,
+      (val) => {
+        if (val.startsWith("/") || val.includes("..")) return "Invalid path";
+        if (!/^[a-z0-9._/-]+$/.test(val)) return "Only lowercase letters, numbers, dots, hyphens, slashes, or underscores.";
+        return null;
+      },
+      this.currentFilePath,
+    );
+    if (!newPath || newPath === this.currentFilePath) return;
+
+    this.renameBtnTarget.textContent = "Renaming...";
+
+    try {
+      await this.hub.renameFile(this.currentFilePath, newPath, this.#fsScope());
+      this.currentFilePath = newPath;
+      this.editorTitleTarget.textContent = newPath;
+      await this.scanTree();
+      this.#selectFileByPath(newPath);
+    } catch (error) {
+      this.#showError(`Rename failed: ${error.message}`);
+    } finally {
+      this.renameBtnTarget.textContent = "Rename";
     }
   }
 
@@ -771,8 +802,8 @@ export default class extends Controller {
 
   // ========== Prompt / Confirm Dialog ==========
 
-  async #promptUser(title, message, validate) {
-    return this.#openDialog(title, message, { mode: "prompt", validate });
+  async #promptUser(title, message, validate, defaultValue) {
+    return this.#openDialog(title, message, { mode: "prompt", validate, defaultValue });
   }
 
   async #confirmUser(title, message) {
@@ -780,14 +811,14 @@ export default class extends Controller {
     return result !== null;
   }
 
-  async #openDialog(title, message, { mode, validate }) {
+  async #openDialog(title, message, { mode, validate, defaultValue }) {
     const dialog = document.getElementById("settings-prompt-modal");
     if (!dialog) return null;
 
     this.promptPanelTarget.dataset.mode = mode;
     this.promptTitleTarget.textContent = title;
     this.promptMessageTarget.textContent = message;
-    this.promptInputTarget.value = "";
+    this.promptInputTarget.value = defaultValue || "";
     this.promptErrorTarget.textContent = "";
 
     this._promptMode = mode;
@@ -824,9 +855,8 @@ export default class extends Controller {
 
     const value = this.promptInputTarget.value.trim();
 
-    if (!value || !/^[a-z][a-z0-9_-]*$/.test(value)) {
-      this.promptErrorTarget.textContent =
-        "Must start with a letter. Only lowercase letters, numbers, hyphens, or underscores.";
+    if (!value) {
+      this.promptErrorTarget.textContent = "Value is required.";
       return;
     }
 
@@ -836,6 +866,11 @@ export default class extends Controller {
         this.promptErrorTarget.textContent = error;
         return;
       }
+    } else if (!/^[a-z][a-z0-9_-]*$/.test(value)) {
+      // Default strict naming validation (for session/profile names)
+      this.promptErrorTarget.textContent =
+        "Must start with a letter. Only lowercase letters, numbers, hyphens, or underscores.";
+      return;
     }
 
     const resolve = this._promptResolve;

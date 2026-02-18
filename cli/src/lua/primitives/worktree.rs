@@ -3,15 +3,16 @@
 //! Exposes git worktree queries and operations to Lua, allowing scripts to
 //! list, find, create, and delete worktrees.
 //!
-//! # Design Principle: "Query freely. Mutate via queue."
+//! # Design Principle: "Query freely. Mutate via event."
 //!
 //! - **Queries** (`list`, `exists`, `find`, `repo_root`) read directly from
 //!   `HandleCache` - non-blocking, thread-safe snapshots
 //! - **Create** (`create`) runs synchronously (legacy, blocks Hub event loop)
-//! - **Create async** (`create_async`) queues request for Hub to process on a
-//!   blocking threadpool. Hub fires `worktree_created` or `worktree_create_failed`
-//!   Lua events when done.
-//! - **Delete** (`delete`) queues request for Hub to process asynchronously
+//! - **Create async** (`create_async`) sends `HubEvent::LuaWorktreeRequest` for
+//!   Hub to process on a blocking threadpool. Hub fires `worktree_created` or
+//!   `worktree_create_failed` Lua events when done.
+//! - **Delete** (`delete`) sends `HubEvent::LuaWorktreeRequest` for Hub to
+//!   process asynchronously
 //!
 //! # Usage in Lua
 //!
@@ -39,22 +40,24 @@
 //! -- Create worktree asynchronously (returns immediately, fires event on completion)
 //! worktree.create_async({ agent_key = "key", branch = "feature-branch", prompt = "..." })
 //!
-//! -- Delete worktree (queues request for async processing)
+//! -- Delete worktree (sends event for async processing)
 //! worktree.delete("/path/to/worktree", "feature-branch")
 //! ```
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
 
+use super::HubEventSender;
 use crate::git::WorktreeManager;
+use crate::hub::events::HubEvent;
 use crate::hub::handle_cache::HandleCache;
 
-/// Worktree operation requests queued from Lua.
+/// Worktree operation requests sent from Lua via `HubEvent::LuaWorktreeRequest`.
 ///
-/// These are processed by Hub in its event loop after Lua callbacks return.
+/// These are delivered directly to the Hub event loop.
 /// `Create` requests are dispatched to a blocking threadpool via
 /// `tokio::task::spawn_blocking` so the Hub event loop stays responsive.
 #[derive(Debug, Clone)]
@@ -119,15 +122,6 @@ pub type WorktreeResultReceiver = tokio::sync::mpsc::UnboundedReceiver<WorktreeC
 /// Channel type for sending async worktree creation results.
 pub type WorktreeResultSender = tokio::sync::mpsc::UnboundedSender<WorktreeCreateResult>;
 
-/// Shared request queue for worktree operations from Lua.
-pub type WorktreeRequestQueue = Arc<Mutex<Vec<WorktreeRequest>>>;
-
-/// Create a new worktree request queue.
-#[must_use]
-pub fn new_request_queue() -> WorktreeRequestQueue {
-    Arc::new(Mutex::new(Vec::new()))
-}
-
 /// Register worktree primitives with the Lua state.
 ///
 /// Adds the following functions to the `worktree` table:
@@ -141,16 +135,16 @@ pub fn new_request_queue() -> WorktreeRequestQueue {
 /// # Arguments
 ///
 /// * `lua` - The Lua state to register primitives in
-/// * `request_queue` - Shared queue for worktree operations (processed by Hub)
+/// * `hub_event_tx` - Shared sender for Hub events (filled in later by `set_hub_event_tx`)
 /// * `handle_cache` - Thread-safe cache for worktree queries
 /// * `worktree_base` - Base directory for worktree storage
 ///
 /// # Errors
 ///
 /// Returns an error if Lua table or function creation fails.
-pub fn register(
+pub(crate) fn register(
     lua: &Lua,
-    request_queue: WorktreeRequestQueue,
+    hub_event_tx: HubEventSender,
     handle_cache: Arc<HandleCache>,
     worktree_base: PathBuf,
 ) -> Result<()> {
@@ -265,7 +259,7 @@ pub fn register(
     //
     // params is a table with: agent_key, branch, issue_number, prompt,
     // profile_name, client_rows, client_cols
-    let create_async_queue = Arc::clone(&request_queue);
+    let tx = hub_event_tx.clone();
     let create_async_fn = lua
         .create_function(move |_, params: LuaTable| {
             let agent_key: String = params.get("agent_key").map_err(|e| {
@@ -282,18 +276,20 @@ pub fn register(
             let client_rows: u16 = params.get("client_rows").unwrap_or(24);
             let client_cols: u16 = params.get("client_cols").unwrap_or(80);
 
-            let mut q = create_async_queue
-                .lock()
-                .expect("Worktree request queue mutex poisoned");
-            q.push(WorktreeRequest::Create {
-                agent_key,
-                branch,
-                issue_number,
-                prompt,
-                profile_name,
-                client_rows,
-                client_cols,
-            });
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaWorktreeRequest(WorktreeRequest::Create {
+                    agent_key,
+                    branch,
+                    issue_number,
+                    prompt,
+                    profile_name,
+                    client_rows,
+                    client_cols,
+                }));
+            } else {
+                ::log::warn!("[Worktree] create_async() called before hub_event_tx set — event dropped");
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create worktree.create_async function: {e}"))?;
@@ -347,13 +343,15 @@ pub fn register(
     // worktree.delete(path, branch) - Queue worktree deletion
     //
     // Queues a request to delete a worktree. Hub processes it asynchronously.
-    let delete_queue = request_queue;
+    let tx = hub_event_tx;
     let delete_fn = lua
         .create_function(move |_, (path, branch): (String, String)| {
-            let mut q = delete_queue
-                .lock()
-                .expect("Worktree request queue mutex poisoned");
-            q.push(WorktreeRequest::Delete { path, branch });
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaWorktreeRequest(WorktreeRequest::Delete { path, branch }));
+            } else {
+                ::log::warn!("[Worktree] delete() called before hub_event_tx set — event dropped");
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create worktree.delete function: {e}"))?;
@@ -373,10 +371,11 @@ pub fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::new_hub_event_sender;
 
-    fn create_test_queue_and_cache() -> (WorktreeRequestQueue, Arc<HandleCache>, PathBuf) {
+    fn create_test_queue_and_cache() -> (HubEventSender, Arc<HandleCache>, PathBuf) {
         (
-            new_request_queue(),
+            new_hub_event_sender(),
             Arc::new(HandleCache::new()),
             PathBuf::from("/tmp/test-worktrees"),
         )
@@ -385,9 +384,9 @@ mod tests {
     #[test]
     fn test_register_creates_worktree_table() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
-        register(&lua, queue, cache, base).expect("Should register worktree primitives");
+        register(&lua, tx, cache, base).expect("Should register worktree primitives");
 
         let wt: LuaTable = lua
             .globals()
@@ -406,9 +405,9 @@ mod tests {
     #[test]
     fn test_list_returns_empty_table() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
-        register(&lua, queue, cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         let worktrees: LuaTable = lua.load("return worktree.list()").eval().unwrap();
         assert_eq!(worktrees.len().unwrap(), 0);
@@ -418,9 +417,9 @@ mod tests {
     #[test]
     fn test_list_empty_returns_table() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
-        register(&lua, queue, cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         let worktrees: LuaTable = lua.load("return worktree.list()").eval().unwrap();
         assert_eq!(worktrees.len().unwrap(), 0, "Empty worktree list should have length 0");
@@ -429,7 +428,7 @@ mod tests {
     #[test]
     fn test_list_returns_cached_worktrees() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
         // Pre-populate the cache
         cache.set_worktrees(vec![
@@ -437,7 +436,7 @@ mod tests {
             ("/path/to/wt2".to_string(), "feature-b".to_string()),
         ]);
 
-        register(&lua, queue, cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         let worktrees: LuaTable = lua.load("return worktree.list()").eval().unwrap();
         assert_eq!(worktrees.len().unwrap(), 2);
@@ -446,9 +445,9 @@ mod tests {
     #[test]
     fn test_exists_returns_false_when_empty() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
-        register(&lua, queue, cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         let exists: bool = lua
             .load(r#"return worktree.exists("feature-a")"#)
@@ -460,14 +459,14 @@ mod tests {
     #[test]
     fn test_exists_returns_true_when_found() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
         cache.set_worktrees(vec![(
             "/path/to/wt1".to_string(),
             "feature-a".to_string(),
         )]);
 
-        register(&lua, queue, cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         let exists: bool = lua
             .load(r#"return worktree.exists("feature-a")"#)
@@ -479,14 +478,14 @@ mod tests {
     #[test]
     fn test_exists_returns_false_for_wrong_branch() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
         cache.set_worktrees(vec![(
             "/path/to/wt1".to_string(),
             "feature-a".to_string(),
         )]);
 
-        register(&lua, queue, cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         let exists: bool = lua
             .load(r#"return worktree.exists("feature-b")"#)
@@ -498,9 +497,9 @@ mod tests {
     #[test]
     fn test_find_returns_nil_when_not_found() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
-        register(&lua, queue, cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         let result: LuaValue = lua
             .load(r#"return worktree.find("feature-a")"#)
@@ -512,14 +511,14 @@ mod tests {
     #[test]
     fn test_find_returns_path_when_found() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
         cache.set_worktrees(vec![(
             "/path/to/wt1".to_string(),
             "feature-a".to_string(),
         )]);
 
-        register(&lua, queue, cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         let path: String = lua
             .load(r#"return worktree.find("feature-a")"#)
@@ -529,36 +528,40 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_queues_request() {
+    fn test_delete_sends_event() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let tx = new_hub_event_sender();
+        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+        let cache = Arc::new(HandleCache::new());
+        let base = PathBuf::from("/tmp/test-worktrees");
 
-        register(&lua, Arc::clone(&queue), cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         lua.load(r#"worktree.delete("/path/to/wt", "feature-branch")"#)
             .exec()
             .expect("Should delete worktree");
 
-        let requests = queue
-            .lock()
-            .expect("Worktree request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-
-        match &requests[0] {
-            WorktreeRequest::Delete { path, branch } => {
+        let event = rx.try_recv().expect("Should have received event");
+        match event {
+            HubEvent::LuaWorktreeRequest(WorktreeRequest::Delete { path, branch }) => {
                 assert_eq!(path, "/path/to/wt");
                 assert_eq!(branch, "feature-branch");
             }
-            _ => panic!("Expected Delete request"),
+            _ => panic!("Expected LuaWorktreeRequest(Delete) event"),
         }
     }
 
     #[test]
-    fn test_multiple_delete_requests_queue_in_order() {
+    fn test_multiple_delete_requests_send_events_in_order() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let tx = new_hub_event_sender();
+        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+        let cache = Arc::new(HandleCache::new());
+        let base = PathBuf::from("/tmp/test-worktrees");
 
-        register(&lua, Arc::clone(&queue), cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         lua.load(
             r#"
@@ -567,23 +570,24 @@ mod tests {
         "#,
         )
         .exec()
-        .expect("Should queue multiple requests");
+        .expect("Should send multiple events");
 
-        let requests = queue
-            .lock()
-            .expect("Worktree request queue mutex poisoned");
-        assert_eq!(requests.len(), 2);
-
-        assert!(matches!(requests[0], WorktreeRequest::Delete { .. }));
-        assert!(matches!(requests[1], WorktreeRequest::Delete { .. }));
+        match rx.try_recv().unwrap() {
+            HubEvent::LuaWorktreeRequest(WorktreeRequest::Delete { .. }) => {}
+            _ => panic!("Expected LuaWorktreeRequest(Delete)"),
+        }
+        match rx.try_recv().unwrap() {
+            HubEvent::LuaWorktreeRequest(WorktreeRequest::Delete { .. }) => {}
+            _ => panic!("Expected LuaWorktreeRequest(Delete)"),
+        }
     }
 
     #[test]
     fn test_repo_root_returns_value_or_nil() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
-        register(&lua, queue, cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         // repo_root() should return a string or nil depending on whether
         // we're running in a git repo. In tests, this is typically a git repo.
@@ -606,11 +610,15 @@ mod tests {
     }
 
     #[test]
-    fn test_create_async_queues_request() {
+    fn test_create_async_sends_event() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let tx = new_hub_event_sender();
+        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+        let cache = Arc::new(HandleCache::new());
+        let base = PathBuf::from("/tmp/test-worktrees");
 
-        register(&lua, Arc::clone(&queue), cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         lua.load(
             r#"worktree.create_async({
@@ -624,15 +632,11 @@ mod tests {
             })"#,
         )
         .exec()
-        .expect("Should queue create_async request");
+        .expect("Should send create_async event");
 
-        let requests = queue
-            .lock()
-            .expect("Worktree request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-
-        match &requests[0] {
-            WorktreeRequest::Create {
+        let event = rx.try_recv().expect("Should have received event");
+        match event {
+            HubEvent::LuaWorktreeRequest(WorktreeRequest::Create {
                 agent_key,
                 branch,
                 issue_number,
@@ -640,26 +644,25 @@ mod tests {
                 profile_name,
                 client_rows,
                 client_cols,
-                ..
-            } => {
+            }) => {
                 assert_eq!(agent_key, "test-repo-42");
                 assert_eq!(branch, "feature-branch");
-                assert_eq!(*issue_number, Some(42));
+                assert_eq!(issue_number, Some(42));
                 assert_eq!(prompt, "Fix the bug");
                 assert_eq!(profile_name.as_deref(), Some("default"));
-                assert_eq!(*client_rows, 30);
-                assert_eq!(*client_cols, 120);
+                assert_eq!(client_rows, 30);
+                assert_eq!(client_cols, 120);
             }
-            _ => panic!("Expected Create request"),
+            _ => panic!("Expected LuaWorktreeRequest(Create) event"),
         }
     }
 
     #[test]
     fn test_create_returns_error_for_invalid_branch() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
-        register(&lua, queue, cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         // Calling create() with a branch name when not in a repo (or invalid setup)
         // should raise a Lua error rather than panic
@@ -691,12 +694,12 @@ mod tests {
     #[test]
     fn test_list_returns_proper_lua_tables() {
         let lua = Lua::new();
-        let (queue, cache, base) = create_test_queue_and_cache();
+        let (tx, cache, base) = create_test_queue_and_cache();
 
         // Inject a worktree so list returns data
         cache.set_worktrees(vec![("/tmp/wt".to_string(), "main".to_string())]);
 
-        register(&lua, queue, cache, base).expect("Should register");
+        register(&lua, tx, cache, base).expect("Should register");
 
         let result: LuaValue = lua.load("return worktree.list()").eval().unwrap();
         assert!(

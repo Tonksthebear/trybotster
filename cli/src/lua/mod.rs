@@ -51,13 +51,13 @@ pub mod runtime;
 pub use file_watcher::LuaFileWatcher;
 pub use primitives::{
     // PTY primitives
-    CreateForwarderRequest, PtyForwarder, PtyOutputContext, PtyRequest, PtyRequestQueue,
+    CreateForwarderRequest, PtyForwarder, PtyOutputContext, PtyRequest,
     // WebRTC primitives
-    WebRtcSendQueue, WebRtcSendRequest,
+    WebRtcSendRequest,
     // Hub state primitives
-    HubRequest, HubRequestQueue,
+    HubRequest,
     // Worktree primitives
-    WorktreeRequest, WorktreeRequestQueue,
+    WorktreeRequest,
     // Event system primitives
     EventCallbackId, EventCallbacks, SharedEventCallbacks,
 };

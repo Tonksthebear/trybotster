@@ -202,8 +202,6 @@ pub(crate) fn run_event_loop(
                 }
             }
 
-            // Flush Lua-queued operations after every event
-            hub.flush_lua_queues();
 
             // Check shutdown conditions
             if hub.quit || shutdown_flag.load(Ordering::SeqCst) {

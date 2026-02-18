@@ -231,6 +231,7 @@ local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, a
         sessions = sessions,
         dims = dims,
         agent_key = agent_key,
+        profile_name = profile_name,
     })
 
     if not ok then

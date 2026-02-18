@@ -77,6 +77,8 @@ class WorkerBridge {
       webrtcTransport.on("subscription:confirmed", (data) => this.#dispatchEvent({ event: "subscription:confirmed", ...data }))
       webrtcTransport.on("health", (data) => this.#dispatchEvent({ event: "health", ...data }))
       webrtcTransport.on("session:invalid", (data) => this.#dispatchEvent({ event: "session:invalid", ...data }))
+      webrtcTransport.on("session:refreshed", (data) => this.#dispatchEvent({ event: "session:refreshed", ...data }))
+      webrtcTransport.on("signaling:state", (data) => this.#dispatchEvent({ event: "signaling:state", ...data }))
       webrtcTransport.on("stream:frame", (data) => this.#dispatchEvent({ event: "stream:frame", ...data }))
 
       this.#initialized = true
@@ -167,6 +169,8 @@ class WorkerBridge {
         return webrtcTransport.connectPeer(params.hubId)
       case "disconnectPeer":
         return webrtcTransport.disconnectPeer(params.hubId)
+      case "probePeerHealth":
+        return webrtcTransport.probePeerHealth(params.hubId)
       case "disconnect":
         return webrtcTransport.disconnect(params.hubId)
       case "subscribe": {

@@ -25,6 +25,10 @@ export class WebRtcPtyTransport {
   #callbacks = null;
   #unsubscribers = [];
   #decoder = new TextDecoder();
+  #wasConnected = false;
+  #onReconnect = null;
+  #onConnect = null;
+  #onDisconnect = null;
 
   constructor({ hubId, agentIndex, ptyIndex }) {
     this.#hubId = hubId;
@@ -82,8 +86,20 @@ export class WebRtcPtyTransport {
     return this.#terminalConn?.isConnected() ?? false;
   }
 
+  /**
+   * Register a callback for reconnection events (DataChannel restored after drop).
+   * Fires before the CLI sends fresh snapshot data, allowing consumers to
+   * clear local state (e.g., Restty scrollback) before the snapshot repopulates it.
+   */
+  set onReconnect(callback) { this.#onReconnect = callback; }
+  set onConnect(callback) { this.#onConnect = callback; }
+  set onDisconnect(callback) { this.#onDisconnect = callback; }
+
   destroy() {
     this.disconnect();
+    this.#onReconnect = null;
+    this.#onConnect = null;
+    this.#onDisconnect = null;
     this.#terminalConn?.release();
     this.#terminalConn = null;
   }
@@ -105,12 +121,16 @@ export class WebRtcPtyTransport {
 
     this.#unsubscribers.push(
       this.#terminalConn.onConnected(() => {
+        if (this.#wasConnected) this.#onReconnect?.();
+        this.#wasConnected = true;
+        this.#onConnect?.();
         this.#callbacks?.onConnect?.();
       }),
     );
 
     this.#unsubscribers.push(
       this.#terminalConn.onDisconnected(() => {
+        this.#onDisconnect?.();
         this.#callbacks?.onDisconnect?.();
       }),
     );
