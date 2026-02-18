@@ -47,7 +47,6 @@ impl Hub {
         self.poll_webrtc_channels();
         self.poll_lua_file_changes();
         self.poll_user_file_watches();
-        self.flush_lua_queues();
     }
 
     /// Legacy periodic maintenance (test-only fallback).
@@ -76,7 +75,6 @@ impl Hub {
             }
             HubEvent::WebSocketEvent(ws_event) => {
                 self.lua.fire_websocket_event(ws_event);
-                self.flush_lua_queues();
             }
             HubEvent::PtyNotification(notif) => {
                 self.lua.notify_pty_notification(
@@ -87,7 +85,6 @@ impl Hub {
             }
             HubEvent::TimerFired { timer_id } => {
                 self.lua.fire_timer_callback(&timer_id);
-                self.flush_lua_queues();
             }
             HubEvent::AcChannelMessage { channel_id, message } => {
                 use crate::lua::primitives::action_cable;
@@ -96,11 +93,14 @@ impl Hub {
                     self.lua.lua_ref(),
                     &self.lua_ac_channels,
                     &self.lua_ac_connections,
+                    self.lua.ac_callback_registry(),
                     crypto,
                     &channel_id,
                     message,
                 );
-                self.flush_lua_queues();
+            }
+            HubEvent::LuaActionCableRequest(request) => {
+                self.process_single_action_cable_request(request);
             }
             HubEvent::WebRtcMessage { browser_identity, payload } => {
                 self.handle_webrtc_message(&browser_identity, &payload);
@@ -122,7 +122,6 @@ impl Hub {
                 let fired = self.lua.fire_user_file_watch(&watch_id, events);
                 if fired > 0 {
                     log::debug!("Fired {} user file watch event(s)", fired);
-                    self.flush_lua_queues();
                 }
             }
             HubEvent::LuaFileChange { modules } => {
@@ -135,6 +134,7 @@ impl Hub {
                 self.cleanup_disconnected_webrtc_channels();
                 self.poll_stream_frames_outgoing();
                 self.poll_pty_observers();
+                self.ratchet_restarted_peers.clear();
             }
             HubEvent::DcOpened { browser_identity } => {
                 log::info!(
@@ -171,7 +171,258 @@ impl Hub {
                 if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
                     log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
                 }
-                self.flush_lua_queues();
+            }
+            HubEvent::WebRtcSend(send_req) => {
+                use crate::lua::primitives::WebRtcSendRequest;
+                const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+                match send_req {
+                    WebRtcSendRequest::Json { peer_id, data } => {
+                        if let Some(channel) = self.webrtc_channels.get(&peer_id) {
+                            let payload = match serde_json::to_vec(&data) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    log::warn!("[WebRTC] Lua send failed to serialize: {e}");
+                                    return;
+                                }
+                            };
+                            let peer = crate::channel::PeerId(peer_id.clone());
+                            match tokio::task::block_in_place(|| {
+                                self.tokio_runtime.block_on(
+                                    tokio::time::timeout(SEND_TIMEOUT, channel.send_to(&payload, &peer))
+                                )
+                            }) {
+                                Ok(Err(e)) => log::warn!("[WebRTC] Lua send failed: {e}"),
+                                Err(_) => log::warn!("[WebRTC] Lua send timed out for {}", &peer_id[..peer_id.len().min(8)]),
+                                Ok(Ok(())) => {}
+                            }
+                        } else {
+                            log::debug!("[WebRTC] Lua send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
+                        }
+                    }
+                    WebRtcSendRequest::Binary { peer_id, data } => {
+                        if let Some(channel) = self.webrtc_channels.get(&peer_id) {
+                            let peer = crate::channel::PeerId(peer_id.clone());
+                            match tokio::task::block_in_place(|| {
+                                self.tokio_runtime.block_on(
+                                    tokio::time::timeout(SEND_TIMEOUT, channel.send_to(&data, &peer))
+                                )
+                            }) {
+                                Ok(Err(e)) => log::warn!("[WebRTC] Lua binary send failed: {e}"),
+                                Err(_) => log::warn!("[WebRTC] Lua binary send timed out for {}", &peer_id[..peer_id.len().min(8)]),
+                                Ok(Ok(())) => {}
+                            }
+                        } else {
+                            log::debug!("[WebRTC] Lua binary send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
+                        }
+                    }
+                }
+            }
+            HubEvent::TuiSend(send_req) => {
+                use crate::client::TuiOutput;
+                use crate::lua::primitives::TuiSendRequest;
+
+                let Some(ref tx) = self.tui_output_tx else {
+                    return; // No TUI connected, discard
+                };
+
+                match send_req {
+                    TuiSendRequest::Json { data } => {
+                        let _ = tx.send(TuiOutput::Message(data));
+                    }
+                    TuiSendRequest::Binary { data } => {
+                        let _ = tx.send(TuiOutput::Output {
+                            agent_index: None,
+                            pty_index: None,
+                            data,
+                        });
+                    }
+                }
+                self.wake_tui();
+            }
+            HubEvent::LuaPtyRequest(request) => {
+                use crate::lua::PtyRequest;
+
+                match request {
+                    PtyRequest::CreateForwarder(req) => {
+                        self.create_lua_pty_forwarder(req);
+                    }
+                    PtyRequest::CreateTuiForwarder(req) => {
+                        self.create_lua_tui_pty_forwarder(req);
+                    }
+                    PtyRequest::StopForwarder { forwarder_id } => {
+                        self.stop_lua_pty_forwarder(&forwarder_id);
+                    }
+                    PtyRequest::WritePty { agent_index, pty_index, data } => {
+                        if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
+                            if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
+                                if let Err(e) = pty_handle.write_input_direct(&data) {
+                                    log::error!("[PTY-WRITE] Write failed: {e}");
+                                }
+                            } else {
+                                log::warn!("[PTY-WRITE] No PTY at index {} for agent {}", pty_index, agent_index);
+                            }
+                        } else {
+                            log::warn!("[PTY-WRITE] No agent at index {}", agent_index);
+                        }
+                    }
+                    PtyRequest::ResizePty { agent_index, pty_index, rows, cols } => {
+                        if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
+                            if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
+                                pty_handle.resize_direct(rows, cols);
+                            } else {
+                                log::debug!("[Lua] No PTY at index {} for agent {}", pty_index, agent_index);
+                            }
+                        } else {
+                            log::debug!("[Lua] No agent at index {}", agent_index);
+                        }
+                    }
+                    PtyRequest::SpawnNotificationWatcher { watcher_key, agent_key, session_name, event_tx } => {
+                        self.spawn_notification_watcher(watcher_key, agent_key, session_name, event_tx);
+                    }
+                }
+            }
+            HubEvent::LuaHubRequest(request) => {
+                use crate::lua::primitives::HubRequest;
+
+                match request {
+                    HubRequest::Quit => {
+                        log::info!("[Lua] Processing quit request");
+                        self.quit = true;
+                    }
+                    HubRequest::HandleWebrtcOffer { browser_identity, sdp } => {
+                        log::info!(
+                            "[Lua] Processing WebRTC offer from {}",
+                            &browser_identity[..browser_identity.len().min(8)]
+                        );
+                        self.handle_webrtc_offer(&sdp, &browser_identity);
+                    }
+                    HubRequest::HandleIceCandidate { browser_identity, candidate } => {
+                        let candidate_str = candidate
+                            .get("candidate")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+                        let sdp_mid = candidate.get("sdpMid").and_then(|m| m.as_str());
+                        let sdp_mline_index = candidate
+                            .get("sdpMLineIndex")
+                            .and_then(|i| i.as_u64())
+                            .map(|i| i as u16);
+
+                        if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
+                            if let Err(e) = tokio::task::block_in_place(|| {
+                                self.tokio_runtime.block_on(
+                                    channel.handle_ice_candidate(candidate_str, sdp_mid, sdp_mline_index),
+                                )
+                            }) {
+                                log::warn!("[Lua] Failed to add ICE candidate: {e}");
+                            }
+                        } else {
+                            log::warn!(
+                                "[Lua] ICE candidate for unknown browser {}",
+                                &browser_identity[..browser_identity.len().min(8)]
+                            );
+                        }
+                    }
+                    HubRequest::RatchetRestart { browser_identity } => {
+                        let olm_key = crate::relay::extract_olm_key(&browser_identity).to_string();
+                        if !self.ratchet_restarted_peers.contains(&olm_key) {
+                            log::warn!(
+                                "[Lua] Signaling decrypt failed for {}, initiating ratchet restart",
+                                &browser_identity[..browser_identity.len().min(8)]
+                            );
+                            self.send_ratchet_restart(&browser_identity);
+                            self.ratchet_restarted_peers.insert(olm_key);
+                        }
+                    }
+                }
+            }
+            HubEvent::LuaConnectionRequest(request) => {
+                use crate::lua::primitives::ConnectionRequest;
+
+                match request {
+                    ConnectionRequest::Generate => {
+                        log::debug!("[Lua] Processing connection.generate() request");
+                        match self.generate_connection_url() {
+                            Ok(ref url) => {
+                                if let Err(e) = self.lua.fire_connection_code_ready(url) {
+                                    log::error!("Failed to fire connection_code_ready: {e}");
+                                }
+                            }
+                            Err(ref e) => {
+                                log::warn!("Connection URL generation failed: {e}");
+                                if let Err(fire_err) = self.lua.fire_connection_code_error(e) {
+                                    log::error!("Failed to fire connection_code_error: {fire_err}");
+                                }
+                            }
+                        }
+                    }
+                    ConnectionRequest::Regenerate => {
+                        log::info!("[Lua] Processing connection.regenerate() request");
+                        actions::dispatch(self, HubAction::RegenerateConnectionCode);
+                    }
+                    ConnectionRequest::CopyToClipboard => {
+                        log::debug!("[Lua] Processing connection.copy_to_clipboard() request");
+                        actions::dispatch(self, HubAction::CopyConnectionUrl);
+                    }
+                }
+            }
+            HubEvent::LuaWorktreeRequest(request) => {
+                use crate::git::WorktreeManager;
+                use crate::lua::primitives::{WorktreeCreateResult, WorktreeRequest};
+
+                match request {
+                    WorktreeRequest::Create {
+                        agent_key, branch, issue_number, prompt, profile_name,
+                        client_rows, client_cols,
+                    } => {
+                        log::info!(
+                            "[Lua] Dispatching async worktree.create({}) for agent {}",
+                            branch, agent_key
+                        );
+                        let worktree_base = self.config.worktree_base.clone();
+                        let result_tx = self.worktree_result_tx.clone();
+                        let branch_clone = branch.clone();
+                        let agent_key_clone = agent_key.clone();
+
+                        self.tokio_runtime.spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || {
+                                let manager = WorktreeManager::new(worktree_base);
+                                manager.create_worktree_with_branch(&branch_clone)
+                            }).await;
+
+                            let outcome = match result {
+                                Ok(Ok(path)) => Ok(path),
+                                Ok(Err(e)) => Err(e.to_string()),
+                                Err(e) => Err(format!("spawn_blocking panicked: {e}")),
+                            };
+
+                            let _ = result_tx.send(WorktreeCreateResult {
+                                agent_key: agent_key_clone,
+                                branch,
+                                result: outcome,
+                                issue_number,
+                                prompt,
+                                profile_name,
+                                client_rows,
+                                client_cols,
+                            });
+                        });
+                    }
+                    WorktreeRequest::Delete { path, branch } => {
+                        log::info!("[Lua] Processing worktree.delete({}, {})", path, branch);
+                        let manager = WorktreeManager::new(self.config.worktree_base.clone());
+                        if let Err(e) = manager.delete_worktree_by_path(
+                            std::path::Path::new(&path),
+                            &branch,
+                        ) {
+                            log::error!("[Lua] Failed to delete worktree: {e}");
+                        } else {
+                            if let Err(e) = self.load_available_worktrees() {
+                                log::warn!("Failed to refresh worktrees after deletion: {e}");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -184,7 +435,6 @@ impl Hub {
                 if let Err(e) = self.lua.call_tui_message(msg) {
                     log::error!("[TUI] Lua message handling error: {}", e);
                 }
-                self.flush_lua_queues();
             }
             TuiRequest::PtyInput {
                 agent_index,
@@ -333,21 +583,6 @@ impl Hub {
         self.poll_pty_observers();
     }
 
-    /// Flush all Lua-queued operations.
-    ///
-    /// Processes WebRTC sends, TUI sends, PTY requests, and Hub requests that Lua
-    /// callbacks may have queued. Called automatically in `tick()` to ensure all
-    /// queued operations are processed without requiring manual calls after each
-    /// Lua event.
-    pub(crate) fn flush_lua_queues(&mut self) {
-        self.process_lua_webrtc_sends();
-        self.process_lua_tui_sends();
-        self.process_lua_pty_requests();
-        self.process_lua_hub_requests();
-        self.process_lua_connection_requests();
-        self.process_lua_worktree_requests();
-        self.process_lua_action_cable_requests();
-    }
 
     /// Poll for Lua file changes and hot-reload modified modules.
     ///
@@ -550,7 +785,6 @@ impl Hub {
                     if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
                         log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
                     }
-                    self.flush_lua_queues();
                 }
             }
         }
@@ -758,222 +992,16 @@ impl Hub {
         self.call_lua_webrtc_message(browser_identity, msg);
     }
 
-    /// Call Lua WebRTC message handler and process any queued sends.
+    /// Call Lua WebRTC message handler.
     ///
-    /// Passes the decrypted message to Lua's on_message callback (if registered).
-    /// After the callback returns, drains any messages that Lua queued via
-    /// webrtc.send() and sends them to the appropriate peers, and also processes
-    /// any PTY requests that Lua queued.
+    /// Passes the decrypted message to Lua's `on_message` callback (if registered).
+    /// Any operations queued by the callback are sent directly via `HubEvent`.
     fn call_lua_webrtc_message(&mut self, browser_identity: &str, msg: serde_json::Value) {
         // Call Lua callback
         if let Err(e) = self.lua.call_webrtc_message(browser_identity, msg) {
             log::error!("[WebRTC-LUA] Lua callback error: {e}");
         }
 
-        // Process any sends, PTY requests, and Hub requests that Lua queued
-        self.process_lua_webrtc_sends();
-        self.process_lua_pty_requests();
-        self.process_lua_hub_requests();
-    }
-
-    /// Process WebRTC send requests queued by Lua callbacks.
-    ///
-    /// Drains the Lua send queue and sends each message to the target peer.
-    /// Called after any Lua callback that might queue messages.
-    fn process_lua_webrtc_sends(&mut self) {
-        use crate::lua::primitives::WebRtcSendRequest;
-
-        /// Send timeout to prevent SCTP congestion from blocking the tick loop.
-        const SEND_TIMEOUT: Duration = Duration::from_secs(2);
-
-        for send_req in self.lua.drain_webrtc_sends() {
-            match send_req {
-                WebRtcSendRequest::Json { peer_id, data } => {
-                    // For Lua sends, we send directly without subscription wrapping
-                    // since Lua handles its own message framing.
-                    if let Some(channel) = self.webrtc_channels.get(&peer_id) {
-                        let payload = match serde_json::to_vec(&data) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                log::warn!("[WebRTC] Lua send failed to serialize: {e}");
-                                continue;
-                            }
-                        };
-
-                        let peer = crate::channel::PeerId(peer_id.clone());
-                        match tokio::task::block_in_place(|| {
-                            self.tokio_runtime.block_on(
-                                tokio::time::timeout(SEND_TIMEOUT, channel.send_to(&payload, &peer))
-                            )
-                        }) {
-                            Ok(Err(e)) => log::warn!("[WebRTC] Lua send failed: {e}"),
-                            Err(_) => log::warn!("[WebRTC] Lua send timed out for {}", &peer_id[..peer_id.len().min(8)]),
-                            Ok(Ok(())) => {}
-                        }
-                    } else {
-                        log::debug!("[WebRTC] Lua send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
-                    }
-                }
-                WebRtcSendRequest::Binary { peer_id, data } => {
-                    if let Some(channel) = self.webrtc_channels.get(&peer_id) {
-                        let peer = crate::channel::PeerId(peer_id.clone());
-                        match tokio::task::block_in_place(|| {
-                            self.tokio_runtime.block_on(
-                                tokio::time::timeout(SEND_TIMEOUT, channel.send_to(&data, &peer))
-                            )
-                        }) {
-                            Ok(Err(e)) => log::warn!("[WebRTC] Lua binary send failed: {e}"),
-                            Err(_) => log::warn!("[WebRTC] Lua binary send timed out for {}", &peer_id[..peer_id.len().min(8)]),
-                            Ok(Ok(())) => {}
-                        }
-                    } else {
-                        log::debug!("[WebRTC] Lua binary send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Process PTY requests queued by Lua callbacks.
-    ///
-    /// Drains the Lua PTY request queue and processes each request.
-    /// Called after any Lua callback that might queue PTY operations.
-    fn process_lua_pty_requests(&mut self) {
-        use crate::lua::PtyRequest;
-
-        for request in self.lua.drain_pty_requests() {
-            match request {
-                PtyRequest::CreateForwarder(req) => {
-                    self.create_lua_pty_forwarder(req);
-                }
-                PtyRequest::CreateTuiForwarder(req) => {
-                    self.create_lua_tui_pty_forwarder(req);
-                }
-                PtyRequest::StopForwarder { forwarder_id } => {
-                    self.stop_lua_pty_forwarder(&forwarder_id);
-                }
-                PtyRequest::WritePty {
-                    agent_index,
-                    pty_index,
-                    data,
-                } => {
-                    if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
-                        if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
-                            if let Err(e) = pty_handle.write_input_direct(&data) {
-                                log::error!("[PTY-WRITE] Write failed: {e}");
-                            }
-                        } else {
-                            log::warn!("[PTY-WRITE] No PTY at index {} for agent {}", pty_index, agent_index);
-                        }
-                    } else {
-                        log::warn!("[PTY-WRITE] No agent at index {}", agent_index);
-                    }
-                }
-                PtyRequest::ResizePty {
-                    agent_index,
-                    pty_index,
-                    rows,
-                    cols,
-                } => {
-                    if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
-                        if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
-                            pty_handle.resize_direct(rows, cols);
-                        } else {
-                            log::debug!("[Lua] No PTY at index {} for agent {}", pty_index, agent_index);
-                        }
-                    } else {
-                        log::debug!("[Lua] No agent at index {}", agent_index);
-                    }
-                }
-                PtyRequest::SpawnNotificationWatcher {
-                    watcher_key,
-                    agent_key,
-                    session_name,
-                    event_tx,
-                } => {
-                    self.spawn_notification_watcher(
-                        watcher_key,
-                        agent_key,
-                        session_name,
-                        event_tx,
-                    );
-                }
-            }
-        }
-    }
-
-    /// Process Hub requests queued by Lua callbacks.
-    ///
-    /// Drains the Lua Hub request queue and processes each request.
-    /// Called after any Lua callback that might queue Hub-level operations.
-    fn process_lua_hub_requests(&mut self) {
-        use crate::lua::primitives::HubRequest;
-
-        // Track peers that already received a ratchet restart this batch
-        // to avoid burning multiple OTKs for the same decrypt failure storm.
-        let mut restarted_peers = std::collections::HashSet::<String>::new();
-
-        for request in self.lua.drain_hub_requests() {
-            match request {
-                HubRequest::Quit => {
-                    log::info!("[Lua] Processing quit request");
-                    self.quit = true;
-                }
-                HubRequest::HandleWebrtcOffer {
-                    browser_identity,
-                    sdp,
-                } => {
-                    log::info!(
-                        "[Lua] Processing WebRTC offer from {}",
-                        &browser_identity[..browser_identity.len().min(8)]
-                    );
-                    self.handle_webrtc_offer(&sdp, &browser_identity);
-                }
-                HubRequest::HandleIceCandidate {
-                    browser_identity,
-                    candidate,
-                } => {
-                    let candidate_str = candidate
-                        .get("candidate")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("");
-                    let sdp_mid = candidate.get("sdpMid").and_then(|m| m.as_str());
-                    let sdp_mline_index = candidate
-                        .get("sdpMLineIndex")
-                        .and_then(|i| i.as_u64())
-                        .map(|i| i as u16);
-
-                    if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
-                        if let Err(e) = tokio::task::block_in_place(|| {
-                            self.tokio_runtime.block_on(
-                                channel.handle_ice_candidate(candidate_str, sdp_mid, sdp_mline_index),
-                            )
-                        }) {
-                            log::warn!("[Lua] Failed to add ICE candidate: {e}");
-                        }
-                    } else {
-                        log::warn!(
-                            "[Lua] ICE candidate for unknown browser {}",
-                            &browser_identity[..browser_identity.len().min(8)]
-                        );
-                    }
-                }
-                HubRequest::RatchetRestart { browser_identity } => {
-                    // Deduplicate: only restart once per Olm key per batch.
-                    // Multiple queued signals from the same peer all fail decryption,
-                    // but we only need one fresh OTK per restart.
-                    let olm_key = crate::relay::extract_olm_key(&browser_identity).to_string();
-                    if !restarted_peers.contains(&olm_key) {
-                        log::warn!(
-                            "[Lua] Signaling decrypt failed for {}, initiating ratchet restart",
-                            &browser_identity[..browser_identity.len().min(8)]
-                        );
-                        self.send_ratchet_restart(&browser_identity);
-                        restarted_peers.insert(olm_key);
-                    }
-                }
-            }
-        }
     }
 
     /// Poll WebSocket connections for events and fire Lua callbacks.
@@ -982,31 +1010,181 @@ impl Hub {
     /// Production uses `HubEvent::WebSocketEvent` via `handle_hub_event()`.
     #[cfg(test)]
     fn poll_lua_websocket_events(&mut self) {
-        let count = self.lua.poll_websocket_events();
-        if count > 0 {
-            self.flush_lua_queues();
-        }
+        let _count = self.lua.poll_websocket_events();
     }
 
-    /// Process ActionCable requests queued by Lua callbacks.
+    /// Process a single ActionCable request from `HubEvent::LuaActionCableRequest`.
     ///
-    /// Delegates to the primitive's processing function which drains the
-    /// shared queue and handles connect/subscribe/perform/unsubscribe/close.
-    /// Passes the event channel sender so new subscriptions spawn forwarding
-    /// tasks in production mode.
-    fn process_lua_action_cable_requests(&mut self) {
-        use crate::lua::primitives::action_cable;
+    /// Handles connect/subscribe/perform/unsubscribe/close operations. When
+    /// subscribing, spawns a forwarding task that sends `HubEvent::AcChannelMessage`
+    /// for each received message.
+    fn process_single_action_cable_request(
+        &mut self,
+        request: crate::lua::primitives::ActionCableRequest,
+    ) {
+        use crate::lua::primitives::action_cable::{LuaAcChannel, LuaAcConnection};
+        use crate::lua::primitives::ActionCableRequest;
 
-        let handle = self.tokio_runtime.handle().clone();
-        action_cable::process_lua_action_cable_requests(
-            self.lua.action_cable_queue_ref(),
-            &mut self.lua_ac_connections,
-            &mut self.lua_ac_channels,
-            &self.config.server_url,
-            self.config.get_api_key(),
-            &handle,
-            Some(&self.hub_event_tx),
-        );
+        match request {
+            ActionCableRequest::Connect {
+                connection_id,
+                crypto,
+            } => {
+                let handle = self.tokio_runtime.handle().clone();
+                let _guard = handle.enter();
+                let connection = crate::hub::action_cable_connection::ActionCableConnection::connect(
+                    &self.config.server_url,
+                    self.config.get_api_key(),
+                );
+                self.lua_ac_connections.insert(
+                    connection_id.clone(),
+                    LuaAcConnection {
+                        connection,
+                        crypto_enabled: crypto,
+                    },
+                );
+                log::info!(
+                    "[ActionCable-Lua] Connection '{}' opened (crypto={})",
+                    connection_id,
+                    crypto
+                );
+            }
+
+            ActionCableRequest::Subscribe {
+                connection_id,
+                channel_id,
+                channel_name,
+                params,
+            } => {
+                if let Some(conn) = self.lua_ac_connections.get(&connection_id) {
+                    // Build the ActionCable identifier JSON with channel name and params
+                    let mut identifier = serde_json::json!({ "channel": channel_name });
+                    if let serde_json::Value::Object(map) = params {
+                        if let serde_json::Value::Object(ref mut id_map) = identifier {
+                            for (k, v) in map {
+                                id_map.insert(k, v);
+                            }
+                        }
+                    }
+
+                    let mut ch_handle = conn.connection.subscribe(identifier);
+
+                    // Spawn a forwarding task for incoming channel messages.
+                    let forwarder_handle = if let Some(mut rx) = ch_handle.take_message_rx() {
+                        let tx = self.hub_event_tx.clone();
+                        let ch_id = channel_id.clone();
+                        let handle = self.tokio_runtime.handle().clone();
+                        Some(handle.spawn(async move {
+                            while let Some(msg) = rx.recv().await {
+                                if tx.send(super::events::HubEvent::AcChannelMessage {
+                                    channel_id: ch_id.clone(),
+                                    message: msg,
+                                }).is_err() {
+                                    break;
+                                }
+                            }
+                        }))
+                    } else {
+                        None
+                    };
+
+                    self.lua_ac_channels.insert(
+                        channel_id.clone(),
+                        LuaAcChannel {
+                            handle: ch_handle,
+                            connection_id,
+                            forwarder_handle,
+                        },
+                    );
+                    log::info!(
+                        "[ActionCable-Lua] Channel '{}' subscribed to '{}'",
+                        channel_id,
+                        channel_name
+                    );
+                } else {
+                    log::warn!(
+                        "[ActionCable-Lua] Subscribe failed: connection '{}' not found",
+                        connection_id
+                    );
+                }
+            }
+
+            ActionCableRequest::Perform {
+                channel_id,
+                action,
+                data,
+            } => {
+                if let Some(ch) = self.lua_ac_channels.get(&channel_id) {
+                    ch.handle.perform(&action, data);
+                    log::trace!(
+                        "[ActionCable-Lua] Performed '{}' on channel '{}'",
+                        action,
+                        channel_id
+                    );
+                } else {
+                    log::warn!(
+                        "[ActionCable-Lua] Perform failed: channel '{}' not found",
+                        channel_id
+                    );
+                }
+            }
+
+            ActionCableRequest::Unsubscribe { channel_id } => {
+                if self.lua_ac_channels.remove(&channel_id).is_some() {
+                    // Clean up the callback registry entry and release the RegistryKey.
+                    if let Ok(mut reg) = self.lua.ac_callback_registry().lock() {
+                        if let Some(key) = reg.remove(&channel_id) {
+                            let _ = self.lua.lua_ref().remove_registry_value(key);
+                        }
+                    }
+                    log::info!(
+                        "[ActionCable-Lua] Channel '{}' unsubscribed",
+                        channel_id
+                    );
+                } else {
+                    log::warn!(
+                        "[ActionCable-Lua] Unsubscribe failed: channel '{}' not found",
+                        channel_id
+                    );
+                }
+            }
+
+            ActionCableRequest::Close { connection_id } => {
+                // Remove all channels belonging to this connection
+                let orphaned: Vec<String> = self.lua_ac_channels
+                    .iter()
+                    .filter(|(_, ch)| ch.connection_id == connection_id)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+
+                for ch_id in &orphaned {
+                    self.lua_ac_channels.remove(ch_id);
+                }
+
+                // Clean up callback registry entries for all removed channels.
+                if let Ok(mut reg) = self.lua.ac_callback_registry().lock() {
+                    for ch_id in &orphaned {
+                        if let Some(key) = reg.remove(ch_id) {
+                            let _ = self.lua.lua_ref().remove_registry_value(key);
+                        }
+                    }
+                }
+
+                if let Some(conn) = self.lua_ac_connections.remove(&connection_id) {
+                    conn.connection.shutdown();
+                    log::info!(
+                        "[ActionCable-Lua] Connection '{}' closed ({} channels removed)",
+                        connection_id,
+                        orphaned.len()
+                    );
+                } else {
+                    log::warn!(
+                        "[ActionCable-Lua] Close failed: connection '{}' not found",
+                        connection_id
+                    );
+                }
+            }
+        }
     }
 
     /// Poll Lua ActionCable channels for incoming messages and fire callbacks.
@@ -1018,129 +1196,13 @@ impl Hub {
         use crate::lua::primitives::action_cable;
 
         let crypto = self.browser.crypto_service.as_ref();
-        let count = action_cable::poll_lua_action_cable_channels(
+        let _count = action_cable::poll_lua_action_cable_channels(
             self.lua.lua_ref(),
             &mut self.lua_ac_channels,
             &self.lua_ac_connections,
+            self.lua.ac_callback_registry(),
             crypto,
         );
-        if count > 0 {
-            self.flush_lua_queues();
-        }
-    }
-
-    /// Process connection requests queued by Lua callbacks.
-    ///
-    /// Drains the Lua connection request queue and processes each request.
-    /// Called after any Lua callback that might queue connection operations.
-    fn process_lua_connection_requests(&mut self) {
-        use crate::lua::primitives::ConnectionRequest;
-
-        for request in self.lua.drain_connection_requests() {
-            match request {
-                ConnectionRequest::Generate => {
-                    log::debug!("[Lua] Processing connection.generate() request");
-                    match self.generate_connection_url() {
-                        Ok(ref url) => {
-                            if let Err(e) = self.lua.fire_connection_code_ready(url) {
-                                log::error!("Failed to fire connection_code_ready: {e}");
-                            }
-                        }
-                        Err(ref e) => {
-                            log::warn!("Connection URL generation failed: {e}");
-                            if let Err(fire_err) = self.lua.fire_connection_code_error(e) {
-                                log::error!("Failed to fire connection_code_error: {fire_err}");
-                            }
-                        }
-                    }
-                }
-                ConnectionRequest::Regenerate => {
-                    log::info!("[Lua] Processing connection.regenerate() request");
-                    actions::dispatch(self, HubAction::RegenerateConnectionCode);
-                }
-                ConnectionRequest::CopyToClipboard => {
-                    log::debug!("[Lua] Processing connection.copy_to_clipboard() request");
-                    actions::dispatch(self, HubAction::CopyConnectionUrl);
-                }
-            }
-        }
-    }
-
-    /// Process worktree requests queued by Lua callbacks.
-    ///
-    /// Drains the Lua worktree request queue and processes each request.
-    /// `Delete` requests run inline (fast). `Create` requests are dispatched
-    /// to a blocking threadpool via `tokio::task::spawn_blocking` so the Hub
-    /// event loop stays responsive. Results arrive via `poll_worktree_results()`.
-    fn process_lua_worktree_requests(&mut self) {
-        use crate::git::WorktreeManager;
-        use crate::lua::primitives::{WorktreeCreateResult, WorktreeRequest};
-
-        for request in self.lua.drain_worktree_requests() {
-            match request {
-                WorktreeRequest::Create {
-                    agent_key,
-                    branch,
-                    issue_number,
-                    prompt,
-                    profile_name,
-                    client_rows,
-                    client_cols,
-                } => {
-                    log::info!(
-                        "[Lua] Dispatching async worktree.create({}) for agent {}",
-                        branch,
-                        agent_key
-                    );
-                    let worktree_base = self.config.worktree_base.clone();
-                    let result_tx = self.worktree_result_tx.clone();
-                    let branch_clone = branch.clone();
-                    let agent_key_clone = agent_key.clone();
-
-                    self.tokio_runtime.spawn(async move {
-                        // Run git operations on a blocking thread to avoid
-                        // stalling the tokio runtime's async workers.
-                        let result = tokio::task::spawn_blocking(move || {
-                            let manager = WorktreeManager::new(worktree_base);
-                            manager.create_worktree_with_branch(&branch_clone)
-                        })
-                        .await;
-
-                        let outcome = match result {
-                            Ok(Ok(path)) => Ok(path),
-                            Ok(Err(e)) => Err(e.to_string()),
-                            Err(e) => Err(format!("spawn_blocking panicked: {e}")),
-                        };
-
-                        let _ = result_tx.send(WorktreeCreateResult {
-                            agent_key: agent_key_clone,
-                            branch,
-                            result: outcome,
-                            issue_number,
-                            prompt,
-                            profile_name,
-                            client_rows,
-                            client_cols,
-                        });
-                    });
-                }
-                WorktreeRequest::Delete { path, branch } => {
-                    log::info!("[Lua] Processing worktree.delete({}, {})", path, branch);
-                    let manager = WorktreeManager::new(self.config.worktree_base.clone());
-                    if let Err(e) = manager.delete_worktree_by_path(
-                        std::path::Path::new(&path),
-                        &branch,
-                    ) {
-                        log::error!("[Lua] Failed to delete worktree: {e}");
-                    } else {
-                        // Refresh worktrees after deletion
-                        if let Err(e) = self.load_available_worktrees() {
-                            log::warn!("Failed to refresh worktrees after deletion: {e}");
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// Poll for completed async worktree creation results.
@@ -1859,7 +1921,7 @@ impl Hub {
         };
 
         // Drain into Vec to release the mutable borrow on self before
-        // calling lua.call_tui_message() and flush_lua_queues().
+        // calling lua.call_tui_message().
         let requests: Vec<TuiRequest> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
 
         for request in requests {
@@ -1868,7 +1930,6 @@ impl Hub {
                     if let Err(e) = self.lua.call_tui_message(msg) {
                         log::error!("[TUI] Lua message handling error: {}", e);
                     }
-                    self.flush_lua_queues();
                 }
                 TuiRequest::PtyInput {
                     agent_index,
@@ -1892,46 +1953,6 @@ impl Hub {
                     }
                 }
             }
-        }
-    }
-
-    /// Process TUI send requests queued by Lua callbacks.
-    ///
-    /// Drains JSON and binary messages queued by `tui.send()` in Lua.
-    /// JSON messages carry agent lifecycle events (`agent_created`,
-    /// `agent_deleted`, `worktree_list`, etc.) and are forwarded as
-    /// `TuiOutput::Message`. Binary messages are forwarded as
-    /// `TuiOutput::Output` (raw terminal data).
-    fn process_lua_tui_sends(&mut self) {
-        use crate::client::TuiOutput;
-        use crate::lua::primitives::TuiSendRequest;
-
-        let Some(ref tx) = self.tui_output_tx else {
-            // No TUI connected, drain and discard
-            let _ = self.lua.drain_tui_sends();
-            return;
-        };
-
-        let mut sent_any = false;
-        for send_req in self.lua.drain_tui_sends() {
-            match send_req {
-                TuiSendRequest::Json { data } => {
-                    let _ = tx.send(TuiOutput::Message(data));
-                    sent_any = true;
-                }
-                TuiSendRequest::Binary { data } => {
-                    // Binary data = raw terminal output, forward to active parser
-                    let _ = tx.send(TuiOutput::Output {
-                        agent_index: None,
-                        pty_index: None,
-                        data,
-                    });
-                    sent_any = true;
-                }
-            }
-        }
-        if sent_any {
-            self.wake_tui();
         }
     }
 

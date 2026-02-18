@@ -4,13 +4,13 @@
 //! inspect worktrees, register/unregister agents, request lifecycle operations,
 //! and initiate WebRTC signaling.
 //!
-//! # Design Principle: "Query freely. Mutate via queue."
+//! # Design Principle: "Query freely. Mutate via event."
 //!
 //! - **State queries** (`get_worktrees`, `server_id`, `detect_repo`)
 //!   read directly from shared state or environment
 //! - **Registration** (`register_agent`, `unregister_agent`) manages PTY handles
 //! - **Operations** (`quit`, `handle_webrtc_offer`, `handle_ice_candidate`)
-//!   queue requests for Hub to process asynchronously
+//!   send events to the Hub event loop via `HubEventSender`
 //!
 //! # Usage in Lua
 //!
@@ -40,6 +40,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
 
+use super::HubEventSender;
+use crate::hub::events::HubEvent;
 use crate::hub::handle_cache::HandleCache;
 use crate::hub::state::HubState;
 
@@ -71,17 +73,8 @@ pub enum HubRequest {
     },
 }
 
-/// Shared request queue for Hub operations from Lua.
-pub type HubRequestQueue = Arc<Mutex<Vec<HubRequest>>>;
-
 /// Server-assigned hub ID, shared between Hub and Lua primitives.
 pub type SharedServerId = Arc<Mutex<Option<String>>>;
-
-/// Create a new Hub request queue.
-#[must_use]
-pub fn new_request_queue() -> HubRequestQueue {
-    Arc::new(Mutex::new(Vec::new()))
-}
 
 /// Register Hub state primitives with the Lua state.
 ///
@@ -92,14 +85,14 @@ pub fn new_request_queue() -> HubRequestQueue {
 /// - `hub.server_id()` - Get server-assigned hub ID
 /// - `hub.detect_repo()` - Detect current repo name
 /// - `hub.api_token()` - Get hub's API bearer token for authenticated requests
-/// - `hub.handle_webrtc_offer(browser_identity, sdp)` - Queue WebRTC offer
-/// - `hub.handle_ice_candidate(browser_identity, candidate)` - Queue ICE candidate
+/// - `hub.handle_webrtc_offer(browser_identity, sdp)` - Send WebRTC offer event
+/// - `hub.handle_ice_candidate(browser_identity, candidate)` - Send ICE candidate event
 /// - `hub.quit()` - Request Hub shutdown
 ///
 /// # Arguments
 ///
 /// * `lua` - The Lua state to register primitives in
-/// * `request_queue` - Shared queue for Hub operations (processed by Hub)
+/// * `hub_event_tx` - Shared sender for Hub events (processed by Hub event loop)
 /// * `handle_cache` - Thread-safe cache of agent handles for queries
 /// * `server_id` - Server-assigned hub ID (set after registration)
 /// * `shared_state` - Shared hub state for agent queries
@@ -107,9 +100,9 @@ pub fn new_request_queue() -> HubRequestQueue {
 /// # Errors
 ///
 /// Returns an error if Lua table or function creation fails.
-pub fn register(
+pub(crate) fn register(
     lua: &Lua,
-    request_queue: HubRequestQueue,
+    hub_event_tx: HubEventSender,
     handle_cache: Arc<HandleCache>,
     server_id: SharedServerId,
     _shared_state: Arc<RwLock<HubState>>,
@@ -278,15 +271,19 @@ pub fn register(
     hub.set("api_token", api_token_fn)
         .map_err(|e| anyhow!("Failed to set hub.api_token: {e}"))?;
 
-    // hub.handle_webrtc_offer(browser_identity, sdp) - Queue a WebRTC SDP offer for processing.
-    let queue_offer = Arc::clone(&request_queue);
+    // hub.handle_webrtc_offer(browser_identity, sdp) - Send a WebRTC SDP offer event.
+    let tx = hub_event_tx.clone();
     let handle_webrtc_offer_fn = lua
         .create_function(move |_, (browser_identity, sdp): (String, String)| {
-            let mut q = queue_offer.lock().expect("Hub request queue mutex poisoned");
-            q.push(HubRequest::HandleWebrtcOffer {
-                browser_identity,
-                sdp,
-            });
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::HandleWebrtcOffer {
+                    browser_identity,
+                    sdp,
+                }));
+            } else {
+                ::log::warn!("[Hub] handle_webrtc_offer called before hub_event_tx set — event dropped");
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create hub.handle_webrtc_offer function: {e}"))?;
@@ -294,19 +291,23 @@ pub fn register(
     hub.set("handle_webrtc_offer", handle_webrtc_offer_fn)
         .map_err(|e| anyhow!("Failed to set hub.handle_webrtc_offer: {e}"))?;
 
-    // hub.handle_ice_candidate(browser_identity, candidate_data) - Queue an ICE candidate.
+    // hub.handle_ice_candidate(browser_identity, candidate_data) - Send an ICE candidate event.
     //
     // `candidate_data` is a Lua table with `candidate`, `sdpMid`, and `sdpMLineIndex` fields,
     // matching the JSON structure from browser WebRTC signaling.
-    let queue_ice = Arc::clone(&request_queue);
+    let tx = hub_event_tx.clone();
     let handle_ice_candidate_fn = lua
         .create_function(move |lua, (browser_identity, candidate_data): (String, LuaValue)| {
             let candidate: serde_json::Value = lua.from_value(candidate_data)?;
-            let mut q = queue_ice.lock().expect("Hub request queue mutex poisoned");
-            q.push(HubRequest::HandleIceCandidate {
-                browser_identity,
-                candidate,
-            });
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::HandleIceCandidate {
+                    browser_identity,
+                    candidate,
+                }));
+            } else {
+                ::log::warn!("[Hub] handle_ice_candidate called before hub_event_tx set — event dropped");
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create hub.handle_ice_candidate function: {e}"))?;
@@ -315,13 +316,17 @@ pub fn register(
         .map_err(|e| anyhow!("Failed to set hub.handle_ice_candidate: {e}"))?;
 
     // hub.request_ratchet_restart(browser_identity) - Initiate Olm ratchet restart for a peer.
-    let queue_restart = Arc::clone(&request_queue);
+    let tx = hub_event_tx.clone();
     let request_ratchet_restart_fn = lua
         .create_function(move |_, browser_identity: String| {
-            let mut q = queue_restart
-                .lock()
-                .expect("Hub request queue mutex poisoned");
-            q.push(HubRequest::RatchetRestart { browser_identity });
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::RatchetRestart {
+                    browser_identity,
+                }));
+            } else {
+                ::log::warn!("[Hub] request_ratchet_restart called before hub_event_tx set — event dropped");
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create hub.request_ratchet_restart function: {e}"))?;
@@ -330,12 +335,15 @@ pub fn register(
         .map_err(|e| anyhow!("Failed to set hub.request_ratchet_restart: {e}"))?;
 
     // hub.quit() - Request Hub shutdown
-    let queue3 = request_queue;
+    let tx = hub_event_tx;
     let quit_fn = lua
         .create_function(move |_, ()| {
-            let mut q = queue3.lock()
-                .expect("Hub request queue mutex poisoned");
-            q.push(HubRequest::Quit);
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::Quit));
+            } else {
+                ::log::warn!("[Hub] quit() called before hub_event_tx set — event dropped");
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create hub.quit function: {e}"))?;
@@ -354,9 +362,10 @@ pub fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::new_hub_event_sender;
 
     fn create_test_deps() -> (
-        HubRequestQueue,
+        HubEventSender,
         Arc<HandleCache>,
         SharedServerId,
         Arc<RwLock<HubState>>,
@@ -365,7 +374,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/test-worktrees"),
         )));
         (
-            new_request_queue(),
+            new_hub_event_sender(),
             Arc::new(HandleCache::new()),
             Arc::new(Mutex::new(Some("test-hub-id".to_string()))),
             state,
@@ -375,9 +384,9 @@ mod tests {
     #[test]
     fn test_register_creates_hub_table() {
         let lua = Lua::new();
-        let (queue, cache, sid, state) = create_test_deps();
+        let (tx, cache, sid, state) = create_test_deps();
 
-        register(&lua, queue, cache, sid, state).expect("Should register hub primitives");
+        register(&lua, tx, cache, sid, state).expect("Should register hub primitives");
 
         let hub: LuaTable = lua.globals().get("hub").expect("hub table should exist");
         assert!(hub.contains_key("get_worktrees").unwrap());
@@ -393,9 +402,9 @@ mod tests {
     #[test]
     fn test_get_worktrees_returns_empty_array() {
         let lua = Lua::new();
-        let (queue, cache, sid, state) = create_test_deps();
+        let (tx, cache, sid, state) = create_test_deps();
 
-        register(&lua, queue, cache, sid, state).expect("Should register");
+        register(&lua, tx, cache, sid, state).expect("Should register");
 
         let worktrees: LuaTable = lua.load("return hub.get_worktrees()").eval().unwrap();
         assert_eq!(worktrees.len().unwrap(), 0);
@@ -405,35 +414,38 @@ mod tests {
     #[test]
     fn test_get_worktrees_empty_returns_table() {
         let lua = Lua::new();
-        let (queue, cache, sid, state) = create_test_deps();
+        let (tx, cache, sid, state) = create_test_deps();
 
-        register(&lua, queue, cache, sid, state).expect("Should register");
+        register(&lua, tx, cache, sid, state).expect("Should register");
 
         let worktrees: LuaTable = lua.load("return hub.get_worktrees()").eval().unwrap();
         assert_eq!(worktrees.len().unwrap(), 0, "Empty worktrees should have length 0");
     }
 
     #[test]
-    fn test_quit_queues_request() {
+    fn test_quit_sends_event() {
         let lua = Lua::new();
-        let (queue, cache, sid, state) = create_test_deps();
+        let (tx, cache, sid, state) = create_test_deps();
 
-        register(&lua, Arc::clone(&queue), cache, sid, state).expect("Should register");
+        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
 
-        lua.load("hub.quit()").exec().expect("Should queue quit");
+        register(&lua, tx, cache, sid, state).expect("Should register");
 
-        let requests = queue.lock()
-            .expect("Hub request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-        assert!(matches!(requests[0], HubRequest::Quit));
+        lua.load("hub.quit()").exec().expect("Should send quit event");
+
+        match rx.try_recv() {
+            Ok(HubEvent::LuaHubRequest(HubRequest::Quit)) => {}
+            other => panic!("Expected LuaHubRequest(Quit), got: {other:?}"),
+        }
     }
 
     #[test]
     fn test_server_id_returns_value() {
         let lua = Lua::new();
-        let (queue, cache, sid, state) = create_test_deps();
+        let (tx, cache, sid, state) = create_test_deps();
 
-        register(&lua, queue, cache, sid, state).expect("Should register");
+        register(&lua, tx, cache, sid, state).expect("Should register");
 
         let id: String = lua.load("return hub.server_id()").eval().unwrap();
         assert_eq!(id, "test-hub-id");
@@ -442,60 +454,62 @@ mod tests {
     #[test]
     fn test_server_id_returns_nil_when_unset() {
         let lua = Lua::new();
-        let (queue, cache, _sid, state) = create_test_deps();
+        let (tx, cache, _sid, state) = create_test_deps();
         let nil_sid: SharedServerId = Arc::new(Mutex::new(None));
 
-        register(&lua, queue, cache, nil_sid, state).expect("Should register");
+        register(&lua, tx, cache, nil_sid, state).expect("Should register");
 
         let id: LuaValue = lua.load("return hub.server_id()").eval().unwrap();
         assert!(id.is_nil());
     }
 
     #[test]
-    fn test_handle_webrtc_offer_queues_request() {
+    fn test_handle_webrtc_offer_sends_event() {
         let lua = Lua::new();
-        let (queue, cache, sid, state) = create_test_deps();
+        let (tx, cache, sid, state) = create_test_deps();
 
-        register(&lua, Arc::clone(&queue), cache, sid, state).expect("Should register");
+        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+
+        register(&lua, tx, cache, sid, state).expect("Should register");
 
         lua.load(r#"hub.handle_webrtc_offer("browser-123", "v=0 test-sdp")"#)
             .exec()
-            .expect("Should queue offer");
+            .expect("Should send offer event");
 
-        let requests = queue.lock().expect("Hub request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-        match &requests[0] {
-            HubRequest::HandleWebrtcOffer {
+        match rx.try_recv() {
+            Ok(HubEvent::LuaHubRequest(HubRequest::HandleWebrtcOffer {
                 browser_identity,
                 sdp,
-            } => {
+            })) => {
                 assert_eq!(browser_identity, "browser-123");
                 assert_eq!(sdp, "v=0 test-sdp");
             }
-            other => panic!("Expected HandleWebrtcOffer, got: {other:?}"),
+            other => panic!("Expected LuaHubRequest(HandleWebrtcOffer), got: {other:?}"),
         }
     }
 
     #[test]
-    fn test_handle_ice_candidate_queues_request() {
+    fn test_handle_ice_candidate_sends_event() {
         let lua = Lua::new();
-        let (queue, cache, sid, state) = create_test_deps();
+        let (tx, cache, sid, state) = create_test_deps();
 
-        register(&lua, Arc::clone(&queue), cache, sid, state).expect("Should register");
+        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+
+        register(&lua, tx, cache, sid, state).expect("Should register");
 
         lua.load(
             r#"hub.handle_ice_candidate("browser-456", {candidate = "candidate:...", sdpMid = "0"})"#,
         )
         .exec()
-        .expect("Should queue ICE candidate");
+        .expect("Should send ICE candidate event");
 
-        let requests = queue.lock().expect("Hub request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-        match &requests[0] {
-            HubRequest::HandleIceCandidate {
+        match rx.try_recv() {
+            Ok(HubEvent::LuaHubRequest(HubRequest::HandleIceCandidate {
                 browser_identity,
                 candidate,
-            } => {
+            })) => {
                 assert_eq!(browser_identity, "browser-456");
                 assert_eq!(
                     candidate.get("candidate").and_then(|v| v.as_str()),
@@ -506,7 +520,7 @@ mod tests {
                     Some("0")
                 );
             }
-            other => panic!("Expected HandleIceCandidate, got: {other:?}"),
+            other => panic!("Expected LuaHubRequest(HandleIceCandidate), got: {other:?}"),
         }
     }
 
@@ -516,12 +530,12 @@ mod tests {
     #[test]
     fn test_get_worktrees_null_field_is_nil_not_userdata() {
         let lua = Lua::new();
-        let (queue, cache, sid, state) = create_test_deps();
+        let (tx, cache, sid, state) = create_test_deps();
 
         // Inject a worktree so get_worktrees returns data
         cache.set_worktrees(vec![("/tmp/wt".to_string(), "main".to_string())]);
 
-        register(&lua, queue, cache, sid, state).expect("Should register");
+        register(&lua, tx, cache, sid, state).expect("Should register");
 
         // get_worktrees returns array of {path, branch} - both strings, no nulls.
         // But the conversion path must use json_to_lua for safety.

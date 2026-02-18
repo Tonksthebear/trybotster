@@ -39,7 +39,7 @@ export const TransportState = {
 }
 
 // Connection mode (P2P vs relayed)
-export const ConnectionMode = {
+const ConnectionMode = {
   UNKNOWN: "unknown",     // Not yet determined
   DIRECT: "direct",       // P2P (host, srflx, prflx candidates)
   RELAYED: "relayed",     // Through TURN server
@@ -97,14 +97,6 @@ class WebRTCTransport {
     // Clean up connections on actual page unload only.
     // Turbo navigation preserves connections - they're cleaned up via grace periods
     // when controllers release them.
-    // When tab becomes visible after backgrounding, check for stale connections.
-    // Browsers throttle timers and may not fire ICE/connection state handlers
-    // while backgrounded, so connections can die silently.
-    document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState !== "visible") return
-      this.#probeStaleConnections()
-    })
-
     window.addEventListener("beforeunload", () => {
       // Cancel all grace timers and close immediately
       for (const timer of this.#graceTimers.values()) {
@@ -195,6 +187,9 @@ class WebRTCTransport {
       iceRestartTimer: null,
       iceDisrupted: false,
       decryptFailures: 0,
+      // Start true — ActionCable buffers messages until confirmed.
+      // Set false by disconnected callback, true again by connected.
+      signalingConnected: true,
     }
     this.#connections.set(hubId, newConn)
 
@@ -214,9 +209,17 @@ class WebRTCTransport {
     if (!conn) throw new Error(`No signaling connection for hub ${hubId}`)
 
     if (conn.pc) {
-      // Dead peer — clean up so we can create a fresh one
-      if (conn.pc.connectionState === "closed" || conn.pc.connectionState === "failed") {
+      const pcState = conn.pc.connectionState
+      const dcState = conn.dataChannel?.readyState
+      // Dead peer — tear down so we can create a fresh one.
+      // PC terminal states are obvious. But also: if the DataChannel
+      // is dead, the peer is useless even if PC state hasn't caught up
+      // (iOS sleep: PC reports "connected" but DC is already closed).
+      const dead = pcState === "closed" || pcState === "failed" || pcState === "disconnected" ||
+                   dcState !== "open"
+      if (dead) {
         this.#teardownPeer(conn)
+        this.#emit("connection:state", { hubId, state: "disconnected" })
       } else {
         return { state: conn.state }
       }
@@ -239,6 +242,7 @@ class WebRTCTransport {
   async #doConnectPeer(hubId, conn) {
     const subscription = this.#cableSubscriptions.get(hubId)
     if (!subscription) throw new Error(`No signaling subscription for hub ${hubId}`)
+    if (!conn.signalingConnected) throw new Error(`Signaling not connected for hub ${hubId}`)
 
     console.debug(`[WebRTCTransport] Creating peer connection for hub ${hubId}`)
 
@@ -298,6 +302,8 @@ class WebRTCTransport {
         this.#detectConnectionMode(hubId, conn).then(mode => {
           this.#emit("connection:state", { hubId, state: "connected", mode })
           this.#emit("connection:mode", { hubId, mode })
+        }).catch(() => {
+          this.#emit("connection:state", { hubId, state: "connected", mode: "unknown" })
         })
       } else if (state === "closed") {
         // Only clean up peer on explicit close — don't remove signaling
@@ -326,6 +332,31 @@ class WebRTCTransport {
     subscription.perform("signal", { envelope })
 
     return { state: TransportState.CONNECTING }
+  }
+
+  /**
+   * Probe WebRTC peer health for a specific hub.
+   * If the peer is dead (PC failed/closed/disconnected, or DC not open),
+   * cleans it up and emits connection:state disconnected.
+   * @returns {{ alive: boolean, pcState: string, dcState: string }}
+   */
+  probePeerHealth(hubId) {
+    const conn = this.#connections.get(hubId)
+    if (!conn?.pc) return { alive: false, pcState: "none", dcState: "none" }
+
+    const pcState = conn.pc.connectionState
+    const dcState = conn.dataChannel?.readyState || "none"
+
+    const dead = pcState === "failed" || pcState === "closed" || pcState === "disconnected" ||
+                 dcState !== "open"
+
+    if (dead) {
+      console.debug(`[WebRTCTransport] Probe: peer dead for hub ${hubId} (pc=${pcState}, dc=${dcState}), cleaning up`)
+      conn.iceRestartAttempts = 0
+      this.#cleanupPeer(hubId, conn)
+    }
+
+    return { alive: !dead, pcState, dcState }
   }
 
   /**
@@ -373,36 +404,6 @@ class WebRTCTransport {
       console.debug(`[WebRTCTransport] Cancelled grace period for hub ${hubId} (reacquired)`)
       clearTimeout(timer)
       this.#graceTimers.delete(hubId)
-    }
-  }
-
-  /**
-   * Check all connections for stale peers after tab becomes visible.
-   * Cleans up dead peers and emits disconnected so the connection layer
-   * can re-initiate via #ensureConnected().
-   */
-  #probeStaleConnections() {
-    for (const [hubId, conn] of this.#connections) {
-      if (!conn.pc) continue // signaling-only, nothing to probe
-
-      const pcState = conn.pc.connectionState
-      const dcState = conn.dataChannel?.readyState
-
-      // Peer is clearly dead
-      if (pcState === "failed" || pcState === "closed" || pcState === "disconnected") {
-        console.debug(`[WebRTCTransport] Stale peer detected for hub ${hubId} (pc=${pcState}), cleaning up`)
-        conn.iceRestartAttempts = 0 // reset so reconnect gets fresh attempts
-        this.#cleanupPeer(hubId, conn)
-        continue
-      }
-
-      // PC reports connected but DataChannel is gone (browser killed it while backgrounded)
-      if (pcState === "connected" && dcState !== "open") {
-        console.debug(`[WebRTCTransport] DataChannel stale for hub ${hubId} (dc=${dcState}), cleaning up peer`)
-        conn.iceRestartAttempts = 0
-        this.#cleanupPeer(hubId, conn)
-        continue
-      }
     }
   }
 
@@ -796,15 +797,6 @@ class WebRTCTransport {
     this.#emit("connection:state", { hubId, state: "disconnected" })
   }
 
-  /**
-   * Clean up everything (peer + signaling) and remove from connections map.
-   */
-  #cleanupConnection(hubId, conn) {
-    this.#teardownPeer(conn)
-    this.#emit("connection:state", { hubId, state: "disconnected" })
-    this.#connections.delete(hubId)
-  }
-
   #emit(eventName, data) {
     const listeners = this.#eventListeners.get(eventName)
     if (listeners) {
@@ -879,9 +871,15 @@ class WebRTCTransport {
         },
         connected: () => {
           console.debug(`[WebRTCTransport] Signaling channel connected for hub ${hubId}`)
+          const conn = this.#connections.get(hubId)
+          if (conn) conn.signalingConnected = true
+          this.#emit("signaling:state", { hubId, state: "connected" })
         },
         disconnected: () => {
           console.debug(`[WebRTCTransport] Signaling channel disconnected for hub ${hubId}`)
+          const conn = this.#connections.get(hubId)
+          if (conn) conn.signalingConnected = false
+          this.#emit("signaling:state", { hubId, state: "disconnected" })
         },
         rejected: () => {
           console.error(`[WebRTCTransport] Signaling channel REJECTED for hub ${hubId} (auth or hub not found)`)

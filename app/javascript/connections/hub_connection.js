@@ -219,6 +219,10 @@ export class HubConnection extends Connection {
     return this.fsRequest("fs:rmdir", { path, scope });
   }
 
+  renameFile(fromPath, toPath, scope) {
+    return this.fsRequest("fs:rename", { from_path: fromPath, to_path: toPath, scope });
+  }
+
   // ========== Template API ==========
 
   /**

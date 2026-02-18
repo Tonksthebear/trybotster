@@ -1,10 +1,10 @@
 //! ActionCable Lua primitives for managing WebSocket connections.
 //!
-//! Exposes ActionCable connection management to Lua scripts via a request
-//! queue pattern. Lua enqueues requests (connect, subscribe, perform, close)
-//! which the Hub processes via `flush_lua_queues()`. In production, a
-//! forwarding task per channel sends `HubEvent::AcChannelMessage` events
-//! to the Hub event loop for instant callback dispatch.
+//! Exposes ActionCable connection management to Lua scripts via the event-driven
+//! `HubEvent` channel. Lua closures send `HubEvent::LuaActionCableRequest`
+//! directly to the Hub event loop, which processes connect/subscribe/perform/
+//! unsubscribe/close operations. Incoming channel messages arrive via
+//! `HubEvent::AcChannelMessage` from per-channel forwarding tasks.
 //!
 //! # Architecture
 //!
@@ -12,20 +12,20 @@
 //! Lua script                    Hub event loop
 //!     │                              │
 //!     │ action_cable.connect()       │
-//!     │ ───────────────────────►     │ process_lua_action_cable_requests()
+//!     │ ──── HubEvent ──────────►    │ process_single_action_cable_request()
 //!     │                              │   → creates ActionCableConnection
 //!     │ action_cable.subscribe()     │
-//!     │ ───────────────────────►     │   → spawns forwarding task
+//!     │ ──── HubEvent ──────────►    │   → spawns forwarding task
 //!     │                              │
 //!     │ action_cable.perform()       │
-//!     │ ───────────────────────►     │   → calls handle.perform()
+//!     │ ──── HubEvent ──────────►    │   → calls handle.perform()
 //!     │                              │
 //!     │                              │ HubEvent::AcChannelMessage
 //!     │   ◄──────────────────────    │   → fire_single_ac_message()
 //!     │   callback(message)          │   → auto-decrypts if crypto=true
 //!     │                              │
 //!     │ action_cable.close()         │
-//!     │ ───────────────────────►     │   → shuts down connection
+//!     │ ──── HubEvent ──────────►    │   → shuts down connection
 //! ```
 //!
 //! # Crypto
@@ -62,17 +62,39 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 
+use super::HubEventSender;
 use crate::hub::action_cable_connection::{ActionCableConnection, ChannelHandle};
+use crate::hub::events::HubEvent;
 use crate::relay::{CryptoService, OlmEnvelope};
 
 // =============================================================================
-// Request queue types (Lua -> Hub)
+// Callback registry (Lua-thread-pinned, shared with Hub)
+// =============================================================================
+
+/// Thread-safe registry mapping channel IDs to Lua callback keys.
+///
+/// Callbacks are stored here at subscribe time (in the Lua closure) and
+/// looked up by channel ID when messages arrive. This follows the same
+/// pattern as HTTP, Timer, WebSocket, and Watch registries — the `RegistryKey`
+/// stays pinned to the Lua thread while only `Send`-safe string IDs cross
+/// the `HubEvent` channel.
+pub type ActionCableCallbackRegistry = Arc<Mutex<HashMap<String, mlua::RegistryKey>>>;
+
+/// Create a new empty callback registry.
+#[must_use]
+pub fn new_callback_registry() -> ActionCableCallbackRegistry {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+// =============================================================================
+// Request types (Lua -> Hub via HubEvent channel)
 // =============================================================================
 
 /// Request from Lua to the Hub for ActionCable operations.
 ///
-/// Enqueued by Lua primitive functions, drained by the Hub tick loop
-/// via [`process_lua_action_cable_requests`].
+/// Sent directly via `HubEvent::LuaActionCableRequest` from Lua closures
+/// to the Hub event loop. All variants are `Send`-safe — callback keys are
+/// stored separately in [`ActionCableCallbackRegistry`].
 #[derive(Debug)]
 pub enum ActionCableRequest {
     /// Open a new ActionCable WebSocket connection.
@@ -83,6 +105,10 @@ pub enum ActionCableRequest {
         crypto: bool,
     },
     /// Subscribe to a channel on an existing connection.
+    ///
+    /// The callback for this channel is stored in the
+    /// [`ActionCableCallbackRegistry`] at subscribe time (keyed by
+    /// `channel_id`), not carried in this request.
     Subscribe {
         /// Connection to subscribe on.
         connection_id: String,
@@ -92,8 +118,6 @@ pub enum ActionCableRequest {
         channel_name: String,
         /// Subscription parameters merged into the identifier JSON.
         params: serde_json::Value,
-        /// Lua registry key for the message callback function.
-        callback_key: mlua::RegistryKey,
     },
     /// Perform an action on a subscribed channel.
     Perform {
@@ -116,14 +140,6 @@ pub enum ActionCableRequest {
     },
 }
 
-/// Thread-safe queue for ActionCable requests from Lua.
-pub type ActionCableRequestQueue = Arc<Mutex<Vec<ActionCableRequest>>>;
-
-/// Create a new ActionCable request queue.
-#[must_use]
-pub fn new_request_queue() -> ActionCableRequestQueue {
-    Arc::new(Mutex::new(Vec::new()))
-}
 
 // =============================================================================
 // Hub-owned state
@@ -140,14 +156,13 @@ pub struct LuaAcConnection {
     pub crypto_enabled: bool,
 }
 
-/// A Lua-managed channel subscription with its callback.
+/// A Lua-managed channel subscription.
 ///
-/// Owned by the Hub, keyed by channel_id in a `HashMap`.
+/// Owned by the Hub, keyed by channel_id in a `HashMap`. The Lua callback
+/// for this channel is stored in the [`ActionCableCallbackRegistry`], not here.
 pub struct LuaAcChannel {
     /// The channel handle for receiving messages and performing actions.
     pub handle: ChannelHandle,
-    /// Lua registry key for the message callback function.
-    pub callback_key: mlua::RegistryKey,
     /// The connection this channel belongs to (for crypto lookup).
     pub connection_id: String,
     /// Handle for the forwarding task that reads from `message_rx` and sends
@@ -174,196 +189,6 @@ impl Drop for LuaAcChannel {
     }
 }
 
-// =============================================================================
-// Processing functions (called by Hub in tick loop)
-// =============================================================================
-
-/// Process queued ActionCable requests from Lua.
-///
-/// Drains the request queue and executes each request:
-/// - `Connect`: creates a new `ActionCableConnection` via tokio runtime
-/// - `Subscribe`: subscribes to a channel on an existing connection
-/// - `Perform`: sends an action on a subscribed channel
-/// - `Unsubscribe`: drops a channel handle (aborts forwarder via `Drop`)
-/// - `Close`: shuts down a connection and removes all its channels
-///
-/// When `hub_event_tx` is `Some` (production), newly subscribed channels
-/// have their `message_rx` taken and a forwarding task spawned that sends
-/// [`HubEvent::AcChannelMessage`] for each received message. When `None`
-/// (tests), channels use poll-based `try_recv()`.
-///
-/// # Arguments
-///
-/// * `requests` - The request queue to drain
-/// * `connections` - Hub-owned map of active connections
-/// * `channels` - Hub-owned map of active channel subscriptions
-/// * `server_url` - Server URL for new connections
-/// * `api_key` - API key for authentication
-/// * `tokio_runtime` - Tokio runtime handle for spawning async connection tasks
-/// * `hub_event_tx` - Event channel sender for spawning forwarding tasks
-pub(crate) fn process_lua_action_cable_requests(
-    requests: &ActionCableRequestQueue,
-    connections: &mut HashMap<String, LuaAcConnection>,
-    channels: &mut HashMap<String, LuaAcChannel>,
-    server_url: &str,
-    api_key: &str,
-    tokio_runtime: &tokio::runtime::Handle,
-    hub_event_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
-) {
-    let reqs: Vec<ActionCableRequest> = {
-        let mut queue = requests.lock().expect("ActionCable request queue mutex poisoned");
-        queue.drain(..).collect()
-    };
-
-    for req in reqs {
-        match req {
-            ActionCableRequest::Connect {
-                connection_id,
-                crypto,
-            } => {
-                let _guard = tokio_runtime.enter();
-                let connection = ActionCableConnection::connect(server_url, api_key);
-                connections.insert(
-                    connection_id.clone(),
-                    LuaAcConnection {
-                        connection,
-                        crypto_enabled: crypto,
-                    },
-                );
-                log::info!(
-                    "[ActionCable-Lua] Connection '{}' opened (crypto={})",
-                    connection_id,
-                    crypto
-                );
-            }
-
-            ActionCableRequest::Subscribe {
-                connection_id,
-                channel_id,
-                channel_name,
-                params,
-                callback_key,
-            } => {
-                if let Some(conn) = connections.get(&connection_id) {
-                    // Build the ActionCable identifier JSON with channel name and params
-                    let mut identifier = serde_json::json!({ "channel": channel_name });
-                    if let serde_json::Value::Object(map) = params {
-                        if let serde_json::Value::Object(ref mut id_map) = identifier {
-                            for (k, v) in map {
-                                id_map.insert(k, v);
-                            }
-                        }
-                    }
-
-                    let mut handle = conn.connection.subscribe(identifier);
-
-                    // Spawn a forwarding task if the event channel is available.
-                    let forwarder_handle = if let Some(tx) = hub_event_tx {
-                        if let Some(mut rx) = handle.take_message_rx() {
-                            let tx = tx.clone();
-                            let ch_id = channel_id.clone();
-                            Some(tokio_runtime.spawn(async move {
-                                while let Some(msg) = rx.recv().await {
-                                    if tx.send(crate::hub::events::HubEvent::AcChannelMessage {
-                                        channel_id: ch_id.clone(),
-                                        message: msg,
-                                    }).is_err() {
-                                        break;
-                                    }
-                                }
-                            }))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    channels.insert(
-                        channel_id.clone(),
-                        LuaAcChannel {
-                            handle,
-                            callback_key,
-                            connection_id,
-                            forwarder_handle,
-                        },
-                    );
-                    log::info!(
-                        "[ActionCable-Lua] Channel '{}' subscribed to '{}'",
-                        channel_id,
-                        channel_name
-                    );
-                } else {
-                    log::warn!(
-                        "[ActionCable-Lua] Subscribe failed: connection '{}' not found",
-                        connection_id
-                    );
-                }
-            }
-
-            ActionCableRequest::Perform {
-                channel_id,
-                action,
-                data,
-            } => {
-                if let Some(ch) = channels.get(&channel_id) {
-                    ch.handle.perform(&action, data);
-                    log::trace!(
-                        "[ActionCable-Lua] Performed '{}' on channel '{}'",
-                        action,
-                        channel_id
-                    );
-                } else {
-                    log::warn!(
-                        "[ActionCable-Lua] Perform failed: channel '{}' not found",
-                        channel_id
-                    );
-                }
-            }
-
-            ActionCableRequest::Unsubscribe { channel_id } => {
-                if channels.remove(&channel_id).is_some() {
-                    log::info!(
-                        "[ActionCable-Lua] Channel '{}' unsubscribed",
-                        channel_id
-                    );
-                } else {
-                    log::warn!(
-                        "[ActionCable-Lua] Unsubscribe failed: channel '{}' not found",
-                        channel_id
-                    );
-                }
-            }
-
-            ActionCableRequest::Close { connection_id } => {
-                // Remove all channels belonging to this connection
-                let orphaned: Vec<String> = channels
-                    .iter()
-                    .filter(|(_, ch)| ch.connection_id == connection_id)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-
-                for ch_id in &orphaned {
-                    channels.remove(ch_id);
-                }
-
-                if let Some(conn) = connections.remove(&connection_id) {
-                    conn.connection.shutdown();
-                    log::info!(
-                        "[ActionCable-Lua] Connection '{}' closed ({} channels removed)",
-                        connection_id,
-                        orphaned.len()
-                    );
-                } else {
-                    log::warn!(
-                        "[ActionCable-Lua] Close failed: connection '{}' not found",
-                        connection_id
-                    );
-                }
-            }
-        }
-    }
-}
 
 /// Poll all Lua ActionCable channels for incoming messages and fire callbacks.
 ///
@@ -371,11 +196,14 @@ pub(crate) fn process_lua_action_cable_requests(
 /// has `crypto_enabled` and the message has `type == "signal"`, the `envelope`
 /// field is automatically decrypted via `CryptoService` before the callback fires.
 ///
+/// Callbacks are looked up from the [`ActionCableCallbackRegistry`] by channel ID,
+/// matching the pattern used by HTTP, Timer, WebSocket, and Watch registries.
+///
 /// # Deadlock Prevention
 ///
 /// Messages are collected first, then callbacks are fired without holding any
-/// locks on the channel map. Crypto decryption acquires the `CryptoService`
-/// mutex briefly per envelope.
+/// locks on the channel map or callback registry. Crypto decryption acquires
+/// the `CryptoService` mutex briefly per envelope.
 ///
 /// # Returns
 ///
@@ -384,15 +212,19 @@ pub fn poll_lua_action_cable_channels(
     lua: &Lua,
     channels: &mut HashMap<String, LuaAcChannel>,
     connections: &HashMap<String, LuaAcConnection>,
+    callback_registry: &ActionCableCallbackRegistry,
     crypto_service: Option<&CryptoService>,
 ) -> usize {
-    // Phase 1: collect all pending messages with their callback keys and channel IDs.
-    // The channel_id is passed as a second argument to the Lua callback, eliminating
-    // the need for Lua scripts to capture channel_id via upvalues (which don't survive
-    // mlua's registry-stored closures reliably).
+    // Phase 1: collect all pending messages with cloned callback keys and channel IDs.
     let mut pending: Vec<(mlua::RegistryKey, serde_json::Value, String)> = Vec::new();
 
+    let registry = callback_registry.lock().expect("ActionCableCallbackRegistry mutex poisoned");
+
     for (channel_id, channel) in channels.iter_mut() {
+        let Some(callback_key) = registry.get(channel_id) else {
+            continue;
+        };
+
         // Look up crypto status for this channel's connection
         let crypto_enabled = connections
             .get(&channel.connection_id)
@@ -415,12 +247,10 @@ pub fn poll_lua_action_cable_channels(
                 }
             }
 
-            // Clone the registry key reference for the callback.
-            // We re-use the same key for every message on this channel.
-            // Collect as (key_ref, message, channel_id) tuples for firing.
+            // Clone the callback key for safe firing outside the lock.
             pending.push((
                 lua.create_registry_value(
-                    lua.registry_value::<mlua::Function>(&channel.callback_key)
+                    lua.registry_value::<mlua::Function>(callback_key)
                         .expect("ActionCable callback registry key should be valid"),
                 )
                 .expect("Failed to clone callback registry key"),
@@ -430,6 +260,9 @@ pub fn poll_lua_action_cable_channels(
         }
     }
 
+    // Release the registry lock before firing callbacks.
+    drop(registry);
+
     // Phase 2: fire callbacks
     let count = pending.len();
 
@@ -437,8 +270,6 @@ pub fn poll_lua_action_cable_channels(
         let result: mlua::Result<()> = (|| {
             let callback: mlua::Function = lua.registry_value(callback_key)?;
             let lua_msg = super::json::json_to_lua(lua, msg)?;
-            // Pass (message, channel_id) so Lua callbacks can use channel_id directly
-            // without relying on upvalue capture from the subscribe() return value.
             callback.call::<()>((lua_msg, channel_id.as_str()))?;
             Ok(())
         })();
@@ -459,15 +290,17 @@ pub fn poll_lua_action_cable_channels(
 /// Fire the Lua callback for a single ActionCable channel message.
 ///
 /// Called from [`handle_hub_event`] for [`HubEvent::AcChannelMessage`] events.
-/// Performs crypto decryption if enabled for the channel's connection, then
-/// fires the Lua callback with `(message, channel_id)`.
+/// Looks up the callback from the [`ActionCableCallbackRegistry`] by channel ID,
+/// performs crypto decryption if enabled, then fires the callback with
+/// `(message, channel_id)`.
 ///
-/// Does nothing if the channel has been removed (unsubscribed between send
-/// and receive — benign race).
+/// Does nothing if the channel or callback has been removed (unsubscribed
+/// between send and receive — benign race).
 pub(crate) fn fire_single_ac_message(
     lua: &Lua,
     channels: &HashMap<String, LuaAcChannel>,
     connections: &HashMap<String, LuaAcConnection>,
+    callback_registry: &ActionCableCallbackRegistry,
     crypto_service: Option<&CryptoService>,
     channel_id: &str,
     mut message: serde_json::Value,
@@ -476,6 +309,31 @@ pub(crate) fn fire_single_ac_message(
         // Channel was unsubscribed between send and receive — benign race.
         return;
     };
+
+    // Phase 1: Look up and clone the callback key under the registry lock.
+    let callback_key = {
+        let registry = callback_registry
+            .lock()
+            .expect("ActionCableCallbackRegistry mutex poisoned");
+        let Some(key) = registry.get(channel_id) else {
+            // Callback removed (unsubscribed) — benign race.
+            return;
+        };
+        match lua.registry_value::<mlua::Function>(key) {
+            Ok(cb) => match lua.create_registry_value(cb) {
+                Ok(cloned) => cloned,
+                Err(e) => {
+                    log::warn!("[ActionCable-Lua] Failed to clone callback key for {channel_id}: {e}");
+                    return;
+                }
+            },
+            Err(e) => {
+                log::warn!("[ActionCable-Lua] Failed to retrieve callback for {channel_id}: {e}");
+                return;
+            }
+        }
+    };
+    // Registry lock released — safe to call Lua.
 
     // Auto-decrypt signal envelopes when crypto is enabled for this connection.
     let crypto_enabled = connections
@@ -497,22 +355,7 @@ pub(crate) fn fire_single_ac_message(
         }
     }
 
-    // Clone the callback key for firing.
-    let callback_key = match lua.registry_value::<mlua::Function>(&channel.callback_key) {
-        Ok(cb) => match lua.create_registry_value(cb) {
-            Ok(key) => key,
-            Err(e) => {
-                log::warn!("[ActionCable-Lua] Failed to clone callback key for {channel_id}: {e}");
-                return;
-            }
-        },
-        Err(e) => {
-            log::warn!("[ActionCable-Lua] Failed to retrieve callback for {channel_id}: {e}");
-            return;
-        }
-    };
-
-    // Fire callback.
+    // Phase 2: Fire callback.
     let result: mlua::Result<()> = (|| {
         let callback: mlua::Function = lua.registry_value(&callback_key)?;
         let lua_msg = super::json::json_to_lua(lua, &message)?;
@@ -524,7 +367,7 @@ pub(crate) fn fire_single_ac_message(
         log::warn!("[ActionCable-Lua] Callback error for {channel_id}: {e}");
     }
 
-    // Clean up temporary registry key.
+    // Phase 3: Clean up temporary registry key.
     let _ = lua.remove_registry_value(callback_key);
 }
 
@@ -608,6 +451,22 @@ fn decrypt_signal_envelope(
 // Lua registration
 // =============================================================================
 
+/// Send an ActionCable request via the shared `HubEventSender`.
+///
+/// Helper used by all Lua closure registrations to send requests to the Hub
+/// event loop. Silently drops the request if the sender is not yet set
+/// (during early init before `set_hub_event_tx()`).
+fn send_ac_event(tx: &HubEventSender, request: ActionCableRequest) {
+    let guard = tx.lock().expect("HubEventSender mutex poisoned");
+    if let Some(ref sender) = *guard {
+        let _ = sender.send(HubEvent::LuaActionCableRequest(request));
+    } else {
+        ::log::warn!(
+            "[ActionCable] request sent before hub_event_tx set — event dropped"
+        );
+    }
+}
+
 /// Register the `action_cable` global table with Lua.
 ///
 /// Creates functions:
@@ -620,7 +479,11 @@ fn decrypt_signal_envelope(
 /// # Errors
 ///
 /// Returns an error if Lua table or function creation fails.
-pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Result<()> {
+pub(crate) fn register_action_cable(
+    lua: &Lua,
+    hub_event_tx: HubEventSender,
+    callback_registry: ActionCableCallbackRegistry,
+) -> Result<()> {
     let ac_table = lua
         .create_table()
         .map_err(|e| anyhow!("Failed to create action_cable table: {e}"))?;
@@ -633,7 +496,7 @@ pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Resul
     //
     // Options table:
     //   crypto: boolean (default false) - enable auto-decryption of signal envelopes
-    let connect_queue = Arc::clone(&queue);
+    let tx = Arc::clone(&hub_event_tx);
     let connect_counter = Arc::clone(&conn_counter);
     let connect_fn = lua
         .create_function(move |_, opts: Option<Table>| {
@@ -651,15 +514,10 @@ pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Resul
                 id
             };
 
-            {
-                let mut q = connect_queue
-                    .lock()
-                    .expect("ActionCable request queue mutex poisoned");
-                q.push(ActionCableRequest::Connect {
-                    connection_id: connection_id.clone(),
-                    crypto,
-                });
-            }
+            send_ac_event(&tx, ActionCableRequest::Connect {
+                connection_id: connection_id.clone(),
+                crypto,
+            });
 
             Ok(connection_id)
         })
@@ -670,8 +528,13 @@ pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Resul
         .map_err(|e| anyhow!("Failed to set action_cable.connect: {e}"))?;
 
     // action_cable.subscribe(conn_id, channel_name, params, callback) -> channel_id
-    let subscribe_queue = Arc::clone(&queue);
+    //
+    // Stores the callback in the ActionCableCallbackRegistry (keyed by channel_id)
+    // and sends a Subscribe request (without the callback) via HubEvent channel.
+    // This matches the pattern used by HTTP, Timer, WebSocket, and Watch registries.
+    let tx = Arc::clone(&hub_event_tx);
     let subscribe_counter = Arc::clone(&ch_counter);
+    let cb_registry = Arc::clone(&callback_registry);
     let subscribe_fn = lua
         .create_function(
             move |lua,
@@ -702,18 +565,21 @@ pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Resul
                     id
                 };
 
+                // Store callback in registry (Lua-thread-pinned).
                 {
-                    let mut q = subscribe_queue
+                    let mut registry = cb_registry
                         .lock()
-                        .expect("ActionCable request queue mutex poisoned");
-                    q.push(ActionCableRequest::Subscribe {
-                        connection_id: conn_id,
-                        channel_id: channel_id.clone(),
-                        channel_name,
-                        params: params_json,
-                        callback_key,
-                    });
+                        .expect("ActionCableCallbackRegistry mutex poisoned");
+                    registry.insert(channel_id.clone(), callback_key);
                 }
+
+                // Send request without callback — only Send-safe data crosses the channel.
+                send_ac_event(&tx, ActionCableRequest::Subscribe {
+                    connection_id: conn_id,
+                    channel_id: channel_id.clone(),
+                    channel_name,
+                    params: params_json,
+                });
 
                 Ok(channel_id)
             },
@@ -725,7 +591,7 @@ pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Resul
         .map_err(|e| anyhow!("Failed to set action_cable.subscribe: {e}"))?;
 
     // action_cable.perform(channel_id, action, data)
-    let perform_queue = Arc::clone(&queue);
+    let tx = Arc::clone(&hub_event_tx);
     let perform_fn = lua
         .create_function(
             move |lua, (channel_id, action, data): (String, String, Value)| {
@@ -735,16 +601,11 @@ pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Resul
                     ))
                 })?;
 
-                {
-                    let mut q = perform_queue
-                        .lock()
-                        .expect("ActionCable request queue mutex poisoned");
-                    q.push(ActionCableRequest::Perform {
-                        channel_id,
-                        action,
-                        data: data_json,
-                    });
-                }
+                send_ac_event(&tx, ActionCableRequest::Perform {
+                    channel_id,
+                    action,
+                    data: data_json,
+                });
 
                 Ok(())
             },
@@ -756,13 +617,10 @@ pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Resul
         .map_err(|e| anyhow!("Failed to set action_cable.perform: {e}"))?;
 
     // action_cable.unsubscribe(channel_id)
-    let unsub_queue = Arc::clone(&queue);
+    let tx = Arc::clone(&hub_event_tx);
     let unsubscribe_fn = lua
         .create_function(move |_, channel_id: String| {
-            let mut q = unsub_queue
-                .lock()
-                .expect("ActionCable request queue mutex poisoned");
-            q.push(ActionCableRequest::Unsubscribe { channel_id });
+            send_ac_event(&tx, ActionCableRequest::Unsubscribe { channel_id });
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create action_cable.unsubscribe function: {e}"))?;
@@ -772,13 +630,10 @@ pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Resul
         .map_err(|e| anyhow!("Failed to set action_cable.unsubscribe: {e}"))?;
 
     // action_cable.close(conn_id)
-    let close_queue = Arc::clone(&queue);
+    let tx = Arc::clone(&hub_event_tx);
     let close_fn = lua
         .create_function(move |_, connection_id: String| {
-            let mut q = close_queue
-                .lock()
-                .expect("ActionCable request queue mutex poisoned");
-            q.push(ActionCableRequest::Close { connection_id });
+            send_ac_event(&tx, ActionCableRequest::Close { connection_id });
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create action_cable.close function: {e}"))?;
@@ -797,12 +652,25 @@ pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::new_hub_event_sender;
+
+    /// Create a test sender with a wired-up channel for event capture.
+    fn setup_with_channel() -> (
+        HubEventSender,
+        tokio::sync::mpsc::UnboundedReceiver<HubEvent>,
+    ) {
+        let tx = new_hub_event_sender();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+        (tx, receiver)
+    }
 
     #[test]
     fn test_action_cable_table_created() {
         let lua = Lua::new();
-        let queue = new_request_queue();
-        register_action_cable(&lua, queue).expect("Should register action_cable primitives");
+        let tx = new_hub_event_sender();
+        let registry = new_callback_registry();
+        register_action_cable(&lua, tx, registry).expect("Should register action_cable primitives");
 
         let globals = lua.globals();
         let ac_table: Table = globals
@@ -819,10 +687,11 @@ mod tests {
     }
 
     #[test]
-    fn test_connect_returns_id_and_queues_request() {
+    fn test_connect_sends_event() {
         let lua = Lua::new();
-        let queue = new_request_queue();
-        register_action_cable(&lua, Arc::clone(&queue))
+        let (tx, mut rx) = setup_with_channel();
+        let registry = new_callback_registry();
+        register_action_cable(&lua, tx, registry)
             .expect("Should register action_cable primitives");
 
         let conn_id: String = lua
@@ -835,25 +704,25 @@ mod tests {
             "Connection ID should start with 'ac_conn_', got: {conn_id}"
         );
 
-        let reqs = queue.lock().unwrap();
-        assert_eq!(reqs.len(), 1);
-        match &reqs[0] {
-            ActionCableRequest::Connect {
+        let event = rx.try_recv().expect("Should have received an event");
+        match event {
+            HubEvent::LuaActionCableRequest(ActionCableRequest::Connect {
                 connection_id,
                 crypto,
-            } => {
-                assert_eq!(connection_id, &conn_id);
+            }) => {
+                assert_eq!(connection_id, conn_id);
                 assert!(crypto);
             }
-            _ => panic!("Expected Connect request"),
+            _ => panic!("Expected LuaActionCableRequest(Connect), got: {event:?}"),
         }
     }
 
     #[test]
     fn test_connect_default_no_crypto() {
         let lua = Lua::new();
-        let queue = new_request_queue();
-        register_action_cable(&lua, Arc::clone(&queue))
+        let (tx, mut rx) = setup_with_channel();
+        let registry = new_callback_registry();
+        register_action_cable(&lua, tx, registry)
             .expect("Should register action_cable primitives");
 
         let _: String = lua
@@ -861,21 +730,21 @@ mod tests {
             .eval()
             .expect("connect without opts should work");
 
-        let reqs = queue.lock().unwrap();
-        assert_eq!(reqs.len(), 1);
-        match &reqs[0] {
-            ActionCableRequest::Connect { crypto, .. } => {
+        let event = rx.try_recv().expect("Should have received an event");
+        match event {
+            HubEvent::LuaActionCableRequest(ActionCableRequest::Connect { crypto, .. }) => {
                 assert!(!crypto, "Default crypto should be false");
             }
-            _ => panic!("Expected Connect request"),
+            _ => panic!("Expected LuaActionCableRequest(Connect)"),
         }
     }
 
     #[test]
-    fn test_subscribe_returns_channel_id_and_queues_request() {
+    fn test_subscribe_sends_event_and_stores_callback() {
         let lua = Lua::new();
-        let queue = new_request_queue();
-        register_action_cable(&lua, Arc::clone(&queue))
+        let (tx, mut rx) = setup_with_channel();
+        let registry = new_callback_registry();
+        register_action_cable(&lua, tx, Arc::clone(&registry))
             .expect("Should register action_cable primitives");
 
         let ch_id: String = lua
@@ -897,90 +766,99 @@ mod tests {
             "Channel ID should start with 'ac_ch_', got: {ch_id}"
         );
 
-        let reqs = queue.lock().unwrap();
-        assert_eq!(reqs.len(), 1);
-        match &reqs[0] {
-            ActionCableRequest::Subscribe {
+        let event = rx.try_recv().expect("Should have received an event");
+        match event {
+            HubEvent::LuaActionCableRequest(ActionCableRequest::Subscribe {
                 connection_id,
                 channel_id,
                 channel_name,
                 params,
-                ..
-            } => {
+            }) => {
                 assert_eq!(connection_id, "ac_conn_0");
-                assert_eq!(channel_id, &ch_id);
+                assert_eq!(channel_id, ch_id);
                 assert_eq!(channel_name, "HubCommandChannel");
                 assert_eq!(params["hub_id"], "test-hub");
                 assert_eq!(params["start_from"], 0);
             }
-            _ => panic!("Expected Subscribe request"),
+            _ => panic!("Expected LuaActionCableRequest(Subscribe)"),
         }
+
+        // Verify callback was stored in the registry (not in the event)
+        let reg = registry.lock().unwrap();
+        assert!(reg.contains_key(&ch_id), "Callback should be stored in registry");
     }
 
     #[test]
-    fn test_perform_queues_request() {
+    fn test_perform_sends_event() {
         let lua = Lua::new();
-        let queue = new_request_queue();
-        register_action_cable(&lua, Arc::clone(&queue))
+        let (tx, mut rx) = setup_with_channel();
+        let registry = new_callback_registry();
+        register_action_cable(&lua, tx, registry)
             .expect("Should register action_cable primitives");
 
         lua.load(r#"action_cable.perform("ac_ch_0", "ack", { sequence = 42 })"#)
             .exec()
             .expect("perform should succeed");
 
-        let reqs = queue.lock().unwrap();
-        assert_eq!(reqs.len(), 1);
-        match &reqs[0] {
-            ActionCableRequest::Perform {
+        let event = rx.try_recv().expect("Should have received an event");
+        match event {
+            HubEvent::LuaActionCableRequest(ActionCableRequest::Perform {
                 channel_id,
                 action,
                 data,
-            } => {
+            }) => {
                 assert_eq!(channel_id, "ac_ch_0");
                 assert_eq!(action, "ack");
                 assert_eq!(data["sequence"], 42);
             }
-            _ => panic!("Expected Perform request"),
+            _ => panic!("Expected LuaActionCableRequest(Perform)"),
         }
     }
 
     #[test]
-    fn test_unsubscribe_queues_request() {
+    fn test_unsubscribe_sends_event() {
         let lua = Lua::new();
-        let queue = new_request_queue();
-        register_action_cable(&lua, Arc::clone(&queue))
+        let (tx, mut rx) = setup_with_channel();
+        let registry = new_callback_registry();
+        register_action_cable(&lua, tx, registry)
             .expect("Should register action_cable primitives");
 
         lua.load(r#"action_cable.unsubscribe("ac_ch_0")"#)
             .exec()
             .expect("unsubscribe should succeed");
 
-        let reqs = queue.lock().unwrap();
-        assert_eq!(reqs.len(), 1);
-        assert!(matches!(&reqs[0], ActionCableRequest::Unsubscribe { channel_id } if channel_id == "ac_ch_0"));
+        let event = rx.try_recv().expect("Should have received an event");
+        assert!(matches!(
+            event,
+            HubEvent::LuaActionCableRequest(ActionCableRequest::Unsubscribe { channel_id }) if channel_id == "ac_ch_0"
+        ));
     }
 
     #[test]
-    fn test_close_queues_request() {
+    fn test_close_sends_event() {
         let lua = Lua::new();
-        let queue = new_request_queue();
-        register_action_cable(&lua, Arc::clone(&queue))
+        let (tx, mut rx) = setup_with_channel();
+        let registry = new_callback_registry();
+        register_action_cable(&lua, tx, registry)
             .expect("Should register action_cable primitives");
 
         lua.load(r#"action_cable.close("ac_conn_0")"#)
             .exec()
             .expect("close should succeed");
 
-        let reqs = queue.lock().unwrap();
-        assert_eq!(reqs.len(), 1);
-        assert!(matches!(&reqs[0], ActionCableRequest::Close { connection_id } if connection_id == "ac_conn_0"));
+        let event = rx.try_recv().expect("Should have received an event");
+        assert!(matches!(
+            event,
+            HubEvent::LuaActionCableRequest(ActionCableRequest::Close { connection_id }) if connection_id == "ac_conn_0"
+        ));
     }
 
     #[test]
     fn test_sequential_ids_increment() {
         let lua = Lua::new();
-        let queue = new_request_queue();
-        register_action_cable(&lua, Arc::clone(&queue))
+        let (tx, _rx) = setup_with_channel();
+        let registry = new_callback_registry();
+        register_action_cable(&lua, tx, registry)
             .expect("Should register action_cable primitives");
 
         let id1: String = lua
@@ -1016,7 +894,8 @@ mod tests {
         let mut channels: HashMap<String, LuaAcChannel> = HashMap::new();
         let connections: HashMap<String, LuaAcConnection> = HashMap::new();
 
-        let count = poll_lua_action_cable_channels(&lua, &mut channels, &connections, None);
+        let registry = new_callback_registry();
+        let count = poll_lua_action_cable_channels(&lua, &mut channels, &connections, &registry, None);
         assert_eq!(count, 0);
     }
 }

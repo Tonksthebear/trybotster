@@ -177,6 +177,27 @@ commands.register("fs:rmdir", function(client, sub_id, command)
     end
 end, { description = "Recursively remove a directory from the repo" })
 
+commands.register("fs:rename", function(client, sub_id, command)
+    local from_path, from_err = safe_path(command.from_path or "", command.scope)
+    if not from_path then
+        respond(client, sub_id, command.request_id, "fs:rename", { ok = false, error = from_err })
+        return
+    end
+
+    local to_path, to_err = safe_path(command.to_path or "", command.scope)
+    if not to_path then
+        respond(client, sub_id, command.request_id, "fs:rename", { ok = false, error = to_err })
+        return
+    end
+
+    local ok, rename_err = fs.rename(from_path, to_path)
+    if ok then
+        respond(client, sub_id, command.request_id, "fs:rename", { ok = true })
+    else
+        respond(client, sub_id, command.request_id, "fs:rename", { ok = false, error = rename_err })
+    end
+end, { description = "Rename/move a file or directory" })
+
 -- ============================================================================
 -- Module Interface
 -- ============================================================================

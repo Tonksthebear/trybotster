@@ -273,6 +273,10 @@ pub struct Hub {
     /// Handles for notification watcher tasks, keyed by "{agent_key}:{session_name}".
     notification_watcher_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
 
+    /// Tracks peers that received a ratchet restart during the current cleanup window.
+    /// Cleared every `CleanupTick` (5s) to coalesce decrypt failure storms.
+    ratchet_restarted_peers: std::collections::HashSet<String>,
+
     // === TUI via Lua (Hub-side Processing) ===
     /// Sender for TUI output messages to TuiRunner.
     ///
@@ -427,6 +431,7 @@ impl Hub {
             #[cfg(test)]
             pty_output_messages_drained: 0,
             notification_watcher_handles: std::collections::HashMap::new(),
+            ratchet_restarted_peers: std::collections::HashSet::new(),
             tui_output_tx: None,
             tui_wake_fd: None,
             tui_request_rx: None,
@@ -535,6 +540,7 @@ impl Hub {
         // Load Lua init script and start file watching for hot-reload
         self.load_lua_init();
         self.start_lua_file_watching();
+
 
         // Bundle generation is deferred - don't call generate_connection_url() here.
         // The bundle will be generated lazily when:
@@ -717,7 +723,6 @@ impl Hub {
         if let Err(e) = self.lua.call_tui_connected() {
             log::warn!("Lua tui_connected callback error: {}", e);
         }
-        self.flush_lua_queues();
 
         log::info!("TUI registered via Lua (Hub-side processing)");
 

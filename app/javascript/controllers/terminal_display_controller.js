@@ -38,6 +38,7 @@ export default class extends Controller {
   #viewportHandler = null;
   #momentumRafId = null;
   #disconnected = false;
+  #overlay = null;
 
   connect() {
     this.#disconnected = false;
@@ -61,6 +62,9 @@ export default class extends Controller {
 
     this.#transport?.destroy();
     this.#transport = null;
+
+    this.#overlay?.remove();
+    this.#overlay = null;
   }
 
   /**
@@ -123,6 +127,9 @@ export default class extends Controller {
       agentIndex: this.agentIndexValue,
       ptyIndex: this.ptyIndexValue,
     });
+    this.#transport.onReconnect = () => this.#restty?.clearScreen();
+    this.#transport.onConnect = () => this.#hideOverlay();
+    this.#transport.onDisconnect = () => this.#showOverlay();
 
     // 3. Create Restty — loads WASM, renders canvas
     //    onBackend fires after WASM init → connectPty() subscribes terminal channel
@@ -140,7 +147,6 @@ export default class extends Controller {
             spellcheck: false,
           });
           this.#bindTapDetection(pane.canvas);
-          this.#bindMobileEnter(pane.imeInput);
         }
       },
       appOptions: {
@@ -335,36 +341,28 @@ export default class extends Controller {
     this.#momentumRafId = requestAnimationFrame(tick);
   }
 
-  /**
-   * Mobile Enter → Shift+Enter. On mobile there's no Shift key, so Enter
-   * always submits (e.g. in Claude). Intercept at both keydown AND
-   * beforeinput levels — mobile IME processes Enter through the Input
-   * Events API, not keydown alone.
-   *
-   * Sends \n (0x0A / LF) which the CLI maps to "shift+enter" (see
-   * raw_input.rs:236). This works regardless of kitty keyboard protocol
-   * state. The touch button `sendEnter` still sends bare \r for submitting.
-   */
-  #bindMobileEnter(imeInput) {
-    let enterHandled = false;
+  #showOverlay() {
+    if (!this.#overlay) {
+      const container = this.hasContainerTarget ? this.containerTarget : this.element;
+      container.style.position = "relative";
+      this.#overlay = document.createElement("div");
+      this.#overlay.className = "absolute inset-0 flex items-center justify-center bg-black/70 z-10 pointer-events-none";
+      this.#overlay.innerHTML = `
+        <div class="flex items-center gap-2.5 text-zinc-400 text-sm font-medium">
+          <svg class="animate-spin size-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+          </svg>
+          Reconnecting…
+        </div>
+      `;
+      container.appendChild(this.#overlay);
+    }
+    this.#overlay.hidden = false;
+  }
 
-    imeInput.addEventListener("keydown", (e) => {
-      if (e.key !== "Enter" || e.shiftKey) return;
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      enterHandled = true;
-      this.#restty?.sendKeyInput("\n");
-    }, true);
-
-    imeInput.addEventListener("beforeinput", (e) => {
-      if (e.inputType === "insertLineBreak" || e.inputType === "insertParagraph") {
-        e.preventDefault();
-        if (!enterHandled) {
-          this.#restty?.sendKeyInput("\n");
-        }
-        enterHandled = false;
-      }
-    }, true);
+  #hideOverlay() {
+    if (this.#overlay) this.#overlay.hidden = true;
   }
 
   // Public actions for touch control buttons

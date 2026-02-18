@@ -14,7 +14,8 @@ import { ConnectionManager, HubConnection } from "connections";
  * All values come from Rails via data attributes — no URL parsing.
  *
  * Template placeholders (data attributes):
- *   data-field="name"     - Sets textContent to agent.name
+ *   data-field="name"     - Sets textContent to agent.display_name
+ *   data-field="subtext"  - Sets textContent to "profile · branch"
  *   data-field="id"       - Sets textContent to agent.id
  *   data-field="index"    - Sets textContent to agent index
  *   data-href             - Interpolates {hubId} and {index} in href
@@ -138,7 +139,7 @@ export default class extends Controller {
 
     const agentId = event.currentTarget.dataset.agentId;
     const agent = this.agentsValue.find((a) => a.id === agentId);
-    const name = agent?.name || agent?.id || "this agent";
+    const name = agent?.display_name || agent?.id || "this agent";
 
     // Set pending info on modal controller element and open dialog
     const modal = document.getElementById("delete-agent-modal");
@@ -192,7 +193,12 @@ export default class extends Controller {
       clone.querySelectorAll("[data-field]").forEach((el) => {
         const field = el.dataset.field;
         if (field === "name") {
-          el.textContent = agent.name || agent.id;
+          el.textContent = agent.display_name || agent.id;
+        } else if (field === "subtext") {
+          const parts = [];
+          if (agent.profile_name) parts.push(agent.profile_name);
+          if (agent.branch_name) parts.push(agent.branch_name);
+          el.textContent = parts.join(" · ");
         } else if (field === "id") {
           el.textContent = agent.id;
         } else if (field === "index") {

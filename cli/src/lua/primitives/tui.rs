@@ -28,19 +28,20 @@
 //! end)
 //! ```
 //!
-//! # Send Queue
+//! # Event-Driven Delivery
 //!
-//! Messages sent via `tui.send()` are queued and processed by the Hub
-//! after the Lua callback returns. This avoids async complexity in Lua.
-
-use std::sync::{Arc, Mutex};
+//! Messages sent via `tui.send()` are delivered directly to the Hub event
+//! loop as `HubEvent::TuiSend` events via the shared `HubEventSender`.
 
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
 
+use super::HubEventSender;
+use crate::hub::events::HubEvent;
+
 /// Request to send a message to the TUI.
 ///
-/// Queued by Lua's `tui.send()` and processed by Hub.
+/// Sent from Lua's `tui.send()` as `HubEvent::TuiSend` and processed by Hub.
 #[derive(Debug, Clone)]
 pub enum TuiSendRequest {
     /// Send JSON data to the TUI.
@@ -53,15 +54,6 @@ pub enum TuiSendRequest {
         /// Binary data to send.
         data: Vec<u8>,
     },
-}
-
-/// Shared send queue for TUI messages from Lua.
-pub type TuiSendQueue = Arc<Mutex<Vec<TuiSendRequest>>>;
-
-/// Create a new send queue for TUI messages.
-#[must_use]
-pub fn new_send_queue() -> TuiSendQueue {
-    Arc::new(Mutex::new(Vec::new()))
 }
 
 /// Registry keys for TUI callbacks.
@@ -89,12 +81,12 @@ pub mod registry_keys {
 /// # Arguments
 ///
 /// * `lua` - The Lua state to register primitives in
-/// * `send_queue` - Queue for outgoing messages (processed by Hub)
+/// * `hub_event_tx` - Shared sender for Hub events (filled in later by `set_hub_event_tx`)
 ///
 /// # Errors
 ///
 /// Returns an error if Lua table or function creation fails.
-pub fn register(lua: &Lua, send_queue: TuiSendQueue) -> Result<()> {
+pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
     let tui_table = lua
         .create_table()
         .map_err(|e| anyhow!("Failed to create tui table: {e}"))?;
@@ -133,16 +125,16 @@ pub fn register(lua: &Lua, send_queue: TuiSendQueue) -> Result<()> {
         .map_err(|e| anyhow!("Failed to set tui.on_message: {e}"))?;
 
     // tui.send(table) — no peer_id, single TUI client
-    let send_queue_clone = Arc::clone(&send_queue);
+    let tx = hub_event_tx.clone();
     let send_fn = lua
         .create_function(move |lua, value: LuaValue| {
             let json: serde_json::Value = lua.from_value(value)?;
-
-            let mut queue = send_queue_clone
-                .lock()
-                .expect("TUI send queue mutex poisoned");
-            queue.push(TuiSendRequest::Json { data: json });
-
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::TuiSend(TuiSendRequest::Json { data: json }));
+            } else {
+                ::log::warn!("[TUI] send() called before hub_event_tx set — event dropped");
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create tui.send function: {e}"))?;
@@ -151,16 +143,16 @@ pub fn register(lua: &Lua, send_queue: TuiSendQueue) -> Result<()> {
         .map_err(|e| anyhow!("Failed to set tui.send: {e}"))?;
 
     // tui.send_binary(data) — no peer_id, single TUI client
-    let send_queue_clone = Arc::clone(&send_queue);
+    let tx = hub_event_tx;
     let send_binary_fn = lua
         .create_function(move |_, data: LuaString| {
             let bytes = data.as_bytes().to_vec();
-
-            let mut queue = send_queue_clone
-                .lock()
-                .expect("TUI send queue mutex poisoned");
-            queue.push(TuiSendRequest::Binary { data: bytes });
-
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::TuiSend(TuiSendRequest::Binary { data: bytes }));
+            } else {
+                ::log::warn!("[TUI] send_binary() called before hub_event_tx set — event dropped");
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create tui.send_binary function: {e}"))?;
@@ -179,52 +171,49 @@ pub fn register(lua: &Lua, send_queue: TuiSendQueue) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::new_hub_event_sender;
+
+    fn setup() -> (Lua, HubEventSender) {
+        let lua = Lua::new();
+        let tx = new_hub_event_sender();
+        register(&lua, tx.clone()).expect("Should register tui primitives");
+        (lua, tx)
+    }
+
+    fn setup_with_channel() -> (Lua, tokio::sync::mpsc::UnboundedReceiver<HubEvent>) {
+        let lua = Lua::new();
+        let tx = new_hub_event_sender();
+        register(&lua, tx.clone()).expect("Should register tui primitives");
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+        (lua, receiver)
+    }
 
     #[test]
     fn test_tui_table_created() {
-        let lua = Lua::new();
-        let queue = new_send_queue();
-        register(&lua, queue).expect("Should register tui primitives");
+        let (lua, _tx) = setup();
 
         let globals = lua.globals();
         let tui_table: mlua::Table =
             globals.get("tui").expect("tui table should exist");
 
-        // Verify all functions exist
-        let _: mlua::Function = tui_table
-            .get("on_connected")
-            .expect("on_connected should exist");
-        let _: mlua::Function = tui_table
-            .get("on_disconnected")
-            .expect("on_disconnected should exist");
-        let _: mlua::Function = tui_table
-            .get("on_message")
-            .expect("on_message should exist");
-        let _: mlua::Function = tui_table
-            .get("send")
-            .expect("send should exist");
-        let _: mlua::Function = tui_table
-            .get("send_binary")
-            .expect("send_binary should exist");
+        let _: mlua::Function = tui_table.get("on_connected").expect("on_connected should exist");
+        let _: mlua::Function = tui_table.get("on_disconnected").expect("on_disconnected should exist");
+        let _: mlua::Function = tui_table.get("on_message").expect("on_message should exist");
+        let _: mlua::Function = tui_table.get("send").expect("send should exist");
+        let _: mlua::Function = tui_table.get("send_binary").expect("send_binary should exist");
     }
 
     #[test]
     fn test_on_connected_stores_callback() {
-        let lua = Lua::new();
-        let queue = new_send_queue();
-        register(&lua, queue).expect("Should register tui primitives");
+        let (lua, _tx) = setup();
 
-        lua.load(
-            r#"
+        lua.load(r#"
             tui.on_connected(function()
                 connected_called = true
             end)
-        "#,
-        )
-        .exec()
-        .expect("Should register callback");
+        "#).exec().expect("Should register callback");
 
-        // Verify callback is stored in registry
         let key: mlua::RegistryKey = lua
             .named_registry_value(registry_keys::ON_CONNECTED)
             .expect("Callback should be stored in registry");
@@ -232,33 +221,22 @@ mod tests {
         let callback: mlua::Function =
             lua.registry_value(&key).expect("Should retrieve callback");
 
-        lua.globals()
-            .set("connected_called", LuaValue::Nil)
-            .unwrap();
+        lua.globals().set("connected_called", LuaValue::Nil).unwrap();
         callback.call::<()>(()).expect("Should call callback");
 
-        let result: bool = lua
-            .globals()
-            .get("connected_called")
-            .expect("connected_called should be set");
+        let result: bool = lua.globals().get("connected_called").expect("connected_called should be set");
         assert!(result);
     }
 
     #[test]
     fn test_on_message_stores_callback() {
-        let lua = Lua::new();
-        let queue = new_send_queue();
-        register(&lua, queue).expect("Should register tui primitives");
+        let (lua, _tx) = setup();
 
-        lua.load(
-            r#"
+        lua.load(r#"
             tui.on_message(function(msg)
                 received_type = msg.type
             end)
-        "#,
-        )
-        .exec()
-        .expect("Should register callback");
+        "#).exec().expect("Should register callback");
 
         let key: mlua::RegistryKey = lua
             .named_registry_value(registry_keys::ON_MESSAGE)
@@ -267,102 +245,70 @@ mod tests {
         let callback: mlua::Function =
             lua.registry_value(&key).expect("Should retrieve callback");
 
-        // Call with a table argument
-        lua.globals()
-            .set("received_type", LuaValue::Nil)
-            .unwrap();
+        lua.globals().set("received_type", LuaValue::Nil).unwrap();
         let msg = lua.create_table().unwrap();
         msg.set("type", "test_msg").unwrap();
         callback.call::<()>(msg).expect("Should call callback");
 
-        let result: String = lua
-            .globals()
-            .get("received_type")
-            .expect("received_type should be set");
+        let result: String = lua.globals().get("received_type").expect("received_type should be set");
         assert_eq!(result, "test_msg");
     }
 
     #[test]
-    fn test_send_queues_json_message() {
-        let lua = Lua::new();
-        let queue = new_send_queue();
-        register(&lua, Arc::clone(&queue)).expect("Should register tui primitives");
+    fn test_send_delivers_json_event() {
+        let (lua, mut rx) = setup_with_channel();
 
-        lua.load(
-            r#"
+        lua.load(r#"
             tui.send({ type = "agent_list", count = 3 })
-        "#,
-        )
-        .exec()
-        .expect("Should send message");
+        "#).exec().expect("Should send message");
 
-        let pending = queue.lock().expect("TUI send queue mutex poisoned");
-        assert_eq!(pending.len(), 1);
-
-        match &pending[0] {
-            TuiSendRequest::Json { data } => {
+        let event = rx.try_recv().expect("Should have received event");
+        match event {
+            HubEvent::TuiSend(TuiSendRequest::Json { data }) => {
                 assert_eq!(data["type"], "agent_list");
                 assert_eq!(data["count"], 3);
             }
-            _ => panic!("Expected Json request"),
+            _ => panic!("Expected TuiSend Json event"),
         }
     }
 
     #[test]
-    fn test_send_binary_queues_binary_message() {
-        let lua = Lua::new();
-        let queue = new_send_queue();
-        register(&lua, Arc::clone(&queue)).expect("Should register tui primitives");
+    fn test_send_binary_delivers_binary_event() {
+        let (lua, mut rx) = setup_with_channel();
 
-        lua.load(
-            r#"
+        lua.load(r#"
             tui.send_binary("hello bytes")
-        "#,
-        )
-        .exec()
-        .expect("Should send binary");
+        "#).exec().expect("Should send binary");
 
-        let pending = queue.lock().expect("TUI send queue mutex poisoned");
-        assert_eq!(pending.len(), 1);
-
-        match &pending[0] {
-            TuiSendRequest::Binary { data } => {
+        let event = rx.try_recv().expect("Should have received event");
+        match event {
+            HubEvent::TuiSend(TuiSendRequest::Binary { data }) => {
                 assert_eq!(data, b"hello bytes");
             }
-            _ => panic!("Expected Binary request"),
+            _ => panic!("Expected TuiSend Binary event"),
         }
     }
 
     #[test]
-    fn test_multiple_sends_queue_in_order() {
-        let lua = Lua::new();
-        let queue = new_send_queue();
-        register(&lua, Arc::clone(&queue)).expect("Should register tui primitives");
+    fn test_multiple_sends_deliver_in_order() {
+        let (lua, mut rx) = setup_with_channel();
 
-        lua.load(
-            r#"
+        lua.load(r#"
             tui.send({ msg = "first" })
             tui.send({ msg = "second" })
             tui.send_binary("third")
-        "#,
-        )
-        .exec()
-        .expect("Should send messages");
+        "#).exec().expect("Should send messages");
 
-        let pending = queue.lock().expect("TUI send queue mutex poisoned");
-        assert_eq!(pending.len(), 3);
-
-        // Verify order is preserved
-        match &pending[0] {
-            TuiSendRequest::Json { data } => assert_eq!(data["msg"], "first"),
+        match rx.try_recv().unwrap() {
+            HubEvent::TuiSend(TuiSendRequest::Json { data }) => assert_eq!(data["msg"], "first"),
             _ => panic!("Expected Json"),
         }
-        match &pending[1] {
-            TuiSendRequest::Json { data } => assert_eq!(data["msg"], "second"),
+        match rx.try_recv().unwrap() {
+            HubEvent::TuiSend(TuiSendRequest::Json { data }) => assert_eq!(data["msg"], "second"),
             _ => panic!("Expected Json"),
         }
-        match &pending[2] {
-            TuiSendRequest::Binary { .. } => {}
+        match rx.try_recv().unwrap() {
+            HubEvent::TuiSend(TuiSendRequest::Binary { .. }) => {}
             _ => panic!("Expected Binary"),
         }
     }

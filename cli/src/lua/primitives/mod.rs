@@ -47,44 +47,58 @@ pub mod websocket;
 pub mod worktree;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use mlua::Lua;
 
 use crate::hub::handle_cache::HandleCache;
 
+/// Shared sender for Lua primitives to deliver events to the Hub event loop.
+///
+/// Lua closures capture a clone of this Arc. Initially `None` (primitives are
+/// registered before the event channel exists). Filled in by
+/// `LuaRuntime::set_hub_event_tx()` before any Lua plugins execute.
+///
+/// If a Lua closure fires before the sender is set (shouldn't happen in
+/// practice), the event is dropped with a warning log.
+pub(crate) type HubEventSender = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>>>;
+
+/// Create a new `HubEventSender` (initially `None`).
+#[must_use]
+pub(crate) fn new_hub_event_sender() -> HubEventSender {
+    Arc::new(Mutex::new(None))
+}
+
 pub use events::{
     new_event_callbacks, EventCallbackId, EventCallbacks, SharedEventCallbacks,
 };
-pub use connection::{
-    new_request_queue as new_connection_queue, ConnectionRequest, ConnectionRequestQueue,
-};
-pub use hub::{new_request_queue as new_hub_queue, HubRequest, HubRequestQueue, SharedServerId};
+pub use connection::ConnectionRequest;
+pub use hub::{HubRequest, SharedServerId};
 pub use pty::{
-    new_request_queue as new_pty_queue, CreateForwarderRequest, CreateTuiForwarderRequest,
-    PtyForwarder, PtyOutputContext, PtyRequest, PtyRequestQueue, PtySessionHandle,
+    CreateForwarderRequest, CreateTuiForwarderRequest,
+    PtyForwarder, PtyOutputContext, PtyRequest, PtySessionHandle,
 };
-pub use tui::{new_send_queue as new_tui_queue, TuiSendQueue, TuiSendRequest};
-pub use webrtc::{new_send_queue, WebRtcSendQueue, WebRtcSendRequest};
+pub use tui::TuiSendRequest;
+pub use webrtc::WebRtcSendRequest;
 pub use http::{new_http_registry, HttpAsyncRegistry};
 pub use timer::{new_timer_registry, TimerRegistry};
 pub use watch::{new_watcher_registry, WatcherRegistry};
 pub use action_cable::{
-    new_request_queue as new_action_cable_queue, ActionCableRequest, ActionCableRequestQueue,
-    LuaAcChannel, LuaAcConnection,
+    ActionCableCallbackRegistry, ActionCableRequest, LuaAcChannel, LuaAcConnection,
+    new_callback_registry as new_ac_callback_registry,
 };
 pub use websocket::{new_websocket_registry, WebSocketRegistry};
 pub use worktree::{
-    WorktreeCreateResult, WorktreeRequest, WorktreeRequestQueue, WorktreeResultReceiver,
-    WorktreeResultSender, new_request_queue as new_worktree_queue,
+    WorktreeCreateResult, WorktreeRequest, WorktreeResultReceiver,
+    WorktreeResultSender,
 };
 
 /// Register all primitive functions with the Lua state.
 ///
 /// Called during `LuaRuntime::new()` to set up the runtime environment.
-/// Note: WebRTC and PTY primitives are registered separately via
-/// `register_webrtc()` and `register_pty()` because they require queue references.
+/// Note: WebRTC, TUI, PTY, Hub, connection, and worktree primitives are
+/// registered separately because they require a `HubEventSender` reference.
 ///
 /// # Errors
 ///
@@ -98,69 +112,54 @@ pub fn register_all(lua: &Lua) -> Result<()> {
     Ok(())
 }
 
-/// Register WebRTC primitives with a send queue.
+/// Register WebRTC primitives with a shared event sender.
 ///
 /// Call this after `register_all()` to set up WebRTC message handling.
-/// The send queue is drained by Hub after Lua callbacks return.
-///
-/// # Arguments
-///
-/// * `lua` - The Lua state to register primitives in
-/// * `send_queue` - Shared queue for outgoing WebRTC messages
+/// Events are sent directly to the Hub event loop via `HubEventSender`.
 ///
 /// # Errors
 ///
 /// Returns an error if registration fails.
-pub fn register_webrtc(lua: &Lua, send_queue: WebRtcSendQueue) -> Result<()> {
-    webrtc::register(lua, send_queue)?;
+pub(crate) fn register_webrtc(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
+    webrtc::register(lua, hub_event_tx)?;
     Ok(())
 }
 
-/// Register TUI primitives with a send queue.
+/// Register TUI primitives with a shared event sender.
 ///
 /// Call this after `register_all()` to set up TUI message handling.
-/// The send queue is drained by Hub after Lua callbacks return.
-///
-/// # Arguments
-///
-/// * `lua` - The Lua state to register primitives in
-/// * `send_queue` - Shared queue for outgoing TUI messages
+/// Events are sent directly to the Hub event loop via `HubEventSender`.
 ///
 /// # Errors
 ///
 /// Returns an error if registration fails.
-pub fn register_tui(lua: &Lua, send_queue: TuiSendQueue) -> Result<()> {
-    tui::register(lua, send_queue)?;
+pub(crate) fn register_tui(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
+    tui::register(lua, hub_event_tx)?;
     Ok(())
 }
 
-/// Register PTY primitives with a request queue.
+/// Register PTY primitives with a shared event sender.
 ///
 /// Call this after `register_all()` to set up PTY operations.
-/// The request queue is drained by Hub after Lua callbacks return.
-///
-/// # Arguments
-///
-/// * `lua` - The Lua state to register primitives in
-/// * `request_queue` - Shared queue for PTY operations
+/// Events are sent directly to the Hub event loop via `HubEventSender`.
 ///
 /// # Errors
 ///
 /// Returns an error if registration fails.
-pub fn register_pty(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
-    pty::register(lua, request_queue)?;
+pub(crate) fn register_pty(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
+    pty::register(lua, hub_event_tx)?;
     Ok(())
 }
 
-/// Register Hub state primitives with a request queue, handle cache, and shared state.
+/// Register Hub state primitives with a shared event sender, handle cache, and shared state.
 ///
 /// Call this after `register_all()` to set up Hub state queries and operations.
-/// The request queue is drained by Hub after Lua callbacks return.
+/// Events are sent directly to the Hub event loop via `HubEventSender`.
 ///
 /// # Arguments
 ///
 /// * `lua` - The Lua state to register primitives in
-/// * `request_queue` - Shared queue for Hub operations
+/// * `hub_event_tx` - Shared sender for Hub events
 /// * `handle_cache` - Thread-safe cache of agent handles for queries
 /// * `server_id` - Server-assigned hub ID (set after registration)
 /// * `shared_state` - Shared hub state for agent queries
@@ -168,62 +167,62 @@ pub fn register_pty(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if registration fails.
-pub fn register_hub(
+pub(crate) fn register_hub(
     lua: &Lua,
-    request_queue: HubRequestQueue,
+    hub_event_tx: HubEventSender,
     handle_cache: Arc<HandleCache>,
     server_id: SharedServerId,
     shared_state: Arc<std::sync::RwLock<crate::hub::state::HubState>>,
 ) -> Result<()> {
-    hub::register(lua, request_queue, handle_cache, server_id, shared_state)?;
+    hub::register(lua, hub_event_tx, handle_cache, server_id, shared_state)?;
     Ok(())
 }
 
-/// Register connection primitives with a request queue and handle cache.
+/// Register connection primitives with a shared event sender and handle cache.
 ///
 /// Call this after `register_all()` to set up connection URL queries and
-/// code regeneration. The request queue is drained by Hub after Lua callbacks return.
+/// code regeneration. Events are sent directly to the Hub event loop.
 ///
 /// # Arguments
 ///
 /// * `lua` - The Lua state to register primitives in
-/// * `request_queue` - Shared queue for connection operations
+/// * `hub_event_tx` - Shared sender for Hub events
 /// * `handle_cache` - Thread-safe cache for connection URL queries
 ///
 /// # Errors
 ///
 /// Returns an error if registration fails.
-pub fn register_connection(
+pub(crate) fn register_connection(
     lua: &Lua,
-    request_queue: ConnectionRequestQueue,
+    hub_event_tx: HubEventSender,
     handle_cache: Arc<HandleCache>,
 ) -> Result<()> {
-    connection::register(lua, request_queue, handle_cache)?;
+    connection::register(lua, hub_event_tx, handle_cache)?;
     Ok(())
 }
 
-/// Register worktree primitives with a request queue and handle cache.
+/// Register worktree primitives with a shared event sender and handle cache.
 ///
 /// Call this after `register_all()` to set up worktree queries and operations.
-/// The request queue is drained by Hub after Lua callbacks return.
+/// Events are sent directly to the Hub event loop.
 ///
 /// # Arguments
 ///
 /// * `lua` - The Lua state to register primitives in
-/// * `request_queue` - Shared queue for worktree operations
+/// * `hub_event_tx` - Shared sender for Hub events
 /// * `handle_cache` - Thread-safe cache for worktree queries
 /// * `worktree_base` - Base directory for worktree storage
 ///
 /// # Errors
 ///
 /// Returns an error if registration fails.
-pub fn register_worktree(
+pub(crate) fn register_worktree(
     lua: &Lua,
-    request_queue: WorktreeRequestQueue,
+    hub_event_tx: HubEventSender,
     handle_cache: Arc<HandleCache>,
     worktree_base: PathBuf,
 ) -> Result<()> {
-    worktree::register(lua, request_queue, handle_cache, worktree_base)?;
+    worktree::register(lua, hub_event_tx, handle_cache, worktree_base)?;
     Ok(())
 }
 
@@ -315,21 +314,26 @@ pub fn register_websocket(lua: &Lua, registry: WebSocketRegistry) -> Result<()> 
     Ok(())
 }
 
-/// Register ActionCable primitives with a request queue.
+/// Register ActionCable primitives with the shared event sender.
 ///
 /// Call this after `register_all()` to set up ActionCable connection management.
-/// The request queue is drained by `flush_lua_queues()`. In production,
-/// a forwarding task per channel sends `HubEvent::AcChannelMessage`.
+/// Lua closures send `HubEvent::LuaActionCableRequest` via the shared sender.
+/// In production, a forwarding task per channel sends `HubEvent::AcChannelMessage`
+/// for incoming messages.
 ///
 /// # Arguments
 ///
 /// * `lua` - The Lua state to register primitives in
-/// * `queue` - Shared request queue for ActionCable operations
+/// * `hub_event_tx` - Shared event sender for ActionCable operations
 ///
 /// # Errors
 ///
 /// Returns an error if registration fails.
-pub fn register_action_cable(lua: &Lua, queue: ActionCableRequestQueue) -> Result<()> {
-    action_cable::register_action_cable(lua, queue)?;
+pub(crate) fn register_action_cable(
+    lua: &Lua,
+    hub_event_tx: HubEventSender,
+    callback_registry: ActionCableCallbackRegistry,
+) -> Result<()> {
+    action_cable::register_action_cable(lua, hub_event_tx, callback_registry)?;
     Ok(())
 }

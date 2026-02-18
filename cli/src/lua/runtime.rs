@@ -15,19 +15,14 @@ use crate::hub::handle_cache::HandleCache;
 use super::file_watcher::LuaFileWatcher;
 use super::primitives;
 use super::primitives::events::SharedEventCallbacks;
-use super::primitives::connection::{ConnectionRequest, ConnectionRequestQueue};
-use super::primitives::hub::{HubRequest, HubRequestQueue};
-use super::primitives::worktree::{WorktreeRequest, WorktreeRequestQueue};
-use super::primitives::pty::{PtyOutputContext, PtyRequest, PtyRequestQueue};
-use super::primitives::tui::{
-    registry_keys as tui_registry_keys, TuiSendQueue, TuiSendRequest,
-};
+use super::primitives::pty::PtyOutputContext;
+use super::primitives::tui::registry_keys as tui_registry_keys;
 use super::primitives::http::HttpAsyncRegistry;
 use super::primitives::timer::TimerRegistry;
 use super::primitives::watch::WatcherRegistry;
-use super::primitives::webrtc::{registry_keys, WebRtcSendQueue, WebRtcSendRequest};
+use super::primitives::webrtc::registry_keys;
 use super::primitives::websocket::WebSocketRegistry;
-use super::primitives::action_cable::{ActionCableRequest, ActionCableRequestQueue};
+use super::primitives::HubEventSender;
 
 /// Lua scripting runtime for the botster hub.
 ///
@@ -54,18 +49,12 @@ pub struct LuaRuntime {
     strict: bool,
     /// Optional file watcher for hot-reload support.
     file_watcher: Option<LuaFileWatcher>,
-    /// Queue for outgoing WebRTC messages from Lua callbacks.
-    webrtc_send_queue: WebRtcSendQueue,
-    /// Queue for outgoing TUI messages from Lua callbacks.
-    tui_send_queue: TuiSendQueue,
-    /// Queue for PTY operations from Lua callbacks.
-    pty_request_queue: PtyRequestQueue,
-    /// Queue for Hub operations from Lua callbacks.
-    hub_request_queue: HubRequestQueue,
-    /// Queue for connection operations from Lua callbacks.
-    connection_request_queue: ConnectionRequestQueue,
-    /// Queue for worktree operations from Lua callbacks.
-    worktree_request_queue: WorktreeRequestQueue,
+    /// Shared sender for Lua primitives to deliver events to the Hub event loop.
+    ///
+    /// Initially `None`, filled by `set_hub_event_tx()` before plugins execute.
+    /// Captured by closures in WebRTC, TUI, PTY, Hub, connection, and worktree
+    /// primitives so they can send events directly without intermediate queues.
+    hub_event_sender: HubEventSender,
     /// Event callbacks registered by Lua scripts.
     event_callbacks: SharedEventCallbacks,
     /// Registry of active user file watches (for `watch.directory()`).
@@ -76,8 +65,8 @@ pub struct LuaRuntime {
     http_registry: HttpAsyncRegistry,
     /// Registry of WebSocket connections (for `websocket.connect()`).
     websocket_registry: WebSocketRegistry,
-    /// Queue for ActionCable requests from Lua (for `action_cable.connect()`).
-    action_cable_queue: ActionCableRequestQueue,
+    /// Registry of ActionCable channel callbacks (for `action_cable.subscribe()`).
+    ac_callback_registry: primitives::ActionCableCallbackRegistry,
     /// Cached compiled function for PTY output interceptor calls.
     pty_hook_fn: Option<mlua::RegistryKey>,
     /// Cached reusable context table for PTY output interceptor calls.
@@ -96,12 +85,6 @@ pub struct LuaRuntime {
 
 impl std::fmt::Debug for LuaRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let webrtc_queue_len = self.webrtc_send_queue.lock().map(|q| q.len()).unwrap_or(0);
-        let tui_queue_len = self.tui_send_queue.lock().map(|q| q.len()).unwrap_or(0);
-        let pty_queue_len = self.pty_request_queue.lock().map(|q| q.len()).unwrap_or(0);
-        let hub_queue_len = self.hub_request_queue.lock().map(|q| q.len()).unwrap_or(0);
-        let conn_queue_len = self.connection_request_queue.lock().map(|q| q.len()).unwrap_or(0);
-        let wt_queue_len = self.worktree_request_queue.lock().map(|q| q.len()).unwrap_or(0);
         let event_cb_count = self.event_callbacks.lock().map(|c| c.callback_count()).unwrap_or(0);
         let watch_count = self.watcher_registry.lock().map(|w| w.len()).unwrap_or(0);
         let timer_count = self.timer_registry.lock().map(|t| t.len()).unwrap_or(0);
@@ -110,16 +93,14 @@ impl std::fmt::Debug for LuaRuntime {
             .lock()
             .map(|h| (h.pending_count(), h.in_flight_count()))
             .unwrap_or((0, 0));
+        let hub_event_tx_active = self.hub_event_sender.lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
         f.debug_struct("LuaRuntime")
             .field("base_path", &self.base_path)
             .field("strict", &self.strict)
             .field("file_watching", &self.file_watcher.is_some())
-            .field("webrtc_queue_len", &webrtc_queue_len)
-            .field("tui_queue_len", &tui_queue_len)
-            .field("pty_queue_len", &pty_queue_len)
-            .field("hub_queue_len", &hub_queue_len)
-            .field("connection_queue_len", &conn_queue_len)
-            .field("worktree_queue_len", &wt_queue_len)
+            .field("hub_event_tx_active", &hub_event_tx_active)
             .field("event_callback_count", &event_cb_count)
             .field("active_watches", &watch_count)
             .field("active_timers", &timer_count)
@@ -127,8 +108,6 @@ impl std::fmt::Debug for LuaRuntime {
             .field("http_in_flight", &http_in_flight)
             .field("websocket_connections",
                 &self.websocket_registry.lock().map(|r| r.connection_count()).unwrap_or(0))
-            .field("action_cable_queue_len",
-                &self.action_cable_queue.lock().map(|q| q.len()).unwrap_or(0))
             .finish_non_exhaustive()
     }
 }
@@ -160,23 +139,9 @@ impl LuaRuntime {
             .map(|v| v == "1")
             .unwrap_or(false);
 
-        // Create WebRTC send queue
-        let webrtc_send_queue = primitives::new_send_queue();
-
-        // Create TUI send queue
-        let tui_send_queue = primitives::new_tui_queue();
-
-        // Create PTY request queue
-        let pty_request_queue = primitives::new_pty_queue();
-
-        // Create Hub request queue
-        let hub_request_queue = primitives::new_hub_queue();
-
-        // Create connection request queue
-        let connection_request_queue = primitives::new_connection_queue();
-
-        // Create worktree request queue
-        let worktree_request_queue = primitives::new_worktree_queue();
+        // Create shared event sender for Lua primitives (initially None,
+        // filled by set_hub_event_tx() before plugins execute)
+        let hub_event_sender = primitives::new_hub_event_sender();
 
         // Create event callback storage
         let event_callbacks = primitives::new_event_callbacks();
@@ -193,22 +158,22 @@ impl LuaRuntime {
         // Create WebSocket connection registry for websocket.connect()
         let websocket_registry = primitives::new_websocket_registry();
 
-        // Create ActionCable request queue for action_cable.connect()
-        let action_cable_queue = primitives::new_action_cable_queue();
+        // Create ActionCable callback registry for action_cable.subscribe()
+        let ac_callback_registry = primitives::new_ac_callback_registry();
 
         // Register all primitives
         primitives::register_all(&lua).context("Failed to register Lua primitives")?;
 
-        // Register WebRTC primitives with the send queue
-        primitives::register_webrtc(&lua, Arc::clone(&webrtc_send_queue))
+        // Register WebRTC primitives with the shared event sender
+        primitives::register_webrtc(&lua, Arc::clone(&hub_event_sender))
             .context("Failed to register WebRTC primitives")?;
 
-        // Register TUI primitives with the send queue
-        primitives::register_tui(&lua, Arc::clone(&tui_send_queue))
+        // Register TUI primitives with the shared event sender
+        primitives::register_tui(&lua, Arc::clone(&hub_event_sender))
             .context("Failed to register TUI primitives")?;
 
-        // Register PTY primitives with the request queue
-        primitives::register_pty(&lua, Arc::clone(&pty_request_queue))
+        // Register PTY primitives with the shared event sender
+        primitives::register_pty(&lua, Arc::clone(&hub_event_sender))
             .context("Failed to register PTY primitives")?;
 
         // Register event primitives with the callback storage
@@ -231,9 +196,12 @@ impl LuaRuntime {
         primitives::register_websocket(&lua, Arc::clone(&websocket_registry))
             .context("Failed to register WebSocket primitives")?;
 
-        // Register ActionCable primitives with the request queue
-        primitives::register_action_cable(&lua, Arc::clone(&action_cable_queue))
-            .context("Failed to register ActionCable primitives")?;
+        // Register ActionCable primitives with the shared event sender and callback registry
+        primitives::register_action_cable(
+            &lua,
+            Arc::clone(&hub_event_sender),
+            Arc::clone(&ac_callback_registry),
+        ).context("Failed to register ActionCable primitives")?;
 
         // Note: Hub, connection, and worktree primitives are registered later via
         // register_hub_primitives() because they need a HandleCache reference from Hub
@@ -252,18 +220,13 @@ impl LuaRuntime {
             base_path,
             strict,
             file_watcher: None,
-            webrtc_send_queue,
-            tui_send_queue,
-            pty_request_queue,
-            hub_request_queue,
-            connection_request_queue,
-            worktree_request_queue,
+            hub_event_sender,
             event_callbacks,
             watcher_registry,
             timer_registry,
             http_registry,
             websocket_registry,
-            action_cable_queue,
+            ac_callback_registry,
             pty_hook_fn: None,
             pty_hook_ctx: None,
             hub_event_tx: None,
@@ -1122,36 +1085,6 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Drain pending WebRTC send requests.
-    ///
-    /// Returns all messages queued by Lua's `webrtc.send()` and `webrtc.send_binary()`
-    /// calls since the last drain. The queue is cleared after this call.
-    ///
-    /// Hub should call this after invoking Lua callbacks to process any
-    /// outgoing messages.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // After calling Lua callback
-    /// for request in lua.drain_webrtc_sends() {
-    ///     match request {
-    ///         WebRtcSendRequest::Json { peer_id, data } => {
-    ///             hub.send_webrtc_message(&peer_id, &data);
-    ///         }
-    ///         WebRtcSendRequest::Binary { peer_id, data } => {
-    ///             hub.send_webrtc_raw(&peer_id, &data);
-    ///         }
-    ///     }
-    /// }
-    /// ```
-    #[must_use]
-    pub fn drain_webrtc_sends(&self) -> Vec<WebRtcSendRequest> {
-        let mut queue = self.webrtc_send_queue.lock()
-            .expect("WebRTC send queue mutex poisoned");
-        std::mem::take(&mut *queue)
-    }
-
     /// Check if any WebRTC callbacks are registered.
     ///
     /// Returns true if at least one of:
@@ -1319,22 +1252,6 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Drain pending TUI send requests.
-    ///
-    /// Returns all messages queued by Lua's `tui.send()` and `tui.send_binary()`
-    /// calls since the last drain. The queue is cleared after this call.
-    ///
-    /// Hub should call this after invoking Lua callbacks to process any
-    /// outgoing TUI messages.
-    #[must_use]
-    pub fn drain_tui_sends(&self) -> Vec<TuiSendRequest> {
-        let mut queue = self
-            .tui_send_queue
-            .lock()
-            .expect("TUI send queue mutex poisoned");
-        std::mem::take(&mut *queue)
-    }
-
     /// Check if any TUI callbacks are registered.
     ///
     /// Returns true if at least one of on_connected, on_disconnected,
@@ -1351,38 +1268,6 @@ impl LuaRuntime {
     // =========================================================================
     // PTY Operations
     // =========================================================================
-
-    /// Drain pending PTY requests.
-    ///
-    /// Returns all PTY operations queued by Lua's `webrtc.create_pty_forwarder()`,
-    /// `hub.write_pty()`, `hub.resize_pty()`, etc. since the last drain.
-    /// The queue is cleared after this call.
-    ///
-    /// Hub should call this after invoking Lua callbacks to process any
-    /// PTY operations.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // After calling Lua callback
-    /// for request in lua.drain_pty_requests() {
-    ///     match request {
-    ///         PtyRequest::CreateForwarder(req) => {
-    ///             hub.create_lua_pty_forwarder(req);
-    ///         }
-    ///         PtyRequest::WritePty { agent_index, pty_index, data } => {
-    ///             hub.write_to_pty(agent_index, pty_index, &data);
-    ///         }
-    ///         // ...
-    ///     }
-    /// }
-    /// ```
-    #[must_use]
-    pub fn drain_pty_requests(&self) -> Vec<PtyRequest> {
-        let mut queue = self.pty_request_queue.lock()
-            .expect("PTY request queue mutex poisoned");
-        std::mem::take(&mut *queue)
-    }
 
     /// Notify PTY output observers (fire-and-forget).
     ///
@@ -1544,7 +1429,7 @@ impl LuaRuntime {
     ) -> Result<()> {
         primitives::register_hub(
             &self.lua,
-            Arc::clone(&self.hub_request_queue),
+            Arc::clone(&self.hub_event_sender),
             Arc::clone(&handle_cache),
             server_id,
             shared_state,
@@ -1553,14 +1438,14 @@ impl LuaRuntime {
 
         primitives::register_connection(
             &self.lua,
-            Arc::clone(&self.connection_request_queue),
+            Arc::clone(&self.hub_event_sender),
             Arc::clone(&handle_cache),
         )
         .context("Failed to register connection primitives")?;
 
         primitives::register_worktree(
             &self.lua,
-            Arc::clone(&self.worktree_request_queue),
+            Arc::clone(&self.hub_event_sender),
             handle_cache,
             worktree_base,
         )
@@ -1569,94 +1454,6 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Drain pending Hub requests.
-    ///
-    /// Returns all Hub operations queued by Lua's `hub.create_agent()` and
-    /// `hub.delete_agent()` calls since the last drain. The queue is cleared
-    /// after this call.
-    ///
-    /// Hub should call this after invoking Lua callbacks to process any
-    /// agent lifecycle operations.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// for request in lua.drain_hub_requests() {
-    ///     match request {
-    ///         HubRequest::Quit => {
-    ///             hub.quit = true;
-    ///         }
-    ///     }
-    /// }
-    /// ```
-    #[must_use]
-    pub fn drain_hub_requests(&self) -> Vec<HubRequest> {
-        let mut queue = self.hub_request_queue.lock()
-            .expect("Hub request queue mutex poisoned");
-        std::mem::take(&mut *queue)
-    }
-
-    /// Drain pending connection requests.
-    ///
-    /// Returns all connection operations queued by Lua's `connection.regenerate()`
-    /// calls since the last drain. The queue is cleared after this call.
-    ///
-    /// Hub should call this after invoking Lua callbacks to process any
-    /// connection operations.
-    #[must_use]
-    pub fn drain_connection_requests(&self) -> Vec<ConnectionRequest> {
-        let mut queue = self
-            .connection_request_queue
-            .lock()
-            .expect("Connection request queue mutex poisoned");
-        std::mem::take(&mut *queue)
-    }
-
-    /// Drain pending worktree requests.
-    ///
-    /// Returns all worktree operations queued by Lua's `worktree.create_async()`
-    /// and `worktree.delete()` calls since the last drain. The queue is cleared
-    /// after this call.
-    ///
-    /// Hub should call this after invoking Lua callbacks to process any
-    /// worktree operations.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // After calling Lua callback
-    /// for request in lua.drain_worktree_requests() {
-    ///     match request {
-    ///         WorktreeRequest::CreateAsync { branch, response_key } => {
-    ///             hub.create_worktree_async(branch, response_key);
-    ///         }
-    ///         WorktreeRequest::Delete { path, branch } => {
-    ///             hub.delete_worktree(&path, &branch);
-    ///         }
-    ///     }
-    /// }
-    /// ```
-    #[must_use]
-    pub fn drain_worktree_requests(&self) -> Vec<WorktreeRequest> {
-        let mut queue = self
-            .worktree_request_queue
-            .lock()
-            .expect("Worktree request queue mutex poisoned");
-        std::mem::take(&mut *queue)
-    }
-
-    /// Drain pending ActionCable requests.
-    ///
-    /// Returns all ActionCable operations queued by Lua's `action_cable.*`
-    /// calls since the last drain. The queue is cleared after this call.
-    #[must_use]
-    pub fn drain_action_cable_requests(&self) -> Vec<ActionCableRequest> {
-        let mut queue = self
-            .action_cable_queue
-            .lock()
-            .expect("ActionCable request queue mutex poisoned");
-        std::mem::take(&mut *queue)
-    }
 
     /// Poll WebSocket events via shared vec (test-only fallback).
     ///
@@ -1669,16 +1466,34 @@ impl LuaRuntime {
         )
     }
 
+    /// Set up a test event channel for the `HubEventSender`.
+    ///
+    /// Creates an unbounded channel, fills the shared `HubEventSender` so that
+    /// Lua closures can send events, and returns the receiver for assertions.
+    #[cfg(test)]
+    pub(crate) fn setup_test_event_channel(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::hub::events::HubEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.hub_event_sender.lock().expect("HubEventSender mutex poisoned") = Some(tx);
+        rx
+    }
+
     /// Inject the Hub event channel sender into primitive registries.
     ///
     /// Called once during Hub initialization after the `LuaRuntime` is created.
-    /// Enables background threads and spawned tasks to send events directly to
-    /// the Hub event loop instead of pushing to shared vecs.
+    /// Enables Lua closures and background threads to send events directly to
+    /// the Hub event loop.
+    ///
+    /// This fills the shared `HubEventSender` (captured by WebRTC, TUI, PTY,
+    /// Hub, connection, and worktree closures) and configures the HTTP, WebSocket,
+    /// timer, and watcher registries.
     pub(crate) fn set_hub_event_tx(
         &mut self,
         tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
         tokio_handle: tokio::runtime::Handle,
     ) {
+        // Fill the shared HubEventSender for all 6 event-driven Lua primitives
+        *self.hub_event_sender.lock().expect("HubEventSender mutex poisoned") = Some(tx.clone());
+
         self.http_registry
             .lock()
             .expect("HttpAsyncEntries mutex poisoned")
@@ -1740,19 +1555,20 @@ impl LuaRuntime {
         );
     }
 
-    /// Get a reference to the ActionCable request queue.
-    ///
-    /// Used by Hub to pass to `process_lua_action_cable_requests()`.
-    pub fn action_cable_queue_ref(&self) -> &ActionCableRequestQueue {
-        &self.action_cable_queue
-    }
-
     /// Get a reference to the inner Lua state.
     ///
     /// Used by Hub for ActionCable channel polling where direct Lua access
     /// is needed for callback dispatch.
     pub fn lua_ref(&self) -> &Lua {
         &self.lua
+    }
+
+    /// Get a reference to the ActionCable callback registry.
+    ///
+    /// Used by Hub to look up channel callbacks when firing AC messages
+    /// and to clean up entries on unsubscribe/close.
+    pub fn ac_callback_registry(&self) -> &primitives::ActionCableCallbackRegistry {
+        &self.ac_callback_registry
     }
 
     // =========================================================================
@@ -1966,6 +1782,10 @@ impl LuaRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::events::HubEvent;
+    use crate::lua::primitives::webrtc::WebRtcSendRequest;
+    use crate::lua::primitives::tui::TuiSendRequest;
+    use crate::lua::primitives::pty::PtyRequest;
 
     #[test]
     fn test_runtime_creation() {
@@ -2219,25 +2039,38 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_webrtc_sends_returns_queued_messages() {
+    fn test_webrtc_send_delivers_events() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut rx = runtime.setup_test_event_channel();
 
         runtime.lua().load(r#"
             webrtc.send("peer-1", { type = "hello" })
             webrtc.send("peer-2", { type = "world" })
         "#).exec().unwrap();
 
-        let sends = runtime.drain_webrtc_sends();
-        assert_eq!(sends.len(), 2);
+        let event1 = rx.try_recv().expect("Should receive first event");
+        let event2 = rx.try_recv().expect("Should receive second event");
+        assert!(rx.try_recv().is_err(), "No more events expected");
 
-        // Queue should be empty after drain
-        let sends2 = runtime.drain_webrtc_sends();
-        assert!(sends2.is_empty());
+        match event1 {
+            HubEvent::WebRtcSend(WebRtcSendRequest::Json { peer_id, .. }) => {
+                assert_eq!(peer_id, "peer-1");
+            }
+            _ => panic!("Expected WebRtcSend Json event"),
+        }
+
+        match event2 {
+            HubEvent::WebRtcSend(WebRtcSendRequest::Json { peer_id, .. }) => {
+                assert_eq!(peer_id, "peer-2");
+            }
+            _ => panic!("Expected WebRtcSend Json event"),
+        }
     }
 
     #[test]
-    fn test_callback_can_send_response() {
+    fn test_webrtc_callback_sends_event() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut rx = runtime.setup_test_event_channel();
 
         runtime.lua().load(r#"
             webrtc.on_message(function(peer_id, msg)
@@ -2250,15 +2083,15 @@ mod tests {
         let ping = serde_json::json!({ "type": "ping" });
         runtime.call_webrtc_message("peer-echo", ping).expect("Should call callback");
 
-        let sends = runtime.drain_webrtc_sends();
-        assert_eq!(sends.len(), 1);
+        let event = rx.try_recv().expect("Should receive event");
+        assert!(rx.try_recv().is_err(), "No more events expected");
 
-        match &sends[0] {
-            WebRtcSendRequest::Json { peer_id, data } => {
+        match event {
+            HubEvent::WebRtcSend(WebRtcSendRequest::Json { peer_id, data }) => {
                 assert_eq!(peer_id, "peer-echo");
                 assert_eq!(data["type"], "pong");
             }
-            _ => panic!("Expected Json request"),
+            _ => panic!("Expected WebRtcSend Json event"),
         }
     }
 
@@ -2284,58 +2117,61 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_pty_requests_empty_initially() {
+    fn test_pty_events_empty_initially() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
-        let requests = runtime.drain_pty_requests();
-        assert!(requests.is_empty());
+        let mut rx = runtime.setup_test_event_channel();
+        assert!(rx.try_recv().is_err(), "No events expected initially");
     }
 
     #[test]
-    fn test_pty_write_queues_request() {
+    fn test_pty_write_sends_event() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut rx = runtime.setup_test_event_channel();
 
         runtime.lua().load(r#"
             hub.write_pty(0, 0, "hello")
         "#).exec().unwrap();
 
-        let requests = runtime.drain_pty_requests();
-        assert_eq!(requests.len(), 1);
+        let event = rx.try_recv().expect("Should receive event");
+        assert!(rx.try_recv().is_err(), "No more events expected");
 
-        match &requests[0] {
-            PtyRequest::WritePty { agent_index, pty_index, data } => {
-                assert_eq!(*agent_index, 0);
-                assert_eq!(*pty_index, 0);
+        match event {
+            HubEvent::LuaPtyRequest(PtyRequest::WritePty { agent_index, pty_index, data }) => {
+                assert_eq!(agent_index, 0);
+                assert_eq!(pty_index, 0);
                 assert_eq!(data, b"hello");
             }
-            _ => panic!("Expected WritePty request"),
+            _ => panic!("Expected LuaPtyRequest WritePty event"),
         }
     }
 
     #[test]
-    fn test_pty_resize_queues_request() {
+    fn test_pty_resize_sends_event() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut rx = runtime.setup_test_event_channel();
 
         runtime.lua().load(r#"
             hub.resize_pty(1, 0, 50, 100)
         "#).exec().unwrap();
 
-        let requests = runtime.drain_pty_requests();
-        assert_eq!(requests.len(), 1);
+        let event = rx.try_recv().expect("Should receive event");
+        assert!(rx.try_recv().is_err(), "No more events expected");
 
-        match &requests[0] {
-            PtyRequest::ResizePty { agent_index, pty_index, rows, cols } => {
-                assert_eq!(*agent_index, 1);
-                assert_eq!(*pty_index, 0);
-                assert_eq!(*rows, 50);
-                assert_eq!(*cols, 100);
+        match event {
+            HubEvent::LuaPtyRequest(PtyRequest::ResizePty { agent_index, pty_index, rows, cols }) => {
+                assert_eq!(agent_index, 1);
+                assert_eq!(pty_index, 0);
+                assert_eq!(rows, 50);
+                assert_eq!(cols, 100);
             }
-            _ => panic!("Expected ResizePty request"),
+            _ => panic!("Expected LuaPtyRequest ResizePty event"),
         }
     }
 
     #[test]
-    fn test_create_forwarder_queues_request() {
+    fn test_create_forwarder_sends_event() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut rx = runtime.setup_test_event_channel();
 
         runtime.lua().load(r#"
             forwarder = webrtc.create_pty_forwarder({
@@ -2346,17 +2182,17 @@ mod tests {
             })
         "#).exec().unwrap();
 
-        let requests = runtime.drain_pty_requests();
-        assert_eq!(requests.len(), 1);
+        let event = rx.try_recv().expect("Should receive event");
+        assert!(rx.try_recv().is_err(), "No more events expected");
 
-        match &requests[0] {
-            PtyRequest::CreateForwarder(req) => {
+        match event {
+            HubEvent::LuaPtyRequest(PtyRequest::CreateForwarder(req)) => {
                 assert_eq!(req.peer_id, "test-browser");
                 assert_eq!(req.agent_index, 0);
                 assert_eq!(req.pty_index, 0);
                 assert_eq!(req.subscription_id, "sub_1_test");
             }
-            _ => panic!("Expected CreateForwarder request"),
+            _ => panic!("Expected LuaPtyRequest CreateForwarder event"),
         }
     }
 
@@ -2572,10 +2408,10 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_hub_requests_empty_initially() {
+    fn test_hub_events_empty_initially() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
-        let requests = runtime.drain_hub_requests();
-        assert!(requests.is_empty());
+        let mut rx = runtime.setup_test_event_channel();
+        assert!(rx.try_recv().is_err(), "No events expected initially");
     }
 
     // =========================================================================
@@ -2669,25 +2505,38 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_tui_sends_returns_queued_messages() {
+    fn test_tui_send_delivers_events() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut rx = runtime.setup_test_event_channel();
 
         runtime.lua().load(r#"
             tui.send({ type = "agent_list" })
             tui.send({ type = "status" })
         "#).exec().unwrap();
 
-        let sends = runtime.drain_tui_sends();
-        assert_eq!(sends.len(), 2);
+        let event1 = rx.try_recv().expect("Should receive first event");
+        let event2 = rx.try_recv().expect("Should receive second event");
+        assert!(rx.try_recv().is_err(), "No more events expected");
 
-        // Queue should be empty after drain
-        let sends2 = runtime.drain_tui_sends();
-        assert!(sends2.is_empty());
+        match event1 {
+            HubEvent::TuiSend(TuiSendRequest::Json { data }) => {
+                assert_eq!(data["type"], "agent_list");
+            }
+            _ => panic!("Expected TuiSend Json event"),
+        }
+
+        match event2 {
+            HubEvent::TuiSend(TuiSendRequest::Json { data }) => {
+                assert_eq!(data["type"], "status");
+            }
+            _ => panic!("Expected TuiSend Json event"),
+        }
     }
 
     #[test]
-    fn test_tui_callback_can_send_response() {
+    fn test_tui_callback_sends_event() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut rx = runtime.setup_test_event_channel();
 
         runtime.lua().load(r#"
             tui.on_message(function(msg)
@@ -2700,15 +2549,15 @@ mod tests {
         let msg = serde_json::json!({ "type": "list_agents" });
         runtime.call_tui_message(msg).expect("Should call callback");
 
-        let sends = runtime.drain_tui_sends();
-        assert_eq!(sends.len(), 1);
+        let event = rx.try_recv().expect("Should receive event");
+        assert!(rx.try_recv().is_err(), "No more events expected");
 
-        match &sends[0] {
-            TuiSendRequest::Json { data } => {
+        match event {
+            HubEvent::TuiSend(TuiSendRequest::Json { data }) => {
                 assert_eq!(data["type"], "agent_list");
                 assert_eq!(data["count"], 0);
             }
-            _ => panic!("Expected Json request"),
+            _ => panic!("Expected TuiSend Json event"),
         }
     }
 
@@ -3135,15 +2984,16 @@ mod tests {
         assert_eq!(data_type, "quit");
     }
 
-    /// Verifies that a Hub event fires through to the TUI send queue.
+    /// Verifies that a Hub event fires through to the TUI event channel.
     ///
     /// When `fire_json_event("agent_created", ...)` fires, Lua observers
     /// (e.g., `connections.lua`) should call `tui.send()` to relay the event
     /// to the TUI. This test verifies that chain works end-to-end at the
-    /// Rust↔Lua boundary.
+    /// Rust/Lua boundary.
     #[test]
-    fn test_hub_event_reaches_tui_send_queue() {
+    fn test_hub_event_reaches_tui_event_channel() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
+        let mut rx = runtime.setup_test_event_channel();
 
         // Set up an event handler that relays to TUI
         runtime
@@ -3170,18 +3020,15 @@ mod tests {
             .fire_json_event("agent_created", &payload)
             .expect("Should fire event");
 
-        let sends = runtime.drain_tui_sends();
-        assert!(
-            !sends.is_empty(),
-            "Hub event should produce TUI send messages"
-        );
+        let event = rx.try_recv().expect("Hub event should produce TUI send event");
+        assert!(rx.try_recv().is_err(), "No more events expected");
 
-        match &sends[0] {
-            TuiSendRequest::Json { data } => {
+        match event {
+            HubEvent::TuiSend(TuiSendRequest::Json { data }) => {
                 assert_eq!(data["type"], "agent_created");
                 assert_eq!(data["agent_id"], "owner-repo-42");
             }
-            _ => panic!("Expected Json TUI send request"),
+            _ => panic!("Expected TuiSend Json event"),
         }
     }
 }

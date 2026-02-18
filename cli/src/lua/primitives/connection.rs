@@ -3,11 +3,11 @@
 //! Exposes connection URL and code regeneration to Lua, allowing scripts to
 //! query the current pairing URL and request code regeneration.
 //!
-//! # Design Principle: "Query freely. Mutate via queue."
+//! # Design Principle: "Query freely. Mutate via event."
 //!
 //! - **Queries** (`get_url`) read directly from `HandleCache` - non-blocking,
 //!   thread-safe snapshot
-//! - **Mutations** (`regenerate`) queue requests for Hub to process
+//! - **Mutations** (`regenerate`) send events for Hub to process
 //!   asynchronously after Lua callbacks return
 //!
 //! # Usage in Lua
@@ -27,7 +27,10 @@
 
 // Rust guideline compliant 2026-02-03
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use super::HubEventSender;
+use crate::hub::events::HubEvent;
 
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
@@ -61,15 +64,6 @@ pub enum ConnectionRequest {
     CopyToClipboard,
 }
 
-/// Shared request queue for connection operations from Lua.
-pub type ConnectionRequestQueue = Arc<Mutex<Vec<ConnectionRequest>>>;
-
-/// Create a new connection request queue.
-#[must_use]
-pub fn new_request_queue() -> ConnectionRequestQueue {
-    Arc::new(Mutex::new(Vec::new()))
-}
-
 /// Register connection primitives with the Lua state.
 ///
 /// Adds the following functions to the `connection` table:
@@ -79,15 +73,15 @@ pub fn new_request_queue() -> ConnectionRequestQueue {
 /// # Arguments
 ///
 /// * `lua` - The Lua state to register primitives in
-/// * `request_queue` - Shared queue for connection operations (processed by Hub)
+/// * `hub_event_tx` - Event sender for connection operations (processed by Hub)
 /// * `handle_cache` - Thread-safe cache for connection URL queries
 ///
 /// # Errors
 ///
 /// Returns an error if Lua table or function creation fails.
-pub fn register(
+pub(crate) fn register(
     lua: &Lua,
-    request_queue: ConnectionRequestQueue,
+    hub_event_tx: HubEventSender,
     handle_cache: Arc<HandleCache>,
 ) -> Result<()> {
     let connection = lua
@@ -113,20 +107,22 @@ pub fn register(
         .set("get_url", get_url_fn)
         .map_err(|e| anyhow!("Failed to set connection.get_url: {e}"))?;
 
-    // connection.generate() - Queue a lazy generation request
+    // connection.generate() - Send a lazy generation event
     //
     // Triggers Hub-side generation which:
     // - Creates the PreKeyBundle on first call
     // - Auto-regenerates if previous bundle was consumed
     // - Caches result in HandleCache
     // - Fires connection_code_ready Lua event for broadcast
-    let generate_queue = Arc::clone(&request_queue);
+    let tx = hub_event_tx.clone();
     let generate_fn = lua
         .create_function(move |_, ()| {
-            let mut q = generate_queue
-                .lock()
-                .expect("Connection request queue mutex poisoned");
-            q.push(ConnectionRequest::Generate);
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaConnectionRequest(ConnectionRequest::Generate));
+            } else {
+                ::log::warn!("[Connection] generate() called before hub_event_tx set — event dropped");
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create connection.generate function: {e}"))?;
@@ -135,14 +131,16 @@ pub fn register(
         .set("generate", generate_fn)
         .map_err(|e| anyhow!("Failed to set connection.generate: {e}"))?;
 
-    // connection.regenerate() - Queue a forced code regeneration request
-    let regen_queue = Arc::clone(&request_queue);
+    // connection.regenerate() - Send a forced code regeneration event
+    let tx = hub_event_tx.clone();
     let regenerate_fn = lua
         .create_function(move |_, ()| {
-            let mut q = regen_queue
-                .lock()
-                .expect("Connection request queue mutex poisoned");
-            q.push(ConnectionRequest::Regenerate);
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaConnectionRequest(ConnectionRequest::Regenerate));
+            } else {
+                ::log::warn!("[Connection] regenerate() called before hub_event_tx set — event dropped");
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create connection.regenerate function: {e}"))?;
@@ -152,13 +150,15 @@ pub fn register(
         .map_err(|e| anyhow!("Failed to set connection.regenerate: {e}"))?;
 
     // connection.copy_to_clipboard() - Copy connection URL to system clipboard
-    let clipboard_queue = request_queue;
+    let tx = hub_event_tx;
     let copy_fn = lua
         .create_function(move |_, ()| {
-            let mut q = clipboard_queue
-                .lock()
-                .expect("Connection request queue mutex poisoned");
-            q.push(ConnectionRequest::CopyToClipboard);
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaConnectionRequest(ConnectionRequest::CopyToClipboard));
+            } else {
+                ::log::warn!("[Connection] copy_to_clipboard() called before hub_event_tx set — event dropped");
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("Failed to create connection.copy_to_clipboard function: {e}"))?;
@@ -178,17 +178,28 @@ pub fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::new_hub_event_sender;
 
-    fn create_test_queue_and_cache() -> (ConnectionRequestQueue, Arc<HandleCache>) {
-        (new_request_queue(), Arc::new(HandleCache::new()))
+    fn create_test_sender_and_cache() -> (HubEventSender, Arc<HandleCache>) {
+        (new_hub_event_sender(), Arc::new(HandleCache::new()))
+    }
+
+    /// Wire up an actual channel so events are captured.
+    fn create_test_sender_and_cache_with_channel(
+    ) -> (HubEventSender, Arc<HandleCache>, tokio::sync::mpsc::UnboundedReceiver<HubEvent>) {
+        let tx = new_hub_event_sender();
+        let cache = Arc::new(HandleCache::new());
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+        (tx, cache, receiver)
     }
 
     #[test]
     fn test_register_creates_connection_table() {
         let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
+        let (tx, cache) = create_test_sender_and_cache();
 
-        register(&lua, queue, cache).expect("Should register connection primitives");
+        register(&lua, tx, cache).expect("Should register connection primitives");
 
         let conn: LuaTable = lua
             .globals()
@@ -203,9 +214,9 @@ mod tests {
     #[test]
     fn test_get_url_returns_nil_and_error_when_not_generated() {
         let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
+        let (tx, cache) = create_test_sender_and_cache();
 
-        register(&lua, queue, cache).expect("Should register");
+        register(&lua, tx, cache).expect("Should register");
 
         let (url, err): (Option<String>, Option<String>) = lua
             .load("return connection.get_url()")
@@ -223,12 +234,12 @@ mod tests {
     #[test]
     fn test_get_url_returns_cached_url() {
         let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
+        let (tx, cache) = create_test_sender_and_cache();
 
         // Pre-populate the cache
         cache.set_connection_url(Ok("https://example.com/connect#abc123".to_string()));
 
-        register(&lua, queue, cache).expect("Should register");
+        register(&lua, tx, cache).expect("Should register");
 
         let (url, err): (Option<String>, Option<String>) = lua
             .load("return connection.get_url()")
@@ -242,12 +253,12 @@ mod tests {
     #[test]
     fn test_get_url_returns_cached_error() {
         let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
+        let (tx, cache) = create_test_sender_and_cache();
 
         // Pre-populate with an error
         cache.set_connection_url(Err("Crypto init failed".to_string()));
 
-        register(&lua, queue, cache).expect("Should register");
+        register(&lua, tx, cache).expect("Should register");
 
         let (url, err): (Option<String>, Option<String>) = lua
             .load("return connection.get_url()")
@@ -259,43 +270,43 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_queues_request() {
+    fn test_generate_sends_event() {
         let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
+        let (tx, cache, mut rx) = create_test_sender_and_cache_with_channel();
 
-        register(&lua, Arc::clone(&queue), cache).expect("Should register");
+        register(&lua, tx, cache).expect("Should register");
 
         lua.load("connection.generate()").exec().unwrap();
 
-        let requests = queue
-            .lock()
-            .expect("Connection request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-        assert!(matches!(requests[0], ConnectionRequest::Generate));
+        let event = rx.try_recv().expect("Should have received an event");
+        assert!(matches!(
+            event,
+            HubEvent::LuaConnectionRequest(ConnectionRequest::Generate)
+        ));
     }
 
     #[test]
-    fn test_regenerate_queues_request() {
+    fn test_regenerate_sends_event() {
         let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
+        let (tx, cache, mut rx) = create_test_sender_and_cache_with_channel();
 
-        register(&lua, Arc::clone(&queue), cache).expect("Should register");
+        register(&lua, tx, cache).expect("Should register");
 
         lua.load("connection.regenerate()").exec().unwrap();
 
-        let requests = queue
-            .lock()
-            .expect("Connection request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-        assert!(matches!(requests[0], ConnectionRequest::Regenerate));
+        let event = rx.try_recv().expect("Should have received an event");
+        assert!(matches!(
+            event,
+            HubEvent::LuaConnectionRequest(ConnectionRequest::Regenerate)
+        ));
     }
 
     #[test]
-    fn test_multiple_regenerate_requests_queue_in_order() {
+    fn test_multiple_regenerate_requests_send_events_in_order() {
         let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
+        let (tx, cache, mut rx) = create_test_sender_and_cache_with_channel();
 
-        register(&lua, Arc::clone(&queue), cache).expect("Should register");
+        register(&lua, tx, cache).expect("Should register");
 
         lua.load(
             r#"
@@ -307,25 +318,28 @@ mod tests {
         .exec()
         .unwrap();
 
-        let requests = queue
-            .lock()
-            .expect("Connection request queue mutex poisoned");
-        assert_eq!(requests.len(), 3);
+        for _ in 0..3 {
+            let event = rx.try_recv().expect("Should have received an event");
+            assert!(matches!(
+                event,
+                HubEvent::LuaConnectionRequest(ConnectionRequest::Regenerate)
+            ));
+        }
     }
 
     #[test]
-    fn test_copy_to_clipboard_queues_request() {
+    fn test_copy_to_clipboard_sends_event() {
         let lua = Lua::new();
-        let (queue, cache) = create_test_queue_and_cache();
+        let (tx, cache, mut rx) = create_test_sender_and_cache_with_channel();
 
-        register(&lua, Arc::clone(&queue), cache).expect("Should register");
+        register(&lua, tx, cache).expect("Should register");
 
         lua.load("connection.copy_to_clipboard()").exec().unwrap();
 
-        let requests = queue
-            .lock()
-            .expect("Connection request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-        assert!(matches!(requests[0], ConnectionRequest::CopyToClipboard));
+        let event = rx.try_recv().expect("Should have received an event");
+        assert!(matches!(
+            event,
+            HubEvent::LuaConnectionRequest(ConnectionRequest::CopyToClipboard)
+        ));
     }
 }

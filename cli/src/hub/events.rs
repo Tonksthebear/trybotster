@@ -8,8 +8,15 @@
 // Rust guideline compliant 2026-02
 
 use crate::file_watcher::FileEvent;
+use crate::lua::primitives::connection::ConnectionRequest;
 use crate::lua::primitives::http::CompletedHttpResponse;
+use crate::lua::primitives::hub::HubRequest;
+use crate::lua::primitives::pty::PtyRequest;
+use crate::lua::primitives::tui::TuiSendRequest;
+use crate::lua::primitives::webrtc::WebRtcSendRequest;
 use crate::lua::primitives::websocket::WsEvent;
+use crate::lua::primitives::action_cable::ActionCableRequest;
+use crate::lua::primitives::worktree::WorktreeRequest;
 
 /// Event from a background producer delivered to the Hub event loop.
 ///
@@ -93,5 +100,30 @@ pub(crate) enum HubEvent {
     /// (timeout/disconnect checks) and safety-net queue drains for
     /// stream frames and PTY observers.
     CleanupTick,
+
+    // =========================================================================
+    // Lua primitive events — sent directly from Lua closures via HubEventSender
+    // =========================================================================
+
+    /// WebRTC send request from a Lua callback.
+    WebRtcSend(WebRtcSendRequest),
+
+    /// TUI send request from a Lua callback.
+    TuiSend(TuiSendRequest),
+
+    /// PTY operation request from a Lua callback.
+    LuaPtyRequest(PtyRequest),
+
+    /// Hub operation request from a Lua callback.
+    LuaHubRequest(HubRequest),
+
+    /// Connection operation request from a Lua callback.
+    LuaConnectionRequest(ConnectionRequest),
+
+    /// Worktree operation request from a Lua callback.
+    LuaWorktreeRequest(WorktreeRequest),
+
+    /// ActionCable operation request from a Lua callback.
+    LuaActionCableRequest(ActionCableRequest),
 }
 

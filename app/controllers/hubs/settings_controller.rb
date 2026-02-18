@@ -32,16 +32,20 @@ module Hubs
       }
     end
 
-    # Parse app/templates/**/*.lua into a grouped catalog.
+    # Parse app/templates/**/*.{lua,sh} into a grouped catalog.
     # Each template has @tag metadata in comment headers.
+    # Lua uses `-- @tag`, shell uses `# @tag`.
     def template_catalog
-      Dir.glob(Rails.root.join("app/templates/**/*.lua")).filter_map { |path|
+      Dir.glob(Rails.root.join("app/templates/**/*.{lua,sh}")).filter_map { |path|
         content = File.read(path)
         meta = extract_template_metadata(content)
         next unless meta[:template] && meta[:category] && meta[:dest]
 
+        ext = File.extname(path)
+        basename = File.basename(path, ext)
+
         {
-          slug: "#{meta[:category]}-#{File.basename(path, '.lua')}",
+          slug: "#{meta[:category]}-#{basename}",
           name: meta[:template],
           description: meta[:description],
           category: meta[:category],
@@ -53,11 +57,17 @@ module Hubs
       }.group_by { |t| t[:category] }
     end
 
+    # Extract @tag metadata from comment headers.
+    # Supports both Lua (`-- @tag value`) and shell (`# @tag value`) comments.
+    # Stops at the first non-comment line (ignoring shebangs and blank lines).
     def extract_template_metadata(content)
       metadata = {}
       content.each_line do |line|
-        break unless line.start_with?("--")
-        if (match = line.match(/^--\s*@(\w+)\s+(.+)/))
+        next if line.start_with?("#!") # skip shebang
+        next if line.strip.empty?
+        break unless line.start_with?("--") || line.start_with?("#")
+
+        if (match = line.match(/^(?:--|#)\s*@(\w+)\s+(.+)/))
           metadata[match[1].to_sym] = match[2].strip
         end
       end

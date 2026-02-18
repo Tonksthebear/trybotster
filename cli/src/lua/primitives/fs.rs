@@ -58,6 +58,7 @@ use mlua::Lua;
 /// - `fs.copy(src, dst)` - Copy a file
 /// - `fs.listdir(path)` - List entries in a directory
 /// - `fs.is_dir(path)` - Check if path is a directory
+/// - `fs.rename(from, to)` - Rename/move a file or directory
 /// - `fs.rmdir(path)` - Recursively remove a directory and all contents
 ///
 /// # Errors
@@ -274,6 +275,40 @@ pub fn register(lua: &Lua) -> Result<()> {
     fs_table
         .set("stat", stat_fn)
         .map_err(|e| anyhow!("Failed to set fs.stat: {e}"))?;
+
+    // fs.rename(from, to) -> (true, nil) or (nil, error_string)
+    //
+    // Renames (moves) a file or directory. Creates parent directories for
+    // the destination if they don't exist.
+    let rename_fn = lua
+        .create_function(|_, (from, to): (String, String)| {
+            let from_path = Path::new(&from);
+            if !from_path.exists() {
+                return Ok((None::<bool>, Some("Source path does not exist".to_string())));
+            }
+
+            let to_path = Path::new(&to);
+            if let Some(parent) = to_path.parent() {
+                if !parent.exists() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return Ok((
+                            None::<bool>,
+                            Some(format!("Failed to create parent directories: {e}")),
+                        ));
+                    }
+                }
+            }
+
+            match std::fs::rename(&from, &to) {
+                Ok(()) => Ok((Some(true), None::<String>)),
+                Err(e) => Ok((None::<bool>, Some(format!("Failed to rename: {e}")))),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create fs.rename function: {e}"))?;
+
+    fs_table
+        .set("rename", rename_fn)
+        .map_err(|e| anyhow!("Failed to set fs.rename: {e}"))?;
 
     // fs.resolve_safe(root, relative) -> (absolute_path, nil) or (nil, error_string)
     //

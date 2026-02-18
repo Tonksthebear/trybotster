@@ -99,8 +99,8 @@ pub enum TuiOutput {
     ///
     /// Carries agent lifecycle events and subscription data from Lua
     /// callbacks (`agent_created`, `agent_deleted`, `worktree_list`, etc.).
-    /// These are broadcast by `broadcast_hub_event()` in Lua and forwarded
-    /// by `process_lua_tui_sends()` in Hub.
+    /// These are broadcast by `broadcast_hub_event()` in Lua and delivered
+    /// via `HubEvent::TuiSend` to the Hub event loop.
     Message(serde_json::Value),
 }
 

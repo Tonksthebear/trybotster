@@ -72,7 +72,15 @@ local function build_agent_items(state)
   -- Existing agents from client-side cache
   for _, agent in ipairs(_tui_state and _tui_state.agents or {}) do
     local name = agent.display_name or agent.branch_name
-    table.insert(items, { text = name })
+    local parts = {}
+    if agent.profile_name then table.insert(parts, agent.profile_name) end
+    if agent.branch_name then table.insert(parts, agent.branch_name) end
+    local secondary = #parts > 0 and table.concat(parts, " · ") or nil
+    local item = { text = name }
+    if secondary then
+      item.secondary = { { text = secondary, style = "dim" } }
+    end
+    table.insert(items, item)
   end
 
   return items

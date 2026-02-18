@@ -412,6 +412,12 @@ async fn run_message_loop(
     // Track which channels have been confirmed by the server
     let mut confirmed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Queue performs that arrive before channel confirmation. Rails ActionCable
+    // can deliver data messages (e.g., replayed pending messages) before sending
+    // confirm_subscription, so callbacks may fire performs before we know the
+    // channel is confirmed. These are flushed once confirmation arrives.
+    let mut pending_performs: Vec<ChannelPerform> = Vec::new();
+
     // Track when each subscription was sent, for confirmation timeout.
     // Entries are removed once confirmed. Re-subscribe fires if the entry
     // exceeds CONFIRM_TIMEOUT without confirmation.
@@ -438,9 +444,23 @@ async fn run_message_loop(
             msg = reader.recv() => {
                 match msg {
                     Some(Ok(crate::ws::WsMessage::Text(text))) => {
+                        let prev_confirmed = confirmed.len();
                         match handle_text_message(&text, subscriptions, &mut confirmed, &mut pending_confirm).await {
                             TextMessageResult::Continue => {}
                             TextMessageResult::Disconnected => return ConnectionLoopExit::Disconnected,
+                        }
+                        // If a new channel was just confirmed, flush any queued performs for it.
+                        if confirmed.len() > prev_confirmed {
+                            let (ready, still_pending): (Vec<_>, Vec<_>) = pending_performs
+                                .drain(..)
+                                .partition(|p| confirmed.contains(&p.identifier));
+                            pending_performs = still_pending;
+                            for request in ready {
+                                if let Err(e) = send_perform(writer, &request).await {
+                                    log::warn!("[ActionCable] Failed to send queued perform '{}': {}", request.action, e);
+                                    return ConnectionLoopExit::Disconnected;
+                                }
+                            }
                         }
                     }
                     Some(Ok(crate::ws::WsMessage::Ping(data))) => {
@@ -483,35 +503,18 @@ async fn run_message_loop(
             // Process outgoing perform requests
             Some(request) = perform_rx.recv() => {
                 if confirmed.contains(&request.identifier) {
-                    // Build data object: merge action name with caller-provided fields.
-                    // ActionCable expects data as a JSON string containing action + fields.
-                    let mut data_obj = serde_json::json!({
-                        "action": request.action,
-                    });
-                    if let serde_json::Value::Object(map) = request.data {
-                        for (k, v) in map {
-                            data_obj[&k] = v;
-                        }
-                    }
-
-                    let perform_cmd = serde_json::json!({
-                        "command": "message",
-                        "identifier": request.identifier,
-                        "data": data_obj.to_string()
-                    });
-
-                    if let Err(e) = writer.send_text(&perform_cmd.to_string()).await {
+                    if let Err(e) = send_perform(writer, &request).await {
                         log::warn!("[ActionCable] Failed to send perform '{}': {}", request.action, e);
                         return ConnectionLoopExit::Disconnected;
                     }
-                    log::trace!("[ActionCable] Sent perform '{}'", request.action);
                 } else {
+                    // Queue for later — channel may not be confirmed yet because
+                    // Rails sends data messages before confirm_subscription.
                     log::debug!(
-                        "[ActionCable] Dropping perform '{}' -- channel not yet confirmed (identifier={}, confirmed={:?})",
+                        "[ActionCable] Queueing perform '{}' until channel confirmed",
                         request.action,
-                        &request.identifier[..request.identifier.len().min(80)],
-                        confirmed
                     );
+                    pending_performs.push(request);
                 }
             }
 
@@ -648,6 +651,29 @@ async fn handle_text_message(
     }
 }
 
+
+/// Send an ActionCable perform command over the WebSocket.
+async fn send_perform(
+    writer: &mut crate::ws::WsWriter,
+    request: &ChannelPerform,
+) -> anyhow::Result<()> {
+    let mut data_obj = serde_json::json!({ "action": request.action });
+    if let serde_json::Value::Object(ref map) = request.data {
+        for (k, v) in map {
+            data_obj[k] = v.clone();
+        }
+    }
+
+    let perform_cmd = serde_json::json!({
+        "command": "message",
+        "identifier": request.identifier,
+        "data": data_obj.to_string()
+    });
+
+    writer.send_text(&perform_cmd.to_string()).await?;
+    log::trace!("[ActionCable] Sent perform '{}'", request.action);
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

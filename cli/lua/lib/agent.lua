@@ -63,6 +63,7 @@ function Agent.new(config)
         worktree_path = config.worktree_path,
         prompt = config.prompt,
         invocation_url = config.invocation_url,
+        profile_name = config.profile_name,
         created_at = os.time(),
         status = "running",
         sessions = {},        -- name -> PtySessionHandle (for lookup by name)
@@ -344,6 +345,7 @@ function Agent:info()
     return {
         id = key,
         display_name = display_name,
+        profile_name = self.profile_name,
         repo = self.repo,
         issue_number = self.issue_number,
         branch_name = self.branch_name,

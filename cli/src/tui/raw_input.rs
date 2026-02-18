@@ -251,7 +251,6 @@ impl RawInputReader {
                     let descriptor = match b {
                         0x09 => "tab".to_string(),       // Ctrl+I = Tab
                         0x0d => "enter".to_string(),     // Ctrl+M = Enter (CR)
-                        0x0a => "shift+enter".to_string(), // LF — terminals send this for Shift+Enter
                         _ => {
                             let ch = (b + b'@') as char;
                             format!("ctrl+{}", ch.to_ascii_lowercase())
@@ -677,11 +676,11 @@ mod tests {
     }
 
     #[test]
-    fn test_shift_enter() {
-        // 0x0A (LF) — terminals send this for Shift+Enter
+    fn test_lf_is_ctrl_j() {
+        // 0x0A (LF) = Ctrl+J — no special-casing, falls through to default
         let mut r = reader_with_bytes(&[0x0a]);
         let events = r.parse_events();
-        assert_eq!(first_descriptor(&events), "shift+enter");
+        assert_eq!(first_descriptor(&events), "ctrl+j");
     }
 
     #[test]

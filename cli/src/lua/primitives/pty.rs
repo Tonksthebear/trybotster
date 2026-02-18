@@ -92,12 +92,14 @@ use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 use crate::agent::pty::{PtySession, SharedPtyState};
 use crate::agent::spawn::PtySpawnConfig;
+use crate::hub::events::HubEvent;
 use tokio::sync::broadcast;
 
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
 
 use crate::agent::pty::events::PtyEvent;
+use super::HubEventSender;
 
 // =============================================================================
 // PtySessionHandle - Lua-facing handle to a spawned PtySession
@@ -459,13 +461,16 @@ impl Clone for PtyRequest {
     }
 }
 
-/// Shared request queue for PTY operations from Lua.
-pub type PtyRequestQueue = Arc<Mutex<Vec<PtyRequest>>>;
-
-/// Create a new PTY request queue.
-#[must_use]
-pub fn new_request_queue() -> PtyRequestQueue {
-    Arc::new(Mutex::new(Vec::new()))
+/// Helper to send a PTY request through the shared event sender.
+///
+/// Silently drops the event with a warning if the sender isn't wired up yet.
+fn send_pty_event(tx: &HubEventSender, request: PtyRequest) {
+    let guard = tx.lock().expect("HubEventSender mutex poisoned");
+    if let Some(ref sender) = *guard {
+        let _ = sender.send(HubEvent::LuaPtyRequest(request));
+    } else {
+        ::log::warn!("[PTY] Request sent before hub_event_tx set — event dropped");
+    }
 }
 
 /// Register PTY primitives with the Lua state.
@@ -480,12 +485,12 @@ pub fn new_request_queue() -> PtyRequestQueue {
 /// # Arguments
 ///
 /// * `lua` - The Lua state to register primitives in
-/// * `request_queue` - Shared queue for PTY operations (processed by Hub)
+/// * `hub_event_tx` - Shared sender for Hub events (filled in later by `set_hub_event_tx`)
 ///
 /// # Errors
 ///
 /// Returns an error if Lua table or function creation fails.
-pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
+pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
     // Get or create the webrtc table
     let webrtc: LuaTable = lua
         .globals()
@@ -493,7 +498,7 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
         .unwrap_or_else(|_| lua.create_table().unwrap());
 
     // webrtc.create_pty_forwarder({ peer_id, agent_index, pty_index, subscription_id, prefix? })
-    let queue = request_queue.clone();
+    let tx = hub_event_tx.clone();
     let create_forwarder_fn = lua
         .create_function(move |_lua, opts: LuaTable| {
             let peer_id: String = opts
@@ -513,19 +518,15 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
             let forwarder_id = format!("{}:{}:{}", peer_id, agent_index, pty_index);
             let active_flag = Arc::new(Mutex::new(true));
 
-            // Queue the request for Hub to process
-            {
-                let mut q = queue.lock()
-                    .expect("PTY request queue mutex poisoned");
-                q.push(PtyRequest::CreateForwarder(CreateForwarderRequest {
-                    peer_id: peer_id.clone(),
-                    agent_index,
-                    pty_index,
-                    prefix: prefix.map(|p| p.as_bytes().to_vec()),
-                    subscription_id,
-                    active_flag: Arc::clone(&active_flag),
-                }));
-            }
+            // Send the request to Hub via event channel
+            send_pty_event(&tx, PtyRequest::CreateForwarder(CreateForwarderRequest {
+                peer_id: peer_id.clone(),
+                agent_index,
+                pty_index,
+                prefix: prefix.map(|p| p.as_bytes().to_vec()),
+                subscription_id,
+                active_flag: Arc::clone(&active_flag),
+            }));
 
             // Return forwarder handle immediately
             // The actual forwarder task is spawned when Hub processes the request
@@ -560,7 +561,7 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
     //
     // Like webrtc.create_pty_forwarder but routes output through TUI send queue.
     // No peer_id needed — there's only one TUI client.
-    let queue_tui = request_queue.clone();
+    let tx_tui = hub_event_tx.clone();
     let create_tui_forwarder_fn = lua
         .create_function(move |_lua, opts: LuaTable| {
             let agent_index: usize = opts
@@ -576,18 +577,13 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
             let forwarder_id = format!("tui:{}:{}", agent_index, pty_index);
             let active_flag = Arc::new(Mutex::new(true));
 
-            // Queue the request for Hub to process
-            {
-                let mut q = queue_tui
-                    .lock()
-                    .expect("PTY request queue mutex poisoned");
-                q.push(PtyRequest::CreateTuiForwarder(CreateTuiForwarderRequest {
-                    agent_index,
-                    pty_index,
-                    subscription_id,
-                    active_flag: Arc::clone(&active_flag),
-                }));
-            }
+            // Send the request to Hub via event channel
+            send_pty_event(&tx_tui, PtyRequest::CreateTuiForwarder(CreateTuiForwarderRequest {
+                agent_index,
+                pty_index,
+                subscription_id,
+                active_flag: Arc::clone(&active_flag),
+            }));
 
             // Return forwarder handle immediately
             let forwarder = PtyForwarder {
@@ -617,13 +613,11 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
         .unwrap_or_else(|_| lua.create_table().unwrap());
 
     // hub.write_pty(agent_index, pty_index, data)
-    let queue2 = request_queue.clone();
+    let tx2 = hub_event_tx.clone();
     let write_pty_fn = lua
         .create_function(
             move |_, (agent_index, pty_index, data): (usize, usize, LuaString)| {
-                let mut q = queue2.lock()
-                    .expect("PTY request queue mutex poisoned");
-                q.push(PtyRequest::WritePty {
+                send_pty_event(&tx2, PtyRequest::WritePty {
                     agent_index,
                     pty_index,
                     data: data.as_bytes().to_vec(),
@@ -637,13 +631,11 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
         .map_err(|e| anyhow!("Failed to set hub.write_pty: {e}"))?;
 
     // hub.resize_pty(agent_index, pty_index, rows, cols)
-    let queue3 = request_queue.clone();
+    let tx3 = hub_event_tx.clone();
     let resize_pty_fn = lua
         .create_function(
             move |_, (agent_index, pty_index, rows, cols): (usize, usize, u16, u16)| {
-                let mut q = queue3.lock()
-                    .expect("PTY request queue mutex poisoned");
-                q.push(PtyRequest::ResizePty {
+                send_pty_event(&tx3, PtyRequest::ResizePty {
                     agent_index,
                     pty_index,
                     rows,
@@ -686,7 +678,7 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
     //   agent_key: string (optional) - Agent key for notification watcher
     //   session_name: string (optional) - Session name for notification watcher
     //   cols: number (default 80) - Initial cols
-    let queue_spawn = request_queue.clone();
+    let tx_spawn = hub_event_tx.clone();
     let spawn_fn = lua
         .create_function(move |_lua, opts: LuaTable| {
             // Parse required fields
@@ -746,14 +738,11 @@ pub fn register(lua: &Lua, request_queue: PtyRequestQueue) -> Result<()> {
             let (shared_state, shadow_screen, event_tx, kitty_enabled) = session.get_direct_access();
             let session_port = session.port();
 
-            // Auto-queue notification watcher if notifications enabled and identity provided
+            // Auto-send notification watcher request if notifications enabled and identity provided
             if detect_notifications {
                 if let (Some(ak), Some(sn)) = (&agent_key, &session_name) {
                     let watcher_key = format!("{ak}:{sn}");
-                    let mut q = queue_spawn
-                        .lock()
-                        .expect("PTY request queue mutex poisoned");
-                    q.push(PtyRequest::SpawnNotificationWatcher {
+                    send_pty_event(&tx_spawn, PtyRequest::SpawnNotificationWatcher {
                         watcher_key,
                         agent_key: ak.clone(),
                         session_name: sn.clone(),
@@ -804,6 +793,15 @@ pub struct PtyOutputContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::new_hub_event_sender;
+
+    /// Create a wired-up sender with a channel for tests that need to check events.
+    fn setup_with_channel() -> (HubEventSender, tokio::sync::mpsc::UnboundedReceiver<HubEvent>) {
+        let tx = new_hub_event_sender();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+        (tx, receiver)
+    }
 
     #[test]
     fn test_pty_forwarder_userdata() {
@@ -844,14 +842,12 @@ mod tests {
     }
 
     #[test]
-    fn test_create_pty_forwarder_queues_request() {
+    fn test_create_pty_forwarder_sends_event() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let (tx, mut rx) = setup_with_channel();
 
-        // Register primitives
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx).expect("Should register PTY primitives");
 
-        // Create forwarder
         lua.load(
             r#"
             forwarder = webrtc.create_pty_forwarder({
@@ -865,23 +861,18 @@ mod tests {
         .exec()
         .expect("Should create forwarder");
 
-        // Check queue has the request
-        let requests = queue.lock()
-            .expect("PTY request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-
-        match &requests[0] {
-            PtyRequest::CreateForwarder(req) => {
+        let event = rx.try_recv().expect("Should have received event");
+        match event {
+            HubEvent::LuaPtyRequest(PtyRequest::CreateForwarder(req)) => {
                 assert_eq!(req.peer_id, "browser-123");
                 assert_eq!(req.agent_index, 0);
                 assert_eq!(req.pty_index, 1);
                 assert_eq!(req.subscription_id, "sub_1_1234567890");
                 assert!(req.prefix.is_none());
             }
-            _ => panic!("Expected CreateForwarder request"),
+            _ => panic!("Expected LuaPtyRequest CreateForwarder event"),
         }
 
-        // Check forwarder handle is returned
         let id: String = lua.load("return forwarder:id()").eval().unwrap();
         assert_eq!(id, "browser-123:0:1");
     }
@@ -889,9 +880,9 @@ mod tests {
     #[test]
     fn test_create_pty_forwarder_with_prefix() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let (tx, mut rx) = setup_with_channel();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx).expect("Should register PTY primitives");
 
         lua.load(
             r#"
@@ -907,83 +898,75 @@ mod tests {
         .exec()
         .expect("Should create forwarder with prefix");
 
-        let requests = queue.lock()
-            .expect("PTY request queue mutex poisoned");
-        match &requests[0] {
-            PtyRequest::CreateForwarder(req) => {
+        match rx.try_recv().unwrap() {
+            HubEvent::LuaPtyRequest(PtyRequest::CreateForwarder(req)) => {
                 assert_eq!(req.prefix, Some(vec![0x01]));
                 assert_eq!(req.subscription_id, "sub_2_9876543210");
             }
-            _ => panic!("Expected CreateForwarder request"),
+            _ => panic!("Expected CreateForwarder event"),
         }
     }
 
     #[test]
-    fn test_write_pty_queues_request() {
+    fn test_write_pty_sends_event() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let (tx, mut rx) = setup_with_channel();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx).expect("Should register PTY primitives");
 
         lua.load(r#"hub.write_pty(0, 1, "ls -la\n")"#)
             .exec()
             .expect("Should write PTY");
 
-        let requests = queue.lock()
-            .expect("PTY request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-
-        match &requests[0] {
-            PtyRequest::WritePty {
+        let event = rx.try_recv().expect("Should have received event");
+        match event {
+            HubEvent::LuaPtyRequest(PtyRequest::WritePty {
                 agent_index,
                 pty_index,
                 data,
-            } => {
-                assert_eq!(*agent_index, 0);
-                assert_eq!(*pty_index, 1);
+            }) => {
+                assert_eq!(agent_index, 0);
+                assert_eq!(pty_index, 1);
                 assert_eq!(data, b"ls -la\n");
             }
-            _ => panic!("Expected WritePty request"),
+            _ => panic!("Expected LuaPtyRequest WritePty event"),
         }
     }
 
     #[test]
-    fn test_resize_pty_queues_request() {
+    fn test_resize_pty_sends_event() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let (tx, mut rx) = setup_with_channel();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx).expect("Should register PTY primitives");
 
         lua.load(r#"hub.resize_pty(0, 0, 40, 120)"#)
             .exec()
             .expect("Should resize PTY");
 
-        let requests = queue.lock()
-            .expect("PTY request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-
-        match &requests[0] {
-            PtyRequest::ResizePty {
+        let event = rx.try_recv().expect("Should have received event");
+        match event {
+            HubEvent::LuaPtyRequest(PtyRequest::ResizePty {
                 agent_index,
                 pty_index,
                 rows,
                 cols,
-            } => {
-                assert_eq!(*agent_index, 0);
-                assert_eq!(*pty_index, 0);
-                assert_eq!(*rows, 40);
-                assert_eq!(*cols, 120);
+            }) => {
+                assert_eq!(agent_index, 0);
+                assert_eq!(pty_index, 0);
+                assert_eq!(rows, 40);
+                assert_eq!(cols, 120);
             }
-            _ => panic!("Expected ResizePty request"),
+            _ => panic!("Expected LuaPtyRequest ResizePty event"),
         }
     }
 
     #[test]
-    fn test_multiple_requests_queue_in_order() {
+    fn test_multiple_requests_send_in_order() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let (tx, mut rx) = setup_with_channel();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx).expect("Should register PTY primitives");
 
         lua.load(
             r#"
@@ -993,23 +976,23 @@ mod tests {
         "#,
         )
         .exec()
-        .expect("Should queue multiple requests");
+        .expect("Should send multiple events");
 
-        let requests = queue.lock()
-            .expect("PTY request queue mutex poisoned");
-        assert_eq!(requests.len(), 3);
+        let e1 = rx.try_recv().expect("Should have first event");
+        let e2 = rx.try_recv().expect("Should have second event");
+        let e3 = rx.try_recv().expect("Should have third event");
 
-        assert!(matches!(requests[0], PtyRequest::CreateForwarder(_)));
-        assert!(matches!(requests[1], PtyRequest::WritePty { .. }));
-        assert!(matches!(requests[2], PtyRequest::ResizePty { .. }));
+        assert!(matches!(e1, HubEvent::LuaPtyRequest(PtyRequest::CreateForwarder(_))));
+        assert!(matches!(e2, HubEvent::LuaPtyRequest(PtyRequest::WritePty { .. })));
+        assert!(matches!(e3, HubEvent::LuaPtyRequest(PtyRequest::ResizePty { .. })));
     }
 
     #[test]
     fn test_create_forwarder_requires_peer_id() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let tx = new_hub_event_sender();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx.clone()).expect("Should register PTY primitives");
 
         let result: mlua::Result<()> = lua
             .load(
@@ -1027,9 +1010,9 @@ mod tests {
     #[test]
     fn test_create_forwarder_requires_agent_index() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let tx = new_hub_event_sender();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx.clone()).expect("Should register PTY primitives");
 
         let result: mlua::Result<()> = lua
             .load(
@@ -1051,9 +1034,9 @@ mod tests {
     #[test]
     fn test_create_forwarder_requires_subscription_id() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let tx = new_hub_event_sender();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx.clone()).expect("Should register PTY primitives");
 
         let result: mlua::Result<()> = lua
             .load(
@@ -1079,14 +1062,14 @@ mod tests {
     #[test]
     fn test_tui_create_pty_forwarder_exists() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let tx = new_hub_event_sender();
 
         // Register TUI table stub first (pty.rs appends to it)
         lua.globals()
             .set("tui", lua.create_table().unwrap())
             .unwrap();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx.clone()).expect("Should register PTY primitives");
 
         let tui: mlua::Table = lua.globals().get("tui").expect("tui should exist");
         let _: mlua::Function = tui
@@ -1095,15 +1078,15 @@ mod tests {
     }
 
     #[test]
-    fn test_tui_create_pty_forwarder_queues_request() {
+    fn test_tui_create_pty_forwarder_sends_event() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let (tx, mut rx) = setup_with_channel();
 
         lua.globals()
             .set("tui", lua.create_table().unwrap())
             .unwrap();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx).expect("Should register PTY primitives");
 
         lua.load(
             r#"
@@ -1117,18 +1100,14 @@ mod tests {
         .exec()
         .expect("Should create TUI forwarder");
 
-        let requests = queue
-            .lock()
-            .expect("PTY request queue mutex poisoned");
-        assert_eq!(requests.len(), 1);
-
-        match &requests[0] {
-            PtyRequest::CreateTuiForwarder(req) => {
+        let event = rx.try_recv().expect("Should have received event");
+        match event {
+            HubEvent::LuaPtyRequest(PtyRequest::CreateTuiForwarder(req)) => {
                 assert_eq!(req.agent_index, 0);
                 assert_eq!(req.pty_index, 1);
                 assert_eq!(req.subscription_id, "tui_term_1");
             }
-            _ => panic!("Expected CreateTuiForwarder request"),
+            _ => panic!("Expected LuaPtyRequest CreateTuiForwarder event"),
         }
 
         // Verify forwarder handle
@@ -1145,13 +1124,13 @@ mod tests {
     #[test]
     fn test_tui_create_pty_forwarder_requires_agent_index() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let tx = new_hub_event_sender();
 
         lua.globals()
             .set("tui", lua.create_table().unwrap())
             .unwrap();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx.clone()).expect("Should register PTY primitives");
 
         let result: mlua::Result<()> = lua
             .load(
@@ -1173,13 +1152,13 @@ mod tests {
     #[test]
     fn test_tui_forwarder_stop_sets_inactive() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let tx = new_hub_event_sender();
 
         lua.globals()
             .set("tui", lua.create_table().unwrap())
             .unwrap();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx.clone()).expect("Should register PTY primitives");
 
         lua.load(
             r#"
@@ -1415,9 +1394,9 @@ mod tests {
     #[tokio::test]
     async fn test_pty_spawn_function_exists() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let tx = new_hub_event_sender();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx.clone()).expect("Should register PTY primitives");
 
         let pty: mlua::Table = lua.globals().get("pty").expect("pty table should exist");
         let _: mlua::Function = pty
@@ -1428,9 +1407,9 @@ mod tests {
     #[tokio::test]
     async fn test_pty_spawn_requires_worktree_path() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let tx = new_hub_event_sender();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx.clone()).expect("Should register PTY primitives");
 
         let result: mlua::Result<()> = lua
             .load(
@@ -1452,9 +1431,9 @@ mod tests {
     #[tokio::test]
     async fn test_pty_spawn_basic() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let tx = new_hub_event_sender();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx.clone()).expect("Should register PTY primitives");
 
         let temp_dir = tempfile::TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_string_lossy().to_string();
@@ -1503,9 +1482,9 @@ mod tests {
     #[tokio::test]
     async fn test_pty_spawn_with_port() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let tx = new_hub_event_sender();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx.clone()).expect("Should register PTY primitives");
 
         let temp_dir = tempfile::TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_string_lossy().to_string();
@@ -1534,11 +1513,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pty_spawn_with_notifications_queues_watcher() {
+    async fn test_pty_spawn_with_notifications_sends_watcher_event() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let (tx, mut rx) = setup_with_channel();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx).expect("Should register PTY primitives");
 
         let temp_dir = tempfile::TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_string_lossy().to_string();
@@ -1561,30 +1540,29 @@ mod tests {
         .exec()
         .expect("pty.spawn with notifications should work");
 
-        // Should have queued a SpawnNotificationWatcher request
-        let requests = queue.lock().expect("queue lock");
-        assert_eq!(requests.len(), 1);
-        match &requests[0] {
-            PtyRequest::SpawnNotificationWatcher {
+        // Should have sent a SpawnNotificationWatcher event
+        let event = rx.try_recv().expect("Should have received event");
+        match event {
+            HubEvent::LuaPtyRequest(PtyRequest::SpawnNotificationWatcher {
                 watcher_key,
                 agent_key,
                 session_name,
                 ..
-            } => {
+            }) => {
                 assert_eq!(watcher_key, "agent-1:cli");
                 assert_eq!(agent_key, "agent-1");
                 assert_eq!(session_name, "cli");
             }
-            other => panic!("Expected SpawnNotificationWatcher, got {:?}", other),
+            other => panic!("Expected LuaPtyRequest SpawnNotificationWatcher, got {:?}", other),
         }
     }
 
     #[tokio::test]
     async fn test_pty_spawn_notifications_without_identity_no_watcher() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let (tx, mut rx) = setup_with_channel();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx).expect("Should register PTY primitives");
 
         let temp_dir = tempfile::TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_string_lossy().to_string();
@@ -1593,7 +1571,7 @@ mod tests {
             .set("temp_path", temp_path)
             .expect("Failed to set temp_path");
 
-        // detect_notifications=true but no agent_key/session_name -> no watcher queued
+        // detect_notifications=true but no agent_key/session_name -> no event sent
         lua.load(
             r#"
                 session = pty.spawn({
@@ -1606,16 +1584,15 @@ mod tests {
         .exec()
         .expect("pty.spawn should work");
 
-        let requests = queue.lock().expect("queue lock");
-        assert!(requests.is_empty(), "No watcher should be queued without identity");
+        assert!(rx.try_recv().is_err(), "No event should be sent without identity");
     }
 
     #[tokio::test]
     async fn test_pty_spawn_write_and_snapshot() {
         let lua = Lua::new();
-        let queue = new_request_queue();
+        let tx = new_hub_event_sender();
 
-        super::register(&lua, Arc::clone(&queue)).expect("Should register PTY primitives");
+        super::register(&lua, tx.clone()).expect("Should register PTY primitives");
 
         let temp_dir = tempfile::TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_string_lossy().to_string();

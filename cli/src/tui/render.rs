@@ -26,7 +26,7 @@ use ratatui::{
     backend::{Backend, TestBackend},
     layout::{Alignment, Rect},
     style::{Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{
         Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
         ScrollbarState, StatefulWidget, Widget, Wrap,
@@ -323,11 +323,19 @@ pub(super) fn render_list_widget(
             list_items.push(li);
         } else {
             selectable_to_absolute.push(i);
-            let line = item.content.to_line();
-            let li = if let Some(ref style) = item.style {
-                ListItem::new(line).style(style.to_ratatui_style())
+            let primary = item.content.to_line();
+            let li = if let Some(ref secondary) = item.secondary {
+                let secondary_line = secondary
+                    .to_line()
+                    .style(Style::default().add_modifier(Modifier::DIM));
+                ListItem::new(Text::from(vec![primary, secondary_line]))
             } else {
-                ListItem::new(line)
+                ListItem::new(primary)
+            };
+            let li = if let Some(ref style) = item.style {
+                li.style(style.to_ratatui_style())
+            } else {
+                li
             };
             list_items.push(li);
         }
