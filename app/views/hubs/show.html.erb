@@ -118,18 +118,27 @@
 
         <%# Template for agent cards %>
         <template data-agent-list-target="template">
-          <a data-href="/hubs/{hubId}/agents/{index}"
-             data-agent-id
-             class="flex items-center gap-3 px-4 py-3 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 hover:border-zinc-700 rounded-lg transition-colors">
-            <div class="size-10 rounded-lg bg-zinc-700/50 flex items-center justify-center text-zinc-400">
-              <%= icon "command-line", class: "size-5" %>
-            </div>
-            <div class="flex-1 min-w-0">
-              <div data-field="name" class="text-sm font-medium text-zinc-200 truncate font-mono"></div>
-              <div data-field="subtext" class="text-xs text-zinc-500 truncate"></div>
-            </div>
-            <%= icon "chevron-right", class: "size-5 text-zinc-600" %>
-          </a>
+          <div class="group flex items-center gap-0 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 hover:border-zinc-700 rounded-lg transition-colors">
+            <a data-href="/hubs/{hubId}/agents/{index}"
+               data-agent-id
+               class="flex items-center gap-3 px-4 py-3 flex-1 min-w-0">
+              <div class="size-10 rounded-lg bg-zinc-700/50 flex items-center justify-center text-zinc-400 shrink-0">
+                <%= icon "command-line", class: "size-5" %>
+              </div>
+              <div class="flex-1 min-w-0">
+                <div data-field="name" class="text-sm font-medium text-zinc-200 truncate font-mono"></div>
+                <div data-field="subtext" class="text-xs text-zinc-500 truncate"></div>
+              </div>
+              <%= icon "chevron-right", class: "size-5 text-zinc-600 shrink-0" %>
+            </a>
+            <button type="button"
+                    data-agent-id
+                    data-action="agent-list#delete"
+                    class="shrink-0 p-3 text-zinc-600 hover:text-red-400 transition-colors"
+                    title="Delete agent">
+              <%= icon "trash", class: "size-4" %>
+            </button>
+          </div>
         </template>
 
         <%# List container %>

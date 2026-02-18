@@ -6,9 +6,11 @@ import { ConnectionManager, HubConnection } from "connections";
  *
  * Minimal controller that acquires HubConnection to send delete commands.
  * Agent ID is stored on the modal element via data-agent-id (set by opener).
+ * When in_worktree is false, the "delete worktree" option is hidden.
  */
 export default class extends Controller {
-  static values = { hubId: String };
+  static values = { hubId: String, inWorktree: { type: Boolean, default: true } };
+  static targets = ["worktreeOption", "worktreePrompt"];
 
   connect() {
     if (!this.hubIdValue) return;
@@ -24,6 +26,15 @@ export default class extends Controller {
     const hub = this.hub;
     this.hub = null;
     hub?.release();
+  }
+
+  inWorktreeValueChanged() {
+    if (this.hasWorktreeOptionTarget) {
+      this.worktreeOptionTarget.classList.toggle("hidden", !this.inWorktreeValue);
+    }
+    if (this.hasWorktreePromptTarget) {
+      this.worktreePromptTarget.classList.toggle("hidden", !this.inWorktreeValue);
+    }
   }
 
   // Action: close agent, keep worktree

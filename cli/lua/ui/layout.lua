@@ -292,9 +292,9 @@ function render_overlay(state)
     }
   elseif _tui_state.mode == "close_agent_confirm" then
     local sa = get_selected_agent()
-    local on_main = sa and sa.branch_name == "main"
+    local in_worktree = sa and sa.in_worktree
     local lines
-    if on_main then
+    if not in_worktree then
       lines = {
         "Close selected agent?",
         "",
