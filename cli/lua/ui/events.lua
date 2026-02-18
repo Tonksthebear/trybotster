@@ -104,17 +104,30 @@ function M.on_hub_event(event_type, event_data, context)
     local agent_id = event_data.agent_id
     if not agent_id then return nil end
 
-    -- Update client state
+    -- Update client state (removes from _tui_state.agents)
     remove_agent(agent_id)
 
-    -- Clear focus if the deleted agent was selected
+    -- If the deleted agent was selected, move to next available or clear
     if context.selected_agent == agent_id then
-      _tui_state.selected_agent_index = nil
-      _tui_state.active_pty_index = 0
-      return {
-        { op = "focus_terminal" },  -- nil agent_id clears selection
-        set_mode_ops("normal"),
-      }
+      local agents = _tui_state.agents
+      if #agents > 0 then
+        -- Pick the last agent (most recently added), or clamp to end of list
+        local next = agents[#agents]
+        local idx = agent_index_for(next.id)
+        _tui_state.selected_agent_index = idx
+        _tui_state.active_pty_index = 0
+        return {
+          { op = "focus_terminal", agent_id = next.id, pty_index = 0, agent_index = idx },
+          set_mode_ops("insert"),
+        }
+      else
+        _tui_state.selected_agent_index = nil
+        _tui_state.active_pty_index = 0
+        return {
+          { op = "focus_terminal" },  -- nil agent_id clears selection
+          set_mode_ops("normal"),
+        }
+      end
     end
 
     return {}
