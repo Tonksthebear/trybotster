@@ -14,6 +14,7 @@ class Hub < ApplicationRecord
   scope :with_device, -> { where.not(device_id: nil) }
 
   after_commit :broadcast_hubs_list
+  after_create_commit :broadcast_redirect_to_hub
   after_update_commit :broadcast_health_status, if: :health_status_changed?
   after_destroy_commit :broadcast_health_offline
 
@@ -70,6 +71,16 @@ class Hub < ApplicationRecord
 
   def normalize_agents_data(data)
     data.is_a?(ActionController::Parameters) ? data.values : Array(data)
+  end
+
+  def broadcast_redirect_to_hub
+    Turbo::StreamsChannel.broadcast_action_to(
+      [ user, :hubs ],
+      action: :redirect,
+      attributes: { url: Rails.application.routes.url_helpers.hub_path(self), from: "/hubs" }
+    )
+  rescue => e
+    Rails.logger.warn "Failed to broadcast hub redirect: #{e.message}"
   end
 
   def broadcast_hubs_list
