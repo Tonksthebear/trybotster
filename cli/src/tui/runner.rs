@@ -1453,7 +1453,7 @@ where
                 }
                 Ok(TuiOutput::ProcessExited { exit_code, .. }) => {
                     log::info!("PTY process exited with code {:?}", exit_code);
-                    // Process exited - we remain connected for any final output
+                    // Process exited - view cleanup handled by agent_deleted hub event in Lua
                 }
                 Ok(TuiOutput::Message(value)) => {
                     self.dispatch_hub_event(value, layout_lua);
@@ -1745,6 +1745,9 @@ where
             self.current_agent_index = None;
             self.current_pty_index = None;
             self.current_terminal_sub_id = None;
+            // Reset parser to empty so the terminal view clears
+            let (rows, cols) = self.terminal_dims;
+            self.vt100_parser = Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK)));
             return;
         };
 
