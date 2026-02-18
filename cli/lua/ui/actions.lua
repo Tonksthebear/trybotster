@@ -57,14 +57,14 @@ local function transition_to_worktree_selection()
   }
 end
 
---- Check if the currently selected agent is on the main branch.
-local function selected_agent_on_main(context)
+--- Check if the currently selected agent is NOT in a worktree.
+local function selected_agent_not_in_worktree(context)
   local agent_id = context.selected_agent
-  if not agent_id then return false end
+  if not agent_id then return true end
   for _, a in ipairs(_tui_state.agents) do
-    if a.id == agent_id then return a.branch_name == "main" end
+    if a.id == agent_id then return not a.in_worktree end
   end
-  return false
+  return true
 end
 
 --- Look up 0-based agent index from agent_id in client state.
@@ -236,8 +236,8 @@ function M.on_action(action, context)
   end
 
   if action == "confirm_close_delete" and _tui_state.mode == "close_agent_confirm" then
-    -- Don't allow deleting worktree when agent is on main branch
-    if selected_agent_on_main(context) then return nil end
+    -- Don't allow deleting worktree when agent is not in a worktree
+    if selected_agent_not_in_worktree(context) then return nil end
     if context.selected_agent then
       return {
         { op = "send_msg", data = {

@@ -140,12 +140,16 @@ export default class extends Controller {
     const agentId = event.currentTarget.dataset.agentId;
     const agent = this.agentsValue.find((a) => a.id === agentId);
     const name = agent?.display_name || agent?.id || "this agent";
+    const inWorktree = agent?.in_worktree ?? true; // default to showing option
 
     // Set pending info on modal controller element and open dialog
     const modal = document.getElementById("delete-agent-modal");
     if (modal) {
       const controller = modal.querySelector("[data-controller='delete-agent-modal']");
-      if (controller) controller.dataset.agentId = agentId;
+      if (controller) {
+        controller.dataset.agentId = agentId;
+        controller.dataset.deleteAgentModalInWorktreeValue = inWorktree;
+      }
       const nameEl = modal.querySelector("[data-agent-name]");
       if (nameEl) nameEl.textContent = name;
       modal.showModal();

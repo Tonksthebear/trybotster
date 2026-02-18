@@ -350,6 +350,7 @@ function Agent:info()
         issue_number = self.issue_number,
         branch_name = self.branch_name,
         worktree_path = self.worktree_path,
+        in_worktree = self._has_context_file,
         status = self.status,
         -- New: ordered sessions array
         sessions = sessions_info,
