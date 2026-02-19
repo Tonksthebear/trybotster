@@ -190,9 +190,14 @@ function render(state)
   end
 
   -- Build terminal panel: always show selected agent only
+  local terminal_props = {}
+  if _tui_state.selected_agent_index then
+    terminal_props.agent_index = _tui_state.selected_agent_index
+    terminal_props.pty_index = _tui_state.active_pty_index or 0
+  end
   local terminal_panel = {
     type = "terminal",
-    props = { agent_index = _tui_state.selected_agent_index or 0, pty_index = _tui_state.active_pty_index or 0 },
+    props = terminal_props,
     block = { title = term_title, borders = "all" },
   }
 

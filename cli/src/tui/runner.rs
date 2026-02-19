@@ -3727,13 +3727,18 @@ mod tests {
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
 
-        // Tree with a single terminal widget (no explicit binding → defaults)
+        // Tree with a single terminal widget with explicit binding
         let tree = crate::tui::render_tree::RenderNode::Widget {
             widget_type: crate::tui::render_tree::WidgetType::Terminal,
             id: None,
             block: None,
             custom_lines: None,
-            props: None,
+            props: Some(crate::tui::render_tree::WidgetProps::Terminal(
+                crate::tui::render_tree::TerminalBinding {
+                    agent_index: Some(0),
+                    pty_index: Some(0),
+                },
+            )),
         };
 
         runner.sync_subscriptions(&tree);
@@ -3812,7 +3817,12 @@ mod tests {
             id: None,
             block: None,
             custom_lines: None,
-            props: None,
+            props: Some(crate::tui::render_tree::WidgetProps::Terminal(
+                crate::tui::render_tree::TerminalBinding {
+                    agent_index: Some(0),
+                    pty_index: Some(0),
+                },
+            )),
         };
 
         runner.sync_subscriptions(&tree);
