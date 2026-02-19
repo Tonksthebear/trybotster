@@ -92,12 +92,12 @@ export default class extends Controller {
   }
 
   #renderTabs(sessions) {
-    const tabBar = this.tabBarTarget;
-    tabBar.innerHTML = "";
+    const newTabBar = this.tabBarTarget.cloneNode(false);
 
     sessions.forEach((session, index) => {
       const isActive = index === this.ptyIndexValue;
       const link = document.createElement("a");
+      link.id = `pty-tab-${index}`;
       link.href = `/hubs/${this.hubIdValue}/agents/${this.agentIndexValue}/ptys/${index}`;
       link.dataset.turboAction = "replace";
       link.className = `px-2 py-1 text-xs font-medium rounded transition-colors ${
@@ -109,7 +109,11 @@ export default class extends Controller {
       // Capitalize session name
       const name = session.name;
       link.textContent = name.charAt(0).toUpperCase() + name.slice(1);
-      tabBar.appendChild(link);
+      newTabBar.appendChild(link);
+    });
+
+    window.Turbo.morphElements(this.tabBarTarget, newTabBar, {
+      morphStyle: "innerHTML",
     });
   }
 

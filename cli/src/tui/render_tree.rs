@@ -1028,14 +1028,14 @@ fn collect_bindings_recursive(
             ..
         } => {
             if matches!(widget_type, WidgetType::Terminal) {
-                let (agent_idx, pty_idx) = match props {
-                    Some(WidgetProps::Terminal(b)) => (
-                        b.agent_index.unwrap_or(default_agent),
-                        b.pty_index.unwrap_or(default_pty),
-                    ),
-                    _ => (default_agent, default_pty),
-                };
-                set.insert((agent_idx, pty_idx));
+                // Only collect a binding when the terminal widget has explicit
+                // props (agent selected). An unbound terminal (no agent selected)
+                // should not subscribe to any PTY or keep parsers alive.
+                if let Some(WidgetProps::Terminal(b)) = props {
+                    let agent_idx = b.agent_index.unwrap_or(default_agent);
+                    let pty_idx = b.pty_index.unwrap_or(default_pty);
+                    set.insert((agent_idx, pty_idx));
+                }
             }
         }
     }
@@ -1658,8 +1658,7 @@ mod tests {
             props: None,
         };
         let bindings = collect_terminal_bindings(&tree, 2, 1);
-        assert_eq!(bindings.len(), 1);
-        assert!(bindings.contains(&(2, 1)), "No-props terminal should use defaults");
+        assert_eq!(bindings.len(), 0, "Unbound terminal should not produce a binding");
     }
 
     #[test]
@@ -1757,8 +1756,7 @@ mod tests {
             ],
         };
         let bindings = collect_terminal_bindings(&tree, 0, 0);
-        assert_eq!(bindings.len(), 1, "Only terminal widgets should produce bindings");
-        assert!(bindings.contains(&(0, 0)));
+        assert_eq!(bindings.len(), 0, "Unbound terminals should not produce bindings");
     }
 
     #[test]

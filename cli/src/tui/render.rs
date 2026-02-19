@@ -230,13 +230,11 @@ pub(super) fn render_terminal_panel(
         (0, ctx.active_pty_index)
     };
 
-    let parser = if let Some(b) = binding {
-        if b.agent_index.is_some() || b.pty_index.is_some() {
-            ctx.parser_pool.get(&(agent_idx, pty_idx)).cloned()
-        } else {
-            ctx.active_parser.clone()
-        }
+    let parser = if binding.is_some() {
+        // Bound terminal: look up the specific parser from the pool
+        ctx.parser_pool.get(&(agent_idx, pty_idx)).cloned()
     } else {
+        // Unbound terminal (no agent selected): use the active parser
         ctx.active_parser.clone()
     };
 

@@ -557,7 +557,7 @@ export default class extends Controller {
 
   #renderTree() {
     const container = this.treeContainerTarget;
-    container.innerHTML = "";
+    const newContainer = container.cloneNode(false);
 
     const isDevice = this.configScope === "device";
     const sharedBase = isDevice ? "shared" : ".botster/shared";
@@ -565,7 +565,7 @@ export default class extends Controller {
 
     // Shared section
     if (this.tree.shared) {
-      container.appendChild(this.#renderSection("Shared", sharedBase, this.tree.shared));
+      newContainer.appendChild(this.#renderSection("Shared", sharedBase, this.tree.shared));
     }
 
     // Profiles section
@@ -574,10 +574,10 @@ export default class extends Controller {
       const header = document.createElement("div");
       header.className = "mt-2";
       header.innerHTML = `<h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">Profiles</h2>`;
-      container.appendChild(header);
+      newContainer.appendChild(header);
 
       for (const name of profileNames) {
-        container.appendChild(
+        newContainer.appendChild(
           this.#renderSection(
             this.#capitalize(name),
             `${profilesBase}/${name}`,
@@ -591,14 +591,19 @@ export default class extends Controller {
     // Add profile button
     const addBtn = document.createElement("button");
     addBtn.type = "button";
+    addBtn.id = "add-profile-btn";
     addBtn.className = "w-full mt-2 px-3 py-2 text-xs font-medium text-zinc-500 hover:text-zinc-300 border border-dashed border-zinc-700 hover:border-zinc-600 rounded-lg transition-colors";
     addBtn.textContent = "+ Add Profile";
     addBtn.dataset.action = "hub-settings#addProfile";
-    container.appendChild(addBtn);
+    newContainer.appendChild(addBtn);
+
+    window.Turbo.morphElements(container, newContainer, {
+      morphStyle: "innerHTML",
+    });
 
     this.treePanelTarget.dataset.view = "tree";
 
-    // Re-apply selection highlight after tree rebuild
+    // Re-apply selection highlight after morph
     if (this.currentFilePath) {
       this.#highlightSelected(this.currentFilePath);
     }
@@ -609,6 +614,7 @@ export default class extends Controller {
     const isProfile = !!profileName;
 
     const section = document.createElement("div");
+    section.id = `section-${(profileName || "shared").replace(/[^a-zA-Z0-9-]/g, "-")}`;
     section.className = "mb-3 group/section data-[flash]:ring-1 data-[flash]:ring-primary-500/30 data-[flash]:rounded-lg";
 
     if (isProfile) {
@@ -733,6 +739,7 @@ export default class extends Controller {
 
   #renderFileEntry(filePath, label, status) {
     const btn = document.createElement("button");
+    btn.id = `file-${filePath.replace(/[^a-zA-Z0-9-]/g, "-")}`;
     btn.type = "button";
     btn.className =
       "w-full text-left px-2.5 py-1.5 rounded border border-zinc-700/50 hover:border-zinc-700 hover:bg-zinc-800/50 transition-colors " +
@@ -760,6 +767,7 @@ export default class extends Controller {
 
   #renderPortForwardToggle(filePath, sessionName, enabled) {
     const div = document.createElement("div");
+    div.id = `pf-toggle-${filePath.replace(/[^a-zA-Z0-9-]/g, "-")}`;
     div.className = "flex items-center justify-between px-2.5 py-1";
 
     const id = `pf-${filePath.replace(/[/.]/g, "-")}`;

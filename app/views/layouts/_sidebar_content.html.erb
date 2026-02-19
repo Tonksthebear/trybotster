@@ -50,10 +50,11 @@
             <a data-href="/hubs/{hubId}/agents/{index}"
                data-agent-id
                data-action="agent-list#select"
-               class="flex-1 text-left px-2 py-1.5 min-w-0 text-zinc-400 hover:text-zinc-200 data-[selected=true]:text-primary-400 data-[selected=true]:font-medium">
+               class="flex-1 text-left px-2 py-1.5 min-w-0 text-zinc-300 hover:text-zinc-100 data-[selected=true]:text-primary-300 data-[selected=true]:font-medium">
               <span data-field="name" class="truncate font-mono text-xs block"></span>
-              <span data-field="subtext" class="truncate text-[10px] text-zinc-600 block"></span>
+              <span data-field="subtext" class="truncate text-[10px] text-zinc-500 block"></span>
             </a>
+            <span data-notification-badge class="hidden size-2 rounded-full bg-primary-400 shrink-0"></span>
             <button type="button"
                     data-agent-id
                     data-action="agent-list#delete"
