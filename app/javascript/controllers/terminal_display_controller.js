@@ -129,7 +129,10 @@ export default class extends Controller {
     });
     this.#transport.onReconnect = () => this.#restty?.clearScreen();
     this.#transport.onConnect = () => this.#hideOverlay();
-    this.#transport.onDisconnect = () => this.#showOverlay();
+    this.#transport.onDisconnect = () => {
+      this.#restty?.setMouseMode("off");
+      this.#showOverlay();
+    };
 
     // 3. Create Restty — loads WASM, renders canvas
     //    onBackend fires after WASM init → connectPty() subscribes terminal channel
