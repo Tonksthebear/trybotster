@@ -21,6 +21,7 @@ use base64::Engine;
 use crate::channel::Channel;
 use crate::hub::actions::{self, HubAction};
 use crate::hub::{registration, Hub, WebRtcPtyOutput};
+use crate::notifications::push::send_push_direct;
 
 impl Hub {
     /// Legacy polling entrypoint — calls all poll functions + flush.
@@ -82,6 +83,21 @@ impl Hub {
                     &notif.session_name,
                     &notif.notification,
                 );
+                // Push notifications now triggered by Lua hooks via push.send()
+            }
+            HubEvent::PtyProcessExited { agent_key, session_name, exit_code } => {
+                log::info!(
+                    "[Hub] PTY process exited for {}:{} (code={:?})",
+                    agent_key, session_name, exit_code
+                );
+                let data = serde_json::json!({
+                    "agent_key": agent_key,
+                    "session_name": session_name,
+                    "exit_code": exit_code,
+                });
+                if let Err(e) = self.lua.fire_json_event("process_exited", &data) {
+                    log::error!("Failed to fire process_exited event: {e}");
+                }
             }
             HubEvent::TimerFired { timer_id } => {
                 self.lua.fire_timer_callback(&timer_id);
@@ -101,6 +117,26 @@ impl Hub {
             }
             HubEvent::LuaActionCableRequest(request) => {
                 self.process_single_action_cable_request(request);
+            }
+            HubEvent::LuaPushRequest { payload } => {
+                self.handle_lua_push_request(payload);
+            }
+            HubEvent::PushSubscriptionsExpired { identities } => {
+                for identity in &identities {
+                    self.push_subscriptions.remove(identity);
+                    log::info!(
+                        "[WebPush] Removed stale subscription for {}",
+                        &identity[..identity.len().min(8)]
+                    );
+                }
+                if !identities.is_empty() {
+                    if let Err(e) = crate::relay::persistence::save_push_subscriptions(
+                        &self.hub_identifier,
+                        &self.push_subscriptions,
+                    ) {
+                        log::error!("[WebPush] Failed to save push subscriptions after cleanup: {e}");
+                    }
+                }
             }
             HubEvent::WebRtcMessage { browser_identity, payload } => {
                 self.handle_webrtc_message(&browser_identity, &payload);
@@ -446,7 +482,17 @@ impl Hub {
                         if let Err(e) = pty_handle.write_input_direct(&data) {
                             log::error!("[PTY-INPUT] Write failed: {e}");
                         }
+                    } else {
+                        log::warn!(
+                            "[PTY-INPUT] No PTY at index {} for agent {} (key={})",
+                            pty_index, agent_index, agent_handle.agent_key()
+                        );
                     }
+                } else {
+                    log::warn!(
+                        "[PTY-INPUT] No agent at index {} (cache has {} agents)",
+                        agent_index, self.handle_cache.len()
+                    );
                 }
             }
         }
@@ -674,8 +720,21 @@ impl Hub {
                             break;
                         }
                     }
+                    Ok(PtyEvent::ProcessExited { exit_code }) => {
+                        log::info!(
+                            "[NotifWatcher] Process exited (code={:?}) for {}",
+                            exit_code, key
+                        );
+                        let event = super::events::HubEvent::PtyProcessExited {
+                            agent_key: agent_key.clone(),
+                            session_name: session_name.clone(),
+                            exit_code,
+                        };
+                        let _ = hub_tx.send(event);
+                        break;
+                    }
                     Ok(_) => {
-                        // Ignore non-notification events
+                        // Ignore other events (Output, Resized)
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!("[NotifWatcher] Lagged by {} events for {}", n, key);
@@ -988,7 +1047,42 @@ impl Hub {
             }
         };
 
-        // Delegate all message handling to Lua
+        // Intercept push notification protocol messages before Lua
+        if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
+            match msg_type {
+                "push_sub" => {
+                    self.handle_push_subscription(browser_identity, &msg);
+                    return;
+                }
+                "vapid_generate" => {
+                    self.handle_vapid_generate(browser_identity);
+                    return;
+                }
+                "vapid_key_req" => {
+                    self.handle_vapid_key_request(browser_identity);
+                    return;
+                }
+                "vapid_key_set" => {
+                    self.handle_vapid_key_set(browser_identity, &msg);
+                    return;
+                }
+                "vapid_pub_req" => {
+                    self.handle_vapid_pub_request(browser_identity);
+                    return;
+                }
+                "push_test" => {
+                    self.handle_push_test(browser_identity);
+                    return;
+                }
+                "push_disable" => {
+                    self.handle_push_disable(browser_identity);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Delegate all other message handling to Lua
         self.call_lua_webrtc_message(browser_identity, msg);
     }
 
@@ -2170,6 +2264,595 @@ impl Hub {
         }
     }
 
+    // === Web Push Notifications ===
+
+    /// Send VAPID public key to a browser via DataChannel.
+    ///
+    /// Called by `handle_vapid_generate` and `handle_vapid_key_set` after
+    /// VAPID keys are available.
+    fn send_vapid_public_key(&mut self, browser_identity: &str) {
+        let Some(ref vapid) = self.vapid_keys else {
+            return;
+        };
+
+        let msg = serde_json::json!({
+            "type": "vapid_pub",
+            "key": vapid.public_key_base64url(),
+        });
+
+        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
+            let payload = match serde_json::to_vec(&msg) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("[WebPush] Failed to serialize vapid_pub: {e}");
+                    return;
+                }
+            };
+            let peer = crate::channel::PeerId(browser_identity.to_string());
+            match tokio::task::block_in_place(|| {
+                self.tokio_runtime.block_on(tokio::time::timeout(
+                    Duration::from_secs(2),
+                    channel.send_to(&payload, &peer),
+                ))
+            }) {
+                Ok(Ok(())) => {
+                    log::info!(
+                        "[WebPush] Sent VAPID public key to {}",
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
+                }
+                Ok(Err(e)) => log::warn!("[WebPush] Failed to send vapid_pub: {e}"),
+                Err(_) => log::warn!("[WebPush] vapid_pub send timed out"),
+            }
+        }
+    }
+
+    /// Handle a push subscription from a browser.
+    ///
+    /// The browser sends `{ type: "push_sub", endpoint, p256dh, auth }` after
+    /// subscribing to push using our VAPID public key.
+    fn handle_push_subscription(&mut self, browser_identity: &str, msg: &serde_json::Value) {
+        let endpoint = msg.get("endpoint").and_then(|v| v.as_str()).unwrap_or("");
+        let p256dh = msg.get("p256dh").and_then(|v| v.as_str()).unwrap_or("");
+        let auth = msg.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+
+        if endpoint.is_empty() || p256dh.is_empty() || auth.is_empty() {
+            log::warn!("[WebPush] Received incomplete push subscription");
+            return;
+        }
+
+        // Validate endpoint is HTTPS to prevent SSRF
+        if !endpoint.starts_with("https://") {
+            log::warn!("[WebPush] Rejected push endpoint with non-HTTPS scheme");
+            return;
+        }
+
+        let subscription = crate::notifications::push::PushSubscription {
+            endpoint: endpoint.to_string(),
+            p256dh: p256dh.to_string(),
+            auth: auth.to_string(),
+        };
+
+        self.push_subscriptions
+            .upsert(browser_identity.to_string(), subscription);
+
+        // Persist to encrypted storage
+        if let Err(e) = crate::relay::persistence::save_push_subscriptions(
+            &self.hub_identifier,
+            &self.push_subscriptions,
+        ) {
+            log::error!("[WebPush] Failed to save push subscriptions: {e}");
+        }
+
+        log::info!(
+            "[WebPush] Stored push subscription from {} ({} total)",
+            &browser_identity[..browser_identity.len().min(8)],
+            self.push_subscriptions.len()
+        );
+
+        // Send acknowledgment
+        self.send_push_sub_ack(browser_identity);
+    }
+
+    /// Handle browser request to generate VAPID keys (Flow A).
+    ///
+    /// The browser sends `{ type: "vapid_generate" }` when the user enables
+    /// push notifications for this device for the first time.
+    fn handle_vapid_generate(&mut self, browser_identity: &str) {
+        // Load existing or generate fresh keys
+        let keys = match crate::relay::persistence::load_vapid_keys() {
+            Ok(Some(existing)) => existing,
+            Ok(None) => {
+                match crate::notifications::vapid::VapidKeys::generate() {
+                    Ok(new_keys) => {
+                        if let Err(e) = crate::relay::persistence::save_vapid_keys(&new_keys) {
+                            log::error!("[WebPush] Failed to save generated VAPID keys: {e}");
+                            return;
+                        }
+                        log::info!("[WebPush] Generated and saved new device-level VAPID keys");
+                        new_keys
+                    }
+                    Err(e) => {
+                        log::error!("[WebPush] Failed to generate VAPID keys: {e}");
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("[WebPush] Failed to load VAPID keys: {e}");
+                return;
+            }
+        };
+
+        self.vapid_keys = Some(keys);
+        self.set_notifications_enabled(true);
+        self.send_vapid_public_key(browser_identity);
+    }
+
+    /// Handle browser sending a copied VAPID keypair (Flow B).
+    ///
+    /// The browser sends `{ type: "vapid_key_set", pub, priv }` after copying
+    /// keys from another device. This device stores the keypair and notifies
+    /// Rails that notifications are enabled.
+    fn handle_vapid_key_set(&mut self, browser_identity: &str, msg: &serde_json::Value) {
+        let pub_key = match msg.get("pub").and_then(|v| v.as_str()) {
+            Some(k) => k,
+            None => {
+                log::warn!("[WebPush] vapid_key_set missing 'pub' field");
+                return;
+            }
+        };
+        let priv_key = match msg.get("priv").and_then(|v| v.as_str()) {
+            Some(k) => k,
+            None => {
+                log::warn!("[WebPush] vapid_key_set missing 'priv' field");
+                return;
+            }
+        };
+
+        let keys = match crate::notifications::vapid::VapidKeys::from_base64url(pub_key, priv_key)
+        {
+            Ok(k) => k,
+            Err(e) => {
+                log::error!("[WebPush] Invalid VAPID keys in vapid_key_set: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = crate::relay::persistence::save_vapid_keys(&keys) {
+            log::error!("[WebPush] Failed to save copied VAPID keys: {e}");
+            return;
+        }
+
+        log::info!("[WebPush] Stored copied VAPID keys from another device");
+        self.vapid_keys = Some(keys);
+        self.set_notifications_enabled(true);
+        self.send_vapid_public_key(browser_identity);
+    }
+
+    /// Handle browser request for existing VAPID public key (Flow C).
+    ///
+    /// The browser sends `{ type: "vapid_pub_req" }` when the CLI already has
+    /// VAPID keys but this browser isn't subscribed yet. Just send back the
+    /// existing public key so the browser can subscribe its push manager.
+    fn handle_vapid_pub_request(&mut self, browser_identity: &str) {
+        // Ensure keys are loaded into memory
+        if self.vapid_keys.is_none() {
+            match crate::relay::persistence::load_vapid_keys() {
+                Ok(Some(keys)) => self.vapid_keys = Some(keys),
+                Ok(None) => {
+                    log::warn!("[WebPush] vapid_pub_req but no VAPID keys exist");
+                    return;
+                }
+                Err(e) => {
+                    log::error!("[WebPush] Failed to load VAPID keys for pub_req: {e}");
+                    return;
+                }
+            }
+        }
+
+        self.send_vapid_public_key(browser_identity);
+    }
+
+    /// Handle a VAPID key copy request from a browser.
+    ///
+    /// The browser sends `{ type: "vapid_key_req" }` when copying VAPID keys
+    /// from this device to another device via the notifications settings GUI.
+    fn handle_vapid_key_request(&mut self, browser_identity: &str) {
+        let Some(ref vapid) = self.vapid_keys else {
+            log::warn!("[WebPush] VAPID key requested but no keys loaded");
+            return;
+        };
+
+        // Send full keypair (private + public) for multi-device VAPID key copying.
+        // This is safe because the DataChannel is E2E encrypted via Olm.
+        let msg = serde_json::json!({
+            "type": "vapid_keys",
+            "pub": vapid.public_key_base64url(),
+            "priv": vapid.private_key_base64url(),
+        });
+
+        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
+            let payload = match serde_json::to_vec(&msg) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("[WebPush] Failed to serialize vapid_keys: {e}");
+                    return;
+                }
+            };
+            let peer = crate::channel::PeerId(browser_identity.to_string());
+            match tokio::task::block_in_place(|| {
+                self.tokio_runtime.block_on(tokio::time::timeout(
+                    Duration::from_secs(2),
+                    channel.send_to(&payload, &peer),
+                ))
+            }) {
+                Ok(Ok(())) => log::info!("[WebPush] Sent VAPID keypair to browser for copy"),
+                Ok(Err(e)) => log::warn!("[WebPush] Failed to send vapid_keys: {e}"),
+                Err(_) => log::warn!("[WebPush] vapid_keys send timed out"),
+            }
+        }
+    }
+
+    /// Send push subscription acknowledgment to browser.
+    fn send_push_sub_ack(&self, browser_identity: &str) {
+        let msg = serde_json::json!({ "type": "push_sub_ack" });
+
+        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
+            let payload = match serde_json::to_vec(&msg) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("[WebPush] Failed to serialize push_sub_ack: {e}");
+                    return;
+                }
+            };
+            let peer = crate::channel::PeerId(browser_identity.to_string());
+            match tokio::task::block_in_place(|| {
+                self.tokio_runtime.block_on(tokio::time::timeout(
+                    Duration::from_secs(2),
+                    channel.send_to(&payload, &peer),
+                ))
+            }) {
+                Ok(Err(e)) => log::warn!("[WebPush] push_sub_ack send failed: {e}"),
+                Err(_) => log::warn!("[WebPush] push_sub_ack send timed out"),
+                Ok(Ok(())) => {}
+            }
+        }
+    }
+
+    /// Handle a test push request from the browser.
+    ///
+    /// Sends a test notification to all subscriptions, then acks the browser
+    /// so the UI can confirm delivery.
+    fn handle_push_test(&mut self, browser_identity: &str) {
+        let Some(ref vapid) = self.vapid_keys else {
+            log::warn!("[WebPush] Cannot send test push: no VAPID keys");
+            return;
+        };
+        if self.push_subscriptions.is_empty() {
+            log::warn!("[WebPush] Cannot send test push: no subscriptions");
+            return;
+        }
+
+        let Some(ref hub_id) = self.botster_id else {
+            log::warn!("[WebPush] Cannot send test push: no server hub ID");
+            return;
+        };
+
+        let base_url = self.config.server_url.trim_end_matches('/');
+        let navigate_url = format!("{base_url}/hubs/{hub_id}");
+
+        let payload = serde_json::json!({
+            "web_push": 8030,
+            "notification": {
+                "title": "Botster",
+                "body": "Test notification — push is working!",
+                "icon": format!("{base_url}/icon.png"),
+                "navigate": navigate_url,
+                "data": {
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "kind": "test",
+                    "hubId": hub_id,
+                    "url": format!("/hubs/{hub_id}"),
+                    "createdAt": chrono::Utc::now().to_rfc3339(),
+                }
+            }
+        });
+        let payload_bytes = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("[WebPush] Failed to serialize test payload: {e}");
+                return;
+            }
+        };
+
+        let vapid_b64 = vapid.private_key_base64url().to_string();
+
+        let subs: Vec<(String, crate::notifications::push::PushSubscription)> = self
+            .push_subscriptions
+            .all()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+
+        // Ack immediately — the push notification arriving is the real confirmation
+        self.send_push_test_ack(browser_identity, subs.len());
+
+        let event_tx = self.hub_event_tx.clone();
+        self.tokio_runtime.handle().spawn(async move {
+            let client = reqwest::Client::new();
+            let mut stale = Vec::new();
+            let mut sent = 0usize;
+
+            for (identity, sub) in &subs {
+                match send_push_direct(&client, &vapid_b64, sub, &payload_bytes).await {
+                    Ok(true) => sent += 1,
+                    Ok(false) => stale.push(identity.clone()),
+                    Err(e) => {
+                        log::error!(
+                            "[WebPush] Test push failed for {}: {e}",
+                            &identity[..identity.len().min(8)]
+                        );
+                    }
+                }
+            }
+
+            log::info!("[WebPush] Test push: {sent} sent, {} stale", stale.len());
+
+            if !stale.is_empty() {
+                let _ = event_tx.send(super::events::HubEvent::PushSubscriptionsExpired {
+                    identities: stale,
+                });
+            }
+        });
+    }
+
+    /// Send test push acknowledgment to browser.
+    fn send_push_test_ack(&self, browser_identity: &str, count: usize) {
+        let msg = serde_json::json!({ "type": "push_test_ack", "sent": count });
+
+        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
+            let payload = match serde_json::to_vec(&msg) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("[WebPush] Failed to serialize push_test_ack: {e}");
+                    return;
+                }
+            };
+            let peer = crate::channel::PeerId(browser_identity.to_string());
+            match tokio::task::block_in_place(|| {
+                self.tokio_runtime.block_on(tokio::time::timeout(
+                    Duration::from_secs(2),
+                    channel.send_to(&payload, &peer),
+                ))
+            }) {
+                Ok(Err(e)) => log::warn!("[WebPush] push_test_ack send failed: {e}"),
+                Err(_) => log::warn!("[WebPush] push_test_ack send timed out"),
+                Ok(Ok(())) => {}
+            }
+        }
+    }
+
+    /// Handle browser request to disable push notifications.
+    ///
+    /// Clears all push subscriptions, tells Rails notifications are disabled,
+    /// and acks the browser so it can unsubscribe from the push manager.
+    fn handle_push_disable(&mut self, browser_identity: &str) {
+        // Clear all stored push subscriptions
+        self.push_subscriptions = crate::notifications::push::PushSubscriptionStore::default();
+        if let Err(e) = crate::relay::persistence::save_push_subscriptions(
+            &self.hub_identifier,
+            &self.push_subscriptions,
+        ) {
+            log::error!("[WebPush] Failed to clear push subscriptions: {e}");
+        }
+
+        self.set_notifications_enabled(false);
+
+        log::info!("[WebPush] Push notifications disabled");
+
+        // Ack browser
+        let msg = serde_json::json!({ "type": "push_disable_ack" });
+        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
+            let payload = match serde_json::to_vec(&msg) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("[WebPush] Failed to serialize push_disable_ack: {e}");
+                    return;
+                }
+            };
+            let peer = crate::channel::PeerId(browser_identity.to_string());
+            match tokio::task::block_in_place(|| {
+                self.tokio_runtime.block_on(tokio::time::timeout(
+                    Duration::from_secs(2),
+                    channel.send_to(&payload, &peer),
+                ))
+            }) {
+                Ok(Err(e)) => log::warn!("[WebPush] push_disable_ack send failed: {e}"),
+                Err(_) => log::warn!("[WebPush] push_disable_ack send timed out"),
+                Ok(Ok(())) => {}
+            }
+        }
+    }
+
+    /// Notify Rails that this device's notifications_enabled flag changed.
+    ///
+    /// PATCHes `/devices/{device_id}` with the new value. Fire-and-forget:
+    /// a failure here doesn't block the push subscription flow.
+    fn set_notifications_enabled(&self, enabled: bool) {
+        let Some(device_id) = self.device.device_id else {
+            log::warn!("[WebPush] No device_id, cannot update notifications_enabled on Rails");
+            return;
+        };
+        let url = format!("{}/devices/{}", self.config.server_url, device_id);
+        let body = serde_json::json!({ "notifications_enabled": enabled });
+        // block_in_place: reqwest::blocking cannot run inside a tokio runtime
+        // (it drops an internal runtime, which panics in async context).
+        let result = tokio::task::block_in_place(|| {
+            self.client
+                .patch(&url)
+                .bearer_auth(self.config.get_api_key())
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+        });
+        match result {
+            Ok(response) if response.status().is_success() => {
+                log::info!("[WebPush] Set notifications_enabled={enabled} on Rails");
+            }
+            Ok(response) => {
+                log::warn!(
+                    "[WebPush] Failed to update notifications_enabled: {}",
+                    response.status()
+                );
+            }
+            Err(e) => log::warn!("[WebPush] Failed to update notifications_enabled: {e}"),
+        }
+    }
+
+    /// Handle a push notification request from Lua's `push.send()`.
+    ///
+    /// Merges Lua-provided fields with defaults (id, hubId, createdAt) and
+    /// broadcasts to all subscribed browsers. The Lua payload must include
+    /// at least a `kind` field; all other fields are optional overrides.
+    fn handle_lua_push_request(&mut self, lua_payload: serde_json::Value) {
+        let Some(ref vapid) = self.vapid_keys else {
+            return;
+        };
+        if self.push_subscriptions.is_empty() {
+            return;
+        }
+
+        let Some(ref hub_id) = self.botster_id else {
+            log::warn!("[WebPush] Cannot send Lua push: no server hub ID yet");
+            return;
+        };
+
+        let base_url = self.config.server_url.trim_end_matches('/');
+        let lua = lua_payload.as_object();
+
+        // Extract fields from Lua payload with defaults
+        let id = lua
+            .and_then(|o| o.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let id = if id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            id
+        };
+
+        let kind = lua
+            .and_then(|o| o.get("kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("agent_alert");
+        let title = lua
+            .and_then(|o| o.get("title"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Botster");
+        let body = lua
+            .and_then(|o| o.get("body"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Your attention is needed");
+        let relative_url = lua
+            .and_then(|o| o.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let relative_url = if relative_url.is_empty() {
+            format!("/hubs/{hub_id}")
+        } else {
+            relative_url
+        };
+
+        let icon_path = lua
+            .and_then(|o| o.get("icon"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("/icon.png");
+
+        // Build absolute URLs for declarative web push `navigate` field
+        let navigate_url = if relative_url.starts_with("http") {
+            relative_url.clone()
+        } else {
+            format!("{base_url}{relative_url}")
+        };
+        let icon_url = if icon_path.starts_with("http") {
+            icon_path.to_string()
+        } else {
+            format!("{base_url}{icon_path}")
+        };
+
+        let mut notification = serde_json::json!({
+            "title": title,
+            "body": body,
+            "icon": icon_url,
+            "navigate": navigate_url,
+            "data": {
+                "id": id,
+                "kind": kind,
+                "hubId": hub_id,
+                "url": relative_url,
+                "createdAt": chrono::Utc::now().to_rfc3339(),
+            }
+        });
+
+        // Forward optional `tag` field
+        if let Some(tag) = lua.and_then(|o| o.get("tag")) {
+            notification["tag"] = tag.clone();
+        }
+
+        let payload = serde_json::json!({
+            "web_push": 8030,
+            "notification": notification,
+        });
+
+        let payload_bytes = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("[WebPush] Failed to serialize Lua push payload: {e}");
+                return;
+            }
+        };
+
+        let vapid_b64 = vapid.private_key_base64url().to_string();
+
+        let subs: Vec<(String, crate::notifications::push::PushSubscription)> = self
+            .push_subscriptions
+            .all()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+
+        let event_tx = self.hub_event_tx.clone();
+        self.tokio_runtime.handle().spawn(async move {
+            let client = reqwest::Client::new();
+            let mut stale = Vec::new();
+            let mut sent = 0usize;
+
+            for (identity, sub) in &subs {
+                match send_push_direct(&client, &vapid_b64, sub, &payload_bytes).await {
+                    Ok(true) => sent += 1,
+                    Ok(false) => stale.push(identity.clone()),
+                    Err(e) => {
+                        log::error!(
+                            "[WebPush] Lua push failed for {}: {e}",
+                            &identity[..identity.len().min(8)]
+                        );
+                    }
+                }
+            }
+
+            if sent > 0 || !stale.is_empty() {
+                log::info!("[WebPush] Lua push: {sent} sent, {} stale", stale.len());
+            }
+
+            if !stale.is_empty() {
+                let _ = event_tx.send(super::events::HubEvent::PushSubscriptionsExpired {
+                    identities: stale,
+                });
+            }
+        });
+    }
+
     // === Connection Setup ===
 
     /// Register the device with the server if not already registered.
@@ -2194,6 +2877,65 @@ impl Hub {
         self.botster_id = Some(botster_id.clone());
         // Sync to shared copy for Lua primitives
         *self.shared_server_id.lock().expect("SharedServerId mutex poisoned") = Some(botster_id);
+    }
+
+    /// Initialize web push state from encrypted storage.
+    ///
+    /// Loads device-level VAPID keys (if they exist) and per-hub push
+    /// subscriptions. Does NOT generate keys — that's triggered by the
+    /// browser via `vapid_generate` DataChannel message.
+    pub(crate) fn init_web_push(&mut self) {
+        // Device-level VAPID keys
+        match crate::relay::persistence::load_vapid_keys() {
+            Ok(Some(keys)) => {
+                log::info!("[WebPush] Loaded device-level VAPID keys");
+                self.vapid_keys = Some(keys);
+            }
+            Ok(None) => {
+                // Try legacy per-hub keys (migration from earlier versions)
+                match crate::relay::persistence::load_legacy_hub_vapid_keys(
+                    &self.hub_identifier,
+                ) {
+                    Ok(Some(legacy_keys)) => {
+                        log::info!("[WebPush] Migrating legacy per-hub VAPID keys to device level");
+                        if let Err(e) = crate::relay::persistence::save_vapid_keys(&legacy_keys) {
+                            log::error!("[WebPush] Failed to save migrated VAPID keys: {e}");
+                        }
+                        self.vapid_keys = Some(legacy_keys);
+                    }
+                    Ok(None) => {
+                        log::debug!("[WebPush] No VAPID keys yet (browser will trigger generation)");
+                    }
+                    Err(e) => log::error!("[WebPush] Failed to load legacy VAPID keys: {e}"),
+                }
+            }
+            Err(e) => log::error!("[WebPush] Failed to load VAPID keys: {e}"),
+        }
+
+        // Per-hub push subscriptions
+        match crate::relay::persistence::load_push_subscriptions(&self.hub_identifier) {
+            Ok(mut store) => {
+                // Clean up duplicate subscriptions from browser reconnections
+                let removed = store.dedup_by_endpoint();
+                if removed > 0 {
+                    log::info!(
+                        "[WebPush] Removed {} duplicate subscription(s) (same endpoint, different identity)",
+                        removed
+                    );
+                    if let Err(e) = crate::relay::persistence::save_push_subscriptions(
+                        &self.hub_identifier,
+                        &store,
+                    ) {
+                        log::error!("[WebPush] Failed to save deduped subscriptions: {e}");
+                    }
+                }
+                if !store.is_empty() {
+                    log::info!("[WebPush] Loaded {} push subscription(s)", store.len());
+                }
+                self.push_subscriptions = store;
+            }
+            Err(e) => log::error!("[WebPush] Failed to load push subscriptions: {e}"),
+        }
     }
 
     /// Initialize CryptoService for E2E encryption (vodozemac Olm).
@@ -2254,6 +2996,45 @@ mod tests {
         rt.block_on(async {
             let result = tokio::task::block_in_place(|| rt.block_on(async { 42 }));
             assert_eq!(result, 42);
+        });
+    }
+
+    /// Reproduces the panic from `set_notifications_enabled`:
+    /// reqwest::blocking::Client cannot `.send()` inside a tokio runtime
+    /// because it internally drops a runtime in an async context.
+    #[test]
+    #[should_panic(expected = "Cannot drop a runtime")]
+    fn test_reqwest_blocking_inside_tokio_panics() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::blocking::Client::new();
+        rt.block_on(async {
+            // This is exactly what set_notifications_enabled did:
+            // blocking HTTP inside the select! loop's block_on context.
+            let _ = client
+                .patch("http://127.0.0.1:1/devices/1")
+                .json(&serde_json::json!({"notifications_enabled": true}))
+                .send();
+        });
+    }
+
+    /// Proves that wrapping the blocking HTTP call in `block_in_place`
+    /// prevents the nested-runtime panic.
+    #[test]
+    fn test_reqwest_blocking_with_block_in_place_works() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            tokio::task::block_in_place(|| {
+                // Will fail to connect (no server), but won't panic
+                let result = client
+                    .patch("http://127.0.0.1:1/devices/1")
+                    .json(&serde_json::json!({"notifications_enabled": true}))
+                    .send();
+                assert!(result.is_err()); // connection refused, not a panic
+            });
         });
     }
 

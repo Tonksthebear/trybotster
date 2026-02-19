@@ -90,14 +90,14 @@ impl Device {
         }
     }
 
-    /// Get the device config file path
+    /// Get the botster config directory.
     ///
     /// Directory selection priority:
     /// 1. `#[cfg(test)]` (unit tests): `tmp/botster-test`
     /// 2. `BOTSTER_CONFIG_DIR` env var: explicit override
     /// 3. `BOTSTER_ENV=test`: `tmp/botster-test` (integration tests)
     /// 4. Default: system config directory (e.g., `~/Library/Application Support/botster`)
-    fn config_path() -> Result<PathBuf> {
+    pub fn config_dir() -> Result<PathBuf> {
         let config_dir = {
             #[cfg(test)]
             {
@@ -130,7 +130,12 @@ impl Device {
 
         fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
 
-        Ok(config_dir.join("device.json"))
+        Ok(config_dir)
+    }
+
+    /// Get the device config file path.
+    fn config_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("device.json"))
     }
 
     /// Store signing secret key in consolidated credentials.

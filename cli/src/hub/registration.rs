@@ -240,7 +240,7 @@ pub fn write_connection_url_lazy(
 
     // Build connection URL
     // Mixed-mode QR: byte for URL, alphanumeric for Base32 bundle
-    let connection_url = format!("{}/hubs/{}#{}", server_url, server_hub_id, encoded);
+    let connection_url = format!("{}/hubs/{}/pairing#{}", server_url, server_hub_id, encoded);
 
     // Write to file for external access (testing/automation)
     if let Err(e) = write_connection_url(local_identifier, &connection_url) {

@@ -37,6 +37,7 @@ pub mod http;
 pub mod hub;
 pub mod json;
 pub mod log;
+pub mod push;
 pub mod pty;
 pub mod secrets;
 pub mod timer;
@@ -109,6 +110,19 @@ pub fn register_all(lua: &Lua) -> Result<()> {
     json::register(lua)?;
     config::register(lua)?;
     secrets::register(lua)?;
+    Ok(())
+}
+
+/// Register web push notification primitives with a shared event sender.
+///
+/// Call this after `register_all()` to set up push notification sending.
+/// Events are sent directly to the Hub event loop via `HubEventSender`.
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub(crate) fn register_push(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
+    push::register(lua, hub_event_tx)?;
     Ok(())
 }
 

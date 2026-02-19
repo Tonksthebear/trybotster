@@ -53,6 +53,14 @@ class DevicesController < ApplicationController
     end
   end
 
+  # PATCH /devices/:id
+  # Update device attributes (currently: notifications_enabled)
+  def update
+    device = current_device_user.devices.find(params[:id])
+    device.update!(params.permit(:notifications_enabled))
+    render json: device_json(device)
+  end
+
   # DELETE /devices/:id
   # Remove a device (and revoke its access)
   def destroy
@@ -85,7 +93,8 @@ class DevicesController < ApplicationController
       fingerprint: device.fingerprint,
       last_seen_at: device.last_seen_at,
       active: device.active?,
-      hubs_count: device.hubs.active.count
+      hubs_count: device.hubs.active.count,
+      notifications_enabled: device.notifications_enabled
     }
   end
 end

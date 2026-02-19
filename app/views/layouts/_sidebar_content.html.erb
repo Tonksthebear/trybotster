@@ -49,6 +49,7 @@
           <div class="group flex items-center gap-1 rounded transition-colors hover:bg-zinc-800/50 data-[selected=true]:bg-primary-500/20">
             <a data-href="/hubs/{hubId}/agents/{index}"
                data-agent-id
+               data-action="agent-list#select"
                class="flex-1 text-left px-2 py-1.5 min-w-0 text-zinc-400 hover:text-zinc-200 data-[selected=true]:text-primary-400 data-[selected=true]:font-medium">
               <span data-field="name" class="truncate font-mono text-xs block"></span>
               <span data-field="subtext" class="truncate text-[10px] text-zinc-600 block"></span>
@@ -89,6 +90,19 @@
       <span>Docs</span>
       <%= icon "arrow-top-right-on-square", class: "size-3 text-zinc-600" %>
     <% end %>
+
+    <%# Notifications %>
+    <div data-controller="notifications">
+      <%= link_to notifications_path,
+          class: "flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
+        <%= icon "bell", class: "size-5" %>
+        <span>Notifications</span>
+        <span data-notifications-target="badge"
+              class="hidden ml-auto inline-flex items-center rounded-full bg-primary-500/20 px-2 py-0.5 text-xs font-medium text-primary-400">
+          <span data-notifications-target="count">0</span>
+        </span>
+      <% end %>
+    </div>
 
     <%# Settings %>
     <%= link_to settings_path,

@@ -21,6 +21,7 @@ export default class extends Controller {
     "promptInput",
     "profileSelect",
     "profileSection",
+    "noConfigWarning",
   ];
 
   static values = {
@@ -217,7 +218,16 @@ export default class extends Controller {
       if (this.hasProfileSectionTarget) {
         this.profileSectionTarget.classList.add("hidden");
       }
+      // Show warning that no session config exists
+      if (this.hasNoConfigWarningTarget) {
+        this.noConfigWarningTarget.classList.remove("hidden");
+      }
       return;
+    }
+
+    // Has config — hide warning if it was showing
+    if (this.hasNoConfigWarningTarget) {
+      this.noConfigWarningTarget.classList.add("hidden");
     }
 
     // Show the section

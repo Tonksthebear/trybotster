@@ -15,6 +15,9 @@ pin_all_from "app/javascript/channels", under: "channels"
 pin "matrix/bundle", to: "matrix/bundle.js"
 pin_all_from "app/javascript/workers", under: "workers"
 
+# Notifications (client-side IndexedDB storage)
+pin_all_from "app/javascript/notifications", under: "notifications"
+
 # Connection management (global, Turbo-aware)
 pin "connections", to: "connections/index.js"
 pin_all_from "app/javascript/connections", under: "connections"

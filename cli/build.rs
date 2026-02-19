@@ -85,8 +85,15 @@ fn generate_embedded_lua(dest_path: &Path) {
     writeln!(output, "        .map(|(_, content)| *content)").unwrap();
     writeln!(output, "}}").unwrap();
 
-    // Tell Cargo to rerun if any Lua file changes
-    println!("cargo:rerun-if-changed=lua");
+    // Tell Cargo to rerun if any Lua file changes.
+    //
+    // cargo:rerun-if-changed on a directory only watches the directory's own
+    // mtime, NOT files in subdirectories. We must watch each subdirectory
+    // individually so that adding a new .lua file (which changes the parent
+    // dir's mtime) triggers a rebuild.
+    watch_lua_directory(&Path::new("lua"));
+
+    // Also watch individual files for content changes
     for (_, abs_path) in &lua_files {
         println!("cargo:rerun-if-changed={}", abs_path);
     }
@@ -114,6 +121,25 @@ fn generate_stub_lua(dest_path: &Path) {
 
     // Only rerun if build.rs itself changes, NOT when Lua files change
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// Recursively register `cargo:rerun-if-changed` for a directory and all
+/// its subdirectories.
+///
+/// `cargo:rerun-if-changed` on a directory only detects changes to the
+/// directory's own mtime (e.g., a file added/removed directly inside it).
+/// Without watching subdirectories, adding `lua/lib/agent.lua` would only
+/// change `lua/lib/`'s mtime — not `lua/`'s — so build.rs wouldn't re-run
+/// and the new file would be missing from the embedded binary.
+fn watch_lua_directory(dir: &Path) {
+    println!("cargo:rerun-if-changed={}", dir.display());
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                watch_lua_directory(&entry.path());
+            }
+        }
+    }
 }
 
 /// Recursively collect all .lua files from a directory.

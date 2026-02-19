@@ -1158,6 +1158,28 @@ class WebRTCTransport {
       return
     }
 
+    // Push notification protocol messages
+    if (msg.type === "vapid_pub") {
+      this.#emit("push:vapid_key", { hubId, key: msg.key })
+      return
+    }
+    if (msg.type === "push_sub_ack") {
+      this.#emit("push:sub_ack", { hubId })
+      return
+    }
+    if (msg.type === "vapid_keys") {
+      this.#emit("push:vapid_keys", { hubId, pub: msg.pub, priv: msg.priv })
+      return
+    }
+    if (msg.type === "push_test_ack") {
+      this.#emit("push:test_ack", { hubId, sent: msg.sent })
+      return
+    }
+    if (msg.type === "push_disable_ack") {
+      this.#emit("push:disable_ack", { hubId })
+      return
+    }
+
     if (msg.subscriptionId) {
       // Message with subscription routing
       this.#emit("subscription:message", {

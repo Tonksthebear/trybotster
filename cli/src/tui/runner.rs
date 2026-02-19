@@ -1145,6 +1145,11 @@ where
                                 // Unbound key — forward raw bytes to PTY only in insert mode
                                 if self.mode == "insert" && !self.has_overlay && !raw_bytes.is_empty() {
                                     self.handle_pty_input(&raw_bytes);
+                                } else if !raw_bytes.is_empty() {
+                                    log::debug!(
+                                        "[TUI-KEY] Swallowed unbound key: mode='{}' overlay={} bytes={}",
+                                        self.mode, self.has_overlay, raw_bytes.len()
+                                    );
                                 }
                                 return;
                             }
@@ -1325,6 +1330,10 @@ where
         if let (Some(agent_index), Some(pty_index)) =
             (self.current_agent_index, self.current_pty_index)
         {
+            log::trace!(
+                "[PTY-FWD] Sending {} bytes to agent={} pty={} (overlay={})",
+                data.len(), agent_index, pty_index, self.has_overlay
+            );
             if let Err(e) = self.request_tx.send(TuiRequest::PtyInput {
                 agent_index,
                 pty_index,
@@ -1332,6 +1341,11 @@ where
             }) {
                 log::error!("Failed to send PTY input: {e}");
             }
+        } else {
+            log::warn!(
+                "[PTY-FWD] Dropped {} bytes: agent_index={:?} pty_index={:?}",
+                data.len(), self.current_agent_index, self.current_pty_index
+            );
         }
     }
 

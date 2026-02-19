@@ -34,6 +34,20 @@ pub(crate) enum HubEvent {
     /// PTY notification from a watcher task.
     PtyNotification(super::PtyNotificationEvent),
 
+    /// PTY process exited (reader thread detected EOF).
+    ///
+    /// Sent from the notification watcher task when it receives
+    /// `PtyEvent::ProcessExited`. Triggers Lua `process_exited` event
+    /// which updates agent status and broadcasts to all clients.
+    PtyProcessExited {
+        /// Agent key identifying which agent's PTY exited.
+        agent_key: String,
+        /// Session name (e.g., "agent", "server").
+        session_name: String,
+        /// Exit code if available (None if killed by signal or unknown).
+        exit_code: Option<i32>,
+    },
+
     /// WebRTC DataChannel has opened for a browser peer.
     ///
     /// Sent from the `on_data_channel` callback. Triggers `peer_connected`
@@ -125,5 +139,24 @@ pub(crate) enum HubEvent {
 
     /// ActionCable operation request from a Lua callback.
     LuaActionCableRequest(ActionCableRequest),
+
+    /// Web push notification request from a Lua callback.
+    ///
+    /// Sent from Lua's `push.send()` with a JSON payload containing
+    /// notification fields (kind, title, body, url, icon, tag, data).
+    /// The Hub merges defaults (id, hubId, createdAt) and broadcasts
+    /// to all subscribed browsers.
+    LuaPushRequest {
+        /// Notification payload from Lua (must include at least `kind`).
+        payload: serde_json::Value,
+    },
+
+    /// Stale push subscriptions to remove (410 Gone from push service).
+    ///
+    /// Sent from the async web push broadcast task when subscriptions expire.
+    PushSubscriptionsExpired {
+        /// Browser identity keys whose subscriptions returned 410 Gone.
+        identities: Vec<String>,
+    },
 }
 

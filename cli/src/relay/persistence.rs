@@ -12,14 +12,17 @@
 //! # Storage structure
 //!
 //! ```text
-//! ~/.config/botster/hubs/{hub_id}/
-//!     vodozemac_store.enc    # AES-GCM encrypted Matrix crypto state
+//! ~/.config/botster/
+//!     vapid_keys.enc                         # Device-level VAPID keys (AES-GCM)
+//!     hubs/{hub_id}/
+//!         vodozemac_store.enc                # AES-GCM encrypted Matrix crypto state
+//!         push_subscriptions.enc             # Browser push subscriptions (AES-GCM)
 //!
 //! OS Keyring (consolidated):
-//!     botster/credentials  # Contains crypto_keys[hub_id] = base64 AES key
+//!     botster/credentials  # Contains crypto_keys[key_id] = base64 AES key
 //! ```
 //!
-//! Rust guideline compliant 2025-01
+//! Rust guideline compliant 2026-02
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -218,6 +221,162 @@ pub fn save_vodozemac_crypto_store(hub_id: &str, state: &VodozemacCryptoState) -
     }
 
     log::debug!("Saved encrypted Matrix store to {:?}", store_path);
+    Ok(())
+}
+
+// ============================================================================
+// VAPID Key Persistence
+// ============================================================================
+
+use crate::notifications::vapid::VapidKeys;
+use crate::notifications::push::PushSubscriptionStore;
+
+/// VAPID persistence format version.
+const VAPID_VERSION: u8 = 1;
+
+/// Push subscription persistence format version.
+const PUSH_SUB_VERSION: u8 = 1;
+
+/// Device-level config directory (same as `device.json` location).
+///
+/// VAPID keys are device-level — shared across all hubs on this CLI.
+fn device_state_dir() -> Result<PathBuf> {
+    crate::device::Device::config_dir()
+}
+
+/// Load VAPID keys from device-level encrypted storage.
+///
+/// Returns `None` if no keys have been generated yet.
+/// Keys are stored in `vapid_keys.enc` alongside `device.json`.
+pub fn load_vapid_keys() -> Result<Option<VapidKeys>> {
+    let state_dir = device_state_dir()?;
+    let keys_path = state_dir.join("vapid_keys.enc");
+
+    if !keys_path.exists() {
+        return Ok(None);
+    }
+
+    let key = get_or_create_encryption_key("_device_vapid")?;
+    let content = fs::read_to_string(&keys_path).context("Failed to read VAPID keys file")?;
+    let encrypted: EncryptedData =
+        serde_json::from_str(&content).context("Failed to parse VAPID keys file")?;
+    let plaintext = crate::crypto::decrypt(&key, &encrypted)?;
+    let vapid: VapidKeys =
+        serde_json::from_slice(&plaintext).context("Failed to deserialize VAPID keys")?;
+
+    // Migrate legacy DER formats (SEC1/PKCS8) to raw 32-byte scalar.
+    // Re-save so migration only happens once.
+    let old_priv = vapid.private_key_base64url().to_string();
+    let vapid = vapid.migrate_if_needed()?;
+    if vapid.private_key_base64url() != old_priv {
+        save_vapid_keys(&vapid)?;
+    }
+
+    log::info!("Loaded device-level VAPID keys (encrypted)");
+    Ok(Some(vapid))
+}
+
+/// Save VAPID keys to device-level encrypted storage.
+pub fn save_vapid_keys(vapid: &VapidKeys) -> Result<()> {
+    let key = get_or_create_encryption_key("_device_vapid")?;
+    let state_dir = device_state_dir()?;
+    let keys_path = state_dir.join("vapid_keys.enc");
+
+    let plaintext = serde_json::to_vec(vapid).context("Failed to serialize VAPID keys")?;
+    let encrypted = crate::crypto::encrypt(&key, &plaintext, VAPID_VERSION)?;
+    let content =
+        serde_json::to_string_pretty(&encrypted).context("Failed to serialize encrypted VAPID")?;
+    fs::write(&keys_path, content).context("Failed to write VAPID keys file")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&keys_path, perms)
+            .context("Failed to set VAPID keys file permissions")?;
+    }
+
+    log::debug!("Saved encrypted device-level VAPID keys to {:?}", keys_path);
+    Ok(())
+}
+
+/// Load VAPID keys from legacy per-hub storage (migration helper).
+///
+/// Early versions stored VAPID keys per-hub. This loads from the old path
+/// so `init_web_push` can migrate them to device-level on first run.
+pub fn load_legacy_hub_vapid_keys(hub_id: &str) -> Result<Option<VapidKeys>> {
+    let state_dir = hub_state_dir(hub_id)?;
+    let keys_path = state_dir.join("vapid_keys.enc");
+
+    if !keys_path.exists() {
+        return Ok(None);
+    }
+
+    let key = get_or_create_encryption_key(hub_id)?;
+    let content = fs::read_to_string(&keys_path).context("Failed to read legacy VAPID keys")?;
+    let encrypted: EncryptedData =
+        serde_json::from_str(&content).context("Failed to parse legacy VAPID keys")?;
+    let plaintext = crate::crypto::decrypt(&key, &encrypted)?;
+    let vapid: VapidKeys =
+        serde_json::from_slice(&plaintext).context("Failed to deserialize legacy VAPID keys")?;
+    let vapid = vapid.migrate_if_needed()?;
+    log::info!(
+        "Loaded legacy per-hub VAPID keys for hub {}",
+        &hub_id[..hub_id.len().min(8)]
+    );
+    Ok(Some(vapid))
+}
+
+/// Load push subscriptions from encrypted storage.
+///
+/// Returns an empty store if the file doesn't exist yet.
+pub fn load_push_subscriptions(hub_id: &str) -> Result<PushSubscriptionStore> {
+    let state_dir = hub_state_dir(hub_id)?;
+    let subs_path = state_dir.join("push_subscriptions.enc");
+
+    if !subs_path.exists() {
+        return Ok(PushSubscriptionStore::default());
+    }
+
+    let key = get_or_create_encryption_key(hub_id)?;
+    let content =
+        fs::read_to_string(&subs_path).context("Failed to read push subscriptions file")?;
+    let encrypted: EncryptedData =
+        serde_json::from_str(&content).context("Failed to parse push subscriptions file")?;
+    let plaintext = crate::crypto::decrypt(&key, &encrypted)?;
+    let store: PushSubscriptionStore =
+        serde_json::from_slice(&plaintext).context("Failed to deserialize push subscriptions")?;
+
+    log::info!(
+        "Loaded {} push subscription(s) for hub {}",
+        store.len(),
+        &hub_id[..hub_id.len().min(8)]
+    );
+    Ok(store)
+}
+
+/// Save push subscriptions to encrypted storage.
+pub fn save_push_subscriptions(hub_id: &str, store: &PushSubscriptionStore) -> Result<()> {
+    let key = get_or_create_encryption_key(hub_id)?;
+    let state_dir = hub_state_dir(hub_id)?;
+    let subs_path = state_dir.join("push_subscriptions.enc");
+
+    let plaintext =
+        serde_json::to_vec(store).context("Failed to serialize push subscriptions")?;
+    let encrypted = crate::crypto::encrypt(&key, &plaintext, PUSH_SUB_VERSION)?;
+    let content = serde_json::to_string_pretty(&encrypted)
+        .context("Failed to serialize encrypted push subscriptions")?;
+    fs::write(&subs_path, content).context("Failed to write push subscriptions file")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&subs_path, perms)
+            .context("Failed to set push subscriptions file permissions")?;
+    }
+
+    log::debug!("Saved encrypted push subscriptions to {:?}", subs_path);
     Ok(())
 }
 

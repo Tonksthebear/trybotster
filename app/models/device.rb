@@ -22,6 +22,7 @@ class Device < ApplicationRecord
   scope :cli_devices, -> { where(device_type: "cli") }
   scope :browser_devices, -> { where(device_type: "browser") }
   scope :active, -> { where("last_seen_at > ?", 5.minutes.ago) }
+  scope :with_notifications, -> { where(notifications_enabled: true) }
   scope :by_last_seen, -> { order(last_seen_at: :desc) }
 
   def cli?

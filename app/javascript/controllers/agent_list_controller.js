@@ -47,6 +47,7 @@ export default class extends Controller {
   };
 
   #disconnected = false;
+  #turboLoadHandler = () => this.#syncSelectionFromUrl();
 
   connect() {
     if (!this.hubIdValue) return;
@@ -54,6 +55,10 @@ export default class extends Controller {
 
     // Track unsubscribe functions for cleanup
     this.unsubscribers = [];
+
+    // Sync selection from URL on connect and turbo navigations
+    this.#syncSelectionFromUrl();
+    document.addEventListener("turbo:load", this.#turboLoadHandler);
 
     // agentsValueChanged fires automatically on connect if value differs from default,
     // so persisted data from turbo-permanent renders without explicit call
@@ -102,6 +107,8 @@ export default class extends Controller {
   disconnect() {
     this.#disconnected = true;
 
+    document.removeEventListener("turbo:load", this.#turboLoadHandler);
+
     // Clean up event subscriptions before releasing
     this.unsubscribers?.forEach((unsub) => unsub());
     this.unsubscribers = null;
@@ -116,6 +123,8 @@ export default class extends Controller {
   // Stimulus: called when agentsValue changes
   agentsValueChanged() {
     this.#render();
+    // Agents may arrive after connect — re-sync selection from URL
+    this.#syncSelectionFromUrl();
   }
 
   // Stimulus: called when selectedIdValue changes
@@ -145,7 +154,9 @@ export default class extends Controller {
     // Set pending info on modal controller element and open dialog
     const modal = document.getElementById("delete-agent-modal");
     if (modal) {
-      const controller = modal.querySelector("[data-controller='delete-agent-modal']");
+      const controller = modal.querySelector(
+        "[data-controller='delete-agent-modal']",
+      );
       if (controller) {
         controller.dataset.agentId = agentId;
         controller.dataset.deleteAgentModalInWorktreeValue = inWorktree;
@@ -246,6 +257,20 @@ export default class extends Controller {
     el.querySelectorAll("[data-agent-index]").forEach((child) => {
       child.dataset.agentIndex = index;
     });
+  }
+
+  // Private: derive selected agent from current URL path
+  #syncSelectionFromUrl() {
+    const match = window.location.pathname.match(
+      /\/hubs\/[^/]+\/agents\/(\d+)/,
+    );
+    if (!match) return;
+
+    const index = parseInt(match[1], 10);
+    const agent = this.agentsValue[index];
+    if (agent && agent.id !== this.selectedIdValue) {
+      this.selectedIdValue = agent.id;
+    }
   }
 
   // Private: update selection state without full re-render

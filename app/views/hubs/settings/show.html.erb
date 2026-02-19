@@ -129,13 +129,37 @@
                    data-hub-settings-target="treeFeedback">Connecting to hub...</p>
               </div>
 
-              <%# Empty state — no config directory found for active scope %>
-              <div class="group-data-[view=empty]/tree:block hidden text-center py-6">
-                <p class="text-sm text-zinc-500 mb-3">No configuration found</p>
+              <%# Empty state — guided setup with template suggestions %>
+              <div class="group-data-[view=empty]/tree:block hidden py-4">
+                <h3 class="text-sm font-medium text-zinc-300 mb-1">Get Started</h3>
+                <p class="text-xs text-zinc-500 mb-4">Choose a session template to initialize your hub:</p>
+
+                <% if @session_templates.any? %>
+                  <div class="space-y-2 mb-4">
+                    <% @session_templates.each do |template| %>
+                      <button type="button"
+                              data-action="hub-settings#quickSetup"
+                              data-template-dest="<%= template[:dest] %>"
+                              data-template-content="<%= template[:content] %>"
+                              class="w-full text-left px-3 py-2.5 rounded-lg border border-zinc-700/50 hover:border-primary-500/30 hover:bg-zinc-800/50 transition-colors group/card">
+                        <div class="flex items-center justify-between">
+                          <div class="min-w-0">
+                            <div class="text-sm font-medium text-zinc-200 group-hover/card:text-primary-300 transition-colors"><%= template[:name] %></div>
+                            <div class="text-xs text-zinc-500 mt-0.5 truncate"><%= template[:description] %></div>
+                          </div>
+                          <span class="shrink-0 ml-2 text-xs text-primary-400 opacity-0 group-hover/card:opacity-100 transition-opacity">
+                            Install &rarr;
+                          </span>
+                        </div>
+                      </button>
+                    <% end %>
+                  </div>
+                <% end %>
+
                 <button type="button"
                         data-action="hub-settings#initBotster"
-                        class="px-3 py-1.5 text-xs font-medium text-primary-400 bg-primary-500/10 border border-primary-500/30 rounded hover:bg-primary-500/20 transition-colors">
-                  Initialize
+                        class="w-full text-center px-3 py-1.5 text-xs text-zinc-600 hover:text-zinc-400 transition-colors">
+                  Initialize empty
                 </button>
               </div>
 

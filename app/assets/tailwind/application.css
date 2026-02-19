@@ -8,6 +8,11 @@
 @source "../../../app/components";
 @source "../../../config/elements.yml";
 
+/* Disable pinch zoom in standalone PWA mode */
+html {
+  touch-action: pan-x pan-y;
+}
+
 /* Terminal container — restty canvas fills the space */
 .terminal-container {
   overflow: hidden;

@@ -80,6 +80,11 @@ class WorkerBridge {
       webrtcTransport.on("session:refreshed", (data) => this.#dispatchEvent({ event: "session:refreshed", ...data }))
       webrtcTransport.on("signaling:state", (data) => this.#dispatchEvent({ event: "signaling:state", ...data }))
       webrtcTransport.on("stream:frame", (data) => this.#dispatchEvent({ event: "stream:frame", ...data }))
+      webrtcTransport.on("push:vapid_key", (data) => this.#dispatchEvent({ event: "push:vapid_key", ...data }))
+      webrtcTransport.on("push:sub_ack", (data) => this.#dispatchEvent({ event: "push:sub_ack", ...data }))
+      webrtcTransport.on("push:vapid_keys", (data) => this.#dispatchEvent({ event: "push:vapid_keys", ...data }))
+      webrtcTransport.on("push:test_ack", (data) => this.#dispatchEvent({ event: "push:test_ack", ...data }))
+      webrtcTransport.on("push:disable_ack", (data) => this.#dispatchEvent({ event: "push:disable_ack", ...data }))
 
       this.#initialized = true
     } catch (error) {
@@ -199,6 +204,16 @@ class WorkerBridge {
         return webrtcTransport.sendStreamFrame(params.hubId, params.frameType, params.streamId, params.payload)
       case "sendPtyInput":
         return webrtcTransport.sendPtyInput(params.hubId, params.subscriptionId, params.data)
+      case "sendControlMessage": {
+        // Send arbitrary JSON control message via encrypted DataChannel
+        const jsonBytes = new TextEncoder().encode(JSON.stringify(params.message))
+        const plaintext = new Uint8Array(1 + jsonBytes.length)
+        plaintext[0] = 0x00  // CONTENT_MSG
+        plaintext.set(jsonBytes, 1)
+
+        const { data: encrypted } = await this.encryptBinary(params.hubId, plaintext)
+        return webrtcTransport.sendEncrypted(params.hubId, encrypted)
+      }
       default:
         throw new Error(`Unknown action: ${action}`)
     }

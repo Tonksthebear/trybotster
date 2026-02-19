@@ -2,12 +2,15 @@
 
 module Hubs
   class SettingsController < ApplicationController
+    include TemplateReadable
+
     before_action :authenticate_user!
     before_action :set_hub
 
     def show
       @config_metadata = config_metadata
       @templates = template_catalog
+      @session_templates = @templates["sessions"] || []
     end
 
     private
@@ -55,23 +58,6 @@ module Hubs
           content: content
         }
       }.group_by { |t| t[:category] }
-    end
-
-    # Extract @tag metadata from comment headers.
-    # Supports both Lua (`-- @tag value`) and shell (`# @tag value`) comments.
-    # Stops at the first non-comment line (ignoring shebangs and blank lines).
-    def extract_template_metadata(content)
-      metadata = {}
-      content.each_line do |line|
-        next if line.start_with?("#!") # skip shebang
-        next if line.strip.empty?
-        break unless line.start_with?("--") || line.start_with?("#")
-
-        if (match = line.match(/^(?:--|#)\s*@(\w+)\s+(.+)/))
-          metadata[match[1].to_sym] = match[2].strip
-        end
-      end
-      metadata
     end
   end
 end

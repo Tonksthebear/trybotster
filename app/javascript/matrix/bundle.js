@@ -139,12 +139,41 @@ export function parseBundleFromFragment() {
     const bundle = parseBinaryBundle(bytes)
 
     // Extract hub ID from URL path (e.g., /hubs/abc123)
-    const hubMatch = window.location.pathname.match(/\/hubs\/([^\/]+)/)
+    const hubMatch = window.location.pathname.match(/\/hubs\/([^\/]+)(?:\/pairing)?/)
     bundle.hubId = hubMatch ? hubMatch[1] : ""
 
     return bundle
   } catch (error) {
     console.error("[Bundle] Failed to parse bundle from fragment:", error)
+    return null
+  }
+}
+
+/**
+ * Parse DeviceKeyBundle from a pasted URL string.
+ * Extracts the hash fragment and parses the bundle from it.
+ *
+ * @param {string} urlString - Full URL (e.g., "https://trybotster.com/hubs/123/pairing#BASE32...")
+ * @returns {Object|null} Parsed bundle, or null if invalid
+ */
+export function parseBundleFromUrl(urlString) {
+  try {
+    const url = new URL(urlString)
+    const base32Data = url.hash.startsWith("#") ? url.hash.slice(1) : url.hash
+
+    if (!base32Data || base32Data.length < 50) {
+      return null
+    }
+
+    const bytes = base32Decode(base32Data)
+    const bundle = parseBinaryBundle(bytes)
+
+    const hubMatch = url.pathname.match(/\/hubs\/([^\/]+)/)
+    bundle.hubId = hubMatch ? hubMatch[1] : ""
+
+    return bundle
+  } catch (error) {
+    console.error("[Bundle] Failed to parse bundle from URL:", error)
     return null
   }
 }

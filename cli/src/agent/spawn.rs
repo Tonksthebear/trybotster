@@ -149,7 +149,11 @@ pub fn spawn_reader_thread(
 
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    log::info!("{label} PTY reader got EOF, broadcasting ProcessExited");
+                    let _ = event_tx.send(PtyEvent::process_exited(None));
+                    break;
+                }
                 Ok(n) => {
                     // Detect notifications and broadcast as PtyEvent::Notification
                     if detect_notifs {
@@ -199,6 +203,7 @@ pub fn spawn_reader_thread(
                 }
                 Err(e) => {
                     log::error!("{label} PTY read error: {e}");
+                    let _ = event_tx.send(PtyEvent::process_exited(None));
                     break;
                 }
             }
@@ -411,11 +416,9 @@ mod tests {
         let event = event_rx.try_recv().expect("Should receive Output event");
         assert!(matches!(event, PtyEvent::Output(_)));
 
-        match event_rx.try_recv() {
-            Err(broadcast::error::TryRecvError::Empty)
-            | Err(broadcast::error::TryRecvError::Closed) => {}
-            other => panic!("Expected no more events, got {:?}", other),
-        }
+        // Reader emits ProcessExited on EOF
+        let exit_event = event_rx.try_recv().expect("Should receive ProcessExited on EOF");
+        assert!(matches!(exit_event, PtyEvent::ProcessExited { exit_code: None }));
     }
 
     // =========================================================================
