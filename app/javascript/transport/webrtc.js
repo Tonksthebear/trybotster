@@ -212,11 +212,17 @@ class WebRTCTransport {
       const pcState = conn.pc.connectionState
       const dcState = conn.dataChannel?.readyState
       // Dead peer — tear down so we can create a fresh one.
-      // PC terminal states are obvious. But also: if the DataChannel
-      // is dead, the peer is useless even if PC state hasn't caught up
-      // (iOS sleep: PC reports "connected" but DC is already closed).
+      // Terminal PC states (closed/failed/disconnected) are obviously dead.
+      // Also dead: PC is "connected" but DC is closed/gone (iOS sleep: PC
+      // reports connected but DC silently died). DC "connecting" is OK — brief
+      // window between DTLS connect and SCTP open.
+      // NOT dead: PC is "new" or "connecting" — peer is actively establishing,
+      // DC will naturally be "connecting" until ICE completes. Tearing down a
+      // connecting peer sends a new offer that the CLI rejects ("Connection in
+      // progress"), causing a reconnect storm.
+      const dcAlive = dcState === "open" || dcState === "connecting"
       const dead = pcState === "closed" || pcState === "failed" || pcState === "disconnected" ||
-                   dcState !== "open"
+                   (pcState === "connected" && !dcAlive)
       if (dead) {
         this.#teardownPeer(conn)
         this.#emit("connection:state", { hubId, state: "disconnected" })

@@ -8,7 +8,7 @@ import { HubConnection } from "connections/hub_connection";
  * Push Subscription Controller
  *
  * Manages browser push notification subscriptions per device.
- * Mounts on the /notifications page — one instance per device card.
+ * Mounts on /settings/devices/:id — one instance per device page.
  *
  * Three states per device row:
  * 1. CLI has no VAPID keys → show Enable (generate or copy keys)
@@ -37,6 +37,7 @@ export default class extends Controller {
   ];
 
   #unsubscribers = [];
+  #connUnsubscribers = [];  // onConnected/onError callbacks on HubConnection
   #hubConn = null;
   #sourceHubConn = null;
 
@@ -77,19 +78,20 @@ export default class extends Controller {
       return;
     }
 
-    // CLI has VAPID keys — check if this browser has a push subscription
+    // CLI has VAPID keys — check if this browser has a valid push subscription.
+    // A subscription is only valid if we recorded the VAPID key we used to create it.
+    // This catches stale subscriptions from old VAPID keys (e.g. after device reset).
     try {
       const registration = await navigator.serviceWorker.getRegistration("/");
       const subscription = await registration?.pushManager?.getSubscription();
 
-      if (subscription) {
+      if (subscription && localStorage.getItem("botster_vapid_key")) {
         this.#showButtons("subscribed");
       } else {
         this.#showButtons("enableBrowser");
       }
     } catch (e) {
-      // Can't check — fall back to showing subscribed (existing behavior)
-      this.#showButtons("subscribed");
+      this.#showButtons("enableBrowser");
     }
   }
 
@@ -108,6 +110,7 @@ export default class extends Controller {
   // ========== Actions ==========
 
   async enable() {
+    if (!this.hubIdValue) return;
     if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
       this.#setStatus("not-supported");
       return;
@@ -132,15 +135,18 @@ export default class extends Controller {
         );
       }
 
-      this.#hubConn.onConnected(() => this.#startFlow());
-
-      this.#hubConn.onError(({ reason }) => {
-        if (reason === "unpaired") {
-          this.#setStatus("unpaired");
-        } else {
-          this.#setStatus("error");
-        }
-      });
+      this.#connUnsubscribers.push(
+        this.#hubConn.onConnected(() => this.#startFlow())
+      );
+      this.#connUnsubscribers.push(
+        this.#hubConn.onError(({ reason }) => {
+          if (reason === "unpaired") {
+            this.#setStatus("unpaired");
+          } else {
+            this.#setStatus("error");
+          }
+        })
+      );
     } catch (e) {
       console.error("[PushSubscription] Failed to acquire connection:", e);
       this.#setStatus("error");
@@ -153,6 +159,7 @@ export default class extends Controller {
    * get the public key and subscribe this browser's push manager.
    */
   async enableBrowser() {
+    if (!this.hubIdValue) return;
     if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
       this.#setStatus("not-supported");
       return;
@@ -171,23 +178,26 @@ export default class extends Controller {
         HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
       );
 
-      this.#hubConn.onConnected(async () => {
-        this.#setStatus("enabling");
-        // Ask CLI for its existing VAPID public key
-        await bridge.send("sendControlMessage", {
-          hubId: this.hubIdValue,
-          message: { type: "vapid_pub_req" },
-        });
-        // Continues in #handleVapidKey when CLI responds
-      });
-
-      this.#hubConn.onError(({ reason }) => {
-        if (reason === "unpaired") {
-          this.#setStatus("unpaired");
-        } else {
-          this.#setStatus("error");
-        }
-      });
+      this.#connUnsubscribers.push(
+        this.#hubConn.onConnected(async () => {
+          this.#setStatus("enabling");
+          // Ask CLI for its existing VAPID public key
+          await bridge.send("sendControlMessage", {
+            hubId: this.hubIdValue,
+            message: { type: "vapid_pub_req" },
+          });
+          // Continues in #handleVapidKey when CLI responds
+        })
+      );
+      this.#connUnsubscribers.push(
+        this.#hubConn.onError(({ reason }) => {
+          if (reason === "unpaired") {
+            this.#setStatus("unpaired");
+          } else {
+            this.#setStatus("error");
+          }
+        })
+      );
     } catch (e) {
       console.error("[PushSubscription] Failed to acquire connection:", e);
       this.#setStatus("error");
@@ -196,18 +206,23 @@ export default class extends Controller {
   }
 
   async disable() {
+    if (!this.hubIdValue) return;
     this.#setStatus("disabling");
     try {
       this.#hubConn = await ConnectionManager.acquire(
         HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
       );
-      this.#hubConn.onConnected(async () => {
-        await bridge.send("sendControlMessage", {
-          hubId: this.hubIdValue,
-          message: { type: "push_disable" },
-        });
-      });
-      this.#hubConn.onError(() => this.#setStatus("error"));
+      this.#connUnsubscribers.push(
+        this.#hubConn.onConnected(async () => {
+          await bridge.send("sendControlMessage", {
+            hubId: this.hubIdValue,
+            message: { type: "push_disable" },
+          });
+        })
+      );
+      this.#connUnsubscribers.push(
+        this.#hubConn.onError(() => this.#setStatus("error"))
+      );
     } catch (e) {
       console.error("[PushSubscription] Failed to disable:", e);
       this.#setStatus("error");
@@ -215,18 +230,23 @@ export default class extends Controller {
   }
 
   async test() {
+    if (!this.hubIdValue) return;
     this.#setStatus("testing");
     try {
       this.#hubConn = await ConnectionManager.acquire(
         HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
       );
-      this.#hubConn.onConnected(async () => {
-        await bridge.send("sendControlMessage", {
-          hubId: this.hubIdValue,
-          message: { type: "push_test" },
-        });
-      });
-      this.#hubConn.onError(() => this.#setStatus("error"));
+      this.#connUnsubscribers.push(
+        this.#hubConn.onConnected(async () => {
+          await bridge.send("sendControlMessage", {
+            hubId: this.hubIdValue,
+            message: { type: "push_test" },
+          });
+        })
+      );
+      this.#connUnsubscribers.push(
+        this.#hubConn.onError(() => this.#setStatus("error"))
+      );
     } catch (e) {
       console.error("[PushSubscription] Test failed:", e);
       this.#setStatus("error");
@@ -290,11 +310,23 @@ export default class extends Controller {
       );
       await navigator.serviceWorker.ready;
 
+      // Unsubscribe any existing push subscription — the VAPID key may have
+      // changed (e.g. device reset), and PushManager rejects subscribe() if
+      // the applicationServerKey doesn't match the existing subscription.
+      const existing = await registration.pushManager.getSubscription();
+      if (existing) {
+        await existing.unsubscribe();
+      }
+
       const applicationServerKey = this.#urlBase64ToUint8Array(key);
       const subscription = await registration.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey,
       });
+
+      // Record the VAPID key so #checkBrowserState can verify the subscription
+      // is for the current key (detects stale subscriptions after key rotation).
+      localStorage.setItem("botster_vapid_key", key);
 
       await this.#sendSubscriptionToCli(subscription);
       this.#setStatus("subscribing");
@@ -334,6 +366,8 @@ export default class extends Controller {
       console.error("[PushSubscription] Failed to unsubscribe browser push:", e);
     }
 
+    localStorage.removeItem("botster_vapid_key");
+
     Turbo.visit(window.location.href, { action: "replace" });
   }
 
@@ -345,11 +379,22 @@ export default class extends Controller {
       hubId: this.hubIdValue,
       message: {
         type: "push_sub",
+        browser_id: this.#getBrowserId(),
         endpoint: json.endpoint,
         p256dh: json.keys.p256dh,
         auth: json.keys.auth,
       },
     });
+  }
+
+  #getBrowserId() {
+    const key = "botster_browser_id";
+    let id = localStorage.getItem(key);
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem(key, id);
+    }
+    return id;
   }
 
   #setStatus(status) {
@@ -359,6 +404,10 @@ export default class extends Controller {
   }
 
   #releaseConnections() {
+    for (const unsub of this.#connUnsubscribers) {
+      unsub();
+    }
+    this.#connUnsubscribers = [];
     this.#hubConn?.release();
     this.#hubConn = null;
     this.#sourceHubConn?.release();
