@@ -20,7 +20,7 @@
  */
 
 import bridge from "workers/bridge"
-import { ensureMatrixReady, parseBundleFromFragment } from "matrix/bundle"
+import { ensureMatrixReady } from "matrix/bundle"
 import { HandshakeManager } from "connections/handshake_manager"
 import { HealthTracker } from "connections/health_tracker"
 import { setupHubEventListeners } from "connections/hub_event_handlers"
@@ -104,17 +104,6 @@ export class Connection {
   async initialize() {
     try {
       this.#setState(ConnectionState.LOADING)
-
-      // Parse bundle from URL fragment BEFORE async worker init.
-      // The hash can get stripped during the ensureMatrixReady() async gap
-      // (SharedWorker + WASM loading), so read it synchronously now.
-      if (!this.options.sessionBundle) {
-        const bundle = parseBundleFromFragment()
-        if (bundle) {
-          this.options.sessionBundle = bundle
-          history.replaceState(null, "", location.pathname + location.search)
-        }
-      }
 
       const cryptoWorkerUrl = document.querySelector('meta[name="crypto-worker-url"]')?.content
       const wasmJsUrl = document.querySelector('meta[name="crypto-wasm-js-url"]')?.content
@@ -203,19 +192,10 @@ export class Connection {
 
     const hubId = this.getHubId()
 
-    // 1. Handle Olm session (optional — not required for ActionCable health)
-    const sessionBundle = this.options.sessionBundle || null
-    let hasOlmSession = false
-
-    if (sessionBundle) {
-      await bridge.createSession(hubId, sessionBundle)
-      hasOlmSession = true
-    } else {
-      const result = await bridge.hasSession(hubId)
-      hasOlmSession = result.hasSession
-      if (!hasOlmSession) {
-        console.debug(`[${this.constructor.name}] No Olm session — WebRTC disabled until QR scan`)
-      }
+    // 1. Check for existing Olm session (created on /pairing page)
+    const { hasSession: hasOlmSession } = await bridge.hasSession(hubId)
+    if (!hasOlmSession) {
+      console.debug(`[${this.constructor.name}] No Olm session — WebRTC disabled until pairing`)
     }
 
     // Get identity key only when a session exists. An account (keypair) can exist
@@ -694,22 +674,6 @@ export class Connection {
   async reacquire() {
     const hubId = this.getHubId()
     if (!hubId) return
-
-    // Check for new session bundle in URL fragment (QR code scan)
-    const sessionBundle = parseBundleFromFragment()
-    if (sessionBundle) {
-      history.replaceState(null, "", location.pathname + location.search)
-      await bridge.createSession(hubId, sessionBundle)
-      // Update identity key now that session exists
-      try {
-        const keyResult = await bridge.getIdentityKey(hubId)
-        this.identityKey = keyResult.identityKey
-        this.browserIdentity = `${this.identityKey}:${Connection.tabId}`
-      } catch { /* handled below via hasSession check */ }
-      // Clear unpaired error
-      this.errorCode = null
-      this.errorReason = null
-    }
 
     const { hasSession } = await bridge.hasSession(hubId)
 

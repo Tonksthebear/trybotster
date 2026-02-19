@@ -2,6 +2,7 @@
 
 class HubsController < ApplicationController
   include ApiKeyAuthenticatable
+  include TemplateReadable
 
   before_action :authenticate_user!, only: [ :index, :show ]
   before_action :authenticate_hub_request!, only: [ :create, :update, :destroy ]
@@ -15,7 +16,6 @@ class HubsController < ApplicationController
 
   # GET /hubs/:id
   # Terminal view for a specific hub
-  # URL fragment contains E2E key: /hubs/:id#<bundle>
   #
   # JSON format returns status info for browser-side error handling
   def show
@@ -30,6 +30,7 @@ class HubsController < ApplicationController
     respond_to do |format|
       format.html do
         @browser_device = current_user.devices.browser_devices.order(last_seen_at: :desc).first
+        @recommended_template = read_template("sessions/claude-github.sh")
       end
       format.json do
         # Return hub status for browser-side error handling

@@ -1,0 +1,147 @@
+<div class="min-h-[calc(100vh-8rem)] flex items-center justify-center px-4 py-12"
+     data-controller="pairing"
+     data-pairing-hub-id-value="<%= Current.hub.id %>"
+     data-pairing-redirect-url-value="<%= hub_path(Current.hub) %>">
+
+  <div class="max-w-md w-full">
+    <%# Header %>
+    <div class="text-center mb-8">
+      <div class="inline-flex items-center justify-center w-16 h-16 bg-primary-500/10 rounded-2xl mb-6">
+        <svg class="w-8 h-8 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
+        </svg>
+      </div>
+      <h1 class="text-3xl font-bold text-zinc-100 mb-2">Secure Pairing</h1>
+      <p class="text-zinc-400">
+        Establish an encrypted connection to your hub
+      </p>
+    </div>
+
+    <%# Paste link state - shown when no bundle in URL (e.g. PWA direct navigation) %>
+    <div data-pairing-target="pasteLink" class="hidden">
+      <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-6 mb-6">
+        <div class="space-y-4">
+          <div class="flex items-start gap-3">
+            <div class="shrink-0 mt-0.5">
+              <%= icon "link", class: "size-5 text-primary-400" %>
+            </div>
+            <div>
+              <h3 class="text-sm font-medium text-zinc-200">Paste Connection Link</h3>
+              <p class="text-xs text-zinc-500 mt-1">
+                Copy the connection URL from your hub's share menu and paste it below.
+              </p>
+            </div>
+          </div>
+
+          <div class="pt-2">
+            <input type="text"
+                   data-pairing-target="pasteLinkInput"
+                   data-action="paste->pairing#handlePaste"
+                   placeholder="Paste connection link here..."
+                   class="w-full px-3 py-2.5 bg-zinc-950 border border-zinc-700 rounded-lg text-zinc-300 text-sm font-mono placeholder-zinc-600 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/20">
+            <p data-pairing-target="pasteLinkError" class="text-xs text-danger-400 mt-2 hidden"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex items-start gap-2 p-3 bg-zinc-900/50 border border-zinc-800 rounded-lg">
+        <%= icon "shield-check", class: "size-4 text-emerald-500 mt-0.5 shrink-0" %>
+        <p class="text-xs text-zinc-400">
+          The connection link contains encrypted keys that never touch the server. Your session is end-to-end encrypted.
+        </p>
+      </div>
+    </div>
+
+    <%# Ready state - bundle parsed, waiting for user action %>
+    <div data-pairing-target="ready" class="hidden">
+      <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-6 mb-6">
+        <div class="space-y-4">
+          <div class="flex items-start gap-3">
+            <div class="shrink-0 mt-0.5">
+              <svg class="w-5 h-5 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
+              </svg>
+            </div>
+            <div>
+              <h3 class="text-sm font-medium text-zinc-200">End-to-end encrypted</h3>
+              <p class="text-xs text-zinc-500 mt-1">
+                Your private keys are generated locally and never leave this device. Not even Botster's servers can read your messages.
+              </p>
+            </div>
+          </div>
+
+          <div class="border-t border-zinc-800 pt-4">
+            <div class="flex items-center justify-between">
+              <span class="text-xs text-zinc-500">Hub identity fingerprint</span>
+              <code data-pairing-target="fingerprint" class="text-xs font-mono text-primary-400/80"></code>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <button type="button"
+              data-action="pairing#pair"
+              data-pairing-target="pairButton"
+              class="w-full inline-flex items-center justify-center gap-2 px-6 py-3 bg-primary-600 hover:bg-primary-500 text-white rounded-lg text-base font-medium transition-colors">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
+        </svg>
+        Complete Secure Pairing
+      </button>
+    </div>
+
+    <%# Loading state - pairing in progress %>
+    <div data-pairing-target="loading" class="hidden">
+      <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-8 text-center">
+        <div class="inline-flex items-center justify-center w-12 h-12 bg-primary-500/10 rounded-xl mb-4">
+          <svg class="w-6 h-6 text-primary-400 animate-spin" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+          </svg>
+        </div>
+        <p class="text-sm text-zinc-300">Establishing encrypted session...</p>
+      </div>
+    </div>
+
+    <%# Success state %>
+    <div data-pairing-target="success" class="hidden">
+      <div class="bg-success-500/10 border border-success-500/20 rounded-lg p-8 text-center">
+        <div class="inline-flex items-center justify-center w-12 h-12 bg-success-500/10 rounded-xl mb-4">
+          <svg class="w-6 h-6 text-success-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.5 12.75l6 6 9-13.5" />
+          </svg>
+        </div>
+        <h3 class="text-lg font-medium text-zinc-100 mb-1">Paired successfully</h3>
+        <p class="text-sm text-zinc-400">Redirecting to your hub...</p>
+      </div>
+    </div>
+
+    <%# Error state - no bundle or invalid %>
+    <div data-pairing-target="error" class="hidden">
+      <div class="bg-danger-500/10 border border-danger-500/20 rounded-lg p-6 mb-6">
+        <div class="flex items-start gap-3">
+          <svg class="w-5 h-5 text-danger-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+          </svg>
+          <div>
+            <h3 class="text-sm font-medium text-danger-300">Pairing failed</h3>
+            <p data-pairing-target="errorMessage" class="text-sm text-zinc-400 mt-1">
+              Invalid or missing connection code. Scan the QR code from your hub's terminal to try again.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <%= link_to hub_path(Current.hub), class: "block text-center text-sm text-zinc-500 hover:text-zinc-300 transition-colors" do %>
+        &larr; Back to hub
+      <% end %>
+    </div>
+
+    <%# Back link (shown with ready and paste states) %>
+    <div data-pairing-target="backLink" class="hidden text-center mt-6">
+      <%= link_to hub_path(Current.hub), class: "text-sm text-zinc-500 hover:text-zinc-300 transition-colors" do %>
+        &larr; Back to hub
+      <% end %>
+    </div>
+  </div>
+</div>

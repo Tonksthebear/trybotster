@@ -43,4 +43,22 @@ class Hubs::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_match "sessions", response.body
     assert_match "initialization", response.body
   end
+
+  test "settings empty state shows session template suggestions" do
+    get hub_settings_path(@hub)
+    assert_response :success
+
+    # Empty state should have quick setup buttons with template data
+    assert_select "[data-action='hub-settings#quickSetup']", minimum: 1
+    assert_select "[data-action='hub-settings#initBotster']", text: /Initialize empty/
+  end
+
+  test "settings empty state includes session template content in data attributes" do
+    get hub_settings_path(@hub)
+    assert_response :success
+
+    # Session templates should have dest and content data attributes
+    assert_select "[data-action='hub-settings#quickSetup'][data-template-dest]", minimum: 1
+    assert_select "[data-action='hub-settings#quickSetup'][data-template-content]", minimum: 1
+  end
 end

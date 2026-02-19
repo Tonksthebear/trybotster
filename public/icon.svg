@@ -1,3 +1,33 @@
-<svg width="512" height="512" xmlns="http://www.w3.org/2000/svg">
-  <circle cx="256" cy="256" r="256" fill="red"/>
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect width="512" height="512" fill="#09090b"/>
+
+  <!-- Scale content to fill canvas. Robot centered with ~8% padding for icon safe area -->
+  <g transform="translate(256, 256) scale(1.35) translate(-256, -256)">
+    <!-- Antenna -->
+    <line x1="256" y1="88" x2="256" y2="128" stroke="#3db8c1" stroke-width="12" stroke-linecap="round"/>
+    <circle cx="256" cy="78" r="14" fill="#3db8c1"/>
+
+    <!-- Head -->
+    <rect x="112" y="128" width="288" height="200" rx="40" fill="#18181b" stroke="#3db8c1" stroke-width="10"/>
+
+    <!-- Eyes -->
+    <rect x="172" y="192" width="56" height="56" rx="12" fill="#3db8c1"/>
+    <rect x="284" y="192" width="56" height="56" rx="12" fill="#3db8c1"/>
+
+    <!-- Mouth - terminal cursor line -->
+    <line x1="192" y1="296" x2="320" y2="296" stroke="#3db8c1" stroke-width="10" stroke-linecap="round"/>
+
+    <!-- Body -->
+    <rect x="144" y="344" width="224" height="96" rx="24" fill="#18181b" stroke="#3db8c1" stroke-width="10"/>
+
+    <!-- Body detail lines -->
+    <line x1="208" y1="368" x2="208" y2="416" stroke="#3db8c1" stroke-width="6" stroke-linecap="round" opacity="0.5"/>
+    <line x1="256" y1="368" x2="256" y2="416" stroke="#3db8c1" stroke-width="6" stroke-linecap="round" opacity="0.5"/>
+    <line x1="304" y1="368" x2="304" y2="416" stroke="#3db8c1" stroke-width="6" stroke-linecap="round" opacity="0.5"/>
+
+    <!-- Side ears/bolts -->
+    <circle cx="96" cy="228" r="18" fill="#3db8c1"/>
+    <circle cx="416" cy="228" r="18" fill="#3db8c1"/>
+  </g>
 </svg>

@@ -77,6 +77,10 @@ ed25519-dalek = "2"            # Ed25519 signing for device identity
 zeroize = { version = "1.8", features = ["derive"] }  # Secure memory zeroing
 aes-gcm = "0.10"               # AES-GCM for encrypting state at rest
 
+# Web push notifications (CLI-direct, no Rails relay)
+web-push = { version = "0.11", default-features = false }  # VAPID + RFC8291 encryption only; default-features=false drops isahc (HTTP sent via reqwest for custom Content-Type)
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }  # VAPID key generation (P-256 ECDSA)
+
 # WebSocket (kept for potential future use)
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"

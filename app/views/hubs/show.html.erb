@@ -79,21 +79,59 @@
         </dl>
       </div>
 
+      <%# Setup Banner - shown when hub has no session configuration %>
+      <% if @recommended_template %>
+        <div data-controller="hub-setup-banner"
+             data-hub-setup-banner-hub-id-value="<%= Current.hub.id %>"
+             data-hub-setup-banner-template-dest-value="<%= @recommended_template[:dest] %>"
+             data-hub-setup-banner-template-content-value="<%= @recommended_template[:content] %>">
+          <div data-hub-setup-banner-target="banner"
+               class="hidden bg-amber-500/10 border border-amber-500/20 rounded-lg p-4 lg:p-6 mb-6">
+            <div class="flex items-start gap-4">
+              <div class="shrink-0 size-10 rounded-lg bg-amber-500/10 flex items-center justify-center">
+                <%= icon "exclamation-triangle", class: "size-5 text-amber-400" %>
+              </div>
+              <div class="flex-1 min-w-0">
+                <h3 class="text-sm font-medium text-amber-300">No session configuration</h3>
+                <p class="text-sm text-zinc-400 mt-1">
+                  Agents need an initialization script to run properly. Install a session template to get started.
+                </p>
+                <div class="flex items-center gap-3 mt-3">
+                  <button type="button"
+                          data-action="hub-setup-banner#quickSetup"
+                          data-controller="requires-connection"
+                          data-requires-connection-key-value="<%= Current.hub.id %>"
+                          class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-amber-200 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/30 rounded-lg transition-colors disabled:opacity-50"
+                          disabled>
+                    <%= icon "bolt", class: "size-3.5" %>
+                    <span data-hub-setup-banner-target="status">Quick Setup: <%= @recommended_template[:name] %></span>
+                  </button>
+                  <%= link_to hub_settings_path(Current.hub),
+                        class: "text-sm text-zinc-500 hover:text-zinc-300 transition-colors" do %>
+                    Go to Settings &rarr;
+                  <% end %>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      <% end %>
+
       <%# Scan QR Prompt - shown when connection needs pairing %>
       <div data-controller="scan-prompt"
            data-scan-prompt-hub-id-value="<%= Current.hub.id %>"
            class="hidden bg-amber-500/10 border border-amber-500/20 rounded-lg p-4 lg:p-6 mb-6">
-        <div class="flex items-start gap-4">
+        <%= link_to hub_pairing_path(Current.hub), class: "flex items-start gap-4 group" do %>
           <div class="shrink-0 size-10 rounded-lg bg-amber-500/10 flex items-center justify-center">
             <%= icon "qr-code", class: "size-5 text-amber-400" %>
           </div>
           <div>
-            <h3 class="text-sm font-medium text-amber-300">Scan Connection Code</h3>
+            <h3 class="text-sm font-medium text-amber-300 group-hover:text-amber-200 transition-colors">Pair This Device</h3>
             <p class="text-sm text-zinc-400 mt-1">
-              Open the hub's terminal and scan the QR code displayed there to establish a secure connection.
+              Scan the QR code on your hub's terminal, or paste a connection link to establish a secure connection.
             </p>
           </div>
-        </div>
+        <% end %>
       </div>
 
       <%# Agents Section %>
@@ -176,4 +214,5 @@
       </div>
     </div>
   </div>
+
 </div>

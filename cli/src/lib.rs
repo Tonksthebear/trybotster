@@ -36,6 +36,7 @@ pub mod ws;
 pub mod compat;
 pub mod config;
 pub mod crypto;
+pub mod notifications;
 pub mod file_watcher;
 pub mod constants;
 pub mod device;

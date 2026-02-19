@@ -77,6 +77,16 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_select "a[href=?]", hub_settings_path(@active_hub)
   end
 
+  test "show includes setup banner with recommended template" do
+    sign_in @user
+    get hub_path(@active_hub)
+    assert_response :success
+
+    assert_select "[data-controller='hub-setup-banner']"
+    assert_select "[data-hub-setup-banner-target='banner']"
+    assert_select "[data-action='hub-setup-banner#quickSetup']"
+  end
+
   test "show redirects to index for non-existent hub" do
     sign_in @user
     get hub_path("non-existent-hub-id")

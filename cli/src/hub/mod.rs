@@ -277,6 +277,12 @@ pub struct Hub {
     /// Cleared every `CleanupTick` (5s) to coalesce decrypt failure storms.
     ratchet_restarted_peers: std::collections::HashSet<String>,
 
+    // === Web Push Notifications ===
+    /// VAPID keys for web push authentication (loaded on startup).
+    pub(crate) vapid_keys: Option<crate::notifications::vapid::VapidKeys>,
+    /// Browser push subscriptions (persisted to encrypted storage).
+    pub(crate) push_subscriptions: crate::notifications::push::PushSubscriptionStore,
+
     // === TUI via Lua (Hub-side Processing) ===
     /// Sender for TUI output messages to TuiRunner.
     ///
@@ -432,6 +438,8 @@ impl Hub {
             pty_output_messages_drained: 0,
             notification_watcher_handles: std::collections::HashMap::new(),
             ratchet_restarted_peers: std::collections::HashSet::new(),
+            vapid_keys: None,
+            push_subscriptions: crate::notifications::push::PushSubscriptionStore::default(),
             tui_output_tx: None,
             tui_wake_fd: None,
             tui_request_rx: None,
@@ -518,6 +526,7 @@ impl Hub {
             self.register_hub_with_server();
         }
         self.init_crypto_service();
+        self.init_web_push();
 
         // ActionCable connections are now managed by Lua plugins
         // (hub_commands.lua and github.lua handle subscription lifecycle)
@@ -564,14 +573,13 @@ impl Hub {
 
     /// Load the Lua initialization script.
     ///
-    /// Loading priority:
-    /// 1. Dev mode (debug build) - `cli/lua/` filesystem with hot-reload
-    /// 2. Release mode - extract embedded files to `~/.botster/lua/`, load from there
+    /// Module resolution priority (highest to lowest):
+    /// 1. Project root (`{repo}/.botster/lua/`) — project-specific overrides
+    /// 2. Userspace (`~/.botster/lua/`) — user overrides
+    /// 3. Embedded (compiled from `cli/lua/`) — fallback/base
     ///
-    /// In release mode, embedded Lua is always extracted first (content-hash
-    /// checked) so that on-disk files stay in sync with the binary. Users can
-    /// still edit the extracted files for hot-reload; edits persist until the
-    /// next binary update changes the content hash.
+    /// Debug builds skip embedded entirely — they load from `cli/lua/`
+    /// filesystem with hot-reload support.
     pub(crate) fn load_lua_init(&mut self) {
         // In debug builds, use source directory for hot-reload during development
         #[cfg(debug_assertions)]
@@ -598,7 +606,20 @@ impl Hub {
             }
         }
 
-        // No dev directory found — load embedded Lua directly from the binary.
+        // Release mode: add project root to package.path (highest priority).
+        // update_package_path prepends, so project root is searched before
+        // the userspace ~/.botster/lua/ that setup_package_path already configured.
+        if let Ok((repo_path, _)) = crate::git::WorktreeManager::detect_current_repo() {
+            let project_lua = repo_path.join(".botster").join("lua");
+            if project_lua.exists() {
+                log::info!("Adding project Lua path: {}", project_lua.display());
+                if let Err(e) = self.lua.update_package_path(&project_lua) {
+                    log::warn!("Failed to add project Lua path: {}", e);
+                }
+            }
+        }
+
+        // Load embedded Lua as fallback (searcher appended to end of package.searchers).
         log::info!("Loading embedded Lua files");
         if let Err(e) = self.lua.load_embedded() {
             log::warn!("Failed to load embedded Lua: {}", e);

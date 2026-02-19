@@ -147,6 +147,51 @@ hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
     broadcast_hub_event("worktree_list", { worktrees = worktrees })
 end)
 
+-- Send a web push notification when a PTY notification (bell) fires.
+-- Builds a deep link to the exact hub/agent/pty session.
+-- Customizable: override by calling hooks.off("pty_notification", "push_notification")
+-- and registering your own handler with push.send().
+hooks.on("pty_notification", "push_notification", function(info)
+    local hub_id = hub.server_id()
+    local agent = info.agent_key and Agent.get(info.agent_key)
+
+    -- Build deep link: /hubs/:id/agents/:index/ptys/:pty_index
+    local url = nil
+    if hub_id and agent and agent.agent_index then
+        -- Find pty_index from session_order (0-based for URL)
+        local pty_index = 0
+        for i, entry in ipairs(agent.session_order or {}) do
+            if entry.name == info.session_name then
+                pty_index = i - 1
+                break
+            end
+        end
+        url = string.format("/hubs/%s/agents/%d/ptys/%d", hub_id, agent.agent_index, pty_index)
+    elseif hub_id then
+        url = string.format("/hubs/%s", hub_id)
+    end
+
+    -- Build a readable title from agent metadata
+    local title = "Agent alert"
+    if agent then
+        -- Use short repo name (strip owner prefix) + issue/branch
+        local repo_short = agent.repo and agent.repo:match("/(.+)$") or agent.repo
+        if agent.issue_number then
+            title = string.format("%s #%s", repo_short or "agent", agent.issue_number)
+        elseif repo_short then
+            title = repo_short
+        end
+    end
+    local body = info.message or info.body or "Your attention is needed"
+
+    push.send({
+        kind = "agent_alert",
+        title = title,
+        body = body,
+        url = url,
+    })
+end)
+
 hooks.on("agent_lifecycle", "broadcast_lifecycle", function(info)
     log.debug(string.format("Broadcasting agent_lifecycle: %s -> %s",
         info.agent_id or "?", info.status or "?"))
@@ -185,6 +230,22 @@ _event_subs[#_event_subs + 1] = events.on("agent_status_changed", function(info)
     })
 end)
 
+_event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
+    local agent_key = data.agent_key
+    local exit_code = data.exit_code
+    log.info(string.format("Process exited for %s (code=%s)",
+        agent_key or "?", tostring(exit_code)))
+
+    local agent = Agent.get(agent_key)
+    if agent then
+        agent.status = "exited"
+        broadcast_hub_event("agent_status_changed", {
+            agent_id = agent_key,
+            status = "exited",
+        })
+    end
+end)
+
 -- ============================================================================
 -- Module Interface
 -- ============================================================================
@@ -210,6 +271,7 @@ function M._before_reload()
     hooks.off("agent_created", "broadcast_agent_created")
     hooks.off("agent_deleted", "broadcast_agent_deleted")
     hooks.off("agent_lifecycle", "broadcast_lifecycle")
+    hooks.off("pty_notification", "push_notification")
     log.info(string.format("connections.lua reloading with %d client(s)", get_client_count()))
 end
 

@@ -164,6 +164,10 @@ impl LuaRuntime {
         // Register all primitives
         primitives::register_all(&lua).context("Failed to register Lua primitives")?;
 
+        // Register push notification primitives with the shared event sender
+        primitives::register_push(&lua, Arc::clone(&hub_event_sender))
+            .context("Failed to register push primitives")?;
+
         // Register WebRTC primitives with the shared event sender
         primitives::register_webrtc(&lua, Arc::clone(&hub_event_sender))
             .context("Failed to register WebRTC primitives")?;
@@ -272,11 +276,11 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Update Lua package.path to include an additional directory (for embedded fallback).
+    /// Prepend a directory to Lua `package.path`, giving it priority over existing paths.
     ///
-    /// This is used when loading embedded Lua files from a different directory than
-    /// the configured base path. It appends the new directory to the existing package.path
-    /// so that require() calls can find modules in the embedded location.
+    /// Used to layer override directories onto the search path. Called paths
+    /// are searched before any previously configured paths, enabling the chain:
+    /// project root (highest) > userspace > default.
     ///
     /// # Arguments
     ///
@@ -300,7 +304,7 @@ impl LuaRuntime {
             .get("path")
             .map_err(|e| anyhow!("Failed to get package.path: {e}"))?;
 
-        // Prepend the additional path to package.path so embedded modules are found first
+        // Prepend so this path takes priority over paths already in package.path
         let new_path = format!(
             "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/hub/?.lua;{path}/plugins/?.lua;{path}/plugins/?/init.lua;{current}",
             path = additional_path.display(),
@@ -456,10 +460,11 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Load all embedded Lua files.
+    /// Load embedded Lua files as a fallback module source.
     ///
-    /// Iterates through all files embedded at compile time and loads them
-    /// in dependency order (core modules first, then lib, then handlers).
+    /// Installs a custom searcher (appended last in `package.searchers`)
+    /// and loads `hub/init.lua`, whose `require()` calls resolve modules
+    /// lazily from embedded content when not found on the filesystem.
     ///
     /// # Errors
     ///
@@ -475,9 +480,8 @@ impl LuaRuntime {
 
         log::info!("Loading {} embedded Lua file(s)", files.len());
 
-        // Install a custom searcher in package.searchers so require() resolves
-        // from embedded files. This handles arbitrary dependency graphs naturally —
-        // Lua loads modules on-demand and detects cycles itself.
+        // Install embedded searcher as fallback (last in package.searchers).
+        // Filesystem paths (project root, userspace) are checked first.
         self.install_embedded_searcher()?;
 
         // Now load hub/init.lua — its require() calls trigger the embedded
@@ -492,15 +496,19 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Install a custom Lua searcher for embedded modules.
+    /// Install a custom Lua searcher for embedded modules as a fallback.
     ///
-    /// Prepends a searcher to `package.searchers` that maps module names
+    /// Appends a searcher to `package.searchers` that maps module names
     /// (e.g., `"lib.agent"`) to embedded source files (e.g., `"lib/agent.lua"`).
-    /// When `require("lib.agent")` is called, this searcher returns a loader
-    /// function that compiles and executes the embedded source.
+    /// When `require("lib.agent")` is called and no filesystem match is found,
+    /// this searcher returns a loader function that compiles and executes the
+    /// embedded source.
     ///
-    /// This replaces the previous eager `eval()` approach, which broke when
-    /// modules had cross-tier dependencies (e.g., `lib/` requiring `hub/`).
+    /// The searcher is appended (last position) so filesystem paths take
+    /// priority. This enables the override chain:
+    /// 1. Project root (`{repo}/.botster/lua/`) — highest priority
+    /// 2. Userspace (`~/.botster/lua/`) — user overrides
+    /// 3. Embedded (this searcher) — fallback/base
     fn install_embedded_searcher(&self) -> Result<()> {
         use super::embedded;
 
@@ -526,13 +534,13 @@ impl LuaRuntime {
             .set("_EMBEDDED_MODULES", embedded_modules)
             .map_err(|e| anyhow!("Failed to set _EMBEDDED_MODULES: {e}"))?;
 
-        // Install the searcher via Lua code — this is the cleanest way to
-        // prepend to package.searchers and return a proper loader function.
+        // Install the searcher via Lua code — append to package.searchers
+        // so filesystem paths are checked first (embedded is the fallback).
         lua.load(
             r#"
             local embedded = _EMBEDDED_MODULES
-            -- Prepend our searcher so embedded modules are found before filesystem
-            table.insert(package.searchers, 2, function(module_name)
+            -- Append our searcher so filesystem paths (userspace, project root) win
+            table.insert(package.searchers, function(module_name)
                 local source = embedded[module_name]
                 if source then
                     local fn, err = load(source, "=" .. module_name:gsub("%.", "/") .. ".lua")
@@ -2683,9 +2691,9 @@ mod tests {
                 ]],
             }
 
-            -- Install the same searcher logic as install_embedded_searcher
+            -- Install the same searcher logic as install_embedded_searcher (appended as fallback)
             local embedded = _EMBEDDED_MODULES
-            table.insert(package.searchers, 2, function(module_name)
+            table.insert(package.searchers, function(module_name)
                 local source = embedded[module_name]
                 if source then
                     local fn, err = load(source, "=" .. module_name:gsub("%.", "/") .. ".lua")
@@ -2723,6 +2731,138 @@ mod tests {
         assert!(
             result,
             "Embedded searcher should resolve transitive dependencies lazily"
+        );
+    }
+
+    /// Verifies the embedded searcher is appended (last position) so filesystem
+    /// paths take priority. This is critical for the override chain:
+    /// project root > userspace > embedded.
+    #[test]
+    fn test_embedded_searcher_is_last_in_package_searchers() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+        let lua = runtime.lua();
+
+        // Count searchers before installing embedded
+        let count_before: usize = lua
+            .load("return #package.searchers")
+            .eval()
+            .expect("Should get searcher count");
+
+        // Set up a fake embedded module and install the searcher
+        lua.load(
+            r#"
+            _EMBEDDED_MODULES = {
+                ["test.module"] = 'return { name = "embedded" }',
+            }
+            local embedded = _EMBEDDED_MODULES
+            table.insert(package.searchers, function(module_name)
+                local source = embedded[module_name]
+                if source then
+                    local fn, err = load(source, "=" .. module_name:gsub("%.", "/") .. ".lua")
+                    if fn then return fn
+                    else return "\n\tembedded load error: " .. (err or "unknown") end
+                end
+                return "\n\tno embedded module '" .. module_name .. "'"
+            end)
+            _EMBEDDED_MODULES = nil
+            "#,
+        )
+        .exec()
+        .expect("Searcher setup should succeed");
+
+        // Verify searcher was appended (last position)
+        let count_after: usize = lua
+            .load("return #package.searchers")
+            .eval()
+            .expect("Should get searcher count");
+
+        assert_eq!(
+            count_after,
+            count_before + 1,
+            "Should have exactly one more searcher"
+        );
+
+        // The embedded searcher should be the LAST one
+        let is_last: bool = lua
+            .load(
+                r#"
+                local last = package.searchers[#package.searchers]
+                -- Call it with our test module to verify it's our searcher
+                local result = last("test.module")
+                return type(result) == "function"
+                "#,
+            )
+            .eval()
+            .expect("Should check last searcher");
+
+        assert!(
+            is_last,
+            "The last searcher should be our embedded searcher that finds test.module"
+        );
+    }
+
+    /// Verifies that filesystem paths take priority over the embedded searcher.
+    ///
+    /// When a module exists both in embedded and on the filesystem (via
+    /// `package.path`), the filesystem version should win because the embedded
+    /// searcher is appended last.
+    #[test]
+    fn test_filesystem_overrides_embedded_searcher() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+        let lua = runtime.lua();
+
+        // Create a temp directory with a filesystem module
+        let tmp = std::env::temp_dir().join("botster_lua_priority_test");
+        let _ = std::fs::create_dir_all(&tmp);
+        std::fs::write(
+            tmp.join("priority_test.lua"),
+            r#"return { source = "filesystem" }"#,
+        )
+        .expect("Should write test file");
+
+        // Add the temp dir to package.path (simulating userspace/project root)
+        let prepend_path = format!("{}/?.lua", tmp.display());
+        lua.load(&format!(
+            r#"package.path = "{}" .. ";" .. package.path"#,
+            prepend_path,
+        ))
+        .exec()
+        .expect("Should update package.path");
+
+        // Install embedded searcher with the SAME module name but different content
+        lua.load(
+            r#"
+            _EMBEDDED_MODULES = {
+                ["priority_test"] = 'return { source = "embedded" }',
+            }
+            local embedded = _EMBEDDED_MODULES
+            table.insert(package.searchers, function(module_name)
+                local source = embedded[module_name]
+                if source then
+                    local fn, err = load(source, "=" .. module_name:gsub("%.", "/") .. ".lua")
+                    if fn then return fn
+                    else return "\n\tembedded load error: " .. (err or "unknown") end
+                end
+                return "\n\tno embedded module '" .. module_name .. "'"
+            end)
+            _EMBEDDED_MODULES = nil
+            "#,
+        )
+        .exec()
+        .expect("Searcher setup should succeed");
+
+        // require should find the FILESYSTEM version (not embedded)
+        let source: String = lua
+            .load(r#"return require("priority_test").source"#)
+            .eval()
+            .expect("Should require priority_test");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            source, "filesystem",
+            "Filesystem module should override embedded (embedded searcher is fallback)"
         );
     }
 

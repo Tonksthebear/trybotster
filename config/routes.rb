@@ -33,6 +33,7 @@ Rails.application.routes.draw do
       resources :notifications, only: [ :create ]
       resource :webrtc, only: [ :show ], controller: :webrtc  # GET config
       resource :settings, only: [ :show ], controller: :settings
+      resource :pairing, only: [ :show ], controller: :pairing
       # Agent terminal view by index
       # /hubs/:hub_id/agents/:index - agent overview (redirects to PTY 0)
       # /hubs/:hub_id/agents/:index/ptys/:pty_index - specific PTY terminal
@@ -59,7 +60,10 @@ Rails.application.routes.draw do
   end
 
   # E2E devices (browser keypairs - no heartbeat, they're session-based)
-  resources :devices, only: [ :index, :create, :destroy ]
+  resources :devices, only: [ :index, :create, :update, :destroy ]
+
+  # Notifications (client-side only — page shell, data in IndexedDB)
+  resources :notifications, only: [ :index ]
 
   # User settings
   resource :settings, only: [ :show ]
@@ -69,6 +73,10 @@ Rails.application.routes.draw do
   get "docs/*path", to: "docs#show", as: :doc
 
   root to: "home#index"
+
+  # PWA
+  get "manifest" => "rails/pwa#manifest", as: :pwa_manifest
+  get "service-worker" => "rails/pwa#service_worker", as: :pwa_service_worker
 
   # Health check for load balancers and uptime monitors
   get "up" => "rails/health#show", as: :rails_health_check

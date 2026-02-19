@@ -370,6 +370,38 @@ export default class extends Controller {
     }
   }
 
+  async quickSetup(event) {
+    const dest = event.currentTarget.dataset.templateDest;
+    const content = event.currentTarget.dataset.templateContent;
+    if (!dest || !content || !this.hub) return;
+
+    const btn = event.currentTarget;
+    const originalHtml = btn.innerHTML;
+    btn.innerHTML = `<span class="text-sm text-zinc-400">Installing...</span>`;
+    btn.disabled = true;
+
+    try {
+      // Initialize directory structure and write template.
+      // dest is relative to the scope root (e.g., "shared/sessions/agent/initialization").
+      const parentDir = dest.replace(/\/[^/]+$/, "");
+      if (this.configScope === "device") {
+        await this.hub.mkDir(parentDir, "device");
+        await this.hub.mkDir("profiles", "device");
+        await this.hub.writeFile(dest, content, "device");
+      } else {
+        await this.hub.mkDir(`.botster/${parentDir}`);
+        await this.hub.mkDir(".botster/profiles");
+        await this.hub.writeFile(`.botster/${dest}`, content);
+      }
+
+      this.scanTree();
+    } catch (error) {
+      btn.innerHTML = originalHtml;
+      btn.disabled = false;
+      this.#showError(`Setup failed: ${error.message}`);
+    }
+  }
+
   onEditorInput() {
     this.#updateDirtyState();
   }
