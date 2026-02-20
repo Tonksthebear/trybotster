@@ -43,9 +43,15 @@ class ConnectionManagerSingleton {
     // Check for existing connection
     let entry = this.connections.get(key);
     if (entry) {
+      const wasIdle = entry.refCount <= 0;
       entry.refCount++;
-      // Tell worker we're reacquiring (cancels any pending grace period)
-      await entry.wrapper.reacquire();
+      // Only reacquire when connection was idle (refCount was 0).
+      // During Turbo navigation, multiple controllers acquire the same key —
+      // only the first needs to re-subscribe. Subsequent acquires reuse the
+      // active connection without disrupting the in-flight subscription.
+      if (wasIdle) {
+        await entry.wrapper.reacquire();
+      }
       return entry.wrapper;
     }
 
@@ -101,11 +107,19 @@ class ConnectionManagerSingleton {
 
     entry.refCount--;
 
-    // When refCount hits 0, notify worker to start grace period
-    // Worker will close connection if not reacquired within grace period
-    // We keep the wrapper around for potential reuse
-    if (entry.refCount <= 0) {
-      entry.wrapper.notifyIdle();
+    // When refCount hits 0, defer idle notification to the next microtask.
+    // During Turbo navigation, Stimulus disconnects old controllers then
+    // connects new ones in the same frame. Deferring lets the refCount
+    // bounce 0→N before we decide to start the grace period, avoiding
+    // unnecessary disconnect/reconnect churn on rapid link clicks.
+    if (entry.refCount <= 0 && !entry.idlePending) {
+      entry.idlePending = true;
+      queueMicrotask(() => {
+        entry.idlePending = false;
+        if (entry.refCount <= 0) {
+          entry.wrapper.notifyIdle();
+        }
+      });
     }
   }
 
@@ -190,6 +204,24 @@ class ConnectionManagerSingleton {
         console.error(`[ConnectionManager] Subscriber error for ${key}:`, e);
       }
     }
+  }
+
+  /**
+   * Check if any connection sharing a hubId still has active references.
+   * Used by notifyIdle() to avoid starting a grace period on the shared
+   * transport when another connection type (e.g., HubConnection) is still
+   * alive for the same hub.
+   *
+   * @param {string} hubId - Hub identifier
+   * @returns {boolean}
+   */
+  hasActiveConnectionForHub(hubId) {
+    for (const [key, entry] of this.connections) {
+      if (entry.wrapper.getHubId() === hubId && entry.refCount > 0) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

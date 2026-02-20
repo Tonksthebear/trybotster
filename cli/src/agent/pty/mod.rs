@@ -48,7 +48,7 @@ mod commands;
 pub mod events;
 
 pub use commands::PtyCommand;
-pub use events::PtyEvent;
+pub use events::{PromptMark, PtyEvent};
 
 pub use super::spawn::PtySpawnConfig;
 

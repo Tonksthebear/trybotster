@@ -228,6 +228,15 @@ pub struct Hub {
     pty_input_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::PtyInputIncoming>>,
     /// Sender for binary PTY input (cloned into each WebRtcChannel).
     pub pty_input_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::PtyInputIncoming>,
+    /// Receiver for file transfers from browser via WebRTC DataChannels.
+    ///
+    /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
+    file_input_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::FileInputIncoming>>,
+    /// Sender for file transfers (cloned into each WebRtcChannel).
+    pub file_input_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::FileInputIncoming>,
+    /// Temp files from browser paste/drop, keyed by agent session key.
+    /// Cleaned up when the agent is closed.
+    paste_files: std::collections::HashMap<String, Vec<std::path::PathBuf>>,
 
     // === Handle Cache ===
     /// Thread-safe cache of agent handles for non-blocking client access.
@@ -391,6 +400,8 @@ impl Hub {
         let (stream_frame_tx, stream_frame_rx) = tokio::sync::mpsc::unbounded_channel();
         // Create channel for binary PTY input from WebRTC DataChannels
         let (pty_input_tx, pty_input_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Create channel for file transfers from browser via WebRTC DataChannels
+        let (file_input_tx, file_input_rx) = tokio::sync::mpsc::unbounded_channel();
         // Create channel for async worktree creation results
         let (worktree_result_tx, worktree_result_rx) = tokio::sync::mpsc::unbounded_channel();
         // Unified event bus for background producers (HTTP, WS, timers, etc.)
@@ -428,6 +439,9 @@ impl Hub {
             stream_frame_tx,
             pty_input_rx: Some(pty_input_rx),
             pty_input_tx,
+            file_input_rx: Some(file_input_rx),
+            file_input_tx,
+            paste_files: std::collections::HashMap::new(),
             lua,
             lua_ac_connections: std::collections::HashMap::new(),
             lua_ac_channels: std::collections::HashMap::new(),
@@ -795,6 +809,11 @@ impl Drop for Hub {
     /// safety net for panic unwinds, early returns, or any path that skips
     /// `shutdown()`.
     fn drop(&mut self) {
+        // Clean up any remaining paste files
+        let keys: Vec<String> = self.paste_files.keys().cloned().collect();
+        for key in keys {
+            self.cleanup_paste_files(&key);
+        }
         self.lua.stop_all_watchers();
     }
 }

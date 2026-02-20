@@ -58,17 +58,20 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
         .user_agent(crate::constants::user_agent())
         .build()?;
 
-    // Get device name from hostname
-    let device_name = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "Botster CLI".to_string());
+    // Load or create device identity so the auth flow can send our fingerprint.
+    // This ensures the server creates a Device with our real identity, not a
+    // random fingerprint that would result in a duplicate device on registration.
+    let device = crate::device::Device::load_or_create()
+        .context("Failed to load device identity for auth flow")?;
 
     // Step 1: Request device code
     let url = format!("{}/hubs/codes", server_url);
     let response = client
         .post(&url)
-        .json(&serde_json::json!({ "device_name": device_name }))
+        .json(&serde_json::json!({
+            "device_name": device.name,
+            "fingerprint": device.fingerprint,
+        }))
         .send()
         .context("Failed to request device code")?;
 

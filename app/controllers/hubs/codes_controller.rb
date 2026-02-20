@@ -9,7 +9,10 @@ module Hubs
     # POST /hubs/codes
     # CLI requests a new device code to start auth flow
     def create
-      auth = DeviceAuthorization.create!(device_name: params[:device_name])
+      auth = DeviceAuthorization.create!(
+        device_name: params[:device_name],
+        fingerprint: params[:fingerprint]
+      )
 
       render json: {
         device_code: auth.device_code,
@@ -56,16 +59,15 @@ module Hubs
     private
 
     def create_device_tokens(auth)
-      device = auth.user.devices.create!(
-        name: auth.device_name,
-        device_type: "cli",
-        fingerprint: SecureRandom.hex(8).scan(/../).join(":")
-      )
+      fingerprint = auth.fingerprint.presence || SecureRandom.hex(8).scan(/../).join(":")
+      device = auth.user.devices.find_or_initialize_by(fingerprint: fingerprint)
+      device.update!(name: auth.device_name, device_type: "cli")
 
-      {
-        device_token: device.create_device_token!(name: auth.device_name),
-        mcp_token: device.create_mcp_token!(name: "#{auth.device_name} MCP")
-      }
+      # Create tokens if the device doesn't already have them
+      device_token = device.device_token || device.create_device_token!(name: auth.device_name)
+      mcp_token = device.mcp_token || device.create_mcp_token!(name: "#{auth.device_name} MCP")
+
+      { device_token: device_token, mcp_token: mcp_token }
     end
   end
 end

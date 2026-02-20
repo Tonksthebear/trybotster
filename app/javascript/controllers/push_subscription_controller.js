@@ -8,11 +8,14 @@ import { HubConnection } from "connections/hub_connection";
  * Push Subscription Controller
  *
  * Manages browser push notification subscriptions per device.
- * Mounts on /settings/devices/:id — one instance per device page.
+ * Mounts on hub device settings page — one instance per device.
  *
- * Three states per device row:
+ * On connect, acquires HubConnection and sends push_status_req to CLI
+ * with this browser's stable ID. CLI responds with push:status containing
+ * has_keys and browser_subscribed booleans. Three states:
+ *
  * 1. CLI has no VAPID keys → show Enable (generate or copy keys)
- * 2. CLI has VAPID keys, browser not subscribed → show "Enable on this device"
+ * 2. CLI has VAPID keys, browser not subscribed → show "Enable on this browser"
  * 3. CLI has VAPID keys, browser subscribed → show Test / Disable
  *
  * Two flows for enabling:
@@ -26,7 +29,6 @@ export default class extends Controller {
     hubId: String,
     sourceHubId: String,
     swUrl: String,
-    enabled: Boolean,
   };
 
   static targets = [
@@ -43,6 +45,9 @@ export default class extends Controller {
 
   connect() {
     this.#unsubscribers.push(
+      bridge.on("push:status", (data) => this.#handlePushStatus(data))
+    );
+    this.#unsubscribers.push(
       bridge.on("push:vapid_key", (data) => this.#handleVapidKey(data))
     );
     this.#unsubscribers.push(
@@ -58,7 +63,7 @@ export default class extends Controller {
       bridge.on("push:disable_ack", (data) => this.#handleDisableAck(data))
     );
 
-    this.#checkBrowserState();
+    this.#queryPushStatus();
   }
 
   disconnect() {
@@ -69,30 +74,56 @@ export default class extends Controller {
     this.#releaseConnections();
   }
 
-  // ========== Browser State Check ==========
+  // ========== Push Status Query ==========
 
-  async #checkBrowserState() {
-    if (!this.enabledValue) {
-      // CLI has no VAPID keys — show full enable flow
-      this.#showButtons("enable");
-      return;
-    }
+  async #queryPushStatus() {
+    if (!this.hubIdValue) return;
 
-    // CLI has VAPID keys — check if this browser has a valid push subscription.
-    // A subscription is only valid if we recorded the VAPID key we used to create it.
-    // This catches stale subscriptions from old VAPID keys (e.g. after device reset).
+    this.#setStatus("checking");
+
     try {
-      const registration = await navigator.serviceWorker.getRegistration("/");
-      const subscription = await registration?.pushManager?.getSubscription();
+      this.#hubConn = await ConnectionManager.acquire(
+        HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
+      );
 
-      if (subscription && localStorage.getItem("botster_vapid_key")) {
-        this.#showButtons("subscribed");
-      } else {
-        this.#showButtons("enableBrowser");
-      }
+      this.#connUnsubscribers.push(
+        this.#hubConn.onConnected(async () => {
+          await bridge.send("sendControlMessage", {
+            hubId: this.hubIdValue,
+            message: {
+              type: "push_status_req",
+              browser_id: this.#getBrowserId(),
+            },
+          });
+        })
+      );
+      this.#connUnsubscribers.push(
+        this.#hubConn.onError(({ reason }) => {
+          if (reason === "unpaired") {
+            this.#setStatus("unpaired");
+          } else {
+            this.#setStatus("error");
+          }
+        })
+      );
     } catch (e) {
-      this.#showButtons("enableBrowser");
+      console.error("[PushSubscription] Failed to query push status:", e);
+      this.#setStatus("error");
     }
+  }
+
+  #handlePushStatus({ hubId, hasKeys, browserSubscribed }) {
+    if (hubId !== this.hubIdValue) return;
+
+    if (!hasKeys) {
+      this.#showButtons("enable");
+    } else if (!browserSubscribed) {
+      this.#showButtons("enableBrowser");
+    } else {
+      this.#showButtons("subscribed");
+    }
+
+    this.#setStatus("");
   }
 
   #showButtons(state) {
@@ -125,9 +156,13 @@ export default class extends Controller {
     this.#setStatus("connecting");
 
     try {
-      this.#hubConn = await ConnectionManager.acquire(
-        HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
-      );
+      // Connection is already acquired from #queryPushStatus — reuse it.
+      // If not connected yet, acquire fresh.
+      if (!this.#hubConn) {
+        this.#hubConn = await ConnectionManager.acquire(
+          HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
+        );
+      }
 
       if (this.hasSourceHubIdValue && this.sourceHubIdValue) {
         this.#sourceHubConn = await ConnectionManager.acquire(
@@ -174,9 +209,11 @@ export default class extends Controller {
     this.#setStatus("connecting");
 
     try {
-      this.#hubConn = await ConnectionManager.acquire(
-        HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
-      );
+      if (!this.#hubConn) {
+        this.#hubConn = await ConnectionManager.acquire(
+          HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
+        );
+      }
 
       this.#connUnsubscribers.push(
         this.#hubConn.onConnected(async () => {
@@ -209,9 +246,11 @@ export default class extends Controller {
     if (!this.hubIdValue) return;
     this.#setStatus("disabling");
     try {
-      this.#hubConn = await ConnectionManager.acquire(
-        HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
-      );
+      if (!this.#hubConn) {
+        this.#hubConn = await ConnectionManager.acquire(
+          HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
+        );
+      }
       this.#connUnsubscribers.push(
         this.#hubConn.onConnected(async () => {
           await bridge.send("sendControlMessage", {
@@ -233,9 +272,11 @@ export default class extends Controller {
     if (!this.hubIdValue) return;
     this.#setStatus("testing");
     try {
-      this.#hubConn = await ConnectionManager.acquire(
-        HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
-      );
+      if (!this.#hubConn) {
+        this.#hubConn = await ConnectionManager.acquire(
+          HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
+        );
+      }
       this.#connUnsubscribers.push(
         this.#hubConn.onConnected(async () => {
           await bridge.send("sendControlMessage", {
@@ -324,8 +365,7 @@ export default class extends Controller {
         applicationServerKey,
       });
 
-      // Record the VAPID key so #checkBrowserState can verify the subscription
-      // is for the current key (detects stale subscriptions after key rotation).
+      // Record the VAPID key so we can detect stale subscriptions after key rotation.
       localStorage.setItem("botster_vapid_key", key);
 
       await this.#sendSubscriptionToCli(subscription);
@@ -338,20 +378,18 @@ export default class extends Controller {
 
   #handleSubAck({ hubId }) {
     if (hubId !== this.hubIdValue) return;
-    this.#releaseConnections();
-    // Reload to re-render server-side button state (Enable → Disable)
-    Turbo.visit(window.location.href, { action: "replace" });
+    // Re-query CLI for fresh state instead of reloading the page
+    this.#showButtons("subscribed");
+    this.#setStatus("");
   }
 
   #handleTestAck({ hubId, sent }) {
     if (hubId !== this.hubIdValue) return;
-    this.#releaseConnections();
     this.#setStatus(sent > 0 ? "test-sent" : "test-failed");
   }
 
   async #handleDisableAck({ hubId }) {
     if (hubId !== this.hubIdValue) return;
-    this.#releaseConnections();
 
     // Unsubscribe browser push after CLI confirms it's disabled
     try {
@@ -368,7 +406,9 @@ export default class extends Controller {
 
     localStorage.removeItem("botster_vapid_key");
 
-    Turbo.visit(window.location.href, { action: "replace" });
+    // Update buttons inline instead of page reload
+    this.#showButtons("enable");
+    this.#setStatus("");
   }
 
   // ========== Helpers ==========

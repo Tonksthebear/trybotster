@@ -62,10 +62,14 @@ export class HubConnection extends Connection {
 
     switch (message.type) {
       case "agents":
-      case "agent_list":
+      case "agent_list": {
         // Handle Lua's empty table {} serializing as object instead of array
-        this.emit("agentList", Array.isArray(message.agents) ? message.agents : []);
+        const agents = Array.isArray(message.agents) ? message.agents : [];
+        this.emit("agentList", agents);
+        // Sync app badge with notification count from agent list
+        this.#updateAppBadge(agents);
         break;
+      }
 
       case "worktrees":
       case "worktree_list":
@@ -305,5 +309,21 @@ export class HubConnection extends Connection {
    */
   onError(callback) {
     return this.on("error", callback);
+  }
+
+  // ========== Private ==========
+
+  /**
+   * Update the PWA app badge to reflect notification count from agent list.
+   * Uses the Badging API (navigator.setAppBadge / clearAppBadge).
+   */
+  #updateAppBadge(agents) {
+    if (!navigator.setAppBadge) return;
+    const count = agents.filter((a) => a.notification).length;
+    if (count > 0) {
+      navigator.setAppBadge(count);
+    } else if (navigator.clearAppBadge) {
+      navigator.clearAppBadge();
+    }
   }
 }

@@ -47,9 +47,9 @@ class CliPairingTest < ApplicationSystemTestCase
     uri = URI.parse(url)
     fragment = uri.fragment
 
-    # Path should be /hubs/:id (Rails integer ID)
-    assert_match %r{\A/hubs/\d+\z}, uri.path,
-      "URL path should be /hubs/:id, got: #{uri.path}"
+    # Path should be /hubs/:id/pairing (Rails integer ID)
+    assert_match %r{\A/hubs/\d+/pairing\z}, uri.path,
+      "URL path should be /hubs/:id/pairing, got: #{uri.path}"
 
     # Fragment should be present and reasonably long (Base32 of 161 bytes ~ 258 chars)
     assert fragment.present?, "URL should have a fragment (Base32-encoded bundle)"
@@ -73,6 +73,13 @@ class CliPairingTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit url
+
+    # Pairing page: wait for bundle to be parsed, then click pair button
+    assert_selector "[data-pairing-target='ready']", wait: 15
+    find("[data-action='pairing#pair']").click
+
+    # Wait for redirect to hub page after successful pairing
+    assert_selector "[data-connection-status-target='connectionSection']", wait: 15
 
     # All three status sections should reach their connected states
     assert_selector(
@@ -121,6 +128,13 @@ class CliPairingTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit url
+
+    # Pairing page: wait for bundle to be parsed, then click pair button
+    assert_selector "[data-pairing-target='ready']", wait: 15
+    find("[data-action='pairing#pair']").click
+
+    # Wait for redirect to hub page after successful pairing
+    assert_selector "[data-connection-status-target='connectionSection']", wait: 15
 
     # Wait for connection to fully establish
     assert_selector(

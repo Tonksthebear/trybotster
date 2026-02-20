@@ -80,6 +80,7 @@ pub(crate) fn run_event_loop(
     // of &mut hub in match arms. The poll_* fallback methods handle None
     // gracefully (early return).
     let mut pty_input_rx = hub.pty_input_rx.take();
+    let mut file_input_rx = hub.file_input_rx.take();
     let mut webrtc_signal_rx = hub.webrtc_outgoing_signal_rx.take();
     let mut webrtc_pty_output_rx = hub.webrtc_pty_output_rx.take();
     let mut stream_frame_rx = hub.stream_frame_rx.take();
@@ -137,6 +138,16 @@ pub(crate) fn run_event_loop(
                             hub.handle_pty_input(more);
                         }
                     }
+                }
+
+                // File transfer from browser (image paste/drop)
+                Some(file) = async {
+                    match file_input_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    hub.handle_file_input(file);
                 }
 
                 // WebRTC PTY output (highest volume — batch drain)
@@ -220,6 +231,7 @@ pub(crate) fn run_event_loop(
 
     // Restore receivers for clean shutdown (Hub.drop may need them)
     hub.pty_input_rx = pty_input_rx;
+    hub.file_input_rx = file_input_rx;
     hub.webrtc_outgoing_signal_rx = webrtc_signal_rx;
     hub.webrtc_pty_output_rx = webrtc_pty_output_rx;
     hub.stream_frame_rx = stream_frame_rx;

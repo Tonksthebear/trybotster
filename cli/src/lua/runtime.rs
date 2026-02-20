@@ -71,6 +71,13 @@ pub struct LuaRuntime {
     pty_hook_fn: Option<mlua::RegistryKey>,
     /// Cached reusable context table for PTY output interceptor calls.
     pty_hook_ctx: Option<mlua::RegistryKey>,
+    /// Whether any agent has a pending notification to clear on PTY input.
+    ///
+    /// Set `true` by `notify_pty_notification` when a notification fires.
+    /// Checked by `notify_pty_input` on every keystroke — when `false`
+    /// (99.9% of the time), the Lua call is skipped entirely.
+    /// Cleared when the last notification is dismissed.
+    pty_input_listening: bool,
     /// Hub event channel for spawning file watcher forwarder tasks.
     hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
     /// Tokio runtime handle for spawning blocking forwarder tasks.
@@ -233,6 +240,7 @@ impl LuaRuntime {
             ac_callback_registry,
             pty_hook_fn: None,
             pty_hook_ctx: None,
+            pty_input_listening: false,
             hub_event_tx: None,
             tokio_handle: None,
             lua_file_watch_forwarder: None,
@@ -1740,7 +1748,7 @@ impl LuaRuntime {
     /// - `agent_key`: agent identifier
     /// - `session_name`: PTY session name
     pub fn notify_pty_notification(
-        &self,
+        &mut self,
         agent_key: &str,
         session_name: &str,
         notification: &crate::agent::AgentNotification,
@@ -1772,6 +1780,105 @@ impl LuaRuntime {
 
         if let Err(e) = result {
             log::warn!("PTY notification hook failed: {}", e);
+        }
+
+        // Arm the PTY input listener so keystrokes clear the notification.
+        self.pty_input_listening = true;
+    }
+
+    /// Clear agent notification on PTY input if any are pending.
+    ///
+    /// Gated by `pty_input_listening` — when no notifications are pending
+    /// (99.9% of keystrokes), this is a single bool check with no Lua call.
+    /// When armed, calls `_on_pty_input(agent_index)` in Lua which clears
+    /// the notification and returns whether any agents still have pending
+    /// notifications. Disarms when none remain.
+    ///
+    /// Called from both browser (WebRTC) and TUI PTY input paths —
+    /// the single convergence point for all input sources.
+    pub fn notify_pty_input(&mut self, agent_index: usize) {
+        if !self.pty_input_listening {
+            return;
+        }
+
+        let result: mlua::Result<bool> = (|| {
+            let func: mlua::Function = self.lua.globals().get("_on_pty_input")?;
+            func.call::<bool>(agent_index)
+        })();
+
+        match result {
+            Ok(keep_listening) => self.pty_input_listening = keep_listening,
+            Err(e) => {
+                log::warn!("PTY input notification clear failed: {}", e);
+                self.pty_input_listening = false;
+            }
+        }
+    }
+
+    /// Dispatch a PTY OSC metadata event to the appropriate Lua hook.
+    ///
+    /// Maps `PtyEvent` variants to distinct hook names:
+    /// - `TitleChanged` → `"pty_title_changed"` with `{ agent_key, session_name, title }`
+    /// - `CwdChanged` → `"pty_cwd_changed"` with `{ agent_key, session_name, cwd }`
+    /// - `PromptMark` → `"pty_prompt"` with `{ agent_key, session_name, mark, exit_code?, command? }`
+    ///
+    /// Other PtyEvent variants are ignored (they use different dispatch paths).
+    pub fn notify_pty_osc_event(
+        &self,
+        agent_key: &str,
+        session_name: &str,
+        event: &crate::agent::pty::PtyEvent,
+    ) {
+        use crate::agent::pty::{PromptMark, PtyEvent};
+
+        let result: mlua::Result<()> = (|| {
+            let data = self.lua.create_table()?;
+            data.set("agent_key", agent_key)?;
+            data.set("session_name", session_name)?;
+
+            let hook_name = match event {
+                PtyEvent::TitleChanged(title) => {
+                    data.set("title", title.as_str())?;
+                    "pty_title_changed"
+                }
+                PtyEvent::CwdChanged(cwd) => {
+                    data.set("cwd", cwd.as_str())?;
+                    "pty_cwd_changed"
+                }
+                PtyEvent::PromptMark(mark) => {
+                    match mark {
+                        PromptMark::PromptStart => {
+                            data.set("mark", "prompt_start")?;
+                        }
+                        PromptMark::CommandStart => {
+                            data.set("mark", "command_start")?;
+                        }
+                        PromptMark::CommandExecuted(cmd) => {
+                            data.set("mark", "command_executed")?;
+                            if let Some(c) = cmd {
+                                data.set("command", c.as_str())?;
+                            }
+                        }
+                        PromptMark::CommandFinished(code) => {
+                            data.set("mark", "command_finished")?;
+                            if let Some(c) = code {
+                                data.set("exit_code", *c)?;
+                            }
+                        }
+                    }
+                    "pty_prompt"
+                }
+                _ => return Ok(()), // Other PtyEvent variants use different paths
+            };
+
+            let hooks: mlua::Table = self.lua.globals().get("hooks")?;
+            let notify: mlua::Function = hooks.get("notify")?;
+            notify.call::<mlua::Value>((hook_name, data))?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            log::warn!("PTY OSC event hook failed: {}", e);
         }
     }
 
@@ -3170,5 +3277,376 @@ mod tests {
             }
             _ => panic!("Expected TuiSend Json event"),
         }
+    }
+
+    // =========================================================================
+    // PTY Input Notification Gating Tests
+    // =========================================================================
+
+    /// Set up a minimal Lua environment for notification tests.
+    ///
+    /// Mirrors the production code structure in `handlers/connections.lua`:
+    /// - `clear_agent_notification()` — shared clear logic
+    /// - `_on_pty_input()` — called from Rust hot path, fires plugin hook
+    /// - `_clear_agent_notification()` — called from command handler, no hook
+    fn setup_notification_env(runtime: &LuaRuntime) {
+        runtime.lua().load(r#"
+            -- Minimal Agent mock with notification support
+            _test_agents = {}
+            Agent = {
+                list = function()
+                    local result = {}
+                    for _, a in ipairs(_test_agents) do
+                        table.insert(result, a)
+                    end
+                    return result
+                end,
+                all_info = function()
+                    local result = {}
+                    for _, a in ipairs(_test_agents) do
+                        table.insert(result, { notification = a.notification })
+                    end
+                    return result
+                end,
+            }
+
+            -- Track hook notifications for plugin test
+            _pty_input_hook_calls = {}
+            hooks = {
+                notify = function(event_name, data)
+                    if event_name == "pty_input" then
+                        table.insert(_pty_input_hook_calls, data)
+                    end
+                end,
+            }
+
+            -- Track broadcast calls
+            _broadcasts = {}
+            function broadcast_hub_event(event_type, data)
+                table.insert(_broadcasts, { type = event_type, data = data })
+            end
+
+            -- Shared clear logic (mirrors connections.lua)
+            local function clear_agent_notification(agent_index)
+                local agents = Agent.list()
+                local agent = agents[agent_index + 1]
+                local cleared = false
+                if agent and agent.notification then
+                    agent.notification = false
+                    broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+                    cleared = true
+                end
+                local any_remaining = false
+                for _, a in ipairs(agents) do
+                    if a.notification then any_remaining = true; break end
+                end
+                return cleared, any_remaining, agent
+            end
+
+            -- Called from Rust PTY input hot path
+            function _on_pty_input(agent_index)
+                local cleared, any_remaining, agent = clear_agent_notification(agent_index)
+                if cleared and agent then
+                    hooks.notify("pty_input", {
+                        agent_index = agent_index,
+                        agent_key = agent._agent_key,
+                    })
+                end
+                return any_remaining
+            end
+
+            -- Called from clear_notification command (TUI agent switch)
+            function _clear_agent_notification(agent_index)
+                local _, any_remaining = clear_agent_notification(agent_index)
+                return any_remaining
+            end
+        "#).exec().unwrap();
+    }
+
+    /// Add a test agent to the Lua mock.
+    fn add_test_agent(runtime: &LuaRuntime, key: &str, notification: bool) {
+        runtime.lua().load(&format!(
+            r#"table.insert(_test_agents, {{ _agent_key = "{key}", notification = {notif} }})"#,
+            key = key,
+            notif = notification,
+        )).exec().unwrap();
+    }
+
+    #[test]
+    fn test_pty_input_listening_starts_false() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+        assert!(!runtime.pty_input_listening, "Should start disarmed");
+    }
+
+    #[test]
+    fn test_notify_pty_notification_arms_listener() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+
+        // Set up minimal hooks for notify_pty_notification
+        runtime.lua().load(r#"
+            hooks.on = function() end
+            hooks.off = function() end
+        "#).exec().unwrap();
+
+        assert!(!runtime.pty_input_listening);
+
+        runtime.notify_pty_notification(
+            "test-agent",
+            "agent",
+            &crate::agent::AgentNotification::Osc9(Some("bell".to_string())),
+        );
+
+        assert!(runtime.pty_input_listening, "Should be armed after notification");
+    }
+
+    #[test]
+    fn test_notify_pty_input_noop_when_disarmed() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+
+        // Don't arm — pty_input_listening is false
+        assert!(!runtime.pty_input_listening);
+
+        // This should be a pure bool check, no Lua call
+        runtime.notify_pty_input(0);
+
+        // Verify _on_pty_input was never called (no broadcasts)
+        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
+            .eval().unwrap();
+        assert_eq!(broadcast_count, 0, "Should not call Lua when disarmed");
+    }
+
+    #[test]
+    fn test_notify_pty_input_clears_notification_and_disarms() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+        add_test_agent(&runtime, "agent-0", true);  // has notification
+
+        // Arm the listener
+        runtime.pty_input_listening = true;
+
+        // First keystroke should clear the notification
+        runtime.notify_pty_input(0);
+
+        // Notification should be cleared
+        let notif: bool = runtime.lua().load(
+            "return _test_agents[1].notification"
+        ).eval().unwrap();
+        assert!(!notif, "Notification should be cleared after input");
+
+        // Should have broadcast the updated agent list
+        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
+            .eval().unwrap();
+        assert_eq!(broadcast_count, 1, "Should broadcast agent_list update");
+
+        // Listener should be disarmed (no more notifications pending)
+        assert!(
+            !runtime.pty_input_listening,
+            "Should disarm when no notifications remain"
+        );
+    }
+
+    #[test]
+    fn test_notify_pty_input_stays_armed_with_multiple_notifications() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+        add_test_agent(&runtime, "agent-0", true);  // has notification
+        add_test_agent(&runtime, "agent-1", true);  // also has notification
+
+        runtime.pty_input_listening = true;
+
+        // Keystroke on agent 0 — clears its notification
+        runtime.notify_pty_input(0);
+
+        // Agent 0 cleared, agent 1 still has notification
+        let notif0: bool = runtime.lua().load(
+            "return _test_agents[1].notification"
+        ).eval().unwrap();
+        let notif1: bool = runtime.lua().load(
+            "return _test_agents[2].notification"
+        ).eval().unwrap();
+        assert!(!notif0, "Agent 0 notification should be cleared");
+        assert!(notif1, "Agent 1 notification should remain");
+
+        // Listener should stay armed
+        assert!(
+            runtime.pty_input_listening,
+            "Should stay armed when other agents have notifications"
+        );
+
+        // Keystroke on agent 1 — clears its notification
+        runtime.notify_pty_input(1);
+
+        let notif1_after: bool = runtime.lua().load(
+            "return _test_agents[2].notification"
+        ).eval().unwrap();
+        assert!(!notif1_after, "Agent 1 notification should be cleared");
+
+        // Now disarmed — no notifications remain
+        assert!(
+            !runtime.pty_input_listening,
+            "Should disarm when all notifications cleared"
+        );
+    }
+
+    #[test]
+    fn test_notify_pty_input_noop_for_agent_without_notification() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+        add_test_agent(&runtime, "agent-0", false);  // no notification
+        add_test_agent(&runtime, "agent-1", true);   // has notification
+
+        runtime.pty_input_listening = true;
+
+        // Keystroke on agent 0 (no notification) — should not broadcast
+        runtime.notify_pty_input(0);
+
+        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
+            .eval().unwrap();
+        assert_eq!(broadcast_count, 0, "Should not broadcast when agent has no notification");
+
+        // But should stay armed because agent 1 still has one
+        assert!(runtime.pty_input_listening, "Should stay armed");
+    }
+
+    #[test]
+    fn test_notify_pty_input_fires_hook_for_plugins() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+        add_test_agent(&runtime, "my-agent", true);
+
+        runtime.pty_input_listening = true;
+        runtime.notify_pty_input(0);
+
+        // Should have fired hooks.notify("pty_input", ...) for plugins
+        let hook_call_count: i64 = runtime.lua().load(
+            "return #_pty_input_hook_calls"
+        ).eval().unwrap();
+        assert_eq!(hook_call_count, 1, "Should fire pty_input hook for plugins");
+
+        let hook_agent_key: String = runtime.lua().load(
+            "return _pty_input_hook_calls[1].agent_key"
+        ).eval().unwrap();
+        assert_eq!(hook_agent_key, "my-agent");
+    }
+
+    #[test]
+    fn test_notify_pty_input_no_hook_when_no_notification_cleared() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+        add_test_agent(&runtime, "agent-0", false);  // no notification
+        add_test_agent(&runtime, "agent-1", true);   // keeps us armed
+
+        runtime.pty_input_listening = true;
+
+        // Keystroke on agent 0 (no notification to clear)
+        runtime.notify_pty_input(0);
+
+        let hook_call_count: i64 = runtime.lua().load(
+            "return #_pty_input_hook_calls"
+        ).eval().unwrap();
+        assert_eq!(hook_call_count, 0, "Should not fire hook when no notification cleared");
+    }
+
+    #[test]
+    fn test_full_lifecycle_arm_clear_rearm() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+        add_test_agent(&runtime, "agent-0", false);
+
+        // Initially disarmed
+        assert!(!runtime.pty_input_listening);
+        runtime.notify_pty_input(0);  // no-op
+
+        // Simulate notification arriving (set flag + agent state)
+        runtime.lua().load("_test_agents[1].notification = true").exec().unwrap();
+        runtime.pty_input_listening = true;
+
+        // Keystroke clears it
+        runtime.notify_pty_input(0);
+        assert!(!runtime.pty_input_listening, "Disarmed after clear");
+
+        // Another keystroke — should be pure bool check, no Lua
+        let broadcasts_before: i64 = runtime.lua().load("return #_broadcasts")
+            .eval().unwrap();
+        runtime.notify_pty_input(0);
+        let broadcasts_after: i64 = runtime.lua().load("return #_broadcasts")
+            .eval().unwrap();
+        assert_eq!(broadcasts_before, broadcasts_after, "No Lua call when disarmed");
+
+        // Second notification arrives
+        runtime.lua().load("_test_agents[1].notification = true").exec().unwrap();
+        runtime.pty_input_listening = true;
+
+        // Keystroke clears again
+        runtime.notify_pty_input(0);
+        assert!(!runtime.pty_input_listening, "Disarmed after second clear");
+
+        // Total: 2 broadcasts (one per notification clear)
+        let total_broadcasts: i64 = runtime.lua().load("return #_broadcasts")
+            .eval().unwrap();
+        assert_eq!(total_broadcasts, 2);
+    }
+
+    #[test]
+    fn test_clear_agent_notification_command_path_no_hook() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+        add_test_agent(&runtime, "agent-0", true);
+
+        // Simulate the clear_notification command path (TUI agent switch)
+        let remaining: bool = runtime.lua().load(
+            "return _clear_agent_notification(0)"
+        ).eval().unwrap();
+
+        // Notification should be cleared
+        let notif: bool = runtime.lua().load(
+            "return _test_agents[1].notification"
+        ).eval().unwrap();
+        assert!(!notif, "Notification should be cleared");
+
+        // Should have broadcast the update
+        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
+            .eval().unwrap();
+        assert_eq!(broadcast_count, 1, "Should broadcast agent_list update");
+
+        // But should NOT fire the pty_input hook (this wasn't typing)
+        let hook_call_count: i64 = runtime.lua().load(
+            "return #_pty_input_hook_calls"
+        ).eval().unwrap();
+        assert_eq!(hook_call_count, 0, "Command path should not fire pty_input hook");
+
+        // No more notifications remaining
+        assert!(!remaining);
+    }
+
+    #[test]
+    fn test_command_clear_and_pty_input_clear_both_broadcast() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+        add_test_agent(&runtime, "agent-0", true);
+        add_test_agent(&runtime, "agent-1", true);
+
+        // Clear agent 0 via command path (TUI agent switch)
+        runtime.lua().load("_clear_agent_notification(0)").exec().unwrap();
+
+        // Clear agent 1 via PTY input path (typing)
+        runtime.pty_input_listening = true;
+        runtime.notify_pty_input(1);
+
+        // Both should have broadcast
+        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
+            .eval().unwrap();
+        assert_eq!(broadcast_count, 2, "Both paths should broadcast");
+
+        // Only the PTY input path should fire the hook
+        let hook_call_count: i64 = runtime.lua().load(
+            "return #_pty_input_hook_calls"
+        ).eval().unwrap();
+        assert_eq!(hook_call_count, 1, "Only PTY input should fire hook");
+
+        // Listener should be disarmed (all cleared)
+        assert!(!runtime.pty_input_listening);
     }
 }

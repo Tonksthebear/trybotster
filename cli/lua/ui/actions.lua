@@ -318,10 +318,17 @@ function M.on_action(action, context)
     if not next_agent then return nil end
     _tui_state.selected_agent_index = next_idx
     _tui_state.active_pty_index = 0
-    return {
+    local ops = {
       { op = "focus_terminal", agent_id = next_agent.id, pty_index = 0, agent_index = next_idx },
       set_mode_ops("insert"),
     }
+    if next_agent.notification then
+      table.insert(ops, { op = "send_msg", data = {
+        subscriptionId = "tui_hub",
+        data = { type = "clear_notification", agent_index = next_idx },
+      }})
+    end
+    return ops
   end
 
   if action == "select_previous" then
@@ -338,10 +345,17 @@ function M.on_action(action, context)
     if not prev_agent then return nil end
     _tui_state.selected_agent_index = prev_idx
     _tui_state.active_pty_index = 0
-    return {
+    local ops = {
       { op = "focus_terminal", agent_id = prev_agent.id, pty_index = 0, agent_index = prev_idx },
       set_mode_ops("insert"),
     }
+    if prev_agent.notification then
+      table.insert(ops, { op = "send_msg", data = {
+        subscriptionId = "tui_hub",
+        data = { type = "clear_notification", agent_index = prev_idx },
+      }})
+    end
+    return ops
   end
 
   -- === Refresh agent list ===

@@ -184,12 +184,98 @@ hooks.on("pty_notification", "push_notification", function(info)
     end
     local body = info.message or info.body or "Your attention is needed"
 
+    -- Set notification flag on agent and broadcast updated list.
+    -- Done before push.send() so the badge appears regardless of push delivery.
+    if agent then
+        agent.notification = true
+        broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+    end
+
+    -- Count agents with active notifications for app badge
+    local badge_count = 0
+    for _, a in ipairs(Agent.list()) do
+        if a.notification then badge_count = badge_count + 1 end
+    end
+
     push.send({
         kind = "agent_alert",
         title = title,
         body = body,
         url = url,
+        agentIndex = agent and agent.agent_index or nil,
+        ptyIndex = pty_index,
+        app_badge = badge_count,
     })
+end)
+
+-- Clear a pending notification on an agent by index.
+-- Shared by both PTY input (Rust hot path) and clear_notification command (TUI agent switch).
+-- Returns true if any agent still has notifications, false otherwise.
+local function clear_agent_notification(agent_index)
+    local agents = Agent.list()
+    local agent = agents[agent_index + 1]  -- 0-based, 1-based Lua
+    local cleared = false
+    if agent and agent.notification then
+        agent.notification = false
+        broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+        cleared = true
+    end
+    -- Check if any agent still has a pending notification
+    local any_remaining = false
+    for _, a in ipairs(agents) do
+        if a.notification then any_remaining = true; break end
+    end
+    return cleared, any_remaining, agent
+end
+
+-- Called directly from Rust on the PTY input hot path.
+-- Rust gates calls with a bool flag — this only runs when a notification
+-- is actually pending. Returns true if any agent still has notifications
+-- (keeps Rust listening), false to disarm until the next notification.
+--
+-- Fires hooks.notify("pty_input", ...) so plugins can react to
+-- notifications cleared by typing (not by agent switching).
+function _on_pty_input(agent_index)
+    local cleared, any_remaining, agent = clear_agent_notification(agent_index)
+    if cleared and agent then
+        hooks.notify("pty_input", { agent_index = agent_index, agent_key = agent._agent_key })
+    end
+    return any_remaining
+end
+
+-- Also exported for the clear_notification command (TUI agent switching).
+-- Does NOT fire the pty_input hook since no input occurred.
+function _clear_agent_notification(agent_index)
+    local _, any_remaining = clear_agent_notification(agent_index)
+    return any_remaining
+end
+
+-- Update agent title when the running program sets the terminal title (OSC 0/2).
+-- This drives the agent display_name in both TUI and browser agent lists.
+hooks.on("pty_title_changed", "update_agent_title", function(info)
+    local agent = info.agent_key and Agent.get(info.agent_key)
+    if agent then
+        agent.title = info.title
+        broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+    end
+end)
+
+-- Update agent CWD when the shell reports a directory change (OSC 7).
+hooks.on("pty_cwd_changed", "update_agent_cwd", function(info)
+    local agent = info.agent_key and Agent.get(info.agent_key)
+    if agent then
+        agent.cwd = info.cwd
+        broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+    end
+end)
+
+-- Track shell integration prompt marks (OSC 133/633).
+-- Stores the last mark on the agent for future use (command tracking, etc.).
+hooks.on("pty_prompt", "update_agent_prompt", function(info)
+    local agent = info.agent_key and Agent.get(info.agent_key)
+    if agent then
+        agent.last_prompt_mark = info
+    end
 end)
 
 hooks.on("agent_lifecycle", "broadcast_lifecycle", function(info)

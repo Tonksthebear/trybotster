@@ -22,7 +22,7 @@ import { WebRtcPtyTransport } from "transport/webrtc_pty_transport";
  * Restty handles: GPU rendering, auto-resize, touch selection, font shaping.
  */
 export default class extends Controller {
-  static targets = ["container"];
+  static targets = ["container", "dropZone", "toast"];
 
   static values = {
     hubId: String,
@@ -128,7 +128,16 @@ export default class extends Controller {
       ptyIndex: this.ptyIndexValue,
     });
     this.#transport.onReconnect = () => this.#restty?.clearScreen();
-    this.#transport.onConnect = () => this.#hideOverlay();
+    this.#transport.onConnect = () => {
+      // Force recalculate grid dimensions. Restty's init() calls updateSize()
+      // before the canvas is in the DOM (getBoundingClientRect returns 0x0).
+      // The ResizeObserver usually corrects this, but can race with WASM init.
+      // Forcing it here guarantees correct dimensions once everything is ready.
+      this.#restty?.updateSize(true);
+      // Restore VT-driven mouse mode after disconnect override
+      this.#restty?.setMouseMode("auto");
+      this.#hideOverlay();
+    };
     this.#transport.onDisconnect = () => {
       this.#restty?.setMouseMode("off");
       this.#showOverlay();
@@ -173,7 +182,7 @@ export default class extends Controller {
           { type: "url", url: "https://cdn.jsdelivr.net/gh/notofonts/noto-fonts@main/unhinted/ttf/NotoSansSymbols2/NotoSansSymbols2-Regular.ttf" },
           { type: "url", url: "https://cdn.jsdelivr.net/gh/ChiefMikeK/ttf-symbola@master/Symbola.ttf" },
         ],
-        maxScrollback: 10_000_000, // 10MB — ~7,000 lines at 175 cols
+        maxScrollbackBytes: 10_000_000, // 10MB — ~7,000 lines at 175 cols
         touchSelectionMode: "long-press",
         callbacks: {
           onLog: (line) => {
@@ -191,6 +200,94 @@ export default class extends Controller {
         },
       },
     });
+
+    // 4. Intercept file paste/drop — capture phase beats Restty's imeInput handler
+    this.#bindFileDrop(container);
+  }
+
+  static MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+  #toastTimeout = null;
+
+  /**
+   * Intercept paste and drop events for file transfers.
+   * Sends file bytes over WebRTC to the CLI which writes a temp file
+   * and injects the path into the PTY. Accepts any file type.
+   */
+  #bindFileDrop(container) {
+    // Paste: intercept files before Restty's imeInput handler.
+    // Text-only paste (no files) falls through to Restty normally.
+    container.addEventListener("paste", async (e) => {
+      const items = [...(e.clipboardData?.items || [])];
+      const fileItem = items.find(i => i.kind === "file");
+      if (!fileItem) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+
+      const blob = fileItem.getAsFile();
+      if (!blob) return;
+
+      await this.#sendFile(blob);
+    }, { capture: true });
+
+    // Dragover: must preventDefault for browser to allow drop.
+    // Capture phase to intercept before Restty's canvas.
+    container.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer?.types?.includes("Files")) return;
+      e.preventDefault();
+      if (this.hasDropZoneTarget) this.dropZoneTarget.toggleAttribute("data-visible", true);
+    }, { capture: true });
+
+    container.addEventListener("dragleave", (e) => {
+      if (!container.contains(e.relatedTarget)) {
+        if (this.hasDropZoneTarget) this.dropZoneTarget.removeAttribute("data-visible");
+      }
+    }, { capture: true });
+
+    // Drop: extract files (capture phase to beat canvas)
+    container.addEventListener("drop", async (e) => {
+      if (this.hasDropZoneTarget) this.dropZoneTarget.removeAttribute("data-visible");
+      const files = [...(e.dataTransfer?.files || [])];
+      if (!files.length) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+
+      for (const file of files) {
+        await this.#sendFile(file);
+      }
+    }, { capture: true });
+  }
+
+  async #sendFile(blob) {
+    if (blob.size > this.constructor.MAX_FILE_SIZE) {
+      const sizeMB = (blob.size / 1024 / 1024).toFixed(1);
+      this.#showToast(`File too large (${sizeMB}MB, max 50MB)`, "error");
+      return;
+    }
+
+    const buffer = await blob.arrayBuffer();
+    const data = new Uint8Array(buffer);
+    const filename = blob.name || `paste.${blob.type.split("/")[1] || "bin"}`;
+    const ok = this.#transport?.sendFile(data, filename);
+
+    if (ok !== false) {
+      this.#showToast(`Sent ${filename}`, "success");
+    }
+  }
+
+  #showToast(message, type = "success") {
+    if (!this.hasToastTarget) return;
+    const el = this.toastTarget;
+
+    clearTimeout(this.#toastTimeout);
+    el.textContent = message;
+    el.dataset.toastType = type;
+    el.toggleAttribute("data-visible", true);
+
+    this.#toastTimeout = setTimeout(() => {
+      el.removeAttribute("data-visible");
+    }, 2000);
   }
 
   /**

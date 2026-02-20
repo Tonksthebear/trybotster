@@ -738,17 +738,19 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
             let (shared_state, shadow_screen, event_tx, kitty_enabled) = session.get_direct_access();
             let session_port = session.port();
 
-            // Auto-send notification watcher request if notifications enabled and identity provided
-            if detect_notifications {
-                if let (Some(ak), Some(sn)) = (&agent_key, &session_name) {
-                    let watcher_key = format!("{ak}:{sn}");
-                    send_pty_event(&tx_spawn, PtyRequest::SpawnNotificationWatcher {
-                        watcher_key,
-                        agent_key: ak.clone(),
-                        session_name: sn.clone(),
-                        event_tx: event_tx.clone(),
-                    });
-                }
+            // Always spawn the event watcher when agent identity is provided.
+            // The watcher forwards PtyEvent variants (notifications, title, CWD,
+            // prompt marks) to Lua hooks. Notification detection in the reader
+            // thread is still gated by `detect_notifications`, but OSC metadata
+            // events (title/CWD/prompt) are emitted unconditionally.
+            if let (Some(ak), Some(sn)) = (&agent_key, &session_name) {
+                let watcher_key = format!("{ak}:{sn}");
+                send_pty_event(&tx_spawn, PtyRequest::SpawnNotificationWatcher {
+                    watcher_key,
+                    agent_key: ak.clone(),
+                    session_name: sn.clone(),
+                    event_tx: event_tx.clone(),
+                });
             }
 
             // Wrap session in Arc<Mutex<>> to keep it alive (Drop kills child)
@@ -1585,6 +1587,53 @@ mod tests {
         .expect("pty.spawn should work");
 
         assert!(rx.try_recv().is_err(), "No event should be sent without identity");
+    }
+
+    #[tokio::test]
+    async fn test_pty_spawn_watcher_spawned_without_detect_notifications() {
+        // Watcher should spawn even with detect_notifications=false when identity is provided,
+        // because OSC metadata events (title, CWD, prompt) need forwarding for all sessions.
+        let lua = Lua::new();
+        let (tx, mut rx) = setup_with_channel();
+
+        super::register(&lua, tx).expect("Should register PTY primitives");
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+
+        lua.globals()
+            .set("temp_path", temp_path)
+            .expect("Failed to set temp_path");
+
+        lua.load(
+            r#"
+                session = pty.spawn({
+                    worktree_path = temp_path,
+                    command = "echo hello",
+                    detect_notifications = false,
+                    agent_key = "agent-1",
+                    session_name = "server",
+                })
+            "#,
+        )
+        .exec()
+        .expect("pty.spawn should work");
+
+        // Should have sent a SpawnNotificationWatcher event even without detect_notifications
+        let event = rx.try_recv().expect("Should have received watcher event");
+        match event {
+            HubEvent::LuaPtyRequest(PtyRequest::SpawnNotificationWatcher {
+                watcher_key,
+                agent_key,
+                session_name,
+                ..
+            }) => {
+                assert_eq!(watcher_key, "agent-1:server");
+                assert_eq!(agent_key, "agent-1");
+                assert_eq!(session_name, "server");
+            }
+            other => panic!("Expected SpawnNotificationWatcher, got {:?}", other),
+        }
     }
 
     #[tokio::test]

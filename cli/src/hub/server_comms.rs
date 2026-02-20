@@ -85,6 +85,9 @@ impl Hub {
                 );
                 // Push notifications now triggered by Lua hooks via push.send()
             }
+            HubEvent::PtyOscEvent { agent_key, session_name, event } => {
+                self.lua.notify_pty_osc_event(&agent_key, &session_name, &event);
+            }
             HubEvent::PtyProcessExited { agent_key, session_name, exit_code } => {
                 log::info!(
                     "[Hub] PTY process exited for {}:{} (code={:?})",
@@ -131,7 +134,6 @@ impl Hub {
                 }
                 if !identities.is_empty() {
                     if let Err(e) = crate::relay::persistence::save_push_subscriptions(
-                        &self.hub_identifier,
                         &self.push_subscriptions,
                     ) {
                         log::error!("[WebPush] Failed to save push subscriptions after cleanup: {e}");
@@ -477,6 +479,7 @@ impl Hub {
                 pty_index,
                 data,
             } => {
+                self.lua.notify_pty_input(agent_index);
                 if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
                     if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
                         if let Err(e) = pty_handle.write_input_direct(&data) {
@@ -500,11 +503,87 @@ impl Hub {
 
     /// Handle a single binary PTY input from a browser (WebRTC).
     pub fn handle_pty_input(&mut self, input: crate::channel::webrtc::PtyInputIncoming) {
+        self.lua.notify_pty_input(input.agent_index);
         if let Some(agent_handle) = self.handle_cache.get_agent(input.agent_index) {
             if let Some(pty_handle) = agent_handle.get_pty(input.pty_index) {
                 if let Err(e) = pty_handle.write_input_direct(&input.data) {
                     log::error!("[PTY-INPUT] Write failed: {e}");
                 }
+            }
+        }
+    }
+
+    /// Handle a file transfer from browser (image paste/drop via WebRTC).
+    ///
+    /// Writes the file to a temp path and injects the path as text into the
+    /// target PTY, so CLI tools (e.g., Claude Code) see a local file path.
+    pub fn handle_file_input(&mut self, file: crate::channel::webrtc::FileInputIncoming) {
+        use std::io::Write;
+
+        // Determine file extension from filename
+        let ext = std::path::Path::new(&file.filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png");
+
+        // Hash content for dedup filename
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            file.data.hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        };
+
+        let path = std::path::PathBuf::from(format!("/tmp/botster-paste-{hash}.{ext}"));
+
+        // Write file
+        match std::fs::File::create(&path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(&file.data) {
+                    log::error!("[FILE-INPUT] Failed to write paste file: {e}");
+                    return;
+                }
+            }
+            Err(e) => {
+                log::error!("[FILE-INPUT] Failed to create paste file: {e}");
+                return;
+            }
+        }
+
+        log::info!(
+            "[FILE-INPUT] Wrote {} bytes to {} (agent={}, pty={})",
+            file.data.len(),
+            path.display(),
+            file.agent_index,
+            file.pty_index,
+        );
+
+        // Track for cleanup + inject path into PTY
+        if let Some(agent_handle) = self.handle_cache.get_agent(file.agent_index) {
+            self.paste_files
+                .entry(agent_handle.agent_key().to_string())
+                .or_default()
+                .push(path.clone());
+
+            if let Some(pty_handle) = agent_handle.get_pty(file.pty_index) {
+                let path_with_space = format!("{} ", path.display());
+                if let Err(e) = pty_handle.write_input_direct(path_with_space.as_bytes()) {
+                    log::error!("[FILE-INPUT] Failed to inject path into PTY: {e}");
+                }
+            }
+        }
+    }
+
+    /// Clean up paste files for a closed agent.
+    pub fn cleanup_paste_files(&mut self, agent_key: &str) {
+        if let Some(files) = self.paste_files.remove(agent_key) {
+            for path in &files {
+                if let Err(e) = std::fs::remove_file(path) {
+                    log::warn!("[FILE-INPUT] Failed to clean up paste file {}: {e}", path.display());
+                }
+            }
+            if !files.is_empty() {
+                log::info!("[FILE-INPUT] Cleaned up {} paste file(s) for agent {agent_key}", files.len());
             }
         }
     }
@@ -733,6 +812,21 @@ impl Hub {
                         let _ = hub_tx.send(event);
                         break;
                     }
+                    Ok(event @ PtyEvent::TitleChanged(_))
+                    | Ok(event @ PtyEvent::CwdChanged(_))
+                    | Ok(event @ PtyEvent::PromptMark(_)) => {
+                        if hub_tx
+                            .send(super::events::HubEvent::PtyOscEvent {
+                                agent_key: agent_key.clone(),
+                                session_name: session_name.clone(),
+                                event,
+                            })
+                            .is_err()
+                        {
+                            log::warn!("[NotifWatcher] Hub event channel closed for {}", key);
+                            break;
+                        }
+                    }
                     Ok(_) => {
                         // Ignore other events (Output, Resized)
                     }
@@ -757,7 +851,7 @@ impl Hub {
     /// Test-only fallback for Hub instances without the event channel wired.
     /// Production uses `HubEvent::PtyNotification` via `handle_hub_event()`.
     #[cfg(test)]
-    fn poll_pty_notifications(&self) {
+    fn poll_pty_notifications(&mut self) {
         let events: Vec<super::PtyNotificationEvent> = {
             let mut queue = self
                 .pty_notification_queue
@@ -1076,6 +1170,10 @@ impl Hub {
                 }
                 "push_disable" => {
                     self.handle_push_disable(browser_identity);
+                    return;
+                }
+                "push_status_req" => {
+                    self.handle_push_status_request(browser_identity, &msg);
                     return;
                 }
                 _ => {}
@@ -2163,6 +2261,7 @@ impl Hub {
                 .signal_tx(self.webrtc_outgoing_signal_tx.clone())
                 .stream_frame_tx(self.stream_frame_tx.clone())
                 .pty_input_tx(self.pty_input_tx.clone())
+                .file_input_tx(self.file_input_tx.clone())
                 .hub_event_tx(self.hub_event_tx.clone())
                 .build();
 
@@ -2309,8 +2408,12 @@ impl Hub {
 
     /// Handle a push subscription from a browser.
     ///
-    /// The browser sends `{ type: "push_sub", endpoint, p256dh, auth }` after
-    /// subscribing to push using our VAPID public key.
+    /// The browser sends `{ type: "push_sub", browser_id, endpoint, p256dh, auth }`
+    /// after subscribing to push using our VAPID public key.
+    ///
+    /// `browser_id` is a stable UUID stored in localStorage, so the same physical
+    /// browser always maps to the same key regardless of WebRTC identity rotation.
+    /// Falls back to `browser_identity` for older clients that don't send it.
     fn handle_push_subscription(&mut self, browser_identity: &str, msg: &serde_json::Value) {
         let endpoint = msg.get("endpoint").and_then(|v| v.as_str()).unwrap_or("");
         let p256dh = msg.get("p256dh").and_then(|v| v.as_str()).unwrap_or("");
@@ -2327,6 +2430,14 @@ impl Hub {
             return;
         }
 
+        // Use stable browser_id when available, fall back to ephemeral identity
+        let storage_key = msg
+            .get("browser_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(browser_identity)
+            .to_string();
+
         let subscription = crate::notifications::push::PushSubscription {
             endpoint: endpoint.to_string(),
             p256dh: p256dh.to_string(),
@@ -2334,19 +2445,18 @@ impl Hub {
         };
 
         self.push_subscriptions
-            .upsert(browser_identity.to_string(), subscription);
+            .upsert(storage_key.clone(), subscription);
 
         // Persist to encrypted storage
         if let Err(e) = crate::relay::persistence::save_push_subscriptions(
-            &self.hub_identifier,
             &self.push_subscriptions,
         ) {
             log::error!("[WebPush] Failed to save push subscriptions: {e}");
         }
 
         log::info!(
-            "[WebPush] Stored push subscription from {} ({} total)",
-            &browser_identity[..browser_identity.len().min(8)],
+            "[WebPush] Stored push subscription for {} ({} total)",
+            &storage_key[..storage_key.len().min(8)],
             self.push_subscriptions.len()
         );
 
@@ -2640,7 +2750,6 @@ impl Hub {
         // Clear all stored push subscriptions
         self.push_subscriptions = crate::notifications::push::PushSubscriptionStore::default();
         if let Err(e) = crate::relay::persistence::save_push_subscriptions(
-            &self.hub_identifier,
             &self.push_subscriptions,
         ) {
             log::error!("[WebPush] Failed to clear push subscriptions: {e}");
@@ -2670,6 +2779,61 @@ impl Hub {
                 Ok(Err(e)) => log::warn!("[WebPush] push_disable_ack send failed: {e}"),
                 Err(_) => log::warn!("[WebPush] push_disable_ack send timed out"),
                 Ok(Ok(())) => {}
+            }
+        }
+    }
+
+    /// Handle push status check from the device settings page.
+    ///
+    /// Browser sends `{ type: "push_status_req", browser_id }` on connect
+    /// to determine which notification buttons to show. Responds with the
+    /// authoritative CLI state: whether VAPID keys exist and whether this
+    /// specific browser has a stored push subscription.
+    fn handle_push_status_request(
+        &mut self,
+        browser_identity: &str,
+        msg: &serde_json::Value,
+    ) {
+        let has_keys = self.vapid_keys.is_some();
+
+        // Use stable browser_id when available, fall back to ephemeral identity
+        let browser_id = msg
+            .get("browser_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(browser_identity);
+
+        let browser_subscribed = self.push_subscriptions.contains(browser_id);
+
+        let response = serde_json::json!({
+            "type": "push_status",
+            "has_keys": has_keys,
+            "browser_subscribed": browser_subscribed,
+        });
+
+        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
+            let payload = match serde_json::to_vec(&response) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("[WebPush] Failed to serialize push_status: {e}");
+                    return;
+                }
+            };
+            let peer = crate::channel::PeerId(browser_identity.to_string());
+            match tokio::task::block_in_place(|| {
+                self.tokio_runtime.block_on(tokio::time::timeout(
+                    Duration::from_secs(2),
+                    channel.send_to(&payload, &peer),
+                ))
+            }) {
+                Ok(Ok(())) => {
+                    log::info!(
+                        "[WebPush] Sent push_status to {} (has_keys={has_keys}, subscribed={browser_subscribed})",
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
+                }
+                Ok(Err(e)) => log::warn!("[WebPush] push_status send failed: {e}"),
+                Err(_) => log::warn!("[WebPush] push_status send timed out"),
             }
         }
     }
@@ -2782,18 +2946,33 @@ impl Hub {
             format!("{base_url}{icon_path}")
         };
 
+        let agent_index = lua
+            .and_then(|o| o.get("agentIndex"))
+            .and_then(|v| v.as_i64());
+        let pty_index = lua
+            .and_then(|o| o.get("ptyIndex"))
+            .and_then(|v| v.as_i64());
+
+        let mut data = serde_json::json!({
+            "id": id,
+            "kind": kind,
+            "hubId": hub_id,
+            "url": relative_url,
+            "createdAt": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Some(ai) = agent_index {
+            data["agentIndex"] = serde_json::json!(ai);
+        }
+        if let Some(pi) = pty_index {
+            data["ptyIndex"] = serde_json::json!(pi);
+        }
+
         let mut notification = serde_json::json!({
             "title": title,
             "body": body,
             "icon": icon_url,
             "navigate": navigate_url,
-            "data": {
-                "id": id,
-                "kind": kind,
-                "hubId": hub_id,
-                "url": relative_url,
-                "createdAt": chrono::Utc::now().to_rfc3339(),
-            }
+            "data": data,
         });
 
         // Forward optional `tag` field
@@ -2801,10 +2980,25 @@ impl Hub {
             notification["tag"] = tag.clone();
         }
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "web_push": 8030,
             "notification": notification,
         });
+
+        // Forward any extra Lua fields to the top-level payload (e.g. app_badge).
+        // This keeps Rust generic — Lua uses Declarative Web Push field names directly.
+        const CONSUMED_KEYS: &[&str] = &[
+            "kind", "title", "body", "url", "icon", "tag", "id",
+            "agentIndex", "ptyIndex",
+            "web_push", "notification", // prevent overwriting structured fields
+        ];
+        if let Some(obj) = lua {
+            for (key, value) in obj {
+                if !CONSUMED_KEYS.contains(&key.as_str()) {
+                    payload[key] = value.clone();
+                }
+            }
+        }
 
         let payload_bytes = match serde_json::to_vec(&payload) {
             Ok(b) => b,
@@ -2912,8 +3106,8 @@ impl Hub {
             Err(e) => log::error!("[WebPush] Failed to load VAPID keys: {e}"),
         }
 
-        // Per-hub push subscriptions
-        match crate::relay::persistence::load_push_subscriptions(&self.hub_identifier) {
+        // Device-level push subscriptions (shared across all hubs)
+        match crate::relay::persistence::load_push_subscriptions() {
             Ok(mut store) => {
                 // Clean up duplicate subscriptions from browser reconnections
                 let removed = store.dedup_by_endpoint();
@@ -2923,7 +3117,6 @@ impl Hub {
                         removed
                     );
                     if let Err(e) = crate::relay::persistence::save_push_subscriptions(
-                        &self.hub_identifier,
                         &store,
                     ) {
                         log::error!("[WebPush] Failed to save deduped subscriptions: {e}");

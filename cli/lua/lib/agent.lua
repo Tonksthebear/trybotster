@@ -66,6 +66,9 @@ function Agent.new(config)
         profile_name = config.profile_name,
         created_at = os.time(),
         status = "running",
+        title = nil,          -- window title from OSC 0/2 (set by pty_title_changed hook)
+        cwd = nil,            -- current working directory from OSC 7 (set by pty_cwd_changed hook)
+        notification = false, -- true when OSC notification fired, cleared by client
         sessions = {},        -- name -> PtySessionHandle (for lookup by name)
         session_order = {},   -- ordered array of { name, port_forward, port }
     }, Agent)
@@ -328,23 +331,30 @@ function Agent:info()
         end
     end
 
-    -- Build display name: branch_name plus instance suffix from key if present
-    local display_name = self.branch_name
-    local base_key = (function()
-        local repo_safe = self.repo:gsub("/", "-")
-        if self.issue_number then
-            return repo_safe .. "-" .. tostring(self.issue_number)
-        else
-            return repo_safe .. "-" .. self.branch_name:gsub("/", "-")
+    -- Build display name: prefer OSC title, fall back to branch_name + suffix
+    local display_name
+    if self.title and self.title ~= "" then
+        display_name = self.title
+    else
+        display_name = self.branch_name
+        local base_key = (function()
+            local repo_safe = self.repo:gsub("/", "-")
+            if self.issue_number then
+                return repo_safe .. "-" .. tostring(self.issue_number)
+            else
+                return repo_safe .. "-" .. self.branch_name:gsub("/", "-")
+            end
+        end)()
+        if #key > #base_key and key:sub(1, #base_key) == base_key then
+            display_name = self.branch_name .. key:sub(#base_key + 1)
         end
-    end)()
-    if #key > #base_key and key:sub(1, #base_key) == base_key then
-        display_name = self.branch_name .. key:sub(#base_key + 1)
     end
 
     return {
         id = key,
         display_name = display_name,
+        title = self.title,
+        cwd = self.cwd,
         profile_name = self.profile_name,
         repo = self.repo,
         issue_number = self.issue_number,
@@ -354,6 +364,7 @@ function Agent:info()
         status = self.status,
         -- New: ordered sessions array
         sessions = sessions_info,
+        notification = self.notification or false,
         -- Backward compat (browser checks sessions first, falls back to these)
         has_server_pty = has_server_pty,
         server_running = server_running,

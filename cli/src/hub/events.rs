@@ -34,6 +34,20 @@ pub(crate) enum HubEvent {
     /// PTY notification from a watcher task.
     PtyNotification(super::PtyNotificationEvent),
 
+    /// PTY OSC metadata event forwarded from a watcher task.
+    ///
+    /// A single variant carries agent context + the raw PtyEvent.
+    /// The Lua bridge method discriminates the event type and fires
+    /// the appropriate hook (e.g., `pty_title_changed`, `pty_cwd_changed`).
+    PtyOscEvent {
+        /// Agent key for the Lua hook context.
+        agent_key: String,
+        /// Session name (e.g., "agent", "server").
+        session_name: String,
+        /// The PtyEvent variant (TitleChanged, CwdChanged, PromptMark).
+        event: crate::agent::pty::PtyEvent,
+    },
+
     /// PTY process exited (reader thread detected EOF).
     ///
     /// Sent from the notification watcher task when it receives

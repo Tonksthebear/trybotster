@@ -14,9 +14,9 @@
 //! ```text
 //! ~/.config/botster/
 //!     vapid_keys.enc                         # Device-level VAPID keys (AES-GCM)
+//!     push_subscriptions.enc                 # Device-level browser push subscriptions (AES-GCM)
 //!     hubs/{hub_id}/
 //!         vodozemac_store.enc                # AES-GCM encrypted Matrix crypto state
-//!         push_subscriptions.enc             # Browser push subscriptions (AES-GCM)
 //!
 //! OS Keyring (consolidated):
 //!     botster/credentials  # Contains crypto_keys[key_id] = base64 AES key
@@ -327,18 +327,20 @@ pub fn load_legacy_hub_vapid_keys(hub_id: &str) -> Result<Option<VapidKeys>> {
     Ok(Some(vapid))
 }
 
-/// Load push subscriptions from encrypted storage.
+/// Load push subscriptions from device-level encrypted storage.
 ///
+/// Push subscriptions are device-level — the same browser subscription is valid
+/// for any hub on this CLI (since VAPID keys are device-level too).
 /// Returns an empty store if the file doesn't exist yet.
-pub fn load_push_subscriptions(hub_id: &str) -> Result<PushSubscriptionStore> {
-    let state_dir = hub_state_dir(hub_id)?;
+pub fn load_push_subscriptions() -> Result<PushSubscriptionStore> {
+    let state_dir = device_state_dir()?;
     let subs_path = state_dir.join("push_subscriptions.enc");
 
     if !subs_path.exists() {
         return Ok(PushSubscriptionStore::default());
     }
 
-    let key = get_or_create_encryption_key(hub_id)?;
+    let key = get_or_create_encryption_key("_device_push")?;
     let content =
         fs::read_to_string(&subs_path).context("Failed to read push subscriptions file")?;
     let encrypted: EncryptedData =
@@ -347,18 +349,14 @@ pub fn load_push_subscriptions(hub_id: &str) -> Result<PushSubscriptionStore> {
     let store: PushSubscriptionStore =
         serde_json::from_slice(&plaintext).context("Failed to deserialize push subscriptions")?;
 
-    log::info!(
-        "Loaded {} push subscription(s) for hub {}",
-        store.len(),
-        &hub_id[..hub_id.len().min(8)]
-    );
+    log::info!("Loaded {} device-level push subscription(s)", store.len());
     Ok(store)
 }
 
-/// Save push subscriptions to encrypted storage.
-pub fn save_push_subscriptions(hub_id: &str, store: &PushSubscriptionStore) -> Result<()> {
-    let key = get_or_create_encryption_key(hub_id)?;
-    let state_dir = hub_state_dir(hub_id)?;
+/// Save push subscriptions to device-level encrypted storage.
+pub fn save_push_subscriptions(store: &PushSubscriptionStore) -> Result<()> {
+    let key = get_or_create_encryption_key("_device_push")?;
+    let state_dir = device_state_dir()?;
     let subs_path = state_dir.join("push_subscriptions.enc");
 
     let plaintext =
@@ -376,7 +374,7 @@ pub fn save_push_subscriptions(hub_id: &str, store: &PushSubscriptionStore) -> R
             .context("Failed to set push subscriptions file permissions")?;
     }
 
-    log::debug!("Saved encrypted push subscriptions to {:?}", subs_path);
+    log::debug!("Saved encrypted device-level push subscriptions to {:?}", subs_path);
     Ok(())
 }
 

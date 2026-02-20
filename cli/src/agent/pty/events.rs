@@ -10,6 +10,9 @@
 //! - [`PtyEvent::Resized`] - PTY dimensions changed
 //! - [`PtyEvent::ProcessExited`] - Process in PTY terminated
 //! - [`PtyEvent::Notification`] - OSC notification detected (OSC 9, OSC 777)
+//! - [`PtyEvent::TitleChanged`] - Window title set via OSC 0/2
+//! - [`PtyEvent::CwdChanged`] - Working directory reported via OSC 7
+//! - [`PtyEvent::PromptMark`] - Shell integration prompt mark (OSC 133/633)
 //!
 //! # Usage
 //!
@@ -28,6 +31,24 @@
 // Rust guideline compliant 2026-02
 
 use super::super::notification::AgentNotification;
+
+/// Shell integration prompt marks detected from OSC 133/633 sequences.
+///
+/// These sequences are emitted by shells with prompt integration (bash, zsh, fish)
+/// and VS Code's terminal shell integration. They mark command boundaries in the
+/// terminal output stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptMark {
+    /// Prompt is about to be displayed (OSC 133;A / 633;A).
+    PromptStart,
+    /// User has entered a command, prompt ended (OSC 133;B / 633;B).
+    CommandStart,
+    /// Command has been executed, output begins (OSC 133;C / 633;C).
+    /// The optional string carries the command text from OSC 633;E.
+    CommandExecuted(Option<String>),
+    /// Command finished with an exit code (OSC 133;D / 633;D).
+    CommandFinished(Option<i32>),
+}
 
 /// Events broadcast by PTY sessions to connected clients.
 ///
@@ -69,6 +90,24 @@ pub enum PtyEvent {
     /// notification sequences. Subscribers (e.g., notification watcher
     /// tasks) can filter for this event to fire Lua hooks.
     Notification(AgentNotification),
+
+    /// Window title changed via OSC 0 or OSC 2.
+    ///
+    /// Programs set the terminal tab title with `ESC ] 0 ; title BEL`
+    /// (set title + icon) or `ESC ] 2 ; title BEL` (set title only).
+    TitleChanged(String),
+
+    /// Current working directory reported via OSC 7.
+    ///
+    /// Shells report CWD changes with `ESC ] 7 ; file://hostname/path BEL`.
+    /// The string contains the decoded path (not the full URI).
+    CwdChanged(String),
+
+    /// Shell integration prompt mark detected (OSC 133/633).
+    ///
+    /// Marks command boundaries in the terminal output stream.
+    /// Used for tracking command lifecycle in agent sessions.
+    PromptMark(PromptMark),
 }
 
 impl PtyEvent {
@@ -96,6 +135,24 @@ impl PtyEvent {
         Self::Notification(notif)
     }
 
+    /// Create a title changed event.
+    #[must_use]
+    pub fn title_changed(title: impl Into<String>) -> Self {
+        Self::TitleChanged(title.into())
+    }
+
+    /// Create a CWD changed event.
+    #[must_use]
+    pub fn cwd_changed(cwd: impl Into<String>) -> Self {
+        Self::CwdChanged(cwd.into())
+    }
+
+    /// Create a prompt mark event.
+    #[must_use]
+    pub fn prompt_mark(mark: PromptMark) -> Self {
+        Self::PromptMark(mark)
+    }
+
     /// Check if this is an output event.
     #[must_use]
     pub fn is_output(&self) -> bool {
@@ -118,6 +175,24 @@ impl PtyEvent {
     #[must_use]
     pub fn is_notification(&self) -> bool {
         matches!(self, Self::Notification(_))
+    }
+
+    /// Check if this is a title changed event.
+    #[must_use]
+    pub fn is_title_changed(&self) -> bool {
+        matches!(self, Self::TitleChanged(_))
+    }
+
+    /// Check if this is a CWD changed event.
+    #[must_use]
+    pub fn is_cwd_changed(&self) -> bool {
+        matches!(self, Self::CwdChanged(_))
+    }
+
+    /// Check if this is a prompt mark event.
+    #[must_use]
+    pub fn is_prompt_mark(&self) -> bool {
+        matches!(self, Self::PromptMark(_))
     }
 }
 
@@ -187,6 +262,9 @@ mod tests {
         assert!(!output.is_resized());
         assert!(!output.is_process_exited());
         assert!(!output.is_notification());
+        assert!(!output.is_title_changed());
+        assert!(!output.is_cwd_changed());
+        assert!(!output.is_prompt_mark());
 
         let resized = PtyEvent::resized(24, 80);
         assert!(!resized.is_output());
@@ -199,6 +277,19 @@ mod tests {
         assert!(!notification.is_resized());
         assert!(!notification.is_process_exited());
         assert!(notification.is_notification());
+
+        let title = PtyEvent::title_changed("My Title");
+        assert!(title.is_title_changed());
+        assert!(!title.is_output());
+        assert!(!title.is_notification());
+
+        let cwd = PtyEvent::cwd_changed("/home/user");
+        assert!(cwd.is_cwd_changed());
+        assert!(!cwd.is_output());
+
+        let mark = PtyEvent::prompt_mark(PromptMark::PromptStart);
+        assert!(mark.is_prompt_mark());
+        assert!(!mark.is_output());
     }
 
     #[test]

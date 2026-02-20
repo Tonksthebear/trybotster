@@ -1,6 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
 import { ConnectionManager, HubConnection } from "connections";
-import { getUnreadByHub } from "notifications/store";
 
 /**
  * Agent List Controller
@@ -126,7 +125,6 @@ export default class extends Controller {
     this.#render();
     // Agents may arrive after connect — re-sync selection from URL
     this.#syncSelectionFromUrl();
-    this.#updateNotificationBadges();
   }
 
   // Stimulus: called when selectedIdValue changes
@@ -241,6 +239,12 @@ export default class extends Controller {
         root.dataset.selected = "true";
       }
 
+      // Notification badge
+      const badge = root.querySelector("[data-notification-badge]");
+      if (badge) {
+        badge.classList.toggle("hidden", !agent.notification);
+      }
+
       newList.appendChild(root);
     });
 
@@ -273,7 +277,11 @@ export default class extends Controller {
     const match = window.location.pathname.match(
       /\/hubs\/[^/]+\/agents\/(\d+)/,
     );
-    if (!match) return;
+    if (!match) {
+      // Not on an agent page — clear selection
+      if (this.selectedIdValue) this.selectedIdValue = "";
+      return;
+    }
 
     const index = parseInt(match[1], 10);
     const agent = this.agentsValue[index];
@@ -295,28 +303,4 @@ export default class extends Controller {
     });
   }
 
-  // Private: show/hide notification badges on agent items
-  async #updateNotificationBadges() {
-    if (!this.hasListTarget || !this.hubIdValue) return;
-
-    try {
-      const unread = await getUnreadByHub(this.hubIdValue);
-      const byAgent = {};
-      for (const n of unread) {
-        if (n.agentIndex != null) {
-          byAgent[n.agentIndex] = (byAgent[n.agentIndex] || 0) + 1;
-        }
-      }
-
-      this.listTarget.querySelectorAll("[data-agent-index]").forEach((el) => {
-        const idx = parseInt(el.dataset.agentIndex, 10);
-        const badge = el.querySelector("[data-notification-badge]");
-        if (badge) {
-          badge.classList.toggle("hidden", !byAgent[idx]);
-        }
-      });
-    } catch {
-      // IndexedDB unavailable
-    }
-  }
 }

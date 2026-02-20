@@ -39,7 +39,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::relay::crypto_service::CryptoService;
-use crate::relay::olm_crypto::{CONTENT_MSG, CONTENT_PTY, CONTENT_STREAM};
+use crate::relay::olm_crypto::{CONTENT_FILE, CONTENT_MSG, CONTENT_PTY, CONTENT_STREAM};
 
 /// Incoming PTY input from browser via binary DataChannel frame.
 ///
@@ -52,6 +52,22 @@ pub struct PtyInputIncoming {
     /// PTY index parsed from subscription ID.
     pub pty_index: usize,
     /// Raw input bytes from browser.
+    pub data: Vec<u8>,
+}
+
+/// Incoming file from browser via binary DataChannel frame.
+///
+/// Parsed from `CONTENT_FILE`. The browser sends image/file data
+/// which the CLI writes to a temp file and injects the path into the PTY.
+#[derive(Debug)]
+pub struct FileInputIncoming {
+    /// Agent index parsed from subscription ID.
+    pub agent_index: usize,
+    /// PTY index parsed from subscription ID.
+    pub pty_index: usize,
+    /// Original filename from the browser (e.g., "screenshot.png").
+    pub filename: String,
+    /// Raw file bytes.
     pub data: Vec<u8>,
 }
 
@@ -121,6 +137,7 @@ pub struct WebRtcChannelBuilder {
     signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
     stream_frame_tx: Option<mpsc::UnboundedSender<StreamIncoming>>,
     pty_input_tx: Option<mpsc::UnboundedSender<PtyInputIncoming>>,
+    file_input_tx: Option<mpsc::UnboundedSender<FileInputIncoming>>,
     hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
 }
 
@@ -132,6 +149,7 @@ impl std::fmt::Debug for WebRtcChannelBuilder {
             .field("signal_tx", &self.signal_tx.is_some())
             .field("stream_frame_tx", &self.stream_frame_tx.is_some())
             .field("pty_input_tx", &self.pty_input_tx.is_some())
+            .field("file_input_tx", &self.file_input_tx.is_some())
             .field("hub_event_tx", &self.hub_event_tx.is_some())
             .finish()
     }
@@ -146,6 +164,7 @@ impl Default for WebRtcChannelBuilder {
             signal_tx: None,
             stream_frame_tx: None,
             pty_input_tx: None,
+            file_input_tx: None,
             hub_event_tx: None,
         }
     }
@@ -200,6 +219,13 @@ impl WebRtcChannelBuilder {
         self
     }
 
+    /// Set the file input sender for file transfers from browser.
+    #[must_use]
+    pub fn file_input_tx(mut self, tx: mpsc::UnboundedSender<FileInputIncoming>) -> Self {
+        self.file_input_tx = Some(tx);
+        self
+    }
+
     /// Set the Hub event channel sender for DC opened notifications.
     #[must_use]
     pub(crate) fn hub_event_tx(
@@ -225,6 +251,7 @@ impl WebRtcChannelBuilder {
             signal_tx: self.signal_tx,
             stream_frame_tx: self.stream_frame_tx,
             pty_input_tx: self.pty_input_tx,
+            file_input_tx: self.file_input_tx,
             peer_connection: Arc::new(Mutex::new(None)),
             data_channel: Arc::new(Mutex::new(None)),
             state: SharedConnectionState::new(),
@@ -258,6 +285,8 @@ pub struct WebRtcChannel {
     stream_frame_tx: Option<mpsc::UnboundedSender<StreamIncoming>>,
     /// Sender for incoming PTY input from browser (binary, bypasses JSON/Lua).
     pty_input_tx: Option<mpsc::UnboundedSender<PtyInputIncoming>>,
+    /// Sender for incoming file transfers from browser.
+    file_input_tx: Option<mpsc::UnboundedSender<FileInputIncoming>>,
     /// WebRTC peer connection.
     peer_connection: Arc<Mutex<Option<Arc<RTCPeerConnection>>>>,
     /// WebRTC data channel.
@@ -537,6 +566,7 @@ impl WebRtcChannel {
         let decrypt_failures = Arc::clone(&self.decrypt_failures);
         let stream_frame_tx = self.stream_frame_tx.clone();
         let pty_input_tx = self.pty_input_tx.clone();
+        let file_input_tx = self.file_input_tx.clone();
         let dc_opened = Arc::clone(&self.dc_opened);
         let hub_event_tx = self.hub_event_tx.clone();
 
@@ -549,6 +579,7 @@ impl WebRtcChannel {
             let decrypt_failures = Arc::clone(&decrypt_failures);
             let stream_frame_tx = stream_frame_tx.clone();
             let pty_input_tx = pty_input_tx.clone();
+            let file_input_tx = file_input_tx.clone();
             let dc_opened = Arc::clone(&dc_opened);
             let hub_event_tx = hub_event_tx.clone();
 
@@ -577,6 +608,7 @@ impl WebRtcChannel {
                 let decrypt_failures_inner = Arc::clone(&decrypt_failures);
                 let stream_frame_tx_inner = stream_frame_tx.clone();
                 let pty_input_tx_inner = pty_input_tx.clone();
+                let file_input_tx_inner = file_input_tx.clone();
 
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     let recv_tx = Arc::clone(&recv_tx_inner);
@@ -586,6 +618,7 @@ impl WebRtcChannel {
                     let decrypt_failures = Arc::clone(&decrypt_failures_inner);
                     let stream_frame_tx = stream_frame_tx_inner.clone();
                     let pty_input_tx = pty_input_tx_inner.clone();
+                    let file_input_tx = file_input_tx_inner.clone();
 
                     Box::pin(async move {
                         let data = msg.data.to_vec();
@@ -679,6 +712,53 @@ impl WebRtcChannel {
                                         stream_id,
                                         payload,
                                     });
+                                }
+                                return;
+                            }
+                            CONTENT_FILE => {
+                                // File transfer: [CONTENT_FILE][sub_id_len][sub_id][filename_len_lo][filename_len_hi][filename][data]
+                                if plaintext.len() < 4 {
+                                    log::warn!("[WebRTC-DC] CONTENT_FILE frame too short");
+                                    return;
+                                }
+                                let sub_id_len = plaintext[1] as usize;
+                                if plaintext.len() < 2 + sub_id_len + 2 {
+                                    log::warn!("[WebRTC-DC] CONTENT_FILE sub_id/filename truncated");
+                                    return;
+                                }
+                                let sub_id = std::str::from_utf8(&plaintext[2..2 + sub_id_len])
+                                    .unwrap_or("");
+                                let fname_offset = 2 + sub_id_len;
+                                let filename_len = u16::from_le_bytes([
+                                    plaintext[fname_offset],
+                                    plaintext[fname_offset + 1],
+                                ]) as usize;
+                                let fname_start = fname_offset + 2;
+                                if plaintext.len() < fname_start + filename_len {
+                                    log::warn!("[WebRTC-DC] CONTENT_FILE filename truncated");
+                                    return;
+                                }
+                                let filename = std::str::from_utf8(
+                                    &plaintext[fname_start..fname_start + filename_len],
+                                )
+                                .unwrap_or("paste.png")
+                                .to_string();
+                                let data = plaintext[fname_start + filename_len..].to_vec();
+
+                                // Parse sub_id for agent/pty routing
+                                if let Some(pty_info) = parse_pty_input_sub_id(sub_id, Vec::new()) {
+                                    if let Some(ref tx) = file_input_tx {
+                                        let _ = tx.send(FileInputIncoming {
+                                            agent_index: pty_info.agent_index,
+                                            pty_index: pty_info.pty_index,
+                                            filename,
+                                            data,
+                                        });
+                                    }
+                                } else {
+                                    log::warn!(
+                                        "[WebRTC-DC] Failed to parse file input sub_id: {sub_id}"
+                                    );
                                 }
                                 return;
                             }

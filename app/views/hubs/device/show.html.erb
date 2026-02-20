@@ -1,0 +1,114 @@
+<div class="h-full flex flex-col overflow-hidden">
+  <%# Header %>
+  <div class="shrink-0 border-b border-zinc-800 bg-zinc-900/50">
+    <div class="px-4 py-4 lg:py-6">
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0 flex items-center gap-3">
+          <%= link_to hub_path(Current.hub), class: "text-zinc-500 hover:text-zinc-300 transition-colors" do %>
+            <%= icon "arrow-left", class: "size-5" %>
+          <% end %>
+          <div>
+            <h1 class="text-xl lg:text-2xl font-bold text-zinc-100 font-mono truncate"><%= @device.name %></h1>
+            <p class="text-sm text-zinc-500 mt-1">Device Settings</p>
+          </div>
+        </div>
+
+        <%# Connection status ticker %>
+        <%= render "shared/connection_status", hub: Current.hub, connection_type: "hub" %>
+      </div>
+    </div>
+  </div>
+
+  <%# Content %>
+  <div class="flex-1 overflow-y-auto">
+    <div class="max-w-2xl mx-auto px-4 py-6 lg:py-8">
+      <%# Device Info %>
+      <section class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6 mb-6">
+        <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-4">Device Information</h2>
+        <dl class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <dt class="text-xs text-zinc-500">Name</dt>
+            <dd class="text-sm text-zinc-200 font-mono mt-1"><%= @device.name %></dd>
+          </div>
+          <div>
+            <dt class="text-xs text-zinc-500">Type</dt>
+            <dd class="text-sm text-zinc-200 mt-1"><%= @device.device_type.titleize %></dd>
+          </div>
+          <div>
+            <dt class="text-xs text-zinc-500">Fingerprint</dt>
+            <dd class="text-sm text-zinc-200 font-mono mt-1"><%= @device.fingerprint || "—" %></dd>
+          </div>
+          <div>
+            <dt class="text-xs text-zinc-500">Hubs</dt>
+            <dd class="text-sm text-zinc-200 mt-1">
+              <% if @active_hubs.any? %>
+                <%= @active_hubs.map(&:name).join(", ") %>
+              <% else %>
+                No active hubs
+              <% end %>
+            </dd>
+          </div>
+        </dl>
+      </section>
+
+      <%# Push Notifications %>
+      <section class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6"
+               data-controller="push-subscription"
+               data-push-subscription-device-id-value="<%= @device.id %>"
+               data-push-subscription-hub-id-value="<%= Current.hub.id %>"
+               data-push-subscription-sw-url-value="<%= pwa_service_worker_path %>"
+               <% source_hub = @source_device&.hubs&.find(&:active?) if @source_device %>
+               <% if source_hub %>
+                 data-push-subscription-source-hub-id-value="<%= source_hub.id %>"
+               <% end %>>
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider">Push Notifications</h2>
+          <span data-push-subscription-target="status" class="text-xs text-zinc-500"></span>
+        </div>
+
+        <div class="flex items-center justify-between gap-4">
+          <div class="min-w-0">
+            <p class="text-sm text-zinc-300">
+              Receive browser push notifications when agents need your attention.
+            </p>
+            <% if @source_device && @source_device != @device %>
+              <p class="text-xs text-zinc-500 mt-1">
+                Keys will be copied from <strong class="text-zinc-400"><%= @source_device.name %></strong>
+              </p>
+            <% end %>
+          </div>
+
+          <div class="shrink-0 flex items-center gap-2">
+            <%# CLI has keys + browser subscribed %>
+            <div data-push-subscription-target="subscribedButtons" class="hidden flex items-center gap-2">
+              <button data-action="push-subscription#test"
+                      class="text-xs px-3 py-1.5 text-zinc-400 hover:text-zinc-200 bg-zinc-800 hover:bg-zinc-800/80 border border-zinc-700/50 rounded-lg transition-colors">
+                Test
+              </button>
+              <button data-action="push-subscription#disable"
+                      class="text-xs px-3 py-1.5 text-zinc-400 hover:text-red-400 bg-zinc-800 hover:bg-zinc-800/80 border border-zinc-700/50 rounded-lg transition-colors">
+                Disable
+              </button>
+            </div>
+
+            <%# CLI has keys but browser NOT subscribed %>
+            <div data-push-subscription-target="enableBrowserButtons" class="hidden">
+              <button data-action="push-subscription#enableBrowser"
+                      class="text-xs px-3 py-1.5 text-primary-300 hover:text-primary-200 bg-primary-500/10 hover:bg-primary-500/20 border border-primary-500/20 rounded-lg transition-colors">
+                Enable on this browser
+              </button>
+            </div>
+
+            <%# CLI has NO keys — full enable flow %>
+            <div data-push-subscription-target="enableButtons" class="hidden">
+              <button data-action="push-subscription#enable"
+                      class="text-xs px-3 py-1.5 text-primary-300 hover:text-primary-200 bg-primary-500/10 hover:bg-primary-500/20 border border-primary-500/20 rounded-lg transition-colors">
+                Enable
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>

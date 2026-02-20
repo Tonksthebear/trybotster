@@ -155,51 +155,112 @@ pub fn spawn_reader_thread(
                     break;
                 }
                 Ok(n) => {
+                    let chunk = &buf[..n];
+
                     // Detect notifications and broadcast as PtyEvent::Notification
                     if detect_notifs {
-                        let notifications = detect_notifications(&buf[..n]);
+                        let notifications = detect_notifications(chunk);
                         for notif in notifications {
                             log::info!("Broadcasting PTY notification: {:?}", notif);
                             let _ = event_tx.send(PtyEvent::notification(notif));
                         }
                     }
 
+                    // Detect OSC metadata events (title, CWD, prompt marks).
+                    // These run for all sessions (not just detect_notifs) because
+                    // title/CWD/prompt info is useful for both CLI and server PTYs.
+                    if let Some(title) = scan_window_title(chunk) {
+                        let _ = event_tx.send(PtyEvent::title_changed(title));
+                    }
+                    if let Some(cwd) = scan_cwd(chunk) {
+                        let _ = event_tx.send(PtyEvent::cwd_changed(cwd));
+                    }
+                    for mark in scan_prompt_marks(chunk) {
+                        let _ = event_tx.send(PtyEvent::prompt_mark(mark));
+                    }
+
                     // Track kitty keyboard protocol state from raw PTY output.
                     // The vt100 crate doesn't parse kitty sequences, so we scan
                     // the raw bytes for CSI > flags u (push) / CSI < u (pop).
-                    if let Some(state) = scan_kitty_keyboard_state(&buf[..n]) {
+                    if let Some(state) = scan_kitty_keyboard_state(chunk) {
                         kitty_enabled.store(state, Ordering::Relaxed);
                     }
 
                     // Feed PTY bytes to shadow screen for parsed state tracking.
                     // vt100 handles scrollback limits internally by line count.
+                    //
+                    // vt100 0.16.2 has an unchecked subtraction overflow in
+                    // `grid.rs:683` (`col_wrap`) that panics on certain
+                    // escape sequences after a terminal resize creates an
+                    // invalid single-row scroll region. We use catch_unwind
+                    // to absorb the panic and keep the reader thread alive.
                     {
                         let mut parser = shadow_screen
                             .lock()
                             .expect("shadow_screen lock poisoned");
-                        parser.process(&buf[..n]);
 
-                        // CSI 3 J (\x1b[3J) = "Erase Saved Lines" (clear scrollback).
-                        // The vt100 crate ignores this sequence, so we handle it manually
-                        // by replacing the parser with a fresh one seeded with the current
-                        // visible screen state. This ensures `clear` drops stale history
-                        // from reconnect snapshots.
-                        if contains_clear_scrollback(&buf[..n]) {
+                        // catch_unwind requires the closure to be UnwindSafe.
+                        // MutexGuard is !UnwindSafe because the guarded state
+                        // may be inconsistent after a panic. We use
+                        // AssertUnwindSafe because on panic we immediately
+                        // replace the parser with a fresh instance, so
+                        // any inconsistent grid state is discarded.
+                        let result = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| {
+                                parser.process(chunk);
+                            }),
+                        );
+
+                        if let Err(panic_info) = result {
+                            let msg = panic_info
+                                .downcast_ref::<String>()
+                                .map(String::as_str)
+                                .or_else(|| {
+                                    panic_info.downcast_ref::<&str>().copied()
+                                })
+                                .unwrap_or("unknown panic");
+
+                            // The parser's internal grid state is now
+                            // inconsistent (e.g. invalid scroll region),
+                            // so every future process() would also panic.
+                            // Replace with a fresh parser at the same
+                            // dimensions. Reading size() is safe — it just
+                            // returns stored u16 fields, no grid arithmetic.
                             let (rows, cols) = parser.screen().size();
-                            let visible = parser.screen().contents_formatted();
                             *parser = vt100::Parser::new(
                                 rows,
                                 cols,
                                 super::pty::SHADOW_SCROLLBACK_LINES,
                             );
-                            parser.process(&visible);
-                            log::info!("{label} shadow screen scrollback cleared (CSI 3 J)");
+                            log::error!(
+                                "{label} vt100 parser panicked (reset {rows}x{cols}): {msg}"
+                            );
+                        } else {
+                            // CSI 3 J (\x1b[3J) = "Erase Saved Lines" (clear
+                            // scrollback). The vt100 crate ignores this
+                            // sequence, so we handle it manually by replacing
+                            // the parser with a fresh one seeded with the
+                            // current visible screen state.
+                            if contains_clear_scrollback(chunk) {
+                                let (rows, cols) = parser.screen().size();
+                                let visible =
+                                    parser.screen().contents_formatted();
+                                *parser = vt100::Parser::new(
+                                    rows,
+                                    cols,
+                                    super::pty::SHADOW_SCROLLBACK_LINES,
+                                );
+                                parser.process(&visible);
+                                log::info!(
+                                    "{label} shadow screen scrollback cleared (CSI 3 J)"
+                                );
+                            }
                         }
                     }
 
                     // Broadcast raw output to all live subscribers.
                     // Clients parse bytes in their own parsers (xterm.js, TUI vt100).
-                    let _ = event_tx.send(PtyEvent::output(buf[..n].to_vec()));
+                    let _ = event_tx.send(PtyEvent::output(chunk.to_vec()));
                 }
                 Err(e) => {
                     log::error!("{label} PTY read error: {e}");
@@ -268,6 +329,231 @@ pub fn scan_kitty_keyboard_state(data: &[u8]) -> Option<bool> {
     }
 
     result
+}
+
+/// Scan PTY output for OSC 0/2 window title sequences.
+///
+/// Returns the last title found in the buffer, or `None` if no title sequences
+/// were detected. We return only the last because rapid title updates (e.g.,
+/// shell prompt) mean only the final value matters.
+///
+/// Supports both BEL (0x07) and ST (ESC \) terminators.
+/// - OSC 0: `ESC ] 0 ; title BEL` — sets window title and icon name
+/// - OSC 2: `ESC ] 2 ; title BEL` — sets window title only
+pub fn scan_window_title(data: &[u8]) -> Option<String> {
+    let mut last_title = None;
+    let mut i = 0;
+
+    while i + 1 < data.len() {
+        if data[i] == 0x1b && data[i + 1] == b']' {
+            let osc_start = i + 2;
+            // Check for OSC 0; or OSC 2; prefix
+            let is_title = osc_start + 2 <= data.len()
+                && (data[osc_start] == b'0' || data[osc_start] == b'2')
+                && osc_start + 1 < data.len()
+                && data[osc_start + 1] == b';';
+
+            if is_title {
+                let title_start = osc_start + 2;
+                // Find terminator (BEL or ST)
+                let mut end = None;
+                for j in title_start..data.len() {
+                    if data[j] == 0x07 {
+                        end = Some((j, j + 1));
+                        break;
+                    } else if j + 1 < data.len() && data[j] == 0x1b && data[j + 1] == b'\\' {
+                        end = Some((j, j + 2));
+                        break;
+                    }
+                }
+                if let Some((content_end, skip_to)) = end {
+                    let title = String::from_utf8_lossy(&data[title_start..content_end]).to_string();
+                    last_title = Some(title);
+                    i = skip_to;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    last_title
+}
+
+/// Scan PTY output for OSC 7 current working directory sequences.
+///
+/// Returns the last CWD path found in the buffer, or `None`.
+/// Format: `ESC ] 7 ; file://hostname/path BEL`
+///
+/// Extracts just the path component, percent-decoded.
+pub fn scan_cwd(data: &[u8]) -> Option<String> {
+    let mut last_cwd = None;
+    let mut i = 0;
+
+    while i + 1 < data.len() {
+        if data[i] == 0x1b && data[i + 1] == b']' {
+            let osc_start = i + 2;
+            // Check for OSC 7; prefix
+            let is_cwd = osc_start + 2 <= data.len()
+                && data[osc_start] == b'7'
+                && osc_start + 1 < data.len()
+                && data[osc_start + 1] == b';';
+
+            if is_cwd {
+                let uri_start = osc_start + 2;
+                let mut end = None;
+                for j in uri_start..data.len() {
+                    if data[j] == 0x07 {
+                        end = Some((j, j + 1));
+                        break;
+                    } else if j + 1 < data.len() && data[j] == 0x1b && data[j + 1] == b'\\' {
+                        end = Some((j, j + 2));
+                        break;
+                    }
+                }
+                if let Some((content_end, skip_to)) = end {
+                    let uri = String::from_utf8_lossy(&data[uri_start..content_end]);
+                    // Extract path from file://hostname/path URI
+                    let path = if let Some(rest) = uri.strip_prefix("file://") {
+                        // Skip hostname (everything up to the next /)
+                        if let Some(slash_pos) = rest.find('/') {
+                            percent_decode(&rest[slash_pos..])
+                        } else {
+                            percent_decode(rest)
+                        }
+                    } else {
+                        // Not a proper URI, use as-is
+                        uri.to_string()
+                    };
+                    if !path.is_empty() {
+                        last_cwd = Some(path);
+                    }
+                    i = skip_to;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    last_cwd
+}
+
+/// Simple percent-decoding for file URIs.
+///
+/// Decodes `%XX` sequences to their byte values. Used for OSC 7 paths
+/// which may contain encoded spaces and special characters.
+fn percent_decode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(
+                &input[i + 1..i + 3],
+                16,
+            ) {
+                result.push(byte as char);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
+/// Scan PTY output for OSC 133/633 shell integration prompt marks.
+///
+/// Returns all prompt marks found in the buffer. These sequences mark
+/// command boundaries:
+/// - `A` — Prompt start (shell is about to display prompt)
+/// - `B` — Command start (user finished typing, prompt ended)
+/// - `C` — Command executed (output begins)
+/// - `D` [; exitcode] — Command finished
+/// - `E` ; commandline — (OSC 633 only) Command text
+///
+/// Supports both OSC 133 (FinalTerm/iTerm2) and OSC 633 (VS Code).
+pub fn scan_prompt_marks(data: &[u8]) -> Vec<super::pty::PromptMark> {
+    use super::pty::PromptMark;
+    let mut marks = Vec::new();
+    let mut i = 0;
+
+    while i + 1 < data.len() {
+        if data[i] == 0x1b && data[i + 1] == b']' {
+            let osc_start = i + 2;
+
+            // Check for OSC 133; or OSC 633; prefix
+            let (prefix_len, is_vscode) = if osc_start + 4 <= data.len()
+                && &data[osc_start..osc_start + 4] == b"133;"
+            {
+                (4, false)
+            } else if osc_start + 4 <= data.len()
+                && &data[osc_start..osc_start + 4] == b"633;"
+            {
+                (4, true)
+            } else {
+                i += 1;
+                continue;
+            };
+
+            let mark_start = osc_start + prefix_len;
+
+            // Find terminator
+            let mut end = None;
+            for j in mark_start..data.len() {
+                if data[j] == 0x07 {
+                    end = Some((j, j + 1));
+                    break;
+                } else if j + 1 < data.len() && data[j] == 0x1b && data[j + 1] == b'\\' {
+                    end = Some((j, j + 2));
+                    break;
+                }
+            }
+
+            if let Some((content_end, skip_to)) = end {
+                let content = &data[mark_start..content_end];
+
+                let mark = if !content.is_empty() {
+                    match content[0] {
+                        b'A' => Some(PromptMark::PromptStart),
+                        b'B' => Some(PromptMark::CommandStart),
+                        b'C' => Some(PromptMark::CommandExecuted(None)),
+                        b'D' => {
+                            // Optional exit code after ;
+                            let exit_code = if content.len() > 2 && content[1] == b';' {
+                                String::from_utf8_lossy(&content[2..])
+                                    .trim()
+                                    .parse::<i32>()
+                                    .ok()
+                            } else {
+                                None
+                            };
+                            Some(PromptMark::CommandFinished(exit_code))
+                        }
+                        b'E' if is_vscode && content.len() > 2 && content[1] == b';' => {
+                            // VS Code command text: OSC 633;E;command_text BEL
+                            let cmd = String::from_utf8_lossy(&content[2..]).to_string();
+                            Some(PromptMark::CommandExecuted(Some(cmd)))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(m) = mark {
+                    marks.push(m);
+                }
+                i = skip_to;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    marks
 }
 
 #[cfg(test)]
@@ -607,5 +893,385 @@ mod tests {
         handle.join().expect("Reader thread panicked");
 
         assert!(!kitty.load(Ordering::Relaxed), "kitty should remain false");
+    }
+
+    // =========================================================================
+    // Reader Thread OSC Event Integration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_reader_emits_title_changed_event() {
+        let mut data = Vec::new();
+        data.extend(b"some output\r\n");
+        data.extend(b"\x1b]0;My Agent Title\x07");
+        data.extend(b"more output");
+
+        let reader = MockReader::new(&data);
+        let shadow = test_shadow_screen();
+        let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
+
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag());
+        handle.join().expect("Reader thread panicked");
+
+        // Collect all events
+        let mut found_title = false;
+        while let Ok(event) = rx.try_recv() {
+            if let PtyEvent::TitleChanged(title) = event {
+                assert_eq!(title, "My Agent Title");
+                found_title = true;
+            }
+        }
+        assert!(found_title, "Should have emitted TitleChanged event");
+    }
+
+    #[test]
+    fn test_reader_emits_cwd_changed_event() {
+        let data = b"\x1b]7;file://localhost/home/user/projects\x07";
+        let reader = MockReader::new(data);
+        let shadow = test_shadow_screen();
+        let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
+
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag());
+        handle.join().expect("Reader thread panicked");
+
+        let mut found_cwd = false;
+        while let Ok(event) = rx.try_recv() {
+            if let PtyEvent::CwdChanged(cwd) = event {
+                assert_eq!(cwd, "/home/user/projects");
+                found_cwd = true;
+            }
+        }
+        assert!(found_cwd, "Should have emitted CwdChanged event");
+    }
+
+    #[test]
+    fn test_reader_emits_prompt_mark_events() {
+        let mut data = Vec::new();
+        data.extend(b"\x1b]133;A\x07"); // prompt start
+        data.extend(b"$ ls\r\n");
+        data.extend(b"\x1b]133;D;0\x07"); // command finished
+
+        let reader = MockReader::new(&data);
+        let shadow = test_shadow_screen();
+        let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
+
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag());
+        handle.join().expect("Reader thread panicked");
+
+        let mut marks = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let PtyEvent::PromptMark(mark) = event {
+                marks.push(mark);
+            }
+        }
+        assert_eq!(marks.len(), 2);
+        assert_eq!(marks[0], super::super::pty::PromptMark::PromptStart);
+        assert_eq!(marks[1], super::super::pty::PromptMark::CommandFinished(Some(0)));
+    }
+
+    #[test]
+    fn test_reader_emits_osc_events_without_detect_notifs() {
+        // OSC metadata events should fire even with detect_notifs=false (server sessions)
+        let mut data = Vec::new();
+        data.extend(b"\x1b]0;Server Title\x07");
+        data.extend(b"\x1b]7;file:///var/www\x07");
+        data.extend(b"\x1b]9;notification\x07"); // this should NOT emit (detect_notifs=false)
+
+        let reader = MockReader::new(&data);
+        let shadow = test_shadow_screen();
+        let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
+
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag());
+        handle.join().expect("Reader thread panicked");
+
+        let mut has_title = false;
+        let mut has_cwd = false;
+        let mut has_notification = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                PtyEvent::TitleChanged(_) => has_title = true,
+                PtyEvent::CwdChanged(_) => has_cwd = true,
+                PtyEvent::Notification(_) => has_notification = true,
+                _ => {}
+            }
+        }
+        assert!(has_title, "Title should emit regardless of detect_notifs");
+        assert!(has_cwd, "CWD should emit regardless of detect_notifs");
+        assert!(!has_notification, "Notification should NOT emit when detect_notifs=false");
+    }
+
+    // =========================================================================
+    // Window Title Scanner Tests (OSC 0/2)
+    // =========================================================================
+
+    #[test]
+    fn test_scan_window_title_osc0_bel() {
+        let data = b"\x1b]0;My Terminal Title\x07";
+        assert_eq!(scan_window_title(data), Some("My Terminal Title".to_string()));
+    }
+
+    #[test]
+    fn test_scan_window_title_osc2_bel() {
+        let data = b"\x1b]2;Window Title Only\x07";
+        assert_eq!(scan_window_title(data), Some("Window Title Only".to_string()));
+    }
+
+    #[test]
+    fn test_scan_window_title_st_terminator() {
+        let data = b"\x1b]0;Title with ST\x1b\\";
+        assert_eq!(scan_window_title(data), Some("Title with ST".to_string()));
+    }
+
+    #[test]
+    fn test_scan_window_title_last_wins() {
+        let data = b"\x1b]0;First\x07\x1b]0;Second\x07";
+        assert_eq!(scan_window_title(data), Some("Second".to_string()));
+    }
+
+    #[test]
+    fn test_scan_window_title_empty() {
+        // Empty title (program clearing the title)
+        let data = b"\x1b]0;\x07";
+        assert_eq!(scan_window_title(data), Some(String::new()));
+    }
+
+    #[test]
+    fn test_scan_window_title_none() {
+        assert_eq!(scan_window_title(b"plain text"), None);
+        assert_eq!(scan_window_title(b"\x1b]9;notification\x07"), None);
+    }
+
+    #[test]
+    fn test_scan_window_title_embedded_in_output() {
+        let mut data = Vec::new();
+        data.extend(b"\x1b[32mgreen\x1b[0m");
+        data.extend(b"\x1b]0;~/projects/botster\x07");
+        data.extend(b"more output");
+        assert_eq!(scan_window_title(&data), Some("~/projects/botster".to_string()));
+    }
+
+    // =========================================================================
+    // CWD Scanner Tests (OSC 7)
+    // =========================================================================
+
+    #[test]
+    fn test_scan_cwd_basic() {
+        let data = b"\x1b]7;file://localhost/home/user/projects\x07";
+        assert_eq!(scan_cwd(data), Some("/home/user/projects".to_string()));
+    }
+
+    #[test]
+    fn test_scan_cwd_st_terminator() {
+        let data = b"\x1b]7;file://host/tmp/dir\x1b\\";
+        assert_eq!(scan_cwd(data), Some("/tmp/dir".to_string()));
+    }
+
+    #[test]
+    fn test_scan_cwd_percent_encoded() {
+        let data = b"\x1b]7;file://localhost/home/user/my%20project\x07";
+        assert_eq!(scan_cwd(data), Some("/home/user/my project".to_string()));
+    }
+
+    #[test]
+    fn test_scan_cwd_empty_hostname() {
+        // Some shells emit file:///path (empty hostname)
+        let data = b"\x1b]7;file:///Users/jason/code\x07";
+        assert_eq!(scan_cwd(data), Some("/Users/jason/code".to_string()));
+    }
+
+    #[test]
+    fn test_scan_cwd_none() {
+        assert_eq!(scan_cwd(b"plain text"), None);
+        assert_eq!(scan_cwd(b"\x1b]0;title\x07"), None);
+    }
+
+    // =========================================================================
+    // Prompt Mark Scanner Tests (OSC 133/633)
+    // =========================================================================
+
+    #[test]
+    fn test_scan_prompt_marks_133_a() {
+        use super::super::pty::PromptMark;
+        let data = b"\x1b]133;A\x07";
+        let marks = scan_prompt_marks(data);
+        assert_eq!(marks, vec![PromptMark::PromptStart]);
+    }
+
+    #[test]
+    fn test_scan_prompt_marks_633_a() {
+        use super::super::pty::PromptMark;
+        let data = b"\x1b]633;A\x07";
+        let marks = scan_prompt_marks(data);
+        assert_eq!(marks, vec![PromptMark::PromptStart]);
+    }
+
+    #[test]
+    fn test_scan_prompt_marks_all_types() {
+        use super::super::pty::PromptMark;
+        let mut data = Vec::new();
+        data.extend(b"\x1b]133;A\x07");  // prompt start
+        data.extend(b"\x1b]133;B\x07");  // command start
+        data.extend(b"\x1b]133;C\x07");  // command executed
+        data.extend(b"\x1b]133;D;0\x07"); // command finished (exit 0)
+        let marks = scan_prompt_marks(&data);
+        assert_eq!(marks, vec![
+            PromptMark::PromptStart,
+            PromptMark::CommandStart,
+            PromptMark::CommandExecuted(None),
+            PromptMark::CommandFinished(Some(0)),
+        ]);
+    }
+
+    #[test]
+    fn test_scan_prompt_marks_633_e_command_text() {
+        use super::super::pty::PromptMark;
+        let data = b"\x1b]633;E;ls -la\x07";
+        let marks = scan_prompt_marks(data);
+        assert_eq!(marks, vec![PromptMark::CommandExecuted(Some("ls -la".to_string()))]);
+    }
+
+    #[test]
+    fn test_scan_prompt_marks_exit_code() {
+        use super::super::pty::PromptMark;
+        let data = b"\x1b]133;D;1\x07";
+        let marks = scan_prompt_marks(data);
+        assert_eq!(marks, vec![PromptMark::CommandFinished(Some(1))]);
+    }
+
+    #[test]
+    fn test_scan_prompt_marks_no_exit_code() {
+        use super::super::pty::PromptMark;
+        let data = b"\x1b]133;D\x07";
+        let marks = scan_prompt_marks(data);
+        assert_eq!(marks, vec![PromptMark::CommandFinished(None)]);
+    }
+
+    #[test]
+    fn test_scan_prompt_marks_none() {
+        assert!(scan_prompt_marks(b"plain text").is_empty());
+        assert!(scan_prompt_marks(b"\x1b]0;title\x07").is_empty());
+    }
+
+    #[test]
+    fn test_percent_decode() {
+        assert_eq!(percent_decode("/path/to/file"), "/path/to/file");
+        assert_eq!(percent_decode("/path%20with%20spaces"), "/path with spaces");
+        assert_eq!(percent_decode("%2Froot"), "/root");
+        assert_eq!(percent_decode("no%encoding"), "no%encoding"); // invalid hex
+    }
+
+    // =========================================================================
+    // vt100 Panic Recovery Tests
+    // =========================================================================
+
+    /// Confirm the vt100 bug exists: resize can create a single-row scroll
+    /// region (scroll_top == scroll_bottom) that `col_wrap` cannot handle.
+    ///
+    /// vt100 0.16.2 `grid.rs:683` does `prev_pos.row -= scrolled` without
+    /// overflow protection. When cursor is at row 0 inside a single-row
+    /// scroll region and wraps, `scrolled=1` and `0 - 1` panics.
+    #[test]
+    #[should_panic(expected = "attempt to subtract with overflow")]
+    fn test_vt100_col_wrap_underflow_reproducer() {
+        // Step 1: 3-row terminal, set scroll region rows 1..2 (0-indexed: 0..1).
+        let mut parser = vt100::Parser::new(3, 10, 0);
+        parser.process(b"\x1b[1;2r"); // scroll_top=0, scroll_bottom=1
+
+        // Step 2: Resize to 1 row. set_size clamps scroll_bottom to 0,
+        //         but the `< scroll_top` guard doesn't fire (0 < 0 = false),
+        //         leaving scroll_top=0, scroll_bottom=0 — an invalid state
+        //         that set_scroll_region would reject.
+        parser.screen_mut().set_size(1, 10);
+
+        // Step 3: Fill the row (10 chars) then one more to trigger col_wrap.
+        //         col_wrap: prev_pos.row=0, row_inc_scroll returns 1,
+        //         0_u16 - 1_u16 → overflow panic.
+        parser.process(b"AAAAAAAAAAB");
+    }
+
+    /// Verify the reader thread survives a vt100 parser panic.
+    ///
+    /// This test feeds the reader thread data that triggers the vt100
+    /// `col_wrap` underflow after a resize shrinks the terminal into an
+    /// invalid single-row scroll region. Without `catch_unwind` protection,
+    /// the panic kills the thread, poisons the `shadow_screen` mutex, and
+    /// cascades into a full process crash.
+    #[test]
+    fn test_reader_survives_vt100_parser_panic() {
+        // Phase 1: establish a scroll region (delivered as PTY output).
+        let phase1 = b"\x1b[1;2r";
+
+        // Phase 2: post-resize overflow trigger + post-panic output.
+        let phase2 = b"AAAAAAAAAAB\x1b[r after panic";
+
+        // We use two separate MockReaders stitched by a wrapper that
+        // injects a resize between phases, simulating a real terminal
+        // resize arriving between two PTY read() calls.
+        struct ResizeThenRead {
+            phase: u8,
+            phase1: Cursor<Vec<u8>>,
+            phase2: Cursor<Vec<u8>>,
+            shadow: Arc<Mutex<vt100::Parser>>,
+        }
+        impl Read for ResizeThenRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.phase {
+                    0 => {
+                        let n = self.phase1.read(buf)?;
+                        if n == 0 {
+                            // Between reads, resize shrinks terminal to 1 row,
+                            // creating the invalid single-row scroll region.
+                            self.shadow
+                                .lock()
+                                .unwrap()
+                                .screen_mut()
+                                .set_size(1, 10);
+                            self.phase = 1;
+                            self.phase2.read(buf)
+                        } else {
+                            Ok(n)
+                        }
+                    }
+                    _ => self.phase2.read(buf),
+                }
+            }
+        }
+
+        // Start with 3 rows, 10 cols.
+        let shadow: Arc<Mutex<vt100::Parser>> =
+            Arc::new(Mutex::new(vt100::Parser::new(3, 10, 0)));
+        let reader: Box<dyn Read + Send> = Box::new(ResizeThenRead {
+            phase: 0,
+            phase1: Cursor::new(phase1.to_vec()),
+            phase2: Cursor::new(phase2.to_vec()),
+            shadow: Arc::clone(&shadow),
+        });
+        let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(64);
+
+        let handle = spawn_reader_thread(
+            reader,
+            shadow.clone(),
+            event_tx,
+            false,
+            test_kitty_flag(),
+        );
+
+        // The reader thread must not panic.
+        handle.join().expect("Reader thread panicked — catch_unwind missing");
+
+        // The shadow_screen mutex must not be poisoned.
+        assert!(
+            shadow.lock().is_ok(),
+            "shadow_screen mutex poisoned — catch_unwind missing"
+        );
+
+        // Output events should still have been broadcast.
+        let mut got_output = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event, PtyEvent::Output(_)) {
+                got_output = true;
+            }
+        }
+        assert!(got_output, "Reader should still broadcast output events");
     }
 }

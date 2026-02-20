@@ -43,19 +43,6 @@ local function parse_issue_or_branch(issue_or_branch)
     end
 end
 
---- Generate a default prompt when none is provided.
---
--- @param issue_number number|nil
--- @param branch_name string
--- @return string
-local function default_prompt(issue_number, branch_name)
-    if issue_number then
-        return string.format("Work on issue #%d", issue_number)
-    else
-        return string.format("Work on %s", branch_name)
-    end
-end
-
 --- Build the agent key for duplicate checking.
 -- Matches Agent:agent_key() format: repo with "/" replaced by "-", plus
 -- issue_number or branch_name.
@@ -311,14 +298,14 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         local base_key = build_agent_key(repo, nil, "main")
         local suffix = Agent.next_instance_suffix(base_key)
         local agent_key = base_key .. (suffix or "")
-        return spawn_agent("main", nil, repo_root, prompt or "Work on the main branch", client, agent_key, profile_name)
+        return spawn_agent("main", nil, repo_root, prompt, client, agent_key, profile_name)
     end
 
     local issue_number, branch_name = parse_issue_or_branch(issue_or_branch)
 
-    -- Generate default prompt if not provided
-    if not prompt or prompt == "" then
-        prompt = default_prompt(issue_number, branch_name)
+    -- Treat empty string as no prompt
+    if prompt == "" then
+        prompt = nil
     end
 
     -- Detect repo
