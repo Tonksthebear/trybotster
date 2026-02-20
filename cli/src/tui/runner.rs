@@ -240,11 +240,21 @@ pub struct TuiRunner<B: Backend> {
     outer_bracketed_paste: bool,
 
     // === Kitty Keyboard Protocol Mirroring ===
-    /// Whether the active PTY has pushed Kitty keyboard protocol.
-    /// Detected by scanning PTY output for CSI > flags u (push) / CSI < u (pop).
+    /// Whether the active PTY has kitty keyboard protocol enabled.
+    ///
+    /// Set from the `kitty_enabled` boolean on `PtyHandle` (carried in
+    /// `TuiOutput::Scrollback` on connect/switch, and via `kitty_changed`
+    /// message from the forwarder on live state changes).
     inner_kitty_enabled: bool,
     /// Whether we've pushed Kitty to the outer terminal.
     outer_kitty_enabled: bool,
+
+    // === Terminal Focus Passthrough ===
+    /// Whether the outer terminal window is currently focused.
+    ///
+    /// Updated by `FocusGained` / `FocusLost` events from the terminal.
+    /// Used to send synthetic focus events to the viewed PTY on switch.
+    terminal_focused: bool,
 
     // === Cached Overlay State ===
     /// Action strings for selectable items in the current overlay list widget.
@@ -361,6 +371,7 @@ where
             outer_bracketed_paste: false,
             inner_kitty_enabled: false,
             outer_kitty_enabled: false,
+            terminal_focused: true,
             overlay_list_actions: Vec::new(),
             has_overlay: false,
             widget_states: super::widget_state::WidgetStateStore::new(),
@@ -1006,6 +1017,20 @@ where
                 InputEvent::MouseScroll { .. } => {
                     // Overlay active — swallow scroll events.
                 }
+                InputEvent::FocusGained => {
+                    self.terminal_focused = true;
+                    // Forward to viewed PTY so inner apps (e.g. Claude Code)
+                    // know the terminal is focused and can suppress notifications.
+                    if self.mode == "insert" && !self.has_overlay {
+                        self.handle_pty_input(b"\x1b[I");
+                    }
+                }
+                InputEvent::FocusLost => {
+                    self.terminal_focused = false;
+                    if self.mode == "insert" && !self.has_overlay {
+                        self.handle_pty_input(b"\x1b[O");
+                    }
+                }
                 InputEvent::Key { .. } => {
                     // Flush accumulated scroll before processing the key event,
                     // so key handlers see the correct scroll position.
@@ -1118,9 +1143,9 @@ where
                     self.handle_pty_input(&raw_bytes);
                 }
             }
-            InputEvent::MouseScroll { .. } => {
-                // Mouse scroll events are coalesced in poll_input() and never
-                // reach here. This arm exists only for exhaustiveness.
+            InputEvent::MouseScroll { .. } | InputEvent::FocusGained | InputEvent::FocusLost => {
+                // Mouse scroll and focus events are handled in poll_input() and
+                // never reach here. These arms exist only for exhaustiveness.
             }
         }
     }
@@ -1389,30 +1414,24 @@ where
         // Process up to 100 events per tick
         for _ in 0..100 {
             match self.output_rx.try_recv() {
-                Ok(TuiOutput::Scrollback { agent_index, pty_index, data }) => {
-                    // Scrollback includes kitty push/pop state from snapshot.
-                    // Scan it so inner_kitty_enabled is correct after agent switch.
-                    let is_active = agent_index.unwrap_or(0) == self.current_agent_index.unwrap_or(0)
-                        && pty_index.unwrap_or(0) == self.current_pty_index.unwrap_or(0);
-                    if is_active {
-                        if let Some(kitty_state) = crate::agent::spawn::scan_kitty_keyboard_state(&data) {
-                            log::info!("Kitty keyboard state from scrollback: {}", kitty_state);
-                            self.inner_kitty_enabled = kitty_state;
-                        }
-                    }
+                Ok(TuiOutput::Scrollback { agent_index, pty_index, data, kitty_enabled }) => {
                     let panel = self.resolve_panel(agent_index, pty_index);
                     panel.on_scrollback(&data);
-                    log::debug!("Processed {} bytes of scrollback (fresh)", data.len());
+                    // Set kitty state from the PTY session boolean.
+                    // vt100 silently consumes kitty CSI sequences in the snapshot,
+                    // so we carry the boolean separately.
+                    let is_focused = agent_index == self.current_agent_index
+                        && pty_index == self.current_pty_index;
+                    if is_focused {
+                        self.inner_kitty_enabled = kitty_enabled;
+                    }
+                    log::debug!(
+                        "Processed {} bytes of scrollback (kitty={}{})",
+                        data.len(), kitty_enabled,
+                        if is_focused { ", applied" } else { "" }
+                    );
                 }
                 Ok(TuiOutput::Output { agent_index, pty_index, data }) => {
-                    // Scan active PTY output for Kitty keyboard protocol push/pop
-                    let is_active = agent_index.unwrap_or(0) == self.current_agent_index.unwrap_or(0)
-                        && pty_index.unwrap_or(0) == self.current_pty_index.unwrap_or(0);
-                    if is_active {
-                        if let Some(kitty_state) = crate::agent::spawn::scan_kitty_keyboard_state(&data) {
-                            self.inner_kitty_enabled = kitty_state;
-                        }
-                    }
                     let key = (
                         agent_index.or(self.current_agent_index).unwrap_or(0),
                         pty_index.or(self.current_pty_index).unwrap_or(0),
@@ -1425,9 +1444,16 @@ where
                     let panel = self.resolve_panel(agent_index, pty_index);
                     panel.on_output(&data);
                 }
-                Ok(TuiOutput::ProcessExited { exit_code, .. }) => {
+                Ok(TuiOutput::ProcessExited { agent_index, pty_index, exit_code }) => {
                     log::info!("PTY process exited with code {:?}", exit_code);
-                    // Process exited - view cleanup handled by agent_deleted hub event in Lua
+                    // Reset kitty if the exited PTY is the focused one.
+                    // Well-behaved programs pop kitty before exit, but crashes don't.
+                    if agent_index == self.current_agent_index
+                        && pty_index == self.current_pty_index
+                    {
+                        self.inner_kitty_enabled = false;
+                    }
+                    // View cleanup handled by agent_deleted hub event in Lua
                 }
                 Ok(TuiOutput::Message(value)) => {
                     self.dispatch_hub_event(value, layout_lua);
@@ -1464,6 +1490,19 @@ where
         layout_lua: Option<&LayoutLua>,
     ) {
         let event_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Handle kitty_changed directly — sets outer terminal keyboard mode.
+        // Only apply if the message is for the currently focused PTY.
+        if event_type == "kitty_changed" {
+            let msg_agent = msg.get("agent_index").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let msg_pty = msg.get("pty_index").and_then(|v| v.as_u64()).map(|v| v as usize);
+            if msg_agent == self.current_agent_index && msg_pty == self.current_pty_index {
+                if let Some(enabled) = msg.get("enabled").and_then(|v| v.as_bool()) {
+                    self.inner_kitty_enabled = enabled;
+                }
+            }
+            return;
+        }
 
         if let Some(lua) = layout_lua {
             if lua.has_events() {
@@ -1625,7 +1664,18 @@ where
                     // Shadow update only — canonical state is _tui_state.mode in Lua.
                     if let Some(mode) = op.get("mode").and_then(|v| v.as_str()) {
                         log::info!("[TUI-OP] set_mode: {} -> {}", self.mode, mode);
+                        let was_insert = self.mode == "insert" && !self.has_overlay;
                         self.mode = mode.to_string();
+                        let now_insert = self.mode == "insert" && !self.has_overlay;
+                        // Synthetic focus events on mode transition so the viewed
+                        // PTY tracks whether it's "active" even across overlays.
+                        if self.terminal_focused && was_insert != now_insert {
+                            if now_insert {
+                                self.handle_pty_input(b"\x1b[I");
+                            } else {
+                                self.handle_pty_input(b"\x1b[O");
+                            }
+                        }
                         // Reset Rust-side widget state on mode transition
                         // (mirrors Lua's set_mode_ops resetting list_selected/input_buffer)
                         self.widget_states.reset_all();
@@ -1695,6 +1745,10 @@ where
 
         // Clear selection if no agent_id
         let Some(agent_id) = agent_id else {
+            // Synthetic focus-out before clearing (handle_pty_input uses current indices)
+            if self.terminal_focused && self.current_agent_index.is_some() {
+                self.handle_pty_input(b"\x1b[O");
+            }
             // Disconnect old panel
             if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
                 if let Some(panel) = self.panels.get_mut(&(ai, pi)) {
@@ -1707,6 +1761,7 @@ where
             self.current_agent_index = None;
             self.current_pty_index = None;
             self.current_terminal_sub_id = None;
+            self.inner_kitty_enabled = false;
             // Reset parser to empty so the terminal view clears
             let (rows, cols) = self.terminal_dims;
             self.vt100_parser = Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK)));
@@ -1719,10 +1774,20 @@ where
             return;
         };
 
-        // Skip if already focused on same agent + pty
-        if self.current_agent_index == Some(index) && self.current_pty_index == Some(pty_index) {
+        // Skip if already focused on same agent + pty.
+        // Must also check agent_id: after an agent is removed, a different agent
+        // can shift into the same index position.
+        if self.current_agent_index == Some(index)
+            && self.current_pty_index == Some(pty_index)
+            && self.selected_agent.as_deref() == Some(agent_id)
+        {
             log::debug!("focus_terminal: already focused on agent {agent_id} pty {pty_index}");
             return;
+        }
+
+        // Synthetic focus-out to old PTY before switching (uses current indices)
+        if self.terminal_focused && self.current_agent_index.is_some() {
+            self.handle_pty_input(b"\x1b[O");
         }
 
         // Disconnect old panel
@@ -1734,8 +1799,13 @@ where
             }
         }
 
-        // Get or create the new panel — existing parser content is kept
-        // (stale content is better than a blank frame while waiting for scrollback).
+        // If a different agent now occupies this index (e.g. after removal shifted
+        // indices), discard the stale panel so we get a fresh parser.
+        if self.selected_agent.as_deref() != Some(agent_id) {
+            self.panels.remove(&(index, pty_index));
+        }
+
+        // Get or create the panel for this slot.
         let (rows, cols) = self.terminal_dims;
         let panel = self.panels
             .entry((index, pty_index))
@@ -1757,6 +1827,11 @@ where
         self.current_pty_index = Some(pty_index);
         self.active_pty_index = pty_index;
         self.current_terminal_sub_id = Some(format!("tui:{}:{}", index, pty_index));
+
+        // Synthetic focus-in to new PTY (after indices updated so handle_pty_input targets it)
+        if self.terminal_focused {
+            self.handle_pty_input(b"\x1b[I");
+        }
     }
 
 }
@@ -2276,6 +2351,8 @@ mod tests {
         // Initialize mode from Lua (same as production boot path)
         let lua = make_test_layout_with_keybindings();
         runner.mode = lua.call_initial_mode();
+        // Disable focus passthrough in tests — tests don't expect PtyInput focus events.
+        runner.terminal_focused = false;
 
         (runner, request_rx)
     }
@@ -2340,6 +2417,8 @@ mod tests {
         // Initialize mode from Lua (same as production boot path)
         let lua = make_test_layout_with_keybindings();
         runner.mode = lua.call_initial_mode();
+        // Disable focus passthrough in tests — tests don't expect PtyInput focus events.
+        runner.terminal_focused = false;
 
         (runner, output_tx, passthrough_rx, shutdown)
     }
@@ -3640,6 +3719,7 @@ mod tests {
             agent_index: Some(0),
             pty_index: Some(0),
             data: b"fresh snapshot\r\n".to_vec(),
+            kitty_enabled: false,
         }).unwrap();
 
         // Process the event
