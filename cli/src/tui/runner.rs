@@ -1440,9 +1440,14 @@ where
         for _ in 0..100 {
             match self.output_rx.try_recv() {
                 Ok(TuiOutput::Scrollback { agent_index, pty_index, data }) => {
+                    // Scrollback = fresh snapshot: clear existing content before
+                    // processing so the widget always starts from a clean state.
                     let parser = self.resolve_parser(agent_index, pty_index);
-                    parser.lock().expect("parser lock poisoned").process(&data);
-                    log::debug!("Processed {} bytes of scrollback", data.len());
+                    let mut p = parser.lock().expect("parser lock poisoned");
+                    p.process(b"\x1b[H\x1b[2J\x1b[0m");
+                    p.screen_mut().set_scrollback(0);
+                    p.process(&data);
+                    log::debug!("Processed {} bytes of scrollback (fresh)", data.len());
                 }
                 Ok(TuiOutput::Output { agent_index, pty_index, data }) => {
                     // Scan active PTY output for Kitty keyboard protocol push/pop
@@ -1788,12 +1793,14 @@ where
             }
         }
 
-        // Point vt100_parser at the pool entry for the target PTY
-        let (rows, cols) = self.terminal_dims;
-        let parser = self.parser_pool
-            .entry((index, pty_index))
-            .or_insert_with(|| Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK))))
-            .clone();
+        // Replace the pool entry with a fresh parser so we don't render stale
+        // content while waiting for the snapshot to arrive from Hub.
+        let (rows, cols) = self.widget_dims
+            .get(&(index, pty_index))
+            .copied()
+            .unwrap_or(self.terminal_dims);
+        let parser = Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK)));
+        self.parser_pool.insert((index, pty_index), parser.clone());
         self.vt100_parser = parser;
 
         // Subscribe to new PTY via Lua protocol
@@ -3590,6 +3597,124 @@ mod tests {
         assert!(
             request_rx.try_recv().is_err(),
             "No JSON should be sent when already focused on target"
+        );
+    }
+
+    /// Verifies `focus_terminal` replaces pool entry with a fresh parser.
+    ///
+    /// # Scenario
+    ///
+    /// When switching from agent-0 (which has existing content) to agent-1,
+    /// the parser for agent-1 should be blank — no stale content from a
+    /// previous subscription.
+    #[test]
+    fn test_focus_terminal_creates_fresh_parser() {
+        let (mut runner, _request_rx) = create_test_runner();
+
+        // Setup: pre-populate parser pool with stale content for agent 1
+        let (rows, cols) = runner.terminal_dims;
+        let stale_parser = Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK)));
+        stale_parser.lock().unwrap().process(b"stale content from previous session");
+        runner.parser_pool.insert((1, 0), stale_parser);
+
+        // Action: focus agent-1
+        runner.execute_focus_terminal(&serde_json::json!({
+            "op": "focus_terminal",
+            "agent_id": "agent-1",
+            "agent_index": 1,
+            "pty_index": 0,
+        }));
+
+        // Verify: parser is fresh (no stale content)
+        let parser = runner.vt100_parser.lock().unwrap();
+        let contents = parser.screen().contents();
+        assert!(
+            !contents.contains("stale"),
+            "Parser should be fresh after focus_terminal, got: {contents:?}"
+        );
+    }
+
+    /// Verifies `focus_terminal` uses widget dims when available.
+    ///
+    /// # Scenario
+    ///
+    /// When a terminal widget has been rendered at a specific size, the
+    /// fresh parser created on focus should use those dims, not the full
+    /// terminal dims.
+    #[test]
+    fn test_focus_terminal_uses_widget_dims() {
+        let (mut runner, _request_rx) = create_test_runner();
+
+        // Setup: widget dims known from a previous render pass
+        runner.widget_dims.insert((1, 0), (20, 60));
+
+        // Action: focus agent-1
+        runner.execute_focus_terminal(&serde_json::json!({
+            "op": "focus_terminal",
+            "agent_id": "agent-1",
+            "agent_index": 1,
+            "pty_index": 0,
+        }));
+
+        // Verify: parser has widget dims, not terminal dims
+        let parser = runner.vt100_parser.lock().unwrap();
+        assert_eq!(parser.screen().size(), (20, 60));
+    }
+
+    /// Verifies scrollback event clears parser before processing snapshot.
+    ///
+    /// # Scenario
+    ///
+    /// A parser pool entry has existing content and a non-zero scroll offset.
+    /// When a Scrollback event arrives, the parser should be cleared and
+    /// scroll reset to 0 before the snapshot data is processed.
+    #[test]
+    fn test_scrollback_clears_parser_before_processing() {
+        let (mut runner, _request_rx) = create_test_runner();
+
+        // Setup: parser with existing content and scroll offset
+        let (rows, cols) = runner.terminal_dims;
+        let parser = Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK)));
+        {
+            let mut p = parser.lock().unwrap();
+            // Write enough lines to have scrollback
+            for i in 0..30 {
+                p.process(format!("old line {i}\r\n").as_bytes());
+            }
+            p.screen_mut().set_scrollback(5);
+            assert!(p.screen().scrollback() > 0, "precondition: scrolled");
+        }
+        runner.parser_pool.insert((0, 0), parser);
+        runner.current_agent_index = Some(0);
+        runner.current_pty_index = Some(0);
+
+        // Deliver scrollback event with fresh content
+        runner.output_rx.close();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        runner.output_rx = rx;
+        tx.send(TuiOutput::Scrollback {
+            agent_index: Some(0),
+            pty_index: Some(0),
+            data: b"fresh snapshot\r\n".to_vec(),
+        }).unwrap();
+
+        // Process the event
+        runner.poll_pty_events(None);
+
+        // Verify: old content gone, scroll reset, new content present
+        let parser = runner.parser_pool.get(&(0, 0)).unwrap().lock().unwrap();
+        let contents = parser.screen().contents();
+        assert!(
+            !contents.contains("old line"),
+            "Old content should be cleared, got: {contents:?}"
+        );
+        assert!(
+            contents.contains("fresh snapshot"),
+            "Snapshot should be processed, got: {contents:?}"
+        );
+        assert_eq!(
+            parser.screen().scrollback(), 0,
+            "Scroll should be reset to bottom"
         );
     }
 

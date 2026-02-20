@@ -8,7 +8,7 @@
   </div>
 
   <%# Account Info %>
-  <div class="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden">
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden mb-6">
     <div class="px-6 py-4 border-b border-zinc-800">
       <div class="flex items-center gap-3">
         <svg class="size-5 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -32,4 +32,17 @@
         <% end %>
     </div>
   </div>
+
+  <%# Devices %>
+  <%= link_to settings_devices_path,
+        class: "group flex items-center justify-between bg-zinc-900 border border-zinc-800 hover:border-zinc-700 rounded-lg px-6 py-4 transition-colors" do %>
+    <div class="flex items-center gap-3">
+      <%= icon "computer-desktop", class: "size-5 text-zinc-500" %>
+      <div>
+        <span class="font-medium text-zinc-200 group-hover:text-zinc-100">Devices</span>
+        <p class="text-xs text-zinc-500 mt-0.5">Manage CLI devices and push notifications</p>
+      </div>
+    </div>
+    <%= icon "chevron-right", class: "size-5 text-zinc-600 group-hover:text-zinc-400 transition-colors" %>
+  <% end %>
 </div>

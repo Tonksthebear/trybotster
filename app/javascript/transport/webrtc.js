@@ -45,10 +45,11 @@ const ConnectionMode = {
   RELAYED: "relayed",     // Through TURN server
 }
 
-// Binary inner content types (must match CLI's CONTENT_MSG / CONTENT_PTY / CONTENT_STREAM)
+// Binary inner content types (must match CLI's CONTENT_MSG / CONTENT_PTY / CONTENT_STREAM / CONTENT_FILE)
 const CONTENT_MSG = 0x00
 const CONTENT_PTY = 0x01
 const CONTENT_STREAM = 0x02
+const CONTENT_FILE = 0x03
 
 // Olm session restart wire type (unencrypted control, CLI → Browser)
 const MSG_TYPE_BUNDLE_REFRESH = 0x02
@@ -590,6 +591,36 @@ class WebRTCTransport {
   }
 
   /**
+   * Send a file (image paste/drop) through the encrypted DataChannel.
+   * Frame: [CONTENT_FILE][sub_id_len][sub_id][filename_len_lo][filename_len_hi][filename][data]
+   * @param {string} hubId - Hub identifier
+   * @param {string} subscriptionId - Terminal subscription ID (e.g., "terminal_0_0")
+   * @param {Uint8Array} data - Raw file bytes
+   * @param {string} filename - Original filename (e.g., "screenshot.png")
+   */
+  async sendFileInput(hubId, subscriptionId, data, filename) {
+    const conn = this.#connections.get(hubId)
+    if (!conn) throw new Error(`No connection for hub ${hubId}`)
+    if (conn.dataChannel?.readyState !== "open") throw new Error("DataChannel not open")
+
+    const subIdBytes = new TextEncoder().encode(subscriptionId)
+    const filenameBytes = new TextEncoder().encode(filename)
+    // Frame: [0x03][sub_id_len:1][sub_id][filename_len:2 LE][filename][data]
+    const plaintext = new Uint8Array(1 + 1 + subIdBytes.length + 2 + filenameBytes.length + data.length)
+    let offset = 0
+    plaintext[offset++] = CONTENT_FILE
+    plaintext[offset++] = subIdBytes.length
+    plaintext.set(subIdBytes, offset); offset += subIdBytes.length
+    plaintext[offset++] = filenameBytes.length & 0xFF
+    plaintext[offset++] = (filenameBytes.length >> 8) & 0xFF
+    plaintext.set(filenameBytes, offset); offset += filenameBytes.length
+    plaintext.set(data, offset)
+
+    const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
+    conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+  }
+
+  /**
    * Get the current connection mode for a hub.
    * @returns {string} ConnectionMode value (direct, relayed, unknown)
    */
@@ -1089,7 +1120,7 @@ class WebRTCTransport {
 
         if (contentType === CONTENT_PTY) {
           // PTY: [CONTENT_PTY][flags:1][sub_id_len:1][sub_id][payload]
-          this.#handlePtyBinary(hubId, plaintext)
+          await this.#handlePtyBinary(hubId, plaintext)
           return
         }
 
@@ -1183,6 +1214,10 @@ class WebRTCTransport {
     }
     if (msg.type === "push_disable_ack") {
       this.#emit("push:disable_ack", { hubId })
+      return
+    }
+    if (msg.type === "push_status") {
+      this.#emit("push:status", { hubId, hasKeys: msg.has_keys, browserSubscribed: msg.browser_subscribed })
       return
     }
 

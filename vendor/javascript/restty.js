@@ -1,4 +1,4 @@
-// restty@0.1.31 (local build with kitty modifier fix)
+// restty@0.1.33 downloaded from https://cdn.jsdelivr.net/npm/restty@0.1.33/dist/restty.js
 
 import {
   RESTTY_PLUGIN_API_VERSION,
@@ -10,7 +10,7 @@ import {
   isBuiltinThemeName,
   listBuiltinThemeNames,
   parseGhosttyTheme,
-} from "chunk-s7071hhg";
+} from "chunk-p8wzkwjt";
 export {
   parseGhosttyTheme,
   listBuiltinThemeNames,

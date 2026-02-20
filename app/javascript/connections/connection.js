@@ -46,6 +46,7 @@ export class Connection {
   #initRetryTimer = null    // Pending retry timer
   #peerReconnectTimer = null  // Pending peer reconnect timer
   #peerReconnectAttempts = 0  // Retry counter for peer reconnection
+  #reacquirePromise = null    // Serializes concurrent reacquire() calls
   #handshake = null           // HandshakeManager instance
   #health = null              // HealthTracker instance
 
@@ -660,6 +661,14 @@ export class Connection {
   notifyIdle() {
     const hubId = this.getHubId()
     if (hubId && this.#hubConnected) {
+      // Don't start a grace period if another connection sharing this hubId
+      // is still active. Multiple connection types (HubConnection,
+      // TerminalConnection) share the same transport-level WebRTC connection.
+      // Without this check, a stale TerminalConnection's notifyIdle can start
+      // a NEW grace period after a HubConnection's reacquire already cancelled
+      // the previous one, causing the shared connection to close.
+      if (this.manager.hasActiveConnectionForHub(hubId)) return
+
       // Tell transport to start grace period for this hub connection.
       // If reacquired before grace period expires, connection is reused.
       bridge.send("disconnect", { hubId }).catch(() => {})
@@ -670,10 +679,37 @@ export class Connection {
    * Notify worker that this connection is being reacquired.
    * Cancels any pending grace period in the worker.
    * Called by ConnectionManager.acquire() when reusing a wrapper.
+   *
+   * Serialized: if multiple controllers call acquire() concurrently,
+   * they share the same reacquire work instead of each clearing
+   * and re-creating the subscription.
    */
   async reacquire() {
+    if (this.#reacquirePromise) {
+      return this.#reacquirePromise
+    }
+    this.#reacquirePromise = this.#doReacquire()
+    try {
+      return await this.#reacquirePromise
+    } finally {
+      this.#reacquirePromise = null
+    }
+  }
+
+  async #doReacquire() {
     const hubId = this.getHubId()
     if (!hubId) return
+
+    // Cancel grace period FIRST by touching signaling, before any async
+    // SharedWorker calls. connectSignaling is idempotent — returns existing
+    // state if connected, creates a new channel if the grace timer already
+    // destroyed it. This prevents the 3s grace timer from racing with the
+    // hasSession() round-trip to the crypto SharedWorker.
+    const result = await bridge.send("connectSignaling", {
+      hubId,
+      browserIdentity: this.browserIdentity
+    })
+    this.#hubConnected = true
 
     const { hasSession } = await bridge.hasSession(hubId)
 
@@ -684,14 +720,6 @@ export class Connection {
       this.#setError("unpaired", "Scan connection code")
       return
     }
-
-    // Re-establish signaling (cancels any pending grace period).
-    const result = await bridge.send("connectSignaling", {
-      hubId,
-      browserIdentity: this.browserIdentity
-    })
-
-    this.#hubConnected = true
 
     // Seed cliStatus from transport if no health event has updated it yet
     if (result?.state === "connected" && this.cliStatus === CliStatus.UNKNOWN) {
@@ -848,6 +876,33 @@ export class Connection {
       return true
     } catch (error) {
       console.error(`[${this.constructor.name}] sendBinaryPty failed:`, error)
+      return false
+    }
+  }
+
+  /**
+   * Send a file (image paste/drop) through the encrypted channel.
+   * @param {Uint8Array} data - Raw file bytes
+   * @param {string} filename - Original filename
+   * @returns {Promise<boolean>}
+   */
+  async sendBinaryFile(data, filename) {
+    if (!this.subscriptionId) {
+      await this.#ensureConnected()
+      if (!this.subscriptionId) return false
+    }
+
+    try {
+      const hubId = this.getHubId()
+      await bridge.send("sendFileInput", {
+        hubId,
+        subscriptionId: this.subscriptionId,
+        data,
+        filename,
+      })
+      return true
+    } catch (error) {
+      console.error(`[${this.constructor.name}] sendBinaryFile failed:`, error)
       return false
     }
   }

@@ -33,6 +33,7 @@ Rails.application.routes.draw do
       resources :notifications, only: [ :create ]
       resource :webrtc, only: [ :show ], controller: :webrtc  # GET config
       resource :settings, only: [ :show ], controller: :settings
+      resource :device, only: [ :show ], controller: :device
       resource :pairing, only: [ :show ], controller: :pairing
       # Agent terminal view by index
       # /hubs/:hub_id/agents/:index - agent overview (redirects to PTY 0)
@@ -62,11 +63,11 @@ Rails.application.routes.draw do
   # E2E devices (browser keypairs - no heartbeat, they're session-based)
   resources :devices, only: [ :index, :create, :update, :destroy ]
 
-  # Notifications (client-side only — page shell, data in IndexedDB)
-  resources :notifications, only: [ :index ]
-
   # User settings
   resource :settings, only: [ :show ]
+  namespace :settings do
+    resources :devices, only: [ :index, :show ]
+  end
 
   # Documentation (public)
   get "docs", to: "docs#show", as: :docs

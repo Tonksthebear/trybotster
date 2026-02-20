@@ -307,7 +307,8 @@ mod tests {
         };
 
         register_device(&mut device, &client, &config);
-        // Success = no panic
+        // Success = no panic, device_id unchanged
+        assert_eq!(device.device_id, Some(123));
     }
 
     #[test]

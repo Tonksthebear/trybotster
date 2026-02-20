@@ -244,6 +244,13 @@ class ConfigEditingTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit url
 
+    # Pairing page: wait for bundle to be parsed, then click pair button
+    assert_selector "[data-pairing-target='ready']", wait: 15
+    find("[data-action='pairing#pair']").click
+
+    # Wait for redirect to hub page after successful pairing
+    assert_selector "[data-connection-status-target='connectionSection']", wait: 15
+
     # Wait for WebRTC DataChannel to be established (direct or relay)
     assert_selector(
       "[data-connection-status-target='connectionSection'][data-state='direct'], " \

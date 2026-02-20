@@ -102,6 +102,9 @@ pub const CONTENT_PTY: u8 = 0x01;
 /// Binary inner content type: TCP stream multiplexer.
 pub const CONTENT_STREAM: u8 = 0x02;
 
+/// Binary inner content type: file transfer (browser → CLI).
+pub const CONTENT_FILE: u8 = 0x03;
+
 /// Encrypted message envelope (minimal wire format).
 ///
 /// Uses short keys to minimize wire size:

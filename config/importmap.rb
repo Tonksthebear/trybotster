@@ -15,9 +15,6 @@ pin_all_from "app/javascript/channels", under: "channels"
 pin "matrix/bundle", to: "matrix/bundle.js"
 pin_all_from "app/javascript/workers", under: "workers"
 
-# Notifications (client-side IndexedDB storage)
-pin_all_from "app/javascript/notifications", under: "notifications"
-
 # Connection management (global, Turbo-aware)
 pin "connections", to: "connections/index.js"
 pin_all_from "app/javascript/connections", under: "connections"
@@ -27,5 +24,5 @@ pin_all_from "app/javascript/transport", under: "transport"
 pin_all_from "app/javascript/preview", under: "preview"
 pin_all_from "app/javascript/channels", under: "channels"
 pin "@tailwindplus/elements", to: "@tailwindplus--elements.js" # @1.0.22
-pin "restty" # @0.1.31 (local build with kitty modifier fix)
-pin "chunk-s7071hhg" # @0.1.31
+pin "restty" # @0.1.33
+pin "chunk-p8wzkwjt" # @0.1.33

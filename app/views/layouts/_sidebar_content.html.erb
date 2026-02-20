@@ -46,7 +46,8 @@
 
         <%# Template for each agent item %>
         <template data-agent-list-target="template">
-          <div class="group flex items-center gap-1 rounded transition-colors hover:bg-zinc-800/50 data-[selected=true]:bg-primary-500/20">
+          <div class="group relative flex items-center gap-1 rounded transition-colors hover:bg-zinc-800/50 data-[selected=true]:bg-primary-500/20">
+            <span data-notification-badge class="hidden absolute top-0.5 right-0.5 size-2 rounded-full bg-yellow-400 ring-2 ring-zinc-900 animate-pulse"></span>
             <a data-href="/hubs/{hubId}/agents/{index}"
                data-agent-id
                data-action="agent-list#select"
@@ -54,7 +55,6 @@
               <span data-field="name" class="truncate font-mono text-xs block"></span>
               <span data-field="subtext" class="truncate text-[10px] text-zinc-500 block"></span>
             </a>
-            <span data-notification-badge class="hidden size-2 rounded-full bg-primary-400 shrink-0"></span>
             <button type="button"
                     data-agent-id
                     data-action="agent-list#delete"
@@ -66,7 +66,7 @@
         </template>
 
         <%# List container %>
-        <div data-agent-list-target="list" class="flex-1 overflow-y-auto px-2 pb-2 space-y-1"></div>
+        <div data-agent-list-target="list" class="flex-1 overflow-y-auto px-2 pt-1 pb-2 space-y-1"></div>
 
         <%# Empty state %>
         <div data-agent-list-target="empty" class="hidden px-2 pb-2">
@@ -83,6 +83,15 @@
 
   <%# Bottom section - Docs, Settings & User %>
   <div class="shrink-0 border-t border-zinc-800">
+    <%# Device Settings - only when viewing a hub with a device %>
+    <% if Current.hub&.device %>
+      <%= link_to hub_device_path(Current.hub),
+          class: "flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
+          <%= icon "device-phone-mobile", class: "size-5" %>
+        <span>Device Settings</span>
+      <% end %>
+    <% end %>
+
     <%# Docs %>
     <%= link_to docs_path,
         target: "_blank",
@@ -90,26 +99,6 @@
         <%= icon "book-open", class: "size-5" %>
       <span>Docs</span>
       <%= icon "arrow-top-right-on-square", class: "size-3 text-zinc-600" %>
-    <% end %>
-
-    <%# Notifications %>
-    <div data-controller="notifications">
-      <%= link_to notifications_path,
-          class: "flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
-        <%= icon "bell", class: "size-5" %>
-        <span>Notifications</span>
-        <span data-notifications-target="badge"
-              class="hidden ml-auto inline-flex items-center rounded-full bg-primary-500/20 px-2 py-0.5 text-xs font-medium text-primary-400">
-          <span data-notifications-target="count">0</span>
-        </span>
-      <% end %>
-    </div>
-
-    <%# Settings %>
-    <%= link_to settings_path,
-        class: "flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
-        <%= icon "cog-6-tooth", class: "size-5" %>
-      <span>Settings</span>
     <% end %>
 
     <%# User dropdown %>

@@ -76,7 +76,15 @@ local function build_agent_items(state)
     if agent.profile_name then table.insert(parts, agent.profile_name) end
     if agent.branch_name then table.insert(parts, agent.branch_name) end
     local secondary = #parts > 0 and table.concat(parts, " · ") or nil
-    local item = { text = name }
+    local item
+    if agent.notification then
+      item = { text = {
+        { text = "● ", style = { fg = "yellow" } },
+        { text = name },
+      } }
+    else
+      item = { text = name }
+    end
     if secondary then
       item.secondary = { { text = secondary, style = "dim" } }
     end

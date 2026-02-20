@@ -76,6 +76,12 @@ export class WebRtcPtyTransport {
     return true;
   }
 
+  sendFile(data, filename) {
+    if (!this.#terminalConn?.isConnected()) return false;
+    this.#terminalConn.sendFile(data, filename);
+    return true;
+  }
+
   resize(cols, rows) {
     if (!this.#terminalConn?.isConnected()) return false;
     this.#terminalConn.sendResize(cols, rows);

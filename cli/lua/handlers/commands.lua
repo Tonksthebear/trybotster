@@ -83,6 +83,16 @@ commands.register("select_agent", function(_client, _sub_id, command)
     log.debug(string.format("Select agent: %s", tostring(command.id or command.agent_index)))
 end, { description = "Select agent (client-side only, no-op)" })
 
+commands.register("clear_notification", function(_client, _sub_id, command)
+    local agent_index = command.agent_index
+    if agent_index == nil then
+        log.warn("clear_notification missing agent_index")
+        return
+    end
+    -- Shared clear logic (no pty_input hook — this is agent switching, not typing)
+    _clear_agent_notification(agent_index)
+end, { description = "Clear notification flag on an agent" })
+
 -- ============================================================================
 -- Connection Commands
 -- ============================================================================

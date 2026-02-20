@@ -80,6 +80,11 @@ impl PushSubscriptionStore {
         self.subscriptions.is_empty()
     }
 
+    /// Check if a subscription exists for a given browser identity.
+    pub fn contains(&self, browser_identity: &str) -> bool {
+        self.subscriptions.contains_key(browser_identity)
+    }
+
     /// Remove duplicate subscriptions that share the same push endpoint.
     ///
     /// When a browser reconnects with a new identity key but the same push

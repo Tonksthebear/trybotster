@@ -106,7 +106,28 @@
       </div>
 
       <%# Terminal content %>
-      <div data-terminal-display-target="container" class="terminal-container flex-1 min-h-0 bg-zinc-950"></div>
+      <div data-terminal-display-target="container" class="terminal-container relative flex-1 min-h-0 bg-zinc-950">
+
+        <%# Drop zone overlay — visible toggled via data-visible attribute %>
+        <div data-terminal-display-target="dropZone"
+             class="absolute inset-0 z-20 flex items-center justify-center pointer-events-none
+                    opacity-0 transition-opacity duration-150
+                    data-[visible]:opacity-100"
+             aria-hidden="true">
+          <div class="absolute inset-2 rounded-lg border-2 border-dashed border-primary-400/50 bg-primary-500/5"></div>
+          <span class="relative text-sm font-medium text-primary-300">Drop file</span>
+        </div>
+
+        <%# File transfer toast — shown via data-toast on container, type via data-toast-type %>
+        <output data-terminal-display-target="toast"
+                role="status"
+                class="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 px-3 py-1.5 rounded-md border text-xs font-medium
+                       opacity-0 transition-opacity duration-300 pointer-events-none
+                       data-[visible]:opacity-100
+                       data-[toast-type=success]:bg-zinc-800/90 data-[toast-type=success]:text-zinc-200 data-[toast-type=success]:border-zinc-700/50
+                       data-[toast-type=error]:bg-red-900/90 data-[toast-type=error]:text-red-200 data-[toast-type=error]:border-red-700/50">
+        </output>
+      </div>
     </div>
   </div>
 

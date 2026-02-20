@@ -129,6 +129,10 @@ export class TerminalConnection extends Connection {
     return this.sendBinaryPty(data);
   }
 
+  sendFile(data, filename) {
+    return this.sendBinaryFile(data, filename);
+  }
+
   sendResize(cols, rows) {
     return this.send("resize", { cols, rows });
   }
@@ -210,6 +214,7 @@ export class TerminalConnection extends Connection {
       }
 
       this.#snapshotBuffer = null;
+      console.debug(`[TerminalConnection] Snapshot ${snapshotId.toString(16)} complete: ${totalChunks} chunks, ${totalLen} bytes`);
       this.emit("output", combined);
     }
   }
