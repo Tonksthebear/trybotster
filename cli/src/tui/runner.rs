@@ -435,7 +435,11 @@ where
     /// bindings, then connects idle panels and disconnects panels no longer
     /// in the tree. Panel state is the source of truth — no separate
     /// `active_subscriptions` set.
-    pub(super) fn sync_subscriptions(&mut self, tree: &super::render_tree::RenderNode) {
+    pub(super) fn sync_subscriptions(
+        &mut self,
+        tree: &super::render_tree::RenderNode,
+        areas: &std::collections::HashMap<(usize, usize), (u16, u16)>,
+    ) {
         use crate::tui::terminal_panel::PanelState;
 
         let default_agent = self.current_agent_index.unwrap_or(0);
@@ -445,7 +449,11 @@ where
 
         // Connect panels for new bindings
         for &(agent_idx, pty_idx) in &desired {
-            let (rows, cols) = self.terminal_dims;
+            // Use the actual rendered widget area if available, falling back
+            // to terminal_dims only for the first frame before any render.
+            let (rows, cols) = areas.get(&(agent_idx, pty_idx))
+                .copied()
+                .unwrap_or(self.terminal_dims);
             let panel = self.panels
                 .entry((agent_idx, pty_idx))
                 .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(rows, cols));
@@ -1019,15 +1027,19 @@ where
                 }
                 InputEvent::FocusGained => {
                     self.terminal_focused = true;
+                    log::info!("[FOCUS] terminal gained focus, mode={} overlay={}", self.mode, self.has_overlay);
                     // Forward to viewed PTY so inner apps (e.g. Claude Code)
                     // know the terminal is focused and can suppress notifications.
                     if self.mode == "insert" && !self.has_overlay {
+                        log::info!("[FOCUS] forwarding \\x1b[I to PTY agent={:?} pty={:?}", self.current_agent_index, self.current_pty_index);
                         self.handle_pty_input(b"\x1b[I");
                     }
                 }
                 InputEvent::FocusLost => {
                     self.terminal_focused = false;
+                    log::info!("[FOCUS] terminal lost focus, mode={} overlay={}", self.mode, self.has_overlay);
                     if self.mode == "insert" && !self.has_overlay {
+                        log::info!("[FOCUS] forwarding \\x1b[O to PTY agent={:?} pty={:?}", self.current_agent_index, self.current_pty_index);
                         self.handle_pty_input(b"\x1b[O");
                     }
                 }
@@ -1366,19 +1378,30 @@ where
         // In modal modes (menu, input, etc.) we want traditional bytes for our keybindings.
         let desired_kitty = self.inner_kitty_enabled && !self.has_overlay;
         if desired_kitty != self.outer_kitty_enabled {
+            log::info!(
+                "[KITTY] Syncing outer terminal: inner={} overlay={} desired={} outer={}",
+                self.inner_kitty_enabled, self.has_overlay, desired_kitty, self.outer_kitty_enabled
+            );
             self.outer_kitty_enabled = desired_kitty;
             if desired_kitty {
-                let _ = execute!(
-                    std::io::stdout(),
-                    crossterm::event::PushKeyboardEnhancementFlags(
-                        crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    )
-                );
+                // Write kitty push directly — CSI > 1 u
+                let push_result = std::io::Write::write_all(
+                    &mut std::io::stdout(),
+                    b"\x1b[>1u",
+                ).and_then(|_| std::io::Write::flush(&mut std::io::stdout()));
+                match push_result {
+                    Ok(()) => log::info!("[KITTY] Pushed kitty to outer terminal (raw CSI > 1 u)"),
+                    Err(e) => log::error!("[KITTY] Failed to push kitty: {e}"),
+                }
             } else {
-                let _ = execute!(
-                    std::io::stdout(),
-                    crossterm::event::PopKeyboardEnhancementFlags
-                );
+                let pop_result = std::io::Write::write_all(
+                    &mut std::io::stdout(),
+                    b"\x1b[<u",
+                ).and_then(|_| std::io::Write::flush(&mut std::io::stdout()));
+                match pop_result {
+                    Ok(()) => log::info!("[KITTY] Popped kitty from outer terminal (raw CSI < u)"),
+                    Err(e) => log::error!("[KITTY] Failed to pop kitty: {e}"),
+                }
             }
         }
     }
@@ -1424,6 +1447,13 @@ where
                         && pty_index == self.current_pty_index;
                     if is_focused {
                         self.inner_kitty_enabled = kitty_enabled;
+                        // PTY is now Connected — Claude Code is running and may have
+                        // enabled focus reporting. Resend current focus state so it
+                        // doesn't miss the initial synthetic sent during switch.
+                        if self.terminal_focused {
+                            log::info!("[FOCUS] resending focus-in on scrollback (PTY now connected)");
+                            self.handle_pty_input(b"\x1b[I");
+                        }
                     }
                     log::debug!(
                         "Processed {} bytes of scrollback (kitty={}{})",
@@ -1597,7 +1627,7 @@ where
 
         if let Some(ref result) = lua_result {
             // Sync subscriptions to match what the render tree declares
-            self.sync_subscriptions(&result.tree);
+            self.sync_subscriptions(&result.tree, &rendered_areas);
 
             // Track overlay presence for input routing (PTY vs keybindings)
             self.has_overlay = result.overlay.is_some();
@@ -1671,8 +1701,10 @@ where
                         // PTY tracks whether it's "active" even across overlays.
                         if self.terminal_focused && was_insert != now_insert {
                             if now_insert {
+                                log::info!("[FOCUS] synthetic focus-in on mode change to insert");
                                 self.handle_pty_input(b"\x1b[I");
                             } else {
+                                log::info!("[FOCUS] synthetic focus-out on mode change from insert");
                                 self.handle_pty_input(b"\x1b[O");
                             }
                         }
@@ -1747,6 +1779,7 @@ where
         let Some(agent_id) = agent_id else {
             // Synthetic focus-out before clearing (handle_pty_input uses current indices)
             if self.terminal_focused && self.current_agent_index.is_some() {
+                log::info!("[FOCUS] synthetic focus-out on clear, agent={:?}", self.current_agent_index);
                 self.handle_pty_input(b"\x1b[O");
             }
             // Disconnect old panel
@@ -1787,6 +1820,7 @@ where
 
         // Synthetic focus-out to old PTY before switching (uses current indices)
         if self.terminal_focused && self.current_agent_index.is_some() {
+            log::info!("[FOCUS] synthetic focus-out on switch, old_agent={:?}", self.current_agent_index);
             self.handle_pty_input(b"\x1b[O");
         }
 
@@ -1806,10 +1840,19 @@ where
         }
 
         // Get or create the panel for this slot.
-        let (rows, cols) = self.terminal_dims;
+        // Grab the outgoing panel's dims (same widget area) before it might
+        // get removed — avoids using terminal_dims which includes chrome and
+        // would cause a resize bounce.
+        let old_key = (
+            self.current_agent_index.unwrap_or(usize::MAX),
+            self.current_pty_index.unwrap_or(usize::MAX),
+        );
+        let widget_dims = self.panels.get(&old_key)
+            .map(|p| p.dims())
+            .unwrap_or(self.terminal_dims);
         let panel = self.panels
             .entry((index, pty_index))
-            .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(rows, cols));
+            .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(widget_dims.0, widget_dims.1));
 
         // Subscribe IMMEDIATELY (no waiting for sync_subscriptions in render cycle)
         let connect_msg = panel.connect(index, pty_index);
@@ -1830,7 +1873,10 @@ where
 
         // Synthetic focus-in to new PTY (after indices updated so handle_pty_input targets it)
         if self.terminal_focused {
+            log::info!("[FOCUS] synthetic focus-in on switch, new_agent={:?} pty={}", index, pty_index);
             self.handle_pty_input(b"\x1b[I");
+        } else {
+            log::info!("[FOCUS] skipping focus-in on switch (terminal not focused)");
         }
     }
 
@@ -3631,6 +3677,8 @@ mod tests {
         panel.on_scrollback(b"stale content from previous session");
         panel.disconnect(1, 0);
         runner.panels.insert((1, 0), panel);
+        // Simulate already viewing this agent (prevents stale-panel eviction)
+        runner.selected_agent = Some("agent-1".to_string());
 
         // Action: focus agent-1
         runner.execute_focus_terminal(&serde_json::json!({
@@ -3663,6 +3711,8 @@ mod tests {
         let panel = crate::tui::terminal_panel::TerminalPanel::new(20, 60);
         // Panel was previously connected and disconnected (has dims)
         runner.panels.insert((1, 0), panel);
+        // Simulate already viewing this agent (prevents stale-panel eviction)
+        runner.selected_agent = Some("agent-1".to_string());
 
         // Action: focus agent-1
         runner.execute_focus_terminal(&serde_json::json!({
@@ -3886,7 +3936,7 @@ mod tests {
             )),
         };
 
-        runner.sync_subscriptions(&tree);
+        runner.sync_subscriptions(&tree, &std::collections::HashMap::new());
 
         // Should have sent a subscribe message for (0, 0)
         match request_rx.try_recv() {
@@ -3939,7 +3989,7 @@ mod tests {
             )),
         };
 
-        runner.sync_subscriptions(&tree);
+        runner.sync_subscriptions(&tree, &std::collections::HashMap::new());
 
         // Should have sent unsubscribe for (0, 1)
         let mut found_unsubscribe = false;
@@ -3987,7 +4037,7 @@ mod tests {
             )),
         };
 
-        runner.sync_subscriptions(&tree);
+        runner.sync_subscriptions(&tree, &std::collections::HashMap::new());
 
         // No messages should be sent (already connected)
         assert!(
