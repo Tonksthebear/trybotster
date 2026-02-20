@@ -189,11 +189,12 @@ pub fn spawn_reader_thread(
                     // Feed PTY bytes to shadow screen for parsed state tracking.
                     // vt100 handles scrollback limits internally by line count.
                     //
-                    // vt100 0.16.2 has an unchecked subtraction overflow in
-                    // `grid.rs:683` (`col_wrap`) that panics on certain
-                    // escape sequences after a terminal resize creates an
-                    // invalid single-row scroll region. We use catch_unwind
-                    // to absorb the panic and keep the reader thread alive.
+                    // Safety net: vt100 0.16.2 has arithmetic overflow bugs
+                    // (e.g. `grid.rs:683` col_wrap). The primary defense is
+                    // the DECSTBM reset in PtySession::resize(), but we keep
+                    // catch_unwind as a generic safety net for any unforeseen
+                    // vt100 panics. On panic the parser is replaced with a
+                    // fresh instance to avoid cascading failures.
                     {
                         let mut parser = shadow_screen
                             .lock()
@@ -1189,13 +1190,12 @@ mod tests {
         parser.process(b"AAAAAAAAAAB");
     }
 
-    /// Verify the reader thread survives a vt100 parser panic.
+    /// Verify the reader thread survives a vt100 parser panic (safety net).
     ///
-    /// This test feeds the reader thread data that triggers the vt100
-    /// `col_wrap` underflow after a resize shrinks the terminal into an
-    /// invalid single-row scroll region. Without `catch_unwind` protection,
-    /// the panic kills the thread, poisons the `shadow_screen` mutex, and
-    /// cascades into a full process crash.
+    /// This test bypasses the production DECSTBM reset fix by calling
+    /// `set_size()` directly, simulating a hypothetical vt100 panic from
+    /// any cause. Without `catch_unwind` + parser reset, the panic would
+    /// kill the thread and poison the `shadow_screen` mutex.
     #[test]
     fn test_reader_survives_vt100_parser_panic() {
         // Phase 1: establish a scroll region (delivered as PTY output).
@@ -1273,5 +1273,27 @@ mod tests {
             }
         }
         assert!(got_output, "Reader should still broadcast output events");
+    }
+
+    /// Verify that resetting the scroll region after `set_size()` prevents
+    /// the vt100 col_wrap panic entirely.
+    ///
+    /// This is the production fix: `PtySession::resize()` processes `\x1b[r`
+    /// (DECSTBM reset) after `set_size()` to clear any invalid scroll region
+    /// left by the resize. Without `\x1b[r`, this sequence panics (see
+    /// `test_vt100_col_wrap_underflow_reproducer`).
+    #[test]
+    fn test_scroll_region_reset_prevents_panic() {
+        let mut parser = vt100::Parser::new(3, 10, 0);
+        parser.process(b"\x1b[1;2r"); // scroll_top=0, scroll_bottom=1
+
+        // Resize to 1 row — creates invalid scroll region.
+        parser.screen_mut().set_size(1, 10);
+
+        // Reset scroll region to full screen (our fix).
+        parser.process(b"\x1b[r");
+
+        // This would panic without the \x1b[r above.
+        parser.process(b"AAAAAAAAAAB");
     }
 }

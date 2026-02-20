@@ -663,12 +663,20 @@ impl PtySession {
             }
         }
 
-        // Keep shadow screen in sync with PTY dimensions
-        self.shadow_screen
-            .lock()
-            .expect("shadow_screen lock poisoned")
-            .screen_mut()
-            .set_size(rows, cols);
+        // Keep shadow screen in sync with PTY dimensions.
+        // After set_size, reset the scroll region (DECSTBM) to prevent
+        // vt100 0.16.2 col_wrap panic: set_size can leave scroll_top ==
+        // scroll_bottom which is an invalid state that panics on the
+        // next line wrap. The PTY process will re-establish its own
+        // scroll region after receiving SIGWINCH.
+        {
+            let mut parser = self
+                .shadow_screen
+                .lock()
+                .expect("shadow_screen lock poisoned");
+            parser.screen_mut().set_size(rows, cols);
+            parser.process(b"\x1b[r");
+        }
 
         // Broadcast resize event
         self.broadcast(PtyEvent::resized(rows, cols));
@@ -826,12 +834,16 @@ pub(crate) fn do_resize(
         }
     }
 
-    // Keep shadow screen in sync with PTY dimensions
-    shadow_screen
-        .lock()
-        .expect("shadow_screen lock poisoned")
-        .screen_mut()
-        .set_size(rows, cols);
+    // Keep shadow screen in sync with PTY dimensions.
+    // Reset scroll region after set_size to prevent vt100 0.16.2
+    // col_wrap panic (see PtySession::resize for details).
+    {
+        let mut parser = shadow_screen
+            .lock()
+            .expect("shadow_screen lock poisoned");
+        parser.screen_mut().set_size(rows, cols);
+        parser.process(b"\x1b[r");
+    }
 
     // Broadcast resize event
     let _ = event_tx.send(PtyEvent::resized(rows, cols));
