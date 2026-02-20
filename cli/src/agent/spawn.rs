@@ -190,11 +190,12 @@ pub fn spawn_reader_thread(
                     // vt100 handles scrollback limits internally by line count.
                     //
                     // Safety net: vt100 0.16.2 has arithmetic overflow bugs
-                    // (e.g. `grid.rs:683` col_wrap). The primary defense is
-                    // the DECSTBM reset in PtySession::resize(), but we keep
-                    // catch_unwind as a generic safety net for any unforeseen
-                    // vt100 panics. On panic the parser is replaced with a
-                    // fresh instance to avoid cascading failures.
+                    // (e.g. `grid.rs:683` col_wrap on 1-row grids). The primary
+                    // defense is the MIN_PARSER_ROWS clamp in PtySession and
+                    // resize_shadow_screen(), but we keep catch_unwind as a
+                    // generic safety net for any unforeseen vt100 panics.
+                    // On panic the parser is replaced with a fresh instance
+                    // to avoid cascading failures.
                     {
                         let mut parser = shadow_screen
                             .lock()
@@ -228,6 +229,7 @@ pub fn spawn_reader_thread(
                             // dimensions. Reading size() is safe — it just
                             // returns stored u16 fields, no grid arithmetic.
                             let (rows, cols) = parser.screen().size();
+                            let rows = rows.max(super::pty::MIN_PARSER_ROWS);
                             *parser = vt100::Parser::new(
                                 rows,
                                 cols,
@@ -1275,25 +1277,30 @@ mod tests {
         assert!(got_output, "Reader should still broadcast output events");
     }
 
-    /// Verify that resetting the scroll region after `set_size()` prevents
-    /// the vt100 col_wrap panic entirely.
+    /// Verify that clamping rows to `MIN_PARSER_ROWS` prevents the vt100
+    /// col_wrap panic.
     ///
-    /// This is the production fix: `PtySession::resize()` processes `\x1b[r`
-    /// (DECSTBM reset) after `set_size()` to clear any invalid scroll region
-    /// left by the resize. Without `\x1b[r`, this sequence panics (see
-    /// `test_vt100_col_wrap_underflow_reproducer`).
+    /// This is the production fix: all `set_size()` and `Parser::new()` calls
+    /// clamp rows to at least 2. A 1-row grid triggers an underflow in
+    /// `Grid::col_wrap` (grid.rs:683) on any line wrap.
     #[test]
-    fn test_scroll_region_reset_prevents_panic() {
-        let mut parser = vt100::Parser::new(3, 10, 0);
-        parser.process(b"\x1b[1;2r"); // scroll_top=0, scroll_bottom=1
+    fn test_min_rows_clamp_prevents_panic() {
+        use crate::agent::pty::MIN_PARSER_ROWS;
 
-        // Resize to 1 row — creates invalid scroll region.
-        parser.screen_mut().set_size(1, 10);
+        // Without clamp: 1-row grid panics on line wrap.
+        let result = std::panic::catch_unwind(|| {
+            let mut parser = vt100::Parser::new(1, 10, 0);
+            parser.process(b"AAAAAAAAAAB"); // wraps → col_wrap → boom
+        });
+        assert!(result.is_err(), "1-row grid should panic on col_wrap");
 
-        // Reset scroll region to full screen (our fix).
-        parser.process(b"\x1b[r");
+        // With clamp: MIN_PARSER_ROWS avoids the panic.
+        let rows: u16 = 1;
+        let mut parser = vt100::Parser::new(rows.max(MIN_PARSER_ROWS), 10, 0);
+        parser.process(b"AAAAAAAAAAB"); // wraps safely with 2+ rows
 
-        // This would panic without the \x1b[r above.
+        // Also safe after set_size with clamp.
+        parser.screen_mut().set_size(rows.max(MIN_PARSER_ROWS), 10);
         parser.process(b"AAAAAAAAAAB");
     }
 }

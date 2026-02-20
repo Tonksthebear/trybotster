@@ -86,18 +86,6 @@ function M.on_action(action, context)
   -- _tui_state.list_selected / _tui_state.input_buffer automatically.
   -- Only workflow actions (list_select, input_submit, mode transitions) remain here.
 
-  -- === Mode transitions ===
-  if action == "enter_normal_mode" then
-    return { set_mode_ops("normal") }
-  end
-
-  if action == "enter_insert_mode" then
-    if context.selected_agent then
-      return { set_mode_ops("insert") }
-    end
-    return nil  -- no agent, can't insert
-  end
-
   -- === Menu selection ===
   if action == "list_select" and _tui_state.mode == "menu" then
     local actions = context.overlay_actions or {}

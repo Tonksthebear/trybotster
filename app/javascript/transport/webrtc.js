@@ -112,7 +112,8 @@ class WebRTCTransport {
       this.#cableSubscriptions.clear()
 
       for (const [hubId, conn] of this.#connections) {
-        if (conn.dataChannel) conn.dataChannel.close()
+        // Skip dc.close() — pc.close() handles it, and explicit DC close
+        // triggers an SCTP stream reset that crashes webrtc-rs/sctp.
         if (conn.pc) conn.pc.close()
       }
       this.#connections.clear()
@@ -806,7 +807,10 @@ class WebRTCTransport {
       conn.dataChannel.onclose = null
       conn.dataChannel.onerror = null
       conn.dataChannel.onmessage = null
-      conn.dataChannel.close()
+      // Don't call dc.close() — it sends an SCTP stream reset that
+      // webrtc-rs/sctp 0.11.0 can't handle (ErrChunk), crashing the
+      // SCTP association before pc.close() can tear down cleanly.
+      // pc.close() below handles DC cleanup implicitly.
       conn.dataChannel = null
     }
     if (conn.pc) {

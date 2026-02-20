@@ -148,6 +148,14 @@ export class HubConnection extends Connection {
   }
 
   /**
+   * Clear the notification flag on an agent by index.
+   * @param {number} agentIndex - 0-based agent index
+   */
+  clearNotification(agentIndex) {
+    return this.send("clear_notification", { agent_index: agentIndex });
+  }
+
+  /**
    * Create a new agent.
    * @param {Object} options - Agent creation options
    */

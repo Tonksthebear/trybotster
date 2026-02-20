@@ -56,8 +56,8 @@ export class WebRtcPtyTransport {
         hubId: this.#hubId,
         agentIndex: this.#agentIndex,
         ptyIndex: this.#ptyIndex,
-        rows: options.rows || 24,
-        cols: options.cols || 80,
+        rows: options.rows,
+        cols: options.cols,
       },
     );
 

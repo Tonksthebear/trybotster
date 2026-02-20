@@ -185,15 +185,8 @@ function render(state)
     if state.is_scrolled then
       scroll = string.format(" [SCROLLBACK +%d | Shift+End: live]", state.scroll_offset)
     end
-    local mode_hint = ""
-    if _tui_state.mode == "normal" then
-      mode_hint = " NORMAL [i: insert] "
-    elseif _tui_state.mode == "insert" then
-      mode_hint = " INSERT [Esc: normal] "
-    end
     term_title = {
       { text = string.format(" %s %s%s ", sa.branch_name or "main", view, scroll) },
-      { text = mode_hint, style = { fg = _tui_state.mode == "insert" and "green" or "yellow" } },
     }
   end
 

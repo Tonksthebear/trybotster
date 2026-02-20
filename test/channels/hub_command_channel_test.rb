@@ -157,7 +157,7 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
     @hub.update!(alive: false, last_seen_at: 10.minutes.ago)
 
     subscribe hub_id: @hub.id
-    perform :heartbeat, agents: []
+    perform :heartbeat
 
     @hub.reload
     assert @hub.alive?
