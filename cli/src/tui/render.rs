@@ -69,9 +69,9 @@ pub struct RenderContext<'a> {
     /// Used by the fallback renderer and as default for terminal widgets
     /// without explicit bindings.
     pub active_parser: Option<Arc<Mutex<Parser>>>,
-    /// Pool of VT100 parsers keyed by `(agent_index, pty_index)`.
+    /// Terminal panels keyed by `(agent_index, pty_index)`.
     /// Used by terminal widgets with explicit PTY bindings.
-    pub parser_pool: &'a std::collections::HashMap<(usize, usize), Arc<Mutex<Parser>>>,
+    pub panels: &'a std::collections::HashMap<(usize, usize), super::terminal_panel::TerminalPanel>,
     /// Index of the currently active PTY session (0 = first session).
     pub active_pty_index: usize,
     /// Current scroll offset for the active PTY.
@@ -231,8 +231,8 @@ pub(super) fn render_terminal_panel(
     };
 
     let parser = if binding.is_some() {
-        // Bound terminal: look up the specific parser from the pool
-        ctx.parser_pool.get(&(agent_idx, pty_idx)).cloned()
+        // Bound terminal: look up the parser from the panel
+        ctx.panels.get(&(agent_idx, pty_idx)).map(|p| Arc::clone(p.parser()))
     } else {
         // Unbound terminal (no agent selected): use the active parser
         ctx.active_parser.clone()
