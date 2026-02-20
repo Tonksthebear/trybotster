@@ -10,13 +10,15 @@
 -- NOTE: ActionCable protocol pings are handled automatically by the
 -- action_cable primitive (Rust). The 30s heartbeat here is application-
 -- level HubCommandChannel business logic, NOT protocol-level.
+--
+-- Hot-reload safe: connection, subscription, timer, and event listener
+-- are stored in hub.state so they survive reloads without orphaning.
 
+local state = require("hub.state")
 local Agent = require("lib.agent")
 
--- Table stores channel_id for use outside the callback (heartbeat, signal relay).
--- Inside the callback, channel_id is passed as the second argument by the primitive.
-local ch = {}
-local conn = nil
+-- Persistent handles across hot-reloads
+local handles = state.get("hub_commands.handles", {})
 
 -- Skip network connections in unit test mode (BOTSTER_ENV=test)
 if config.env("BOTSTER_ENV") == "test" then
@@ -24,12 +26,18 @@ if config.env("BOTSTER_ENV") == "test" then
     return {}
 end
 
--- Connect with E2E encryption enabled (transparent OlmEnvelope handling)
-conn = action_cable.connect({ crypto = true })
+-- Reuse existing connection or create a new one
+if not handles.conn then
+    handles.conn = action_cable.connect({ crypto = true })
+end
 
--- Subscribe to HubCommandChannel
--- The callback receives (message, channel_id) from the primitive.
-ch.hub = action_cable.subscribe(conn, "HubCommandChannel",
+-- Subscribe to HubCommandChannel (reuse existing or create new)
+-- The callback is always replaced on reload so routing logic stays current.
+if handles.channel then
+    action_cable.unsubscribe(handles.channel)
+end
+
+handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
     { hub_id = hub.server_id(), start_from = 0 },
     function(message, channel_id)
         local msg_type = message.type
@@ -93,45 +101,50 @@ ch.hub = action_cable.subscribe(conn, "HubCommandChannel",
     end
 )
 
--- Build agent list from Lua's agent registry (the source of truth).
--- Returns the format Rails expects: [{ session_key, last_invocation_url? }]
-local function agent_list()
-    local result = {}
-    for _, agent in ipairs(Agent.list()) do
-        result[#result + 1] = {
-            session_key = agent:agent_key(),
-            last_invocation_url = agent.invocation_url,
-        }
+-- Send heartbeat helper (used by timer)
+local function send_heartbeat()
+    if handles.channel then
+        action_cable.perform(handles.channel, "heartbeat", {})
     end
-    return result
 end
 
--- Send heartbeat helper (used by timer and agent lifecycle hooks)
-local function send_heartbeat()
-    if ch.hub then
-        action_cable.perform(ch.hub, "heartbeat", { agents = agent_list() })
-    end
+-- Cancel old heartbeat timer before creating a new one
+if handles.heartbeat_timer then
+    timer.cancel(handles.heartbeat_timer)
 end
 
 -- Application-level heartbeat (30s interval, 3 chances before 90s timeout)
--- This syncs agent status with Rails — NOT an ActionCable protocol heartbeat
-timer.every(30, send_heartbeat)
+-- Keeps the hub marked alive in Rails — NOT an ActionCable protocol heartbeat
+handles.heartbeat_timer = timer.every(30, send_heartbeat)
 
--- Immediately sync agent list when agents are created or deleted
-hooks.on("agent_created", "heartbeat_on_agent_created", function()
-    send_heartbeat()
-end)
-
-hooks.on("agent_deleted", "heartbeat_on_agent_deleted", function()
-    send_heartbeat()
-end)
+-- Unsubscribe old event listener before re-registering
+if handles.signal_event_sub then
+    events.off(handles.signal_event_sub)
+end
 
 -- Relay outgoing WebRTC signals (pre-encrypted by Rust) through ActionCable
-events.on("outgoing_signal", function(data)
-    if ch.hub then
-        action_cable.perform(ch.hub, "signal", data)
+handles.signal_event_sub = events.on("outgoing_signal", function(data)
+    if handles.channel then
+        action_cable.perform(handles.channel, "signal", data)
     end
 end)
 
+-- ============================================================================
+-- Module Interface
+-- ============================================================================
+
+local M = {}
+
+function M._before_reload()
+    -- Connection and subscription are stored in hub.state — no cleanup needed
+    -- here. The module top-level code unsubscribes/resubscribes the channel
+    -- and cancels/recreates the timer on reload.
+    log.info("hub_commands.lua reloading")
+end
+
+function M._after_reload()
+    log.info("hub_commands.lua reloaded")
+end
+
 log.info("Hub commands plugin loaded")
-return {}
+return M

@@ -110,9 +110,10 @@ function Client:handle_subscribe(msg)
     local agent_index = params.agent_index
     local pty_index = params.pty_index
 
-    log.debug(string.format("Subscribe: %s -> %s (agent=%s, pty=%s)",
-        sub_id:sub(1, 16), channel,
-        tostring(agent_index), tostring(pty_index)))
+    log.info(string.format("Subscribe: %s -> %s (peer=%s, agent=%s, pty=%s, rows=%s, cols=%s)",
+        sub_id:sub(1, 16), channel, self.peer_id:sub(1, 8),
+        tostring(agent_index), tostring(pty_index),
+        tostring(params.rows), tostring(params.cols)))
 
     -- Store subscription info
     self.subscriptions[sub_id] = {
@@ -146,8 +147,14 @@ function Client:handle_subscribe(msg)
         -- Register with pty_clients for dimension tracking.
         -- This resizes the PTY before the forwarder is created.
         if agent_index ~= nil and pty_index ~= nil then
-            pty_clients.register(agent_index, pty_index, self.peer_id,
-                params.rows or 24, params.cols or 80)
+            local rows = params.rows or 24
+            local cols = params.cols or 80
+            if rows < 2 or cols < 2 then
+                log.warn(string.format(
+                    "Suspicious terminal dimensions from %s: %dx%d (agent=%d, pty=%d)",
+                    self.peer_id:sub(1, 8), cols, rows, agent_index, pty_index))
+            end
+            pty_clients.register(agent_index, pty_index, self.peer_id, rows, cols)
         end
         self:setup_terminal_subscription(sub_id, agent_index, pty_index)
     elseif channel == "hub" then
@@ -304,6 +311,8 @@ function Client:handle_terminal_data(sub, command)
     if cmd_type == "resize" or command.command == "resize" then
         local rows = command.rows or 24
         local cols = command.cols or 80
+        log.info(string.format("Resize: peer=%s, agent=%d, pty=%d, %dx%d",
+            self.peer_id:sub(1, 8), agent_index, pty_index, cols, rows))
         pty_clients.update(agent_index, pty_index, self.peer_id, rows, cols)
     else
         log.debug(string.format("Unknown terminal command: %s", tostring(cmd_type)))

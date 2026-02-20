@@ -421,8 +421,11 @@ local function notify_existing_agent(agent, text)
     end
 end
 
+-- Track event subscriptions for cleanup on hot-reload
+local _event_subs = {}
+
 -- Handle command channel messages that create or delete agents.
-events.on("command_message", function(message)
+_event_subs[#_event_subs + 1] = events.on("command_message", function(message)
     if not message then return end
 
     local msg_type = message.type or message.command
@@ -467,7 +470,7 @@ end)
 --- Resume agent spawning after async worktree creation completes.
 -- Fired by Hub when spawn_blocking finishes the git worktree add.
 -- Carries all context needed to continue where handle_create_agent left off.
-events.on("worktree_created", function(info)
+_event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
     log.info(string.format("Worktree created for %s at %s, resuming agent spawn",
         info.branch, info.path))
 
@@ -504,7 +507,7 @@ end)
 
 --- Handle async worktree creation failure.
 -- Fired by Hub when the blocking git operation fails.
-events.on("worktree_create_failed", function(info)
+_event_subs[#_event_subs + 1] = events.on("worktree_create_failed", function(info)
     log.error(string.format("Async worktree creation failed for %s: %s",
         info.branch, info.error))
     notify_lifecycle(info.agent_key, "failed", { error = info.error })
@@ -521,6 +524,11 @@ local M = {
 
 -- Lifecycle hooks for hot-reload
 function M._before_reload()
+    -- Unsubscribe event listeners to prevent duplicate firing
+    for _, sub_id in ipairs(_event_subs) do
+        events.off(sub_id)
+    end
+    _event_subs = {}
     log.info("agents.lua reloading")
 end
 

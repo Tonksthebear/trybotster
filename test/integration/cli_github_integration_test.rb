@@ -47,6 +47,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       cli = start_cli_in_git_repo(@hub, timeout: 30)
 
       assert_message_acknowledged(message, timeout: 20)
+      assert_equal "acknowledged", message.reload.status
     end
   end
 
@@ -64,6 +65,8 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
         timeout: 15,
         message: -> { "Worktree directory should exist at #{expected_worktree}.\nCLI logs:\n#{cli.log_contents(lines: 50)}" }
       ) { File.directory?(expected_worktree) }
+
+      assert File.directory?(expected_worktree), "Worktree should exist at #{expected_worktree}"
     end
   end
 
@@ -88,6 +91,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       )
 
       assert_message_acknowledged(cleanup_message, timeout: 20)
+      assert_equal "acknowledged", cleanup_message.reload.status
     end
   end
 
@@ -102,6 +106,9 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       messages.each do |msg|
         assert_message_acknowledged(msg, timeout: 20)
       end
+
+      assert_equal 3, messages.count { |m| m.reload.status == "acknowledged" },
+        "All three messages should be acknowledged"
     end
   end
 

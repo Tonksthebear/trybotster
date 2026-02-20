@@ -509,7 +509,7 @@ where
         areas: &std::collections::HashMap<(usize, usize), (u16, u16)>,
     ) {
         for (&(agent_idx, pty_idx), &(rows, cols)) in areas {
-            if rows == 0 || cols == 0 {
+            if rows < 2 || cols == 0 {
                 continue;
             }
 
@@ -1424,7 +1424,7 @@ where
         // Also resize the fallback parser (used when no Lua layout is active)
         {
             let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-            parser.screen_mut().set_size(rows, cols);
+            parser.screen_mut().set_size(rows.max(2), cols);
         }
     }
 
@@ -1803,25 +1803,13 @@ where
         self.parser_pool.insert((index, pty_index), parser.clone());
         self.vt100_parser = parser;
 
-        // Subscribe to new PTY via Lua protocol
-        let sub_id = format!("tui:{}:{}", index, pty_index);
-        self.send_msg(serde_json::json!({
-            "type": "subscribe",
-            "channel": "terminal",
-            "subscriptionId": sub_id,
-            "params": {
-                "agent_index": index,
-                "pty_index": pty_index,
-            }
-        }));
-
-        // Update state
+        // Update state — sync_subscriptions() on the next render cycle
+        // handles the actual subscribe (with correct dimensions).
         self.selected_agent = Some(agent_id.to_string());
         self.current_agent_index = Some(index);
         self.current_pty_index = Some(pty_index);
         self.active_pty_index = pty_index;
-        self.current_terminal_sub_id = Some(sub_id);
-        self.active_subscriptions.insert((index, pty_index));
+        self.current_terminal_sub_id = Some(format!("tui:{}:{}", index, pty_index));
     }
 
 }
@@ -3421,25 +3409,17 @@ mod tests {
             "pty_index": 0,
         }));
 
-        // Verify: subscribe message sent for agent index 1
-        match request_rx.try_recv() {
-            Ok(req) => {
-                let msg = unwrap_lua_msg(req);
-                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
-                assert_eq!(msg.get("channel").and_then(|v| v.as_str()), Some("terminal"));
-                let params = msg.get("params").expect("should have params");
-                assert_eq!(params.get("agent_index").and_then(|v| v.as_u64()), Some(1));
-                assert_eq!(params.get("pty_index").and_then(|v| v.as_u64()), Some(0));
-            }
-            Err(_) => panic!("Expected subscribe message to be sent"),
-        }
+        // Verify: no subscribe message sent (deferred to sync_subscriptions)
+        assert!(
+            request_rx.try_recv().is_err(),
+            "focus_terminal should not send subscribe — sync_subscriptions handles it"
+        );
 
-        // Verify local state updated
+        // Verify local state updated (subscribe pending next render)
         assert_eq!(runner.selected_agent.as_deref(), Some("agent-1"));
         assert_eq!(runner.current_agent_index, Some(1));
         assert_eq!(runner.current_pty_index, Some(0));
         assert_eq!(runner.current_terminal_sub_id, Some("tui:1:0".to_string()));
-        assert!(runner.active_subscriptions.contains(&(1, 0)));
     }
 
     /// Verifies `focus_terminal` with nil agent_id clears selection.
@@ -3480,14 +3460,15 @@ mod tests {
         assert_eq!(runner.current_terminal_sub_id, None);
     }
 
-    /// Verifies `focus_terminal` sends unsubscribe then subscribe when switching.
+    /// Verifies `focus_terminal` sends unsubscribe when switching agents.
     ///
     /// # Scenario
     ///
-    /// When switching from one agent to another, the TUI must unsubscribe from
-    /// the current terminal before subscribing to the new one.
+    /// When switching from one agent to another, `focus_terminal` immediately
+    /// unsubscribes from the old terminal. The subscribe for the new one is
+    /// deferred to `sync_subscriptions` on the next render cycle.
     #[test]
-    fn test_focus_terminal_unsubscribes_then_subscribes() {
+    fn test_focus_terminal_unsubscribes_old_on_switch() {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: agent 0 selected with active subscription
@@ -3505,14 +3486,13 @@ mod tests {
             "pty_index": 0,
         }));
 
-        // Verify: first message is unsubscribe
+        // Verify: unsubscribe sent for old terminal
         match request_rx.try_recv() {
             Ok(req) => {
                 let msg = unwrap_lua_msg(req);
                 assert_eq!(
                     msg.get("type").and_then(|v| v.as_str()),
                     Some("unsubscribe"),
-                    "First message should be unsubscribe"
                 );
                 assert_eq!(
                     msg.get("subscriptionId").and_then(|v| v.as_str()),
@@ -3522,26 +3502,17 @@ mod tests {
             Err(_) => panic!("Expected unsubscribe message to be sent"),
         }
 
-        // Verify: second message is subscribe
-        match request_rx.try_recv() {
-            Ok(req) => {
-                let msg = unwrap_lua_msg(req);
-                assert_eq!(
-                    msg.get("type").and_then(|v| v.as_str()),
-                    Some("subscribe"),
-                    "Second message should be subscribe"
-                );
-                assert_eq!(msg.get("channel").and_then(|v| v.as_str()), Some("terminal"));
-            }
-            Err(_) => panic!("Expected subscribe message to be sent"),
-        }
+        // Verify: no subscribe sent (deferred to sync_subscriptions)
+        assert!(
+            request_rx.try_recv().is_err(),
+            "focus_terminal should not send subscribe"
+        );
 
-        // Verify state and active_subscriptions
+        // Verify state
         assert_eq!(runner.selected_agent.as_deref(), Some("agent-1"));
         assert_eq!(runner.current_agent_index, Some(1));
         assert_eq!(runner.current_terminal_sub_id, Some("tui:1:0".to_string()));
         assert!(!runner.active_subscriptions.contains(&(0, 0)), "Old sub should be removed");
-        assert!(runner.active_subscriptions.contains(&(1, 0)), "New sub should be added");
     }
 
     /// Verifies `focus_terminal` with unknown agent_id is a no-op.

@@ -18,12 +18,12 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to root_path
   end
 
-  test "index shows select a hub message when hubs exist" do
+  test "index shows hubs list when hubs exist" do
     sign_in @user
     get hubs_path
     assert_response :success
 
-    assert_select "h2", text: /Select a Hub/
+    assert_select "h2", text: /Hubs/
   end
 
   test "index shows empty state when no hubs" do

@@ -77,6 +77,15 @@ const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
 /// while keeping memory bounded by line count rather than raw bytes.
 pub(crate) const SHADOW_SCROLLBACK_LINES: usize = 5000;
 
+/// Minimum row count for vt100 parser to avoid col_wrap overflow panic.
+///
+/// vt100 0.16.2 has a bug where a 1-row grid causes `col_wrap()` to
+/// underflow (`prev_pos.row -= scrolled` where both are 0 and 1). This
+/// affects both `set_size()` and `Parser::new()`. Clamping to 2 rows
+/// avoids the impossible state while being functionally equivalent (a
+/// 1-row terminal is unusable anyway).
+pub(crate) const MIN_PARSER_ROWS: u16 = 2;
+
 /// Default broadcast channel capacity.
 ///
 /// This determines how many events can be buffered before slow receivers
@@ -262,7 +271,7 @@ impl PtySession {
             command_processor_handle: None,
             child: None,
             shadow_screen: Arc::new(Mutex::new(
-                vt100::Parser::new(rows, cols, SHADOW_SCROLLBACK_LINES),
+                vt100::Parser::new(rows.max(MIN_PARSER_ROWS), cols, SHADOW_SCROLLBACK_LINES),
             )),
             event_tx,
             command_tx,
@@ -664,18 +673,15 @@ impl PtySession {
         }
 
         // Keep shadow screen in sync with PTY dimensions.
-        // After set_size, reset the scroll region (DECSTBM) to prevent
-        // vt100 0.16.2 col_wrap panic: set_size can leave scroll_top ==
-        // scroll_bottom which is an invalid state that panics on the
-        // next line wrap. The PTY process will re-establish its own
-        // scroll region after receiving SIGWINCH.
+        // Clamp rows to MIN_PARSER_ROWS to avoid vt100 0.16.2 col_wrap
+        // panic: a 1-row grid causes `prev_pos.row -= scrolled` to
+        // underflow in Grid::col_wrap (grid.rs:683).
         {
             let mut parser = self
                 .shadow_screen
                 .lock()
                 .expect("shadow_screen lock poisoned");
-            parser.screen_mut().set_size(rows, cols);
-            parser.process(b"\x1b[r");
+            parser.screen_mut().set_size(rows.max(MIN_PARSER_ROWS), cols);
         }
 
         // Broadcast resize event
@@ -835,14 +841,13 @@ pub(crate) fn do_resize(
     }
 
     // Keep shadow screen in sync with PTY dimensions.
-    // Reset scroll region after set_size to prevent vt100 0.16.2
-    // col_wrap panic (see PtySession::resize for details).
+    // Clamp rows to MIN_PARSER_ROWS to avoid vt100 0.16.2 col_wrap
+    // panic (see PtySession::resize for details).
     {
         let mut parser = shadow_screen
             .lock()
             .expect("shadow_screen lock poisoned");
-        parser.screen_mut().set_size(rows, cols);
-        parser.process(b"\x1b[r");
+        parser.screen_mut().set_size(rows.max(MIN_PARSER_ROWS), cols);
     }
 
     // Broadcast resize event

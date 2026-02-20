@@ -17,9 +17,9 @@
 --
 -- Safety: Ctrl+Q is hardcoded in Rust and never reaches Lua.
 --
--- Modes:
---   normal  - Command mode. Single-key bindings available. No PTY forwarding.
---   insert  - PTY mode. Keys forward to terminal. Only modifier combos bound.
+-- Modes (automatic, not user-invoked):
+--   normal  - No agent selected. Keys swallowed unless bound.
+--   insert  - Agent selected. Unbound keys forward to PTY.
 
 local M = {}
 
@@ -39,15 +39,13 @@ local shared_bindings = {
   ["ctrl+r"]         = "refresh_agents",
 }
 
--- Normal mode: command mode, single-key bindings available
+-- Normal mode: no agent selected, only shared modifier bindings
 M.normal = {}
 for k, v in pairs(shared_bindings) do M.normal[k] = v end
-M.normal["i"] = "enter_insert_mode"
 
--- Insert mode: PTY forwarding, only modifier combos
+-- Insert mode: agent selected, PTY forwarding, only shared modifier bindings
 M.insert = {}
 for k, v in pairs(shared_bindings) do M.insert[k] = v end
--- Escape is NOT bound in insert mode — it forwards to PTY (vim, etc.)
 
 M.menu = {
   ["escape"]  = "close_modal",
@@ -143,6 +141,9 @@ function M.handle_key(key, mode, context)
     end
     if key == "space" then
       return { action = "input_char", char = " " }
+    end
+    if key == "shift+enter" then
+      return { action = "input_char", char = "\n" }
     end
     if #key == 1 then
       return { action = "input_char", char = key }

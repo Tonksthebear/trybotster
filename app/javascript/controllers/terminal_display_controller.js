@@ -137,6 +137,8 @@ export default class extends Controller {
       // Restore VT-driven mouse mode after disconnect override
       this.#restty?.setMouseMode("auto");
       this.#hideOverlay();
+      // Viewing the terminal clears any pending notification badge
+      this.#hubConn?.clearNotification(this.agentIndexValue);
     };
     this.#transport.onDisconnect = () => {
       this.#restty?.setMouseMode("off");
