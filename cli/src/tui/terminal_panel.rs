@@ -129,10 +129,13 @@ impl TerminalPanel {
         if self.state == PanelState::Idle {
             return;
         }
-        let mut p = self.parser.lock().expect("parser lock poisoned");
-        p.process(b"\x1b[H\x1b[2J\x1b[0m");
-        p.screen_mut().set_scrollback(0);
-        p.process(data);
+        // Replace the parser entirely so the old scrollback buffer is discarded.
+        // Escape sequences like \x1b[2J only clear the visible screen — they
+        // leave the scrollback buffer intact, causing duplication on reconnect.
+        let (rows, cols) = self.dims;
+        let mut fresh = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
+        fresh.process(data);
+        *self.parser.lock().expect("parser lock poisoned") = fresh;
         self.state = PanelState::Connected;
     }
 
