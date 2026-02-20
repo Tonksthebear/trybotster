@@ -7,10 +7,10 @@
 //!
 //! ```text
 //! TuiRunner (TUI thread)
-//! ├── parser_pool: HashMap<(agent, pty), Parser>  - per-PTY terminal emulation
+//! ├── panels: HashMap<(agent, pty), TerminalPanel>  - per-PTY state machines
 //! ├── vt100_parser: Arc<Mutex<Parser>>  - alias into pool for focused PTY
 //! ├── widget_states: WidgetStateStore  - persistent state for uncontrolled widgets
-//! ├── active_subscriptions: HashSet<(agent, pty)>  - synced from render tree
+//! │   (panels track their own subscription state + dimensions)
 //! ├── terminal: Terminal<CrosstermBackend>  - ratatui terminal
 //! ├── mode (shadow of Lua _tui_state.mode)  - for PTY routing
 //! ├── selected_agent, current_agent_index  - focus state
@@ -98,15 +98,16 @@ pub struct TuiRunner<B: Backend> {
     // === Terminal ===
     /// VT100 parser for the currently active PTY.
     ///
-    /// This is an Arc clone of the active entry in `parser_pool`, so writing
+    /// This is an Arc clone of the focused panel's parser, so writing
     /// to one updates both. Existing scroll/resize code uses this directly.
     pub(super) vt100_parser: Arc<Mutex<Parser>>,
 
-    /// Pool of VT100 parsers keyed by `(agent_index, pty_index)`.
+    /// Terminal panels keyed by `(agent_index, pty_index)`.
     ///
-    /// Each visible terminal widget can bind to a different parser.
-    /// Parsers are created on demand when PTY output arrives.
-    pub(super) parser_pool: std::collections::HashMap<(usize, usize), Arc<Mutex<Parser>>>,
+    /// Each panel owns a vt100 parser and tracks its connection state.
+    /// Panels are created on demand when PTY output arrives or focus
+    /// switches to a new `(agent, pty)` pair.
+    pub(super) panels: std::collections::HashMap<(usize, usize), crate::tui::terminal_panel::TerminalPanel>,
 
     /// Ratatui terminal for rendering.
     terminal: Terminal<B>,
@@ -156,20 +157,6 @@ pub struct TuiRunner<B: Backend> {
     /// Tracks which PTY subscription receives keyboard input and resize events.
     /// Uses the same subscription protocol as browser clients.
     pub(super) current_terminal_sub_id: Option<String>,
-
-    /// Set of `(agent_index, pty_index)` pairs with active Lua subscriptions.
-    ///
-    /// Maintained by `sync_subscriptions()` which diffs the desired bindings
-    /// (from the render tree) against this set, sending subscribe/unsubscribe
-    /// messages as needed. This enables Lua to declaratively control which
-    /// PTYs receive data without manual subscription management.
-    pub(super) active_subscriptions: std::collections::HashSet<(usize, usize)>,
-
-    /// Last known widget dimensions (rows, cols) for each terminal binding.
-    ///
-    /// Tracks the rendered area of each terminal widget so we can detect
-    /// when a PTY needs resizing (layout change, terminal resize, etc.).
-    pub(super) widget_dims: std::collections::HashMap<(usize, usize), (u16, u16)>,
 
     // === Output Channel ===
     /// Receiver for PTY output and Lua events from Hub.
@@ -341,7 +328,7 @@ where
 
         Self {
             vt100_parser,
-            parser_pool: std::collections::HashMap::new(),
+            panels: std::collections::HashMap::new(),
             terminal,
             mode: String::new(),
             connection_code: None,
@@ -352,8 +339,6 @@ where
             current_agent_index: None,
             current_pty_index: None,
             current_terminal_sub_id: None,
-            active_subscriptions: std::collections::HashSet::new(),
-            widget_dims: std::collections::HashMap::new(),
             output_rx,
             wake_fd,
             shutdown,
@@ -415,131 +400,95 @@ where
         Arc::clone(&self.vt100_parser)
     }
 
-    /// Resolve a parser from the pool by agent/PTY identity.
+    /// Resolve a panel by agent/PTY identity, creating one on demand.
     ///
-    /// If identity is `Some`, looks up or creates a parser in the pool.
-    /// If identity is `None`, falls back to `current_agent_index`/`current_pty_index`.
-    /// Creates parsers on demand with current terminal dimensions.
-    fn resolve_parser(
+    /// Falls back to `current_agent_index`/`current_pty_index` when `None`.
+    fn resolve_panel(
         &mut self,
         agent_index: Option<usize>,
         pty_index: Option<usize>,
-    ) -> Arc<Mutex<Parser>> {
+    ) -> &mut crate::tui::terminal_panel::TerminalPanel {
         let key = (
             agent_index.or(self.current_agent_index).unwrap_or(0),
             pty_index.or(self.current_pty_index).unwrap_or(0),
         );
         let (rows, cols) = self.terminal_dims;
-        self.parser_pool
+        self.panels
             .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK))))
-            .clone()
+            .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(rows, cols))
     }
 
-    /// Synchronize PTY subscriptions to match what the render tree needs.
+    /// Synchronize PTY subscriptions to match the render tree.
     ///
-    /// Walks the render tree, collects all `(agent_index, pty_index)` bindings
-    /// from terminal widgets, then diffs against `active_subscriptions`:
-    /// - **New pairs**: sends subscribe JSON, creates parser in pool
-    /// - **Removed pairs**: sends unsubscribe JSON, removes parser from pool
-    ///
-    /// This is the declarative reconciliation layer: Lua says "show these PTYs",
-    /// Rust ensures exactly those subscriptions are active. Called after each
-    /// successful Lua render.
+    /// Walks the render tree, collects desired `(agent_index, pty_index)`
+    /// bindings, then connects idle panels and disconnects panels no longer
+    /// in the tree. Panel state is the source of truth — no separate
+    /// `active_subscriptions` set.
     pub(super) fn sync_subscriptions(&mut self, tree: &super::render_tree::RenderNode) {
+        use crate::tui::terminal_panel::PanelState;
+
         let default_agent = self.current_agent_index.unwrap_or(0);
         let default_pty = self.current_pty_index.unwrap_or(0);
 
         let desired = super::render_tree::collect_terminal_bindings(tree, default_agent, default_pty);
 
-        // Subscribe to new pairs
+        // Connect panels for new bindings
         for &(agent_idx, pty_idx) in &desired {
-            if !self.active_subscriptions.contains(&(agent_idx, pty_idx)) {
-                // Use per-widget dims if known (from previous render), else full terminal dims.
-                let (rows, cols) = self.widget_dims
-                    .get(&(agent_idx, pty_idx))
-                    .copied()
-                    .unwrap_or(self.terminal_dims);
+            let (rows, cols) = self.terminal_dims;
+            let panel = self.panels
+                .entry((agent_idx, pty_idx))
+                .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(rows, cols));
 
-                let sub_id = format!("tui:{}:{}", agent_idx, pty_idx);
-                self.send_msg(serde_json::json!({
-                    "type": "subscribe",
-                    "channel": "terminal",
-                    "subscriptionId": sub_id,
-                    "params": {
-                        "agent_index": agent_idx,
-                        "pty_index": pty_idx,
-                        "rows": rows,
-                        "cols": cols,
-                    }
-                }));
-
-                // Ensure parser exists for this binding.
-                self.parser_pool
-                    .entry((agent_idx, pty_idx))
-                    .or_insert_with(|| Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK))));
+            if panel.state() == PanelState::Idle {
+                if let Some(msg) = panel.connect(agent_idx, pty_idx) {
+                    self.send_msg(msg);
+                }
             }
         }
 
-        // Unsubscribe from removed pairs
-        for &(agent_idx, pty_idx) in &self.active_subscriptions {
-            if !desired.contains(&(agent_idx, pty_idx)) {
-                let sub_id = format!("tui:{}:{}", agent_idx, pty_idx);
-                self.send_msg(serde_json::json!({
-                    "type": "unsubscribe",
-                    "subscriptionId": sub_id,
-                }));
+        // Disconnect panels not in desired set (skip the focused panel)
+        let focused = (
+            self.current_agent_index.unwrap_or(usize::MAX),
+            self.current_pty_index.unwrap_or(usize::MAX),
+        );
+        let to_disconnect: Vec<(usize, usize)> = self.panels.keys()
+            .filter(|k| !desired.contains(k) && **k != focused)
+            .copied()
+            .collect();
 
-                // Remove parser from pool (data no longer needed)
-                self.parser_pool.remove(&(agent_idx, pty_idx));
+        for (ai, pi) in to_disconnect {
+            if let Some(panel) = self.panels.get_mut(&(ai, pi)) {
+                if let Some(msg) = panel.disconnect(ai, pi) {
+                    self.send_msg(msg);
+                }
             }
+            // Remove idle panels to free memory
+            self.panels.remove(&(ai, pi));
         }
-
-        self.active_subscriptions = desired;
     }
 
-    /// Resize parsers and PTYs to match the actual rendered widget areas.
+    /// Resize panels to match actual rendered widget areas.
     ///
-    /// Called after each render pass. Compares the collected terminal widget
-    /// areas against the last known dimensions. For any that changed, resizes
-    /// both the vt100 parser (so output is interpreted correctly) and sends a
-    /// resize command to the PTY process (so programs like vim/less reflow).
+    /// Called after each render pass. Each panel tracks its own dimensions
+    /// and only sends a resize message when they change.
     pub(super) fn sync_widget_dims(
         &mut self,
         areas: &std::collections::HashMap<(usize, usize), (u16, u16)>,
     ) {
         for (&(agent_idx, pty_idx), &(rows, cols)) in areas {
-            if rows < 2 || cols == 0 {
-                continue;
-            }
-
-            let prev = self.widget_dims.get(&(agent_idx, pty_idx));
-            if prev == Some(&(rows, cols)) {
-                continue; // No change
-            }
-
-            self.widget_dims.insert((agent_idx, pty_idx), (rows, cols));
-
-            // Resize the parser
-            if let Some(parser) = self.parser_pool.get(&(agent_idx, pty_idx)) {
-                let mut p = parser.lock().expect("parser lock poisoned");
-                p.screen_mut().set_size(rows, cols);
-            }
-
-            // Send resize to the PTY process
-            let sub_id = format!("tui:{}:{}", agent_idx, pty_idx);
-            self.send_msg(serde_json::json!({
-                "subscriptionId": sub_id,
-                "data": {
-                    "type": "resize",
-                    "rows": rows,
-                    "cols": cols,
+            if let Some(panel) = self.panels.get_mut(&(agent_idx, pty_idx)) {
+                if let Some(msg) = panel.resize(rows, cols, agent_idx, pty_idx) {
+                    self.send_msg(msg);
                 }
-            }));
+            }
         }
 
-        // Clean up stale entries for bindings no longer rendered
-        self.widget_dims.retain(|k, _| areas.contains_key(k));
+        // Remove panels for bindings no longer rendered (except the focused one)
+        let focused = (
+            self.current_agent_index.unwrap_or(usize::MAX),
+            self.current_pty_index.unwrap_or(usize::MAX),
+        );
+        self.panels.retain(|k, _| areas.contains_key(k) || *k == focused);
     }
 
     /// Get the current mode string.
@@ -1388,7 +1337,7 @@ where
         // Drop the parser lock before writing Kitty sequences (which use execute!())
         drop(parser);
 
-        // Kitty keyboard protocol: only push when PTY wants it AND we're in Normal mode.
+        // Kitty keyboard protocol: only push when PTY wants it AND there's no overlay.
         // In modal modes (menu, input, etc.) we want traditional bytes for our keybindings.
         let desired_kitty = self.inner_kitty_enabled && !self.has_overlay;
         if desired_kitty != self.outer_kitty_enabled {
@@ -1417,9 +1366,10 @@ where
     fn handle_resize(&mut self, rows: u16, cols: u16) {
         self.terminal_dims = (rows, cols);
 
-        // Clear cached widget dims so the next render + sync_widget_dims will
-        // recompute and resize all parsers/PTYs to their actual widget areas.
-        self.widget_dims.clear();
+        // Invalidate cached dims so the next sync_widget_dims detects changes.
+        for panel in self.panels.values_mut() {
+            panel.invalidate_dims();
+        }
 
         // Also resize the fallback parser (used when no Lua layout is active)
         {
@@ -1440,13 +1390,18 @@ where
         for _ in 0..100 {
             match self.output_rx.try_recv() {
                 Ok(TuiOutput::Scrollback { agent_index, pty_index, data }) => {
-                    // Scrollback = fresh snapshot: clear existing content before
-                    // processing so the widget always starts from a clean state.
-                    let parser = self.resolve_parser(agent_index, pty_index);
-                    let mut p = parser.lock().expect("parser lock poisoned");
-                    p.process(b"\x1b[H\x1b[2J\x1b[0m");
-                    p.screen_mut().set_scrollback(0);
-                    p.process(&data);
+                    // Scrollback includes kitty push/pop state from snapshot.
+                    // Scan it so inner_kitty_enabled is correct after agent switch.
+                    let is_active = agent_index.unwrap_or(0) == self.current_agent_index.unwrap_or(0)
+                        && pty_index.unwrap_or(0) == self.current_pty_index.unwrap_or(0);
+                    if is_active {
+                        if let Some(kitty_state) = crate::agent::spawn::scan_kitty_keyboard_state(&data) {
+                            log::info!("Kitty keyboard state from scrollback: {}", kitty_state);
+                            self.inner_kitty_enabled = kitty_state;
+                        }
+                    }
+                    let panel = self.resolve_panel(agent_index, pty_index);
+                    panel.on_scrollback(&data);
                     log::debug!("Processed {} bytes of scrollback (fresh)", data.len());
                 }
                 Ok(TuiOutput::Output { agent_index, pty_index, data }) => {
@@ -1463,12 +1418,12 @@ where
                         pty_index.or(self.current_pty_index).unwrap_or(0),
                     );
                     log::debug!(
-                        "PTY output: agent={:?} pty={:?} -> pool key={:?}, {} bytes, pool_has={}",
+                        "PTY output: agent={:?} pty={:?} -> panel key={:?}, {} bytes, panel_exists={}",
                         agent_index, pty_index, key, data.len(),
-                        self.parser_pool.contains_key(&key)
+                        self.panels.contains_key(&key)
                     );
-                    let parser = self.resolve_parser(agent_index, pty_index);
-                    parser.lock().expect("parser lock poisoned").process(&data);
+                    let panel = self.resolve_panel(agent_index, pty_index);
+                    panel.on_output(&data);
                 }
                 Ok(TuiOutput::ProcessExited { exit_code, .. }) => {
                     log::info!("PTY process exited with code {:?}", exit_code);
@@ -1480,16 +1435,14 @@ where
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     log::debug!("PTY output channel disconnected");
-                    // Channel closed - Hub was dropped or terminated.
-                    // Unsubscribe from all active subscriptions.
-                    for &(agent_idx, pty_idx) in &self.active_subscriptions {
-                        let sub_id = format!("tui:{}:{}", agent_idx, pty_idx);
-                        self.send_msg(serde_json::json!({
-                            "type": "unsubscribe",
-                            "subscriptionId": sub_id,
-                        }));
+                    // Channel closed — disconnect all panels.
+                    let msgs: Vec<_> = self.panels.iter_mut()
+                        .filter_map(|(&(ai, pi), panel)| panel.disconnect(ai, pi))
+                        .collect();
+                    for msg in msgs {
+                        self.send_msg(msg);
                     }
-                    self.active_subscriptions.clear();
+                    self.panels.clear();
                     self.current_terminal_sub_id = None;
                     self.current_agent_index = None;
                     self.current_pty_index = None;
@@ -1564,7 +1517,7 @@ where
 
             // Terminal State - use TuiRunner's local parser
             active_parser: Some(self.parser_handle()),
-            parser_pool: &self.parser_pool,
+            panels: &self.panels,
             active_pty_index: self.active_pty_index,
             scroll_offset,
             is_scrolled,
@@ -1605,15 +1558,7 @@ where
 
         if let Some(ref result) = lua_result {
             // Sync subscriptions to match what the render tree declares
-            let bindings_before = self.active_subscriptions.clone();
             self.sync_subscriptions(&result.tree);
-            if self.active_subscriptions != bindings_before {
-                log::info!(
-                    "sync_subscriptions: {:?} -> {:?}, parser_pool keys: {:?}",
-                    bindings_before, self.active_subscriptions,
-                    self.parser_pool.keys().collect::<Vec<_>>()
-                );
-            }
 
             // Track overlay presence for input routing (PTY vs keybindings)
             self.has_overlay = result.overlay.is_some();
@@ -1750,14 +1695,12 @@ where
 
         // Clear selection if no agent_id
         let Some(agent_id) = agent_id else {
-            // Unsubscribe from current focused PTY
-            if let Some(ref sub_id) = self.current_terminal_sub_id {
-                self.send_msg(serde_json::json!({
-                    "type": "unsubscribe",
-                    "subscriptionId": sub_id,
-                }));
-                if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
-                    self.active_subscriptions.remove(&(ai, pi));
+            // Disconnect old panel
+            if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
+                if let Some(panel) = self.panels.get_mut(&(ai, pi)) {
+                    if let Some(msg) = panel.disconnect(ai, pi) {
+                        self.send_msg(msg);
+                    }
                 }
             }
             self.selected_agent = None;
@@ -1782,29 +1725,33 @@ where
             return;
         }
 
-        // Unsubscribe from current focused PTY
-        if let Some(ref sub_id) = self.current_terminal_sub_id {
-            self.send_msg(serde_json::json!({
-                "type": "unsubscribe",
-                "subscriptionId": sub_id,
-            }));
-            if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
-                self.active_subscriptions.remove(&(ai, pi));
+        // Disconnect old panel
+        if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
+            if let Some(panel) = self.panels.get_mut(&(ai, pi)) {
+                if let Some(msg) = panel.disconnect(ai, pi) {
+                    self.send_msg(msg);
+                }
             }
         }
 
-        // Replace the pool entry with a fresh parser so we don't render stale
-        // content while waiting for the snapshot to arrive from Hub.
-        let (rows, cols) = self.widget_dims
-            .get(&(index, pty_index))
-            .copied()
-            .unwrap_or(self.terminal_dims);
-        let parser = Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK)));
-        self.parser_pool.insert((index, pty_index), parser.clone());
-        self.vt100_parser = parser;
+        // Get or create the new panel — existing parser content is kept
+        // (stale content is better than a blank frame while waiting for scrollback).
+        let (rows, cols) = self.terminal_dims;
+        let panel = self.panels
+            .entry((index, pty_index))
+            .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(rows, cols));
 
-        // Update state — sync_subscriptions() on the next render cycle
-        // handles the actual subscribe (with correct dimensions).
+        // Subscribe IMMEDIATELY (no waiting for sync_subscriptions in render cycle)
+        let connect_msg = panel.connect(index, pty_index);
+
+        // Point vt100_parser alias at the panel's parser
+        self.vt100_parser = Arc::clone(panel.parser());
+
+        if let Some(msg) = connect_msg {
+            self.send_msg(msg);
+        }
+
+        // Update focus state
         self.selected_agent = Some(agent_id.to_string());
         self.current_agent_index = Some(index);
         self.current_pty_index = Some(pty_index);
@@ -3391,12 +3338,12 @@ mod tests {
     // Agent navigation now uses the Lua subscribe/unsubscribe protocol (fire-and-forget),
     // so tests use `create_test_runner()` and verify subscribe messages directly.
 
-    /// Verifies `focus_terminal` op subscribes and updates state.
+    /// Verifies `focus_terminal` op subscribes immediately and updates state.
     ///
     /// # Scenario
     ///
     /// Given 3 agents, `focus_terminal` with agent-1 should subscribe to
-    /// that agent's PTY and update all selection state.
+    /// that agent's PTY immediately and update all selection state.
     #[test]
     fn test_focus_terminal_subscribes_and_updates_state() {
         let (mut runner, mut request_rx) = create_test_runner();
@@ -3409,17 +3356,25 @@ mod tests {
             "pty_index": 0,
         }));
 
-        // Verify: no subscribe message sent (deferred to sync_subscriptions)
-        assert!(
-            request_rx.try_recv().is_err(),
-            "focus_terminal should not send subscribe — sync_subscriptions handles it"
-        );
+        // Verify: subscribe message sent immediately (no deferral)
+        match request_rx.try_recv() {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
+                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
+                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:1:0"));
+            }
+            Err(_) => panic!("Expected subscribe message"),
+        }
 
-        // Verify local state updated (subscribe pending next render)
+        // Verify local state updated
         assert_eq!(runner.selected_agent.as_deref(), Some("agent-1"));
         assert_eq!(runner.current_agent_index, Some(1));
         assert_eq!(runner.current_pty_index, Some(0));
         assert_eq!(runner.current_terminal_sub_id, Some("tui:1:0".to_string()));
+
+        // Verify panel created and in Connecting state
+        use crate::tui::terminal_panel::PanelState;
+        assert_eq!(runner.panels.get(&(1, 0)).unwrap().state(), PanelState::Connecting);
     }
 
     /// Verifies `focus_terminal` with nil agent_id clears selection.
@@ -3432,12 +3387,16 @@ mod tests {
     fn test_focus_terminal_nil_clears_selection() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Setup: agent 0 selected with active subscription
+        // Setup: agent 0 selected with active panel
         runner.selected_agent = Some("agent-0".to_string());
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
         runner.current_terminal_sub_id = Some("tui:0:0".to_string());
-        runner.active_subscriptions.insert((0, 0));
+        {
+            let panel = runner.panels.entry((0, 0))
+                .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(24, 80));
+            panel.connect(0, 0); // put in Connecting state
+        }
 
         // Action: focus_terminal with no agent_id (clear selection)
         runner.execute_focus_terminal(&serde_json::json!({
@@ -3460,23 +3419,26 @@ mod tests {
         assert_eq!(runner.current_terminal_sub_id, None);
     }
 
-    /// Verifies `focus_terminal` sends unsubscribe when switching agents.
+    /// Verifies `focus_terminal` sends unsubscribe for old and subscribe for new.
     ///
     /// # Scenario
     ///
     /// When switching from one agent to another, `focus_terminal` immediately
-    /// unsubscribes from the old terminal. The subscribe for the new one is
-    /// deferred to `sync_subscriptions` on the next render cycle.
+    /// unsubscribes from the old and subscribes to the new.
     #[test]
     fn test_focus_terminal_unsubscribes_old_on_switch() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Setup: agent 0 selected with active subscription
+        // Setup: agent 0 selected with active panel
         runner.selected_agent = Some("agent-0".to_string());
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
         runner.current_terminal_sub_id = Some("tui:0:0".to_string());
-        runner.active_subscriptions.insert((0, 0));
+        {
+            let panel = runner.panels.entry((0, 0))
+                .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(24, 80));
+            panel.connect(0, 0);
+        }
 
         // Action: focus agent-1 (Lua provides agent_index)
         runner.execute_focus_terminal(&serde_json::json!({
@@ -3490,29 +3452,30 @@ mod tests {
         match request_rx.try_recv() {
             Ok(req) => {
                 let msg = unwrap_lua_msg(req);
-                assert_eq!(
-                    msg.get("type").and_then(|v| v.as_str()),
-                    Some("unsubscribe"),
-                );
-                assert_eq!(
-                    msg.get("subscriptionId").and_then(|v| v.as_str()),
-                    Some("tui:0:0")
-                );
+                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("unsubscribe"));
+                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:0:0"));
             }
             Err(_) => panic!("Expected unsubscribe message to be sent"),
         }
 
-        // Verify: no subscribe sent (deferred to sync_subscriptions)
-        assert!(
-            request_rx.try_recv().is_err(),
-            "focus_terminal should not send subscribe"
-        );
+        // Verify: subscribe sent for new terminal (immediate, not deferred)
+        match request_rx.try_recv() {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
+                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
+                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:1:0"));
+            }
+            Err(_) => panic!("Expected subscribe message to be sent"),
+        }
 
         // Verify state
         assert_eq!(runner.selected_agent.as_deref(), Some("agent-1"));
         assert_eq!(runner.current_agent_index, Some(1));
         assert_eq!(runner.current_terminal_sub_id, Some("tui:1:0".to_string()));
-        assert!(!runner.active_subscriptions.contains(&(0, 0)), "Old sub should be removed");
+
+        use crate::tui::terminal_panel::PanelState;
+        assert_eq!(runner.panels.get(&(0, 0)).unwrap().state(), PanelState::Idle);
+        assert_eq!(runner.panels.get(&(1, 0)).unwrap().state(), PanelState::Connecting);
     }
 
     /// Verifies `focus_terminal` with unknown agent_id is a no-op.
@@ -3554,7 +3517,6 @@ mod tests {
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
         runner.current_terminal_sub_id = Some("tui:0:0".to_string());
-        runner.active_subscriptions.insert((0, 0));
 
         // Action: focus same agent+pty (Lua provides agent_index)
         runner.execute_focus_terminal(&serde_json::json!({
@@ -3571,22 +3533,25 @@ mod tests {
         );
     }
 
-    /// Verifies `focus_terminal` replaces pool entry with a fresh parser.
+    /// Verifies `focus_terminal` preserves existing parser content.
     ///
     /// # Scenario
     ///
-    /// When switching from agent-0 (which has existing content) to agent-1,
-    /// the parser for agent-1 should be blank — no stale content from a
-    /// previous subscription.
+    /// When switching to an agent that has stale content, the parser is
+    /// reused (not blanked). Stale content is visible until the scrollback
+    /// snapshot arrives, avoiding a blank frame.
     #[test]
-    fn test_focus_terminal_creates_fresh_parser() {
+    fn test_focus_terminal_preserves_stale_parser() {
         let (mut runner, _request_rx) = create_test_runner();
 
-        // Setup: pre-populate parser pool with stale content for agent 1
-        let (rows, cols) = runner.terminal_dims;
-        let stale_parser = Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK)));
-        stale_parser.lock().unwrap().process(b"stale content from previous session");
-        runner.parser_pool.insert((1, 0), stale_parser);
+        // Setup: pre-populate panel with stale content for agent 1.
+        // Panel must be Connected for on_output to be accepted, then
+        // disconnect so it's Idle when focus_terminal runs.
+        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        panel.connect(1, 0);
+        panel.on_scrollback(b"stale content from previous session");
+        panel.disconnect(1, 0);
+        runner.panels.insert((1, 0), panel);
 
         // Action: focus agent-1
         runner.execute_focus_terminal(&serde_json::json!({
@@ -3596,28 +3561,29 @@ mod tests {
             "pty_index": 0,
         }));
 
-        // Verify: parser is fresh (no stale content)
+        // Verify: stale content is preserved (not blanked)
         let parser = runner.vt100_parser.lock().unwrap();
         let contents = parser.screen().contents();
         assert!(
-            !contents.contains("stale"),
-            "Parser should be fresh after focus_terminal, got: {contents:?}"
+            contents.contains("stale"),
+            "Parser should preserve stale content, got: {contents:?}"
         );
     }
 
-    /// Verifies `focus_terminal` uses widget dims when available.
+    /// Verifies `focus_terminal` uses panel dims from previous render.
     ///
     /// # Scenario
     ///
-    /// When a terminal widget has been rendered at a specific size, the
-    /// fresh parser created on focus should use those dims, not the full
-    /// terminal dims.
+    /// When a panel already exists with known dimensions from a previous
+    /// render, the subscribe message uses those dims.
     #[test]
-    fn test_focus_terminal_uses_widget_dims() {
-        let (mut runner, _request_rx) = create_test_runner();
+    fn test_focus_terminal_uses_panel_dims() {
+        let (mut runner, mut request_rx) = create_test_runner();
 
-        // Setup: widget dims known from a previous render pass
-        runner.widget_dims.insert((1, 0), (20, 60));
+        // Setup: panel with known dims from a previous render
+        let panel = crate::tui::terminal_panel::TerminalPanel::new(20, 60);
+        // Panel was previously connected and disconnected (has dims)
+        runner.panels.insert((1, 0), panel);
 
         // Action: focus agent-1
         runner.execute_focus_terminal(&serde_json::json!({
@@ -3627,9 +3593,16 @@ mod tests {
             "pty_index": 0,
         }));
 
-        // Verify: parser has widget dims, not terminal dims
-        let parser = runner.vt100_parser.lock().unwrap();
-        assert_eq!(parser.screen().size(), (20, 60));
+        // Verify: subscribe uses the panel's dims (20x60), not terminal dims (24x80)
+        match request_rx.try_recv() {
+            Ok(req) => {
+                let msg = unwrap_lua_msg(req);
+                let params = msg.get("params").expect("should have params");
+                assert_eq!(params.get("rows").and_then(|v| v.as_u64()), Some(20));
+                assert_eq!(params.get("cols").and_then(|v| v.as_u64()), Some(60));
+            }
+            Err(_) => panic!("Expected subscribe message"),
+        }
     }
 
     /// Verifies scrollback event clears parser before processing snapshot.
@@ -3643,19 +3616,19 @@ mod tests {
     fn test_scrollback_clears_parser_before_processing() {
         let (mut runner, _request_rx) = create_test_runner();
 
-        // Setup: parser with existing content and scroll offset
-        let (rows, cols) = runner.terminal_dims;
-        let parser = Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK)));
+        // Setup: panel in Connecting state with existing content and scroll offset
+        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        panel.connect(0, 0); // Idle → Connecting (subscribe sent)
         {
-            let mut p = parser.lock().unwrap();
-            // Write enough lines to have scrollback
+            let p = panel.parser();
+            let mut p = p.lock().unwrap();
             for i in 0..30 {
                 p.process(format!("old line {i}\r\n").as_bytes());
             }
             p.screen_mut().set_scrollback(5);
             assert!(p.screen().scrollback() > 0, "precondition: scrolled");
         }
-        runner.parser_pool.insert((0, 0), parser);
+        runner.panels.insert((0, 0), panel);
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
 
@@ -3673,7 +3646,7 @@ mod tests {
         runner.poll_pty_events(None);
 
         // Verify: old content gone, scroll reset, new content present
-        let parser = runner.parser_pool.get(&(0, 0)).unwrap().lock().unwrap();
+        let parser = runner.panels.get(&(0, 0)).unwrap().parser().lock().unwrap();
         let contents = parser.screen().contents();
         assert!(
             !contents.contains("old line"),
@@ -3689,30 +3662,26 @@ mod tests {
         );
     }
 
-    /// Verifies `handle_resize()` sends resize through Lua terminal subscription
-    /// when connected to a PTY.
+    /// Verifies `handle_resize()` invalidates panel dims for next render.
     ///
     /// # Scenario
     ///
-    /// When terminal is resized to 40 rows x 120 cols with a PTY connected,
-    /// TuiRunner should:
-    /// 1. Update local `terminal_dims`
-    /// 2. Resize the fallback parser
-    /// 3. Clear `widget_dims` so next render triggers per-widget resize
-    /// 4. Send client-level resize via hub subscription
-    ///
-    /// Per-PTY resize is NOT sent here — it's deferred to `sync_widget_dims()`
-    /// after the next render pass, which knows the actual widget dimensions.
+    /// When terminal is resized, panel dims should be invalidated so
+    /// `sync_widget_dims` detects changes on the next render pass.
     #[test]
-    fn test_handle_resize_updates_local_state_and_clears_widget_dims() {
+    fn test_handle_resize_invalidates_panel_dims() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Set up connected state with active subscription and cached widget dims
+        // Set up connected state with a panel
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
         runner.current_terminal_sub_id = Some("tui:0:0".to_string());
-        runner.active_subscriptions.insert((0, 0));
-        runner.widget_dims.insert((0, 0), (24, 80));
+        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        panel.connect(0, 0);
+        runner.panels.insert((0, 0), panel);
+
+        // Drain the subscribe message
+        let _ = request_rx.try_recv();
 
         // Action: resize to 40 rows x 120 cols
         runner.handle_resize(40, 120);
@@ -3723,8 +3692,8 @@ mod tests {
         // Verify: local state updated
         assert_eq!(runner.terminal_dims, (40, 120));
 
-        // Verify: widget_dims cleared so next render triggers per-PTY resize
-        assert!(runner.widget_dims.is_empty());
+        // Verify: panel dims invalidated (will trigger resize on next render)
+        assert_eq!(runner.panels.get(&(0, 0)).unwrap().dims(), (0, 0));
     }
 
     /// Verifies `handle_resize()` updates state without sending messages
@@ -3792,15 +3761,15 @@ mod tests {
     }
 
     fn make_test_render_context() -> super::super::render::RenderContext<'static> {
-        // 'static requires leaked reference for the empty pool
-        let pool: &'static std::collections::HashMap<(usize, usize), std::sync::Arc<std::sync::Mutex<vt100::Parser>>> =
+        // 'static requires leaked reference for the empty panels map
+        let panels: &'static std::collections::HashMap<(usize, usize), crate::tui::terminal_panel::TerminalPanel> =
             Box::leak(Box::new(std::collections::HashMap::new()));
         super::super::render::RenderContext {
             error_message: None,
             connection_code: None,
             bundle_used: false,
             active_parser: None,
-            parser_pool: pool,
+            panels,
             active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
@@ -3852,8 +3821,8 @@ mod tests {
             Err(_) => panic!("Expected subscribe message"),
         }
 
-        assert!(runner.active_subscriptions.contains(&(0, 0)));
-        assert!(runner.parser_pool.contains_key(&(0, 0)));
+        use crate::tui::terminal_panel::PanelState;
+        assert_eq!(runner.panels.get(&(0, 0)).unwrap().state(), PanelState::Connecting);
     }
 
     /// Verifies `sync_subscriptions` unsubscribes when a binding is removed.
@@ -3864,9 +3833,17 @@ mod tests {
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
 
-        // Pre-populate active subscriptions for two PTYs
-        runner.active_subscriptions.insert((0, 0));
-        runner.active_subscriptions.insert((0, 1));
+        // Pre-populate panels for two PTYs (both connected)
+        {
+            let mut p0 = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+            p0.connect(0, 0);
+            runner.panels.insert((0, 0), p0);
+            let mut p1 = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+            p1.connect(0, 1);
+            runner.panels.insert((0, 1), p1);
+        }
+        // Drain subscribe messages
+        while request_rx.try_recv().is_ok() {}
 
         // Tree only has terminal for PTY 0 — PTY 1 should be unsubscribed
         let tree = crate::tui::render_tree::RenderNode::Widget {
@@ -3895,18 +3872,27 @@ mod tests {
         }
         assert!(found_unsubscribe, "Should send unsubscribe for removed binding");
 
-        assert!(runner.active_subscriptions.contains(&(0, 0)));
-        assert!(!runner.active_subscriptions.contains(&(0, 1)));
+        // Panel (0, 0) still exists, (0, 1) removed
+        assert!(runner.panels.contains_key(&(0, 0)));
+        assert!(!runner.panels.contains_key(&(0, 1)));
     }
 
-    /// Verifies `sync_subscriptions` is idempotent for unchanged bindings.
+    /// Verifies `sync_subscriptions` is idempotent for already-connected panels.
     #[test]
     fn test_sync_subscriptions_no_change_idempotent() {
         let (mut runner, mut request_rx) = create_test_runner();
 
         runner.current_agent_index = Some(0);
         runner.current_pty_index = Some(0);
-        runner.active_subscriptions.insert((0, 0));
+
+        // Pre-populate with a connected panel
+        {
+            let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+            panel.connect(0, 0);
+            runner.panels.insert((0, 0), panel);
+        }
+        // Drain subscribe message
+        while request_rx.try_recv().is_ok() {}
 
         let tree = crate::tui::render_tree::RenderNode::Widget {
             widget_type: crate::tui::render_tree::WidgetType::Terminal,
@@ -3923,12 +3909,12 @@ mod tests {
 
         runner.sync_subscriptions(&tree);
 
-        // No messages should be sent (already subscribed)
+        // No messages should be sent (already connected)
         assert!(
             request_rx.try_recv().is_err(),
             "No messages should be sent when subscriptions unchanged"
         );
-        assert_eq!(runner.active_subscriptions.len(), 1);
+        assert_eq!(runner.panels.len(), 1);
     }
 
     // =========================================================================

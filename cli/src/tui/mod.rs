@@ -43,6 +43,7 @@ pub mod runner;
 mod runner_handlers;
 pub mod screen;
 pub mod scroll;
+pub mod terminal_panel;
 pub mod widget_state;
 
 #[doc(inline)]
