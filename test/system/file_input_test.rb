@@ -33,7 +33,7 @@ class FileInputTest < ApplicationSystemTestCase
     # Create an agent so we have a terminal to receive the file
     create_agent_via_ui
 
-    # Navigate to agent page — waits for terminal to connect
+    # Navigate to agent page
     first("[data-agent-list-target='list'] a[href*='/agents/']", wait: 15).click
     find("[data-controller='terminal-display']", wait: 15)
 
@@ -42,7 +42,9 @@ class FileInputTest < ApplicationSystemTestCase
     page.execute_script("document.body.insertAdjacentHTML('beforeend', '<input type=\"file\" id=\"test-file-input\">')")
     attach_file("test-file-input", fixture_path.to_s, make_visible: true)
 
-    # Send the file via the TerminalConnection (correctly routes with sub_id terminal_0_0)
+    # Send via TerminalConnection (not HubConnection — correct sub_id routing).
+    # Capybara's .drop() doesn't work here because Chrome's synthetic DragEvent
+    # doesn't populate dataTransfer.files. We use attach_file + sendFile instead.
     result = page.driver.browser.execute_async_script(<<~JS, @hub.id.to_s)
       var done = arguments[arguments.length - 1];
       var hubId = arguments[0];
@@ -50,10 +52,9 @@ class FileInputTest < ApplicationSystemTestCase
       (async function() {
         try {
           var { ConnectionManager } = await import("connections/connection_manager");
-
           var key = "terminal:" + hubId + ":0:0";
 
-          // Wait for the TerminalConnection to be created by terminal_display_controller
+          // Wait for TerminalConnection to be created by terminal_display_controller
           var conn = null;
           for (var i = 0; i < 50; i++) {
             conn = ConnectionManager.get(key);
@@ -61,13 +62,9 @@ class FileInputTest < ApplicationSystemTestCase
             conn = null;
             await new Promise(r => setTimeout(r, 200));
           }
-          if (!conn) {
-            done("error: TerminalConnection not ready after 10s");
-            return;
-          }
+          if (!conn) { done("error: TerminalConnection not ready"); return; }
 
-          var input = document.getElementById("test-file-input");
-          var file = input.files[0];
+          var file = document.getElementById("test-file-input").files[0];
           if (!file) { done("error: No file attached"); return; }
 
           var buffer = await file.arrayBuffer();
@@ -127,17 +124,12 @@ class FileInputTest < ApplicationSystemTestCase
   end
 
   def create_agent_via_ui
-    # Open the new agent dialog
     find("#new-agent-modal", visible: :all)
     page.execute_script("document.getElementById('new-agent-modal').showModal()")
 
-    # Step 1: Select main branch
     find("[data-action='new-agent-form#selectMainBranch']", wait: 10).click
-
-    # Step 2: Start agent (no prompt needed)
     find("[data-action='new-agent-form#submit']", wait: 10).click
 
-    # Wait for agent to appear in the list
     assert_selector "[data-agent-list-target='list'] [data-agent-id]", wait: 30
   end
 end
