@@ -146,13 +146,8 @@ impl Hub {
                 if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
                     let failures = channel.decrypt_failure_count();
                     if failures >= 3 {
-                        log::warn!(
-                            "[WebRTC] {} consecutive decryption failures for {}, initiating ratchet restart",
-                            failures,
-                            &browser_identity[..browser_identity.len().min(8)]
-                        );
                         channel.reset_decrypt_failures();
-                        self.send_ratchet_restart(&browser_identity);
+                        self.try_ratchet_restart(&browser_identity);
                     }
                 }
             }
@@ -362,15 +357,7 @@ impl Hub {
                         }
                     }
                     HubRequest::RatchetRestart { browser_identity } => {
-                        let olm_key = crate::relay::extract_olm_key(&browser_identity).to_string();
-                        if !self.ratchet_restarted_peers.contains(&olm_key) {
-                            log::warn!(
-                                "[Lua] Signaling decrypt failed for {}, initiating ratchet restart",
-                                &browser_identity[..browser_identity.len().min(8)]
-                            );
-                            self.send_ratchet_restart(&browser_identity);
-                            self.ratchet_restarted_peers.insert(olm_key);
-                        }
+                        self.try_ratchet_restart(&browser_identity);
                     }
                 }
             }
@@ -910,13 +897,8 @@ impl Hub {
             if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
                 let failures = channel.decrypt_failure_count();
                 if failures >= 3 {
-                    log::warn!(
-                        "[WebRTC] {} consecutive decryption failures for {}, initiating ratchet restart",
-                        failures,
-                        &browser_identity[..browser_identity.len().min(8)]
-                    );
                     channel.reset_decrypt_failures();
-                    self.send_ratchet_restart(&browser_identity);
+                    self.try_ratchet_restart(&browser_identity);
                 }
             }
         }
@@ -940,6 +922,34 @@ impl Hub {
                     }
                 }
             }
+        }
+    }
+
+    /// Attempt a ratchet restart, deduplicating by both Olm key and tab ID.
+    ///
+    /// Prevents cascading restarts when the same browser device reconnects
+    /// with a new Olm identity (new account after bundle refresh) but the
+    /// same tab/session UUID.
+    fn try_ratchet_restart(&mut self, browser_identity: &str) {
+        let olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
+        let tab_id = browser_identity
+            .split_once(':')
+            .map(|(_, id)| id.to_string());
+        let already_restarted = self.ratchet_restarted_peers.contains(&olm_key)
+            || tab_id
+                .as_ref()
+                .is_some_and(|id| self.ratchet_restarted_peers.contains(id));
+        if already_restarted {
+            return;
+        }
+        log::warn!(
+            "[RatchetRestart] Initiating restart for {}",
+            &browser_identity[..browser_identity.len().min(8)]
+        );
+        self.send_ratchet_restart(browser_identity);
+        self.ratchet_restarted_peers.insert(olm_key);
+        if let Some(id) = tab_id {
+            self.ratchet_restarted_peers.insert(id);
         }
     }
 
