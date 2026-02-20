@@ -1,0 +1,48 @@
+<% hubs.each do |hub| %>
+  <%= link_to hub_path(hub),
+      class: "#{dom_id(hub, :dashboard)} group relative block rounded-xl border border-zinc-800/80 bg-zinc-900/40 hover:bg-zinc-900/80 hover:border-zinc-700/60 transition-all duration-200",
+      data: { active: hub.active?, hub_id: hub.id } do %>
+    <div class="px-5 py-4">
+      <div class="flex items-start justify-between gap-3 mb-3">
+        <div class="flex items-center gap-3 min-w-0">
+          <div class="shrink-0 size-10 rounded-lg flex items-center justify-center transition-colors
+                      group-data-[active=true]:bg-primary-500/10 bg-zinc-800/80">
+            <%= icon "command-line", class: "size-5 group-data-[active=true]:text-primary-400 text-zinc-600 transition-colors" %>
+          </div>
+          <div class="min-w-0">
+            <h3 class="text-sm font-semibold text-zinc-200 group-hover:text-zinc-50 truncate transition-colors"><%= hub.name %></h3>
+            <p class="text-xs text-zinc-600 font-mono truncate mt-0.5"><%= hub.identifier.truncate(28) %></p>
+          </div>
+        </div>
+        <div class="shrink-0 flex items-center gap-1.5 mt-1">
+          <span class="size-2 rounded-full group-data-[active=true]:bg-success-500 group-data-[active=true]:shadow-[0_0_6px_var(--color-success-500)] bg-zinc-700 transition-colors"></span>
+          <span class="text-[11px] font-medium group-data-[active=true]:text-success-400 text-zinc-600 transition-colors">
+            <%= hub.active? ? "Online" : "Offline" %>
+          </span>
+        </div>
+      </div>
+      <div class="flex items-center gap-4 text-[11px] text-zinc-600">
+        <% if hub.device %>
+          <span class="flex items-center gap-1">
+            <%= icon "device-phone-mobile", class: "size-3" %>
+            <%= hub.device.name %>
+          </span>
+        <% end %>
+        <% if hub.last_seen_at %>
+          <span class="flex items-center gap-1 ml-auto">
+            <%= icon "clock", class: "size-3" %>
+            <%= time_ago_in_words(hub.last_seen_at) %> ago
+          </span>
+        <% end %>
+      </div>
+    </div>
+    <%# Hover arrow %>
+    <div class="absolute right-4 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity">
+      <%= icon "chevron-right", class: "size-5 text-zinc-600" %>
+    </div>
+  <% end %>
+<% end %>
+
+<% if hubs.empty? %>
+  <p class="px-2 py-6 text-center text-xs text-zinc-600">No hubs connected</p>
+<% end %>

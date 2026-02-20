@@ -269,28 +269,6 @@ class HubTest < ActiveSupport::TestCase
     assert_not_includes result, hub_without_device
   end
 
-  test "sync_agents creates and removes agents" do
-    hub = Hub.create!(
-      user: @user,
-      identifier: SecureRandom.uuid,
-      last_seen_at: Time.current
-    )
-    hub.hub_agents.create!(session_key: "old-agent")
-
-    hub.sync_agents([
-      { session_key: "new-agent-1" },
-      { session_key: "new-agent-2", last_invocation_url: "https://example.com" }
-    ])
-
-    hub.reload
-    assert_equal 2, hub.hub_agents.count
-    assert_nil hub.hub_agents.find_by(session_key: "old-agent")
-    assert_not_nil hub.hub_agents.find_by(session_key: "new-agent-1")
-
-    agent2 = hub.hub_agents.find_by(session_key: "new-agent-2")
-    assert_equal "https://example.com", agent2.last_invocation_url
-  end
-
   test "next_message_sequence! increments atomically" do
     hub = Hub.create!(
       user: @user,
@@ -333,14 +311,15 @@ class HubTest < ActiveSupport::TestCase
     end
   end
 
-  test "hubs list broadcast targets both sidebars" do
+  test "hubs list broadcast targets sidebar and dashboard" do
     streams = capture_turbo_stream_broadcasts [ @user, :hubs ] do
       Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current)
     end
 
-    update_stream = streams.find { |s| s["action"] == "update" }
-    assert_not_nil update_stream, "Expected an update broadcast"
-    assert_equal ".hubs-list", update_stream["targets"]
+    update_streams = streams.select { |s| s["action"] == "update" }
+    targets = update_streams.map { |s| s["targets"] }
+    assert_includes targets, ".hubs-list", "Expected sidebar broadcast"
+    assert_includes targets, ".hubs-dashboard", "Expected dashboard broadcast"
   end
 
   test "destroying hub broadcasts health offline" do
@@ -370,22 +349,4 @@ class HubTest < ActiveSupport::TestCase
     end
   end
 
-  # ==========================================================================
-  # Associations
-  # ==========================================================================
-
-  test "destroying hub destroys associated hub_agents" do
-    hub = Hub.create!(
-      user: @user,
-      identifier: SecureRandom.uuid,
-      last_seen_at: Time.current
-    )
-    agent = hub.hub_agents.create!(
-      session_key: "owner-repo-123",
-      last_invocation_url: "https://github.com/owner/repo/issues/123"
-    )
-
-    hub.destroy
-    assert_raises(ActiveRecord::RecordNotFound) { agent.reload }
-  end
 end

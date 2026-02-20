@@ -11,7 +11,7 @@ class HubsController < ApplicationController
   # GET /hubs
   # Dashboard showing list of hubs with health status
   def index
-    @hubs = current_user.hubs.active.includes(:device, :hub_agents)
+    @hubs = current_user.hubs.includes(:device).order(last_seen_at: :desc)
   end
 
   # GET /hubs/:id
@@ -91,8 +91,6 @@ class HubsController < ApplicationController
     end
 
     if Current.hub.save
-      Current.hub.sync_agents(params[:agents] || [])
-
       render json: { success: true, hub_id: Current.hub.id, e2e_enabled: Current.hub.e2e_enabled? }
     else
       render json: { error: Current.hub.errors.full_messages.join(", ") }, status: :unprocessable_entity

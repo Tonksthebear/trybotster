@@ -142,24 +142,6 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_operator hub.last_seen_at, :>, old_last_seen
   end
 
-  test "PUT /hubs/:id syncs agents" do
-    hub = hubs(:active_hub)
-
-    put hub_url(hub),
-      params: {
-        agents: [
-          { session_key: "session-123", last_invocation_url: "https://github.com/owner/repo/issues/42" },
-          { session_key: "session-456" }
-        ]
-      }.to_json,
-      headers: auth_headers_for(:jason)
-
-    assert_response :ok
-
-    hub.reload
-    assert_equal 2, hub.hub_agents.count
-  end
-
   test "PUT /hubs/:id associates device when device_id provided" do
     device = users(:jason).devices.create!(
       device_type: "cli",
