@@ -59,10 +59,6 @@ class HubCommandChannel < ApplicationCable::Channel
   def heartbeat(data)
     @hub.update!(alive: true, last_seen_at: Time.current)
 
-    if data.key?("agents")
-      @hub.sync_agents(data["agents"])
-    end
-
     Rails.logger.debug "[HubCommandChannel] Heartbeat from hub=#{@hub.id}"
   end
 

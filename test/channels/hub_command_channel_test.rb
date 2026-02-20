@@ -164,36 +164,6 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
     assert @hub.last_seen_at > 1.minute.ago
   end
 
-  test "heartbeat syncs agent list" do
-    subscribe hub_id: @hub.id
-
-    perform :heartbeat, agents: [
-      { session_key: "owner-repo-42", last_invocation_url: "https://github.com/owner/repo/issues/42" },
-      { session_key: "owner-repo-99" }
-    ]
-
-    @hub.reload
-    assert_equal 2, @hub.hub_agents.count
-
-    agent42 = @hub.hub_agents.find_by(session_key: "owner-repo-42")
-    assert_not_nil agent42
-    assert_equal "https://github.com/owner/repo/issues/42", agent42.last_invocation_url
-
-    agent99 = @hub.hub_agents.find_by(session_key: "owner-repo-99")
-    assert_not_nil agent99
-  end
-
-  test "heartbeat removes agents no longer reported" do
-    @hub.hub_agents.create!(session_key: "stale-agent")
-
-    subscribe hub_id: @hub.id
-    perform :heartbeat, agents: [ { session_key: "active-agent" } ]
-
-    @hub.reload
-    assert_equal 1, @hub.hub_agents.count
-    assert_equal "active-agent", @hub.hub_agents.first.session_key
-  end
-
   # === Signal Action Tests ===
 
   test "signal relays envelope to browser-specific stream" do

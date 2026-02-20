@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_02_19_065753) do
+ActiveRecord::Schema[8.1].define(version: 2026_02_20_041932) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -140,20 +140,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_19_065753) do
     t.index ["status"], name: "index_github_messages_on_status"
   end
 
-  create_table "hub_agents", force: :cascade do |t|
-    t.datetime "created_at", null: false
-    t.bigint "hub_id", null: false
-    t.string "last_invocation_url"
-    t.string "session_key", null: false
-    t.datetime "tunnel_connected_at"
-    t.datetime "tunnel_last_request_at"
-    t.integer "tunnel_port"
-    t.string "tunnel_status", default: "disconnected"
-    t.datetime "updated_at", null: false
-    t.index ["hub_id", "session_key"], name: "index_hub_agents_on_hub_id_and_session_key", unique: true
-    t.index ["hub_id"], name: "index_hub_agents_on_hub_id"
-  end
-
   create_table "hub_commands", force: :cascade do |t|
     t.datetime "acknowledged_at"
     t.datetime "created_at", null: false
@@ -248,7 +234,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_19_065753) do
   add_foreign_key "device_authorizations", "users"
   add_foreign_key "device_tokens", "devices"
   add_foreign_key "devices", "users"
-  add_foreign_key "hub_agents", "hubs"
   add_foreign_key "hub_commands", "hubs"
   add_foreign_key "hubs", "devices"
   add_foreign_key "hubs", "users"

@@ -3,7 +3,6 @@
 class Hub < ApplicationRecord
   belongs_to :user
   belongs_to :device, optional: true  # The CLI device running this hub
-  has_many :hub_agents, dependent: :destroy
   has_many :hub_commands, dependent: :destroy
 
   validates :identifier, presence: true, uniqueness: true
@@ -33,31 +32,6 @@ class Hub < ApplicationRecord
     read_attribute(:name).presence || device&.name || identifier.truncate(20)
   end
 
-  # Synchronize hub_agents with data from CLI heartbeat.
-  # Removes agents not in the list, creates/updates those present.
-  # @param agents_data [Array<Hash>, ActionController::Parameters] Agent data from CLI
-  def sync_agents(agents_data)
-    agents_array = normalize_agents_data(agents_data)
-    session_keys = agents_array.filter_map { |a| a[:session_key] || a["session_key"] }
-
-    # Remove agents no longer reported by CLI
-    hub_agents.where.not(session_key: session_keys).destroy_all
-
-    # Create or update agents (retry on unique constraint race)
-    agents_array.each do |agent_data|
-      session_key = agent_data[:session_key] || agent_data["session_key"]
-      next if session_key.blank?
-
-      url = agent_data[:last_invocation_url] || agent_data["last_invocation_url"]
-      hub_agents
-        .create_with(last_invocation_url: url)
-        .find_or_create_by!(session_key: session_key)
-        .then { |agent| agent.update!(last_invocation_url: url) if url.present? && agent.last_invocation_url != url }
-    rescue ActiveRecord::RecordNotUnique
-      retry
-    end
-  end
-
   # Atomically increment and return the next message sequence number.
   # Uses row-level locking for safe concurrent access.
   def next_message_sequence!
@@ -68,10 +42,6 @@ class Hub < ApplicationRecord
   end
 
   private
-
-  def normalize_agents_data(data)
-    data.is_a?(ActionController::Parameters) ? data.values : Array(data)
-  end
 
   def broadcast_redirect_to_hub
     Turbo::StreamsChannel.broadcast_action_to(
@@ -84,11 +54,20 @@ class Hub < ApplicationRecord
   end
 
   def broadcast_hubs_list
+    hubs = user.hubs.includes(:device).order(last_seen_at: :desc)
+
     Turbo::StreamsChannel.broadcast_update_to(
       [ user, :hubs ],
       targets: ".hubs-list",
       partial: "layouts/sidebar_hubs",
-      locals: { hubs: user.hubs.includes(:device).order(last_seen_at: :desc) }
+      locals: { hubs: hubs }
+    )
+
+    Turbo::StreamsChannel.broadcast_update_to(
+      [ user, :hubs ],
+      targets: ".hubs-dashboard",
+      partial: "hubs/index_hubs",
+      locals: { hubs: hubs }
     )
   rescue => e
     Rails.logger.warn "Failed to broadcast hubs list: #{e.message}"
