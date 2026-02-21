@@ -1,62 +1,59 @@
-//! TUI Runner - independent TUI thread with its own event loop.
+//! TUI Runner - thin event loop wiring subsystems together.
 //!
-//! The TuiRunner owns all TUI state and runs in its own thread, communicating
-//! with the Hub via channels. This isolates terminal handling from hub logic.
+//! The TuiRunner is the message bus for the TUI thread. It owns subsystems
+//! as fields and wires them together in a poll → process → render loop.
+//! Subsystems are pure state machines — only the runner touches I/O channels.
 //!
 //! # Architecture
 //!
 //! ```text
-//! TuiRunner (TUI thread)
-//! ├── panels: HashMap<(agent, pty), TerminalPanel>  - per-PTY state machines
-//! ├── vt100_parser: Arc<Mutex<Parser>>  - alias into pool for focused PTY
-//! ├── widget_states: WidgetStateStore  - persistent state for uncontrolled widgets
-//! │   (panels track their own subscription state + dimensions)
-//! ├── terminal: Terminal<CrosstermBackend>  - ratatui terminal
-//! ├── mode (shadow of Lua _tui_state.mode)  - for PTY routing
-//! ├── selected_agent, current_agent_index  - focus state
-//! ├── request_tx  - send requests to Hub
-//! └── output_rx  - receive PTY output and Lua events from Hub
+//! TuiRunner (the bus)
+//!   ├── PanelPool        — owns terminal panels, focus state, subscriptions
+//!   ├── TerminalModes    — mirrors DECCKM/bracketed paste/kitty to outer terminal
+//!   ├── HotReloader      — watches filesystem, reloads Lua state in-place
+//!   ├── WidgetStateStore — persistent state for uncontrolled widgets
+//!   ├── request_tx       — sends messages to Hub (only I/O point)
+//!   └── output_rx        — receives PTY output and Lua events from Hub
 //! ```
 //!
 //! # Event Loop
 //!
-//! The TuiRunner event loop:
-//! 1. Polls for keyboard/mouse input
-//! 2. Polls for PTY output and Lua events (via Hub output channel)
-//! 3. Renders the UI
+//! ```text
+//! while !quit {
+//!     poll_input(lua);              // keyboard/mouse → Lua → TuiAction/ops
+//!     poll_pty_events(lua);         // Hub output → panel_pool
+//!     terminal_modes.sync(panel);   // mirror PTY modes to outer terminal
+//!     if hot_reloader.poll(lua) { dirty = true; }
+//!     if dirty { render(lua); }
+//!     poll_wait();                  // block until next event
+//! }
+//! ```
 //!
-//! All communication with Hub is non-blocking via channels.
+//! # Subsystem Communication
 //!
-//! # Running with Hub
-//!
-//! Use [`run_with_hub`] to run the TUI alongside a Hub. This spawns
-//! TuiRunner in a dedicated thread while the main thread runs Hub
-//! operations.
-//!
-//! # Module Organization
-//!
-//! Handler methods are split across modules for maintainability:
-//! - [`super::runner_handlers`] - `handle_tui_action()` for generic UI actions
+//! Subsystem methods return `OutMessages` (Vec<serde_json::Value>) instead of
+//! sending directly. The runner collects returned messages and sends them via
+//! `request_tx`. No subsystem knows about channels.
 //!
 //! # Event Flow
 //!
 //! Agent lifecycle events flow through Lua (`broadcast_hub_event()` in
 //! `connections.lua`) and arrive as `TuiOutput::Message` JSON. TuiRunner
 //! dispatches these through `events.lua` via `call_on_hub_event()`, which
-//! returns ops that update cached state mechanically.
+//! returns typed `LuaOp` variants that update cached state mechanically.
 
 // Rust guideline compliant 2026-02
 
 use std::io::Stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::backend::Backend;
 use ratatui::Terminal;
-use vt100::Parser;
+
 
 use ratatui::backend::CrosstermBackend;
 
@@ -70,7 +67,7 @@ use super::raw_input::{InputEvent, RawInputReader, ScrollDirection};
 use super::qr::ConnectionCodeData;
 
 /// Default scrollback lines for VT100 parser.
-pub(super) const DEFAULT_SCROLLBACK: usize = 1000;
+
 
 /// TUI Runner - owns all TUI state and runs the TUI event loop.
 ///
@@ -88,25 +85,15 @@ pub(super) const DEFAULT_SCROLLBACK: usize = 1000;
 /// └── PTY forwarders ──────────────────────────► TuiOutput::Output
 ///                                                       │
 ///                                            TuiRunner (output_rx)
-///                                            ──► vt100_parser ──► render
+///                                            ──► panels[focused] ──► render
 /// ```
 ///
 /// TuiRunner sends `TuiRequest` messages through `request_tx`: control messages
 /// go through Lua `client.lua`, PTY keyboard input goes directly to the PTY.
 pub struct TuiRunner<B: Backend> {
-    // === Terminal ===
-    /// VT100 parser for the currently active PTY.
-    ///
-    /// This is an Arc clone of the focused panel's parser, so writing
-    /// to one updates both. Existing scroll/resize code uses this directly.
-    pub(super) vt100_parser: Arc<Mutex<Parser>>,
-
-    /// Terminal panels keyed by `(agent_index, pty_index)`.
-    ///
-    /// Each panel owns a vt100 parser and tracks its connection state.
-    /// Panels are created on demand when PTY output arrives or focus
-    /// switches to a new `(agent, pty)` pair.
-    pub(super) panels: std::collections::HashMap<(usize, usize), crate::tui::terminal_panel::TerminalPanel>,
+    // === Subsystems ===
+    /// Terminal panel pool — owns panels, focus state, and subscriptions.
+    pub(super) panel_pool: super::panel_pool::PanelPool,
 
     /// Ratatui terminal for rendering.
     terminal: Terminal<B>,
@@ -129,34 +116,6 @@ pub struct TuiRunner<B: Backend> {
     /// is sent as `TuiRequest::PtyInput` and written directly to the PTY.
     pub(super) request_tx: tokio::sync::mpsc::UnboundedSender<TuiRequest>,
 
-    // === Selection State ===
-    /// Currently selected agent ID.
-    ///
-    /// The agent ID (session key) of the currently selected agent.
-    pub(super) selected_agent: Option<String>,
-
-    /// Active PTY session index (0 = first session, typically "agent").
-    ///
-    /// Cycles through available sessions with Ctrl+]. TuiRunner owns this state.
-    pub(super) active_pty_index: usize,
-
-    /// Index of the agent currently being viewed/interacted with.
-    ///
-    /// Used for Lua subscribe/unsubscribe operations.
-    pub(super) current_agent_index: Option<usize>,
-
-    /// Index of the PTY currently being viewed/interacted with.
-    ///
-    /// 0 = CLI PTY, 1 = Server PTY. This tracks which PTY receives keyboard
-    /// input and is displayed in the terminal widget.
-    pub(super) current_pty_index: Option<usize>,
-
-    /// Active terminal subscription ID for the focused PTY (receives keyboard input).
-    ///
-    /// Tracks which PTY subscription receives keyboard input and resize events.
-    /// Uses the same subscription protocol as browser clients.
-    pub(super) current_terminal_sub_id: Option<String>,
-
     // === Output Channel ===
     /// Receiver for PTY output and Lua events from Hub.
     ///
@@ -176,49 +135,9 @@ pub struct TuiRunner<B: Backend> {
     /// Internal quit flag.
     pub(super) quit: bool,
 
-    // === Dimensions ===
-    /// Terminal dimensions (rows, cols).
-    pub(super) terminal_dims: (u16, u16),
-
-    // === Lua Layout ===
-    /// Lua layout source code, loaded into a LayoutLua state after thread spawn.
-    ///
-    /// Stored as String (Send) rather than LayoutLua (!Send) so TuiRunner
-    /// can be moved across threads. Converted to LayoutLua in run().
-    layout_lua_source: Option<String>,
-
-    /// Filesystem path to layout.lua for hot-reload watching.
-    /// None if loaded from embedded (no watching needed).
-    layout_lua_fs_path: Option<std::path::PathBuf>,
-
-    // === Lua Keybindings ===
-    /// Lua keybinding source code, loaded alongside layout.
-    keybinding_lua_source: Option<String>,
-
-    /// Filesystem path to keybindings.lua for hot-reload watching.
-    keybinding_lua_fs_path: Option<std::path::PathBuf>,
-
-    // === Lua Actions ===
-    /// Lua actions source code for compound action dispatch.
-    actions_lua_source: Option<String>,
-
-    /// Filesystem path to actions.lua for hot-reload watching.
-    actions_lua_fs_path: Option<std::path::PathBuf>,
-
-    // === Lua Events ===
-    /// Lua events source code for hub event handling.
-    events_lua_source: Option<String>,
-
-    /// Filesystem path to events.lua for hot-reload watching.
-    events_lua_fs_path: Option<std::path::PathBuf>,
-
-    // === Lua Extensions ===
-    /// Botster API source (loaded after built-ins, before extensions).
-    botster_api_source: Option<String>,
-
-    /// UI extension sources from plugins and user directory.
-    /// Loaded in order after botster API: plugins first, then user.
-    extension_sources: Vec<ExtensionSource>,
+    // === Lua Bootstrap ===
+    /// Lua sources consumed once at startup by `run()`. `None` after init.
+    lua_bootstrap: Option<super::hot_reload::LuaBootstrap>,
 
     // === Raw Input ===
     /// Raw stdin reader — replaces crossterm's event reader for keyboard input.
@@ -233,27 +152,10 @@ pub struct TuiRunner<B: Backend> {
     pub(super) resize_flag: Arc<AtomicBool>,
 
     // === Terminal Mode Mirroring ===
-    /// Whether we've pushed application cursor mode (DECCKM) to the outer terminal.
-    outer_app_cursor: bool,
-    /// Whether we've pushed bracketed paste mode to the outer terminal.
-    outer_bracketed_paste: bool,
-
-    // === Kitty Keyboard Protocol Mirroring ===
-    /// Whether the active PTY has kitty keyboard protocol enabled.
-    ///
-    /// Set from the `kitty_enabled` boolean on `PtyHandle` (carried in
-    /// `TuiOutput::Scrollback` on connect/switch, and via `kitty_changed`
-    /// message from the forwarder on live state changes).
-    inner_kitty_enabled: bool,
-    /// Whether we've pushed Kitty to the outer terminal.
-    outer_kitty_enabled: bool,
-
-    // === Terminal Focus Passthrough ===
-    /// Whether the outer terminal window is currently focused.
-    ///
-    /// Updated by `FocusGained` / `FocusLost` events from the terminal.
-    /// Used to send synthetic focus events to the viewed PTY on switch.
-    terminal_focused: bool,
+    /// Mirrors DECCKM, bracketed paste, and kitty keyboard protocol
+    /// from the focused PTY to the outer terminal. Also tracks OS-level
+    /// terminal focus for synthetic focus events.
+    pub(super) terminal_modes: super::terminal_modes::TerminalModes,
 
     // === Cached Overlay State ===
     /// Action strings for selectable items in the current overlay list widget.
@@ -288,6 +190,11 @@ pub struct TuiRunner<B: Backend> {
     /// Used to route `input_char`/`input_backspace`/cursor actions to the
     /// correct widget state.
     pub(super) focused_input_id: Option<String>,
+
+    /// Dirty flag — when true, the next loop iteration will render.
+    /// Set by any event that changes visible state (PTY output, input,
+    /// resize, hot-reload). Cleared after render.
+    dirty: bool,
 }
 
 impl<B: Backend> std::fmt::Debug for TuiRunner<B>
@@ -297,9 +204,9 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TuiRunner")
             .field("mode", &self.mode)
-            .field("selected_agent", &self.selected_agent)
-            .field("current_agent_index", &self.current_agent_index)
-            .field("terminal_dims", &self.terminal_dims)
+            .field("selected_agent", &self.panel_pool.selected_agent)
+            .field("current_agent_index", &self.panel_pool.current_agent_index)
+            .field("terminal_dims", &self.panel_pool.terminal_dims())
             .field("quit", &self.quit)
             .finish_non_exhaustive()
     }
@@ -331,182 +238,34 @@ where
         terminal_dims: (u16, u16),
         wake_fd: Option<std::os::unix::io::RawFd>,
     ) -> Self {
-        let (rows, cols) = terminal_dims;
-        let parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
-        let vt100_parser = Arc::new(Mutex::new(parser));
-
         Self {
-            vt100_parser,
-            panels: std::collections::HashMap::new(),
+            panel_pool: super::panel_pool::PanelPool::new(terminal_dims),
             terminal,
             mode: String::new(),
             connection_code: None,
             error_message: None,
             request_tx,
-            selected_agent: None,
-            active_pty_index: 0,
-            current_agent_index: None,
-            current_pty_index: None,
-            current_terminal_sub_id: None,
             output_rx,
             wake_fd,
             shutdown,
             quit: false,
-            terminal_dims,
-            layout_lua_source: None,
-            layout_lua_fs_path: None,
-            keybinding_lua_source: None,
-            keybinding_lua_fs_path: None,
-            actions_lua_source: None,
-            actions_lua_fs_path: None,
-            events_lua_source: None,
-            events_lua_fs_path: None,
-            botster_api_source: None,
-            extension_sources: Vec::new(),
+            lua_bootstrap: None,
             raw_reader: RawInputReader::new(),
             stdin_dead: false,
             resize_flag: Arc::new(AtomicBool::new(false)),
-            outer_app_cursor: false,
-            outer_bracketed_paste: false,
-            inner_kitty_enabled: false,
-            outer_kitty_enabled: false,
-            terminal_focused: true,
+            terminal_modes: super::terminal_modes::TerminalModes::new(),
             overlay_list_actions: Vec::new(),
             has_overlay: false,
             widget_states: super::widget_state::WidgetStateStore::new(),
             focused_list_id: None,
             focused_input_id: None,
+            dirty: true, // render on first frame
         }
     }
 
-    /// Set the Lua layout source for declarative UI.
-    ///
-    /// The source is stored as a string and loaded into a `LayoutLua` state
-    /// when `run()` is called (after the TuiRunner is moved to its thread).
-    pub fn set_layout_lua_source(&mut self, lua_source: String) {
-        self.layout_lua_source = Some(lua_source);
-    }
-
-    /// Set the Lua keybinding source for hot-reloadable key handling.
-    pub fn set_keybinding_lua_source(&mut self, lua_source: String) {
-        self.keybinding_lua_source = Some(lua_source);
-    }
-
-    /// Set the Lua actions source for compound action dispatch.
-    pub fn set_actions_lua_source(&mut self, lua_source: String) {
-        self.actions_lua_source = Some(lua_source);
-    }
-
-    /// Set the Lua events source for hub event handling.
-    pub fn set_events_lua_source(&mut self, lua_source: String) {
-        self.events_lua_source = Some(lua_source);
-    }
-
-    /// Get the VT100 parser handle for the active PTY.
-    ///
-    /// Used for rendering the terminal content.
-    #[must_use]
-    pub fn parser_handle(&self) -> Arc<Mutex<Parser>> {
-        Arc::clone(&self.vt100_parser)
-    }
-
-    /// Resolve a panel by agent/PTY identity, creating one on demand.
-    ///
-    /// Falls back to `current_agent_index`/`current_pty_index` when `None`.
-    fn resolve_panel(
-        &mut self,
-        agent_index: Option<usize>,
-        pty_index: Option<usize>,
-    ) -> &mut crate::tui::terminal_panel::TerminalPanel {
-        let key = (
-            agent_index.or(self.current_agent_index).unwrap_or(0),
-            pty_index.or(self.current_pty_index).unwrap_or(0),
-        );
-        let (rows, cols) = self.terminal_dims;
-        self.panels
-            .entry(key)
-            .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(rows, cols))
-    }
-
-    /// Synchronize PTY subscriptions to match the render tree.
-    ///
-    /// Walks the render tree, collects desired `(agent_index, pty_index)`
-    /// bindings, then connects idle panels and disconnects panels no longer
-    /// in the tree. Panel state is the source of truth — no separate
-    /// `active_subscriptions` set.
-    pub(super) fn sync_subscriptions(
-        &mut self,
-        tree: &super::render_tree::RenderNode,
-        areas: &std::collections::HashMap<(usize, usize), (u16, u16)>,
-    ) {
-        use crate::tui::terminal_panel::PanelState;
-
-        let default_agent = self.current_agent_index.unwrap_or(0);
-        let default_pty = self.current_pty_index.unwrap_or(0);
-
-        let desired = super::render_tree::collect_terminal_bindings(tree, default_agent, default_pty);
-
-        // Connect panels for new bindings
-        for &(agent_idx, pty_idx) in &desired {
-            // Use the actual rendered widget area if available, falling back
-            // to terminal_dims only for the first frame before any render.
-            let (rows, cols) = areas.get(&(agent_idx, pty_idx))
-                .copied()
-                .unwrap_or(self.terminal_dims);
-            let panel = self.panels
-                .entry((agent_idx, pty_idx))
-                .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(rows, cols));
-
-            if panel.state() == PanelState::Idle {
-                if let Some(msg) = panel.connect(agent_idx, pty_idx) {
-                    self.send_msg(msg);
-                }
-            }
-        }
-
-        // Disconnect panels not in desired set (skip the focused panel)
-        let focused = (
-            self.current_agent_index.unwrap_or(usize::MAX),
-            self.current_pty_index.unwrap_or(usize::MAX),
-        );
-        let to_disconnect: Vec<(usize, usize)> = self.panels.keys()
-            .filter(|k| !desired.contains(k) && **k != focused)
-            .copied()
-            .collect();
-
-        for (ai, pi) in to_disconnect {
-            if let Some(panel) = self.panels.get_mut(&(ai, pi)) {
-                if let Some(msg) = panel.disconnect(ai, pi) {
-                    self.send_msg(msg);
-                }
-            }
-            // Remove idle panels to free memory
-            self.panels.remove(&(ai, pi));
-        }
-    }
-
-    /// Resize panels to match actual rendered widget areas.
-    ///
-    /// Called after each render pass. Each panel tracks its own dimensions
-    /// and only sends a resize message when they change.
-    pub(super) fn sync_widget_dims(
-        &mut self,
-        areas: &std::collections::HashMap<(usize, usize), (u16, u16)>,
-    ) {
-        for (&(agent_idx, pty_idx), &(rows, cols)) in areas {
-            if let Some(panel) = self.panels.get_mut(&(agent_idx, pty_idx)) {
-                if let Some(msg) = panel.resize(rows, cols, agent_idx, pty_idx) {
-                    self.send_msg(msg);
-                }
-            }
-        }
-
-        // Remove panels for bindings no longer rendered (except the focused one)
-        let focused = (
-            self.current_agent_index.unwrap_or(usize::MAX),
-            self.current_pty_index.unwrap_or(usize::MAX),
-        );
-        self.panels.retain(|k, _| areas.contains_key(k) || *k == focused);
+    /// Set the Lua bootstrap (consumed once by `run()` to init Lua + hot-reloader).
+    pub fn set_lua_bootstrap(&mut self, bootstrap: super::hot_reload::LuaBootstrap) {
+        self.lua_bootstrap = Some(bootstrap);
     }
 
     /// Get the current mode string.
@@ -515,13 +274,12 @@ where
         &self.mode
     }
 
-    /// Get the selected agent key.
+    /// Get the selected agent key (delegates to PanelPool).
     #[must_use]
     pub fn selected_agent(&self) -> Option<&str> {
-        self.selected_agent.as_deref()
+        self.panel_pool.selected_agent()
     }
 
-    /// Get the agent list.
     /// Build an `ActionContext` from current TuiRunner state.
     ///
     /// Shared by action dispatch and hub event dispatch so both Lua
@@ -529,8 +287,9 @@ where
     pub(super) fn build_action_context(&self) -> super::layout_lua::ActionContext {
         super::layout_lua::ActionContext {
             overlay_actions: self.overlay_list_actions.clone(),
-            selected_agent: self.selected_agent.clone(),
+            selected_agent: self.panel_pool.selected_agent.clone(),
             action_char: None,
+            terminal_focused: self.terminal_modes.terminal_focused(),
         }
     }
 
@@ -550,147 +309,20 @@ where
     pub fn run(&mut self) -> Result<()> {
         log::info!("TuiRunner event loop starting");
 
-        // Create LayoutLua from stored source (if any).
+        // Initialize Lua and hot-reloader from bootstrap (consumed once).
         // Done here (after thread::spawn) because mlua::Lua is !Send.
-        let mut layout_lua = self.layout_lua_source.take().and_then(|source| {
-            match LayoutLua::new(&source) {
-                Ok(lua) => {
-                    log::info!("Lua layout engine initialized");
-                    Some(lua)
-                }
-                Err(e) => {
-                    log::warn!("Failed to initialize Lua layout engine: {e}");
-                    None
-                }
-            }
-        });
+        let (mut layout_lua, initial_mode, mut hot_reloader) = self
+            .lua_bootstrap
+            .take()
+            .map(|b| b.init())
+            .unwrap_or_else(|| (None, String::new(), super::hot_reload::HotReloader::empty()));
 
-        // Load keybindings and actions into the same Lua state (if available).
-        if let Some(ref mut lua) = layout_lua {
-            if let Some(kb_source) = self.keybinding_lua_source.take() {
-                match lua.load_keybindings(&kb_source) {
-                    Ok(()) => log::info!("Lua keybindings loaded"),
-                    Err(e) => log::warn!("Failed to load Lua keybindings: {e}"),
-                }
-            }
-            if let Some(actions_source) = self.actions_lua_source.take() {
-                match lua.load_actions(&actions_source) {
-                    Ok(()) => log::info!("Lua actions loaded"),
-                    Err(e) => log::warn!("Failed to load Lua actions: {e}"),
-                }
-            }
-            if let Some(events_source) = self.events_lua_source.take() {
-                match lua.load_events(&events_source) {
-                    Ok(()) => log::info!("Lua events loaded"),
-                    Err(e) => log::warn!("Failed to load Lua events: {e}"),
-                }
-            }
-
-            // Bootstrap TUI client-side state.
-            // _tui_state is LayoutLua's local state — same role as JavaScript
-            // state in the browser client. All UI modules read/write it directly.
-            let _ = lua.load_extension(
-                "_tui_state = _tui_state or {\
-                    agents = {},\
-                    pending_fields = {},\
-                    available_worktrees = {},\
-                    available_profiles = {},\
-                    mode = 'normal',\
-                    input_buffer = '',\
-                    list_selected = 0,\
-                    selected_agent = nil,\
-                    selected_agent_index = nil,\
-                    active_pty_index = 0,\
-                    connection_code = nil,\
-                }",
-                "_tui_state_init",
-            );
-
-            // Load botster API (provides botster.keymap, botster.action, botster.ui, etc.)
-            if let Some(ref botster_source) = self.botster_api_source {
-                match lua.load_extension(botster_source, "botster") {
-                    Ok(()) => log::info!("Botster API loaded"),
-                    Err(e) => log::warn!("Failed to load botster API: {e}"),
-                }
-            }
-
-            // Load UI extensions (plugins first, then user overrides)
-            for ext in &self.extension_sources {
-                match lua.load_extension(&ext.source, &ext.name) {
-                    Ok(()) => log::info!("Loaded UI extension: {}", ext.name),
-                    Err(e) => log::warn!("Failed to load UI extension '{}': {e}", ext.name),
-                }
-            }
-
-            // Wire botster action/keymap dispatch after all extensions loaded
-            let _ = lua.load_extension(
-                "if type(botster) == 'table' then botster._wire_actions() botster._wire_keybindings() end",
-                "_wire_botster",
-            );
-
-            // Let Lua declare the initial mode (Rust has no opinion on mode names)
-            self.mode = lua.call_initial_mode();
+        if !initial_mode.is_empty() {
+            self.mode = initial_mode;
         }
 
-        // Set up file watcher for hot-reload.
-        // Watches: built-in ui/ directory, user ui/ directory, and plugin ui/ directories.
-        let keybinding_fs_path = self.keybinding_lua_fs_path.take();
-        let actions_fs_path = self.actions_lua_fs_path.take();
-        let events_fs_path = self.events_lua_fs_path.take();
-        let extension_sources = std::mem::take(&mut self.extension_sources);
-        let botster_api_source = self.botster_api_source.take();
-
-        let layout_watcher = self.layout_lua_fs_path.take().and_then(|path| {
-            match crate::file_watcher::FileWatcher::new() {
-                Ok(mut watcher) => {
-                    // Watch the built-in ui/ directory
-                    if let Some(parent) = path.parent() {
-                        if let Err(e) = watcher.watch(parent, false) {
-                            log::warn!("Failed to watch layout directory: {e}");
-                            return None;
-                        }
-                    }
-
-                    // Watch user directories for extension hot-reload
-                    let lua_base = resolve_lua_user_path();
-                    for subdir in ["ui", "user/ui"] {
-                        let dir = lua_base.join(subdir);
-                        if dir.exists() {
-                            if let Err(e) = watcher.watch(&dir, false) {
-                                log::warn!("Failed to watch {}: {e}", dir.display());
-                            } else {
-                                log::info!("Hot-reload watching: {}", dir.display());
-                            }
-                        }
-                    }
-
-                    // Watch plugin ui/ directories
-                    let mut watched_plugin_dirs = std::collections::HashSet::new();
-                    for ext in &extension_sources {
-                        if let Some(parent) = ext.fs_path.parent() {
-                            if watched_plugin_dirs.insert(parent.to_path_buf()) {
-                                if let Err(e) = watcher.watch(parent, false) {
-                                    log::warn!("Failed to watch plugin UI dir {}: {e}", parent.display());
-                                }
-                            }
-                        }
-                    }
-
-                    log::info!("Hot-reload watching: {}", path.display());
-                    Some((watcher, path))
-                }
-                Err(e) => {
-                    log::warn!("Failed to create layout file watcher: {e}");
-                    None
-                }
-            }
-        });
-
-        // Error tracking for layout Lua failures
-        let mut layout_error: Option<String> = None;
-
         // Initialize parser with terminal dimensions
-        let (rows, cols) = self.terminal_dims;
+        let (rows, cols) = self.panel_pool.terminal_dims();
         log::info!("Initial TUI dimensions: {}cols x {}rows", cols, rows);
 
         // Send initial resize to Lua client so it knows the actual terminal
@@ -717,179 +349,23 @@ where
             self.poll_pty_events(layout_lua.as_ref());
 
             // 2b. Mirror terminal modes from PTY to outer terminal
-            self.sync_terminal_modes();
-
-            // 3. Hot-reload: built-in UI files and extensions
-            if let Some((ref watcher, ref layout_path)) = layout_watcher {
-                let events = watcher.poll();
-                if !events.is_empty() {
-                    let is_modify = |evt: &crate::file_watcher::FileEvent| {
-                        matches!(
-                            evt.kind,
-                            crate::file_watcher::FileEventKind::Create
-                                | crate::file_watcher::FileEventKind::Modify
-                                | crate::file_watcher::FileEventKind::Rename
-                        )
-                    };
-
-                    let layout_changed = events.iter().any(|evt| {
-                        is_modify(evt) && evt.path.file_name() == layout_path.file_name()
-                    });
-
-                    let keybinding_changed = keybinding_fs_path.as_ref().map_or(false, |kb_path| {
-                        events.iter().any(|evt| {
-                            is_modify(evt) && evt.path.file_name() == kb_path.file_name()
-                        })
-                    });
-
-                    let actions_changed = actions_fs_path.as_ref().map_or(false, |a_path| {
-                        events.iter().any(|evt| {
-                            is_modify(evt) && evt.path.file_name() == a_path.file_name()
-                        })
-                    });
-
-                    let events_changed = events_fs_path.as_ref().map_or(false, |e_path| {
-                        events.iter().any(|evt| {
-                            is_modify(evt) && evt.path.file_name() == e_path.file_name()
-                        })
-                    });
-
-                    // Check if any extension file changed
-                    let extension_changed = extension_sources.iter().any(|ext| {
-                        events.iter().any(|evt| is_modify(evt) && evt.path == ext.fs_path)
-                    });
-
-                    // Also check if a file changed in user/ui/ or the user override ui/ dir
-                    let user_ui_changed = events.iter().any(|evt| {
-                        is_modify(evt)
-                            && evt.path.extension().is_some_and(|e| e == "lua")
-                            && evt.path.parent().map_or(false, |p| {
-                                p.ends_with("user/ui") || p.ends_with(".botster/lua/ui")
-                            })
-                    });
-
-                    let any_builtin_changed = layout_changed || keybinding_changed || actions_changed || events_changed;
-                    let any_extension_changed = extension_changed || user_ui_changed;
-
-                    // Reload built-in files if they changed
-                    if layout_changed {
-                        match std::fs::read_to_string(layout_path) {
-                            Ok(new_source) => {
-                                if let Some(ref mut lua) = layout_lua {
-                                    match lua.reload(&new_source) {
-                                        Ok(()) => {
-                                            log::info!("Layout hot-reloaded");
-                                            layout_error = None;
-                                        }
-                                        Err(e) => {
-                                            let msg = format!("{e}");
-                                            log::warn!("Layout reload failed: {msg}");
-                                            layout_error = Some(truncate_error(&msg, 80));
-                                        }
-                                    }
-                                } else {
-                                    match LayoutLua::new(&new_source) {
-                                        Ok(lua) => {
-                                            log::info!("Layout engine recovered via hot-reload");
-                                            layout_lua = Some(lua);
-                                            layout_error = None;
-                                        }
-                                        Err(e) => {
-                                            let msg = format!("{e}");
-                                            log::warn!("Layout reload failed: {msg}");
-                                            layout_error = Some(truncate_error(&msg, 80));
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => log::warn!("Failed to read layout.lua: {e}"),
-                        }
-                    }
-
-                    if keybinding_changed {
-                        if let Some(ref kb_path) = keybinding_fs_path {
-                            match std::fs::read_to_string(kb_path) {
-                                Ok(new_source) => {
-                                    if let Some(ref mut lua) = layout_lua {
-                                        match lua.reload_keybindings(&new_source) {
-                                            Ok(()) => log::info!("Keybindings hot-reloaded"),
-                                            Err(e) => log::warn!("Keybindings reload failed: {e}"),
-                                        }
-                                    }
-                                }
-                                Err(e) => log::warn!("Failed to read keybindings.lua: {e}"),
-                            }
-                        }
-                    }
-
-                    if actions_changed {
-                        if let Some(ref a_path) = actions_fs_path {
-                            match std::fs::read_to_string(a_path) {
-                                Ok(new_source) => {
-                                    if let Some(ref mut lua) = layout_lua {
-                                        match lua.reload_actions(&new_source) {
-                                            Ok(()) => log::info!("Actions hot-reloaded"),
-                                            Err(e) => log::warn!("Actions reload failed: {e}"),
-                                        }
-                                    }
-                                }
-                                Err(e) => log::warn!("Failed to read actions.lua: {e}"),
-                            }
-                        }
-                    }
-
-                    if events_changed {
-                        if let Some(ref e_path) = events_fs_path {
-                            match std::fs::read_to_string(e_path) {
-                                Ok(new_source) => {
-                                    if let Some(ref mut lua) = layout_lua {
-                                        match lua.reload_events(&new_source) {
-                                            Ok(()) => log::info!("Events hot-reloaded"),
-                                            Err(e) => log::warn!("Events reload failed: {e}"),
-                                        }
-                                    }
-                                }
-                                Err(e) => log::warn!("Failed to read events.lua: {e}"),
-                            }
-                        }
-                    }
-
-                    // Replay extensions if any built-in or extension changed
-                    if (any_builtin_changed || any_extension_changed) && layout_lua.is_some() {
-                        if let Some(ref lua) = layout_lua {
-                            // Re-discover extensions and user overrides (picks up new files)
-                            let lua_base = resolve_lua_user_path();
-                            let mut fresh_extensions = discover_ui_extensions(&lua_base);
-                            fresh_extensions.extend(discover_user_ui_overrides());
-
-                            // Reload botster API
-                            if let Some(ref bs) = botster_api_source {
-                                if let Err(e) = lua.load_extension(bs, "botster") {
-                                    log::warn!("Failed to reload botster API: {e}");
-                                }
-                            }
-
-                            // Replay all extensions (freshly read by discover_ui_extensions)
-                            for ext in &fresh_extensions {
-                                if let Err(e) = lua.load_extension(&ext.source, &ext.name) {
-                                    log::warn!("Failed to reload extension '{}': {e}", ext.name);
-                                }
-                            }
-
-                            // Re-wire dispatch
-                            let _ = lua.load_extension(
-                                "if type(botster) == 'table' then botster._wire_actions() botster._wire_keybindings() end",
-                                "_wire_botster",
-                            );
-
-                            log::info!("Extensions replayed ({} total)", fresh_extensions.len());
-                        }
-                    }
-                }
+            {
+                let focused = self.panel_pool.current_agent_index
+                    .zip(self.panel_pool.current_pty_index)
+                    .and_then(|key| self.panel_pool.panels.get(&key));
+                self.terminal_modes.sync(focused, self.has_overlay);
             }
 
-            // 4. Render
-            self.render(layout_lua.as_ref(), layout_error.as_deref())?;
+            // 3. Hot-reload: built-in UI files and extensions
+            if hot_reloader.poll(&mut layout_lua) {
+                self.dirty = true;
+            }
+
+            // 4. Render only when something changed
+            if self.dirty {
+                self.render(layout_lua.as_ref(), hot_reloader.layout_error())?;
+                self.dirty = false;
+            }
 
             // Block until stdin has input, wake pipe signals, or timeout.
             // Replaces the old `thread::sleep(16ms)` with event-driven wakeup:
@@ -1012,6 +488,7 @@ where
         for event in events {
             match &event {
                 InputEvent::MouseScroll { direction } if !self.has_overlay => {
+                    self.dirty = true;
                     scroll_event_count += 1;
                     // Acceleration: first event = 1 line, then ramp up.
                     // 1, 2, 3, 4... lines per successive event in the same tick.
@@ -1025,24 +502,23 @@ where
                     // Overlay active — swallow scroll events.
                 }
                 InputEvent::FocusGained => {
-                    self.terminal_focused = true;
+                    self.terminal_modes.on_focus_gained();
                     log::debug!("[FOCUS] terminal gained focus, mode={} overlay={}", self.mode, self.has_overlay);
-                    // Forward to viewed PTY so inner apps (e.g. Claude Code)
-                    // know the terminal is focused and can suppress notifications.
                     if self.mode == "insert" && !self.has_overlay {
-                        log::debug!("[FOCUS] forwarding \\x1b[I to PTY agent={:?} pty={:?}", self.current_agent_index, self.current_pty_index);
+                        log::debug!("[FOCUS] forwarding \\x1b[I to PTY agent={:?} pty={:?}", self.panel_pool.current_agent_index, self.panel_pool.current_pty_index);
                         self.handle_pty_input(b"\x1b[I");
                     }
                 }
                 InputEvent::FocusLost => {
-                    self.terminal_focused = false;
+                    self.terminal_modes.on_focus_lost();
                     log::debug!("[FOCUS] terminal lost focus, mode={} overlay={}", self.mode, self.has_overlay);
                     if self.mode == "insert" && !self.has_overlay {
-                        log::debug!("[FOCUS] forwarding \\x1b[O to PTY agent={:?} pty={:?}", self.current_agent_index, self.current_pty_index);
+                        log::debug!("[FOCUS] forwarding \\x1b[O to PTY agent={:?} pty={:?}", self.panel_pool.current_agent_index, self.panel_pool.current_pty_index);
                         self.handle_pty_input(b"\x1b[O");
                     }
                 }
                 InputEvent::Key { .. } => {
+                    self.dirty = true;
                     // Flush accumulated scroll before processing the key event,
                     // so key handlers see the correct scroll position.
                     if pending_scroll != 0 {
@@ -1061,6 +537,7 @@ where
         }
         // Check SIGWINCH resize flag
         if self.resize_flag.swap(false, Ordering::SeqCst) {
+            self.dirty = true;
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
             let (inner_rows, inner_cols) = terminal_widget_inner_area(cols, rows);
             self.handle_resize(inner_rows, inner_cols);
@@ -1103,7 +580,7 @@ where
                 // (for Lua keybinding lookup) and the raw bytes (for PTY forward,
                 // since the inner app expects kitty encoding).
                 // See: https://github.com/ghostty-org/ghostty/issues/1850
-                if self.outer_kitty_enabled && raw_bytes == [0x0a] {
+                if self.terminal_modes.outer_kitty_enabled() && raw_bytes == [0x0a] {
                     descriptor = "shift+enter".to_string();
                     raw_bytes = b"\x1b[13;2u".to_vec();
                 }
@@ -1125,7 +602,7 @@ where
                     if lua.has_keybindings() {
                         let context = KeyContext {
                             list_count: self.overlay_list_actions.len(),
-                            terminal_rows: self.terminal_dims.0,
+                            terminal_rows: self.panel_pool.terminal_dims().0,
                         };
 
                         match lua.call_handle_key(&descriptor, &self.mode, &context) {
@@ -1187,10 +664,10 @@ where
         // Scroll actions are handled directly by Rust (no Lua state involved).
         let scroll_action = match action_str {
             "scroll_half_up" => {
-                Some(TuiAction::ScrollUp(self.terminal_dims.0 as usize / 2))
+                Some(TuiAction::ScrollUp(self.panel_pool.terminal_dims().0 as usize / 2))
             }
             "scroll_half_down" => {
-                Some(TuiAction::ScrollDown(self.terminal_dims.0 as usize / 2))
+                Some(TuiAction::ScrollDown(self.panel_pool.terminal_dims().0 as usize / 2))
             }
             "scroll_top" => Some(TuiAction::ScrollToTop),
             "scroll_bottom" => Some(TuiAction::ScrollToBottom),
@@ -1325,7 +802,7 @@ where
     /// correct PTY. No-op if no PTY is currently focused.
     fn handle_pty_input(&mut self, data: &[u8]) {
         if let (Some(agent_index), Some(pty_index)) =
-            (self.current_agent_index, self.current_pty_index)
+            (self.panel_pool.current_agent_index, self.panel_pool.current_pty_index)
         {
             log::trace!(
                 "[PTY-FWD] Sending {} bytes to agent={} pty={} (overlay={})",
@@ -1341,108 +818,20 @@ where
         } else {
             log::warn!(
                 "[PTY-FWD] Dropped {} bytes: agent_index={:?} pty_index={:?}",
-                data.len(), self.current_agent_index, self.current_pty_index
+                data.len(), self.panel_pool.current_agent_index, self.panel_pool.current_pty_index
             );
         }
     }
 
     /// Mirror terminal modes from PTY to the outer terminal.
     ///
-    /// When PTY apps (vim, less) change terminal modes via escape sequences,
-    /// we push those same modes to the outer terminal. This makes raw stdin
-    /// passthrough work correctly — the outer terminal generates the same
-    /// byte sequences that the PTY app expects.
-    ///
-    /// Tracked modes:
-    /// - DECCKM (application cursor): arrow keys send ESC O x vs ESC [ x
-    /// - Bracketed paste: paste is wrapped in ESC [200~ / ESC [201~
-    /// - Kitty keyboard protocol: disambiguate modified keys (shift+enter, etc.)
-    ///
-    /// # Kitty + Ghostty workaround
-    ///
-    /// Even with kitty mode pushed, Ghostty still sends `0x0a` for shift+enter
-    /// instead of the proper `CSI 13;2 u`. This is a known Ghostty behavior:
-    /// - <https://github.com/ghostty-org/ghostty/issues/1850>
-    /// - <https://github.com/anthropics/claude-code/issues/5757>
-    /// - <https://github.com/ghostty-org/ghostty/discussions/7780>
-    ///
-    /// We work around this in [`Self::handle_raw_input_event`] by remapping
-    /// `0x0a` (ctrl+j) to `shift+enter` when kitty is active on the outer
-    /// terminal. This is safe because with kitty mode 1, a real ctrl+j press
-    /// arrives as `CSI 106;5 u`, never as bare `0x0a`.
-    fn sync_terminal_modes(&mut self) {
-        let parser = self.vt100_parser.lock().expect("parser lock poisoned");
-        let screen = parser.screen();
-
-        let app_cursor = screen.application_cursor();
-        if app_cursor != self.outer_app_cursor {
-            self.outer_app_cursor = app_cursor;
-            let seq = if app_cursor {
-                b"\x1b[?1h" as &[u8]
-            } else {
-                b"\x1b[?1l" as &[u8]
-            };
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), seq);
-        }
-
-        let bp = screen.bracketed_paste();
-        if bp != self.outer_bracketed_paste {
-            self.outer_bracketed_paste = bp;
-            let seq = if bp {
-                b"\x1b[?2004h" as &[u8]
-            } else {
-                b"\x1b[?2004l" as &[u8]
-            };
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), seq);
-        }
-
-        // Drop the parser lock before writing kitty sequences.
-        drop(parser);
-
-        // Kitty keyboard protocol: only push when PTY wants it AND there's no overlay.
-        // In modal modes (menu, input, etc.) we want traditional bytes for our keybindings.
-        let desired_kitty = self.inner_kitty_enabled && !self.has_overlay;
-        if desired_kitty != self.outer_kitty_enabled {
-            log::info!(
-                "[KITTY] sync: inner={} overlay={} desired={} outer={}",
-                self.inner_kitty_enabled, self.has_overlay, desired_kitty, self.outer_kitty_enabled
-            );
-            self.outer_kitty_enabled = desired_kitty;
-            // Write raw bytes via libc to bypass any buffering. Push = CSI > 1 u,
-            // Pop = CSI < u (flag 1 = DISAMBIGUATE_ESCAPE_CODES).
-            let seq: &[u8] = if desired_kitty {
-                b"\x1b[>1u"
-            } else {
-                b"\x1b[<u"
-            };
-            unsafe {
-                libc::write(
-                    libc::STDOUT_FILENO,
-                    seq.as_ptr() as *const libc::c_void,
-                    seq.len(),
-                );
-            }
-        }
-    }
-
     /// Handle resize event.
     ///
     /// Updates local state only. The next render cycle will call
     /// `sync_widget_dims()` which sends per-terminal resize through
     /// terminal subscriptions → `pty_clients.update()`.
     fn handle_resize(&mut self, rows: u16, cols: u16) {
-        self.terminal_dims = (rows, cols);
-
-        // Invalidate cached dims so the next sync_widget_dims detects changes.
-        for panel in self.panels.values_mut() {
-            panel.invalidate_dims();
-        }
-
-        // Also resize the fallback parser (used when no Lua layout is active)
-        {
-            let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-            parser.screen_mut().set_size(rows.max(2), cols);
-        }
+        self.panel_pool.handle_resize(rows, cols);
     }
 
     /// Poll PTY output and Lua events from Hub output channel.
@@ -1453,19 +842,20 @@ where
     fn poll_pty_events(&mut self, layout_lua: Option<&LayoutLua>) {
         use tokio::sync::mpsc::error::TryRecvError;
 
-        // Process up to 100 events per tick
-        for _ in 0..100 {
+        // Drain all pending events (no arbitrary cap).
+        loop {
             match self.output_rx.try_recv() {
                 Ok(TuiOutput::Scrollback { agent_index, pty_index, data, kitty_enabled }) => {
-                    let panel = self.resolve_panel(agent_index, pty_index);
+                    self.dirty = true;
+                    let panel = self.panel_pool.resolve_panel(agent_index, pty_index);
                     panel.on_scrollback(&data);
                     // Set kitty state from the PTY session boolean.
                     // vt100 silently consumes kitty CSI sequences in the snapshot,
                     // so we carry the boolean separately.
-                    let is_focused = agent_index == self.current_agent_index
-                        && pty_index == self.current_pty_index;
+                    let is_focused = agent_index == self.panel_pool.current_agent_index
+                        && pty_index == self.panel_pool.current_pty_index;
                     if is_focused {
-                        self.inner_kitty_enabled = kitty_enabled;
+                        self.terminal_modes.on_kitty_changed(kitty_enabled);
                     }
                     log::debug!(
                         "Processed {} bytes of scrollback (kitty={}{})",
@@ -1474,51 +864,53 @@ where
                     );
                 }
                 Ok(TuiOutput::Output { agent_index, pty_index, data }) => {
+                    self.dirty = true;
                     let key = (
-                        agent_index.or(self.current_agent_index).unwrap_or(0),
-                        pty_index.or(self.current_pty_index).unwrap_or(0),
+                        agent_index.or(self.panel_pool.current_agent_index).unwrap_or(0),
+                        pty_index.or(self.panel_pool.current_pty_index).unwrap_or(0),
                     );
                     log::debug!(
                         "PTY output: agent={:?} pty={:?} -> panel key={:?}, {} bytes, panel_exists={}",
                         agent_index, pty_index, key, data.len(),
-                        self.panels.contains_key(&key)
+                        self.panel_pool.panels.contains_key(&key)
                     );
-                    let panel = self.resolve_panel(agent_index, pty_index);
+                    let panel = self.panel_pool.resolve_panel(agent_index, pty_index);
                     panel.on_output(&data);
                 }
+                Ok(TuiOutput::OutputBatch { agent_index, pty_index, chunks }) => {
+                    self.dirty = true;
+                    let panel = self.panel_pool.resolve_panel(agent_index, pty_index);
+                    for data in &chunks {
+                        panel.on_output(data);
+                    }
+                }
                 Ok(TuiOutput::ProcessExited { agent_index, pty_index, exit_code }) => {
+                    self.dirty = true;
                     log::info!("PTY process exited with code {:?}", exit_code);
                     // Reset kitty if the exited PTY is the focused one.
                     // Well-behaved programs pop kitty before exit, but crashes don't.
-                    if agent_index == self.current_agent_index
-                        && pty_index == self.current_pty_index
+                    if agent_index == self.panel_pool.current_agent_index
+                        && pty_index == self.panel_pool.current_pty_index
                     {
-                        self.inner_kitty_enabled = false;
+                        self.terminal_modes.clear_inner_kitty();
                     }
                     // View cleanup handled by agent_deleted hub event in Lua
                 }
                 Ok(TuiOutput::Message(value)) => {
+                    self.dirty = true;
                     self.dispatch_hub_event(value, layout_lua);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     log::debug!("PTY output channel disconnected");
                     // Unfocus current PTY so the focused flag doesn't stick.
-                    if self.terminal_focused && self.current_agent_index.is_some() {
+                    if self.terminal_modes.terminal_focused() && self.panel_pool.current_agent_index.is_some() {
                         self.handle_pty_input(b"\x1b[O");
                     }
-                    // Channel closed — disconnect all panels.
-                    let msgs: Vec<_> = self.panels.iter_mut()
-                        .filter_map(|(&(ai, pi), panel)| panel.disconnect(ai, pi))
-                        .collect();
+                    let msgs = self.panel_pool.disconnect_all();
                     for msg in msgs {
                         self.send_msg(msg);
                     }
-                    self.panels.clear();
-                    self.current_terminal_sub_id = None;
-                    self.current_agent_index = None;
-                    self.current_pty_index = None;
-                    self.selected_agent = None;
                     break;
                 }
             }
@@ -1542,9 +934,9 @@ where
         if event_type == "kitty_changed" {
             let msg_agent = msg.get("agent_index").and_then(|v| v.as_u64()).map(|v| v as usize);
             let msg_pty = msg.get("pty_index").and_then(|v| v.as_u64()).map(|v| v as usize);
-            if msg_agent == self.current_agent_index && msg_pty == self.current_pty_index {
+            if msg_agent == self.panel_pool.current_agent_index && msg_pty == self.panel_pool.current_pty_index {
                 if let Some(enabled) = msg.get("enabled").and_then(|v| v.as_bool()) {
-                    self.inner_kitty_enabled = enabled;
+                    self.terminal_modes.on_kitty_changed(enabled);
                 }
             }
             return;
@@ -1555,9 +947,9 @@ where
         if event_type == "focus_requested" {
             let msg_agent = msg.get("agent_index").and_then(|v| v.as_u64()).map(|v| v as usize);
             let msg_pty = msg.get("pty_index").and_then(|v| v.as_u64()).map(|v| v as usize);
-            if msg_agent == self.current_agent_index && msg_pty == self.current_pty_index {
-                let seq = if self.terminal_focused { b"\x1b[I" as &[u8] } else { b"\x1b[O" };
-                log::debug!("[FOCUS] PTY requested focus reporting, responding with {}", if self.terminal_focused { "focused" } else { "unfocused" });
+            if msg_agent == self.panel_pool.current_agent_index && msg_pty == self.panel_pool.current_pty_index {
+                let seq = if self.terminal_modes.terminal_focused() { b"\x1b[I" as &[u8] } else { b"\x1b[O" };
+                log::debug!("[FOCUS] PTY requested focus reporting, responding with {}", if self.terminal_modes.terminal_focused() { "focused" } else { "unfocused" });
                 self.handle_pty_input(seq);
             }
             return;
@@ -1597,12 +989,12 @@ where
     ) -> Result<()> {
         use super::render::{render, RenderContext};
 
-        // Check scroll state from parser
-        let (scroll_offset, is_scrolled) = {
-            let parser = self.vt100_parser.lock().expect("parser lock poisoned");
-            let offset = parser.screen().scrollback();
-            (offset, offset > 0)
-        };
+        // Read scroll state from the focused panel (no mutex needed)
+        let (scroll_offset, is_scrolled) = self.panel_pool.current_agent_index
+            .zip(self.panel_pool.current_pty_index)
+            .and_then(|(ai, pi)| self.panel_pool.panels.get(&(ai, pi)))
+            .map(|panel| (panel.scroll_offset(), panel.is_scrolled()))
+            .unwrap_or((0, false));
 
         // Connection code is cached from Lua responses (requested via show_connection_code action)
 
@@ -1613,10 +1005,9 @@ where
             connection_code: self.connection_code.as_ref(),
             bundle_used: false, // TuiRunner doesn't track this - would need from Hub
 
-            // Terminal State - use TuiRunner's local parser
-            active_parser: Some(self.parser_handle()),
-            panels: &self.panels,
-            active_pty_index: self.active_pty_index,
+            // Terminal State — panels own parsers directly (no mutex)
+            panels: &self.panel_pool.panels,
+            active_pty_index: self.panel_pool.active_pty_index,
             scroll_offset,
             is_scrolled,
 
@@ -1626,8 +1017,8 @@ where
             vpn_status: None,
 
             // Terminal dimensions for responsive layout
-            terminal_cols: self.terminal_dims.1,
-            terminal_rows: self.terminal_dims.0,
+            terminal_cols: self.panel_pool.terminal_dims().1,
+            terminal_rows: self.panel_pool.terminal_dims().0,
 
             // Widget area tracking (populated during rendering)
             terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1656,7 +1047,8 @@ where
 
         if let Some(ref result) = lua_result {
             // Sync subscriptions to match what the render tree declares
-            self.sync_subscriptions(&result.tree, &rendered_areas);
+            let msgs = self.panel_pool.sync_subscriptions(&result.tree, &rendered_areas);
+            for msg in msgs { self.send_msg(msg); }
 
             // Track overlay presence for input routing (PTY vs keybindings)
             self.has_overlay = result.overlay.is_some();
@@ -1686,7 +1078,8 @@ where
 
         // Resize parsers and PTYs to match actual widget areas from the render pass
         if !rendered_areas.is_empty() {
-            self.sync_widget_dims(&rendered_areas);
+            let msgs = self.panel_pool.sync_widget_dims(&rendered_areas);
+            for msg in msgs { self.send_msg(msg); }
         }
 
         // Render error indicator overlay if there's a layout error
@@ -1713,78 +1106,82 @@ where
 
     /// Execute a sequence of compound action operations from Lua.
     ///
-    /// Each op is a JSON object with an `op` field and operation-specific parameters.
-    /// This is the Rust side of the Lua compound action dispatch system.
+    /// Parses JSON ops into typed [`LuaOp`] variants, then dispatches each.
+    /// Parsing and validation happen in [`LuaOp::parse`]; this method handles
+    /// only execution and side effects.
     pub(super) fn execute_lua_ops(&mut self, ops: Vec<serde_json::Value>) {
-        for op in ops {
-            let op_name = op.get("op").and_then(|v| v.as_str()).unwrap_or("");
-            match op_name {
-                "set_mode" => {
-                    // Shadow update only — canonical state is _tui_state.mode in Lua.
-                    if let Some(mode) = op.get("mode").and_then(|v| v.as_str()) {
-                        log::info!("[TUI-OP] set_mode: {} -> {}", self.mode, mode);
-                        let was_insert = self.mode == "insert" && !self.has_overlay;
-                        self.mode = mode.to_string();
-                        let now_insert = self.mode == "insert" && !self.has_overlay;
-                        // Synthetic focus events on mode transition so the viewed
-                        // PTY tracks whether it's "active" even across overlays.
-                        if self.terminal_focused && was_insert != now_insert {
-                            if now_insert {
-                                log::debug!("[FOCUS] synthetic focus-in on mode change to insert");
-                                self.handle_pty_input(b"\x1b[I");
-                            } else {
-                                log::debug!("[FOCUS] synthetic focus-out on mode change from insert");
-                                self.handle_pty_input(b"\x1b[O");
-                            }
+        use super::lua_ops::LuaOp;
+
+        for op in LuaOp::parse_vec(ops) {
+            match op {
+                LuaOp::SetMode { mode } => {
+                    log::info!("[TUI-OP] set_mode: {} -> {}", self.mode, mode);
+                    let was_insert = self.mode == "insert" && !self.has_overlay;
+                    self.mode = mode;
+                    let now_insert = self.mode == "insert" && !self.has_overlay;
+                    // Synthetic focus events on mode transition so the viewed
+                    // PTY tracks whether it's "active" even across overlays.
+                    if self.terminal_modes.terminal_focused() && was_insert != now_insert {
+                        if now_insert {
+                            log::debug!("[FOCUS] synthetic focus-in on mode change to insert");
+                            self.handle_pty_input(b"\x1b[I");
+                        } else {
+                            log::debug!("[FOCUS] synthetic focus-out on mode change from insert");
+                            self.handle_pty_input(b"\x1b[O");
                         }
-                        // Reset Rust-side widget state on mode transition
-                        // (mirrors Lua's set_mode_ops resetting list_selected/input_buffer)
-                        self.widget_states.reset_all();
-                        // Clear focused widget IDs — new mode may have different widgets.
-                        // In production, the next render pass re-extracts these.
-                        self.focused_list_id = None;
-                        self.focused_input_id = None;
                     }
+                    // Reset Rust-side widget state on mode transition
+                    // (mirrors Lua's set_mode_ops resetting list_selected/input_buffer)
+                    self.widget_states.reset_all();
+                    self.focused_list_id = None;
+                    self.focused_input_id = None;
                 }
-                "send_msg" => {
-                    if let Some(data) = op.get("data") {
-                        log::info!("[TUI-OP] send_msg: {}", data);
-                        self.send_msg(data.clone());
-                    }
+                LuaOp::SendMsg { data } => {
+                    log::info!("[TUI-OP] send_msg: {}", data);
+                    self.send_msg(data);
                 }
-                "quit" => {
+                LuaOp::Quit => {
                     self.quit = true;
                 }
-                "focus_terminal" => {
-                    self.execute_focus_terminal(&op);
+                LuaOp::FocusTerminal {
+                    agent_id,
+                    agent_index,
+                    pty_index,
+                } => {
+                    self.execute_focus_terminal_typed(
+                        agent_id.as_deref(),
+                        agent_index,
+                        pty_index,
+                    );
                 }
-                "set_connection_code" => {
-                    let url = op.get("url").and_then(|v| v.as_str());
-                    let qr_ascii = op.get("qr_ascii").and_then(|v| v.as_array());
-
-                    if let (Some(url), Some(qr_array)) = (url, qr_ascii) {
-                        let qr_lines: Vec<String> = qr_array
-                            .iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect();
-
-                        let qr_width = qr_lines.first().map(|l| l.chars().count() as u16).unwrap_or(0);
-                        let qr_height = qr_lines.len() as u16;
-                        self.connection_code = Some(ConnectionCodeData {
-                            url: url.to_string(),
-                            qr_ascii: qr_lines,
-                            qr_width,
-                            qr_height,
-                        });
-                    } else {
-                        log::warn!("set_connection_code op missing url or qr_ascii");
-                    }
+                LuaOp::SetConnectionCode { url, qr_ascii } => {
+                    let qr_width = qr_ascii
+                        .first()
+                        .map(|l| l.chars().count() as u16)
+                        .unwrap_or(0);
+                    let qr_height = qr_ascii.len() as u16;
+                    self.connection_code = Some(ConnectionCodeData {
+                        url,
+                        qr_ascii,
+                        qr_width,
+                        qr_height,
+                    });
                 }
-                "clear_connection_code" => {
+                LuaOp::ClearConnectionCode => {
                     self.connection_code = None;
                 }
-                _ => {
-                    log::warn!("Unknown Lua compound op: {op_name}");
+                LuaOp::OscAlert { title, body } => {
+                    // Strip control characters to prevent OSC injection.
+                    let title: String = title.chars().filter(|c| !c.is_control()).collect();
+                    let body: String = body.chars().filter(|c| !c.is_control()).collect();
+                    // OSC 777 (rich: title + body) then OSC 9 (simple).
+                    // Terminals silently ignore sequences they don't support.
+                    let osc = format!(
+                        "\x1b]777;notify;{title};{body}\x07\x1b]9;{title}: {body}\x07"
+                    );
+                    let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    log::debug!("[OSC_ALERT] title={title:?} body={body:?}");
                 }
             }
         }
@@ -1792,123 +1189,68 @@ where
 
     /// Execute the `focus_terminal` op — switch to a specific agent and PTY.
     ///
-    /// If `agent_id` is absent/null, clears the current selection.
-    /// Otherwise, looks up the agent by ID, unsubscribes from the current
-    /// focused PTY, switches the parser pointer, and subscribes to the new one.
-    fn execute_focus_terminal(&mut self, op: &serde_json::Value) {
-        let agent_id = op.get("agent_id").and_then(|v| v.as_str());
-        let pty_index = op.get("pty_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let agent_index = op.get("agent_index").and_then(|v| v.as_u64()).map(|v| v as usize);
+    /// Delegates to [`PanelPool::focus_terminal`] for state logic, then
+    /// applies the returned [`FocusEffects`] (PTY inputs, Hub messages,
+    /// kitty state).
+    fn execute_focus_terminal_typed(
+        &mut self,
+        agent_id: Option<&str>,
+        agent_index: Option<usize>,
+        pty_index: usize,
+    ) {
         log::info!(
             "focus_terminal: agent_id={:?}, agent_index={:?}, pty_index={}",
             agent_id, agent_index, pty_index
         );
 
-        // Clear selection if no agent_id
-        let Some(agent_id) = agent_id else {
-            // Synthetic focus-out before clearing (handle_pty_input uses current indices)
-            if self.terminal_focused && self.current_agent_index.is_some() {
-                log::debug!("[FOCUS] synthetic focus-out on clear, agent={:?}", self.current_agent_index);
-                self.handle_pty_input(b"\x1b[O");
-            }
-            // Disconnect old panel
-            if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
-                if let Some(panel) = self.panels.get_mut(&(ai, pi)) {
-                    if let Some(msg) = panel.disconnect(ai, pi) {
-                        self.send_msg(msg);
-                    }
-                }
-            }
-            self.selected_agent = None;
-            self.current_agent_index = None;
-            self.current_pty_index = None;
-            self.current_terminal_sub_id = None;
-            self.inner_kitty_enabled = false;
-            // Reset parser to empty so the terminal view clears
-            let (rows, cols) = self.terminal_dims;
-            self.vt100_parser = Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK)));
-            return;
-        };
-
-        // Agent index provided by Lua (computed from _tui_state.agents)
-        let Some(index) = agent_index else {
-            log::warn!("focus_terminal: missing agent_index for agent {agent_id}");
-            return;
-        };
-
-        // Skip if already focused on same agent + pty.
-        // Must also check agent_id: after an agent is removed, a different agent
-        // can shift into the same index position.
-        if self.current_agent_index == Some(index)
-            && self.current_pty_index == Some(pty_index)
-            && self.selected_agent.as_deref() == Some(agent_id)
-        {
-            log::debug!("focus_terminal: already focused on agent {agent_id} pty {pty_index}");
-            return;
-        }
-
-        // Synthetic focus-out to old PTY before switching (uses current indices)
-        if self.terminal_focused && self.current_agent_index.is_some() {
-            log::debug!("[FOCUS] synthetic focus-out on switch, old_agent={:?}", self.current_agent_index);
-            self.handle_pty_input(b"\x1b[O");
-        }
-
-        // Disconnect old panel
-        if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
-            if let Some(panel) = self.panels.get_mut(&(ai, pi)) {
-                if let Some(msg) = panel.disconnect(ai, pi) {
-                    self.send_msg(msg);
-                }
-            }
-        }
-
-        // If a different agent now occupies this index (e.g. after removal shifted
-        // indices), discard the stale panel so we get a fresh parser.
-        if self.selected_agent.as_deref() != Some(agent_id) {
-            self.panels.remove(&(index, pty_index));
-        }
-
-        // Get or create the panel for this slot.
-        // Grab the outgoing panel's dims (same widget area) before it might
-        // get removed — avoids using terminal_dims which includes chrome and
-        // would cause a resize bounce.
-        let old_key = (
-            self.current_agent_index.unwrap_or(usize::MAX),
-            self.current_pty_index.unwrap_or(usize::MAX),
+        let terminal_focused = self.terminal_modes.terminal_focused();
+        let effects = self.panel_pool.focus_terminal(
+            agent_id, agent_index, pty_index, terminal_focused,
         );
-        let widget_dims = self.panels.get(&old_key)
-            .map(|p| p.dims())
-            .unwrap_or(self.terminal_dims);
-        let panel = self.panels
-            .entry((index, pty_index))
-            .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(widget_dims.0, widget_dims.1));
+        self.apply_focus_effects(effects);
+    }
 
-        // Subscribe IMMEDIATELY (no waiting for sync_subscriptions in render cycle)
-        let connect_msg = panel.connect(index, pty_index);
-
-        // Point vt100_parser alias at the panel's parser
-        self.vt100_parser = Arc::clone(panel.parser());
-
-        if let Some(msg) = connect_msg {
+    /// Apply side effects from a focus switch.
+    ///
+    /// Sends explicitly-targeted PTY inputs, Hub messages, and clears
+    /// kitty state as needed.
+    fn apply_focus_effects(
+        &mut self,
+        effects: super::panel_pool::FocusEffects,
+    ) {
+        // Subscribe/unsubscribe before focus sequences so pty_clients
+        // has the "tui" entry registered before set_focused runs.
+        for msg in effects.messages {
             self.send_msg(msg);
         }
-
-        // Update focus state
-        self.selected_agent = Some(agent_id.to_string());
-        self.current_agent_index = Some(index);
-        self.current_pty_index = Some(pty_index);
-        self.active_pty_index = pty_index;
-        self.current_terminal_sub_id = Some(format!("tui:{}:{}", index, pty_index));
-
-        // Synthetic focus-in to new PTY (after indices updated so handle_pty_input targets it)
-        if self.terminal_focused {
-            log::debug!("[FOCUS] synthetic focus-in on switch, new_agent={:?} pty={}", index, pty_index);
-            self.handle_pty_input(b"\x1b[I");
-        } else {
-            log::debug!("[FOCUS] skipping focus-in on switch (terminal not focused)");
+        for input in effects.pty_inputs {
+            if let Err(e) = self.request_tx.send(TuiRequest::PtyInput {
+                agent_index: input.agent_index,
+                pty_index: input.pty_index,
+                data: input.data.to_vec(),
+            }) {
+                log::error!("Failed to send PTY input: {e}");
+            }
+        }
+        if effects.clear_kitty {
+            self.terminal_modes.clear_inner_kitty();
         }
     }
 
+    /// JSON convenience wrapper for tests — delegates to [`Self::execute_focus_terminal_typed`].
+    #[cfg(test)]
+    pub(super) fn execute_focus_terminal(&mut self, op: &serde_json::Value) {
+        let agent_id = op.get("agent_id").and_then(|v| v.as_str());
+        let pty_index = op
+            .get("pty_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let agent_index = op
+            .get("agent_index")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        self.execute_focus_terminal_typed(agent_id, agent_index, pty_index);
+    }
 }
 
 /// Result from Lua layout rendering.
@@ -1990,16 +1332,6 @@ where
     })?;
 
     Ok(())
-}
-
-/// Truncate an error message to a maximum length, adding ellipsis if needed.
-fn truncate_error(msg: &str, max_len: usize) -> String {
-    let trimmed = msg.lines().next().unwrap_or(msg);
-    if trimmed.len() <= max_len {
-        trimmed.to_string()
-    } else {
-        format!("{}...", &trimmed[..max_len.saturating_sub(3)])
-    }
 }
 
 /// Run the TUI alongside a Hub.
@@ -2093,39 +1425,8 @@ pub fn run_with_hub(
         wake_read_fd,
     );
 
-    // Load Lua layout source: try filesystem first, then embedded.
-    // Filesystem allows hot-reload in dev; embedded is the release fallback.
-    if let Some(layout) = load_layout_lua_source() {
-        tui_runner.set_layout_lua_source(layout.source);
-        tui_runner.layout_lua_fs_path = layout.fs_path;
-    }
-
-    // Load Lua keybinding source alongside layout.
-    if let Some(kb) = load_keybinding_lua_source() {
-        tui_runner.set_keybinding_lua_source(kb.source);
-        tui_runner.keybinding_lua_fs_path = kb.fs_path;
-    }
-
-    // Load Lua actions source for compound action dispatch.
-    if let Some(actions) = load_actions_lua_source() {
-        tui_runner.set_actions_lua_source(actions.source);
-        tui_runner.actions_lua_fs_path = actions.fs_path;
-    }
-
-    // Load Lua events source for hub event handling.
-    if let Some(events) = load_events_lua_source() {
-        tui_runner.set_events_lua_source(events.source);
-        tui_runner.events_lua_fs_path = events.fs_path;
-    }
-
-    // Load botster API and discover UI extensions (plugins + user overrides).
-    tui_runner.botster_api_source = load_botster_api_source();
-    let lua_base = resolve_lua_user_path();
-    let mut extensions = discover_ui_extensions(&lua_base);
-    // User UI overrides (~/.botster/lua/ui/) layer on top of built-in modules.
-    // They redefine only the functions they want to customize.
-    extensions.extend(discover_user_ui_overrides());
-    tui_runner.extension_sources = extensions;
+    // Load all Lua sources and create bootstrap (consumed once by run()).
+    tui_runner.set_lua_bootstrap(super::hot_reload::LuaBootstrap::load());
 
     // Register SIGWINCH to set the resize flag (TuiRunner polls this each tick)
     #[cfg(unix)]
@@ -2174,187 +1475,6 @@ pub fn run_with_hub(
 
     log::info!("Hub event loop exiting");
     Ok(())
-}
-
-/// Result of loading Lua layout source.
-struct LayoutSource {
-    /// The Lua source code.
-    source: String,
-    /// Filesystem path if loaded from disk (for hot-reload watching).
-    /// None if loaded from embedded (no watching needed).
-    fs_path: Option<std::path::PathBuf>,
-}
-
-/// A UI extension source loaded from a plugin or user directory.
-#[derive(Debug)]
-struct ExtensionSource {
-    /// Lua source code.
-    source: String,
-    /// Human-readable name for error messages (e.g., "plugin:my-plugin/layout").
-    name: String,
-    /// Filesystem path for hot-reload watching.
-    fs_path: std::path::PathBuf,
-}
-
-/// Load a Lua UI module by name.
-///
-/// Returns the built-in source (embedded or source tree). User overrides
-/// in `~/.botster/lua/ui/` are loaded separately as extensions that layer
-/// on top — redefining only the functions they want to customize.
-fn load_lua_ui_source(name: &str) -> Option<LayoutSource> {
-    let rel_path = format!("ui/{name}");
-
-    // 1. Embedded (release builds).
-    if let Some(source) = crate::lua::embedded::get(&rel_path) {
-        log::info!("Loaded {name} from embedded");
-        return Some(LayoutSource {
-            source: source.to_string(),
-            fs_path: None,
-        });
-    }
-
-    // 2. Local source tree (debug builds where embedded is stubbed out).
-    let local = std::path::PathBuf::from("lua").join(&rel_path);
-    if let Ok(source) = std::fs::read_to_string(&local) {
-        let fs_path = local.canonicalize().unwrap_or(local);
-        log::info!("Loaded {name} from source tree: {}", fs_path.display());
-        return Some(LayoutSource {
-            source,
-            fs_path: Some(fs_path),
-        });
-    }
-
-    log::warn!("No {name} found");
-    None
-}
-
-/// Discover user UI override files from `~/.botster/lua/ui/`.
-///
-/// These are loaded as extensions on top of the built-in UI modules,
-/// so they only need to redefine the functions they want to customize.
-/// For example, a user `layout.lua` containing only `function render_overlay(state) ... end`
-/// overrides just the overlay while `render()` stays built-in.
-fn discover_user_ui_overrides() -> Vec<ExtensionSource> {
-    let mut overrides = Vec::new();
-    let ui_dir = match dirs::home_dir() {
-        Some(home) => home.join(".botster").join("lua").join("ui"),
-        None => return overrides,
-    };
-
-    if let Ok(entries) = std::fs::read_dir(&ui_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "lua") {
-                if let Ok(source) = std::fs::read_to_string(&path) {
-                    let name = path.file_stem()
-                        .map(|s| format!("user_ui_{}", s.to_string_lossy()))
-                        .unwrap_or_else(|| "user_ui".to_string());
-                    log::info!("Found user UI override: {}", path.display());
-                    overrides.push(ExtensionSource {
-                        name,
-                        source,
-                        fs_path: path.canonicalize().unwrap_or(path),
-                    });
-                }
-            }
-        }
-    }
-
-    overrides
-}
-
-fn load_layout_lua_source() -> Option<LayoutSource> {
-    load_lua_ui_source("layout.lua")
-}
-
-fn load_keybinding_lua_source() -> Option<LayoutSource> {
-    load_lua_ui_source("keybindings.lua")
-}
-
-fn load_actions_lua_source() -> Option<LayoutSource> {
-    load_lua_ui_source("actions.lua")
-}
-
-fn load_events_lua_source() -> Option<LayoutSource> {
-    load_lua_ui_source("events.lua")
-}
-
-fn load_botster_api_source() -> Option<String> {
-    load_lua_ui_source("botster.lua").map(|s| s.source)
-}
-
-/// Discover UI extension files from plugins and user directories.
-///
-/// Returns extensions in load order:
-/// 1. Plugin `ui/` files (alphabetical by plugin name)
-/// 2. User `~/.botster/lua/user/ui/` files (highest priority)
-fn discover_ui_extensions(lua_base: &std::path::Path) -> Vec<ExtensionSource> {
-    let mut extensions = Vec::new();
-    let ui_files = ["layout.lua", "keybindings.lua", "actions.lua"];
-
-    // Plugin UI extensions: ~/.botster/plugins/*/ui/{layout,keybindings,actions}.lua
-    // lua_base is ~/.botster/lua, plugins are at ~/.botster/plugins
-    let plugins_dir = lua_base
-        .parent()
-        .unwrap_or(lua_base)
-        .join("plugins");
-
-    if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
-        let mut plugin_dirs: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        plugin_dirs.sort_by_key(|e| e.file_name());
-
-        for entry in plugin_dirs {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let plugin_name = entry.file_name().to_string_lossy().to_string();
-
-            for ui_file in &ui_files {
-                let ui_path = path.join("ui").join(ui_file);
-                if let Ok(source) = std::fs::read_to_string(&ui_path) {
-                    log::info!("Discovered plugin UI extension: {plugin_name}/{ui_file}");
-                    extensions.push(ExtensionSource {
-                        source,
-                        name: format!("plugin:{plugin_name}/{ui_file}"),
-                        fs_path: ui_path,
-                    });
-                }
-            }
-        }
-    }
-
-    // User UI overrides: ~/.botster/lua/user/ui/{layout,keybindings,actions}.lua
-    let user_ui_dir = lua_base.join("user").join("ui");
-    for ui_file in &ui_files {
-        let path = user_ui_dir.join(ui_file);
-        if let Ok(source) = std::fs::read_to_string(&path) {
-            log::info!("Discovered user UI extension: {ui_file}");
-            extensions.push(ExtensionSource {
-                source,
-                name: format!("user/{ui_file}"),
-                fs_path: path,
-            });
-        }
-    }
-
-    extensions
-}
-
-/// Resolve candidate Lua base paths for loading UI modules.
-///
-/// Returns paths in priority order — loaders check each until the file is
-/// found. This allows `~/.botster/lua/` overrides to coexist with dev
-/// defaults in `./lua/`, like Neovim's runtimepath.
-///
-/// Resolve the user-level Lua path (`~/.botster/lua/`).
-///
-/// Used for discovering extensions and user overrides — not for loading
-/// core UI modules (which use `resolve_lua_search_paths`).
-fn resolve_lua_user_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".botster").join("lua"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".botster/lua"))
 }
 
 #[cfg(test)]
@@ -2427,7 +1547,7 @@ mod tests {
         let lua = make_test_layout_with_keybindings();
         runner.mode = lua.call_initial_mode();
         // Disable focus passthrough in tests — tests don't expect PtyInput focus events.
-        runner.terminal_focused = false;
+        runner.terminal_modes.on_focus_lost();
 
         (runner, request_rx)
     }
@@ -2493,7 +1613,7 @@ mod tests {
         let lua = make_test_layout_with_keybindings();
         runner.mode = lua.call_initial_mode();
         // Disable focus passthrough in tests — tests don't expect PtyInput focus events.
-        runner.terminal_focused = false;
+        runner.terminal_modes.on_focus_lost();
 
         (runner, output_tx, passthrough_rx, shutdown)
     }
@@ -2687,7 +1807,7 @@ mod tests {
     // =========================================================================
     //
     // These tests verify the critical output path:
-    // PTY broadcast -> poll_pty_events() -> vt100_parser.process()
+    // PTY broadcast -> poll_pty_events() -> panel.on_output()
 
     /// Verifies PTY output is fed to the VT100 parser.
 
@@ -3447,38 +2567,29 @@ mod tests {
     ///
     /// # Expected Behavior
     ///
-    /// `handle_resize()` should also call:
-    /// ```ignore
-    /// let mut parser = self.vt100_parser.lock().expect("parser lock poisoned");
-    /// parser.screen_mut().set_size(rows, cols);
-    /// ```
+    /// `handle_resize()` invalidates panel dims. Panels are resized by
+    /// `sync_widget_dims()` during the next render pass (matching the
+    /// actual widget area). There is no separate vt100_parser — each
+    /// panel owns its parser directly.
     #[test]
-    fn test_resize_updates_vt100_parser_dimensions() {
+    fn test_resize_invalidates_panel_dims() {
         let (mut runner, _cmd_rx) = create_test_runner();
 
-        // Initial dimensions from create_test_runner: (24, 80)
-        let initial_size = {
-            let parser = runner.vt100_parser.lock().expect("parser lock poisoned");
-            parser.screen().size()
-        };
-        assert_eq!(initial_size, (24, 80), "Initial parser size should be 24x80");
+        // Setup: create a panel with initial dims
+        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        panel.connect(0, 0);
+        runner.panel_pool.panels.insert((0, 0), panel);
 
-        // Simulate resize event to 40 rows x 120 cols
-        // (handle_resize receives rows, cols in that order)
+        assert_eq!(runner.panel_pool.panels.get(&(0, 0)).unwrap().dims(), (24, 80));
+
+        // Simulate resize event
         runner.handle_resize(40, 120);
 
-        // Verify terminal_dims was updated (this already works)
-        assert_eq!(runner.terminal_dims, (40, 120), "terminal_dims should be updated");
-
-        // BUG: Parser dimensions should ALSO be updated, but they're not
-        let new_size = {
-            let parser = runner.vt100_parser.lock().expect("parser lock poisoned");
-            parser.screen().size()
-        };
+        // Verify: terminal_dims updated, panel dims invalidated (0,0)
+        assert_eq!(runner.panel_pool.terminal_dims, (40, 120));
         assert_eq!(
-            new_size, (40, 120),
-            "Parser dimensions should be updated on resize. \
-             BUG: vt100_parser.screen_mut().set_size() is never called in handle_resize()"
+            runner.panel_pool.panels.get(&(0, 0)).unwrap().dims(), (0, 0),
+            "Panel dims should be invalidated so sync_widget_dims detects change"
         );
     }
 
@@ -3521,14 +2632,14 @@ mod tests {
         }
 
         // Verify local state updated
-        assert_eq!(runner.selected_agent.as_deref(), Some("agent-1"));
-        assert_eq!(runner.current_agent_index, Some(1));
-        assert_eq!(runner.current_pty_index, Some(0));
-        assert_eq!(runner.current_terminal_sub_id, Some("tui:1:0".to_string()));
+        assert_eq!(runner.panel_pool.selected_agent.as_deref(), Some("agent-1"));
+        assert_eq!(runner.panel_pool.current_agent_index, Some(1));
+        assert_eq!(runner.panel_pool.current_pty_index, Some(0));
+        assert_eq!(runner.panel_pool.current_terminal_sub_id, Some("tui:1:0".to_string()));
 
         // Verify panel created and in Connecting state
         use crate::tui::terminal_panel::PanelState;
-        assert_eq!(runner.panels.get(&(1, 0)).unwrap().state(), PanelState::Connecting);
+        assert_eq!(runner.panel_pool.panels.get(&(1, 0)).unwrap().state(), PanelState::Connecting);
     }
 
     /// Verifies `focus_terminal` with nil agent_id clears selection.
@@ -3542,12 +2653,12 @@ mod tests {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: agent 0 selected with active panel
-        runner.selected_agent = Some("agent-0".to_string());
-        runner.current_agent_index = Some(0);
-        runner.current_pty_index = Some(0);
-        runner.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.panel_pool.selected_agent = Some("agent-0".to_string());
+        runner.panel_pool.current_agent_index = Some(0);
+        runner.panel_pool.current_pty_index = Some(0);
+        runner.panel_pool.current_terminal_sub_id = Some("tui:0:0".to_string());
         {
-            let panel = runner.panels.entry((0, 0))
+            let panel = runner.panel_pool.panels.entry((0, 0))
                 .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(24, 80));
             panel.connect(0, 0); // put in Connecting state
         }
@@ -3567,10 +2678,10 @@ mod tests {
         }
 
         // Verify selection cleared
-        assert_eq!(runner.selected_agent, None);
-        assert_eq!(runner.current_agent_index, None);
-        assert_eq!(runner.current_pty_index, None);
-        assert_eq!(runner.current_terminal_sub_id, None);
+        assert_eq!(runner.panel_pool.selected_agent, None);
+        assert_eq!(runner.panel_pool.current_agent_index, None);
+        assert_eq!(runner.panel_pool.current_pty_index, None);
+        assert_eq!(runner.panel_pool.current_terminal_sub_id, None);
     }
 
     /// Verifies `focus_terminal` sends unsubscribe for old and subscribe for new.
@@ -3584,12 +2695,12 @@ mod tests {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: agent 0 selected with active panel
-        runner.selected_agent = Some("agent-0".to_string());
-        runner.current_agent_index = Some(0);
-        runner.current_pty_index = Some(0);
-        runner.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.panel_pool.selected_agent = Some("agent-0".to_string());
+        runner.panel_pool.current_agent_index = Some(0);
+        runner.panel_pool.current_pty_index = Some(0);
+        runner.panel_pool.current_terminal_sub_id = Some("tui:0:0".to_string());
         {
-            let panel = runner.panels.entry((0, 0))
+            let panel = runner.panel_pool.panels.entry((0, 0))
                 .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(24, 80));
             panel.connect(0, 0);
         }
@@ -3623,13 +2734,13 @@ mod tests {
         }
 
         // Verify state
-        assert_eq!(runner.selected_agent.as_deref(), Some("agent-1"));
-        assert_eq!(runner.current_agent_index, Some(1));
-        assert_eq!(runner.current_terminal_sub_id, Some("tui:1:0".to_string()));
+        assert_eq!(runner.panel_pool.selected_agent.as_deref(), Some("agent-1"));
+        assert_eq!(runner.panel_pool.current_agent_index, Some(1));
+        assert_eq!(runner.panel_pool.current_terminal_sub_id, Some("tui:1:0".to_string()));
 
         use crate::tui::terminal_panel::PanelState;
-        assert_eq!(runner.panels.get(&(0, 0)).unwrap().state(), PanelState::Idle);
-        assert_eq!(runner.panels.get(&(1, 0)).unwrap().state(), PanelState::Connecting);
+        assert_eq!(runner.panel_pool.panels.get(&(0, 0)).unwrap().state(), PanelState::Idle);
+        assert_eq!(runner.panel_pool.panels.get(&(1, 0)).unwrap().state(), PanelState::Connecting);
     }
 
     /// Verifies `focus_terminal` with unknown agent_id is a no-op.
@@ -3667,10 +2778,10 @@ mod tests {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Setup: agent 0 already focused
-        runner.selected_agent = Some("agent-0".to_string());
-        runner.current_agent_index = Some(0);
-        runner.current_pty_index = Some(0);
-        runner.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.panel_pool.selected_agent = Some("agent-0".to_string());
+        runner.panel_pool.current_agent_index = Some(0);
+        runner.panel_pool.current_pty_index = Some(0);
+        runner.panel_pool.current_terminal_sub_id = Some("tui:0:0".to_string());
 
         // Action: focus same agent+pty (Lua provides agent_index)
         runner.execute_focus_terminal(&serde_json::json!({
@@ -3705,9 +2816,9 @@ mod tests {
         panel.connect(1, 0);
         panel.on_scrollback(b"stale content from previous session");
         panel.disconnect(1, 0);
-        runner.panels.insert((1, 0), panel);
+        runner.panel_pool.panels.insert((1, 0), panel);
         // Simulate already viewing this agent (prevents stale-panel eviction)
-        runner.selected_agent = Some("agent-1".to_string());
+        runner.panel_pool.selected_agent = Some("agent-1".to_string());
 
         // Action: focus agent-1
         runner.execute_focus_terminal(&serde_json::json!({
@@ -3717,12 +2828,12 @@ mod tests {
             "pty_index": 0,
         }));
 
-        // Verify: stale content is preserved (not blanked)
-        let parser = runner.vt100_parser.lock().unwrap();
-        let contents = parser.screen().contents();
+        // Verify: stale content is preserved in the panel (not blanked)
+        let panel = runner.panel_pool.panels.get(&(1, 0)).unwrap();
+        let contents = panel.screen().contents();
         assert!(
             contents.contains("stale"),
-            "Parser should preserve stale content, got: {contents:?}"
+            "Panel should preserve stale content, got: {contents:?}"
         );
     }
 
@@ -3739,9 +2850,9 @@ mod tests {
         // Setup: panel with known dims from a previous render
         let panel = crate::tui::terminal_panel::TerminalPanel::new(20, 60);
         // Panel was previously connected and disconnected (has dims)
-        runner.panels.insert((1, 0), panel);
+        runner.panel_pool.panels.insert((1, 0), panel);
         // Simulate already viewing this agent (prevents stale-panel eviction)
-        runner.selected_agent = Some("agent-1".to_string());
+        runner.panel_pool.selected_agent = Some("agent-1".to_string());
 
         // Action: focus agent-1
         runner.execute_focus_terminal(&serde_json::json!({
@@ -3777,18 +2888,14 @@ mod tests {
         // Setup: panel in Connecting state with existing content and scroll offset
         let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect(0, 0); // Idle → Connecting (subscribe sent)
-        {
-            let p = panel.parser();
-            let mut p = p.lock().unwrap();
-            for i in 0..30 {
-                p.process(format!("old line {i}\r\n").as_bytes());
-            }
-            p.screen_mut().set_scrollback(5);
-            assert!(p.screen().scrollback() > 0, "precondition: scrolled");
+        for i in 0..30 {
+            panel.on_output(format!("old line {i}\r\n").as_bytes());
         }
-        runner.panels.insert((0, 0), panel);
-        runner.current_agent_index = Some(0);
-        runner.current_pty_index = Some(0);
+        panel.scroll_up(5);
+        assert!(panel.is_scrolled(), "precondition: scrolled");
+        runner.panel_pool.panels.insert((0, 0), panel);
+        runner.panel_pool.current_agent_index = Some(0);
+        runner.panel_pool.current_pty_index = Some(0);
 
         // Deliver scrollback event with fresh content
         runner.output_rx.close();
@@ -3805,8 +2912,8 @@ mod tests {
         runner.poll_pty_events(None);
 
         // Verify: old content gone, scroll reset, new content present
-        let parser = runner.panels.get(&(0, 0)).unwrap().parser().lock().unwrap();
-        let contents = parser.screen().contents();
+        let panel = runner.panel_pool.panels.get(&(0, 0)).unwrap();
+        let contents = panel.screen().contents();
         assert!(
             !contents.contains("old line"),
             "Old content should be cleared, got: {contents:?}"
@@ -3815,8 +2922,8 @@ mod tests {
             contents.contains("fresh snapshot"),
             "Snapshot should be processed, got: {contents:?}"
         );
-        assert_eq!(
-            parser.screen().scrollback(), 0,
+        assert!(
+            !panel.is_scrolled(),
             "Scroll should be reset to bottom"
         );
     }
@@ -3832,12 +2939,12 @@ mod tests {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Set up connected state with a panel
-        runner.current_agent_index = Some(0);
-        runner.current_pty_index = Some(0);
-        runner.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.panel_pool.current_agent_index = Some(0);
+        runner.panel_pool.current_pty_index = Some(0);
+        runner.panel_pool.current_terminal_sub_id = Some("tui:0:0".to_string());
         let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect(0, 0);
-        runner.panels.insert((0, 0), panel);
+        runner.panel_pool.panels.insert((0, 0), panel);
 
         // Drain the subscribe message
         let _ = request_rx.try_recv();
@@ -3849,10 +2956,10 @@ mod tests {
         assert!(request_rx.try_recv().is_err(), "handle_resize should not send any messages");
 
         // Verify: local state updated
-        assert_eq!(runner.terminal_dims, (40, 120));
+        assert_eq!(runner.panel_pool.terminal_dims, (40, 120));
 
         // Verify: panel dims invalidated (will trigger resize on next render)
-        assert_eq!(runner.panels.get(&(0, 0)).unwrap().dims(), (0, 0));
+        assert_eq!(runner.panel_pool.panels.get(&(0, 0)).unwrap().dims(), (0, 0));
     }
 
     /// Verifies `handle_resize()` updates state without sending messages
@@ -3868,29 +2975,10 @@ mod tests {
         assert!(request_rx.try_recv().is_err(), "handle_resize should not send any messages");
 
         // Verify: local state still updated
-        assert_eq!(runner.terminal_dims, (40, 120));
+        assert_eq!(runner.panel_pool.terminal_dims, (40, 120));
     }
 
-    // === Hot-Reload & Error UX ===
-
-    #[test]
-    fn test_truncate_error_short() {
-        assert_eq!(truncate_error("short error", 80), "short error");
-    }
-
-    #[test]
-    fn test_truncate_error_long() {
-        let long = "a".repeat(100);
-        let result = truncate_error(&long, 20);
-        assert_eq!(result.len(), 20);
-        assert!(result.ends_with("..."));
-    }
-
-    #[test]
-    fn test_truncate_error_multiline() {
-        let msg = "first line\nsecond line\nthird line";
-        assert_eq!(truncate_error(msg, 80), "first line");
-    }
+    // === Hot-Reload & Lua Reload ===
 
     #[test]
     fn test_layout_lua_reload_valid() {
@@ -3927,7 +3015,6 @@ mod tests {
             error_message: None,
             connection_code: None,
             bundle_used: false,
-            active_parser: None,
             panels,
             active_pty_index: 0,
             scroll_offset: 0,
@@ -3948,8 +3035,8 @@ mod tests {
     fn test_sync_subscriptions_subscribes_new() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        runner.current_agent_index = Some(0);
-        runner.current_pty_index = Some(0);
+        runner.panel_pool.current_agent_index = Some(0);
+        runner.panel_pool.current_pty_index = Some(0);
 
         // Tree with a single terminal widget with explicit binding
         let tree = crate::tui::render_tree::RenderNode::Widget {
@@ -3965,7 +3052,8 @@ mod tests {
             )),
         };
 
-        runner.sync_subscriptions(&tree, &std::collections::HashMap::new());
+        let msgs = runner.panel_pool.sync_subscriptions(&tree, &std::collections::HashMap::new());
+        for msg in msgs { runner.send_msg(msg); }
 
         // Should have sent a subscribe message for (0, 0)
         match request_rx.try_recv() {
@@ -3981,7 +3069,7 @@ mod tests {
         }
 
         use crate::tui::terminal_panel::PanelState;
-        assert_eq!(runner.panels.get(&(0, 0)).unwrap().state(), PanelState::Connecting);
+        assert_eq!(runner.panel_pool.panels.get(&(0, 0)).unwrap().state(), PanelState::Connecting);
     }
 
     /// Verifies `sync_subscriptions` unsubscribes when a binding is removed.
@@ -3989,17 +3077,17 @@ mod tests {
     fn test_sync_subscriptions_unsubscribes_removed() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        runner.current_agent_index = Some(0);
-        runner.current_pty_index = Some(0);
+        runner.panel_pool.current_agent_index = Some(0);
+        runner.panel_pool.current_pty_index = Some(0);
 
         // Pre-populate panels for two PTYs (both connected)
         {
             let mut p0 = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
             p0.connect(0, 0);
-            runner.panels.insert((0, 0), p0);
+            runner.panel_pool.panels.insert((0, 0), p0);
             let mut p1 = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
             p1.connect(0, 1);
-            runner.panels.insert((0, 1), p1);
+            runner.panel_pool.panels.insert((0, 1), p1);
         }
         // Drain subscribe messages
         while request_rx.try_recv().is_ok() {}
@@ -4018,7 +3106,8 @@ mod tests {
             )),
         };
 
-        runner.sync_subscriptions(&tree, &std::collections::HashMap::new());
+        let msgs = runner.panel_pool.sync_subscriptions(&tree, &std::collections::HashMap::new());
+        for msg in msgs { runner.send_msg(msg); }
 
         // Should have sent unsubscribe for (0, 1)
         let mut found_unsubscribe = false;
@@ -4032,8 +3121,8 @@ mod tests {
         assert!(found_unsubscribe, "Should send unsubscribe for removed binding");
 
         // Panel (0, 0) still exists, (0, 1) removed
-        assert!(runner.panels.contains_key(&(0, 0)));
-        assert!(!runner.panels.contains_key(&(0, 1)));
+        assert!(runner.panel_pool.panels.contains_key(&(0, 0)));
+        assert!(!runner.panel_pool.panels.contains_key(&(0, 1)));
     }
 
     /// Verifies `sync_subscriptions` is idempotent for already-connected panels.
@@ -4041,14 +3130,14 @@ mod tests {
     fn test_sync_subscriptions_no_change_idempotent() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        runner.current_agent_index = Some(0);
-        runner.current_pty_index = Some(0);
+        runner.panel_pool.current_agent_index = Some(0);
+        runner.panel_pool.current_pty_index = Some(0);
 
         // Pre-populate with a connected panel
         {
             let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
             panel.connect(0, 0);
-            runner.panels.insert((0, 0), panel);
+            runner.panel_pool.panels.insert((0, 0), panel);
         }
         // Drain subscribe message
         while request_rx.try_recv().is_ok() {}
@@ -4066,14 +3155,15 @@ mod tests {
             )),
         };
 
-        runner.sync_subscriptions(&tree, &std::collections::HashMap::new());
+        let msgs = runner.panel_pool.sync_subscriptions(&tree, &std::collections::HashMap::new());
+        for msg in msgs { runner.send_msg(msg); }
 
         // No messages should be sent (already connected)
         assert!(
             request_rx.try_recv().is_err(),
             "No messages should be sent when subscriptions unchanged"
         );
-        assert_eq!(runner.panels.len(), 1);
+        assert_eq!(runner.panel_pool.panels.len(), 1);
     }
 
     // =========================================================================
