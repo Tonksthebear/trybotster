@@ -68,6 +68,12 @@ pub enum TuiOutput {
         pty_index: Option<usize>,
         /// Raw scrollback data.
         data: Vec<u8>,
+        /// Whether the inner PTY has kitty keyboard protocol active.
+        ///
+        /// Carried alongside scrollback because vt100 silently consumes
+        /// the kitty CSI sequences in the snapshot bytes. The TUI needs
+        /// this to push kitty to the outer terminal on agent switch.
+        kitty_enabled: bool,
     },
 
     /// Ongoing PTY output.
@@ -110,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_tui_output_debug() {
-        let scrollback = TuiOutput::Scrollback { agent_index: Some(0), pty_index: Some(0), data: vec![1, 2, 3] };
+        let scrollback = TuiOutput::Scrollback { agent_index: Some(0), pty_index: Some(0), data: vec![1, 2, 3], kitty_enabled: false };
         let output = TuiOutput::Output { agent_index: Some(0), pty_index: Some(1), data: vec![4, 5, 6] };
         let exited = TuiOutput::ProcessExited { agent_index: Some(0), pty_index: Some(0), exit_code: Some(0) };
         let message = TuiOutput::Message(serde_json::json!({"type": "agent_created"}));
