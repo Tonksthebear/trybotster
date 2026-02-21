@@ -169,7 +169,7 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
   # The pairing page parses the bundle from the URL fragment, shows a
   # confirmation button, then redirects to the hub after session creation.
   def complete_pairing
-    click_button "Complete Secure Pairing", wait: 10
+    click_button "Complete Pairing", wait: 10
     # Pairing controller shows success state then redirects after 800ms.
     # Wait for hub page to load (connection-status targets appear).
     assert_selector "[data-connection-status-target='connectionSection']", wait: 15

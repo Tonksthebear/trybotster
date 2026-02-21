@@ -19,8 +19,6 @@
 
 // Rust guideline compliant 2026-01
 
-use std::sync::{Arc, Mutex};
-
 use anyhow::Result;
 use ratatui::{
     backend::{Backend, TestBackend},
@@ -33,7 +31,6 @@ use ratatui::{
     },
     Frame, Terminal,
 };
-use vt100::Parser;
 
 use crate::app::buffer_to_ansi;
 
@@ -65,10 +62,6 @@ pub struct RenderContext<'a> {
     pub bundle_used: bool,
 
     // === Terminal State ===
-    /// The VT100 parser for the currently focused agent's active PTY.
-    /// Used by the fallback renderer and as default for terminal widgets
-    /// without explicit bindings.
-    pub active_parser: Option<Arc<Mutex<Parser>>>,
     /// Terminal panels keyed by `(agent_index, pty_index)`.
     /// Used by terminal widgets with explicit PTY bindings.
     pub panels: &'a std::collections::HashMap<(usize, usize), super::terminal_panel::TerminalPanel>,
@@ -102,7 +95,6 @@ pub struct RenderContext<'a> {
 impl<'a> std::fmt::Debug for RenderContext<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RenderContext")
-            .field("has_active_parser", &self.active_parser.is_some())
             .field("active_pty_index", &self.active_pty_index)
             .field("scroll_offset", &self.scroll_offset)
             .field("is_scrolled", &self.is_scrolled)
@@ -219,7 +211,7 @@ pub(super) fn render_terminal_panel(
     block: Block,
     binding: Option<&super::render_tree::TerminalBinding>,
 ) {
-    // Resolve which parser to use: explicit binding → pool lookup, else active parser
+    // Resolve which panel to use: explicit binding → pool lookup, else focused PTY
     let (agent_idx, pty_idx) = if let Some(b) = binding {
         (
             b.agent_index.unwrap_or(0),
@@ -230,14 +222,6 @@ pub(super) fn render_terminal_panel(
         (0, ctx.active_pty_index)
     };
 
-    let parser = if binding.is_some() {
-        // Bound terminal: look up the parser from the panel
-        ctx.panels.get(&(agent_idx, pty_idx)).map(|p| Arc::clone(p.parser()))
-    } else {
-        // Unbound terminal (no agent selected): use the active parser
-        ctx.active_parser.clone()
-    };
-
     // Record the inner area (minus borders) so the runner can resize parsers/PTYs
     let inner = block.inner(area);
     if inner.width > 0 && inner.height > 0 {
@@ -246,12 +230,14 @@ pub(super) fn render_terminal_panel(
             .insert((agent_idx, pty_idx), (inner.height, inner.width));
     }
 
-    if let Some(ref parser) = parser {
-        let mut parser_lock = parser.lock().expect("parser lock not poisoned");
-        let scroll_offset = parser_lock.screen().scrollback();
-        let is_scrolled = scroll_offset > 0;
+    let panel = ctx.panels.get(&(agent_idx, pty_idx));
 
-        let screen = parser_lock.screen();
+    if let Some(panel) = panel {
+        let scroll_offset = panel.scroll_offset();
+        let scrollback_depth = panel.scrollback_depth();
+        let is_scrolled = panel.is_scrolled();
+
+        let screen = panel.screen();
         let widget = crate::TerminalWidget::new(screen).block(block);
         let widget = if is_scrolled {
             widget.hide_cursor()
@@ -261,23 +247,17 @@ pub(super) fn render_terminal_panel(
 
         widget.render(area, f.buffer_mut());
 
-        // Scrollbar overlay when scrolled
-        if is_scrolled {
-            // Get total scrollback by seeking to max, reading clamped value, restoring
-            parser_lock.screen_mut().set_scrollback(usize::MAX);
-            let scroll_total = parser_lock.screen().scrollback();
-            parser_lock.screen_mut().set_scrollback(scroll_offset);
-
-            if scroll_total > 0 {
-                let content_length = scroll_total + inner.height as usize;
-                // scroll_offset=max means top of history; position=0 means scrollbar at top
-                let position =
-                    content_length.saturating_sub(scroll_offset + inner.height as usize);
-                let mut scrollbar_state =
-                    ScrollbarState::new(content_length).position(position);
-                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-                scrollbar.render(inner, f.buffer_mut(), &mut scrollbar_state);
-            }
+        // Scrollbar overlay when scrolled — uses panel's pre-computed
+        // scrollback_depth, no mid-render mutations.
+        if is_scrolled && scrollback_depth > 0 {
+            let content_length = scrollback_depth + inner.height as usize;
+            // scroll_offset=max means top of history; position=0 means scrollbar at top
+            let position =
+                content_length.saturating_sub(scroll_offset + inner.height as usize);
+            let mut scrollbar_state =
+                ScrollbarState::new(content_length).position(position);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+            scrollbar.render(inner, f.buffer_mut(), &mut scrollbar_state);
         }
     } else {
         f.render_widget(block, area);

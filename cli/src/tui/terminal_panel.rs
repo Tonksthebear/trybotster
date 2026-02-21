@@ -1,8 +1,12 @@
 //! Terminal panel state machine for PTY connections.
 //!
-//! Each `TerminalPanel` owns a vt100 parser and tracks its connection
-//! lifecycle: `Idle` (not subscribed), `Connecting` (subscribe sent,
-//! awaiting scrollback), and `Connected` (receiving live data).
+//! Each `TerminalPanel` directly owns a vt100 parser and tracks its
+//! connection lifecycle: `Idle` (not subscribed), `Connecting`
+//! (subscribe sent, awaiting scrollback), and `Connected` (receiving
+//! live data).
+//!
+//! The parser is owned without `Arc<Mutex<>>` — the TUI thread is the
+//! sole accessor, so no synchronization is needed.
 //!
 //! The panel returns JSON messages for the caller to send rather than
 //! owning the transport channel, keeping it testable and free of
@@ -18,8 +22,6 @@
 
 // Rust guideline compliant 2026-02
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Mutex};
 use vt100::Parser;
 
 use crate::agent::spawn::contains_clear_scrollback;
@@ -44,14 +46,25 @@ pub enum PanelState {
 
 /// Owns a vt100 parser and its connection state.
 ///
-/// Encapsulates parser lifecycle, dimensions, and subscription
-/// management that was previously scattered across `TuiRunner` fields.
+/// Encapsulates parser lifecycle, dimensions, scroll state, and
+/// subscription management. The parser is directly owned (no mutex) —
+/// the TUI thread is the sole accessor.
+///
+/// Scroll offset and scrollback depth are tracked externally rather
+/// than relying on vt100's internal scrollback position, eliminating
+/// the `set_scrollback(usize::MAX)` hack that caused mid-render
+/// mutations.
+///
 /// Methods return `Option<serde_json::Value>` messages for the caller
 /// to send via the transport channel.
 pub struct TerminalPanel {
-    parser: Arc<Mutex<Parser>>,
+    parser: Parser,
     state: PanelState,
     dims: (u16, u16),
+    /// Lines scrolled up from live view. Zero means at bottom (live).
+    scroll_offset: usize,
+    /// Total scrollback lines available in the buffer.
+    scrollback_depth: usize,
 }
 
 impl std::fmt::Debug for TerminalPanel {
@@ -67,15 +80,20 @@ impl TerminalPanel {
     /// Create a panel with an empty parser at the given dimensions.
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
-            parser: Arc::new(Mutex::new(Parser::new(rows, cols, DEFAULT_SCROLLBACK))),
+            parser: Parser::new(rows, cols, DEFAULT_SCROLLBACK),
             state: PanelState::Idle,
             dims: (rows, cols),
+            scroll_offset: 0,
+            scrollback_depth: 0,
         }
     }
 
-    /// Shared reference to the parser for rendering.
-    pub fn parser(&self) -> &Arc<Mutex<Parser>> {
-        &self.parser
+    /// Borrow the parser's screen for rendering.
+    ///
+    /// Returns the vt100 screen with the correct scrollback offset
+    /// already applied — callers can render directly without mutations.
+    pub fn screen(&self) -> &vt100::Screen {
+        self.parser.screen()
     }
 
     /// Current connection state.
@@ -140,9 +158,13 @@ impl TerminalPanel {
         // Escape sequences like \x1b[2J only clear the visible screen — they
         // leave the scrollback buffer intact, causing duplication on reconnect.
         let (rows, cols) = self.dims;
-        let mut fresh = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
-        fresh.process(data);
-        *self.parser.lock().expect("parser lock poisoned") = fresh;
+        self.parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
+        self.parser.process(data);
+
+        // Reset scroll state — reconnect starts at live view
+        self.scroll_offset = 0;
+        self.measure_scrollback_depth();
+
         self.state = PanelState::Connected;
     }
 
@@ -156,50 +178,26 @@ impl TerminalPanel {
     /// silently ignores this sequence, so without manual handling the
     /// scrollback buffer accumulates duplicate screen content on every
     /// clear cycle.
-    ///
-    /// Wraps `parser.process()` in `catch_unwind` as a safety net for
-    /// vt100 arithmetic overflow panics (e.g. `col_wrap` on 1-row grids).
-    /// On panic, the parser is replaced with a fresh instance to avoid
-    /// poisoning the mutex and cascading failures.
     pub fn on_output(&mut self, data: &[u8]) {
         if self.state == PanelState::Idle {
             return;
         }
-        let mut parser = self.parser.lock().expect("parser lock poisoned");
 
-        // catch_unwind requires UnwindSafe. MutexGuard is !UnwindSafe
-        // because guarded state may be inconsistent after a panic. We use
-        // AssertUnwindSafe because on panic we immediately replace the
-        // parser with a fresh instance, discarding any inconsistent state.
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            parser.process(data);
-        }));
-
-        if let Err(panic_info) = result {
-            let msg = panic_info
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-
-            let (rows, cols) = parser.screen().size();
-            let rows = rows.max(crate::agent::pty::MIN_PARSER_ROWS);
-            *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
-            log::error!(
-                "TUI panel vt100 parser panicked (reset {rows}x{cols}): {msg}"
-            );
-            return;
-        }
+        self.parser.process(data);
 
         // CSI 3 J = \x1b[3J — "Erase Saved Lines" (clear scrollback).
         // vt100 ignores this, so we replace the parser to discard scrollback.
         if contains_clear_scrollback(data) {
-            let (rows, cols) = parser.screen().size();
-            let visible = parser.screen().contents_formatted();
-            let mut fresh = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
-            fresh.process(&visible);
-            *parser = fresh;
+            let (rows, cols) = self.parser.screen().size();
+            let visible = self.parser.screen().contents_formatted();
+            self.parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
+            self.parser.process(&visible);
+            self.scroll_offset = 0;
+            self.scrollback_depth = 0;
+            return;
         }
+
+        self.measure_scrollback_depth();
     }
 
     /// Resize the parser and notify the PTY if subscribed.
@@ -217,11 +215,7 @@ impl TerminalPanel {
             return None;
         }
         self.dims = (rows, cols);
-        self.parser
-            .lock()
-            .expect("parser lock poisoned")
-            .screen_mut()
-            .set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
 
         if self.state == PanelState::Idle {
             return None;
@@ -239,6 +233,70 @@ impl TerminalPanel {
     /// resized on the next render pass.
     pub fn invalidate_dims(&mut self) {
         self.dims = (0, 0);
+    }
+
+    // === Scroll State ===
+
+    /// Scroll up into history by `lines` lines.
+    pub fn scroll_up(&mut self, lines: usize) {
+        if lines == 0 {
+            return;
+        }
+        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(self.scrollback_depth);
+        self.parser.screen_mut().set_scrollback(self.scroll_offset);
+    }
+
+    /// Scroll down toward live view by `lines` lines.
+    pub fn scroll_down(&mut self, lines: usize) {
+        if lines == 0 || self.scroll_offset == 0 {
+            return;
+        }
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        self.parser.screen_mut().set_scrollback(self.scroll_offset);
+    }
+
+    /// Jump to the top of the scrollback buffer.
+    pub fn scroll_to_top(&mut self) {
+        if self.scrollback_depth == 0 {
+            return;
+        }
+        self.scroll_offset = self.scrollback_depth;
+        self.parser.screen_mut().set_scrollback(self.scroll_offset);
+    }
+
+    /// Jump to the bottom (return to live view).
+    pub fn scroll_to_bottom(&mut self) {
+        if self.scroll_offset == 0 {
+            return;
+        }
+        self.scroll_offset = 0;
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    /// Whether the panel is scrolled up from live view.
+    pub fn is_scrolled(&self) -> bool {
+        self.scroll_offset > 0
+    }
+
+    /// Current scroll offset (lines up from bottom).
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    /// Total scrollback lines available.
+    pub fn scrollback_depth(&self) -> usize {
+        self.scrollback_depth
+    }
+
+    /// Measure the actual scrollback depth from the parser.
+    ///
+    /// Uses the `set_scrollback(usize::MAX)` trick once, then restores
+    /// the real offset. Called after `process()` so we know the true
+    /// buffer depth.
+    fn measure_scrollback_depth(&mut self) {
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        self.scrollback_depth = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(self.scroll_offset);
     }
 }
 
@@ -291,8 +349,7 @@ mod tests {
         panel.on_scrollback(b"Hello, World!");
         assert_eq!(panel.state(), PanelState::Connected);
 
-        let p = panel.parser().lock().unwrap();
-        let cell = p.screen().cell(0, 0).unwrap();
+        let cell = panel.screen().cell(0, 0).unwrap();
         assert_eq!(cell.contents(), "H");
     }
 
@@ -301,8 +358,7 @@ mod tests {
         let mut panel = TerminalPanel::new(24, 80);
         panel.on_output(b"should be ignored");
 
-        let p = panel.parser().lock().unwrap();
-        let cell = p.screen().cell(0, 0).unwrap();
+        let cell = panel.screen().cell(0, 0).unwrap();
         assert!(!cell.has_contents());
     }
 
@@ -312,8 +368,7 @@ mod tests {
         panel.connect(0, 0);
         panel.on_output(b"data");
 
-        let p = panel.parser().lock().unwrap();
-        let cell = p.screen().cell(0, 0).unwrap();
+        let cell = panel.screen().cell(0, 0).unwrap();
         assert_eq!(cell.contents(), "d");
     }
 
@@ -401,8 +456,7 @@ mod tests {
         panel.on_output(b"old content");
         panel.on_scrollback(b"new snapshot");
 
-        let p = panel.parser().lock().unwrap();
-        let cell = p.screen().cell(0, 0).unwrap();
+        let cell = panel.screen().cell(0, 0).unwrap();
         assert_eq!(cell.contents(), "n");
     }
 
@@ -412,8 +466,7 @@ mod tests {
         panel.on_scrollback(b"should be ignored");
         assert_eq!(panel.state(), PanelState::Idle);
 
-        let p = panel.parser().lock().unwrap();
-        let cell = p.screen().cell(0, 0).unwrap();
+        let cell = panel.screen().cell(0, 0).unwrap();
         assert!(!cell.has_contents());
     }
 
@@ -427,24 +480,18 @@ mod tests {
             panel.on_output(format!("line {i}\r\n").as_bytes());
         }
 
-        // Probe actual scrollback buffer depth (not just scroll offset).
-        {
-            let mut p = panel.parser().lock().unwrap();
-            p.screen_mut().set_scrollback(usize::MAX);
-            let depth = p.screen().scrollback();
-            assert!(depth > 0, "should have scrollback buffer before clear");
-        }
+        // Panel tracks scrollback depth externally.
+        assert!(panel.scrollback_depth() > 0, "should have scrollback before clear");
 
         // Send CSI 3 J (clear scrollback).
         panel.on_output(b"\x1b[3J");
 
-        let mut p = panel.parser().lock().unwrap();
-        p.screen_mut().set_scrollback(usize::MAX);
         assert_eq!(
-            p.screen().scrollback(),
+            panel.scrollback_depth(),
             0,
-            "scrollback buffer should be empty after CSI 3 J"
+            "scrollback depth should be zero after CSI 3 J"
         );
+        assert_eq!(panel.scroll_offset(), 0, "scroll offset should reset on clear");
     }
 
     #[test]
@@ -456,39 +503,8 @@ mod tests {
         panel.on_output(b"visible text");
         panel.on_output(b"\x1b[3J");
 
-        let p = panel.parser().lock().unwrap();
-        let cell = p.screen().cell(0, 0).unwrap();
+        let cell = panel.screen().cell(0, 0).unwrap();
         assert_eq!(cell.contents(), "v", "visible screen should survive clear");
-    }
-
-    #[test]
-    fn on_output_recovers_from_vt100_panic() {
-        let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
-        panel.on_output(b"before panic");
-
-        // Shrink to 1 row to trigger the known col_wrap arithmetic
-        // overflow in vt100. The resize itself is safe, but subsequent
-        // process() calls on certain sequences can panic.
-        panel
-            .parser()
-            .lock()
-            .unwrap()
-            .screen_mut()
-            .set_size(1, 80);
-
-        // Even if this doesn't trigger the specific panic path, the
-        // catch_unwind structure is tested by verifying the parser
-        // remains usable after any vt100 panic. Feed normal output
-        // to confirm the parser is not poisoned.
-        panel.on_output(b"after resize");
-
-        // Parser should still be functional (not poisoned).
-        let p = panel.parser().lock().unwrap();
-        assert!(
-            !p.screen().contents().is_empty(),
-            "parser should be usable after potential panic recovery"
-        );
     }
 
     #[test]
@@ -497,5 +513,82 @@ mod tests {
         let debug = format!("{panel:?}");
         assert!(debug.contains("TerminalPanel"));
         assert!(debug.contains("Idle"));
+    }
+
+    #[test]
+    fn scroll_up_and_down() {
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect(0, 0);
+
+        // Write enough lines to create scrollback.
+        for i in 0..50 {
+            panel.on_output(format!("line {i}\r\n").as_bytes());
+        }
+        assert!(panel.scrollback_depth() > 0);
+
+        panel.scroll_up(10);
+        assert!(panel.is_scrolled());
+        assert_eq!(panel.scroll_offset(), 10);
+
+        panel.scroll_down(5);
+        assert_eq!(panel.scroll_offset(), 5);
+
+        panel.scroll_to_bottom();
+        assert!(!panel.is_scrolled());
+        assert_eq!(panel.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scroll_to_top_clamps_to_depth() {
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect(0, 0);
+
+        for i in 0..50 {
+            panel.on_output(format!("line {i}\r\n").as_bytes());
+        }
+        let depth = panel.scrollback_depth();
+
+        panel.scroll_to_top();
+        assert_eq!(panel.scroll_offset(), depth);
+    }
+
+    #[test]
+    fn scroll_up_clamped_to_scrollback_depth() {
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect(0, 0);
+
+        for i in 0..30 {
+            panel.on_output(format!("line {i}\r\n").as_bytes());
+        }
+        let depth = panel.scrollback_depth();
+
+        // Try to scroll way past the buffer
+        panel.scroll_up(usize::MAX);
+        assert_eq!(panel.scroll_offset(), depth);
+    }
+
+    #[test]
+    fn scroll_down_does_not_go_negative() {
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect(0, 0);
+        panel.scroll_down(100);
+        assert_eq!(panel.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scrollback_resets_scroll_on_reconnect() {
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect(0, 0);
+
+        for i in 0..30 {
+            panel.on_output(format!("line {i}\r\n").as_bytes());
+        }
+        panel.scroll_up(10);
+        assert!(panel.is_scrolled());
+
+        // Reconnect resets scroll
+        panel.on_scrollback(b"fresh snapshot");
+        assert!(!panel.is_scrolled());
+        assert_eq!(panel.scroll_offset(), 0);
     }
 }

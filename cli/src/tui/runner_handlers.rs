@@ -27,19 +27,27 @@ where
             }
 
             TuiAction::ScrollUp(lines) => {
-                crate::tui::scroll::up_parser(&self.vt100_parser, lines);
+                if let Some(panel) = self.focused_panel_mut() {
+                    panel.scroll_up(lines);
+                }
             }
 
             TuiAction::ScrollDown(lines) => {
-                crate::tui::scroll::down_parser(&self.vt100_parser, lines);
+                if let Some(panel) = self.focused_panel_mut() {
+                    panel.scroll_down(lines);
+                }
             }
 
             TuiAction::ScrollToTop => {
-                crate::tui::scroll::to_top_parser(&self.vt100_parser);
+                if let Some(panel) = self.focused_panel_mut() {
+                    panel.scroll_to_top();
+                }
             }
 
             TuiAction::ScrollToBottom => {
-                crate::tui::scroll::to_bottom_parser(&self.vt100_parser);
+                if let Some(panel) = self.focused_panel_mut() {
+                    panel.scroll_to_bottom();
+                }
             }
 
             TuiAction::SendMessage(msg) => {
@@ -48,5 +56,10 @@ where
 
             TuiAction::None => {}
         }
+    }
+
+    /// Get a mutable reference to the currently focused terminal panel.
+    fn focused_panel_mut(&mut self) -> Option<&mut crate::tui::terminal_panel::TerminalPanel> {
+        self.panel_pool.focused_panel_mut()
     }
 }

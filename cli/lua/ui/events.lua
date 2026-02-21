@@ -15,6 +15,7 @@
 --   focus_terminal    { op, agent_id, pty_index, agent_index }
 --   set_connection_code { op, url, qr_ascii }
 --   clear_connection_code { op }
+--   osc_alert           { op, title, body }            - Write OSC 777/9 to outer terminal
 
 local M = {}
 
@@ -164,6 +165,15 @@ function M.on_hub_event(event_type, event_data, context)
     local agents = event_data.agents
     if not agents then return nil end
     _tui_state.agents = agents
+    return {}
+  end
+
+  if event_type == "pty_notification" then
+    -- Emit OSC alert only when the TUI terminal does NOT have focus.
+    -- When focused, the user can already see the dot in the agent list.
+    if not context.terminal_focused then
+      return {{ op = "osc_alert", title = event_data.title, body = event_data.body }}
+    end
     return {}
   end
 
