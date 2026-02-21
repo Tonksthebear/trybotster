@@ -9,7 +9,6 @@
 //! - Scroll operations work on parser references
 //! - Agents track PTY lifecycle and scrollback buffer, not terminal emulation
 
-use botster::tui::scroll;
 use botster::{Agent, PtyView, TerminalWidget};
 use ratatui::{
     backend::TestBackend,
@@ -17,7 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState},
     Terminal,
 };
-use std::sync::{Arc, Mutex, Once, mpsc};
+use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -46,6 +45,30 @@ fn create_test_agent() -> (Agent, TempDir) {
         temp_dir.path().to_path_buf(),
     );
     (agent, temp_dir)
+}
+
+// Scroll helpers for integration tests — operate on raw Arc<Mutex<Parser>>.
+// These replace the deleted `tui::scroll` module with inline equivalents.
+
+fn scroll_up(parser: &Arc<Mutex<Parser>>, lines: usize) {
+    let mut p = parser.lock().unwrap();
+    let current = p.screen().scrollback();
+    p.screen_mut().set_scrollback(current.saturating_add(lines));
+}
+
+fn scroll_down(parser: &Arc<Mutex<Parser>>, lines: usize) {
+    let mut p = parser.lock().unwrap();
+    let current = p.screen().scrollback();
+    p.screen_mut().set_scrollback(current.saturating_sub(lines));
+}
+
+fn scroll_to_top(parser: &Arc<Mutex<Parser>>) {
+    let mut p = parser.lock().unwrap();
+    p.screen_mut().set_scrollback(usize::MAX);
+}
+
+fn is_scrolled(parser: &Arc<Mutex<Parser>>) -> bool {
+    parser.lock().unwrap().screen().scrollback() > 0
 }
 
 /// Create a standalone test parser (simulates client's parser).
@@ -101,8 +124,8 @@ fn test_scroll_then_render() {
     let parser = create_parser_with_content(24, 80, 100);
 
     // Scroll up using parser-based scroll module
-    scroll::up_parser(&parser, 20);
-    assert!(scroll::is_scrolled_parser(&parser));
+    scroll_up(&parser,20);
+    assert!(is_scrolled(&parser));
 
     // Now render - this should not deadlock
     let parser_lock = parser.lock().unwrap();
@@ -144,8 +167,8 @@ fn test_extreme_scrollback_render() {
     let parser = create_parser_with_content(24, 80, 1000);
 
     // Scroll to top
-    scroll::to_top_parser(&parser);
-    assert!(scroll::is_scrolled_parser(&parser));
+    scroll_to_top(&parser);
+    assert!(is_scrolled(&parser));
 
     // Render
     let parser_lock = parser.lock().unwrap();
@@ -179,8 +202,8 @@ fn test_rapid_scroll_no_deadlock() {
 
     // Rapid scroll operations
     for _ in 0..100 {
-        scroll::up_parser(&parser, 3);
-        scroll::down_parser(&parser, 1);
+        scroll_up(&parser,3);
+        scroll_down(&parser,1);
 
         // Simulate render check
         let parser_lock = parser.lock().unwrap();
@@ -241,7 +264,7 @@ fn test_main_render_loop_pattern() {
     let parser = create_parser_with_content(24, 80, 50);
 
     // Scroll up so we're in scrollback mode
-    scroll::up_parser(&parser, 10);
+    scroll_up(&parser,10);
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -299,7 +322,7 @@ fn test_render_with_timeout() {
     let handle = thread::spawn(move || {
         let parser = create_parser_with_content(24, 80, 50);
 
-        scroll::up_parser(&parser, 10);
+        scroll_up(&parser,10);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -325,7 +348,7 @@ fn test_render_with_timeout() {
             drop(parser_lock);
 
             // Scroll between renders
-            scroll::down_parser(&parser, 1);
+            scroll_down(&parser,1);
         }
 
         tx.send(()).unwrap();
@@ -596,12 +619,12 @@ fn test_rapid_scroll_parser_no_deadlock() {
         for i in 0..50 {
             // Scroll using parser-based API
             if i % 3 == 0 {
-                scroll::up_parser(&parser, 5);
+                scroll_up(&parser,5);
             } else if i % 3 == 1 {
-                scroll::down_parser(&parser, 2);
+                scroll_down(&parser,2);
             } else {
-                scroll::to_top_parser(&parser);
-                scroll::down_parser(&parser, 10);
+                scroll_to_top(&parser);
+                scroll_down(&parser,10);
             }
 
             // Lock and render

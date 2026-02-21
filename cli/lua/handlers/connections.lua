@@ -234,6 +234,9 @@ hooks.on("pty_notification", "push_notification", function(info)
         ptyIndex = info.pty_index,
         app_badge = badge_count,
     })
+
+    -- Broadcast to all clients (TUI + browser) so they can handle natively.
+    broadcast_hub_event("pty_notification", { title = title, body = body })
 end)
 
 -- Clear a pending notification on an agent by index.

@@ -88,6 +88,18 @@ pub enum TuiOutput {
         data: Vec<u8>,
     },
 
+    /// Batched PTY output — multiple chunks coalesced by the forwarder.
+    ///
+    /// Reduces wake pipe writes from one-per-4KB-chunk to one-per-batch.
+    OutputBatch {
+        /// Agent index for parser routing.
+        agent_index: Option<usize>,
+        /// PTY index for parser routing.
+        pty_index: Option<usize>,
+        /// Coalesced output chunks (processed sequentially to preserve CSI 3J detection).
+        chunks: Vec<Vec<u8>>,
+    },
+
     /// PTY process exited.
     ///
     /// Sent when the PTY process terminates. TuiRunner should handle this

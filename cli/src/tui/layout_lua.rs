@@ -54,6 +54,8 @@ pub struct ActionContext {
     pub selected_agent: Option<String>,
     /// Character for `input_char` action (set by Rust when dispatching).
     pub action_char: Option<char>,
+    /// Whether the outer terminal window has OS-level focus.
+    pub terminal_focused: bool,
 }
 
 /// TUI-owned Lua state for layout rendering and keybinding dispatch.
@@ -501,6 +503,10 @@ impl LayoutLua {
             set_field(&ctx_table, "_char", c.to_string().as_str())?;
         }
 
+        ctx_table
+            .set("terminal_focused", context.terminal_focused)
+            .map_err(|e| anyhow!("Failed to set terminal_focused: {e}"))?;
+
         Ok(ctx_table)
     }
 }
@@ -676,7 +682,6 @@ mod tests {
             error_message: None,
             connection_code: None,
             bundle_used: false,
-            active_parser: None,
             panels,
             active_pty_index: 0,
             scroll_offset: 0,
@@ -1924,8 +1929,7 @@ mod tests {
                 "close_agent".to_string(),
                 "show_connection_code".to_string(),
             ],
-            selected_agent: None,
-            action_char: None,
+            ..Default::default()
         };
         // list_selected defaults to 0 (first item = new_agent)
         let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
@@ -1956,8 +1960,7 @@ mod tests {
 
         let ctx = ActionContext {
             overlay_actions: vec!["new_agent".to_string()],
-            selected_agent: None,
-            action_char: None,
+            ..Default::default()
         };
         lua.call_on_action("list_select", &ctx).unwrap();
 
@@ -2287,9 +2290,8 @@ mod tests {
         enter_new_agent_flow(&lua);
 
         let ctx = ActionContext {
-            overlay_actions: vec![],
             selected_agent: Some("test-agent-1".to_string()),
-            action_char: None,
+            ..Default::default()
         };
         let ops = lua.call_on_action("close_modal", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["mode"], "insert",
@@ -2318,8 +2320,7 @@ mod tests {
         // Dispatch list_select with new_agent → mode becomes "new_agent_select_profile"
         let ctx = ActionContext {
             overlay_actions: vec!["new_agent".to_string()],
-            selected_agent: None,
-            action_char: None,
+            ..Default::default()
         };
         lua.call_on_action("list_select", &ctx).unwrap();
 
