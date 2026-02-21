@@ -1221,7 +1221,7 @@ class WebRTCTransport {
       return
     }
     if (msg.type === "push_status") {
-      this.#emit("push:status", { hubId, hasKeys: msg.has_keys, browserSubscribed: msg.browser_subscribed })
+      this.#emit("push:status", { hubId, hasKeys: msg.has_keys, browserSubscribed: msg.browser_subscribed, vapidPub: msg.vapid_pub })
       return
     }
 

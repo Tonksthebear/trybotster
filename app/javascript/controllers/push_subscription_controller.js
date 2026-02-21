@@ -112,8 +112,21 @@ export default class extends Controller {
     }
   }
 
-  #handlePushStatus({ hubId, hasKeys, browserSubscribed }) {
+  #handlePushStatus({ hubId, hasKeys, browserSubscribed, vapidPub }) {
     if (hubId !== this.hubIdValue) return;
+
+    // Detect stale subscription: CLI has keys and thinks browser is subscribed,
+    // but the browser's PushManager subscription was created with a different
+    // VAPID key (e.g. after a key rotation or device reset). Transparently
+    // resubscribe with the current key.
+    if (hasKeys && browserSubscribed && vapidPub) {
+      const storedKey = localStorage.getItem("botster_vapid_key");
+      if (storedKey && storedKey !== vapidPub) {
+        console.warn("[PushSubscription] VAPID key mismatch — resubscribing with current key");
+        this.#handleVapidKey({ hubId, key: vapidPub });
+        return;
+      }
+    }
 
     if (!hasKeys) {
       this.#showButtons("enable");
