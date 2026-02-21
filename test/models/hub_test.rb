@@ -348,5 +348,4 @@ class HubTest < ActiveSupport::TestCase
       hub.update!(last_seen_at: Time.current)
     end
   end
-
 end

@@ -162,8 +162,8 @@ export default class extends Controller {
     //    onBackend fires after WASM init → connectPty() subscribes terminal channel
     this.#restty = new Restty({
       root: container,
+      defaultContextMenu: false,
       onPaneCreated: (pane) => {
-        container.addEventListener("contextmenu", (e) => e.preventDefault());
         if (isMobile) {
           this.#imeInput = pane.imeInput;
           // Suppress iOS autocorrect/QuickType bar — not useful for terminal input
