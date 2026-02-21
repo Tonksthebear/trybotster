@@ -167,6 +167,9 @@ end
 -- When an agent sends an OSC notification (e.g., "question asked"),
 -- this posts to Rails which can update the GitHub issue/PR.
 hooks.on("pty_notification", "github_question_notify", function(data)
+    -- Skip if agent already has a pending notification (avoid duplicate comments)
+    if data.already_notified then return end
+
     local agent_key = data.agent_key
     if not agent_key then return end
 

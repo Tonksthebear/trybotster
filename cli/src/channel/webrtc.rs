@@ -53,6 +53,8 @@ pub struct PtyInputIncoming {
     pub pty_index: usize,
     /// Raw input bytes from browser.
     pub data: Vec<u8>,
+    /// Browser identity key (for per-client focus tracking).
+    pub browser_identity: String,
 }
 
 /// Incoming file from browser via binary DataChannel frame.
@@ -684,7 +686,7 @@ impl WebRtcChannel {
                                 let payload = plaintext[3 + sub_id_len..].to_vec();
 
                                 // Parse "terminal_{agent}_{pty}" and send directly to PTY
-                                if let Some(incoming) = parse_pty_input_sub_id(sub_id, payload) {
+                                if let Some(incoming) = parse_pty_input_sub_id(sub_id, payload, browser_identity.clone()) {
                                     if let Some(ref tx) = pty_input_tx {
                                         let _ = tx.send(incoming);
                                     }
@@ -746,7 +748,7 @@ impl WebRtcChannel {
                                 let data = plaintext[fname_start + filename_len..].to_vec();
 
                                 // Parse sub_id for agent/pty routing
-                                if let Some(pty_info) = parse_pty_input_sub_id(sub_id, Vec::new()) {
+                                if let Some(pty_info) = parse_pty_input_sub_id(sub_id, Vec::new(), browser_identity.clone()) {
                                     if let Some(ref tx) = file_input_tx {
                                         let _ = tx.send(FileInputIncoming {
                                             agent_index: pty_info.agent_index,
@@ -1215,7 +1217,7 @@ impl WebRtcChannel {
 }
 
 /// Parse a terminal subscription ID ("terminal_{agent}_{pty}") into a [`PtyInputIncoming`].
-fn parse_pty_input_sub_id(sub_id: &str, data: Vec<u8>) -> Option<PtyInputIncoming> {
+fn parse_pty_input_sub_id(sub_id: &str, data: Vec<u8>, browser_identity: String) -> Option<PtyInputIncoming> {
     let parts: Vec<&str> = sub_id.split('_').collect();
     if parts.len() == 3 && parts[0] == "terminal" {
         let agent_index = parts[1].parse().ok()?;
@@ -1224,6 +1226,7 @@ fn parse_pty_input_sub_id(sub_id: &str, data: Vec<u8>) -> Option<PtyInputIncomin
             agent_index,
             pty_index,
             data,
+            browser_identity,
         })
     } else {
         None
