@@ -1763,15 +1763,71 @@ impl Hub {
 
                 match pty_rx.recv().await {
                     Ok(PtyEvent::Output(data)) => {
-                        if sink.send(TuiOutput::Output {
+                        // Batch: drain all immediately available Output chunks
+                        // before sending. One wake per batch instead of per chunk.
+                        //
+                        // try_recv() consumes items before pattern matching, so
+                        // a non-Output event would be lost if we used `while let`.
+                        // Instead, we stash it and feed it back through the same
+                        // match arms after sending the batch.
+                        let mut chunks = vec![data];
+                        let mut stashed: Option<PtyEvent> = None;
+                        loop {
+                            match pty_rx.try_recv() {
+                                Ok(PtyEvent::Output(more)) => chunks.push(more),
+                                Ok(other) => { stashed = Some(other); break; }
+                                Err(_) => break,
+                            }
+                        }
+                        if sink.send(TuiOutput::OutputBatch {
                             agent_index: Some(agent_index),
                             pty_index: Some(pty_index),
-                            data,
+                            chunks,
                         }).is_err() {
                             log::trace!("[Lua-TUI] Output channel closed, stopping forwarder");
                             break;
                         }
                         if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+
+                        // Process the stashed non-output event that was consumed
+                        // during batching. These are rare (KittyChanged,
+                        // FocusRequested, ProcessExited) but must not be dropped.
+                        if let Some(event) = stashed {
+                            match event {
+                                PtyEvent::ProcessExited { exit_code } => {
+                                    log::info!(
+                                        "[Lua-TUI] PTY process exited (code={:?}) for agent {} pty {} (stashed)",
+                                        exit_code, agent_index, pty_index
+                                    );
+                                    let _ = sink.send(TuiOutput::ProcessExited {
+                                        agent_index: Some(agent_index),
+                                        pty_index: Some(pty_index),
+                                        exit_code,
+                                    });
+                                    if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                                    break; // exit forwarder on process exit
+                                }
+                                PtyEvent::KittyChanged(enabled) => {
+                                    let _ = sink.send(TuiOutput::Message(serde_json::json!({
+                                        "type": "kitty_changed",
+                                        "enabled": enabled,
+                                        "agent_index": agent_index,
+                                        "pty_index": pty_index,
+                                    })));
+                                    if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                                }
+                                PtyEvent::FocusRequested => {
+                                    let _ = sink.send(TuiOutput::Message(serde_json::json!({
+                                        "type": "focus_requested",
+                                        "agent_index": agent_index,
+                                        "pty_index": pty_index,
+                                    })));
+                                    if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                                }
+                                PtyEvent::Output(_) => unreachable!("output handled above"),
+                                _ => {} // Resized, Notification, etc. — not forwarded to TUI
+                            }
+                        }
                     }
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
                         log::info!(

@@ -968,7 +968,7 @@ impl ActionCableChannel {
             );
             let decrypt_start = std::time::Instant::now();
             let plaintext = match cs.lock() {
-                Ok(mut guard) => match guard.decrypt(&envelope) {
+                Ok(mut guard) => match guard.decrypt(&envelope, envelope.sender_key.as_deref()) {
                     Ok(p) => {
                         log::trace!(
                             "[INPUT-TRACE] Decrypted {} bytes from {} in {:?}",

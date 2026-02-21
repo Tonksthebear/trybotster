@@ -1321,4 +1321,5 @@ mod tests {
         parser.screen_mut().set_size(rows.max(MIN_PARSER_ROWS), 10);
         parser.process(b"AAAAAAAAAAB");
     }
+
 }
