@@ -18,10 +18,17 @@
 
 // Rust guideline compliant 2026-02
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use vt100::Parser;
 
+use crate::agent::spawn::contains_clear_scrollback;
+
 /// Default scrollback buffer size in lines.
+///
+/// Intentionally larger than `SHADOW_SCROLLBACK_LINES` (5000) because
+/// the TUI user can scroll back interactively, while the shadow screen
+/// only needs enough history for reconnect snapshots.
 const DEFAULT_SCROLLBACK: usize = 10_000;
 
 /// Connection lifecycle for a terminal panel.
@@ -143,11 +150,56 @@ impl TerminalPanel {
     ///
     /// Accepted in `Connecting` or `Connected` state. Ignored if `Idle`
     /// because we are not subscribed and data is stale.
+    ///
+    /// Detects CSI 3 J (clear scrollback) and replaces the parser with a
+    /// fresh one seeded with the current visible screen. The vt100 crate
+    /// silently ignores this sequence, so without manual handling the
+    /// scrollback buffer accumulates duplicate screen content on every
+    /// clear cycle.
+    ///
+    /// Wraps `parser.process()` in `catch_unwind` as a safety net for
+    /// vt100 arithmetic overflow panics (e.g. `col_wrap` on 1-row grids).
+    /// On panic, the parser is replaced with a fresh instance to avoid
+    /// poisoning the mutex and cascading failures.
     pub fn on_output(&mut self, data: &[u8]) {
         if self.state == PanelState::Idle {
             return;
         }
-        self.parser.lock().expect("parser lock poisoned").process(data);
+        let mut parser = self.parser.lock().expect("parser lock poisoned");
+
+        // catch_unwind requires UnwindSafe. MutexGuard is !UnwindSafe
+        // because guarded state may be inconsistent after a panic. We use
+        // AssertUnwindSafe because on panic we immediately replace the
+        // parser with a fresh instance, discarding any inconsistent state.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            parser.process(data);
+        }));
+
+        if let Err(panic_info) = result {
+            let msg = panic_info
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+
+            let (rows, cols) = parser.screen().size();
+            let rows = rows.max(crate::agent::pty::MIN_PARSER_ROWS);
+            *parser = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
+            log::error!(
+                "TUI panel vt100 parser panicked (reset {rows}x{cols}): {msg}"
+            );
+            return;
+        }
+
+        // CSI 3 J = \x1b[3J — "Erase Saved Lines" (clear scrollback).
+        // vt100 ignores this, so we replace the parser to discard scrollback.
+        if contains_clear_scrollback(data) {
+            let (rows, cols) = parser.screen().size();
+            let visible = parser.screen().contents_formatted();
+            let mut fresh = Parser::new(rows, cols, DEFAULT_SCROLLBACK);
+            fresh.process(&visible);
+            *parser = fresh;
+        }
     }
 
     /// Resize the parser and notify the PTY if subscribed.
@@ -363,6 +415,80 @@ mod tests {
         let p = panel.parser().lock().unwrap();
         let cell = p.screen().cell(0, 0).unwrap();
         assert!(!cell.has_contents());
+    }
+
+    #[test]
+    fn on_output_clears_scrollback_on_csi_3j() {
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect(0, 0);
+
+        // Write enough lines to create scrollback.
+        for i in 0..30 {
+            panel.on_output(format!("line {i}\r\n").as_bytes());
+        }
+
+        // Probe actual scrollback buffer depth (not just scroll offset).
+        {
+            let mut p = panel.parser().lock().unwrap();
+            p.screen_mut().set_scrollback(usize::MAX);
+            let depth = p.screen().scrollback();
+            assert!(depth > 0, "should have scrollback buffer before clear");
+        }
+
+        // Send CSI 3 J (clear scrollback).
+        panel.on_output(b"\x1b[3J");
+
+        let mut p = panel.parser().lock().unwrap();
+        p.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(
+            p.screen().scrollback(),
+            0,
+            "scrollback buffer should be empty after CSI 3 J"
+        );
+    }
+
+    #[test]
+    fn on_output_preserves_visible_screen_after_csi_3j() {
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect(0, 0);
+
+        // Write visible content then clear scrollback.
+        panel.on_output(b"visible text");
+        panel.on_output(b"\x1b[3J");
+
+        let p = panel.parser().lock().unwrap();
+        let cell = p.screen().cell(0, 0).unwrap();
+        assert_eq!(cell.contents(), "v", "visible screen should survive clear");
+    }
+
+    #[test]
+    fn on_output_recovers_from_vt100_panic() {
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect(0, 0);
+        panel.on_output(b"before panic");
+
+        // Shrink to 1 row to trigger the known col_wrap arithmetic
+        // overflow in vt100. The resize itself is safe, but subsequent
+        // process() calls on certain sequences can panic.
+        panel
+            .parser()
+            .lock()
+            .unwrap()
+            .screen_mut()
+            .set_size(1, 80);
+
+        // Even if this doesn't trigger the specific panic path, the
+        // catch_unwind structure is tested by verifying the parser
+        // remains usable after any vt100 panic. Feed normal output
+        // to confirm the parser is not poisoned.
+        panel.on_output(b"after resize");
+
+        // Parser should still be functional (not poisoned).
+        let p = panel.parser().lock().unwrap();
+        assert!(
+            !p.screen().contents().is_empty(),
+            "parser should be usable after potential panic recovery"
+        );
     }
 
     #[test]

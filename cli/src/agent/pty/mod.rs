@@ -747,6 +747,7 @@ impl PtySession {
     pub fn kitty_enabled(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.kitty_enabled)
     }
+
 }
 
 impl Drop for PtySession {
@@ -930,7 +931,16 @@ pub fn snapshot_with_scrollback(screen: &mut vt100::Screen) -> Vec<u8> {
     screen.set_scrollback(saved_offset);
 
     // Phase 2: Visible screen with full ANSI formatting and cursor position.
-    output.extend(b"\x1b[H\x1b[2J\x1b[0m");
+    //
+    // After Phase 1, the last `rows`-worth of scrollback lines are sitting on
+    // the receiving parser's visible screen. \x1b[2J would erase them without
+    // pushing to scrollback, losing those lines. Instead, scroll them off the
+    // top so they land in the scrollback buffer, then draw the live screen.
+    output.extend(format!("\x1b[{};1H", rows).as_bytes());
+    for _ in 0..rows {
+        output.push(b'\n');
+    }
+    output.extend(b"\x1b[H\x1b[0m");
     output.extend(screen.contents_formatted());
     let (row, col) = screen.cursor_position();
     output.extend(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
