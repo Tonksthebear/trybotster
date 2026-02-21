@@ -118,7 +118,11 @@
        data-status="<%= hub.active? ? 'online' : 'offline' %>"
        title="Hub CLI status">
     <%# Label %>
-    <span class="text-zinc-400 hidden sm:inline">Hub</span>
+    <span class="hidden sm:inline transition-colors
+                 group-data-[status=offline]/hub:text-zinc-500
+                 group-data-[status=connecting]/hub:text-amber-500
+                 group-data-[status=online]/hub:text-emerald-500
+                 group-data-[status=error]/hub:text-red-500">Hub</span>
     <%# Status dot %>
     <span class="size-1.5 rounded-full transition-colors
                  group-data-[status=offline]/hub:bg-zinc-500

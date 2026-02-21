@@ -2903,10 +2903,13 @@ impl Hub {
 
         let browser_subscribed = self.push_subscriptions.contains(browser_id);
 
+        let vapid_pub = self.vapid_keys.as_ref().map(|k| k.public_key_base64url().to_string());
+
         let response = serde_json::json!({
             "type": "push_status",
             "has_keys": has_keys,
             "browser_subscribed": browser_subscribed,
+            "vapid_pub": vapid_pub,
         });
 
         if let Some(channel) = self.webrtc_channels.get(browser_identity) {
