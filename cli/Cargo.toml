@@ -79,6 +79,7 @@ aes-gcm = "0.10"               # AES-GCM for encrypting state at rest
 
 # Web push notifications (CLI-direct, no Rails relay)
 web-push = { version = "0.11", default-features = false }  # VAPID + RFC8291 encryption only; default-features=false drops isahc (HTTP sent via reqwest for custom Content-Type)
+openssl = { version = "0.10", features = ["vendored"] }    # Vendored OpenSSL for cross-compilation (web-push → ece → openssl)
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }  # VAPID key generation (P-256 ECDSA)
 
 # WebSocket (kept for potential future use)
