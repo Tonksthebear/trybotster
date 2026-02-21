@@ -83,7 +83,6 @@ impl Hub {
                     &notif.session_name,
                     &notif.notification,
                 );
-                // Push notifications now triggered by Lua hooks via push.send()
             }
             HubEvent::PtyOscEvent { agent_key, session_name, event } => {
                 self.lua.notify_pty_osc_event(&agent_key, &session_name, &event);
@@ -466,6 +465,13 @@ impl Hub {
                 pty_index,
                 data,
             } => {
+                // Track per-client focus state in Lua pty_clients
+                // (before notify_pty_input so focus is current).
+                if data == b"\x1b[I" {
+                    self.lua.set_pty_focused(agent_index, pty_index, "tui", true);
+                } else if data == b"\x1b[O" {
+                    self.lua.set_pty_focused(agent_index, pty_index, "tui", false);
+                }
                 self.lua.notify_pty_input(agent_index);
                 if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
                     if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
@@ -490,6 +496,13 @@ impl Hub {
 
     /// Handle a single binary PTY input from a browser (WebRTC).
     pub fn handle_pty_input(&mut self, input: crate::channel::webrtc::PtyInputIncoming) {
+        // Track per-client focus state in Lua pty_clients
+        // (before notify_pty_input so focus is current).
+        if input.data == b"\x1b[I" {
+            self.lua.set_pty_focused(input.agent_index, input.pty_index, &input.browser_identity, true);
+        } else if input.data == b"\x1b[O" {
+            self.lua.set_pty_focused(input.agent_index, input.pty_index, &input.browser_identity, false);
+        }
         self.lua.notify_pty_input(input.agent_index);
         if let Some(agent_handle) = self.handle_cache.get_agent(input.agent_index) {
             if let Some(pty_handle) = agent_handle.get_pty(input.pty_index) {
@@ -775,7 +788,7 @@ impl Hub {
             loop {
                 match rx.recv().await {
                     Ok(PtyEvent::Notification(notif)) => {
-                        log::info!("[NotifWatcher] Got notification for {}: {:?}", key, notif);
+                        log::debug!("[NotifWatcher] Notification for {}: {:?}", key, notif);
                         let event = super::PtyNotificationEvent {
                             agent_key: agent_key.clone(),
                             session_name: session_name.clone(),
@@ -1699,8 +1712,9 @@ impl Hub {
             log::debug!("[Lua-TUI] Aborted existing PTY forwarder for {}", forwarder_key);
         }
 
-        // Get snapshot BEFORE subscribing to avoid duplicate data.
+        // Get snapshot and kitty state BEFORE subscribing to avoid duplicate data.
         let snapshot = pty_handle.get_snapshot();
+        let kitty_enabled = pty_handle.kitty_enabled();
         let pty_rx = pty_handle.subscribe();
 
         let sink = output_tx.clone();
@@ -1728,6 +1742,7 @@ impl Hub {
                     agent_index: Some(agent_index),
                     pty_index: Some(pty_index),
                     data: snapshot,
+                    kitty_enabled,
                 }).is_err() {
                     log::trace!("[Lua-TUI] Output channel closed before snapshot sent");
                     return;
@@ -1770,6 +1785,23 @@ impl Hub {
                         });
                         if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
                         break;
+                    }
+                    Ok(PtyEvent::KittyChanged(enabled)) => {
+                        let _ = sink.send(TuiOutput::Message(serde_json::json!({
+                            "type": "kitty_changed",
+                            "enabled": enabled,
+                            "agent_index": agent_index,
+                            "pty_index": pty_index,
+                        })));
+                        if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                    }
+                    Ok(PtyEvent::FocusRequested) => {
+                        let _ = sink.send(TuiOutput::Message(serde_json::json!({
+                            "type": "focus_requested",
+                            "agent_index": agent_index,
+                            "pty_index": pty_index,
+                        })));
+                        if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

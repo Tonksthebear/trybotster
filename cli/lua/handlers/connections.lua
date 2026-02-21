@@ -8,6 +8,7 @@
 
 local state = require("hub.state")
 local Agent = require("lib.agent")
+local pty_clients = require("lib.pty_clients")
 
 -- Shared client registry - all transports register here
 local clients = state.get("connections.clients", {})
@@ -147,26 +148,53 @@ hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
     broadcast_hub_event("worktree_list", { worktrees = worktrees })
 end)
 
--- Send a web push notification when a PTY notification (bell) fires.
--- Builds a deep link to the exact hub/agent/pty session.
--- Customizable: override by calling hooks.off("pty_notification", "push_notification")
--- and registering your own handler with push.send().
-hooks.on("pty_notification", "push_notification", function(info)
-    local hub_id = hub.server_id()
-    local agent = info.agent_key and Agent.get(info.agent_key)
+-- Global callable by Rust to update per-client focus state.
+-- Rust calls this when it detects focus-in/focus-out sequences in PTY input.
+function _set_pty_focused(agent_index, pty_index, peer_id, focused)
+    pty_clients.set_focused(agent_index, pty_index, peer_id, focused)
+end
 
-    -- Build deep link: /hubs/:id/agents/:index/ptys/:pty_index
-    local url = nil
-    if hub_id and agent and agent.agent_index then
-        -- Find pty_index from session_order (0-based for URL)
-        local pty_index = 0
+-- Enrich raw PTY notifications from Rust with agent state, then re-dispatch
+-- as the public "pty_notification" event. Consumers get `already_notified`,
+-- `has_focus`, and `pty_index` without needing to query anything themselves.
+hooks.on("_pty_notification_raw", "enrich_and_dispatch", function(info)
+    local agent = info.agent_key and Agent.get(info.agent_key)
+    info.already_notified = agent and agent.notification or false
+
+    -- Resolve pty_index from session_order (0-based)
+    local pty_index = 0
+    if agent then
         for i, entry in ipairs(agent.session_order or {}) do
             if entry.name == info.session_name then
                 pty_index = i - 1
                 break
             end
         end
-        url = string.format("/hubs/%s/agents/%d/ptys/%d", hub_id, agent.agent_index, pty_index)
+    end
+    info.pty_index = pty_index
+
+    -- Check if any client is actively viewing this PTY
+    info.has_focus = agent and agent.agent_index
+        and pty_clients.is_any_focused(agent.agent_index, pty_index) or false
+
+    hooks.notify("pty_notification", info)
+end)
+
+-- Send a web push notification when a PTY notification (bell) fires.
+-- Builds a deep link to the exact hub/agent/pty session.
+-- Customizable: override by calling hooks.off("pty_notification", "push_notification")
+-- and registering your own handler with push.send().
+hooks.on("pty_notification", "push_notification", function(info)
+    if info.has_focus then return end
+    if info.already_notified then return end
+
+    local hub_id = hub.server_id()
+    local agent = info.agent_key and Agent.get(info.agent_key)
+
+    -- Build deep link: /hubs/:id/agents/:index/ptys/:pty_index
+    local url = nil
+    if hub_id and agent and agent.agent_index then
+        url = string.format("/hubs/%s/agents/%d/ptys/%d", hub_id, agent.agent_index, info.pty_index)
     elseif hub_id then
         url = string.format("/hubs/%s", hub_id)
     end
@@ -203,7 +231,7 @@ hooks.on("pty_notification", "push_notification", function(info)
         body = body,
         url = url,
         agentIndex = agent and agent.agent_index or nil,
-        ptyIndex = pty_index,
+        ptyIndex = info.pty_index,
         app_badge = badge_count,
     })
 end)
@@ -357,7 +385,10 @@ function M._before_reload()
     hooks.off("agent_created", "broadcast_agent_created")
     hooks.off("agent_deleted", "broadcast_agent_deleted")
     hooks.off("agent_lifecycle", "broadcast_lifecycle")
+    hooks.off("_pty_notification_raw", "enrich_and_dispatch")
     hooks.off("pty_notification", "push_notification")
+    -- Remove global callable (re-registered on reload)
+    _set_pty_focused = nil
     log.info(string.format("connections.lua reloading with %d client(s)", get_client_count()))
 end
 

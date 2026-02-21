@@ -78,6 +78,7 @@ function M.register(agent_idx, pty_idx, peer_id, rows, cols)
         peer_id = peer_id,
         rows = rows,
         cols = cols,
+        focused = false,
         updated_at = os.clock(),
     })
 
@@ -189,6 +190,36 @@ function M.get_active_dims(agent_idx, pty_idx)
     end
 
     return nil, nil
+end
+
+--- Set a client's focused state for a PTY.
+-- Called by Rust when focus-in/focus-out sequences are detected.
+-- @param agent_idx Agent index
+-- @param pty_idx PTY index
+-- @param peer_id Client peer ID
+-- @param focused boolean
+function M.set_focused(agent_idx, pty_idx, peer_id, focused)
+    local store = get_store()
+    local key = make_key(agent_idx, pty_idx)
+    if not store[key] then return end
+    local entry = find_entry(store[key], peer_id)
+    if entry then entry.focused = focused end
+end
+
+--- Check if any client is currently focused on a PTY.
+-- Used by the push notification handler to suppress notifications
+-- when at least one client is actively viewing the PTY.
+-- @param agent_idx Agent index
+-- @param pty_idx PTY index
+-- @return boolean
+function M.is_any_focused(agent_idx, pty_idx)
+    local store = get_store()
+    local key = make_key(agent_idx, pty_idx)
+    if not store[key] then return false end
+    for _, entry in ipairs(store[key]) do
+        if entry.focused then return true end
+    end
+    return false
 end
 
 -- Lifecycle hooks for hot-reload

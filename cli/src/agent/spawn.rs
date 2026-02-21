@@ -184,6 +184,13 @@ pub fn spawn_reader_thread(
                     // the raw bytes for CSI > flags u (push) / CSI < u (pop).
                     if let Some(state) = scan_kitty_keyboard_state(chunk) {
                         kitty_enabled.store(state, Ordering::Relaxed);
+                        let _ = event_tx.send(PtyEvent::kitty_changed(state));
+                    }
+
+                    // Detect focus reporting enable (CSI ? 1004 h) so the TUI
+                    // can respond with the current terminal focus state.
+                    if scan_focus_reporting_enabled(chunk) {
+                        let _ = event_tx.send(PtyEvent::focus_requested());
                     }
 
                     // Feed PTY bytes to shadow screen for parsed state tracking.
@@ -281,7 +288,7 @@ pub fn spawn_reader_thread(
 /// Scans for `\x1b[3J` which terminals emit when the user runs `clear` or
 /// equivalent commands. The vt100 crate does not handle this sequence, so
 /// callers must clear scrollback manually when this returns true.
-fn contains_clear_scrollback(data: &[u8]) -> bool {
+pub(crate) fn contains_clear_scrollback(data: &[u8]) -> bool {
     // CSI 3 J = ESC [ 3 J = [0x1b, 0x5b, 0x33, 0x4a]
     data.windows(4)
         .any(|w| w == b"\x1b[3J")
@@ -332,6 +339,17 @@ pub fn scan_kitty_keyboard_state(data: &[u8]) -> Option<bool> {
     }
 
     result
+}
+
+/// Scan PTY output for focus reporting enable sequence (`CSI ? 1004 h`).
+///
+/// Returns `true` if the byte stream contains `\x1b[?1004h`, indicating
+/// the application wants terminal focus events. The TUI should respond
+/// with the current focus state (`CSI I` or `CSI O`).
+pub fn scan_focus_reporting_enabled(data: &[u8]) -> bool {
+    // Match the byte sequence: ESC [ ? 1 0 0 4 h
+    let needle = b"\x1b[?1004h";
+    data.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Scan PTY output for OSC 0/2 window title sequences.

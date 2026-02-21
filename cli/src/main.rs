@@ -276,7 +276,7 @@ fn run_with_tui() -> Result<()> {
     // NOW setup terminal (after all initialization that could fail)
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, crossterm::event::EnableFocusChange)?;
 
     // Kitty keyboard protocol is NOT pushed here — it's mirrored dynamically
     // from the inner PTY's state by sync_terminal_modes() in the event loop.
