@@ -301,6 +301,12 @@ impl PtyHandle {
 
     /// Get a clean ANSI snapshot of the current terminal state.
     ///
+    /// Whether the inner PTY has kitty keyboard protocol active.
+    #[must_use]
+    pub fn kitty_enabled(&self) -> bool {
+        self.kitty_enabled.load(Ordering::Relaxed)
+    }
+
     /// Locks the shadow screen and delegates to [`crate::agent::pty::snapshot_with_scrollback`].
     /// Appends the kitty keyboard push sequence when the inner PTY has
     /// activated kitty mode, so connecting terminals enter kitty mode.
