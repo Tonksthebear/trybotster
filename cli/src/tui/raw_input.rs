@@ -45,6 +45,10 @@ pub enum InputEvent {
         /// Scroll direction (up or down).
         direction: ScrollDirection,
     },
+    /// Outer terminal gained focus (`CSI I`).
+    FocusGained,
+    /// Outer terminal lost focus (`CSI O`).
+    FocusLost,
 }
 
 /// Mouse scroll direction.
@@ -163,7 +167,12 @@ impl RawInputReader {
                 return true;
             }
 
-            self.pending.extend_from_slice(&buf[..n as usize]);
+            let chunk = &buf[..n as usize];
+            // Log raw stdin bytes containing ESC to help diagnose focus event issues.
+            if chunk.contains(&0x1b) {
+                log::debug!("[STDIN-RAW] {} bytes: {:?}", chunk.len(), chunk);
+            }
+            self.pending.extend_from_slice(chunk);
         }
         false
     }
@@ -396,6 +405,18 @@ impl RawInputReader {
         } else {
             1 // No modifier
         };
+
+        // Focus reporting: CSI I (gained) / CSI O (lost) — no parameters.
+        if params.is_empty() {
+            if final_byte == b'I' {
+                self.pending.drain(..seq_len);
+                return Some(InputEvent::FocusGained);
+            }
+            if final_byte == b'O' {
+                self.pending.drain(..seq_len);
+                return Some(InputEvent::FocusLost);
+            }
+        }
 
         let modifier_prefix = modifier_to_prefix(modifier);
 
@@ -677,7 +698,11 @@ mod tests {
 
     #[test]
     fn test_lf_is_ctrl_j() {
-        // 0x0A (LF) = Ctrl+J — no special-casing, falls through to default
+        // 0x0A (LF) = Ctrl+J — no special-casing, falls through to default.
+        // NOTE: Ghostty sends 0x0A for shift+enter even when kitty keyboard
+        // protocol is active. TuiRunner remaps this at the dispatch level
+        // (not here) because it depends on outer_kitty_enabled state.
+        // See: https://github.com/ghostty-org/ghostty/issues/1850
         let mut r = reader_with_bytes(&[0x0a]);
         let events = r.parse_events();
         assert_eq!(first_descriptor(&events), "ctrl+j");

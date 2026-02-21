@@ -54,7 +54,6 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::execute;
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 use vt100::Parser;
@@ -1027,19 +1026,19 @@ where
                 }
                 InputEvent::FocusGained => {
                     self.terminal_focused = true;
-                    log::info!("[FOCUS] terminal gained focus, mode={} overlay={}", self.mode, self.has_overlay);
+                    log::debug!("[FOCUS] terminal gained focus, mode={} overlay={}", self.mode, self.has_overlay);
                     // Forward to viewed PTY so inner apps (e.g. Claude Code)
                     // know the terminal is focused and can suppress notifications.
                     if self.mode == "insert" && !self.has_overlay {
-                        log::info!("[FOCUS] forwarding \\x1b[I to PTY agent={:?} pty={:?}", self.current_agent_index, self.current_pty_index);
+                        log::debug!("[FOCUS] forwarding \\x1b[I to PTY agent={:?} pty={:?}", self.current_agent_index, self.current_pty_index);
                         self.handle_pty_input(b"\x1b[I");
                     }
                 }
                 InputEvent::FocusLost => {
                     self.terminal_focused = false;
-                    log::info!("[FOCUS] terminal lost focus, mode={} overlay={}", self.mode, self.has_overlay);
+                    log::debug!("[FOCUS] terminal lost focus, mode={} overlay={}", self.mode, self.has_overlay);
                     if self.mode == "insert" && !self.has_overlay {
-                        log::info!("[FOCUS] forwarding \\x1b[O to PTY agent={:?} pty={:?}", self.current_agent_index, self.current_pty_index);
+                        log::debug!("[FOCUS] forwarding \\x1b[O to PTY agent={:?} pty={:?}", self.current_agent_index, self.current_pty_index);
                         self.handle_pty_input(b"\x1b[O");
                     }
                 }
@@ -1096,7 +1095,19 @@ where
     /// Mouse scroll events are handled directly.
     fn handle_raw_input_event(&mut self, event: InputEvent, layout_lua: Option<&LayoutLua>) {
         match event {
-            InputEvent::Key { descriptor, raw_bytes } => {
+            InputEvent::Key { mut descriptor, mut raw_bytes } => {
+                // Ghostty workaround: shift+enter arrives as 0x0a (LF = ctrl+j)
+                // even when kitty keyboard protocol is active. With kitty mode 1,
+                // a real ctrl+j press arrives as CSI 106;5 u, so bare 0x0a can
+                // only be Ghostty's broken shift+enter. Remap both the descriptor
+                // (for Lua keybinding lookup) and the raw bytes (for PTY forward,
+                // since the inner app expects kitty encoding).
+                // See: https://github.com/ghostty-org/ghostty/issues/1850
+                if self.outer_kitty_enabled && raw_bytes == [0x0a] {
+                    descriptor = "shift+enter".to_string();
+                    raw_bytes = b"\x1b[13;2u".to_vec();
+                }
+
                 // Safety: Ctrl+Q always works, even if Lua is broken.
                 // Sends quit message directly (duplicates Lua's quit action)
                 // because this path must work without Lua.
@@ -1345,6 +1356,20 @@ where
     /// Tracked modes:
     /// - DECCKM (application cursor): arrow keys send ESC O x vs ESC [ x
     /// - Bracketed paste: paste is wrapped in ESC [200~ / ESC [201~
+    /// - Kitty keyboard protocol: disambiguate modified keys (shift+enter, etc.)
+    ///
+    /// # Kitty + Ghostty workaround
+    ///
+    /// Even with kitty mode pushed, Ghostty still sends `0x0a` for shift+enter
+    /// instead of the proper `CSI 13;2 u`. This is a known Ghostty behavior:
+    /// - <https://github.com/ghostty-org/ghostty/issues/1850>
+    /// - <https://github.com/anthropics/claude-code/issues/5757>
+    /// - <https://github.com/ghostty-org/ghostty/discussions/7780>
+    ///
+    /// We work around this in [`Self::handle_raw_input_event`] by remapping
+    /// `0x0a` (ctrl+j) to `shift+enter` when kitty is active on the outer
+    /// terminal. This is safe because with kitty mode 1, a real ctrl+j press
+    /// arrives as `CSI 106;5 u`, never as bare `0x0a`.
     fn sync_terminal_modes(&mut self) {
         let parser = self.vt100_parser.lock().expect("parser lock poisoned");
         let screen = parser.screen();
@@ -1371,7 +1396,7 @@ where
             let _ = std::io::Write::write_all(&mut std::io::stdout(), seq);
         }
 
-        // Drop the parser lock before writing Kitty sequences (which use execute!())
+        // Drop the parser lock before writing kitty sequences.
         drop(parser);
 
         // Kitty keyboard protocol: only push when PTY wants it AND there's no overlay.
@@ -1379,29 +1404,23 @@ where
         let desired_kitty = self.inner_kitty_enabled && !self.has_overlay;
         if desired_kitty != self.outer_kitty_enabled {
             log::info!(
-                "[KITTY] Syncing outer terminal: inner={} overlay={} desired={} outer={}",
+                "[KITTY] sync: inner={} overlay={} desired={} outer={}",
                 self.inner_kitty_enabled, self.has_overlay, desired_kitty, self.outer_kitty_enabled
             );
             self.outer_kitty_enabled = desired_kitty;
-            if desired_kitty {
-                // Write kitty push directly — CSI > 1 u
-                let push_result = std::io::Write::write_all(
-                    &mut std::io::stdout(),
-                    b"\x1b[>1u",
-                ).and_then(|_| std::io::Write::flush(&mut std::io::stdout()));
-                match push_result {
-                    Ok(()) => log::info!("[KITTY] Pushed kitty to outer terminal (raw CSI > 1 u)"),
-                    Err(e) => log::error!("[KITTY] Failed to push kitty: {e}"),
-                }
+            // Write raw bytes via libc to bypass any buffering. Push = CSI > 1 u,
+            // Pop = CSI < u (flag 1 = DISAMBIGUATE_ESCAPE_CODES).
+            let seq: &[u8] = if desired_kitty {
+                b"\x1b[>1u"
             } else {
-                let pop_result = std::io::Write::write_all(
-                    &mut std::io::stdout(),
-                    b"\x1b[<u",
-                ).and_then(|_| std::io::Write::flush(&mut std::io::stdout()));
-                match pop_result {
-                    Ok(()) => log::info!("[KITTY] Popped kitty from outer terminal (raw CSI < u)"),
-                    Err(e) => log::error!("[KITTY] Failed to pop kitty: {e}"),
-                }
+                b"\x1b[<u"
+            };
+            unsafe {
+                libc::write(
+                    libc::STDOUT_FILENO,
+                    seq.as_ptr() as *const libc::c_void,
+                    seq.len(),
+                );
             }
         }
     }
@@ -1447,13 +1466,6 @@ where
                         && pty_index == self.current_pty_index;
                     if is_focused {
                         self.inner_kitty_enabled = kitty_enabled;
-                        // PTY is now Connected — Claude Code is running and may have
-                        // enabled focus reporting. Resend current focus state so it
-                        // doesn't miss the initial synthetic sent during switch.
-                        if self.terminal_focused {
-                            log::info!("[FOCUS] resending focus-in on scrollback (PTY now connected)");
-                            self.handle_pty_input(b"\x1b[I");
-                        }
                     }
                     log::debug!(
                         "Processed {} bytes of scrollback (kitty={}{})",
@@ -1491,6 +1503,10 @@ where
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     log::debug!("PTY output channel disconnected");
+                    // Unfocus current PTY so the focused flag doesn't stick.
+                    if self.terminal_focused && self.current_agent_index.is_some() {
+                        self.handle_pty_input(b"\x1b[O");
+                    }
                     // Channel closed — disconnect all panels.
                     let msgs: Vec<_> = self.panels.iter_mut()
                         .filter_map(|(&(ai, pi), panel)| panel.disconnect(ai, pi))
@@ -1530,6 +1546,19 @@ where
                 if let Some(enabled) = msg.get("enabled").and_then(|v| v.as_bool()) {
                     self.inner_kitty_enabled = enabled;
                 }
+            }
+            return;
+        }
+
+        // Handle focus_requested — PTY enabled focus reporting (CSI ? 1004 h).
+        // Respond with current terminal focus state so the app knows immediately.
+        if event_type == "focus_requested" {
+            let msg_agent = msg.get("agent_index").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let msg_pty = msg.get("pty_index").and_then(|v| v.as_u64()).map(|v| v as usize);
+            if msg_agent == self.current_agent_index && msg_pty == self.current_pty_index {
+                let seq = if self.terminal_focused { b"\x1b[I" as &[u8] } else { b"\x1b[O" };
+                log::debug!("[FOCUS] PTY requested focus reporting, responding with {}", if self.terminal_focused { "focused" } else { "unfocused" });
+                self.handle_pty_input(seq);
             }
             return;
         }
@@ -1701,10 +1730,10 @@ where
                         // PTY tracks whether it's "active" even across overlays.
                         if self.terminal_focused && was_insert != now_insert {
                             if now_insert {
-                                log::info!("[FOCUS] synthetic focus-in on mode change to insert");
+                                log::debug!("[FOCUS] synthetic focus-in on mode change to insert");
                                 self.handle_pty_input(b"\x1b[I");
                             } else {
-                                log::info!("[FOCUS] synthetic focus-out on mode change from insert");
+                                log::debug!("[FOCUS] synthetic focus-out on mode change from insert");
                                 self.handle_pty_input(b"\x1b[O");
                             }
                         }
@@ -1779,7 +1808,7 @@ where
         let Some(agent_id) = agent_id else {
             // Synthetic focus-out before clearing (handle_pty_input uses current indices)
             if self.terminal_focused && self.current_agent_index.is_some() {
-                log::info!("[FOCUS] synthetic focus-out on clear, agent={:?}", self.current_agent_index);
+                log::debug!("[FOCUS] synthetic focus-out on clear, agent={:?}", self.current_agent_index);
                 self.handle_pty_input(b"\x1b[O");
             }
             // Disconnect old panel
@@ -1820,7 +1849,7 @@ where
 
         // Synthetic focus-out to old PTY before switching (uses current indices)
         if self.terminal_focused && self.current_agent_index.is_some() {
-            log::info!("[FOCUS] synthetic focus-out on switch, old_agent={:?}", self.current_agent_index);
+            log::debug!("[FOCUS] synthetic focus-out on switch, old_agent={:?}", self.current_agent_index);
             self.handle_pty_input(b"\x1b[O");
         }
 
@@ -1873,10 +1902,10 @@ where
 
         // Synthetic focus-in to new PTY (after indices updated so handle_pty_input targets it)
         if self.terminal_focused {
-            log::info!("[FOCUS] synthetic focus-in on switch, new_agent={:?} pty={}", index, pty_index);
+            log::debug!("[FOCUS] synthetic focus-in on switch, new_agent={:?} pty={}", index, pty_index);
             self.handle_pty_input(b"\x1b[I");
         } else {
-            log::info!("[FOCUS] skipping focus-in on switch (terminal not focused)");
+            log::debug!("[FOCUS] skipping focus-in on switch (terminal not focused)");
         }
     }
 

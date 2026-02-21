@@ -1741,12 +1741,15 @@ impl LuaRuntime {
 
     /// Notify observers of a PTY notification event.
     ///
-    /// Fires the `pty_notification` hook with a table containing:
+    /// Fires the `_pty_notification_raw` hook with a table containing:
     /// - `type`: "osc9" or "osc777"
     /// - `message`: notification message (osc9)
     /// - `title`/`body`: notification fields (osc777)
     /// - `agent_key`: agent identifier
     /// - `session_name`: PTY session name
+    ///
+    /// Lua enriches this with `already_notified` (from the Agent model)
+    /// and re-dispatches as the public `pty_notification` event.
     pub fn notify_pty_notification(
         &mut self,
         agent_key: &str,
@@ -1774,7 +1777,7 @@ impl LuaRuntime {
 
             let hooks: mlua::Table = self.lua.globals().get("hooks")?;
             let notify: mlua::Function = hooks.get("notify")?;
-            notify.call::<mlua::Value>(("pty_notification", data))?;
+            notify.call::<mlua::Value>(("_pty_notification_raw", data))?;
             Ok(())
         })();
 
@@ -1784,6 +1787,29 @@ impl LuaRuntime {
 
         // Arm the PTY input listener so keystrokes clear the notification.
         self.pty_input_listening = true;
+    }
+
+    /// Update per-client focus state in Lua's `pty_clients` module.
+    ///
+    /// Called when focus-in (`\x1b[I`) or focus-out (`\x1b[O`) sequences
+    /// are detected in PTY input. The `peer_id` identifies the client
+    /// ("tui" for TUI, browser identity key for WebRTC).
+    pub fn set_pty_focused(
+        &self,
+        agent_index: usize,
+        pty_index: usize,
+        peer_id: &str,
+        focused: bool,
+    ) {
+        let result: mlua::Result<()> = (|| {
+            let func: mlua::Function = self.lua.globals().get("_set_pty_focused")?;
+            func.call::<()>((agent_index, pty_index, peer_id, focused))?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            log::warn!("set_pty_focused failed: {}", e);
+        }
     }
 
     /// Clear agent notification on PTY input if any are pending.
@@ -3310,12 +3336,23 @@ mod tests {
                 end,
             }
 
+            -- Agent.get by key (mirrors lib/agent.lua)
+            Agent.get = function(key)
+                for _, a in ipairs(_test_agents) do
+                    if a._agent_key == key then return a end
+                end
+                return nil
+            end
+
             -- Track hook notifications for plugin test
             _pty_input_hook_calls = {}
+            _pty_notification_calls = {}
             hooks = {
                 notify = function(event_name, data)
                     if event_name == "pty_input" then
                         table.insert(_pty_input_hook_calls, data)
+                    elseif event_name == "pty_notification" then
+                        table.insert(_pty_notification_calls, data)
                     end
                 end,
             }
@@ -3648,5 +3685,117 @@ mod tests {
 
         // Listener should be disarmed (all cleared)
         assert!(!runtime.pty_input_listening);
+    }
+
+    // =========================================================================
+    // PTY Notification Enrichment Tests
+    // =========================================================================
+
+    /// Set up the enrichment bridge that mirrors production `connections.lua`.
+    ///
+    /// Registers the `_pty_notification_raw` → `pty_notification` observer
+    /// so tests can verify `already_notified` enrichment end-to-end.
+    fn setup_enrichment_bridge(runtime: &LuaRuntime) {
+        runtime.lua().load(r#"
+            -- Register the enrichment bridge (mirrors connections.lua)
+            hooks.on = function(event, name, callback)
+                if event == "_pty_notification_raw" and name == "enrich_and_dispatch" then
+                    -- Wire the bridge into hooks.notify so Rust's
+                    -- hooks.notify("_pty_notification_raw", data) triggers it
+                    local base = hooks.notify
+                    hooks.notify = function(ev, ...)
+                        if ev == "_pty_notification_raw" then
+                            callback(...)
+                        end
+                        return base(ev, ...)
+                    end
+                end
+            end
+            hooks.off = function() end
+
+            -- Register the bridge
+            hooks.on("_pty_notification_raw", "enrich_and_dispatch", function(info)
+                local agent = info.agent_key and Agent.get(info.agent_key)
+                info.already_notified = agent and agent.notification or false
+                hooks.notify("pty_notification", info)
+            end)
+        "#).exec().unwrap();
+    }
+
+    #[test]
+    fn test_enrichment_sets_already_notified_false_when_no_prior() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+        setup_enrichment_bridge(&runtime);
+        add_test_agent(&runtime, "agent-0", false); // no prior notification
+
+        runtime.notify_pty_notification(
+            "agent-0",
+            "agent",
+            &crate::agent::AgentNotification::Osc9(Some("bell".to_string())),
+        );
+
+        let already: bool = runtime.lua().load(
+            "return _pty_notification_calls[1].already_notified"
+        ).eval().unwrap();
+        assert!(!already, "Should be false when agent has no prior notification");
+    }
+
+    #[test]
+    fn test_enrichment_sets_already_notified_true_when_pending() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+        setup_enrichment_bridge(&runtime);
+        add_test_agent(&runtime, "agent-0", true); // already has notification
+
+        runtime.notify_pty_notification(
+            "agent-0",
+            "agent",
+            &crate::agent::AgentNotification::Osc9(Some("bell".to_string())),
+        );
+
+        let already: bool = runtime.lua().load(
+            "return _pty_notification_calls[1].already_notified"
+        ).eval().unwrap();
+        assert!(already, "Should be true when agent already has a pending notification");
+    }
+
+    #[test]
+    fn test_enrichment_preserves_original_fields() {
+        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        setup_notification_env(&runtime);
+        setup_enrichment_bridge(&runtime);
+        add_test_agent(&runtime, "agent-0", false);
+
+        runtime.notify_pty_notification(
+            "agent-0",
+            "cli",
+            &crate::agent::AgentNotification::Osc777 {
+                title: "Build Done".to_string(),
+                body: "All tests passed".to_string(),
+            },
+        );
+
+        let agent_key: String = runtime.lua().load(
+            "return _pty_notification_calls[1].agent_key"
+        ).eval().unwrap();
+        let session: String = runtime.lua().load(
+            "return _pty_notification_calls[1].session_name"
+        ).eval().unwrap();
+        let ntype: String = runtime.lua().load(
+            "return _pty_notification_calls[1].type"
+        ).eval().unwrap();
+        let title: String = runtime.lua().load(
+            "return _pty_notification_calls[1].title"
+        ).eval().unwrap();
+        let body: String = runtime.lua().load(
+            "return _pty_notification_calls[1].body"
+        ).eval().unwrap();
+
+        assert_eq!(agent_key, "agent-0");
+        assert_eq!(session, "cli");
+        assert_eq!(ntype, "osc777");
+        assert_eq!(title, "Build Done");
+        assert_eq!(body, "All tests passed");
     }
 }

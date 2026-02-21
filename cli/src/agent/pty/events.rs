@@ -108,6 +108,18 @@ pub enum PtyEvent {
     /// Marks command boundaries in the terminal output stream.
     /// Used for tracking command lifecycle in agent sessions.
     PromptMark(PromptMark),
+
+    /// Kitty keyboard protocol state changed.
+    ///
+    /// Emitted when the reader thread detects `CSI > flags u` (push, true)
+    /// or `CSI < u` (pop, false) in the PTY output stream.
+    KittyChanged(bool),
+
+    /// PTY enabled focus reporting via `CSI ? 1004 h`.
+    ///
+    /// The TUI should respond with the current terminal focus state
+    /// (`CSI I` or `CSI O`) so the inner application knows immediately.
+    FocusRequested,
 }
 
 impl PtyEvent {
@@ -151,6 +163,18 @@ impl PtyEvent {
     #[must_use]
     pub fn prompt_mark(mark: PromptMark) -> Self {
         Self::PromptMark(mark)
+    }
+
+    /// Create a kitty keyboard protocol state change event.
+    #[must_use]
+    pub fn kitty_changed(enabled: bool) -> Self {
+        Self::KittyChanged(enabled)
+    }
+
+    /// Create a focus reporting requested event.
+    #[must_use]
+    pub fn focus_requested() -> Self {
+        Self::FocusRequested
     }
 
     /// Check if this is an output event.
