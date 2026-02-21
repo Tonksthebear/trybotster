@@ -30,7 +30,7 @@ class HubsController < ApplicationController
     respond_to do |format|
       format.html do
         @browser_device = current_user.devices.browser_devices.order(last_seen_at: :desc).first
-        @recommended_template = read_template("sessions/claude-github.sh")
+        @recommended_template = read_template("sessions/claude.sh")
       end
       format.json do
         # Return hub status for browser-side error handling
