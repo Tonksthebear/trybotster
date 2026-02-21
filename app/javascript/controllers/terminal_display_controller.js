@@ -2,6 +2,7 @@ import { Controller } from "@hotwired/stimulus";
 import { Restty } from "restty";
 import { ConnectionManager, HubConnection } from "connections";
 import { WebRtcPtyTransport } from "transport/webrtc_pty_transport";
+import { usePresence } from "lib/use_presence";
 
 /**
  * Terminal Display Controller
@@ -39,14 +40,22 @@ export default class extends Controller {
   #momentumRafId = null;
   #disconnected = false;
   #overlay = null;
+  #focused = false;
+  #present = true;
+  #connected = false;
+  #teardownPresence = null;
 
   connect() {
     this.#disconnected = false;
     this.#initTerminal();
     this.#bindViewport();
+    this.#teardownPresence = usePresence(this, { ms: 120000 });
   }
 
   disconnect() {
+    this.#sendFocusOut();
+    this.#teardownPresence?.();
+    this.#teardownPresence = null;
     this.#disconnected = true;
     this.#unbindViewport();
 
@@ -139,10 +148,14 @@ export default class extends Controller {
       this.#hideOverlay();
       // Viewing the terminal clears any pending notification badge
       this.#hubConn?.clearNotification(this.agentIndexValue);
+      this.#connected = true;
+      this.#updateFocus();
     };
     this.#transport.onDisconnect = () => {
       this.#restty?.setMouseMode("off");
       this.#showOverlay();
+      this.#connected = false;
+      this.#updateFocus();
     };
 
     // 3. Create Restty — loads WASM, renders canvas
@@ -465,6 +478,31 @@ export default class extends Controller {
 
   #hideOverlay() {
     if (this.#overlay) this.#overlay.hidden = true;
+  }
+
+  // usePresence callbacks
+  away() {
+    this.#present = false;
+    this.#updateFocus();
+  }
+
+  back() {
+    this.#present = true;
+    this.#updateFocus();
+  }
+
+  #updateFocus() {
+    const shouldFocus = this.#connected && this.#present;
+    if (shouldFocus === this.#focused) return;
+    this.#focused = shouldFocus;
+    this.#transport?.sendInput(shouldFocus ? "\x1b[I" : "\x1b[O");
+  }
+
+  #sendFocusOut() {
+    if (this.#focused) {
+      this.#focused = false;
+      this.#transport?.sendInput("\x1b[O");
+    }
   }
 
   // Public actions for touch control buttons

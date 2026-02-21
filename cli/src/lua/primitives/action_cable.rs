@@ -403,7 +403,7 @@ fn decrypt_signal_envelope(
 
     // Decrypt via CryptoService (brief mutex lock)
     let plaintext = match crypto.lock() {
-        Ok(mut guard) => match guard.decrypt(&envelope) {
+        Ok(mut guard) => match guard.decrypt(&envelope, envelope.sender_key.as_deref()) {
             Ok(pt) => pt,
             Err(e) => {
                 log::warn!(

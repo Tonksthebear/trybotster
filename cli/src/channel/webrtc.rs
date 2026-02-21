@@ -633,8 +633,9 @@ impl WebRtcChannel {
                         };
 
                         // Decrypt binary frame via vodozemac
+                        let peer_olm_key = crate::relay::extract_olm_key(&browser_identity);
                         let plaintext = match cs.lock() {
-                            Ok(mut guard) => match guard.decrypt_binary(&data) {
+                            Ok(mut guard) => match guard.decrypt_binary(&data, Some(peer_olm_key)) {
                                 Ok(pt) => {
                                     decrypt_failures.store(0, Ordering::Relaxed);
                                     pt

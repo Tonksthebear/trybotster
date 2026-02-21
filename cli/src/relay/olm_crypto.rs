@@ -436,8 +436,9 @@ impl VodozemacCrypto {
     ///
     /// For PreKey messages: looks up existing session by sender_key, or creates
     /// a new inbound session. Supports multiple concurrent browser sessions.
-    /// For Normal messages: tries all sessions (few sessions, fast HMAC fail).
-    pub fn decrypt(&mut self, envelope: &OlmEnvelope) -> Result<Vec<u8>> {
+    /// For Normal messages: uses `peer_key` for direct lookup when available,
+    /// otherwise falls back to trying all sessions.
+    pub fn decrypt(&mut self, envelope: &OlmEnvelope, peer_key: Option<&str>) -> Result<Vec<u8>> {
         let ciphertext_bytes = STANDARD_NO_PAD
             .decode(&envelope.ciphertext)
             .context("Invalid base64 ciphertext")?;
@@ -490,8 +491,21 @@ impl VodozemacCrypto {
                 let normal_message = vodozemac::olm::Message::try_from(ciphertext_bytes.as_slice())
                     .map_err(|e| anyhow::anyhow!("Invalid Normal message: {e}"))?;
 
-                // Try all sessions — there are typically 1-3, and wrong sessions
-                // fail fast on HMAC check.
+                // Fast path: direct session lookup when peer key is known.
+                if let Some(key) = peer_key {
+                    if let Some(session) = self.sessions.get_mut(key) {
+                        return session
+                            .decrypt(&OlmMessage::Normal(normal_message))
+                            .map_err(|e| anyhow::anyhow!("Decrypt failed for known peer: {e}"));
+                    }
+                    log::warn!(
+                        "[CRYPTO] No session for peer_key {}..., falling back to scan ({} sessions)",
+                        &key[..key.len().min(16)],
+                        self.sessions.len()
+                    );
+                }
+
+                // Slow path: try all sessions (no peer key hint available).
                 for session in self.sessions.values_mut() {
                     match session.decrypt(&OlmMessage::Normal(normal_message.clone())) {
                         Ok(plaintext) => return Ok(plaintext),
@@ -548,7 +562,11 @@ impl VodozemacCrypto {
     ///
     /// Input: `[message_type: 1][raw ciphertext]` (Normal)
     /// or: `[message_type: 1][32-byte sender key][raw ciphertext]` (PreKey).
-    pub fn decrypt_binary(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    ///
+    /// When `peer_key` is provided, Normal messages use direct session lookup
+    /// instead of iterating all sessions (O(1) vs O(n) where each miss costs
+    /// an HMAC check).
+    pub fn decrypt_binary(&mut self, data: &[u8], peer_key: Option<&str>) -> Result<Vec<u8>> {
         anyhow::ensure!(!data.is_empty(), "Empty binary frame");
 
         let msg_type = data[0];
@@ -601,7 +619,21 @@ impl VodozemacCrypto {
                     vodozemac::olm::Message::try_from(ciphertext)
                         .map_err(|e| anyhow::anyhow!("Invalid Normal message: {e}"))?;
 
-                // Try all sessions.
+                // Fast path: direct session lookup when peer key is known.
+                if let Some(key) = peer_key {
+                    if let Some(session) = self.sessions.get_mut(key) {
+                        return session
+                            .decrypt(&OlmMessage::Normal(normal_message))
+                            .map_err(|e| anyhow::anyhow!("Decrypt failed for known peer: {e}"));
+                    }
+                    log::warn!(
+                        "[CRYPTO] No session for peer_key {}..., falling back to scan ({} sessions)",
+                        &key[..key.len().min(16)],
+                        self.sessions.len()
+                    );
+                }
+
+                // Slow path: try all sessions (no peer key hint available).
                 for session in self.sessions.values_mut() {
                     match session.decrypt(&OlmMessage::Normal(normal_message.clone())) {
                         Ok(plaintext) => return Ok(plaintext),
@@ -830,7 +862,7 @@ mod tests {
         assert_eq!(envelope.message_type, MSG_TYPE_PREKEY);
 
         // CLI decrypts (creates inbound session)
-        let decrypted = cli.decrypt(&envelope).unwrap();
+        let decrypted = cli.decrypt(&envelope, None).unwrap();
         assert_eq!(decrypted, plaintext);
         assert!(cli.has_session());
 
@@ -840,7 +872,7 @@ mod tests {
         assert_eq!(reply_envelope.message_type, MSG_TYPE_NORMAL);
 
         // Browser decrypts
-        let reply_decrypted = browser.decrypt(&reply_envelope).unwrap();
+        let reply_decrypted = browser.decrypt(&reply_envelope, None).unwrap();
         assert_eq!(reply_decrypted, reply);
     }
 
@@ -919,20 +951,20 @@ mod tests {
 
         // CLI decrypts all 5 — first creates inbound session, rest use it.
         for (i, (msg, env)) in envelopes.iter().enumerate() {
-            let decrypted = cli.decrypt(env).unwrap();
+            let decrypted = cli.decrypt(env, None).unwrap();
             assert_eq!(decrypted, msg.as_bytes(), "msg {i} decryption mismatch");
         }
 
         // CLI replies (Normal). Browser decrypts → session ratchets.
         let reply_env = cli.encrypt(b"cli reply", &browser_key).unwrap();
         assert_eq!(reply_env.message_type, MSG_TYPE_NORMAL);
-        let reply_dec = browser.decrypt(&reply_env).unwrap();
+        let reply_dec = browser.decrypt(&reply_env, None).unwrap();
         assert_eq!(reply_dec, b"cli reply");
 
         // Browser's subsequent messages are now Normal.
         let post_ratchet = browser.encrypt(b"normal now", &cli_key).unwrap();
         assert_eq!(post_ratchet.message_type, MSG_TYPE_NORMAL);
-        let dec = cli.decrypt(&post_ratchet).unwrap();
+        let dec = cli.decrypt(&post_ratchet, None).unwrap();
         assert_eq!(dec, b"normal now");
     }
 
@@ -950,20 +982,20 @@ mod tests {
 
         // Establish session
         let envelope = browser.encrypt(b"first", &cli_key).unwrap();
-        let _ = cli.decrypt(&envelope).unwrap();
+        let _ = cli.decrypt(&envelope, None).unwrap();
 
         // Multiple messages in both directions
         for i in 0..5 {
             let msg = format!("cli message {i}");
             let env = cli.encrypt(msg.as_bytes(), &browser_key).unwrap();
             assert_eq!(env.message_type, MSG_TYPE_NORMAL);
-            let dec = browser.decrypt(&env).unwrap();
+            let dec = browser.decrypt(&env, None).unwrap();
             assert_eq!(dec, msg.as_bytes());
 
             let msg2 = format!("browser message {i}");
             let env2 = browser.encrypt(msg2.as_bytes(), &cli_key).unwrap();
             assert_eq!(env2.message_type, MSG_TYPE_NORMAL);
-            let dec2 = cli.decrypt(&env2).unwrap();
+            let dec2 = cli.decrypt(&env2, None).unwrap();
             assert_eq!(dec2, msg2.as_bytes());
         }
     }
@@ -988,7 +1020,7 @@ mod tests {
         assert!(frame.len() > 33);
 
         // CLI decrypts binary
-        let decrypted = cli.decrypt_binary(&frame).unwrap();
+        let decrypted = cli.decrypt_binary(&frame, None).unwrap();
         assert_eq!(decrypted, plaintext);
 
         // CLI encrypts binary back (Normal)
@@ -998,7 +1030,7 @@ mod tests {
         // Normal frame: [0x01][ciphertext]
 
         // Browser decrypts binary
-        let reply_dec = browser.decrypt_binary(&reply_frame).unwrap();
+        let reply_dec = browser.decrypt_binary(&reply_frame, None).unwrap();
         assert_eq!(reply_dec, reply);
 
         // Multiple binary round-trips
@@ -1006,7 +1038,7 @@ mod tests {
             let msg = format!("binary msg {i}");
             let f = cli.encrypt_binary(msg.as_bytes(), &browser_key).unwrap();
             assert_eq!(f[0], MSG_TYPE_NORMAL);
-            let d = browser.decrypt_binary(&f).unwrap();
+            let d = browser.decrypt_binary(&f, None).unwrap();
             assert_eq!(d, msg.as_bytes());
         }
     }
@@ -1028,7 +1060,7 @@ mod tests {
             .create_outbound_session(&bundle1.curve25519_key, &bundle1.one_time_key)
             .unwrap();
         let env1 = desktop.encrypt(b"hello from desktop", &cli_key).unwrap();
-        let dec1 = cli.decrypt(&env1).unwrap();
+        let dec1 = cli.decrypt(&env1, None).unwrap();
         assert_eq!(dec1, b"hello from desktop");
 
         // Phone pairs second (needs a fresh OTK).
@@ -1037,7 +1069,7 @@ mod tests {
             .create_outbound_session(&bundle2.curve25519_key, &bundle2.one_time_key)
             .unwrap();
         let env2 = phone.encrypt(b"hello from phone", &cli_key).unwrap();
-        let dec2 = cli.decrypt(&env2).unwrap();
+        let dec2 = cli.decrypt(&env2, None).unwrap();
         assert_eq!(dec2, b"hello from phone");
 
         // CLI should have 2 sessions.
@@ -1047,12 +1079,12 @@ mod tests {
         let reply_desktop = cli.encrypt(b"reply to desktop", &desktop_key).unwrap();
         let reply_phone = cli.encrypt(b"reply to phone", &phone_key).unwrap();
 
-        assert_eq!(desktop.decrypt(&reply_desktop).unwrap(), b"reply to desktop");
-        assert_eq!(phone.decrypt(&reply_phone).unwrap(), b"reply to phone");
+        assert_eq!(desktop.decrypt(&reply_desktop, None).unwrap(), b"reply to desktop");
+        assert_eq!(phone.decrypt(&reply_phone, None).unwrap(), b"reply to phone");
 
         // Continued messages from desktop still work (session not broken by phone).
         let env3 = desktop.encrypt(b"desktop still here", &cli_key).unwrap();
-        assert_eq!(cli.decrypt(&env3).unwrap(), b"desktop still here");
+        assert_eq!(cli.decrypt(&env3, None).unwrap(), b"desktop still here");
     }
 
     #[test]
@@ -1091,7 +1123,7 @@ mod tests {
             .create_outbound_session(&bundle.curve25519_key, &bundle.one_time_key)
             .unwrap();
         let env = browser.encrypt(b"hello", &cli_key).unwrap();
-        cli.decrypt(&env).unwrap();
+        cli.decrypt(&env, None).unwrap();
         assert!(cli.has_session());
 
         // Remove session
@@ -1115,7 +1147,7 @@ mod tests {
             .create_outbound_session(&bundle1.curve25519_key, &bundle1.one_time_key)
             .unwrap();
         let env = browser.encrypt(b"initial", &cli_key).unwrap();
-        cli.decrypt(&env).unwrap();
+        cli.decrypt(&env, None).unwrap();
 
         // Refresh bundle — old session cleared, new OTK generated
         let refresh_bytes = cli.refresh_bundle_for_peer(&browser_key).unwrap();
@@ -1142,9 +1174,9 @@ mod tests {
             .create_outbound_session(&bundle.curve25519_key, &bundle.one_time_key)
             .unwrap();
         let env = browser.encrypt(b"hello", &cli_key).unwrap();
-        cli.decrypt(&env).unwrap();
+        cli.decrypt(&env, None).unwrap();
         let reply = cli.encrypt(b"world", &browser_key).unwrap();
-        browser.decrypt(&reply).unwrap();
+        browser.decrypt(&reply, None).unwrap();
 
         // Step 2: CLI refreshes bundle (simulates desync detection)
         let refresh_bytes = cli.refresh_bundle_for_peer(&browser_key).unwrap();
@@ -1165,13 +1197,13 @@ mod tests {
         assert_eq!(prekey_env.message_type, MSG_TYPE_PREKEY);
 
         // CLI creates inbound session from PreKey
-        let dec = cli.decrypt(&prekey_env).unwrap();
+        let dec = cli.decrypt(&prekey_env, None).unwrap();
         assert_eq!(dec, b"back online");
 
         // Step 5: Bidirectional communication restored
         let browser2_key = browser2.identity_key().to_string();
         let cli_reply = cli.encrypt(b"welcome back", &browser2_key).unwrap();
-        let dec2 = browser2.decrypt(&cli_reply).unwrap();
+        let dec2 = browser2.decrypt(&cli_reply, None).unwrap();
         assert_eq!(dec2, b"welcome back");
     }
 }

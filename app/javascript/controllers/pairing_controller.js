@@ -13,11 +13,12 @@ export default class extends Controller {
   static values = { hubId: String, redirectUrl: String }
   static targets = [
     "ready", "loading", "success", "error", "errorMessage",
-    "fingerprint", "pairButton", "backLink",
+    "fingerprint", "pairButton", "copyButton", "copyLabel", "backLink",
     "pasteLink", "pasteLinkInput", "pasteLinkError"
   ]
 
   connect() {
+    this.rawCode = location.hash?.startsWith("#") ? location.hash.slice(1) : null
     this.bundle = parseBundleFromFragment()
 
     if (this.bundle) {
@@ -66,6 +67,10 @@ export default class extends Controller {
 
       this.bundle = bundle
       this.bundle.hubId = this.hubIdValue
+      try {
+        const url = new URL(input)
+        this.rawCode = url.hash?.startsWith("#") ? url.hash.slice(1) : null
+      } catch (_) {}
       this.#showReadyWithBundle()
     } catch (error) {
       console.error("[Pairing] Failed to parse pasted URL:", error)
@@ -79,6 +84,19 @@ export default class extends Controller {
       this.fingerprintTarget.textContent = fp + "..."
     }
     this.#showReady()
+  }
+
+  async copyCode() {
+    if (!this.rawCode) return
+
+    try {
+      await navigator.clipboard.writeText(this.rawCode)
+      const label = this.copyLabelTarget
+      label.textContent = "Copied!"
+      setTimeout(() => { label.textContent = "Copy Code" }, 2000)
+    } catch (error) {
+      console.error("[Pairing] Copy failed:", error)
+    }
   }
 
   async pair() {
