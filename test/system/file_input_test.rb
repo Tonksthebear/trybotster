@@ -27,7 +27,7 @@ class FileInputTest < ApplicationSystemTestCase
     Dir.glob("/tmp/botster-paste-*").each { |f| File.delete(f) rescue nil }
   end
 
-  test "file dropped on terminal is written to tmp by CLI" do
+  test "small file dropped on terminal is written to tmp by CLI" do
     sign_in_and_connect
 
     # Create an agent so we have a terminal to receive the file
@@ -94,6 +94,72 @@ class FileInputTest < ApplicationSystemTestCase
     written_bytes = File.binread(paste_file)
     assert_equal png_bytes, written_bytes,
       "Paste file content should match the test fixture PNG"
+  end
+
+  test "large file (>65KB) dropped on terminal survives SCTP transfer" do
+    sign_in_and_connect
+    create_agent_via_ui
+
+    first("[data-agent-list-target='list'] a[href*='/agents/']", wait: 15).click
+    find("[data-controller='terminal-display']", wait: 15)
+
+    # Use the 360KB test image — exceeds Chrome's 256KB SCTP max-message-size,
+    # which forces the browser to use application-level chunking (CONTENT_FILE_CHUNK).
+    fixture_path = Rails.root.join("test/fixtures/files/large_test_image.png")
+    assert File.size(fixture_path) > 256 * 1024, "Fixture must exceed 256KB to test chunking"
+
+    page.execute_script("document.body.insertAdjacentHTML('beforeend', '<input type=\"file\" id=\"test-file-input\">')")
+    attach_file("test-file-input", fixture_path.to_s, make_visible: true)
+
+    result = page.driver.browser.execute_async_script(<<~JS, @hub.id.to_s)
+      var done = arguments[arguments.length - 1];
+      var hubId = arguments[0];
+
+      (async function() {
+        try {
+          var { ConnectionManager } = await import("connections/connection_manager");
+          var key = "terminal:" + hubId + ":0:0";
+
+          var conn = null;
+          for (var i = 0; i < 50; i++) {
+            conn = ConnectionManager.get(key);
+            if (conn && conn.isConnected()) break;
+            conn = null;
+            await new Promise(r => setTimeout(r, 200));
+          }
+          if (!conn) { done("error: TerminalConnection not ready"); return; }
+
+          var file = document.getElementById("test-file-input").files[0];
+          if (!file) { done("error: No file attached"); return; }
+
+          var buffer = await file.arrayBuffer();
+          var data = new Uint8Array(buffer);
+          await conn.sendFile(data, file.name);
+          done("ok:" + data.length);
+        } catch(e) {
+          done("error: " + e.message + " | stack: " + (e.stack || "none"));
+        }
+      })();
+    JS
+
+    assert result&.start_with?("ok"), "sendFile should succeed for large file: #{result}"
+
+    png_bytes = File.binread(fixture_path)
+    paste_file = nil
+    assert wait_until?(timeout: 15, poll: 0.3) {
+      matches = Dir.glob("/tmp/botster-paste-*.png")
+      if matches.any?
+        paste_file = matches.first
+        true
+      end
+    }, "Expected CLI to write large paste file to /tmp/botster-paste-*.png.\n" \
+       "CLI logs:\n#{@cli.log_contents(lines: 30)}"
+
+    written_bytes = File.binread(paste_file)
+    assert_equal png_bytes.size, written_bytes.size,
+      "Paste file size should match (expected #{png_bytes.size}, got #{written_bytes.size})"
+    assert_equal png_bytes, written_bytes,
+      "Paste file content should match the large test fixture byte-for-byte"
   end
 
   private
