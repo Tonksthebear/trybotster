@@ -9,6 +9,7 @@
 //! ```text
 //! stdin (fd 0, raw mode) → RawInputReader.drain_events()
 //!     ├→ Key { descriptor, raw_bytes }   → Lua keybinding lookup
+//!     ├→ Paste { raw_bytes }             → atomic PTY forward (bracketed paste)
 //!     ├→ MouseScroll { direction }       → TuiAction::ScrollUp/Down
 //!     └→ Unrecognized sequences          → forwarded as Key with empty descriptor
 //! ```
@@ -40,6 +41,16 @@ pub enum InputEvent {
         /// Original raw bytes from stdin — forwarded to PTY if unbound.
         raw_bytes: Vec<u8>,
     },
+    /// Bracketed paste: all bytes between `ESC[200~` and `ESC[201~`, inclusive.
+    ///
+    /// Terminals wrap drag/drop file paths and clipboard paste in these markers.
+    /// The full sequence (start marker + content + end marker) is preserved so
+    /// the PTY receives it atomically in a single write — required for apps like
+    /// Claude Code to detect paste-as-file-attachment vs typed input.
+    Paste {
+        /// Complete paste bytes including `ESC[200~` prefix and `ESC[201~` suffix.
+        raw_bytes: Vec<u8>,
+    },
     /// Mouse scroll event (from SGR mouse encoding).
     MouseScroll {
         /// Scroll direction (up or down).
@@ -60,11 +71,17 @@ pub enum ScrollDirection {
     Down,
 }
 
+/// Bracketed paste end marker: `ESC[201~`.
+const PASTE_END: &[u8] = b"\x1b[201~";
+
 /// Raw stdin reader with byte-to-descriptor parsing.
 ///
 /// Reads directly from stdin fd 0 (which is already in raw mode via crossterm).
 /// Parses byte sequences into descriptors for Lua keybinding lookup while
 /// preserving the original bytes for PTY passthrough.
+///
+/// Bracketed paste (`ESC[200~` ... `ESC[201~`) is collected into a single
+/// [`InputEvent::Paste`] so the PTY receives the complete paste atomically.
 #[derive(Debug)]
 pub struct RawInputReader {
     /// Pending bytes from previous drain that didn't form a complete sequence.
@@ -73,6 +90,9 @@ pub struct RawInputReader {
     esc_start: Option<Instant>,
     /// Timeout for ESC disambiguation.
     esc_timeout: Duration,
+    /// Accumulator for bytes inside a bracketed paste (`ESC[200~` ... `ESC[201~`).
+    /// `Some` means we're mid-paste; `None` means normal parsing.
+    paste_buf: Option<Vec<u8>>,
 }
 
 impl RawInputReader {
@@ -82,6 +102,7 @@ impl RawInputReader {
             pending: Vec::new(),
             esc_start: None,
             esc_timeout: ESC_TIMEOUT,
+            paste_buf: None,
         }
     }
 
@@ -180,6 +201,16 @@ impl RawInputReader {
     /// Parse pending bytes into events.
     fn parse_events(&mut self) -> Vec<InputEvent> {
         let mut events = Vec::new();
+
+        // If we're inside a bracketed paste, scan for the end marker first.
+        if self.paste_buf.is_some() {
+            if let Some(event) = self.continue_paste() {
+                events.push(event);
+            } else {
+                // End marker not yet received — wait for more bytes.
+                return events;
+            }
+        }
 
         // Handle ESC timeout: if we have a pending ESC and timeout elapsed,
         // emit it as a bare Escape key.
@@ -430,8 +461,18 @@ impl RawInputReader {
             b'Z' => "backtab".to_string(), // Shift+Tab always reported as backtab
             b'~' => {
                 // Tilde-terminated sequences: CSI <number> ~ or CSI <number>;<mod> ~
-                let key_num = param_parts.first().and_then(|s| s.parse::<u8>().ok());
+                let key_num = param_parts.first().and_then(|s| s.parse::<u16>().ok());
                 match key_num {
+                    // Bracketed paste start (CSI 200 ~): enter paste mode.
+                    // Consume the start marker and begin buffering until CSI 201 ~.
+                    Some(200) => {
+                        self.pending.drain(..seq_len);
+                        self.paste_buf = Some(raw);
+                        return self.continue_paste();
+                    }
+                    // CSI 201 ~ (paste end) outside paste mode is a stale marker.
+                    // Falls through to `_ => String::new()` — harmless empty-descriptor
+                    // Key event that gets swallowed or forwarded as inert bytes.
                     Some(1) => format!("{modifier_prefix}home"),
                     Some(2) => format!("{modifier_prefix}insert"),
                     Some(3) => format!("{modifier_prefix}delete"),
@@ -539,6 +580,50 @@ impl RawInputReader {
             raw_bytes: raw,
         })
     }
+
+    /// Continue collecting a bracketed paste, scanning for `ESC[201~`.
+    ///
+    /// Called when `paste_buf` is `Some`. Appends pending bytes to the paste
+    /// buffer, scanning for the end marker. Returns `Some(Paste { .. })` when
+    /// the end marker is found, `None` if more data is needed.
+    fn continue_paste(&mut self) -> Option<InputEvent> {
+        let buf = self.paste_buf.as_mut()?;
+        buf.extend_from_slice(&self.pending);
+        self.pending.clear();
+
+        // Scan for the paste-end marker in the accumulated buffer.
+        // The marker is 6 bytes (`ESC[201~`), so we need at least that many
+        // bytes after the start marker to find it.
+        if let Some(pos) = find_subsequence(buf, PASTE_END) {
+            let end = pos + PASTE_END.len();
+            let paste_bytes = buf[..end].to_vec();
+
+            // Any leftover bytes after the end marker go back to pending.
+            if end < buf.len() {
+                self.pending.extend_from_slice(&buf[end..]);
+            }
+            self.paste_buf = None;
+
+            log::debug!(
+                "[PASTE] Bracketed paste received: {} bytes",
+                paste_bytes.len()
+            );
+
+            Some(InputEvent::Paste {
+                raw_bytes: paste_bytes,
+            })
+        } else {
+            // End marker not yet received — keep buffering.
+            None
+        }
+    }
+}
+
+/// Find the first occurrence of `needle` in `haystack`.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Convert CSI modifier byte to descriptor prefix string.
@@ -1100,5 +1185,165 @@ mod tests {
         let mut r = reader_with_bytes(b"\x1b[97;3u");
         let events = r.parse_events();
         assert_eq!(first_raw_bytes(&events), b"\x1b[97;3u");
+    }
+
+    // === Bracketed Paste ===
+
+    /// Helper to extract the first Paste event's raw bytes.
+    fn first_paste_bytes(events: &[InputEvent]) -> &[u8] {
+        match &events[0] {
+            InputEvent::Paste { raw_bytes } => raw_bytes,
+            other => panic!("Expected Paste event, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bracketed_paste_simple_path() {
+        // Drag/drop a file: terminal sends ESC[200~ <path> ESC[201~
+        let path = b"/Users/test/image.png";
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b[200~");
+        input.extend_from_slice(path);
+        input.extend_from_slice(b"\x1b[201~");
+
+        let mut r = reader_with_bytes(&input);
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        // Full paste including markers is preserved for PTY forwarding.
+        assert_eq!(first_paste_bytes(&events), input.as_slice());
+    }
+
+    #[test]
+    fn test_bracketed_paste_with_spaces() {
+        // File paths with escaped spaces (common in drag/drop).
+        let path = b"/Users/test/Screenshot\\ 2026-02-21\\ at\\ 19.27.35.png";
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b[200~");
+        input.extend_from_slice(path);
+        input.extend_from_slice(b"\x1b[201~");
+
+        let mut r = reader_with_bytes(&input);
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(first_paste_bytes(&events), input.as_slice());
+    }
+
+    #[test]
+    fn test_bracketed_paste_multiline() {
+        // Multi-line paste (e.g., pasting a code block).
+        let content = b"line1\nline2\nline3";
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b[200~");
+        input.extend_from_slice(content);
+        input.extend_from_slice(b"\x1b[201~");
+
+        let mut r = reader_with_bytes(&input);
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(first_paste_bytes(&events), input.as_slice());
+    }
+
+    #[test]
+    fn test_bracketed_paste_with_escape_bytes_inside() {
+        // Paste content can contain ESC bytes that aren't the end marker.
+        let content = b"text\x1b[31mred\x1b[0mnormal";
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b[200~");
+        input.extend_from_slice(content);
+        input.extend_from_slice(b"\x1b[201~");
+
+        let mut r = reader_with_bytes(&input);
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(first_paste_bytes(&events), input.as_slice());
+    }
+
+    #[test]
+    fn test_bracketed_paste_incomplete_waits() {
+        // Start marker received but no end marker yet — should wait.
+        let mut r = reader_with_bytes(b"\x1b[200~/Users/test/file.png");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 0, "Should wait for end marker");
+        assert!(r.paste_buf.is_some(), "Should be in paste mode");
+    }
+
+    #[test]
+    fn test_bracketed_paste_split_across_reads() {
+        // Paste arrives in two chunks (simulating split reads).
+        let mut r = reader_with_bytes(b"\x1b[200~/Users/test/");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 0);
+        assert!(r.paste_buf.is_some());
+
+        // Second chunk completes the paste.
+        r.pending.extend_from_slice(b"file.png\x1b[201~");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        let expected = b"\x1b[200~/Users/test/file.png\x1b[201~";
+        assert_eq!(first_paste_bytes(&events), expected);
+        assert!(r.paste_buf.is_none());
+    }
+
+    #[test]
+    fn test_bracketed_paste_followed_by_keypress() {
+        // Paste followed by a regular keypress in the same read.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b[200~hello\x1b[201~");
+        input.push(b'x'); // Regular keypress after paste
+
+        let mut r = reader_with_bytes(&input);
+        let events = r.parse_events();
+        assert_eq!(events.len(), 2);
+        // First event: paste
+        assert!(matches!(&events[0], InputEvent::Paste { .. }));
+        assert_eq!(first_paste_bytes(&events), b"\x1b[200~hello\x1b[201~");
+        // Second event: the 'x' keypress
+        match &events[1] {
+            InputEvent::Key { descriptor, .. } => assert_eq!(descriptor, "x"),
+            other => panic!("Expected Key event, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bracketed_paste_keypress_before_paste() {
+        // Keypress then paste in same read.
+        let mut input = Vec::new();
+        input.push(b'a');
+        input.extend_from_slice(b"\x1b[200~pasted\x1b[201~");
+
+        let mut r = reader_with_bytes(&input);
+        let events = r.parse_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(first_descriptor(&events), "a");
+        assert!(matches!(&events[1], InputEvent::Paste { .. }));
+    }
+
+    #[test]
+    fn test_stale_paste_end_marker_passes_through() {
+        // A stray CSI 201 ~ without a preceding CSI 200 ~ becomes an
+        // empty-descriptor Key event (harmlessly swallowed or forwarded).
+        let mut r = reader_with_bytes(b"\x1b[201~a");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 2);
+        // First event: stale end marker as empty-descriptor Key
+        assert_eq!(first_descriptor(&events), "");
+        assert_eq!(first_raw_bytes(&events), b"\x1b[201~");
+        // Second event: 'a' still parses normally
+        match &events[1] {
+            InputEvent::Key { descriptor, .. } => assert_eq!(descriptor, "a"),
+            other => panic!("Expected Key event, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_empty_bracketed_paste() {
+        // Empty paste (no content between markers).
+        let mut r = reader_with_bytes(b"\x1b[200~\x1b[201~");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            first_paste_bytes(&events),
+            b"\x1b[200~\x1b[201~"
+        );
     }
 }
