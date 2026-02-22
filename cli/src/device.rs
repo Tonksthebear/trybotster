@@ -243,12 +243,12 @@ impl Device {
                     );
                     anyhow::bail!(
                         "Signing key not found. Your credentials may have been lost.\n\
-                         Re-authenticate with 'botster auth'."
+                         Run 'botster reset' then 'botster start' to re-authenticate."
                     );
                 }
                 anyhow::bail!(
                     "Failed to load signing key: {}.\n\
-                     Re-authenticate with 'botster auth'.",
+                     Run 'botster reset' then 'botster start' to re-authenticate.",
                     e
                 );
             }
