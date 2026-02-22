@@ -8,7 +8,7 @@ cd "$BOTSTER_WORKTREE_PATH"
 # Falls back to env vars when running on main (no context file).
 botster_context() {
   local val
-  val=$("$BOTSTER_BIN" json-get .botster/context.json "$1" 2>/dev/null | tr -d '"')
+  val=$(botster json-get .botster/context.json "$1" 2>/dev/null | tr -d '"')
   echo "$val"
 }
 
@@ -23,7 +23,7 @@ BOTSTER_BRANCH_NAME=$(botster_context "branch_name")
 BOTSTER_BRANCH_NAME="${BOTSTER_BRANCH_NAME:-$BOTSTER_BRANCH_NAME}"
 
 # Auto-trust the worktree in Claude config using botster's JSON tools
-"$BOTSTER_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
+botster json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
 
 # Note: We detect when Claude asks questions by scanning for UI patterns like
 # "Enter to select" and "Tab/Arrow keys to navigate" in the terminal output.

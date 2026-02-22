@@ -2,13 +2,13 @@
 # Run before worktree is deleted
 
 # Remove the worktree from Claude's trusted projects
-"$BOTSTER_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
+botster json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
 
 # Helper to read values from .botster/context.json (worktrees only).
 # Falls back to env vars when running on main (no context file).
 botster_context() {
   local val
-  val=$("$BOTSTER_BIN" json-get .botster/context.json "$1" 2>/dev/null | tr -d '"')
+  val=$(botster json-get .botster/context.json "$1" 2>/dev/null | tr -d '"')
   echo "$val"
 }
 
