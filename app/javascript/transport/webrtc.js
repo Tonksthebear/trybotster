@@ -187,6 +187,7 @@ class WebRTCTransport {
       pendingCandidates: [],
       iceRestartAttempts: 0,
       iceRestartTimer: null,
+      iceDisconnectedTimer: null,
       iceDisrupted: false,
       decryptFailures: 0,
       // Start true — ActionCable buffers messages until confirmed.
@@ -285,6 +286,10 @@ class WebRTCTransport {
           clearTimeout(conn.iceRestartTimer)
           conn.iceRestartTimer = null
         }
+        if (conn.iceDisconnectedTimer) {
+          clearTimeout(conn.iceDisconnectedTimer)
+          conn.iceDisconnectedTimer = null
+        }
         if (conn.iceDisrupted) {
           conn.iceDisrupted = false
           this.#detectConnectionMode(hubId, conn).then(mode => {
@@ -292,11 +297,27 @@ class WebRTCTransport {
             this.#emit("connection:mode", { hubId, mode })
           })
         }
-      } else if (state === "disconnected" || state === "failed") {
+      } else if (state === "failed") {
+        // ICE failed (all candidate pairs exhausted) — restart ICE to try new paths.
         conn.mode = ConnectionMode.UNKNOWN
         conn.iceDisrupted = true
         this.#emit("connection:mode", { hubId, mode: ConnectionMode.UNKNOWN })
         this.#scheduleIceRestart(hubId, conn)
+      } else if (state === "disconnected") {
+        // ICE disconnected is TRANSIENT — a single missed STUN check triggers it.
+        // Don't restart ICE immediately; connectivity checks usually recover on their own.
+        // Safety net: if ICE stays disconnected for 15s without escalating to "failed",
+        // clean up the peer so handlePeerDisconnected triggers a full reconnect.
+        console.debug(`[WebRTCTransport] ICE disconnected (transient), waiting for recovery or failure`)
+        if (!conn.iceDisconnectedTimer) {
+          conn.iceDisconnectedTimer = setTimeout(() => {
+            conn.iceDisconnectedTimer = null
+            if (pc.iceConnectionState === "disconnected") {
+              console.debug(`[WebRTCTransport] ICE stuck disconnected for 15s, cleaning up peer`)
+              this.#cleanupPeer(hubId, conn)
+            }
+          }, 15_000)
+        }
       }
     }
 
@@ -307,12 +328,14 @@ class WebRTCTransport {
 
       if (state === "connected") {
         conn.state = TransportState.CONNECTED
+        // Don't emit connection:state here — DC onopen will emit it
+        // when the DataChannel is actually usable. Emitting here triggers
+        // premature subscribe attempts (DC not open yet → 5s timeout →
+        // peer teardown → reconnect storm).
         this.#detectConnectionMode(hubId, conn).then(mode => {
-          this.#emit("connection:state", { hubId, state: "connected", mode })
+          conn.mode = mode  // cache for DC onopen to include
           this.#emit("connection:mode", { hubId, mode })
-        }).catch(() => {
-          this.#emit("connection:state", { hubId, state: "connected", mode: "unknown" })
-        })
+        }).catch(() => {})
       } else if (state === "closed") {
         // Only clean up peer on explicit close — don't remove signaling
         this.#cleanupPeer(hubId, conn)
@@ -355,8 +378,13 @@ class WebRTCTransport {
     const pcState = conn.pc.connectionState
     const dcState = conn.dataChannel?.readyState || "none"
 
-    const dead = pcState === "failed" || pcState === "closed" || pcState === "disconnected" ||
-                 dcState !== "open"
+    // Terminal PC states are obviously dead.
+    // "connected" PC with DC not open AND not connecting = stale (iOS sleep: DC silently died).
+    // "connected" PC with DC "connecting" = alive (DTLS done, SCTP handshake in progress).
+    // "new"/"connecting" PC = alive (ICE/DTLS still negotiating).
+    const terminalDead = pcState === "failed" || pcState === "closed" || pcState === "disconnected"
+    const stalePeer = pcState === "connected" && dcState !== "open" && dcState !== "connecting"
+    const dead = terminalDead || stalePeer
 
     if (dead) {
       console.debug(`[WebRTCTransport] Probe: peer dead for hub ${hubId} (pc=${pcState}, dc=${dcState}), cleaning up`)
@@ -853,6 +881,10 @@ class WebRTCTransport {
       clearTimeout(conn.iceRestartTimer)
       conn.iceRestartTimer = null
     }
+    if (conn.iceDisconnectedTimer) {
+      clearTimeout(conn.iceDisconnectedTimer)
+      conn.iceDisconnectedTimer = null
+    }
 
     if (conn.dataChannel) {
       conn.dataChannel.onopen = null
@@ -1100,7 +1132,9 @@ class WebRTCTransport {
       if (conn) {
         conn.state = TransportState.CONNECTED
       }
-      this.#emit("connection:state", { hubId, state: "connected" })
+      const mode = conn?.mode
+      this.#emit("connection:state", { hubId, state: "connected", mode })
+      if (mode) this.#emit("connection:mode", { hubId, mode })
     }
 
     dataChannel.onclose = () => {
