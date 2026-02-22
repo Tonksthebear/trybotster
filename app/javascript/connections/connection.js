@@ -286,12 +286,29 @@ export class Connection {
       try {
         await this.subscribe()  // has its own lock, early-returns if subscribed
       } catch (e) {
-        // Transport failures are retriable. Tear down stale peer on timeout
-        // (iOS wake: DC reports "open" but is dead, subscribe hangs).
+        // Transport failures are retriable. Probe peer health before deciding:
+        // - Peer alive (DC open) but CLI didn't respond → genuinely stale, tear down
+        // - Peer connecting (DC not open yet) → defer, DC onopen will retry
+        // - Peer dead → handlePeerDisconnected will fire naturally
         if (e.message?.includes("timeout") || e.message?.includes("stale")) {
-          console.debug(`[${this.constructor.name}] Peer likely stale, tearing down: ${e.message}`)
-          await this.#disconnectPeer()
-          this.#schedulePeerReconnect()
+          try {
+            const hubId = this.getHubId()
+            const { dcState } = await bridge.send("probePeerHealth", { hubId })
+            if (dcState === "open") {
+              // DC is open but CLI didn't respond — genuinely stale (iOS sleep etc.)
+              console.debug(`[${this.constructor.name}] Peer stale (DC open, CLI unresponsive), tearing down`)
+              await this.#disconnectPeer()
+              this.#schedulePeerReconnect()
+            } else {
+              // DC still connecting — defer, DC onopen will trigger ensureConnected → subscribe
+              console.debug(`[${this.constructor.name}] Subscribe timed out (dc=${dcState}), deferring to DC open`)
+            }
+          } catch {
+            // Worker bridge down — assume peer is dead, tear down
+            console.debug(`[${this.constructor.name}] Probe failed, tearing down peer`)
+            await this.#disconnectPeer()
+            this.#schedulePeerReconnect()
+          }
           return
         }
         if (e.message?.includes("DataChannel") || e.message?.includes("No connection")) {

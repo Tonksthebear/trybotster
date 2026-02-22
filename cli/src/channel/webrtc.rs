@@ -429,8 +429,37 @@ impl WebRtcChannel {
         let mut pc_guard = self.peer_connection.lock().await;
 
         if pc_guard.is_some() {
-            log::info!("[WebRTC] Ignoring duplicate offer (peer connection already exists)");
-            return Err(ChannelError::ConnectionFailed("Connection in progress".to_string()));
+            // ICE restart: apply new offer on existing PC for renegotiation.
+            // The browser sends a new offer with fresh ICE credentials when the
+            // network path changes (wifi→cellular, NAT rebinding, etc.). We apply
+            // it to the existing PC so ICE can gather new candidates without
+            // tearing down the DataChannel or SCTP association.
+            let pc = pc_guard.as_ref().unwrap().clone();
+            drop(pc_guard);
+
+            log::info!("[WebRTC] Applying ICE restart offer on existing connection");
+
+            let offer = SessionDescription::parse(SdpType::Offer, sdp)
+                .map_err(|e| ChannelError::ConnectionFailed(format!("Invalid SDP offer: {e}")))?;
+
+            pc.set_remote_description(offer)
+                .await
+                .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to set remote description: {e}")))?;
+
+            let answer = pc
+                .create_answer()
+                .await
+                .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to create answer: {e}")))?;
+
+            pc.set_local_description(answer.clone())
+                .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to set local description: {e}")))?;
+
+            let mut sdp = answer.to_sdp_string();
+            if !sdp.contains("max-message-size") {
+                sdp = inject_max_message_size(&sdp, 16 * 1024 * 1024);
+            }
+
+            return Ok(sdp);
         }
 
         // Reset DC-opened flag so a stale signal from the previous PC doesn't
