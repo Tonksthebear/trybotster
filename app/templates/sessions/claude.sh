@@ -25,7 +25,7 @@ cd "$BOTSTER_WORKTREE_PATH"
 
 botster_context() {
   local val
-  val=$("$BOTSTER_BIN" json-get .botster/context.json "$1" 2>/dev/null | tr -d '"')
+  val=$(botster json-get .botster/context.json "$1" 2>/dev/null | tr -d '"')
   echo "$val"
 }
 
@@ -40,7 +40,7 @@ BOTSTER_BRANCH_NAME="${BOTSTER_BRANCH_NAME:-$BOTSTER_BRANCH_NAME}"
 # ---------------------------------------------------------------------------
 # Auto-accept the trust dialog for this worktree so Claude doesn't prompt.
 
-"$BOTSTER_BIN" json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
+botster json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
 
 # ---------------------------------------------------------------------------
 # Launch

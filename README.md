@@ -204,7 +204,7 @@ mise.toml
 
 ```bash
 # Remove the worktree from Claude's trusted projects
-"$BOTSTER_BIN" json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
+botster json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
 ```
 
 ### Example: profile with dev server
@@ -275,7 +275,6 @@ BOTSTER_BRANCH_NAME=botster-issue-123
 BOTSTER_WORKTREE_PATH=/path/to/worktree
 BOTSTER_PROMPT="User's request text"
 BOTSTER_MESSAGE_ID=42
-BOTSTER_BIN=/path/to/botster
 BOTSTER_TOKEN=your_api_key
 BOTSTER_TUNNEL_PORT=4001
 ```

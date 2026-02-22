@@ -630,7 +630,7 @@ impl WorktreeManager {
             for cmd in teardown_commands {
                 log::info!("Running teardown: {}", cmd);
 
-                // Run the command in a shell with environment variables
+                // Run the command in a shell with environment variables.
                 // Task context (repo, issue, branch) lives in .botster/context.json
                 let output = std::process::Command::new("sh")
                     .arg("-c")
@@ -638,13 +638,6 @@ impl WorktreeManager {
                     .env(
                         "BOTSTER_WORKTREE_PATH",
                         worktree_path.to_str().expect("path is valid UTF-8"),
-                    )
-                    .env(
-                        "BOTSTER_BIN",
-                        std::env::current_exe()
-                            .ok()
-                            .and_then(|p| p.to_str().map(std::string::ToString::to_string))
-                            .unwrap_or_else(|| "botster".to_string()),
                     )
                     .output()?;
 
@@ -749,7 +742,7 @@ impl WorktreeManager {
             for cmd in teardown_commands {
                 log::info!("Running teardown: {}", cmd);
 
-                // Run the command in a shell with environment variables
+                // Run the command in a shell with environment variables.
                 // Task context (repo, issue, branch) lives in .botster/context.json
                 let output = std::process::Command::new("sh")
                     .arg("-c")
@@ -757,13 +750,6 @@ impl WorktreeManager {
                     .env(
                         "BOTSTER_WORKTREE_PATH",
                         worktree_path.to_str().expect("path is valid UTF-8"),
-                    )
-                    .env(
-                        "BOTSTER_BIN",
-                        std::env::current_exe()
-                            .ok()
-                            .and_then(|p| p.to_str().map(std::string::ToString::to_string))
-                            .unwrap_or_else(|| "botster".to_string()),
                     )
                     .output()?;
 
