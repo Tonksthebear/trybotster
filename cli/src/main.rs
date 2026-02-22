@@ -231,8 +231,10 @@ fn run_with_tui() -> Result<()> {
         );
     }
 
-    // Check for updates first (at most once per 24h, never blocks startup on failure)
-    let _ = commands::update::check_on_boot();
+    // Check for updates first — show errors so the user knows if an update failed
+    if let Err(e) = commands::update::check_on_boot() {
+        eprintln!("Update failed: {e:#}");
+    }
 
     // Ensure we have a valid authentication token
     ensure_authenticated()?;
