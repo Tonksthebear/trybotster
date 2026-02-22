@@ -38,8 +38,8 @@ const GITHUB_RELEASES_DOWNLOAD: &str =
 const USER_AGENT: &str = "botster";
 
 /// Timeout for the boot-time version fetch.
-/// Short to avoid delaying startup when offline or GitHub is slow.
-const BOOT_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Must be long enough for cold DNS + TLS handshake to api.github.com.
+const BOOT_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Result of checking for updates.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +68,7 @@ pub enum UpdateStatus {
 /// Checks for updates at boot time and prompts the user to update if available.
 ///
 /// This is designed to be called early in startup, before the TUI takes over.
-/// Failures are silently logged — an update check must never block startup.
+/// Failures are logged at warn level — an update check must never block startup.
 ///
 /// # Errors
 ///
@@ -82,7 +82,7 @@ pub fn check_on_boot() -> Result<()> {
     let latest_str = match fetch_latest_version_with_timeout(BOOT_CHECK_TIMEOUT) {
         Ok(v) => v,
         Err(e) => {
-            log::debug!("Boot update check skipped: {e}");
+            log::warn!("Boot update check failed: {e}");
             return Ok(());
         }
     };
@@ -134,7 +134,7 @@ pub fn check_on_boot_headless() -> Result<()> {
     let latest_str = match fetch_latest_version_with_timeout(BOOT_CHECK_TIMEOUT) {
         Ok(v) => v,
         Err(e) => {
-            log::debug!("Boot update check skipped: {e}");
+            log::warn!("Boot update check failed: {e}");
             return Ok(());
         }
     };

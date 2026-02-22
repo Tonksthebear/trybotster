@@ -13,7 +13,7 @@
 //!
 //! # Auth-time Storage Check
 //!
-//! During `botster auth`, [`check_credential_storage`] probes the keyring with a
+//! During first-time setup, [`check_credential_storage`] probes the keyring with a
 //! round-trip test. If the probe fails, the user is warned once with distro-specific
 //! installation instructions and offered file-based fallback. This is the only time
 //! the warning is shown.
