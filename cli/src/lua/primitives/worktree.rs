@@ -298,14 +298,30 @@ pub(crate) fn register(
         .set("create_async", create_async_fn)
         .map_err(|e| anyhow!("Failed to set worktree.create_async: {e}"))?;
 
+    // Detect git repo once at registration time — shared by is_git_repo() and repo_root().
+    let detected = WorktreeManager::detect_current_repo();
+    let is_git = detected.is_ok();
+    let repo_root: Option<String> = match detected {
+        Ok((path, _name)) => Some(path.to_string_lossy().to_string()),
+        Err(_) => std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string()),
+    };
+
+    // worktree.is_git_repo() -> boolean
+    //
+    // Returns true if running inside a git repository, false otherwise.
+    let is_git_fn = lua
+        .create_function(move |_, ()| Ok(is_git))
+        .map_err(|e| anyhow!("Failed to create worktree.is_git_repo function: {e}"))?;
+
+    worktree
+        .set("is_git_repo", is_git_fn)
+        .map_err(|e| anyhow!("Failed to set worktree.is_git_repo: {e}"))?;
+
     // worktree.repo_root() -> path string or nil
     //
-    // Returns the main repository root path, or nil if not in a git repository.
-    // Detected once at registration time for efficiency.
-    let repo_root: Option<String> = match WorktreeManager::detect_current_repo() {
-        Ok((path, _name)) => Some(path.to_string_lossy().to_string()),
-        Err(_) => None,
-    };
+    // Returns the git repo root, or cwd if not in a git repo.
     let repo_root_fn = lua
         .create_function(move |_, ()| Ok(repo_root.clone()))
         .map_err(|e| anyhow!("Failed to create worktree.repo_root function: {e}"))?;

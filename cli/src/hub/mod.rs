@@ -358,8 +358,7 @@ impl Hub {
         let state = Arc::new(RwLock::new(HubState::new(config.worktree_base.clone())));
         let tokio_runtime = tokio::runtime::Runtime::new()?;
 
-        // Generate stable hub_identifier: env var > repo path hash
-        // NO FALLBACKS - if we can't determine a stable identifier, fail explicitly
+        // Generate stable hub_identifier: env var > repo path hash > cwd hash
         let hub_identifier = if let Ok(id) = std::env::var("BOTSTER_HUB_ID") {
             log::info!("Hub identifier (from env): {}...", &id[..id.len().min(8)]);
             id
@@ -370,16 +369,12 @@ impl Hub {
                     log::info!("Hub identifier (from repo): {}...", &id[..8]);
                     id
                 }
-                Err(e) => {
-                    // No silent fallback to random UUID - that causes session mismatches
-                    // Either set BOTSTER_HUB_ID env var or run from a git repository
-                    anyhow::bail!(
-                        "Cannot determine hub identifier. Either:\n\
-                         1. Run from within a git repository, or\n\
-                         2. Set BOTSTER_HUB_ID environment variable\n\
-                         \n\
-                         Error: {e}"
-                    );
+                Err(_) => {
+                    // Not in a git repo — derive hub ID from current working directory
+                    let cwd = std::env::current_dir()?;
+                    let id = hub_id_for_repo(&cwd);
+                    log::info!("Hub identifier (from cwd): {}...", &id[..8]);
+                    id
                 }
             }
         };

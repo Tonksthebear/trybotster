@@ -317,6 +317,12 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     -- Allow multiple agents on the same branch by suffixing the key
     agent_key = next_available_key(agent_key)
 
+    -- Non-git mode: no worktree isolation, spawn directly in cwd
+    if not worktree.is_git_repo() then
+        log.info(string.format("No git repo — spawning %s directly in %s", branch_name, repo_root))
+        return spawn_agent(branch_name, issue_number, repo_root, prompt, client, agent_key, profile_name)
+    end
+
     -- Find or create worktree
     local wt_path = from_worktree or worktree.find(branch_name)
     if not wt_path then
