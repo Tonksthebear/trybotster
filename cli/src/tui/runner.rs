@@ -517,6 +517,20 @@ where
                         self.handle_pty_input(b"\x1b[O");
                     }
                 }
+                InputEvent::Paste { ref raw_bytes } => {
+                    self.dirty = true;
+                    // Forward the complete bracketed paste atomically to the PTY.
+                    // Apps like Claude Code rely on receiving the full paste
+                    // (start marker + content + end marker) in one read to detect
+                    // file drag/drop vs typed input.
+                    if self.mode == "insert" && !self.has_overlay {
+                        log::debug!(
+                            "[PASTE] Forwarding {} bytes to PTY",
+                            raw_bytes.len()
+                        );
+                        self.handle_pty_input(raw_bytes);
+                    }
+                }
                 InputEvent::Key { .. } => {
                     self.dirty = true;
                     // Flush accumulated scroll before processing the key event,
@@ -643,9 +657,12 @@ where
                     self.handle_pty_input(&raw_bytes);
                 }
             }
-            InputEvent::MouseScroll { .. } | InputEvent::FocusGained | InputEvent::FocusLost => {
-                // Mouse scroll and focus events are handled in poll_input() and
-                // never reach here. These arms exist only for exhaustiveness.
+            InputEvent::Paste { .. }
+            | InputEvent::MouseScroll { .. }
+            | InputEvent::FocusGained
+            | InputEvent::FocusLost => {
+                // Paste, mouse scroll, and focus events are handled in poll_input()
+                // and never reach here. These arms exist only for exhaustiveness.
             }
         }
     }
