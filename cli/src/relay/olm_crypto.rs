@@ -105,6 +105,15 @@ pub const CONTENT_STREAM: u8 = 0x02;
 /// Binary inner content type: file transfer (browser → CLI).
 pub const CONTENT_FILE: u8 = 0x03;
 
+/// Binary inner content type: chunked file transfer (browser → CLI).
+///
+/// Used when the encrypted file exceeds Chrome's 256KB SCTP message limit.
+/// First chunk:  `[0x04][transfer_id][flags=0x01][sub_id_len][sub_id][fname_len:2LE][fname][data]`
+/// Middle chunk: `[0x04][transfer_id][flags=0x00][data]`
+/// Last chunk:   `[0x04][transfer_id][flags=0x02][data]`
+/// Flags: bit 0 = START (first chunk), bit 1 = END (last chunk).
+pub const CONTENT_FILE_CHUNK: u8 = 0x04;
+
 /// Encrypted message envelope (minimal wire format).
 ///
 /// Uses short keys to minimize wire size:

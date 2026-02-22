@@ -7,8 +7,8 @@
 //!
 //! ```text
 //! WebRtcChannel
-//!     |-- RTCPeerConnection (webrtc-rs)
-//!     |-- RTCDataChannel (SCTP - reliable ordered)
+//!     |-- PeerConnection (rustrtc)
+//!     |-- DataChannel (SCTP - reliable ordered, no message size limit)
 //!     |-- E2E encryption (via CryptoService = Arc<Mutex<VodozemacCrypto>>)
 //!     |-- Gzip compression (via compression module)
 //!     `-- Signaling via ActionCable (encrypted envelopes)
@@ -25,21 +25,17 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::interceptor::registry::Registry;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
+
+use rustrtc::transports::ice::IceCandidate;
+use rustrtc::{
+    IceServer, PeerConnection, PeerConnectionEvent, RtcConfiguration, SdpType,
+    SessionDescription,
+};
+use rustrtc::transports::sctp::DataChannel;
+use rustrtc::DataChannelEvent;
 
 use crate::relay::crypto_service::CryptoService;
-use crate::relay::olm_crypto::{CONTENT_FILE, CONTENT_MSG, CONTENT_PTY, CONTENT_STREAM};
+use crate::relay::olm_crypto::{CONTENT_FILE, CONTENT_FILE_CHUNK, CONTENT_MSG, CONTENT_PTY, CONTENT_STREAM};
 
 /// Incoming PTY input from browser via binary DataChannel frame.
 ///
@@ -86,6 +82,16 @@ pub struct StreamIncoming {
     pub payload: Vec<u8>,
 }
 
+/// In-progress chunked file transfer reassembly state.
+struct FileChunkAssembly {
+    /// Metadata from the first chunk (sub_id, filename parsing).
+    agent_index: usize,
+    pty_index: usize,
+    filename: String,
+    /// Accumulated file data across chunks.
+    data: Vec<u8>,
+}
+
 use super::compression::maybe_compress;
 use super::{
     Channel, ChannelConfig, ChannelError, ConnectionState, IncomingMessage, PeerId,
@@ -101,7 +107,7 @@ pub(crate) struct RawIncoming {
 
 /// Outgoing signal destined for a browser, sent via ActionCable relay.
 ///
-/// Produced by async WebRTC callbacks (e.g., `on_ice_candidate`), drained
+/// Produced by the ICE candidate forwarder task, drained
 /// by `server_comms` tick loop, and forwarded through `CommandChannelHandle::perform`.
 #[derive(Debug)]
 pub enum OutgoingSignal {
@@ -256,6 +262,7 @@ impl WebRtcChannelBuilder {
             file_input_tx: self.file_input_tx,
             peer_connection: Arc::new(Mutex::new(None)),
             data_channel: Arc::new(Mutex::new(None)),
+            data_channel_id: Arc::new(Mutex::new(None)),
             state: SharedConnectionState::new(),
             peers: Arc::new(RwLock::new(HashSet::new())),
             config: Arc::new(Mutex::new(None)),
@@ -267,6 +274,7 @@ impl WebRtcChannelBuilder {
             hub_event_tx: self.hub_event_tx,
             close_complete_tx: close_tx,
             close_complete_rx: close_rx,
+            event_loop_handle: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -289,10 +297,12 @@ pub struct WebRtcChannel {
     pty_input_tx: Option<mpsc::UnboundedSender<PtyInputIncoming>>,
     /// Sender for incoming file transfers from browser.
     file_input_tx: Option<mpsc::UnboundedSender<FileInputIncoming>>,
-    /// WebRTC peer connection.
-    peer_connection: Arc<Mutex<Option<Arc<RTCPeerConnection>>>>,
-    /// WebRTC data channel.
-    data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    /// WebRTC peer connection (rustrtc — Clone wraps Arc internally).
+    peer_connection: Arc<Mutex<Option<PeerConnection>>>,
+    /// WebRTC data channel (set by event loop when browser creates it).
+    data_channel: Arc<Mutex<Option<Arc<DataChannel>>>>,
+    /// DataChannel SCTP stream ID (for `pc.send_data(channel_id, ...)`).
+    data_channel_id: Arc<Mutex<Option<u16>>>,
     /// Shared connection state.
     state: Arc<SharedConnectionState>,
     /// Connected peers (browser identities with active sessions).
@@ -311,14 +321,15 @@ pub struct WebRtcChannel {
     /// Kept as test-only fallback when `hub_event_tx` is None.
     dc_opened: Arc<AtomicBool>,
     /// Event channel sender for DC opened notifications.
-    /// When set, `on_data_channel` sends `HubEvent::DcOpened` instead of
+    /// When set, the event loop sends `HubEvent::DcOpened` instead of
     /// setting the atomic bool.
     hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
-    /// Set to `true` when the state handler's close task completes (pc/dc sockets released).
-    /// Uses `watch` so late subscribers see the value even if the close already happened
-    /// (unlike `Notify`, which is fire-and-forget).
+    /// Set to `true` when the connection closes (pc/dc sockets released).
+    /// Uses `watch` so late subscribers see the value even if the close already happened.
     close_complete_tx: tokio::sync::watch::Sender<bool>,
     close_complete_rx: tokio::sync::watch::Receiver<bool>,
+    /// Handle for the spawned event loop task (for cleanup on disconnect).
+    event_loop_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for WebRtcChannel {
@@ -346,7 +357,7 @@ impl WebRtcChannel {
     const ICE_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// Fetch ICE server configuration from Rails.
-    async fn fetch_ice_config(&self, hub_id: &str) -> Result<Vec<RTCIceServer>, ChannelError> {
+    async fn fetch_ice_config(&self, hub_id: &str) -> Result<Vec<IceServer>, ChannelError> {
         let url = format!("{}/hubs/{}/webrtc", self.server_url, hub_id);
 
         let client = reqwest::Client::builder()
@@ -370,11 +381,11 @@ impl WebRtcChannel {
 
         #[derive(serde::Deserialize)]
         struct IceConfig {
-            ice_servers: Vec<IceServer>,
+            ice_servers: Vec<IceServerJson>,
         }
 
         #[derive(serde::Deserialize)]
-        struct IceServer {
+        struct IceServerJson {
             urls: String,
             username: Option<String>,
             credential: Option<String>,
@@ -388,128 +399,33 @@ impl WebRtcChannel {
         Ok(config
             .ice_servers
             .into_iter()
-            .map(|s| RTCIceServer {
+            .map(|s| IceServer {
                 urls: vec![s.urls],
-                username: s.username.unwrap_or_default(),
-                credential: s.credential.unwrap_or_default(),
-                ..Default::default()
+                username: s.username,
+                credential: s.credential,
+                credential_type: rustrtc::IceCredentialType::Password,
             })
             .collect())
     }
 
     /// Create the WebRTC peer connection.
-    async fn create_peer_connection(
+    fn create_peer_connection(
         &self,
-        ice_servers: Vec<RTCIceServer>,
-    ) -> Result<Arc<RTCPeerConnection>, ChannelError> {
-        // Create media engine (required even for data-only)
-        let mut media_engine = MediaEngine::default();
-        media_engine
-            .register_default_codecs()
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to register codecs: {e}")))?;
-
-        // Create interceptor registry
-        let mut registry = Registry::new();
-        registry = register_default_interceptors(registry, &mut media_engine)
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to register interceptors: {e}")))?;
-
-        // Create API
-        let api = APIBuilder::new()
-            .with_media_engine(media_engine)
-            .with_interceptor_registry(registry)
-            .build();
-
-        // Create peer connection config
-        let config = RTCConfiguration {
+        ice_servers: Vec<IceServer>,
+    ) -> Result<PeerConnection, ChannelError> {
+        let config = RtcConfiguration {
             ice_servers,
             ..Default::default()
         };
 
-        // Create peer connection
-        let pc = api
-            .new_peer_connection(config)
-            .await
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to create peer connection: {e}")))?;
-
-        Ok(Arc::new(pc))
-    }
-
-    /// Set up event handlers for the peer connection.
-    fn setup_peer_connection_handlers(&self, pc: &Arc<RTCPeerConnection>) {
-        let state = Arc::clone(&self.state);
-        let data_channel = Arc::clone(&self.data_channel);
-        let peer_connection = Arc::clone(&self.peer_connection);
-        let close_complete = self.close_complete_tx.clone();
-
-        // Connection state change handler
-        pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-            let state = Arc::clone(&state);
-            let data_channel = Arc::clone(&data_channel);
-            let peer_connection = Arc::clone(&peer_connection);
-            let close_complete = close_complete.clone();
-            Box::pin(async move {
-                log::info!("[WebRTC] Connection state changed: {s}");
-                match s {
-                    RTCPeerConnectionState::Connected => {
-                        state.set(ConnectionState::Connected).await;
-                    }
-                    RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed => {
-                        state.set(ConnectionState::Disconnected).await;
-                        // Take resources out (so new offers work immediately) and
-                        // spawn close task. Can't close inline — pc.close() triggers
-                        // a Closed state callback which would deadlock on the Mutex.
-                        // webrtc-rs Drop does NOT shut down SCTP; only close() does.
-                        let dc = data_channel.lock().await.take();
-                        let pc = peer_connection.lock().await.take();
-                        if dc.is_some() || pc.is_some() {
-                            let close_complete = close_complete.clone();
-                            tokio::spawn(async move {
-                                // close() may take up to ~60s if SCTP retransmits
-                                // exhaust their limit, but it WILL complete. No timeout —
-                                // dropping without close() leaks sockets (the original bug).
-                                if let Some(dc) = dc {
-                                    let _ = dc.close().await;
-                                }
-                                if let Some(pc) = pc {
-                                    let _ = pc.close().await;
-                                }
-                                log::debug!("[WebRTC] Closed stale peer connection resources");
-                                let _ = close_complete.send(true);
-                            });
-                        } else {
-                            // No resources to close — signal immediately
-                            let _ = close_complete.send(true);
-                        }
-                    }
-                    RTCPeerConnectionState::Closed => {
-                        state.set(ConnectionState::Disconnected).await;
-                        // Resources may already be cleaned up by Disconnected/Failed handler
-                        let dc = data_channel.lock().await.take();
-                        let pc = peer_connection.lock().await.take();
-                        if dc.is_some() || pc.is_some() {
-                            let close_complete = close_complete.clone();
-                            tokio::spawn(async move {
-                                if let Some(dc) = dc {
-                                    let _ = dc.close().await;
-                                }
-                                if let Some(pc) = pc {
-                                    let _ = pc.close().await;
-                                }
-                                let _ = close_complete.send(true);
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            })
-        }));
+        Ok(PeerConnection::new(config))
     }
 
     /// Handle incoming SDP offer from browser and create answer.
     ///
     /// Called when CLI receives an encrypted offer via ActionCable signal channel.
     pub async fn handle_sdp_offer(&self, sdp: &str, browser_identity: &str) -> Result<String, ChannelError> {
-        // Get or create peer connection
+        // Check for existing connection
         let mut pc_guard = self.peer_connection.lock().await;
 
         if pc_guard.is_some() {
@@ -521,7 +437,7 @@ impl WebRtcChannel {
         // cause a premature peer_connected on the new connection.
         self.dc_opened.store(false, Ordering::Relaxed);
 
-        // Fetch ICE config and create peer connection
+        // Fetch ICE config
         let config_guard = self.config.lock().await;
         let hub_id = config_guard
             .as_ref()
@@ -530,27 +446,25 @@ impl WebRtcChannel {
         drop(config_guard);
 
         let ice_servers = self.fetch_ice_config(&hub_id).await?;
-        let pc = self.create_peer_connection(ice_servers).await?;
-        self.setup_peer_connection_handlers(&pc);
-        *pc_guard = Some(pc.clone());
 
-        // Set remote description (offer)
-        let offer = RTCSessionDescription::offer(sdp.to_string())
+        // Create peer connection (sync — no MediaEngine/Registry/APIBuilder boilerplate)
+        let pc = self.create_peer_connection(ice_servers)?;
+
+        // Parse and set remote description (offer from browser)
+        let offer = SessionDescription::parse(SdpType::Offer, sdp)
             .map_err(|e| ChannelError::ConnectionFailed(format!("Invalid SDP offer: {e}")))?;
 
         pc.set_remote_description(offer)
             .await
             .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to set remote description: {e}")))?;
 
-        // Create answer
+        // Create and set local description (answer)
         let answer = pc
-            .create_answer(None)
+            .create_answer()
             .await
             .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to create answer: {e}")))?;
 
-        // Set local description
         pc.set_local_description(answer.clone())
-            .await
             .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to set local description: {e}")))?;
 
         // Store the peer's Olm key for encrypt routing.
@@ -559,304 +473,13 @@ impl WebRtcChannel {
             *olm_key = Some(crate::relay::extract_olm_key(browser_identity).to_string());
         }
 
-        // Set up data channel handler (browser creates the channel, we receive it)
-        let recv_tx = Arc::clone(&self.recv_tx);
-        let peers = Arc::clone(&self.peers);
-        let crypto_service = self.crypto_service.clone();
-        let browser_id = browser_identity.to_string();
-        let data_channel = Arc::clone(&self.data_channel);
-        let decrypt_failures = Arc::clone(&self.decrypt_failures);
-        let stream_frame_tx = self.stream_frame_tx.clone();
-        let pty_input_tx = self.pty_input_tx.clone();
-        let file_input_tx = self.file_input_tx.clone();
-        let dc_opened = Arc::clone(&self.dc_opened);
-        let hub_event_tx = self.hub_event_tx.clone();
+        // Store PC clone in struct (for handle_ice_candidate and send methods)
+        *pc_guard = Some(pc.clone());
+        drop(pc_guard);
 
-        pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
-            let recv_tx = Arc::clone(&recv_tx);
-            let peers = Arc::clone(&peers);
-            let crypto_service = crypto_service.clone();
-            let browser_id = browser_id.clone();
-            let data_channel = Arc::clone(&data_channel);
-            let decrypt_failures = Arc::clone(&decrypt_failures);
-            let stream_frame_tx = stream_frame_tx.clone();
-            let pty_input_tx = pty_input_tx.clone();
-            let file_input_tx = file_input_tx.clone();
-            let dc_opened = Arc::clone(&dc_opened);
-            let hub_event_tx = hub_event_tx.clone();
-
-            Box::pin(async move {
-                log::info!("[WebRTC] Data channel opened: {}", dc.label());
-
-                // Store data channel and signal readiness
-                *data_channel.lock().await = Some(Arc::clone(&dc));
-
-                // Notify the Hub event loop that the DC is open.
-                // Event channel path (production): instant delivery.
-                // Atomic bool path (tests): polled by tick().
-                if let Some(ref tx) = hub_event_tx {
-                    let _ = tx.send(crate::hub::events::HubEvent::DcOpened {
-                        browser_identity: browser_id.clone(),
-                    });
-                } else {
-                    dc_opened.store(true, Ordering::Relaxed);
-                }
-
-                // Set up message handler — every byte is Olm-encrypted
-                let recv_tx_inner = Arc::clone(&recv_tx);
-                let peers_inner = Arc::clone(&peers);
-                let crypto_inner = crypto_service.clone();
-                let browser_inner = browser_id.clone();
-                let decrypt_failures_inner = Arc::clone(&decrypt_failures);
-                let stream_frame_tx_inner = stream_frame_tx.clone();
-                let pty_input_tx_inner = pty_input_tx.clone();
-                let file_input_tx_inner = file_input_tx.clone();
-
-                dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                    let recv_tx = Arc::clone(&recv_tx_inner);
-                    let peers = Arc::clone(&peers_inner);
-                    let crypto_service = crypto_inner.clone();
-                    let browser_identity = browser_inner.clone();
-                    let decrypt_failures = Arc::clone(&decrypt_failures_inner);
-                    let stream_frame_tx = stream_frame_tx_inner.clone();
-                    let pty_input_tx = pty_input_tx_inner.clone();
-                    let file_input_tx = file_input_tx_inner.clone();
-
-                    Box::pin(async move {
-                        let data = msg.data.to_vec();
-
-                        // Every DataChannel message is a binary Olm frame:
-                        // [msg_type:1][ciphertext] or [msg_type:1][key:32][ciphertext]
-                        let Some(ref cs) = crypto_service else {
-                            log::error!("[WebRTC-DC] No crypto service -- cannot decrypt");
-                            return;
-                        };
-
-                        // Decrypt binary frame via vodozemac
-                        let peer_olm_key = crate::relay::extract_olm_key(&browser_identity);
-                        let plaintext = match cs.lock() {
-                            Ok(mut guard) => match guard.decrypt_binary(&data, Some(peer_olm_key)) {
-                                Ok(pt) => {
-                                    decrypt_failures.store(0, Ordering::Relaxed);
-                                    pt
-                                }
-                                Err(e) => {
-                                    decrypt_failures.fetch_add(1, Ordering::Relaxed);
-                                    log::error!("[WebRTC-DC] Olm decryption FAILED: {e}");
-                                    return;
-                                }
-                            },
-                            Err(e) => {
-                                log::error!("[WebRTC-DC] Crypto mutex poisoned: {e}");
-                                return;
-                            }
-                        };
-
-                        // Parse binary inner content: first byte = content type
-                        if plaintext.is_empty() {
-                            log::warn!("[WebRTC-DC] Empty decrypted content");
-                            return;
-                        }
-
-                        let body_bytes = match plaintext[0] {
-                            CONTENT_MSG => {
-                                // Control message: [CONTENT_MSG][JSON bytes]
-                                plaintext[1..].to_vec()
-                            }
-                            CONTENT_PTY => {
-                                // PTY: [CONTENT_PTY][flags][sub_id_len][sub_id][payload]
-                                if plaintext.len() < 4 {
-                                    log::warn!("[WebRTC-DC] CONTENT_PTY frame too short");
-                                    return;
-                                }
-                                let flags = plaintext[1];
-                                let is_input = flags & 0x02 != 0;
-
-                                if !is_input {
-                                    log::warn!("[WebRTC-DC] Unexpected PTY output from browser");
-                                    return;
-                                }
-
-                                let sub_id_len = plaintext[2] as usize;
-                                if plaintext.len() < 3 + sub_id_len {
-                                    log::warn!("[WebRTC-DC] CONTENT_PTY sub_id truncated");
-                                    return;
-                                }
-                                let sub_id = std::str::from_utf8(&plaintext[3..3 + sub_id_len])
-                                    .unwrap_or("");
-                                let payload = plaintext[3 + sub_id_len..].to_vec();
-
-                                // Parse "terminal_{agent}_{pty}" and send directly to PTY
-                                if let Some(incoming) = parse_pty_input_sub_id(sub_id, payload, browser_identity.clone()) {
-                                    if let Some(ref tx) = pty_input_tx {
-                                        let _ = tx.send(incoming);
-                                    }
-                                } else {
-                                    log::warn!(
-                                        "[WebRTC-DC] Failed to parse PTY input sub_id: {sub_id}"
-                                    );
-                                }
-                                return;
-                            }
-                            CONTENT_STREAM => {
-                                // Stream mux: [CONTENT_STREAM][frame_type][stream_id_hi][stream_id_lo][payload]
-                                if plaintext.len() < 4 {
-                                    log::warn!("[WebRTC-DC] CONTENT_STREAM frame too short");
-                                    return;
-                                }
-                                let frame_type = plaintext[1];
-                                let stream_id = u16::from_be_bytes([plaintext[2], plaintext[3]]);
-                                let payload = plaintext[4..].to_vec();
-
-                                if let Some(ref tx) = stream_frame_tx {
-                                    let _ = tx.send(StreamIncoming {
-                                        browser_identity: browser_identity.clone(),
-                                        frame_type,
-                                        stream_id,
-                                        payload,
-                                    });
-                                }
-                                return;
-                            }
-                            CONTENT_FILE => {
-                                // File transfer: [CONTENT_FILE][sub_id_len][sub_id][filename_len_lo][filename_len_hi][filename][data]
-                                if plaintext.len() < 4 {
-                                    log::warn!("[WebRTC-DC] CONTENT_FILE frame too short");
-                                    return;
-                                }
-                                let sub_id_len = plaintext[1] as usize;
-                                if plaintext.len() < 2 + sub_id_len + 2 {
-                                    log::warn!("[WebRTC-DC] CONTENT_FILE sub_id/filename truncated");
-                                    return;
-                                }
-                                let sub_id = std::str::from_utf8(&plaintext[2..2 + sub_id_len])
-                                    .unwrap_or("");
-                                let fname_offset = 2 + sub_id_len;
-                                let filename_len = u16::from_le_bytes([
-                                    plaintext[fname_offset],
-                                    plaintext[fname_offset + 1],
-                                ]) as usize;
-                                let fname_start = fname_offset + 2;
-                                if plaintext.len() < fname_start + filename_len {
-                                    log::warn!("[WebRTC-DC] CONTENT_FILE filename truncated");
-                                    return;
-                                }
-                                let filename = std::str::from_utf8(
-                                    &plaintext[fname_start..fname_start + filename_len],
-                                )
-                                .unwrap_or("paste.png")
-                                .to_string();
-                                let data = plaintext[fname_start + filename_len..].to_vec();
-
-                                // Parse sub_id for agent/pty routing
-                                if let Some(pty_info) = parse_pty_input_sub_id(sub_id, Vec::new(), browser_identity.clone()) {
-                                    if let Some(ref tx) = file_input_tx {
-                                        let _ = tx.send(FileInputIncoming {
-                                            agent_index: pty_info.agent_index,
-                                            pty_index: pty_info.pty_index,
-                                            filename,
-                                            data,
-                                        });
-                                    }
-                                } else {
-                                    log::warn!(
-                                        "[WebRTC-DC] Failed to parse file input sub_id: {sub_id}"
-                                    );
-                                }
-                                return;
-                            }
-                            other => {
-                                log::warn!("[WebRTC-DC] Unknown content type: 0x{other:02x}");
-                                return;
-                            }
-                        };
-
-                        // Add peer
-                        {
-                            let mut peers = peers.write().await;
-                            peers.insert(PeerId(browser_identity.clone()));
-                        }
-
-                        // Send to receive queue
-                        if let Some(tx) = recv_tx.lock().await.as_ref() {
-                            let _ = tx
-                                .send(RawIncoming {
-                                    payload: body_bytes,
-                                    sender: PeerId(browser_identity.clone()),
-                                })
-                                .await;
-                        } else {
-                            log::error!("[WebRTC-DC] recv_tx is None! Cannot queue message");
-                        }
-                    })
-                }));
-            })
-        }));
-
-        // Set up ICE candidate handler -- encrypt and send via mpsc for ActionCable relay.
-        let ice_crypto = self.crypto_service.clone();
-        let ice_signal_tx = self.signal_tx.clone();
-        let browser_id = browser_identity.to_string();
-
-        pc.on_ice_candidate(Box::new(move |candidate| {
-            let crypto = ice_crypto.clone();
-            let signal_tx = ice_signal_tx.clone();
-            let browser_id = browser_id.clone();
-
-            Box::pin(async move {
-                let Some(c) = candidate else { return };
-
-                let candidate_json = match c.to_json() {
-                    Ok(j) => j,
-                    Err(e) => {
-                        log::error!("[WebRTC] Failed to serialize ICE candidate: {e}");
-                        return;
-                    }
-                };
-
-                // Build the plaintext payload
-                let payload = serde_json::json!({
-                    "type": "ice",
-                    "candidate": candidate_json,
-                });
-
-                // Encrypt with E2E encryption if crypto service available
-                let envelope = if let Some(ref cs) = crypto {
-                    let plaintext = serde_json::to_vec(&payload).unwrap_or_default();
-                    match cs.lock() {
-                        Ok(mut guard) => match guard.encrypt(&plaintext, crate::relay::extract_olm_key(&browser_id)) {
-                            Ok(env) => match serde_json::to_value(&env) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    log::error!("[WebRTC] Failed to serialize ICE envelope: {e}");
-                                    return;
-                                }
-                            },
-                            Err(e) => {
-                                log::error!("[WebRTC] Failed to encrypt ICE candidate: {e}");
-                                return;
-                            }
-                        },
-                        Err(e) => {
-                            log::error!("[WebRTC] Crypto mutex poisoned: {e}");
-                            return;
-                        }
-                    }
-                } else {
-                    payload
-                };
-
-                // Send via mpsc for ActionCable relay
-                if let Some(ref tx) = signal_tx {
-                    let _ = tx.send(OutgoingSignal::Ice {
-                        browser_identity: browser_id.clone(),
-                        envelope,
-                    });
-                } else {
-                    log::warn!("[WebRTC] No signal_tx -- cannot relay ICE candidate");
-                }
-            })
-        }));
+        // Spawn event loop task (replaces all on_* callbacks from webrtc-rs)
+        let handle = self.spawn_event_loop(pc, browser_identity);
+        *self.event_loop_handle.lock().await = Some(handle);
 
         // Add peer
         {
@@ -864,33 +487,305 @@ impl WebRtcChannel {
             peers.insert(PeerId(browser_identity.to_string()));
         }
 
-        Ok(answer.sdp)
+        // rustrtc omits a=max-message-size from SDP. Per RFC 8841, browsers
+        // default to 65536 when absent, causing RTCErrorEvent on large sends
+        // (e.g. encrypted screenshots). Chrome caps at 256KB when value is 0,
+        // so use an explicit large value (16MB) instead.
+        let mut sdp = answer.to_sdp_string();
+        if !sdp.contains("max-message-size") {
+            sdp = inject_max_message_size(&sdp, 16 * 1024 * 1024);
+        }
+
+        // Log the application section of SDP answer for debugging
+        if let Some(app_idx) = sdp.find("m=application") {
+            let section: String = sdp[app_idx..].lines().take(5).collect::<Vec<_>>().join(" | ");
+            log::debug!("[WebRTC] SDP answer application section: {section}");
+        } else {
+            log::warn!("[WebRTC] SDP answer has no m=application section!");
+        }
+
+        Ok(sdp)
+    }
+
+    /// Spawn the event loop task that replaces webrtc-rs callbacks.
+    ///
+    /// This single task handles:
+    /// - ICE candidate forwarding (via sub-task)
+    /// - Peer connection state changes
+    /// - DataChannel open/message/close events
+    fn spawn_event_loop(
+        &self,
+        pc: PeerConnection,
+        browser_identity: &str,
+    ) -> tokio::task::JoinHandle<()> {
+        // Clone all Arc/mpsc handles needed (same set as the old callbacks)
+        let state = Arc::clone(&self.state);
+        let data_channel = Arc::clone(&self.data_channel);
+        let data_channel_id = Arc::clone(&self.data_channel_id);
+        let peer_connection = Arc::clone(&self.peer_connection);
+        let close_complete = self.close_complete_tx.clone();
+        let recv_tx = Arc::clone(&self.recv_tx);
+        let peers = Arc::clone(&self.peers);
+        let crypto_service = self.crypto_service.clone();
+        let browser_id = browser_identity.to_string();
+        let decrypt_failures = Arc::clone(&self.decrypt_failures);
+        let stream_frame_tx = self.stream_frame_tx.clone();
+        let pty_input_tx = self.pty_input_tx.clone();
+        let file_input_tx = self.file_input_tx.clone();
+        let dc_opened = Arc::clone(&self.dc_opened);
+        let hub_event_tx = self.hub_event_tx.clone();
+
+        // Subscribe to ICE candidates for forwarding
+        let mut ice_rx = pc.subscribe_ice_candidates();
+        let ice_crypto = self.crypto_service.clone();
+        let ice_signal_tx = self.signal_tx.clone();
+        let ice_browser_id = browser_id.clone();
+
+        // Subscribe to peer connection state changes
+        let mut peer_state_rx = pc.subscribe_peer_state();
+
+        tokio::spawn(async move {
+            // Sub-task: forward local ICE candidates to browser via ActionCable
+            let ice_task = tokio::spawn(async move {
+                loop {
+                    match ice_rx.recv().await {
+                        Ok(candidate) => {
+                            // Build JSON matching browser's RTCIceCandidateInit format
+                            let candidate_json = serde_json::json!({
+                                "candidate": format!("candidate:{}", candidate.to_sdp()),
+                                "sdpMid": "0",
+                                "sdpMLineIndex": 0,
+                            });
+
+                            let payload = serde_json::json!({
+                                "type": "ice",
+                                "candidate": candidate_json,
+                            });
+
+                            // Encrypt with E2E encryption
+                            let envelope = if let Some(ref cs) = ice_crypto {
+                                let plaintext = serde_json::to_vec(&payload).unwrap_or_default();
+                                match cs.lock() {
+                                    Ok(mut guard) => match guard.encrypt(&plaintext, crate::relay::extract_olm_key(&ice_browser_id)) {
+                                        Ok(env) => match serde_json::to_value(&env) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                log::error!("[WebRTC] Failed to serialize ICE envelope: {e}");
+                                                continue;
+                                            }
+                                        },
+                                        Err(e) => {
+                                            log::error!("[WebRTC] Failed to encrypt ICE candidate: {e}");
+                                            continue;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        log::error!("[WebRTC] Crypto mutex poisoned: {e}");
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                payload
+                            };
+
+                            if let Some(ref tx) = ice_signal_tx {
+                                let _ = tx.send(OutgoingSignal::Ice {
+                                    browser_identity: ice_browser_id.clone(),
+                                    envelope,
+                                });
+                            } else {
+                                log::warn!("[WebRTC] No signal_tx -- cannot relay ICE candidate");
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            log::warn!("[WebRTC] ICE candidate subscription lagged by {n}");
+                        }
+                    }
+                }
+            });
+
+            // Track the DC reader so we can abort it on exit
+            let mut dc_reader_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+            // Notify from DC reader → event loop when DataChannel closes.
+            // Without this, the event loop stays alive after DC close (peer
+            // state may remain Connected), blocking new offers with
+            // "Connection in progress".
+            let dc_closed = Arc::new(tokio::sync::Notify::new());
+
+            // Main event loop: select between PeerConnection events, state changes,
+            // and DC close notifications
+            loop {
+                tokio::select! {
+                    event = pc.recv() => {
+                        match event {
+                            Some(PeerConnectionEvent::DataChannel(dc)) => {
+                                log::info!("[WebRTC] Data channel opened: {}", dc.label);
+
+                                let channel_id = dc.id;
+
+                                // Store data channel and ID for send methods
+                                // dc is already Arc<DataChannel> from PeerConnectionEvent
+                                *data_channel.lock().await = Some(Arc::clone(&dc));
+                                *data_channel_id.lock().await = Some(channel_id);
+
+                                // Notify DC opened
+                                if let Some(ref tx) = hub_event_tx {
+                                    let _ = tx.send(crate::hub::events::HubEvent::DcOpened {
+                                        browser_identity: browser_id.clone(),
+                                    });
+                                } else {
+                                    dc_opened.store(true, Ordering::Relaxed);
+                                }
+
+                                // Abort previous DC reader if replacing (defensive)
+                                if let Some(h) = dc_reader_handle.take() {
+                                    h.abort();
+                                }
+
+                                // Spawn DataChannel message reader
+                                let recv_tx = Arc::clone(&recv_tx);
+                                let peers = Arc::clone(&peers);
+                                let crypto = crypto_service.clone();
+                                let browser = browser_id.clone();
+                                let failures = Arc::clone(&decrypt_failures);
+                                let stream_tx = stream_frame_tx.clone();
+                                let pty_tx = pty_input_tx.clone();
+                                let file_tx = file_input_tx.clone();
+                                let dc_reader = Arc::clone(&dc);
+                                let dc_closed_signal = Arc::clone(&dc_closed);
+
+                                dc_reader_handle = Some(tokio::spawn(async move {
+                                    let mut chunk_assemblies: std::collections::HashMap<u8, FileChunkAssembly> = std::collections::HashMap::new();
+                                    loop {
+                                        match dc_reader.recv().await {
+                                            Some(DataChannelEvent::Message(data)) => {
+                                                handle_dc_message(
+                                                    &data,
+                                                    &browser,
+                                                    &crypto,
+                                                    &failures,
+                                                    &recv_tx,
+                                                    &peers,
+                                                    &stream_tx,
+                                                    &pty_tx,
+                                                    &file_tx,
+                                                    &mut chunk_assemblies,
+                                                )
+                                                .await;
+                                            }
+                                            Some(DataChannelEvent::Open) => {
+                                                log::debug!("[WebRTC-DC] DataChannel Open event");
+                                            }
+                                            Some(DataChannelEvent::Close) | None => {
+                                                log::info!("[WebRTC-DC] DataChannel closed");
+                                                dc_closed_signal.notify_one();
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }));
+                            }
+                            Some(PeerConnectionEvent::Track(_)) => {
+                                // We don't use media tracks, ignore
+                            }
+                            None => {
+                                // PeerConnection event channel closed
+                                log::info!("[WebRTC] PeerConnection event loop ended");
+                                state.set(ConnectionState::Disconnected).await;
+                                data_channel.lock().await.take();
+                                data_channel_id.lock().await.take();
+                                peer_connection.lock().await.take();
+                                let _ = close_complete.send(true);
+                                break;
+                            }
+                        }
+                    }
+                    _ = peer_state_rx.changed() => {
+                        let s = *peer_state_rx.borrow();
+                        log::info!("[WebRTC] Connection state changed: {s:?}");
+                        match s {
+                            rustrtc::PeerConnectionState::Connected => {
+                                state.set(ConnectionState::Connected).await;
+                            }
+                            rustrtc::PeerConnectionState::Disconnected
+                            | rustrtc::PeerConnectionState::Failed => {
+                                state.set(ConnectionState::Disconnected).await;
+                                data_channel.lock().await.take();
+                                data_channel_id.lock().await.take();
+                                // Close is sync — no 60-second wait
+                                if let Some(pc) = peer_connection.lock().await.take() {
+                                    pc.close();
+                                }
+                                let _ = close_complete.send(true);
+                                break;
+                            }
+                            rustrtc::PeerConnectionState::Closed => {
+                                state.set(ConnectionState::Disconnected).await;
+                                data_channel.lock().await.take();
+                                data_channel_id.lock().await.take();
+                                peer_connection.lock().await.take();
+                                let _ = close_complete.send(true);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ = dc_closed.notified() => {
+                        // DataChannel closed but peer state didn't transition —
+                        // tear down so new offers aren't blocked.
+                        log::info!("[WebRTC] DataChannel closed, tearing down connection");
+                        state.set(ConnectionState::Disconnected).await;
+                        data_channel.lock().await.take();
+                        data_channel_id.lock().await.take();
+                        if let Some(pc) = peer_connection.lock().await.take() {
+                            pc.close();
+                        }
+                        let _ = close_complete.send(true);
+                        break;
+                    }
+                }
+            }
+
+            // Cleanup: abort sub-tasks so nothing leaks
+            ice_task.abort();
+            if let Some(h) = dc_reader_handle {
+                h.abort();
+            }
+        })
     }
 
     /// Handle incoming ICE candidate from browser.
     pub async fn handle_ice_candidate(
         &self,
         candidate: &str,
-        sdp_mid: Option<&str>,
-        sdp_mline_index: Option<u16>,
+        _sdp_mid: Option<&str>,
+        _sdp_mline_index: Option<u16>,
     ) -> Result<(), ChannelError> {
         let pc_guard = self.peer_connection.lock().await;
         let pc = pc_guard
             .as_ref()
             .ok_or_else(|| ChannelError::ConnectionFailed("No peer connection".to_string()))?;
 
-        let candidate_init = RTCIceCandidateInit {
-            candidate: candidate.to_string(),
-            sdp_mid: sdp_mid.map(String::from),
-            sdp_mline_index,
-            ..Default::default()
-        };
+        // Parse the candidate SDP string (browser sends "candidate:..." format)
+        let sdp_str = candidate.trim_start_matches("candidate:");
+        let ice_candidate = IceCandidate::from_sdp(sdp_str)
+            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to parse ICE candidate: {e}")))?;
 
-        pc.add_ice_candidate(candidate_init)
-            .await
+        pc.add_ice_candidate(ice_candidate)
             .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to add ICE candidate: {e}")))?;
 
         Ok(())
+    }
+
+    /// Get the peer's Olm identity key for encrypting messages.
+    async fn get_peer_olm_key(&self) -> Result<String, ChannelError> {
+        self.peer_olm_key
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| ChannelError::EncryptionError("No peer Olm key (SDP offer not yet handled)".into()))
     }
 }
 
@@ -914,18 +809,23 @@ impl Channel for WebRtcChannel {
     }
 
     async fn disconnect(&mut self) {
-        // Close data channel
-        if let Some(dc) = self.data_channel.lock().await.take() {
-            let _ = dc.close().await;
+        // Abort event loop task (stops recv() loop)
+        if let Some(handle) = self.event_loop_handle.lock().await.take() {
+            handle.abort();
         }
 
-        // Close peer connection
+        // Clear data channel
+        self.data_channel.lock().await.take();
+        self.data_channel_id.lock().await.take();
+
+        // Close and drop peer connection (sync, immediate — no 60-second wait)
         if let Some(pc) = self.peer_connection.lock().await.take() {
-            let _ = pc.close().await;
+            pc.close();
         }
 
         self.state.set(ConnectionState::Disconnected).await;
         self.peers.write().await.clear();
+        let _ = self.close_complete_tx.send(true);
     }
 
     fn state(&self) -> ConnectionState {
@@ -946,9 +846,12 @@ impl Channel for WebRtcChannel {
     }
 
     async fn send_to(&self, msg: &[u8], _peer: &PeerId) -> Result<(), ChannelError> {
-        let dc_guard = self.data_channel.lock().await;
-        let dc = dc_guard
+        let pc_guard = self.peer_connection.lock().await;
+        let pc = pc_guard
             .as_ref()
+            .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
+
+        let dc_id = self.data_channel_id.lock().await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let cs = self
@@ -970,7 +873,7 @@ impl Channel for WebRtcChannel {
             .encrypt_binary(&plaintext, &peer_key)
             .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
 
-        dc.send(&bytes::Bytes::from(encrypted))
+        pc.send_data(dc_id, &encrypted)
             .await
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
@@ -1056,22 +959,13 @@ impl WebRtcChannel {
 
     /// Returns a watch receiver for close-complete signaling.
     ///
-    /// The value transitions to `true` when the state handler's close task
-    /// finishes releasing pc/dc sockets. Callers can `wait_for(|v| *v)`
+    /// The value transitions to `true` when the connection closes and
+    /// sockets are released. Callers can `wait_for(|v| *v)`
     /// (with a timeout) before creating a replacement connection to prevent
     /// fd exhaustion. Unlike `Notify`, `watch` retains the last value so
     /// late subscribers see it immediately.
     pub fn close_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
         self.close_complete_rx.clone()
-    }
-
-    /// Get the peer's Olm identity key for encrypting messages.
-    async fn get_peer_olm_key(&self) -> Result<String, ChannelError> {
-        self.peer_olm_key
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| ChannelError::EncryptionError("No peer Olm key (SDP offer not yet handled)".into()))
     }
 
     /// Check if the channel is ready for application messages.
@@ -1095,9 +989,12 @@ impl WebRtcChannel {
         data: &[u8],
         _peer: &PeerId,
     ) -> Result<(), ChannelError> {
-        let dc_guard = self.data_channel.lock().await;
-        let dc = dc_guard
+        let pc_guard = self.peer_connection.lock().await;
+        let pc = pc_guard
             .as_ref()
+            .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
+
+        let dc_id = self.data_channel_id.lock().await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let cs = self
@@ -1145,7 +1042,7 @@ impl WebRtcChannel {
             .encrypt_binary(&plaintext, &peer_key)
             .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
 
-        dc.send(&bytes::Bytes::from(encrypted))
+        pc.send_data(dc_id, &encrypted)
             .await
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
@@ -1162,9 +1059,12 @@ impl WebRtcChannel {
         payload: &[u8],
         _peer: &PeerId,
     ) -> Result<(), ChannelError> {
-        let dc_guard = self.data_channel.lock().await;
-        let dc = dc_guard
+        let pc_guard = self.peer_connection.lock().await;
+        let pc = pc_guard
             .as_ref()
+            .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
+
+        let dc_id = self.data_channel_id.lock().await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let cs = self
@@ -1187,7 +1087,7 @@ impl WebRtcChannel {
             .encrypt_binary(&plaintext, &peer_key)
             .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
 
-        dc.send(&bytes::Bytes::from(encrypted))
+        pc.send_data(dc_id, &encrypted)
             .await
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
@@ -1200,20 +1100,312 @@ impl WebRtcChannel {
     /// The browser verifies the identity key matches the original QR trust anchor,
     /// then creates a new outbound Olm session from the fresh one-time key.
     pub async fn send_bundle_refresh(&self, bundle_bytes: &[u8]) -> Result<(), ChannelError> {
-        let dc_guard = self.data_channel.lock().await;
-        let dc = dc_guard
+        let pc_guard = self.peer_connection.lock().await;
+        let pc = pc_guard
             .as_ref()
+            .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
+
+        let dc_id = self.data_channel_id.lock().await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let mut frame = Vec::with_capacity(1 + bundle_bytes.len());
         frame.push(crate::relay::MSG_TYPE_BUNDLE_REFRESH);
         frame.extend_from_slice(bundle_bytes);
 
-        dc.send(&bytes::Bytes::from(frame))
+        pc.send_data(dc_id, &frame)
             .await
             .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+/// Handle an incoming DataChannel message: decrypt and route by content type.
+///
+/// Extracted as a standalone async fn to avoid deep nesting in the event loop.
+#[allow(clippy::too_many_arguments)]
+async fn handle_dc_message(
+    data: &[u8],
+    browser_identity: &str,
+    crypto_service: &Option<CryptoService>,
+    decrypt_failures: &Arc<AtomicU32>,
+    recv_tx: &Arc<Mutex<Option<mpsc::Sender<RawIncoming>>>>,
+    peers: &Arc<RwLock<HashSet<PeerId>>>,
+    stream_frame_tx: &Option<mpsc::UnboundedSender<StreamIncoming>>,
+    pty_input_tx: &Option<mpsc::UnboundedSender<PtyInputIncoming>>,
+    file_input_tx: &Option<mpsc::UnboundedSender<FileInputIncoming>>,
+    chunk_assemblies: &mut std::collections::HashMap<u8, FileChunkAssembly>,
+) {
+    // Every DataChannel message is a binary Olm frame:
+    // [msg_type:1][ciphertext] or [msg_type:1][key:32][ciphertext]
+    let Some(ref cs) = crypto_service else {
+        log::error!("[WebRTC-DC] No crypto service -- cannot decrypt");
+        return;
+    };
+
+    // Decrypt binary frame via vodozemac
+    let peer_olm_key = crate::relay::extract_olm_key(browser_identity);
+    let plaintext = match cs.lock() {
+        Ok(mut guard) => match guard.decrypt_binary(data, Some(peer_olm_key)) {
+            Ok(pt) => {
+                decrypt_failures.store(0, Ordering::Relaxed);
+                pt
+            }
+            Err(e) => {
+                decrypt_failures.fetch_add(1, Ordering::Relaxed);
+                log::error!("[WebRTC-DC] Olm decryption FAILED: {e}");
+                return;
+            }
+        },
+        Err(e) => {
+            log::error!("[WebRTC-DC] Crypto mutex poisoned: {e}");
+            return;
+        }
+    };
+
+    // Parse binary inner content: first byte = content type
+    if plaintext.is_empty() {
+        log::warn!("[WebRTC-DC] Empty decrypted content");
+        return;
+    }
+
+    let body_bytes = match plaintext[0] {
+        CONTENT_MSG => {
+            // Control message: [CONTENT_MSG][JSON bytes]
+            plaintext[1..].to_vec()
+        }
+        CONTENT_PTY => {
+            // PTY: [CONTENT_PTY][flags][sub_id_len][sub_id][payload]
+            if plaintext.len() < 4 {
+                log::warn!("[WebRTC-DC] CONTENT_PTY frame too short");
+                return;
+            }
+            let flags = plaintext[1];
+            let is_input = flags & 0x02 != 0;
+
+            if !is_input {
+                log::warn!("[WebRTC-DC] Unexpected PTY output from browser");
+                return;
+            }
+
+            let sub_id_len = plaintext[2] as usize;
+            if plaintext.len() < 3 + sub_id_len {
+                log::warn!("[WebRTC-DC] CONTENT_PTY sub_id truncated");
+                return;
+            }
+            let sub_id = std::str::from_utf8(&plaintext[3..3 + sub_id_len])
+                .unwrap_or("");
+            let payload = plaintext[3 + sub_id_len..].to_vec();
+
+            // Parse "terminal_{agent}_{pty}" and send directly to PTY
+            if let Some(incoming) = parse_pty_input_sub_id(sub_id, payload, browser_identity.to_string()) {
+                if let Some(ref tx) = pty_input_tx {
+                    let _ = tx.send(incoming);
+                }
+            } else {
+                log::warn!(
+                    "[WebRTC-DC] Failed to parse PTY input sub_id: {sub_id}"
+                );
+            }
+            return;
+        }
+        CONTENT_STREAM => {
+            // Stream mux: [CONTENT_STREAM][frame_type][stream_id_hi][stream_id_lo][payload]
+            if plaintext.len() < 4 {
+                log::warn!("[WebRTC-DC] CONTENT_STREAM frame too short");
+                return;
+            }
+            let frame_type = plaintext[1];
+            let stream_id = u16::from_be_bytes([plaintext[2], plaintext[3]]);
+            let payload = plaintext[4..].to_vec();
+
+            if let Some(ref tx) = stream_frame_tx {
+                let _ = tx.send(StreamIncoming {
+                    browser_identity: browser_identity.to_string(),
+                    frame_type,
+                    stream_id,
+                    payload,
+                });
+            }
+            return;
+        }
+        CONTENT_FILE => {
+            // File transfer: [CONTENT_FILE][sub_id_len][sub_id][filename_len_lo][filename_len_hi][filename][data]
+            if plaintext.len() < 4 {
+                log::warn!("[WebRTC-DC] CONTENT_FILE frame too short");
+                return;
+            }
+            let sub_id_len = plaintext[1] as usize;
+            if plaintext.len() < 2 + sub_id_len + 2 {
+                log::warn!("[WebRTC-DC] CONTENT_FILE sub_id/filename truncated");
+                return;
+            }
+            let sub_id = std::str::from_utf8(&plaintext[2..2 + sub_id_len])
+                .unwrap_or("");
+            let fname_offset = 2 + sub_id_len;
+            let filename_len = u16::from_le_bytes([
+                plaintext[fname_offset],
+                plaintext[fname_offset + 1],
+            ]) as usize;
+            let fname_start = fname_offset + 2;
+            if plaintext.len() < fname_start + filename_len {
+                log::warn!("[WebRTC-DC] CONTENT_FILE filename truncated");
+                return;
+            }
+            let filename = std::str::from_utf8(
+                &plaintext[fname_start..fname_start + filename_len],
+            )
+            .unwrap_or("paste.png")
+            .to_string();
+            let data = plaintext[fname_start + filename_len..].to_vec();
+
+            // Parse sub_id for agent/pty routing
+            if let Some(pty_info) = parse_pty_input_sub_id(sub_id, Vec::new(), browser_identity.to_string()) {
+                if let Some(ref tx) = file_input_tx {
+                    let _ = tx.send(FileInputIncoming {
+                        agent_index: pty_info.agent_index,
+                        pty_index: pty_info.pty_index,
+                        filename,
+                        data,
+                    });
+                }
+            } else {
+                log::warn!(
+                    "[WebRTC-DC] Failed to parse file input sub_id: {sub_id}"
+                );
+            }
+            return;
+        }
+        CONTENT_FILE_CHUNK => {
+            // Chunked file transfer: [0x04][transfer_id][flags][payload...]
+            // flags: bit 0 = START (first chunk), bit 1 = END (last chunk)
+            if plaintext.len() < 4 {
+                log::warn!("[WebRTC-DC] CONTENT_FILE_CHUNK frame too short");
+                return;
+            }
+            let transfer_id = plaintext[1];
+            let flags = plaintext[2];
+            let is_start = (flags & 0x01) != 0;
+            let is_end = (flags & 0x02) != 0;
+            let payload = &plaintext[3..];
+
+            if is_start {
+                // First chunk: payload = [sub_id_len][sub_id][fname_len:2LE][fname][data...]
+                // Same layout as CONTENT_FILE minus the 0x03 byte
+                if payload.len() < 3 {
+                    log::warn!("[WebRTC-DC] CONTENT_FILE_CHUNK START too short");
+                    return;
+                }
+                let sub_id_len = payload[0] as usize;
+                if payload.len() < 1 + sub_id_len + 2 {
+                    log::warn!("[WebRTC-DC] CONTENT_FILE_CHUNK START sub_id truncated");
+                    return;
+                }
+                let sub_id = std::str::from_utf8(&payload[1..1 + sub_id_len]).unwrap_or("");
+                let fname_offset = 1 + sub_id_len;
+                let filename_len = u16::from_le_bytes([
+                    payload[fname_offset],
+                    payload[fname_offset + 1],
+                ]) as usize;
+                let fname_start = fname_offset + 2;
+                if payload.len() < fname_start + filename_len {
+                    log::warn!("[WebRTC-DC] CONTENT_FILE_CHUNK START filename truncated");
+                    return;
+                }
+                let filename = std::str::from_utf8(&payload[fname_start..fname_start + filename_len])
+                    .unwrap_or("paste.png")
+                    .to_string();
+                let file_data = &payload[fname_start + filename_len..];
+
+                // Parse routing info
+                let (agent_index, pty_index) = if let Some(pty_info) =
+                    parse_pty_input_sub_id(sub_id, Vec::new(), browser_identity.to_string())
+                {
+                    (pty_info.agent_index, pty_info.pty_index)
+                } else {
+                    log::warn!("[WebRTC-DC] CONTENT_FILE_CHUNK: bad sub_id: {sub_id}");
+                    return;
+                };
+
+                log::debug!(
+                    "[WebRTC-DC] File chunk START: transfer_id={transfer_id}, filename={filename}, first_data={}",
+                    file_data.len()
+                );
+
+                let mut assembly = FileChunkAssembly {
+                    agent_index,
+                    pty_index,
+                    filename,
+                    data: Vec::with_capacity(512 * 1024), // pre-allocate for typical file
+                };
+                assembly.data.extend_from_slice(file_data);
+
+                if is_end {
+                    // Single chunk with both START and END (small file sent as chunk)
+                    if let Some(ref tx) = file_input_tx {
+                        let _ = tx.send(FileInputIncoming {
+                            agent_index: assembly.agent_index,
+                            pty_index: assembly.pty_index,
+                            filename: assembly.filename,
+                            data: assembly.data,
+                        });
+                    }
+                } else {
+                    chunk_assemblies.insert(transfer_id, assembly);
+                }
+            } else {
+                // Middle or last chunk: payload = raw file data
+                let assembly = match chunk_assemblies.get_mut(&transfer_id) {
+                    Some(a) => a,
+                    None => {
+                        log::warn!(
+                            "[WebRTC-DC] CONTENT_FILE_CHUNK: no assembly for transfer_id={transfer_id}"
+                        );
+                        return;
+                    }
+                };
+                assembly.data.extend_from_slice(payload);
+
+                if is_end {
+                    let assembly = chunk_assemblies.remove(&transfer_id).unwrap();
+                    log::debug!(
+                        "[WebRTC-DC] File chunk END: transfer_id={transfer_id}, total={}",
+                        assembly.data.len()
+                    );
+                    if let Some(ref tx) = file_input_tx {
+                        let _ = tx.send(FileInputIncoming {
+                            agent_index: assembly.agent_index,
+                            pty_index: assembly.pty_index,
+                            filename: assembly.filename,
+                            data: assembly.data,
+                        });
+                    }
+                }
+            }
+            return;
+        }
+        other => {
+            log::warn!("[WebRTC-DC] Unknown content type: 0x{other:02x}");
+            return;
+        }
+    };
+
+    // Add peer
+    {
+        let mut peers = peers.write().await;
+        peers.insert(PeerId(browser_identity.to_string()));
+    }
+
+    // Send to receive queue
+    if let Some(tx) = recv_tx.lock().await.as_ref() {
+        let _ = tx
+            .send(RawIncoming {
+                payload: body_bytes,
+                sender: PeerId(browser_identity.to_string()),
+            })
+            .await;
+    } else {
+        log::error!("[WebRTC-DC] recv_tx is None! Cannot queue message");
     }
 }
 
@@ -1232,4 +1424,27 @@ fn parse_pty_input_sub_id(sub_id: &str, data: Vec<u8>, browser_identity: String)
     } else {
         None
     }
+}
+
+/// Inject `a=max-message-size:{value}` into the application media section of an SDP string.
+///
+/// Browsers default to 65536 when this attribute is absent (RFC 8841 §6.1),
+/// which causes `RTCErrorEvent` when sending encrypted payloads larger than 64 KB
+/// (e.g. screenshot file transfers). A value of 0 means no limit.
+fn inject_max_message_size(sdp: &str, value: u64) -> String {
+    // Insert after the m=application line (before the next m= or at end)
+    let mut result = String::with_capacity(sdp.len() + 30);
+    let mut injected = false;
+
+    for line in sdp.lines() {
+        result.push_str(line);
+        result.push_str("\r\n");
+
+        if !injected && line.starts_with("m=application") {
+            result.push_str(&format!("a=max-message-size:{value}\r\n"));
+            injected = true;
+        }
+    }
+
+    result
 }

@@ -617,8 +617,60 @@ class WebRTCTransport {
     plaintext.set(filenameBytes, offset); offset += filenameBytes.length
     plaintext.set(data, offset)
 
-    const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
-    conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+    // Chrome caps SCTP user messages at 256KB (RTCSctpTransport.maxMessageSize).
+    // Olm encryption adds ~80 bytes overhead. Chunk the plaintext so each
+    // encrypted message stays well under the limit.
+    const maxMsg = conn.pc?.sctp?.maxMessageSize || 262144
+    // Leave headroom for Olm envelope overhead (~100 bytes)
+    const chunkLimit = Math.max(maxMsg - 256, 16384)
+
+    if (plaintext.length <= chunkLimit) {
+      // Small enough to send in one shot
+      const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
+      conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+    } else {
+      // Split into CONTENT_FILE_CHUNK messages
+      // First chunk: [0x04][transfer_id][flags=START][original header][chunk data]
+      // Middle:      [0x04][transfer_id][flags=0][chunk data]
+      // Last:        [0x04][transfer_id][flags=END][chunk data]
+      const CONTENT_FILE_CHUNK = 0x04
+      const transferId = Math.floor(Math.random() * 256)
+      // Header = everything before the file data (content type + sub_id + filename metadata)
+      const headerLen = 1 + 1 + subIdBytes.length + 2 + filenameBytes.length
+      const header = plaintext.slice(1, headerLen) // skip the 0x03 content type byte
+      const fileData = plaintext.slice(headerLen)
+      // Chunk size for file data (leave room for chunk envelope + header in first chunk)
+      const dataChunkSize = chunkLimit - 4 // [0x04][transferId][flags][...data]
+
+      let pos = 0
+      while (pos < fileData.length) {
+        const isFirst = pos === 0
+        const end = Math.min(pos + (isFirst ? dataChunkSize - header.length : dataChunkSize), fileData.length)
+        const isLast = end >= fileData.length
+        const flags = (isFirst ? 0x01 : 0) | (isLast ? 0x02 : 0)
+
+        let chunk
+        if (isFirst) {
+          // First chunk includes the original file header (sub_id, filename)
+          chunk = new Uint8Array(3 + header.length + (end - pos))
+          chunk[0] = CONTENT_FILE_CHUNK
+          chunk[1] = transferId
+          chunk[2] = flags
+          chunk.set(header, 3)
+          chunk.set(fileData.slice(pos, end), 3 + header.length)
+        } else {
+          chunk = new Uint8Array(3 + (end - pos))
+          chunk[0] = CONTENT_FILE_CHUNK
+          chunk[1] = transferId
+          chunk[2] = flags
+          chunk.set(fileData.slice(pos, end), 3)
+        }
+
+        const { data: encrypted } = await bridge.encryptBinary(String(hubId), chunk)
+        conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+        pos = end
+      }
+    }
   }
 
   /**
