@@ -402,10 +402,10 @@ pub fn install() -> Result<()> {
 
     // Get current binary path
     let current_exe = env::current_exe()?;
-    let temp_path = current_exe.with_extension("new");
-    let backup_path = current_exe.with_extension("bak");
 
-    // Write new binary to temp location
+    // Write new binary to a temp file (use /tmp so it always succeeds regardless
+    // of permissions on the install directory)
+    let temp_path = std::env::temp_dir().join(format!("botster-update-{}", std::process::id()));
     fs::write(&temp_path, &binary_data)?;
 
     // Make it executable
@@ -417,15 +417,57 @@ pub fn install() -> Result<()> {
         fs::set_permissions(&temp_path, perms)?;
     }
 
-    // Backup current binary before replacing
-    if let Err(e) = fs::copy(&current_exe, &backup_path) {
-        log::warn!("Could not create backup at {}: {e}", backup_path.display());
-    }
+    // Replace current binary — try direct first, escalate to sudo if needed
+    let replaced = replace_binary(&temp_path, &current_exe);
 
-    // Replace current binary
-    fs::rename(&temp_path, &current_exe)?;
+    // Clean up temp file if it still exists (sudo mv would have moved it)
+    let _ = fs::remove_file(&temp_path);
+
+    replaced?;
 
     println!("✓ Successfully updated to version {}", latest_version_str);
+
+    Ok(())
+}
+
+/// Replaces the current binary with the new one, escalating to `sudo` if needed.
+///
+/// Tries a direct `fs::rename` first. If that fails with a permission error,
+/// falls back to `sudo mv` so the user gets a password prompt on their terminal.
+fn replace_binary(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    use std::fs;
+
+    // Try direct rename first (works when user owns the install dir)
+    match fs::rename(src, dest) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            log::debug!("Direct rename failed (permission denied), trying sudo");
+        }
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            // Cross-device rename (e.g. /tmp -> /usr/local/bin on different filesystems)
+            log::debug!("Direct rename failed (cross-device), trying copy then sudo");
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // Fall back to sudo — this passes the password prompt through to the terminal
+    println!("Installing to {} requires elevated permissions.", dest.display());
+    let status = std::process::Command::new("sudo")
+        .arg("mv")
+        .arg(src)
+        .arg(dest)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "Failed to install update to {} (sudo exited with {})",
+            dest.display(),
+            status
+        );
+    }
 
     Ok(())
 }
