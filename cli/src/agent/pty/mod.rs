@@ -645,20 +645,37 @@ impl PtySession {
 
     /// Resize the PTY to new dimensions.
     ///
-    /// Updates the underlying PTY size, resizes the shadow screen, and
-    /// broadcasts a resize event. Clients should update their own parsers
-    /// when they receive the resize event.
+    /// Resizes the shadow screen *before* the PTY so that when the inner
+    /// application redraws for the new size, the reader thread's
+    /// `parser.process()` already targets the correct dimensions.
+    /// Resizing in the opposite order (PTY first) creates a race where
+    /// redraw output is parsed against stale dimensions, corrupting
+    /// cursor tracking — especially visible on Linux.
     pub fn resize(&self, rows: u16, cols: u16) {
+        // 1. Shadow screen first — ready for new-size output.
+        // Clamp rows to MIN_PARSER_ROWS to avoid vt100 0.16.2 col_wrap
+        // panic: a 1-row grid causes `prev_pos.row -= scrolled` to
+        // underflow in Grid::col_wrap (grid.rs:683).
+        let old_dims = {
+            let mut parser = self
+                .shadow_screen
+                .lock()
+                .expect("shadow_screen lock poisoned");
+            let screen = parser.screen_mut();
+            let old = screen.size();
+            screen.set_size(rows.max(MIN_PARSER_ROWS), cols);
+            old
+        };
+
+        // 2. PTY resize — triggers application redraw.
         {
             let mut state = self
                 .shared_state
                 .lock()
                 .expect("shared_state lock poisoned");
 
-            // Track dimensions locally
             state.dimensions = (rows, cols);
 
-            // Resize the PTY
             if let Some(master_pty) = &state.master_pty {
                 if let Err(e) = master_pty.resize(PtySize {
                     rows,
@@ -667,21 +684,16 @@ impl PtySession {
                     pixel_height: 0,
                 }) {
                     log::warn!("Failed to resize PTY: {e}");
+                    // Revert shadow screen to match the actual PTY dimensions.
+                    let mut parser = self
+                        .shadow_screen
+                        .lock()
+                        .expect("shadow_screen lock poisoned");
+                    parser.screen_mut().set_size(old_dims.0.max(MIN_PARSER_ROWS), old_dims.1);
+                    state.dimensions = (old_dims.0, old_dims.1);
                     return;
                 }
             }
-        }
-
-        // Keep shadow screen in sync with PTY dimensions.
-        // Clamp rows to MIN_PARSER_ROWS to avoid vt100 0.16.2 col_wrap
-        // panic: a 1-row grid causes `prev_pos.row -= scrolled` to
-        // underflow in Grid::col_wrap (grid.rs:683).
-        {
-            let mut parser = self
-                .shadow_screen
-                .lock()
-                .expect("shadow_screen lock poisoned");
-            parser.screen_mut().set_size(rows.max(MIN_PARSER_ROWS), cols);
         }
 
         // Broadcast resize event
@@ -810,8 +822,9 @@ fn process_single_command(
 
 /// Perform PTY resize operation.
 ///
-/// Updates dimensions, resizes the PTY and shadow screen, and broadcasts
-/// the resize event.
+/// Resizes shadow screen before PTY to avoid the race where the reader
+/// thread processes new-size output against stale shadow screen dimensions.
+/// See `PtySession::resize` for detailed rationale.
 ///
 /// Exposed as `pub(crate)` for direct sync resize from `PtyHandle`.
 pub(crate) fn do_resize(
@@ -821,13 +834,23 @@ pub(crate) fn do_resize(
     shadow_screen: &Arc<Mutex<vt100::Parser>>,
     event_tx: &broadcast::Sender<PtyEvent>,
 ) {
+    // 1. Shadow screen first — ready for new-size output.
+    let old_dims = {
+        let mut parser = shadow_screen
+            .lock()
+            .expect("shadow_screen lock poisoned");
+        let screen = parser.screen_mut();
+        let old = screen.size();
+        screen.set_size(rows.max(MIN_PARSER_ROWS), cols);
+        old
+    };
+
+    // 2. PTY resize — triggers application redraw.
     {
         let mut state = shared_state.lock().expect("shared_state lock poisoned");
 
-        // Track dimensions
         state.dimensions = (rows, cols);
 
-        // Resize the PTY
         if let Some(master_pty) = &state.master_pty {
             if let Err(e) = master_pty.resize(PtySize {
                 rows,
@@ -836,19 +859,15 @@ pub(crate) fn do_resize(
                 pixel_height: 0,
             }) {
                 log::warn!("Failed to resize PTY: {e}");
+                // Revert shadow screen to match the actual PTY dimensions.
+                let mut parser = shadow_screen
+                    .lock()
+                    .expect("shadow_screen lock poisoned");
+                parser.screen_mut().set_size(old_dims.0.max(MIN_PARSER_ROWS), old_dims.1);
+                state.dimensions = (old_dims.0, old_dims.1);
                 return;
             }
         }
-    }
-
-    // Keep shadow screen in sync with PTY dimensions.
-    // Clamp rows to MIN_PARSER_ROWS to avoid vt100 0.16.2 col_wrap
-    // panic (see PtySession::resize for details).
-    {
-        let mut parser = shadow_screen
-            .lock()
-            .expect("shadow_screen lock poisoned");
-        parser.screen_mut().set_size(rows.max(MIN_PARSER_ROWS), cols);
     }
 
     // Broadcast resize event
