@@ -277,6 +277,11 @@ function Agent:build_env(base_env)
             env[k] = v
         end
     end
+    -- Inherit TERM from the daemon's environment so the inner PTY
+    -- advertises the correct terminal capabilities (kitty keyboard, etc.).
+    -- Agent config can override via base_env; fall back to xterm-256color
+    -- for headless environments (systemd, cron) where TERM may be unset.
+    env.TERM = env.TERM or os.getenv("TERM") or "xterm-256color"
     env.BOTSTER_WORKTREE_PATH = self.worktree_path
     -- On main checkout (no context.json), pass task context via env vars
     if not self._has_context_file then
