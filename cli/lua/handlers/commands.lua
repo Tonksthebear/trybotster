@@ -122,6 +122,47 @@ commands.register("quit", function(_client, _sub_id, _command)
 end, { description = "Shut down the hub" })
 
 -- ============================================================================
+-- Update Commands
+-- ============================================================================
+
+commands.register("check_update", function(client, sub_id, _command)
+    local ok, status = pcall(update.check)
+    if not ok then
+        client:send({
+            subscriptionId = sub_id,
+            type = "update_error",
+            error = tostring(status),
+        })
+        return
+    end
+    local agents = require("lib.agent").all_info()
+    local active_count = 0
+    for _, agent in ipairs(agents) do
+        if agent.status ~= "closed" then active_count = active_count + 1 end
+    end
+    client:send({
+        subscriptionId = sub_id,
+        type = "update_status",
+        status = status.status,
+        current = status.current,
+        latest = status.latest,
+        active_agents = active_count,
+    })
+end, { description = "Check for CLI updates" })
+
+commands.register("install_update", function(client, sub_id, _command)
+    local result = update.install()
+    if result.error then
+        client:send({
+            subscriptionId = sub_id,
+            type = "update_error",
+            error = result.error,
+        })
+    end
+    -- On success, process exec-restarts — connection drops, browser reconnects
+end, { description = "Install update and restart (kills active agents)" })
+
+-- ============================================================================
 -- Module Interface
 -- ============================================================================
 

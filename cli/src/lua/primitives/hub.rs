@@ -52,6 +52,8 @@ use crate::hub::state::HubState;
 pub enum HubRequest {
     /// Request Hub shutdown.
     Quit,
+    /// Request update-and-restart (exec into new binary).
+    ExecRestart,
     /// Handle an incoming WebRTC SDP offer from a browser.
     HandleWebrtcOffer {
         /// Browser identity key (e.g., `identityKey:tabId`).

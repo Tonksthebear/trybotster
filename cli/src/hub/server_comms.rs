@@ -322,6 +322,11 @@ impl Hub {
                         log::info!("[Lua] Processing quit request");
                         self.quit = true;
                     }
+                    HubRequest::ExecRestart => {
+                        log::info!("[Lua] Processing exec-restart request (self-update)");
+                        self.exec_restart = true;
+                        self.quit = true;
+                    }
                     HubRequest::HandleWebrtcOffer { browser_identity, sdp } => {
                         log::info!(
                             "[Lua] Processing WebRTC offer from {}",

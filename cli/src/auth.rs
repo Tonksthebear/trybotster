@@ -207,29 +207,19 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
     }
 }
 
-/// Prompt the user to name their hub during first-time setup.
+/// Prompt the user to name their device during first-time setup.
 ///
-/// Detects the current git repo name as a default. Returns the chosen name.
-pub fn prompt_hub_name() -> Result<String> {
-    let repo_name = std::env::var("BOTSTER_REPO")
+/// Defaults to the system hostname. Returns the chosen name.
+pub fn prompt_device_name() -> Result<String> {
+    let hostname = hostname::get()
         .ok()
-        .or_else(|| {
-            crate::git::WorktreeManager::detect_current_repo()
-                .map(|(_, name)| name)
-                .ok()
-        });
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "my-device".to_string());
 
     println!();
-    println!("  Setting up a new Botster hub.");
+    println!("  Setting up Botster on this device.");
     println!();
-
-    let default_name = repo_name.as_deref().unwrap_or("my-hub");
-
-    if repo_name.is_some() {
-        print!("  Name this hub (Enter for \"{}\"): ", default_name);
-    } else {
-        print!("  Name this hub: ");
-    }
+    print!("  Device name (Enter for \"{}\"): ", hostname);
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -237,7 +227,44 @@ pub fn prompt_hub_name() -> Result<String> {
     let input = input.trim();
 
     let name = if input.is_empty() {
-        default_name.to_string()
+        hostname
+    } else {
+        input.to_string()
+    };
+
+    println!();
+    Ok(name)
+}
+
+/// Prompt the user to name a hub for the current directory.
+///
+/// Detects the current git repo name as a default. Returns the chosen name.
+pub fn prompt_hub_name() -> Result<String> {
+    // Priority: BOTSTER_REPO env > git repo name > directory basename > "my-hub"
+    let default_name = std::env::var("BOTSTER_REPO")
+        .ok()
+        .or_else(|| {
+            crate::git::WorktreeManager::detect_current_repo()
+                .map(|(_, name)| name)
+                .ok()
+        })
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        })
+        .unwrap_or_else(|| "my-hub".to_string());
+
+    println!();
+    print!("  Hub name (Enter for \"{}\"): ", default_name);
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    let name = if input.is_empty() {
+        default_name
     } else {
         input.to_string()
     };
