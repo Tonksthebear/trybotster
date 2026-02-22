@@ -4,7 +4,7 @@
 //! for the core functionality.
 
 use anyhow::Result;
-use botster::{commands, tui, Config, Hub};
+use botster::{commands, tui, Config, Hub, HubRegistry};
 use mimalloc::MiMalloc;
 
 /// Global allocator configured per M-MIMALLOC-APPS guideline.
@@ -52,9 +52,16 @@ fn ensure_authenticated() -> Result<()> {
         // Check credential storage before first save — warns once during auth
         botster::keyring::check_credential_storage()?;
 
-        // Name the hub first, then authenticate
-        let hub_name = auth::prompt_hub_name()?;
-        config.hub_name = Some(hub_name);
+        // Name the device, then authenticate
+        let device_name = auth::prompt_device_name()?;
+
+        // Update device identity with user-chosen name
+        if let Ok(mut device) = botster::device::Device::load_or_create() {
+            device.name = device_name;
+            if let Err(e) = device.save() {
+                log::warn!("Failed to save device name: {e}");
+            }
+        }
 
         let token_response = auth::device_flow(&config.server_url)?;
         save_tokens(&mut config, &token_response)?;
@@ -151,6 +158,81 @@ fn save_tokens(
     Ok(())
 }
 
+/// Ensure the current directory has a hub name in the registry.
+///
+/// Computes the hub_identifier for the current directory, checks the registry,
+/// and prompts the user if this is a new directory. Sets `config.hub_name` to
+/// the looked-up or newly-chosen name so `Hub::new()` can pass it to the server.
+fn ensure_hub_named(config: &mut Config) -> Result<()> {
+    use botster::auth;
+    use botster::hub::hub_id_for_repo;
+
+    if botster::env::is_test_mode() {
+        return Ok(());
+    }
+
+    // Compute hub_identifier using the same logic as Hub::new()
+    let (hub_id, repo_path) = if let Ok(id) = std::env::var("BOTSTER_HUB_ID") {
+        (id, None)
+    } else {
+        match botster::WorktreeManager::detect_current_repo() {
+            Ok((path, _)) => {
+                let id = hub_id_for_repo(&path);
+                let canonical = path.canonicalize().unwrap_or(path);
+                (id, Some(canonical.to_string_lossy().to_string()))
+            }
+            Err(_) => {
+                let cwd = std::env::current_dir()?;
+                let id = hub_id_for_repo(&cwd);
+                let canonical = cwd.canonicalize().unwrap_or(cwd);
+                (id, Some(canonical.to_string_lossy().to_string()))
+            }
+        }
+    };
+
+    let mut registry = HubRegistry::load();
+
+    if let Some(name) = registry.get_hub_name(&hub_id) {
+        // Already registered — use cached name
+        config.hub_name = Some(name.to_string());
+    } else if registry.is_empty() && config.hub_name.is_some() {
+        // Migrate from old global hub_name to per-directory registry.
+        // Only if registry is empty (first migration) — otherwise the legacy
+        // name was for a different directory and should not be reused.
+        let legacy_name = config.hub_name.as_ref().unwrap();
+        log::info!("Migrating legacy hub_name '{}' to registry", legacy_name);
+        registry.set_hub_name(&hub_id, legacy_name.clone(), repo_path);
+        registry.save()?;
+    } else if atty::is(atty::Stream::Stdin) {
+        // New directory, interactive — prompt for hub name
+        let name = auth::prompt_hub_name()?;
+        registry.set_hub_name(&hub_id, name.clone(), repo_path);
+        registry.save()?;
+        config.hub_name = Some(name);
+    } else {
+        // New directory, non-interactive — auto-name from repo or dir basename
+        let name = std::env::var("BOTSTER_REPO")
+            .ok()
+            .or_else(|| {
+                botster::WorktreeManager::detect_current_repo()
+                    .map(|(_, name)| name)
+                    .ok()
+            })
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            })
+            .unwrap_or_else(|| "my-hub".to_string());
+        log::info!("Auto-naming hub: {name} (non-interactive)");
+        registry.set_hub_name(&hub_id, name.clone(), repo_path);
+        registry.save()?;
+        config.hub_name = Some(name);
+    }
+
+    Ok(())
+}
+
 /// Runs the hub in headless mode (no TUI).
 ///
 /// This mode is useful for:
@@ -174,7 +256,7 @@ fn run_headless() -> Result<()> {
     flag::register(SIGHUP, Arc::clone(&SHUTDOWN_FLAG))?;
 
     // Create Hub with default terminal size (80x24 for headless)
-    let config = Config::load()?;
+    let mut config = Config::load()?;
 
     // Verify token is available after load - catches keyring save/load issues
     // Skip in test mode since ensure_authenticated() skips auth entirely
@@ -194,6 +276,9 @@ fn run_headless() -> Result<()> {
         );
     }
 
+    // Ensure this directory has a hub name in the registry
+    ensure_hub_named(&mut config)?;
+
     let mut hub = Hub::new(config)?;
 
     println!("Setting up connections...");
@@ -212,7 +297,12 @@ fn run_headless() -> Result<()> {
     hub.run_headless(&SHUTDOWN_FLAG)?;
 
     println!("Shutting down...");
+    let should_restart = hub.exec_restart;
     hub.shutdown();
+
+    if should_restart {
+        commands::update::exec_restart()?;
+    }
 
     Ok(())
 }
@@ -248,7 +338,7 @@ fn run_with_tui() -> Result<()> {
 
     // Create Hub BEFORE entering raw mode so errors are visible
     println!("Initializing hub...");
-    let config = Config::load()?;
+    let mut config = Config::load()?;
 
     // Verify token is available after load - catches keyring save/load issues
     // Skip in test mode since ensure_authenticated() skips auth entirely
@@ -267,6 +357,10 @@ fn run_with_tui() -> Result<()> {
             &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
         );
     }
+
+    // Ensure this directory has a hub name in the registry
+    ensure_hub_named(&mut config)?;
+
     let mut hub = Hub::new(config)?;
 
     // Perform setup BEFORE entering raw mode so errors are visible
@@ -294,7 +388,12 @@ fn run_with_tui() -> Result<()> {
     tui::run_with_hub(&mut hub, terminal, &*SHUTDOWN_FLAG)?;
 
     // Shutdown
+    let should_restart = hub.exec_restart;
     hub.shutdown();
+
+    if should_restart {
+        commands::update::exec_restart()?;
+    }
 
     Ok(())
 }

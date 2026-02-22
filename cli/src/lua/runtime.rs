@@ -171,6 +171,10 @@ impl LuaRuntime {
         // Register all primitives
         primitives::register_all(&lua).context("Failed to register Lua primitives")?;
 
+        // Register self-update primitives with the shared event sender
+        primitives::register_update(&lua, Arc::clone(&hub_event_sender))
+            .context("Failed to register update primitives")?;
+
         // Register push notification primitives with the shared event sender
         primitives::register_push(&lua, Arc::clone(&hub_event_sender))
             .context("Failed to register push primitives")?;

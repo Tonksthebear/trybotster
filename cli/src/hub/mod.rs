@@ -120,7 +120,7 @@ const PTY_OBSERVER_QUEUE_CAPACITY: usize = 1024;
 /// Uses SHA256 hash of the absolute path to ensure the same repo
 /// always gets the same hub_id, even across CLI restarts.
 #[must_use]
-pub(crate) fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
+pub fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
     let canonical = repo_path
         .canonicalize()
         .unwrap_or_else(|_| repo_path.to_path_buf());
@@ -160,6 +160,8 @@ pub struct Hub {
     // === Control Flags ===
     /// Whether the hub should quit.
     pub quit: bool,
+    /// Whether to exec-restart after shutdown (for self-update).
+    pub exec_restart: bool,
 
     // === Browser Relay ===
     /// Browser connection state and communication.
@@ -419,6 +421,7 @@ impl Hub {
             shared_server_id: Arc::new(Mutex::new(None)),
             tokio_runtime,
             quit: false,
+            exec_restart: false,
             browser: crate::relay::BrowserState::default(),
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),

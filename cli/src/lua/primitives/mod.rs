@@ -42,6 +42,7 @@ pub mod pty;
 pub mod secrets;
 pub mod timer;
 pub mod tui;
+pub mod update;
 pub mod watch;
 pub mod webrtc;
 pub mod websocket;
@@ -110,6 +111,19 @@ pub fn register_all(lua: &Lua) -> Result<()> {
     json::register(lua)?;
     config::register(lua)?;
     secrets::register(lua)?;
+    Ok(())
+}
+
+/// Register self-update primitives with a shared event sender.
+///
+/// Call this after `register_all()` to set up update checking and installation.
+/// The install function sends `HubEvent::LuaHubRequest(ExecRestart)` on success.
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub(crate) fn register_update(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
+    update::register(lua, hub_event_tx)?;
     Ok(())
 }
 

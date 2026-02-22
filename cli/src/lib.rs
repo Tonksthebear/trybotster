@@ -49,7 +49,7 @@ pub mod terminal_widget;
 
 // Re-export commonly used types
 pub use agent::{Agent, PtyView};
-pub use config::Config;
+pub use config::{Config, HubRegistry};
 pub use git::WorktreeManager;
 pub use relay::{AgentInfo, TerminalMessage, WorktreeInfo};
 pub use terminal_widget::TerminalWidget;

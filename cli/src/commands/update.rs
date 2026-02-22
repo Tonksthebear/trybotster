@@ -41,6 +41,10 @@ const USER_AGENT: &str = "botster";
 /// Must be long enough for cold DNS + TLS handshake to api.github.com.
 const BOOT_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Timeout for Lua-triggered version checks (`update.check()`).
+/// Prevents blocking the hub event loop on slow/unreachable GitHub API.
+const LUA_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Result of checking for updates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateStatus {
@@ -158,7 +162,7 @@ pub fn check_on_boot_headless() -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if `exec` fails (e.g., binary not found or permission denied).
-fn exec_restart() -> Result<()> {
+pub fn exec_restart() -> Result<()> {
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().collect();
 
@@ -259,6 +263,31 @@ pub fn check() -> Result<()> {
 /// - Version parsing fails
 pub fn get_update_status() -> Result<UpdateStatus> {
     let latest_version_str = fetch_latest_version()?;
+
+    let current = Version::parse(VERSION)?;
+    let latest = Version::parse(&latest_version_str)?;
+
+    match latest.cmp(&current) {
+        std::cmp::Ordering::Greater => Ok(UpdateStatus::UpdateAvailable {
+            current: VERSION.to_string(),
+            latest: latest_version_str,
+        }),
+        std::cmp::Ordering::Equal => Ok(UpdateStatus::UpToDate {
+            version: VERSION.to_string(),
+        }),
+        std::cmp::Ordering::Less => Ok(UpdateStatus::AheadOfRelease {
+            current: VERSION.to_string(),
+            latest: latest_version_str,
+        }),
+    }
+}
+
+/// Like [`get_update_status`] but with a bounded timeout.
+///
+/// Used by the Lua `update.check()` primitive to avoid blocking the hub
+/// event loop indefinitely on slow or unreachable GitHub API responses.
+pub fn get_update_status_with_timeout() -> Result<UpdateStatus> {
+    let latest_version_str = fetch_latest_version_with_timeout(LUA_CHECK_TIMEOUT)?;
 
     let current = Version::parse(VERSION)?;
     let latest = Version::parse(&latest_version_str)?;
