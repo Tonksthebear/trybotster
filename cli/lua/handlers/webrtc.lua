@@ -32,6 +32,7 @@ end
 -- Called when WebRTC peer connects (ICE complete, DataChannel ready)
 webrtc.on_peer_connected(function(peer_id)
     log.info(string.format("WebRTC peer connected: %s...", peer_id:sub(1, 8)))
+    print("Browser connected (" .. peer_id:sub(1, 8) .. "...)")
 
     local client = Client.new(peer_id, make_webrtc_transport(peer_id))
     connections.register_client(peer_id, client)
@@ -45,6 +46,7 @@ end)
 -- Called when WebRTC peer disconnects
 webrtc.on_peer_disconnected(function(peer_id)
     log.info(string.format("WebRTC peer disconnected: %s...", peer_id:sub(1, 8)))
+    print("Browser disconnected (" .. peer_id:sub(1, 8) .. "...)")
     connections.unregister_client(peer_id)
 end)
 

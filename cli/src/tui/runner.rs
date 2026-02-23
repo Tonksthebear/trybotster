@@ -263,6 +263,11 @@ where
         }
     }
 
+    /// Returns a clone of the resize flag for SIGWINCH registration.
+    pub fn resize_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.resize_flag)
+    }
+
     /// Set the Lua bootstrap (consumed once by `run()` to init Lua + hot-reloader).
     pub fn set_lua_bootstrap(&mut self, bootstrap: super::hot_reload::LuaBootstrap) {
         self.lua_bootstrap = Some(bootstrap);

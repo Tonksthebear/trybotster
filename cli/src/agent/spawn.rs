@@ -133,12 +133,14 @@ pub fn build_command(
 /// * `event_tx` - Broadcast channel for PtyEvent notifications
 /// * `detect_notifs` - Enable OSC notification detection
 /// * `kitty_enabled` - Shared flag updated when kitty keyboard protocol is pushed/popped
+/// * `resize_pending` - Cleared when PTY output arrives (app has redrawn after resize)
 pub fn spawn_reader_thread(
     reader: Box<dyn Read + Send>,
     shadow_screen: Arc<Mutex<vt100::Parser>>,
     event_tx: broadcast::Sender<PtyEvent>,
     detect_notifs: bool,
     kitty_enabled: Arc<AtomicBool>,
+    resize_pending: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     let label = if detect_notifs { "CLI" } else { "Server" };
 
@@ -267,6 +269,10 @@ pub fn spawn_reader_thread(
                             }
                         }
                     }
+
+                    // App produced output — shadow screen is no longer stale
+                    // from a prior resize.
+                    resize_pending.store(false, Ordering::Release);
 
                     // Broadcast raw output to all live subscribers.
                     // Clients parse bytes in their own parsers (xterm.js, TUI vt100).
@@ -636,6 +642,10 @@ mod tests {
         Arc::new(AtomicBool::new(false))
     }
 
+    fn test_resize_flag() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     #[test]
     fn test_unified_reader_broadcasts_output_without_notifications() {
         let test_data = b"Hello from unified reader (server mode)";
@@ -643,7 +653,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (tx, mut rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, shadow.clone(), tx, false, test_kitty_flag());
+        let handle = spawn_reader_thread(reader, shadow.clone(), tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         // Verify event was broadcast
@@ -670,7 +680,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, true, test_kitty_flag());
+        let handle = spawn_reader_thread(reader, shadow, event_tx, true, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         let event = event_rx.try_recv().expect("Should receive Output event");
@@ -690,7 +700,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, true, test_kitty_flag());
+        let handle = spawn_reader_thread(reader, shadow, event_tx, true, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         let event = event_rx.try_recv().expect("Should receive Notification event");
@@ -717,7 +727,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag());
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         let event = event_rx.try_recv().expect("Should receive Output event");
@@ -766,7 +776,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, _event_rx) = broadcast::channel::<PtyEvent>(64);
 
-        let handle = spawn_reader_thread(reader, shadow.clone(), event_tx, false, test_kitty_flag());
+        let handle = spawn_reader_thread(reader, shadow.clone(), event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         // Scrollback should have been cleared — only visible screen remains
@@ -880,7 +890,7 @@ mod tests {
 
         assert!(!kitty.load(Ordering::Relaxed), "kitty should start false");
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, false, Arc::clone(&kitty));
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, Arc::clone(&kitty), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         assert!(kitty.load(Ordering::Relaxed), "kitty should be true after push");
@@ -897,7 +907,7 @@ mod tests {
         let (event_tx, _rx) = broadcast::channel::<PtyEvent>(16);
         let kitty = test_kitty_flag();
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, false, Arc::clone(&kitty));
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, Arc::clone(&kitty), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         assert!(!kitty.load(Ordering::Relaxed), "kitty should be false after pop");
@@ -910,7 +920,7 @@ mod tests {
         let (event_tx, _rx) = broadcast::channel::<PtyEvent>(16);
         let kitty = test_kitty_flag();
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, false, Arc::clone(&kitty));
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, Arc::clone(&kitty), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         assert!(!kitty.load(Ordering::Relaxed), "kitty should remain false");
@@ -931,7 +941,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag());
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         // Collect all events
@@ -952,7 +962,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag());
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         let mut found_cwd = false;
@@ -976,7 +986,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag());
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         let mut marks = Vec::new();
@@ -1002,7 +1012,7 @@ mod tests {
         let shadow = test_shadow_screen();
         let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
 
-        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag());
+        let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
         let mut has_title = false;
@@ -1274,6 +1284,7 @@ mod tests {
             event_tx,
             false,
             test_kitty_flag(),
+            test_resize_flag(),
         );
 
         // The reader thread must not panic.

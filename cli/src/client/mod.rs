@@ -35,6 +35,8 @@ pub enum ClientId {
     Tui,
     /// A browser client, identified by crypto identity key.
     Browser(String),
+    /// A Unix domain socket client, identified by a short random ID.
+    Socket(String),
     /// Internal operations (Lua scripts, background tasks).
     ///
     /// Used for operations that don't have a specific client identity,
@@ -62,7 +64,7 @@ impl ClientId {
     pub fn browser_identity(&self) -> Option<&str> {
         match self {
             ClientId::Browser(id) => Some(id),
-            ClientId::Tui | ClientId::Internal => None,
+            ClientId::Tui | ClientId::Socket(_) | ClientId::Internal => None,
         }
     }
 }
@@ -72,6 +74,7 @@ impl std::fmt::Display for ClientId {
         match self {
             ClientId::Tui => write!(f, "tui"),
             ClientId::Browser(id) => write!(f, "browser:{}", &id[..8.min(id.len())]),
+            ClientId::Socket(id) => write!(f, "{id}"),
             ClientId::Internal => write!(f, "internal"),
         }
     }

@@ -40,6 +40,7 @@ pub mod log;
 pub mod push;
 pub mod pty;
 pub mod secrets;
+pub mod socket;
 pub mod timer;
 pub mod tui;
 pub mod update;
@@ -78,9 +79,10 @@ pub use events::{
 pub use connection::ConnectionRequest;
 pub use hub::{HubRequest, SharedServerId};
 pub use pty::{
-    CreateForwarderRequest, CreateTuiForwarderRequest,
+    CreateForwarderRequest, CreateSocketForwarderRequest, CreateTuiForwarderRequest,
     PtyForwarder, PtyOutputContext, PtyRequest, PtySessionHandle,
 };
+pub use socket::SocketSendRequest;
 pub use tui::TuiSendRequest;
 pub use webrtc::WebRtcSendRequest;
 pub use http::{new_http_registry, HttpAsyncRegistry};
@@ -150,6 +152,19 @@ pub(crate) fn register_push(lua: &Lua, hub_event_tx: HubEventSender) -> Result<(
 /// Returns an error if registration fails.
 pub(crate) fn register_webrtc(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
     webrtc::register(lua, hub_event_tx)?;
+    Ok(())
+}
+
+/// Register socket IPC primitives with a shared event sender.
+///
+/// Call this after `register_all()` to set up socket client message handling.
+/// Events are sent directly to the Hub event loop via `HubEventSender`.
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub(crate) fn register_socket(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
+    socket::register(lua, hub_event_tx)?;
     Ok(())
 }
 

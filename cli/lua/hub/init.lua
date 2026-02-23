@@ -67,6 +67,7 @@ safe_require("handlers.hub_commands")
 -- Load transport handlers (register peer/message callbacks)
 safe_require("handlers.webrtc")
 safe_require("handlers.tui")
+safe_require("handlers.socket")
 
 -- Load command registrations (registers built-in hub commands)
 -- Must load after transports; uses require() for lazy handler access.
