@@ -218,6 +218,16 @@ pub struct PtySession {
     /// mode on connect/reconnect.
     kitty_enabled: Arc<AtomicBool>,
 
+    /// Whether the shadow screen was resized without the application redrawing.
+    ///
+    /// Set by `do_resize()` when the shadow screen dimensions change. Checked
+    /// by `get_snapshot()` to avoid capturing stale visible-screen content
+    /// (the application hasn't had time to redraw for the new dimensions).
+    /// When true, the snapshot emits scrollback + clear screen instead of
+    /// drawing stale `contents_formatted()`. The live forwarder carries the
+    /// application's actual redraw.
+    resize_pending: Arc<AtomicBool>,
+
     /// Allocated port for HTTP forwarding.
     ///
     /// Used by sessions with `port_forward` enabled to expose the dev server
@@ -278,6 +288,7 @@ impl PtySession {
             command_rx: Some(command_rx),
             detect_notifications: false,
             kitty_enabled: Arc::new(AtomicBool::new(false)),
+            resize_pending: Arc::new(AtomicBool::new(false)),
             port: None,
         }
     }
@@ -402,6 +413,7 @@ impl PtySession {
             self.event_sender(),
             config.detect_notifications,
             Arc::clone(&self.kitty_enabled),
+            Arc::clone(&self.resize_pending),
         ));
 
         self.set_master_pty(pair.master);
@@ -457,7 +469,7 @@ impl PtySession {
     ///
     /// # Returns
     ///
-    /// Tuple of (shared_state, shadow_screen, event_tx, kitty_enabled) for direct access.
+    /// Tuple of (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) for direct access.
     #[must_use]
     pub fn get_direct_access(
         &self,
@@ -466,12 +478,14 @@ impl PtySession {
         Arc<Mutex<vt100::Parser>>,
         broadcast::Sender<PtyEvent>,
         Arc<AtomicBool>,
+        Arc<AtomicBool>,
     ) {
         (
             Arc::clone(&self.shared_state),
             Arc::clone(&self.shadow_screen),
             self.event_tx.clone(),
             Arc::clone(&self.kitty_enabled),
+            Arc::clone(&self.resize_pending),
         )
     }
 
@@ -741,7 +755,8 @@ impl PtySession {
             .shadow_screen
             .lock()
             .expect("shadow_screen lock poisoned");
-        let mut snapshot = snapshot_with_scrollback(parser.screen_mut());
+        let skip_visible = self.resize_pending.swap(false, Ordering::AcqRel);
+        let mut snapshot = snapshot_with_scrollback(parser.screen_mut(), skip_visible);
 
         // Restore kitty keyboard protocol state in the snapshot.
         // The vt100 shadow screen doesn't track kitty mode, so we append
@@ -833,6 +848,7 @@ pub(crate) fn do_resize(
     shared_state: &Arc<Mutex<SharedPtyState>>,
     shadow_screen: &Arc<Mutex<vt100::Parser>>,
     event_tx: &broadcast::Sender<PtyEvent>,
+    resize_pending: &Arc<AtomicBool>,
 ) {
     // 1. Shadow screen first — ready for new-size output.
     let old_dims = {
@@ -870,6 +886,14 @@ pub(crate) fn do_resize(
         }
     }
 
+    // Only mark resize_pending when dimensions actually changed.
+    // Same-size "resizes" (e.g. browser reconnect at same dimensions)
+    // don't invalidate the visible screen content.
+    let effective_rows = rows.max(MIN_PARSER_ROWS);
+    if (effective_rows, cols) != (old_dims.0.max(MIN_PARSER_ROWS), old_dims.1) {
+        resize_pending.store(true, Ordering::Release);
+    }
+
     // Broadcast resize event
     let _ = event_tx.send(PtyEvent::resized(rows, cols));
 }
@@ -905,8 +929,12 @@ pub fn snapshot_from_screen(screen: &vt100::Screen) -> Vec<u8> {
 /// rendered with precise cursor positioning.
 ///
 /// Falls back to [`snapshot_from_screen`] when no scrollback exists.
+///
+/// When `skip_visible` is true (resize just happened, app hasn't redrawn),
+/// Phase 2 clears the screen instead of drawing stale `contents_formatted()`.
+/// The live forwarder will carry the application's actual redraw output.
 #[must_use]
-pub fn snapshot_with_scrollback(screen: &mut vt100::Screen) -> Vec<u8> {
+pub fn snapshot_with_scrollback(screen: &mut vt100::Screen, skip_visible: bool) -> Vec<u8> {
     let saved_offset = screen.scrollback();
 
     // Discover how many scrollback lines the shadow terminal has accumulated.
@@ -915,6 +943,10 @@ pub fn snapshot_with_scrollback(screen: &mut vt100::Screen) -> Vec<u8> {
     screen.set_scrollback(saved_offset);
 
     if total_scrollback == 0 {
+        if skip_visible {
+            // No scrollback and stale visible content — just clear.
+            return b"\x1b[H\x1b[2J\x1b[0m".to_vec();
+        }
         return snapshot_from_screen(screen);
     }
 
@@ -960,9 +992,18 @@ pub fn snapshot_with_scrollback(screen: &mut vt100::Screen) -> Vec<u8> {
         output.push(b'\n');
     }
     output.extend(b"\x1b[H\x1b[0m");
-    output.extend(screen.contents_formatted());
-    let (row, col) = screen.cursor_position();
-    output.extend(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+
+    if skip_visible {
+        // Resize just happened — the shadow screen's visible content is the
+        // old layout reflowed to new dimensions (stale). Clear the screen and
+        // let the application's SIGWINCH-triggered redraw arrive via the live
+        // forwarder instead.
+        output.extend(b"\x1b[2J\x1b[H");
+    } else {
+        output.extend(screen.contents_formatted());
+        let (row, col) = screen.cursor_position();
+        output.extend(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+    }
 
     output
 }

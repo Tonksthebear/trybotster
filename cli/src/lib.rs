@@ -30,6 +30,7 @@ pub mod commands;
 pub mod hub;
 pub mod lua;
 pub mod relay;
+pub mod socket;
 pub mod tui;
 pub mod ws;
 

@@ -3,7 +3,7 @@
 //! This is the main binary entry point. See the `botster` library
 //! for the core functionality.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use botster::{commands, tui, Config, Hub, HubRegistry};
 use mimalloc::MiMalloc;
 
@@ -284,6 +284,9 @@ fn run_headless() -> Result<()> {
     println!("Setting up connections...");
     hub.setup();
 
+    // Start socket server for IPC (allows `botster attach` and plugin access)
+    hub.start_socket_server();
+
     // In headless mode, eagerly generate the connection URL so external
     // tools (system tests, automation) can read it from connection_url.txt
     // without needing a TUI interaction to trigger lazy generation.
@@ -366,6 +369,9 @@ fn run_with_tui() -> Result<()> {
     // Perform setup BEFORE entering raw mode so errors are visible
     println!("Setting up connections...");
     hub.setup();
+
+    // Start socket server for IPC (allows `botster attach` and plugin access)
+    hub.start_socket_server();
 
     println!("Starting TUI...");
 
@@ -467,6 +473,12 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Attach a TUI to a running headless hub (like tmux attach)
+    Attach {
+        /// Hub identifier or name (defaults to current directory)
+        #[arg(long)]
+        hub: Option<String>,
+    },
 }
 
 /// Raise the process file descriptor limit to accommodate WebRTC connections.
@@ -488,6 +500,210 @@ fn raise_fd_limit() {
             }
         }
     }
+}
+
+/// RAII guard for a pair of pipe file descriptors.
+///
+/// Closes both fds on drop, preventing leaks if `run_attach` exits early.
+struct WakePipe {
+    read_fd: Option<i32>,
+    write_fd: Option<i32>,
+}
+
+impl WakePipe {
+    fn new() -> Self {
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+            unsafe {
+                let flags = libc::fcntl(fds[0], libc::F_GETFL);
+                libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+                let flags = libc::fcntl(fds[1], libc::F_GETFL);
+                libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            Self { read_fd: Some(fds[0]), write_fd: Some(fds[1]) }
+        } else {
+            Self { read_fd: None, write_fd: None }
+        }
+    }
+
+    fn read_fd(&self) -> Option<i32> { self.read_fd }
+    fn write_fd(&self) -> Option<i32> { self.write_fd }
+}
+
+impl Drop for WakePipe {
+    fn drop(&mut self) {
+        if let Some(fd) = self.read_fd {
+            unsafe { libc::close(fd); }
+        }
+        if let Some(fd) = self.write_fd {
+            unsafe { libc::close(fd); }
+        }
+    }
+}
+
+/// Attach a TUI to a running headless hub via Unix domain socket.
+/// Derive the hub_id for the current working directory.
+///
+/// Returns `None` only if both repo detection and `current_dir()` fail.
+fn resolve_hub_id_for_cwd() -> Option<String> {
+    let repo_path = match botster::WorktreeManager::detect_current_repo() {
+        Ok((path, _)) => path,
+        Err(_) => std::env::current_dir().ok()?,
+    };
+    Some(botster::hub::hub_id_for_repo(&repo_path))
+}
+
+///
+/// Discovers a running hub (by directory or explicit `--hub` arg),
+/// connects to its socket, and runs the TUI with a bridge adapter.
+fn run_attach(hub_arg: Option<String>) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use botster::hub::daemon;
+    use botster::socket::tui_bridge::TuiBridge;
+
+    // Require an interactive terminal
+    if !atty::is(atty::Stream::Stdin) {
+        anyhow::bail!("Error: 'attach' requires an interactive terminal (stdin is not a TTY).");
+    }
+
+    // Resolve hub_id
+    let hub_id = if let Some(ref arg) = hub_arg {
+        arg.clone()
+    } else {
+        // Derive from current directory (same logic as Hub::new)
+        let repo_path = match botster::WorktreeManager::detect_current_repo() {
+            Ok((path, _)) => path,
+            Err(_) => std::env::current_dir()?,
+        };
+        botster::hub::hub_id_for_repo(&repo_path)
+    };
+
+    // Check if hub is running
+    if !daemon::is_hub_running(&hub_id) {
+        // Try to find any running hub
+        let running = daemon::discover_running_hubs();
+        if running.is_empty() {
+            anyhow::bail!(
+                "No running hub found for this directory.\n\
+                 Start one with: botster start --headless"
+            );
+        } else {
+            eprintln!("No running hub found for this directory.");
+            eprintln!("Running hubs:");
+            for (id, pid) in &running {
+                eprintln!("  {} (pid={})", &id[..id.len().min(8)], pid);
+            }
+            anyhow::bail!("Use --hub <id> to specify which hub to attach to.");
+        }
+    }
+
+    let socket_path = daemon::socket_path(&hub_id)?;
+    if !socket_path.exists() {
+        anyhow::bail!(
+            "Hub is running (pid={}) but socket not found at {}",
+            daemon::read_pid_file(&hub_id).unwrap_or(0),
+            socket_path.display()
+        );
+    }
+
+    println!("Connecting to hub {}...", &hub_id[..hub_id.len().min(8)]);
+
+    // Create tokio runtime for the bridge
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // Connect to socket
+    let stream = rt.block_on(async {
+        tokio::net::UnixStream::connect(&socket_path).await
+    }).with_context(|| format!("Failed to connect to socket: {}", socket_path.display()))?;
+
+    // Create wake pipe for TuiRunner (RAII guard ensures cleanup on any exit path)
+    let pipe = WakePipe::new();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Create bridge
+    let (bridge, channels) = TuiBridge::connect(stream, pipe.write_fd(), Arc::clone(&shutdown));
+
+    // Set up terminal — create guard BEFORE execute! so raw mode is restored
+    // even if the crossterm commands fail.
+    enable_raw_mode()?;
+    let _terminal_guard = tui::TerminalGuard::new();
+
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, crossterm::event::EnableFocusChange)?;
+
+    let backend = CrosstermBackend::new(stdout);
+    let terminal = Terminal::new(backend)?;
+
+    // Calculate terminal dimensions
+    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (inner_rows, inner_cols) = tui::terminal_widget_inner_area(term_cols, term_rows);
+
+    // Create TuiRunner with bridge channels (same as run_with_hub)
+    let tui_shutdown = Arc::clone(&shutdown);
+    let mut tui_runner = tui::TuiRunner::new(
+        terminal,
+        channels.request_tx,
+        channels.output_rx,
+        tui_shutdown,
+        (inner_rows, inner_cols),
+        pipe.read_fd(),
+    );
+    tui_runner.set_lua_bootstrap(tui::hot_reload::LuaBootstrap::load());
+
+    // Register SIGWINCH
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::signal::SIGWINCH;
+        if let Err(e) = signal_hook::flag::register(SIGWINCH, tui_runner.resize_flag()) {
+            log::warn!("Failed to register SIGWINCH handler: {e}");
+        }
+    }
+
+    // Register SIGINT/SIGTERM
+    {
+        use signal_hook::consts::signal::{SIGINT, SIGTERM};
+        use signal_hook::flag;
+        flag::register(SIGINT, Arc::clone(&SHUTDOWN_FLAG))?;
+        flag::register(SIGTERM, Arc::clone(&SHUTDOWN_FLAG))?;
+    }
+
+    // Spawn TUI thread
+    let tui_handle = std::thread::Builder::new()
+        .name("tui-runner".to_string())
+        .spawn(move || {
+            if let Err(e) = tui_runner.run() {
+                log::error!("TuiRunner error: {}", e);
+            }
+        })?;
+
+    // Run bridge in tokio runtime (blocks until shutdown)
+    let bridge_shutdown = Arc::clone(&shutdown);
+    rt.block_on(async move {
+        tokio::select! {
+            _ = bridge.run() => {}
+            _ = async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if bridge_shutdown.load(Ordering::Relaxed) || SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            } => {}
+        }
+    });
+
+    // Signal TUI shutdown
+    shutdown.store(true, Ordering::SeqCst);
+
+    // Wait for TUI thread
+    if let Err(e) = tui_handle.join() {
+        log::error!("TuiRunner thread panicked: {:?}", e);
+    }
+
+    // pipe fds closed automatically by WakePipe drop
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -551,8 +767,22 @@ fn main() -> Result<()> {
             if headless {
                 run_headless()?;
             } else {
-                // Use the TUI-based architecture (proper layer separation)
-                run_with_tui()?;
+                // If a hub is already running for this directory AND has a
+                // socket, attach to it (tmux-like behavior). If the socket
+                // is missing (legacy hub started before socket support),
+                // fall through to starting a new TUI.
+                let can_attach = resolve_hub_id_for_cwd().is_some_and(|id| {
+                    botster::hub::daemon::is_hub_running(&id)
+                        && botster::hub::daemon::socket_path(&id)
+                            .map(|p| p.exists())
+                            .unwrap_or(false)
+                });
+                if can_attach {
+                    println!("Hub already running — attaching...");
+                    run_attach(None)?;
+                } else {
+                    run_with_tui()?;
+                }
             }
         }
         Commands::Status => {
@@ -606,6 +836,9 @@ fn main() -> Result<()> {
         }
         Commands::Reset { yes } => {
             commands::reset::run(yes)?;
+        }
+        Commands::Attach { hub: hub_arg } => {
+            run_attach(hub_arg)?;
         }
     }
 

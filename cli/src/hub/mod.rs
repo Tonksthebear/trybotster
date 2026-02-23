@@ -42,6 +42,7 @@
 pub mod action_cable_connection;
 pub mod actions;
 pub mod agent_handle;
+pub mod daemon;
 pub(crate) mod events;
 pub mod handle_cache;
 pub mod lifecycle;
@@ -203,7 +204,7 @@ pub struct Hub {
     /// Active PTY forwarder task handles for cleanup on unsubscribe.
     ///
     /// Maps subscriptionId -> JoinHandle for the forwarder task.
-    webrtc_pty_forwarders: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    pty_forwarders: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
 
     /// Sender for outgoing WebRTC signals (ICE candidates) from async callbacks.
     ///
@@ -293,6 +294,12 @@ pub struct Hub {
     pub(crate) vapid_keys: Option<crate::notifications::vapid::VapidKeys>,
     /// Browser push subscriptions (persisted to encrypted storage).
     pub(crate) push_subscriptions: crate::notifications::push::PushSubscriptionStore,
+
+    // === Socket IPC ===
+    /// Unix domain socket server for external client connections.
+    socket_server: Option<crate::socket::server::SocketServer>,
+    /// Connected socket clients, keyed by client_id.
+    socket_clients: std::collections::HashMap<String, crate::socket::client_conn::SocketClientConn>,
 
     // === TUI via Lua (Hub-side Processing) ===
     /// Sender for TUI output messages to TuiRunner.
@@ -429,7 +436,7 @@ impl Hub {
             webrtc_pending_closes: std::collections::HashMap::new(),
             webrtc_pty_output_tx,
             webrtc_pty_output_rx: Some(webrtc_pty_output_rx),
-            webrtc_pty_forwarders: std::collections::HashMap::new(),
+            pty_forwarders: std::collections::HashMap::new(),
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
             stream_muxes: std::collections::HashMap::new(),
@@ -452,6 +459,8 @@ impl Hub {
             ratchet_restarted_peers: std::collections::HashSet::new(),
             vapid_keys: None,
             push_subscriptions: crate::notifications::push::PushSubscriptionStore::default(),
+            socket_server: None,
+            socket_clients: std::collections::HashMap::new(),
             tui_output_tx: None,
             tui_wake_fd: None,
             tui_request_rx: None,
@@ -571,6 +580,41 @@ impl Hub {
         // This avoids blocking boot for up to 10 seconds in TUI mode.
     }
 
+    /// Start the Unix domain socket server for IPC.
+    ///
+    /// Creates the socket at `/tmp/botster-{uid}/{hub_id}.sock`,
+    /// writes a PID file, and begins accepting client connections.
+    /// Socket events are delivered via `HubEvent` variants.
+    pub fn start_socket_server(&mut self) {
+        let _guard = self.tokio_runtime.enter();
+
+        // Clean up stale files from previous runs
+        daemon::cleanup_stale_files(&self.hub_identifier);
+
+        // Write PID file
+        if let Err(e) = daemon::write_pid_file(&self.hub_identifier) {
+            log::warn!("Failed to write PID file: {e}");
+        }
+
+        // Start socket server
+        match daemon::socket_path(&self.hub_identifier) {
+            Ok(path) => {
+                match crate::socket::server::SocketServer::start(path, self.hub_event_tx.clone()) {
+                    Ok(server) => {
+                        log::info!("Socket server started for hub {}", &self.hub_identifier[..self.hub_identifier.len().min(8)]);
+                        self.socket_server = Some(server);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to start socket server: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to resolve socket path: {e}");
+            }
+        }
+    }
+
     /// Eagerly generate the connection URL.
     ///
     /// In headless mode there is no TUI to trigger lazy generation, so
@@ -663,6 +707,18 @@ impl Hub {
 
     /// Send shutdown notification to server and cleanup resources.
     pub fn shutdown(&mut self) {
+        // Disconnect all socket clients
+        for (client_id, conn) in self.socket_clients.drain() {
+            log::debug!("Disconnecting socket client: {}", client_id);
+            conn.disconnect();
+        }
+        // Shutdown socket server
+        if let Some(server) = self.socket_server.take() {
+            server.shutdown();
+        }
+        // Clean up daemon files (PID, socket)
+        daemon::cleanup_on_shutdown(&self.hub_identifier);
+
         // Notify Lua that TUI is disconnecting
         if let Err(e) = self.lua.call_tui_disconnected() {
             log::warn!("Lua tui_disconnected callback error: {}", e);
@@ -681,7 +737,7 @@ impl Hub {
         self.lua.stop_all_watchers();
 
         // Abort all PTY forwarder tasks
-        for (_key, task) in self.webrtc_pty_forwarders.drain() {
+        for (_key, task) in self.pty_forwarders.drain() {
             task.abort();
         }
 

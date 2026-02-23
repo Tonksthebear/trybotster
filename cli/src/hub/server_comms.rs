@@ -272,6 +272,64 @@ impl Hub {
                 }
                 self.wake_tui();
             }
+            HubEvent::SocketClientConnected { client_id, conn } => {
+                log::info!("[Socket] Registering client: {}", client_id);
+                self.socket_clients.insert(client_id.clone(), conn);
+                if let Err(e) = self.lua.call_socket_client_connected(&client_id) {
+                    log::warn!("[Socket] Lua client_connected callback error: {e}");
+                }
+            }
+            HubEvent::SocketClientDisconnected { client_id } => {
+                log::info!("[Socket] Unregistering client: {}", client_id);
+                if let Some(conn) = self.socket_clients.remove(&client_id) {
+                    conn.disconnect();
+                }
+                if let Err(e) = self.lua.call_socket_client_disconnected(&client_id) {
+                    log::warn!("[Socket] Lua client_disconnected callback error: {e}");
+                }
+            }
+            HubEvent::SocketMessage { client_id, msg } => {
+                if let Err(e) = self.lua.call_socket_message(&client_id, msg) {
+                    log::error!("[Socket] Lua message handling error for {}: {e}", client_id);
+                }
+            }
+            HubEvent::SocketPtyInput { client_id, agent_index, pty_index, data } => {
+                // Track per-client focus state
+                if data == b"\x1b[I" {
+                    self.lua.set_pty_focused(agent_index, pty_index, &client_id, true);
+                } else if data == b"\x1b[O" {
+                    self.lua.set_pty_focused(agent_index, pty_index, &client_id, false);
+                }
+                self.lua.notify_pty_input(agent_index);
+                if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
+                    if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
+                        if let Err(e) = pty_handle.write_input_direct(&data) {
+                            log::error!("[Socket] PTY write failed for {}: {e}", client_id);
+                        }
+                    }
+                }
+            }
+            HubEvent::SocketSend(send_req) => {
+                use crate::lua::primitives::SocketSendRequest;
+                use crate::socket::framing::Frame;
+
+                match send_req {
+                    SocketSendRequest::Json { client_id, data } => {
+                        if let Some(conn) = self.socket_clients.get(&client_id) {
+                            conn.send_frame(&Frame::Json(data));
+                        } else {
+                            log::debug!("[Socket] Send to unknown client: {}", client_id);
+                        }
+                    }
+                    SocketSendRequest::Binary { client_id, data } => {
+                        if let Some(conn) = self.socket_clients.get(&client_id) {
+                            conn.send_frame(&Frame::Binary(data));
+                        } else {
+                            log::debug!("[Socket] Binary send to unknown client: {}", client_id);
+                        }
+                    }
+                }
+            }
             HubEvent::LuaPtyRequest(request) => {
                 use crate::lua::PtyRequest;
 
@@ -281,6 +339,9 @@ impl Hub {
                     }
                     PtyRequest::CreateTuiForwarder(req) => {
                         self.create_lua_tui_pty_forwarder(req);
+                    }
+                    PtyRequest::CreateSocketForwarder(req) => {
+                        self.create_lua_socket_pty_forwarder(req);
                     }
                     PtyRequest::StopForwarder { forwarder_id } => {
                         self.stop_lua_pty_forwarder(&forwarder_id);
@@ -1136,7 +1197,7 @@ impl Hub {
 
         // Abort any PTY forwarders for this browser.
         // Forwarder keys are "{peer_id}:{agent_index}:{pty_index}" where peer_id = browser_identity
-        self.webrtc_pty_forwarders.retain(|key, task| {
+        self.pty_forwarders.retain(|key, task| {
             if key.starts_with(browser_identity) {
                 task.abort();
                 log::debug!("[WebRTC] Aborted PTY forwarder: {}", key);
@@ -1522,7 +1583,7 @@ impl Hub {
         };
 
         // Abort any existing forwarder for this key
-        if let Some(old_task) = self.webrtc_pty_forwarders.remove(&forwarder_key) {
+        if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
             log::debug!("[Lua] Aborted existing PTY forwarder for {}", forwarder_key);
         }
@@ -1677,7 +1738,7 @@ impl Hub {
             );
         });
 
-        self.webrtc_pty_forwarders.insert(forwarder_key, task);
+        self.pty_forwarders.insert(forwarder_key, task);
     }
 
     /// Create a TUI PTY forwarder requested by Lua.
@@ -1712,7 +1773,7 @@ impl Hub {
         };
 
         // Abort any existing forwarder for this key
-        if let Some(old_task) = self.webrtc_pty_forwarders.remove(&forwarder_key) {
+        if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
             log::debug!("[Lua-TUI] Aborted existing PTY forwarder for {}", forwarder_key);
         }
@@ -1890,12 +1951,164 @@ impl Hub {
             );
         });
 
-        self.webrtc_pty_forwarders.insert(forwarder_key, task);
+        self.pty_forwarders.insert(forwarder_key, task);
+    }
+
+    /// Create a socket PTY forwarder requested by Lua.
+    ///
+    /// Spawns a forwarder task that streams PTY output as `Frame::PtyOutput`
+    /// to a specific socket client connection.
+    fn create_lua_socket_pty_forwarder(&mut self, req: crate::lua::primitives::CreateSocketForwarderRequest) {
+        use crate::socket::framing::Frame;
+
+        let forwarder_key = format!("{}:{}:{}", req.client_id, req.agent_index, req.pty_index);
+
+        let Some(agent_handle) = self.handle_cache.get_agent(req.agent_index) else {
+            log::warn!("[Lua-Socket] Cannot create forwarder: no agent at index {}", req.agent_index);
+            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
+            return;
+        };
+
+        let Some(pty_handle) = agent_handle.get_pty(req.pty_index) else {
+            log::warn!(
+                "[Lua-Socket] Cannot create forwarder: no PTY at index {} for agent {}",
+                req.pty_index, req.agent_index
+            );
+            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
+            return;
+        };
+
+        let Some(conn) = self.socket_clients.get(&req.client_id) else {
+            log::warn!("[Lua-Socket] Cannot create forwarder: no socket client {}", req.client_id);
+            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
+            return;
+        };
+
+        // Abort any existing forwarder for this key
+        if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
+            old_task.abort();
+            log::debug!("[Lua-Socket] Aborted existing PTY forwarder for {}", forwarder_key);
+        }
+
+        // Get snapshot and kitty state BEFORE subscribing to avoid duplicate data.
+        let snapshot = pty_handle.get_snapshot();
+        let kitty_enabled = pty_handle.kitty_enabled();
+        let pty_rx = pty_handle.subscribe();
+
+        // Clone the frame sender from the connection — we only need to send encoded frames.
+        let frame_tx = conn.frame_sender();
+        let agent_index = req.agent_index;
+        let pty_index = req.pty_index;
+        let active_flag = req.active_flag;
+        let client_id = req.client_id.clone();
+
+        let _guard = self.tokio_runtime.enter();
+        let task = tokio::spawn(async move {
+            use crate::agent::pty::PtyEvent;
+
+            log::info!(
+                "[Lua-Socket] Started PTY forwarder for {} agent {} pty {}",
+                client_id, agent_index, pty_index
+            );
+
+            // Send scrollback snapshot first
+            if !snapshot.is_empty() {
+                let frame = Frame::Scrollback {
+                    agent_index: agent_index as u16,
+                    pty_index: pty_index as u16,
+                    kitty_enabled,
+                    data: snapshot,
+                };
+                if frame_tx.send(frame.encode()).is_err() {
+                    log::trace!("[Lua-Socket] Frame channel closed before snapshot sent");
+                    return;
+                }
+            }
+
+            let mut pty_rx = pty_rx;
+            loop {
+                {
+                    let active = active_flag.lock().expect("Forwarder active_flag mutex poisoned");
+                    if !*active {
+                        log::debug!("[Lua-Socket] PTY forwarder stopped by Lua");
+                        break;
+                    }
+                }
+
+                match pty_rx.recv().await {
+                    Ok(PtyEvent::Output(data)) => {
+                        let frame = Frame::PtyOutput {
+                            agent_index: agent_index as u16,
+                            pty_index: pty_index as u16,
+                            data,
+                        };
+                        if frame_tx.send(frame.encode()).is_err() {
+                            log::trace!("[Lua-Socket] Frame channel closed, stopping forwarder");
+                            break;
+                        }
+                    }
+                    Ok(PtyEvent::ProcessExited { exit_code }) => {
+                        log::info!(
+                            "[Lua-Socket] PTY process exited (code={:?}) for {} agent {} pty {}",
+                            exit_code, client_id, agent_index, pty_index
+                        );
+                        let frame = Frame::ProcessExited {
+                            agent_index: agent_index as u16,
+                            pty_index: pty_index as u16,
+                            exit_code,
+                        };
+                        let _ = frame_tx.send(frame.encode());
+                        break;
+                    }
+                    Ok(PtyEvent::KittyChanged(enabled)) => {
+                        // Send as JSON event (same as TUI forwarder)
+                        let frame = Frame::Json(serde_json::json!({
+                            "type": "kitty_changed",
+                            "enabled": enabled,
+                            "agent_index": agent_index,
+                            "pty_index": pty_index,
+                        }));
+                        let _ = frame_tx.send(frame.encode());
+                    }
+                    Ok(PtyEvent::FocusRequested) => {
+                        let frame = Frame::Json(serde_json::json!({
+                            "type": "focus_requested",
+                            "agent_index": agent_index,
+                            "pty_index": pty_index,
+                        }));
+                        let _ = frame_tx.send(frame.encode());
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!(
+                            "[Lua-Socket] PTY forwarder lagged by {} events for {} agent {} pty {}",
+                            n, client_id, agent_index, pty_index
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        log::info!(
+                            "[Lua-Socket] PTY channel closed for {} agent {} pty {}",
+                            client_id, agent_index, pty_index
+                        );
+                        break;
+                    }
+                }
+            }
+
+            *active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
+
+            log::info!(
+                "[Lua-Socket] Stopped PTY forwarder for {} agent {} pty {}",
+                client_id, agent_index, pty_index
+            );
+        });
+
+        self.pty_forwarders.insert(forwarder_key, task);
     }
 
     /// Stop a PTY forwarder by ID.
     fn stop_lua_pty_forwarder(&mut self, forwarder_id: &str) {
-        if let Some(task) = self.webrtc_pty_forwarders.remove(forwarder_id) {
+        if let Some(task) = self.pty_forwarders.remove(forwarder_id) {
             task.abort();
             log::debug!("[Lua] Stopped PTY forwarder {}", forwarder_id);
         }

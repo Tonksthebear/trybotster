@@ -215,6 +215,12 @@ pub struct PtyHandle {
     /// Used by `get_snapshot()` to include the kitty push sequence.
     kitty_enabled: Arc<AtomicBool>,
 
+    /// Whether a resize happened without the application redrawing yet.
+    ///
+    /// Set by `resize_direct()`, checked by `get_snapshot()` to avoid
+    /// capturing stale visible-screen content after a resize.
+    resize_pending: Arc<AtomicBool>,
+
     /// HTTP forwarding port for preview proxying.
     ///
     /// Primarily used by server PTYs (pty_index=1) to expose the dev server
@@ -251,6 +257,7 @@ impl PtyHandle {
         shared_state: Arc<Mutex<SharedPtyState>>,
         shadow_screen: Arc<Mutex<vt100::Parser>>,
         kitty_enabled: Arc<AtomicBool>,
+        resize_pending: Arc<AtomicBool>,
         port: Option<u16>,
     ) -> Self {
         Self {
@@ -258,6 +265,7 @@ impl PtyHandle {
             shared_state,
             shadow_screen,
             kitty_enabled,
+            resize_pending,
             port,
         }
     }
@@ -310,13 +318,17 @@ impl PtyHandle {
     /// Locks the shadow screen and delegates to [`crate::agent::pty::snapshot_with_scrollback`].
     /// Appends the kitty keyboard push sequence when the inner PTY has
     /// activated kitty mode, so connecting terminals enter kitty mode.
+    ///
+    /// When a resize is pending (shadow screen resized but app hasn't redrawn),
+    /// the snapshot skips the stale visible-screen content and clears instead.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
         let mut parser = self
             .shadow_screen
             .lock()
             .expect("shadow_screen lock poisoned");
-        let mut snapshot = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut());
+        let skip_visible = self.resize_pending.swap(false, Ordering::AcqRel);
+        let mut snapshot = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut(), skip_visible);
 
         // Restore kitty keyboard protocol state in the snapshot.
         // The vt100 shadow screen doesn't track kitty mode, so we append
@@ -365,7 +377,7 @@ impl PtyHandle {
     /// Unconditionally resizes the PTY and shadow screen. Lua is the trusted
     /// coordinator — client-level ownership is managed there, not in the PTY.
     pub fn resize_direct(&self, rows: u16, cols: u16) {
-        do_resize(rows, cols, &self.shared_state, &self.shadow_screen, &self.event_tx);
+        do_resize(rows, cols, &self.shared_state, &self.shadow_screen, &self.event_tx, &self.resize_pending);
     }
 }
 
@@ -382,10 +394,10 @@ mod tests {
     /// Helper to create a PTY handle for testing with a specific port.
     fn create_test_pty_with_port(port: Option<u16>) -> PtyHandle {
         let pty_session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled) = pty_session.get_direct_access();
+        let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) = pty_session.get_direct_access();
         // Leak the session to keep the state alive for tests
         std::mem::forget(pty_session);
-        PtyHandle::new(event_tx, shared_state, shadow_screen, kitty_enabled, port)
+        PtyHandle::new(event_tx, shared_state, shadow_screen, kitty_enabled, resize_pending, port)
     }
 
     #[test]

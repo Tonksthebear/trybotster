@@ -16,6 +16,7 @@ use super::file_watcher::LuaFileWatcher;
 use super::primitives;
 use super::primitives::events::SharedEventCallbacks;
 use super::primitives::pty::PtyOutputContext;
+use super::primitives::socket::registry_keys as socket_registry_keys;
 use super::primitives::tui::registry_keys as tui_registry_keys;
 use super::primitives::http::HttpAsyncRegistry;
 use super::primitives::timer::TimerRegistry;
@@ -186,6 +187,10 @@ impl LuaRuntime {
         // Register TUI primitives with the shared event sender
         primitives::register_tui(&lua, Arc::clone(&hub_event_sender))
             .context("Failed to register TUI primitives")?;
+
+        // Register socket IPC primitives with the shared event sender
+        primitives::register_socket(&lua, Arc::clone(&hub_event_sender))
+            .context("Failed to register socket primitives")?;
 
         // Register PTY primitives with the shared event sender
         primitives::register_pty(&lua, Arc::clone(&hub_event_sender))
@@ -1283,6 +1288,87 @@ impl LuaRuntime {
         let has_message = self.has_callback_registered(tui_registry_keys::ON_MESSAGE);
 
         has_connected || has_disconnected || has_message
+    }
+
+    // =========================================================================
+    // Socket Client Callbacks
+    // =========================================================================
+
+    /// Call the socket on_client_connected callback if registered.
+    pub fn call_socket_client_connected(&self, client_id: &str) -> Result<()> {
+        match self.call_socket_client_connected_internal(client_id) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.strict { Err(e) } else {
+                    log::warn!("Lua socket_client_connected callback error: {}", e);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn call_socket_client_connected_internal(&self, client_id: &str) -> Result<()> {
+        let key_result: mlua::Result<mlua::RegistryKey> =
+            self.lua.named_registry_value(socket_registry_keys::ON_CLIENT_CONNECTED);
+        if let Ok(key) = key_result {
+            let callback: mlua::Function = self.lua.registry_value(&key)
+                .map_err(|e| anyhow!("Failed to get socket_client_connected callback: {e}"))?;
+            callback.call::<()>(client_id)
+                .map_err(|e| anyhow!("socket_client_connected callback failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Call the socket on_client_disconnected callback if registered.
+    pub fn call_socket_client_disconnected(&self, client_id: &str) -> Result<()> {
+        match self.call_socket_client_disconnected_internal(client_id) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.strict { Err(e) } else {
+                    log::warn!("Lua socket_client_disconnected callback error: {}", e);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn call_socket_client_disconnected_internal(&self, client_id: &str) -> Result<()> {
+        let key_result: mlua::Result<mlua::RegistryKey> =
+            self.lua.named_registry_value(socket_registry_keys::ON_CLIENT_DISCONNECTED);
+        if let Ok(key) = key_result {
+            let callback: mlua::Function = self.lua.registry_value(&key)
+                .map_err(|e| anyhow!("Failed to get socket_client_disconnected callback: {e}"))?;
+            callback.call::<()>(client_id)
+                .map_err(|e| anyhow!("socket_client_disconnected callback failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Call the socket on_message callback with a client_id and JSON value.
+    pub fn call_socket_message(&self, client_id: &str, message: serde_json::Value) -> Result<()> {
+        match self.call_socket_message_internal(client_id, message) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.strict { Err(e) } else {
+                    log::warn!("Lua socket_message callback error: {}", e);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn call_socket_message_internal(&self, client_id: &str, message: serde_json::Value) -> Result<()> {
+        let key_result: mlua::Result<mlua::RegistryKey> =
+            self.lua.named_registry_value(socket_registry_keys::ON_MESSAGE);
+        if let Ok(key) = key_result {
+            let callback: mlua::Function = self.lua.registry_value(&key)
+                .map_err(|e| anyhow!("Failed to get socket_message callback: {e}"))?;
+            let lua_value = crate::lua::primitives::json::json_to_lua(&self.lua, &message)
+                .map_err(|e| anyhow!("Failed to convert JSON to Lua value: {e}"))?;
+            callback.call::<()>((client_id, lua_value))
+                .map_err(|e| anyhow!("socket_message callback failed: {e}"))?;
+        }
+        Ok(())
     }
 
     // =========================================================================

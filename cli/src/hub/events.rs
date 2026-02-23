@@ -17,6 +17,7 @@ use crate::lua::primitives::webrtc::WebRtcSendRequest;
 use crate::lua::primitives::websocket::WsEvent;
 use crate::lua::primitives::action_cable::ActionCableRequest;
 use crate::lua::primitives::worktree::WorktreeRequest;
+use crate::socket::client_conn::SocketClientConn;
 
 /// Event from a background producer delivered to the Hub event loop.
 ///
@@ -172,5 +173,56 @@ pub(crate) enum HubEvent {
         /// Browser identity keys whose subscriptions returned 410 Gone.
         identities: Vec<String>,
     },
+
+    // =========================================================================
+    // Socket IPC events — Unix domain socket client connections
+    // =========================================================================
+
+    /// A new socket client has connected.
+    ///
+    /// Sent from the socket server accept loop. The Hub stores the connection
+    /// and notifies Lua via the socket client_connected callback.
+    SocketClientConnected {
+        /// Unique identifier for this socket client (e.g., "socket:a1b2c3").
+        client_id: String,
+        /// Connection handle for sending frames back to this client.
+        conn: SocketClientConn,
+    },
+
+    /// A socket client has disconnected (EOF or error).
+    SocketClientDisconnected {
+        /// Client identifier.
+        client_id: String,
+    },
+
+    /// JSON message from a socket client.
+    ///
+    /// Routed through Lua's socket message callback, which delegates
+    /// to the shared `client.lua` protocol (same as TUI and WebRTC).
+    SocketMessage {
+        /// Client identifier.
+        client_id: String,
+        /// JSON message payload.
+        msg: serde_json::Value,
+    },
+
+    /// Binary PTY input from a socket client.
+    ///
+    /// Raw keyboard bytes, written directly to the PTY (bypasses Lua).
+    SocketPtyInput {
+        /// Client identifier (for focus tracking).
+        client_id: String,
+        /// Agent index.
+        agent_index: usize,
+        /// PTY index within the agent.
+        pty_index: usize,
+        /// Raw input bytes.
+        data: Vec<u8>,
+    },
+
+    /// Socket send request from a Lua callback.
+    ///
+    /// Lua's `socket.send(client_id, msg)` pushes this event.
+    SocketSend(crate::lua::primitives::socket::SocketSendRequest),
 }
 

@@ -88,7 +88,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 
 use crate::agent::pty::{PtySession, SharedPtyState};
 use crate::agent::spawn::PtySpawnConfig;
@@ -145,6 +145,9 @@ pub struct PtySessionHandle {
     /// Whether the inner PTY has kitty keyboard protocol active.
     kitty_enabled: Arc<AtomicBool>,
 
+    /// Whether a resize happened without the application redrawing yet.
+    resize_pending: Arc<AtomicBool>,
+
     /// Forwarding port (if configured).
     port: Option<u16>,
 }
@@ -169,6 +172,7 @@ impl PtySessionHandle {
             Arc::clone(&self.shared_state),
             Arc::clone(&self.shadow_screen),
             Arc::clone(&self.kitty_enabled),
+            Arc::clone(&self.resize_pending),
             self.port,
         )
     }
@@ -233,7 +237,8 @@ impl LuaUserData for PtySessionHandle {
                 .shadow_screen
                 .lock()
                 .expect("PtySessionHandle shadow_screen lock poisoned");
-            let output = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut());
+            let skip_visible = this.resize_pending.swap(false, Ordering::AcqRel);
+            let output = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut(), skip_visible);
             lua.create_string(&output)
         });
 
@@ -243,7 +248,8 @@ impl LuaUserData for PtySessionHandle {
                 .shadow_screen
                 .lock()
                 .expect("PtySessionHandle shadow_screen lock poisoned");
-            let output = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut());
+            let skip_visible = this.resize_pending.swap(false, Ordering::AcqRel);
+            let output = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut(), skip_visible);
             lua.create_string(&output)
         });
 
@@ -364,6 +370,23 @@ pub struct CreateTuiForwarderRequest {
     pub active_flag: Arc<Mutex<bool>>,
 }
 
+/// Request to create a socket PTY forwarder (queued for Hub to process).
+///
+/// Streams PTY output as `Frame::PtyOutput` over a Unix domain socket connection.
+#[derive(Debug, Clone)]
+pub struct CreateSocketForwarderRequest {
+    /// Socket client identifier (e.g., "socket:0137b").
+    pub client_id: String,
+    /// Agent index in Hub's agent list.
+    pub agent_index: usize,
+    /// PTY index within the agent (0=CLI, 1=Server).
+    pub pty_index: usize,
+    /// Subscription ID for tracking (Lua-generated).
+    pub subscription_id: String,
+    /// Shared active flag for the forwarder handle.
+    pub active_flag: Arc<Mutex<bool>>,
+}
+
 /// PTY operations queued from Lua.
 ///
 /// These are processed by Hub in its event loop after Lua callbacks return.
@@ -374,6 +397,9 @@ pub enum PtyRequest {
 
     /// Create a new PTY forwarder for streaming to TUI (index-based).
     CreateTuiForwarder(CreateTuiForwarderRequest),
+
+    /// Create a new PTY forwarder for streaming to a socket client.
+    CreateSocketForwarder(CreateSocketForwarderRequest),
 
     /// Stop an existing PTY forwarder.
     StopForwarder {
@@ -457,6 +483,7 @@ impl Clone for PtyRequest {
                 session_name: session_name.clone(),
                 event_tx: event_tx.clone(),
             },
+            Self::CreateSocketForwarder(req) => Self::CreateSocketForwarder(req.clone()),
         }
     }
 }
@@ -735,7 +762,7 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
             })?;
 
             // Extract direct access handles before wrapping in Arc
-            let (shared_state, shadow_screen, event_tx, kitty_enabled) = session.get_direct_access();
+            let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) = session.get_direct_access();
             let session_port = session.port();
 
             // Always spawn the event watcher when agent identity is provided.
@@ -762,6 +789,7 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
                 shadow_screen,
                 event_tx,
                 kitty_enabled,
+                resize_pending,
                 port: session_port,
             };
 
@@ -1192,7 +1220,7 @@ mod tests {
     /// manually.
     fn create_test_session_handle() -> PtySessionHandle {
         let session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled) = session.get_direct_access();
+        let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) = session.get_direct_access();
         let session_arc = Arc::new(Mutex::new(session));
 
         PtySessionHandle {
@@ -1201,6 +1229,7 @@ mod tests {
             shadow_screen,
             event_tx,
             kitty_enabled,
+            resize_pending,
             port: None,
         }
     }
