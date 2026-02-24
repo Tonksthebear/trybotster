@@ -219,7 +219,7 @@ pub fn prompt_device_name() -> Result<String> {
     println!();
     println!("  Setting up Botster on this device.");
     println!();
-    print!("  Device name (Enter for \"{}\"): ", hostname);
+    print!("  Device name [{}]: ", hostname);
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -256,7 +256,7 @@ pub fn prompt_hub_name() -> Result<String> {
         .unwrap_or_else(|| "my-hub".to_string());
 
     println!();
-    print!("  Hub name (Enter for \"{}\"): ", default_name);
+    print!("  Hub name [{}]: ", default_name);
     io::stdout().flush()?;
 
     let mut input = String::new();
