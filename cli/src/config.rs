@@ -54,7 +54,7 @@ impl Default for Config {
         };
 
         Self {
-            server_url: "https://trybotster.com".to_string(),
+            server_url: crate::env::DEFAULT_SERVER_URL.to_string(),
             token: String::new(),
             poll_interval: 5,
             agent_timeout: 3600,
@@ -99,7 +99,7 @@ impl Config {
                     // Production: use platform-standard config directory
                     dirs::config_dir()
                         .context("Could not determine config directory")?
-                        .join("botster")
+                        .join(crate::env::APP_NAME)
                 }
             }
         };
@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.server_url, "https://trybotster.com");
+        assert_eq!(config.server_url, crate::env::DEFAULT_SERVER_URL);
         assert_eq!(config.poll_interval, 5);
         assert_eq!(config.max_sessions, 20);
         assert_eq!(config.agent_timeout, 3600);

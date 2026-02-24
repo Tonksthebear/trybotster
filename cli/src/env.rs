@@ -27,6 +27,24 @@
 //! - `development` or `dev` - Development mode
 //! - (anything else or unset) - Production mode
 
+/// Application identity: `"botster"` in release, `"botster-dev"` in debug.
+///
+/// Scopes keyring service, config directory, and all on-disk storage so that
+/// dev-built and release-installed binaries can coexist on the same machine
+/// without stomping each other's credentials or state.
+pub const APP_NAME: &str = if cfg!(debug_assertions) {
+    "botster-dev"
+} else {
+    "botster"
+};
+
+/// Default server URL: dev server in debug builds, production in release.
+pub const DEFAULT_SERVER_URL: &str = if cfg!(debug_assertions) {
+    "https://dev.trybotster.com"
+} else {
+    "https://trybotster.com"
+};
+
 /// Runtime environment for the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Environment {

@@ -51,18 +51,22 @@ use super::json::json_to_lua;
 /// Invalidated (set to None) on `config.set()`, lazily repopulated on next read.
 type ConfigCache = Arc<Mutex<Option<serde_json::Value>>>;
 
-/// Default config directory under the user's config path.
-const CONFIG_DIR: &str = "botster";
+/// Config directory under the user's config path (scoped by build profile).
+fn config_dir_name() -> &'static str {
+    crate::env::APP_NAME
+}
 
 /// Config file name.
 const CONFIG_FILE: &str = "config.json";
 
-/// Default data directory name under home.
-const DATA_DIR: &str = ".botster";
+/// Data directory name under home (scoped by build profile).
+fn data_dir_name() -> String {
+    format!(".{}", crate::env::APP_NAME)
+}
 
 /// Get the config file path: `~/.config/botster/config.json`.
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join(CONFIG_DIR).join(CONFIG_FILE))
+    dirs::config_dir().map(|d| d.join(config_dir_name()).join(CONFIG_FILE))
 }
 
 /// Get the data directory path.
@@ -73,7 +77,7 @@ fn data_dir_path() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("BOTSTER_CONFIG_DIR") {
         return Some(PathBuf::from(custom));
     }
-    dirs::home_dir().map(|d| d.join(DATA_DIR))
+    dirs::home_dir().map(|d| d.join(data_dir_name()))
 }
 
 /// Read the config file, returning an empty object if it doesn't exist.
@@ -287,7 +291,7 @@ pub fn register(lua: &Lua) -> Result<()> {
     let server_url_fn = lua
         .create_function(|_, ()| {
             let url = std::env::var("BOTSTER_SERVER_URL")
-                .unwrap_or_else(|_| "https://trybotster.com".to_string());
+                .unwrap_or_else(|_| crate::env::DEFAULT_SERVER_URL.to_string());
             Ok(url)
         })
         .map_err(|e| anyhow!("Failed to create config.server_url function: {e}"))?;
@@ -379,9 +383,10 @@ mod tests {
             .eval()
             .expect("config.data_dir should be callable");
 
+        let expected = format!(".{}", crate::env::APP_NAME);
         assert!(
-            result.contains(".botster"),
-            "data_dir should contain '.botster', got: {result}"
+            result.contains(&expected),
+            "data_dir should contain '{expected}', got: {result}"
         );
     }
 
@@ -472,7 +477,7 @@ mod tests {
         if dirs::config_dir().is_some() {
             assert!(path.is_some());
             let p = path.unwrap();
-            assert!(p.to_string_lossy().contains("botster"));
+            assert!(p.to_string_lossy().contains(crate::env::APP_NAME));
             assert!(p.to_string_lossy().contains("config.json"));
         }
     }
@@ -482,7 +487,8 @@ mod tests {
         let path = data_dir_path();
         if dirs::home_dir().is_some() {
             assert!(path.is_some());
-            assert!(path.unwrap().to_string_lossy().contains(".botster"));
+            let expected = format!(".{}", crate::env::APP_NAME);
+            assert!(path.unwrap().to_string_lossy().contains(&expected));
         }
     }
 }

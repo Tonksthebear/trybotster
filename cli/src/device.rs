@@ -123,7 +123,7 @@ impl Device {
                     // Production: use system config directory
                     dirs::config_dir()
                         .context("Could not determine config directory")?
-                        .join("botster")
+                        .join(crate::env::APP_NAME)
                 }
             }
         };
