@@ -52,7 +52,8 @@ fn ensure_authenticated() -> Result<()> {
         // Check credential storage before first save — warns once during auth
         botster::keyring::check_credential_storage()?;
 
-        // Name the device, then authenticate
+        // Collect all setup info upfront before opening the browser.
+        // Avoids the jarring flow of: name device → browser → back to CLI → name hub.
         let device_name = auth::prompt_device_name()?;
 
         // Update device identity with user-chosen name
@@ -60,6 +61,38 @@ fn ensure_authenticated() -> Result<()> {
             device.name = device_name;
             if let Err(e) = device.save() {
                 log::warn!("Failed to save device name: {e}");
+            }
+        }
+
+        // Also prompt for hub name now (while we're still in the setup flow)
+        // so the user doesn't get asked again after returning from the browser.
+        if atty::is(atty::Stream::Stdin) && !botster::env::is_test_mode() {
+            use botster::hub::hub_id_for_repo;
+
+            let (hub_id, repo_path) = if let Ok(id) = std::env::var("BOTSTER_HUB_ID") {
+                (id, None)
+            } else {
+                match botster::WorktreeManager::detect_current_repo() {
+                    Ok((path, _)) => {
+                        let id = hub_id_for_repo(&path);
+                        let canonical = path.canonicalize().unwrap_or(path);
+                        (id, Some(canonical.to_string_lossy().to_string()))
+                    }
+                    Err(_) => {
+                        let cwd = std::env::current_dir()?;
+                        let id = hub_id_for_repo(&cwd);
+                        let canonical = cwd.canonicalize().unwrap_or(cwd);
+                        (id, Some(canonical.to_string_lossy().to_string()))
+                    }
+                }
+            };
+
+            let mut registry = HubRegistry::load();
+            if registry.get_hub_name(&hub_id).is_none() {
+                let name = auth::prompt_hub_name()?;
+                registry.set_hub_name(&hub_id, name.clone(), repo_path);
+                registry.save()?;
+                config.hub_name = Some(name);
             }
         }
 
