@@ -12,17 +12,21 @@ export default class extends Controller {
   static values = { hubId: String, inWorktree: { type: Boolean, default: true } };
   static targets = ["worktreeOption", "worktreePrompt"];
 
+  #hubReady = null;
+
   connect() {
     if (!this.hubIdValue) return;
 
-    ConnectionManager.acquire(HubConnection, this.hubIdValue, {
+    this.#hubReady = ConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
     }).then((hub) => {
       this.hub = hub;
+      return hub;
     });
   }
 
   disconnect() {
+    this.#hubReady = null;
     const hub = this.hub;
     this.hub = null;
     hub?.release();
@@ -38,18 +42,24 @@ export default class extends Controller {
   }
 
   // Action: close agent, keep worktree
-  confirmKeep() {
+  async confirmKeep() {
     const agentId = this.element.dataset.agentId;
-    if (agentId && this.hub) {
-      this.hub.deleteAgent(agentId, false);
-    }
+    if (!agentId) return;
+    const hub = this.hub ?? (await this.#hubReady);
+    if (hub) hub.deleteAgent(agentId, false);
+    this.#closeDialog();
   }
 
   // Action: close agent and delete worktree
-  confirmDelete() {
+  async confirmDelete() {
     const agentId = this.element.dataset.agentId;
-    if (agentId && this.hub) {
-      this.hub.deleteAgent(agentId, true);
-    }
+    if (!agentId) return;
+    const hub = this.hub ?? (await this.#hubReady);
+    if (hub) hub.deleteAgent(agentId, true);
+    this.#closeDialog();
+  }
+
+  #closeDialog() {
+    this.element.closest("dialog")?.close();
   }
 }
