@@ -103,7 +103,7 @@ fn secrets_base_dir() -> Result<PathBuf> {
 
         dirs::config_dir()
             .context("Could not determine config directory")
-            .map(|d| d.join("botster").join("secrets"))
+            .map(|d| d.join(crate::env::APP_NAME).join("secrets"))
     }
 }
 

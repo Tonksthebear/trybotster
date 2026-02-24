@@ -47,8 +47,10 @@ static STORAGE_CHECKED: AtomicBool = AtomicBool::new(false);
 /// When set, `save()` skips the keyring attempt and goes straight to file.
 static FILE_STORAGE_ACCEPTED: AtomicBool = AtomicBool::new(false);
 
-/// Keyring service name.
-const KEYRING_SERVICE: &str = "botster";
+/// Keyring service name (scoped by build profile via `APP_NAME`).
+fn keyring_service() -> &'static str {
+    crate::env::APP_NAME
+}
 /// Consolidated keyring entry name.
 const KEYRING_CREDENTIALS: &str = "credentials";
 
@@ -195,7 +197,7 @@ fn probe_keyring() -> Result<()> {
     /// Value written during the round-trip test.
     const PROBE_VALUE: &str = "probe";
 
-    let entry = Entry::new(KEYRING_SERVICE, PROBE_ENTRY)
+    let entry = Entry::new(keyring_service(), PROBE_ENTRY)
         .map_err(|e| anyhow::anyhow!("Failed to create probe entry: {e:?}"))?;
 
     entry
@@ -225,7 +227,7 @@ fn prompt_file_storage_fallback() -> Result<()> {
 
     let path = credentials_file_path()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "~/.config/botster/credentials.json".to_string());
+        .unwrap_or_else(|_| format!("~/.config/{}/credentials.json", crate::env::APP_NAME));
 
     let has_dbus = std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok();
 
@@ -435,7 +437,7 @@ impl Credentials {
 
     /// Attempt a single load from keyring, categorizing any errors.
     fn try_load_from_keyring() -> std::result::Result<Self, KeyringAccessError> {
-        let entry = Entry::new(KEYRING_SERVICE, KEYRING_CREDENTIALS)
+        let entry = Entry::new(keyring_service(), KEYRING_CREDENTIALS)
             .map_err(|e| KeyringAccessError::Other(format!("Failed to create entry: {e:?}")))?;
 
         match entry.get_password() {
@@ -492,7 +494,7 @@ impl Credentials {
 
     /// Attempt to save credentials to the OS keyring.
     fn try_save_to_keyring(&self) -> Result<()> {
-        let entry = Entry::new(KEYRING_SERVICE, KEYRING_CREDENTIALS)
+        let entry = Entry::new(keyring_service(), KEYRING_CREDENTIALS)
             .map_err(|e| anyhow::anyhow!("Failed to create keyring entry: {e:?}"))?;
 
         let json = serde_json::to_string(self)?;
@@ -537,7 +539,7 @@ impl Credentials {
         }
 
         // Also try to clean up the keyring entry
-        if let Ok(entry) = Entry::new(KEYRING_SERVICE, KEYRING_CREDENTIALS) {
+        if let Ok(entry) = Entry::new(keyring_service(), KEYRING_CREDENTIALS) {
             let _ = entry.delete_credential();
             log::info!("Deleted credentials from OS keyring");
         }
