@@ -44,7 +44,7 @@ class ConfigEditingTest < ApplicationSystemTestCase
     @cli = start_cli(@hub)
 
     sign_in_and_connect
-    visit hub_settings_path(@hub)
+    click_settings_link
 
     # Without pre-existing .botster/ dir, tree shows empty state
     assert_selector "[data-hub-settings-target='treePanel'][data-view='empty']", wait: 30
@@ -62,7 +62,7 @@ class ConfigEditingTest < ApplicationSystemTestCase
     @cli = start_cli(@hub)
 
     sign_in_and_connect
-    visit hub_settings_path(@hub)
+    click_settings_link
 
     # Initialize config structure first
     initialize_config_via_ui
@@ -92,7 +92,7 @@ class ConfigEditingTest < ApplicationSystemTestCase
     @cli = start_cli(@hub)
 
     sign_in_and_connect
-    visit hub_settings_path(@hub)
+    click_settings_link
 
     # Initialize and find a file that exists (initialization script)
     initialize_config_via_ui
@@ -137,7 +137,7 @@ class ConfigEditingTest < ApplicationSystemTestCase
     @cli = start_cli(@hub)
 
     sign_in_and_connect
-    visit hub_settings_path(@hub)
+    click_settings_link
 
     # Tree should show empty state (no .botster/ directory exists)
     assert_selector "[data-hub-settings-target='treePanel'][data-view='empty']", wait: 30
@@ -195,7 +195,7 @@ class ConfigEditingTest < ApplicationSystemTestCase
     @cli = start_cli(@hub)
 
     sign_in_and_connect
-    visit hub_settings_path(@hub)
+    click_settings_link
 
     # Switch to templates tab and wait for DataChannel installed-check to complete.
     # The hub-templates controller sets data-hub-templates-ready after #checkInstalled,
@@ -257,6 +257,13 @@ class ConfigEditingTest < ApplicationSystemTestCase
       "[data-connection-status-target='connectionSection'][data-state='relay']",
       wait: 30
     )
+  end
+
+  # Navigate to settings via Turbo by clicking the Settings link on the hub page.
+  # The link is enabled by requires-connection controller once DataChannel is up.
+  def click_settings_link
+    find("[data-controller='requires-connection'] span", text: "Settings", wait: 10).click
+    assert_selector "[data-hub-settings-target='treePanel']", wait: 10
   end
 
   # Click Initialize in the settings UI to create the default .botster/

@@ -5,6 +5,7 @@
 
 // Rust guideline compliant 2025-01
 
+use botster::env::DEFAULT_SERVER_URL;
 use botster::Config;
 use std::env;
 use std::path::PathBuf;
@@ -83,7 +84,7 @@ fn test_default_config_no_env_vars() {
     let config = Config::default();
 
     // Verify default values
-    assert_eq!(config.server_url, "https://trybotster.com");
+    assert_eq!(config.server_url, DEFAULT_SERVER_URL);
     assert_eq!(config.token, "");
     assert_eq!(config.poll_interval, 5);
     assert_eq!(config.agent_timeout, 3600);
@@ -228,7 +229,7 @@ fn test_partial_env_overrides() {
 
     // Default values for non-overridden
     assert_eq!(
-        config.server_url, "https://trybotster.com",
+        config.server_url, DEFAULT_SERVER_URL,
         "Server URL should be default"
     );
     assert_eq!(config.max_sessions, 20);
@@ -438,7 +439,7 @@ fn test_documented_environment_variables() {
         (
             "BOTSTER_SERVER_URL",
             "string",
-            "https://trybotster.com",
+            DEFAULT_SERVER_URL,
             "URL of the botster server",
         ),
         (
