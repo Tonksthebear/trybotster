@@ -3,7 +3,7 @@
 -- Orchestrates agent creation and deletion with full lifecycle broadcasting.
 --
 -- Responsibilities:
--- - Parse issue-or-branch input into branch_name + issue_number
+-- - Parse issue-or-branch input into branch_name
 -- - Find or create worktrees
 -- - Resolve config profiles via ConfigResolver
 -- - Spawn agents via Agent.new() (which handles PTY, env, prompt files)
@@ -44,21 +44,15 @@ local function parse_issue_or_branch(issue_or_branch)
 end
 
 --- Build the agent key for duplicate checking.
--- Matches Agent:agent_key() format: repo with "/" replaced by "-", plus
--- issue_number or branch_name.
+-- Matches Agent:agent_key() format: repo with "/" replaced by "-", plus branch_name.
 --
 -- @param repo string  "owner/repo"
--- @param issue_number number|nil
 -- @param branch_name string
 -- @return string
-local function build_agent_key(repo, issue_number, branch_name)
+local function build_agent_key(repo, branch_name)
     local repo_safe = repo:gsub("/", "-")
-    if issue_number then
-        return repo_safe .. "-" .. tostring(issue_number)
-    else
-        local branch_safe = branch_name:gsub("/", "-")
-        return repo_safe .. "-" .. branch_safe
-    end
+    local branch_safe = branch_name:gsub("/", "-")
+    return repo_safe .. "-" .. branch_safe
 end
 
 --- Find the next available agent key by appending a suffix if needed.
@@ -175,15 +169,15 @@ end
 --- Spawn an agent in an existing worktree.
 --
 -- @param branch_name string
--- @param issue_number number|nil
 -- @param wt_path string        Worktree filesystem path
 -- @param prompt string          Task description
 -- @param client table|nil       Requesting client (for dimensions)
 -- @param agent_key string       Pre-computed agent key for status broadcasts
 -- @param profile_name string    Profile to use for config resolution
+-- @param metadata table|nil     Plugin metadata (e.g., issue_number, invocation_url)
 -- @return Agent|nil             The created agent, or nil on error
-local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name)
-    local repo = config.env("BOTSTER_REPO") or "unknown/repo"
+local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, profile_name, metadata)
+    local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
     local repo_root = worktree.repo_root()
 
     -- Broadcast: spawning PTYs
@@ -211,10 +205,10 @@ local function spawn_agent(branch_name, issue_number, wt_path, prompt, client, a
 
     local ok, agent = pcall(Agent.new, {
         repo = repo,
-        issue_number = issue_number,
         branch_name = branch_name,
         worktree_path = wt_path,
         prompt = prompt,
+        metadata = metadata,
         sessions = sessions,
         dims = dims,
         agent_key = agent_key,
@@ -252,8 +246,9 @@ end
 -- @param from_worktree string|nil    Optional existing worktree path
 -- @param client table|nil            Requesting client (for progress/dims)
 -- @param profile_name string|nil     Profile name (auto-selected if only one)
+-- @param metadata table|nil          Plugin metadata (e.g., issue_number, invocation_url)
 -- @return Agent|nil                  The created agent, or nil on error
-local function handle_create_agent(issue_or_branch, prompt, from_worktree, client, profile_name)
+local function handle_create_agent(issue_or_branch, prompt, from_worktree, client, profile_name, metadata)
     -- Early identifier for lifecycle events on error paths (matches what TUI
     -- sets for creating_agent_id in actions.lua).
     local early_id = issue_or_branch or "main"
@@ -264,6 +259,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         prompt = prompt,
         from_worktree = from_worktree,
         profile_name = profile_name,
+        metadata = metadata,
     })
     if params == nil then
         log.info("before_agent_create interceptor blocked agent creation")
@@ -275,6 +271,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     prompt = params.prompt
     from_worktree = params.from_worktree
     profile_name = params.profile_name
+    metadata = params.metadata
 
     -- Resolve profile name (auto-select if only one, nil = shared-only)
     local repo_root = worktree.repo_root()
@@ -294,14 +291,14 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
 
     -- Main repo mode: no issue_or_branch AND no from_worktree
     if not issue_or_branch and not from_worktree then
-        local repo = config.env("BOTSTER_REPO") or "unknown/repo"
-        local base_key = build_agent_key(repo, nil, "main")
+        local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
+        local base_key = build_agent_key(repo, "main")
         local suffix = Agent.next_instance_suffix(base_key)
         local agent_key = base_key .. (suffix or "")
-        return spawn_agent("main", nil, repo_root, prompt, client, agent_key, profile_name)
+        return spawn_agent("main", repo_root, prompt, client, agent_key, profile_name, metadata)
     end
 
-    local issue_number, branch_name = parse_issue_or_branch(issue_or_branch)
+    local _, branch_name = parse_issue_or_branch(issue_or_branch)
 
     -- Treat empty string as no prompt
     if prompt == "" then
@@ -309,10 +306,10 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     end
 
     -- Detect repo
-    local repo = config.env("BOTSTER_REPO") or "unknown/repo"
+    local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
 
     -- Build agent key for status broadcasts and duplicate checking
-    local agent_key = build_agent_key(repo, issue_number, branch_name)
+    local agent_key = build_agent_key(repo, branch_name)
 
     -- Allow multiple agents on the same branch by suffixing the key
     agent_key = next_available_key(agent_key)
@@ -320,7 +317,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     -- Non-git mode: no worktree isolation, spawn directly in cwd
     if not worktree.is_git_repo() then
         log.info(string.format("No git repo — spawning %s directly in %s", branch_name, repo_root))
-        return spawn_agent(branch_name, issue_number, repo_root, prompt, client, agent_key, profile_name)
+        return spawn_agent(branch_name, repo_root, prompt, client, agent_key, profile_name, metadata)
     end
 
     -- Find or create worktree
@@ -337,8 +334,8 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         worktree.create_async({
             agent_key = agent_key,
             branch = branch_name,
-            issue_number = issue_number,
             prompt = prompt,
+            metadata = metadata,
             profile_name = profile_name,
             client_rows = client_rows,
             client_cols = client_cols,
@@ -348,7 +345,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         log.info(string.format("Worktree found for %s at %s", branch_name, wt_path))
     end
 
-    return spawn_agent(branch_name, issue_number, wt_path, prompt, client, agent_key, profile_name)
+    return spawn_agent(branch_name, wt_path, prompt, client, agent_key, profile_name, metadata)
 end
 
 --- Handle a request to delete an agent.
@@ -420,7 +417,7 @@ end
 local function notify_existing_agent(agent, text)
     local session = agent.sessions and agent.sessions["agent"]
     if session then
-        session:write(text .. "\r\r")
+        session:send_message(text)
         log.info("Sent notification to existing agent: " .. agent:agent_key())
     else
         log.warn("Cannot notify agent (no 'agent' session): " .. agent:agent_key())
@@ -438,12 +435,21 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
     if msg_type == "create_agent" then
         local issue_or_branch = message.issue_or_branch or message.branch
 
-        -- Check if any agents already exist for this issue — notify all of them
+        -- Check if any agents already exist for this issue/repo — notify them
         if issue_or_branch then
-            local repo = message.repo or config.env("BOTSTER_REPO") or "unknown/repo"
-            local issue_number, branch_name = parse_issue_or_branch(issue_or_branch)
-            local base_key = build_agent_key(repo, issue_number, branch_name)
-            local existing = Agent.find_by_base_key(base_key)
+            local repo = message.repo or config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
+            local issue_number, _ = parse_issue_or_branch(issue_or_branch)
+
+            -- Search by metadata (repo + issue_number)
+            local existing = {}
+            if issue_number then
+                for _, agent in ipairs(Agent.find_by_meta("issue_number", issue_number)) do
+                    if agent.repo == repo then
+                        existing[#existing + 1] = agent
+                    end
+                end
+            end
+
             if #existing > 0 then
                 local notification = format_notification(message)
                 for _, agent in ipairs(existing) do
@@ -455,7 +461,16 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
         end
 
         if issue_or_branch then
-            handle_create_agent(issue_or_branch, message.prompt, message.from_worktree, nil, message.profile)
+            -- Build metadata from message fields
+            local meta = message.metadata or {}
+            if message.invocation_url and not meta.invocation_url then
+                meta.invocation_url = message.invocation_url
+            end
+            local issue_number, _ = parse_issue_or_branch(issue_or_branch)
+            if issue_number and not meta.issue_number then
+                meta.issue_number = issue_number
+            end
+            handle_create_agent(issue_or_branch, message.prompt, message.from_worktree, nil, message.profile, meta)
         else
             log.warn("command_message create_agent missing issue_or_branch")
         end
@@ -502,12 +517,12 @@ _event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
 
     spawn_agent(
         info.branch,
-        info.issue_number,
         info.path,
         info.prompt,
         client,
         info.agent_key,
-        info.profile_name
+        info.profile_name,
+        info.metadata
     )
 end)
 

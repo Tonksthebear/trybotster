@@ -25,7 +25,7 @@
 //!
 //! - `server_comms`: WebSocket command channel, notification worker, registration
 //! - `actions`: Hub action dispatch
-//! - `lifecycle`: Agent close operations (spawn is now Lua-owned)
+//! - Agent lifecycle is fully Lua-owned (`handlers/agents.lua` + `lib/agent.lua`)
 //! - `registration`: Device and hub registration
 //!
 //! # Usage
@@ -45,7 +45,6 @@ pub mod agent_handle;
 pub mod daemon;
 pub(crate) mod events;
 pub mod handle_cache;
-pub mod lifecycle;
 pub mod registration;
 pub mod run;
 mod server_comms;
@@ -244,7 +243,7 @@ pub struct Hub {
     // === Handle Cache ===
     /// Thread-safe cache of agent handles for non-blocking client access.
     ///
-    /// Updated by Hub when agents are created/deleted via `sync_handle_cache()`.
+    /// Updated by Lua via `hub.register_agent()` and `hub.unregister_agent()`.
     /// `HandleCache::get_agent()` reads from this cache directly, allowing clients
     /// to access agent handles without blocking commands - safe from any thread.
     pub handle_cache: Arc<handle_cache::HandleCache>,
@@ -480,25 +479,6 @@ impl Hub {
         self.botster_id.as_deref().unwrap_or(&self.hub_identifier)
     }
 
-    /// Get the number of active agents.
-    #[must_use]
-    pub fn agent_count(&self) -> usize {
-        self.state.read().unwrap().agent_count()
-    }
-
-    /// Sync the handle cache with current state.
-    ///
-    /// Rebuilds HandleCache from HubState's agent PTY handles. Call this after
-    /// agents are created or deleted. Agent metadata is not included -- Lua
-    /// manages that separately.
-    pub fn sync_handle_cache(&self) {
-        let state = self.state.read().unwrap();
-        let handles: Vec<AgentPtys> = (0..state.agent_count())
-            .filter_map(|i| state.get_agent_handle(i))
-            .collect();
-        self.handle_cache.set_all(handles);
-    }
-
     /// Check if the hub should quit.
     #[must_use]
     pub fn should_quit(&self) -> bool {
@@ -523,8 +503,8 @@ impl Hub {
 
     /// Load available worktrees for the selection UI.
     ///
-    /// Delegates to `HubState::load_available_worktrees()` and syncs the
-    /// result to HandleCache for non-blocking client reads.
+    /// Delegates to `HubState::load_available_worktrees()` and syncs
+    /// to HandleCache for non-blocking client reads.
     pub fn load_available_worktrees(&mut self) -> anyhow::Result<()> {
         self.state.write().unwrap().load_available_worktrees()?;
         // Sync to HandleCache so clients can read without blocking commands
@@ -895,7 +875,6 @@ mod tests {
         let hub = Hub::new(config).unwrap();
 
         assert!(!hub.should_quit());
-        assert_eq!(hub.agent_count(), 0);
     }
 
     /// Verifies Hub drop completes without deadlocking.
@@ -1025,251 +1004,6 @@ mod tests {
 
         hub.handle_action(HubAction::Quit);
         assert!(hub.should_quit());
-    }
-
-    // === Agent Lifecycle / HandleCache Integration Tests ===
-    //
-    // These tests verify the integration between Hub, HandleCache, and HubAction
-    // for agent lifecycle operations (create, select, delete).
-
-    /// Helper: create a test agent and return (key, agent).
-    fn make_agent(issue: u32) -> (String, crate::agent::Agent) {
-        let agent = crate::agent::Agent::new(
-            uuid::Uuid::new_v4(),
-            "test/repo".to_string(),
-            Some(issue),
-            format!("botster-issue-{}", issue),
-            PathBuf::from("/tmp/test"),
-        );
-        (format!("test-repo-{}", issue), agent)
-    }
-
-    /// Helper: add agent to hub state and return the key.
-    fn add_agent_to_hub(hub: &Hub, issue: u32) -> String {
-        let (key, agent) = make_agent(issue);
-        hub.state.write().unwrap().add_agent(key.clone(), agent);
-        key
-    }
-
-    #[test]
-    fn test_handle_cache_syncs_on_agent_create() {
-        let config = test_config();
-        let hub = Hub::new(config).unwrap();
-
-        // Initially empty
-        assert!(hub.handle_cache.is_empty());
-
-        // Add agent to state
-        let key = add_agent_to_hub(&hub, 42);
-
-        // Sync cache
-        hub.sync_handle_cache();
-
-        // Cache should have 1 agent
-        assert_eq!(hub.handle_cache.len(), 1);
-        let cached = hub.handle_cache.get_agent(0);
-        assert!(cached.is_some(), "get_agent(0) should return Some after sync");
-
-        // Verify agent_id matches
-        let handle = cached.unwrap();
-        assert_eq!(handle.agent_key(), key);
-    }
-
-    #[test]
-    fn test_handle_cache_syncs_on_agent_delete() {
-        let config = test_config();
-        let hub = Hub::new(config).unwrap();
-
-        // Add 2 agents
-        let key1 = add_agent_to_hub(&hub, 1);
-        let key2 = add_agent_to_hub(&hub, 2);
-        hub.sync_handle_cache();
-
-        assert_eq!(hub.handle_cache.len(), 2);
-        assert_eq!(hub.handle_cache.get_agent(0).unwrap().agent_key(), &key1);
-        assert_eq!(hub.handle_cache.get_agent(1).unwrap().agent_key(), &key2);
-
-        // Remove agent 0 (key1)
-        hub.state.write().unwrap().remove_agent(&key1);
-        hub.sync_handle_cache();
-
-        // Cache should now have 1 agent, and index 0 should point to what was agent 1 (key2)
-        assert_eq!(hub.handle_cache.len(), 1);
-        let remaining = hub.handle_cache.get_agent(0).unwrap();
-        assert_eq!(
-            remaining.agent_key(), key2,
-            "After deleting agent 0, index 0 should now point to what was agent 1"
-        );
-    }
-
-    // Note: TUI request processing tests are in runner.rs.
-
-    #[test]
-    fn test_create_delete_agent_cycle() {
-        let config = test_config();
-        let hub = Hub::new(config).unwrap();
-
-        // Add 3 agents, sync cache after each
-        let key1 = add_agent_to_hub(&hub, 1);
-        hub.sync_handle_cache();
-        assert_eq!(hub.handle_cache.len(), 1);
-
-        let key2 = add_agent_to_hub(&hub, 2);
-        hub.sync_handle_cache();
-        assert_eq!(hub.handle_cache.len(), 2);
-
-        let key3 = add_agent_to_hub(&hub, 3);
-        hub.sync_handle_cache();
-        assert_eq!(hub.handle_cache.len(), 3);
-
-        // Verify cache contents
-        assert_eq!(hub.handle_cache.get_agent(0).unwrap().agent_key(), &key1);
-        assert_eq!(hub.handle_cache.get_agent(1).unwrap().agent_key(), &key2);
-        assert_eq!(hub.handle_cache.get_agent(2).unwrap().agent_key(), &key3);
-
-        // Delete middle agent (key2)
-        hub.state.write().unwrap().remove_agent(&key2);
-        hub.sync_handle_cache();
-
-        // Cache should have 2 agents with correct IDs
-        assert_eq!(hub.handle_cache.len(), 2);
-        assert_eq!(
-            hub.handle_cache.get_agent(0).unwrap().agent_key(), &key1,
-            "After deleting middle agent, index 0 should still be agent 1"
-        );
-        assert_eq!(
-            hub.handle_cache.get_agent(1).unwrap().agent_key(), &key3,
-            "After deleting middle agent, index 1 should now be agent 3"
-        );
-    }
-
-    // === Stress / Concurrency Tests ===
-    //
-    // These tests verify thread safety and deadlock freedom under concurrent
-    // access patterns. Each uses a timeout to detect deadlocks.
-
-    /// Run a closure on a background thread with a timeout.
-    ///
-    /// If the closure doesn't complete within the given duration, the test
-    /// fails with a "possible deadlock" message. This is the primary mechanism
-    /// for detecting deadlocks in concurrent tests.
-    fn run_with_timeout<F: FnOnce() + Send + 'static>(f: F, timeout: std::time::Duration) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            f();
-            let _ = tx.send(());
-        });
-        rx.recv_timeout(timeout).expect("Test timed out - possible deadlock");
-    }
-
-    /// Stress test: concurrent reads and writes to HandleCache.
-    ///
-    /// Spawns a reader thread that continuously reads from the cache while
-    /// the main thread adds/removes agents and syncs the cache. Verifies
-    /// that the RwLock-based HandleCache doesn't deadlock or panic under
-    /// concurrent access.
-    ///
-    /// This exercises the production pattern where clients read from
-    /// HandleCache while Hub mutates it on agent lifecycle events.
-    #[test]
-    fn test_handle_cache_concurrent_read_write() {
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        run_with_timeout(|| {
-            let config = test_config();
-            let hub = Hub::new(config).unwrap();
-            let cache = Arc::clone(&hub.handle_cache);
-
-            // Spawn reader thread: continuously reads from cache
-            let reader_cache = Arc::clone(&cache);
-            let reader_handle = std::thread::spawn(move || {
-                for _ in 0..100 {
-                    // Exercise all read paths
-                    let _len = reader_cache.len();
-                    let _empty = reader_cache.is_empty();
-                    let _agent = reader_cache.get_agent(0);
-                    let _all = reader_cache.get_all_agents();
-
-                    // Small yield to interleave with writer
-                    std::thread::yield_now();
-                }
-            });
-
-            // Main thread: add/remove agents and sync cache
-            for i in 0..100u32 {
-                let key = add_agent_to_hub(&hub, i);
-                hub.sync_handle_cache();
-
-                // Every other iteration, remove the agent we just added
-                if i % 2 == 0 {
-                    hub.state.write().unwrap().remove_agent(&key);
-                    hub.sync_handle_cache();
-                }
-            }
-
-            // Join reader - should not have panicked
-            reader_handle.join().expect("Reader thread panicked during concurrent access");
-        }, Duration::from_secs(5));
-    }
-
-    /// Consistency test: cache count matches state count through add/remove cycle.
-    ///
-    /// Adds 5 agents one by one, calling sync_handle_cache() after each, then
-    /// removes 3 agents one by one with sync after each. At every step, verifies
-    /// that the cache count matches the state count.
-    ///
-    /// This is a deterministic correctness test (not a concurrency test) that
-    /// ensures the cache faithfully mirrors Hub state through lifecycle events.
-    #[test]
-    fn test_multiple_cache_syncs_are_consistent() {
-        use std::time::Duration;
-
-        run_with_timeout(|| {
-            let config = test_config();
-            let hub = Hub::new(config).unwrap();
-
-            // Add 5 agents one by one, verify cache matches state at each step
-            let mut keys = Vec::new();
-            for i in 1..=5u32 {
-                let key = add_agent_to_hub(&hub, i);
-                keys.push(key);
-                hub.sync_handle_cache();
-
-                let state_count = hub.state.read().unwrap().agent_count();
-                let cache_count = hub.handle_cache.len();
-                assert_eq!(
-                    cache_count, state_count,
-                    "After adding agent {i}: cache count ({cache_count}) should match state count ({state_count})"
-                );
-                assert_eq!(cache_count, i as usize);
-            }
-
-            // Remove 3 agents one by one, verify cache matches state at each step
-            for (removed_count, key) in keys.iter().take(3).enumerate() {
-                hub.state.write().unwrap().remove_agent(key);
-                hub.sync_handle_cache();
-
-                let state_count = hub.state.read().unwrap().agent_count();
-                let cache_count = hub.handle_cache.len();
-                let expected = 5 - (removed_count + 1);
-                assert_eq!(
-                    cache_count, state_count,
-                    "After removing agent {}: cache count ({cache_count}) should match state count ({state_count})",
-                    removed_count + 1
-                );
-                assert_eq!(cache_count, expected);
-            }
-
-            // Final verification: 2 agents remain
-            assert_eq!(hub.handle_cache.len(), 2);
-            assert_eq!(hub.state.read().unwrap().agent_count(), 2);
-
-            // Verify the remaining agents are correct (keys[3] and keys[4])
-            let cached_agents = hub.handle_cache.get_all_agents();
-            assert_eq!(cached_agents[0].agent_key(), &keys[3]);
-            assert_eq!(cached_agents[1].agent_key(), &keys[4]);
-        }, Duration::from_secs(5));
     }
 
 }

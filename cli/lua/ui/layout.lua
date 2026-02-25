@@ -115,6 +115,11 @@ local function build_menu_items(state)
         table.insert(items, { text = label, action = "switch_session:" .. (idx - 1) })
       end
     end
+    table.insert(items, { text = "Add Session", action = "add_session" })
+    -- Only show Remove Session when there are sessions beyond the primary (index 0)
+    if #sessions > 1 then
+      table.insert(items, { text = "Remove Session", action = "remove_session" })
+    end
     table.insert(items, { text = "Close Agent", action = "close_agent" })
   end
 
@@ -342,6 +347,53 @@ function render_overlay(state)
           "Scan QR to connect securely",
           "Link used - [r] to pair new device",
           "[r] new link  [c] copy  [Esc] close",
+        },
+      },
+    }
+  elseif _tui_state.mode == "add_session_select_type" then
+    local type_items = {}
+    for _, t in ipairs(_tui_state.available_session_types or {}) do
+      local label = t.label or t.name
+      table.insert(type_items, { text = label, secondary = { { text = t.description or "", style = "dim" } } })
+    end
+    if #type_items == 0 then
+      type_items = { { text = "Loading...", style = "dim" } }
+    end
+    return {
+      type = "centered", width = 50, height = 30,
+      child = {
+        type = "list",
+        id = "session_type_list",
+        block = { title = " Add Session [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
+        props = {
+          items = type_items,
+        },
+      },
+    }
+  elseif _tui_state.mode == "remove_session_select" then
+    local sa = get_selected_agent()
+    local session_items = {}
+    if sa and sa.sessions then
+      for idx, session in ipairs(sa.sessions) do
+        -- Skip index 0 (primary agent session)
+        if idx > 1 then
+          local name = type(session) == "table" and session.name or session
+          local label = string.upper(name)
+          table.insert(session_items, { text = label })
+        end
+      end
+    end
+    if #session_items == 0 then
+      session_items = { { text = "No removable sessions", style = "dim" } }
+    end
+    return {
+      type = "centered", width = 50, height = 30,
+      child = {
+        type = "list",
+        id = "remove_session_list",
+        block = { title = " Remove Session [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
+        props = {
+          items = session_items,
         },
       },
     }

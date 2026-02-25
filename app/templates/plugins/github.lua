@@ -96,9 +96,8 @@ end)
 -- Agent Matching
 -- ============================================================================
 
---- Find an existing agent that matches a GitHub event.
--- Checks by issue number first, then by branch name pattern.
--- PR events routed to linked issues will match the issue agent.
+--- Find an existing agent that matches a GitHub event by metadata.
+-- Searches all running agents for matching repo + issue_number.
 --
 -- @param event_repo string "owner/repo"
 -- @param payload table The event payload
@@ -107,26 +106,21 @@ local function find_matching_agent(event_repo, payload)
     local issue_number = payload.issue_number
     if not issue_number then return nil end
 
-    local repo_safe = event_repo:gsub("/", "-")
+    for _, agent in ipairs(Agent.find_by_meta("issue_number", issue_number)) do
+        if agent.repo == event_repo then
+            return agent
+        end
+    end
 
-    -- Direct match: agent working on this issue number
-    local by_issue = Agent.get(repo_safe .. "-" .. tostring(issue_number))
-    if by_issue then return by_issue end
-
-    -- Branch pattern match: agent on botster-issue-N branch
-    local by_branch = Agent.get(repo_safe .. "-botster-issue-" .. tostring(issue_number))
-    if by_branch then return by_branch end
-
-    -- PR routing: if this came from a PR routed to an issue, the structured_context
-    -- tells us the target issue number. Check for an agent on that issue.
+    -- PR routing: if this came from a PR routed to an issue, check the target
     local ctx = payload.structured_context
     if ctx and ctx.routed_to and ctx.routed_to.number then
         local target = ctx.routed_to.number
-        local by_routed = Agent.get(repo_safe .. "-" .. tostring(target))
-        if by_routed then return by_routed end
-
-        by_routed = Agent.get(repo_safe .. "-botster-issue-" .. tostring(target))
-        if by_routed then return by_routed end
+        for _, agent in ipairs(Agent.find_by_meta("issue_number", target)) do
+            if agent.repo == event_repo then
+                return agent
+            end
+        end
     end
 
     return nil
@@ -152,7 +146,7 @@ end
 local function notify_agent(agent, payload)
     local session = agent.sessions and agent.sessions["agent"]
     if session then
-        session:write(format_notification(payload) .. "\r\r")
+        session:send_message(format_notification(payload))
         log.info(string.format("GitHub: notified existing agent %s", agent:agent_key()))
     else
         log.warn(string.format("GitHub: cannot notify agent %s (no 'agent' session)", agent:agent_key()))
@@ -177,7 +171,7 @@ hooks.on("pty_notification", "github_question_notify", function(data)
     if not agent then return end
 
     -- Only post if we have issue context
-    if not agent.issue_number and not agent.invocation_url then return end
+    if not agent:get_meta("issue_number") and not agent:get_meta("invocation_url") then return end
 
     local api_token = hub.api_token()
     if not api_token then return end
@@ -198,8 +192,8 @@ hooks.on("pty_notification", "github_question_notify", function(data)
         },
         json = {
             repo = agent.repo,
-            issue_number = agent.issue_number,
-            invocation_url = agent.invocation_url,
+            issue_number = agent:get_meta("issue_number"),
+            invocation_url = agent:get_meta("invocation_url"),
             notification_type = notification_type,
         },
     })
@@ -220,14 +214,18 @@ action_cable.subscribe(conn, "Github::EventsChannel",
         local event_repo = message.repo or repo
 
         if message.event_type == "agent_cleanup" then
-            -- PR closed or issue closed — delete the matching agent
-            local repo_safe = event_repo:gsub("/", "-")
+            -- PR closed or issue closed — delete matching agents by metadata
             if payload.issue_number then
-                events.emit("command_message", {
-                    type = "delete_agent",
-                    agent_id = repo_safe .. "-" .. tostring(payload.issue_number),
-                    delete_worktree = false,
-                })
+                local matches = Agent.find_by_meta("issue_number", payload.issue_number)
+                for _, agent in ipairs(matches) do
+                    if agent.repo == event_repo then
+                        events.emit("command_message", {
+                            type = "delete_agent",
+                            agent_id = agent:agent_key(),
+                            delete_worktree = false,
+                        })
+                    end
+                end
             end
         else
             -- New mention — find existing agent or create a new one
@@ -240,7 +238,10 @@ action_cable.subscribe(conn, "Github::EventsChannel",
                     issue_or_branch = payload.issue_number and tostring(payload.issue_number),
                     prompt = payload.prompt or payload.context or payload.comment_body,
                     repo = event_repo,
-                    invocation_url = payload.issue_url,
+                    metadata = {
+                        issue_number = payload.issue_number,
+                        invocation_url = payload.issue_url,
+                    },
                 })
             end
         end

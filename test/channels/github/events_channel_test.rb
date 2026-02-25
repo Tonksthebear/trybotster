@@ -44,11 +44,12 @@ module Github
       end
     end
 
-    test "rejects subscription when user has no github app token" do
-      @user.define_singleton_method(:github_app_token) { nil }
-      subscribe repo: @test_repo
+    test "rejects subscription when github app is not installed on repo" do
+      Github::App.stub :app_installed_on_repo?, false do
+        subscribe repo: @test_repo
 
-      assert subscription.rejected?
+        assert subscription.rejected?
+      end
     end
 
     # === Replay Tests ===
@@ -165,9 +166,7 @@ module Github
     private
 
     def stub_github_access(success:)
-      installation_result = { success: success }
-      @user.define_singleton_method(:github_app_token) { "fake-token" }
-      Github::App.stub :get_installation_for_repo, installation_result do
+      Github::App.stub :app_installed_on_repo?, success do
         yield
       end
     end

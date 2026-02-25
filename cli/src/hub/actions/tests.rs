@@ -116,7 +116,6 @@ fn test_agent_get_pty_handle_returns_valid_handle() {
     let agent = Agent::new(
         Uuid::new_v4(),
         "test/repo".to_string(),
-        Some(1),
         "test-branch".to_string(),
         temp_dir.path().to_path_buf(),
     );

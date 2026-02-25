@@ -203,6 +203,13 @@ function M.on_hub_event(event_type, event_data, context)
     return {}
   end
 
+  if event_type == "session_types" then
+    local types = event_data.session_types
+    if not types then return nil end
+    _tui_state.available_session_types = types
+    return {}
+  end
+
   if event_type == "connection_code" then
     local url = event_data.url
     local qr_ascii = event_data.qr_ascii

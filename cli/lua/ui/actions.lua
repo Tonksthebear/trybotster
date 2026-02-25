@@ -100,6 +100,22 @@ function M.on_action(action, context)
           data = { type = "list_profiles" },
         }},
       }
+    elseif selected == "add_session" then
+      if context.selected_agent then
+        return {
+          set_mode_ops("add_session_select_type"),
+          { op = "send_msg", data = {
+            subscriptionId = "tui_hub",
+            data = { type = "list_session_types", agent_id = context.selected_agent },
+          }},
+        }
+      end
+      return { set_mode_ops(base_mode(context)) }
+    elseif selected == "remove_session" then
+      if context.selected_agent then
+        return { set_mode_ops("remove_session_select") }
+      end
+      return { set_mode_ops(base_mode(context)) }
     elseif selected == "close_agent" then
       if context.selected_agent then
         return { set_mode_ops("close_agent_confirm") }
@@ -170,6 +186,47 @@ function M.on_action(action, context)
       _tui_state.pending_fields.profile = selected
     end
     return transition_to_worktree_selection()
+  end
+
+  -- === Session type selection ===
+  if action == "list_select" and _tui_state.mode == "add_session_select_type" then
+    local types = _tui_state.available_session_types or {}
+    local selected_type = types[_tui_state.list_selected + 1]  -- Lua 1-based
+    if selected_type and context.selected_agent then
+      return {
+        { op = "send_msg", data = {
+          subscriptionId = "tui_hub",
+          data = {
+            type = "add_session",
+            agent_id = context.selected_agent,
+            session_type = selected_type.name,
+          },
+        }},
+        set_mode_ops(base_mode(context)),
+      }
+    end
+    return { set_mode_ops(base_mode(context)) }
+  end
+
+  -- === Remove session selection ===
+  if action == "list_select" and _tui_state.mode == "remove_session_select" then
+    -- list index is 0-based, and we skipped index 0 (agent session) in the overlay,
+    -- so the actual pty_index is list_index + 1
+    local pty_index = (data.index or 0) + 1
+    if context.selected_agent then
+      return {
+        { op = "send_msg", data = {
+          subscriptionId = "tui_hub",
+          data = {
+            type = "remove_session",
+            agent_id = context.selected_agent,
+            pty_index = pty_index,
+          },
+        }},
+        set_mode_ops(base_mode(context)),
+      }
+    end
+    return { set_mode_ops(base_mode(context)) }
   end
 
   -- === Text input submit ===

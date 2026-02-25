@@ -292,6 +292,7 @@ impl LuaBootstrap {
                     pending_fields = {},\
                     available_worktrees = {},\
                     available_profiles = {},\
+                    available_session_types = {},\
                     mode = 'normal',\
                     input_buffer = '',\
                     list_selected = 0,\

@@ -16,11 +16,11 @@ module Integrations
         def call
           Rails.logger.info "LinkedIssueResolver: repo=#{@repo_full_name}, pr=#{@pr_number}"
 
-          token = valid_github_token
-          return nil unless token
-
-          installation_id = find_installation(token)
-          return nil unless installation_id
+          installation_id = ::Github::App.installation_id_for_repo(@repo_full_name)
+          unless installation_id
+            Rails.logger.warn "GitHub App not installed on #{@repo_full_name}"
+            return nil
+          end
 
           pr_body = fetch_pr_body(installation_id)
           return nil unless pr_body
@@ -34,39 +34,9 @@ module Integrations
 
         private
 
-        def valid_github_token
-          user = User.where.not(github_app_token: nil).first
-          token = user&.valid_github_app_token
-
-          unless token
-            Rails.logger.warn "No valid GitHub App token available"
-          end
-
-          token
-        end
-
-        def find_installation(token)
-          result = ::Github::App.get_installation_for_repo(token, @repo_full_name)
-
-          unless result[:success]
-            Rails.logger.warn "Could not find installation for repo: #{@repo_full_name}"
-            return nil
-          end
-
-          result[:installation_id]
-        end
-
         def fetch_pr_body(installation_id)
-          token_result = ::Github::App.get_installation_token(installation_id)
-
-          unless token_result[:success]
-            Rails.logger.warn "Could not create installation token: #{token_result[:error]}"
-            return nil
-          end
-
-          client = ::Github::App.client(token_result[:token])
+          client = ::Github::App.installation_client(installation_id)
           pr = client.pull_request(@repo_full_name, @pr_number)
-
           pr.body
         end
 

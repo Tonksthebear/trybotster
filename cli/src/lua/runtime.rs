@@ -1984,6 +1984,10 @@ impl LuaRuntime {
                     }
                     "pty_prompt"
                 }
+                PtyEvent::CursorVisibilityChanged(visible) => {
+                    data.set("visible", *visible)?;
+                    "pty_cursor_visibility"
+                }
                 _ => return Ok(()), // Other PtyEvent variants use different paths
             };
 

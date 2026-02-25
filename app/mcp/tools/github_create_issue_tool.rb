@@ -13,84 +13,52 @@ class GithubCreateIssueTool < ApplicationMCPTool
   validates :title, presence: true, length: { minimum: 1, maximum: 256 }
 
   def perform
-    # Check if user has authorized GitHub App
-    unless current_user&.github_app_authorized?
-      report_error("GitHub App not authorized. Please authorize at /github_app/authorize")
+    installation_id = ::Github::App.installation_id_for_repo(repo)
+    unless installation_id
+      report_error("GitHub App is not installed on #{repo}")
       return
     end
 
-    # Get the correct installation ID for this repository
-    access_token = current_user.valid_github_app_token
-    installation_result = Github::App.get_installation_for_repo(access_token, repo)
-
-    unless installation_result[:success]
-      report_error(installation_result[:error])
-      return
-    end
-
-    installation_id = installation_result[:installation_id]
-    Rails.logger.info "Using GitHub App installation ID: #{installation_id} for #{repo} (account: #{installation_result[:account]})"
+    client = ::Github::App.installation_client(installation_id)
 
     # Detect client for user feedback
     client_info = detect_client_type
-    render(text: "Creating issue in #{repo} as [bot] via #{installation_result[:account]} installation (#{client_info})...")
+    render(text: "Creating issue in #{repo} as [bot] (#{client_info})...")
 
     # Parse labels if provided
     label_array = labels.present? ? labels.split(",").map(&:strip) : []
-
-    # Get installation client (shows as [bot])
-    begin
-      client = Github::App.installation_client(installation_id)
-    rescue => e
-      report_error("Failed to get bot credentials: #{e.message}")
-      return
-    end
 
     # Add attribution footer to issue body
     enhanced_body = body.to_s + attribution_footer
 
     # Create issue using installation token (bot attribution)
-    begin
-      issue = client.create_issue(repo, title, enhanced_body, labels: label_array)
-      result = { success: true, issue: issue.to_h }
-    rescue Octokit::Error => e
-      Rails.logger.error "Octokit error: #{e.message}"
-      result = { success: false, error: e.message }
-    rescue => e
-      Rails.logger.error "General error creating issue: #{e.message}"
-      result = { success: false, error: e.message }
+    issue = client.create_issue(repo, title, enhanced_body, labels: label_array)
+
+    success_message = [
+      "✅ Issue created successfully!",
+      "",
+      "📝 Issue ##{issue[:number]}: #{issue[:title]}",
+      "   Repository: #{repo}",
+      "   URL: #{issue[:html_url]}",
+      "   State: #{issue[:state]}"
+    ]
+
+    if issue[:created_at]
+      created_time = issue[:created_at].is_a?(String) ? Time.parse(issue[:created_at]) : issue[:created_at]
+      success_message << "   Created: #{created_time.strftime('%Y-%m-%d %H:%M')}"
     end
 
-    if result[:success]
-      issue = result[:issue]
-
-      success_message = [
-        "✅ Issue created successfully!",
-        "",
-        "📝 Issue ##{issue[:number]}: #{issue[:title]}",
-        "   Repository: #{repo}",
-        "   URL: #{issue[:html_url]}",
-        "   State: #{issue[:state]}"
-      ]
-
-      # Add created_at only if it exists
-      if issue[:created_at]
-        created_time = issue[:created_at].is_a?(String) ? Time.parse(issue[:created_at]) : issue[:created_at]
-        success_message << "   Created: #{created_time.strftime('%Y-%m-%d %H:%M')}"
-      end
-
-      if issue[:labels]&.any?
-        labels_text = issue[:labels].map { |l| l[:name] }.join(", ")
-        success_message << "   Labels: #{labels_text}"
-      end
-
-      success_message << ""
-      success_message << "You can view and edit the issue at: #{issue[:html_url]}"
-
-      render(text: success_message.join("\n"))
-    else
-      report_error("Failed to create issue: #{result[:error]}")
+    if issue[:labels]&.any?
+      labels_text = issue[:labels].map { |l| l[:name] }.join(", ")
+      success_message << "   Labels: #{labels_text}"
     end
+
+    success_message << ""
+    success_message << "You can view and edit the issue at: #{issue[:html_url]}"
+
+    render(text: success_message.join("\n"))
+  rescue Octokit::Error => e
+    report_error("Failed to create issue: #{e.message}")
   rescue => e
     report_error("Error creating issue: #{e.message}")
   end

@@ -55,38 +55,36 @@ module MCPToolTestHelper
     resource
   end
 
-  # Create a mock authorized user (avoids encryption issues)
-  def create_authorized_user
-    user = OpenStruct.new(
-      id: 1,
-      email: "test@example.com",
-      username: "testuser"
-    )
-    user.define_singleton_method(:github_app_authorized?) { true }
-    user.define_singleton_method(:valid_github_app_token) { "mock_token_123" }
-    user
-  end
-
-  # Create a mock unauthorized user
-  def create_unauthorized_user
-    user = OpenStruct.new(
-      id: 2,
-      email: "test2@example.com",
-      username: "testuser2"
-    )
-    user.define_singleton_method(:github_app_authorized?) { false }
-    user.define_singleton_method(:valid_github_app_token) { nil }
-    user
-  end
-
   # Setup tool with common mocks
-  def setup_tool_mocks(tool, user: nil)
-    user ||= create_authorized_user
-    tool.define_singleton_method(:current_user) { user }
+  def setup_tool_mocks(tool)
     tool.define_singleton_method(:render) { |**args| @rendered = args }
     tool.define_singleton_method(:report_error) { |msg| @error = msg }
     tool.define_singleton_method(:detect_client_type) { "Test Client" }
+    tool.define_singleton_method(:attribution_footer) { "\n\n_via test_" }
     tool
+  end
+
+  # Stub installation lookup + client for a block
+  def with_installation_client(mock_client, installation_id: 12345, &block)
+    Github::App.stub :installation_id_for_repo, installation_id do
+      Github::App.stub :installation_client, mock_client do
+        block.call
+      end
+    end
+  end
+
+  # Stub installation_id_for_repo returning nil (app not installed)
+  def with_no_installation(&block)
+    Github::App.stub :installation_id_for_repo, nil do
+      block.call
+    end
+  end
+
+  # Create a mock Octokit client that responds to a method with fixture data
+  def mock_octokit_client(method_name, return_data)
+    client = Object.new
+    client.define_singleton_method(method_name) { |*_args, **_kwargs| return_data }
+    client
   end
 end
 
@@ -101,7 +99,8 @@ class GithubGetPullRequestToolTest < ActiveSupport::TestCase
     tool = GithubGetPullRequestTool.new(repo: "owner/repo", pr_number: 49)
     setup_tool_mocks(tool)
 
-    Github::App.stub :get_pull_request, { success: true, pull_request: @pr_data } do
+    client = mock_octokit_client(:pull_request, mock_resource(@pr_data))
+    with_installation_client(client) do
       tool.perform
       assert_nil tool.instance_variable_get(:@error)
       rendered = tool.instance_variable_get(:@rendered)
@@ -109,23 +108,14 @@ class GithubGetPullRequestToolTest < ActiveSupport::TestCase
     end
   end
 
-  test "returns error when user not authorized" do
-    tool = GithubGetPullRequestTool.new(repo: "owner/repo", pr_number: 49)
-    setup_tool_mocks(tool, user: create_unauthorized_user)
-
-    tool.perform
-    error = tool.instance_variable_get(:@error)
-    assert error&.include?("not authorized")
-  end
-
-  test "returns error when API call fails" do
+  test "returns error when app not installed" do
     tool = GithubGetPullRequestTool.new(repo: "owner/repo", pr_number: 49)
     setup_tool_mocks(tool)
 
-    Github::App.stub :get_pull_request, { success: false, error: "Not found" } do
+    with_no_installation do
       tool.perform
       error = tool.instance_variable_get(:@error)
-      assert error&.include?("Not found")
+      assert error&.include?("not installed")
     end
   end
 
@@ -153,9 +143,21 @@ class GithubGetIssueToolTest < ActiveSupport::TestCase
     tool = GithubGetIssueTool.new(repo: "owner/repo", issue_number: 123)
     setup_tool_mocks(tool)
 
-    Github::App.stub :get_issue, { success: true, issue: @issue_data } do
+    client = mock_octokit_client(:issue, mock_resource(@issue_data))
+    with_installation_client(client) do
       tool.perform
       assert_nil tool.instance_variable_get(:@error)
+    end
+  end
+
+  test "returns error when app not installed" do
+    tool = GithubGetIssueTool.new(repo: "owner/repo", issue_number: 123)
+    setup_tool_mocks(tool)
+
+    with_no_installation do
+      tool.perform
+      error = tool.instance_variable_get(:@error)
+      assert error&.include?("not installed")
     end
   end
 
@@ -174,14 +176,15 @@ class GithubGetIssueCommentsToolTest < ActiveSupport::TestCase
   include MCPToolTestHelper
 
   setup do
-    @comments = [ symbolize_keys_deep(load_github_fixture("comment")) ]
+    @comments = [ mock_resource(symbolize_keys_deep(load_github_fixture("comment"))) ]
   end
 
   test "returns comments on success" do
     tool = GithubGetIssueCommentsTool.new(repo: "owner/repo", issue_number: 123)
     setup_tool_mocks(tool)
 
-    Github::App.stub :get_issue_comments, { success: true, comments: @comments } do
+    client = mock_octokit_client(:issue_comments, @comments)
+    with_installation_client(client) do
       tool.perform
       assert_nil tool.instance_variable_get(:@error)
     end
@@ -191,7 +194,8 @@ class GithubGetIssueCommentsToolTest < ActiveSupport::TestCase
     tool = GithubGetIssueCommentsTool.new(repo: "owner/repo", issue_number: 123)
     setup_tool_mocks(tool)
 
-    Github::App.stub :get_issue_comments, { success: true, comments: [] } do
+    client = mock_octokit_client(:issue_comments, [])
+    with_installation_client(client) do
       tool.perform
       rendered = tool.instance_variable_get(:@rendered)
       assert rendered[:text]&.include?("No comments found")
@@ -210,23 +214,21 @@ class GithubCreateIssueToolTest < ActiveSupport::TestCase
     tool = GithubCreateIssueTool.new(repo: "owner/repo", title: "New issue", body: "Description")
     setup_tool_mocks(tool)
 
-    installation_result = { success: true, installation_id: 12345, account: "owner" }
-    mock_client = Object.new
-    created_issue = @created_issue
-    mock_client.define_singleton_method(:create_issue) { |*args| mock_resource(created_issue) }
-
-    # Need mock_resource accessible in the mock_client context
-    def mock_client.mock_resource(data)
-      resource = OpenStruct.new(data)
-      resource.define_singleton_method(:to_h) { data }
-      resource
+    client = mock_octokit_client(:create_issue, mock_resource(@created_issue))
+    with_installation_client(client) do
+      tool.perform
+      assert_nil tool.instance_variable_get(:@error)
     end
+  end
 
-    Github::App.stub :get_installation_for_repo, installation_result do
-      Github::App.stub :installation_client, mock_client do
-        tool.perform
-        assert_nil tool.instance_variable_get(:@error)
-      end
+  test "returns error when app not installed" do
+    tool = GithubCreateIssueTool.new(repo: "owner/repo", title: "New issue", body: "Description")
+    setup_tool_mocks(tool)
+
+    with_no_installation do
+      tool.perform
+      error = tool.instance_variable_get(:@error)
+      assert error&.include?("not installed")
     end
   end
 
@@ -254,20 +256,21 @@ class GithubCommentIssueToolTest < ActiveSupport::TestCase
     tool = GithubCommentIssueTool.new(repo: "owner/repo", issue_number: 123, body: "Great work!")
     setup_tool_mocks(tool)
 
-    installation_result = { success: true, installation_id: 12345, account: "owner" }
-    comment_data = @comment
-    mock_client = Object.new
-    mock_client.define_singleton_method(:add_comment) do |*args|
-      resource = OpenStruct.new(comment_data)
-      resource.define_singleton_method(:to_h) { comment_data }
-      resource
+    client = mock_octokit_client(:add_comment, mock_resource(@comment))
+    with_installation_client(client) do
+      tool.perform
+      assert_nil tool.instance_variable_get(:@error)
     end
+  end
 
-    Github::App.stub :get_installation_for_repo, installation_result do
-      Github::App.stub :installation_client, mock_client do
-        tool.perform
-        assert_nil tool.instance_variable_get(:@error)
-      end
+  test "returns error when app not installed" do
+    tool = GithubCommentIssueTool.new(repo: "owner/repo", issue_number: 123, body: "Great work!")
+    setup_tool_mocks(tool)
+
+    with_no_installation do
+      tool.perform
+      error = tool.instance_variable_get(:@error)
+      assert error&.include?("not installed")
     end
   end
 
@@ -299,7 +302,7 @@ class GithubCommentIssueToolTest < ActiveSupport::TestCase
     tool.define_singleton_method(:idempotency_key_from_request) { "test-idempotency-key" }
 
     # The API should NOT be called since we have a cached response
-    Github::App.stub :get_installation_for_repo, ->(*) { raise "API should not be called" } do
+    Github::App.stub :installation_id_for_repo, ->(*) { raise "API should not be called" } do
       tool.perform
       rendered = tool.instance_variable_get(:@rendered)
       assert rendered[:text]&.include?("Comment added successfully")
@@ -313,20 +316,10 @@ class GithubCommentIssueToolTest < ActiveSupport::TestCase
     idempotency_key_value = "new-idempotency-key-#{SecureRandom.hex(8)}"
     tool.define_singleton_method(:idempotency_key_from_request) { idempotency_key_value }
 
-    installation_result = { success: true, installation_id: 12345, account: "owner" }
-    comment_data = @comment
-    mock_client = Object.new
-    mock_client.define_singleton_method(:add_comment) do |*args|
-      resource = OpenStruct.new(comment_data)
-      resource.define_singleton_method(:to_h) { comment_data }
-      resource
-    end
-
-    Github::App.stub :get_installation_for_repo, installation_result do
-      Github::App.stub :installation_client, mock_client do
-        tool.perform
-        assert_nil tool.instance_variable_get(:@error)
-      end
+    client = mock_octokit_client(:add_comment, mock_resource(@comment))
+    with_installation_client(client) do
+      tool.perform
+      assert_nil tool.instance_variable_get(:@error)
     end
 
     # Verify idempotency key was stored
@@ -340,10 +333,9 @@ class GithubCommentIssueToolTest < ActiveSupport::TestCase
     idempotency_key_value = "retry-key-#{SecureRandom.hex(8)}"
     api_call_count = 0
 
-    installation_result = { success: true, installation_id: 12345, account: "owner" }
     comment_data = @comment
     mock_client = Object.new
-    mock_client.define_singleton_method(:add_comment) do |*args|
+    mock_client.define_singleton_method(:add_comment) do |*_args|
       api_call_count += 1
       resource = OpenStruct.new(comment_data)
       resource.define_singleton_method(:to_h) { comment_data }
@@ -355,10 +347,8 @@ class GithubCommentIssueToolTest < ActiveSupport::TestCase
     setup_tool_mocks(tool1)
     tool1.define_singleton_method(:idempotency_key_from_request) { idempotency_key_value }
 
-    Github::App.stub :get_installation_for_repo, installation_result do
-      Github::App.stub :installation_client, mock_client do
-        tool1.perform
-      end
+    with_installation_client(mock_client) do
+      tool1.perform
     end
 
     assert_equal 1, api_call_count, "First request should call API once"
@@ -368,10 +358,8 @@ class GithubCommentIssueToolTest < ActiveSupport::TestCase
     setup_tool_mocks(tool2)
     tool2.define_singleton_method(:idempotency_key_from_request) { idempotency_key_value }
 
-    Github::App.stub :get_installation_for_repo, installation_result do
-      Github::App.stub :installation_client, mock_client do
-        tool2.perform
-      end
+    with_installation_client(mock_client) do
+      tool2.perform
     end
 
     assert_equal 1, api_call_count, "Second request with same idempotency key should NOT call API again"
@@ -382,21 +370,18 @@ class GithubCommentIssueToolTest < ActiveSupport::TestCase
     setup_tool_mocks(tool)
     tool.define_singleton_method(:idempotency_key_from_request) { nil }
 
-    installation_result = { success: true, installation_id: 12345, account: "owner" }
+    api_called = false
     comment_data = @comment
     mock_client = Object.new
-    api_called = false
-    mock_client.define_singleton_method(:add_comment) do |*args|
+    mock_client.define_singleton_method(:add_comment) do |*_args|
       api_called = true
       resource = OpenStruct.new(comment_data)
       resource.define_singleton_method(:to_h) { comment_data }
       resource
     end
 
-    Github::App.stub :get_installation_for_repo, installation_result do
-      Github::App.stub :installation_client, mock_client do
-        tool.perform
-      end
+    with_installation_client(mock_client) do
+      tool.perform
     end
 
     assert api_called, "API should be called when no idempotency key is provided"
@@ -414,20 +399,21 @@ class GithubUpdateIssueToolTest < ActiveSupport::TestCase
     tool = GithubUpdateIssueTool.new(repo: "owner/repo", issue_number: 123, state: "closed")
     setup_tool_mocks(tool)
 
-    installation_result = { success: true, installation_id: 12345, account: "owner" }
-    issue_data = @updated_issue
-    mock_client = Object.new
-    mock_client.define_singleton_method(:update_issue) do |*args|
-      resource = OpenStruct.new(issue_data)
-      resource.define_singleton_method(:to_h) { issue_data }
-      resource
+    client = mock_octokit_client(:update_issue, mock_resource(@updated_issue))
+    with_installation_client(client) do
+      tool.perform
+      assert_nil tool.instance_variable_get(:@error)
     end
+  end
 
-    Github::App.stub :get_installation_for_repo, installation_result do
-      Github::App.stub :installation_client, mock_client do
-        tool.perform
-        assert_nil tool.instance_variable_get(:@error)
-      end
+  test "returns error when app not installed" do
+    tool = GithubUpdateIssueTool.new(repo: "owner/repo", issue_number: 123, state: "closed")
+    setup_tool_mocks(tool)
+
+    with_no_installation do
+      tool.perform
+      error = tool.instance_variable_get(:@error)
+      assert error&.include?("not installed")
     end
   end
 
@@ -441,15 +427,11 @@ class GithubUpdateIssueToolTest < ActiveSupport::TestCase
     tool = GithubUpdateIssueTool.new(repo: "owner/repo", issue_number: 123)
     setup_tool_mocks(tool)
 
-    installation_result = { success: true, installation_id: 12345, account: "owner" }
-    mock_client = Object.new
-
-    Github::App.stub :get_installation_for_repo, installation_result do
-      Github::App.stub :installation_client, mock_client do
-        tool.perform
-        error = tool.instance_variable_get(:@error)
-        assert error&.include?("No update parameters")
-      end
+    client = Object.new
+    with_installation_client(client) do
+      tool.perform
+      error = tool.instance_variable_get(:@error)
+      assert error&.include?("No update parameters")
     end
   end
 end
@@ -471,20 +453,26 @@ class GithubCreatePullRequestToolTest < ActiveSupport::TestCase
     )
     setup_tool_mocks(tool)
 
-    installation_result = { success: true, installation_id: 12345, account: "owner" }
-    pr_data = @created_pr
-    mock_client = Object.new
-    mock_client.define_singleton_method(:create_pull_request) do |*args|
-      resource = OpenStruct.new(pr_data)
-      resource.define_singleton_method(:to_h) { pr_data }
-      resource
+    client = mock_octokit_client(:create_pull_request, mock_resource(@created_pr))
+    with_installation_client(client) do
+      tool.perform
+      assert_nil tool.instance_variable_get(:@error)
     end
+  end
 
-    Github::App.stub :get_installation_for_repo, installation_result do
-      Github::App.stub :installation_client, mock_client do
-        tool.perform
-        assert_nil tool.instance_variable_get(:@error)
-      end
+  test "returns error when app not installed" do
+    tool = GithubCreatePullRequestTool.new(
+      repo: "owner/repo",
+      title: "New feature",
+      head: "feature-branch",
+      base: "main"
+    )
+    setup_tool_mocks(tool)
+
+    with_no_installation do
+      tool.perform
+      error = tool.instance_variable_get(:@error)
+      assert error&.include?("not installed")
     end
   end
 
@@ -503,28 +491,46 @@ class GithubListIssuesToolTest < ActiveSupport::TestCase
   include MCPToolTestHelper
 
   setup do
-    @issues = [ symbolize_keys_deep(load_github_fixture("issue")) ]
+    @issues = [ mock_resource(symbolize_keys_deep(load_github_fixture("issue"))) ]
   end
 
   test "lists issues on success" do
-    tool = GithubListIssuesTool.new(filter: "assigned", state: "open")
+    tool = GithubListIssuesTool.new(repo: "owner/repo", state: "open")
     setup_tool_mocks(tool)
 
-    Github::App.stub :get_user_issues, { success: true, issues: @issues } do
+    client = mock_octokit_client(:list_issues, @issues)
+    with_installation_client(client) do
       tool.perform
       assert_nil tool.instance_variable_get(:@error)
     end
   end
 
   test "handles empty issues list" do
-    tool = GithubListIssuesTool.new
+    tool = GithubListIssuesTool.new(repo: "owner/repo")
     setup_tool_mocks(tool)
 
-    Github::App.stub :get_user_issues, { success: true, issues: [] } do
+    client = mock_octokit_client(:list_issues, [])
+    with_installation_client(client) do
       tool.perform
       rendered = tool.instance_variable_get(:@rendered)
       assert rendered[:text]&.include?("No issues found")
     end
+  end
+
+  test "returns error when app not installed" do
+    tool = GithubListIssuesTool.new(repo: "owner/repo")
+    setup_tool_mocks(tool)
+
+    with_no_installation do
+      tool.perform
+      error = tool.instance_variable_get(:@error)
+      assert error&.include?("not installed")
+    end
+  end
+
+  test "validates repo format" do
+    tool = GithubListIssuesTool.new(repo: "invalid")
+    assert_not tool.valid?
   end
 end
 
@@ -536,10 +542,10 @@ class GithubListReposToolTest < ActiveSupport::TestCase
   end
 
   test "lists repositories on success" do
-    tool = GithubListReposTool.new(per_page: 10, sort: "updated")
+    tool = GithubListReposTool.new(per_page: 10, sort: "updated_at")
     setup_tool_mocks(tool)
 
-    Github::App.stub :get_user_repos, { success: true, repos: @repos } do
+    Github::App.stub :list_installation_repos, @repos do
       tool.perform
       assert_nil tool.instance_variable_get(:@error)
     end
@@ -549,7 +555,7 @@ class GithubListReposToolTest < ActiveSupport::TestCase
     tool = GithubListReposTool.new
     setup_tool_mocks(tool)
 
-    Github::App.stub :get_user_repos, { success: true, repos: [] } do
+    Github::App.stub :list_installation_repos, [] do
       tool.perform
       rendered = tool.instance_variable_get(:@rendered)
       assert rendered[:text]&.include?("No repositories found")
@@ -561,16 +567,23 @@ class GithubSearchReposToolTest < ActiveSupport::TestCase
   include MCPToolTestHelper
 
   setup do
-    @repos = [ symbolize_keys_deep(load_github_fixture("repository")) ]
+    @repos = [ mock_resource(symbolize_keys_deep(load_github_fixture("repository"))) ]
+    @search_result = OpenStruct.new(items: @repos, total_count: 1)
   end
 
   test "searches repositories on success" do
     tool = GithubSearchReposTool.new(query: "rails language:ruby", sort: "stars")
     setup_tool_mocks(tool)
 
-    Github::App.stub :search_repos, { success: true, repos: @repos, total_count: 1 } do
-      tool.perform
-      assert_nil tool.instance_variable_get(:@error)
+    client = mock_octokit_client(:search_repositories, @search_result)
+
+    Github::App.stub :installation_id_for_repo, nil do
+      Github::App.stub :first_installation_id, 12345 do
+        Github::App.stub :installation_client, client do
+          tool.perform
+          assert_nil tool.instance_variable_get(:@error)
+        end
+      end
     end
   end
 
@@ -583,10 +596,17 @@ class GithubSearchReposToolTest < ActiveSupport::TestCase
     tool = GithubSearchReposTool.new(query: "nonexistent-repo-xyz")
     setup_tool_mocks(tool)
 
-    Github::App.stub :search_repos, { success: true, repos: [], total_count: 0 } do
-      tool.perform
-      rendered = tool.instance_variable_get(:@rendered)
-      assert rendered[:text]&.include?("No repositories found")
+    empty_result = OpenStruct.new(items: [], total_count: 0)
+    client = mock_octokit_client(:search_repositories, empty_result)
+
+    Github::App.stub :installation_id_for_repo, nil do
+      Github::App.stub :first_installation_id, 12345 do
+        Github::App.stub :installation_client, client do
+          tool.perform
+          rendered = tool.instance_variable_get(:@rendered)
+          assert rendered[:text]&.include?("No repositories found")
+        end
+      end
     end
   end
 end

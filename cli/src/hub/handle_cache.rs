@@ -1,7 +1,7 @@
 //! Thread-safe cache of agent PTY handles for read-only access.
 //!
-//! Hub maintains this separately from HubState. When agents are
-//! created/deleted, Hub updates the cache via `sync_handle_cache()`.
+//! Lua manages agent lifecycle and updates the cache via
+//! `hub.register_agent()` / `hub.unregister_agent()`.
 //! Clients call `HandleCache::get_agent()` to read directly without
 //! sending commands.
 //!
@@ -9,7 +9,7 @@
 //!
 //! PTY I/O operations need non-blocking access to agent handles. Blocking
 //! commands from Hub's thread would deadlock. HandleCache provides direct,
-//! non-blocking access. Hub updates the cache on agent lifecycle events.
+//! non-blocking access. Lua updates the cache on agent lifecycle events.
 //!
 //! # Lua Migration
 //!
@@ -44,11 +44,11 @@ use super::agent_handle::AgentPtys;
 /// - Uses `RwLock` for interior mutability
 /// - All stored types are `Clone + Send + Sync`
 /// - Multiple readers can access simultaneously
-/// - Single writer (Hub) updates on lifecycle events
+/// - Single writer (Lua via Hub primitives) updates on lifecycle events
 ///
 /// # Cached Data
 ///
-/// - **Agent PTY handles**: Updated on agent create/delete via `sync_handle_cache()`
+/// - **Agent PTY handles**: Updated by Lua via `hub.register_agent()` / `hub.unregister_agent()`
 /// - **Worktrees**: Updated when Hub loads worktrees (menu open, agent lifecycle)
 /// - **Connection URL**: Updated when Hub generates/refreshes the device key bundle
 #[derive(Debug, Default)]
@@ -159,6 +159,18 @@ impl HandleCache {
             true
         } else {
             false
+        }
+    }
+
+    /// Update an agent's stored index to match its actual position.
+    ///
+    /// Called after `add_agent()` to fix up the `agent_index` field,
+    /// which may differ from the actual position on replace.
+    pub fn update_agent_index(&self, key: &str, index: usize) {
+        if let Ok(mut agents) = self.agents.write() {
+            if let Some(agent) = agents.iter_mut().find(|a| a.agent_key() == key) {
+                agent.set_agent_index(index);
+            }
         }
     }
 

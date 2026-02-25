@@ -224,5 +224,14 @@ pub(crate) enum HubEvent {
     ///
     /// Lua's `socket.send(client_id, msg)` pushes this event.
     SocketSend(crate::lua::primitives::socket::SocketSendRequest),
+
+    /// A queued message was successfully delivered to an agent PTY.
+    ///
+    /// Sent from the message delivery task after probe succeeded and
+    /// message was injected. Can be used by Lua for delivery confirmation.
+    MessageDelivered {
+        /// Length of the delivered message in bytes.
+        message_len: usize,
+    },
 }
 

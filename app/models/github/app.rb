@@ -26,6 +26,77 @@ module Github
       end
     end
 
+    # Check if the GitHub App is installed on a repository.
+    # Uses the App's private key (JWT auth) — no user OAuth token needed.
+    # @param repo [String] Repository in "owner/repo" format
+    # @return [Boolean] true if the App is installed on the repo
+    def app_installed_on_repo?(repo)
+      return false unless app_id && private_key
+
+      app_client = Octokit::Client.new(bearer_token: generate_jwt)
+      app_client.find_repository_installation(repo)
+      true
+    rescue Octokit::NotFound
+      false
+    rescue => e
+      Rails.logger.warn "[Github::App] Installation check failed for #{repo}: #{e.message}"
+      false
+    end
+
+    # Get the installation ID for a repository using App JWT auth.
+    # No user OAuth token needed — uses the App's private key.
+    # @param repo [String] Repository in "owner/repo" format
+    # @return [Integer, nil] Installation ID or nil if not installed
+    def installation_id_for_repo(repo)
+      return nil unless app_id && private_key
+
+      app_client = Octokit::Client.new(bearer_token: generate_jwt)
+      installation = app_client.find_repository_installation(repo)
+      installation.id
+    rescue Octokit::NotFound
+      nil
+    rescue => e
+      Rails.logger.warn "[Github::App] Installation lookup failed for #{repo}: #{e.message}"
+      nil
+    end
+
+    # Get the first available installation ID (for non-repo-specific operations like search).
+    # @return [Integer, nil]
+    def first_installation_id
+      return nil unless app_id && private_key
+
+      app_client = Octokit::Client.new(bearer_token: generate_jwt)
+      installations = app_client.find_app_installations
+      installations.first&.id
+    rescue => e
+      Rails.logger.warn "[Github::App] Failed to find installations: #{e.message}"
+      nil
+    end
+
+    # List all repositories accessible to the GitHub App across all installations.
+    # Uses App JWT auth — no user OAuth token needed.
+    # @return [Array<Hash>] Array of repository hashes
+    def list_installation_repos
+      return [] unless app_id && private_key
+
+      app_client = Octokit::Client.new(bearer_token: generate_jwt)
+      installations = app_client.find_app_installations
+
+      repos = []
+      installations.each do |inst|
+        token_result = get_installation_token(inst.id)
+        next unless token_result[:success]
+
+        inst_client = Octokit::Client.new(access_token: token_result[:token])
+        inst_repos = inst_client.list_app_installation_repositories
+        repos.concat(inst_repos.repositories.map(&:to_h))
+      end
+      repos
+    rescue => e
+      Rails.logger.warn "[Github::App] Failed to list installation repos: #{e.message}"
+      []
+    end
+
     # Get installation token for acting as the app (shows [bot] badge)
     # @param installation_id [String] The installation ID
     # @return [Hash] Response with :success, :token, :expires_at, :error
@@ -33,17 +104,7 @@ module Github
       return { success: false, error: "Missing GITHUB_APP_ID" } unless app_id
       return { success: false, error: "Missing private key" } unless private_key
 
-      # Create JWT for app authentication
-      payload = {
-        iat: Time.now.to_i - 60, # issued at time, 60 seconds in the past to allow for clock drift
-        exp: Time.now.to_i + (10 * 60), # JWT expiration time (10 minute maximum)
-        iss: app_id.to_s # GitHub expects this as a string
-      }
-
-      jwt = JWT.encode(payload, OpenSSL::PKey::RSA.new(private_key), "RS256")
-
-      # Get installation token using JWT
-      app_client = Octokit::Client.new(bearer_token: jwt)
+      app_client = Octokit::Client.new(bearer_token: generate_jwt)
       token_response = app_client.create_app_installation_access_token(installation_id)
 
       {
@@ -142,71 +203,6 @@ module Github
       Octokit::Client.new(access_token: access_token)
     end
 
-    # Get the installation ID for a user
-    # @param access_token [String] The user's access token
-    # @return [Hash] Response with :success, :installation_id, :permissions, :error
-    def get_user_installation(access_token)
-      client = client(access_token)
-      installations = client.find_user_installations
-
-      if installations.total_count > 0
-        # Prefer personal account installation over org installations
-        installation = installations.installations.find { |i| i.account.type == "User" } || installations.installations.first
-        {
-          success: true,
-          installation_id: installation.id,
-          account: installation.account.login,
-          account_type: installation.account.type,
-          permissions: installation.permissions&.to_h || {}
-        }
-      else
-        {
-          success: false,
-          error: "No installation found for this user"
-        }
-      end
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App installation lookup error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
-    # Get the installation ID for a specific repository
-    # @param access_token [String] The user's access token
-    # @param repo [String] Repository in "owner/repo" format
-    # @return [Hash] Response with :success, :installation_id, :account, :error
-    def get_installation_for_repo(access_token, repo)
-      owner = repo.split("/").first
-      client = client(access_token)
-      installations = client.find_user_installations
-
-      if installations.total_count > 0
-        # Find installation that matches the repo owner
-        installation = installations.installations.find { |i| i.account.login.casecmp?(owner) }
-
-        if installation
-          {
-            success: true,
-            installation_id: installation.id,
-            account: installation.account.login,
-            account_type: installation.account.type
-          }
-        else
-          {
-            success: false,
-            error: "No installation found for #{owner}. Install the GitHub App on #{owner}'s account at https://github.com/settings/installations"
-          }
-        end
-      else
-        {
-          success: false,
-          error: "No GitHub App installations found. Please install the app first."
-        }
-      end
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App installation lookup for repo error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
     # Get user information from GitHub
     # @param access_token [String] The GitHub access token
     # @return [Hash] User information or error
@@ -223,207 +219,18 @@ module Github
       { success: false, error: e.message }
     end
 
-    # Get user's repositories
-    # @param access_token [String] The GitHub access token
-    # @param options [Hash] Options like per_page, page, sort, etc.
-    # @return [Hash] Repositories list or error
-    def get_user_repos(access_token, **options)
-      client = client(access_token)
-      repos = client.repos(nil, options)
-
-      {
-        success: true,
-        repos: repos.map(&:to_h)
-      }
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App repos error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
-    # Get user's issues
-    # @param access_token [String] The GitHub access token
-    # @param filter [String] Filter: assigned, created, mentioned, subscribed, all
-    # @param state [String] State: open, closed, all
-    # @return [Hash] Issues list or error
-    def get_user_issues(access_token, filter: "assigned", state: "open")
-      client = client(access_token)
-      issues = client.issues(filter: filter, state: state)
-
-      {
-        success: true,
-        issues: issues.map(&:to_h)
-      }
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App issues error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
-    # Get user's pull requests
-    # @param access_token [String] The GitHub access token
-    # @param state [String] State: open, closed, all
-    # @return [Hash] Pull requests list or error
-    def get_user_pull_requests(access_token, state: "open")
-      client = client(access_token)
-      query = "is:pr author:@me state:#{state}"
-      result = client.search_issues(query, sort: "updated", order: "desc")
-
-      {
-        success: true,
-        pull_requests: result.items.map(&:to_h)
-      }
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App PRs error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
-    # Create an issue comment
-    # @param access_token [String] The GitHub access token
+    # Check if a user is a collaborator on a repository.
+    # Uses installation token — fails closed (returns false on error).
+    # @param installation_id [Integer] The GitHub App installation ID
     # @param repo [String] Repository in "owner/repo" format
-    # @param issue_number [Integer] Issue or PR number
-    # @param body [String] Comment body
-    # @return [Hash] Comment data or error
-    def create_issue_comment(access_token, repo:, issue_number:, body:)
-      client = client(access_token)
-      comment = client.add_comment(repo, issue_number, body)
-
-      {
-        success: true,
-        comment: comment.to_h
-      }
+    # @param username [String] GitHub username to check
+    # @return [Boolean] true if the user is a collaborator
+    def repo_collaborator?(installation_id, repo, username)
+      client = installation_client(installation_id)
+      client.collaborator?(repo, username)
     rescue Octokit::Error => e
-      Rails.logger.error "GitHub App comment error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
-    # Create an issue
-    # @param access_token [String] The GitHub access token
-    # @param repo [String] Repository in "owner/repo" format
-    # @param title [String] Issue title
-    # @param body [String] Issue body
-    # @param labels [Array<String>] Optional labels
-    # @return [Hash] Issue data or error
-    def create_issue(access_token, repo:, title:, body: nil, labels: [])
-      client = client(access_token)
-      issue = client.create_issue(repo, title, body, labels: labels)
-
-      {
-        success: true,
-        issue: issue.to_h
-      }
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App create issue error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
-    # Get repository details
-    # @param access_token [String] The GitHub access token
-    # @param repo [String] Repository in "owner/repo" format
-    # @return [Hash] Repository data or error
-    def get_repo(access_token, repo:)
-      client = client(access_token)
-      repository = client.repository(repo)
-
-      {
-        success: true,
-        repo: repository.to_h
-      }
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App get repo error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
-    # Get issue details
-    # @param access_token [String] The GitHub access token
-    # @param repo [String] Repository in "owner/repo" format
-    # @param issue_number [Integer] Issue or PR number
-    # @return [Hash] Issue data or error
-    def get_issue(access_token, repo:, issue_number:)
-      client = client(access_token)
-      issue = client.issue(repo, issue_number)
-
-      {
-        success: true,
-        issue: issue.to_h
-      }
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App get issue error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
-    # Get pull request details (with full PR-specific fields like head/base branches, mergeable state)
-    # @param access_token [String] The GitHub access token
-    # @param repo [String] Repository in "owner/repo" format
-    # @param pr_number [Integer] Pull request number
-    # @return [Hash] Pull request data or error
-    def get_pull_request(access_token, repo:, pr_number:)
-      client = client(access_token)
-      pr = client.pull_request(repo, pr_number)
-
-      {
-        success: true,
-        pull_request: pr.to_h
-      }
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App get pull request error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
-    # Get issue comments
-    # @param access_token [String] The GitHub access token
-    # @param repo [String] Repository in "owner/repo" format
-    # @param issue_number [Integer] Issue or PR number
-    # @return [Hash] Comments array or error
-    def get_issue_comments(access_token, repo:, issue_number:)
-      client = client(access_token)
-      comments = client.issue_comments(repo, issue_number)
-
-      {
-        success: true,
-        comments: comments.map(&:to_h)
-      }
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App get issue comments error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
-    # Search repositories
-    # @param access_token [String] The GitHub access token
-    # @param query [String] Search query
-    # @param options [Hash] Options like sort, order, per_page
-    # @return [Hash] Search results or error
-    def search_repos(access_token, query:, **options)
-      client = client(access_token)
-      result = client.search_repositories(query, options)
-
-      {
-        success: true,
-        repos: result.items.map(&:to_h),
-        total_count: result.total_count
-      }
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App search repos error: #{e.message}"
-      { success: false, error: e.message }
-    end
-
-    # Get file contents from repository
-    # @param access_token [String] The GitHub access token
-    # @param repo [String] Repository in "owner/repo" format
-    # @param path [String] File path in repository
-    # @param ref [String] Branch, tag, or commit (default: main branch)
-    # @return [Hash] File content or error
-    def get_file_contents(access_token, repo:, path:, ref: nil)
-      client = client(access_token)
-      options = ref ? { ref: ref } : {}
-      content = client.contents(repo, path: path, **options)
-
-      {
-        success: true,
-        content: content.to_h,
-        decoded_content: Base64.decode64(content.content)
-      }
-    rescue Octokit::Error => e
-      Rails.logger.error "GitHub App get file error: #{e.message}"
-      { success: false, error: e.message }
+      Rails.logger.warn "[Github::App] Collaborator check failed for #{username} on #{repo}: #{e.message}"
+      false
     end
 
     # Add a reaction to an issue comment (using installation token - shows as bot)
@@ -465,6 +272,18 @@ module Github
     end
 
     private
+
+    # Generate a JWT for GitHub App authentication.
+    # Uses the App's private key (RS256). Valid for 10 minutes.
+    # @return [String] Encoded JWT
+    def generate_jwt
+      payload = {
+        iat: Time.now.to_i - 60,
+        exp: Time.now.to_i + (10 * 60),
+        iss: app_id.to_s
+      }
+      JWT.encode(payload, OpenSSL::PKey::RSA.new(private_key), "RS256")
+    end
 
     # Parse token response from GitHub
     def parse_token_response(data)

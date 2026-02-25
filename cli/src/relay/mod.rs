@@ -50,7 +50,7 @@ pub mod state;
 pub mod stream_mux;
 pub mod types;
 
-pub use state::{build_agent_info, build_worktree_info, BrowserState};
+pub use state::BrowserState;
 
 pub use types::{AgentInfo, BrowserCommand, BrowserResize, SessionInfo, TerminalMessage, WorktreeInfo};
 

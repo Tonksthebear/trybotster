@@ -150,6 +150,12 @@ pub struct PtySessionHandle {
 
     /// Forwarding port (if configured).
     port: Option<u16>,
+
+    /// Message delivery state (created lazily on first send_message).
+    delivery: Arc<std::sync::OnceLock<Arc<crate::agent::message_delivery::MessageDeliveryState>>>,
+
+    /// Hub event sender for delivery task notifications.
+    hub_event_tx: HubEventSender,
 }
 
 impl std::fmt::Debug for PtySessionHandle {
@@ -230,6 +236,51 @@ impl LuaUserData for PtySessionHandle {
             Ok((rows, cols))
         });
 
+        // session:cursor_visible() -> boolean
+        // Returns true when the PTY's cursor is visible (free-text input expected),
+        // false when hidden (generation, selection UI, or no input expected).
+        // Reads directly from the vt100 shadow screen state.
+        methods.add_method("cursor_visible", |_, this, ()| {
+            let parser = this
+                .shadow_screen
+                .lock()
+                .expect("PtySessionHandle shadow_screen lock poisoned");
+            Ok(!parser.screen().hide_cursor())
+        });
+
+        // session:send_message(text) - Queue a message for probe-based delivery.
+        // The message is delivered when the PTY is accepting free-text input.
+        // Returns immediately; delivery happens asynchronously.
+        methods.add_method("send_message", |_, this, text: LuaString| {
+            use crate::agent::message_delivery::{MessageDeliveryState, spawn_delivery_task};
+
+            let text_str = text.to_str()
+                .map_err(|e| LuaError::runtime(format!("Invalid UTF-8 in message: {e}")))?
+                .to_string();
+
+            log::info!("[PtySessionHandle] send_message called ({} bytes)", text_str.len());
+
+            let delivery = this.delivery.get_or_init(|| {
+                log::info!("[PtySessionHandle] Spawning delivery task");
+                let state = Arc::new(MessageDeliveryState::new());
+                let hub_tx = this.hub_event_tx
+                    .lock()
+                    .expect("hub_event_tx lock poisoned")
+                    .clone();
+                let _handle = spawn_delivery_task(
+                    Arc::clone(&state),
+                    Arc::clone(&this.shared_state),
+                    this.event_tx.clone(),
+                    hub_tx,
+                    Arc::clone(&this.kitty_enabled),
+                );
+                state
+            });
+
+            delivery.enqueue(text_str);
+            Ok(())
+        });
+
         // session:get_snapshot() -> string (clean ANSI bytes)
         // Also aliased as get_scrollback for backwards compatibility.
         methods.add_method("get_snapshot", |lua, this, ()| {
@@ -266,6 +317,15 @@ impl LuaUserData for PtySessionHandle {
                 .lock()
                 .expect("PtySessionHandle shared_state lock poisoned");
             Ok(state.writer.is_some())
+        });
+
+        // session:kitty_enabled() -> boolean
+        //
+        // Returns true when the PTY's child process has activated kitty
+        // keyboard protocol. Used by notification writers to send the
+        // correct Enter key encoding (CSI 13 u vs raw \r).
+        methods.add_method("kitty_enabled", |_, this, ()| {
+            Ok(this.kitty_enabled.load(std::sync::atomic::Ordering::Relaxed))
         });
 
         // session:kill() - Kill the child process.
@@ -791,6 +851,8 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
                 kitty_enabled,
                 resize_pending,
                 port: session_port,
+                delivery: Arc::new(std::sync::OnceLock::new()),
+                hub_event_tx: tx_spawn.clone(),
             };
 
             Ok(handle)
@@ -1231,6 +1293,8 @@ mod tests {
             kitty_enabled,
             resize_pending,
             port: None,
+            delivery: Arc::new(std::sync::OnceLock::new()),
+            hub_event_tx: crate::lua::primitives::new_hub_event_sender(),
         }
     }
 
@@ -1270,6 +1334,69 @@ mod tests {
             .eval()
             .expect("dimensions should work after resize");
         assert_eq!(result, (40, 120));
+    }
+
+    #[test]
+    fn test_pty_session_handle_cursor_visible_default() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle();
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        // Default state: cursor should be visible
+        let result: bool = lua
+            .load("return session:cursor_visible()")
+            .eval()
+            .expect("cursor_visible should work");
+        assert!(result, "Cursor should be visible by default");
+    }
+
+    #[test]
+    fn test_pty_session_handle_cursor_hidden() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle();
+
+        // Send DECTCEM hide cursor sequence to shadow screen
+        handle
+            .shadow_screen
+            .lock()
+            .expect("shadow_screen lock")
+            .process(b"\x1b[?25l");
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        let result: bool = lua
+            .load("return session:cursor_visible()")
+            .eval()
+            .expect("cursor_visible should work");
+        assert!(!result, "Cursor should be hidden after DECTCEM hide");
+    }
+
+    #[test]
+    fn test_pty_session_handle_cursor_show_after_hide() {
+        let lua = Lua::new();
+        let handle = create_test_session_handle();
+
+        // Hide then show cursor
+        handle
+            .shadow_screen
+            .lock()
+            .expect("shadow_screen lock")
+            .process(b"\x1b[?25l\x1b[?25h");
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        let result: bool = lua
+            .load("return session:cursor_visible()")
+            .eval()
+            .expect("cursor_visible should work");
+        assert!(result, "Cursor should be visible after show sequence");
     }
 
     #[test]

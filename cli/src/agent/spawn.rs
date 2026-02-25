@@ -148,6 +148,8 @@ pub fn spawn_reader_thread(
         let mut reader = reader;
         log::info!("{label} PTY reader thread started");
         let mut buf = [0u8; 4096];
+        // Track cursor visibility state for transition-only emission.
+        let mut last_cursor_visible: Option<bool> = None;
 
         loop {
             match reader.read(&mut buf) {
@@ -193,6 +195,15 @@ pub fn spawn_reader_thread(
                     // can respond with the current terminal focus state.
                     if scan_focus_reporting_enabled(chunk) {
                         let _ = event_tx.send(PtyEvent::focus_requested());
+                    }
+
+                    // Detect DECTCEM cursor visibility changes (CSI ? 25 h/l).
+                    // Only emit on transitions to avoid flooding during TUI redraws.
+                    if let Some(visible) = scan_cursor_visibility(chunk) {
+                        if last_cursor_visible != Some(visible) {
+                            last_cursor_visible = Some(visible);
+                            let _ = event_tx.send(PtyEvent::cursor_visibility_changed(visible));
+                        }
                     }
 
                     // Feed PTY bytes to shadow screen for parsed state tracking.
@@ -356,6 +367,31 @@ pub fn scan_focus_reporting_enabled(data: &[u8]) -> bool {
     // Match the byte sequence: ESC [ ? 1 0 0 4 h
     let needle = b"\x1b[?1004h";
     data.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Scan PTY output for DECTCEM cursor visibility sequences.
+///
+/// Detects `CSI ? 25 h` (show cursor) and `CSI ? 25 l` (hide cursor).
+/// Returns the last visibility state found in the buffer, since a single
+/// chunk may contain multiple show/hide sequences (e.g., during TUI redraws).
+///
+/// Returns `Some(true)` for show, `Some(false)` for hide, `None` if no
+/// DECTCEM sequence found.
+pub fn scan_cursor_visibility(data: &[u8]) -> Option<bool> {
+    let show = b"\x1b[?25h";
+    let hide = b"\x1b[?25l";
+    let mut result = None;
+
+    // Find last occurrence of either sequence (last wins, like kitty scanning).
+    for i in 0..data.len() {
+        if data[i..].starts_with(show) {
+            result = Some(true);
+        } else if data[i..].starts_with(hide) {
+            result = Some(false);
+        }
+    }
+
+    result
 }
 
 /// Scan PTY output for OSC 0/2 window title sequences.
@@ -869,6 +905,51 @@ mod tests {
         assert_eq!(scan_kitty_keyboard_state(b"\x1b[>0u"), Some(true));
         assert_eq!(scan_kitty_keyboard_state(b"\x1b[>3u"), Some(true));
         assert_eq!(scan_kitty_keyboard_state(b"\x1b[>31u"), Some(true));
+    }
+
+    // =========================================================================
+    // Cursor Visibility Scanner Tests (DECTCEM CSI ? 25 h/l)
+    // =========================================================================
+
+    #[test]
+    fn test_scan_cursor_show() {
+        assert_eq!(scan_cursor_visibility(b"\x1b[?25h"), Some(true));
+    }
+
+    #[test]
+    fn test_scan_cursor_hide() {
+        assert_eq!(scan_cursor_visibility(b"\x1b[?25l"), Some(false));
+    }
+
+    #[test]
+    fn test_scan_cursor_last_wins() {
+        // Hide then show → show wins
+        let mut data = Vec::new();
+        data.extend(b"\x1b[?25l");
+        data.extend(b"\x1b[?25h");
+        assert_eq!(scan_cursor_visibility(&data), Some(true));
+
+        // Show then hide → hide wins
+        let mut data2 = Vec::new();
+        data2.extend(b"\x1b[?25h");
+        data2.extend(b"\x1b[?25l");
+        assert_eq!(scan_cursor_visibility(&data2), Some(false));
+    }
+
+    #[test]
+    fn test_scan_cursor_embedded_in_output() {
+        let mut data = Vec::new();
+        data.extend(b"\x1b[32msome green text\x1b[0m");
+        data.extend(b"\x1b[?25l"); // hide cursor
+        data.extend(b"more output");
+        assert_eq!(scan_cursor_visibility(&data), Some(false));
+    }
+
+    #[test]
+    fn test_scan_cursor_no_sequences() {
+        assert_eq!(scan_cursor_visibility(b"plain text"), None);
+        assert_eq!(scan_cursor_visibility(b"\x1b[32m"), None);
+        assert_eq!(scan_cursor_visibility(b""), None);
     }
 
     // =========================================================================

@@ -34,6 +34,7 @@ module Integrations
           return false if comment_body.blank?
           return false if bot_author?(comment_author)
           return false unless mentioned_trybotster?(comment_body)
+          return false unless collaborator?(comment_author)
 
           true
         end

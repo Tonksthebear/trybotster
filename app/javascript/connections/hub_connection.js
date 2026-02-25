@@ -96,6 +96,15 @@ export class HubConnection extends Connection {
         });
         break;
 
+      case "session_types":
+        this.emit("sessionTypes", {
+          agentId: message.agent_id,
+          sessionTypes: Array.isArray(message.session_types)
+            ? message.session_types
+            : [],
+        });
+        break;
+
       default:
         // Route fs:* and template:* responses to one-shot listeners keyed by request_id
         if (message.type?.startsWith("fs:") && message.request_id) {
@@ -168,6 +177,38 @@ export class HubConnection extends Connection {
    */
   requestProfiles() {
     return this.send("list_profiles");
+  }
+
+  /**
+   * Add a PTY session to a running agent.
+   * @param {string} agentId - Agent key
+   * @param {string} sessionType - Session type name (e.g., "shell", "server")
+   */
+  addSession(agentId, sessionType) {
+    return this.send("add_session", {
+      agent_id: agentId,
+      session_type: sessionType,
+    });
+  }
+
+  /**
+   * Remove a PTY session from a running agent.
+   * @param {string} agentId - Agent key
+   * @param {number} ptyIndex - 0-based PTY index to remove (must be > 0)
+   */
+  removeSession(agentId, ptyIndex) {
+    return this.send("remove_session", {
+      agent_id: agentId,
+      pty_index: ptyIndex,
+    });
+  }
+
+  /**
+   * Request available session types for an agent.
+   * @param {string} agentId - Agent key
+   */
+  requestSessionTypes(agentId) {
+    return this.send("list_session_types", { agent_id: agentId });
   }
 
   /**
@@ -267,6 +308,14 @@ export class HubConnection extends Connection {
 
   listInstalledTemplates() {
     return this.templateRequest("template:list");
+  }
+
+  reloadPlugin(pluginName) {
+    return this.templateRequest("plugin:reload", { plugin_name: pluginName });
+  }
+
+  loadPlugin(pluginName) {
+    return this.templateRequest("plugin:load", { plugin_name: pluginName });
   }
 
   // ========== Convenience event helpers ==========

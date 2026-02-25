@@ -739,6 +739,43 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// File writer that truncates when the log exceeds a size cap.
+///
+/// Prevents unbounded log growth during long-running hub sessions.
+/// When the cap is exceeded, the file is truncated and logging resumes
+/// from the beginning with a rotation marker.
+struct CappedFileWriter {
+    file: std::fs::File,
+    bytes_written: u64,
+    cap: u64,
+}
+
+impl CappedFileWriter {
+    fn new(file: std::fs::File, cap: u64) -> Self {
+        Self { file, bytes_written: 0, cap }
+    }
+}
+
+impl std::io::Write for CappedFileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.bytes_written + buf.len() as u64 > self.cap {
+            use std::io::{Seek, SeekFrom};
+            self.file.seek(SeekFrom::Start(0))?;
+            self.file.set_len(0)?;
+            let marker = b"--- log rotated (cap reached) ---\n";
+            self.file.write_all(marker)?;
+            self.bytes_written = marker.len() as u64;
+        }
+        let n = self.file.write(buf)?;
+        self.bytes_written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 fn main() -> Result<()> {
     // Raise fd limit for WebRTC. Each peer connection opens ~15 UDP sockets
     // for ICE gathering, and webrtc-rs close() takes up to 60s for SCTP
@@ -763,8 +800,9 @@ fn main() -> Result<()> {
     };
     let log_file = std::fs::File::create(&log_path)
         .unwrap_or_else(|_| panic!("Failed to create log file at {:?}", log_path));
+    let capped_writer = CappedFileWriter::new(log_file, 10 * 1024 * 1024); // 10 MB
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Pipe(Box::new(log_file)))
+        .target(env_logger::Target::Pipe(Box::new(capped_writer)))
         .format_timestamp_secs()
         .init();
 

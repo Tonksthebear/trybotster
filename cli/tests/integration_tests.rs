@@ -40,7 +40,6 @@ fn create_test_agent() -> (Agent, TempDir) {
     let agent = Agent::new(
         uuid::Uuid::new_v4(),
         "test/repo".to_string(),
-        Some(1),
         "test-branch".to_string(),
         temp_dir.path().to_path_buf(),
     );
@@ -395,7 +394,6 @@ fn test_spawn_real_pty_with_init_script() {
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "test-branch".to_string(),
             temp_dir.path().to_path_buf(),
         );
@@ -468,7 +466,6 @@ fn test_spawn_server_pty() {
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "test-branch".to_string(),
             temp_dir.path().to_path_buf(),
         );
@@ -544,7 +541,6 @@ fn test_real_pty_view_switching() {
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "test-branch".to_string(),
             temp_dir.path().to_path_buf(),
         );
@@ -820,7 +816,6 @@ fn test_spawned_pty_output_reaches_scrollback() {
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "test-branch".to_string(),
             temp_dir.path().to_path_buf(),
         );
@@ -884,7 +879,6 @@ fn test_input_written_to_pty_appears_in_scrollback() {
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "test-branch".to_string(),
             temp_dir.path().to_path_buf(),
         );

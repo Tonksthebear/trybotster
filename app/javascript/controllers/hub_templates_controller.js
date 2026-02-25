@@ -103,6 +103,8 @@ export default class extends Controller {
       } else {
         await this.hub.installTemplate(dest, panel.dataset.content, scope);
         scopeSet.add(name);
+        // Auto-load the plugin so it runs without a hub reboot
+        await this.hub.loadPlugin(name).catch(() => {});
       }
       this.#syncState(slug, dest);
       this.dispatch("templateChanged");
@@ -127,6 +129,26 @@ export default class extends Controller {
     // Update install button text
     const dest = this.previewPanelTargets.find((p) => p.dataset.slug === slug)?.dataset.dest;
     if (dest) this.#syncState(slug, dest);
+  }
+
+  async reloadPlugin(event) {
+    const btn = event.currentTarget;
+    const slug = btn.dataset.slug;
+    const panel = this.previewPanelTargets.find((p) => p.dataset.slug === slug);
+    if (!panel || !this.hub) return;
+
+    const name = this.#pluginName(panel.dataset.dest);
+    btn.disabled = true;
+    btn.textContent = "Reloading...";
+
+    try {
+      await this.hub.reloadPlugin(name);
+      btn.textContent = "Reloaded";
+      setTimeout(() => { btn.textContent = "Reload"; btn.disabled = false; }, 1500);
+    } catch (error) {
+      btn.textContent = "Failed";
+      setTimeout(() => { btn.textContent = "Reload"; btn.disabled = false; }, 2000);
+    }
   }
 
   recheckInstalled() {

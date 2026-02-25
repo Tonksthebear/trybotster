@@ -116,6 +116,13 @@ pub struct SharedPtyState {
 
     /// Current PTY dimensions (rows, cols).
     pub(crate) dimensions: (u16, u16),
+
+    /// Timestamp (ms since epoch) of last human PTY input.
+    ///
+    /// Stamped by `write_input_direct()` on every keystroke from a human
+    /// client (TUI, browser, socket). Read by the message delivery task
+    /// to defer probe injection while a human is actively typing.
+    pub(crate) last_human_input_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl std::fmt::Debug for SharedPtyState {
@@ -273,6 +280,7 @@ impl PtySession {
             master_pty: None,
             writer: None,
             dimensions: (rows, cols),
+            last_human_input_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         };
 
         Self {
@@ -1333,6 +1341,7 @@ mod tests {
             master_pty: None,
             writer: None,
             dimensions: (24, 80),
+            last_human_input_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }));
 
         process_single_command(
