@@ -120,6 +120,32 @@ impl Hub {
             HubEvent::LuaActionCableRequest(request) => {
                 self.process_single_action_cable_request(request);
             }
+            HubEvent::LuaHubClientRequest(request) => {
+                self.process_hub_client_request(request);
+            }
+            HubEvent::HubClientMessage { connection_id, message } => {
+                use crate::lua::primitives::hub_client;
+                hub_client::fire_hub_client_message(
+                    self.lua.lua_ref(),
+                    self.lua.hub_client_callback_registry(),
+                    &connection_id,
+                    message,
+                );
+            }
+            HubEvent::HubClientDisconnected { connection_id } => {
+                if self.lua_hub_client_connections.remove(&connection_id).is_some() {
+                    // Clean up the callback registry entry and release the RegistryKey.
+                    if let Ok(mut reg) = self.lua.hub_client_callback_registry().lock() {
+                        if let Some(key) = reg.remove(&connection_id) {
+                            let _ = self.lua.lua_ref().remove_registry_value(key);
+                        }
+                    }
+                    log::info!(
+                        "[HubClient] Connection '{}' disconnected (remote EOF)",
+                        connection_id
+                    );
+                }
+            }
             HubEvent::LuaPushRequest { payload } => {
                 self.handle_lua_push_request(payload);
             }
@@ -1465,6 +1491,204 @@ impl Hub {
                 } else {
                     log::warn!(
                         "[ActionCable-Lua] Close failed: connection '{}' not found",
+                        connection_id
+                    );
+                }
+            }
+        }
+    }
+
+    /// Process a single hub client request from `HubEvent::LuaHubClientRequest`.
+    ///
+    /// Handles connect/send/close operations. When connecting, spawns read and
+    /// write tokio tasks. The read task sends `HubEvent::HubClientMessage` for
+    /// each incoming JSON frame and `HubEvent::HubClientDisconnected` on EOF.
+    fn process_hub_client_request(
+        &mut self,
+        request: crate::lua::primitives::HubClientRequest,
+    ) {
+        use crate::lua::primitives::hub_client::LuaHubClientConn;
+        use crate::lua::primitives::HubClientRequest;
+        use crate::socket::framing::{Frame, FrameDecoder};
+
+        match request {
+            HubClientRequest::Connect {
+                connection_id,
+                socket_path,
+            } => {
+                let hub_tx = self.hub_event_tx.clone();
+                let conn_id = connection_id.clone();
+                let handle = self.tokio_runtime.handle().clone();
+
+                let hub_tx2 = hub_tx.clone();
+                let conn_id2 = conn_id.clone();
+
+                // Use std UnixStream::connect (synchronous) and convert to tokio.
+                // Cannot use tokio's async connect here because we're inside the
+                // Hub's block_on event loop — nested block_on panics.
+                let std_stream = match std::os::unix::net::UnixStream::connect(&socket_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!(
+                            "[HubClient] Failed to connect to {}: {}",
+                            socket_path,
+                            e
+                        );
+                        return;
+                    }
+                };
+                if let Err(e) = std_stream.set_nonblocking(true) {
+                    log::warn!(
+                        "[HubClient] Failed to set nonblocking on {}: {}",
+                        socket_path,
+                        e
+                    );
+                    return;
+                }
+                let stream = match tokio::net::UnixStream::from_std(std_stream) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!(
+                            "[HubClient] Failed to convert to tokio stream for {}: {}",
+                            socket_path,
+                            e
+                        );
+                        return;
+                    }
+                };
+
+                let (read_half, write_half) = stream.into_split();
+                let (frame_tx, mut frame_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+                // Subscribe immediately (same as TuiBridge)
+                let sub_frame = Frame::Json(serde_json::json!({
+                    "type": "subscribe",
+                    "channel": "hub",
+                    "subscriptionId": format!("hub_client_{}", conn_id)
+                }));
+                let _ = frame_tx.send(sub_frame.encode());
+
+                // Spawn write task
+                let write_handle = handle.spawn(async move {
+                    let mut writer = tokio::io::BufWriter::new(write_half);
+                    while let Some(data) = frame_rx.recv().await {
+                        use tokio::io::AsyncWriteExt;
+                        if writer.write_all(&data).await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                // Spawn read task
+                let read_handle = handle.spawn(async move {
+                    let mut reader = tokio::io::BufReader::new(read_half);
+                    let mut decoder = FrameDecoder::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        use tokio::io::AsyncReadExt;
+                        match reader.read(&mut buf).await {
+                            Ok(0) | Err(_) => {
+                                let _ = hub_tx2.send(
+                                    super::events::HubEvent::HubClientDisconnected {
+                                        connection_id: conn_id2.clone(),
+                                    },
+                                );
+                                break;
+                            }
+                            Ok(n) => {
+                                match decoder.feed(&buf[..n]) {
+                                    Ok(frames) => {
+                                        for frame in frames {
+                                            if let Frame::Json(v) = frame {
+                                                let _ = hub_tx2.send(
+                                                    super::events::HubEvent::HubClientMessage {
+                                                        connection_id: conn_id2.clone(),
+                                                        message: v,
+                                                    },
+                                                );
+                                            }
+                                            // Other frame types (PtyOutput etc) could be handled later
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[HubClient] Frame decode error on '{}': {}",
+                                            conn_id2,
+                                            e
+                                        );
+                                        let _ = hub_tx2.send(
+                                            super::events::HubEvent::HubClientDisconnected {
+                                                connection_id: conn_id2.clone(),
+                                            },
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // Store connection
+                self.lua_hub_client_connections.insert(
+                    connection_id.clone(),
+                    LuaHubClientConn {
+                        frame_tx,
+                        read_handle,
+                        write_handle,
+                    },
+                );
+                log::info!(
+                    "[HubClient] Connection '{}' opened to '{}'",
+                    connection_id,
+                    socket_path
+                );
+            }
+
+            HubClientRequest::Send {
+                connection_id,
+                data,
+            } => {
+                if let Some(conn) = self.lua_hub_client_connections.get(&connection_id) {
+                    let frame = Frame::Json(data);
+                    if conn.frame_tx.send(frame.encode()).is_err() {
+                        log::warn!(
+                            "[HubClient] Send failed: write task closed for '{}'",
+                            connection_id
+                        );
+                    } else {
+                        log::trace!(
+                            "[HubClient] Sent frame to '{}'",
+                            connection_id
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "[HubClient] Send failed: connection '{}' not found",
+                        connection_id
+                    );
+                }
+            }
+
+            HubClientRequest::Close { connection_id } => {
+                if self.lua_hub_client_connections.remove(&connection_id).is_some() {
+                    // Clean up the callback registry entry and release the RegistryKey.
+                    if let Ok(mut reg) = self.lua.hub_client_callback_registry().lock() {
+                        if let Some(key) = reg.remove(&connection_id) {
+                            let _ = self.lua.lua_ref().remove_registry_value(key);
+                        }
+                    }
+                    log::info!(
+                        "[HubClient] Connection '{}' closed",
+                        connection_id
+                    );
+                } else {
+                    log::warn!(
+                        "[HubClient] Close failed: connection '{}' not found",
                         connection_id
                     );
                 }
