@@ -35,24 +35,16 @@ module Hubs
         return
       end
 
-      # Check if user has GitHub authorization
-      unless current_api_user.github_app_authorized?
-        render json: { error: "GitHub App not authorized" }, status: :unauthorized
-        return
-      end
-
-      # Get installation for this repo
-      access_token = current_api_user.valid_github_app_token
-      installation_result = Github::App.get_installation_for_repo(access_token, repo)
-
-      unless installation_result[:success]
-        render json: { error: installation_result[:error] }, status: :unprocessable_entity
+      # Check if GitHub App is installed on this repo
+      installation_id = ::Github::App.installation_id_for_repo(repo)
+      unless installation_id
+        render json: { error: "GitHub App is not installed on #{repo}" }, status: :unprocessable_entity
         return
       end
 
       # Post comment as bot
       comment_body = build_notification_comment(notification_type)
-      result = post_github_comment(installation_result[:installation_id], repo, issue_number, comment_body)
+      result = post_github_comment(installation_id, repo, issue_number, comment_body)
 
       if result[:success]
         Rails.logger.info "Posted agent notification to #{repo}##{issue_number}: #{notification_type}"

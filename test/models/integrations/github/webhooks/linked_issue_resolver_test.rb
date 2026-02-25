@@ -115,31 +115,18 @@ class Integrations::Github::Webhooks::LinkedIssueResolverTest < ActiveSupport::T
     end
   end
 
-  test "call returns nil when no valid github token" do
-    chain = WhereChain.new(nil)
-
-    User.stub :where, chain do
+  test "call returns nil when installation not found" do
+    Github::App.stub :installation_id_for_repo, nil do
       result = @resolver.call
       assert_nil result
     end
   end
 
-  test "call returns nil when installation not found" do
-    stub_valid_token do
-      Github::App.stub :get_installation_for_repo, { success: false } do
+  test "call returns nil when installation token fails" do
+    Github::App.stub :installation_id_for_repo, 111 do
+      Github::App.stub :installation_client, ->(*) { raise "Failed to get installation token: bad token" } do
         result = @resolver.call
         assert_nil result
-      end
-    end
-  end
-
-  test "call returns nil when installation token fails" do
-    stub_valid_token do
-      Github::App.stub :get_installation_for_repo, { success: true, installation_id: 111 } do
-        Github::App.stub :get_installation_token, { success: false, error: "bad token" } do
-          result = @resolver.call
-          assert_nil result
-        end
       end
     end
   end
@@ -159,11 +146,9 @@ class Integrations::Github::Webhooks::LinkedIssueResolverTest < ActiveSupport::T
   end
 
   test "call returns nil and does not raise on API error" do
-    stub_valid_token do
-      Github::App.stub :get_installation_for_repo, ->(*) { raise StandardError, "boom" } do
-        result = @resolver.call
-        assert_nil result
-      end
+    Github::App.stub :installation_id_for_repo, ->(*) { raise StandardError, "boom" } do
+      result = @resolver.call
+      assert_nil result
     end
   end
 
@@ -174,45 +159,18 @@ class Integrations::Github::Webhooks::LinkedIssueResolverTest < ActiveSupport::T
     @resolver.send(:extract_first_linked_issue, pr_body)
   end
 
-  # Stubs the full GitHub API chain: token lookup, installation, and PR fetch.
+  # Stubs the GitHub API chain: installation lookup and client.
   def stub_github_api(pr_body:)
     pr_double = OpenStruct.new(body: pr_body)
     client_double = Minitest::Mock.new
     client_double.expect(:pull_request, pr_double, [ @repo, @pr_number ])
 
-    stub_valid_token do
-      Github::App.stub :get_installation_for_repo, { success: true, installation_id: 111 } do
-        Github::App.stub :get_installation_token, { success: true, token: "inst_token_123" } do
-          Github::App.stub :client, client_double do
-            yield
-          end
-        end
+    Github::App.stub :installation_id_for_repo, 111 do
+      Github::App.stub :installation_client, client_double do
+        yield
       end
     end
 
     client_double.verify
-  end
-
-  # Builds a chainable double for User.where.not(github_app_token: nil).first
-  class WhereChain
-    def initialize(user)
-      @user = user
-    end
-
-    def not(*)
-      self
-    end
-
-    def first
-      @user
-    end
-  end
-
-  # Stubs User.where.not(github_app_token: nil).first to return a user with a valid token.
-  def stub_valid_token(&block)
-    user_double = OpenStruct.new(valid_github_app_token: "test_token_abc")
-    chain = WhereChain.new(user_double)
-
-    User.stub :where, chain, &block
   end
 end

@@ -21,7 +21,8 @@ require_relative "cli_integration_test_case"
 # - Message acknowledgment flow
 #
 # What's STUBBED (unavoidable):
-# - Github::App.get_installation_for_repo (requires real GitHub App)
+# - Github::App.installation_id_for_repo (requires real GitHub App)
+# - Github::App.repo_collaborator? (requires real GitHub App)
 # - Github::App.create_issue_reaction / create_comment_reaction (GitHub API)
 #
 class CliGithubIntegrationTest < CliIntegrationTestCase
@@ -95,6 +96,54 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     end
   end
 
+  # === Follow-up Comment Routing ===
+
+  test "follow-up comment on same issue notifies existing agent instead of spawning new one" do
+    with_stubbed_github do
+      # Use a long-lived session so the agent stays alive for the follow-up
+      install_long_lived_agent_session(@git_repo_path || nil)
+
+      first_message = create_github_message(issue_number: 500, prompt: "Initial task")
+
+      # Don't set BOTSTER_REPO env var — match production where the CLI
+      # detects the repo from the git remote. This exposes the repo mismatch
+      # bug where agents.lua stored "unknown/repo" instead of the real name.
+      cli = start_cli_in_git_repo(@hub, timeout: 30, skip_repo_env: true)
+      assert_message_acknowledged(first_message, timeout: 20)
+
+      # Wait for the agent to be FULLY spawned (not just worktree created).
+      # Agent.new() registers metadata only after worktree_created fires and
+      # spawn_agent runs. The "Broadcasting agent_created" log confirms the
+      # agent is registered and findable by metadata queries.
+      wait_until(
+        timeout: 20,
+        message: -> { "Agent not fully spawned.\nCLI logs:\n#{cli.log_contents(lines: 80)}" }
+      ) { cli.log_contents(lines: 100)&.match?(/Broadcasting agent_created/) }
+
+      # Send a follow-up comment on the same issue
+      followup_message = create_github_message(
+        issue_number: 500,
+        prompt: "Follow-up question about the task"
+      )
+
+      # Follow-up should be acknowledged (routed to existing agent)
+      assert_message_acknowledged(followup_message, timeout: 20)
+
+      # Verify the plugin notified the existing agent (not spawned a new one).
+      # agents.lua logs "Sent notification to existing agent" or
+      # github.lua logs "notified existing agent" depending on which layer catches it.
+      log = cli.log_contents(lines: 200)
+      assert_match(/notified existing agent|Sent notification to existing agent/i, log,
+        "Follow-up should notify existing agent, not spawn a new one.\nCLI logs:\n#{log}")
+
+      # Only one worktree should exist (no second agent for same issue)
+      repo_safe = @test_repo.tr("/", "-")
+      worktree_dirs = Dir.glob(File.join(@worktree_base, "*issue-500*"))
+      assert_equal 1, worktree_dirs.size,
+        "Should have exactly one worktree for issue 500, got: #{worktree_dirs}"
+    end
+  end
+
   test "multiple agents can run concurrently" do
     with_stubbed_github do
       messages = [ 111, 222, 333 ].map do |issue_num|
@@ -140,6 +189,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     setup_git_repo(temp_dir, TEST_REPO)
     install_github_plugin(temp_dir)
     install_agent_session(temp_dir)
+    write_long_lived_session(temp_dir) if @use_long_lived_session
 
     @test_temp_dirs ||= []
     @test_temp_dirs << temp_dir
@@ -163,10 +213,17 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => api_key,
       "BOTSTER_HUB_ID" => hub.identifier,
-      "BOTSTER_REPO" => TEST_REPO,
       "BOTSTER_WORKTREE_BASE" => worktree_base,
-      "RUST_LOG" => options[:log_level] || "info,botster=debug"
     }
+
+    # By default, set BOTSTER_REPO explicitly. Tests can opt out with
+    # skip_repo_env: true to match production where BOTSTER_REPO isn't
+    # set and the CLI detects the repo from the git remote instead.
+    unless options[:skip_repo_env]
+      env["BOTSTER_REPO"] = TEST_REPO
+    end
+
+    env["RUST_LOG"] = options[:log_level] || "info,botster=debug"
 
     Rails.logger.info "[CliGithubTest] Starting CLI in git repo: #{temp_dir}"
     Rails.logger.info "[CliGithubTest] Worktree base: #{worktree_base}"
@@ -242,6 +299,10 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       system("git config user.email 'test@example.com'", out: File::NULL, err: File::NULL)
       system("git config user.name 'Test User'", out: File::NULL, err: File::NULL)
 
+      # Add a fake origin remote so hub.detect_repo() can parse "owner/repo"
+      # from the remote URL (same as production where BOTSTER_REPO may not be set).
+      system("git remote add origin https://github.com/#{repo_name}.git", out: File::NULL, err: File::NULL)
+
       File.write("README.md", "# Test Repo\n\nRepo: #{repo_name}")
 
       system("git add .", out: File::NULL, err: File::NULL)
@@ -306,6 +367,40 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     Rails.logger.info "[CliGithubTest] Installed agent session config"
   end
 
+  # Install a long-lived agent session that stays alive reading stdin.
+  # Used for tests that need the agent to still be running when follow-up messages arrive.
+  def install_long_lived_agent_session(repo_path)
+    # This may be called before start_cli_in_git_repo sets up @git_repo_path,
+    # so we defer actual installation — mark a flag and install during repo setup.
+    @use_long_lived_session = true
+  end
+
+  def write_long_lived_session(repo_path)
+    session_dir = File.join(repo_path, ".botster", "shared", "sessions", "agent")
+    FileUtils.mkdir_p(session_dir)
+
+    File.write(File.join(session_dir, "initialization"), <<~BASH)
+      #!/bin/bash
+      echo "=== Test Botster Init (long-lived) ==="
+      echo "BOTSTER_WORKTREE_PATH: $BOTSTER_WORKTREE_PATH"
+
+      # Stay alive reading stdin so follow-up messages can be written to PTY
+      while IFS= read -r line || sleep 1; do
+        if [ -n "$line" ]; then
+          echo "RECEIVED: $line"
+        fi
+      done
+    BASH
+    FileUtils.chmod(0o755, File.join(session_dir, "initialization"))
+
+    Dir.chdir(repo_path) do
+      system("git add .botster/", out: File::NULL, err: File::NULL)
+      system("git commit --amend --no-edit", out: File::NULL, err: File::NULL)
+    end
+
+    Rails.logger.info "[CliGithubTest] Installed long-lived agent session"
+  end
+
   def assert_message_acknowledged(message, timeout: 15)
     wait_until(
       timeout: timeout,
@@ -319,6 +414,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
   end
 
   def teardown
+    @use_long_lived_session = false
     @test_temp_dirs&.each do |path|
       FileUtils.rm_rf(path) if File.directory?(path)
     end

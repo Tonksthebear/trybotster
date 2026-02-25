@@ -2,75 +2,64 @@
 
 class GithubListIssuesTool < ApplicationMCPTool
   tool_name "github_list_issues"
-  description "List GitHub issues for the authenticated user. Can filter by assigned, created, mentioned, subscribed, or all. Can filter by state: open, closed, or all."
+  description "List GitHub issues for a repository. Can filter by state: open, closed, or all."
 
-  property :filter, type: "string", description: "Filter: assigned, created, mentioned, subscribed, all (default: assigned)", required: false
+  property :repo, type: "string", description: "Repository in 'owner/repo' format (e.g., 'octocat/Hello-World')", required: true
   property :state, type: "string", description: "State: open, closed, all (default: open)", required: false
 
+  validates :repo, format: { with: /\A[\w\-\.]+\/[\w\-\.]+\z/, message: "must be in 'owner/repo' format" }
+
   def perform
-    # Check if user has authorized GitHub App
-    unless current_user&.github_app_authorized?
-      report_error("GitHub App not authorized. Please authorize at /github_app/authorize")
+    installation_id = ::Github::App.installation_id_for_repo(repo)
+    unless installation_id
+      report_error("GitHub App is not installed on #{repo}")
       return
     end
 
-    # Get valid token (auto-refreshes if needed)
-    token = current_user.valid_github_app_token
-    unless token
-      report_error("Failed to get valid GitHub token. Please re-authorize the GitHub App.")
-      return
-    end
-
-    filter_param = filter || "assigned"
+    client = ::Github::App.installation_client(installation_id)
     state_param = state || "open"
 
     # Detect client for user feedback
     client_info = detect_client_type
-    render(text: "Fetching #{filter_param} issues (#{state_param}) via #{client_info}...")
+    render(text: "Fetching #{state_param} issues for #{repo} (via #{client_info})...")
 
-    # Fetch issues using Octokit
-    result = Github::App.get_user_issues(token, filter: filter_param, state: state_param)
+    issues = client.list_issues(repo, state: state_param)
 
-    if result[:success]
-      issues = result[:issues]
-
-      if issues.empty?
-        render(text: "No issues found with filter '#{filter_param}' and state '#{state_param}'.")
-        return
-      end
-
-      render(text: "Found #{issues.count} issues:\n")
-
-      issues.each do |issue|
-        # Determine if it's a PR or issue
-        is_pr = issue["pull_request"].present?
-        icon = is_pr ? "🔀" : "🐛"
-
-        created_at = issue["created_at"].is_a?(String) ? Time.parse(issue["created_at"]) : issue["created_at"]
-        updated_at = issue["updated_at"].is_a?(String) ? Time.parse(issue["updated_at"]) : issue["updated_at"]
-
-        issue_info = [
-          "#{icon} ##{issue['number']}: #{issue['title']}",
-          "   Repository: #{issue['repository_url']&.split('/')&.last(2)&.join('/')}",
-          "   State: #{issue['state']} | Comments: #{issue['comments']}",
-          "   URL: #{issue['html_url']}",
-          "   Created: #{created_at.strftime('%Y-%m-%d %H:%M')}",
-          "   Updated: #{updated_at.strftime('%Y-%m-%d %H:%M')}"
-        ]
-
-        if issue["labels"]&.any?
-          labels = issue["labels"].map { |l| l["name"] }.join(", ")
-          issue_info << "   Labels: #{labels}"
-        end
-
-        render(text: issue_info.join("\n"))
-        render(text: "\n")
-      end
-
-      render(text: "📊 Summary: #{issues.count} issues retrieved (filter: #{filter_param}, state: #{state_param})")
-    else
-      report_error("Failed to fetch issues: #{result[:error]}")
+    if issues.empty?
+      render(text: "No issues found in #{repo} with state '#{state_param}'.")
+      return
     end
+
+    render(text: "Found #{issues.count} issues:\n")
+
+    issues.each do |issue|
+      # Determine if it's a PR or issue
+      is_pr = issue[:pull_request].present?
+      icon = is_pr ? "🔀" : "🐛"
+
+      created_at = issue[:created_at].is_a?(String) ? Time.parse(issue[:created_at]) : issue[:created_at]
+      updated_at = issue[:updated_at].is_a?(String) ? Time.parse(issue[:updated_at]) : issue[:updated_at]
+
+      issue_info = [
+        "#{icon} ##{issue[:number]}: #{issue[:title]}",
+        "   State: #{issue[:state]} | Comments: #{issue[:comments]}",
+        "   URL: #{issue[:html_url]}",
+        "   Created: #{created_at.strftime('%Y-%m-%d %H:%M')}",
+        "   Updated: #{updated_at.strftime('%Y-%m-%d %H:%M')}"
+      ]
+
+      if issue[:labels]&.any?
+        labels = issue[:labels].map { |l| l[:name] }.join(", ")
+        issue_info << "   Labels: #{labels}"
+      end
+
+      render(text: issue_info.join("\n"))
+      render(text: "\n")
+    end
+
+    render(text: "📊 Summary: #{issues.count} issues retrieved (state: #{state_param})")
+  rescue Octokit::Error => e
+    report_error("Failed to fetch issues: #{e.message}")
   rescue => e
     report_error("Error fetching issues: #{e.message}")
   end

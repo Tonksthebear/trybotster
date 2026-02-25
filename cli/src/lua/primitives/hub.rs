@@ -190,11 +190,14 @@ pub(crate) fn register(
             }
 
             let pty_count = pty_handles.len();
-            let agent_index = cache2.len();
-            let handle = AgentPtys::new(agent_key.clone(), pty_handles, agent_index);
+            // Use a placeholder index; add_agent returns the actual position
+            // (which may differ on replace when agent already exists).
+            let handle = AgentPtys::new(agent_key.clone(), pty_handles, 0);
 
             match cache2.add_agent(handle) {
                 Some(idx) => {
+                    // Update the agent_index to match actual position
+                    cache2.update_agent_index(&agent_key, idx);
                     log::info!("[Lua] Registered agent '{}' at index {} with {} PTY(s)",
                         agent_key, idx, pty_count);
                     Ok(idx)

@@ -111,11 +111,20 @@ safe_require("user.init")
 --   4. {repo}/.botster/profiles/{profile}/plugins/
 
 local ConfigResolver = require("lib.config_resolver")
+local state = require("hub.state")
+local plugin_registry = state.get("plugin_registry", {})
 local loaded_plugin_names = {}
 
 local device_root = config.data_dir and config.data_dir() or nil
 local repo_root = (worktree and worktree.repo_root) and worktree.repo_root() or nil
 local active_profile = (config.get and config.get("active_profile")) or nil
+
+-- Store resolver opts so plugin watcher/reload can re-discover plugins
+state.set("plugin_resolver_opts", {
+    device_root = device_root,
+    repo_root = repo_root,
+    profile = active_profile,
+})
 
 if device_root or repo_root then
     local unified = ConfigResolver.resolve_all({
@@ -129,6 +138,7 @@ if device_root or repo_root then
         for _, plugin in ipairs(unified.plugins) do
             if loader.load_plugin(plugin.init_path, plugin.name) then
                 loaded_plugin_names[plugin.name] = true
+                plugin_registry[plugin.name] = { path = plugin.init_path }
             end
         end
     end
@@ -137,6 +147,9 @@ end
 if not next(loaded_plugin_names) then
     log.debug("No plugins found")
 end
+
+-- Watch plugin directories for hot-reload on file changes
+safe_require("handlers.plugin_watcher")
 
 -- ============================================================================
 -- Agent Improvements (Sandboxed)

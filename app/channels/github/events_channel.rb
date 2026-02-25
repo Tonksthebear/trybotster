@@ -35,14 +35,7 @@ module Github
     private
 
     def validate_github_access!
-      token = current_user.github_app_token
-      return false unless token.present?
-
-      result = ::Github::App.get_installation_for_repo(token, @repo)
-      result[:success]
-    rescue => e
-      Rails.logger.warn "[Github::EventsChannel] Access validation failed: #{e.message}"
-      false
+      ::Github::App.app_installed_on_repo?(@repo)
     end
 
     def replay_pending_messages

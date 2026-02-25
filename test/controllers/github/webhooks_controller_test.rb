@@ -119,6 +119,7 @@ module Github
       payload = {
         action: "created",
         repository: { full_name: "owner/repo" },
+        installation: { id: 12345 },
         issue: {
           number: 123,
           title: "Test issue",
@@ -135,13 +136,15 @@ module Github
 
       body, signature = sign_webhook_payload(payload)
 
-      post "/github/webhooks",
-        params: body,
-        headers: {
-          "Content-Type" => "application/json",
-          "X-GitHub-Event" => "issue_comment",
-          "X-Hub-Signature-256" => signature
-        }
+      with_stubbed_github do
+        post "/github/webhooks",
+          params: body,
+          headers: {
+            "Content-Type" => "application/json",
+            "X-GitHub-Event" => "issue_comment",
+            "X-Hub-Signature-256" => signature
+          }
+      end
 
       assert_response :success
 
@@ -184,19 +187,22 @@ module Github
         },
         repository: {
           full_name: "test/repo"
-        }
+        },
+        installation: { id: 12345 }
       }
 
       body, signature = sign_webhook_payload(payload)
 
-      assert_difference "Integrations::Github::Message.count", 1 do
-        post "/github/webhooks",
-          params: body,
-          headers: {
-            "Content-Type" => "application/json",
-            "X-GitHub-Event" => "issue_comment",
-            "X-Hub-Signature-256" => signature
-          }
+      with_stubbed_github do
+        assert_difference "Integrations::Github::Message.count", 1 do
+          post "/github/webhooks",
+            params: body,
+            headers: {
+              "Content-Type" => "application/json",
+              "X-GitHub-Event" => "issue_comment",
+              "X-Hub-Signature-256" => signature
+            }
+        end
       end
 
       assert_response :success
@@ -273,36 +279,38 @@ module Github
         }
       }
 
-      Integrations::Github::Webhooks::LinkedIssueResolver.stub(:new, ->(_repo, _pr) {
-        OpenStruct.new(call: 50)
-      }) do
-        body, signature = sign_webhook_payload(payload)
+      with_stubbed_github do
+        Integrations::Github::Webhooks::LinkedIssueResolver.stub(:new, ->(_repo, _pr) {
+          OpenStruct.new(call: 50)
+        }) do
+          body, signature = sign_webhook_payload(payload)
 
-        assert_difference "Integrations::Github::Message.count", 1 do
-          post "/github/webhooks",
-            params: body,
-            headers: {
-              "Content-Type" => "application/json",
-              "X-GitHub-Event" => "issue_comment",
-              "X-Hub-Signature-256" => signature
-            }
+          assert_difference "Integrations::Github::Message.count", 1 do
+            post "/github/webhooks",
+              params: body,
+              headers: {
+                "Content-Type" => "application/json",
+                "X-GitHub-Event" => "issue_comment",
+                "X-Hub-Signature-256" => signature
+              }
+          end
+
+          message = Integrations::Github::Message.last
+          assert_equal 50, message.issue_number, "Should route to linked issue #50"
+          assert_equal false, message.payload["is_pr"], "Should be marked as issue, not PR"
+
+          assert_not_nil message.payload["structured_context"]
+          assert_equal "pr_comment", message.payload["structured_context"]["source"]["type"]
+          assert_equal 200, message.payload["structured_context"]["source"]["number"]
+          assert_equal "issue", message.payload["structured_context"]["routed_to"]["type"]
+          assert_equal 50, message.payload["structured_context"]["routed_to"]["number"]
+          assert_equal "pr_linked_to_issue", message.payload["structured_context"]["routed_to"]["reason"]
+
+          prompt = message.payload["prompt"]
+          assert_includes prompt, "## Routing"
+          assert_includes prompt, "Routed to: issue #50"
+          assert_includes prompt, "PR #200"
         end
-
-        message = Integrations::Github::Message.last
-        assert_equal 50, message.issue_number, "Should route to linked issue #50"
-        assert_equal false, message.payload["is_pr"], "Should be marked as issue, not PR"
-
-        assert_not_nil message.payload["structured_context"]
-        assert_equal "pr_comment", message.payload["structured_context"]["source"]["type"]
-        assert_equal 200, message.payload["structured_context"]["source"]["number"]
-        assert_equal "issue", message.payload["structured_context"]["routed_to"]["type"]
-        assert_equal 50, message.payload["structured_context"]["routed_to"]["number"]
-        assert_equal "pr_linked_to_issue", message.payload["structured_context"]["routed_to"]["reason"]
-
-        prompt = message.payload["prompt"]
-        assert_includes prompt, "## Routing"
-        assert_includes prompt, "Routed to: issue #50"
-        assert_includes prompt, "PR #200"
       end
     end
 
@@ -388,20 +396,61 @@ module Github
         },
         repository: {
           full_name: "test/repo"
-        }
+        },
+        installation: { id: 12345 }
       }
 
       body, signature = sign_webhook_payload(payload)
 
-      assert_difference "Integrations::Github::Message.count", 1 do
-        post "/github/webhooks",
-          params: body,
-          headers: {
-            "Content-Type" => "application/json",
-            "X-GitHub-Event" => "issue_comment",
-            "X-Hub-Signature-256" => signature
-          }
+      with_stubbed_github do
+        assert_difference "Integrations::Github::Message.count", 1 do
+          post "/github/webhooks",
+            params: body,
+            headers: {
+              "Content-Type" => "application/json",
+              "X-GitHub-Event" => "issue_comment",
+              "X-Hub-Signature-256" => signature
+            }
+        end
       end
+    end
+
+    test "ignores mentions from non-collaborators" do
+      payload = {
+        action: "created",
+        issue: {
+          number: 42,
+          title: "Test Issue",
+          body: "Issue body",
+          html_url: "https://github.com/test/repo/issues/42",
+          pull_request: nil
+        },
+        comment: {
+          id: 999,
+          body: "@trybotster please help",
+          user: { login: "random_person" }
+        },
+        repository: {
+          full_name: "test/repo"
+        },
+        installation: { id: 12345 }
+      }
+
+      body, signature = sign_webhook_payload(payload)
+
+      Github::App.stub :repo_collaborator?, false do
+        assert_no_difference "Integrations::Github::Message.count" do
+          post "/github/webhooks",
+            params: body,
+            headers: {
+              "Content-Type" => "application/json",
+              "X-GitHub-Event" => "issue_comment",
+              "X-Hub-Signature-256" => signature
+            }
+        end
+      end
+
+      assert_response :success
     end
 
     # === Signature Validation ===
@@ -529,19 +578,22 @@ module Github
           html_url: "https://github.com/test/repo/issues/60",
           user: { login: "reporter" }
         },
-        repository: { full_name: "test/repo" }
+        repository: { full_name: "test/repo" },
+        installation: { id: 12345 }
       }
 
       body, signature = sign_webhook_payload(payload)
 
-      assert_difference "Integrations::Github::Message.count", 1 do
-        post "/github/webhooks",
-          params: body,
-          headers: {
-            "Content-Type" => "application/json",
-            "X-GitHub-Event" => "issues",
-            "X-Hub-Signature-256" => signature
-          }
+      with_stubbed_github do
+        assert_difference "Integrations::Github::Message.count", 1 do
+          post "/github/webhooks",
+            params: body,
+            headers: {
+              "Content-Type" => "application/json",
+              "X-GitHub-Event" => "issues",
+              "X-Hub-Signature-256" => signature
+            }
+        end
       end
 
       message = Integrations::Github::Message.last
@@ -621,19 +673,22 @@ module Github
           html_url: "https://github.com/test/repo/pull/80",
           user: { login: "author" }
         },
-        repository: { full_name: "test/repo" }
+        repository: { full_name: "test/repo" },
+        installation: { id: 12345 }
       }
 
       body, signature = sign_webhook_payload(payload)
 
-      assert_difference "Integrations::Github::Message.count", 1 do
-        post "/github/webhooks",
-          params: body,
-          headers: {
-            "Content-Type" => "application/json",
-            "X-GitHub-Event" => "pull_request",
-            "X-Hub-Signature-256" => signature
-          }
+      with_stubbed_github do
+        assert_difference "Integrations::Github::Message.count", 1 do
+          post "/github/webhooks",
+            params: body,
+            headers: {
+              "Content-Type" => "application/json",
+              "X-GitHub-Event" => "pull_request",
+              "X-Hub-Signature-256" => signature
+            }
+        end
       end
 
       message = Integrations::Github::Message.last

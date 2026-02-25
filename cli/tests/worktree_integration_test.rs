@@ -66,7 +66,6 @@ async fn test_agent_spawns_with_echo_command() {
     let mut agent = Agent::new(
         id,
         "test/repo".to_string(),
-        Some(1),
         "test-branch".to_string(),
         worktree.clone(),
     );
@@ -100,7 +99,6 @@ fn test_multiple_agents_different_issues() {
     let agent1 = Agent::new(
         Uuid::new_v4(),
         "owner/repo".to_string(),
-        Some(1),
         "botster-issue-1".to_string(),
         temp_dir.path().to_path_buf(),
     );
@@ -108,13 +106,12 @@ fn test_multiple_agents_different_issues() {
     let agent2 = Agent::new(
         Uuid::new_v4(),
         "owner/repo".to_string(),
-        Some(2),
         "botster-issue-2".to_string(),
         temp_dir.path().to_path_buf(),
     );
 
     // Different issue numbers should have different agent IDs
     assert_ne!(agent1.agent_id(), agent2.agent_id());
-    assert_eq!(agent1.agent_id(), "owner-repo-1");
-    assert_eq!(agent2.agent_id(), "owner-repo-2");
+    assert_eq!(agent1.agent_id(), "owner-repo-botster-issue-1");
+    assert_eq!(agent2.agent_id(), "owner-repo-botster-issue-2");
 }

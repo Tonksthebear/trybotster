@@ -78,6 +78,115 @@ commands.register("delete_agent", function(_client, _sub_id, command)
     end
 end, { description = "Delete an agent (optionally with worktree)" })
 
+commands.register("add_session", function(client, sub_id, command)
+    local Agent = require("lib.agent")
+    local agent_id = command.agent_id or command.id
+    if not agent_id then
+        log.warn("add_session missing agent_id")
+        return
+    end
+
+    local agent = Agent.get(agent_id)
+    if not agent then
+        log.warn("add_session: agent not found: " .. tostring(agent_id))
+        return
+    end
+
+    local session_type = command.session_type or "shell"
+    local session_config
+
+    if session_type == "shell" then
+        -- Raw shell: just bash, no init script
+        session_config = { name = "shell" }
+    else
+        -- Configured session type: resolve from profile
+        local types = agent:available_session_types()
+        local found = nil
+        for _, t in ipairs(types) do
+            if t.name == session_type then
+                found = t
+                break
+            end
+        end
+        if found and not found.raw then
+            session_config = {
+                name = found.name,
+                init_script = found.initialization,
+                forward_port = found.port_forward,
+            }
+        else
+            -- Fall back to raw shell with the given name
+            session_config = { name = session_type }
+        end
+    end
+
+    local pty_index = agent:add_session(session_config)
+    if pty_index then
+        -- Broadcast updated agent list so all clients see the new session.
+        -- Use agent_list (not agent_created) to avoid TUI auto-focus reset.
+        local connections = require("handlers.connections")
+        connections.broadcast_hub_event("agent_list", {
+            agents = require("lib.agent").all_info(),
+        })
+        log.info(string.format("Added session '%s' to agent %s at pty_index %d",
+            session_config.name, agent_id, pty_index))
+    end
+end, { description = "Add a PTY session to a running agent" })
+
+commands.register("remove_session", function(client, sub_id, command)
+    local Agent = require("lib.agent")
+    local agent_id = command.agent_id or command.id
+    if not agent_id then
+        log.warn("remove_session missing agent_id")
+        return
+    end
+
+    local pty_index = command.pty_index
+    if pty_index == nil then
+        log.warn("remove_session missing pty_index")
+        return
+    end
+
+    local agent = Agent.get(agent_id)
+    if not agent then
+        log.warn("remove_session: agent not found: " .. tostring(agent_id))
+        return
+    end
+
+    local ok = agent:remove_session(pty_index)
+    if ok then
+        -- Broadcast updated agent list so all clients see the removal
+        local connections = require("handlers.connections")
+        connections.broadcast_hub_event("agent_list", {
+            agents = require("lib.agent").all_info(),
+        })
+        log.info(string.format("Removed session at pty_index %d from agent %s", pty_index, agent_id))
+    end
+end, { description = "Remove a PTY session from a running agent" })
+
+commands.register("list_session_types", function(client, sub_id, command)
+    local Agent = require("lib.agent")
+    local agent_id = command.agent_id or command.id
+    if not agent_id then
+        log.warn("list_session_types missing agent_id")
+        return
+    end
+
+    local agent = Agent.get(agent_id)
+    if not agent then
+        log.warn("list_session_types: agent not found: " .. tostring(agent_id))
+        return
+    end
+
+    local types = agent:available_session_types()
+    client:send({
+        subscriptionId = sub_id,
+        type = "session_types",
+        agent_id = agent_id,
+        session_types = types,
+    })
+end, { description = "List available session types for an agent" })
+
 commands.register("select_agent", function(_client, _sub_id, command)
     -- No backend action needed; agent selection is client-side UI state
     log.debug(string.format("Select agent: %s", tostring(command.id or command.agent_index)))

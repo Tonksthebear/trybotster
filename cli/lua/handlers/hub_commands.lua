@@ -75,20 +75,33 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
         elseif msg_type == "message" then
             local event_type = message.event_type or ""
 
-            if event_type == "create_agent" or event_type == "agent_cleanup" then
+            if event_type == "create_agent" then
                 local payload = message.payload or {}
                 events.emit("command_message", {
-                    type = (event_type == "agent_cleanup") and "delete_agent" or "create_agent",
-                    event_type = event_type,
+                    type = "create_agent",
                     issue_or_branch = payload.issue_number and tostring(payload.issue_number),
                     prompt = payload.prompt or payload.context or payload.comment_body,
                     repo = config.env("BOTSTER_REPO") or hub.detect_repo(),
-                    invocation_url = payload.issue_url,
-                    agent_id = payload.issue_number and
-                        ((config.env("BOTSTER_REPO") or hub.detect_repo() or ""):gsub("/", "-")
-                        .. "-" .. tostring(payload.issue_number)),
-                    delete_worktree = false,
+                    metadata = {
+                        issue_number = payload.issue_number,
+                        invocation_url = payload.issue_url,
+                    },
                 })
+            elseif event_type == "agent_cleanup" then
+                local payload = message.payload or {}
+                local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or ""
+                if payload.issue_number then
+                    local matches = Agent.find_by_meta("issue_number", payload.issue_number)
+                    for _, agent in ipairs(matches) do
+                        if agent.repo == repo then
+                            events.emit("command_message", {
+                                type = "delete_agent",
+                                agent_id = agent:agent_key(),
+                                delete_worktree = false,
+                            })
+                        end
+                    end
+                end
             else
                 log.warn("Unhandled command event_type: " .. event_type)
             end

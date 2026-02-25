@@ -72,8 +72,8 @@ pub enum WorktreeRequest {
         agent_key: String,
         /// Git branch name for the worktree.
         branch: String,
-        /// GitHub issue number (if launched from an issue).
-        issue_number: Option<u32>,
+        /// Opaque plugin metadata (carried through for Lua agent spawning).
+        metadata: serde_json::Value,
         /// Task prompt for the agent.
         prompt: String,
         /// Profile name for config resolution.
@@ -104,8 +104,8 @@ pub struct WorktreeCreateResult {
     pub branch: String,
     /// `Ok(path)` on success, `Err(message)` on failure.
     pub result: Result<std::path::PathBuf, String>,
-    /// GitHub issue number (carried forward from request).
-    pub issue_number: Option<u32>,
+    /// Opaque plugin metadata (carried forward from request).
+    pub metadata: serde_json::Value,
     /// Task prompt (carried forward from request).
     pub prompt: String,
     /// Profile name (carried forward from request).
@@ -257,11 +257,11 @@ pub(crate) fn register(
     // threadpool. Returns immediately. Hub fires `worktree_created` or
     // `worktree_create_failed` Lua events on completion.
     //
-    // params is a table with: agent_key, branch, issue_number, prompt,
+    // params is a table with: agent_key, branch, metadata, prompt,
     // profile_name, client_rows, client_cols
     let tx = hub_event_tx.clone();
     let create_async_fn = lua
-        .create_function(move |_, params: LuaTable| {
+        .create_function(move |lua_inner, params: LuaTable| {
             let agent_key: String = params.get("agent_key").map_err(|e| {
                 mlua::Error::runtime(format!("create_async: missing agent_key: {e}"))
             })?;
@@ -271,7 +271,9 @@ pub(crate) fn register(
             let prompt: String = params.get::<Option<String>>("prompt")
                 .unwrap_or(None)
                 .unwrap_or_default();
-            let issue_number: Option<u32> = params.get("issue_number").unwrap_or(None);
+            let metadata_lua: mlua::Value = params.get("metadata").unwrap_or(mlua::Value::Nil);
+            let metadata_json = lua_inner.from_value::<serde_json::Value>(metadata_lua)
+                .unwrap_or(serde_json::Value::Null);
             let profile_name: Option<String> = params.get("profile_name").unwrap_or(None);
             let client_rows: u16 = params.get("client_rows").unwrap_or(24);
             let client_cols: u16 = params.get("client_cols").unwrap_or(80);
@@ -281,7 +283,7 @@ pub(crate) fn register(
                 let _ = sender.send(HubEvent::LuaWorktreeRequest(WorktreeRequest::Create {
                     agent_key,
                     branch,
-                    issue_number,
+                    metadata: metadata_json,
                     prompt,
                     profile_name,
                     client_rows,
@@ -640,7 +642,7 @@ mod tests {
             r#"worktree.create_async({
                 agent_key = "test-repo-42",
                 branch = "feature-branch",
-                issue_number = 42,
+                metadata = { issue_number = 42, invocation_url = "https://github.com/test/repo/issues/42" },
                 prompt = "Fix the bug",
                 profile_name = "default",
                 client_rows = 30,
@@ -655,7 +657,7 @@ mod tests {
             HubEvent::LuaWorktreeRequest(WorktreeRequest::Create {
                 agent_key,
                 branch,
-                issue_number,
+                metadata,
                 prompt,
                 profile_name,
                 client_rows,
@@ -663,7 +665,8 @@ mod tests {
             }) => {
                 assert_eq!(agent_key, "test-repo-42");
                 assert_eq!(branch, "feature-branch");
-                assert_eq!(issue_number, Some(42));
+                assert_eq!(metadata["issue_number"], 42);
+                assert_eq!(metadata["invocation_url"], "https://github.com/test/repo/issues/42");
                 assert_eq!(prompt, "Fix the bug");
                 assert_eq!(profile_name.as_deref(), Some("default"));
                 assert_eq!(client_rows, 30);

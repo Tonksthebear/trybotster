@@ -36,6 +36,16 @@ module Integrations
           author == "trybotster" || author&.downcase&.end_with?("[bot]")
         end
 
+        def collaborator?(username)
+          return false if username.blank? || repo_full_name.blank? || installation_id.blank?
+
+          result = ::Github::App.repo_collaborator?(installation_id, repo_full_name, username)
+          unless result
+            Rails.logger.info "Ignoring @trybotster mention from non-collaborator #{username} on #{repo_full_name}"
+          end
+          result
+        end
+
         def create_github_message(params)
           MessageCreator.new(params).call
         end

@@ -103,6 +103,46 @@ function M.load_plugin(path, name)
     return true
 end
 
+--- Reload a plugin by name using the runtime registry.
+-- Plugins are loaded from absolute paths (not package.path), so the standard
+-- reload() won't work. This looks up the path from hub.state, runs lifecycle
+-- hooks, and re-executes the plugin file.
+-- @param name string Plugin name (e.g., "github")
+-- @return boolean success
+-- @return string|nil error message on failure
+function M.reload_plugin(name)
+    local state = require("hub.state")
+    local registry = state.get("plugin_registry", {})
+    local entry = registry[name]
+    if not entry then
+        return false, "Plugin not found in registry: " .. name
+    end
+
+    local module_key = "plugin." .. name
+    local old = package.loaded[module_key]
+
+    -- Lifecycle: cleanup before reload
+    if old and type(old) == "table" and old._before_reload then
+        local ok, err = pcall(old._before_reload)
+        if not ok then
+            log.warn(string.format("_before_reload failed for plugin %s: %s", name, tostring(err)))
+        end
+    end
+
+    -- Clear old module
+    package.loaded[module_key] = nil
+
+    -- Re-load from disk
+    local ok = M.load_plugin(entry.path, name)
+    if not ok then
+        -- Restore old module on failure
+        package.loaded[module_key] = old
+        return false, "Failed to reload plugin: " .. name
+    end
+
+    return true
+end
+
 -- ============================================================================
 -- Trust Tiers / Sandboxing
 -- ============================================================================

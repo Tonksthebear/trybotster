@@ -11,18 +11,17 @@ class GithubSearchReposTool < ApplicationMCPTool
   validates :query, presence: true, length: { minimum: 1 }
 
   def perform
-    # Check if user has authorized GitHub App
-    unless current_user&.github_app_authorized?
-      report_error("GitHub App not authorized. Please authorize at /github_app/authorize")
+    # Search is global — any installation token provides authenticated rate limits.
+    # Try repo hint from query first, fall back to first available installation.
+    hint = query_repo_hint
+    installation_id = hint ? ::Github::App.installation_id_for_repo(hint) : nil
+    installation_id ||= ::Github::App.first_installation_id
+    unless installation_id
+      report_error("GitHub App has no installations available for search")
       return
     end
 
-    # Get valid token (auto-refreshes if needed)
-    token = current_user.valid_github_app_token
-    unless token
-      report_error("Failed to get valid GitHub token. Please re-authorize the GitHub App.")
-      return
-    end
+    client = ::Github::App.installation_client(installation_id)
 
     # Detect client for user feedback
     client_info = detect_client_type
@@ -33,53 +32,58 @@ class GithubSearchReposTool < ApplicationMCPTool
     options[:sort] = sort if sort.present?
     options[:per_page] = (per_page || 30).to_i.clamp(1, 100)
 
-    # Search repositories using Octokit
-    result = Github::App.search_repos(token, query: query, **options)
+    result = client.search_repositories(query, options)
+    repos = result.items
 
-    if result[:success]
-      repos = result[:repos]
-      total_count = result[:total_count]
-
-      if repos.empty?
-        render(text: "No repositories found matching query: '#{query}'")
-        return
-      end
-
-      render(text: "Found #{total_count} repositories (showing #{repos.count}):\n")
-
-      repos.each_with_index do |repo, index|
-        updated_at = repo["updated_at"].is_a?(String) ? Time.parse(repo["updated_at"]) : repo["updated_at"]
-
-        repo_info = [
-          "#{index + 1}. 📦 #{repo['full_name']}",
-          "   Description: #{repo['description'] || 'No description'}",
-          "   ⭐ Stars: #{repo['stargazers_count']} | 🍴 Forks: #{repo['forks_count']}",
-          "   Language: #{repo['language'] || 'None'}",
-          "   URL: #{repo['html_url']}",
-          "   Updated: #{updated_at.strftime('%Y-%m-%d')}"
-        ]
-
-        if repo["topics"]&.any?
-          repo_info << "   Topics: #{repo['topics'].join(', ')}"
-        end
-
-        render(text: repo_info.join("\n"))
-        render(text: "\n")
-      end
-
-      summary = [
-        "📊 Search Summary:",
-        "   Query: #{query}",
-        "   Total Results: #{total_count}",
-        "   Showing: #{repos.count}",
-        sort.present? ? "   Sorted by: #{sort}" : nil
-      ].compact
-
-      render(text: summary.join("\n"))
-    else
-      report_error("Failed to search repositories: #{result[:error]}")
+    if repos.empty?
+      render(text: "No repositories found matching query: '#{query}'")
+      return
     end
+
+    render(text: "Found #{result.total_count} repositories (showing #{repos.count}):\n")
+
+    repos.each_with_index do |repo_item, index|
+      updated_at = repo_item[:updated_at].is_a?(String) ? Time.parse(repo_item[:updated_at]) : repo_item[:updated_at]
+
+      repo_info = [
+        "#{index + 1}. 📦 #{repo_item[:full_name]}",
+        "   Description: #{repo_item[:description] || 'No description'}",
+        "   ⭐ Stars: #{repo_item[:stargazers_count]} | 🍴 Forks: #{repo_item[:forks_count]}",
+        "   Language: #{repo_item[:language] || 'None'}",
+        "   URL: #{repo_item[:html_url]}",
+        "   Updated: #{updated_at.strftime('%Y-%m-%d')}"
+      ]
+
+      if repo_item[:topics]&.any?
+        repo_info << "   Topics: #{repo_item[:topics].join(', ')}"
+      end
+
+      render(text: repo_info.join("\n"))
+      render(text: "\n")
+    end
+
+    summary = [
+      "📊 Search Summary:",
+      "   Query: #{query}",
+      "   Total Results: #{result.total_count}",
+      "   Showing: #{repos.count}",
+      sort.present? ? "   Sorted by: #{sort}" : nil
+    ].compact
+
+    render(text: summary.join("\n"))
+  rescue Octokit::Error => e
+    report_error("Failed to search repositories: #{e.message}")
   rescue => e
     report_error("Error searching repositories: #{e.message}")
+  end
+
+  private
+
+  # Try to extract an owner/repo from the query for installation lookup.
+  # Falls back to using the first available installation.
+  def query_repo_hint
+    # If query contains owner/repo pattern, use it
+    match = query.match(/\b([\w\-\.]+\/[\w\-\.]+)\b/)
+    match ? match[1] : nil
   end
 end

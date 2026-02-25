@@ -462,7 +462,7 @@ impl Hub {
 
                 match request {
                     WorktreeRequest::Create {
-                        agent_key, branch, issue_number, prompt, profile_name,
+                        agent_key, branch, metadata, prompt, profile_name,
                         client_rows, client_cols,
                     } => {
                         log::info!(
@@ -490,7 +490,7 @@ impl Hub {
                                 agent_key: agent_key_clone,
                                 branch,
                                 result: outcome,
-                                issue_number,
+                                metadata,
                                 prompt,
                                 profile_name,
                                 client_rows,
@@ -513,6 +513,9 @@ impl Hub {
                         }
                     }
                 }
+            }
+            HubEvent::MessageDelivered { message_len } => {
+                log::info!("[MessageDelivery] Delivered message ({message_len} bytes)");
             }
         }
     }
@@ -715,7 +718,7 @@ impl Hub {
                     "agent_key": result.agent_key,
                     "branch": result.branch,
                     "path": path_str,
-                    "issue_number": result.issue_number,
+                    "metadata": result.metadata,
                     "prompt": result.prompt,
                     "profile_name": result.profile_name,
                     "client_rows": result.client_rows,
@@ -880,7 +883,8 @@ impl Hub {
                     }
                     Ok(event @ PtyEvent::TitleChanged(_))
                     | Ok(event @ PtyEvent::CwdChanged(_))
-                    | Ok(event @ PtyEvent::PromptMark(_)) => {
+                    | Ok(event @ PtyEvent::PromptMark(_))
+                    | Ok(event @ PtyEvent::CursorVisibilityChanged(_)) => {
                         if hub_tx
                             .send(super::events::HubEvent::PtyOscEvent {
                                 agent_key: agent_key.clone(),
@@ -1524,7 +1528,7 @@ impl Hub {
                         "agent_key": result.agent_key,
                         "branch": result.branch,
                         "path": path_str,
-                        "issue_number": result.issue_number,
+                        "metadata": result.metadata,
                         "prompt": result.prompt,
                         "profile_name": result.profile_name,
                         "client_rows": result.client_rows,

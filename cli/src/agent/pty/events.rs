@@ -120,6 +120,13 @@ pub enum PtyEvent {
     /// The TUI should respond with the current terminal focus state
     /// (`CSI I` or `CSI O`) so the inner application knows immediately.
     FocusRequested,
+
+    /// Cursor visibility changed via DECTCEM (`CSI ? 25 h` / `CSI ? 25 l`).
+    ///
+    /// `true` = cursor shown (free-text input expected),
+    /// `false` = cursor hidden (generation, selection UI, no input expected).
+    /// Emitted only on transitions, not on every occurrence.
+    CursorVisibilityChanged(bool),
 }
 
 impl PtyEvent {
@@ -177,6 +184,12 @@ impl PtyEvent {
         Self::FocusRequested
     }
 
+    /// Create a cursor visibility changed event.
+    #[must_use]
+    pub fn cursor_visibility_changed(visible: bool) -> Self {
+        Self::CursorVisibilityChanged(visible)
+    }
+
     /// Check if this is an output event.
     #[must_use]
     pub fn is_output(&self) -> bool {
@@ -217,6 +230,12 @@ impl PtyEvent {
     #[must_use]
     pub fn is_prompt_mark(&self) -> bool {
         matches!(self, Self::PromptMark(_))
+    }
+
+    /// Check if this is a cursor visibility changed event.
+    #[must_use]
+    pub fn is_cursor_visibility_changed(&self) -> bool {
+        matches!(self, Self::CursorVisibilityChanged(_))
     }
 }
 
@@ -289,31 +308,47 @@ mod tests {
         assert!(!output.is_title_changed());
         assert!(!output.is_cwd_changed());
         assert!(!output.is_prompt_mark());
+        assert!(!output.is_cursor_visibility_changed());
 
         let resized = PtyEvent::resized(24, 80);
         assert!(!resized.is_output());
         assert!(resized.is_resized());
         assert!(!resized.is_process_exited());
         assert!(!resized.is_notification());
+        assert!(!resized.is_cursor_visibility_changed());
 
         let notification = PtyEvent::notification(AgentNotification::Osc9(Some("test".to_string())));
         assert!(!notification.is_output());
         assert!(!notification.is_resized());
         assert!(!notification.is_process_exited());
         assert!(notification.is_notification());
+        assert!(!notification.is_cursor_visibility_changed());
 
         let title = PtyEvent::title_changed("My Title");
         assert!(title.is_title_changed());
         assert!(!title.is_output());
         assert!(!title.is_notification());
+        assert!(!title.is_cursor_visibility_changed());
 
         let cwd = PtyEvent::cwd_changed("/home/user");
         assert!(cwd.is_cwd_changed());
         assert!(!cwd.is_output());
+        assert!(!cwd.is_cursor_visibility_changed());
 
         let mark = PtyEvent::prompt_mark(PromptMark::PromptStart);
         assert!(mark.is_prompt_mark());
         assert!(!mark.is_output());
+        assert!(!mark.is_cursor_visibility_changed());
+
+        let cursor = PtyEvent::cursor_visibility_changed(true);
+        assert!(cursor.is_cursor_visibility_changed());
+        assert!(!cursor.is_output());
+        assert!(!cursor.is_resized());
+        assert!(!cursor.is_process_exited());
+        assert!(!cursor.is_notification());
+        assert!(!cursor.is_title_changed());
+        assert!(!cursor.is_cwd_changed());
+        assert!(!cursor.is_prompt_mark());
     }
 
     #[test]

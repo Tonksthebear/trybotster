@@ -29,8 +29,9 @@
 //! - [`notification`]: Terminal notification detection (OSC 9, OSC 777)
 //! - [`pty`]: PTY session management
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-02
 
+pub mod message_delivery;
 pub mod notification;
 pub mod pty;
 pub mod spawn;
@@ -71,6 +72,10 @@ pub enum PtyView {
 ///
 /// The agent is process-agnostic - it runs whatever the user configures.
 ///
+/// Agent metadata (repo, issue, status, etc.) is managed by Lua.
+/// This struct provides PTY infrastructure for tests. In production,
+/// PTY sessions are created directly and registered via HandleCache.
+///
 /// # Client State Separation
 ///
 /// Agent does NOT track:
@@ -85,8 +90,6 @@ pub struct Agent {
     pub id: uuid::Uuid,
     /// Repository name in "owner/repo" format.
     pub repo: String,
-    /// Issue number if working on a specific issue.
-    pub issue_number: Option<u32>,
     /// Git branch name.
     pub branch_name: String,
     /// Path to the git worktree directory.
@@ -95,8 +98,6 @@ pub struct Agent {
     pub start_time: chrono::DateTime<chrono::Utc>,
     /// Current execution status.
     pub status: AgentStatus,
-    /// GitHub URL where this agent was last invoked from.
-    pub last_invocation_url: Option<String>,
     /// macOS Terminal window ID for focusing.
     pub terminal_window_id: Option<String>,
 
@@ -114,7 +115,6 @@ impl std::fmt::Debug for Agent {
         f.debug_struct("Agent")
             .field("id", &self.id)
             .field("repo", &self.repo)
-            .field("issue_number", &self.issue_number)
             .field("branch_name", &self.branch_name)
             .field("worktree_path", &self.worktree_path)
             .field("status", &self.status)
@@ -139,14 +139,12 @@ impl Agent {
     pub fn new(
         id: uuid::Uuid,
         repo: String,
-        issue_number: Option<u32>,
         branch_name: String,
         worktree_path: PathBuf,
     ) -> Self {
         Self::new_with_dims(
             id,
             repo,
-            issue_number,
             branch_name,
             worktree_path,
             (DEFAULT_PTY_ROWS, DEFAULT_PTY_COLS),
@@ -159,7 +157,6 @@ impl Agent {
     ///
     /// * `id` - Unique agent identifier
     /// * `repo` - Repository name in "owner/repo" format
-    /// * `issue_number` - Optional issue number
     /// * `branch_name` - Git branch name
     /// * `worktree_path` - Path to the git worktree
     /// * `terminal_dims` - PTY dimensions as (rows, cols)
@@ -167,7 +164,6 @@ impl Agent {
     pub fn new_with_dims(
         id: uuid::Uuid,
         repo: String,
-        issue_number: Option<u32>,
         branch_name: String,
         worktree_path: PathBuf,
         terminal_dims: (u16, u16),
@@ -176,12 +172,10 @@ impl Agent {
         Self {
             id,
             repo,
-            issue_number,
             branch_name,
             worktree_path,
             start_time: chrono::Utc::now(),
             status: AgentStatus::Initializing,
-            last_invocation_url: None,
             terminal_window_id: None,
             cli_pty: PtySession::new(rows, cols),
             server_pty: None,
@@ -215,16 +209,6 @@ impl Agent {
     /// - Index 1: Server PTY (if server is running)
     ///
     /// Returns `None` if index is out of bounds or server PTY not available.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Get handle for CLI PTY
-    /// let cli_handle = agent.get_pty_handle(0)?;
-    ///
-    /// // Subscribe to PTY events
-    /// let rx = cli_handle.subscribe();
-    /// ```
     #[must_use]
     pub fn get_pty_handle(&self, pty_index: usize) -> Option<crate::hub::agent_handle::PtyHandle> {
         match pty_index {
@@ -325,15 +309,11 @@ impl Agent {
 
     /// Generate a unique agent ID for this agent.
     ///
-    /// Format: `{repo-safe}-{issue_number}` or `{repo-safe}-{branch-name}`.
+    /// Format: `{repo-safe}-{branch-name}` (slashes replaced with dashes).
     #[must_use]
     pub fn agent_id(&self) -> String {
         let repo_safe = self.repo.replace('/', "-");
-        if let Some(issue_num) = self.issue_number {
-            format!("{repo_safe}-{issue_num}")
-        } else {
-            format!("{}-{}", repo_safe, self.branch_name.replace('/', "-"))
-        }
+        format!("{}-{}", repo_safe, self.branch_name.replace('/', "-"))
     }
 
     // =========================================================================
@@ -380,13 +360,11 @@ mod tests {
         let agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "issue-1".to_string(),
             temp_dir.path().to_path_buf(),
         );
 
         assert_eq!(agent.repo, "test/repo");
-        assert_eq!(agent.issue_number, Some(1));
         assert_eq!(agent.branch_name, "issue-1");
         assert!(matches!(agent.status, AgentStatus::Initializing));
     }
@@ -397,12 +375,11 @@ mod tests {
         let agent = Agent::new(
             uuid::Uuid::new_v4(),
             "owner/repo".to_string(),
-            Some(42),
-            "issue-42".to_string(),
+            "botster-issue-42".to_string(),
             temp_dir.path().to_path_buf(),
         );
 
-        assert_eq!(agent.agent_id(), "owner-repo-42");
+        assert_eq!(agent.agent_id(), "owner-repo-botster-issue-42");
     }
 
     #[test]
@@ -411,7 +388,6 @@ mod tests {
         let agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "issue-1".to_string(),
             temp_dir.path().to_path_buf(),
         );
@@ -428,7 +404,6 @@ mod tests {
         let agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "issue-1".to_string(),
             temp_dir.path().to_path_buf(),
         );
@@ -443,7 +418,6 @@ mod tests {
         let agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "issue-1".to_string(),
             temp_dir.path().to_path_buf(),
         );
@@ -462,7 +436,6 @@ mod tests {
         let agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "issue-1".to_string(),
             temp_dir.path().to_path_buf(),
         );
@@ -481,7 +454,6 @@ mod tests {
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "issue-1".to_string(),
             temp_dir.path().to_path_buf(),
         );
@@ -502,7 +474,6 @@ mod tests {
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "issue-1".to_string(),
             temp_dir.path().to_path_buf(),
         );
@@ -524,7 +495,6 @@ mod tests {
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "issue-1".to_string(),
             temp_dir.path().to_path_buf(),
         );
@@ -555,7 +525,6 @@ mod tests {
         let mut agent = Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
-            Some(1),
             "issue-1".to_string(),
             temp_dir.path().to_path_buf(),
         );

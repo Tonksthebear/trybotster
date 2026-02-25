@@ -93,18 +93,11 @@ module GithubTestHelper
   #
   def with_stubbed_github(installation_id: 12345, comment_url: "https://github.com/owner/repo/issues/1#issuecomment-123")
     # Save original methods
-    original_get_installation = Github::App.method(:get_installation_for_repo)
+    original_installation_id_for_repo = Github::App.method(:installation_id_for_repo)
+    original_app_installed_on_repo = Github::App.method(:app_installed_on_repo?)
     original_installation_client = Github::App.method(:installation_client)
     original_get_installation_token = Github::App.method(:get_installation_token)
-    original_client = Github::App.method(:client)
-
-    # Create mock response for get_installation_for_repo
-    installation_response = {
-      success: true,
-      installation_id: installation_id,
-      account: "owner",
-      account_type: "Organization"
-    }
+    original_repo_collaborator = Github::App.method(:repo_collaborator?)
 
     # Create mock response for get_installation_token
     token_response = {
@@ -112,7 +105,7 @@ module GithubTestHelper
       token: "ghs_stubbed_token_123"
     }
 
-    # Create mock client for installation_client and client
+    # Create mock client for installation_client
     mock_comment = sawyer_resource(
       html_url: comment_url,
       id: 123,
@@ -128,8 +121,12 @@ module GithubTestHelper
     )
 
     # Replace with stubs
-    Github::App.define_singleton_method(:get_installation_for_repo) do |*_args|
-      installation_response
+    Github::App.define_singleton_method(:installation_id_for_repo) do |*_args|
+      installation_id
+    end
+
+    Github::App.define_singleton_method(:app_installed_on_repo?) do |*_args|
+      true
     end
 
     Github::App.define_singleton_method(:installation_client) do |*_args|
@@ -140,16 +137,17 @@ module GithubTestHelper
       token_response
     end
 
-    Github::App.define_singleton_method(:client) do |*_args|
-      mock_client
+    Github::App.define_singleton_method(:repo_collaborator?) do |*_args|
+      true
     end
 
     yield
   ensure
     # Restore original methods
-    Github::App.define_singleton_method(:get_installation_for_repo, original_get_installation)
+    Github::App.define_singleton_method(:installation_id_for_repo, original_installation_id_for_repo)
+    Github::App.define_singleton_method(:app_installed_on_repo?, original_app_installed_on_repo)
     Github::App.define_singleton_method(:installation_client, original_installation_client)
     Github::App.define_singleton_method(:get_installation_token, original_get_installation_token)
-    Github::App.define_singleton_method(:client, original_client)
+    Github::App.define_singleton_method(:repo_collaborator?, original_repo_collaborator)
   end
 end

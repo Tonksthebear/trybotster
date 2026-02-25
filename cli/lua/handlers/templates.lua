@@ -180,6 +180,73 @@ commands.register("template:list", function(client, sub_id, command)
 end, { description = "List installed templates" })
 
 -- ============================================================================
+-- Plugin Reload Commands
+-- ============================================================================
+
+local loader = require("hub.loader")
+
+commands.register("plugin:reload", function(client, sub_id, command)
+    local name = command.plugin_name
+    if not name then
+        respond(client, sub_id, command.request_id, { ok = false, error = "Missing plugin_name" })
+        return
+    end
+
+    log.info(string.format("Plugin reload requested: %s", name))
+    local ok, err = loader.reload_plugin(name)
+    respond(client, sub_id, command.request_id, { ok = ok, error = err, plugin_name = name })
+end, { description = "Reload a plugin by name" })
+
+commands.register("plugin:load", function(client, sub_id, command)
+    local name = command.plugin_name
+    if not name then
+        respond(client, sub_id, command.request_id, { ok = false, error = "Missing plugin_name" })
+        return
+    end
+
+    local state = require("hub.state")
+    local registry = state.get("plugin_registry", {})
+
+    -- Already loaded? Reload instead
+    if registry[name] then
+        local ok, err = loader.reload_plugin(name)
+        respond(client, sub_id, command.request_id, { ok = ok, error = err, plugin_name = name })
+        return
+    end
+
+    -- Discover from disk
+    local ConfigResolver = require("lib.config_resolver")
+    local opts = state.get("plugin_resolver_opts", {})
+    local unified = ConfigResolver.resolve_all({
+        device_root = opts.device_root,
+        repo_root = opts.repo_root,
+        profile = opts.profile,
+        require_agent = false,
+    })
+
+    local found = nil
+    if unified and unified.plugins then
+        for _, plugin in ipairs(unified.plugins) do
+            if plugin.name == name then
+                found = plugin
+                break
+            end
+        end
+    end
+
+    if not found then
+        respond(client, sub_id, command.request_id, { ok = false, error = "Plugin not found on disk: " .. name })
+        return
+    end
+
+    local ok = loader.load_plugin(found.init_path, name)
+    if ok then
+        registry[name] = { path = found.init_path }
+    end
+    respond(client, sub_id, command.request_id, { ok = ok, plugin_name = name })
+end, { description = "Load a newly installed plugin" })
+
+-- ============================================================================
 -- Module Interface
 -- ============================================================================
 

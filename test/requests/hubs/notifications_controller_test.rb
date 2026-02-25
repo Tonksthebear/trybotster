@@ -92,20 +92,19 @@ class Hubs::NotificationsControllerTest < ActionDispatch::IntegrationTest
     assert_json_error(/Invalid invocation_url/i)
   end
 
-  test "POST /hubs/:hub_id/notifications returns 401 if GitHub not authorized" do
-    # User without GitHub authorization
-    users(:jason).update!(github_app_token: nil)
+  test "POST /hubs/:hub_id/notifications returns error when GitHub App not installed" do
+    Github::App.stub :installation_id_for_repo, nil do
+      post hub_notifications_url(@hub),
+        params: {
+          notification_type: "question_asked",
+          repo: "owner/repo",
+          issue_number: 42
+        }.to_json,
+        headers: auth_headers_for(:jason)
 
-    post hub_notifications_url(@hub),
-      params: {
-        notification_type: "question_asked",
-        repo: "owner/repo",
-        issue_number: 42
-      }.to_json,
-      headers: auth_headers_for(:jason)
-
-    assert_response :unauthorized
-    assert_json_error(/GitHub App not authorized/i)
+      assert_response :unprocessable_entity
+      assert_json_error(/GitHub App is not installed/i)
+    end
   end
 
   test "POST /hubs/:hub_id/notifications supports different notification types" do

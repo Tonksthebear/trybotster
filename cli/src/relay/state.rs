@@ -2,19 +2,16 @@
 //!
 //! Handles the WebSocket relay connection to browsers, including:
 //! - Connection state tracking
-//! - Builder functions for browser messages (AgentInfo, WorktreeInfo)
 //!
 //! # Architecture
 //!
 //! `BrowserState` tracks relay-level connection state. Per-browser view state
 //! (mode, selection, scroll) is managed independently by the browser.
-//! Builder functions here are pure helpers used by WebRTC send methods.
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-02
 
 use super::crypto_service::CryptoService;
 use super::olm_crypto::DeviceKeyBundle;
-use crate::{AgentInfo, WorktreeInfo};
 
 /// Browser connection state.
 ///
@@ -69,44 +66,6 @@ impl BrowserState {
     pub fn handle_disconnected(&mut self) {
         log::info!("Browser disconnected");
         self.connected = false;
-    }
-}
-
-/// Build AgentInfo from agent data.
-///
-/// This is a helper to convert agent data into the format expected by browsers.
-///
-/// Note: `scroll_offset` is set to `None` because it is client-scoped state.
-/// Each browser tracks its own scroll position independently via xterm.js.
-#[must_use]
-pub fn build_agent_info(id: &str, agent: &crate::Agent, hub_identifier: &str) -> AgentInfo {
-    AgentInfo {
-        id: id.to_string(),
-        repo: Some(agent.repo.clone()),
-        issue_number: agent.issue_number.map(u64::from),
-        branch_name: Some(agent.branch_name.clone()),
-        name: None,
-        status: Some(format!("{:?}", agent.status)),
-        sessions: None, // Populated from Lua agent info when available
-        port: agent.port(),
-        server_running: Some(agent.is_server_running()),
-        has_server_pty: Some(agent.has_server_pty()),
-        // Scroll is client-scoped — browser tracks its own position
-        scroll_offset: None,
-        hub_identifier: Some(hub_identifier.to_string()),
-    }
-}
-
-/// Build WorktreeInfo from worktree data.
-#[must_use]
-pub fn build_worktree_info(path: &str, branch: &str) -> WorktreeInfo {
-    let issue_number = branch
-        .strip_prefix("botster-issue-")
-        .and_then(|s| s.parse::<u64>().ok());
-    WorktreeInfo {
-        path: path.to_string(),
-        branch: branch.to_string(),
-        issue_number,
     }
 }
 

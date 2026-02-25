@@ -34,6 +34,7 @@ module Integrations
           return if pr_body.blank?
           return if bot_author?(pr_author)
           return unless mentioned_trybotster?(pr_body)
+          return unless collaborator?(pr_author)
 
           Rails.logger.info "Processing @trybotster mention in PR body #{repo_full_name}##{pr_number}"
 

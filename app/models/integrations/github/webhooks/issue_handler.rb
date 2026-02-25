@@ -34,6 +34,7 @@ module Integrations
           return if issue_body.blank?
           return if bot_author?(issue_author)
           return unless mentioned_trybotster?(issue_body)
+          return unless collaborator?(issue_author)
 
           Rails.logger.info "Processing @trybotster mention in issue body #{repo_full_name}##{issue_number}"
 

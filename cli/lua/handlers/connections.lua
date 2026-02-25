@@ -204,8 +204,8 @@ hooks.on("pty_notification", "push_notification", function(info)
     if agent then
         -- Use short repo name (strip owner prefix) + issue/branch
         local repo_short = agent.repo and agent.repo:match("/(.+)$") or agent.repo
-        if agent.issue_number then
-            title = string.format("%s #%s", repo_short or "agent", agent.issue_number)
+        if agent:get_meta("issue_number") then
+            title = string.format("%s #%s", repo_short or "agent", agent:get_meta("issue_number"))
         elseif repo_short then
             title = repo_short
         end
@@ -309,6 +309,15 @@ hooks.on("pty_prompt", "update_agent_prompt", function(info)
     end
 end)
 
+
+-- Track cursor visibility changes (DECTCEM CSI ? 25 h/l).
+hooks.on("pty_cursor_visibility", "update_agent_cursor", function(info)
+    local agent = info.agent_key and Agent.get(info.agent_key)
+    if agent then
+        agent.cursor_visible = info.visible
+    end
+end)
+
 hooks.on("agent_lifecycle", "broadcast_lifecycle", function(info)
     log.debug(string.format("Broadcasting agent_lifecycle: %s -> %s",
         info.agent_id or "?", info.status or "?"))
@@ -390,6 +399,10 @@ function M._before_reload()
     hooks.off("agent_lifecycle", "broadcast_lifecycle")
     hooks.off("_pty_notification_raw", "enrich_and_dispatch")
     hooks.off("pty_notification", "push_notification")
+    hooks.off("pty_title_changed", "update_agent_title")
+    hooks.off("pty_cwd_changed", "update_agent_cwd")
+    hooks.off("pty_prompt", "update_agent_prompt")
+    hooks.off("pty_cursor_visibility", "update_agent_cursor")
     -- Remove global callable (re-registered on reload)
     _set_pty_focused = nil
     log.info(string.format("connections.lua reloading with %d client(s)", get_client_count()))

@@ -20,72 +20,45 @@ class GithubCommentIssueTool < ApplicationMCPTool
       return
     end
 
-    # Check if user has authorized GitHub App
-    unless current_user&.github_app_authorized?
-      report_error("GitHub App not authorized. Please authorize at /github_app/authorize")
+    installation_id = ::Github::App.installation_id_for_repo(repo)
+    unless installation_id
+      report_error("GitHub App is not installed on #{repo}")
       return
     end
 
-    # Get the correct installation ID for this repository
-    access_token = current_user.valid_github_app_token
-    installation_result = Github::App.get_installation_for_repo(access_token, repo)
-
-    unless installation_result[:success]
-      report_error(installation_result[:error])
-      return
-    end
-
-    installation_id = installation_result[:installation_id]
-    Rails.logger.info "Using GitHub App installation ID: #{installation_id} for #{repo} (account: #{installation_result[:account]})"
+    client = ::Github::App.installation_client(installation_id)
 
     # Detect client for user feedback
     client_info = detect_client_type
-    render(text: "Adding comment to #{repo}##{issue_number} as [bot] via #{installation_result[:account]} installation (#{client_info})...")
-
-    # Get installation client (shows as [bot])
-    begin
-      client = Github::App.installation_client(installation_id)
-    rescue => e
-      report_error("Failed to get bot credentials: #{e.message}")
-      return
-    end
+    render(text: "Adding comment to #{repo}##{issue_number} as [bot] (#{client_info})...")
 
     # Add attribution footer to comment body
     enhanced_body = body + attribution_footer
 
     # Create comment using installation token (bot attribution)
-    begin
-      comment = client.add_comment(repo, issue_number.to_i, enhanced_body)
-      result = { success: true, comment: comment.to_h }
-    rescue Octokit::Error => e
-      result = { success: false, error: e.message }
-    end
+    comment = client.add_comment(repo, issue_number.to_i, enhanced_body)
 
-    if result[:success]
-      comment = result[:comment]
+    success_message = [
+      "✅ Comment added successfully!",
+      "",
+      "💬 Comment on #{repo}##{issue_number}",
+      "   URL: #{comment[:html_url]}",
+      "   Created: #{comment[:created_at].strftime('%Y-%m-%d %H:%M')}",
+      "",
+      "Preview:",
+      "---",
+      body.lines.first(5).join,
+      (body.lines.count > 5 ? "... (truncated)" : ""),
+      "---",
+      "",
+      "View full comment at: #{comment[:html_url]}"
+    ]
 
-      success_message = [
-        "✅ Comment added successfully!",
-        "",
-        "💬 Comment on #{repo}##{issue_number}",
-        "   URL: #{comment[:html_url]}",
-        "   Created: #{comment[:created_at].strftime('%Y-%m-%d %H:%M')}",
-        "",
-        "Preview:",
-        "---",
-        body.lines.first(5).join,
-        (body.lines.count > 5 ? "... (truncated)" : ""),
-        "---",
-        "",
-        "View full comment at: #{comment[:html_url]}"
-      ]
-
-      response_text = success_message.join("\n")
-      store_idempotency_response(response_text)
-      render(text: response_text)
-    else
-      report_error("Failed to add comment: #{result[:error]}")
-    end
+    response_text = success_message.join("\n")
+    store_idempotency_response(response_text)
+    render(text: response_text)
+  rescue Octokit::Error => e
+    report_error("Failed to add comment: #{e.message}")
   rescue => e
     report_error("Error adding comment: #{e.message}")
   end

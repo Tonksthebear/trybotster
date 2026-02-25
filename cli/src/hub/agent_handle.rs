@@ -125,6 +125,14 @@ impl AgentPtys {
         self.agent_index
     }
 
+    /// Update the agent's index.
+    ///
+    /// Used after `HandleCache::add_agent()` to fix up the index to match
+    /// the actual position (which may differ on replace).
+    pub fn set_agent_index(&mut self, index: usize) {
+        self.agent_index = index;
+    }
+
     /// Get PTY handle by index.
     ///
     /// - Index 0: CLI PTY (always present)
@@ -358,6 +366,18 @@ impl PtyHandle {
         let mut state = self.shared_state
             .lock()
             .map_err(|_| "shared_state lock poisoned")?;
+
+        // Stamp human activity for message delivery deferral.
+        // Skip non-keyboard sequences (focus in/out) — a user clicking
+        // through tabs to watch shouldn't defer message delivery.
+        let is_keyboard = data != b"\x1b[I" && data != b"\x1b[O";
+        if is_keyboard {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            state.last_human_input_ms.store(now, std::sync::atomic::Ordering::Relaxed);
+        }
 
         if let Some(writer) = &mut state.writer {
             writer

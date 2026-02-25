@@ -17,35 +17,17 @@ class GithubUpdateIssueTool < ApplicationMCPTool
   validates :state, inclusion: { in: %w[open closed], message: "must be 'open' or 'closed'" }, allow_nil: true
 
   def perform
-    # Check if user has authorized GitHub App
-    unless current_user&.github_app_authorized?
-      report_error("GitHub App not authorized. Please authorize at /github_app/authorize")
+    installation_id = ::Github::App.installation_id_for_repo(repo)
+    unless installation_id
+      report_error("GitHub App is not installed on #{repo}")
       return
     end
 
-    # Get the correct installation ID for this repository
-    access_token = current_user.valid_github_app_token
-    installation_result = Github::App.get_installation_for_repo(access_token, repo)
-
-    unless installation_result[:success]
-      report_error(installation_result[:error])
-      return
-    end
-
-    installation_id = installation_result[:installation_id]
-    Rails.logger.info "Using GitHub App installation ID: #{installation_id} for #{repo} (account: #{installation_result[:account]})"
+    client = ::Github::App.installation_client(installation_id)
 
     # Detect client for user feedback
     client_info = detect_client_type
-    render(text: "Updating #{repo}##{issue_number} as [bot] via #{installation_result[:account]} installation (#{client_info})...")
-
-    # Get installation client (shows as [bot])
-    begin
-      client = Github::App.installation_client(installation_id)
-    rescue => e
-      report_error("Failed to get bot credentials: #{e.message}")
-      return
-    end
+    render(text: "Updating #{repo}##{issue_number} as [bot] (#{client_info})...")
 
     # Build update options
     update_options = {}
@@ -61,50 +43,38 @@ class GithubUpdateIssueTool < ApplicationMCPTool
     end
 
     # Update issue using installation token (bot attribution)
-    begin
-      issue = client.update_issue(repo, issue_number.to_i, update_options)
-      result = { success: true, issue: issue.to_h }
-    rescue Octokit::Error => e
-      Rails.logger.error "Octokit error: #{e.message}"
-      result = { success: false, error: e.message }
-    rescue => e
-      Rails.logger.error "General error updating issue: #{e.message}"
-      result = { success: false, error: e.message }
+    issue = client.update_issue(repo, issue_number.to_i, update_options)
+
+    is_pr = issue[:pull_request].present?
+    icon = is_pr ? "🔀" : "📝"
+
+    success_message = [
+      "✅ #{is_pr ? 'Pull request' : 'Issue'} updated successfully!",
+      "",
+      "#{icon} ##{issue[:number]}: #{issue[:title]}",
+      "   Repository: #{repo}",
+      "   URL: #{issue[:html_url]}",
+      "   State: #{issue[:state]}"
+    ]
+
+    if issue[:labels]&.any?
+      labels_text = issue[:labels].map { |l| l[:name] }.join(", ")
+      success_message << "   Labels: #{labels_text}"
     end
 
-    if result[:success]
-      issue = result[:issue]
-      is_pr = issue[:pull_request].present?
-      icon = is_pr ? "🔀" : "📝"
-
-      success_message = [
-        "✅ #{is_pr ? 'Pull request' : 'Issue'} updated successfully!",
-        "",
-        "#{icon} ##{issue[:number]}: #{issue[:title]}",
-        "   Repository: #{repo}",
-        "   URL: #{issue[:html_url]}",
-        "   State: #{issue[:state]}"
-      ]
-
-      if issue[:labels]&.any?
-        labels_text = issue[:labels].map { |l| l[:name] }.join(", ")
-        success_message << "   Labels: #{labels_text}"
-      end
-
-      if issue[:assignees]&.any?
-        assignees_text = issue[:assignees].map { |a| a[:login] }.join(", ")
-        success_message << "   Assignees: #{assignees_text}"
-      end
-
-      if issue[:updated_at]
-        updated_time = issue[:updated_at].is_a?(String) ? Time.parse(issue[:updated_at]) : issue[:updated_at]
-        success_message << "   Updated: #{updated_time.strftime('%Y-%m-%d %H:%M')}"
-      end
-
-      render(text: success_message.join("\n"))
-    else
-      report_error("Failed to update issue: #{result[:error]}")
+    if issue[:assignees]&.any?
+      assignees_text = issue[:assignees].map { |a| a[:login] }.join(", ")
+      success_message << "   Assignees: #{assignees_text}"
     end
+
+    if issue[:updated_at]
+      updated_time = issue[:updated_at].is_a?(String) ? Time.parse(issue[:updated_at]) : issue[:updated_at]
+      success_message << "   Updated: #{updated_time.strftime('%Y-%m-%d %H:%M')}"
+    end
+
+    render(text: success_message.join("\n"))
+  rescue Octokit::Error => e
+    report_error("Failed to update issue: #{e.message}")
   rescue => e
     report_error("Error updating issue: #{e.message}")
   end

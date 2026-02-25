@@ -77,7 +77,7 @@
           </div>
 
           <%# Dynamic PTY session tabs (populated from sessions[] via Stimulus) %>
-          <div>
+          <div class="flex items-center gap-1">
             <div data-pty-tabs-target="tabBar"
                  class="flex items-center bg-zinc-800/50 rounded p-0.5">
               <%# Default tab rendered server-side; replaced dynamically when session data arrives %>
@@ -87,6 +87,17 @@
                 Agent
               <% end %>
             </div>
+
+            <%# Add session button - sets agent ID on modal, then native command opens it %>
+            <button type="button"
+                    class="px-1.5 py-1 text-xs font-medium rounded text-zinc-600 hover:text-zinc-300 transition-colors"
+                    title="Add session"
+                    command="show-modal"
+                    commandfor="add-session-modal"
+                    data-pty-tabs-target="addSession"
+                    data-action="pty-tabs#prepareAddSession">
+              +
+            </button>
           </div>
         </div>
 
