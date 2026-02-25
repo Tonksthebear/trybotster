@@ -10,6 +10,7 @@
 //! - `pty` - PTY terminal operations (forwarders, input, resize)
 //! - `fs` - File system operations (read, write, copy, exists, listdir, is_dir)
 //! - `hub` - Hub state queries and operations (agents, worktrees)
+//! - `hub_discovery` - Discover running hubs on this machine (list, is_running, socket_path)
 //! - `tui` - TUI terminal connection and messaging
 //! - `worktree` - Git worktree queries and operations (list, find, create, delete)
 //! - `events` - Event subscription system for agent lifecycle events
@@ -19,6 +20,7 @@
 //! - `config` - Hub configuration and environment access
 //! - `secrets` - Plugin-scoped encrypted secret storage (AES-GCM files, no keyring access)
 //! - `action_cable` - ActionCable WebSocket connections (subscribe, perform, callbacks)
+//! - `hub_client` - Outgoing hub-to-hub Unix socket connections (connect, send, callbacks)
 //! - `websocket` - WebSocket client (persistent connections with callbacks)
 //!
 //! # Adding New Primitives
@@ -35,6 +37,8 @@ pub mod events;
 pub mod fs;
 pub mod http;
 pub mod hub;
+pub mod hub_client;
+pub mod hub_discovery;
 pub mod json;
 pub mod log;
 pub mod push;
@@ -93,6 +97,10 @@ pub use action_cable::{
     new_callback_registry as new_ac_callback_registry,
 };
 pub use websocket::{new_websocket_registry, WebSocketRegistry};
+pub use hub_client::{
+    HubClientCallbackRegistry, HubClientRequest, LuaHubClientConn,
+    new_hub_client_callback_registry,
+};
 pub use worktree::{
     WorktreeCreateResult, WorktreeRequest, WorktreeResultReceiver,
     WorktreeResultSender,
@@ -112,6 +120,7 @@ pub fn register_all(lua: &Lua) -> Result<()> {
     log::register(lua)?;
     json::register(lua)?;
     config::register(lua)?;
+    hub_discovery::register(lua)?;
     secrets::register(lua)?;
     Ok(())
 }
@@ -378,5 +387,30 @@ pub(crate) fn register_action_cable(
     callback_registry: ActionCableCallbackRegistry,
 ) -> Result<()> {
     action_cable::register_action_cable(lua, hub_event_tx, callback_registry)?;
+    Ok(())
+}
+
+/// Register hub client primitives with the shared event sender.
+///
+/// Call this after `register_all()` to set up outgoing hub-to-hub socket
+/// connections. Lua closures send `HubEvent::LuaHubClientRequest` via the
+/// shared sender. A read task per connection sends `HubEvent::HubClientMessage`
+/// for incoming frames.
+///
+/// # Arguments
+///
+/// * `lua` - The Lua state to register primitives in
+/// * `hub_event_tx` - Shared event sender for hub client operations
+/// * `callback_registry` - Shared callback registry for message callbacks
+///
+/// # Errors
+///
+/// Returns an error if registration fails.
+pub(crate) fn register_hub_client(
+    lua: &Lua,
+    hub_event_tx: HubEventSender,
+    callback_registry: HubClientCallbackRegistry,
+) -> Result<()> {
+    hub_client::register(lua, hub_event_tx, callback_registry)?;
     Ok(())
 }

@@ -68,6 +68,8 @@ pub struct LuaRuntime {
     websocket_registry: WebSocketRegistry,
     /// Registry of ActionCable channel callbacks (for `action_cable.subscribe()`).
     ac_callback_registry: primitives::ActionCableCallbackRegistry,
+    /// Registry of hub client connection callbacks (for `hub_client.on_message()`).
+    hub_client_callback_registry: primitives::HubClientCallbackRegistry,
     /// Cached compiled function for PTY output interceptor calls.
     pty_hook_fn: Option<mlua::RegistryKey>,
     /// Cached reusable context table for PTY output interceptor calls.
@@ -169,6 +171,9 @@ impl LuaRuntime {
         // Create ActionCable callback registry for action_cable.subscribe()
         let ac_callback_registry = primitives::new_ac_callback_registry();
 
+        // Create hub client callback registry for hub_client.on_message()
+        let hub_client_callback_registry = primitives::new_hub_client_callback_registry();
+
         // Register all primitives
         primitives::register_all(&lua).context("Failed to register Lua primitives")?;
 
@@ -223,6 +228,13 @@ impl LuaRuntime {
             Arc::clone(&ac_callback_registry),
         ).context("Failed to register ActionCable primitives")?;
 
+        // Register hub client primitives with the shared event sender and callback registry
+        primitives::register_hub_client(
+            &lua,
+            Arc::clone(&hub_event_sender),
+            Arc::clone(&hub_client_callback_registry),
+        ).context("Failed to register hub client primitives")?;
+
         // Note: Hub, connection, and worktree primitives are registered later via
         // register_hub_primitives() because they need a HandleCache reference from Hub
 
@@ -247,6 +259,7 @@ impl LuaRuntime {
             http_registry,
             websocket_registry,
             ac_callback_registry,
+            hub_client_callback_registry,
             pty_hook_fn: None,
             pty_hook_ctx: None,
             pty_input_listening: false,
@@ -1675,6 +1688,14 @@ impl LuaRuntime {
     /// and to clean up entries on unsubscribe/close.
     pub fn ac_callback_registry(&self) -> &primitives::ActionCableCallbackRegistry {
         &self.ac_callback_registry
+    }
+
+    /// Get a reference to the hub client callback registry.
+    ///
+    /// Used by Hub to look up connection callbacks when firing hub client messages
+    /// and to clean up entries on close/disconnect.
+    pub fn hub_client_callback_registry(&self) -> &primitives::HubClientCallbackRegistry {
+        &self.hub_client_callback_registry
     }
 
     // =========================================================================

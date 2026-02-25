@@ -16,6 +16,7 @@ use crate::lua::primitives::tui::TuiSendRequest;
 use crate::lua::primitives::webrtc::WebRtcSendRequest;
 use crate::lua::primitives::websocket::WsEvent;
 use crate::lua::primitives::action_cable::ActionCableRequest;
+use crate::lua::primitives::hub_client::HubClientRequest;
 use crate::lua::primitives::worktree::WorktreeRequest;
 use crate::socket::client_conn::SocketClientConn;
 
@@ -154,6 +155,23 @@ pub(crate) enum HubEvent {
 
     /// ActionCable operation request from a Lua callback.
     LuaActionCableRequest(ActionCableRequest),
+
+    /// Hub client operation request from a Lua callback.
+    LuaHubClientRequest(HubClientRequest),
+
+    /// Incoming JSON message from a remote hub via outgoing socket client.
+    HubClientMessage {
+        /// Connection ID for callback lookup.
+        connection_id: String,
+        /// JSON message from the remote hub.
+        message: serde_json::Value,
+    },
+
+    /// Remote hub connection disconnected (EOF or error).
+    HubClientDisconnected {
+        /// Connection ID that disconnected.
+        connection_id: String,
+    },
 
     /// Web push notification request from a Lua callback.
     ///

@@ -258,6 +258,10 @@ pub struct Hub {
     /// Lua-managed ActionCable channel subscriptions keyed by channel ID.
     lua_ac_channels: std::collections::HashMap<String, crate::lua::primitives::action_cable::LuaAcChannel>,
 
+    // === Lua Hub Client ===
+    /// Lua-managed outgoing hub client connections keyed by connection ID.
+    lua_hub_client_connections: std::collections::HashMap<String, crate::lua::primitives::hub_client::LuaHubClientConn>,
+
     /// Pending PTY output observer notifications.
     ///
     /// Populated during [`Self::poll_webrtc_pty_output`] (after WebRTC send),
@@ -449,6 +453,7 @@ impl Hub {
             lua,
             lua_ac_connections: std::collections::HashMap::new(),
             lua_ac_channels: std::collections::HashMap::new(),
+            lua_hub_client_connections: std::collections::HashMap::new(),
             pty_observer_queue: std::collections::VecDeque::new(),
             #[cfg(test)]
             pty_notification_queue: Arc::new(Mutex::new(Vec::new())),
