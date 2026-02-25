@@ -61,51 +61,6 @@ cli/lua/handlers/commands.lua  # Hub command dispatch
 cli/lua/ui/layout.lua          # TUI layout composition
 ```
 
-## PTY Communication
-
-### Writing to PTY Sessions
-
-Two paths exist for writing to agent PTYs:
-
-**Direct input** (human keystrokes): Clients write raw bytes via `PtyHandle::write_input_direct()`. This stamps `last_human_input_ms` on `SharedPtyState` for activity tracking. Focus events (`\x1b[I`/`\x1b[O`) are filtered out — they don't count as human activity.
-
-**Message delivery** (programmatic): Lua calls `session:send_message(text)` to inject text into a PTY. This uses a probe-based delivery gate in `cli/src/agent/message_delivery.rs`:
-
-```
-Lua send_message("fix the bug")
-  → MessageDeliveryState.enqueue()
-  → Delivery task wakes up
-  → Checks human activity cooldown (2s)
-  → Injects "zx" probe into PTY
-  → Watches for echo in PTY output (200ms timeout)
-    → Echo detected: PTY accepts free-text input
-      → Erase probe (backspaces), inject message + Enter
-    → No echo: PTY is in modal state (permission prompt, etc.)
-      → Wait for next output event, retry
-```
-
-The delivery task selects the correct Enter key based on the kitty keyboard protocol state: `\r` (legacy) or `\x1b[13u` (kitty). It runs as a tokio task per PTY session, spawned lazily on first `send_message()` call.
-
-### Key Files
-
-```
-cli/src/agent/message_delivery.rs  # Probe-based message delivery system
-cli/src/agent/pty/mod.rs           # SharedPtyState (last_human_input_ms)
-cli/src/hub/agent_handle.rs        # PtyHandle, write_input_direct()
-cli/src/lua/primitives/pty.rs      # PtySessionHandle (Lua send_message binding)
-cli/src/hub/events.rs              # HubEvent::MessageDelivered
-```
-
-### Lua API
-
-```lua
--- Send a message to an agent's PTY (queued, probe-gated)
-session:send_message("your text here")
-
--- Direct write (immediate, no probe gate)
-session:write("raw bytes\n")
-```
-
 ## VPN Architecture
 
 WireGuard VPN replaces WebSocket tunnels:
