@@ -38,9 +38,6 @@ pub struct TerminalWidget<'a> {
     screen: &'a vt100::Screen,
     block: Option<Block<'a>>,
     cursor: CursorConfig,
-    /// Explicit cursor position override. When set, used instead of
-    /// `screen.cursor_position()` to avoid stale reads after scrollback mutations.
-    cursor_pos_override: Option<(u16, u16)>,
 }
 
 impl std::fmt::Debug for TerminalWidget<'_> {
@@ -59,7 +56,6 @@ impl<'a> TerminalWidget<'a> {
             screen,
             block: None,
             cursor: CursorConfig::default(),
-            cursor_pos_override: None,
         }
     }
 
@@ -80,15 +76,6 @@ impl<'a> TerminalWidget<'a> {
         self.cursor.show = false;
         self
     }
-
-    /// Override the cursor position used for rendering.
-    ///
-    /// Bypasses `screen.cursor_position()` to prevent stale reads caused
-    /// by vt100 cursor tracking lag after scrollback mutations.
-    pub fn with_cursor_pos(mut self, pos: (u16, u16)) -> Self {
-        self.cursor_pos_override = Some(pos);
-        self
-    }
 }
 
 impl Widget for TerminalWidget<'_> {
@@ -107,7 +94,7 @@ impl Widget for TerminalWidget<'_> {
 
         // Render cursor
         if self.cursor.show && !self.screen.hide_cursor() {
-            render_cursor(self.screen, inner_area, buf, &self.cursor, self.cursor_pos_override);
+            render_cursor(self.screen, inner_area, buf, &self.cursor);
         }
     }
 }
@@ -141,10 +128,8 @@ fn render_cursor(
     area: Rect,
     buf: &mut Buffer,
     cursor_config: &CursorConfig,
-    cursor_pos_override: Option<(u16, u16)>,
 ) {
-    let (cursor_row, cursor_col) =
-        cursor_pos_override.unwrap_or_else(|| screen.cursor_position());
+    let (cursor_row, cursor_col) = screen.cursor_position();
 
     let buf_x = area.x + cursor_col;
     let buf_y = area.y + cursor_row;
