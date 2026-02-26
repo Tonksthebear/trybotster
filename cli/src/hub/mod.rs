@@ -634,6 +634,11 @@ impl Hub {
             None
         };
 
+        // Track whether this is a reconnect (existing broker) vs a fresh spawn.
+        // Used below to fire the `broker_reconnected` Lua event so the restart
+        // recovery handler can replay scrollback for surviving agents.
+        let is_reconnect = existing_conn.is_some();
+
         let mut conn = if let Some(c) = existing_conn {
             c
         } else {
@@ -674,6 +679,14 @@ impl Hub {
 
         *self.broker_connection.lock().unwrap() = Some(conn);
         log::info!("[broker] connected");
+
+        // Fire Lua event so the broker_reconnected handler can create ghost PTY
+        // handles and replay scrollback for agents that survived the Hub restart.
+        if is_reconnect {
+            if let Err(e) = self.lua.fire_json_event("broker_reconnected", &serde_json::json!({})) {
+                log::warn!("[broker] broker_reconnected event error: {e}");
+            }
+        }
     }
 
     /// Spawn the broker subprocess detached from the current process.

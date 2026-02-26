@@ -149,6 +149,9 @@ if not next(loaded_plugin_names) then
     log.debug("No plugins found")
 end
 
+-- Load broker restart recovery handler (creates ghost PTYs on Hub restart)
+safe_require("handlers.broker")
+
 -- Watch core modules and plugin directories for hot-reload on file changes
 safe_require("handlers.module_watcher")
 

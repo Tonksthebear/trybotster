@@ -181,6 +181,32 @@ function Agent.new(config)
         else
             log.error(string.format("Agent %s: failed to register with HandleCache: %s", key, tostring(result)))
         end
+
+        -- Register each PTY session with the broker for zero-downtime Hub restart.
+        -- The broker holds a dup of the master FD and ring-buffers output so the
+        -- Hub can replay scrollback after reconnecting. Session IDs are persisted
+        -- in metadata (written to context.json) so they survive a Hub restart.
+        for i, handle in ipairs(ordered_handles) do
+            local pty_index = i - 1  -- 0-based to match Rust PtyHandle indexing
+            local ok2, session_id = pcall(hub.register_pty_with_broker, handle, key, pty_index)
+            if ok2 and session_id then
+                self:set_meta("broker_session_" .. pty_index, tostring(session_id))
+                -- Store PTY dimensions so ghost PTYs created on Hub restart use the
+                -- real terminal size instead of falling back to the 24×80 default.
+                -- dimensions() returns (rows, cols) as two separate values.
+                local dims_ok, rows, cols = pcall(function() return handle:dimensions() end)
+                if dims_ok and rows then
+                    self:set_meta("broker_pty_rows_" .. pty_index, tostring(rows))
+                    self:set_meta("broker_pty_cols_" .. pty_index, tostring(cols))
+                end
+                log.info(string.format("Agent %s: pty_index %d registered with broker → session %d",
+                    key, pty_index, session_id))
+            elseif not ok2 then
+                log.warn(string.format("Agent %s: broker registration failed for pty_index %d: %s",
+                    key, pty_index, tostring(session_id)))
+            -- session_id == nil means broker not connected; skip silently
+            end
+        end
     else
         log.warn(string.format("Agent %s: no sessions to register (all PTY spawns may have failed)", key))
     end
@@ -290,6 +316,42 @@ function Agent:close(delete_worktree)
     hooks.notify("after_agent_close", self)
 
     log.info(string.format("Agent closed: %s (delete_worktree=%s)", key, tostring(delete_worktree or false)))
+end
+
+--- Replay broker ring-buffer scrollback into all sessions' shadow screens.
+--
+-- Fetches the raw ring-buffer bytes from the broker for each session that
+-- has a recorded session ID and feeds them into the vt100 shadow screen so
+-- that newly connecting clients see the current terminal state immediately
+-- instead of a blank screen.
+--
+-- Call this immediately after reconstructing an agent following a Hub restart,
+-- before registering any PTY forwarders or serving snapshot requests.
+-- No-op for sessions that have no recorded broker session ID.
+function Agent:replay_broker_scrollback()
+    local key = self:agent_key()
+    for i, entry in ipairs(self.session_order) do
+        local pty_index = i - 1  -- 0-based
+        local session_id = tonumber(self:get_meta("broker_session_" .. pty_index))
+        if session_id then
+            local snapshot = hub.get_pty_snapshot_from_broker(session_id)
+            if snapshot and #snapshot > 0 then
+                local handle = self.sessions[entry.name]
+                if handle then
+                    local ok, err = pcall(function() handle:feed_output(snapshot) end)
+                    if ok then
+                        log.info(string.format(
+                            "Agent %s: replayed %d bytes of broker scrollback for pty_index %d ('%s')",
+                            key, #snapshot, pty_index, entry.name))
+                    else
+                        log.warn(string.format(
+                            "Agent %s: failed to replay scrollback for pty_index %d: %s",
+                            key, pty_index, tostring(err)))
+                    end
+                end
+            end
+        end
+    end
 end
 
 --- Count active sessions.
