@@ -17,6 +17,20 @@ use crate::socket::framing::{Frame, FrameDecoder};
 /// Subscription ID used for the MCP channel on the hub socket.
 const SUB_ID: &str = "mcp_bridge";
 
+/// How many times to retry connecting to the hub socket on startup.
+///
+/// Claude Code kills and restarts `botster mcp-serve` when it receives a
+/// `notifications/tools/list_changed` event (e.g., after a plugin hot-reload).
+/// The new process may race with the hub briefly holding the socket fd — a
+/// few retries with a short delay cover the timing window reliably.
+const CONNECT_RETRIES: u32 = 5;
+
+/// Base delay between socket connect retries, in milliseconds.
+///
+/// Each attempt waits `attempt * CONNECT_RETRY_BASE_MS` (linear backoff),
+/// so retries span ~0ms, ~300ms, ~600ms, ~900ms, ~1200ms — ~3 s total.
+const CONNECT_RETRY_BASE_MS: u64 = 300;
+
 /// Run the MCP bridge synchronously, blocking on a tokio runtime.
 pub fn run(socket_path: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -28,10 +42,39 @@ pub fn run(socket_path: &str) -> Result<()> {
 async fn run_async(socket_path: &str) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // Connect to the hub's Unix domain socket
-    let stream = tokio::net::UnixStream::connect(socket_path)
-        .await
-        .with_context(|| format!("Failed to connect to hub socket: {socket_path}"))?;
+    // Connect to the hub's Unix domain socket, retrying on failure.
+    // Retries handle the race between Claude Code restarting this process and
+    // the hub briefly being unavailable (see CONNECT_RETRIES / CONNECT_RETRY_BASE_MS).
+    let stream = {
+        let mut last_err: Option<std::io::Error> = None;
+        let mut conn: Option<tokio::net::UnixStream> = None;
+        for attempt in 0..CONNECT_RETRIES {
+            if attempt > 0 {
+                let delay = std::time::Duration::from_millis(attempt as u64 * CONNECT_RETRY_BASE_MS);
+                tokio::time::sleep(delay).await;
+            }
+            match tokio::net::UnixStream::connect(socket_path).await {
+                Ok(s) => {
+                    conn = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[botster-mcp] connect attempt {}/{} failed: {e}",
+                        attempt + 1,
+                        CONNECT_RETRIES
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        conn.with_context(|| {
+            format!(
+                "Failed to connect to hub socket after {CONNECT_RETRIES} attempts: {socket_path}: {}",
+                last_err.map_or_else(|| "unknown error".to_owned(), |e| e.to_string())
+            )
+        })?
+    };
     let (read_half, write_half) = stream.into_split();
 
     // Channel for sending encoded frames to the hub
