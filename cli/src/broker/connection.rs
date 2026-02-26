@@ -67,6 +67,12 @@ pub struct BrokerConnection {
     decoder: BrokerFrameDecoder,
 }
 
+impl std::fmt::Debug for BrokerConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokerConnection").finish_non_exhaustive()
+    }
+}
+
 impl BrokerConnection {
     /// Connect to the broker socket at `path`.
     ///
@@ -327,7 +333,7 @@ fn send_with_fd(stream: &UnixStream, data: &[u8], fd: RawFd) -> Result<()> {
         iov_len: data.len(),
     };
 
-    let mut msg = libc::msghdr {
+    let msg = libc::msghdr {
         msg_name: std::ptr::null_mut(),
         msg_namelen: 0,
         msg_iov: &mut iov,
@@ -339,10 +345,10 @@ fn send_with_fd(stream: &UnixStream, data: &[u8], fd: RawFd) -> Result<()> {
 
     // Populate cmsghdr with SOL_SOCKET / SCM_RIGHTS and the FD value.
     unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        let cmsg = libc::CMSG_FIRSTHDR(&msg as *const _);
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size as u32) as _;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size as libc::c_uint);
         let data_ptr = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
         std::ptr::write_unaligned(data_ptr, fd);
     }
