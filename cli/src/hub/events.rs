@@ -289,5 +289,14 @@ pub(crate) enum HubEvent {
         /// PTY index within the agent (0 = cli, 1 = server).
         pty_index: usize,
     },
+
+    /// An agent's PTY handles were removed from `HandleCache` by `hub.unregister_agent()`.
+    ///
+    /// The Hub removes all `broker_sessions` entries whose `agent_key` matches
+    /// so the routing table does not grow without bound when agents cycle.
+    AgentUnregistered {
+        /// The agent key that was removed.
+        agent_key: String,
+    },
 }
 

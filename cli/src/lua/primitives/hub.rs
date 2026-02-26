@@ -217,12 +217,20 @@ pub(crate) fn register(
     // hub.unregister_agent(agent_key) - Unregister agent PTY handles
     //
     // Called by Lua when an agent is closed to remove it from HandleCache.
+    // Also fires AgentUnregistered so the Hub can clean up broker_sessions entries.
     let cache3 = Arc::clone(&handle_cache);
+    let tx_unreg = hub_event_tx.clone();
     let unregister_agent_fn = lua
         .create_function(move |_, agent_key: String| {
             let removed = cache3.remove_agent(&agent_key);
             if removed {
                 log::info!("[Lua] Unregistered agent '{}'", agent_key);
+                let guard = tx_unreg.lock().expect("HubEventSender mutex poisoned");
+                if let Some(ref sender) = *guard {
+                    let _ = sender.send(HubEvent::AgentUnregistered {
+                        agent_key: agent_key.clone(),
+                    });
+                }
             }
             Ok(removed)
         })
@@ -374,16 +382,16 @@ pub(crate) fn register(
                 move |_, (session_ud, agent_key, pty_index): (LuaAnyUserData, String, usize)| {
                     use crate::lua::primitives::pty::PtySessionHandle;
 
-                    // Extract FD and PID from the PtySessionHandle userdata.
+                    // Extract FD, PID, and current dimensions from the PtySessionHandle userdata.
                     // Drop the borrow before locking the broker so there is no
                     // risk of a lock-ordering deadlock.
-                    let (fd, child_pid) = {
+                    let (fd, child_pid, dims) = {
                         let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
                             LuaError::runtime(format!(
                                 "register_pty_with_broker: not a PtySessionHandle: {e}"
                             ))
                         })?;
-                        (handle.get_master_fd(), handle.get_child_pid())
+                        (handle.get_master_fd(), handle.get_child_pid(), handle.get_dims())
                     }; // PtySessionHandle borrow released here
 
                     let fd = match fd {
@@ -399,9 +407,8 @@ pub(crate) fn register(
                         }
                     };
 
-                    // 24×80 is the default; the caller should resize after registration.
-                    // Magic values: standard VT100 default terminal size.
-                    let (rows, cols) = (24u16, 80u16);
+                    // Use the actual terminal dimensions from the session handle.
+                    let (rows, cols) = dims;
                     let child_pid = child_pid.unwrap_or(0);
 
                     let session_id = {

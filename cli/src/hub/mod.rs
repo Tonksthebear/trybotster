@@ -637,14 +637,22 @@ impl Hub {
         let mut conn = if let Some(c) = existing_conn {
             c
         } else {
-            // No live broker — spawn one and give it a moment to bind.
+            // No live broker — spawn one then retry until it binds (up to 500 ms).
             self.spawn_broker();
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            match crate::broker::BrokerConnection::connect(&path) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("[broker] failed to connect after spawn: {e}");
+            let conn_opt = (0u8..10).find_map(|attempt| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                match crate::broker::BrokerConnection::connect(&path) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        log::debug!("[broker] connect attempt {}: {e}", attempt + 1);
+                        None
+                    }
+                }
+            });
+            match conn_opt {
+                Some(c) => c,
+                None => {
+                    log::warn!("[broker] failed to connect after 10 attempts (500 ms)");
                     return;
                 }
             }
