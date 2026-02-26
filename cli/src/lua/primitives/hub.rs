@@ -542,6 +542,74 @@ pub(crate) fn register(
             .map_err(|e| anyhow!("Failed to set hub.get_pty_snapshot_from_broker: {e}"))?;
     }
 
+    // hub.create_ghost_pty(agent_key, pty_index, session_id, rows, cols)
+    //   → PtySessionHandle userdata
+    //
+    // Creates a shadow-screen-only PTY handle for Hub restart recovery.
+    // No real PTY process is spawned — only the vt100 parser and broadcast
+    // channel are initialised with the given dimensions.
+    //
+    // Also fires HubEvent::BrokerSessionRegistered so the Hub's
+    // broker_sessions routing table maps session_id → (agent_key, pty_index).
+    // BrokerPtyOutput frames then route to the correct HandleCache entry once
+    // the caller registers the ghost handles via hub.register_agent().
+    //
+    // Arguments:
+    //   agent_key:  string  — agent key (e.g. "owner-repo-42")
+    //   pty_index:  integer — 0-based PTY index (0 = CLI, 1 = server)
+    //   session_id: integer — broker session ID from context.json metadata
+    //   rows:       integer — terminal rows saved in context.json metadata
+    //   cols:       integer — terminal cols saved in context.json metadata
+    {
+        let tx_ghost = Arc::clone(&hub_event_tx);
+        let create_ghost_fn = lua
+            .create_function(
+                move |_,
+                      (agent_key, pty_index, session_id, rows, cols): (
+                    String,
+                    usize,
+                    u32,
+                    u16,
+                    u16,
+                )| {
+                    use crate::lua::primitives::pty::PtySessionHandle;
+
+                    // Create a ghost handle — no real PTY, just shadow screen
+                    // and broadcast channel at the dimensions saved in context.json.
+                    let handle = PtySessionHandle::new_ghost(rows, cols, Arc::clone(&tx_ghost));
+
+                    // Register the broker session_id → (agent_key, pty_index) mapping
+                    // so BrokerPtyOutput frames route correctly once the caller calls
+                    // hub.register_agent() to populate HandleCache.
+                    {
+                        let guard = tx_ghost
+                            .lock()
+                            .expect("HubEventSender mutex poisoned");
+                        if let Some(ref sender) = *guard {
+                            let _ = sender.send(HubEvent::BrokerSessionRegistered {
+                                session_id,
+                                agent_key: agent_key.clone(),
+                                pty_index,
+                            });
+                        }
+                    }
+
+                    ::log::info!(
+                        "[Broker] Created ghost PTY '{}' pty={} session={}",
+                        agent_key,
+                        pty_index,
+                        session_id
+                    );
+
+                    Ok(handle)
+                },
+            )
+            .map_err(|e| anyhow!("Failed to create hub.create_ghost_pty function: {e}"))?;
+
+        hub.set("create_ghost_pty", create_ghost_fn)
+            .map_err(|e| anyhow!("Failed to set hub.create_ghost_pty: {e}"))?;
+    }
+
     // hub.quit() - Request Hub shutdown
     let tx = hub_event_tx;
     let quit_fn = lua

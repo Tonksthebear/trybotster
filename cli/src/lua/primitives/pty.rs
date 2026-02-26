@@ -167,6 +167,49 @@ impl std::fmt::Debug for PtySessionHandle {
 }
 
 impl PtySessionHandle {
+    /// Create a ghost `PtySessionHandle` for Hub restart recovery.
+    ///
+    /// A ghost handle has no real PTY process — only the vt100 shadow screen
+    /// and broadcast channel are initialised with the given dimensions. Use
+    /// [`PtySessionHandle::feed_output`] (via Lua) to replay broker scrollback
+    /// bytes into the shadow screen, and [`PtySessionHandle::to_pty_handle`] to
+    /// register the handle with `HandleCache` for `BrokerPtyOutput` routing.
+    ///
+    /// # Arguments
+    ///
+    /// * `rows` - Terminal row count (read from context.json on restart)
+    /// * `cols` - Terminal column count (read from context.json on restart)
+    /// * `hub_event_tx` - Hub event sender for message delivery tasks
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // In the broker_reconnected Lua handler via hub.create_ghost_pty():
+    /// let ghost = PtySessionHandle::new_ghost(24, 80, hub_event_tx.clone());
+    /// // Feed broker scrollback, then register via hub.register_agent()
+    /// ```
+    #[must_use]
+    pub fn new_ghost(rows: u16, cols: u16, hub_event_tx: HubEventSender) -> Self {
+        use crate::agent::pty::PtySession;
+
+        let session = PtySession::new(rows, cols);
+        let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
+            session.get_direct_access();
+        let session_arc = Arc::new(Mutex::new(session));
+
+        Self {
+            _session: session_arc,
+            shared_state,
+            shadow_screen,
+            event_tx,
+            kitty_enabled,
+            resize_pending,
+            port: None,
+            delivery: Arc::new(std::sync::OnceLock::new()),
+            hub_event_tx,
+        }
+    }
+
     /// Create a `PtyHandle` from this session handle.
     ///
     /// Used to register Lua-created PTY sessions with `HandleCache` for
@@ -351,6 +394,21 @@ impl LuaUserData for PtySessionHandle {
                 .expect("PtySessionHandle shadow_screen lock poisoned");
             let text = parser.screen().contents();
             lua.create_string(text.as_bytes())
+        });
+
+        // session:feed_output(bytes) - Feed raw bytes into the shadow screen.
+        //
+        // Processes `bytes` through the vt100 parser that backs `get_snapshot()`
+        // and `get_screen()`. Used by `Agent:replay_broker_scrollback()` to replay
+        // the broker's ring-buffer contents after a Hub restart so newly connecting
+        // clients see the current terminal state instead of a blank screen.
+        //
+        // Does NOT write bytes to the PTY process — use `write()` for input.
+        methods.add_method("feed_output", |_, this, data: LuaString| {
+            if let Ok(mut parser) = this.shadow_screen.lock() {
+                parser.process(&data.as_bytes());
+            }
+            Ok(())
         });
 
         // Backwards-compatible alias
