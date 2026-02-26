@@ -128,7 +128,7 @@ impl BrokerConnection {
             rows,
             cols,
         };
-        let frame_bytes = encode_fd_transfer(&reg);
+        let frame_bytes = encode_fd_transfer(&reg).context("encode FdTransfer")?;
         send_with_fd(&self.stream, &frame_bytes, fd)
             .context("sendmsg FdTransfer to broker")?;
 
@@ -376,47 +376,51 @@ mod tests {
 
     /// Receive one message from `sock`, extracting any SCM_RIGHTS ancillary FDs.
     unsafe fn recv_with_fd(sock: libc::c_int) -> (Vec<u8>, Vec<libc::c_int>) {
-        let mut data_buf = vec![0u8; 4096];
-        let fd_size = std::mem::size_of::<libc::c_int>();
-        let cmsg_space = libc::CMSG_SPACE(fd_size as u32) as usize;
-        let mut cmsg_buf = vec![0u8; cmsg_space * 4];
+        unsafe {
+            let mut data_buf = vec![0u8; 4096];
+            let fd_size = std::mem::size_of::<libc::c_int>();
+            let cmsg_space = libc::CMSG_SPACE(fd_size as u32) as usize;
+            let mut cmsg_buf = vec![0u8; cmsg_space * 4];
 
-        let mut iov = libc::iovec {
-            iov_base: data_buf.as_mut_ptr() as *mut libc::c_void,
-            iov_len: data_buf.len(),
-        };
-        let mut msg = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: &mut iov,
-            msg_iovlen: 1,
-            msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
-            msg_controllen: cmsg_buf.len() as _,
-            msg_flags: 0,
-        };
+            let mut iov = libc::iovec {
+                iov_base: data_buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: data_buf.len(),
+            };
+            let msg = libc::msghdr {
+                msg_name: std::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: &mut iov,
+                msg_iovlen: 1,
+                msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
+                msg_controllen: cmsg_buf.len() as _,
+                msg_flags: 0,
+            };
+            // msghdr must be mut for recvmsg; shadow with a mutable binding.
+            let mut msg = msg;
 
-        let n = libc::recvmsg(sock, &mut msg, 0);
-        assert!(n >= 0, "recvmsg failed: {}", std::io::Error::last_os_error());
-        data_buf.truncate(n as usize);
+            let n = libc::recvmsg(sock, &mut msg, 0);
+            assert!(n >= 0, "recvmsg failed: {}", std::io::Error::last_os_error());
+            data_buf.truncate(n as usize);
 
-        let mut fds = Vec::new();
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let data = libc::CMSG_DATA(cmsg);
-                let count = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize)
-                    / std::mem::size_of::<libc::c_int>();
-                for i in 0..count {
-                    let fd: libc::c_int = std::ptr::read_unaligned(
-                        data.add(i * std::mem::size_of::<libc::c_int>()) as *const libc::c_int,
-                    );
-                    fds.push(fd);
+            let mut fds = Vec::new();
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let data = libc::CMSG_DATA(cmsg);
+                    let count = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize)
+                        / std::mem::size_of::<libc::c_int>();
+                    for i in 0..count {
+                        let fd: libc::c_int = std::ptr::read_unaligned(
+                            data.add(i * std::mem::size_of::<libc::c_int>()) as *const libc::c_int,
+                        );
+                        fds.push(fd);
+                    }
                 }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
             }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-        }
 
-        (data_buf, fds)
+            (data_buf, fds)
+        }
     }
 
     // ── SCM_RIGHTS send/receive ───────────────────────────────────────────────
@@ -482,11 +486,13 @@ mod tests {
     #[test]
     fn test_received_fd_valid_after_sender_closes_original() {
         let mut sv: [libc::c_int; 2] = [0; 2];
-        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(ret, 0, "socketpair: {}", std::io::Error::last_os_error());
         let (sender_sock, receiver_sock) = (sv[0], sv[1]);
 
         let mut pipefd: [libc::c_int; 2] = [0; 2];
-        unsafe { libc::pipe(pipefd.as_mut_ptr()) };
+        let ret = unsafe { libc::pipe(pipefd.as_mut_ptr()) };
+        assert_eq!(ret, 0, "pipe: {}", std::io::Error::last_os_error());
         let (pipe_read, pipe_write) = (pipefd[0], pipefd[1]);
 
         let stream = unsafe { UnixStream::from_raw_fd(sender_sock) };

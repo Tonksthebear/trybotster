@@ -179,8 +179,27 @@ pub struct FdTransferPayload {
 
 impl FdTransferPayload {
     /// Encode to wire bytes.
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `agent_key` exceeds 255 bytes or `pty_index` exceeds 255,
+    /// as both are stored as `u8` in the wire format.
+    pub fn encode(&self) -> Result<Vec<u8>> {
         let key = self.agent_key.as_bytes();
+        if key.len() > u8::MAX as usize {
+            bail!(
+                "FdTransfer agent_key too long: {} bytes (max {})",
+                key.len(),
+                u8::MAX
+            );
+        }
+        if self.pty_index > u8::MAX as usize {
+            bail!(
+                "FdTransfer pty_index too large: {} (max {})",
+                self.pty_index,
+                u8::MAX
+            );
+        }
         let mut buf = Vec::with_capacity(1 + key.len() + 1 + 4 + 2 + 2);
         buf.push(key.len() as u8);
         buf.extend_from_slice(key);
@@ -188,7 +207,7 @@ impl FdTransferPayload {
         buf.extend_from_slice(&self.child_pid.to_le_bytes());
         buf.extend_from_slice(&self.rows.to_le_bytes());
         buf.extend_from_slice(&self.cols.to_le_bytes());
-        buf
+        Ok(buf)
     }
 
     /// Decode from wire bytes.
@@ -251,8 +270,12 @@ pub fn encode_data(frame_type: u8, session_id: u32, data: &[u8]) -> Vec<u8> {
 
 /// Encode an `FdTransfer` frame (without the ancillary FD — that is
 /// sent separately via `sendmsg`).
-pub fn encode_fd_transfer(reg: &FdTransferPayload) -> Vec<u8> {
-    encode_raw(frame_type::FD_TRANSFER, &reg.encode())
+///
+/// # Errors
+///
+/// Propagates validation errors from [`FdTransferPayload::encode`].
+pub fn encode_fd_transfer(reg: &FdTransferPayload) -> Result<Vec<u8>> {
+    Ok(encode_raw(frame_type::FD_TRANSFER, &reg.encode()?))
 }
 
 fn encode_raw(ft: u8, payload: &[u8]) -> Vec<u8> {
@@ -384,7 +407,7 @@ mod tests {
         let mut dec = BrokerFrameDecoder::new();
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
-        matches!(&frames[0], BrokerFrame::HubControl(HubMessage::ResizePty { session_id: 3, .. }));
+        assert!(matches!(&frames[0], BrokerFrame::HubControl(HubMessage::ResizePty { session_id: 3, .. })));
     }
 
     #[test]
@@ -398,7 +421,7 @@ mod tests {
         let mut dec = BrokerFrameDecoder::new();
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
-        matches!(&frames[0], BrokerFrame::BrokerControl(BrokerMessage::Registered { session_id: 42, .. }));
+        assert!(matches!(&frames[0], BrokerFrame::BrokerControl(BrokerMessage::Registered { session_id: 42, .. })));
     }
 
     #[test]
@@ -424,7 +447,7 @@ mod tests {
             rows: 24,
             cols: 80,
         };
-        let encoded = reg.encode();
+        let encoded = reg.encode().unwrap();
         let decoded = FdTransferPayload::decode(&encoded).unwrap();
         assert_eq!(decoded.agent_key, "test-agent");
         assert_eq!(decoded.pty_index, 1);
@@ -635,7 +658,7 @@ mod tests {
             rows: 50,
             cols: 220,
         };
-        let encoded = encode_fd_transfer(&reg);
+        let encoded = encode_fd_transfer(&reg).unwrap();
         // Verify the frame type byte is FD_TRANSFER (0x15).
         assert_eq!(encoded[4], frame_type::FD_TRANSFER);
 
@@ -663,10 +686,34 @@ mod tests {
             rows: 24,
             cols: 80,
         };
-        let encoded = reg.encode();
+        let encoded = reg.encode().unwrap();
         let decoded = FdTransferPayload::decode(&encoded).unwrap();
         assert_eq!(decoded.agent_key, "");
         assert_eq!(decoded.child_pid, 1);
+    }
+
+    #[test]
+    fn fd_transfer_payload_key_too_long_error() {
+        let reg = FdTransferPayload {
+            agent_key: "x".repeat(256),
+            pty_index: 0,
+            child_pid: 1,
+            rows: 24,
+            cols: 80,
+        };
+        assert!(reg.encode().is_err(), "agent_key > 255 bytes must fail");
+    }
+
+    #[test]
+    fn fd_transfer_payload_pty_index_too_large_error() {
+        let reg = FdTransferPayload {
+            agent_key: "ok".into(),
+            pty_index: 256,
+            child_pid: 1,
+            rows: 24,
+            cols: 80,
+        };
+        assert!(reg.encode().is_err(), "pty_index > 255 must fail");
     }
 
     #[test]
