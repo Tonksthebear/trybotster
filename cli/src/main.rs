@@ -524,6 +524,15 @@ enum Commands {
         /// Context key (e.g., agent_key, repo, prompt, issue_number)
         key: Option<String>,
     },
+    /// Run the PTY broker process (internal — spawned by the hub)
+    Broker {
+        /// Hub identifier this broker is serving
+        #[arg(long)]
+        hub_id: String,
+        /// Seconds to wait for Hub reconnect before killing sessions
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
 }
 
 /// Raise the process file descriptor limit to accommodate WebRTC connections.
@@ -953,6 +962,9 @@ fn main() -> Result<()> {
         }
         Commands::Context { key } => {
             commands::context::run(key.as_deref())?;
+        }
+        Commands::Broker { hub_id, timeout } => {
+            botster::broker::run(&hub_id, timeout)?;
         }
     }
 
