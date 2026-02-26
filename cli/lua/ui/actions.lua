@@ -413,6 +413,12 @@ function M.on_action(action, context)
     }
   end
 
+  -- === Quad view toggle ===
+  if action == "toggle_quad_view" then
+    _tui_state.quad_view = not _tui_state.quad_view
+    return {}
+  end
+
   -- === Application control ===
   if action == "quit" then
     return {

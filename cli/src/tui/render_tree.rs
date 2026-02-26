@@ -210,6 +210,8 @@ pub struct BlockConfig {
     pub borders: BorderStyle,
     /// Border styling (color, bold, etc.). Applied via `Block::border_style()`.
     pub border_style: Option<SpanStyle>,
+    /// Border type (plain, rounded, thick, double). Defaults to plain.
+    pub border_type: Option<ratatui::widgets::BorderType>,
 }
 
 /// Border style for blocks.
@@ -691,7 +693,16 @@ fn parse_block_config(table: &LuaTable) -> Option<BlockConfig> {
         .ok()
         .and_then(|v| parse_span_style(&v).ok());
 
-    Some(BlockConfig { title, borders, border_style })
+    let border_type_str: Option<String> = block_table.get("border_type").ok();
+    let border_type = match border_type_str.as_deref() {
+        Some("thick") => Some(ratatui::widgets::BorderType::Thick),
+        Some("double") => Some(ratatui::widgets::BorderType::Double),
+        Some("rounded") => Some(ratatui::widgets::BorderType::Rounded),
+        Some("plain") | Some("single") => Some(ratatui::widgets::BorderType::Plain),
+        _ => None,
+    };
+
+    Some(BlockConfig { title, borders, border_style, border_type })
 }
 
 // =============================================================================
@@ -853,6 +864,10 @@ impl BlockConfig {
 
         if let Some(ref style) = self.border_style {
             block = block.border_style(style.to_ratatui_style());
+        }
+
+        if let Some(border_type) = self.border_type {
+            block = block.border_type(border_type);
         }
 
         block
@@ -1508,6 +1523,7 @@ mod tests {
             title: Some(StyledContent::Plain(" Test ".to_string())),
             borders: BorderStyle::All,
             border_style: None,
+            border_type: None,
         };
         // Just verify it doesn't panic — Block doesn't implement PartialEq
         let _block = config.to_block();
@@ -1519,6 +1535,7 @@ mod tests {
             title: None,
             borders: BorderStyle::None,
             border_style: None,
+            border_type: None,
         };
         let _block = config.to_block();
     }
@@ -1532,6 +1549,7 @@ mod tests {
                 fg: Some(SpanColor::Cyan),
                 ..SpanStyle::default()
             }),
+            border_type: None,
         };
         let _block = config.to_block();
     }
