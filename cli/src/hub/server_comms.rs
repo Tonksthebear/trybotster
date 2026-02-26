@@ -593,6 +593,19 @@ impl Hub {
                 );
                 self.broker_sessions.remove(&session_id);
             }
+
+            HubEvent::AgentUnregistered { agent_key } => {
+                let before = self.broker_sessions.len();
+                self.broker_sessions.retain(|_, (key, _)| key != &agent_key);
+                let removed = before - self.broker_sessions.len();
+                if removed > 0 {
+                    log::debug!(
+                        "[Broker] Removed {} session(s) for unregistered agent '{}'",
+                        removed,
+                        agent_key
+                    );
+                }
+            }
         }
     }
 

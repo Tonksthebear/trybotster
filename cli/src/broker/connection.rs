@@ -34,6 +34,7 @@
 
 // Rust guideline compliant 2026-02
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
@@ -65,6 +66,12 @@ pub type SharedBrokerConnection = Arc<Mutex<Option<BrokerConnection>>>;
 pub struct BrokerConnection {
     stream: UnixStream,
     decoder: BrokerFrameDecoder,
+    /// Overflow frames decoded in the same socket read as a response frame.
+    ///
+    /// `read_response` returns exactly one frame per call. When the decoder
+    /// produces multiple frames from a single `read()`, extras are queued here
+    /// and returned on subsequent calls without re-reading the socket.
+    frame_buffer: VecDeque<BrokerFrame>,
 }
 
 impl std::fmt::Debug for BrokerConnection {
@@ -91,6 +98,7 @@ impl BrokerConnection {
         Ok(Self {
             stream,
             decoder: BrokerFrameDecoder::new(),
+            frame_buffer: VecDeque::new(),
         })
     }
 
@@ -291,17 +299,24 @@ impl BrokerConnection {
 
     /// Read one complete control or data frame from the broker socket.
     ///
-    /// Accumulates bytes until the frame decoder produces a complete frame.
+    /// Drains the internal overflow buffer first, so callers that trigger a
+    /// response never silently discard frames decoded in the same `read()`.
     /// Returns `Err` on EOF, I/O error, or decode failure.
     fn read_response(&mut self) -> Result<BrokerFrame> {
+        // Return any frame buffered from a previous read before blocking.
+        if let Some(frame) = self.frame_buffer.pop_front() {
+            return Ok(frame);
+        }
         let mut buf = [0u8; 4096];
         loop {
             let n = self.stream.read(&mut buf).context("read from broker")?;
             if n == 0 {
                 bail!("broker closed connection unexpectedly");
             }
-            let frames = self.decoder.feed(&buf[..n])?;
-            if let Some(frame) = frames.into_iter().next() {
+            let mut frames = self.decoder.feed(&buf[..n])?.into_iter();
+            if let Some(frame) = frames.next() {
+                // Park any extra frames decoded from this read for the next call.
+                self.frame_buffer.extend(frames);
                 return Ok(frame);
             }
         }
@@ -557,7 +572,7 @@ pub(crate) fn start_output_forwarder(
     stream: UnixStream,
     event_tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
 ) {
-    std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("broker-reader".to_owned())
         .spawn(move || {
             let mut decoder = BrokerFrameDecoder::new();
@@ -607,5 +622,7 @@ pub(crate) fn start_output_forwarder(
             }
             log::debug!("[broker-reader] thread exiting");
         })
-        .ok(); // thread spawn failure is non-fatal
+    {
+        log::warn!("[broker] failed to spawn broker-reader thread: {e}");
+    }
 }

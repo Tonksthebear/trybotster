@@ -211,6 +211,22 @@ impl PtySessionHandle {
     pub fn get_child_pid(&self) -> Option<u32> {
         self._session.lock().ok()?.get_child_pid()
     }
+
+    /// Return the current PTY dimensions `(rows, cols)`.
+    ///
+    /// Reads from `SharedPtyState` so the value reflects the most recent
+    /// `resize()` call. Falls back to `(24, 80)` if the mutex is poisoned.
+    ///
+    /// Used by `hub.register_pty_with_broker()` to pass accurate terminal
+    /// dimensions to the broker at registration time instead of hard-coding
+    /// the VT100 defaults.
+    #[must_use]
+    pub fn get_dims(&self) -> (u16, u16) {
+        self.shared_state
+            .lock()
+            .map(|s| s.dimensions)
+            .unwrap_or((24, 80))
+    }
 }
 
 impl LuaUserData for PtySessionHandle {
