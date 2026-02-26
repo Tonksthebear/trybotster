@@ -4,7 +4,7 @@
 # @category sessions
 # @dest shared/sessions/agent/initialization
 # @scope device
-# @version 1.0.0
+# @version 1.1.0
 
 # Claude Agent initialization — runs when the agent PTY session starts.
 #
@@ -16,27 +16,6 @@
 
 # Change to the worktree directory
 cd "$BOTSTER_WORKTREE_PATH"
-
-# ---------------------------------------------------------------------------
-# Context resolution
-# ---------------------------------------------------------------------------
-# Worktrees get a .botster/context.json with full task metadata.
-# Manual agents on main fall back to environment variables.
-
-botster_context() {
-  local val
-  val=$(botster json-get .botster/context.json "$1" 2>/dev/null | tr -d '"')
-  echo "$val"
-}
-
-BOTSTER_PROMPT=$(botster_context "prompt")
-BOTSTER_PROMPT="${BOTSTER_PROMPT:-$BOTSTER_TASK_DESCRIPTION}"
-
-BOTSTER_ISSUE_NUMBER=$(botster_context "issue_number")
-BOTSTER_ISSUE_NUMBER="${BOTSTER_ISSUE_NUMBER:-$BOTSTER_ISSUE_NUMBER}"
-
-BOTSTER_BRANCH_NAME=$(botster_context "branch_name")
-BOTSTER_BRANCH_NAME="${BOTSTER_BRANCH_NAME:-$BOTSTER_BRANCH_NAME}"
 
 # ---------------------------------------------------------------------------
 # Claude trust
@@ -62,14 +41,25 @@ if [ -n "$BOTSTER_MCP_TOKEN" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Hub MCP tools
+# ---------------------------------------------------------------------------
+# Registers the local hub MCP bridge so agents can use plugin-provided tools
+# (orchestrator, custom plugin tools, etc.) via the Botster hub.
+# The mcp-serve subcommand auto-discovers the hub socket from the cwd.
+
+echo "Registering botster hub MCP tools..."
+claude mcp add botster-hub -- botster mcp-serve
+
+# ---------------------------------------------------------------------------
 # Launch
 # ---------------------------------------------------------------------------
 
-if [ "$BOTSTER_ISSUE_NUMBER" != "0" ] && [ -n "$BOTSTER_ISSUE_NUMBER" ]; then
-  echo "Botster agent initialized for issue #$BOTSTER_ISSUE_NUMBER"
+ISSUE=$(botster context issue_number)
+if [ "$ISSUE" != "0" ] && [ -n "$ISSUE" ]; then
+  echo "Botster agent initialized for issue #$ISSUE"
 else
-  echo "Botster agent initialized for branch: $BOTSTER_BRANCH_NAME"
+  echo "Botster agent initialized for branch: $(botster context branch_name)"
 fi
 echo "Worktree: $BOTSTER_WORKTREE_PATH"
 
-claude --permission-mode acceptEdits "$BOTSTER_PROMPT"
+claude --permission-mode acceptEdits "$(botster context prompt)"

@@ -213,7 +213,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => api_key,
       "BOTSTER_HUB_ID" => hub.identifier,
-      "BOTSTER_WORKTREE_BASE" => worktree_base,
+      "BOTSTER_WORKTREE_BASE" => worktree_base
     }
 
     # By default, set BOTSTER_REPO explicitly. Tests can opt out with

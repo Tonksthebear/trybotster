@@ -46,6 +46,7 @@ end
 safe_require("lib.config_resolver")
 safe_require("lib.agent")
 safe_require("lib.commands")
+_G.mcp = safe_require("lib.mcp")
 
 -- ============================================================================
 -- Handler Loading
@@ -148,8 +149,8 @@ if not next(loaded_plugin_names) then
     log.debug("No plugins found")
 end
 
--- Watch plugin directories for hot-reload on file changes
-safe_require("handlers.plugin_watcher")
+-- Watch core modules and plugin directories for hot-reload on file changes
+safe_require("handlers.module_watcher")
 
 -- ============================================================================
 -- Agent Improvements (Sandboxed)

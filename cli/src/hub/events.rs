@@ -115,15 +115,6 @@ pub(crate) enum HubEvent {
         events: Vec<FileEvent>,
     },
 
-    /// Lua hot-reload file change from a blocking forwarder task.
-    ///
-    /// A single forwarder reads from the `LuaFileWatcher`'s receiver
-    /// and sends module names that need reloading.
-    LuaFileChange {
-        /// Module names in dot notation (e.g. `"hub.handlers.foo"`).
-        modules: Vec<String>,
-    },
-
     /// Periodic cleanup tick from a spawned interval task.
     ///
     /// Fires every 5 seconds. Handles WebRTC connection cleanup

@@ -46,7 +46,6 @@ impl Hub {
         self.poll_lua_timers();
         self.poll_lua_action_cable_channels();
         self.poll_webrtc_channels();
-        self.poll_lua_file_changes();
         self.poll_user_file_watches();
     }
 
@@ -128,6 +127,7 @@ impl Hub {
                 hub_client::fire_hub_client_message(
                     self.lua.lua_ref(),
                     self.lua.hub_client_callback_registry(),
+                    self.lua.hub_client_pending_requests(),
                     &connection_id,
                     message,
                 );
@@ -139,6 +139,10 @@ impl Hub {
                         if let Some(key) = reg.remove(&connection_id) {
                             let _ = self.lua.lua_ref().remove_registry_value(key);
                         }
+                    }
+                    // Remove the direct frame sender (used by hub_client.request()).
+                    if let Ok(mut senders) = self.lua.hub_client_frame_senders().lock() {
+                        senders.remove(&connection_id);
                     }
                     log::info!(
                         "[HubClient] Connection '{}' disconnected (remote EOF)",
@@ -182,12 +186,7 @@ impl Hub {
                     log::debug!("Fired {} user file watch event(s)", fired);
                 }
             }
-            HubEvent::LuaFileChange { modules } => {
-                let reloaded = self.lua.reload_lua_modules(&modules);
-                if reloaded > 0 {
-                    log::info!("Hot-reloaded {} Lua module(s)", reloaded);
-                }
-            }
+            // LuaFileChange removed — hot-reload now handled by Lua's module_watcher
             HubEvent::CleanupTick => {
                 self.cleanup_disconnected_webrtc_channels();
                 self.poll_stream_frames_outgoing();
@@ -803,18 +802,6 @@ impl Hub {
         self.poll_pty_observers();
     }
 
-
-    /// Poll for Lua file changes and hot-reload modified modules.
-    ///
-    /// Production uses `HubEvent::LuaFileChange` from a blocking forwarder task.
-    /// Tests use this polling fallback via the legacy `tick()` path.
-    #[cfg(test)]
-    fn poll_lua_file_changes(&self) {
-        let reloaded = self.lua.poll_and_reload();
-        if reloaded > 0 {
-            log::info!("Hot-reloaded {} Lua module(s)", reloaded);
-        }
-    }
 
     /// Poll user file watches created by `watch.directory()` in Lua.
     ///
@@ -1522,6 +1509,12 @@ impl Hub {
 
                 let hub_tx2 = hub_tx.clone();
                 let conn_id2 = conn_id.clone();
+                // Clone pending_requests so the read task can deliver _mcp_rid
+                // responses directly, bypassing the Hub event loop. This is
+                // required because hub_client.request() blocks the event loop
+                // thread via recv_timeout() — the event loop cannot process
+                // HubClientMessage while Lua is blocked.
+                let pending_requests2 = std::sync::Arc::clone(self.lua.hub_client_pending_requests());
 
                 // Use std UnixStream::connect (synchronous) and convert to tokio.
                 // Cannot use tokio's async connect here because we're inside the
@@ -1604,6 +1597,23 @@ impl Hub {
                                     Ok(frames) => {
                                         for frame in frames {
                                             if let Frame::Json(v) = frame {
+                                                // Short-circuit _mcp_rid responses directly to
+                                                // the pending_requests map. hub_client.request()
+                                                // blocks the Hub event loop thread via recv_timeout(),
+                                                // so we cannot route through HubEvent — the event
+                                                // loop is not being polled while Lua waits.
+                                                if let Some(rid) = v.get("_mcp_rid").and_then(|r| r.as_str()) {
+                                                    let sender = {
+                                                        let mut map = pending_requests2
+                                                            .lock()
+                                                            .expect("HubClientPendingRequests mutex poisoned");
+                                                        map.remove(rid)
+                                                    };
+                                                    if let Some(tx) = sender {
+                                                        let _ = tx.send(v);
+                                                        continue;
+                                                    }
+                                                }
                                                 let _ = hub_tx2.send(
                                                     super::events::HubEvent::HubClientMessage {
                                                         connection_id: conn_id2.clone(),
@@ -1632,6 +1642,12 @@ impl Hub {
                         }
                     }
                 });
+
+                // Register the frame sender so hub_client.request() can write
+                // directly without going through the Hub event loop.
+                if let Ok(mut senders) = self.lua.hub_client_frame_senders().lock() {
+                    senders.insert(connection_id.clone(), frame_tx.clone());
+                }
 
                 // Store connection
                 self.lua_hub_client_connections.insert(
@@ -1681,6 +1697,10 @@ impl Hub {
                         if let Some(key) = reg.remove(&connection_id) {
                             let _ = self.lua.lua_ref().remove_registry_value(key);
                         }
+                    }
+                    // Remove the direct frame sender (used by hub_client.request()).
+                    if let Ok(mut senders) = self.lua.hub_client_frame_senders().lock() {
+                        senders.remove(&connection_id);
                     }
                     log::info!(
                         "[HubClient] Connection '{}' closed",
@@ -3807,8 +3827,7 @@ mod tests {
     /// sending requests and receiving output.
     ///
     /// Manually calls `register_hub_primitives()` + `load_lua_init()`
-    /// instead of the full `setup()` to avoid `start_lua_file_watching()`
-    /// which spawns a background file watcher thread.
+    /// instead of the full `setup()` for test isolation.
     fn e2e_hub() -> (
         Hub,
         tokio::sync::mpsc::UnboundedSender<TuiRequest>,
@@ -3825,6 +3844,7 @@ mod tests {
             .register_hub_primitives(
                 std::sync::Arc::clone(&hub.handle_cache),
                 hub.config.worktree_base.clone(),
+                hub.hub_identifier.clone(),
                 std::sync::Arc::clone(&hub.shared_server_id),
                 std::sync::Arc::clone(&hub.state),
             )

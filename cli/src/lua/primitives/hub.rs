@@ -84,6 +84,7 @@ pub type SharedServerId = Arc<Mutex<Option<String>>>;
 /// - `hub.get_worktrees()` - Get available worktrees
 /// - `hub.register_agent(key, sessions)` - Register agent PTY handles
 /// - `hub.unregister_agent(key)` - Unregister agent PTY handles
+/// - `hub.hub_id()` - Get local hub identifier (stable hash, matches hub_discovery IDs)
 /// - `hub.server_id()` - Get server-assigned hub ID
 /// - `hub.detect_repo()` - Detect current repo name
 /// - `hub.api_token()` - Get hub's API bearer token for authenticated requests
@@ -96,6 +97,7 @@ pub type SharedServerId = Arc<Mutex<Option<String>>>;
 /// * `lua` - The Lua state to register primitives in
 /// * `hub_event_tx` - Shared sender for Hub events (processed by Hub event loop)
 /// * `handle_cache` - Thread-safe cache of agent handles for queries
+/// * `hub_identifier` - Local hub identifier (stable hash, matches hub_discovery IDs)
 /// * `server_id` - Server-assigned hub ID (set after registration)
 /// * `shared_state` - Shared hub state for agent queries
 ///
@@ -106,6 +108,7 @@ pub(crate) fn register(
     lua: &Lua,
     hub_event_tx: HubEventSender,
     handle_cache: Arc<HandleCache>,
+    hub_identifier: String,
     server_id: SharedServerId,
     _shared_state: Arc<RwLock<HubState>>,
 ) -> Result<()> {
@@ -226,6 +229,16 @@ pub(crate) fn register(
 
     hub.set("unregister_agent", unregister_agent_fn)
         .map_err(|e| anyhow!("Failed to set hub.unregister_agent: {e}"))?;
+
+    // hub.hub_id() - Returns the local hub identifier (stable hash).
+    // This is the same ID returned by hub_discovery.list(), suitable for
+    // comparing against discovered hubs to identify self.
+    let hub_id_fn = lua
+        .create_function(move |_, ()| Ok(hub_identifier.clone()))
+        .map_err(|e| anyhow!("Failed to create hub.hub_id function: {e}"))?;
+
+    hub.set("hub_id", hub_id_fn)
+        .map_err(|e| anyhow!("Failed to set hub.hub_id: {e}"))?;
 
     // hub.server_id() - Returns the server-assigned hub ID, or nil if not yet registered.
     let sid = Arc::clone(&server_id);
@@ -372,6 +385,7 @@ mod tests {
     fn create_test_deps() -> (
         HubEventSender,
         Arc<HandleCache>,
+        String,
         SharedServerId,
         Arc<RwLock<HubState>>,
     ) {
@@ -381,6 +395,7 @@ mod tests {
         (
             new_hub_event_sender(),
             Arc::new(HandleCache::new()),
+            "test-local-hub-id".to_string(),
             Arc::new(Mutex::new(Some("test-hub-id".to_string()))),
             state,
         )
@@ -389,14 +404,15 @@ mod tests {
     #[test]
     fn test_register_creates_hub_table() {
         let lua = Lua::new();
-        let (tx, cache, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state) = create_test_deps();
 
-        register(&lua, tx, cache, sid, state).expect("Should register hub primitives");
+        register(&lua, tx, cache, hid, sid, state).expect("Should register hub primitives");
 
         let hub: LuaTable = lua.globals().get("hub").expect("hub table should exist");
         assert!(hub.contains_key("get_worktrees").unwrap());
         assert!(hub.contains_key("register_agent").unwrap());
         assert!(hub.contains_key("unregister_agent").unwrap());
+        assert!(hub.contains_key("hub_id").unwrap());
         assert!(hub.contains_key("server_id").unwrap());
         assert!(hub.contains_key("detect_repo").unwrap());
         assert!(hub.contains_key("handle_webrtc_offer").unwrap());
@@ -407,9 +423,9 @@ mod tests {
     #[test]
     fn test_get_worktrees_returns_empty_array() {
         let lua = Lua::new();
-        let (tx, cache, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state) = create_test_deps();
 
-        register(&lua, tx, cache, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state).expect("Should register");
 
         let worktrees: LuaTable = lua.load("return hub.get_worktrees()").eval().unwrap();
         assert_eq!(worktrees.len().unwrap(), 0);
@@ -419,9 +435,9 @@ mod tests {
     #[test]
     fn test_get_worktrees_empty_returns_table() {
         let lua = Lua::new();
-        let (tx, cache, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state) = create_test_deps();
 
-        register(&lua, tx, cache, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state).expect("Should register");
 
         let worktrees: LuaTable = lua.load("return hub.get_worktrees()").eval().unwrap();
         assert_eq!(worktrees.len().unwrap(), 0, "Empty worktrees should have length 0");
@@ -430,12 +446,12 @@ mod tests {
     #[test]
     fn test_quit_sends_event() {
         let lua = Lua::new();
-        let (tx, cache, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
         *tx.lock().unwrap() = Some(sender);
 
-        register(&lua, tx, cache, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state).expect("Should register");
 
         lua.load("hub.quit()").exec().expect("Should send quit event");
 
@@ -448,9 +464,9 @@ mod tests {
     #[test]
     fn test_server_id_returns_value() {
         let lua = Lua::new();
-        let (tx, cache, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state) = create_test_deps();
 
-        register(&lua, tx, cache, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state).expect("Should register");
 
         let id: String = lua.load("return hub.server_id()").eval().unwrap();
         assert_eq!(id, "test-hub-id");
@@ -459,10 +475,10 @@ mod tests {
     #[test]
     fn test_server_id_returns_nil_when_unset() {
         let lua = Lua::new();
-        let (tx, cache, _sid, state) = create_test_deps();
+        let (tx, cache, hid, _sid, state) = create_test_deps();
         let nil_sid: SharedServerId = Arc::new(Mutex::new(None));
 
-        register(&lua, tx, cache, nil_sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, nil_sid, state).expect("Should register");
 
         let id: LuaValue = lua.load("return hub.server_id()").eval().unwrap();
         assert!(id.is_nil());
@@ -471,12 +487,12 @@ mod tests {
     #[test]
     fn test_handle_webrtc_offer_sends_event() {
         let lua = Lua::new();
-        let (tx, cache, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
         *tx.lock().unwrap() = Some(sender);
 
-        register(&lua, tx, cache, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state).expect("Should register");
 
         lua.load(r#"hub.handle_webrtc_offer("browser-123", "v=0 test-sdp")"#)
             .exec()
@@ -497,12 +513,12 @@ mod tests {
     #[test]
     fn test_handle_ice_candidate_sends_event() {
         let lua = Lua::new();
-        let (tx, cache, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
         *tx.lock().unwrap() = Some(sender);
 
-        register(&lua, tx, cache, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state).expect("Should register");
 
         lua.load(
             r#"hub.handle_ice_candidate("browser-456", {candidate = "candidate:...", sdpMid = "0"})"#,
@@ -535,12 +551,12 @@ mod tests {
     #[test]
     fn test_get_worktrees_null_field_is_nil_not_userdata() {
         let lua = Lua::new();
-        let (tx, cache, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state) = create_test_deps();
 
         // Inject a worktree so get_worktrees returns data
         cache.set_worktrees(vec![("/tmp/wt".to_string(), "main".to_string())]);
 
-        register(&lua, tx, cache, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state).expect("Should register");
 
         // get_worktrees returns array of {path, branch} - both strings, no nulls.
         // But the conversion path must use json_to_lua for safety.

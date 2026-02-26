@@ -372,6 +372,20 @@ _event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
     end
 end)
 
+-- Notify MCP clients when tool list changes (so mcp-serve can send tools/list_changed)
+_event_subs[#_event_subs + 1] = events.on("mcp_tools_changed", function()
+    for _, client in pairs(clients) do
+        for sub_id, sub in pairs(client.subscriptions) do
+            if sub.channel == "mcp" then
+                client:send({
+                    subscriptionId = sub_id,
+                    type = "tools_list_changed",
+                })
+            end
+        end
+    end
+end)
+
 -- ============================================================================
 -- Module Interface
 -- ============================================================================

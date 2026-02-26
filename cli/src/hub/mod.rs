@@ -546,15 +546,15 @@ impl Hub {
         if let Err(e) = self.lua.register_hub_primitives(
             Arc::clone(&self.handle_cache),
             self.config.worktree_base.clone(),
+            self.hub_identifier.clone(),
             Arc::clone(&self.shared_server_id),
             Arc::clone(&self.state),
         ) {
             log::warn!("Failed to register Hub Lua primitives: {}", e);
         }
 
-        // Load Lua init script and start file watching for hot-reload
+        // Load Lua init script (hot-reload is now handled by Lua's module_watcher)
         self.load_lua_init();
-        self.start_lua_file_watching();
 
 
         // Bundle generation is deferred - don't call generate_connection_url() here.
@@ -575,6 +575,9 @@ impl Hub {
 
         // Clean up stale files from previous runs
         daemon::cleanup_stale_files(&self.hub_identifier);
+
+        // Sweep orphaned sockets left by crashed/killed processes
+        daemon::cleanup_orphaned_sockets();
 
         // Write PID file
         if let Err(e) = daemon::write_pid_file(&self.hub_identifier) {
@@ -631,8 +634,16 @@ impl Hub {
             if dev_init_path.exists() {
                 log::info!("Dev mode: using Lua files from {}", dev_lua_dir.display());
 
-                // Update base path so file watcher monitors this directory
+                // Update base path for module resolution
                 self.lua.set_base_path(dev_lua_dir.clone());
+
+                // Expose base path to Lua so module_watcher can watch core modules
+                if let Err(e) = self.lua.lua().globals().set(
+                    "_lua_base_path",
+                    dev_lua_dir.to_string_lossy().to_string(),
+                ) {
+                    log::warn!("Failed to set _G._lua_base_path: {}", e);
+                }
 
                 // Update package.path for require() calls
                 if let Err(e) = self.lua.update_package_path(&dev_lua_dir) {
@@ -664,16 +675,6 @@ impl Hub {
         log::info!("Loading embedded Lua files");
         if let Err(e) = self.lua.load_embedded() {
             log::warn!("Failed to load embedded Lua: {}", e);
-        }
-    }
-
-    /// Start Lua file watching for hot-reload support.
-    ///
-    /// If the Lua base path exists, this enables automatic reloading of
-    /// modified Lua scripts during the event loop.
-    fn start_lua_file_watching(&mut self) {
-        if let Err(e) = self.lua.start_file_watching() {
-            log::warn!("Failed to start Lua file watching: {}", e);
         }
     }
 
@@ -886,15 +887,15 @@ mod tests {
     ///
     /// Regression test for a drop-order deadlock: `tokio_runtime` is declared
     /// before `lua` in Hub, so it drops first. But `lua` owns `spawn_blocking`
-    /// file watcher tasks that block on `rx.recv()` — the senders live inside
-    /// `FileWatcher` (also owned by `lua`). Without the `Drop` impl, runtime
-    /// drop blocks forever waiting for tasks that can never complete.
+    /// watcher forwarder tasks that block on `rx.recv()` — the senders live
+    /// inside `FileWatcher` (also owned by `lua`). Without the `Drop` impl,
+    /// runtime drop blocks forever waiting for tasks that can never complete.
     ///
     /// The fix: `Hub::drop()` calls `lua.stop_all_watchers()` before the
     /// runtime drops, aborting forwarder tasks and dropping watchers so the
     /// blocking pool can shut down cleanly.
     #[test]
-    fn test_hub_drop_completes_with_file_watching() {
+    fn test_hub_drop_completes_with_shutdown() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let done = std::sync::Arc::new(AtomicBool::new(false));
@@ -904,26 +905,14 @@ mod tests {
             let config = test_config();
             let mut hub = Hub::new(config).unwrap();
 
-            // Wire up event channel + tokio handle so file watching
-            // spawns a blocking forwarder task (production path).
             let tx = hub.hub_event_tx.clone();
             hub.lua.set_hub_event_tx(tx, hub.tokio_runtime.handle().clone());
-
-            // Create a real directory to watch (file watcher skips nonexistent).
-            let dir = std::env::temp_dir().join("botster_deadlock_test");
-            let _ = std::fs::create_dir_all(&dir);
-            std::fs::write(dir.join("init.lua"), "-- test").unwrap();
-            hub.lua.set_base_path(dir.clone());
-
-            hub.lua.start_file_watching().unwrap();
-            assert!(hub.lua.is_file_watching());
 
             // Simulate the shutdown path: call shutdown then drop.
             // shutdown() stops watchers, and Drop is the safety net.
             hub.shutdown();
             drop(hub);
 
-            let _ = std::fs::remove_dir_all(&dir);
             done_clone.store(true, Ordering::SeqCst);
         });
 
@@ -938,7 +927,7 @@ mod tests {
 
         assert!(
             done.load(Ordering::SeqCst),
-            "Hub::drop deadlocked — file watcher forwarder tasks were not stopped \
+            "Hub::drop deadlocked — watcher forwarder tasks were not stopped \
              before the tokio runtime dropped"
         );
 
@@ -962,17 +951,9 @@ mod tests {
             let tx = hub.hub_event_tx.clone();
             hub.lua.set_hub_event_tx(tx, hub.tokio_runtime.handle().clone());
 
-            let dir = std::env::temp_dir().join("botster_deadlock_test_no_shutdown");
-            let _ = std::fs::create_dir_all(&dir);
-            std::fs::write(dir.join("init.lua"), "-- test").unwrap();
-            hub.lua.set_base_path(dir.clone());
-
-            hub.lua.start_file_watching().unwrap();
-
             // Drop WITHOUT calling shutdown() — Drop impl must handle it.
             drop(hub);
 
-            let _ = std::fs::remove_dir_all(&dir);
             done_clone.store(true, Ordering::SeqCst);
         });
 

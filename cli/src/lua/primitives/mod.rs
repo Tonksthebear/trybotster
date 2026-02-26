@@ -98,8 +98,9 @@ pub use action_cable::{
 };
 pub use websocket::{new_websocket_registry, WebSocketRegistry};
 pub use hub_client::{
-    HubClientCallbackRegistry, HubClientRequest, LuaHubClientConn,
-    new_hub_client_callback_registry,
+    HubClientCallbackRegistry, HubClientFrameSenders, HubClientPendingRequests,
+    HubClientRequest, LuaHubClientConn,
+    new_hub_client_callback_registry, new_hub_client_frame_senders, new_hub_client_pending_requests,
 };
 pub use worktree::{
     WorktreeCreateResult, WorktreeRequest, WorktreeResultReceiver,
@@ -213,6 +214,7 @@ pub(crate) fn register_pty(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()
 /// * `lua` - The Lua state to register primitives in
 /// * `hub_event_tx` - Shared sender for Hub events
 /// * `handle_cache` - Thread-safe cache of agent handles for queries
+/// * `hub_identifier` - Local hub identifier (stable hash, matches hub_discovery IDs)
 /// * `server_id` - Server-assigned hub ID (set after registration)
 /// * `shared_state` - Shared hub state for agent queries
 ///
@@ -223,10 +225,11 @@ pub(crate) fn register_hub(
     lua: &Lua,
     hub_event_tx: HubEventSender,
     handle_cache: Arc<HandleCache>,
+    hub_identifier: String,
     server_id: SharedServerId,
     shared_state: Arc<std::sync::RwLock<crate::hub::state::HubState>>,
 ) -> Result<()> {
-    hub::register(lua, hub_event_tx, handle_cache, server_id, shared_state)?;
+    hub::register(lua, hub_event_tx, handle_cache, hub_identifier, server_id, shared_state)?;
     Ok(())
 }
 
@@ -390,18 +393,20 @@ pub(crate) fn register_action_cable(
     Ok(())
 }
 
-/// Register hub client primitives with the shared event sender.
+/// Register hub client primitives with the shared event sender and registries.
 ///
 /// Call this after `register_all()` to set up outgoing hub-to-hub socket
-/// connections. Lua closures send `HubEvent::LuaHubClientRequest` via the
-/// shared sender. A read task per connection sends `HubEvent::HubClientMessage`
-/// for incoming frames.
+/// connections. `hub_client.send()` routes through the Hub event loop.
+/// `hub_client.request()` bypasses the event loop by writing directly to
+/// `frame_senders` and reading from `pending_requests` — both populated by Hub.
 ///
 /// # Arguments
 ///
 /// * `lua` - The Lua state to register primitives in
-/// * `hub_event_tx` - Shared event sender for hub client operations
-/// * `callback_registry` - Shared callback registry for message callbacks
+/// * `hub_event_tx` - Shared event sender for connect/close operations
+/// * `callback_registry` - Shared callback registry for `on_message()` callbacks
+/// * `pending_requests` - Shared map for blocking `request()` response delivery
+/// * `frame_senders` - Shared map of conn_id → frame write channel for `request()`
 ///
 /// # Errors
 ///
@@ -410,7 +415,9 @@ pub(crate) fn register_hub_client(
     lua: &Lua,
     hub_event_tx: HubEventSender,
     callback_registry: HubClientCallbackRegistry,
+    pending_requests: HubClientPendingRequests,
+    frame_senders: HubClientFrameSenders,
 ) -> Result<()> {
-    hub_client::register(lua, hub_event_tx, callback_registry)?;
+    hub_client::register(lua, hub_event_tx, callback_registry, pending_requests, frame_senders)?;
     Ok(())
 }

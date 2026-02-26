@@ -162,6 +162,14 @@ function Client:handle_subscribe(msg)
         log.info(string.format("Hub subscription from %s...", self.peer_id:sub(1, 8)))
         self:send_agent_list(sub_id)
         self:send_worktree_list(sub_id)
+    elseif channel == "mcp" then
+        -- MCP is pull-based: the client sends tools/list when ready.
+        -- No auto-push on subscribe (unlike hub channel's agent_list).
+        -- Store caller's full context so tool handlers can identify the calling agent.
+        self.subscriptions[sub_id].caller_context = params.context or {}
+        local ctx = params.context or {}
+        log.info(string.format("MCP subscription from %s... (agent=%s, hub=%s)",
+            self.peer_id:sub(1, 8), tostring(ctx.agent_key), tostring(ctx.hub_id)))
     elseif channel == "preview" then
         log.debug(string.format("Preview subscription: %s", sub_id:sub(1, 16)))
     end
@@ -293,6 +301,8 @@ function Client:handle_data(msg)
         self:handle_terminal_data(sub, command)
     elseif sub.channel == "hub" then
         self:handle_hub_data(sub_id, command)
+    elseif sub.channel == "mcp" then
+        self:handle_mcp_data(sub_id, command)
     end
 end
 
@@ -335,6 +345,53 @@ function Client:handle_hub_data(sub_id, command)
     if command == nil then return end
 
     require("lib.commands").dispatch(self, sub_id, command)
+end
+
+--- Handle MCP channel data messages.
+-- Routes tool_call and tools_list requests from MCP bridge clients.
+-- @param sub_id The subscription ID
+-- @param command The command message
+function Client:handle_mcp_data(sub_id, command)
+    local mcp = require("lib.mcp")
+    local sub = self.subscriptions[sub_id]
+    local cmd_type = command.type
+
+    if cmd_type == "tools_list" then
+        self:send({
+            subscriptionId = sub_id,
+            type = "tools_list",
+            tools = mcp.list_tools(),
+        })
+
+    elseif cmd_type == "tool_call" then
+        local call_id = command.call_id
+        local tool_name = command.name
+        local params = command.arguments or {}
+
+        -- Pass the caller's full context to tool handlers
+        local context = sub and sub.caller_context or {}
+
+        local result, err = mcp.call_tool(tool_name, params, context)
+        if err then
+            self:send({
+                subscriptionId = sub_id,
+                type = "tool_result",
+                call_id = call_id,
+                is_error = true,
+                content = { { type = "text", text = err } },
+            })
+        else
+            self:send({
+                subscriptionId = sub_id,
+                type = "tool_result",
+                call_id = call_id,
+                is_error = false,
+                content = result,
+            })
+        end
+    else
+        log.debug(string.format("Unknown MCP command: %s", tostring(cmd_type)))
+    end
 end
 
 --- Count active subscriptions (for debugging).
