@@ -242,7 +242,9 @@ pub(super) fn render_terminal_panel(
         let widget = if is_scrolled {
             widget.hide_cursor()
         } else {
-            widget
+            // Use the panel's cached cursor position — read before the last
+            // set_scrollback(usize::MAX) probe — to avoid stale vt100 state.
+            widget.with_cursor_pos(panel.cursor_position())
         };
 
         widget.render(area, f.buffer_mut());

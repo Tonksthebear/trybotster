@@ -215,11 +215,42 @@ export class TerminalConnection extends Connection {
 
       this.#snapshotBuffer = null;
       console.debug(`[TerminalConnection] Snapshot ${snapshotId.toString(16)} complete: ${totalChunks} chunks, ${totalLen} bytes`);
-      this.emit("output", combined);
+      this.emit("output", this.#validateSnapshotCursor(combined));
     }
   }
 
   // ========== Private helpers ==========
+
+  /**
+   * Validate the trailing cursor-position escape in a snapshot byte array.
+   *
+   * snapshot_with_scrollback() always ends with \x1b[ROW;COLH. If the row
+   * or col is out of bounds (e.g., due to vt100 cursor tracking lag during
+   * scrollback manipulation), strip the escape and let the live forwarder
+   * correct the cursor position instead.
+   *
+   * Uses latin1 decoding on the tail so every byte maps 1:1 to a char,
+   * avoiding multi-byte edge cases in the pattern search.
+   */
+  #validateSnapshotCursor(data) {
+    const tailLen = Math.min(30, data.length);
+    const tail = new TextDecoder("latin1").decode(data.subarray(data.length - tailLen));
+    const match = tail.match(/\x1b\[(\d+);(\d+)H$/);
+    if (!match) return data;
+
+    const row = parseInt(match[1], 10);
+    const col = parseInt(match[2], 10);
+    const maxRows = this.options.rows ?? 24;
+    const maxCols = this.options.cols ?? 80;
+
+    if (row < 1 || col < 1 || row > maxRows || col > maxCols) {
+      console.warn(`[TerminalConnection] Snapshot cursor ${row};${col} out of bounds (${maxRows}x${maxCols}), stripping`);
+      const escLen = new TextEncoder().encode(match[0]).length;
+      return data.slice(0, data.length - escLen);
+    }
+
+    return data;
+  }
 
   async #emitOutput(data, compressed) {
     if (!data) return;
