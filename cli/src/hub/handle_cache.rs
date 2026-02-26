@@ -93,6 +93,23 @@ impl HandleCache {
             .cloned()
     }
 
+    /// Get an agent handle by its key string.
+    ///
+    /// Performs a linear scan of the cache — suitable for the low-frequency
+    /// broker output path (at most one lookup per output frame).
+    ///
+    /// Returns `None` if no agent with `key` is registered or the lock is
+    /// poisoned.
+    #[must_use]
+    pub fn get_agent_by_key(&self, key: &str) -> Option<AgentPtys> {
+        self.agents
+            .read()
+            .ok()?
+            .iter()
+            .find(|a| a.agent_key() == key)
+            .cloned()
+    }
+
     /// Get all agent handles.
     ///
     /// Returns empty vec if lock is poisoned.

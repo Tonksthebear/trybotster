@@ -399,6 +399,28 @@ impl PtyHandle {
     pub fn resize_direct(&self, rows: u16, cols: u16) {
         do_resize(rows, cols, &self.shared_state, &self.shadow_screen, &self.event_tx, &self.resize_pending);
     }
+
+    // =========================================================================
+    // Broker relay injection
+    // =========================================================================
+
+    /// Inject PTY output received from the broker (relay mode after Hub restart).
+    ///
+    /// Feeds `data` into the shadow screen so `get_snapshot()` reflects the
+    /// current terminal state, then broadcasts a `PtyEvent::Output` so all
+    /// forwarders (TUI, WebRTC, socket) receive the bytes transparently.
+    ///
+    /// Called by `Hub::handle_hub_event` when a `HubEvent::BrokerPtyOutput`
+    /// arrives for this session.
+    pub fn feed_broker_output(&self, data: &[u8]) {
+        // Update shadow screen for future snapshot requests.
+        if let Ok(mut parser) = self.shadow_screen.lock() {
+            parser.process(data);
+        }
+        // Broadcast to all subscribed forwarders.
+        // Lagged receivers will skip missed frames — same behavior as a live PTY.
+        let _ = self.event_tx.send(PtyEvent::Output(data.to_vec()));
+    }
 }
 
 #[cfg(test)]

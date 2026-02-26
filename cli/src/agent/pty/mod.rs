@@ -351,6 +351,37 @@ impl PtySession {
     }
 
     // =========================================================================
+    // Broker integration
+    // =========================================================================
+
+    /// Get the raw file descriptor of the master PTY.
+    ///
+    /// Used by the broker integration to send the FD via SCM_RIGHTS for
+    /// zero-downtime Hub restarts.  The kernel duplicates the FD during the
+    /// `sendmsg()` call, so the `PtySession` retains its own copy.
+    ///
+    /// Returns `None` if the PTY has not been spawned yet.
+    #[cfg(unix)]
+    pub fn get_master_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.shared_state
+            .lock()
+            .ok()?
+            .master_pty
+            .as_ref()
+            .and_then(|m| m.as_raw_fd())
+    }
+
+    /// Get the child process ID.
+    ///
+    /// Used by the broker to track and kill the child if the Hub disconnects
+    /// without sending a `KillAll`.
+    ///
+    /// Returns `None` if the PTY has not been spawned yet.
+    pub fn get_child_pid(&self) -> Option<u32> {
+        self.child.as_ref()?.process_id()
+    }
+
+    // =========================================================================
     // Unified Spawn
     // =========================================================================
 

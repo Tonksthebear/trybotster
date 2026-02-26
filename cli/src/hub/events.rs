@@ -242,5 +242,52 @@ pub(crate) enum HubEvent {
         /// Length of the delivered message in bytes.
         message_len: usize,
     },
+
+    // =========================================================================
+    // Broker IPC events — PTY broker process output relay
+    // =========================================================================
+
+    /// Raw PTY output forwarded from the broker (relay mode after Hub restart).
+    ///
+    /// Sent by the broker reader thread started in
+    /// [`crate::broker::connection::start_output_forwarder`].
+    /// The Hub feeds these bytes into the corresponding agent's shadow screen
+    /// and event broadcast channel so connected clients receive live output.
+    BrokerPtyOutput {
+        /// Broker-assigned session identifier.
+        session_id: u32,
+        /// Raw PTY output bytes from the master FD.
+        data: Vec<u8>,
+    },
+
+    /// A broker-managed PTY process has exited.
+    ///
+    /// NOTE: Not sent in broker v1 — the reader thread exits silently when a
+    /// child dies. Retained for future use; do not rely on receiving this event.
+    BrokerPtyExited {
+        /// Broker-assigned session identifier.
+        session_id: u32,
+        /// Agent key identifying the agent that owns this PTY.
+        agent_key: String,
+        /// PTY index within the agent (0 = cli, 1 = server).
+        pty_index: usize,
+        /// Exit code, or `None` if killed by signal.
+        exit_code: Option<i32>,
+    },
+
+    /// Register a broker session → agent PTY mapping in the Hub.
+    ///
+    /// Sent by the `hub.register_pty_with_broker()` Lua primitive after the
+    /// broker returns a session ID for a newly transferred PTY FD. The Hub
+    /// stores this mapping so `BrokerPtyOutput` frames can be routed to the
+    /// correct agent's shadow screen and event broadcast channel.
+    BrokerSessionRegistered {
+        /// Broker-assigned session identifier (returned by `register_pty`).
+        session_id: u32,
+        /// Agent key identifying the owning agent.
+        agent_key: String,
+        /// PTY index within the agent (0 = cli, 1 = server).
+        pty_index: usize,
+    },
 }
 

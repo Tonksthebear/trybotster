@@ -228,8 +228,9 @@ pub(crate) fn register_hub(
     hub_identifier: String,
     server_id: SharedServerId,
     shared_state: Arc<std::sync::RwLock<crate::hub::state::HubState>>,
+    broker_connection: crate::broker::SharedBrokerConnection,
 ) -> Result<()> {
-    hub::register(lua, hub_event_tx, handle_cache, hub_identifier, server_id, shared_state)?;
+    hub::register(lua, hub_event_tx, handle_cache, hub_identifier, server_id, shared_state, broker_connection)?;
     Ok(())
 }
 
