@@ -943,6 +943,10 @@ pub fn snapshot_from_screen(screen: &vt100::Screen) -> Vec<u8> {
 /// The live forwarder will carry the application's actual redraw output.
 #[must_use]
 pub fn snapshot_with_scrollback(screen: &mut vt100::Screen, skip_visible: bool) -> Vec<u8> {
+    // Cache cursor position before any scrollback manipulation — vt100's cursor
+    // tracking can become inconsistent after repeated set_scrollback() calls, so
+    // reading it here (before the loop) ensures we emit the correct position.
+    let (cursor_row, cursor_col) = screen.cursor_position();
     let saved_offset = screen.scrollback();
 
     // Discover how many scrollback lines the shadow terminal has accumulated.
@@ -1009,8 +1013,7 @@ pub fn snapshot_with_scrollback(screen: &mut vt100::Screen, skip_visible: bool) 
         output.extend(b"\x1b[2J\x1b[H");
     } else {
         output.extend(screen.contents_formatted());
-        let (row, col) = screen.cursor_position();
-        output.extend(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        output.extend(format!("\x1b[{};{}H", cursor_row + 1, cursor_col + 1).as_bytes());
     }
 
     output
