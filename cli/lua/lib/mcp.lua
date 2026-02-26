@@ -22,9 +22,32 @@ local M = {}
 local tools = {}
 
 -- Batch mode: when true, mcp_tools_changed is suppressed in tool() and reset().
--- end_batch() clears the flag and emits once. Used by loader.reload_plugin() to
--- collapse N notifications (1 reset + N tool registrations) into a single emit.
+-- end_batch() clears the flag and schedules the debounced notification.
 local _batch = false
+
+-- Debounce state for mcp_tools_changed notifications.
+-- Multiple rapid reloads (e.g. several agents editing plugin files simultaneously)
+-- each call end_batch(), which would fire N notifications and cause N Claude
+-- reconnect cycles. Instead, each call cancels the previous pending timer and
+-- schedules a new one — only the final settle fires the notification.
+local _debounce_timer = nil
+
+-- Seconds to wait after the last tool change before notifying clients.
+-- 500 ms covers a burst of simultaneous plugin reloads while keeping
+-- tool updates feeling near-instant for a single file save.
+local NOTIFY_DEBOUNCE_SECS = 0.5
+
+-- Schedule (or reschedule) the mcp_tools_changed notification.
+-- Cancels any previously pending debounce timer so rapid calls coalesce.
+local function schedule_notify()
+    if _debounce_timer then
+        timer.cancel(_debounce_timer)
+    end
+    _debounce_timer = timer.after(NOTIFY_DEBOUNCE_SECS, function()
+        _debounce_timer = nil
+        events.emit("mcp_tools_changed")
+    end)
+end
 
 --- Get the current plugin source.
 -- Reads _G._loading_plugin_source set by loader.lua during plugin load/reload.
@@ -57,7 +80,7 @@ function M.tool(name, schema, handler)
     }
 
     if not _batch then
-        events.emit("mcp_tools_changed")
+        schedule_notify()
     end
     log.info(string.format("MCP tool registered: %s", name))
 end
@@ -67,7 +90,7 @@ end
 function M.remove_tool(name)
     if tools[name] then
         tools[name] = nil
-        events.emit("mcp_tools_changed")
+        schedule_notify()
         log.info(string.format("MCP tool removed: %s", name))
     end
 end
@@ -92,7 +115,7 @@ function M.reset(source)
     end
     if removed > 0 then
         if not _batch then
-            events.emit("mcp_tools_changed")
+            schedule_notify()
         end
         log.info(string.format("MCP tools reset: %d removed (source=%s)", removed, tostring(source)))
     end
@@ -109,7 +132,7 @@ end
 -- Correct even on load failure: tools were cleared by reset(), clients need to know.
 function M.end_batch()
     _batch = false
-    events.emit("mcp_tools_changed")
+    schedule_notify()
 end
 
 --- List all registered tools (metadata only, no handlers).
@@ -175,6 +198,11 @@ end
 -- Without these hooks, reloading mcp.lua silently orphans all registered tools.
 
 function M._before_reload()
+    -- Cancel any pending debounce timer — the reload cycle will schedule a fresh one.
+    if _debounce_timer then
+        timer.cancel(_debounce_timer)
+        _debounce_timer = nil
+    end
     -- Stash the tool registry via hub.state (in-memory, handles survive reload)
     if _G.state then
         _G.state.set("mcp_tools_saved", tools)
