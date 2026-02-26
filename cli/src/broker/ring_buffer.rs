@@ -24,6 +24,7 @@ pub const DEFAULT_RING_CAPACITY: usize = 1024 * 1024;
 ///
 /// Pushing more bytes than `capacity` silently drops the oldest data.
 /// The buffer never panics or reallocates beyond its configured limit.
+#[derive(Debug)]
 pub struct RingBuffer {
     buf: VecDeque<u8>,
     capacity: usize,
