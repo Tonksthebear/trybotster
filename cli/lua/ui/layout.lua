@@ -195,6 +195,49 @@ function render(state)
     }
   end
 
+  -- Quad view: show all 4 agents in a 2x2 grid
+  if _tui_state.quad_view then
+    local sel_idx = _tui_state.selected_agent_index
+    local function quad_panel(i)
+      local agent = agents[i + 1]
+      if not agent then
+        return { type = "empty", block = { title = " [empty] ", borders = "all" } }
+      end
+      local name = agent.branch_name or agent.display_name or "agent"
+      local focused = (sel_idx == i)
+      local block = {
+        title = string.format(" %s ", name),
+        borders = "all",
+        border_type = focused and "thick" or "plain",
+        border_style = focused and { fg = "cyan" } or nil,
+      }
+      return {
+        type = "terminal",
+        props = { agent_index = i, pty_index = 0 },
+        block = block,
+      }
+    end
+    return {
+      type = "hsplit",
+      constraints = { "15%", "85%" },
+      children = {
+        {
+          type = "list",
+          block = { title = agent_title, borders = "all" },
+          props = { items = build_agent_items(state), selected = agent_selected },
+        },
+        {
+          type = "vsplit",
+          constraints = { "50%", "50%" },
+          children = {
+            { type = "hsplit", constraints = { "50%", "50%" }, children = { quad_panel(0), quad_panel(1) } },
+            { type = "hsplit", constraints = { "50%", "50%" }, children = { quad_panel(2), quad_panel(3) } },
+          },
+        },
+      },
+    }
+  end
+
   -- Build terminal panel: always show selected agent only
   local terminal_props = {}
   if _tui_state.selected_agent_index then

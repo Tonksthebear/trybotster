@@ -5,8 +5,8 @@
 -- authors call Hub.get(params.hub_id):get_pty_snapshot(agent_id, session)
 -- without caring whether the hub is local or remote.
 --
--- Remote hubs are registered/unregistered by the orchestrator plugin when
--- connections are established or dropped.
+-- Hub.get() auto-connects to remote hubs on demand via hub_discovery.
+-- No manual registration is required from plugin code.
 --
 -- This module is hot-reloadable; state is persisted via hub.state.
 -- Uses state.class() for persistent metatable -- existing instances
@@ -28,9 +28,12 @@ local self_id = hub.hub_id()
 -- =============================================================================
 
 --- Generate a unique message ID.
--- Format: msg_<timestamp>_<random hex> — good enough for session-scoped IDs.
+-- Format: msg_<hub_prefix>_<timestamp>_<random hex>
+-- Hub prefix (first 8 chars of hub_id) scopes IDs globally so reply_to
+-- threading works correctly across hubs without collision.
 local function generate_msg_id()
-    return string.format("msg_%d_%06x", os.time(), math.random(0, 0xffffff))
+    local hub_prefix = self_id and self_id:sub(1, 8) or "00000000"
+    return string.format("msg_%s_%d_%06x", hub_prefix, os.time(), math.random(0, 0xffffff))
 end
 
 --- Build a message envelope.
@@ -80,12 +83,29 @@ function Hub.register(hub_id, conn_id)
     log.info(string.format("Hub.register: %s -> %s", hub_id, conn_id))
 end
 
---- Unregister a remote hub connection.
--- Called by the orchestrator plugin on disconnect.
+--- Unregister a remote hub connection and close the underlying socket.
 -- @param hub_id string Remote hub identifier
 function Hub.unregister(hub_id)
+    local conn_id = remote_hubs[hub_id]
+    if conn_id then
+        pcall(hub_client.close, conn_id)
+    end
     remote_hubs[hub_id] = nil
     log.info(string.format("Hub.unregister: %s", hub_id))
+end
+
+--- Remove connections to hubs that are no longer running.
+-- Call periodically to clean up stale auto-connections.
+-- NOTE: Lua (via next()) permits nil-ing the current key during pairs() traversal.
+-- PiL: "the only safe assumption is that you can delete the field currently being visited."
+-- Hub.unregister() sets remote_hubs[hub_id] = nil for the key being visited — safe.
+function Hub.cleanup_dead()
+    for hub_id, _ in pairs(remote_hubs) do
+        if not hub_discovery.is_running(hub_id) then
+            log.info(string.format("Hub.cleanup_dead: hub %s no longer running, unregistering", hub_id))
+            Hub.unregister(hub_id)
+        end
+    end
 end
 
 -- =============================================================================
@@ -94,6 +114,7 @@ end
 
 --- Get a Hub object by ID.
 -- Returns a local hub if hub_id is nil or matches self, otherwise a remote proxy.
+-- Auto-connects to unknown remote hubs via hub_discovery on first access.
 -- @param hub_id string|nil Hub identifier (nil = local)
 -- @return Hub instance
 function Hub.get(hub_id)
@@ -102,13 +123,25 @@ function Hub.get(hub_id)
         return new_hub(self_id, true, nil)
     end
 
-    -- Known remote hub
+    -- Already connected remote hub
     local conn_id = remote_hubs[hub_id]
     if conn_id then
         return new_hub(hub_id, false, conn_id)
     end
 
-    error(string.format("Hub.get: unknown hub '%s' (not local, not connected)", hub_id))
+    -- Auto-connect: look up socket path via hub_discovery
+    local socket_path = hub_discovery.socket_path and hub_discovery.socket_path(hub_id)
+    if not socket_path then
+        error(string.format("Hub.get: hub '%s' not found or not running", hub_id))
+    end
+
+    log.info(string.format("Hub.get: auto-connecting to hub '%s'", hub_id))
+    local new_conn_id = hub_client.connect(socket_path)
+    remote_hubs[hub_id] = new_conn_id
+    -- Emit for observability; other plugins can listen if needed
+    events.emit("hub_connected", { hub_id = hub_id, conn_id = new_conn_id })
+
+    return new_hub(hub_id, false, new_conn_id)
 end
 
 --- Check if a hub ID refers to the local hub.
@@ -116,6 +149,31 @@ end
 -- @return boolean
 function Hub.is_local(hub_id)
     return not hub_id or hub_id == self_id
+end
+
+--- Call fn safely, detecting and cleaning up dead remote connections.
+-- On local hubs, calls fn() directly with no error wrapping.
+-- On remote hubs, catches connection errors (timeout, closed, broken pipe)
+-- and unregisters the hub so Hub.get() can auto-reconnect on next call.
+-- @param hub_id string|nil Hub identifier (nil = local)
+-- @param fn function The function to call (no args)
+-- @return any Return value of fn()
+function Hub.call_safely(hub_id, fn)
+    if Hub.is_local(hub_id) then
+        return fn()
+    end
+    local ok, result = pcall(fn)
+    if not ok then
+        local err = tostring(result)
+        if err:find("timeout", 1, true) or err:find("connection", 1, true)
+                or err:find("closed", 1, true) or err:find("broken pipe", 1, true) then
+            log.warn(string.format("Hub.call_safely: hub %s connection appears dead (%s), unregistering",
+                hub_id, err))
+            Hub.unregister(hub_id)
+        end
+        error(result)
+    end
+    return result
 end
 
 -- =============================================================================
@@ -270,6 +328,8 @@ end
 --- Drain an agent's inbox on this hub.
 -- Returns all non-expired messages and clears the inbox.
 -- Local: calls Agent.receive_messages() directly. Remote: uses hub_client.request().
+-- NOTE: No authorization checks — any caller can drain any agent's inbox.
+-- Acceptable for single-user deployments; multi-user would need caller verification.
 -- @param agent_id string Agent key
 -- @return array of envelope tables (may be empty)
 function Hub:receive_messages(agent_id)
@@ -353,6 +413,25 @@ function Hub:delete_agent(agent_id, delete_worktree)
     end
 
     return result.result
+end
+
+--- List agents on this hub.
+-- Local: returns Agent.all_info(). Remote: uses hub_client.request().
+-- @return array of agent info tables
+function Hub:agent_list()
+    if self._is_local then
+        return Agent.all_info()
+    end
+
+    local result = hub_client.request(self._conn_id, {
+        type = "get_agent_list",
+    }, 5000)
+
+    if result.error then
+        error(string.format("Hub:agent_list remote error: %s", result.error))
+    end
+
+    return result.result or {}
 end
 
 -- =============================================================================

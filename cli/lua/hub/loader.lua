@@ -93,10 +93,18 @@ function M.load_plugin(path, name)
         return false, msg
     end
 
+    -- Batch MCP notifications so N mcp.tool() calls emit exactly one
+    -- mcp_tools_changed event instead of N. end_batch() always runs (via pcall)
+    -- so batch mode is never left stuck on load error.
+    if mcp then mcp.begin_batch() end
+
     -- Set source context so mcp.tool() can track which plugin registered each tool
     _G._loading_plugin_source = "@" .. path
     local ok, result = pcall(chunk)
     _G._loading_plugin_source = nil
+
+    if mcp then mcp.end_batch() end
+
     if not ok then
         local msg = string.format("load_plugin: runtime error in %s: %s", path, tostring(result))
         log.error(msg)
@@ -136,6 +144,11 @@ function M.reload_plugin(name)
         end
     end
 
+    -- Batch MCP notifications: suppress mcp_tools_changed during reset + re-registration,
+    -- then emit exactly once at the end. end_batch() runs even on load failure (tools
+    -- were cleared by reset, clients need one notification to reflect that).
+    if mcp then mcp.begin_batch() end
+
     -- Clear MCP tools registered by this plugin (source = "@" .. path)
     if mcp then
         mcp.reset("@" .. entry.path)
@@ -144,8 +157,12 @@ function M.reload_plugin(name)
     -- Clear old module
     package.loaded[module_key] = nil
 
-    -- Re-load from disk
+    -- Re-load from disk (errors caught internally — load_plugin never throws)
     local ok = M.load_plugin(entry.path, name)
+
+    -- Single notification for the entire reload cycle
+    if mcp then mcp.end_batch() end
+
     if not ok then
         -- Restore old module on failure
         package.loaded[module_key] = old

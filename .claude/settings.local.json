@@ -91,9 +91,13 @@
       "Bash(cargo tree:*)",
       "mcp__botster-hub__get_pty_snapshot",
       "mcp__botster-hub__send_message",
-      "mcp__botster-hub__debug_notify",
       "mcp__botster-hub__post_message",
-      "mcp__botster-hub__receive_messages"
+      "mcp__botster-hub__receive_messages",
+      "Bash(luac:*)",
+      "Bash(~/.botster-dev/shared/plugins/orchestrator/init.lua:*)",
+      "Bash(RUST_LOG=info strings:*)",
+      "WebFetch(domain:releasebot.io)",
+      "WebFetch(domain:news.ycombinator.com)"
     ],
     "deny": [],
     "ask": []

@@ -21,6 +21,11 @@ local M = {}
 -- Internal tool registry: name -> { name, description, input_schema, handler, source }
 local tools = {}
 
+-- Batch mode: when true, mcp_tools_changed is suppressed in tool() and reset().
+-- end_batch() clears the flag and emits once. Used by loader.reload_plugin() to
+-- collapse N notifications (1 reset + N tool registrations) into a single emit.
+local _batch = false
+
 --- Get the current plugin source.
 -- Reads _G._loading_plugin_source set by loader.lua during plugin load/reload.
 -- @return string Source identifier (file path or "unknown")
@@ -51,7 +56,9 @@ function M.tool(name, schema, handler)
         source = caller_source(),
     }
 
-    events.emit("mcp_tools_changed")
+    if not _batch then
+        events.emit("mcp_tools_changed")
+    end
     log.info(string.format("MCP tool registered: %s", name))
 end
 
@@ -84,9 +91,25 @@ function M.reset(source)
         end
     end
     if removed > 0 then
-        events.emit("mcp_tools_changed")
+        if not _batch then
+            events.emit("mcp_tools_changed")
+        end
         log.info(string.format("MCP tools reset: %d removed (source=%s)", removed, tostring(source)))
     end
+end
+
+--- Begin a batch tool update — suppress mcp_tools_changed during reset + registration.
+-- Always pair with end_batch(). Use pcall around load_plugin so end_batch() runs
+-- even on failure — leaving batch mode stuck would permanently silence notifications.
+function M.begin_batch()
+    _batch = true
+end
+
+--- End a batch tool update — emit mcp_tools_changed exactly once.
+-- Correct even on load failure: tools were cleared by reset(), clients need to know.
+function M.end_batch()
+    _batch = false
+    events.emit("mcp_tools_changed")
 end
 
 --- List all registered tools (metadata only, no handlers).
@@ -141,6 +164,34 @@ function M.count()
     local n = 0
     for _ in pairs(tools) do n = n + 1 end
     return n
+end
+
+-- =============================================================================
+-- Lifecycle Hooks for Hot-Reload
+-- =============================================================================
+-- mcp.lua holds plugin-registered tool handlers. On reload:
+--   _before_reload: save tools table (handlers are plugin closures, not mcp code)
+--   _after_reload:  restore tools, update _G.mcp so existing call sites see new module
+-- Without these hooks, reloading mcp.lua silently orphans all registered tools.
+
+function M._before_reload()
+    -- Stash the tool registry via hub.state (in-memory, handles survive reload)
+    if _G.state then
+        _G.state.set("mcp_tools_saved", tools)
+    end
+    log.info(string.format("mcp.lua reloading — saving %d tools", M.count()))
+end
+
+function M._after_reload()
+    -- Restore tools from before reload
+    if _G.state then
+        local saved = _G.state.get("mcp_tools_saved", {})
+        tools = saved
+        _G.state.set("mcp_tools_saved", nil)
+    end
+    -- Update global so callers using _G.mcp get new module methods
+    _G.mcp = M
+    log.info(string.format("mcp.lua reloaded — %d tools preserved", M.count()))
 end
 
 return M

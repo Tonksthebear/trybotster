@@ -37,6 +37,7 @@ local shared_bindings = {
   ["shift+home"]     = "scroll_top",
   ["shift+end"]      = "scroll_bottom",
   ["ctrl+r"]         = "refresh_agents",
+  ["ctrl+g"]         = "toggle_quad_view",
 }
 
 -- Normal mode: no agent selected, only shared modifier bindings
