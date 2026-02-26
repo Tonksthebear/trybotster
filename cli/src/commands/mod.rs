@@ -21,6 +21,7 @@
 //! commands::reset::run(false)?;
 //! ```
 
+pub mod context;
 pub mod json;
 pub mod reset;
 pub mod update;

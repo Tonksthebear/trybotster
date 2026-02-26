@@ -12,7 +12,6 @@ use mlua::{IntoLuaMulti, Lua};
 
 use crate::hub::handle_cache::HandleCache;
 
-use super::file_watcher::LuaFileWatcher;
 use super::primitives;
 use super::primitives::events::SharedEventCallbacks;
 use super::primitives::pty::PtyOutputContext;
@@ -38,9 +37,8 @@ use super::primitives::HubEventSender;
 ///
 /// # Hot-Reload
 ///
-/// Call `start_file_watching()` to enable hot-reload. In production,
-/// a blocking forwarder task sends `HubEvent::LuaFileChange` events
-/// to the Hub event loop for instant module reloading.
+/// Hot-reload of core Lua modules and plugins is handled entirely by
+/// `handlers/module_watcher.lua` using the `watch.directory()` primitive.
 pub struct LuaRuntime {
     /// The Lua interpreter state.
     lua: Lua,
@@ -48,8 +46,6 @@ pub struct LuaRuntime {
     base_path: PathBuf,
     /// Whether to panic on Lua errors (strict mode).
     strict: bool,
-    /// Optional file watcher for hot-reload support.
-    file_watcher: Option<LuaFileWatcher>,
     /// Shared sender for Lua primitives to deliver events to the Hub event loop.
     ///
     /// Initially `None`, filled by `set_hub_event_tx()` before plugins execute.
@@ -70,6 +66,10 @@ pub struct LuaRuntime {
     ac_callback_registry: primitives::ActionCableCallbackRegistry,
     /// Registry of hub client connection callbacks (for `hub_client.on_message()`).
     hub_client_callback_registry: primitives::HubClientCallbackRegistry,
+    /// Pending blocking requests for `hub_client.request()`.
+    hub_client_pending_requests: primitives::HubClientPendingRequests,
+    /// Direct frame write channels for `hub_client.request()` (bypasses event loop).
+    hub_client_frame_senders: primitives::HubClientFrameSenders,
     /// Cached compiled function for PTY output interceptor calls.
     pty_hook_fn: Option<mlua::RegistryKey>,
     /// Cached reusable context table for PTY output interceptor calls.
@@ -81,16 +81,6 @@ pub struct LuaRuntime {
     /// (99.9% of the time), the Lua call is skipped entirely.
     /// Cleared when the last notification is dismissed.
     pty_input_listening: bool,
-    /// Hub event channel for spawning file watcher forwarder tasks.
-    hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
-    /// Tokio runtime handle for spawning blocking forwarder tasks.
-    ///
-    /// Needed because file watcher forwarders may be spawned during
-    /// initialization (before `block_on`), when no implicit runtime
-    /// context exists.
-    tokio_handle: Option<tokio::runtime::Handle>,
-    /// Blocking forwarder task for Lua hot-reload file watcher.
-    lua_file_watch_forwarder: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for LuaRuntime {
@@ -109,7 +99,6 @@ impl std::fmt::Debug for LuaRuntime {
         f.debug_struct("LuaRuntime")
             .field("base_path", &self.base_path)
             .field("strict", &self.strict)
-            .field("file_watching", &self.file_watcher.is_some())
             .field("hub_event_tx_active", &hub_event_tx_active)
             .field("event_callback_count", &event_cb_count)
             .field("active_watches", &watch_count)
@@ -174,6 +163,12 @@ impl LuaRuntime {
         // Create hub client callback registry for hub_client.on_message()
         let hub_client_callback_registry = primitives::new_hub_client_callback_registry();
 
+        // Create hub client pending requests map for hub_client.request()
+        let hub_client_pending_requests = primitives::new_hub_client_pending_requests();
+
+        // Create hub client frame senders map for hub_client.request() direct writes
+        let hub_client_frame_senders = primitives::new_hub_client_frame_senders();
+
         // Register all primitives
         primitives::register_all(&lua).context("Failed to register Lua primitives")?;
 
@@ -228,11 +223,13 @@ impl LuaRuntime {
             Arc::clone(&ac_callback_registry),
         ).context("Failed to register ActionCable primitives")?;
 
-        // Register hub client primitives with the shared event sender and callback registry
+        // Register hub client primitives with the shared event sender and registries
         primitives::register_hub_client(
             &lua,
             Arc::clone(&hub_event_sender),
             Arc::clone(&hub_client_callback_registry),
+            Arc::clone(&hub_client_pending_requests),
+            Arc::clone(&hub_client_frame_senders),
         ).context("Failed to register hub client primitives")?;
 
         // Note: Hub, connection, and worktree primitives are registered later via
@@ -251,7 +248,6 @@ impl LuaRuntime {
             lua,
             base_path,
             strict,
-            file_watcher: None,
             hub_event_sender,
             event_callbacks,
             watcher_registry,
@@ -260,12 +256,11 @@ impl LuaRuntime {
             websocket_registry,
             ac_callback_registry,
             hub_client_callback_registry,
+            hub_client_pending_requests,
+            hub_client_frame_senders,
             pty_hook_fn: None,
             pty_hook_ctx: None,
             pty_input_listening: false,
-            hub_event_tx: None,
-            tokio_handle: None,
-            lua_file_watch_forwarder: None,
         })
     }
 
@@ -672,91 +667,10 @@ impl LuaRuntime {
     }
 
     // =========================================================================
-    // Hot-Reload Support
+    // Watcher Management
     // =========================================================================
 
-    /// Start watching the Lua script directory for changes.
-    ///
-    /// If a Hub event channel is available (production mode), spawns a
-    /// blocking forwarder task that sends `HubEvent::LuaFileChange`
-    /// events. Otherwise, the caller must use `poll_and_reload()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The base path directory does not exist
-    /// - File watcher creation fails
-    pub fn start_file_watching(&mut self) -> Result<()> {
-        if self.file_watcher.is_some() {
-            log::warn!("File watching already started");
-            return Ok(());
-        }
-
-        // Only start watching if the directory exists
-        if !self.base_path.exists() {
-            log::debug!(
-                "Lua base path does not exist, skipping file watch: {:?}",
-                self.base_path
-            );
-            return Ok(());
-        }
-
-        let mut watcher = LuaFileWatcher::new(self.base_path.clone())?;
-        watcher.start_watching()?;
-
-        // Spawn a blocking forwarder task if the event channel and tokio
-        // handle are available. Uses the stored handle because this method
-        // may be called during initialization (before block_on).
-        if let (Some(ref tx), Some(ref handle)) = (&self.hub_event_tx, &self.tokio_handle) {
-            if let Some(rx) = watcher.take_rx() {
-                let tx = tx.clone();
-                let base_path = self.base_path.clone();
-                self.lua_file_watch_forwarder = Some(handle.spawn_blocking(move || {
-                    use super::file_watcher::events_to_modules;
-
-                    // Blocking recv — wakes only when the OS delivers an event.
-                    while let Ok(result) = rx.recv() {
-                        match result {
-                            Ok(event) => {
-                                let modules = events_to_modules(&base_path, &[event]);
-                                if !modules.is_empty() {
-                                    if tx.send(crate::hub::events::HubEvent::LuaFileChange { modules }).is_err() {
-                                        break; // Hub shut down
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!("[lua-watch] File watcher error: {e}");
-                            }
-                        }
-                    }
-                }));
-            }
-        }
-
-        self.file_watcher = Some(watcher);
-
-        Ok(())
-    }
-
-    /// Stop watching the Lua script directory.
-    pub fn stop_file_watching(&mut self) {
-        if let Some(handle) = self.lua_file_watch_forwarder.take() {
-            handle.abort();
-        }
-        if let Some(mut watcher) = self.file_watcher.take() {
-            watcher.stop_watching();
-            log::info!("Stopped Lua file watching");
-        }
-    }
-
-    /// Check if file watching is enabled.
-    #[must_use]
-    pub fn is_file_watching(&self) -> bool {
-        self.file_watcher.is_some()
-    }
-
-    /// Stop all blocking watcher tasks (Lua hot-reload + user watches).
+    /// Stop all blocking watcher tasks (user `watch.directory()` watches).
     ///
     /// Must be called before the tokio runtime drops to prevent a deadlock.
     /// Each watcher's `spawn_blocking` forwarder blocks on `rx.recv()` — the
@@ -764,37 +678,10 @@ impl LuaRuntime {
     /// dropping the watcher closes the channel, allowing the runtime's
     /// blocking pool to shut down cleanly.
     pub fn stop_all_watchers(&mut self) {
-        self.stop_file_watching();
         self.watcher_registry
             .lock()
             .expect("WatcherEntries mutex poisoned")
             .stop_all();
-    }
-
-    /// Poll for Lua file changes via periodic drain (test-only fallback).
-    ///
-    /// Production uses `HubEvent::LuaFileChange` from a blocking forwarder task.
-    #[cfg(test)]
-    pub fn poll_and_reload(&self) -> usize {
-        let Some(ref watcher) = self.file_watcher else {
-            return 0;
-        };
-
-        let changes = watcher.poll_changes();
-        if changes.is_empty() {
-            return 0;
-        }
-
-        log::debug!("Detected {} Lua file change(s)", changes.len());
-
-        let mut reloaded = 0;
-        for module_name in changes {
-            if self.reload_module(&module_name) {
-                reloaded += 1;
-            }
-        }
-
-        reloaded
     }
 
     /// Poll user file watches via periodic drain (test-only fallback).
@@ -804,20 +691,6 @@ impl LuaRuntime {
     pub fn poll_user_file_watches(&self) -> usize {
         use super::primitives::watch;
         watch::poll_user_watches(&self.lua, &self.watcher_registry)
-    }
-
-    /// Reload Lua modules by name (event-driven path).
-    ///
-    /// Called from `handle_hub_event()` for `HubEvent::LuaFileChange` events.
-    pub(crate) fn reload_lua_modules(&self, modules: &[String]) -> usize {
-        log::debug!("Detected {} Lua file change(s)", modules.len());
-        let mut reloaded = 0;
-        for module_name in modules {
-            if self.reload_module(module_name) {
-                reloaded += 1;
-            }
-        }
-        reloaded
     }
 
     /// Fire Lua callbacks for a user file watch event (event-driven path).
@@ -848,26 +721,6 @@ impl LuaRuntime {
     pub fn poll_http_responses(&self) -> usize {
         use super::primitives::http;
         http::poll_http_responses(&self.lua, &self.http_registry)
-    }
-
-    /// Reload a single Lua module via the loader.
-    ///
-    /// Returns `true` if the reload succeeded.
-    fn reload_module(&self, module_name: &str) -> bool {
-        // Call loader.reload(module_name) using safe function call mechanism
-        let result: mlua::Result<bool> = (|| {
-            let loader: mlua::Table = self.lua.globals().get("loader")?;
-            let reload: mlua::Function = loader.get("reload")?;
-            reload.call::<bool>(module_name)
-        })();
-
-        match result {
-            Ok(success) => success,
-            Err(e) => {
-                log::error!("Failed to reload module '{}': {}", module_name, e);
-                false
-            }
-        }
     }
 
     // =========================================================================
@@ -1543,6 +1396,7 @@ impl LuaRuntime {
         &self,
         handle_cache: Arc<HandleCache>,
         worktree_base: PathBuf,
+        hub_identifier: String,
         server_id: primitives::SharedServerId,
         shared_state: Arc<std::sync::RwLock<crate::hub::state::HubState>>,
     ) -> Result<()> {
@@ -1550,6 +1404,7 @@ impl LuaRuntime {
             &self.lua,
             Arc::clone(&self.hub_event_sender),
             Arc::clone(&handle_cache),
+            hub_identifier,
             server_id,
             shared_state,
         )
@@ -1629,8 +1484,6 @@ impl LuaRuntime {
             .lock()
             .expect("WatcherEntries mutex poisoned")
             .set_hub_event_tx(tx.clone(), tokio_handle.clone());
-        self.hub_event_tx = Some(tx);
-        self.tokio_handle = Some(tokio_handle);
     }
 
     /// Fire the Lua callback for a single completed HTTP response.
@@ -1696,6 +1549,21 @@ impl LuaRuntime {
     /// and to clean up entries on close/disconnect.
     pub fn hub_client_callback_registry(&self) -> &primitives::HubClientCallbackRegistry {
         &self.hub_client_callback_registry
+    }
+
+    /// Get a reference to the hub client pending requests map.
+    ///
+    /// Used by Hub to deliver responses to blocking `hub_client.request()` calls.
+    pub fn hub_client_pending_requests(&self) -> &primitives::HubClientPendingRequests {
+        &self.hub_client_pending_requests
+    }
+
+    /// Get a reference to the hub client frame senders map.
+    ///
+    /// Used by Hub to register/deregister direct write channels per connection.
+    /// `hub_client.request()` writes frames here to bypass the blocked event loop.
+    pub fn hub_client_frame_senders(&self) -> &primitives::HubClientFrameSenders {
+        &self.hub_client_frame_senders
     }
 
     // =========================================================================
@@ -2047,7 +1915,6 @@ mod tests {
     fn test_runtime_creation() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         assert!(!runtime.strict);
-        assert!(!runtime.is_file_watching());
     }
 
     #[test]
@@ -2187,17 +2054,6 @@ mod tests {
 
         let result = runtime.call_interceptors("test_event", "hello");
         assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_file_watching_on_nonexistent_dir() {
-        let mut runtime = LuaRuntime::new().expect("Should create runtime");
-        // Override base path to nonexistent directory
-        runtime.base_path = PathBuf::from("/nonexistent/lua/path");
-
-        // Should succeed but not start watching
-        runtime.start_file_watching().expect("Should not error");
-        assert!(!runtime.is_file_watching());
     }
 
     // =========================================================================
@@ -3112,45 +2968,6 @@ mod tests {
             source, "filesystem",
             "Filesystem module should override embedded (embedded searcher is fallback)"
         );
-    }
-
-    /// Verify that `start_file_watching` works outside a tokio runtime context
-    /// when a hub_event_tx is configured. This simulates the production
-    /// initialization path where `start_file_watching` is called before
-    /// `block_on` enters the async context.
-    #[test]
-    fn test_start_file_watching_outside_tokio_context() {
-        // Create a tokio runtime (simulating Hub's tokio_runtime field).
-        let rt = tokio::runtime::Runtime::new().expect("create runtime");
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let mut runtime = LuaRuntime::new().expect("create lua runtime");
-
-        // Inject event channel with handle — NOT inside block_on.
-        runtime.set_hub_event_tx(tx, rt.handle().clone());
-
-        // This must not panic with "must be called from the context of a Tokio runtime".
-        // The base path likely doesn't exist in test, so this is a no-op, but it
-        // exercises the code path.
-        runtime.start_file_watching().expect("start_file_watching should not panic");
-
-        // Also test with a real directory to exercise the forwarder spawn path.
-        let dir = std::env::temp_dir().join("botster_lua_fw_spawn_test");
-        let _ = std::fs::create_dir_all(&dir);
-        std::fs::write(dir.join("init.lua"), "-- test").expect("write");
-
-        runtime.base_path = dir.clone();
-        runtime.stop_file_watching(); // reset state
-        runtime.start_file_watching().expect("start_file_watching with real dir");
-
-        // Verify the forwarder was spawned.
-        assert!(
-            runtime.lua_file_watch_forwarder.is_some(),
-            "Blocking forwarder should be spawned when event channel is set"
-        );
-
-        runtime.stop_file_watching();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // =========================================================================

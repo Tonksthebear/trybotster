@@ -10,6 +10,7 @@
 -- Multiple clients can connect simultaneously (multiple TUIs, CLI tools, plugins).
 
 local Client = require("lib.client")
+local hooks = require("hub.hooks")
 local connections = require("handlers.connections")
 
 --- Create a socket transport for a specific client.
@@ -49,6 +50,12 @@ end)
 
 -- Called for each message from a socket client
 socket.on_message(function(client_id, msg)
+    -- Hub-to-hub RPC request: dispatch via hooks, skip subscription protocol
+    if msg._mcp_rid then
+        hooks.notify("hub_rpc_request", client_id, msg)
+        return
+    end
+
     local client = connections.get_client(client_id)
 
     if not client then

@@ -512,6 +512,18 @@ enum Commands {
         #[arg(long)]
         hub: Option<String>,
     },
+    /// Run as MCP server bridge (connects to hub, speaks MCP on stdio)
+    McpServe {
+        /// Path to hub Unix socket (auto-discovers from cwd if omitted)
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Get agent context values (identity, worktree metadata, plugin data).
+    /// Omit key to dump all context as JSON.
+    Context {
+        /// Context key (e.g., agent_key, repo, prompt, issue_number)
+        key: Option<String>,
+    },
 }
 
 /// Raise the process file descriptor limit to accommodate WebRTC connections.
@@ -783,28 +795,40 @@ fn main() -> Result<()> {
     // reconnects. Every production WebRTC server raises this.
     raise_fd_limit();
 
-    // Set up file logging so TUI doesn't interfere with log output
-    // Use BOTSTER_LOG_FILE or BOTSTER_CONFIG_DIR/botster.log or fallback
-    let log_path = if let Ok(path) = std::env::var("BOTSTER_LOG_FILE") {
-        std::path::PathBuf::from(path)
-    } else if let Ok(config_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
-        std::path::PathBuf::from(config_dir).join("botster.log")
-    } else if botster::env::is_any_test() {
-        // Test mode: use project tmp/ to avoid leaking outside the project
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .map(|p| p.join("tmp/botster.log"))
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/botster.log"))
+    // MCP serve uses stderr for logging (stdout is the MCP JSON-RPC channel).
+    // Skip file logging to avoid truncating the hub's log file.
+    let cli = Cli::parse();
+    let is_mcp_serve = matches!(cli.command, Commands::McpServe { .. } | Commands::Context { .. });
+
+    if is_mcp_serve {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+            .target(env_logger::Target::Stderr)
+            .format_timestamp_secs()
+            .init();
     } else {
-        std::path::PathBuf::from("/tmp/botster.log")
-    };
-    let log_file = std::fs::File::create(&log_path)
-        .unwrap_or_else(|_| panic!("Failed to create log file at {:?}", log_path));
-    let capped_writer = CappedFileWriter::new(log_file, 10 * 1024 * 1024); // 10 MB
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Pipe(Box::new(capped_writer)))
-        .format_timestamp_secs()
-        .init();
+        // Set up file logging so TUI doesn't interfere with log output
+        // Use BOTSTER_LOG_FILE or BOTSTER_CONFIG_DIR/botster.log or fallback
+        let log_path = if let Ok(path) = std::env::var("BOTSTER_LOG_FILE") {
+            std::path::PathBuf::from(path)
+        } else if let Ok(config_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
+            std::path::PathBuf::from(config_dir).join("botster.log")
+        } else if botster::env::is_any_test() {
+            // Test mode: use project tmp/ to avoid leaking outside the project
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .map(|p| p.join("tmp/botster.log"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/botster.log"))
+        } else {
+            std::path::PathBuf::from("/tmp/botster.log")
+        };
+        let log_file = std::fs::File::create(&log_path)
+            .unwrap_or_else(|_| panic!("Failed to create log file at {:?}", log_path));
+        let capped_writer = CappedFileWriter::new(log_file, 10 * 1024 * 1024); // 10 MB
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .target(env_logger::Target::Pipe(Box::new(capped_writer)))
+            .format_timestamp_secs()
+            .init();
+    }
 
     // Set up panic hook to log panics and ensure terminal cleanup
     let default_hook = std::panic::take_hook();
@@ -830,8 +854,6 @@ fn main() -> Result<()> {
         // Call the default panic handler
         default_hook(panic_info);
     }));
-
-    let cli = Cli::parse();
 
     match cli.command {
         Commands::Start { headless } => {
@@ -910,6 +932,27 @@ fn main() -> Result<()> {
         }
         Commands::Attach { hub: hub_arg } => {
             run_attach(hub_arg)?;
+        }
+        Commands::McpServe { socket } => {
+            let socket_path = match socket {
+                Some(s) => s,
+                None => {
+                    // Auto-discover: same logic as `botster attach`
+                    let hub_id = resolve_hub_id_for_cwd()
+                        .ok_or_else(|| anyhow::anyhow!("Cannot detect repo or working directory"))?;
+                    let path = botster::hub::daemon::socket_path(&hub_id)?;
+                    if !path.exists() {
+                        anyhow::bail!(
+                            "No running hub found for this directory. Start one with: botster start"
+                        );
+                    }
+                    path.to_string_lossy().into_owned()
+                }
+            };
+            botster::mcp_serve::run(&socket_path)?;
+        }
+        Commands::Context { key } => {
+            commands::context::run(key.as_deref())?;
         }
     }
 

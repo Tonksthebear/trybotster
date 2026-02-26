@@ -62,6 +62,25 @@ Trigger conditions: `Create`, `Modify`, `Rename` file events on `.lua` files onl
 3. Extensions are always replayed after any reload (`replay_extensions()`): re-discovers plugins, reloads botster API, re-wires action/keymap dispatch
 4. `_tui_state` global is preserved across reloads (initialized once with `or` guard)
 
+## Plugin File Watcher (Hot-Reload for Plugins)
+
+Core modules (`lib/`, `handlers/`) are watched by the Rust `LuaFileWatcher` (FSEvents/inotify). Plugins in `.botster/` directories use a separate Lua-based watcher (`handlers/plugin_watcher.lua`) that uses `watch.directory()` with `poll = true`.
+
+**Why PollWatcher?** macOS FSEvents misses in-place file writes (the kind agent tools like Claude Code's Edit produce). PollWatcher checks mtimes every 2 seconds, reliably detecting all changes.
+
+The plugin watcher watches the same 4 layers that `ConfigResolver` scans:
+1. `~/.botster/shared/plugins/`
+2. `~/.botster/profiles/{profile}/plugins/`
+3. `{repo}/.botster/shared/plugins/`
+4. `{repo}/.botster/profiles/{profile}/plugins/`
+
+On file change:
+1. Debounce (0.2s) to avoid rapid-fire reloads from editors
+2. If the plugin is already loaded: `loader.reload_plugin(name)` (which calls `mcp.reset(source)` to clear MCP tools, then re-executes the plugin)
+3. If it's a new `init.lua`: `loader.load_plugin()` to hot-load a new plugin
+
+MCP tools re-register automatically on reload, and the hub sends a `tools_list_changed` notification to connected MCP clients.
+
 ## Plugin Loading
 
 ### Loading Order (`hub/init.lua`)

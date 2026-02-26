@@ -1,6 +1,6 @@
 # Botster Lua Primitives Reference
 
-19 Rust modules are registered as Lua globals. Core primitives load unconditionally; event-driven primitives require a HubEventSender.
+21 Rust modules are registered as Lua globals, plus `mcp` which is a pure Lua module. Core primitives load unconditionally; event-driven primitives require a HubEventSender.
 
 ## Core Primitives (no HubEventSender needed)
 
@@ -95,8 +95,9 @@ handle:port() -> number           -- for port-forward sessions
 
 ### `hub`
 ```lua
+hub.hub_id() -> string             -- local identifier (SHA256 hash, matches hub_discovery IDs)
+hub.server_id() -> string          -- server-assigned ID (set after registration)
 hub.get_worktrees() -> table
-hub.server_id() -> string
 hub.register_agent(key, handles)
 hub.unregister_agent(key)
 hub.quit()
@@ -149,9 +150,19 @@ timer.cancel(id)
 
 ### `watch`
 ```lua
-local id = watch.directory(path, fn(events), opts?)   -- opts: {recursive = true}
-watch.stop(id)
+local id = watch.directory(path, opts?, callback)
+-- opts: {
+--   recursive = true,       -- watch subdirectories (default: true)
+--   pattern = "*.lua",      -- glob filter (optional)
+--   poll = false,           -- use mtime polling instead of OS events (default: false)
+--   poll_interval = 2.0,    -- poll interval in seconds (default: 2.0)
+-- }
+-- callback: function(event) where event = {path, kind, watch_id}
+-- kind: "create" | "modify" | "rename" | "delete"
+watch.unwatch(id) -> bool
 ```
+
+Use `poll = true` when OS-native watching (FSEvents on macOS) misses in-place file writes. The plugin hot-reload watcher uses this by default.
 
 ### `websocket`
 ```lua
@@ -171,6 +182,65 @@ local conn = action_cable.connect(opts?)   -- opts: {url, token, ...}
 local channel_id = action_cable.subscribe(conn, channel, params, callback)
 action_cable.unsubscribe(channel_id)
 action_cable.perform(channel_id, action, data)
+```
+
+### `hub_discovery`
+```lua
+hub_discovery.list() -> {{id, socket, repo_path}, ...}  -- all running hubs on this machine
+hub_discovery.is_running(hub_id) -> bool
+hub_discovery.socket_path(hub_id) -> string
+```
+
+### `hub_client`
+```lua
+local conn_id = hub_client.connect(socket_path)    -- connect to another hub's socket
+hub_client.on_message(conn_id, fn(message, conn_id))
+hub_client.send(conn_id, table)                    -- send JSON message
+hub_client.close(conn_id)
+```
+
+### `mcp` (Lua module, not a Rust primitive)
+
+Lua-side MCP tool registry. Plugins register tools that agents can invoke via the MCP stdio bridge (`botster mcp-serve`).
+
+```lua
+-- Register a tool (typically in a plugin's init.lua)
+mcp.tool("my_tool", {
+    description = "What this tool does",
+    input_schema = {
+        type = "object",
+        properties = {
+            arg1 = { type = "string", description = "..." },
+        },
+        required = { "arg1" },
+    },
+}, function(params, context)
+    -- params: the arguments from the MCP client
+    -- context: { agent_key, hub_id } injected by the hub
+    return "result string"           -- or return a table (auto JSON-encoded)
+end)
+
+-- Other API
+mcp.remove_tool(name)
+mcp.reset(source)                    -- clear tools by source (used during hot-reload)
+mcp.list_tools() -> table            -- metadata only, no handlers
+mcp.call_tool(name, params, context) -> result, error
+mcp.count() -> number
+```
+
+Tools track their source plugin automatically via `_G._loading_plugin_source` (set by `loader.lua`). On plugin hot-reload, `mcp.reset(source)` clears that plugin's tools before re-registering. The hub emits a `tools_list_changed` notification to connected MCP clients so they re-fetch the tool list.
+
+**MCP stdio bridge**: Run `botster mcp-serve --socket /path/to/hub.sock` to expose registered tools over JSON-RPC stdio. This is how Claude Code agents call hub tools — configure it as an MCP server in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "botster": {
+      "command": "botster",
+      "args": ["mcp-serve", "--socket", "/path/to/hub.sock"]
+    }
+  }
+}
 ```
 
 ### `update`

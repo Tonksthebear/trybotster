@@ -14,6 +14,7 @@ cli/lua/
     client.lua       # Generic client/subscription interface
     commands.lua     # Command registry
     config_resolver.lua  # 4-layer .botster/ config resolution
+    mcp.lua          # MCP tool registry (plugins register tools here)
     pty_clients.lua  # PTY focus tracking
   handlers/
     agents.lua       # Agent lifecycle orchestration
@@ -25,6 +26,7 @@ cli/lua/
     hub_commands.lua # ActionCable HubCommandChannel plugin
     filesystem.lua   # fs:* browser commands
     templates.lua    # template:* commands
+    plugin_watcher.lua # Hot-reload via PollWatcher for plugin directories
   ui/                # Separate mlua instance (TUI-side)
     layout.lua       # Declarative ratatui layout
     keybindings.lua  # Key descriptor -> action mapping

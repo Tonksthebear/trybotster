@@ -74,26 +74,33 @@ end
 -- @return boolean success
 function M.load_plugin(path, name)
     if not fs.exists(path) then
-        log.warn(string.format("load_plugin: %s not found at %s", name, path))
-        return false
+        local msg = string.format("load_plugin: %s not found at %s", name, path)
+        log.warn(msg)
+        return false, msg
     end
 
     local source, read_err = fs.read(path)
     if not source then
-        log.error(string.format("load_plugin: cannot read %s: %s", path, tostring(read_err)))
-        return false
+        local msg = string.format("load_plugin: cannot read %s: %s", path, tostring(read_err))
+        log.error(msg)
+        return false, msg
     end
 
     local chunk, err = load(source, "@" .. path)
     if not chunk then
-        log.error(string.format("load_plugin: syntax error in %s: %s", path, tostring(err)))
-        return false
+        local msg = string.format("load_plugin: syntax error in %s: %s", path, tostring(err))
+        log.error(msg)
+        return false, msg
     end
 
+    -- Set source context so mcp.tool() can track which plugin registered each tool
+    _G._loading_plugin_source = "@" .. path
     local ok, result = pcall(chunk)
+    _G._loading_plugin_source = nil
     if not ok then
-        log.error(string.format("load_plugin: runtime error in %s: %s", path, tostring(result)))
-        return false
+        local msg = string.format("load_plugin: runtime error in %s: %s", path, tostring(result))
+        log.error(msg)
+        return false, msg
     end
 
     -- Register in package.loaded so reload works
@@ -127,6 +134,11 @@ function M.reload_plugin(name)
         if not ok then
             log.warn(string.format("_before_reload failed for plugin %s: %s", name, tostring(err)))
         end
+    end
+
+    -- Clear MCP tools registered by this plugin (source = "@" .. path)
+    if mcp then
+        mcp.reset("@" .. entry.path)
     end
 
     -- Clear old module

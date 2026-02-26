@@ -9,15 +9,15 @@
 //!   receiver, then spawn a blocking forwarder task that sends events
 //!   to the Hub event channel.
 //!
-//! This module is the foundation for both Lua hot-reload
-//! ([`crate::lua::file_watcher::LuaFileWatcher`]) and the Lua `watch`
-//! primitives.
+//! This module is the foundation for the Lua `watch` primitive
+//! and TUI hot-reload.
 
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 
 /// Classification of a file system event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,12 +48,17 @@ pub struct FileEvent {
 
 /// Non-blocking file system watcher using OS-native mechanisms.
 ///
-/// Wraps `notify::RecommendedWatcher` with a channel-based event interface.
+/// Wraps either `notify::RecommendedWatcher` (FSEvents/inotify) or
+/// `notify::PollWatcher` (mtime-based) with a channel-based event interface.
 /// Events can be consumed either by polling via [`poll`](Self::poll) or by
 /// extracting the receiver via [`take_rx`](Self::take_rx) for event-driven
 /// delivery through a blocking forwarder task.
+///
+/// Use [`new`](Self::new) for OS-native watching (fast, low overhead) or
+/// [`new_poll`](Self::new_poll) for mtime-based polling (reliable on macOS
+/// where FSEvents misses in-place file writes).
 pub struct FileWatcher {
-    watcher: RecommendedWatcher,
+    watcher: Box<dyn Watcher + Send>,
     rx: Option<mpsc::Receiver<Result<Event, notify::Error>>>,
 }
 
@@ -64,7 +69,7 @@ impl std::fmt::Debug for FileWatcher {
 }
 
 impl FileWatcher {
-    /// Create a new watcher with no active watches.
+    /// Create a new watcher backed by OS-native mechanisms (FSEvents/inotify).
     ///
     /// Call [`watch`](Self::watch) to start monitoring paths.
     ///
@@ -75,12 +80,40 @@ impl FileWatcher {
     pub fn new() -> Result<Self> {
         let (tx, rx) = mpsc::channel();
 
-        let watcher = notify::recommended_watcher(move |res| {
+        let watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
             let _ = tx.send(res);
         })
         .context("Failed to create file watcher")?;
 
-        Ok(Self { watcher, rx: Some(rx) })
+        Ok(Self { watcher: Box::new(watcher), rx: Some(rx) })
+    }
+
+    /// Create a new watcher backed by mtime polling.
+    ///
+    /// Checks file modification times at the given interval. Slower and
+    /// higher overhead than OS-native watching, but reliably detects
+    /// in-place file writes that macOS FSEvents misses.
+    ///
+    /// # Arguments
+    ///
+    /// * `interval` - How often to check mtimes (e.g., 2 seconds)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the poll watcher cannot be initialized.
+    pub fn new_poll(interval: Duration) -> Result<Self> {
+        let (tx, rx) = mpsc::channel();
+
+        let config = notify::Config::default().with_poll_interval(interval);
+        let watcher = PollWatcher::new(
+            move |res| {
+                let _ = tx.send(res);
+            },
+            config,
+        )
+        .context("Failed to create poll watcher")?;
+
+        Ok(Self { watcher: Box::new(watcher), rx: Some(rx) })
     }
 
     /// Start watching `path` for file system events.
@@ -187,6 +220,12 @@ mod tests {
     #[test]
     fn test_create_watcher() {
         let watcher = FileWatcher::new();
+        assert!(watcher.is_ok());
+    }
+
+    #[test]
+    fn test_create_poll_watcher() {
+        let watcher = FileWatcher::new_poll(Duration::from_secs(2));
         assert!(watcher.is_ok());
     }
 

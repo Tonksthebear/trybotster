@@ -85,6 +85,7 @@ function Agent.new(config)
         sessions = {},        -- name -> PtySessionHandle (for lookup by name)
         session_order = {},   -- ordered array of { name, port_forward, port }
         _session_configs = config.sessions,  -- original session configs from creation (for available_session_types)
+        _inbox = {},          -- inter-agent message inbox: array of envelope tables
     }, Agent)
 
     local key = self:agent_key()
@@ -530,6 +531,8 @@ function Agent:build_env(base_env)
     -- for headless environments (systemd, cron) where TERM may be unset.
     env.TERM = env.TERM or os.getenv("TERM") or "xterm-256color"
     env.BOTSTER_WORKTREE_PATH = self.worktree_path
+    env.BOTSTER_AGENT_KEY = self:agent_key()
+    env.BOTSTER_HUB_ID = hub.server_id() or ""
     -- Fire filter hook for customization
     env = hooks.call("filter_agent_env", env, self) or env
     return env
@@ -685,6 +688,27 @@ function Agent.find_by_meta(key, value)
         end
     end
     return result
+end
+
+--- Drain an agent's inbox, discarding expired messages.
+-- Returns all non-expired messages and clears the inbox.
+-- Messages with no expires_at are kept indefinitely.
+-- @param agent_id string Agent key
+-- @return array of envelope tables (may be empty), or nil if agent not found
+function Agent.receive_messages(agent_id)
+    local agent = Agent.get(agent_id)
+    if not agent then return nil end
+
+    local now = os.time()
+    local valid = {}
+    for _, envelope in ipairs(agent._inbox or {}) do
+        if not envelope.expires_at or envelope.expires_at >= now then
+            valid[#valid + 1] = envelope
+        end
+    end
+
+    agent._inbox = {}
+    return valid
 end
 
 --- Compute the next available instance suffix for a base key.

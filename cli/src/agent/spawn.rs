@@ -110,6 +110,21 @@ pub fn build_command(
     for (key, value) in env_vars {
         cmd.env(key, value);
     }
+
+    // Prepend the running binary's directory to PATH so agent PTYs always
+    // resolve `botster` to the same build that's running the hub — no need
+    // to install globally or manage PATH expectations.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            let base_path = env_vars
+                .get("PATH")
+                .cloned()
+                .or_else(|| std::env::var("PATH").ok())
+                .unwrap_or_default();
+            cmd.env("PATH", format!("{}:{}", bin_dir.display(), base_path));
+        }
+    }
+
     cmd
 }
 

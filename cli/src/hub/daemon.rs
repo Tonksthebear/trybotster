@@ -131,6 +131,53 @@ pub fn cleanup_on_shutdown(hub_id: &str) {
     log::info!("Cleaned up daemon files for hub {}", &hub_id[..hub_id.len().min(8)]);
 }
 
+/// Remove orphaned socket files from `/tmp/botster-{uid}/`.
+///
+/// Scans the socket directory and removes any `.sock` files that don't
+/// have a corresponding live process. This catches sockets left behind
+/// by crashed processes, SIGKILL'd test processes, or any other case
+/// where `cleanup_on_shutdown` didn't run.
+///
+/// Safe to call at startup — only removes sockets for dead processes.
+pub fn cleanup_orphaned_sockets() {
+    let uid = unsafe { libc::getuid() };
+    let dir = PathBuf::from(format!("/tmp/botster-{uid}"));
+
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(ext) = path.extension() else { continue };
+        if ext != "sock" {
+            continue;
+        }
+
+        // Extract hub_id from filename (strip .sock)
+        let Some(hub_id) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+
+        // If the hub has a live PID, keep its socket
+        if is_hub_running(hub_id) {
+            continue;
+        }
+
+        // No live process — remove the orphaned socket
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+            log::debug!("Removed orphaned socket: {}", path.display());
+        }
+    }
+
+    if removed > 0 {
+        log::info!("Cleaned up {removed} orphaned socket(s) from {}", dir.display());
+    }
+}
+
 /// Discover all running hubs by scanning PID files.
 ///
 /// Returns a list of `(hub_id, pid)` pairs for running hubs.

@@ -10,7 +10,6 @@
 //! Hub
 //!  └── LuaRuntime
 //!       ├── Lua state (mlua)
-//!       ├── FileWatcher (hot-reload)
 //!       └── Primitives
 //!            ├── log (info, warn, error, debug)
 //!            ├── webrtc (peer events, messaging)
@@ -27,9 +26,10 @@
 //!
 //! # Hot-Reload
 //!
-//! When file watching is enabled, the runtime monitors the Lua script directory
-//! for changes. Modified files are automatically reloaded via the Lua `loader`
-//! module. Hub modules (`hub.state`, `hub.hooks`, `hub.loader`) are protected
+//! Hot-reload is handled entirely by Lua's `handlers/module_watcher.lua`
+//! using the `watch.directory()` primitive with poll mode. It monitors both
+//! core Lua modules and plugin directories, reloading via `loader.reload()`.
+//! Hub modules (`hub.state`, `hub.hooks`, `hub.loader`) are protected
 //! and cannot be reloaded - their state persists across reloads.
 //!
 //! # Usage
@@ -39,16 +39,14 @@
 //! lua.load_file(Path::new("init.lua"))?;
 //! lua.call_function("my_handler", ())?;
 //!
-//! // Hot-reload support (event-driven via HubEvent::LuaFileChange)
-//! lua.start_file_watching()?;
+//! // Hot-reload is handled by Lua's handlers/module_watcher.lua
+//! // using the watch.directory() primitive.
 //! ```
 
 pub mod embedded;
-pub mod file_watcher;
 pub mod primitives;
 pub mod runtime;
 
-pub use file_watcher::LuaFileWatcher;
 pub use primitives::{
     // PTY primitives
     CreateForwarderRequest, PtyForwarder, PtyOutputContext, PtyRequest,

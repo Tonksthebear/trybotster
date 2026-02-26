@@ -293,6 +293,21 @@ impl LuaUserData for PtySessionHandle {
             lua.create_string(&output)
         });
 
+        // session:get_screen() -> string (plain text, visible screen only)
+        //
+        // Returns the current visible terminal contents as plain text with no
+        // ANSI escape sequences. Intended for agent/LLM consumption where escape
+        // codes add noise. Unlike get_snapshot(), this does not include scrollback
+        // and does not affect resize_pending state.
+        methods.add_method("get_screen", |lua, this, ()| {
+            let parser = this
+                .shadow_screen
+                .lock()
+                .expect("PtySessionHandle shadow_screen lock poisoned");
+            let text = parser.screen().contents();
+            lua.create_string(text.as_bytes())
+        });
+
         // Backwards-compatible alias
         methods.add_method("get_scrollback", |lua, this, ()| {
             let mut parser = this

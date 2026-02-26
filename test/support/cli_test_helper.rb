@@ -81,6 +81,10 @@ module CliTestHelper
       @stderr_r&.close
       FileUtils.rm_rf(@temp_dir) if @temp_dir && File.directory?(@temp_dir)
 
+      # Clean up socket file (lives in /tmp/botster-{uid}/, not temp_dir).
+      # SIGKILL may bypass the Rust shutdown path that normally removes this.
+      cleanup_socket_file
+
       # Clean up the device token (important for non-transactional tests)
       @device_token&.destroy
     end
@@ -139,6 +143,14 @@ module CliTestHelper
       File.readlines(@log_file_path).last(lines).join
     rescue => e
       "Failed to read log: #{e.message}"
+    end
+
+    private
+
+    def cleanup_socket_file
+      uid = Process.uid
+      socket_path = "/tmp/botster-#{uid}/#{@hub.identifier}.sock"
+      FileUtils.rm_f(socket_path) if File.exist?(socket_path)
     end
   end
 

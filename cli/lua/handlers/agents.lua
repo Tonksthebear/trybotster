@@ -322,6 +322,25 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
 
     -- Find or create worktree
     local wt_path = from_worktree or worktree.find(branch_name)
+
+    -- worktree.find() only checks linked worktrees, not the main checkout.
+    -- hub.get_worktrees() also excludes it (filters by .git file vs directory).
+    -- Read .git/HEAD directly to check if branch_name is the main repo branch.
+    if not wt_path then
+        local head_path = repo_root .. "/.git/HEAD"
+        local f = io.open(head_path, "r")
+        if f then
+            local head = f:read("*l")
+            f:close()
+            -- HEAD contains "ref: refs/heads/<branch>" when on a branch
+            local main_branch = head and head:match("^ref: refs/heads/(.+)$")
+            if main_branch == branch_name then
+                wt_path = repo_root
+                log.info(string.format("Branch '%s' is main repo checkout, using %s", branch_name, repo_root))
+            end
+        end
+    end
+
     if not wt_path then
         -- Broadcast: creating worktree (sent immediately to clients)
         notify_lifecycle(agent_key, "creating_worktree")
