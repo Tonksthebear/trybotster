@@ -1399,6 +1399,7 @@ impl LuaRuntime {
         hub_identifier: String,
         server_id: primitives::SharedServerId,
         shared_state: Arc<std::sync::RwLock<crate::hub::state::HubState>>,
+        broker_connection: crate::broker::SharedBrokerConnection,
     ) -> Result<()> {
         primitives::register_hub(
             &self.lua,
@@ -1407,6 +1408,7 @@ impl LuaRuntime {
             hub_identifier,
             server_id,
             shared_state,
+            broker_connection,
         )
         .context("Failed to register Hub primitives")?;
 

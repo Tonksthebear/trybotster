@@ -46,10 +46,15 @@
 
 // Rust guideline compliant 2026-02
 
+pub mod connection;
 pub mod protocol;
+pub mod ring_buffer;
+
+pub(crate) use connection::{start_output_forwarder, BrokerConnection, SharedBrokerConnection};
+
+use ring_buffer::RingBuffer;
 
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
@@ -67,47 +72,10 @@ use protocol::{
 };
 
 /// Ring buffer capacity per PTY session (~1 MB).
-const RING_CAP: usize = 1024 * 1024;
+const RING_CAP: usize = ring_buffer::DEFAULT_RING_CAPACITY;
 
 /// Maximum path length for a Unix domain socket (macOS kernel limit).
 const MAX_SOCK_PATH: usize = 104;
-
-// ─── Ring buffer ───────────────────────────────────────────────────────────
-
-/// Bounded ring buffer of raw PTY output bytes.
-///
-/// Wraps `VecDeque<u8>` with a configurable capacity cap.  When the cap is
-/// reached the oldest bytes are discarded to make room for new data.
-struct RingBuffer {
-    buf: VecDeque<u8>,
-    cap: usize,
-}
-
-impl RingBuffer {
-    fn new(cap: usize) -> Self {
-        Self { buf: VecDeque::with_capacity(cap.min(4096)), cap }
-    }
-
-    /// Append bytes, evicting oldest data if the cap would be exceeded.
-    fn push(&mut self, data: &[u8]) {
-        if data.len() >= self.cap {
-            // The new data alone fills/exceeds the buffer — keep only the tail.
-            self.buf.clear();
-            self.buf.extend(&data[data.len() - self.cap..]);
-            return;
-        }
-        let overflow = (self.buf.len() + data.len()).saturating_sub(self.cap);
-        if overflow > 0 {
-            drop(self.buf.drain(..overflow));
-        }
-        self.buf.extend(data);
-    }
-
-    /// Drain all buffered bytes into a contiguous Vec.
-    fn drain_all(&mut self) -> Vec<u8> {
-        self.buf.make_contiguous().to_vec()
-    }
-}
 
 // ─── Session ───────────────────────────────────────────────────────────────
 
@@ -442,7 +410,7 @@ fn handle_connection(
 
                 BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) => {
                     if let Some(sess) = broker.sessions.get(&session_id) {
-                        let snapshot = sess.ring.lock().map(|mut r| r.drain_all()).unwrap_or_default();
+                        let snapshot = sess.ring.lock().map(|r| r.to_vec()).unwrap_or_default();
                         let frame = encode_data(frame_type::SNAPSHOT, session_id, &snapshot);
                         let _ = output_tx.try_send(frame);
                     }

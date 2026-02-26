@@ -182,6 +182,35 @@ impl PtySessionHandle {
             self.port,
         )
     }
+
+    // =========================================================================
+    // Broker integration — FD and PID extraction
+    // =========================================================================
+
+    /// Return the raw file descriptor of the master PTY end, if available.
+    ///
+    /// Returns `None` if the PTY session mutex is poisoned or the master FD
+    /// has already been transferred (post-`exec` replacement).
+    ///
+    /// Used by `hub.register_pty_with_broker()` to pass the FD to the broker
+    /// process via `SCM_RIGHTS`.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn get_master_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self._session.lock().ok()?.get_master_fd()
+    }
+
+    /// Return the OS process ID of the child process, if available.
+    ///
+    /// Returns `None` if the PTY session mutex is poisoned or the child PID
+    /// is not yet set (spawn not yet completed).
+    ///
+    /// Used by `hub.register_pty_with_broker()` to pass the PID to the broker
+    /// so it can monitor the child process lifetime.
+    #[must_use]
+    pub fn get_child_pid(&self) -> Option<u32> {
+        self._session.lock().ok()?.get_child_pid()
+    }
 }
 
 impl LuaUserData for PtySessionHandle {

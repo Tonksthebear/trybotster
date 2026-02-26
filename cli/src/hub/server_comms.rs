@@ -542,6 +542,57 @@ impl Hub {
             HubEvent::MessageDelivered { message_len } => {
                 log::info!("[MessageDelivery] Delivered message ({message_len} bytes)");
             }
+            // =========================================================
+            // Broker relay events
+            // =========================================================
+
+            // Store the session → agent mapping so BrokerPtyOutput can
+            // be routed to the correct PtyHandle.
+            HubEvent::BrokerSessionRegistered { session_id, agent_key, pty_index } => {
+                log::debug!(
+                    "[Broker] Session {} → '{}' pty={}",
+                    session_id, agent_key, pty_index
+                );
+                self.broker_sessions.insert(session_id, (agent_key, pty_index));
+            }
+
+            // Route broker PTY output to the agent's shadow screen and
+            // all subscribed forwarders (TUI, WebRTC, socket clients).
+            HubEvent::BrokerPtyOutput { session_id, data } => {
+                if let Some((agent_key, pty_index)) = self.broker_sessions.get(&session_id) {
+                    if let Some(agent_handle) = self.handle_cache.get_agent_by_key(agent_key) {
+                        if let Some(pty_handle) = agent_handle.get_pty(*pty_index) {
+                            pty_handle.feed_broker_output(&data);
+                        } else {
+                            log::warn!(
+                                "[Broker] BrokerPtyOutput session={}: no PTY at index {} \
+                                 for agent '{}'",
+                                session_id, pty_index, agent_key
+                            );
+                        }
+                    } else {
+                        log::debug!(
+                            "[Broker] BrokerPtyOutput session={}: agent '{}' not in cache",
+                            session_id, agent_key
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "[Broker] BrokerPtyOutput for unknown session {}",
+                        session_id
+                    );
+                }
+            }
+
+            // NOT sent in broker v1 (reader thread exits silently on child
+            // death). Retained for future use; logged but not acted upon.
+            HubEvent::BrokerPtyExited { session_id, agent_key, pty_index, exit_code } => {
+                log::info!(
+                    "[Broker] PtyExited session={} agent='{}' pty={} exit={:?}",
+                    session_id, agent_key, pty_index, exit_code
+                );
+                self.broker_sessions.remove(&session_id);
+            }
         }
     }
 
@@ -3847,6 +3898,7 @@ mod tests {
                 hub.hub_identifier.clone(),
                 std::sync::Arc::clone(&hub.shared_server_id),
                 std::sync::Arc::clone(&hub.state),
+                std::sync::Arc::clone(&hub.broker_connection),
             )
             .expect("Should register hub primitives");
 

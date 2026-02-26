@@ -304,6 +304,22 @@ pub struct Hub {
     /// Connected socket clients, keyed by client_id.
     socket_clients: std::collections::HashMap<String, crate::socket::client_conn::SocketClientConn>,
 
+    // === PTY Broker ===
+    /// Connection to the PTY broker process.
+    ///
+    /// Wrapped in `Arc<Mutex<Option<...>>>` so the Lua `hub.register_pty_with_broker()`
+    /// primitive can access it without going through Hub commands.
+    ///
+    /// `None` if the broker has not been started or the connection failed.
+    pub broker_connection: crate::broker::SharedBrokerConnection,
+
+    /// Maps broker session IDs to their owning agent and PTY index.
+    ///
+    /// Populated when Lua fires `HubEvent::BrokerSessionRegistered` after
+    /// calling `hub.register_pty_with_broker()`. Used to route incoming
+    /// `HubEvent::BrokerPtyOutput` frames to the correct `PtyHandle`.
+    broker_sessions: std::collections::HashMap<u32, (String, usize)>,
+
     // === TUI via Lua (Hub-side Processing) ===
     /// Sender for TUI output messages to TuiRunner.
     ///
@@ -465,6 +481,8 @@ impl Hub {
             push_subscriptions: crate::notifications::push::PushSubscriptionStore::default(),
             socket_server: None,
             socket_clients: std::collections::HashMap::new(),
+            broker_connection: Arc::new(Mutex::new(None)),
+            broker_sessions: std::collections::HashMap::new(),
             tui_output_tx: None,
             tui_wake_fd: None,
             tui_request_rx: None,
@@ -549,12 +567,19 @@ impl Hub {
             self.hub_identifier.clone(),
             Arc::clone(&self.shared_server_id),
             Arc::clone(&self.state),
+            Arc::clone(&self.broker_connection),
         ) {
             log::warn!("Failed to register Hub Lua primitives: {}", e);
         }
 
         // Load Lua init script (hot-reload is now handled by Lua's module_watcher)
         self.load_lua_init();
+
+        // Connect to (or spawn) the PTY broker for zero-downtime restarts.
+        // Must run after load_lua_init so Lua can call hub.register_pty_with_broker().
+        if !crate::env::is_test_mode() {
+            self.try_connect_broker();
+        }
 
 
         // Bundle generation is deferred - don't call generate_connection_url() here.
@@ -563,6 +588,111 @@ impl Hub {
         // 2. External automation requests the connection URL
         // 3. Headless mode calls setup_headless() which eagerly generates it
         // This avoids blocking boot for up to 10 seconds in TUI mode.
+    }
+
+    // === PTY Broker ===
+
+    /// Attempt to connect to an existing broker process, or spawn a new one.
+    ///
+    /// Called during startup after the socket server is initialised.
+    ///
+    /// # Flow
+    ///
+    /// 1. Check for an existing broker socket (`/tmp/botster-{uid}/broker-{hub_id}.sock`).
+    /// 2. If found, attempt to connect and ping — reuse if alive.
+    /// 3. If no socket or connection fails, spawn a new broker subprocess and
+    ///    connect to it.
+    /// 4. On success, configure the reconnect timeout and start the async
+    ///    output forwarder thread.
+    pub fn try_connect_broker(&mut self) {
+        let path = match crate::broker::broker_socket_path(&self.hub_identifier) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[broker] could not resolve socket path: {e}");
+                return;
+            }
+        };
+
+        // Try to connect to an existing broker.
+        let existing_conn = if path.exists() {
+            match crate::broker::BrokerConnection::connect(&path) {
+                Ok(mut conn) => {
+                    if conn.ping().is_ok() {
+                        log::info!("[broker] reconnected to existing broker at {}", path.display());
+                        Some(conn)
+                    } else {
+                        log::debug!("[broker] existing broker socket unresponsive, will spawn fresh");
+                        None
+                    }
+                }
+                Err(e) => {
+                    log::debug!("[broker] could not connect to existing broker: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut conn = if let Some(c) = existing_conn {
+            c
+        } else {
+            // No live broker — spawn one and give it a moment to bind.
+            self.spawn_broker();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            match crate::broker::BrokerConnection::connect(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("[broker] failed to connect after spawn: {e}");
+                    return;
+                }
+            }
+        };
+
+        // Configure the reconnect window and start the async output forwarder.
+        if let Err(e) = conn.set_timeout(120) {
+            log::warn!("[broker] failed to set timeout: {e}");
+        }
+
+        // Clone the socket for the background output reader thread.
+        match conn.try_clone_stream() {
+            Ok(stream) => {
+                let event_tx = self.hub_event_tx.clone();
+                crate::broker::start_output_forwarder(stream, event_tx);
+            }
+            Err(e) => log::warn!("[broker] failed to clone socket for reader thread: {e}"),
+        }
+
+        *self.broker_connection.lock().unwrap() = Some(conn);
+        log::info!("[broker] connected");
+    }
+
+    /// Spawn the broker subprocess detached from the current process.
+    ///
+    /// Runs `botster broker --hub-id <id> --timeout 120` as a background
+    /// process. It exits on its own when the reconnect timeout expires.
+    fn spawn_broker(&self) {
+        let hub_id = self.hub_identifier.clone();
+        match std::env::current_exe() {
+            Ok(exe) => {
+                match std::process::Command::new(&exe)
+                    .args(["broker", "--hub-id", &hub_id, "--timeout", "120"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        log::info!("[broker] spawned broker process (pid {})", child.id());
+                        // Detach — the broker manages its own lifetime.
+                        std::mem::forget(child);
+                    }
+                    Err(e) => log::warn!("[broker] failed to spawn broker: {e}"),
+                }
+            }
+            Err(e) => log::warn!("[broker] could not locate current exe for broker spawn: {e}"),
+        }
     }
 
     /// Start the Unix domain socket server for IPC.
@@ -693,6 +823,24 @@ impl Hub {
 
     /// Send shutdown notification to server and cleanup resources.
     pub fn shutdown(&mut self) {
+        // Signal the PTY broker before any other cleanup.
+        //
+        // - exec_restart = true  → graceful disconnect (broker keeps PTYs alive,
+        //   the new Hub instance will reconnect within the timeout window).
+        // - exec_restart = false → kill_all (no restart planned; broker should
+        //   kill children and exit to avoid orphan processes).
+        if let Ok(mut guard) = self.broker_connection.lock() {
+            if let Some(conn) = guard.take() {
+                if self.exec_restart {
+                    log::info!("[broker] graceful disconnect (restart mode)");
+                    conn.disconnect_graceful();
+                } else {
+                    log::info!("[broker] kill_all (clean shutdown)");
+                    conn.kill_all();
+                }
+            }
+        }
+
         // Disconnect all socket clients
         for (client_id, conn) in self.socket_clients.drain() {
             log::debug!("Disconnecting socket client: {}", client_id);
