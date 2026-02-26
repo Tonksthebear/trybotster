@@ -65,10 +65,6 @@ pub struct TerminalPanel {
     scroll_offset: usize,
     /// Total scrollback lines available in the buffer.
     scrollback_depth: usize,
-    /// Cursor position cached before `measure_scrollback_depth()` mutates
-    /// the scrollback viewport. Prevents stale reads if vt100's cursor
-    /// tracking lags after set_scrollback() calls.
-    cached_cursor: (u16, u16),
 }
 
 impl std::fmt::Debug for TerminalPanel {
@@ -89,7 +85,6 @@ impl TerminalPanel {
             dims: (rows, cols),
             scroll_offset: 0,
             scrollback_depth: 0,
-            cached_cursor: (0, 0),
         }
     }
 
@@ -299,19 +294,9 @@ impl TerminalPanel {
     /// the real offset. Called after `process()` so we know the true
     /// buffer depth.
     fn measure_scrollback_depth(&mut self) {
-        // Cache cursor before the MAX probe changes the scrollback viewport.
-        self.cached_cursor = self.parser.screen().cursor_position();
         self.parser.screen_mut().set_scrollback(usize::MAX);
         self.scrollback_depth = self.parser.screen().scrollback();
         self.parser.screen_mut().set_scrollback(self.scroll_offset);
-    }
-
-    /// Cursor position cached before the last scrollback depth measurement.
-    ///
-    /// Use this in render paths instead of `screen().cursor_position()` to
-    /// avoid reading a position that may be stale from vt100 scrollback mutations.
-    pub fn cursor_position(&self) -> (u16, u16) {
-        self.cached_cursor
     }
 }
 
