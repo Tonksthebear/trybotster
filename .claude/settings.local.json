@@ -97,7 +97,9 @@
       "Bash(~/.botster-dev/shared/plugins/orchestrator/init.lua:*)",
       "Bash(RUST_LOG=info strings:*)",
       "WebFetch(domain:releasebot.io)",
-      "WebFetch(domain:news.ycombinator.com)"
+      "WebFetch(domain:news.ycombinator.com)",
+      "Bash(do touch:*)",
+      "mcp__github__search_issues"
     ],
     "deny": [],
     "ask": []
