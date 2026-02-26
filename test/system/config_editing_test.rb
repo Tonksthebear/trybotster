@@ -203,9 +203,9 @@ class ConfigEditingTest < ApplicationSystemTestCase
     find("[data-tab='templates']").click
     assert_selector "[data-hub-templates-ready]", wait: 15
 
-    # Click a plugin template card (plugins are tracked by template:list,
+    # Click the github plugin template card (plugins are tracked by template:list,
     # unlike non-plugin templates like user/init.lua which aren't detected)
-    plugin_card = find("[data-hub-templates-target='card'][data-dest*='plugins/']", wait: 10)
+    plugin_card = find("[data-hub-templates-target='card'][data-dest*='plugins/github']", wait: 10)
     plugin_card.click
 
     # Preview panel should appear with an install button
