@@ -21,6 +21,7 @@
 //! - [`config`] - Configuration loading/saving
 
 // Library modules
+pub mod broker;
 pub mod agent;
 pub mod app;
 pub mod auth;
