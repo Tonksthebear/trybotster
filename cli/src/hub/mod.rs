@@ -663,29 +663,44 @@ impl Hub {
             }
         };
 
-        // Configure the reconnect window and start the async output forwarder.
+        // Configure the reconnect window.
         if let Err(e) = conn.set_timeout(120) {
             log::warn!("[broker] failed to set timeout: {e}");
         }
 
-        // Clone the socket for the background output reader thread.
-        match conn.try_clone_stream() {
-            Ok(stream) => {
-                let event_tx = self.hub_event_tx.clone();
-                crate::broker::start_output_forwarder(stream, event_tx);
+        // Clone the stream before consuming `conn` into the mutex.
+        // The forwarder is started *after* the broker_reconnected Lua event fires
+        // (see below) so that BrokerSessionRegistered events are queued before any
+        // BrokerPtyOutput events the forwarder produces. This eliminates the race
+        // where output frames arrive before session routing is registered.
+        let stream_opt = match conn.try_clone_stream() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("[broker] failed to clone socket for reader thread: {e}");
+                None
             }
-            Err(e) => log::warn!("[broker] failed to clone socket for reader thread: {e}"),
-        }
+        };
 
+        // Store the connection before firing broker_reconnected so that
+        // get_pty_snapshot_from_broker() works inside the Lua callback.
         *self.broker_connection.lock().unwrap() = Some(conn);
         log::info!("[broker] connected");
 
-        // Fire Lua event so the broker_reconnected handler can create ghost PTY
-        // handles and replay scrollback for agents that survived the Hub restart.
+        // Fire the Lua event synchronously while the forwarder thread does not
+        // yet exist. The callback queues BrokerSessionRegistered events and
+        // populates HandleCache. When the forwarder starts below, any
+        // BrokerPtyOutput it sends will arrive in the channel after those
+        // BrokerSessionRegistered events, eliminating the routing race.
         if is_reconnect {
             if let Err(e) = self.lua.fire_json_event("broker_reconnected", &serde_json::json!({})) {
                 log::warn!("[broker] broker_reconnected event error: {e}");
             }
+        }
+
+        // Start the output forwarder now that session routing is registered.
+        if let Some(stream) = stream_opt {
+            let event_tx = self.hub_event_tx.clone();
+            crate::broker::start_output_forwarder(stream, event_tx);
         }
     }
 
