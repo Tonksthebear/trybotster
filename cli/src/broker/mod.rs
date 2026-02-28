@@ -18,8 +18,8 @@
 //!
 //! Hub disconnects → broker starts reconnect_timeout countdown
 //! Hub reconnects  → Hub sends GetSnapshot(session_id) per session
-//!                   Broker sends raw ring-buffer bytes in Snapshot frame
-//!                   Hub replays into fresh AlacrittyParser shadow screen
+//!                   Broker calls generate_ansi_snapshot() on its AlacrittyParser
+//!                   Hub feeds the ANSI snapshot into a fresh shadow screen
 //!
 //! Timeout expires → broker kills children and exits
 //! KillAll command → broker kills children and exits immediately
@@ -48,14 +48,13 @@
 
 pub mod connection;
 pub mod protocol;
-pub mod ring_buffer;
 
 #[cfg(test)]
 mod integration_test_full;
 
 pub(crate) use connection::{BrokerConnection, SharedBrokerConnection};
 
-use ring_buffer::RingBuffer;
+use crate::terminal::{AlacrittyParser, DEFAULT_SCROLLBACK_LINES, NoopListener, generate_ansi_snapshot};
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -74,9 +73,6 @@ use protocol::{
     encode_broker_control, encode_data, frame_type,
 };
 
-/// Ring buffer capacity per PTY session (~1 MB).
-const RING_CAP: usize = ring_buffer::DEFAULT_RING_CAPACITY;
-
 /// Maximum path length for a Unix domain socket (macOS kernel limit).
 const MAX_SOCK_PATH: usize = 104;
 
@@ -91,8 +87,12 @@ struct Session {
     /// The master PTY FD.  `OwnedFd` closes on drop.
     master_fd: OwnedFd,
     child_pid: u32,
-    /// Raw output ring buffer, shared with the reader thread.
-    ring: Arc<Mutex<RingBuffer>>,
+    /// Terminal parser, shared with the reader thread.
+    ///
+    /// The reader feeds raw PTY bytes in; on `GetSnapshot` the broker calls
+    /// `generate_ansi_snapshot()` directly from parsed cell state instead of
+    /// storing raw bytes in a separate ring buffer.
+    parser: Arc<Mutex<AlacrittyParser<NoopListener>>>,
     /// Reader thread handle — joined on shutdown.
     reader: Option<thread::JoinHandle<()>>,
 }
@@ -109,7 +109,7 @@ impl Session {
         Ok(())
     }
 
-    /// Resize the PTY via `ioctl(TIOCSWINSZ)`.
+    /// Resize the PTY via `ioctl(TIOCSWINSZ)` and keep the parser in sync.
     fn resize(&self, rows: u16, cols: u16) {
         let raw: RawFd = std::os::unix::io::AsRawFd::as_raw_fd(&self.master_fd);
         let ws = libc::winsize {
@@ -119,6 +119,9 @@ impl Session {
             ws_ypixel: 0,
         };
         unsafe { libc::ioctl(raw, libc::TIOCSWINSZ, &ws) };
+        if let Ok(mut p) = self.parser.lock() {
+            p.resize(rows, cols);
+        }
     }
 
     /// Kill the child process (SIGHUP → SIGKILL after 200 ms).
@@ -169,14 +172,16 @@ impl Broker {
         output_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     ) -> u32 {
         let session_id = self.alloc_session_id();
-        let ring = Arc::new(Mutex::new(RingBuffer::new(RING_CAP)));
-        let ring_clone = Arc::clone(&ring);
+        let parser = Arc::new(Mutex::new(
+            AlacrittyParser::new_noop(reg.rows, reg.cols, DEFAULT_SCROLLBACK_LINES),
+        ));
+        let parser_clone = Arc::clone(&parser);
 
         // Reader thread: blocking read loop on the master PTY FD.
         let raw: RawFd = std::os::unix::io::AsRawFd::as_raw_fd(&fd);
         let reader_sid = session_id;
         let reader = thread::spawn(move || {
-            reader_loop(raw, reader_sid, ring_clone, output_tx);
+            reader_loop(raw, reader_sid, parser_clone, output_tx);
         });
 
         self.key_map.insert((reg.agent_key.clone(), reg.pty_index), session_id);
@@ -186,7 +191,7 @@ impl Broker {
             pty_index: reg.pty_index,
             master_fd: fd,
             child_pid: reg.child_pid,
-            ring,
+            parser,
             reader: Some(reader),
         });
 
@@ -220,13 +225,13 @@ impl Broker {
 
 /// PTY reader loop — runs in a dedicated thread per session.
 ///
-/// Reads from the master FD (borrowing, not owning), appends to the ring
-/// buffer, and sends encoded `PtyOutput` frames to the Hub connection
-/// handler via `output_tx`.
+/// Reads from the master FD (borrowing, not owning), feeds bytes into the
+/// session's `AlacrittyParser`, and forwards encoded `PtyOutput` frames to the
+/// Hub connection handler via `output_tx`.
 fn reader_loop(
     fd: RawFd,
     session_id: u32,
-    ring: Arc<Mutex<RingBuffer>>,
+    parser: Arc<Mutex<AlacrittyParser<NoopListener>>>,
     output_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 ) {
     let mut buf = [0u8; 4096];
@@ -249,9 +254,9 @@ fn reader_loop(
             }
             Ok(n) => {
                 let data = &buf[..n];
-                // Append to ring buffer.
-                if let Ok(mut ring) = ring.lock() {
-                    ring.push(data);
+                // Feed into the parser so GetSnapshot can generate from cell state.
+                if let Ok(mut p) = parser.lock() {
+                    p.process(data);
                 }
                 // Forward to Hub (best-effort; drop if Hub is disconnected).
                 let frame = encode_data(frame_type::PTY_OUTPUT, session_id, data);
@@ -419,7 +424,11 @@ fn handle_connection(
 
                 BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) => {
                     if let Some(sess) = broker.sessions.get(&session_id) {
-                        let snapshot = sess.ring.lock().map(|r| r.to_vec()).unwrap_or_default();
+                        let snapshot = sess
+                            .parser
+                            .lock()
+                            .map(|p| generate_ansi_snapshot(&p, false))
+                            .unwrap_or_default();
                         let frame = encode_data(frame_type::SNAPSHOT, session_id, &snapshot);
                         let _ = output_tx.try_send(frame);
                     }

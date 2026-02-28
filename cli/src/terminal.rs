@@ -287,17 +287,33 @@ pub fn generate_ansi_snapshot<L: EventListener>(
 ) -> Vec<u8> {
     let mut out = Vec::new();
 
+    let term = parser.term();
+    let grid = term.grid();
+
+    // Enter alt screen on the receiving end before emitting content.
+    // Without this, if vim/less/htop is running when a browser reconnects, the
+    // alt-screen cells would be written to the *normal* screen — corrupting it
+    // when the app later exits and restores the normal buffer.
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        out.extend_from_slice(b"\x1b[?1049h");
+    }
+
+    // Capture kitty state before any early return — must be appended in all
+    // paths including skip_visible, because the app won't re-push kitty on
+    // a SIGWINCH redraw; only at startup.
+    let wants_kitty = term.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL);
+
     // Reset all SGR attributes and move cursor home.
     out.extend_from_slice(b"\x1b[0m\x1b[H");
 
     if skip_visible {
         // Blank screen — the app will redraw after receiving SIGWINCH.
         out.extend_from_slice(b"\x1b[2J\x1b[H");
+        if wants_kitty {
+            out.extend_from_slice(b"\x1b[>1u");
+        }
         return out;
     }
-
-    let term = parser.term();
-    let grid = term.grid();
     let cols = grid.columns();
     let screen_lines = grid.screen_lines();
     let history = grid.history_size();
@@ -332,6 +348,14 @@ pub fn generate_ansi_snapshot<L: EventListener>(
     let row = cursor.line.0 as usize + 1;
     let col = cursor.column.0 + 1;
     out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
+
+    // Restore kitty keyboard protocol if the terminal had it active.
+    // Appended here (not in callers) so both the broker snapshot path and the
+    // hub shadow-screen path get it automatically without separate bookkeeping.
+    if wants_kitty {
+        // CSI > 1 u = push with DISAMBIGUATE_ESCAPE_CODES flag.
+        out.extend_from_slice(b"\x1b[>1u");
+    }
 
     out
 }

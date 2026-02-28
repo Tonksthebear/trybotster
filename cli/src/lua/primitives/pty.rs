@@ -400,7 +400,7 @@ impl LuaUserData for PtySessionHandle {
         //
         // Processes `bytes` through the alacritty parser that backs `get_snapshot()`
         // and `get_screen()`. Used by `Agent:replay_broker_scrollback()` to replay
-        // the broker's ring-buffer contents after a Hub restart so newly connecting
+        // the broker's ANSI snapshot after a Hub restart so newly connecting
         // clients see the current terminal state instead of a blank screen.
         //
         // Does NOT write bytes to the PTY process — use `write()` for input.

@@ -353,11 +353,12 @@ impl PtyHandle {
 
     /// Locks the shadow screen and delegates to
     /// [`generate_ansi_snapshot`](crate::terminal::generate_ansi_snapshot).
-    /// Appends the kitty keyboard push sequence when the inner PTY has
-    /// activated kitty mode, so connecting terminals enter kitty mode.
+    ///
+    /// Alt-screen entry, kitty keyboard restore, and SGR state are all handled
+    /// inside `generate_ansi_snapshot` — no post-processing needed here.
     ///
     /// When a resize is pending (shadow screen resized but app hasn't redrawn),
-    /// the snapshot skips the stale visible-screen content and clears instead.
+    /// the snapshot clears the screen; the app redraws on SIGWINCH.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
         let parser = self
@@ -365,18 +366,9 @@ impl PtyHandle {
             .lock()
             .expect("shadow_screen lock poisoned");
         let skip_visible = self.resize_pending.swap(false, Ordering::AcqRel);
-        let mut snapshot = generate_ansi_snapshot(&*parser, skip_visible);
-
-        // Restore kitty keyboard protocol state in the snapshot.
-        // alacritty tracks kitty mode internally, but the snapshot function
-        // doesn't emit the push sequence — append it so connecting terminals
-        // enter kitty mode.
-        if parser.kitty_enabled() {
-            // CSI > 1 u = push kitty keyboard with DISAMBIGUATE_ESCAPE_CODES flag.
-            snapshot.extend(b"\x1b[>1u");
-        }
-
-        snapshot
+        // generate_ansi_snapshot includes kitty restore and alt-screen entry
+        // sequences automatically — no manual appends needed here.
+        generate_ansi_snapshot(&*parser, skip_visible)
     }
 
     // =========================================================================
