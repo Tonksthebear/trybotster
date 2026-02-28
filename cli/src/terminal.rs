@@ -394,13 +394,7 @@ pub fn generate_ansi_snapshot<L: EventListener>(
     out
 }
 
-/// Emit a single grid row as ANSI bytes with incremental SGR transitions.
-///
-/// Wide-char spacer cells ([`Flags::WIDE_CHAR_SPACER`]) are skipped — the base
-/// wide character was already emitted by the preceding cell. Zero-width
-/// combining characters stored in [`alacritty_terminal::term::cell::CellExtra`]
-/// are appended immediately after their base character.
-/// Map a `CursorStyle` to the corresponding DECSCUSR escape sequence bytes.
+/// Map a [`CursorStyle`] to the corresponding DECSCUSR escape sequence bytes.
 ///
 /// DECSCUSR encodes both shape and blink state in a single parameter:
 /// - 1 blinking block, 2 steady block
@@ -424,6 +418,12 @@ fn cursor_shape_decscusr(style: CursorStyle) -> &'static [u8] {
     }
 }
 
+/// Emit a single grid row as ANSI bytes with incremental SGR transitions.
+///
+/// Wide-char spacer cells ([`Flags::WIDE_CHAR_SPACER`]) are skipped — the base
+/// wide character was already emitted by the preceding cell. Zero-width
+/// combining characters stored in [`alacritty_terminal::term::cell::CellExtra`]
+/// are appended immediately after their base character.
 fn emit_grid_line(out: &mut Vec<u8>, grid: &Grid<Cell>, line: Line, cols: usize) {
     let mut sgr = SgrState::reset();
     let mut char_buf = [0u8; 4];
