@@ -33,7 +33,7 @@ use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -207,6 +207,16 @@ impl<L: EventListener> AlacrittyParser<L> {
         !self.term.mode().contains(TermMode::SHOW_CURSOR)
     }
 
+    /// Current cursor style (shape + blink) as set by the running application.
+    ///
+    /// Returns the style set via DECSCUSR, falling back to `CursorStyle::default()`
+    /// (blinking block). Does not include hidden state — check `cursor_hidden()`
+    /// separately, or use `term().renderable_content().cursor.shape` which
+    /// synthesises `CursorShape::Hidden` from `SHOW_CURSOR` mode automatically.
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.term.cursor_style()
+    }
+
     /// Whether the Kitty keyboard protocol is currently active.
     ///
     /// alacritty_terminal tracks this via the composite `KITTY_KEYBOARD_PROTOCOL`
@@ -303,18 +313,26 @@ pub fn generate_ansi_snapshot<L: EventListener>(
     // a SIGWINCH redraw; only at startup.
     let wants_kitty = term.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL);
 
+    // Use RenderableCursor for position, visibility, and shape — all in one call.
+    // This handles wide-char column adjustment and the SHOW_CURSOR TermMode check.
+    let renderable_cursor = term.renderable_content().cursor;
+    let cursor_hidden = renderable_cursor.shape == CursorShape::Hidden;
+
+    // Pre-compute the DECSCUSR sequence for cursor shape. Only emitted when the
+    // cursor is visible; the default browser cursor is a blinking block so we
+    // always emit to ensure the correct shape after reconnect.
+    let cursor_shape_seq = cursor_shape_decscusr(term.cursor_style());
+
     // Reset all SGR attributes and move cursor home.
     out.extend_from_slice(b"\x1b[0m\x1b[H");
-
-    // Capture cursor visibility before any early return — must be applied in
-    // all paths so the browser reflects the correct cursor state on reconnect.
-    let cursor_hidden = !term.mode().contains(TermMode::SHOW_CURSOR);
 
     if skip_visible {
         // Blank screen — the app will redraw after receiving SIGWINCH.
         out.extend_from_slice(b"\x1b[2J\x1b[H");
         if cursor_hidden {
             out.extend_from_slice(b"\x1b[?25l");
+        } else {
+            out.extend_from_slice(cursor_shape_seq);
         }
         if wants_kitty {
             out.extend_from_slice(b"\x1b[>1u");
@@ -347,20 +365,22 @@ pub fn generate_ansi_snapshot<L: EventListener>(
         }
     }
 
-    // Reset SGR then position the cursor at its current location.
+    // Reset SGR then position cursor using RenderableCursor (wide-char corrected).
     // ANSI cursor addressing is 1-indexed; Line/Column are 0-indexed.
     out.extend_from_slice(b"\x1b[0m");
-    let cursor = grid.cursor.point;
-    // Cursor line is always in the viewport (non-negative Line index).
-    let row = cursor.line.0 as usize + 1;
-    let col = cursor.column.0 + 1;
+    // line.0 is always non-negative for a viewport cursor.
+    let row = renderable_cursor.point.line.0 as usize + 1;
+    let col = renderable_cursor.point.column.0 + 1;
     out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
 
-    // Restore cursor visibility. The default (after reconnect) is shown; only
-    // emit the hide sequence if the app has explicitly hidden it (e.g., vim in
-    // insert mode, less, htop). `\x1b[0m` does not affect DECTCEM.
+    // Restore cursor visibility and shape. `\x1b[0m` (SGR reset) does not
+    // affect DECTCEM or DECSCUSR — those are separate terminal state planes.
     if cursor_hidden {
         out.extend_from_slice(b"\x1b[?25l");
+    } else {
+        // Emit DECSCUSR so the browser shows the correct cursor shape (beam in
+        // vim insert mode, underline, etc.).
+        out.extend_from_slice(cursor_shape_seq);
     }
 
     // Restore kitty keyboard protocol if the terminal had it active.
@@ -380,6 +400,30 @@ pub fn generate_ansi_snapshot<L: EventListener>(
 /// wide character was already emitted by the preceding cell. Zero-width
 /// combining characters stored in [`alacritty_terminal::term::cell::CellExtra`]
 /// are appended immediately after their base character.
+/// Map a `CursorStyle` to the corresponding DECSCUSR escape sequence bytes.
+///
+/// DECSCUSR encodes both shape and blink state in a single parameter:
+/// - 1 blinking block, 2 steady block
+/// - 3 blinking underline, 4 steady underline
+/// - 5 blinking beam, 6 steady beam
+///
+/// Returns `b"\x1b[2q"` (steady block) for `HollowBlock` and `Hidden`, which
+/// should not reach this function in practice (callers check visibility first).
+fn cursor_shape_decscusr(style: CursorStyle) -> &'static [u8] {
+    match (style.shape, style.blinking) {
+        (CursorShape::Block, true) => b"\x1b[1q",
+        (CursorShape::Block, false) => b"\x1b[2q",
+        (CursorShape::Underline, true) => b"\x1b[3q",
+        (CursorShape::Underline, false) => b"\x1b[4q",
+        (CursorShape::Beam, true) => b"\x1b[5q",
+        (CursorShape::Beam, false) => b"\x1b[6q",
+        // HollowBlock is a vi-mode variant of block; treat as steady block.
+        (CursorShape::HollowBlock, _) => b"\x1b[2q",
+        // Hidden is handled before calling this function.
+        (CursorShape::Hidden, _) => b"\x1b[2q",
+    }
+}
+
 fn emit_grid_line(out: &mut Vec<u8>, grid: &Grid<Cell>, line: Line, cols: usize) {
     let mut sgr = SgrState::reset();
     let mut char_buf = [0u8; 4];

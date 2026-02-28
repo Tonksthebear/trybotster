@@ -107,6 +107,14 @@ impl TerminalPanel {
         self.parser.cursor_hidden()
     }
 
+    /// Current cursor style (shape + blink) from the running application.
+    ///
+    /// Used by [`TerminalModes`] to mirror DECSCUSR to the outer terminal so
+    /// the cursor shape (beam/block/underline) is correct when focused.
+    pub fn cursor_style(&self) -> alacritty_terminal::vte::ansi::CursorStyle {
+        self.parser.cursor_style()
+    }
+
     /// Extract plain-text grid contents (for tests and content checks).
     pub fn contents(&self) -> String {
         self.parser.contents()
